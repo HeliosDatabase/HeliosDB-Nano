@@ -1544,12 +1544,32 @@ pub(super) fn handle_filtered_scan(executor: &Executor, plan: &LogicalPlan) -> R
                         } else {
                             &[]
                         };
-                        storage.scan_table_branch_aware_with_schema_columnar_columns_filtered(
-                            &actual_table_name,
-                            &schema,
-                            &columns,
-                            pushed_predicates,
-                        )?
+                        let projected_columnar = if apply_columnar_predicates {
+                            projection.as_deref().and_then(|projection| {
+                                storage
+                                    .scan_table_with_schema_columnar_projected_filtered(
+                                        &actual_table_name,
+                                        &schema,
+                                        projection,
+                                        pushed_predicates,
+                                    )
+                                    .transpose()
+                            })
+                        } else {
+                            None
+                        };
+                        if let Some(projected) = projected_columnar.transpose()? {
+                            columnar_predicates_applied = true;
+                            row_projection_applied = true;
+                            projected
+                        } else {
+                            storage.scan_table_branch_aware_with_schema_columnar_columns_filtered(
+                                &actual_table_name,
+                                &schema,
+                                &columns,
+                                pushed_predicates,
+                            )?
+                        }
                     } else if !pushed_predicates.is_empty() {
                         let selected_columns: Option<Vec<usize>> = match decode_hint {
                             Some(ScanDecodeHint::Prefix(prefix_len)) => Some((0..*prefix_len).collect()),

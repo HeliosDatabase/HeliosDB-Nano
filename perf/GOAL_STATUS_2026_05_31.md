@@ -434,6 +434,66 @@ Rejected after `20f206b`:
     accepted 74-76/s band.
   - Decision: reverted. The join gap is not primarily hash function overhead.
 
+## Accepted Follow-Up: Compact Columnar Filtered Scans
+
+Commit after this report: `perf: emit compact columnar filtered scan tuples`.
+
+Change:
+
+- `StorageEngine::scan_table_with_schema_columnar_projected_filtered` emits
+  compact projected tuples directly from columnar side-data when every
+  predicate and projected output column is declared `STORAGE COLUMNAR`.
+- `FilteredScan` uses that path for eligible current-branch scans and falls
+  back for non-main branches, mixed row/columnar references, unsupported
+  predicates, and unprojected scans.
+- This mirrors the row-store compact projected filtered scan boundary: storage
+  evaluates the pushed predicate and crosses the executor boundary once with
+  already-projected rows.
+
+Validation:
+
+```text
+cargo check --lib
+cargo test --test storage_modes_test -- --nocapture --test-threads=1
+HELIOS_TPS=1 HELIOS_TPS_MODE=mem HELIOS_TPS_EMBEDDED_PROFILE=columnar_analytics \
+  HELIOS_TPS_WORKLOADS=filter_scan,agg_count_sum_avg,group_by_status,join_users_orders,order_by_limit10 \
+  HELIOS_TPS_N=10000 HELIOS_TPS_M=2000 \
+  cargo test --profile perf --test tps_workloads run_tps_suite -- --nocapture --test-threads=1
+```
+
+Measured `columnar_analytics` in-memory TPS, `N=10000`, `M=2000`,
+time-travel on:
+
+```text
+before:
+filter_scan(age>50)       222/s
+agg_count_sum_avg        1921/s
+group_by_status           132/s
+join_users_orders          54/s
+order_by_limit10          219/s
+
+after mixed run:
+filter_scan(age>50)       253/s
+agg_count_sum_avg        2146/s
+group_by_status           139/s
+join_users_orders          58/s
+order_by_limit10          227/s
+
+after repeat:
+filter_scan focused       259/s
+mixed run filter          245/s
+mixed run aggregate      2148/s
+mixed run join             48/s
+mixed run Top-N           231/s
+join focused               58/s
+```
+
+Conclusion: this is a useful gated analytics-profile improvement, especially
+for the columnar filter and aggregate shapes, but it does not close the SQLite
+embedded analytics goal. SQLite still leads the mirrored in-memory filter and
+join workloads; the next structural work remains compact/vectorized scan-join
+execution rather than local tuple projection cleanup.
+
 ## Accepted Follow-Up: Skip Dead Result-Cache Writes
 
 Commit after this report: `perf: skip result cache writes for nondeterministic queries`.
