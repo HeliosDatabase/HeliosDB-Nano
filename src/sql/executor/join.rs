@@ -402,17 +402,6 @@ impl JoinKey {
         }
     }
 
-    fn for_each_value(&self, mut f: impl FnMut(&crate::Value)) {
-        match self {
-            Self::Int(value) => f(&crate::Value::Int8(*value)),
-            Self::Single(value) => f(value),
-            Self::Composite(values) => {
-                for value in values {
-                    f(value);
-                }
-            }
-        }
-    }
 }
 
 impl PartialEq for JoinKey {
@@ -424,11 +413,11 @@ impl PartialEq for JoinKey {
         match (self, other) {
             (Self::Int(a), Self::Int(b)) => a == b,
             (Self::Int(a), Self::Single(b)) | (Self::Single(b), Self::Int(a)) => {
-                values_equal_for_join(&crate::Value::Int8(*a), b)
+                int_value_equal_for_join(*a, b)
             }
             (Self::Int(a), Self::Composite(values)) | (Self::Composite(values), Self::Int(a)) => values
                 .first()
-                .is_some_and(|b| values_equal_for_join(&crate::Value::Int8(*a), b)),
+                .is_some_and(|b| int_value_equal_for_join(*a, b)),
             (Self::Single(a), Self::Single(b)) => values_equal_for_join(a, b),
             (Self::Single(a), Self::Composite(values)) | (Self::Composite(values), Self::Single(a)) => {
                 values.first().is_some_and(|b| values_equal_for_join(a, b))
@@ -445,7 +434,29 @@ impl Eq for JoinKey {}
 impl std::hash::Hash for JoinKey {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.len().hash(state);
-        self.for_each_value(|value| hash_value_for_join(value, state));
+        match self {
+            Self::Int(value) => {
+                2u8.hash(state);
+                value.hash(state);
+            }
+            Self::Single(value) => hash_value_for_join(value, state),
+            Self::Composite(values) => {
+                for value in values {
+                    hash_value_for_join(value, state);
+                }
+            }
+        }
+    }
+}
+
+fn int_value_equal_for_join(left: i64, right: &crate::Value) -> bool {
+    use crate::Value;
+    match right {
+        Value::Int2(value) => left == i64::from(*value),
+        Value::Int4(value) => left == i64::from(*value),
+        Value::Int8(value) => left == *value,
+        Value::String(value) => value.parse::<i64>().map_or(false, |parsed| left == parsed),
+        _ => false,
     }
 }
 
@@ -1169,14 +1180,10 @@ impl HashJoinOperator {
 
     /// Estimate memory size of a join key
     fn estimate_key_size(key: &JoinKey) -> usize {
-        let mut values_size = 0usize;
-        key.for_each_value(|value| {
-            values_size += Self::estimate_value_size(value);
-        });
         match key {
             JoinKey::Int(_) => std::mem::size_of::<i64>(),
-            JoinKey::Single(_) => values_size,
-            JoinKey::Composite(_) => 24 + values_size,
+            JoinKey::Single(value) => Self::estimate_value_size(value),
+            JoinKey::Composite(values) => 24 + values.iter().map(Self::estimate_value_size).sum::<usize>(),
         }
     }
 }
