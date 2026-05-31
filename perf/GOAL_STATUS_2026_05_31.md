@@ -1794,12 +1794,18 @@ Change:
 - First execution of a statement still builds the spec through the normal
   parsed/planned path. Later executions can skip the parameterized plan cache
   and go straight to the fast DML executor.
+- Add a one-entry hot fast-spec cache in front of the LRU for the repeated
+  prepared-style statement shape. It is cleared by the same DDL/plan-cache
+  invalidation path and shared by cloned database handles.
+- Because parameterized UPDATE has its own cache, key it directly by SQL instead
+  of allocating a prefixed cache key on every hot call.
 
 Validation:
 
 ```text
 cargo check --lib
 cargo test --test parameterized_query_tests -- --nocapture --test-threads=1
+cargo test --test transaction_tests -- --nocapture --test-threads=1
 HELIOS_TPS_PARAMS=1 HELIOS_TPS_MODE=mem HELIOS_TPS_WORKLOADS=param_update,param_delete HELIOS_TPS_N=10000 HELIOS_TPS_M=2000 cargo test --profile perf --test tps_workloads run_param_tps_suite -- --nocapture --test-threads=1
 HELIOS_TPS_PARAMS=1 HELIOS_TPS_MODE=mem HELIOS_TPS_N=10000 HELIOS_TPS_M=2000 cargo test --profile perf --test tps_workloads run_param_tps_suite -- --nocapture --test-threads=1
 HELIOS_TPS_PARAMS=1 HELIOS_TPS_MODE=mem HELIOS_TPS_EMBEDDED_PROFILE=oltp_fast HELIOS_TPS_WORKLOADS=param_update,param_delete HELIOS_TPS_N=10000 HELIOS_TPS_M=2000 cargo test --profile perf --test tps_workloads run_param_tps_suite -- --nocapture --test-threads=1
@@ -1812,6 +1818,7 @@ before shortcut, rowstore focused      param_update 116,370/s, param_delete 145,
 after shortcut, rowstore focused       param_update 164,998/s, param_delete 228,932/s
 after shortcut, full param suite       param_update 169,943/s, param_delete 228,907/s
 after shortcut, oltp_fast focused      param_update 168,562/s, param_delete 231,725/s
+after hot-spec cache, rowstore focused param_update 171,860/s, param_delete 227,122/s
 SQLite params reference                update 241,284/s, delete 267,989/s
 ```
 
