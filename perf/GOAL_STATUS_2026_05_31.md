@@ -414,6 +414,26 @@ It confirms that the remaining SQLite in-memory filter/join gap is dominated by
 row decoding/materialization and tuple movement, not only by cached-plan
 operator dispatch.
 
+Rejected after `20f206b`:
+
+- Predicate-first projected filtered scan inside
+  `StorageEngine::scan_table_with_schema_projected_filtered`.
+  - Idea: decode the predicate column first, skip output-column decode for
+    rejected rows, then decode projected output only for survivors.
+  - Correctness: `cargo check --lib`, `scan_prefix_decode`,
+    `query_optimizer_tests`, and `join_hardening_tests` passed.
+  - TPS: `filter_scan` stayed similar at about 228-231/s, but
+    `join_users_orders` regressed to 65-70/s from the accepted 74-76/s band.
+  - Decision: reverted. The double selected-column decode and join-input shape
+    outweighed the saved projection decode.
+- Custom non-cryptographic hasher for the hash-join `HashMap`.
+  - Idea: replace SipHash for internal `JoinKey` hashing on hot integer
+    equi-joins.
+  - Correctness: `cargo check --lib` and `join_hardening_tests` passed.
+  - TPS: focused `join_users_orders` measured 72/s, flat to slower than the
+    accepted 74-76/s band.
+  - Decision: reverted. The join gap is not primarily hash function overhead.
+
 ## Accepted Follow-Up: Skip Dead Result-Cache Writes
 
 Commit after this report: `perf: skip result cache writes for nondeterministic queries`.
