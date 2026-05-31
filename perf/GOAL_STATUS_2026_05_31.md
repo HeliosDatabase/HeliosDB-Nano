@@ -895,3 +895,55 @@ Rejected during the next pass:
   worse: `bulk_insert_users(txn)` 140,943/s then 132,790/s and
   `autocommit_insert` 101,954/s then 105,077/s. Reverted. The tiny temporary
   value-vector allocation is not the missing SQLite-scale write lever.
+
+## Accepted Follow-Up: Direct Data-Key Builder
+
+Commit after this report: `perf: build data keys without formatting`.
+
+Finding:
+
+- `StorageEngine::build_data_key()` already used a thread-local byte buffer for
+  the common main-branch `data:{table}:{row_id}` key, but still wrote into that
+  buffer through `write!(..., "data:{}:{}", ...)`.
+- This helper sits on point lookups, fast inserts, deletes, and transaction
+  commit/version-key staging. Avoiding formatting machinery is a direct hot-path
+  cleanup.
+
+Change:
+
+- Build the same key by appending `b"data:"`, table-name bytes, `b':'`, and an
+  `itoa`-formatted row id directly into the reusable byte buffer.
+- Branch-specific `bdata:` key construction is unchanged.
+
+Validation:
+
+```text
+cargo check --lib
+cargo test --lib test_parse_row_id_after_prefix -- --nocapture --test-threads=1
+cargo test --test branch_storage_test -- --nocapture --test-threads=1
+git diff --check
+```
+
+Measured in-memory TPS, `N=10000`, `M=2000`, time-travel on:
+
+```text
+current committed post-row-counter range  bulk_insert_users(txn) 139,484-142,886/s, point_lookup_pk 317,205-336,483/s
+direct key run 1                           bulk_insert_users(txn) 141,457/s, point_lookup_pk 337,604/s
+direct key run 2                           bulk_insert_users(txn) 143,616/s, point_lookup_pk 338,953/s
+```
+
+Interpretation: this is a modest but consistent enough shared read/write
+hot-path win to keep. It still does not change the goal status: SQLite remains
+well ahead on default in-memory bulk insert, aggregate, and joins.
+
+Rejected during the next pass:
+
+- Carried main-branch data-key slice metadata in the transaction fast-insert
+  log so commit could build `v:` / `v_idx:` keys without reparsing
+  `data:{table}:{row_id}`. Correctness checks passed (`cargo check --lib`,
+  row-counter staging test, `transaction_tests` 28/28,
+  `savepoint_hardening_tests` 60/60), but the broader TPS signal regressed:
+  `point_lookup_pk` fell to 281,806/s then 268,953/s and update/delete also
+  softened, while `bulk_insert_users(txn)` only stayed in the existing
+  142-144k/s range. Reverted. The extra insert-log metadata/layout is not worth
+  the avoided commit-time key parse in the current workload shape.
