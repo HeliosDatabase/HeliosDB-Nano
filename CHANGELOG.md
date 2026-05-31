@@ -27,6 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added columnar analytics diagnostics and improvements: columnar range
   predicate pushdown, direct columnar Top-N, and small-group/direct
   `COUNT(*)` + `SUM(integer)` grouped aggregate handling.
+- Added a mixed projected scan path for gated analytics schemas that filter on
+  columnar side-data while projecting default row-store columns, with fallback
+  for dictionary/content-addressed storage modes.
 - Added benchmark harness support for Dockerized PostgreSQL/MariaDB client
   comparisons and explicit embedded in-memory profiles:
   `HELIOS_TPS_EMBEDDED_PROFILE=columnar_analytics` and

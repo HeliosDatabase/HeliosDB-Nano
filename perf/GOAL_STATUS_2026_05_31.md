@@ -2477,3 +2477,75 @@ Decision: kept. This closes the default row-store `group_by_status` gap against
 the current SQLite reference on this focused workload. It does not close the
 remaining SQLite embedded analytics gap because filter, aggregate, and join are
 still behind the SQLite reference.
+
+## Rejected Follow-Up: Two-Numeric Scratch-Free Aggregate Decoder
+
+Experiment:
+
+- Added a row decoder helper that returned two primitive numeric columns as a
+  pair instead of reusing the compact numeric scratch `Vec`.
+- Wired it into the exact row-store
+  `COUNT(*), SUM(balance), AVG(age)` aggregate path.
+
+Validation while present:
+
+```text
+cargo check --lib
+cargo test --lib storage::prefix_decode::tests::compact_two_numeric_decode_avoids_output_buffer -- --nocapture
+```
+
+Focused TPS, embedded mem, `N=10000`, `M=2000`, ops/s:
+
+```text
+fresh pre-change aggregate baseline      agg_count_sum_avg 570/s
+two-numeric decoder prototype            agg_count_sum_avg 513/s
+```
+
+Decision: reverted. Removing the small scratch buffer did not help; the
+aggregate ceiling is still dominated by row iteration and numeric decode work,
+not by the compact scratch `Vec`.
+
+## Accepted Follow-Up: Mixed Columnar Predicate + Row-Store Projection
+
+Finding:
+
+- The gated `columnar_analytics` profile could scan when all referenced columns
+  were columnar, but it fell back when a query filtered on columnar side-data
+  and projected default row-store columns.
+- The join workload has exactly that shape on the `users` side: `age` is
+  columnar in the gated profile, while `id` and `name` remain default
+  row-store columns.
+
+Change:
+
+- Add a mixed projected-filtered scan path that uses columnar side-data for
+  predicate evaluation, then decodes only the default projected columns for
+  surviving rows.
+- The path is gated to main-branch current scans and supported storage modes.
+  Dictionary/content-addressed columns and row-store predicates fall back to
+  the existing scan paths.
+- A trial that changed the columnar profile's filter workload back to the
+  default `SELECT id, name FROM users WHERE age > 50` was rejected for now:
+  it measured 155/s, slower than the row-store default filter path. The
+  columnar profile therefore keeps its explicit columnar-friendly filter SQL.
+
+Validation:
+
+```text
+cargo check --lib
+cargo test --test scan_prefix_decode mixed_columnar_filter_rowstore_projection_preserves_results -- --nocapture --test-threads=1
+```
+
+Focused TPS, embedded mem, `N=10000`, `M=2000`, ops/s:
+
+```text
+previous columnar join band              55-58/s
+focused columnar profile after patch     filter 254/s, join 67/s
+full columnar profile after patch        filter 247/s, aggregate 2202/s,
+                                         group_by 136/s, join 60/s, Top-N 204/s
+```
+
+Decision: kept as gated profile infrastructure. It removes a real fallback for
+hybrid analytical schemas and modestly improves the columnar join path, but it
+does not make the gated columnar profile broadly faster than the default
+row-store profile or SQLite on joins.

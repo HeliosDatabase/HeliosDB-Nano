@@ -77,8 +77,12 @@ regressions from the release batch.
   - filtered scans whose predicate and projection are entirely `STORAGE
     COLUMNAR` now emit compact projected tuples directly from columnar side-data
     instead of building a full-width row and re-projecting it in `ScanOperator`;
+  - mixed scans can now filter on columnar side-data while projecting default
+    row-store columns, which removes one fallback class in hybrid analytical
+    schemas;
   - non-main branches and mixed row/columnar scans still fall back to the
-    existing branch-aware paths.
+    existing branch-aware paths when the query requires unsupported storage
+    modes.
 
 ## Release-Gate Fixes
 
@@ -123,8 +127,9 @@ caveats are explicit. Current status:
   join-input follow-ups nudged row-store filter to about 224-235/s in focused
   runs and join to about 78-97/s, and the row-store text grouped aggregate path
   moved `group_by_status` to about 236-245/s. The gated columnar profile now
-  reaches about 245-259/s on its columnar filter variant and about 2.1k/s on
-  the aggregate shape, but it still does not win the full analytics set.
+  reaches about 245-259/s on its columnar filter variant, about 2.1-2.2k/s on
+  the aggregate shape, and about 60-67/s on the mixed join path, but it still
+  does not win the full analytics set.
 
 This means the release meets the revised acceptance bar for publication:
 surpass-or-similar is achieved across the PostgreSQL/MariaDB Docker mirror and
@@ -366,6 +371,17 @@ post-close row-store text grouped COUNT/SUM gate
   HELIOS_TPS=1 HELIOS_TPS_MODE=mem HELIOS_TPS_WORKLOADS=filter_scan,agg_count_sum_avg,group_by_status,join_users_orders,order_by_limit10 HELIOS_TPS_N=10000 HELIOS_TPS_M=2000 cargo test --profile perf --test tps_workloads run_tps_suite -- --nocapture --test-threads=1
     mixed run: filter_scan 232/s, aggregate 578/s,
     group_by_status 236/s, join_users_orders 97/s, order_by_limit10 454/s
+
+post-close mixed columnar-predicate/default-projection scan gate
+  cargo check --lib
+    passed
+  cargo test --test scan_prefix_decode mixed_columnar_filter_rowstore_projection_preserves_results -- --nocapture --test-threads=1
+    passed
+  HELIOS_TPS=1 HELIOS_TPS_MODE=mem HELIOS_TPS_EMBEDDED_PROFILE=columnar_analytics HELIOS_TPS_WORKLOADS=filter_scan,join_users_orders HELIOS_TPS_N=10000 HELIOS_TPS_M=2000 cargo test --profile perf --test tps_workloads run_tps_suite -- --nocapture --test-threads=1
+    focused columnar profile: filter_scan 254/s, join_users_orders 67/s
+  HELIOS_TPS=1 HELIOS_TPS_MODE=mem HELIOS_TPS_EMBEDDED_PROFILE=columnar_analytics HELIOS_TPS_WORKLOADS=filter_scan,agg_count_sum_avg,group_by_status,join_users_orders,order_by_limit10 HELIOS_TPS_N=10000 HELIOS_TPS_M=2000 cargo test --profile perf --test tps_workloads run_tps_suite -- --nocapture --test-threads=1
+    full columnar profile: filter_scan 247/s, aggregate 2202/s,
+    group_by_status 136/s, join_users_orders 60/s, order_by_limit10 204/s
 ```
 
 ## Recommended Publish Commands

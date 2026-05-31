@@ -264,6 +264,44 @@ fn rowstore_text_group_count_sum_fast_path_preserves_nulls() {
 }
 
 #[test]
+fn mixed_columnar_filter_rowstore_projection_preserves_results() {
+    let db = EmbeddedDatabase::new_in_memory().unwrap();
+    db.execute(
+        "CREATE TABLE mixed_users (
+            id INTEGER PRIMARY KEY,
+            name TEXT,
+            age INTEGER STORAGE COLUMNAR,
+            balance INTEGER STORAGE COLUMNAR
+        )",
+    )
+    .unwrap();
+    db.execute("INSERT INTO mixed_users VALUES (1, 'a', 30, 100)").unwrap();
+    db.execute("INSERT INTO mixed_users VALUES (2, 'b', 45, 200)").unwrap();
+    db.execute("INSERT INTO mixed_users VALUES (3, 'c', 60, 300)").unwrap();
+
+    let rows = db
+        .query("SELECT id, name FROM mixed_users WHERE age > 40 ORDER BY id", &[])
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].values, vec![Value::Int4(2), Value::String("b".into())]);
+    assert_eq!(rows[1].values, vec![Value::Int4(3), Value::String("c".into())]);
+
+    let rows = db
+        .query(
+            "SELECT name, balance FROM mixed_users WHERE age > 40 ORDER BY name",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(
+        rows.iter().map(|row| row.values.clone()).collect::<Vec<_>>(),
+        vec![
+            vec![Value::String("b".into()), Value::Int4(200)],
+            vec![Value::String("c".into()), Value::Int4(300)],
+        ]
+    );
+}
+
+#[test]
 fn storage_filter_pushdown_preserves_sql_null_predicates() {
     let db = EmbeddedDatabase::new_in_memory().unwrap();
     db.execute("CREATE TABLE f (id INTEGER PRIMARY KEY, x INTEGER, payload TEXT)")
