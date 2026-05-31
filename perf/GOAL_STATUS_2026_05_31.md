@@ -555,3 +555,58 @@ SQLite-scale bulk-write lever. It removes real per-row UTF-8 parsing and
 format-string allocation from transaction commit while preserving MVCC behavior,
 but the remaining default write gap is still dominated by SQL-text literal
 parsing/materialization and row serialization/index maintenance.
+
+## Accepted Follow-Up: Skip Literal INSERT Value-Count Scan
+
+Commit after this report: `perf: skip value-count scan for single literal inserts`.
+
+Finding:
+
+- The simple literal INSERT fast path parsed the VALUES list once just to count
+  values, then parsed it again to materialize the tuple.
+- For single-row INSERTs, the expected value count is already implied by the
+  cached table/column shape. The materializer can validate too few or too many
+  values while parsing the values once.
+- This affects both default `bulk_insert_users(txn)` and `autocommit_insert`
+  SQL-text workloads.
+
+Change:
+
+- `fast_literal_insert_spec()` now accepts an optional value count. Single-row
+  literal fast paths pass `None`, avoiding the pre-count scan.
+- `materialize_fast_literal_insert_tuple()` now rejects non-whitespace trailing
+  input after the final expected value, so malformed extra-value INSERTs still
+  fall back to the normal parser/error path.
+- Multi-row literal INSERTs keep the explicit per-row count checks.
+
+Validation:
+
+```text
+cargo check --lib
+cargo test --lib fast_insert -- --nocapture --test-threads=1
+cargo test --test multi_row_insert_values -- --nocapture --test-threads=1
+cargo test --test vector_search_test test_vector_dimension_validation -- --nocapture --test-threads=1
+```
+
+Measured in-memory TPS, `N=10000`, `M=2000`, time-travel on:
+
+```text
+recent pre-change reference       bulk_insert 132,217/s, autocommit_insert 104,794/s
+after change run 1                bulk_insert 141,440/s, autocommit_insert 105,905/s
+after change run 2                bulk_insert 135,893/s, autocommit_insert 100,625/s
+```
+
+Larger current-shape samples, `N=50000`, `M=10000`, time-travel on:
+
+```text
+pre-change reference              bulk_insert 130,831/s, autocommit_insert 92,393/s
+after change run 1                bulk_insert 134,441/s, autocommit_insert 87,601/s
+after change run 2                bulk_insert 125,545/s, autocommit_insert 92,829/s
+```
+
+Interpretation: this removes a real per-row scan from the default SQL-text
+INSERT path and improves the short bulk-insert sample, but it is still a
+modest/noisy win. It reinforces that the remaining SQLite write gap needs a
+larger structural lever: prepared-statement handles/default parameterized
+execution, compact row serialization, or batch-oriented literal INSERT
+execution rather than more parser micro-tuning.
