@@ -1771,3 +1771,52 @@ build-side tuple values after the existing projected join optimization. The
 useful next join work needs to move earlier in the pipeline: compact/vectorized
 scan-filter-probe flow, better hash-table/probe layout, or a batch-oriented
 join executor. The experimental code was reverted before handoff.
+
+## Accepted Follow-Up: Repeated Parameterized UPDATE/DELETE Fast-Spec Shortcut
+
+Finding:
+
+- Repeated `execute_params()` UPDATE/DELETE statements already had fast DML
+  specs cached, but every call still entered `parameterized_plan_cached()` before
+  the fast spec could be used.
+- The TPS parameterized UPDATE/DELETE shapes execute the same statement with a
+  different bound PK value thousands of times, so this plan-cache round trip was
+  avoidable after the first successful fast-spec build.
+
+Change:
+
+- Add an autocommit-only cached-spec shortcut at the start of `execute_params()`
+  for repeated parameterized UPDATE/DELETE.
+- The shortcut uses the existing fast spec caches and keeps the same safety
+  gates as the planned path: no active transaction/savepoint/session
+  transaction, no tenant context, no branch, current RLS/trigger checks, and the
+  FK mode/source in the DELETE cache key.
+- First execution of a statement still builds the spec through the normal
+  parsed/planned path. Later executions can skip the parameterized plan cache
+  and go straight to the fast DML executor.
+
+Validation:
+
+```text
+cargo check --lib
+cargo test --test parameterized_query_tests -- --nocapture --test-threads=1
+HELIOS_TPS_PARAMS=1 HELIOS_TPS_MODE=mem HELIOS_TPS_WORKLOADS=param_update,param_delete HELIOS_TPS_N=10000 HELIOS_TPS_M=2000 cargo test --profile perf --test tps_workloads run_param_tps_suite -- --nocapture --test-threads=1
+HELIOS_TPS_PARAMS=1 HELIOS_TPS_MODE=mem HELIOS_TPS_N=10000 HELIOS_TPS_M=2000 cargo test --profile perf --test tps_workloads run_param_tps_suite -- --nocapture --test-threads=1
+HELIOS_TPS_PARAMS=1 HELIOS_TPS_MODE=mem HELIOS_TPS_EMBEDDED_PROFILE=oltp_fast HELIOS_TPS_WORKLOADS=param_update,param_delete HELIOS_TPS_N=10000 HELIOS_TPS_M=2000 cargo test --profile perf --test tps_workloads run_param_tps_suite -- --nocapture --test-threads=1
+```
+
+Focused TPS, embedded mem, `N=10000`, `M=2000`, ops/s:
+
+```text
+before shortcut, rowstore focused      param_update 116,370/s, param_delete 145,124/s
+after shortcut, rowstore focused       param_update 164,998/s, param_delete 228,932/s
+after shortcut, full param suite       param_update 169,943/s, param_delete 228,907/s
+after shortcut, oltp_fast focused      param_update 168,562/s, param_delete 231,725/s
+SQLite params reference                update 241,284/s, delete 267,989/s
+```
+
+Interpretation: this is a direct improvement to the remaining SQLite
+best-path write gap. Parameterized DELETE is now close to SQLite's in-memory
+bound-parameter delete path on this host, while parameterized UPDATE is still
+behind by roughly 1.4x. The remaining UPDATE cost is likely in storage row
+fetch/serialize/write and row-cache invalidation rather than SQL planning.
