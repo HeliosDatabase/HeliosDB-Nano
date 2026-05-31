@@ -2,7 +2,7 @@
 
 Date: 2026-05-31
 Branch: `codex-next-write-tps`
-Nano commit: `e42cd5c perf: skip query trace allocation when disabled`
+Nano commit: `bdd3ba5 perf: skip nondeterministic scan for uncached fast selects`
 
 Objective: HeliosDB-Nano should have a few times better overall performance than PostgreSQL, MySQL, and SQLite.
 
@@ -415,3 +415,38 @@ after change run 2            point_lookup_pk 275k/s, hot 1.44M/s, filter 193/s,
 ```
 
 The TPS signal is mostly noise at this scale, but the allocation removal is structurally correct and improves the default observability-off path.
+
+## Accepted Follow-Up: Fast SELECT Before Empty Result-Cache Probe
+
+Commit after this report: `perf: skip nondeterministic scan for uncached fast selects`.
+
+Finding:
+
+- Every `query()` call scanned the SQL text for nondeterministic functions before trying the simple PK fast-select parser.
+- For random point lookups (`SELECT * FROM users WHERE id = ...`), the result cache is empty and the narrow fast-select grammar cannot contain volatile functions, so those SQL scans are pure overhead.
+- Moving fast-select unconditionally before result-cache lookup improved random lookups but regressed repeated hot lookups by bypassing the result-cache hit path. The final version only runs fast-select first while the result cache is empty.
+
+Change:
+
+- Snapshot `result_cache_nonempty` once in `query()`.
+- If the result cache is empty, try the simple PK fast-select path before nondeterministic-function scanning.
+- If the result cache is non-empty, keep the existing result-cache lookup first, then fall through to fast-select on misses.
+
+Validation:
+
+```text
+cargo check --lib
+cargo test test_fast_select_result_cache_invalidated_by_dml --lib -- --nocapture
+cargo test test_non_deterministic_query_does_not_populate_result_cache --lib -- --nocapture
+```
+
+Measured in-memory TPS, `N=10000`, `M=2000`, time-travel on:
+
+```text
+recent pre-change range         point_lookup_pk 244-275k/s, hot 1.32-1.44M/s, aggregate 361-410/s, Top-N 285-286/s
+unconditional fast-select first point_lookup_pk 293k/s, hot 852k/s, aggregate 430/s, Top-N 271/s  (rejected shape)
+final run 1                     point_lookup_pk 311k/s, hot 1.42M/s, aggregate 437/s, Top-N 262/s
+final run 2                     point_lookup_pk 317k/s, hot 1.44M/s, aggregate 439/s, Top-N 291/s
+```
+
+This closes most of the in-memory random PK lookup gap to SQLite on this host (SQLite latest: ~324k/s) without sacrificing Nano's hot lookup lead.
