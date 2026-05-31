@@ -2202,3 +2202,32 @@ batched parameterized UPDATE is now similar to SQLite's bound UPDATE reference
 on this host, and batched parameterized DELETE is ahead. It does not close the
 single-row `execute_params()` UPDATE gap, which still needs a deeper storage
 write-path profile.
+
+## Rejected Follow-Up: Pair Numeric Decode for Primitive Aggregate
+
+Experiment:
+
+- Added a one-pass `decode_tuple_numeric_column_pair` helper and routed the
+  primitive `COUNT(*) + SUM(int) + AVG(numeric)` row-store aggregate through it.
+- Goal was to avoid the small per-row selected numeric `Vec` used by
+  `decode_tuple_numeric_column_values_into`.
+
+Validation:
+
+```text
+cargo check --lib
+cargo test --lib storage::prefix_decode::tests::compact_numeric_pair_decode_preserves_request_order -- --nocapture
+```
+
+Focused TPS, embedded mem, `N=10000`, `M=2000`, ops/s:
+
+```text
+pre-experiment focused aggregate    agg_count_sum_avg 518/s
+pair decoder focused aggregate      agg_count_sum_avg 487/s
+pair decoder mixed run              filter 205/s, aggregate 468/s, join 80/s
+```
+
+Decision: reverted. The selected numeric buffer is not the row-store aggregate
+bottleneck; the next aggregate/filter lever is deeper in row iteration, row
+layout, or a broader vectorized/columnar path rather than replacing the tiny
+numeric decode buffer.
