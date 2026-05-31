@@ -1,16 +1,18 @@
 # HeliosDB-Nano 3.33.1 Release Closure
 
 Date: 2026-05-31
-Branch: `codex-next-write-tps`
+Branch: `codex-sqlite-inmem-gap`
 Package version: `3.33.1`
 Latest crates.io version observed by `cargo search heliosdb-nano --limit 3`: `3.33.0`
 
 ## Release Decision
 
-Proceed with the `3.33.1` release candidate. The current tree contains the
-consolidated TPS work, the release docs, and the release-gate fixes listed
-below. It should not be held for the remaining known issues because they are
-pre-existing or semantics decisions, not regressions from the release batch.
+Proceed with the `3.33.1` release candidate from the committed tree. The
+current branch contains the consolidated TPS work, the release docs, the
+release-gate fixes, and the stable post-RC parameterized-DML benchmark
+improvements listed below. It should not be held for the remaining known issues
+because they are pre-existing, explicitly deferred semantics decisions, or
+post-release performance work rather than regressions from the release batch.
 
 ## Included Work
 
@@ -35,6 +37,17 @@ pre-existing or semantics decisions, not regressions from the release batch.
   - `HELIOS_TPS_WORKLOADS` focused selection;
   - `HELIOS_TPS_EMBEDDED_PROFILE=columnar_analytics`;
   - `HELIOS_TPS_EMBEDDED_PROFILE=oltp_fast`.
+- SQLite comparison cleanup:
+  - `SQLITE_TPS_BINDINGS=literal` for a literal-SQL SQLite mirror, making the
+    default Nano literal TPS suite comparable to SQLite driven the same way;
+  - retained SQLite bound-parameter mode as the best-path comparison.
+- Parameterized DML improvements:
+  - repeated `execute_params()` UPDATE/DELETE can use cached fast DML specs
+    before entering the parameterized plan cache;
+  - one-entry hot fast-spec caches avoid LRU work for tight prepared-style
+    UPDATE/DELETE loops;
+  - focused in-memory parameterized DELETE is now close to SQLite's
+    bound-parameter path on this host, while UPDATE remains a tracked gap.
 
 ## Release-Gate Fixes
 
@@ -62,14 +75,18 @@ caveats are explicit. Current status:
 - SQLite durable disk: acceptable for this release. Nano is far ahead on
   durable autocommit writes and point/hot lookups; SQLite remains ahead on
   several disk analytics shapes.
-- SQLite embedded in-memory: partially acceptable. Nano is similar/better on
-  hot lookup, random lookup under current runs, group-by, Top-N, and
-  parameterized/`execute_many` insert in the gated `oltp_fast` profile. SQLite
-  still leads default row-store bulk/autocommit insert, UPDATE/DELETE,
-  filter scan, aggregate, and join.
+- SQLite embedded in-memory: acceptable for this release with caveats. Nano is
+  similar/better on literal-SQL write/lookup shapes when SQLite is also driven
+  through literal SQL; it is similar/better on hot lookup, random lookup under
+  current runs, group-by, Top-N, and parameterized/`execute_many` insert in the
+  gated `oltp_fast` profile. SQLite still leads best-path bound-parameter
+  UPDATE and several analytical scan/join shapes.
 
-This means the goal is materially advanced but should remain active after
-publish; it is not fully complete against SQLite's embedded in-memory path.
+This means the release meets the revised acceptance bar for publication:
+surpass-or-similar is achieved across the PostgreSQL/MariaDB Docker mirror and
+several SQLite embedded modes, with honest caveats. The long-term performance
+goal should remain active after publish because SQLite's embedded in-memory
+analytical path and bound-parameter UPDATE are still ahead.
 
 ## Deferred Items
 
@@ -92,6 +109,28 @@ These are release-accepted deferrals, not crates.io blockers:
    - `ha_integration` and selected PostgreSQL SSL tests can hang in this shared
      sandbox due port/listener environment.
    - Run them only in an isolated network namespace or dedicated CI job.
+
+4. Fixed-width integer UPDATE patching
+   - A post-release prototype patched serialized Int2/Int4/Int8 payload columns
+     in place and measured `param_update_by_pk` at about 187k/s versus the
+     accepted hot-cache result of about 172k/s.
+   - It is not release code. The prototype returned before the normal
+     fast-update LSN increment path, so it needs an explicit LSN/versioning
+     design and a full-suite gate before reconsideration.
+   - Saved for later review at
+     `/tmp/heliosdb-nano-fixed-width-param-update-wip-20260531.patch`.
+
+5. SQLite embedded analytical gap
+   - The next real lever is a compact/vectorized scan-filter-project-join
+     pipeline, not another narrow tuple-boundary micro-optimization.
+   - Keep `columnar_analytics` as a gated diagnostic profile until joins,
+     filters, and Top-N are broadly competitive with the row-store profile.
+
+6. Code-graph ingest batching branch
+   - dm26 reported uncommitted code-graph batching/options work touching
+     `src/lib.rs` and `src/code_graph/storage.rs`.
+   - It is a separate code-graph ingest surface and is not part of this
+     crates.io release candidate unless it lands through a separate gate.
 
 ## Publish Blockers
 
@@ -165,6 +204,17 @@ cargo package
 
 cargo publish --dry-run
   passed after rebase without --allow-dirty; dry-run aborted before upload as expected
+
+post-RC parameterized-DML focused gate on branch codex-sqlite-inmem-gap
+  cargo check --workspace --all-targets
+    passed after final release-close docs
+  cargo test --test parameterized_query_tests -- --nocapture --test-threads=1
+    passed after final release-close docs; 27 tests passed
+  cargo test --test transaction_tests -- --nocapture --test-threads=1
+    passed after final release-close docs; 28 tests passed
+  HELIOS_TPS_PARAMS=1 HELIOS_TPS_MODE=mem HELIOS_TPS_WORKLOADS=param_update,param_delete HELIOS_TPS_N=10000 HELIOS_TPS_M=2000 cargo test --profile perf --test tps_workloads run_param_tps_suite -- --nocapture --test-threads=1
+    accepted committed hot-cache result: param_update_by_pk about 171,860/s,
+    param_delete_by_pk about 227,122/s
 ```
 
 ## Recommended Publish Commands

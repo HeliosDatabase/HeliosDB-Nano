@@ -1827,3 +1827,35 @@ best-path write gap. Parameterized DELETE is now close to SQLite's in-memory
 bound-parameter delete path on this host, while parameterized UPDATE is still
 behind by roughly 1.4x. The remaining UPDATE cost is likely in storage row
 fetch/serialize/write and row-cache invalidation rather than SQL planning.
+
+## Release-Close Pending List
+
+The 3.33.1 release can publish with the committed work above. The following
+items remain intentionally pending after release:
+
+1. SQLite embedded in-memory analytical gap.
+   - SQLite still leads several scan/aggregate/join shapes.
+   - The next credible lever is a compact/vectorized
+     scan-filter-project-join pipeline, with the existing columnar profile kept
+     as a gated diagnostic mode until it is broadly competitive.
+
+2. Bound-parameter UPDATE gap.
+   - The cached fast-spec shortcut narrows the planning overhead, but SQLite's
+     bound UPDATE path is still faster.
+   - A fixed-width integer UPDATE patching prototype measured about 187k/s for
+     `param_update_by_pk`, but it is not release-safe because it returned before
+     the normal fast-update LSN increment path. The WIP patch is saved at
+     `/tmp/heliosdb-nano-fixed-width-param-update-wip-20260531.patch`.
+
+3. Known correctness/semantics deferrals.
+   - A4: TRUNCATE affected-row count semantics.
+   - A6: HNSW tombstone/physical-count accessor semantics.
+   - HA/SSL integration binaries should be gated in an isolated network
+     environment rather than this shared sandbox.
+
+4. Separate code-graph ingest batching work.
+   - dm26 reported uncommitted `src/lib.rs` and
+     `src/code_graph/storage.rs` changes for cross-file resolve batching and
+     code-index opt-out knobs.
+   - Treat that as a separate release surface unless it lands through its own
+     build/test/package gate.
