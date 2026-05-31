@@ -748,20 +748,19 @@ fn collect_join_input_local_filter_columns(
     required: &mut std::collections::BTreeSet<usize>,
 ) -> Option<()> {
     match input {
-        crate::sql::LogicalPlan::FilteredScan {
-            predicate: Some(predicate),
-            ..
-        }
-        | crate::sql::LogicalPlan::Filter { predicate, .. } => {
+        crate::sql::LogicalPlan::Filter { predicate, .. } => {
             collect_join_input_expr_columns(input, predicate, required)?;
             if let crate::sql::LogicalPlan::Filter { input, .. } = input {
                 collect_join_input_local_filter_columns(input, required)?;
             }
             Some(())
         }
-        crate::sql::LogicalPlan::FilteredScan { predicate: None, .. } | crate::sql::LogicalPlan::Scan { .. } => {
-            Some(())
-        }
+        // FilteredScan evaluates its local predicate before rows cross the scan
+        // boundary. The scan decode hint still includes predicate columns for
+        // storage/evaluator fallback, so predicate-only columns do not need to
+        // be kept in the compact tuple handed to the join.
+        crate::sql::LogicalPlan::FilteredScan { .. } => Some(()),
+        crate::sql::LogicalPlan::Scan { .. } => Some(()),
         _ => None,
     }
 }

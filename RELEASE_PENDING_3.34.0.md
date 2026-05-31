@@ -113,7 +113,7 @@ caveats are explicit. Current status:
   SQLite on filter, aggregate, and join, although the final projected
   `FilteredScan`, cached projected-filtered scan dispatch, and compact
   join-input follow-ups nudged row-store filter to about 224-235/s in focused
-  runs and join to about 74-76/s. The gated columnar profile now reaches about
+  runs and join to about 78-81/s. The gated columnar profile now reaches about
   245-259/s on its columnar filter variant and about 2.1k/s on the aggregate
   shape, but it still does not win the full analytics set.
 
