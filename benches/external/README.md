@@ -70,6 +70,9 @@ PostgreSQL 13 for `OFFSET 99990` on a 100k-row table.
 - `pg_vs_helios.py` — broader PostgreSQL comparison (10 query
   categories, not pagination-focused).
 - `sqlite_tps_mirror.py` — SQLite mirror of `tests/tps_workloads.rs`.
+  Defaults to bound parameters, matching SQLite's best embedded API shape.
+  Set `SQLITE_TPS_BINDINGS=literal` to compare against Nano's default
+  literal-SQL TPS harness shape.
 - `docker_sql_tps_mirror.py` — PostgreSQL/MariaDB Docker-client mirror of
   `tests/tps_workloads.rs`, useful for same-host external checks when only
   database containers are available.
@@ -77,6 +80,12 @@ PostgreSQL 13 for `OFFSET 99990` on a 100k-row table.
 Example read/analytics runs:
 
 ```bash
+SQLITE_TPS_MODE=mem SQLITE_TPS_N=10000 SQLITE_TPS_M=2000 \
+  python3 benches/external/sqlite_tps_mirror.py
+
+SQLITE_TPS_BINDINGS=literal SQLITE_TPS_MODE=mem SQLITE_TPS_N=10000 SQLITE_TPS_M=2000 \
+  python3 benches/external/sqlite_tps_mirror.py
+
 python3 benches/external/docker_sql_tps_mirror.py \
   --backend postgres --container postgres-primary \
   --user helios --password helios --database heliosdb \
