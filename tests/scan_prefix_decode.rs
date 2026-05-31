@@ -291,6 +291,15 @@ fn cached_projected_filtered_scan_preserves_results_with_result_cache_disabled()
     assert_eq!(rows[1].values, vec![Value::String("n1".into()), Value::Int4(1)]);
 
     let rows = db
+        .query(
+            "SELECT id FROM pf WHERE payload = 'payload-7' /* NOW(disable_result_cache) */",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].values, vec![Value::Int4(7)]);
+
+    let rows = db
         .query("SELECT id FROM pf WHERE age != 51 /* NOW(disable_result_cache) */", &[])
         .unwrap();
     assert!(

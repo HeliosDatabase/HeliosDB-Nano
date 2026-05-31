@@ -320,6 +320,18 @@ post-close predicate-first integer filtered scan gate
     passed; packaged 706 files, 12.8 MiB uncompressed, 2.5 MiB compressed
   cargo publish --dry-run
     passed; dry-run aborted before upload as expected
+
+post-close predicate-first string equality filtered scan gate
+  cargo check --lib
+    passed
+  cargo test --test scan_prefix_decode -- --nocapture --test-threads=1
+    passed; 8 tests passed
+  cargo test --test join_hardening_tests test_inner_join_with_filter_only_columns -- --nocapture --test-threads=1
+    passed
+  HELIOS_TPS=1 HELIOS_TPS_MODE=mem HELIOS_TPS_WORKLOADS=join_users_orders HELIOS_TPS_N=10000 HELIOS_TPS_M=2000 cargo test --profile perf --test tps_workloads run_tps_suite -- --nocapture --test-threads=1
+    focused join_users_orders: 83/s, versus 82/s pre-change baseline
+  HELIOS_TPS=1 HELIOS_TPS_MODE=mem HELIOS_TPS_WORKLOADS=filter_scan,agg_count_sum_avg,join_users_orders HELIOS_TPS_N=10000 HELIOS_TPS_M=2000 cargo test --profile perf --test tps_workloads run_tps_suite -- --nocapture --test-threads=1
+    repeat mixed runs: join_users_orders 85/s then 86/s
 ```
 
 ## Recommended Publish Commands
