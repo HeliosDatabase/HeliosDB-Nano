@@ -2231,3 +2231,41 @@ Decision: reverted. The selected numeric buffer is not the row-store aggregate
 bottleneck; the next aggregate/filter lever is deeper in row iteration, row
 layout, or a broader vectorized/columnar path rather than replacing the tiny
 numeric decode buffer.
+
+## Accepted Follow-Up: Skip Row-ID Parse For Projected Filtered SELECT Scans
+
+Finding:
+
+- `scan_table_with_schema_projected_filtered` emits compact tuples for read-only
+  projected `FilteredScan` execution.
+- It still parsed the RocksDB data key to populate `Tuple::row_id` for every
+  surviving row, even though this compact path is used by SELECT/read execution
+  and DML paths continue to use row-id-preserving scans.
+
+Change:
+
+- Stop parsing and setting `row_id` in the compact projected filtered row-store
+  scan path.
+- Leave the row-id-preserving full/sparse scan paths unchanged for UPDATE,
+  DELETE, branch, snapshot, and storage API callers.
+
+Validation:
+
+```text
+cargo check --lib
+cargo test --test scan_prefix_decode -- --nocapture --test-threads=1
+cargo test --test query_optimizer_tests -- --nocapture --test-threads=1
+cargo test --test join_hardening_tests test_inner_join_with_filter_only_columns -- --nocapture --test-threads=1
+```
+
+Focused TPS, embedded mem, `N=10000`, `M=2000`, ops/s:
+
+```text
+pre-change fresh run       filter_scan 212/s, join_users_orders 79/s
+filter-only focused run    filter_scan 229/s
+mixed follow-up run        filter_scan 233/s, join_users_orders 81/s
+```
+
+Interpretation: this is a small but clean boundary reduction on the remaining
+row-store filter path. It narrows but does not close the SQLite embedded
+in-memory filter gap.
