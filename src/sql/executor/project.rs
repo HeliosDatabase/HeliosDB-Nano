@@ -16,6 +16,7 @@ pub struct ProjectOperator {
     output_schema: Arc<Schema>,
     evaluator: crate::sql::Evaluator,
     direct_column_indices: Option<Vec<usize>>,
+    direct_move_max_index: Option<usize>,
     distinct: bool,
     seen: std::collections::HashSet<Vec<u8>>,
     timeout_ctx: Option<TimeoutContext>,
@@ -70,6 +71,9 @@ impl ProjectOperator {
         let output_schema = Arc::new(Schema { columns });
 
         let direct_column_indices = direct_project_column_indices(&input_schema, &exprs);
+        let direct_move_max_index = direct_column_indices
+            .as_deref()
+            .and_then(|indices| projection_move_max_index(indices, input_schema.columns.len()));
 
         // Create evaluator with input schema and parameters
         let evaluator = crate::sql::Evaluator::with_parameters(input_schema, parameters);
@@ -81,6 +85,7 @@ impl ProjectOperator {
             output_schema,
             evaluator,
             direct_column_indices,
+            direct_move_max_index,
             distinct,
             seen: std::collections::HashSet::new(),
             timeout_ctx: None,
@@ -100,20 +105,32 @@ impl PhysicalOperator for ProjectOperator {
         loop {
             match self.input.next()? {
                 None => return Ok(None),
-                Some(tuple) => {
+                Some(mut tuple) => {
                     // Evaluate each expression to produce output values
                     let output_values: Result<Vec<crate::Value>> = if let Some(indices) = &self.direct_column_indices {
-                        indices
-                            .iter()
-                            .map(|&idx| {
-                                tuple.get(idx).cloned().ok_or_else(|| {
-                                    crate::Error::query_execution(format!(
-                                        "Column index {} out of bounds in tuple",
-                                        idx
-                                    ))
+                        if self.distinct_on_exprs.is_none()
+                            && self
+                                .direct_move_max_index
+                                .is_some_and(|max_idx| max_idx < tuple.values.len())
+                        {
+                            let mut values = Vec::with_capacity(indices.len());
+                            for &idx in indices {
+                                values.push(std::mem::replace(&mut tuple.values[idx], crate::Value::Null));
+                            }
+                            Ok(values)
+                        } else {
+                            indices
+                                .iter()
+                                .map(|&idx| {
+                                    tuple.get(idx).cloned().ok_or_else(|| {
+                                        crate::Error::query_execution(format!(
+                                            "Column index {} out of bounds in tuple",
+                                            idx
+                                        ))
+                                    })
                                 })
-                            })
-                            .collect()
+                                .collect()
+                        }
                     } else {
                         self.exprs
                             .iter()
@@ -167,6 +184,17 @@ impl PhysicalOperator for ProjectOperator {
     fn schema(&self) -> Arc<Schema> {
         self.output_schema.clone()
     }
+}
+
+fn projection_move_max_index(indices: &[usize], schema_len: usize) -> Option<usize> {
+    let mut max_idx: Option<usize> = None;
+    for (pos, &idx) in indices.iter().enumerate() {
+        if idx >= schema_len || indices[..pos].contains(&idx) {
+            return None;
+        }
+        max_idx = Some(max_idx.map_or(idx, |max| max.max(idx)));
+    }
+    max_idx
 }
 
 fn direct_project_column_indices(schema: &Schema, exprs: &[crate::sql::LogicalExpr]) -> Option<Vec<usize>> {

@@ -264,6 +264,7 @@ pub struct HashJoinOperator {
     current_matches: Vec<Tuple>,
     match_index: usize,
     pure_equi_join: bool,
+    output_projection: Option<Vec<usize>>,
 
     // LEFT/RIGHT/FULL join state
     matched_right_keys: std::collections::HashSet<JoinKey>,
@@ -401,7 +402,6 @@ impl JoinKey {
             Self::Composite(values) => values.len(),
         }
     }
-
 }
 
 impl PartialEq for JoinKey {
@@ -412,20 +412,17 @@ impl PartialEq for JoinKey {
 
         match (self, other) {
             (Self::Int(a), Self::Int(b)) => a == b,
-            (Self::Int(a), Self::Single(b)) | (Self::Single(b), Self::Int(a)) => {
-                int_value_equal_for_join(*a, b)
+            (Self::Int(a), Self::Single(b)) | (Self::Single(b), Self::Int(a)) => int_value_equal_for_join(*a, b),
+            (Self::Int(a), Self::Composite(values)) | (Self::Composite(values), Self::Int(a)) => {
+                values.first().is_some_and(|b| int_value_equal_for_join(*a, b))
             }
-            (Self::Int(a), Self::Composite(values)) | (Self::Composite(values), Self::Int(a)) => values
-                .first()
-                .is_some_and(|b| int_value_equal_for_join(*a, b)),
             (Self::Single(a), Self::Single(b)) => values_equal_for_join(a, b),
             (Self::Single(a), Self::Composite(values)) | (Self::Composite(values), Self::Single(a)) => {
                 values.first().is_some_and(|b| values_equal_for_join(a, b))
             }
-            (Self::Composite(left), Self::Composite(right)) => left
-                .iter()
-                .zip(right)
-                .all(|(a, b)| values_equal_for_join(a, b)),
+            (Self::Composite(left), Self::Composite(right)) => {
+                left.iter().zip(right).all(|(a, b)| values_equal_for_join(a, b))
+            }
         }
     }
 }
@@ -658,6 +655,32 @@ impl HashJoinOperator {
         )
     }
 
+    /// Create a projected inner hash join. The projection indexes refer to the
+    /// normal combined left+right join schema, but emitted tuples contain only
+    /// those projected values. This avoids building a full combined tuple only
+    /// for a parent ProjectOperator to clone a small subset of columns.
+    fn new_projected_inner(
+        left: Box<dyn PhysicalOperator>,
+        right: Box<dyn PhysicalOperator>,
+        on_condition: Option<crate::sql::LogicalExpr>,
+        projection: Vec<usize>,
+        output_schema: Arc<Schema>,
+        build_side: HashJoinBuildSide,
+        timeout_ctx: Option<TimeoutContext>,
+    ) -> Result<Self> {
+        Self::with_memory_limit_projected(
+            left,
+            right,
+            crate::sql::JoinType::Inner,
+            on_condition,
+            build_side,
+            Self::DEFAULT_MEMORY_LIMIT,
+            timeout_ctx,
+            Some(projection),
+            Some(output_schema),
+        )
+    }
+
     /// Create a new hash join operator with custom memory limit
     fn with_memory_limit(
         left: Box<dyn PhysicalOperator>,
@@ -668,6 +691,30 @@ impl HashJoinOperator {
         memory_limit: usize,
         timeout_ctx: Option<TimeoutContext>,
     ) -> Result<Self> {
+        Self::with_memory_limit_projected(
+            left,
+            right,
+            join_type,
+            on_condition,
+            build_side,
+            memory_limit,
+            timeout_ctx,
+            None,
+            None,
+        )
+    }
+
+    fn with_memory_limit_projected(
+        left: Box<dyn PhysicalOperator>,
+        right: Box<dyn PhysicalOperator>,
+        join_type: crate::sql::JoinType,
+        on_condition: Option<crate::sql::LogicalExpr>,
+        build_side: HashJoinBuildSide,
+        memory_limit: usize,
+        timeout_ctx: Option<TimeoutContext>,
+        output_projection: Option<Vec<usize>>,
+        projected_output_schema: Option<Arc<Schema>>,
+    ) -> Result<Self> {
         // Build output schema by combining left and right schemas
         let left_schema = left.schema();
         let right_schema = right.schema();
@@ -677,7 +724,8 @@ impl HashJoinOperator {
 
         let mut columns = left_schema.columns.clone();
         columns.extend(right_schema.columns.clone());
-        let output_schema = Arc::new(Schema { columns });
+        let combined_schema = Arc::new(Schema { columns });
+        let output_schema = projected_output_schema.unwrap_or_else(|| Arc::clone(&combined_schema));
 
         let direct_key_indices = on_condition
             .as_ref()
@@ -685,7 +733,7 @@ impl HashJoinOperator {
         let pure_equi_join = is_pure_equi_join(&on_condition);
 
         // Create evaluator with output schema for evaluating join conditions on combined tuples
-        let evaluator = crate::sql::Evaluator::new(output_schema.clone());
+        let evaluator = crate::sql::Evaluator::new(combined_schema);
 
         // Create separate evaluators for key extraction (left and right schemas)
         let left_evaluator = crate::sql::Evaluator::new(left_schema);
@@ -713,6 +761,7 @@ impl HashJoinOperator {
             current_matches: Vec::new(),
             match_index: 0,
             pure_equi_join,
+            output_projection,
             matched_right_keys: std::collections::HashSet::new(),
             unmatched_right_iter: None,
             unmatched_right_current: None,
@@ -1119,10 +1168,29 @@ impl HashJoinOperator {
         Tuple::new(values)
     }
 
+    fn join_tuples_projected(&self, left: &Tuple, right: &Tuple) -> Tuple {
+        let Some(indices) = &self.output_projection else {
+            return Self::join_tuples(left, right);
+        };
+
+        let mut values = Vec::with_capacity(indices.len());
+        for &idx in indices {
+            let value = if idx < self.left_column_count {
+                left.values.get(idx)
+            } else {
+                right.values.get(idx - self.left_column_count)
+            }
+            .cloned()
+            .unwrap_or(crate::Value::Null);
+            values.push(value);
+        }
+        Tuple::new(values)
+    }
+
     fn join_probe_with_build(&self, probe: &Tuple, build: &Tuple) -> Tuple {
         match self.build_side {
-            HashJoinBuildSide::Right => Self::join_tuples(probe, build),
-            HashJoinBuildSide::Left => Self::join_tuples(build, probe),
+            HashJoinBuildSide::Right => self.join_tuples_projected(probe, build),
+            HashJoinBuildSide::Left => self.join_tuples_projected(build, probe),
         }
     }
 
@@ -1301,6 +1369,81 @@ pub(super) fn handle_join(
             }
         }
     }
+}
+
+pub(super) fn handle_projected_join(
+    executor: &mut Executor,
+    input: &crate::sql::LogicalPlan,
+    exprs: &[crate::sql::LogicalExpr],
+    aliases: &[String],
+) -> Result<Option<Box<dyn PhysicalOperator>>> {
+    let crate::sql::LogicalPlan::Join {
+        left,
+        right,
+        join_type,
+        on,
+        lateral,
+    } = input
+    else {
+        return Ok(None);
+    };
+    if *lateral || !matches!(join_type, crate::sql::JoinType::Inner) {
+        return Ok(None);
+    }
+
+    let Some(condition) = on else {
+        return Ok(None);
+    };
+    let (equi_part, residual_part) = split_join_condition(condition);
+    if equi_part.is_none() || residual_part.is_some() {
+        return Ok(None);
+    }
+
+    let combined_schema = input.schema();
+    let mut projection = Vec::with_capacity(exprs.len());
+    for expr in exprs {
+        let crate::sql::LogicalExpr::Column { table, name } = expr else {
+            return Ok(None);
+        };
+        let Some(idx) = combined_schema.get_qualified_column_index(table.as_deref(), name) else {
+            return Ok(None);
+        };
+        projection.push(idx);
+    }
+
+    use crate::sql::TypeInference;
+    let output_schema = Arc::new(Schema {
+        columns: aliases
+            .iter()
+            .zip(exprs.iter())
+            .map(|(alias, expr)| expr.to_column(alias.clone(), &combined_schema))
+            .collect(),
+    });
+
+    let left_rows = estimate_hash_join_rows(executor, left);
+    let right_rows = estimate_hash_join_rows(executor, right);
+    let build_left_for_inner = std::env::var("HELIOS_HASHJOIN_BUILD_RIGHT").is_err()
+        && matches!((left_rows, right_rows), (Some(l), Some(r)) if l < r);
+
+    let left_op = executor.plan_to_operator(left)?;
+    let right_op = executor.plan_to_operator(right)?;
+    let timeout_ctx = executor.timeout_ctx();
+    let build_side = if build_left_for_inner {
+        HashJoinBuildSide::Left
+    } else {
+        HashJoinBuildSide::Right
+    };
+
+    let op = HashJoinOperator::new_projected_inner(
+        left_op,
+        right_op,
+        equi_part,
+        projection,
+        output_schema,
+        build_side,
+        timeout_ctx,
+    )?;
+    Ok(Some(Box::new(op)))
 }
 
 fn estimate_hash_join_rows(executor: &Executor<'_>, plan: &crate::sql::LogicalPlan) -> Option<usize> {

@@ -8,7 +8,7 @@ use super::{Executor, PhysicalOperator, TimeoutContext};
 use crate::sql::logical_plan::LogicalExpr;
 use crate::sql::LogicalPlan;
 use crate::storage::predicate_pushdown::AnalyzedPredicate;
-use crate::{Error, Result, Schema, Tuple};
+use crate::{DataType, Error, Result, Schema, Tuple, Value};
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -146,10 +146,86 @@ fn should_apply_columnar_predicates(predicates: &[AnalyzedPredicate]) -> bool {
             matches!(
                 predicate.op,
                 crate::storage::predicate_pushdown::PredicateOp::Eq
+                    | crate::storage::predicate_pushdown::PredicateOp::Lt
+                    | crate::storage::predicate_pushdown::PredicateOp::LtEq
+                    | crate::storage::predicate_pushdown::PredicateOp::Gt
+                    | crate::storage::predicate_pushdown::PredicateOp::GtEq
                     | crate::storage::predicate_pushdown::PredicateOp::In
                     | crate::storage::predicate_pushdown::PredicateOp::IsNull
             )
         })
+}
+
+fn storage_predicates_are_sql_safe(schema: &Schema, predicates: &[AnalyzedPredicate]) -> bool {
+    predicates.iter().all(|predicate| {
+        let Some(column) = schema.columns.get(predicate.column_index) else {
+            return false;
+        };
+        match predicate.op {
+            crate::storage::predicate_pushdown::PredicateOp::IsNull
+            | crate::storage::predicate_pushdown::PredicateOp::IsNotNull => true,
+            crate::storage::predicate_pushdown::PredicateOp::Between => {
+                storage_filter_value_matches_type(&column.data_type, &predicate.value)
+                    && predicate
+                        .value2
+                        .as_ref()
+                        .is_some_and(|value| storage_filter_value_matches_type(&column.data_type, value))
+            }
+            crate::storage::predicate_pushdown::PredicateOp::In => predicate
+                .value_list
+                .iter()
+                .all(|value| storage_filter_value_matches_type(&column.data_type, value)),
+            _ => storage_filter_value_matches_type(&column.data_type, &predicate.value),
+        }
+    })
+}
+
+fn storage_filter_value_matches_type(data_type: &DataType, value: &Value) -> bool {
+    if matches!(value, Value::Null) {
+        return true;
+    }
+
+    match data_type {
+        DataType::Int2 | DataType::Int4 | DataType::Int8 => {
+            matches!(value, Value::Int2(_) | Value::Int4(_) | Value::Int8(_))
+        }
+        DataType::Float4 | DataType::Float8 => matches!(value, Value::Float4(_) | Value::Float8(_)),
+        DataType::Text | DataType::Varchar(_) | DataType::Char(_) => matches!(value, Value::String(_)),
+        DataType::Boolean => matches!(value, Value::Boolean(_)),
+        DataType::Bytea => matches!(value, Value::Bytes(_)),
+        DataType::Uuid => matches!(value, Value::Uuid(_)),
+        DataType::Date => matches!(value, Value::Date(_)),
+        DataType::Timestamp | DataType::Timestamptz => matches!(value, Value::Timestamp(_)),
+        DataType::Time => matches!(value, Value::Time(_)),
+        DataType::Interval => matches!(value, Value::Interval(_)),
+        DataType::Numeric => matches!(value, Value::Numeric(_)),
+        DataType::Json | DataType::Jsonb => matches!(value, Value::Json(_)),
+        DataType::Vector(_) => matches!(value, Value::Vector(_)),
+        DataType::Array(_) => matches!(value, Value::Array(_)),
+    }
+}
+
+fn filter_tuples_with_evaluator(
+    tuples: Vec<Tuple>,
+    schema: Arc<Schema>,
+    predicate: &LogicalExpr,
+    parameters: &[Value],
+) -> Result<Vec<Tuple>> {
+    let evaluator = crate::sql::Evaluator::with_parameters(schema, parameters.to_vec());
+    let mut filtered = Vec::with_capacity(tuples.len());
+    for tuple in tuples {
+        match evaluator.evaluate(predicate, &tuple)? {
+            Value::Boolean(true) => filtered.push(tuple),
+            Value::Boolean(false) | Value::Null => {}
+            result => {
+                return Err(Error::query_execution(format!(
+                    "Filter predicate must evaluate to boolean, got: {:?}",
+                    result
+                )));
+            }
+        }
+    }
+    Ok(filtered)
 }
 
 fn collect_single_table_column_indices(plan: &LogicalPlan) -> Option<(String, Vec<usize>, usize)> {
@@ -772,6 +848,7 @@ pub struct ScanOperator {
     table_name: String,
     schema: Arc<Schema>,
     projection: Option<Vec<usize>>,
+    projection_move_max_index: Option<usize>,
     tuples: Vec<Tuple>,
     current_index: usize,
     timeout_ctx: Option<TimeoutContext>,
@@ -787,10 +864,14 @@ impl ScanOperator {
         tuples: Vec<Tuple>,
         parameters: Vec<crate::Value>,
     ) -> Self {
+        let projection_move_max_index = projection
+            .as_deref()
+            .and_then(|indices| projection_move_max_index(indices, schema.columns.len()));
         Self {
             table_name,
             schema,
             projection,
+            projection_move_max_index,
             tuples,
             current_index: 0,
             timeout_ctx: None,
@@ -815,7 +896,7 @@ impl PhysicalOperator for ScanOperator {
             return Ok(None);
         }
 
-        let tuple = std::mem::take(
+        let mut tuple = std::mem::take(
             self.tuples
                 .get_mut(self.current_index)
                 .ok_or_else(|| Error::query_execution("Scan index out of bounds"))?,
@@ -824,7 +905,18 @@ impl PhysicalOperator for ScanOperator {
 
         // Apply projection if specified
         if let Some(indices) = &self.projection {
-            let projected_values: Vec<_> = indices.iter().filter_map(|&i| tuple.get(i).cloned()).collect();
+            let projected_values = if self
+                .projection_move_max_index
+                .is_some_and(|max_idx| max_idx < tuple.values.len())
+            {
+                let mut values = Vec::with_capacity(indices.len());
+                for &idx in indices {
+                    values.push(std::mem::replace(&mut tuple.values[idx], Value::Null));
+                }
+                values
+            } else {
+                indices.iter().filter_map(|&i| tuple.get(i).cloned()).collect()
+            };
             let mut projected_tuple = Tuple::new(projected_values);
             // Preserve row_id through projection for DML operations
             projected_tuple.row_id = tuple.row_id;
@@ -845,6 +937,17 @@ impl PhysicalOperator for ScanOperator {
             self.schema.clone()
         }
     }
+}
+
+fn projection_move_max_index(indices: &[usize], schema_len: usize) -> Option<usize> {
+    let mut max_idx: Option<usize> = None;
+    for (pos, &idx) in indices.iter().enumerate() {
+        if idx >= schema_len || indices[..pos].contains(&idx) {
+            return None;
+        }
+        max_idx = Some(max_idx.map_or(idx, |max| max.max(idx)));
+    }
+    max_idx
 }
 
 /// Vector similarity search operator (k-NN search using HNSW index)
@@ -978,11 +1081,11 @@ impl PhysicalOperator for MaterializedOperator {
             return Ok(None);
         }
 
-        let tuple = self
-            .tuples
-            .get(self.current_index)
-            .cloned()
-            .ok_or_else(|| Error::query_execution("Materialized index out of bounds"))?;
+        let tuple = std::mem::take(
+            self.tuples
+                .get_mut(self.current_index)
+                .ok_or_else(|| Error::query_execution("Materialized index out of bounds"))?,
+        );
         self.current_index += 1;
 
         Ok(Some(tuple))
@@ -1005,7 +1108,6 @@ pub(super) fn handle_scan(executor: &Executor, plan: &LogicalPlan) -> Result<Box
     {
         // Use alias for column source_table (for JOIN disambiguation), fallback to table_name
         let source_name = alias.as_ref().unwrap_or(table_name);
-
         // First, check if this table name is a CTE reference
         if let Some(cte_data) = executor.get_cte(table_name) {
             // Return the materialized CTE data
@@ -1265,6 +1367,10 @@ pub(super) fn handle_filtered_scan(executor: &Executor, plan: &LogicalPlan) -> R
     {
         // Use alias for column source_table (for JOIN disambiguation), fallback to table_name
         let source_name = alias.as_ref().unwrap_or(table_name);
+        let materialized_predicate = predicate
+            .as_ref()
+            .map(|pred| executor.materialize_subqueries(pred))
+            .transpose()?;
 
         // First, check if this table name is a CTE reference
         if let Some(cte_data) = executor.get_cte(table_name) {
@@ -1276,28 +1382,56 @@ pub(super) fn handle_filtered_scan(executor: &Executor, plan: &LogicalPlan) -> R
             }
 
             let schema_arc = Arc::new(schema_with_source);
+            let tuples = if let Some(pred) = &materialized_predicate {
+                filter_tuples_with_evaluator(cte_data.tuples.clone(), schema_arc.clone(), pred, executor.parameters())?
+            } else {
+                cte_data.tuples.clone()
+            };
             let scan_op = Box::new(
                 ScanOperator::new(
                     table_name.clone(),
                     schema_arc.clone(),
                     projection.clone(),
-                    cte_data.tuples.clone(),
+                    tuples,
                     executor.parameters().to_vec(),
                 )
                 .with_timeout(executor.timeout_ctx()),
             );
 
-            // Apply filter if predicate exists
-            if let Some(pred) = predicate {
-                let materialized_pred = executor.materialize_subqueries(pred)?;
-                return Ok(Box::new(super::filter::FilterOperator::new(
-                    scan_op,
-                    materialized_pred,
-                    executor.parameters().to_vec(),
-                )));
-            }
-
             return Ok(scan_op);
+        }
+
+        use crate::sql::phase3::SystemViewRegistry;
+        let registry = SystemViewRegistry::new();
+        if registry.is_system_view(table_name) {
+            let storage = executor
+                .storage()
+                .ok_or_else(|| Error::query_execution("system view requires storage context".to_string()))?;
+            let mut schema = registry
+                .get_schema(table_name)
+                .cloned()
+                .unwrap_or_else(|| Schema { columns: vec![] });
+            for col in &mut schema.columns {
+                col.source_table = Some(source_name.clone());
+                col.source_table_name = Some(table_name.clone());
+            }
+            let schema_arc = Arc::new(schema);
+            let tuples = registry.execute(table_name, storage)?;
+            let tuples = if let Some(pred) = &materialized_predicate {
+                filter_tuples_with_evaluator(tuples, schema_arc.clone(), pred, executor.parameters())?
+            } else {
+                tuples
+            };
+            return Ok(Box::new(
+                ScanOperator::new(
+                    table_name.clone(),
+                    schema_arc,
+                    projection.clone(),
+                    tuples,
+                    executor.parameters().to_vec(),
+                )
+                .with_timeout(executor.timeout_ctx()),
+            ));
         }
 
         // Fetch actual schema from storage and scan table with filtering
@@ -1327,19 +1461,17 @@ pub(super) fn handle_filtered_scan(executor: &Executor, plan: &LogicalPlan) -> R
                 }
             };
 
-            // Materialize any IN subqueries before storage-level pushdown
-            // This converts InSubquery to InList which storage layer can handle
-            let materialized_predicate = if let Some(pred) = predicate {
-                Some(executor.materialize_subqueries(pred)?)
-            } else {
-                None
-            };
-
             // Analyze the predicate for storage-level pushdown
             let analyzed_predicates = if let Some(ref pred) = materialized_predicate {
                 storage.predicate_pushdown().analyze_predicate(pred, &schema)
             } else {
                 Vec::new()
+            };
+            let storage_predicates_safe = storage_predicates_are_sql_safe(&schema, &analyzed_predicates);
+            let pushed_predicates = if storage_predicates_safe {
+                analyzed_predicates.as_slice()
+            } else {
+                &[]
             };
 
             tracing::debug!(
@@ -1360,7 +1492,7 @@ pub(super) fn handle_filtered_scan(executor: &Executor, plan: &LogicalPlan) -> R
                 storage.predicate_pushdown().scan_with_pushdown(
                     &actual_table_name,
                     merged_tuples,
-                    &analyzed_predicates,
+                    pushed_predicates,
                     &schema,
                     None,
                 )
@@ -1388,7 +1520,7 @@ pub(super) fn handle_filtered_scan(executor: &Executor, plan: &LogicalPlan) -> R
                 storage.predicate_pushdown().scan_with_pushdown(
                     &actual_table_name,
                     base_tuples,
-                    &analyzed_predicates,
+                    pushed_predicates,
                     &schema,
                     None, // No limit at storage level
                 )
@@ -1402,12 +1534,12 @@ pub(super) fn handle_filtered_scan(executor: &Executor, plan: &LogicalPlan) -> R
                         &schema,
                         projection.as_ref(),
                         decode_hint,
-                        &analyzed_predicates,
+                        pushed_predicates,
                     ) {
-                        let apply_columnar_predicates = should_apply_columnar_predicates(&analyzed_predicates);
+                        let apply_columnar_predicates = should_apply_columnar_predicates(pushed_predicates);
                         columnar_predicates_applied = apply_columnar_predicates && !storage.is_branch_active();
                         let pushed_predicates = if apply_columnar_predicates {
-                            analyzed_predicates.as_slice()
+                            pushed_predicates
                         } else {
                             &[]
                         };
@@ -1417,7 +1549,7 @@ pub(super) fn handle_filtered_scan(executor: &Executor, plan: &LogicalPlan) -> R
                             &columns,
                             pushed_predicates,
                         )?
-                    } else if !analyzed_predicates.is_empty() {
+                    } else if !pushed_predicates.is_empty() {
                         let selected_columns: Option<Vec<usize>> = match decode_hint {
                             Some(ScanDecodeHint::Prefix(prefix_len)) => Some((0..*prefix_len).collect()),
                             Some(ScanDecodeHint::Columns(columns)) => Some(columns.clone()),
@@ -1427,7 +1559,7 @@ pub(super) fn handle_filtered_scan(executor: &Executor, plan: &LogicalPlan) -> R
                             &actual_table_name,
                             &schema,
                             selected_columns.as_deref(),
-                            &analyzed_predicates,
+                            pushed_predicates,
                         )? {
                             row_predicates_applied = true;
                             tuples
@@ -1468,7 +1600,7 @@ pub(super) fn handle_filtered_scan(executor: &Executor, plan: &LogicalPlan) -> R
                     storage.predicate_pushdown().scan_with_pushdown(
                         &actual_table_name,
                         base_tuples,
-                        &analyzed_predicates,
+                        pushed_predicates,
                         &schema,
                         None, // No limit at storage level
                     )
@@ -1490,7 +1622,17 @@ pub(super) fn handle_filtered_scan(executor: &Executor, plan: &LogicalPlan) -> R
                     })
                     .collect(),
             };
-            (Arc::new(schema_with_source), tuples)
+            let actual_schema = Arc::new(schema_with_source);
+            let tuples = if !storage_predicates_safe {
+                if let Some(pred) = &materialized_predicate {
+                    filter_tuples_with_evaluator(tuples, actual_schema.clone(), pred, executor.parameters())?
+                } else {
+                    tuples
+                }
+            } else {
+                tuples
+            };
+            (actual_schema, tuples)
         } else {
             // No storage, use placeholder schema from plan
             (_plan_schema.clone(), Vec::new())

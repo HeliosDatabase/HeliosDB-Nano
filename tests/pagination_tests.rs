@@ -102,12 +102,47 @@ fn order_by_limit_offset_is_deterministic() -> Result<()> {
 }
 
 #[test]
+fn columnar_order_by_limit_is_deterministic() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute("CREATE TABLE metrics (id INT PRIMARY KEY, age INT STORAGE COLUMNAR, balance INT STORAGE COLUMNAR)")?;
+    for i in 0..20 {
+        db.execute(&format!(
+            "INSERT INTO metrics (id, age, balance) VALUES ({i}, {}, {})",
+            20 + i,
+            (i * 17) % 97
+        ))?;
+    }
+
+    let rows = db.query("SELECT age, balance FROM metrics ORDER BY balance DESC LIMIT 4", &[])?;
+    let values: Vec<(i64, i64)> = rows
+        .iter()
+        .map(|tuple| {
+            let age = value_as_i64(&tuple.values[0]);
+            let balance = value_as_i64(&tuple.values[1]);
+            (age, balance)
+        })
+        .collect();
+
+    assert_eq!(values, vec![(37, 95), (31, 90), (25, 85), (36, 78)]);
+    Ok(())
+}
+
+#[test]
 fn system_view_order_by_limit_uses_registry_rows() -> Result<()> {
     let db = EmbeddedDatabase::new_in_memory()?;
     let rows = db.query("SELECT nspname FROM pg_namespace ORDER BY nspname LIMIT 1", &[])?;
     assert_eq!(rows.len(), 1);
     assert!(matches!(rows[0].values.first(), Some(Value::String(_))));
     Ok(())
+}
+
+fn value_as_i64(value: &Value) -> i64 {
+    match value {
+        Value::Int2(n) => i64::from(*n),
+        Value::Int4(n) => i64::from(*n),
+        Value::Int8(n) => *n,
+        other => panic!("unexpected integer value: {:?}", other),
+    }
 }
 
 // ---------------------------------------------------------------------

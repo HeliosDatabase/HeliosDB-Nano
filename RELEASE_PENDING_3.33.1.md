@@ -1,0 +1,191 @@
+# HeliosDB-Nano 3.33.1 Release Closure
+
+Date: 2026-05-31
+Branch: `codex-next-write-tps`
+Package version: `3.33.1`
+Latest crates.io version observed by `cargo search heliosdb-nano --limit 3`: `3.33.0`
+
+## Release Decision
+
+Proceed with the `3.33.1` release candidate. The current tree contains the
+consolidated TPS work, the release docs, and the release-gate fixes listed
+below. It should not be held for the remaining known issues because they are
+pre-existing or semantics decisions, not regressions from the release batch.
+
+## Included Work
+
+- Docker PostgreSQL/MariaDB TPS mirror improvements and documentation.
+- PostgreSQL wire/read-path improvements:
+  - fast `query_with_columns()` SELECT routing;
+  - shared deterministic result-cache reuse;
+  - no-clone cached-row protocol encoding;
+  - batched DataRow streaming.
+- Embedded TPS improvements:
+  - primitive row aggregate fusion;
+  - integer Top-N projection/materialization reductions;
+  - projected inner hash-join output and direct projection moves;
+  - row-cache invalidation miss cleanup;
+  - payload-only UPDATE move path;
+  - DELETE logical-WAL key allocation deferral.
+- Columnar diagnostic profile improvements:
+  - columnar range predicate pushdown;
+  - direct columnar Top-N;
+  - small-group/direct columnar grouped `COUNT(*)` + `SUM(integer)`.
+- Benchmark harness additions:
+  - `HELIOS_TPS_WORKLOADS` focused selection;
+  - `HELIOS_TPS_EMBEDDED_PROFILE=columnar_analytics`;
+  - `HELIOS_TPS_EMBEDDED_PROFILE=oltp_fast`.
+
+## Release-Gate Fixes
+
+The broad release gate initially exposed seven new blockers. They are fixed in
+this release candidate:
+
+- `FilteredScan` now materializes planner-backed system views before filtering,
+  so `sqlite_master` and `information_schema.referential_constraints` work when
+  selection pushdown rewrites them into filtered scans.
+- Storage predicate pushdown is now gated to predicates whose literal types can
+  be evaluated exactly by the storage filter. Mixed/coercive predicates fall
+  back to SQL evaluator filtering, restoring string-to-int, int-to-decimal,
+  decimal range/IN, date/timestamp string, and UUID string comparison behavior.
+- `tests/comprehensive_benchmarks.rs::bench_transaction_overhead` now computes
+  the percentage from nanoseconds instead of millisecond-truncated durations.
+
+## Current Performance Status
+
+The revised user acceptance bar allows "surpass or similar" results when the
+caveats are explicit. Current status:
+
+- PostgreSQL/MariaDB Docker PG-wire mirror: acceptable for this release. Nano
+  wins the repeated-query write, lookup, and read/analytics shapes measured in
+  `perf/GOAL_STATUS_2026_05_31.md`.
+- SQLite durable disk: acceptable for this release. Nano is far ahead on
+  durable autocommit writes and point/hot lookups; SQLite remains ahead on
+  several disk analytics shapes.
+- SQLite embedded in-memory: partially acceptable. Nano is similar/better on
+  hot lookup, random lookup under current runs, group-by, Top-N, and
+  parameterized/`execute_many` insert in the gated `oltp_fast` profile. SQLite
+  still leads default row-store bulk/autocommit insert, UPDATE/DELETE,
+  filter scan, aggregate, and join.
+
+This means the goal is materially advanced but should remain active after
+publish; it is not fully complete against SQLite's embedded in-memory path.
+
+## Deferred Items
+
+These are release-accepted deferrals, not crates.io blockers:
+
+1. `tests/truncate_hardening_tests.rs::test_truncate_does_not_return_affected_row_count`
+   - Current behavior returns an affected-row count where the test expects
+     DDL-like `0`.
+   - Classified as pre-existing low/medium behavior semantics.
+   - Track for a dedicated SQL compatibility pass.
+
+2. `src/vector/hnsw_index.rs` tombstone count semantics
+   - The failing test expects physical/tombstone count, while current callers
+     use `len()` as live vector count.
+   - Do not change `len()` blindly. Preferred follow-up: add explicit
+     `physical_len()` / tombstone accessors or update the test to assert live
+     count.
+
+3. Sandbox-only HA/SSL integration hangs
+   - `ha_integration` and selected PostgreSQL SSL tests can hang in this shared
+     sandbox due port/listener environment.
+   - Run them only in an isolated network namespace or dedicated CI job.
+
+## Publish Blockers
+
+All local verification blockers for this release candidate are closed. The
+remaining operational release step is to commit/tag the release candidate and
+run the package/publish commands without `--allow-dirty`.
+
+- `cargo check --workspace --all-targets` passes.
+- `cargo test --profile perf --no-fail-fast` has been run in an environment
+  that excludes or isolates the known HA/SSL hang class.
+- Final result has only the accepted deferred A4/A6 failures, or explicit
+  owner sign-off for any other failure.
+- `cargo package --allow-dirty` passes for the exact tree to be published.
+- `cargo publish --dry-run --allow-dirty` passes before the real publish.
+
+## Verification Run On This Release Candidate
+
+Completed in this worktree on 2026-05-31:
+
+```text
+cargo search heliosdb-nano --limit 3
+  latest crates.io version observed: 3.33.0
+
+cargo metadata --no-deps --format-version 1
+  local heliosdb-nano package version: 3.33.1
+
+cargo check --workspace --all-targets
+  passed
+
+cargo package --allow-dirty
+  passed; packaged 706 files, 12.7 MiB uncompressed, 2.5 MiB compressed
+
+cargo publish --dry-run --allow-dirty
+  passed; dry-run aborted before upload as expected
+
+cargo test --test parameterized_query_tests --test crud_tests --test transaction_tests --test protocol_tests --test query_optimizer_tests --test join_hardening_tests --test aggregate_hardening_tests --test pagination_tests --test storage_modes_test -- --nocapture --test-threads=1
+  passed; 260 tests passed
+
+cargo test --profile perf --no-run --message-format=json
+  passed; built 174 test binaries
+
+binary-by-binary release gate from /tmp/helios_test_bins_2.tsv
+  skipped: ha_integration, postgres_ssl_tests (known sandbox hang class)
+  result: 170 passed / 2 failed / 0 timed out / 2 skipped
+  failed: heliosdb_nano (A6 HNSW tombstone-count semantics),
+          truncate_hardening_tests (A4 TRUNCATE affected-count semantics)
+
+cargo check --workspace --all-targets
+  passed after release-gate fixes
+
+cargo package --allow-dirty
+  passed after release-gate fixes; packaged 706 files, 12.7 MiB uncompressed, 2.5 MiB compressed
+
+cargo publish --dry-run --allow-dirty
+  passed after release-gate fixes; dry-run aborted before upload as expected
+
+git diff --check
+  passed
+
+git fetch origin && git rebase origin/main
+  passed cleanly; release candidate now includes origin/main f51ac86
+
+cargo check --workspace --all-targets
+  passed after rebase
+
+cargo test --profile perf --test mcp_conformance --test mcp_endpoint_phase4 --test mcp_auth --test mcp_new_tools --test mcp_axum_routes --test mcp_introspection --test mcp_progress --test mcp_progress_http --test mcp_auto_register -- --test-threads=1
+  passed after rebase; selected MCP binaries compiled and executed successfully
+
+cargo package
+  passed after rebase without --allow-dirty; packaged 706 files, 12.7 MiB uncompressed, 2.5 MiB compressed
+
+cargo publish --dry-run
+  passed after rebase without --allow-dirty; dry-run aborted before upload as expected
+```
+
+## Recommended Publish Commands
+
+```bash
+cargo check --workspace --all-targets
+cargo package
+cargo publish --dry-run
+cargo publish
+```
+
+Use `--allow-dirty` only while validating a local, uncommitted release
+candidate. The final publish path should commit the release candidate, tag it,
+and run the package/publish commands without `--allow-dirty`.
+
+## Notes For Release Messaging
+
+- Do not headline the multi-thousand-x SQLite disk autocommit wins without the
+  fsync caveat.
+- Do state that Nano now wins the Docker PG-wire PostgreSQL/MariaDB mirror on
+  the measured repeated-query suite.
+- Do state that SQLite embedded in-memory analytics remain the main follow-up.
+- Present `oltp_fast` and `columnar_analytics` as explicit gated modes, not
+  default behavior.

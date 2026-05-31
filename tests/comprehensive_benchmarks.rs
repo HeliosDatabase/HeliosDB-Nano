@@ -309,9 +309,9 @@ fn bench_transaction_overhead() -> Result<()> {
     tx.commit()?;
     let with_tx_duration = start.elapsed();
 
-    let overhead_percent = ((with_tx_duration.as_millis() as f64 - without_tx_duration.as_millis() as f64)
-        / without_tx_duration.as_millis() as f64)
-        * 100.0;
+    let without_tx_nanos = without_tx_duration.as_nanos() as f64;
+    let with_tx_nanos = with_tx_duration.as_nanos() as f64;
+    let overhead_percent = ((with_tx_nanos - without_tx_nanos) / without_tx_nanos) * 100.0;
 
     println!("\n=== Transaction Overhead ===");
     println!("Without transaction: {:?}", without_tx_duration);

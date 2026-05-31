@@ -71,8 +71,7 @@ fn count_star_pk_range_handles_negative_keys() {
     let db = EmbeddedDatabase::new_in_memory().unwrap();
     db.execute("CREATE TABLE n (id INTEGER PRIMARY KEY, v TEXT)").unwrap();
     for id in [-3, -1, 0, 1, 4] {
-        db.execute(&format!("INSERT INTO n VALUES ({id}, 'v{id}')"))
-            .unwrap();
+        db.execute(&format!("INSERT INTO n VALUES ({id}, 'v{id}')")).unwrap();
     }
 
     let rows = db.query("SELECT COUNT(*) FROM n WHERE id >= 0", &[]).unwrap();
@@ -158,10 +157,10 @@ fn count_distinct_pk_uses_index_cardinality() {
 #[test]
 fn count_pk_and_count_star_pk_in_list_use_index_cardinality() {
     let db = EmbeddedDatabase::new_in_memory().unwrap();
-    db.execute("CREATE TABLE n (id INTEGER PRIMARY KEY, bucket INT)").unwrap();
+    db.execute("CREATE TABLE n (id INTEGER PRIMARY KEY, bucket INT)")
+        .unwrap();
     for id in 1..=10 {
-        db.execute(&format!("INSERT INTO n VALUES ({id}, {})", id % 3))
-            .unwrap();
+        db.execute(&format!("INSERT INTO n VALUES ({id}, {})", id % 3)).unwrap();
     }
 
     let rows = db.query("SELECT COUNT(id) FROM n", &[]).unwrap();
@@ -185,7 +184,9 @@ fn count_pk_and_count_star_pk_in_list_use_index_cardinality() {
         .unwrap();
     assert_eq!(int(&rows[0].values[0]), 2);
 
-    let rows = db.query("SELECT COUNT(bucket) FROM n WHERE id IN (1, 2, 3)", &[]).unwrap();
+    let rows = db
+        .query("SELECT COUNT(bucket) FROM n WHERE id IN (1, 2, 3)", &[])
+        .unwrap();
     assert_eq!(int(&rows[0].values[0]), 3);
 }
 
@@ -238,13 +239,15 @@ fn storage_filter_pushdown_preserves_sql_null_predicates() {
     db.execute("INSERT INTO f VALUES (3, NULL, 'n')").unwrap();
     db.execute("INSERT INTO f VALUES (4, 20, 'c')").unwrap();
 
-    let rows = db
-        .query("SELECT id FROM f WHERE x > 1 ORDER BY id", &[])
-        .unwrap();
-    assert_eq!(rows.iter().map(|row| int(&row.values[0])).collect::<Vec<_>>(), vec![2, 4]);
+    let rows = db.query("SELECT id FROM f WHERE x > 1 ORDER BY id", &[]).unwrap();
+    assert_eq!(
+        rows.iter().map(|row| int(&row.values[0])).collect::<Vec<_>>(),
+        vec![2, 4]
+    );
 
-    let rows = db
-        .query("SELECT id FROM f WHERE x != 1 ORDER BY id", &[])
-        .unwrap();
-    assert_eq!(rows.iter().map(|row| int(&row.values[0])).collect::<Vec<_>>(), vec![2, 4]);
+    let rows = db.query("SELECT id FROM f WHERE x != 1 ORDER BY id", &[]).unwrap();
+    assert_eq!(
+        rows.iter().map(|row| int(&row.values[0])).collect::<Vec<_>>(),
+        vec![2, 4]
+    );
 }

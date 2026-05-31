@@ -9,6 +9,12 @@
 //!   disk       -> on-disk, WAL=Sync         (fsync per write — the durable default)
 //!   disk_group -> on-disk, WAL=GroupCommit  (batched fsync)
 //!   disk_nowal -> on-disk, WAL disabled     (RocksDB default durability only)
+//! HELIOS_TPS_EMBEDDED_PROFILE:
+//!   rowstore             -> default benchmark schema and SQL shapes
+//!   columnar_analytics   -> in-memory-only A/B profile using STORAGE COLUMNAR
+//!                           for analytical columns and columnar-friendly projections
+//!   oltp_fast            -> in-memory-only OLTP ceiling: rowstore schema,
+//!                           time travel off by default, memory quota accounting off
 //! HELIOS_TPS_TIME_TRAVEL=0 disables MVCC version-key maintenance for write-path diagnosis.
 
 use heliosdb_nano::config::WalSyncModeConfig;
@@ -264,8 +270,18 @@ fn run_columnar_scan_bench() {
     );
     bench_pair(
         "agg_no_filter",
-        &|r| format!("SELECT SUM(a), AVG(d), MAX(b), COUNT(a) FROM row_wide{}", " ".repeat(r + 1)),
-        &|r| format!("SELECT SUM(a), AVG(d), MAX(b), COUNT(a) FROM col_wide{}", " ".repeat(r + 1)),
+        &|r| {
+            format!(
+                "SELECT SUM(a), AVG(d), MAX(b), COUNT(a) FROM row_wide{}",
+                " ".repeat(r + 1)
+            )
+        },
+        &|r| {
+            format!(
+                "SELECT SUM(a), AVG(d), MAX(b), COUNT(a) FROM col_wide{}",
+                " ".repeat(r + 1)
+            )
+        },
     );
     bench_pair(
         "count_star_filter",
@@ -338,6 +354,103 @@ fn no_result_cache(sql: &str) -> String {
     format!("{sql} /* NOW(helios_tps_uncached) */")
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TpsEmbeddedProfile {
+    RowStore,
+    ColumnarAnalytics,
+    OltpFast,
+}
+
+impl TpsEmbeddedProfile {
+    fn from_env() -> Self {
+        match std::env::var("HELIOS_TPS_EMBEDDED_PROFILE") {
+            Ok(value) => match value.as_str() {
+                "rowstore" | "row_store" | "default" => Self::RowStore,
+                "columnar_analytics" | "columnar" | "analytics_columnar" => Self::ColumnarAnalytics,
+                "oltp_fast" | "fast_oltp" | "mem_oltp_fast" => Self::OltpFast,
+                other => panic!("unknown HELIOS_TPS_EMBEDDED_PROFILE: {other}"),
+            },
+            Err(_) => Self::RowStore,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::RowStore => "rowstore",
+            Self::ColumnarAnalytics => "columnar_analytics",
+            Self::OltpFast => "oltp_fast",
+        }
+    }
+
+    fn require_supported(self, mode: &str) {
+        if self != Self::RowStore && mode != "mem" {
+            panic!(
+                "HELIOS_TPS_EMBEDDED_PROFILE={} is currently gated to HELIOS_TPS_MODE=mem",
+                self.label()
+            );
+        }
+    }
+
+    fn create_tables(self, db: &EmbeddedDatabase) -> Result<()> {
+        match self {
+            Self::RowStore | Self::OltpFast => {
+                db.execute(
+                    "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT, age INTEGER, balance INTEGER)",
+                )?;
+                db.execute(
+                    "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, amount INTEGER, status TEXT)",
+                )?;
+            }
+            Self::ColumnarAnalytics => {
+                db.execute(
+                    "CREATE TABLE users (
+                        id INTEGER PRIMARY KEY,
+                        name TEXT,
+                        email TEXT,
+                        age INTEGER STORAGE COLUMNAR,
+                        balance INTEGER STORAGE COLUMNAR
+                    )",
+                )?;
+                db.execute(
+                    "CREATE TABLE orders (
+                        id INTEGER PRIMARY KEY,
+                        user_id INTEGER STORAGE COLUMNAR,
+                        amount INTEGER STORAGE COLUMNAR,
+                        status TEXT STORAGE COLUMNAR
+                    )",
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn filter_scan_sql(self) -> &'static str {
+        match self {
+            Self::RowStore | Self::OltpFast => "SELECT id, name FROM users WHERE age > 50",
+            // Keep this profile diagnostic: all referenced columns are columnar,
+            // so the storage scan can avoid full row materialization.
+            Self::ColumnarAnalytics => "SELECT age, balance FROM users WHERE age > 50",
+        }
+    }
+
+    fn topn_sql(self) -> &'static str {
+        match self {
+            Self::RowStore | Self::OltpFast => "SELECT id, balance FROM users ORDER BY balance DESC LIMIT 10",
+            Self::ColumnarAnalytics => "SELECT age, balance FROM users ORDER BY balance DESC LIMIT 10",
+        }
+    }
+
+    fn default_time_travel(self) -> bool {
+        !matches!(self, Self::OltpFast)
+    }
+
+    fn apply_config(self, config: &mut Config) {
+        if matches!(self, Self::OltpFast) {
+            config.resource_quotas.memory_limit_per_user_mb = 0;
+        }
+    }
+}
+
 fn env_bool_enabled(name: &str, default: bool) -> bool {
     match std::env::var(name) {
         Ok(v) if matches!(v.as_str(), "0" | "false" | "FALSE" | "off" | "OFF" | "no" | "NO") => false,
@@ -346,15 +459,17 @@ fn env_bool_enabled(name: &str, default: bool) -> bool {
     }
 }
 
-fn apply_tps_overrides(config: &mut Config) {
-    config.storage.time_travel_enabled = env_bool_enabled("HELIOS_TPS_TIME_TRAVEL", true);
+fn apply_tps_overrides(config: &mut Config, embedded_profile: TpsEmbeddedProfile) {
+    config.storage.time_travel_enabled =
+        env_bool_enabled("HELIOS_TPS_TIME_TRAVEL", embedded_profile.default_time_travel());
+    embedded_profile.apply_config(config);
 }
 
-fn make_db(mode: &str, dir: &std::path::Path) -> Result<EmbeddedDatabase> {
+fn make_db(mode: &str, dir: &std::path::Path, embedded_profile: TpsEmbeddedProfile) -> Result<EmbeddedDatabase> {
     match mode {
         "mem" => {
             let mut c = Config::in_memory();
-            apply_tps_overrides(&mut c);
+            apply_tps_overrides(&mut c, embedded_profile);
             EmbeddedDatabase::with_config(c)
         }
         "disk" => {
@@ -364,7 +479,7 @@ fn make_db(mode: &str, dir: &std::path::Path) -> Result<EmbeddedDatabase> {
             c.storage.wal_enabled = true;
             c.storage.wal_sync_mode = WalSyncModeConfig::Sync;
             c.storage.logical_wal_per_statement = std::env::var("HELIOS_LOGICAL_WAL").is_ok();
-            apply_tps_overrides(&mut c);
+            apply_tps_overrides(&mut c, embedded_profile);
             EmbeddedDatabase::with_config(c)
         }
         "disk_group" => {
@@ -373,7 +488,7 @@ fn make_db(mode: &str, dir: &std::path::Path) -> Result<EmbeddedDatabase> {
             c.storage.memory_only = false;
             c.storage.wal_enabled = true;
             c.storage.wal_sync_mode = WalSyncModeConfig::GroupCommit;
-            apply_tps_overrides(&mut c);
+            apply_tps_overrides(&mut c, embedded_profile);
             EmbeddedDatabase::with_config(c)
         }
         "disk_nowal" => {
@@ -381,7 +496,7 @@ fn make_db(mode: &str, dir: &std::path::Path) -> Result<EmbeddedDatabase> {
             c.storage.path = Some(dir.to_path_buf());
             c.storage.memory_only = false;
             c.storage.wal_enabled = false;
-            apply_tps_overrides(&mut c);
+            apply_tps_overrides(&mut c, embedded_profile);
             EmbeddedDatabase::with_config(c)
         }
         other => panic!("unknown HELIOS_TPS_MODE: {other}"),
@@ -568,25 +683,25 @@ fn run_tps_suite() {
     let tmp = std::env::temp_dir().join(format!("helios_tps_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).unwrap();
+    let embedded_profile = TpsEmbeddedProfile::from_env();
+    embedded_profile.require_supported(&mode);
 
     println!("\n================ HeliosDB-Nano TPS suite ================");
     println!(
-        "mode={mode}  N={n}  M={m}  time_travel={}  dir={}",
-        env_bool_enabled("HELIOS_TPS_TIME_TRAVEL", true),
+        "mode={mode}  profile={}  N={n}  M={m}  time_travel={}  dir={}",
+        embedded_profile.label(),
+        env_bool_enabled("HELIOS_TPS_TIME_TRAVEL", embedded_profile.default_time_travel()),
         tmp.display()
     );
     println!("{}", "-".repeat(80));
 
-    let db = make_db(&mode, &tmp).expect("db open");
+    let db = make_db(&mode, &tmp, embedded_profile).expect("db open");
     let selected = selected_workloads_env("HELIOS_TPS_WORKLOADS");
     if let Some(selected) = &selected {
         print_selected_workloads(selected);
     }
 
-    db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT, age INTEGER, balance INTEGER)")
-        .unwrap();
-    db.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, amount INTEGER, status TEXT)")
-        .unwrap();
+    embedded_profile.create_tables(&db).unwrap();
 
     let run_bulk = workload_enabled(selected.as_ref(), "bulk_insert_users(txn)", &["bulk_insert", "bulk"]);
     let run_autocommit = workload_enabled(selected.as_ref(), "autocommit_insert", &["autocommit_insert", "insert"]);
@@ -703,7 +818,7 @@ fn run_tps_suite() {
     let scan_iters = 20usize;
     if run_filter {
         bench("filter_scan(age>50)", scan_iters, || {
-            let sql = no_result_cache("SELECT id, name FROM users WHERE age > 50");
+            let sql = no_result_cache(embedded_profile.filter_scan_sql());
             for _ in 0..scan_iters {
                 let _ = db.query(&sql, &[])?;
             }
@@ -750,7 +865,7 @@ fn run_tps_suite() {
     // 11) ORDER BY ... LIMIT (top-N).
     if run_topn {
         bench("order_by_limit10", scan_iters, || {
-            let sql = no_result_cache("SELECT id, balance FROM users ORDER BY balance DESC LIMIT 10");
+            let sql = no_result_cache(embedded_profile.topn_sql());
             for _ in 0..scan_iters {
                 let _ = db.query(&sql, &[])?;
             }
@@ -785,16 +900,19 @@ fn run_param_tps_suite() {
     let tmp = std::env::temp_dir().join(format!("helios_param_tps_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).unwrap();
+    let embedded_profile = TpsEmbeddedProfile::from_env();
+    embedded_profile.require_supported(&mode);
 
     println!("\n============= HeliosDB-Nano parameterized TPS =============");
     println!(
-        "mode={mode}  N={n}  M={m}  time_travel={}  dir={}",
-        env_bool_enabled("HELIOS_TPS_TIME_TRAVEL", true),
+        "mode={mode}  profile={}  N={n}  M={m}  time_travel={}  dir={}",
+        embedded_profile.label(),
+        env_bool_enabled("HELIOS_TPS_TIME_TRAVEL", embedded_profile.default_time_travel()),
         tmp.display()
     );
     println!("{}", "-".repeat(80));
 
-    let db = make_db(&mode, &tmp).expect("db open");
+    let db = make_db(&mode, &tmp, embedded_profile).expect("db open");
     let selected =
         selected_workloads_env("HELIOS_TPS_PARAM_WORKLOADS").or_else(|| selected_workloads_env("HELIOS_TPS_WORKLOADS"));
     if let Some(selected) = &selected {

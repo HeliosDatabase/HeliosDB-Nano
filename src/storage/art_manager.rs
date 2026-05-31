@@ -1201,13 +1201,7 @@ impl ArtIndexManager {
     /// Remove one single-column primary-key entry when the caller already has
     /// the encoded PK key. This avoids fetching/deserializing the old row for
     /// PK-only DELETE fast paths.
-    pub fn remove_single_pk_key(
-        &self,
-        table: &str,
-        key: &[u8],
-        row_id: RowId,
-        pk_value: &Value,
-    ) -> ArtResult<bool> {
+    pub fn remove_single_pk_key(&self, table: &str, key: &[u8], row_id: RowId, pk_value: &Value) -> ArtResult<bool> {
         let pk_name = {
             let pk_indexes = self.pk_indexes.read().unwrap_or_else(|e| e.into_inner());
             match pk_indexes.get(table) {

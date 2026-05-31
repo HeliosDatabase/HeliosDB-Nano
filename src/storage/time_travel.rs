@@ -28,7 +28,7 @@ use crate::{Error, Result};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use lru::LruCache;
 use parking_lot::{Mutex, RwLock};
-use rocksdb::{DB, WriteBatch, WriteOptions};
+use rocksdb::{WriteBatch, WriteOptions, DB};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
@@ -703,11 +703,7 @@ impl SnapshotManager {
         self.finish_version_snapshot(table_name, row_id, timestamp, txn_id, scn, metadata)
     }
 
-    fn allocate_snapshot_metadata(
-        &self,
-        timestamp: u64,
-        lsn: Option<u64>,
-    ) -> (SnapshotMetadata, TransactionId, Scn) {
+    fn allocate_snapshot_metadata(&self, timestamp: u64, lsn: Option<u64>) -> (SnapshotMetadata, TransactionId, Scn) {
         let txn_id = match lsn {
             Some(lsn) => {
                 let mut txn_id = self.current_txn_id.write();
@@ -1189,7 +1185,10 @@ mod tests {
         assert!(db.get(b"v_idx:users:1:18446744073709551515").unwrap().is_some());
         assert!(db.get(b"snapshot:100").unwrap().is_none());
         assert!(db.get(b"txn_map:42").unwrap().is_none());
-        assert!(db.get(format!("scn_map:{}", metadata.scn).as_bytes()).unwrap().is_none());
+        assert!(db
+            .get(format!("scn_map:{}", metadata.scn).as_bytes())
+            .unwrap()
+            .is_none());
     }
 
     #[test]

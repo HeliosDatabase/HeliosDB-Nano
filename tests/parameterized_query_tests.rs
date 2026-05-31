@@ -161,10 +161,8 @@ fn test_parameterized_update_cache_invalidated_by_schema_change() {
 
     db.execute("CREATE TABLE param_update_cache (id INT PRIMARY KEY, v INT)")
         .unwrap();
-    db.execute("INSERT INTO param_update_cache VALUES (1, 10)")
-        .unwrap();
-    db.execute_params(sql, &[Value::Int4(11), Value::Int4(1)])
-        .unwrap();
+    db.execute("INSERT INTO param_update_cache VALUES (1, 10)").unwrap();
+    db.execute_params(sql, &[Value::Int4(11), Value::Int4(1)]).unwrap();
 
     db.execute("DROP TABLE param_update_cache").unwrap();
     db.execute("CREATE TABLE param_update_cache (id INT PRIMARY KEY, v TEXT)")
@@ -174,9 +172,7 @@ fn test_parameterized_update_cache_invalidated_by_schema_change() {
     db.execute_params(sql, &[Value::String("after".to_string()), Value::Int4(1)])
         .unwrap();
 
-    let rows = db
-        .query("SELECT v FROM param_update_cache WHERE id = 1", &[])
-        .unwrap();
+    let rows = db.query("SELECT v FROM param_update_cache WHERE id = 1", &[]).unwrap();
     assert_eq!(rows[0].get(0).unwrap(), &Value::String("after".to_string()));
 }
 
@@ -187,8 +183,7 @@ fn test_parameterized_delete_cache_invalidated_by_schema_change() {
 
     db.execute("CREATE TABLE param_delete_cache (id INT PRIMARY KEY, v TEXT)")
         .unwrap();
-    db.execute("INSERT INTO param_delete_cache VALUES (1, 'old')")
-        .unwrap();
+    db.execute("INSERT INTO param_delete_cache VALUES (1, 'old')").unwrap();
     db.execute_params(sql, &[Value::Int4(1)]).unwrap();
 
     db.execute("DROP TABLE param_delete_cache").unwrap();
@@ -196,8 +191,7 @@ fn test_parameterized_delete_cache_invalidated_by_schema_change() {
         .unwrap();
     db.execute("INSERT INTO param_delete_cache VALUES ('k1', 'new')")
         .unwrap();
-    db.execute_params(sql, &[Value::String("k1".to_string())])
-        .unwrap();
+    db.execute_params(sql, &[Value::String("k1".to_string())]).unwrap();
 
     let rows = db.query("SELECT * FROM param_delete_cache", &[]).unwrap();
     assert_eq!(rows.len(), 0);
@@ -307,9 +301,7 @@ fn test_execute_many_params_insert_autocommit() {
         .unwrap();
     assert_eq!(count, 3);
 
-    let results = db
-        .query("SELECT id, name FROM many_params ORDER BY id", &[])
-        .unwrap();
+    let results = db.query("SELECT id, name FROM many_params ORDER BY id", &[]).unwrap();
     assert_eq!(results.len(), 3);
     assert_eq!(results[1].get(1).unwrap(), &Value::String("b".to_string()));
 }
@@ -344,7 +336,10 @@ fn test_execute_many_params_insert_autocommit_rejects_existing_duplicate() {
         vec![Value::Int4(2), Value::String("new".to_string())],
     ];
     let result = db.execute_many_params("INSERT INTO many_existing_dup (id, name) VALUES ($1, $2)", &rows);
-    assert!(result.is_err(), "execute_many must reject duplicates already in the table");
+    assert!(
+        result.is_err(),
+        "execute_many must reject duplicates already in the table"
+    );
 
     let rows = db
         .query("SELECT id, name FROM many_existing_dup ORDER BY id", &[])
@@ -443,7 +438,10 @@ fn test_update_arithmetic_with_pk_parameter() {
     db.execute("INSERT INTO balances VALUES (1, 10)").unwrap();
 
     let count = db
-        .execute_params("UPDATE balances SET amount = amount + 5 WHERE id = $1", &[Value::Int4(1)])
+        .execute_params(
+            "UPDATE balances SET amount = amount + 5 WHERE id = $1",
+            &[Value::Int4(1)],
+        )
         .expect("Failed to update with arithmetic expression");
     assert_eq!(count, 1);
 

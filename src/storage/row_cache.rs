@@ -305,14 +305,21 @@ impl RowCache {
         let key = RowCacheKey::new(table, row_id);
 
         let mut cache = self.cache.write();
-        if cache.pop(&key).is_some() {
+        let removed = cache.pop(&key).is_some();
+        if removed {
             let mut stats = self.stats.write();
             stats.invalidations += 1;
             stats.current_entries = cache.len() as u64;
         }
+        drop(cache);
 
-        // Mark table as hot
-        self.mark_table_hot(table);
+        // Mark the table hot only when this invalidation actually removed a
+        // cached row. UPDATE/DELETE fast paths often invalidate rows that were
+        // never cached; paying hot-table bookkeeping on every miss is pure
+        // write-path overhead and does not protect correctness.
+        if removed {
+            self.mark_table_hot(table);
+        }
     }
 
     /// Invalidate all cached rows for a table

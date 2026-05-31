@@ -214,6 +214,52 @@ fn build_group_key(values: &[Value], positions: &[usize]) -> Vec<Value> {
         .collect()
 }
 
+fn columnar_group_key_matches(
+    key: &[Value],
+    column_batches: &HashMap<usize, ColumnarBatchIndex>,
+    group_by_columns: &[usize],
+    batch_id: u64,
+    offset: usize,
+) -> bool {
+    key.len() == group_by_columns.len()
+        && key.iter().zip(group_by_columns).all(|(expected, &idx)| {
+            columnar_batch_value(column_batches, idx, batch_id, offset)
+                .map_or(matches!(expected, Value::Null), |actual| expected == actual)
+        })
+}
+
+fn build_columnar_group_key(
+    column_batches: &HashMap<usize, ColumnarBatchIndex>,
+    group_by_columns: &[usize],
+    batch_id: u64,
+    offset: usize,
+) -> Vec<Value> {
+    group_by_columns
+        .iter()
+        .map(|&idx| {
+            columnar_batch_value(column_batches, idx, batch_id, offset)
+                .cloned()
+                .unwrap_or(Value::Null)
+        })
+        .collect()
+}
+
+fn update_columnar_aggregate_states(
+    states: &mut [ColumnarAggregateState],
+    aggregates: &[ColumnarAggregateSpec],
+    column_batches: &HashMap<usize, ColumnarBatchIndex>,
+    batch_id: u64,
+    offset: usize,
+) -> Result<()> {
+    for (state, aggregate) in states.iter_mut().zip(aggregates) {
+        let value = aggregate
+            .column_index
+            .and_then(|idx| columnar_batch_value(column_batches, idx, batch_id, offset));
+        state.update(aggregate.op, value)?;
+    }
+    Ok(())
+}
+
 struct RowTopKEntry {
     key: Vec<Value>,
     tuple: Tuple,
@@ -342,6 +388,58 @@ enum ColumnarAggregateState {
     Avg { sum: f64, count: u64 },
     Min(Option<Value>),
     Max(Option<Value>),
+}
+
+#[derive(Clone, Copy)]
+struct CountSumIntState {
+    count: i64,
+    sum: i64,
+    sum_seen: bool,
+}
+
+impl CountSumIntState {
+    fn new() -> Self {
+        Self {
+            count: 0,
+            sum: 0,
+            sum_seen: false,
+        }
+    }
+
+    fn update_count(&mut self) {
+        self.count += 1;
+    }
+
+    fn update_sum(&mut self, value: Option<&Value>) -> Result<()> {
+        let Some(value) = value else {
+            return Ok(());
+        };
+        let add = match value {
+            Value::Null => return Ok(()),
+            Value::Int2(value) => *value as i64,
+            Value::Int4(value) => *value as i64,
+            Value::Int8(value) => *value,
+            _ => return Err(Error::query_execution("SUM requires numeric values")),
+        };
+        self.sum = self
+            .sum
+            .checked_add(add)
+            .ok_or_else(|| Error::query_execution("integer overflow: BIGINT SUM"))?;
+        self.sum_seen = true;
+        Ok(())
+    }
+
+    fn finish(self, group_key: Value) -> Tuple {
+        Tuple::new(vec![
+            group_key,
+            Value::Int8(self.count),
+            if self.sum_seen {
+                Value::Int8(self.sum)
+            } else {
+                Value::Null
+            },
+        ])
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2562,8 +2660,7 @@ impl StorageEngine {
         let mut heap = std::collections::BinaryHeap::with_capacity(k.saturating_add(1));
         let mut values = Vec::with_capacity(requested.len());
         for item in iter {
-            let (key, raw_value) =
-                item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+            let (key, raw_value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
             if !key.starts_with(prefix_bytes) {
                 break;
             }
@@ -2574,8 +2671,7 @@ impl StorageEngine {
             } else {
                 heap.peek()
                     .map(|top: &RowTopKEntry| {
-                        compare_values_to_topk_key(&values, &sort_positions, &top.key, &asc)
-                            == std::cmp::Ordering::Less
+                        compare_values_to_topk_key(&values, &sort_positions, &top.key, &asc) == std::cmp::Ordering::Less
                     })
                     .unwrap_or(false)
             };
@@ -2593,10 +2689,130 @@ impl StorageEngine {
         }
 
         Ok(Some(
-            heap.into_sorted_vec()
-                .into_iter()
-                .map(|entry| entry.tuple)
-                .collect(),
+            heap.into_sorted_vec().into_iter().map(|entry| entry.tuple).collect(),
+        ))
+    }
+
+    /// Columnar Top-N for direct-column projections. It keeps only the bounded
+    /// heap of projected output tuples, avoiding materializing a full columnar
+    /// scan result before the executor trims to LIMIT.
+    pub(crate) fn scan_table_topk_columnar_projected_columns(
+        &self,
+        table_name: &str,
+        schema: &crate::Schema,
+        output_columns: &[usize],
+        sort_columns: &[usize],
+        asc: &[bool],
+        k: usize,
+    ) -> Result<Option<Vec<Tuple>>> {
+        if k == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        if sort_columns.is_empty() || sort_columns.len() != asc.len() {
+            return Ok(None);
+        }
+
+        let branch_name = self.current_branch.lock().clone();
+        if branch_name.is_some() && branch_name.as_deref() != Some("main") {
+            return Ok(None);
+        }
+
+        let mut requested: Vec<usize> = output_columns.to_vec();
+        requested.extend_from_slice(sort_columns);
+        requested.sort_unstable();
+        requested.dedup();
+
+        for &idx in &requested {
+            let Some(column) = schema.columns.get(idx) else {
+                return Err(Error::storage(format!(
+                    "Column index {} out of bounds for {}",
+                    idx, table_name
+                )));
+            };
+            if column.storage_mode != ColumnStorageMode::Columnar {
+                return Ok(None);
+            }
+        }
+
+        let mut column_batches: HashMap<usize, ColumnarBatchIndex> = HashMap::with_capacity(requested.len());
+        for &idx in &requested {
+            let column = &schema.columns[idx];
+            let batches = ColumnarStore::scan_column_batches(&self.db, table_name, &column.name)?;
+            column_batches.insert(idx, ColumnarBatchIndex::from_batches(batches));
+        }
+
+        let requested_pos = |column_index: usize| -> Result<usize> {
+            requested.binary_search(&column_index).map_err(|_| {
+                Error::storage(format!(
+                    "Column index {} missing from columnar Top-N set for {}",
+                    column_index, table_name
+                ))
+            })
+        };
+        let output_positions: Vec<usize> = output_columns
+            .iter()
+            .map(|&idx| requested_pos(idx))
+            .collect::<Result<Vec<_>>>()?;
+        let sort_positions: Vec<usize> = sort_columns
+            .iter()
+            .map(|&idx| requested_pos(idx))
+            .collect::<Result<Vec<_>>>()?;
+        let asc = Arc::new(asc.to_vec());
+
+        let prefix = format!("data:{}:", table_name);
+        let prefix_bytes = prefix.as_bytes();
+        let mut read_opts = ReadOptions::default();
+        read_opts.set_total_order_seek(true);
+        let iter = self
+            .db
+            .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read_opts);
+
+        let mut heap = std::collections::BinaryHeap::with_capacity(k.saturating_add(1));
+        let mut values = Vec::with_capacity(requested.len());
+        for item in iter {
+            let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+            if !key.starts_with(prefix_bytes) {
+                break;
+            }
+            let Some(row_id) = Self::parse_row_id_after_prefix(&key, prefix_bytes.len()) else {
+                continue;
+            };
+            let batch_id = row_id / BATCH_SIZE as u64;
+            let offset = (row_id % BATCH_SIZE as u64) as usize;
+
+            values.clear();
+            for &idx in &requested {
+                values.push(
+                    columnar_batch_value(&column_batches, idx, batch_id, offset)
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                );
+            }
+
+            let replace = if heap.len() < k {
+                true
+            } else {
+                heap.peek()
+                    .map(|top: &RowTopKEntry| {
+                        compare_values_to_topk_key(&values, &sort_positions, &top.key, &asc) == std::cmp::Ordering::Less
+                    })
+                    .unwrap_or(false)
+            };
+
+            if replace {
+                if heap.len() >= k {
+                    heap.pop();
+                }
+                heap.push(RowTopKEntry {
+                    key: build_topk_key(&values, &sort_positions),
+                    tuple: build_projected_tuple(&values, &output_positions),
+                    asc: Arc::clone(&asc),
+                });
+            }
+        }
+
+        Ok(Some(
+            heap.into_sorted_vec().into_iter().map(|entry| entry.tuple).collect(),
         ))
     }
 
@@ -2756,6 +2972,26 @@ impl StorageEngine {
 
         let filter_predicates: Vec<FilterPredicate> = predicates.iter().filter_map(columnar_filter_predicate).collect();
 
+        if let Some(tuples) = self.try_aggregate_columnar_group_count_sum_int(
+            table_name,
+            schema,
+            group_by_columns,
+            aggregates,
+            &filter_predicates,
+            &column_batches,
+        )? {
+            tracing::debug!(
+                phase = "storage_columnar_aggregate",
+                table = table_name,
+                rows = tuples.len(),
+                columns = requested.len(),
+                predicates = filter_predicates.len(),
+                duration_us = scan_start.elapsed().as_micros() as u64,
+                "Columnar grouped count/sum aggregate complete"
+            );
+            return Ok(tuples);
+        }
+
         if group_by_columns.is_empty() && filter_predicates.is_empty() {
             let mut values = Vec::with_capacity(aggregates.len());
             for aggregate in aggregates {
@@ -2802,12 +3038,7 @@ impl StorageEngine {
                     for (batch_id, batch) in driver_batches.ordered_batches() {
                         for (offset, value) in batch.values.iter().enumerate() {
                             if !driver_predicate.evaluate(value)
-                                || !columnar_row_matches_filters(
-                                    &column_batches,
-                                    batch_id,
-                                    offset,
-                                    &filter_predicates,
-                                )
+                                || !columnar_row_matches_filters(&column_batches, batch_id, offset, &filter_predicates)
                             {
                                 continue;
                             }
@@ -2838,7 +3069,9 @@ impl StorageEngine {
                     return Ok(tuples);
                 }
 
-                let mut groups: HashMap<Vec<Value>, Vec<ColumnarAggregateState>> = HashMap::new();
+                const LINEAR_GROUP_LIMIT: usize = 64;
+                let mut small_groups: Vec<(Vec<Value>, Vec<ColumnarAggregateState>)> = Vec::new();
+                let mut hash_groups: Option<HashMap<Vec<Value>, Vec<ColumnarAggregateState>>> = None;
 
                 for (batch_id, batch) in driver_batches.ordered_batches() {
                     for (offset, value) in batch.values.iter().enumerate() {
@@ -2848,31 +3081,53 @@ impl StorageEngine {
                             continue;
                         }
 
-                        let group_key: Vec<Value> = group_by_columns
-                            .iter()
-                            .map(|&idx| {
-                                columnar_batch_value(&column_batches, idx, batch_id, offset)
-                                    .cloned()
-                                    .unwrap_or(Value::Null)
-                            })
-                            .collect();
-                        let states = groups.entry(group_key).or_insert_with(|| {
-                            aggregates
+                        if let Some(groups) = hash_groups.as_mut() {
+                            let group_key =
+                                build_columnar_group_key(&column_batches, group_by_columns, batch_id, offset);
+                            let states = groups.entry(group_key).or_insert_with(|| {
+                                aggregates
+                                    .iter()
+                                    .map(|aggregate| ColumnarAggregateState::new(aggregate.op))
+                                    .collect()
+                            });
+                            update_columnar_aggregate_states(states, aggregates, &column_batches, batch_id, offset)?;
+                        } else if let Some(idx) = small_groups.iter().position(|(group_key, _)| {
+                            columnar_group_key_matches(group_key, &column_batches, group_by_columns, batch_id, offset)
+                        }) {
+                            update_columnar_aggregate_states(
+                                &mut small_groups[idx].1,
+                                aggregates,
+                                &column_batches,
+                                batch_id,
+                                offset,
+                            )?;
+                        } else {
+                            let mut states: Vec<ColumnarAggregateState> = aggregates
                                 .iter()
                                 .map(|aggregate| ColumnarAggregateState::new(aggregate.op))
-                                .collect()
-                        });
-
-                        for (state, aggregate) in states.iter_mut().zip(aggregates) {
-                            let value = aggregate
-                                .column_index
-                                .and_then(|idx| columnar_batch_value(&column_batches, idx, batch_id, offset));
-                            state.update(aggregate.op, value)?;
+                                .collect();
+                            update_columnar_aggregate_states(
+                                &mut states,
+                                aggregates,
+                                &column_batches,
+                                batch_id,
+                                offset,
+                            )?;
+                            small_groups.push((
+                                build_columnar_group_key(&column_batches, group_by_columns, batch_id, offset),
+                                states,
+                            ));
+                            if small_groups.len() > LINEAR_GROUP_LIMIT {
+                                hash_groups = Some(small_groups.drain(..).collect());
+                            }
                         }
                     }
                 }
 
-                let mut grouped: Vec<(Vec<Value>, Vec<ColumnarAggregateState>)> = groups.into_iter().collect();
+                let mut grouped: Vec<(Vec<Value>, Vec<ColumnarAggregateState>)> = match hash_groups {
+                    Some(groups) => groups.into_iter().collect(),
+                    None => small_groups,
+                };
                 grouped.sort_by(|(left, _), (right, _)| compare_value_slices(left, right));
 
                 let mut tuples = Vec::with_capacity(grouped.len());
@@ -2950,7 +3205,9 @@ impl StorageEngine {
             return Ok(tuples);
         }
 
-        let mut groups: HashMap<Vec<Value>, Vec<ColumnarAggregateState>> = HashMap::new();
+        const LINEAR_GROUP_LIMIT: usize = 64;
+        let mut small_groups: Vec<(Vec<Value>, Vec<ColumnarAggregateState>)> = Vec::new();
+        let mut hash_groups: Option<HashMap<Vec<Value>, Vec<ColumnarAggregateState>>> = None;
 
         let prefix = format!("data:{}:", table_name);
         let prefix_bytes = prefix.as_bytes();
@@ -2975,40 +3232,55 @@ impl StorageEngine {
                 continue;
             }
 
-            let group_key: Vec<Value> = group_by_columns
-                .iter()
-                .map(|&idx| {
-                    columnar_batch_value(&column_batches, idx, batch_id, offset)
-                        .cloned()
-                        .unwrap_or(Value::Null)
-                })
-                .collect();
-            let states = groups.entry(group_key).or_insert_with(|| {
-                aggregates
+            if let Some(groups) = hash_groups.as_mut() {
+                let group_key = build_columnar_group_key(&column_batches, group_by_columns, batch_id, offset);
+                let states = groups.entry(group_key).or_insert_with(|| {
+                    aggregates
+                        .iter()
+                        .map(|aggregate| ColumnarAggregateState::new(aggregate.op))
+                        .collect()
+                });
+                update_columnar_aggregate_states(states, aggregates, &column_batches, batch_id, offset)?;
+            } else if let Some(idx) = small_groups.iter().position(|(group_key, _)| {
+                columnar_group_key_matches(group_key, &column_batches, group_by_columns, batch_id, offset)
+            }) {
+                update_columnar_aggregate_states(
+                    &mut small_groups[idx].1,
+                    aggregates,
+                    &column_batches,
+                    batch_id,
+                    offset,
+                )?;
+            } else {
+                let mut states: Vec<ColumnarAggregateState> = aggregates
                     .iter()
                     .map(|aggregate| ColumnarAggregateState::new(aggregate.op))
-                    .collect()
-            });
-
-            for (state, aggregate) in states.iter_mut().zip(aggregates) {
-                let value = aggregate
-                    .column_index
-                    .and_then(|idx| columnar_batch_value(&column_batches, idx, batch_id, offset));
-                state.update(aggregate.op, value)?;
+                    .collect();
+                update_columnar_aggregate_states(&mut states, aggregates, &column_batches, batch_id, offset)?;
+                small_groups.push((
+                    build_columnar_group_key(&column_batches, group_by_columns, batch_id, offset),
+                    states,
+                ));
+                if small_groups.len() > LINEAR_GROUP_LIMIT {
+                    hash_groups = Some(small_groups.drain(..).collect());
+                }
             }
         }
 
-        if group_by_columns.is_empty() && groups.is_empty() {
-            groups.insert(
+        if group_by_columns.is_empty() && small_groups.is_empty() && hash_groups.is_none() {
+            small_groups.push((
                 Vec::new(),
                 aggregates
                     .iter()
                     .map(|aggregate| ColumnarAggregateState::new(aggregate.op))
                     .collect(),
-            );
+            ));
         }
 
-        let mut grouped: Vec<(Vec<Value>, Vec<ColumnarAggregateState>)> = groups.into_iter().collect();
+        let mut grouped: Vec<(Vec<Value>, Vec<ColumnarAggregateState>)> = match hash_groups {
+            Some(groups) => groups.into_iter().collect(),
+            None => small_groups,
+        };
         grouped.sort_by(|(left, _), (right, _)| compare_value_slices(left, right));
 
         let mut tuples = Vec::with_capacity(grouped.len());
@@ -3030,6 +3302,108 @@ impl StorageEngine {
         );
 
         Ok(tuples)
+    }
+
+    fn try_aggregate_columnar_group_count_sum_int(
+        &self,
+        table_name: &str,
+        schema: &crate::Schema,
+        group_by_columns: &[usize],
+        aggregates: &[ColumnarAggregateSpec],
+        filter_predicates: &[FilterPredicate],
+        column_batches: &HashMap<usize, ColumnarBatchIndex>,
+    ) -> Result<Option<Vec<Tuple>>> {
+        if group_by_columns.len() != 1 || aggregates.len() != 2 {
+            return Ok(None);
+        }
+        if !matches!(aggregates[0].op, ColumnarAggregateOp::CountStar)
+            || !matches!(aggregates[1].op, ColumnarAggregateOp::Sum)
+        {
+            return Ok(None);
+        }
+        let sum_column = match aggregates[1].column_index {
+            Some(idx) => idx,
+            None => return Ok(None),
+        };
+        if !schema
+            .columns
+            .get(sum_column)
+            .is_some_and(|column| primitive_integer_data_type(&column.data_type))
+        {
+            return Ok(None);
+        }
+
+        const LINEAR_GROUP_LIMIT: usize = 64;
+        let group_column = group_by_columns[0];
+        let mut small_groups: Vec<(Value, CountSumIntState)> = Vec::new();
+        let mut hash_groups: Option<HashMap<Value, CountSumIntState>> = None;
+
+        let prefix = format!("data:{}:", table_name);
+        let prefix_bytes = prefix.as_bytes();
+        let mut read_opts = ReadOptions::default();
+        read_opts.set_total_order_seek(true);
+        let iter = self
+            .db
+            .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read_opts);
+
+        for item in iter {
+            let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+            if !key.starts_with(prefix_bytes) {
+                break;
+            }
+            let Some(row_id) = Self::parse_row_id_after_prefix(&key, prefix_bytes.len()) else {
+                continue;
+            };
+
+            let batch_id = row_id / BATCH_SIZE as u64;
+            let offset = (row_id % BATCH_SIZE as u64) as usize;
+            if !columnar_row_matches_filters(column_batches, batch_id, offset, filter_predicates) {
+                continue;
+            }
+
+            let sum_value = columnar_batch_value(column_batches, sum_column, batch_id, offset);
+            if let Some(groups) = hash_groups.as_mut() {
+                let group_key = columnar_batch_value(column_batches, group_column, batch_id, offset)
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let state = groups.entry(group_key).or_insert_with(CountSumIntState::new);
+                state.update_count();
+                state.update_sum(sum_value)?;
+            } else if let Some(idx) = small_groups.iter().position(|(group_key, _)| {
+                columnar_batch_value(column_batches, group_column, batch_id, offset)
+                    .map_or(matches!(group_key, Value::Null), |actual| group_key == actual)
+            }) {
+                let state = &mut small_groups[idx].1;
+                state.update_count();
+                state.update_sum(sum_value)?;
+            } else {
+                let group_key = columnar_batch_value(column_batches, group_column, batch_id, offset)
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let mut state = CountSumIntState::new();
+                state.update_count();
+                state.update_sum(sum_value)?;
+                small_groups.push((group_key, state));
+                if small_groups.len() > LINEAR_GROUP_LIMIT {
+                    hash_groups = Some(small_groups.drain(..).collect());
+                }
+            }
+        }
+
+        let mut grouped: Vec<(Value, CountSumIntState)> = match hash_groups {
+            Some(groups) => groups.into_iter().collect(),
+            None => small_groups,
+        };
+        grouped.sort_by(|(left, _), (right, _)| {
+            compare_value_slices(std::slice::from_ref(left), std::slice::from_ref(right))
+        });
+
+        Ok(Some(
+            grouped
+                .into_iter()
+                .map(|(group_key, state)| state.finish(group_key))
+                .collect(),
+        ))
     }
 
     /// Aggregate directly over row-store data without materializing a ScanOperator
@@ -3175,11 +3549,9 @@ impl StorageEngine {
 
     fn primitive_count_sum_avg_positions(plan: &[PrimitiveRowAggregate]) -> Option<(usize, usize)> {
         match plan {
-            [
-                PrimitiveRowAggregate::CountStar,
-                PrimitiveRowAggregate::SumInt { position: sum_position },
-                PrimitiveRowAggregate::Avg { position: avg_position },
-            ] => Some((*sum_position, *avg_position)),
+            [PrimitiveRowAggregate::CountStar, PrimitiveRowAggregate::SumInt { position: sum_position }, PrimitiveRowAggregate::Avg { position: avg_position }] => {
+                Some((*sum_position, *avg_position))
+            }
             _ => None,
         }
     }
@@ -3461,12 +3833,7 @@ impl StorageEngine {
         Ok(Some(tuples))
     }
 
-    fn decode_rowstore_columns(
-        &self,
-        raw_value: &[u8],
-        columns: &[usize],
-        total_cols: usize,
-    ) -> Result<Tuple> {
+    fn decode_rowstore_columns(&self, raw_value: &[u8], columns: &[usize], total_cols: usize) -> Result<Tuple> {
         let tuple = if let Some(km) = &self.key_manager {
             let decrypted = crypto::decrypt(km.key(), raw_value)?;
             crate::storage::prefix_decode::decode_tuple_columns(&decrypted, columns, total_cols)
@@ -3628,8 +3995,7 @@ impl StorageEngine {
             .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read_opts);
 
         let tuples: Vec<Tuple> = if parallel_decode {
-            let mut raw_rows: Vec<(Box<[u8]>, Box<[u8]>)> =
-                Vec::with_capacity(row_count_hint.unwrap_or_default());
+            let mut raw_rows: Vec<(Box<[u8]>, Box<[u8]>)> = Vec::with_capacity(row_count_hint.unwrap_or_default());
             for item in iter {
                 let (key, raw_value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
                 if !key.starts_with(prefix_bytes) {
@@ -6529,8 +6895,7 @@ impl StorageEngine {
         let needs_logical_value = requires_logical_wal || self.config.storage.time_travel_enabled;
         let logical_value = if needs_logical_value {
             Some(if uses_side_storage {
-                bincode::serialize(&tuple)
-                    .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?
+                bincode::serialize(&tuple).map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?
             } else {
                 value.clone()
             })
@@ -6917,6 +7282,32 @@ impl StorageEngine {
         // Invalidate row cache for this row
         self.row_cache.invalidate(table_name, row_id);
 
+        Ok(1)
+    }
+
+    /// Fast UPDATE for assignments that cannot change any ART index key.
+    ///
+    /// This keeps the common payload-column UPDATE path from cloning the old
+    /// tuple just to prove indexes are unchanged. Callers must have already
+    /// checked that no indexed column is modified.
+    pub fn update_tuple_fast_no_index(
+        &self,
+        table_name: &str,
+        row_id: u64,
+        new_tuple: Tuple,
+        schema: &crate::Schema,
+    ) -> Result<u64> {
+        let value = if schema_uses_column_storage(schema) {
+            let stored_tuple = self.transform_tuple_for_column_storage(table_name, row_id, &new_tuple, schema)?;
+            bincode::serialize(&stored_tuple)
+                .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?
+        } else {
+            bincode::serialize(&new_tuple).map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?
+        };
+
+        let key = Self::build_data_key(table_name, row_id);
+        self.put(&key, &value)?;
+        self.row_cache.invalidate(table_name, row_id);
         Ok(1)
     }
 

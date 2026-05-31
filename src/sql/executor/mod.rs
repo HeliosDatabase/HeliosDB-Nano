@@ -489,19 +489,28 @@ impl<'a> Executor<'a> {
         }
 
         if let Some(spec) = self.direct_topk_project_spec(sort_input, sort_exprs)? {
-            let Some(tuples) = storage.scan_table_topk_projected_columns(
+            let tuples = if let Some(tuples) = storage.scan_table_topk_projected_columns(
                 &spec.table_name,
                 &spec.scan_schema,
                 &spec.output_columns,
                 &spec.sort_columns,
                 asc,
                 limit.saturating_add(offset),
-            )?
-            else {
+            )? {
+                tuples
+            } else if let Some(tuples) = storage.scan_table_topk_columnar_projected_columns(
+                &spec.table_name,
+                &spec.scan_schema,
+                &spec.output_columns,
+                &spec.sort_columns,
+                asc,
+                limit.saturating_add(offset),
+            )? {
+                tuples
+            } else {
                 return Ok(None);
             };
-            let input: Box<dyn PhysicalOperator> =
-                Box::new(MaterializedOperator::new(tuples, spec.output_schema));
+            let input: Box<dyn PhysicalOperator> = Box::new(MaterializedOperator::new(tuples, spec.output_schema));
             return Ok(Some(Box::new(
                 LimitOperator::new(input, limit, offset).with_timeout(self.timeout_ctx.clone()),
             )));
@@ -555,8 +564,7 @@ impl<'a> Executor<'a> {
                 if output_schema.columns.len() != output_columns.len() {
                     return Ok(None);
                 }
-                let Some(sort_columns) =
-                    resolve_sort_columns_to_base(sort_exprs, &output_schema, &output_columns)
+                let Some(sort_columns) = resolve_sort_columns_to_base(sort_exprs, &output_schema, &output_columns)
                 else {
                     return Ok(None);
                 };
@@ -584,8 +592,7 @@ impl<'a> Executor<'a> {
                 if output_schema.columns.len() != output_columns.len() {
                     return Ok(None);
                 }
-                let Some(sort_columns) =
-                    resolve_sort_columns_to_base(sort_exprs, &output_schema, &output_columns)
+                let Some(sort_columns) = resolve_sort_columns_to_base(sort_exprs, &output_schema, &output_columns)
                 else {
                     return Ok(None);
                 };
@@ -868,12 +875,22 @@ impl<'a> Executor<'a> {
                     || Self::expr_has_free_outer_ref(high, inner, outer)
             }
             E::InList { expr, list, .. } => {
-                Self::expr_has_free_outer_ref(expr, inner, outer) || list.iter().any(|e| Self::expr_has_free_outer_ref(e, inner, outer))
+                Self::expr_has_free_outer_ref(expr, inner, outer)
+                    || list.iter().any(|e| Self::expr_has_free_outer_ref(e, inner, outer))
             }
-            E::Case { expr, when_then, else_result } => {
-                expr.as_ref().is_some_and(|e| Self::expr_has_free_outer_ref(e, inner, outer))
-                    || when_then.iter().any(|(w, t)| Self::expr_has_free_outer_ref(w, inner, outer) || Self::expr_has_free_outer_ref(t, inner, outer))
-                    || else_result.as_ref().is_some_and(|e| Self::expr_has_free_outer_ref(e, inner, outer))
+            E::Case {
+                expr,
+                when_then,
+                else_result,
+            } => {
+                expr.as_ref()
+                    .is_some_and(|e| Self::expr_has_free_outer_ref(e, inner, outer))
+                    || when_then.iter().any(|(w, t)| {
+                        Self::expr_has_free_outer_ref(w, inner, outer) || Self::expr_has_free_outer_ref(t, inner, outer)
+                    })
+                    || else_result
+                        .as_ref()
+                        .is_some_and(|e| Self::expr_has_free_outer_ref(e, inner, outer))
             }
             _ => false,
         }
@@ -881,10 +898,15 @@ impl<'a> Executor<'a> {
 
     fn plan_has_free_outer_ref(plan: &LogicalPlan, outer: &Schema) -> bool {
         match plan {
-            LogicalPlan::FilteredScan { schema, predicate: Some(p), .. } => Self::expr_has_free_outer_ref(p, Some(schema), outer),
+            LogicalPlan::FilteredScan {
+                schema,
+                predicate: Some(p),
+                ..
+            } => Self::expr_has_free_outer_ref(p, Some(schema), outer),
             LogicalPlan::Filter { input, predicate } => {
                 let inner = Self::base_scan_schema(input);
-                Self::expr_has_free_outer_ref(predicate, inner.as_deref(), outer) || Self::plan_has_free_outer_ref(input, outer)
+                Self::expr_has_free_outer_ref(predicate, inner.as_deref(), outer)
+                    || Self::plan_has_free_outer_ref(input, outer)
             }
             LogicalPlan::Project { input, .. }
             | LogicalPlan::Aggregate { input, .. }
@@ -911,12 +933,22 @@ impl<'a> Executor<'a> {
                     || self.expr_has_correlated_subquery(high, outer)
             }
             E::InList { expr, list, .. } => {
-                self.expr_has_correlated_subquery(expr, outer) || list.iter().any(|e| self.expr_has_correlated_subquery(e, outer))
+                self.expr_has_correlated_subquery(expr, outer)
+                    || list.iter().any(|e| self.expr_has_correlated_subquery(e, outer))
             }
-            E::Case { expr, when_then, else_result } => {
-                expr.as_ref().is_some_and(|e| self.expr_has_correlated_subquery(e, outer))
-                    || when_then.iter().any(|(w, t)| self.expr_has_correlated_subquery(w, outer) || self.expr_has_correlated_subquery(t, outer))
-                    || else_result.as_ref().is_some_and(|e| self.expr_has_correlated_subquery(e, outer))
+            E::Case {
+                expr,
+                when_then,
+                else_result,
+            } => {
+                expr.as_ref()
+                    .is_some_and(|e| self.expr_has_correlated_subquery(e, outer))
+                    || when_then.iter().any(|(w, t)| {
+                        self.expr_has_correlated_subquery(w, outer) || self.expr_has_correlated_subquery(t, outer)
+                    })
+                    || else_result
+                        .as_ref()
+                        .is_some_and(|e| self.expr_has_correlated_subquery(e, outer))
             }
             _ => false,
         }
@@ -952,7 +984,11 @@ impl<'a> Executor<'a> {
                     Self::bind_expr_to_outer(e, inner, outer, row);
                 }
             }
-            E::Case { expr, when_then, else_result } => {
+            E::Case {
+                expr,
+                when_then,
+                else_result,
+            } => {
                 if let Some(e) = expr {
                     Self::bind_expr_to_outer(e, inner, outer, row);
                 }
@@ -1022,23 +1058,38 @@ impl<'a> Executor<'a> {
             ex.execute(&bound).unwrap_or_default()
         };
         match expr {
-            E::InSubquery { expr: inner_expr, subquery, negated } => {
+            E::InSubquery {
+                expr: inner_expr,
+                subquery,
+                negated,
+            } => {
                 let results = run(subquery);
                 let materialized_inner = self.materialize_subqueries_with_outer(inner_expr, outer, row)?;
                 let list: Vec<E> = results
                     .iter()
                     .filter_map(|t| t.values.first().map(|v| E::Literal(v.clone())))
                     .collect();
-                Ok(E::InList { expr: Box::new(materialized_inner), list, negated: *negated })
+                Ok(E::InList {
+                    expr: Box::new(materialized_inner),
+                    list,
+                    negated: *negated,
+                })
             }
             E::ScalarSubquery { subquery } => {
                 let results = run(subquery);
-                let value = results.first().and_then(|t| t.values.first().cloned()).unwrap_or(crate::Value::Null);
+                let value = results
+                    .first()
+                    .and_then(|t| t.values.first().cloned())
+                    .unwrap_or(crate::Value::Null);
                 Ok(E::Literal(value))
             }
             E::Exists { subquery, negated } => {
                 let exists = !run(subquery).is_empty();
-                Ok(E::Literal(crate::Value::Boolean(if *negated { !exists } else { exists })))
+                Ok(E::Literal(crate::Value::Boolean(if *negated {
+                    !exists
+                } else {
+                    exists
+                })))
             }
             E::BinaryExpr { left, op, right } => Ok(E::BinaryExpr {
                 left: Box::new(self.materialize_subqueries_with_outer(left, outer, row)?),
@@ -1053,30 +1104,59 @@ impl<'a> Executor<'a> {
                 expr: Box::new(self.materialize_subqueries_with_outer(inner, outer, row)?),
                 is_null: *is_null,
             }),
-            E::Between { expr: inner, low, high, negated } => Ok(E::Between {
+            E::Between {
+                expr: inner,
+                low,
+                high,
+                negated,
+            } => Ok(E::Between {
                 expr: Box::new(self.materialize_subqueries_with_outer(inner, outer, row)?),
                 low: Box::new(self.materialize_subqueries_with_outer(low, outer, row)?),
                 high: Box::new(self.materialize_subqueries_with_outer(high, outer, row)?),
                 negated: *negated,
             }),
-            E::InList { expr: inner, list, negated } => {
-                let ml: Result<Vec<E>> = list.iter().map(|e| self.materialize_subqueries_with_outer(e, outer, row)).collect();
-                Ok(E::InList { expr: Box::new(self.materialize_subqueries_with_outer(inner, outer, row)?), list: ml?, negated: *negated })
+            E::InList {
+                expr: inner,
+                list,
+                negated,
+            } => {
+                let ml: Result<Vec<E>> = list
+                    .iter()
+                    .map(|e| self.materialize_subqueries_with_outer(e, outer, row))
+                    .collect();
+                Ok(E::InList {
+                    expr: Box::new(self.materialize_subqueries_with_outer(inner, outer, row)?),
+                    list: ml?,
+                    negated: *negated,
+                })
             }
-            E::Case { expr: operand, when_then, else_result } => {
+            E::Case {
+                expr: operand,
+                when_then,
+                else_result,
+            } => {
                 let mo = match operand {
                     Some(op) => Some(Box::new(self.materialize_subqueries_with_outer(op, outer, row)?)),
                     None => None,
                 };
                 let mwt: Result<Vec<(E, E)>> = when_then
                     .iter()
-                    .map(|(w, t)| Ok((self.materialize_subqueries_with_outer(w, outer, row)?, self.materialize_subqueries_with_outer(t, outer, row)?)))
+                    .map(|(w, t)| {
+                        Ok((
+                            self.materialize_subqueries_with_outer(w, outer, row)?,
+                            self.materialize_subqueries_with_outer(t, outer, row)?,
+                        ))
+                    })
                     .collect();
                 let me = match else_result {
                     Some(e) => Some(Box::new(self.materialize_subqueries_with_outer(e, outer, row)?)),
                     None => None,
                 };
-                Ok(E::Case { expr: mo, when_then: mwt?, else_result: me })
+                Ok(E::Case {
+                    expr: mo,
+                    when_then: mwt?,
+                    else_result: me,
+                })
             }
             _ => Ok(expr.clone()),
         }
@@ -1273,12 +1353,10 @@ impl<'a> Executor<'a> {
 
         let count = match predicate {
             None => storage.count_table_rows(table_name)?,
-            Some(predicate) => {
-                match self.count_single_pk_predicate(table_name, schema, pk_col, predicate)? {
-                    Some(count) => count,
-                    None => return Ok(None),
-                }
-            }
+            Some(predicate) => match self.count_single_pk_predicate(table_name, schema, pk_col, predicate)? {
+                Some(count) => count,
+                None => return Ok(None),
+            },
         };
 
         Ok(Some(Self::count_distinct_schema_operator(
@@ -1452,9 +1530,10 @@ impl<'a> Executor<'a> {
         referenced.dedup();
         if referenced.is_empty()
             || referenced.iter().any(|&idx| {
-                schema.columns.get(idx).map_or(true, |column| {
-                    column.storage_mode != crate::ColumnStorageMode::Columnar
-                })
+                schema
+                    .columns
+                    .get(idx)
+                    .map_or(true, |column| column.storage_mode != crate::ColumnStorageMode::Columnar)
             })
         {
             return Ok(None);
@@ -1538,9 +1617,10 @@ impl<'a> Executor<'a> {
         referenced.sort_unstable();
         referenced.dedup();
         if referenced.iter().any(|&idx| {
-            schema.columns.get(idx).map_or(true, |column| {
-                column.storage_mode != crate::ColumnStorageMode::Default
-            })
+            schema
+                .columns
+                .get(idx)
+                .map_or(true, |column| column.storage_mode != crate::ColumnStorageMode::Default)
         }) {
             return Ok(None);
         }
@@ -1619,7 +1699,9 @@ impl<'a> Executor<'a> {
                     projection,
                     as_of,
                     ..
-                } if projection.is_none() => Some((table_name.as_str(), schema.as_ref(), Some(predicate), as_of.as_ref())),
+                } if projection.is_none() => {
+                    Some((table_name.as_str(), schema.as_ref(), Some(predicate), as_of.as_ref()))
+                }
                 _ => None,
             },
             _ => None,
@@ -1648,10 +1730,12 @@ impl<'a> Executor<'a> {
         };
         let arg = args.first()?;
         match fun {
-            AggregateFunction::Count if !distinct && matches!(arg, LogicalExpr::Wildcard) => Some(ColumnarAggregateSpec {
-                op: ColumnarAggregateOp::CountStar,
-                column_index: None,
-            }),
+            AggregateFunction::Count if !distinct && matches!(arg, LogicalExpr::Wildcard) => {
+                Some(ColumnarAggregateSpec {
+                    op: ColumnarAggregateOp::CountStar,
+                    column_index: None,
+                })
+            }
             AggregateFunction::Count if *distinct => {
                 if matches!(arg, LogicalExpr::Wildcard) {
                     return None;
@@ -1690,8 +1774,7 @@ impl<'a> Executor<'a> {
 
         match expr {
             LogicalExpr::BinaryExpr { left, op, right } if *op == BinaryOperator::And => {
-                Self::is_simple_columnar_pushdown_predicate(left)
-                    && Self::is_simple_columnar_pushdown_predicate(right)
+                Self::is_simple_columnar_pushdown_predicate(left) && Self::is_simple_columnar_pushdown_predicate(right)
             }
             LogicalExpr::BinaryExpr { left, op, right }
                 if matches!(
@@ -1861,10 +1944,7 @@ impl<'a> Executor<'a> {
         }
     }
 
-    fn range_for_column_op(
-        op: crate::sql::BinaryOperator,
-        bound: i64,
-    ) -> Option<IntRangeBounds> {
+    fn range_for_column_op(op: crate::sql::BinaryOperator, bound: i64) -> Option<IntRangeBounds> {
         use crate::sql::BinaryOperator;
         match op {
             BinaryOperator::Eq => Some((Some((bound, true)), Some((bound, true)))),
@@ -1876,10 +1956,7 @@ impl<'a> Executor<'a> {
         }
     }
 
-    fn range_for_value_op(
-        op: crate::sql::BinaryOperator,
-        bound: i64,
-    ) -> Option<IntRangeBounds> {
+    fn range_for_value_op(op: crate::sql::BinaryOperator, bound: i64) -> Option<IntRangeBounds> {
         use crate::sql::BinaryOperator;
         match op {
             BinaryOperator::Eq => Some((Some((bound, true)), Some((bound, true)))),
@@ -2050,6 +2127,12 @@ impl<'a> Executor<'a> {
                         .with_timeout(self.timeout_ctx.clone()),
                     ))
                 } else {
+                    if !*distinct && distinct_on.is_none() {
+                        if let Some(projected_join) = join::handle_projected_join(self, input, exprs, aliases)? {
+                            return Ok(projected_join);
+                        }
+                    }
+
                     let input_op = self.plan_to_operator(input)?;
                     let input_schema = input_op.schema();
                     // Correlated scalar subquery in a projection (e.g.
@@ -2057,7 +2140,9 @@ impl<'a> Executor<'a> {
                     // evaluate per outer row, binding the subquery's free outer refs.
                     if !*distinct
                         && distinct_on.is_none()
-                        && exprs.iter().any(|e| self.expr_has_correlated_subquery(e, &input_schema))
+                        && exprs
+                            .iter()
+                            .any(|e| self.expr_has_correlated_subquery(e, &input_schema))
                     {
                         use crate::sql::TypeInference;
                         let columns = aliases
@@ -2444,10 +2529,7 @@ impl<'a> Executor<'a> {
                 // and Project paths already do this, but HAVING was passed raw, so a
                 // (sub)query in HAVING reached the evaluator as an opaque node, erred,
                 // and silently dropped every group (bug A1/Defect-2).
-                let having = having
-                    .as_ref()
-                    .map(|h| self.materialize_subqueries(h))
-                    .transpose()?;
+                let having = having.as_ref().map(|h| self.materialize_subqueries(h)).transpose()?;
                 Ok(Box::new(AggregateOperator::new(
                     input_op,
                     group_by.clone(),

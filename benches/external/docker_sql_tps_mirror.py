@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """Docker-client SQL mirror of tests/tps_workloads.rs for PostgreSQL/MySQL.
 
-This is intentionally stdlib-only. It drives the database client inside an
-existing Docker container, which is useful on hosts that do not have psql/mysql
-or Python DB drivers installed.
+This is intentionally stdlib-only. By default it drives the database client
+inside an existing Docker container, which is useful on hosts that do not have
+psql/mysql or Python DB drivers installed. For apples-to-apples Docker server
+comparisons, use ``--client-mode client-container`` with a long-lived client
+container that shares the target server container's network namespace. The
+``network-container`` mode is useful as a smoke test, but it starts a fresh
+client container for every timed workload and is dominated by Docker startup.
 
 Examples:
   python3 benches/external/docker_sql_tps_mirror.py \
@@ -21,6 +25,14 @@ Examples:
       --backend postgres --container postgres-primary \
       --user helios --password helios --database heliosdb \
       --workloads filter_scan,agg_count_sum_avg,group_by_status,join_users_orders,order_by_limit10
+
+  # Dockerized psql client against a Dockerized PG-wire server container.
+  docker run -d --name codex-nano-pg-client --network container:codex-nano-tps \
+      postgres:17-bookworm sleep infinity
+  python3 benches/external/docker_sql_tps_mirror.py \
+      --backend postgres --container codex-nano-tps \
+      --client-mode client-container --client-container codex-nano-pg-client \
+      --user postgres --password nano --database heliosdb
 """
 
 from __future__ import annotations
@@ -66,22 +78,33 @@ def insert_rows(table: str, columns: Sequence[str], rows: Sequence[Tuple[object,
 
 
 class DockerSqlClient:
-    def __init__(self, backend: str, container: str, user: str, password: str, database: str) -> None:
+    def __init__(
+        self,
+        backend: str,
+        container: str,
+        user: str,
+        password: str,
+        database: str,
+        client_mode: str,
+        client_image: str | None,
+        client_container: str | None,
+        host: str,
+        port: int | None,
+    ) -> None:
         self.backend = backend
         self.container = container
         self.user = user
         self.password = password
         self.database = database
+        self.client_mode = client_mode
+        self.client_image = client_image
+        self.client_container = client_container
+        self.host = host
+        self.port = port
 
     def command(self) -> List[str]:
         if self.backend == "postgres":
-            return [
-                "docker",
-                "exec",
-                "-i",
-                "-e",
-                f"PGPASSWORD={self.password}",
-                self.container,
+            psql_args = [
                 "psql",
                 "-X",
                 "-q",
@@ -92,14 +115,52 @@ class DockerSqlClient:
                 "-d",
                 self.database,
             ]
-        if self.backend == "mysql":
+            if self.client_mode == "network-container":
+                image = self.client_image or "postgres:17-bookworm"
+                return [
+                    "docker",
+                    "run",
+                    "--rm",
+                    "--network",
+                    f"container:{self.container}",
+                    "-e",
+                    f"PGPASSWORD={self.password}",
+                    image,
+                    *psql_args[:1],
+                    "-h",
+                    self.host,
+                    "-p",
+                    str(self.port or 5432),
+                    *psql_args[1:],
+                ]
+            if self.client_mode == "client-container":
+                if not self.client_container:
+                    raise ValueError("--client-container is required with --client-mode client-container")
+                return [
+                    "docker",
+                    "exec",
+                    "-i",
+                    "-e",
+                    f"PGPASSWORD={self.password}",
+                    self.client_container,
+                    *psql_args[:1],
+                    "-h",
+                    self.host,
+                    "-p",
+                    str(self.port or 5432),
+                    *psql_args[1:],
+                ]
             return [
                 "docker",
                 "exec",
                 "-i",
                 "-e",
-                f"MYSQL_PWD={self.password}",
+                f"PGPASSWORD={self.password}",
                 self.container,
+                *psql_args,
+            ]
+        if self.backend == "mysql":
+            mysql_args = [
                 "mariadb",
                 "--batch",
                 "--raw",
@@ -107,6 +168,50 @@ class DockerSqlClient:
                 "-u",
                 self.user,
                 self.database,
+            ]
+            if self.client_mode == "network-container":
+                image = self.client_image or "mariadb:11"
+                return [
+                    "docker",
+                    "run",
+                    "--rm",
+                    "--network",
+                    f"container:{self.container}",
+                    "-e",
+                    f"MYSQL_PWD={self.password}",
+                    image,
+                    *mysql_args[:1],
+                    "-h",
+                    self.host,
+                    "-P",
+                    str(self.port or 3306),
+                    *mysql_args[1:],
+                ]
+            if self.client_mode == "client-container":
+                if not self.client_container:
+                    raise ValueError("--client-container is required with --client-mode client-container")
+                return [
+                    "docker",
+                    "exec",
+                    "-i",
+                    "-e",
+                    f"MYSQL_PWD={self.password}",
+                    self.client_container,
+                    *mysql_args[:1],
+                    "-h",
+                    self.host,
+                    "-P",
+                    str(self.port or 3306),
+                    *mysql_args[1:],
+                ]
+            return [
+                "docker",
+                "exec",
+                "-i",
+                "-e",
+                f"MYSQL_PWD={self.password}",
+                self.container,
+                *mysql_args,
             ]
         raise ValueError(f"unsupported backend: {self.backend}")
 
@@ -272,6 +377,25 @@ def main() -> int:
     parser.add_argument("--user", required=True)
     parser.add_argument("--password", required=True)
     parser.add_argument("--database", required=True)
+    parser.add_argument(
+        "--client-mode",
+        choices=["exec", "network-container", "client-container"],
+        default="exec",
+        help=(
+            "exec: run client inside --container; network-container: docker-run a client image sharing "
+            "--container network; client-container: docker-exec a long-lived client container"
+        ),
+    )
+    parser.add_argument(
+        "--client-image",
+        help="Docker image containing psql or mariadb for --client-mode network-container",
+    )
+    parser.add_argument(
+        "--client-container",
+        help="Long-lived Docker container containing psql or mariadb for --client-mode client-container",
+    )
+    parser.add_argument("--host", default="127.0.0.1", help="server host used by network-container client mode")
+    parser.add_argument("--port", type=int, help="server port used by network-container client mode")
     parser.add_argument("--n", type=int, default=10_000)
     parser.add_argument("--m", type=int, default=2_000)
     parser.add_argument("--batch-size", type=int, default=500)
@@ -289,9 +413,23 @@ def main() -> int:
         print("docker is required", file=sys.stderr)
         return 2
 
-    client = DockerSqlClient(args.backend, args.container, args.user, args.password, args.database)
+    client = DockerSqlClient(
+        args.backend,
+        args.container,
+        args.user,
+        args.password,
+        args.database,
+        args.client_mode,
+        args.client_image,
+        args.client_container,
+        args.host,
+        args.port,
+    )
     print(f"\n================ {args.backend} Docker TPS mirror ================")
-    print(f"container={args.container}  database={args.database}  N={args.n}  M={args.m}")
+    print(
+        f"container={args.container}  database={args.database}  N={args.n}  M={args.m}  "
+        f"client_mode={args.client_mode}"
+    )
     print("-" * 80)
 
     setup_database(client, args.n, args.batch_size)

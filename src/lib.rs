@@ -572,7 +572,6 @@ struct FastSelectSpec {
 struct FastDeleteTarget {
     table_name: String,
     row_id: u64,
-    key: Vec<u8>,
     pk_key: Vec<u8>,
     pk_value: Value,
     schema: std::sync::Arc<Schema>,
@@ -790,8 +789,8 @@ impl EmbeddedDatabase {
     }
 
     #[allow(clippy::expect_used)] // Safety: cache size is a non-zero compile-time constant.
-    fn new_fast_select_cache(
-    ) -> std::sync::Arc<std::sync::Mutex<lru::LruCache<String, std::sync::Arc<FastSelectSpec>>>> {
+    fn new_fast_select_cache() -> std::sync::Arc<std::sync::Mutex<lru::LruCache<String, std::sync::Arc<FastSelectSpec>>>>
+    {
         std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(
             std::num::NonZeroUsize::new(128).expect("128 is non-zero"),
         )))
@@ -854,6 +853,21 @@ impl EmbeddedDatabase {
             self.result_cache_nonempty
                 .store(true, std::sync::atomic::Ordering::Release);
         }
+    }
+
+    fn query_is_non_deterministic(sql: &str) -> bool {
+        [
+            b"NEXTVAL".as_slice(),
+            b"SETVAL".as_slice(),
+            b"CURRVAL".as_slice(),
+            b"GEN_RANDOM_UUID".as_slice(),
+            b"UUID_GENERATE_V4".as_slice(),
+            b"RANDOM(".as_slice(),
+            b"NOW(".as_slice(),
+            b"CLOCK_TIMESTAMP".as_slice(),
+        ]
+        .iter()
+        .any(|needle| Self::contains_ascii_case_insensitive(sql, needle))
     }
 
     /// Check if a SQL statement is a transaction control statement (zero-allocation)
@@ -4975,9 +4989,7 @@ impl EmbeddedDatabase {
         }
         drop(txn_guard);
 
-        if !self.storage.fast_dml_requires_logical_wal()
-            && Self::fast_insert_batch_can_use_direct_write(&spec.schema)
-        {
+        if !self.storage.fast_dml_requires_logical_wal() && Self::fast_insert_batch_can_use_direct_write(&spec.schema) {
             let prepared = match self.prepare_fast_insert_batch(&spec.table_name, tuples, &spec.schema) {
                 Ok(prepared) => prepared,
                 Err(e) => return Some(Err(e)),
@@ -4985,13 +4997,14 @@ impl EmbeddedDatabase {
             if let Err(e) = self.validate_fast_insert_batch(&spec.table_name, &spec.schema, &prepared) {
                 return Some(Err(e));
             }
-            let inserted = match self
-                .storage
-                .insert_prepared_tuples_fast_batch(&spec.table_name, prepared, &spec.schema)
-            {
-                Ok(inserted) => inserted,
-                Err(e) => return Some(Err(e)),
-            };
+            let inserted =
+                match self
+                    .storage
+                    .insert_prepared_tuples_fast_batch(&spec.table_name, prepared, &spec.schema)
+                {
+                    Ok(inserted) => inserted,
+                    Err(e) => return Some(Err(e)),
+                };
             self.storage.increment_lsn();
             return Some(Ok(inserted));
         }
@@ -5530,7 +5543,7 @@ impl EmbeddedDatabase {
         }
 
         let mut evaluator: Option<sql::Evaluator> = None;
-        let mut new_values = existing_row.values.clone();
+        let mut replacements = Vec::with_capacity(spec.assignments.len());
         for assignment in &spec.assignments {
             let mut value = if let Some(value) = Self::fast_eval_param_expr(&assignment.expr, params) {
                 match value {
@@ -5568,38 +5581,67 @@ impl EmbeddedDatabase {
                     assignment.col_name
                 ))));
             }
-            if let Some(slot) = new_values.get_mut(assignment.col_idx) {
-                *slot = value;
-            } else {
+            if assignment.col_idx >= existing_row.values.len() {
                 return None;
             }
+            replacements.push((assignment.col_idx, value));
         }
 
-        let new_tuple = Tuple::new(new_values);
-        if self.storage.fast_dml_requires_logical_wal() {
-            let key = self.storage.branch_aware_data_key(&spec.table_name, row_id);
-            let value = match bincode::serialize(&new_tuple) {
-                Ok(value) => value,
-                Err(e) => return Some(Err(Error::storage(format!("Failed to serialize tuple: {}", e)))),
-            };
-            let wal_result = if self.storage.logical_wal_per_statement() {
-                self.storage.log_data_update(&spec.table_name, &key, &value)
-            } else {
-                self.storage.log_data_update_nosync(&spec.table_name, &key, &value)
-            };
-            if let Err(e) = wal_result {
-                return Some(Err(e));
+        let result = if spec.assignments_affect_indexes {
+            let mut new_values = existing_row.values.clone();
+            for (idx, value) in replacements {
+                new_values[idx] = value;
             }
-        }
+            let new_tuple = Tuple::new(new_values);
+            if self.storage.fast_dml_requires_logical_wal() {
+                let key = self.storage.branch_aware_data_key(&spec.table_name, row_id);
+                let value = match bincode::serialize(&new_tuple) {
+                    Ok(value) => value,
+                    Err(e) => return Some(Err(Error::storage(format!("Failed to serialize tuple: {}", e)))),
+                };
+                let wal_result = if self.storage.logical_wal_per_statement() {
+                    self.storage.log_data_update(&spec.table_name, &key, &value)
+                } else {
+                    self.storage.log_data_update_nosync(&spec.table_name, &key, &value)
+                };
+                if let Err(e) = wal_result {
+                    return Some(Err(e));
+                }
+            }
 
-        let result = self.storage.update_tuple_fast_with_index_hint(
-            &spec.table_name,
-            row_id,
-            new_tuple,
-            &existing_row,
-            &spec.schema,
-            Some(spec.assignments_affect_indexes),
-        );
+            self.storage.update_tuple_fast_with_index_hint(
+                &spec.table_name,
+                row_id,
+                new_tuple,
+                &existing_row,
+                &spec.schema,
+                Some(true),
+            )
+        } else {
+            let mut new_tuple = existing_row;
+            new_tuple.row_id = None;
+            new_tuple.branch_id = None;
+            for (idx, value) in replacements {
+                new_tuple.values[idx] = value;
+            }
+            if self.storage.fast_dml_requires_logical_wal() {
+                let key = self.storage.branch_aware_data_key(&spec.table_name, row_id);
+                let value = match bincode::serialize(&new_tuple) {
+                    Ok(value) => value,
+                    Err(e) => return Some(Err(Error::storage(format!("Failed to serialize tuple: {}", e)))),
+                };
+                let wal_result = if self.storage.logical_wal_per_statement() {
+                    self.storage.log_data_update(&spec.table_name, &key, &value)
+                } else {
+                    self.storage.log_data_update_nosync(&spec.table_name, &key, &value)
+                };
+                if let Err(e) = wal_result {
+                    return Some(Err(e));
+                }
+            }
+            self.storage
+                .update_tuple_fast_no_index(&spec.table_name, row_id, new_tuple, &spec.schema)
+        };
         if result.is_ok() {
             self.storage.increment_lsn();
         }
@@ -5631,8 +5673,7 @@ impl EmbeddedDatabase {
             None => return None,
         };
 
-        let pk_key =
-            crate::storage::art_manager::ArtIndexManager::encode_key(std::slice::from_ref(&pk_value));
+        let pk_key = crate::storage::art_manager::ArtIndexManager::encode_key(std::slice::from_ref(&pk_value));
         let (row_id, existing_row) = if spec.pk_only_delete {
             match self.storage.art_indexes().pk_index_lookup(&spec.table_name, &pk_key) {
                 Some(row_id) => (row_id, None),
@@ -5655,9 +5696,9 @@ impl EmbeddedDatabase {
             (row_id, Some(existing_row))
         };
 
-        let key = self.storage.branch_aware_data_key(&spec.table_name, row_id);
         let result = (|| {
             if self.storage.fast_dml_requires_logical_wal() {
+                let key = self.storage.branch_aware_data_key(&spec.table_name, row_id);
                 if self.storage.logical_wal_per_statement() {
                     self.storage.log_data_delete(&spec.table_name, &key)?;
                 } else {
@@ -5937,10 +5978,10 @@ impl EmbeddedDatabase {
         if !name.eq_ignore_ascii_case(col_name) {
             return None;
         }
-        let current = row.values.get(col_idx)?;
         let sql::LogicalExpr::Literal(rhs) = right.as_ref() else {
             return None;
         };
+        let current = row.values.get(col_idx)?;
 
         Some(Self::fast_apply_numeric_op(current, op, rhs))
     }
@@ -6640,12 +6681,7 @@ impl EmbeddedDatabase {
         col_values
     }
 
-    fn validate_fast_insert_batch(
-        &self,
-        table_name: &str,
-        schema: &Schema,
-        prepared: &[(u64, Tuple)],
-    ) -> Result<()> {
+    fn validate_fast_insert_batch(&self, table_name: &str, schema: &Schema, prepared: &[(u64, Tuple)]) -> Result<()> {
         if let Some((_, tuple)) = prepared.first() {
             if prepared.len() == 1 {
                 if let Err(e) = self
@@ -7165,55 +7201,72 @@ impl EmbeddedDatabase {
             ))));
         }
 
-        // Build updated tuple
-        let mut new_values = existing_row.values.clone();
-        if spec.set_col_idx < new_values.len() {
-            // Safety: bounds checked on the line above
-            #[allow(clippy::indexing_slicing)]
-            {
-                new_values[spec.set_col_idx] = new_value;
-            }
-        } else {
+        if spec.set_col_idx >= existing_row.values.len() {
             return None;
         }
 
-        let new_tuple = Tuple::new(new_values);
+        let result = if spec.assignment_affects_indexes {
+            let mut new_values = existing_row.values.clone();
+            new_values[spec.set_col_idx] = new_value;
+            let new_tuple = Tuple::new(new_values);
 
-        // Preserve logical WAL / HA broadcast semantics only when strict
-        // logical WAL or HA replication needs the logical stream. In the
-        // standalone default, RocksDB's own WAL covers local recovery.
-        if self.storage.fast_dml_requires_logical_wal() {
-            let key = self.storage.branch_aware_data_key(&spec.table_name, row_id);
-            let value = match bincode::serialize(&new_tuple) {
-                Ok(value) => value,
-                Err(e) => return Some(Err(Error::storage(format!("Failed to serialize tuple: {}", e)))),
-            };
-            let wal_result = if self.storage.logical_wal_per_statement() {
-                self.storage.log_data_update(&spec.table_name, &key, &value)
-            } else {
-                self.storage.log_data_update_nosync(&spec.table_name, &key, &value)
-            };
-            if let Err(e) = wal_result {
-                return Some(Err(e));
+            // Preserve logical WAL / HA broadcast semantics only when strict
+            // logical WAL or HA replication needs the logical stream. In the
+            // standalone default, RocksDB's own WAL covers local recovery.
+            if self.storage.fast_dml_requires_logical_wal() {
+                let key = self.storage.branch_aware_data_key(&spec.table_name, row_id);
+                let value = match bincode::serialize(&new_tuple) {
+                    Ok(value) => value,
+                    Err(e) => return Some(Err(Error::storage(format!("Failed to serialize tuple: {}", e)))),
+                };
+                let wal_result = if self.storage.logical_wal_per_statement() {
+                    self.storage.log_data_update(&spec.table_name, &key, &value)
+                } else {
+                    self.storage.log_data_update_nosync(&spec.table_name, &key, &value)
+                };
+                if let Err(e) = wal_result {
+                    return Some(Err(e));
+                }
             }
-        }
 
-        // Use fast update storage path
-        Some(self.storage.update_tuple_fast_with_index_hint(
-            &spec.table_name,
-            row_id,
-            new_tuple,
-            &existing_row,
-            &spec.schema,
-            Some(spec.assignment_affects_indexes),
-        ))
+            self.storage.update_tuple_fast_with_index_hint(
+                &spec.table_name,
+                row_id,
+                new_tuple,
+                &existing_row,
+                &spec.schema,
+                Some(true),
+            )
+        } else {
+            let mut new_tuple = existing_row;
+            new_tuple.row_id = None;
+            new_tuple.branch_id = None;
+            new_tuple.values[spec.set_col_idx] = new_value;
+
+            if self.storage.fast_dml_requires_logical_wal() {
+                let key = self.storage.branch_aware_data_key(&spec.table_name, row_id);
+                let value = match bincode::serialize(&new_tuple) {
+                    Ok(value) => value,
+                    Err(e) => return Some(Err(Error::storage(format!("Failed to serialize tuple: {}", e)))),
+                };
+                let wal_result = if self.storage.logical_wal_per_statement() {
+                    self.storage.log_data_update(&spec.table_name, &key, &value)
+                } else {
+                    self.storage.log_data_update_nosync(&spec.table_name, &key, &value)
+                };
+                if let Err(e) = wal_result {
+                    return Some(Err(e));
+                }
+            }
+
+            self.storage
+                .update_tuple_fast_no_index(&spec.table_name, row_id, new_tuple, &spec.schema)
+        };
+
+        Some(result)
     }
 
-    fn prepare_fast_delete(
-        &self,
-        sql: &str,
-        require_tuple: bool,
-    ) -> Option<Result<Option<FastDeleteTarget>>> {
+    fn prepare_fast_delete(&self, sql: &str, require_tuple: bool) -> Option<Result<Option<FastDeleteTarget>>> {
         let trimmed = sql.trim();
 
         if trimmed.len() < 24 || !trimmed.as_bytes().get(..6)?.eq_ignore_ascii_case(b"DELETE") {
@@ -7287,8 +7340,7 @@ impl EmbeddedDatabase {
         };
 
         let (pk_value, _) = Self::fast_parse_one_value(pk_val_str, &spec.pk_data_type)?;
-        let pk_key =
-            crate::storage::art_manager::ArtIndexManager::encode_key(std::slice::from_ref(&pk_value));
+        let pk_key = crate::storage::art_manager::ArtIndexManager::encode_key(std::slice::from_ref(&pk_value));
         let (row_id, existing_row) = if spec.pk_only_delete && !require_tuple {
             match self.storage.art_indexes().pk_index_lookup(&spec.table_name, &pk_key) {
                 Some(row_id) => (row_id, None),
@@ -7312,11 +7364,9 @@ impl EmbeddedDatabase {
             (row_id, Some(existing_row))
         };
 
-        let key = self.storage.branch_aware_data_key(&spec.table_name, row_id);
         Some(Ok(Some(FastDeleteTarget {
             table_name: spec.table_name.clone(),
             row_id,
-            key,
             pk_key,
             pk_value,
             schema: std::sync::Arc::clone(&spec.schema),
@@ -7335,19 +7385,20 @@ impl EmbeddedDatabase {
         };
         let existing_row = target.existing_row.as_ref()?;
         let result = (|| {
+            let key = self.storage.branch_aware_data_key(&target.table_name, target.row_id);
             self.storage.stage_columnar_delete_in_transaction(
                 &target.table_name,
                 target.row_id,
                 &target.schema,
                 txn,
             )?;
-            txn.delete(target.key.clone())?;
+            txn.delete(key.clone())?;
 
             if self.storage.fast_dml_requires_logical_wal() {
                 if self.storage.logical_wal_per_statement() {
-                    self.storage.log_data_delete(&target.table_name, &target.key)?;
+                    self.storage.log_data_delete(&target.table_name, &key)?;
                 } else {
-                    self.storage.log_data_delete_nosync(&target.table_name, &target.key)?;
+                    self.storage.log_data_delete_nosync(&target.table_name, &key)?;
                 }
             }
 
@@ -7388,10 +7439,11 @@ impl EmbeddedDatabase {
 
         let result = (|| {
             if self.storage.fast_dml_requires_logical_wal() {
+                let key = self.storage.branch_aware_data_key(&target.table_name, target.row_id);
                 if self.storage.logical_wal_per_statement() {
-                    self.storage.log_data_delete(&target.table_name, &target.key)?;
+                    self.storage.log_data_delete(&target.table_name, &key)?;
                 } else {
-                    self.storage.log_data_delete_nosync(&target.table_name, &target.key)?;
+                    self.storage.log_data_delete_nosync(&target.table_name, &key)?;
                 }
             }
 
@@ -7419,11 +7471,7 @@ impl EmbeddedDatabase {
         format!("\0fast_select\0{table_name}\0{pk_col}")
     }
 
-    fn fast_select_spec(
-        &self,
-        table_name: &str,
-        pk_col: &str,
-    ) -> Option<Result<std::sync::Arc<FastSelectSpec>>> {
+    fn fast_select_spec(&self, table_name: &str, pk_col: &str) -> Option<Result<std::sync::Arc<FastSelectSpec>>> {
         if self.tenant_manager.should_apply_rls(table_name, "SELECT") {
             return None;
         }
@@ -7462,6 +7510,25 @@ impl EmbeddedDatabase {
     /// Fast path for SELECT: `SELECT * FROM table WHERE pk_col = literal`
     /// Bypasses full SQL parsing, planning, and optimization for simple PK lookups.
     fn try_fast_select(&self, sql: &str) -> Option<Result<Vec<Tuple>>> {
+        let (spec, pk_value) = match self.fast_select_lookup(sql)? {
+            Ok(lookup) => lookup,
+            Err(e) => return Some(Err(e)),
+        };
+
+        Some(self.fast_select_rows(&spec, &pk_value))
+    }
+
+    fn try_fast_select_with_columns(&self, sql: &str) -> Option<Result<(Vec<Tuple>, Vec<String>)>> {
+        let (spec, pk_value) = match self.fast_select_lookup(sql)? {
+            Ok(lookup) => lookup,
+            Err(e) => return Some(Err(e)),
+        };
+
+        let columns = spec.schema.columns.iter().map(|column| column.name.clone()).collect();
+        Some(self.fast_select_rows(&spec, &pk_value).map(|rows| (rows, columns)))
+    }
+
+    fn fast_select_lookup(&self, sql: &str) -> Option<Result<(std::sync::Arc<FastSelectSpec>, Value)>> {
         if self.in_transaction() {
             return None;
         }
@@ -7529,14 +7596,17 @@ impl EmbeddedDatabase {
         // Parse PK value
         let (pk_value, _) = Self::fast_parse_one_value(pk_val_str, &spec.pk_data_type)?;
 
-        // Direct PK lookup via ART index + RocksDB
+        Some(Ok((spec, pk_value)))
+    }
+
+    fn fast_select_rows(&self, spec: &FastSelectSpec, pk_value: &Value) -> Result<Vec<Tuple>> {
         match self
             .storage
-            .get_row_by_typed_pk_with_schema(&spec.table_name, &pk_value, &spec.schema)
+            .get_row_by_typed_pk_with_schema(&spec.table_name, pk_value, &spec.schema)
         {
-            Ok(Some(row)) => Some(Ok(vec![row])),
-            Ok(None) => Some(Ok(vec![])),
-            Err(e) => Some(Err(e)),
+            Ok(Some(row)) => Ok(vec![row]),
+            Ok(None) => Ok(vec![]),
+            Err(e) => Err(e),
         }
     }
 
@@ -9985,8 +10055,9 @@ impl EmbeddedDatabase {
                     for (row_id, old_tuple, tuple) in &updates {
                         let key = self.storage.branch_aware_data_key(table_name, *row_id);
                         if !on_branch {
-                            self.storage
-                                .stage_tuple_for_column_storage_in_transaction(table_name, *row_id, tuple, &schema, txn)?;
+                            self.storage.stage_tuple_for_column_storage_in_transaction(
+                                table_name, *row_id, tuple, &schema, txn,
+                            )?;
                         }
                         let value = bincode::serialize(tuple)
                             .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
@@ -10369,9 +10440,7 @@ impl EmbeddedDatabase {
             }
         }
 
-        let result_cache_nonempty = self
-            .result_cache_nonempty
-            .load(std::sync::atomic::Ordering::Acquire);
+        let result_cache_nonempty = self.result_cache_nonempty.load(std::sync::atomic::Ordering::Acquire);
 
         // Fast path: SELECT * FROM table WHERE pk = literal (skips full SQL
         // parsing). When the result cache is empty, run it before the
@@ -10394,18 +10463,7 @@ impl EmbeddedDatabase {
         // state, and gen_random_uuid / random / now / clock_timestamp
         // must return a fresh value every time. Caching any of these
         // would serve stale rows to the caller.
-        let is_non_deterministic = [
-            b"NEXTVAL".as_slice(),
-            b"SETVAL".as_slice(),
-            b"CURRVAL".as_slice(),
-            b"GEN_RANDOM_UUID".as_slice(),
-            b"UUID_GENERATE_V4".as_slice(),
-            b"RANDOM(".as_slice(),
-            b"NOW(".as_slice(),
-            b"CLOCK_TIMESTAMP".as_slice(),
-        ]
-        .iter()
-        .any(|needle| Self::contains_ascii_case_insensitive(sql, needle));
+        let is_non_deterministic = Self::query_is_non_deterministic(sql);
         if !is_non_deterministic && result_cache_nonempty {
             if let Some(cached_results) = self
                 .result_cache
@@ -10564,13 +10622,67 @@ impl EmbeddedDatabase {
     /// Unlike `query()`, this returns the actual column names from the query
     /// plan (e.g. table column names, aliases) instead of requiring the caller
     /// to generate generic names.
+    pub(crate) fn try_cached_query_with_columns(&self, sql: &str) -> Option<(std::sync::Arc<Vec<Tuple>>, Vec<String>)> {
+        if self.in_transaction()
+            || Self::query_is_non_deterministic(sql)
+            || !self.result_cache_nonempty.load(std::sync::atomic::Ordering::Acquire)
+        {
+            return None;
+        }
+
+        let cached_results = self
+            .result_cache
+            .lock()
+            .ok()
+            .and_then(|mut cache| cache.get(sql).map(std::sync::Arc::clone))?;
+        let arc_plan = self
+            .plan_cache
+            .lock()
+            .ok()
+            .and_then(|mut cache| cache.get(sql).map(std::sync::Arc::clone))?;
+        let columns = arc_plan
+            .schema()
+            .columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect();
+
+        Some((cached_results, columns))
+    }
+
     pub fn query_with_columns(&self, sql: &str) -> Result<(Vec<Tuple>, Vec<String>)> {
+        if let Some(result) = self.try_fast_select_with_columns(sql) {
+            return result;
+        }
+
+        let cacheable = !self.in_transaction() && !Self::query_is_non_deterministic(sql);
+        if let Some((cached_results, columns)) = self.try_cached_query_with_columns(sql) {
+            return Ok(((*cached_results).clone(), columns));
+        }
+
         // Phase 3 branching commands (`SHOW BRANCHES`, `USE BRANCH`)
         // aren't recognised by sqlparser; mirror the pre-detect that
         // `execute_in_transaction_inner` already does so the query path
         // produces rows instead of "Statement not yet supported".
         let plan = if sql::Parser::is_show_branches(sql) {
             sql::LogicalPlan::ShowBranches
+        } else if let Some(arc_plan) = self
+            .plan_cache
+            .lock()
+            .ok()
+            .and_then(|mut cache| cache.get(sql).map(std::sync::Arc::clone))
+        {
+            let mut executor =
+                sql::Executor::with_storage(&self.storage).with_timeout(self.config.storage.query_timeout_ms);
+            let result = executor.execute_with_columns(&arc_plan)?;
+            if cacheable {
+                if let Ok(mut cache) = self.result_cache.lock() {
+                    cache.put(sql.to_string(), std::sync::Arc::new(result.0.clone()));
+                    self.result_cache_nonempty
+                        .store(true, std::sync::atomic::Ordering::Release);
+                }
+            }
+            return Ok(result);
         } else {
             let (statement, _) = self.parse_cached(sql)?;
             let catalog = self.storage.catalog();
@@ -10590,10 +10702,23 @@ impl EmbeddedDatabase {
             let opt = optimizer::Optimizer::with_rules(stats, rules, optimizer::OptimizerConfig::default());
             opt.optimize_recursive(plan)?
         };
+        if !matches!(plan, sql::LogicalPlan::ShowBranches) {
+            if let Ok(mut cache) = self.plan_cache.lock() {
+                cache.put(sql.to_string(), std::sync::Arc::new(plan.clone()));
+            }
+        }
 
         let mut executor =
             sql::Executor::with_storage(&self.storage).with_timeout(self.config.storage.query_timeout_ms);
-        executor.execute_with_columns(&plan)
+        let result = executor.execute_with_columns(&plan)?;
+        if cacheable && !matches!(plan, sql::LogicalPlan::ShowBranches) {
+            if let Ok(mut cache) = self.result_cache.lock() {
+                cache.put(sql.to_string(), std::sync::Arc::new(result.0.clone()));
+                self.result_cache_nonempty
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+        Ok(result)
     }
 
     /// Create a full dump of the database
@@ -13935,12 +14060,87 @@ mod tests {
     }
 
     #[test]
+    fn test_query_with_columns_uses_fast_select_metadata() {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE fast_select_columns (id INT PRIMARY KEY, val TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO fast_select_columns VALUES (1, 'value')")
+            .unwrap();
+
+        let (rows, columns) = db
+            .query_with_columns("SELECT * FROM fast_select_columns WHERE id = 1")
+            .unwrap();
+        assert_eq!(columns, vec!["id".to_string(), "val".to_string()]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get(1), Some(&Value::String("value".to_string())));
+        assert!(
+            !db.fast_select_cache.lock().unwrap().is_empty(),
+            "query_with_columns should populate fast SELECT metadata"
+        );
+
+        let (rows, columns) = db
+            .query_with_columns("SELECT * FROM fast_select_columns WHERE id = 2")
+            .unwrap();
+        assert_eq!(columns, vec!["id".to_string(), "val".to_string()]);
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn test_query_with_columns_reuses_plan_cache() {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE qwc_plan_cache (id INT PRIMARY KEY, val INT)")
+            .unwrap();
+        db.execute("INSERT INTO qwc_plan_cache VALUES (1, 10)").unwrap();
+        db.execute("INSERT INTO qwc_plan_cache VALUES (2, 20)").unwrap();
+
+        let sql = "SELECT id, val FROM qwc_plan_cache WHERE val >= 10";
+        let (rows, columns) = db.query_with_columns(sql).unwrap();
+        assert_eq!(columns, vec!["id".to_string(), "val".to_string()]);
+        assert_eq!(rows.len(), 2);
+        assert!(
+            db.plan_cache.lock().unwrap().contains(sql),
+            "query_with_columns should cache optimized non-fast SELECT plans"
+        );
+        assert!(
+            db.result_cache.lock().unwrap().contains(sql),
+            "query_with_columns should share the deterministic SELECT result cache"
+        );
+        let cached_rows = db
+            .try_cached_query_with_columns(sql)
+            .expect("cached query_with_columns rows should be available to protocol handlers")
+            .0;
+        let result_cache_rows = db
+            .result_cache
+            .lock()
+            .unwrap()
+            .get(sql)
+            .map(std::sync::Arc::clone)
+            .unwrap();
+        assert!(
+            std::sync::Arc::ptr_eq(&cached_rows, &result_cache_rows),
+            "crate-internal query_with_columns cache path should avoid cloning cached row vectors"
+        );
+
+        let (rows, columns) = db.query_with_columns(sql).unwrap();
+        assert_eq!(columns, vec!["id".to_string(), "val".to_string()]);
+        assert_eq!(rows.len(), 2);
+
+        db.execute("INSERT INTO qwc_plan_cache VALUES (3, 30)").unwrap();
+        assert!(
+            !db.result_cache.lock().unwrap().contains(sql),
+            "DML should invalidate query_with_columns result-cache entries"
+        );
+        let (rows, columns) = db.query_with_columns(sql).unwrap();
+        assert_eq!(columns, vec!["id".to_string(), "val".to_string()]);
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
     fn test_result_cache_invalidated_on_explicit_commit() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         db.execute("CREATE TABLE txn_cache_commit (id INT PRIMARY KEY, val TEXT)")
             .unwrap();
-        db.execute("INSERT INTO txn_cache_commit VALUES (1, 'before')")
-            .unwrap();
+        db.execute("INSERT INTO txn_cache_commit VALUES (1, 'before')").unwrap();
 
         let sql = "SELECT * FROM txn_cache_commit WHERE id = 1";
         let rows = db.query(sql, &[]).unwrap();
@@ -13971,8 +14171,7 @@ mod tests {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         db.execute("CREATE TABLE no_cache_marker (id INT PRIMARY KEY, val TEXT)")
             .unwrap();
-        db.execute("INSERT INTO no_cache_marker VALUES (1, 'value')")
-            .unwrap();
+        db.execute("INSERT INTO no_cache_marker VALUES (1, 'value')").unwrap();
 
         let sql = "SELECT id, val FROM no_cache_marker /* NOW(no_result_cache_marker) */";
         let rows = db.query(sql, &[]).unwrap();
@@ -13990,8 +14189,7 @@ mod tests {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         db.execute("CREATE TABLE fast_select_meta (id INT PRIMARY KEY, val TEXT)")
             .unwrap();
-        db.execute("INSERT INTO fast_select_meta VALUES (1, 'before')")
-            .unwrap();
+        db.execute("INSERT INTO fast_select_meta VALUES (1, 'before')").unwrap();
 
         let rows = db.query("SELECT * FROM fast_select_meta WHERE id = 1", &[]).unwrap();
         assert_eq!(rows.len(), 1);

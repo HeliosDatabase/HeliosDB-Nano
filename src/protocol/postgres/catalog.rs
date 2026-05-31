@@ -89,9 +89,8 @@ impl PgCatalog {
         // substring router can only serve a single view and can't run
         // the planner's aggregate operator. Plain single-view SELECTs
         // are still intercepted here (legacy contract + direct callers).
-        let needs_planner = query_lower.contains(" join ")
-            || query_lower.contains("count(")
-            || query_lower.contains(" group by ");
+        let needs_planner =
+            query_lower.contains(" join ") || query_lower.contains("count(") || query_lower.contains(" group by ");
         let result = if has_information_schema_ref {
             if needs_planner
                 && (query_lower.contains("information_schema.columns")
