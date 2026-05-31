@@ -610,3 +610,56 @@ modest/noisy win. It reinforces that the remaining SQLite write gap needs a
 larger structural lever: prepared-statement handles/default parameterized
 execution, compact row serialization, or batch-oriented literal INSERT
 execution rather than more parser micro-tuning.
+
+## Accepted Follow-Up: Fast Unescaped String Literals
+
+Commit after this report: `perf: fast parse unescaped string literals`.
+
+Finding:
+
+- `fast_parse_one_value()` always used the escape-aware byte loop for SQL string
+  literals, building the `String` incrementally even when the common case had no
+  doubled single-quote escapes.
+- The default SQL-text insert TPS workloads parse two simple string literals per
+  inserted user row (`name`, `email`), so this sits directly on both
+  `bulk_insert_users(txn)` and `autocommit_insert`.
+
+Change:
+
+- String literal parsing now first finds the next single quote. If it is a real
+  terminator rather than the start of a doubled-quote escape, the parser copies
+  the literal slice directly and returns.
+- Escaped strings still fall back to the existing escape-aware parser.
+- UUID/date/timestamp coercion behavior for quoted literals is unchanged.
+
+Validation:
+
+```text
+cargo check --lib
+cargo test --lib fast_insert -- --nocapture --test-threads=1
+cargo test --test multi_row_insert_values -- --nocapture --test-threads=1
+cargo test --test string_unicode_hardening_tests -- --nocapture --test-threads=1
+cargo test --test vector_search_test test_vector_dimension_validation -- --nocapture --test-threads=1
+cargo test --test edge_case_tests test_quotes_in_strings -- --nocapture --test-threads=1
+```
+
+Measured in-memory TPS, `N=10000`, `M=2000`, time-travel on:
+
+```text
+recent pre-change range           bulk_insert 135,893-141,440/s, autocommit_insert 100,625-105,905/s
+after change run 1                bulk_insert 134,509/s, autocommit_insert 94,000/s
+after change run 2                bulk_insert 137,343/s, autocommit_insert 108,569/s
+```
+
+Larger sample, `N=50000`, `M=10000`, time-travel on:
+
+```text
+recent pre-change range           bulk_insert 125,545-134,441/s, autocommit_insert 87,601-92,829/s
+after change run                  bulk_insert 136,535/s, autocommit_insert 96,586/s
+```
+
+Interpretation: another modest/noisy SQL-text INSERT improvement. It is worth
+keeping because it removes real work from the common literal parser while
+preserving escaped-string behavior, but it still does not change the larger
+status: SQLite remains ahead on in-memory bulk insert unless Nano uses the
+parameterized/execute-many path or gets a larger structural literal/batch path.

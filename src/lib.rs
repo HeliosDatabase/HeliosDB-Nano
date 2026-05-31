@@ -7889,6 +7889,14 @@ impl EmbeddedDatabase {
             }
 
             let inner = s.get(1..)?;
+            if let Some(end) = inner.find('\'') {
+                let rest = inner.get(end + 1..)?;
+                if !rest.starts_with('\'') {
+                    let result = inner.get(..end)?.to_string();
+                    return Some((Self::fast_string_literal_value(result, target_type), rest));
+                }
+            }
+
             let mut end = 0;
             let bytes = inner.as_bytes();
             let mut result = String::new();
@@ -7914,20 +7922,7 @@ impl EmbeddedDatabase {
                     // Value::Uuid(...) and misses every time —
                     // root cause of the CloudV2 admin_db
                     // persistence bug (#205).
-                    let typed = match target_type {
-                        DataType::Uuid => uuid::Uuid::parse_str(&result)
-                            .map(Value::Uuid)
-                            .unwrap_or(Value::String(result)),
-                        DataType::Date => result
-                            .parse::<chrono::NaiveDate>()
-                            .map(Value::Date)
-                            .unwrap_or(Value::String(result)),
-                        DataType::Timestamp => chrono::DateTime::parse_from_rfc3339(&result)
-                            .map(|t| Value::Timestamp(t.to_utc()))
-                            .unwrap_or(Value::String(result)),
-                        _ => Value::String(result),
-                    };
-                    return Some((typed, rest));
+                    return Some((Self::fast_string_literal_value(result, target_type), rest));
                 }
                 end += 1;
             }
@@ -8014,6 +8009,22 @@ impl EmbeddedDatabase {
 
         // Not a recognized literal — bail to normal parser
         None
+    }
+
+    fn fast_string_literal_value(result: String, target_type: &DataType) -> Value {
+        match target_type {
+            DataType::Uuid => uuid::Uuid::parse_str(&result)
+                .map(Value::Uuid)
+                .unwrap_or(Value::String(result)),
+            DataType::Date => result
+                .parse::<chrono::NaiveDate>()
+                .map(Value::Date)
+                .unwrap_or(Value::String(result)),
+            DataType::Timestamp => chrono::DateTime::parse_from_rfc3339(&result)
+                .map(|t| Value::Timestamp(t.to_utc()))
+                .unwrap_or(Value::String(result)),
+            _ => Value::String(result),
+        }
     }
 
     /// Parse SQL with caching. Returns (statement, was_cached).
