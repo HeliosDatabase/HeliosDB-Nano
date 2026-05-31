@@ -240,8 +240,8 @@ pub struct HashJoinOperator {
     join_type: crate::sql::JoinType,
     on_condition: Option<crate::sql::LogicalExpr>,
 
-    // Hash table (key: join columns, value: matching tuples)
-    hash_table: std::collections::HashMap<JoinKey, Vec<Tuple>>,
+    // Hash table (key: join columns, value: matching tuple bucket)
+    hash_table: std::collections::HashMap<JoinKey, JoinBucket>,
 
     // Output schema
     output_schema: Arc<Schema>,
@@ -292,6 +292,67 @@ struct DirectJoinKeyIndices {
 enum HashJoinBuildSide {
     Left,
     Right,
+}
+
+enum JoinBucket {
+    One(Tuple),
+    Many(Vec<Tuple>),
+}
+
+impl JoinBucket {
+    fn push(&mut self, tuple: Tuple) {
+        match self {
+            Self::One(existing) => {
+                let first = std::mem::replace(existing, Tuple::new(Vec::new()));
+                *self = Self::Many(vec![first, tuple]);
+            }
+            Self::Many(values) => values.push(tuple),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::One(_) => 1,
+            Self::Many(values) => values.len(),
+        }
+    }
+
+    fn get(&self, index: usize) -> Option<&Tuple> {
+        match self {
+            Self::One(tuple) => (index == 0).then_some(tuple),
+            Self::Many(values) => values.get(index),
+        }
+    }
+
+    fn iter(&self) -> JoinBucketIter<'_> {
+        match self {
+            Self::One(tuple) => JoinBucketIter::One(Some(tuple)),
+            Self::Many(values) => JoinBucketIter::Many(values.iter()),
+        }
+    }
+
+    fn clone_tuples(&self) -> Vec<Tuple> {
+        match self {
+            Self::One(tuple) => vec![tuple.clone()],
+            Self::Many(values) => values.clone(),
+        }
+    }
+}
+
+enum JoinBucketIter<'a> {
+    One(Option<&'a Tuple>),
+    Many(std::slice::Iter<'a, Tuple>),
+}
+
+impl<'a> Iterator for JoinBucketIter<'a> {
+    type Item = &'a Tuple;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::One(value) => value.take(),
+            Self::Many(iter) => iter.next(),
+        }
+    }
 }
 
 /// Join key for hash table lookups.
@@ -705,8 +766,17 @@ impl HashJoinOperator {
                 )));
             }
 
-            // Insert into hash table (with overflow chaining)
-            self.hash_table.entry(key).or_insert_with(Vec::new).push(tuple);
+            // Insert into hash table (with overflow chaining). Keep the common
+            // unique-key bucket as a single tuple to avoid one Vec allocation
+            // per build row.
+            match self.hash_table.entry(key) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    entry.get_mut().push(tuple);
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(JoinBucket::One(tuple));
+                }
+            }
 
             self.memory_used += additional_memory;
         }
@@ -1004,7 +1074,7 @@ impl HashJoinOperator {
                 .hash_table
                 .iter()
                 .filter(|(key, _)| !self.matched_right_keys.contains(key))
-                .map(|(key, tuples)| (key.clone(), tuples.clone()))
+                .map(|(key, tuples)| (key.clone(), tuples.clone_tuples()))
                 .collect();
 
             self.unmatched_right_iter = Some(unmatched.into_iter());
