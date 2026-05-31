@@ -179,3 +179,35 @@ order_by_limit10        221-239/s  (recorded baseline: 207/s)
 ```
 
 This narrows the rowstore aggregate gap, but SQLite still leads the mirrored in-memory aggregate workload at 969/s. The remaining work is still a vector/compact pipeline across scan/filter/project/join, not isolated tuple-boundary tweaks.
+
+## Accepted Follow-Up: Integer Sort-Key Top-N
+
+Commit after this report: `perf: defer projected decode for integer top-n`.
+
+Change:
+
+- `src/storage/prefix_decode.rs` can now decode one primitive numeric column without materializing a `Vec`.
+- `src/storage/engine.rs` uses that for direct Top-N scans with one integer sort key, decoding only the sort column for every row and decoding projected output columns only for heap candidates.
+- The generic direct-column Top-N path remains the fallback for non-integer sort keys, multi-key sorts, NULLs, branches, columnar side-storage, and full-width outputs.
+
+Validation:
+
+```text
+cargo check --lib
+cargo test prefix_decode --lib -- --nocapture
+cargo test --test pagination_tests -- --nocapture --test-threads=1
+cargo test --test query_optimizer_tests -- --nocapture
+```
+
+Measured in-memory TPS, `N=10000`, `M=2000`, time-travel on:
+
+```text
+baseline A/B order_by_limit10   218/s
+new path order_by_limit10       239/s, 239/s, 254/s
+```
+
+Rejected during this pass:
+
+- Projected filtered scan and predicate-first projected scan: correctness-clean, but `filter_scan(age>50)` stayed at 165-169/s versus the 171/s recorded baseline.
+- In-memory RocksDB block-cache option: first pass looked positive, second pass regressed, so it was reverted.
+- Primitive aggregate visitor and two-column decoder variants: correctness-clean, but `agg_count_sum_avg` regressed to 390-408/s versus the committed 436-443/s range.
