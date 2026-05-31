@@ -2118,9 +2118,12 @@ Change:
 - Extend `handle_projected_join()` for guarded inner equi-joins so direct
   `Scan` / `FilteredScan` inputs are projected before physical operator
   construction.
-- Each side keeps only qualified join-key, pushed-filter, and projected output
-  columns. For the TPS join, the users side becomes `[id, name, age]` and the
-  orders side becomes `[user_id, amount, status]`.
+- Each side keeps only qualified join-key and projected output columns in the
+  tuple handed to the hash join. `FilteredScan` still decodes and applies local
+  predicate columns before rows cross the scan boundary, but predicate-only
+  columns are no longer retained in the join payload. For the TPS join, the
+  users side becomes `[id, name]` and the orders side becomes `[user_id,
+  amount]`.
 - The path falls back for outer/lateral joins, residual join predicates,
   unqualified or complex expressions, subqueries, unsupported input shapes, and
   already-projected inputs.
@@ -2134,6 +2137,7 @@ cargo test --test query_optimizer_tests -- --nocapture --test-threads=1
 cargo test --test scan_prefix_decode -- --nocapture --test-threads=1
 HELIOS_TPS=1 HELIOS_TPS_MODE=mem HELIOS_TPS_WORKLOADS=join_users_orders HELIOS_TPS_N=10000 HELIOS_TPS_M=2000 cargo test --profile perf --test tps_workloads run_tps_suite -- --nocapture --test-threads=1
 HELIOS_TPS=1 HELIOS_TPS_MODE=mem HELIOS_TPS_WORKLOADS=filter_scan,agg_count_sum_avg,group_by_status,join_users_orders,order_by_limit10 HELIOS_TPS_N=10000 HELIOS_TPS_M=2000 cargo test --profile perf --test tps_workloads run_tps_suite -- --nocapture --test-threads=1
+cargo test --test join_hardening_tests test_inner_join_with_filter_only_columns -- --nocapture --test-threads=1
 ```
 
 Focused row-store TPS, embedded mem, `N=10000`, `M=2000`, ops/s:
@@ -2143,12 +2147,15 @@ pre-change final focused run  join_users_orders 64/s
 after change focused run 1    join_users_orders 74/s
 after change focused run 2    join_users_orders 75/s
 mixed analytics run           filter 226/s, aggregate 501/s, group 172/s, join 76/s, Top-N 469/s
+filter-only column pruning    join_users_orders 81/s
+mixed follow-up run           filter 234/s, aggregate 568/s, join 78/s
 ```
 
 Interpretation: this is a real but bounded join improvement, roughly 17-19%
-over the prior final focused snapshot. SQLite still leads this in-memory join
-shape by about 2.8x on the latest reference, so the broader compact/vectorized
-pipeline remains the next analytics lever.
+from the compact input projection and about 22-27% over the prior final focused
+snapshot after dropping local filter-only columns from the join payload. SQLite
+still leads this in-memory join shape by about 2.7x on the latest reference, so
+the broader compact/vectorized pipeline remains the next analytics lever.
 
 ## Accepted Follow-Up: Batched Parameterized UPDATE/DELETE
 

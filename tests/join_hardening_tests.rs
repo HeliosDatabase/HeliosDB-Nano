@@ -149,6 +149,35 @@ mod join_hardening {
     }
 
     #[test]
+    fn test_inner_join_with_filter_only_columns() {
+        let d = db();
+        d.execute("CREATE TABLE j_inner_pf_users (id INT, name TEXT, age INT)")
+            .unwrap();
+        d.execute("CREATE TABLE j_inner_pf_orders (user_id INT, amount INT, status TEXT)")
+            .unwrap();
+        d.execute(
+            "INSERT INTO j_inner_pf_users VALUES (1, 'Ada', 41), (2, 'Ben', 39), (3, 'Cy', 55)",
+        )
+        .unwrap();
+        d.execute(
+            "INSERT INTO j_inner_pf_orders VALUES (1, 10, 'paid'), (1, 11, 'open'), (2, 20, 'paid'), (3, 30, 'paid')",
+        )
+        .unwrap();
+
+        let rows = d
+            .query(
+                "SELECT u.name, o.amount FROM j_inner_pf_users u INNER JOIN j_inner_pf_orders o ON u.id = o.user_id WHERE u.age > 40 AND o.status = 'paid' ORDER BY u.name, o.amount",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(to_str(rows[0].get(0).unwrap()), "Ada");
+        assert_eq!(to_i64(rows[0].get(1).unwrap()), 10);
+        assert_eq!(to_str(rows[1].get(0).unwrap()), "Cy");
+        assert_eq!(to_i64(rows[1].get(1).unwrap()), 30);
+    }
+
+    #[test]
     fn test_inner_join_multiple_conditions() {
         let d = db();
         d.execute("CREATE TABLE j_inner_mc1 (a INT, b INT, val TEXT)").unwrap();
