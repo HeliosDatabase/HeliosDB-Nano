@@ -663,3 +663,52 @@ keeping because it removes real work from the common literal parser while
 preserving escaped-string behavior, but it still does not change the larger
 status: SQLite remains ahead on in-memory bulk insert unless Nano uses the
 parameterized/execute-many path or gets a larger structural literal/batch path.
+
+## Accepted Follow-Up: Single-Tuple Hash Join Buckets
+
+Commit after this report: `perf: avoid per-key hash join vec allocation`.
+
+Finding:
+
+- `HashJoinOperator` stored every build-side hash bucket as `Vec<Tuple>`.
+- The TPS join workload builds on filtered `users.id`, which is unique, so the
+  hash table paid one heap allocation per build row just to store a one-element
+  vector.
+- Prior rejected join experiments covered projected output, PK lookup join, and
+  hash-table pre-sizing. This is a different allocation site in the build table.
+
+Change:
+
+- Hash join buckets now use a `JoinBucket` enum: `One(Tuple)` for unique keys,
+  upgrading to `Many(Vec<Tuple>)` only when duplicate join keys appear.
+- Probe, residual-filter, and unmatched outer-join paths use bucket helpers so
+  duplicate-key and outer-join behavior remains intact.
+
+Validation:
+
+```text
+cargo check --lib
+cargo test --test join_hardening_tests -- --nocapture --test-threads=1
+cargo test --test query_optimizer_tests test_recursive_pushdown_revisits_join_input_filters -- --nocapture --test-threads=1
+cargo test --test integration_test -- join --nocapture --test-threads=1
+```
+
+Measured in-memory TPS, `N=10000`, `M=2000`, time-travel on:
+
+```text
+recent pre-change range           join_users_orders 54-61/s
+after change run 1                join_users_orders 61/s
+after change run 2                join_users_orders 62/s
+```
+
+The same runs also kept the broader suite in the current range:
+
+```text
+run 1  filter 209/s, aggregate 466/s, group_by 177/s, Top-N 319/s
+run 2  filter 205/s, aggregate 430/s, group_by 168/s, Top-N 314/s
+```
+
+Interpretation: this is a small but cleaner hash-join build allocation win. It
+does not close the SQLite join gap by itself; the remaining gap still points to
+a compact/vectorized scan-filter-join pipeline that avoids full `Tuple` cloning
+through scan, join, and project.
