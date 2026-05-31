@@ -1875,13 +1875,14 @@ items remain intentionally pending after release:
 
 ## Final 3.34.0 Focused Snapshot
 
-After the 3.34.0 release metadata commit (`77f0456`), the focused same-host
-in-memory comparison was re-run with `N=10000`, `M=2000`.
+After the 3.34.0 release metadata commit (`77f0456`) and the projected
+filtered-scan follow-up, the focused same-host in-memory comparison was re-run
+with `N=10000`, `M=2000`.
 
 Default row-store analytics:
 
 ```text
-Nano rowstore               filter 221/s, aggregate 541/s, group_by 165/s, join 62/s, Top-N 441/s
+Nano rowstore               filter 229/s, aggregate 540/s, group_by 164/s, join 64/s, Top-N 478/s
 SQLite params reference     filter 374/s, aggregate 978/s, group_by 178/s, join 216/s, Top-N 461/s
 ```
 
@@ -1915,6 +1916,50 @@ DELETE. SQLite still leads single-row autocommit INSERT and single-row UPDATE.
 The remaining single-row UPDATE gap is below the threshold where parser/cache
 micro-tuning has helped; it needs a storage-level profile before more code is
 changed.
+
+## Accepted Follow-Up: Projected Row-Store FilteredScan
+
+Finding:
+
+- `FilteredScan` with a projection decoded only the referenced columns but still
+  returned sparse full-width tuples to `ScanOperator`.
+- `ScanOperator` then projected those tuples again, so the storage/executor
+  boundary still paid for full-width tuple shape and a second projection pass.
+
+Change:
+
+- Add `scan_table_with_schema_projected_filtered()` for the safe current-data
+  row-store path.
+- It decodes predicate + output columns into a reusable compact buffer, evaluates
+  storage-safe predicates before materialization, emits compact projected tuples,
+  and lets `ScanOperator` run with `projection=None`.
+- The path is gated to default row-store columns, main-branch current data, a
+  non-empty projection, and predicates that already passed the storage
+  pushdown safety checks. All other cases fall back to the existing path.
+
+Validation:
+
+```text
+cargo check --lib
+cargo test --test scan_prefix_decode -- --nocapture --test-threads=1
+cargo test --test join_hardening_tests -- --nocapture --test-threads=1
+cargo test --test query_optimizer_tests -- --nocapture --test-threads=1
+HELIOS_TPS=1 HELIOS_TPS_MODE=mem HELIOS_TPS_WORKLOADS=filter_scan,join_users_orders HELIOS_TPS_N=10000 HELIOS_TPS_M=2000 cargo test --profile perf --test tps_workloads run_tps_suite -- --nocapture --test-threads=1
+```
+
+Focused row-store TPS, embedded mem, `N=10000`, `M=2000`, ops/s:
+
+```text
+before final snapshot       filter_scan 221/s  join_users_orders 62/s
+run 1 after patch           filter_scan 230/s  join_users_orders 66/s
+run 2 after patch           filter_scan 230/s  join_users_orders 66/s
+full focused run            filter_scan 229/s  join_users_orders 64/s
+```
+
+Interpretation: keep this as a modest boundary-collapse improvement. It does
+not change the larger conclusion: SQLite still leads filter and join, and the
+next meaningful analytics lever remains a broader compact/vectorized
+scan-filter-project-join pipeline.
 
 ## Accepted Follow-Up: Batched Parameterized UPDATE/DELETE
 
