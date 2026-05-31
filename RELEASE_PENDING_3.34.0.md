@@ -64,7 +64,10 @@ regressions from the release batch.
     path;
   - this is gated to simple column-vs-non-NULL literal comparisons and avoids
     `!=` because the storage predicate helper is not SQL-NULL-safe for that
-    operator.
+    operator;
+  - compact projected row-store filtered scans now skip row-id parsing because
+    this path is used by SELECT/read execution; DML continues to use the
+    row-id-preserving scan paths.
 - Gated columnar analytics profile improvement:
   - filtered scans whose predicate and projection are entirely `STORAGE
     COLUMNAR` now emit compact projected tuples directly from columnar side-data
@@ -282,6 +285,20 @@ post-close join payload pruning gate
     passed; packaged 706 files, 12.8 MiB uncompressed, 2.5 MiB compressed
   cargo publish --dry-run
     passed; dry-run aborted before upload as expected
+
+post-close projected filtered scan row-id gate
+  cargo check --lib
+    passed
+  cargo test --test scan_prefix_decode -- --nocapture --test-threads=1
+    passed; 8 tests passed
+  cargo test --test query_optimizer_tests -- --nocapture --test-threads=1
+    passed; 14 tests passed
+  cargo test --test join_hardening_tests test_inner_join_with_filter_only_columns -- --nocapture --test-threads=1
+    passed
+  HELIOS_TPS=1 HELIOS_TPS_MODE=mem HELIOS_TPS_WORKLOADS=filter_scan HELIOS_TPS_N=10000 HELIOS_TPS_M=2000 cargo test --profile perf --test tps_workloads run_tps_suite -- --nocapture --test-threads=1
+    focused filter_scan: 229/s
+  HELIOS_TPS=1 HELIOS_TPS_MODE=mem HELIOS_TPS_WORKLOADS=filter_scan,join_users_orders HELIOS_TPS_N=10000 HELIOS_TPS_M=2000 cargo test --profile perf --test tps_workloads run_tps_suite -- --nocapture --test-threads=1
+    mixed run: filter_scan 233/s, join_users_orders 81/s
 ```
 
 ## Recommended Publish Commands

@@ -2539,11 +2539,10 @@ impl StorageEngine {
                     projected_values.push(Value::Null);
                 }
             }
-            let mut tuple = Tuple::new(projected_values);
-            if let Some(row_id) = Self::parse_row_id_after_prefix(&key, prefix_bytes.len()) {
-                tuple.row_id = Some(row_id);
-            }
-            tuples.push(tuple);
+            // This compact projected path is used by read-only SELECT execution.
+            // DML paths use row-id-preserving scans, so avoid parsing the data
+            // key for every surviving row here.
+            tuples.push(Tuple::new(projected_values));
         }
 
         Ok(Some(tuples))
