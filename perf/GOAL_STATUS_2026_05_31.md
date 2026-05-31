@@ -2668,3 +2668,46 @@ than thousands of PK point lookups for this workload. The next join lever should
 not be row-at-a-time index nested-loop unless a cost model proves extreme
 selectivity; it should instead reduce the scan/hash boundary or use a vectorized
 batch lookup strategy.
+
+## Accepted Follow-Up: Single-Match HashJoin Direct Emit
+
+Finding:
+
+- The projected compact hash-join path already stores the common unique-key
+  build bucket as `JoinBucket::One`, but the pure-equi probe path still entered
+  the pending-match state machine and performed a second loop/hash-table lookup
+  before emitting that one joined row.
+- The measured `join_users_orders` shape is mostly many-to-one
+  `orders.user_id -> users.id`, so most successful probe keys hit exactly one
+  build tuple.
+
+Change:
+
+- In `src/sql/executor/join.rs`, emit a pure-equi join result immediately when
+  the hash bucket length is one.
+- Multi-match buckets and outer-join match tracking keep the existing path.
+
+Validation:
+
+```text
+cargo check --lib
+cargo test --test join_hardening_tests -- --nocapture --test-threads=1
+HELIOS_TPS=1 HELIOS_TPS_MODE=mem HELIOS_TPS_WORKLOADS=join_users_orders HELIOS_TPS_N=10000 HELIOS_TPS_M=2000 cargo test --profile perf --test tps_workloads run_tps_suite -- --nocapture --test-threads=1
+HELIOS_TPS=1 HELIOS_TPS_MODE=mem HELIOS_TPS_WORKLOADS=filter_scan,agg_count_sum_avg,group_by_status,join_users_orders,order_by_limit10 HELIOS_TPS_N=10000 HELIOS_TPS_M=2000 cargo test --profile perf --test tps_workloads run_tps_suite -- --nocapture --test-threads=1
+```
+
+Focused TPS, embedded mem, `N=10000`, `M=2000`, ops/s:
+
+```text
+fresh pre-change focused rowstore run      join_users_orders 98/s
+after change focused join run              join_users_orders 104/s
+after change mixed analytics run           filter 214/s, aggregate 566/s,
+                                           group_by 222/s, join 100/s, Top-N 455/s
+SQLite params reference, same host          filter 385/s, aggregate 940/s,
+                                           group_by 179/s, join 200/s, Top-N 429/s
+```
+
+Decision: kept. This is a small but real executor-state reduction on the common
+single-match hash-join path. It does not close the SQLite embedded join gap by
+itself; the remaining gap still points to a compact/vectorized scan-filter-join
+pipeline rather than more row-at-a-time lookup work.

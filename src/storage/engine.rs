@@ -142,15 +142,12 @@ fn null_rejecting_filter_predicate(predicates: &[FilterPredicate]) -> Option<&Fi
 }
 
 fn columnar_batch_driver_scan_beneficial(schema: &crate::Schema, predicate: &FilterPredicate) -> bool {
-    schema
-        .columns
-        .get(predicate.column_index)
-        .is_some_and(|column| {
-            matches!(
-                column.data_type,
-                crate::DataType::Text | crate::DataType::Varchar(_) | crate::DataType::Char(_)
-            )
-        })
+    schema.columns.get(predicate.column_index).is_some_and(|column| {
+        matches!(
+            column.data_type,
+            crate::DataType::Text | crate::DataType::Varchar(_) | crate::DataType::Char(_)
+        )
+    })
 }
 
 fn columnar_row_matches_filters(

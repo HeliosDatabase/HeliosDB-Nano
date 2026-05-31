@@ -396,6 +396,17 @@ post-close text-driver columnar projected-filter gate
     focused columnar profile: filter_scan 236/s, join_users_orders 96/s
   HELIOS_TPS=1 HELIOS_TPS_MODE=mem HELIOS_TPS_WORKLOADS=filter_scan,join_users_orders HELIOS_TPS_N=10000 HELIOS_TPS_M=2000 cargo test --profile perf --test tps_workloads run_tps_suite -- --nocapture --test-threads=1
     rowstore sanity: filter_scan 225/s, join_users_orders 83/s
+
+post-close single-match HashJoin direct-emit gate
+  cargo check --lib
+    passed
+  cargo test --test join_hardening_tests -- --nocapture --test-threads=1
+    passed; 46 tests passed
+  HELIOS_TPS=1 HELIOS_TPS_MODE=mem HELIOS_TPS_WORKLOADS=join_users_orders HELIOS_TPS_N=10000 HELIOS_TPS_M=2000 cargo test --profile perf --test tps_workloads run_tps_suite -- --nocapture --test-threads=1
+    focused join_users_orders: 104/s
+  HELIOS_TPS=1 HELIOS_TPS_MODE=mem HELIOS_TPS_WORKLOADS=filter_scan,agg_count_sum_avg,group_by_status,join_users_orders,order_by_limit10 HELIOS_TPS_N=10000 HELIOS_TPS_M=2000 cargo test --profile perf --test tps_workloads run_tps_suite -- --nocapture --test-threads=1
+    mixed run: filter_scan 214/s, aggregate 566/s,
+    group_by_status 222/s, join_users_orders 100/s, order_by_limit10 455/s
 ```
 
 ## Recommended Publish Commands
