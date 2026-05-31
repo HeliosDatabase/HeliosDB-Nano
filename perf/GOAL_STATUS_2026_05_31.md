@@ -997,3 +997,62 @@ Parameterized per-row bulk is only modestly faster than default literal bulk,
 while `execute_many` is the healthier path. The next write-path lever should
 target batch transaction/index/row materialization directly rather than adding
 more literal parse caches.
+
+Rejected during the next pass:
+
+- Specialized batch duplicate validation for single-column integer PK/UNIQUE
+  keys so `execute_many` would avoid per-row encoded byte-key allocation.
+  Correctness checks passed (`cargo check --lib`,
+  `parameterized_query_tests` execute_many duplicate slice 4/4), but TPS
+  regressed: `param_execute_many_insert` 256,716/s then 217,650/s versus the
+  current 264,812-275,327/s range. Reverted.
+- Added a batch ART insert helper that held the ART manager write lock once for
+  direct `execute_many` inserts instead of calling `on_insert_tuple` per row.
+  Correctness checks passed (`cargo check --lib`,
+  `parameterized_query_tests` execute_many duplicate slice 4/4), but TPS fell
+  to 245,923/s. Reverted. At this scale, ART lock churn is not the dominant
+  `execute_many` ceiling.
+
+## Accepted Follow-Up: Fused Primitive COUNT/SUM/AVG
+
+Commit after this report: `perf: fuse primitive count sum avg aggregate`.
+
+Finding:
+
+- `agg_count_sum_avg` already used the primitive row-store aggregate path, but
+  the exact TPS query (`COUNT(*), SUM(balance), AVG(age)`) still updated a
+  vector of aggregate states and matched aggregate variants for every row.
+- The query shape is common enough to specialize safely: one count-star, one
+  integer SUM, and one numeric AVG over the primitive numeric decoder.
+
+Change:
+
+- Add a narrow fused primitive aggregate path for `[CountStar, SumInt, Avg]`.
+- The path keeps existing SUM overflow handling, skips NULL values for SUM/AVG,
+  and falls back to the generic primitive aggregate path if a row cannot be
+  decoded by the numeric fast decoder.
+- Add a hardening test covering `COUNT(*), SUM(amount), AVG(age)` with NULLs.
+
+Validation:
+
+```text
+cargo check --lib
+cargo test --test integration_test aggregate -- --nocapture --test-threads=1
+cargo test --test aggregate_hardening_tests test_count_sum_avg_without_group_by_null_semantics -- --nocapture --test-threads=1
+HELIOS_TPS=1 HELIOS_TPS_WORKLOADS=agg_count_sum_avg HELIOS_TPS_MODE=mem HELIOS_TPS_N=10000 HELIOS_TPS_M=2000 cargo test --release --test tps_workloads run_tps_suite -- --nocapture --test-threads=1
+```
+
+Measured in-memory TPS, `N=10000`, `M=2000`, time-travel on:
+
+```text
+focused pre-change read/analytics run      agg_count_sum_avg 512/s
+after change run 1                         agg_count_sum_avg 546/s
+after change run 2                         agg_count_sum_avg 580/s
+after change run 3                         agg_count_sum_avg 574/s
+combined filter+agg+join run               agg_count_sum_avg 588/s
+```
+
+Interpretation: this is a clean aggregate-path improvement, but SQLite's
+recorded mirror is still about 969/s. The remaining analytics gap still points
+to a broader compact/vectorized scan pipeline rather than more isolated
+aggregate-state dispatch reductions.

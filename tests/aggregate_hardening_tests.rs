@@ -694,6 +694,27 @@ mod aggregate_hardening {
         assert_eq!(to_i64(rows[0].get(3).unwrap()), 30);
     }
 
+    #[test]
+    fn test_count_sum_avg_without_group_by_null_semantics() {
+        let d = db();
+        d.execute("CREATE TABLE no_gb_csa (id INT, amount INT, age INT)")
+            .unwrap();
+        d.execute("INSERT INTO no_gb_csa VALUES (1, 10, 20)").unwrap();
+        d.execute("INSERT INTO no_gb_csa VALUES (2, NULL, 40)").unwrap();
+        d.execute("INSERT INTO no_gb_csa VALUES (3, 30, NULL)").unwrap();
+
+        let rows = d
+            .query("SELECT COUNT(*), SUM(amount), AVG(age) FROM no_gb_csa", &[])
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(to_i64(rows[0].get(0).unwrap()), 3);
+        assert_eq!(to_i64(rows[0].get(1).unwrap()), 40);
+        assert!(
+            (to_f64(rows[0].get(2).unwrap()) - 30.0).abs() < 0.01,
+            "AVG should skip NULLs"
+        );
+    }
+
     // ========================================================================
     // 6. HAVING clause edge cases
     // ========================================================================

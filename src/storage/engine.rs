@@ -3120,6 +3120,14 @@ impl StorageEngine {
             return Ok(Some(vec![Tuple::new(values)]));
         }
 
+        if let Some((sum_position, avg_position)) = Self::primitive_count_sum_avg_positions(&plan) {
+            if let Some(tuple) =
+                self.try_aggregate_primitive_count_sum_avg(table_name, &requested, sum_position, avg_position)?
+            {
+                return Ok(Some(vec![tuple]));
+            }
+        }
+
         let prefix = format!("data:{}:", table_name);
         let prefix_bytes = prefix.as_bytes();
         let mut read_opts = ReadOptions::default();
@@ -3163,6 +3171,94 @@ impl StorageEngine {
         Ok(Some(vec![Tuple::new(
             states.into_iter().map(PrimitiveRowAggregateState::finalize).collect(),
         )]))
+    }
+
+    fn primitive_count_sum_avg_positions(plan: &[PrimitiveRowAggregate]) -> Option<(usize, usize)> {
+        match plan {
+            [
+                PrimitiveRowAggregate::CountStar,
+                PrimitiveRowAggregate::SumInt { position: sum_position },
+                PrimitiveRowAggregate::Avg { position: avg_position },
+            ] => Some((*sum_position, *avg_position)),
+            _ => None,
+        }
+    }
+
+    fn try_aggregate_primitive_count_sum_avg(
+        &self,
+        table_name: &str,
+        requested: &[usize],
+        sum_position: usize,
+        avg_position: usize,
+    ) -> Result<Option<Tuple>> {
+        let prefix = format!("data:{}:", table_name);
+        let prefix_bytes = prefix.as_bytes();
+        let mut read_opts = ReadOptions::default();
+        read_opts.set_total_order_seek(true);
+        let iter = self
+            .db
+            .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read_opts);
+
+        let mut count = 0_i64;
+        let mut sum = 0_i64;
+        let mut sum_seen = false;
+        let mut avg_sum = 0.0_f64;
+        let mut avg_count = 0_u64;
+        let mut values = Vec::with_capacity(requested.len());
+
+        for item in iter {
+            let (key, raw_value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+            if !key.starts_with(prefix_bytes) {
+                break;
+            }
+
+            let decoded = if let Some(km) = &self.key_manager {
+                let decrypted = crypto::decrypt(km.key(), &raw_value)?;
+                crate::storage::prefix_decode::decode_tuple_numeric_column_values_into(
+                    &decrypted,
+                    requested,
+                    &mut values,
+                )
+            } else {
+                crate::storage::prefix_decode::decode_tuple_numeric_column_values_into(
+                    &raw_value,
+                    requested,
+                    &mut values,
+                )
+            };
+            if decoded.is_none() {
+                return Ok(None);
+            }
+
+            count += 1;
+            if let Some(crate::storage::prefix_decode::DecodedNumericValue::Int(value)) = values.get(sum_position) {
+                sum = sum
+                    .checked_add(*value)
+                    .ok_or_else(|| Error::query_execution("integer overflow: BIGINT SUM"))?;
+                sum_seen = true;
+            }
+            match values.get(avg_position) {
+                Some(crate::storage::prefix_decode::DecodedNumericValue::Int(value)) => {
+                    avg_sum += *value as f64;
+                    avg_count += 1;
+                }
+                Some(crate::storage::prefix_decode::DecodedNumericValue::Float(value)) => {
+                    avg_sum += *value;
+                    avg_count += 1;
+                }
+                _ => {}
+            }
+        }
+
+        Ok(Some(Tuple::new(vec![
+            Value::Int8(count),
+            if sum_seen { Value::Int8(sum) } else { Value::Null },
+            if avg_count == 0 {
+                Value::Null
+            } else {
+                Value::Float8(avg_sum / avg_count as f64)
+            },
+        ])))
     }
 
     pub(crate) fn try_aggregate_row_columns(
