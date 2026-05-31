@@ -5,12 +5,15 @@ Usage:
   SQLITE_TPS_MODE=mem   SQLITE_TPS_N=50000 python3 sqlite_tps_mirror.py
   SQLITE_TPS_MODE=disk  SQLITE_TPS_N=50000 python3 sqlite_tps_mirror.py   # journal=DELETE, sync=FULL (durable default)
   SQLITE_TPS_MODE=wal   SQLITE_TPS_N=50000 python3 sqlite_tps_mirror.py   # WAL, sync=NORMAL (common prod)
+  SQLITE_TPS_BINDINGS=literal SQLITE_TPS_MODE=mem python3 sqlite_tps_mirror.py
 """
 import os, sqlite3, time, tempfile, shutil
 
 MODE = os.environ.get("SQLITE_TPS_MODE", "mem")
 N = int(os.environ.get("SQLITE_TPS_N", "50000"))
 M = int(os.environ.get("SQLITE_TPS_M", str(max(N // 5, 2000))))
+BINDINGS = os.environ.get("SQLITE_TPS_BINDINGS", "params").lower()
+USE_LITERAL_SQL = BINDINGS in ("literal", "literals", "sql", "text")
 
 def open_db(tmpdir):
     if MODE == "mem":
@@ -34,7 +37,8 @@ def bench(label, ops, fn):
 def main():
     tmp = tempfile.mkdtemp(prefix="sqlite_tps_")
     print("\n================ SQLite TPS suite ================")
-    print(f"mode={MODE}  N={N}  M={M}  sqlite={sqlite3.sqlite_version}")
+    binding_label = "literal_sql" if USE_LITERAL_SQL else "params"
+    print(f"mode={MODE}  bindings={binding_label}  N={N}  M={M}  sqlite={sqlite3.sqlite_version}")
     print("-" * 80)
     c = open_db(tmp)
     cur = c.cursor()
@@ -45,47 +49,78 @@ def main():
     def bulk_users():
         cur.execute("BEGIN")
         for i in range(N):
-            cur.execute("INSERT INTO users (id,name,email,age,balance) VALUES (?,?,?,?,?)",
-                        (i, f"User{i}", f"u{i}@ex.com", 18 + (i % 60), (i*7) % 100000))
+            if USE_LITERAL_SQL:
+                cur.execute(
+                    f"INSERT INTO users (id,name,email,age,balance) VALUES "
+                    f"({i},'User{i}','u{i}@ex.com',{18 + (i % 60)},{(i*7) % 100000})"
+                )
+            else:
+                cur.execute("INSERT INTO users (id,name,email,age,balance) VALUES (?,?,?,?,?)",
+                            (i, f"User{i}", f"u{i}@ex.com", 18 + (i % 60), (i*7) % 100000))
         c.commit()
     bench("bulk_insert_users(txn)", N, bulk_users)
 
     cur.execute("BEGIN")
     for i in range(N*2):
-        cur.execute("INSERT INTO orders (id,user_id,amount,status) VALUES (?,?,?,?)",
-                    (i, i % N, (i*13) % 5000, "paid" if i % 3 == 0 else "pending"))
+        status = "paid" if i % 3 == 0 else "pending"
+        if USE_LITERAL_SQL:
+            cur.execute(
+                f"INSERT INTO orders (id,user_id,amount,status) VALUES "
+                f"({i},{i % N},{(i*13) % 5000},'{status}')"
+            )
+        else:
+            cur.execute("INSERT INTO orders (id,user_id,amount,status) VALUES (?,?,?,?)",
+                        (i, i % N, (i*13) % 5000, status))
     c.commit()
 
     def autocommit_insert():
         for i in range(M):
             idx = N + i
-            cur.execute("INSERT INTO users (id,name,email,age,balance) VALUES (?,?,?,?,?)",
-                        (idx, f"AC{idx}", f"ac{idx}@ex.com", 33, 500))
+            if USE_LITERAL_SQL:
+                cur.execute(
+                    f"INSERT INTO users (id,name,email,age,balance) VALUES "
+                    f"({idx},'AC{idx}','ac{idx}@ex.com',33,500)"
+                )
+            else:
+                cur.execute("INSERT INTO users (id,name,email,age,balance) VALUES (?,?,?,?,?)",
+                            (idx, f"AC{idx}", f"ac{idx}@ex.com", 33, 500))
             c.commit()
     bench("autocommit_insert", M, autocommit_insert)
 
     def point_lookup():
         for i in range(M):
             idx = (i * 2654435761) % N
-            cur.execute("SELECT * FROM users WHERE id = ?", (idx,)).fetchall()
+            if USE_LITERAL_SQL:
+                cur.execute(f"SELECT * FROM users WHERE id = {idx}").fetchall()
+            else:
+                cur.execute("SELECT * FROM users WHERE id = ?", (idx,)).fetchall()
     bench("point_lookup_pk", M, point_lookup)
 
     hot_id = min(12345, N - 1)
     def point_lookup_hot():
         for _ in range(M):
-            cur.execute("SELECT * FROM users WHERE id = ?", (hot_id,)).fetchall()
+            if USE_LITERAL_SQL:
+                cur.execute(f"SELECT * FROM users WHERE id = {hot_id}").fetchall()
+            else:
+                cur.execute("SELECT * FROM users WHERE id = ?", (hot_id,)).fetchall()
     bench("point_lookup_hot", M, point_lookup_hot)
 
     def update_by_pk():
         for i in range(M):
             idx = (i * 40503) % N
-            cur.execute("UPDATE users SET balance = balance + 1 WHERE id = ?", (idx,))
+            if USE_LITERAL_SQL:
+                cur.execute(f"UPDATE users SET balance = balance + 1 WHERE id = {idx}")
+            else:
+                cur.execute("UPDATE users SET balance = balance + 1 WHERE id = ?", (idx,))
             c.commit()
     bench("update_by_pk", M, update_by_pk)
 
     def delete_by_pk():
         for i in range(M):
-            cur.execute("DELETE FROM users WHERE id = ?", (N + i,))
+            if USE_LITERAL_SQL:
+                cur.execute(f"DELETE FROM users WHERE id = {N + i}")
+            else:
+                cur.execute("DELETE FROM users WHERE id = ?", (N + i,))
             c.commit()
     bench("delete_by_pk", M, delete_by_pk)
 

@@ -1693,3 +1693,81 @@ clients willing to trade time travel and memory quota accounting for higher
 OLTP throughput. It moves bulk/autocommit insert and point lookup closer to the
 revised "surpass or similar" bar against SQLite, but it does not address the
 remaining UPDATE/DELETE and analytical row-store gaps.
+
+## Accepted Follow-Up: SQLite Literal-SQL Mirror Mode
+
+Finding:
+
+- The same-host SQLite mirror used bound parameters for write and lookup
+  shapes, while the default Nano TPS suite intentionally formats literal SQL
+  for its non-parameterized workload.
+- That made the default embedded in-memory write comparison mix two API shapes.
+  Nano's separate parameterized TPS harness remains the right comparison for
+  bound clients, but the literal harness needed a matching SQLite mode.
+
+Change:
+
+- Add `SQLITE_TPS_BINDINGS=literal` to
+  `benches/external/sqlite_tps_mirror.py`.
+- Default behavior remains `params`, preserving the previous SQLite best-path
+  mirror.
+- Document the two SQLite modes in `benches/external/README.md`.
+
+Validation:
+
+```text
+SQLITE_TPS_MODE=mem SQLITE_TPS_N=10000 SQLITE_TPS_M=2000 python3 benches/external/sqlite_tps_mirror.py
+SQLITE_TPS_BINDINGS=literal SQLITE_TPS_MODE=mem SQLITE_TPS_N=10000 SQLITE_TPS_M=2000 python3 benches/external/sqlite_tps_mirror.py
+HELIOS_TPS=1 HELIOS_TPS_MODE=mem HELIOS_TPS_N=10000 HELIOS_TPS_M=2000 cargo test --profile perf --test tps_workloads run_tps_suite -- --nocapture --test-threads=1
+```
+
+Focused result, embedded mem, `N=10000`, `M=2000`, ops/s:
+
+```text
+Nano literal rowstore     bulk 137,556/s, autocommit insert 103,300/s, lookup 322,378/s, hot lookup 1,490,923/s, update 113,950/s, delete 140,218/s
+SQLite params             bulk 499,496/s, autocommit insert 229,233/s, lookup 323,115/s, hot lookup 350,767/s, update 241,284/s, delete 267,989/s
+SQLite literal SQL        bulk 133,613/s, autocommit insert 96,196/s, lookup 79,605/s, hot lookup 305,308/s, update 98,366/s, delete 126,983/s
+```
+
+Interpretation: the default literal-SQL write/lookup comparison is much closer
+than the prior table implied; Nano is similar to or ahead of SQLite when SQLite
+is driven through literal SQL too. SQLite's bound-parameter write path is still
+the best-path comparison, so Nano's `run_param_tps_suite` remains important for
+client APIs that can bind parameters. The residual SQLite goal gap is now more
+clearly concentrated in parameterized UPDATE/DELETE and embedded analytical
+scan/join execution rather than the default literal SQL path.
+
+## Rejected Follow-Up: Compact Build Payload For Projected Hash Join
+
+Experiment:
+
+- Added a temporary specialized inner equi-join for `Project(Join(...))`.
+- The generic projected hash join already avoids emitting a full joined row,
+  but still stores full build-side tuples. The experiment stored only the
+  build-side values referenced by the final projection and emitted from a
+  compact payload.
+- It was gated with a temporary `HELIOS_DISABLE_FAST_PROJECTED_JOIN=1` kill
+  switch while testing.
+
+Validation:
+
+```text
+cargo check --lib
+cargo test --test join_hardening_tests -- --nocapture --test-threads=1
+```
+
+Correctness passed (`join_hardening_tests` 45/45), but TPS was noise-level or
+slightly worse:
+
+```text
+focused join, compact payload       64/s
+focused join, old projected join    63/s
+mixed analytics, compact payload    filter 240/s, aggregate 586/s, group 170/s, join 65/s, Top-N 455/s
+mixed analytics, old projected join filter 237/s, aggregate 564/s, group 174/s, join 67/s, Top-N 463/s
+```
+
+Conclusion: the remaining join gap is not caused mainly by retaining unused
+build-side tuple values after the existing projected join optimization. The
+useful next join work needs to move earlier in the pipeline: compact/vectorized
+scan-filter-probe flow, better hash-table/probe layout, or a batch-oriented
+join executor. The experimental code was reverted before handoff.
