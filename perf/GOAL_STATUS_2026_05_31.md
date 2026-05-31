@@ -2358,3 +2358,44 @@ modest but repeatable enough to keep because it targets the measured join
 payload path and falls back for unsupported cases. SQLite still leads the
 mirrored in-memory join by a wide margin, so the broader pipeline work remains
 open.
+
+## Accepted Follow-Up: Byte-Level String Predicate Compare
+
+Finding:
+
+- The string equality projected-filtered scan path avoided projection decode
+  for rejected rows, but still materialized `Value::String` for every row just
+  to evaluate the predicate.
+- In the TPS join input, that meant allocating/decoding `orders.status` for all
+  order rows before rejecting two thirds of them.
+
+Change:
+
+- Add `tuple_string_column_eq()` to the row prefix decoder.
+- It walks the row blob to one string column and compares the encoded UTF-8
+  bytes directly with the literal.
+- The projected string-filter scan now uses that helper before decoding
+  projected output columns.
+- Unsupported encodings return `None`, preserving the existing fallback path.
+
+Validation:
+
+```text
+cargo check --lib
+cargo test --lib storage::prefix_decode::tests::compact_string_eq_compares_without_materializing_value -- --nocapture
+cargo test --test scan_prefix_decode -- --nocapture --test-threads=1
+```
+
+Focused TPS, embedded mem, `N=10000`, `M=2000`, ops/s:
+
+```text
+pre-helper string path range     join_users_orders 83-86/s
+focused join after helper        join_users_orders 96/s
+mixed run                        filter_scan 231/s, aggregate 552/s, join 95/s
+full analytics run               filter_scan 229/s, aggregate 524/s, group_by 176/s, join 89/s, Top-N 438/s
+```
+
+Interpretation: this is the strongest of the recent join-input micro-pipeline
+wins because it removes allocation from the rejected-row predicate path. The
+full analytics run remains noisy, but the focused and mixed join measurements
+show a clear improvement over the previous 83-86/s string path range.
