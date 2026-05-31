@@ -635,6 +635,15 @@ fn primitive_integer_data_type(data_type: &crate::DataType) -> bool {
     )
 }
 
+fn int_value_for_data_type(data_type: &crate::DataType, value: i64) -> Option<Value> {
+    match data_type {
+        crate::DataType::Int2 => i16::try_from(value).ok().map(Value::Int2),
+        crate::DataType::Int4 => i32::try_from(value).ok().map(Value::Int4),
+        crate::DataType::Int8 => Some(Value::Int8(value)),
+        _ => None,
+    }
+}
+
 fn row_blob_fast_skip_supported(data_type: &crate::DataType) -> bool {
     !matches!(
         data_type,
@@ -2348,22 +2357,42 @@ impl StorageEngine {
         asc: bool,
         k: usize,
     ) -> Result<Option<Vec<Tuple>>> {
-        let mut output_decode_columns = output_columns.to_vec();
+        let mut output_decode_columns: Vec<usize> = output_columns
+            .iter()
+            .copied()
+            .filter(|&column| column != sort_column)
+            .collect();
         output_decode_columns.sort_unstable();
         output_decode_columns.dedup();
 
-        let output_pos = |column_index: usize| -> Result<usize> {
-            output_decode_columns.binary_search(&column_index).map_err(|_| {
-                Error::storage(format!(
-                    "Column index {} missing from integer Top-N output set for {}",
-                    column_index, table_name
-                ))
-            })
+        enum IntTopKOutputSource {
+            SortKey,
+            Decoded(usize),
+        }
+
+        let output_source = |column_index: usize| -> Result<IntTopKOutputSource> {
+            if column_index == sort_column {
+                return Ok(IntTopKOutputSource::SortKey);
+            }
+            output_decode_columns
+                .binary_search(&column_index)
+                .map(IntTopKOutputSource::Decoded)
+                .map_err(|_| {
+                    Error::storage(format!(
+                        "Column index {} missing from integer Top-N output set for {}",
+                        column_index, table_name
+                    ))
+                })
         };
-        let output_positions: Vec<usize> = output_columns
+        let output_sources: Vec<IntTopKOutputSource> = output_columns
             .iter()
-            .map(|&idx| output_pos(idx))
+            .map(|&idx| output_source(idx))
             .collect::<Result<Vec<_>>>()?;
+        let sort_column_type = &schema
+            .columns
+            .get(sort_column)
+            .ok_or_else(|| Error::storage(format!("Column index {} out of bounds for {}", sort_column, table_name)))?
+            .data_type;
 
         let prefix = format!("data:{}:", table_name);
         let prefix_bytes = prefix.as_bytes();
@@ -2407,7 +2436,24 @@ impl StorageEngine {
 
                 let output_values =
                     self.decode_rowstore_column_values(&raw_value, &output_decode_columns, schema.columns.len())?;
-                let mut tuple = build_projected_tuple(&output_values, &output_positions);
+                let mut projected_values = Vec::with_capacity(output_sources.len());
+                for source in &output_sources {
+                    match source {
+                        IntTopKOutputSource::SortKey => {
+                            let value = int_value_for_data_type(sort_column_type, sort_key).ok_or_else(|| {
+                                Error::storage(format!(
+                                    "Integer Top-N sort key out of range for column {} on {}",
+                                    sort_column, table_name
+                                ))
+                            })?;
+                            projected_values.push(value);
+                        }
+                        IntTopKOutputSource::Decoded(pos) => {
+                            projected_values.push(output_values.get(*pos).cloned().unwrap_or(Value::Null));
+                        }
+                    }
+                }
+                let mut tuple = Tuple::new(projected_values);
                 if let Some(row_id) = Self::parse_row_id_after_prefix(&key, prefix_bytes.len()) {
                     tuple.row_id = Some(row_id);
                 }

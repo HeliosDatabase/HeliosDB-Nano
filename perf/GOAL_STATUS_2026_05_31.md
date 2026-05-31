@@ -274,3 +274,42 @@ after change run 2                   join_users_orders 57/s
 ```
 
 This is another modest executor win. It narrows the join gap, but SQLite still leads the mirrored workload at about 201/s, so the main remaining lever is still compact/vectorized scan/filter/join execution.
+
+## Accepted Follow-Up: Reuse Integer Top-N Sort Key In Projection
+
+Commit after this report: `perf: reuse integer top-n sort key for projected output`.
+
+Finding:
+
+- The integer Top-N path decoded the integer sort key for every row, then decoded the same sort column again for heap candidates when the sort column was also part of the projection.
+- The mirrored TPS query is this shape: `SELECT id, balance FROM users ORDER BY balance DESC LIMIT 10`.
+
+Change:
+
+- `src/storage/engine.rs` now reuses the already-decoded integer sort key for projected output columns matching the sort column.
+- Other projected columns are still decoded from row storage, and the output value keeps the schema's integer width (`Int2`, `Int4`, or `Int8`).
+
+Validation:
+
+```text
+cargo check --lib
+cargo test --test pagination_tests -- --nocapture --test-threads=1
+cargo test --test query_optimizer_tests -- --nocapture
+HELIOS_TPS=1 HELIOS_TPS_MODE=mem HELIOS_TPS_N=10000 HELIOS_TPS_M=2000 \
+  cargo test --profile perf --test tps_workloads run_tps_suite -- --nocapture --test-threads=1
+```
+
+Measured in-memory TPS, `N=10000`, `M=2000`, time-travel on:
+
+```text
+baseline recent range                 order_by_limit10 241-256/s
+after change run 1                    order_by_limit10 275/s
+after change run 2                    order_by_limit10 241/s
+after change run 3                    order_by_limit10 287/s
+```
+
+This is a noisy but positive Top-N improvement. SQLite still leads this mirrored workload at about 461/s.
+
+Rejected during this pass:
+
+- Hash-join build hash-table pre-sizing from existing row estimates. Correctness-clean (`join_hardening_tests` 45/45), but TPS was mixed/regressed: `join_users_orders` 54/s then 58/s and scan/aggregate numbers fell versus the current committed range. Reverted.
