@@ -70,9 +70,10 @@ def main():
             cur.execute("SELECT * FROM users WHERE id = ?", (idx,)).fetchall()
     bench("point_lookup_pk", M, point_lookup)
 
+    hot_id = min(12345, N - 1)
     def point_lookup_hot():
         for _ in range(M):
-            cur.execute("SELECT * FROM users WHERE id = 12345").fetchall()
+            cur.execute("SELECT * FROM users WHERE id = ?", (hot_id,)).fetchall()
     bench("point_lookup_hot", M, point_lookup_hot)
 
     def update_by_pk():
