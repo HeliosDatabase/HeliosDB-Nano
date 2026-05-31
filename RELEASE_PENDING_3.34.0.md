@@ -58,6 +58,13 @@ regressions from the release batch.
   - this is a guarded extension of the projected join path and falls back for
     outer/lateral joins, unqualified or complex expressions, subqueries, and
     already-projected inputs.
+- Filtered scan dispatch improvement:
+  - repeated simple projected `FilteredScan` plans can now call the compact
+    storage projected-filtered scan primitive directly from the cached-plan
+    path;
+  - this is gated to simple column-vs-non-NULL literal comparisons and avoids
+    `!=` because the storage predicate helper is not SQL-NULL-safe for that
+    operator.
 
 ## Release-Gate Fixes
 
@@ -98,8 +105,9 @@ caveats are explicit. Current status:
   batched DELETE versus SQLite params at about 491k/s bulk insert, 310k/s
   lookup, 243k/s UPDATE, and 266k/s DELETE. Row-store analytics remain behind
   SQLite on filter, aggregate, and join, although the final projected
-  `FilteredScan` and compact join-input follow-ups nudged row-store filter to
-  about 226-229/s and join to about 74-76/s. The gated columnar profile wins
+  `FilteredScan`, cached projected-filtered scan dispatch, and compact
+  join-input follow-ups nudged row-store filter to about 224-235/s in focused
+  runs and join to about 74-76/s. The gated columnar profile wins
   the aggregate shape but not the full analytics set.
 
 This means the release meets the revised acceptance bar for publication:

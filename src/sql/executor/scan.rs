@@ -156,7 +156,7 @@ fn should_apply_columnar_predicates(predicates: &[AnalyzedPredicate]) -> bool {
         })
 }
 
-fn storage_predicates_are_sql_safe(schema: &Schema, predicates: &[AnalyzedPredicate]) -> bool {
+pub(crate) fn storage_predicates_are_sql_safe(schema: &Schema, predicates: &[AnalyzedPredicate]) -> bool {
     predicates.iter().all(|predicate| {
         let Some(column) = schema.columns.get(predicate.column_index) else {
             return false;
