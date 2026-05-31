@@ -316,6 +316,10 @@ post-close predicate-first integer filtered scan gate
   HELIOS_TPS=1 HELIOS_TPS_MODE=mem HELIOS_TPS_WORKLOADS=filter_scan,agg_count_sum_avg,group_by_status,join_users_orders,order_by_limit10 HELIOS_TPS_N=10000 HELIOS_TPS_M=2000 cargo test --profile perf --test tps_workloads run_tps_suite -- --nocapture --test-threads=1
     full focused analytics: filter_scan 235/s, aggregate 524/s,
     group_by_status 179/s, join_users_orders 82/s, order_by_limit10 477/s
+  cargo package
+    passed; packaged 706 files, 12.8 MiB uncompressed, 2.5 MiB compressed
+  cargo publish --dry-run
+    passed; dry-run aborted before upload as expected
 ```
 
 ## Recommended Publish Commands
