@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [3.33.1] - 2026-05-27
 
+### Performance — TPS release batch
+
+- Added fast-path DML and executor improvements that move the default release
+  substantially closer to the revised TPS goal. The current measured Docker
+  PG-wire mirror has Nano ahead of PostgreSQL and MariaDB on the repeated
+  write, lookup, and read/analytics shapes. SQLite remains the hard comparison
+  for default embedded in-memory analytics.
+- Added fast SELECT routing for `query_with_columns()`, shared deterministic
+  result-cache reuse for PostgreSQL simple-query reads, no-clone cached-row
+  protocol encoding, and batched PostgreSQL DataRow streaming.
+- Added row-store and executor hot-path reductions for primitive aggregates,
+  Top-N projection, projected inner hash-join output, direct projection moves,
+  row-cache invalidation misses, no-index UPDATE moves, and DELETE logical-WAL
+  key deferral.
+- Added columnar analytics diagnostics and improvements: columnar range
+  predicate pushdown, direct columnar Top-N, and small-group/direct
+  `COUNT(*)` + `SUM(integer)` grouped aggregate handling.
+- Added benchmark harness support for Dockerized PostgreSQL/MariaDB client
+  comparisons and explicit embedded in-memory profiles:
+  `HELIOS_TPS_EMBEDDED_PROFILE=columnar_analytics` and
+  `HELIOS_TPS_EMBEDDED_PROFILE=oltp_fast`.
+
+### Release notes
+
+- Crates.io currently has `heliosdb-nano` `3.33.0` as the latest published
+  version, so this verified release candidate can publish as `3.33.1`.
+- Known deferred items for this release are documented in
+  `RELEASE_PENDING_3.33.1.md`: TRUNCATE affected-row count semantics and HNSW
+  tombstone/physical-count test semantics. They are pre-existing and are not
+  regressions from the TPS batch.
+
+### Fixed — Release gate
+
+- Kept `FilteredScan` correct for planner-backed system views by materializing
+  `sqlite_master` and `information_schema.*` views before applying pushed-down
+  filters.
+- Gated storage predicate pushdown to type-exact predicates and fell back to the
+  SQL evaluator for mixed/coercive comparisons, restoring string-to-int,
+  int-to-decimal, decimal range/IN, date/timestamp string, and UUID string
+  `WHERE` behavior.
+- Fixed a timing-fragile benchmark assertion by computing transaction overhead
+  from nanoseconds instead of millisecond-truncated durations.
+
 ### Fixed — Engine FR batch for FK loading, DML routing, Unicode, and MCP tools
 
 - Wired `SET bulk_load_mode = true|false` and `RESET bulk_load_mode` to the storage engine, and deduplicated deferred FK parent probes at commit by referenced table, referenced columns, and parent key.

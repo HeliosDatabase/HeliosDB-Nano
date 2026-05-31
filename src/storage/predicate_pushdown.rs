@@ -567,7 +567,10 @@ impl PredicatePushdownManager {
         let mut matching_tuples = Vec::with_capacity(limit.map_or(total_count, |lim| lim.min(total_count)));
 
         for (tuple_idx, tuple) in tuples.into_iter().enumerate() {
-            if candidate_set.as_ref().is_some_and(|candidates| !candidates.contains(&tuple_idx)) {
+            if candidate_set
+                .as_ref()
+                .is_some_and(|candidates| !candidates.contains(&tuple_idx))
+            {
                 continue;
             }
 

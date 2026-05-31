@@ -553,7 +553,8 @@ where
             let (col_name, value) = Self::resolve_show_parameter(param);
             let schema = Schema::new(vec![crate::Column::new(&col_name, crate::DataType::Text)]);
             let row = Tuple::new(vec![Value::String(value)]);
-            self.send_query_result(schema, vec![row]).await?;
+            let rows = vec![row];
+            self.send_query_result(schema, &rows).await?;
             self.send_ready_for_query().await?;
             return Ok(());
         } else if starts_with_icase(trimmed, "PRAGMA ") || trimmed.eq_ignore_ascii_case("PRAGMA") {
@@ -579,7 +580,7 @@ where
                             crate::Column::new("dflt_value", crate::DataType::Text),
                             crate::Column::new("pk", crate::DataType::Int4),
                         ]);
-                        self.send_query_result(schema, rows).await?;
+                        self.send_query_result(schema, &rows).await?;
                         self.send_ready_for_query().await?;
                         return Ok(());
                     }
@@ -744,7 +745,8 @@ where
 
         // Check for pg_catalog queries
         if let Some(result) = self.catalog.handle_query(query)? {
-            self.send_query_result(result.0, result.1).await?;
+            let (schema, rows) = result;
+            self.send_query_result(schema, &rows).await?;
             self.send_ready_for_query().await?;
             return Ok(());
         }
@@ -760,38 +762,14 @@ where
         };
 
         if is_select {
-            let (results, columns) = self.database.query_with_columns(query)?;
-            let schema = if !columns.is_empty() {
-                Schema::new(
-                    columns
-                        .iter()
-                        .enumerate()
-                        .map(|(i, name)| {
-                            let data_type = results
-                                .first()
-                                .and_then(|r| r.values.get(i))
-                                .map(Value::data_type)
-                                .unwrap_or(crate::DataType::Text);
-                            crate::Column {
-                                name: name.clone(),
-                                data_type,
-                                nullable: true,
-                                primary_key: false,
-                                source_table: None,
-                                source_table_name: None,
-                                default_expr: None,
-                                unique: false,
-                                storage_mode: crate::ColumnStorageMode::Default,
-                            }
-                        })
-                        .collect(),
-                )
-            } else if !results.is_empty() {
-                results[0].schema()
+            if let Some((cached_results, columns)) = self.database.try_cached_query_with_columns(query) {
+                let schema = Self::schema_from_query_columns(&columns, cached_results.as_slice());
+                self.send_query_result(schema, cached_results.as_slice()).await?;
             } else {
-                Schema::new(vec![])
-            };
-            self.send_query_result(schema, results).await?;
+                let (results, columns) = self.database.query_with_columns(query)?;
+                let schema = Self::schema_from_query_columns(&columns, &results);
+                self.send_query_result(schema, &results).await?;
+            }
         } else if is_dml_returning {
             // DML with RETURNING clause - returns rows like a query
             let (affected, tuples) = self.database.execute_returning(query)?;
@@ -808,7 +786,7 @@ where
                         Schema::new(vec![])
                     }
                 });
-                self.send_query_result(schema, tuples).await?;
+                self.send_query_result(schema, &tuples).await?;
             }
         } else {
             let affected = self.database.execute(query)?;
@@ -818,6 +796,39 @@ where
 
         self.send_ready_for_query().await?;
         Ok(())
+    }
+
+    fn schema_from_query_columns(columns: &[String], rows: &[Tuple]) -> Schema {
+        if !columns.is_empty() {
+            Schema::new(
+                columns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, name)| {
+                        let data_type = rows
+                            .first()
+                            .and_then(|r| r.values.get(i))
+                            .map(Value::data_type)
+                            .unwrap_or(crate::DataType::Text);
+                        crate::Column {
+                            name: name.clone(),
+                            data_type,
+                            nullable: true,
+                            primary_key: false,
+                            source_table: None,
+                            source_table_name: None,
+                            default_expr: None,
+                            unique: false,
+                            storage_mode: crate::ColumnStorageMode::Default,
+                        }
+                    })
+                    .collect(),
+            )
+        } else if !rows.is_empty() {
+            rows[0].schema()
+        } else {
+            Schema::new(vec![])
+        }
     }
 
     // Extended protocol methods are in handler_extended.rs module
@@ -963,14 +974,31 @@ where
     }
 
     /// Send query results
-    async fn send_query_result(&mut self, schema: Schema, rows: Vec<Tuple>) -> Result<()> {
+    async fn send_query_result(&mut self, schema: Schema, rows: &[Tuple]) -> Result<()> {
         // Send RowDescription
         let fields = schema_to_field_descriptions(&schema);
         self.send_message(BackendMessage::RowDescription { fields }).await?;
 
-        // Send DataRows (direct encoding avoids intermediate Vec allocations)
-        for row in &rows {
-            self.send_data_row_direct(row).await?;
+        // Encode DataRows into chunks before writing. This keeps the direct
+        // Tuple encoder while avoiding one async write per result row.
+        const DATA_ROW_FLUSH_AT: usize = 64 * 1024;
+        self.write_buf.clear();
+        for row in rows {
+            self.encode_data_row_direct(row);
+            if self.write_buf.len() >= DATA_ROW_FLUSH_AT {
+                self.stream
+                    .write_all(&self.write_buf)
+                    .await
+                    .map_err(|e| Error::network(format!("Failed to send query rows: {}", e)))?;
+                self.write_buf.clear();
+            }
+        }
+        if !self.write_buf.is_empty() {
+            self.stream
+                .write_all(&self.write_buf)
+                .await
+                .map_err(|e| Error::network(format!("Failed to send query rows: {}", e)))?;
+            self.write_buf.clear();
         }
 
         // Send CommandComplete
@@ -1029,11 +1057,10 @@ where
         Ok(())
     }
 
-    /// Encode and send a DataRow directly from a Tuple, avoiding intermediate Vec allocations.
+    /// Encode a DataRow directly from a Tuple, avoiding intermediate Vec allocations.
     /// Uses length-prefix backpatching: writes placeholder, encodes values, then patches the length.
     #[allow(clippy::indexing_slicing)] // length_pos and count_pos are set by us, always valid
-    async fn send_data_row_direct(&mut self, tuple: &Tuple) -> Result<()> {
-        self.write_buf.clear();
+    fn encode_data_row_direct(&mut self, tuple: &Tuple) {
         self.write_buf.put_u8(b'D');
 
         // Reserve space for message length (4 bytes) — will be backpatched
@@ -1199,12 +1226,6 @@ where
         // Backpatch the message length (excludes the type byte, includes itself)
         let msg_len = (self.write_buf.len() - length_pos) as i32;
         self.write_buf[length_pos..length_pos + 4].copy_from_slice(&msg_len.to_be_bytes());
-
-        self.stream
-            .write_all(&self.write_buf)
-            .await
-            .map_err(|e| Error::network(format!("Failed to send message: {}", e)))?;
-        Ok(())
     }
 
     /// Flush all buffered writes to the client.

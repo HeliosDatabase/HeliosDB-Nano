@@ -1997,7 +1997,12 @@ mod tests {
         let rule = JoinPredicatePushdownRule::new();
         let estimator = CostEstimator::new(StatsCatalog::new());
         let on = binary(col("l", "id"), BinaryOperator::Eq, col("r", "id"));
-        let plan = make_join(make_filtered_scan("left_table", "l"), make_scan("r"), Some(on), JoinType::Inner);
+        let plan = make_join(
+            make_filtered_scan("left_table", "l"),
+            make_scan("r"),
+            Some(on),
+            JoinType::Inner,
+        );
         let result = rule.apply(plan, &estimator).unwrap();
         assert!(
             result.is_none(),

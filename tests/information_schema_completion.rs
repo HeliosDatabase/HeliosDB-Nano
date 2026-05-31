@@ -96,7 +96,9 @@ fn referential_constraints_view_exposes_real_fk_metadata() {
 
     // Served by the planner-backed SystemViewRegistry (legacy interception removed).
     let (rows, cols) = db
-        .query_with_columns("SELECT * FROM information_schema.referential_constraints WHERE constraint_schema = 'public'")
+        .query_with_columns(
+            "SELECT * FROM information_schema.referential_constraints WHERE constraint_schema = 'public'",
+        )
         .expect("query");
 
     assert_eq!(rows.len(), 1, "expected exactly one FK row, got {}", rows.len());

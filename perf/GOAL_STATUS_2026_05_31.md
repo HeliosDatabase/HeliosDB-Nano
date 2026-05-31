@@ -2,15 +2,117 @@
 
 Date: 2026-05-31
 Branch: `codex-next-write-tps`
-Nano commit: `bdd3ba5 perf: skip nondeterministic scan for uncached fast selects`
+Nano commit: `ce5efc0 perf: fuse primitive count sum avg aggregate` plus current worktree changes
 
-Objective: HeliosDB-Nano should have a few times better overall performance than PostgreSQL, MySQL, and SQLite.
+Objective: HeliosDB-Nano should have a few times better overall performance than PostgreSQL, MySQL, and SQLite. As of the latest user clarification, surpassing or being similar to those systems on the benchmark set is acceptable when the caveats are stated clearly.
 
 ## Current Evidence
 
-The goal is not complete. On this host, Nano is far ahead of SQLite on durable autocommit writes and now beats same-host PostgreSQL/MariaDB Docker-client read/analytics smoke runs, but SQLite is still faster on most in-memory analytical workloads in the mirrored TPS suite.
+The goal is not complete. On this host, embedded Nano is far ahead on durable autocommit writes and has narrowed several in-memory analytical gaps. The latest Docker PG-wire apples-to-apples checks now show Nano beating PostgreSQL and MariaDB on the mirrored write, lookup, and repeated read/analytics shapes after routing `query_with_columns()` through the fast SELECT path, plan/result-cache reuse, no-clone cached-row protocol encoding, and batched DataRow streaming. Under the revised "surpass or similar is acceptable" bar, the Docker PostgreSQL/MariaDB comparison is close to satisfied for this repeated-query mirror. SQLite remains the main open gap: Nano is similar or better on random/hot lookup, group-by, and Top-N, but SQLite is still materially faster on default embedded in-memory bulk/autocommit writes, update/delete, filter scan, aggregate, and join.
 
 Host `psql` / `mysql` clients are not installed, so `benches/external/docker_sql_tps_mirror.py` was added to drive `psql` / `mariadb` inside existing Docker containers without Python DB drivers.
+
+## Latest Docker Client-Container Gate
+
+The earlier PostgreSQL/MariaDB comparison mixed embedded Nano with Docker-hosted PostgreSQL/MariaDB clients. The latest gate uses Dockerized clients for all three systems. The harness now supports:
+
+- `--client-mode exec`: existing behavior, run the SQL client inside the server container.
+- `--client-mode network-container`: smoke-test mode, start a fresh client container per workload.
+- `--client-mode client-container`: preferred apples-to-apples mode, exec into a long-lived client container sharing the server container's network namespace.
+
+Read/analytics, `N=10000`, `M=2000`, ops/s:
+
+| Workload | Nano PG wire | PostgreSQL Docker | MariaDB Docker | Current winner |
+|---|---:|---:|---:|---|
+| filter_scan(age>50) | 108 | 89 | 92 | Nano, narrow |
+| agg_count_sum_avg | 184 | 162 | 114 | Nano, narrow |
+| group_by_status | 175 | 104 | 15 | Nano |
+| join_users_orders | 67 | 39 | 34 | Nano |
+| order_by_limit10 | 192 | 138 | 119 | Nano |
+
+Write/lookup, `N=10000`, `M=2000`, ops/s:
+
+| Workload | Nano PG wire | PostgreSQL Docker | MariaDB Docker | Current winner |
+|---|---:|---:|---:|---|
+| bulk_insert_users(txn) | 56,739 | 33,482 | 2,727 | Nano |
+| autocommit_insert | 9,585 | 25 | 25 | Nano |
+| point_lookup_pk | 8,657 | 5,201 | 6,560 | Nano |
+| point_lookup_hot | 9,720 | 5,409 | 6,631 | Nano |
+| update_by_pk | 9,034 | 25 | 25 | Nano |
+| delete_by_pk | 9,762 | 26 | 26 | Nano |
+
+Interpretation:
+
+- Nano's write lead survives the Docker PG-wire comparison.
+- Nano's PG-wire point lookup bottleneck was fixed in the current worktree by adding a fast SELECT path to `query_with_columns()`, which is what the PostgreSQL protocol simple-query handler calls.
+- Reusing the optimized plan cache in `query_with_columns()` improved repeated PG-wire read/analytics runs.
+- Sharing `query()`'s deterministic result cache with `query_with_columns()` removed a PG-wire-only repeated-query gap: repeated simple-query reads now reuse the same invalidated-on-DML result cache as embedded reads.
+- The PostgreSQL protocol handler now consumes cached `Arc<Vec<Tuple>>` rows by slice, avoiding a full cached-row vector clone before DataRow encoding.
+- Batching encoded PostgreSQL DataRows into 64 KiB chunks improved result-heavy PG-wire scans without changing the query result format.
+- The next non-embedded target is cold or varying PG-wire read/analytics execution. The repeated-SQL Docker mirror now wins or is similar enough under the revised acceptance bar, but it is cache-friendly and should not be presented as proof of arbitrary SQL speed.
+
+## Embedded In-Memory Columnar Profile Gate
+
+`tests/tps_workloads.rs` now has an explicit in-memory-only diagnostic profile:
+
+```bash
+HELIOS_TPS=1 HELIOS_TPS_MODE=mem \
+HELIOS_TPS_EMBEDDED_PROFILE=columnar_analytics \
+HELIOS_TPS_WORKLOADS=filter_scan,agg_count_sum_avg,group_by_status,join_users_orders,order_by_limit10 \
+HELIOS_TPS_N=10000 HELIOS_TPS_M=2000 \
+cargo test --release --test tps_workloads run_tps_suite -- --nocapture --test-threads=1
+```
+
+It declares analytical columns as `STORAGE COLUMNAR` and uses columnar-friendly projections for the scan/Top-N shapes. This is intentionally gated to `HELIOS_TPS_MODE=mem`; it is not a default engine behavior.
+
+Latest A/B, embedded in-memory, `N=10000`, `M=2000`, ops/s:
+
+| Workload | Row-store profile | Columnar analytics profile | Result |
+|---|---:|---:|---|
+| filter_scan(age>50) | 232 | 232-255 | Similar after columnar range pushdown |
+| agg_count_sum_avg | 558 | 1,937-2,174 | Columnar 3.5-3.9x faster |
+| group_by_status | 162 | 116-137 | Columnar slower, improved |
+| join_users_orders | 59 | 55-57 | Columnar slower/similar |
+| order_by_limit10 | 487 | 224-232 | Columnar slower, improved |
+
+Conclusion: the existing columnar path is a valid special mode for numeric
+aggregate-heavy embedded in-memory workloads, and simple range predicates now
+push into the columnar scan instead of materializing all rows first. Small-group
+columnar aggregation now reduces the text `GROUP BY` penalty, but the profile is
+still not a broad replacement for the row-store profile. The next columnar work
+should focus on join/filter integration and making Top-N competitive with
+row-store before presenting it as a general TPS mode.
+
+`HELIOS_TPS_EMBEDDED_PROFILE=oltp_fast` is a second in-memory-only diagnostic
+profile for the OLTP ceiling. It keeps the row-store schema, defaults
+`time_travel_enabled=false`, and disables benchmark memory-quota accounting.
+This is not the default product profile; it is a gated apples-to-apples probe
+for embedded clients that do not need time travel.
+
+Focused OLTP profile A/B, embedded in-memory, `N=10000`, `M=2000`, ops/s:
+
+| Workload | Row-store default | `oltp_fast` | Result |
+|---|---:|---:|---|
+| bulk_insert_users(txn) | 135,979 | 177,981 | `oltp_fast` 1.3x |
+| autocommit_insert | 90,514 | 166,859 | `oltp_fast` 1.8x |
+| point_lookup_pk | 263,388 | 349,700 | `oltp_fast` 1.3x |
+| update_by_pk | 106,977 | 116,481 | `oltp_fast` 1.1x |
+| delete_by_pk | 139,639 | 137,440 | Similar/no gain |
+
+Parameterized `oltp_fast` spot check:
+
+| Workload | ops/s |
+|---|---:|
+| param_execute_many_insert | 482,609 |
+| param_autocommit_insert | 207,435 |
+| param_point_lookup_pk | 367,178 |
+| param_update_by_pk | 114,687 |
+| param_delete_by_pk | 145,171 |
+
+Conclusion: this formalizes a valid gated in-memory OLTP profile and narrows the
+default write comparison, especially for single-row insert and point lookup.
+It does not close UPDATE/DELETE, so those remain real engine gaps rather than
+only time-travel or benchmark quota artifacts.
 
 ## Same-Host SQLite Comparison
 
@@ -34,30 +136,36 @@ SQLITE_TPS_MODE=disk SQLITE_TPS_N=10000 SQLITE_TPS_M=2000 \
 
 | Workload | Nano ops/s | SQLite ops/s | Current winner |
 |---|---:|---:|---|
-| bulk_insert_users(txn) | 125,704 | 505,670 | SQLite 4.0x |
-| autocommit_insert | 99,459 | 223,369 | SQLite 2.2x |
-| point_lookup_pk | 280,066 | 323,920 | SQLite 1.2x |
-| point_lookup_hot | 1,658,229 | 590,571 | Nano 2.8x |
-| update_by_pk | 109,626 | 244,657 | SQLite 2.2x |
-| delete_by_pk | 131,518 | 266,922 | SQLite 2.0x |
-| filter_scan(age>50) | 171 | 381 | SQLite 2.2x |
-| agg_count_sum_avg | 340 | 969 | SQLite 2.8x |
-| group_by_status | 148 | 167 | SQLite 1.1x |
-| join_users_orders | 53 | 201 | SQLite 3.8x |
-| order_by_limit10 | 207 | 461 | SQLite 2.2x |
+| bulk_insert_users(txn) | 130,058 | 521,083 | SQLite 4.0x |
+| autocommit_insert | 100,242 | 225,028 | SQLite 2.2x |
+| point_lookup_pk | 315,107 | 302,335 | Nano, similar |
+| point_lookup_hot | 1,421,218 | 349,595 | Nano 4.1x |
+| update_by_pk | 110,310 | 240,940 | SQLite 2.2x |
+| delete_by_pk | 137,325 | 261,025 | SQLite 1.9x |
+| filter_scan(age>50) | 186 | 382 | SQLite 2.1x |
+| agg_count_sum_avg | 424 | 908 | SQLite 2.1x |
+| group_by_status | 162 | 183 | SQLite, similar |
+| join_users_orders | 59 | 218 | SQLite 3.7x |
+| order_by_limit10 | 371 | 450 | SQLite, similar |
 
 Parameterized Nano with time-travel disabled shows the write-path ceiling:
 
 | Workload | Nano ops/s |
 |---|---:|
-| param_bulk_insert(txn) | 205,799 |
-| param_execute_many_insert | 521,930 |
-| param_autocommit_insert | 196,916 |
-| param_point_lookup_pk | 353,796 |
-| param_update_by_pk | 121,366 |
-| param_delete_by_pk | 138,876 |
+| param_bulk_insert(txn) | 217,234 |
+| param_execute_many_insert | 534,679 |
+| param_autocommit_insert | 218,044 |
+| param_point_lookup_pk | 377,832 |
+| param_update_by_pk | 120,866 |
+| param_delete_by_pk | 146,655 |
 
-This means the in-memory write gap is heavily tied to default time-travel/MVCC version maintenance and per-row DML overhead, not just RocksDB.
+This means the in-memory INSERT/lookup gap is heavily tied to API shape and
+time-travel/MVCC version maintenance: Nano's bound-parameter `execute_many`
+path with time travel off slightly beats the SQLite bound-parameter bulk insert
+mirror on this run (534k/s vs 521k/s), and parameterized autocommit insert is
+similar (218k/s vs 225k/s). UPDATE/DELETE still lag SQLite by roughly 2x even
+with time travel off, so they remain a real engine gap rather than only a
+literal-SQL measurement artifact.
 
 ### Durable Disk Mode
 
@@ -75,9 +183,9 @@ This means the in-memory write gap is heavily tied to default time-travel/MVCC v
 | join_users_orders | 52 | 230 | SQLite 4.4x |
 | order_by_limit10 | 215 | 426 | SQLite 2.0x |
 
-## Same-Host PostgreSQL/MariaDB Docker-Client Comparison
+## Legacy Embedded-vs-Docker PostgreSQL/MariaDB Comparison
 
-This is a new external gate for the PostgreSQL/MySQL part of the goal. It uses the database clients inside existing containers, discards query output, and mirrors the read/analytics half of `tests/tps_workloads.rs` at `N=10000`, `M=2000`.
+This older comparison is retained as historical context only. It uses embedded Nano numbers against PostgreSQL/MariaDB clients inside existing containers, so it is useful as a same-host guardrail but is not the apples-to-apples Docker PG-wire proof required by the goal. Use the "Latest Docker Client-Container Gate" above for the current PG/MariaDB status.
 
 Commands:
 
@@ -105,7 +213,7 @@ Measured ops/s:
 | join_users_orders | 54-59 | 39 | 34 | Nano 1.4-1.7x |
 | order_by_limit10 | 241-287 | 132 | 80 | Nano 1.8-3.6x |
 
-This improves the PostgreSQL/MySQL evidence gap, but it is not the final proof required by the goal: the comparison path is Docker-client based, while the Nano numbers above are embedded TPS harness numbers. It is still useful because the same SQL shapes now have same-host PG/MySQL guardrails.
+This no longer represents the final PostgreSQL/MySQL evidence gap now that Docker client-container numbers exist above. It remains useful for separating embedded-engine progress from PG-wire/server overhead.
 
 ## Bottlenecks Confirmed
 
@@ -1056,3 +1164,532 @@ Interpretation: this is a clean aggregate-path improvement, but SQLite's
 recorded mirror is still about 969/s. The remaining analytics gap still points
 to a broader compact/vectorized scan pipeline rather than more isolated
 aggregate-state dispatch reductions.
+
+## Rejected Follow-Up: In-Memory Cache and Fused GROUP BY
+
+Two additional narrow levers were tested after the Docker client-container
+gate and reverted because they did not improve the remaining gaps:
+
+- Mirroring the disk RocksDB block-cache setup in `open_in_memory()` looked
+  plausible because the in-memory path uses tmpfs-backed RocksDB. It built and
+  ran, but focused rowstore TPS stayed within noise or regressed:
+  `point_lookup_pk` 321k then 283k/s, `filter_scan` 220 then 223/s,
+  `group_by_status` 177 then 169/s, `join_users_orders` 65 then 62/s,
+  `order_by_limit10` 492 then 454/s. Reverted.
+- A strict fused row-store path for `GROUP BY <text>, COUNT(*), SUM(<int>)`
+  passed targeted aggregate correctness checks, but the focused
+  `group_by_status` TPS fell to 162/s versus the current 169-177/s rowstore
+  range. Reverted.
+
+Interpretation: the easy storage-cache and per-aggregate-dispatch tweaks are
+not the remaining ceiling. The outstanding gap is still full row materializing
+scan/filter/join execution and grouped/text aggregation, not a single small
+branch in the existing row-store aggregate loop.
+
+## Accepted Follow-Up: PG-Wire `query_with_columns()` Result Cache
+
+Finding:
+
+- Embedded `query()` already uses a deterministic result cache, invalidated on
+  DML/DDL, but PostgreSQL simple-query execution calls
+  `query_with_columns()`, which previously skipped that cache.
+- The Docker read/analytics mirror sends repeated identical SQL statements, so
+  PG-wire paid full scan/aggregate/join execution on every statement even when
+  embedded reads would use cached deterministic results.
+
+Change:
+
+- Factor the non-deterministic SQL guard into `query_is_non_deterministic()`.
+- Let `query_with_columns()` read and populate the existing result cache for
+  deterministic, non-transactional SELECTs.
+- Column names are recovered from the optimized plan cache on a result-cache
+  hit, so cached PG-wire rows still send the correct `RowDescription`.
+- Add a crate-internal `try_cached_query_with_columns()` path and pass PG-wire
+  result rows by slice into `send_query_result()`, so cached protocol reads
+  encode directly from the cached `Arc<Vec<Tuple>>` instead of cloning the full
+  row vector first.
+- Existing cache invalidation remains shared with `query()`.
+
+Validation:
+
+```text
+cargo check --lib
+cargo test 'test_query_with_columns_' --lib -- --nocapture
+cargo test test_non_deterministic_query_does_not_populate_result_cache --lib -- --nocapture
+cargo test --test protocol_tests -- --nocapture --test-threads=1
+cargo build --release --bin heliosdb-nano
+```
+
+Docker client-container focused read/analytics, `N=10000`, `M=2000`, ops/s:
+
+```text
+Nano before result-cache reuse      filter 79, aggregate 154, group 95, join 33, Top-N 150
+Nano focused after                  filter 107, aggregate 185, group 188, join 63, Top-N 186
+Nano full after                     filter 105, aggregate 177, group 186, join 54, Top-N 179
+Nano focused after no-clone rows    filter 108-110, aggregate 192-193, group 178-189, join 62-65, Top-N 203-208
+Nano full after no-clone rows       filter 108, aggregate 184, group 175, join 67, Top-N 192
+PostgreSQL recheck                  filter 89, aggregate 162, group 104, join 39, Top-N 138
+MariaDB recheck                     filter 92, aggregate 114, group 15, join 34, Top-N 119
+```
+
+Interpretation: this closes the Docker PG-wire repeated-query comparison on
+this harness under the revised "surpass or similar" bar, but it is not proof
+of arbitrary SQL speed. Cold or varying SQL still runs through the materialized
+scan/filter/join path, and SQLite remains ahead on several default embedded
+in-memory row-store workloads.
+
+## Rejected Follow-Up: Compact Projected Filtered Scan
+
+Experiment:
+
+- Added a row-store filtered scan variant that decoded predicate and projection
+  columns into a reused compact value buffer, filtered in storage, and emitted
+  already-projected tuples through a `MaterializedOperator`.
+- Added a temporary `HELIOS_DISABLE_PROJECTED_FILTERED_SCAN=1` kill switch for
+  A/B comparison.
+- Kept the lower-risk part: `MaterializedOperator::next()` now moves tuples out
+  of its owned vector with `std::mem::take()` instead of cloning each tuple.
+
+Validation while testing the experiment:
+
+```text
+cargo check --lib
+cargo test --test integration_test -- --nocapture --test-threads=1
+cargo test --test query_optimizer_tests -- --nocapture --test-threads=1
+cargo test --test join_hardening_tests -- --nocapture --test-threads=1
+cargo test --test aggregate_hardening_tests -- --nocapture --test-threads=1
+```
+
+TPS A/B, embedded mem, `N=10000`, `M=2000`, ops/s:
+
+```text
+projected path focused run        filter 214, join 63
+old path focused run              filter 203, join 63
+projected path read/analytics     filter 206, aggregate 510, group 158, join 62, Top-N 443
+old path read/analytics           filter 197, aggregate 509, group 165, join 63, Top-N 448
+```
+
+Conclusion: the compact filtered-scan shape was too narrow and noisy to keep.
+It did not materially improve join, aggregate, or Top-N, and the filter-only
+gain was small. The right remaining SQLite lever is still a broader compact or
+vectorized pipeline across scan, filter, join, and projection rather than one
+more local tuple-boundary bypass.
+
+## Accepted Follow-Up: Row-Cache Invalidation Miss Cleanup
+
+Finding:
+
+- `RowCache::invalidate(table, row_id)` marked the table hot on every
+  row-specific invalidation, even when the target row was not cached.
+- Fast UPDATE/DELETE often invalidate rows that were never cached, especially
+  DELETE of freshly inserted autocommit rows. The hot-table bookkeeping is a
+  TTL heuristic, not correctness state.
+
+Change:
+
+- `RowCache::invalidate()` still takes the cache write lock and removes the row
+  if present, preserving invalidation correctness.
+- It now updates invalidation stats and calls `mark_table_hot()` only when a
+  cached entry was actually removed.
+
+Validation:
+
+```text
+cargo test --lib row_cache -- --nocapture
+HELIOS_TPS_PARAMS=1 HELIOS_TPS_TIME_TRAVEL=0 HELIOS_TPS_MODE=mem \
+  HELIOS_TPS_WORKLOADS=param_update,param_delete HELIOS_TPS_N=10000 HELIOS_TPS_M=2000 \
+  cargo test --profile perf --test tps_workloads run_param_tps_suite -- --nocapture --test-threads=1
+HELIOS_TPS_TIME_TRAVEL=0 HELIOS_TPS=1 HELIOS_TPS_MODE=mem \
+  HELIOS_TPS_WORKLOADS=update,delete HELIOS_TPS_N=10000 HELIOS_TPS_M=2000 \
+  cargo test --profile perf --test tps_workloads run_tps_suite -- --nocapture --test-threads=1
+```
+
+TPS signal, embedded mem, `N=10000`, `M=2000`, time travel off:
+
+```text
+parameterized update/delete  update 115k/s, delete 149k/s
+literal update/delete        update 107k/s, delete 138k/s
+```
+
+Interpretation: this is a small write-path cleanup, not a SQLite-closing lever.
+The remaining UPDATE/DELETE gap is deeper than row-cache invalidation misses.
+
+Rejected follow-up:
+
+- A conservative `maybe_nonempty` hint to skip the cache write lock when the
+  row cache was empty passed `row_cache` tests, but the focused UPDATE/DELETE
+  TPS signal was flat/noisy (`param_update` ~119k/s, `param_delete` ~148k/s,
+  literal update/delete ~112k/s and ~142k/s in one run). It was reverted to
+  avoid adding another low-signal write-path branch.
+
+## Accepted Follow-Up: Move Updated Rows When Indexes Are Unchanged
+
+Finding:
+
+- Fast UPDATE always cloned the full existing row values before replacing one
+  assigned column.
+- The common TPS shape updates a non-indexed payload column
+  (`balance = balance + 1`) on rows containing `name` and `email`, so every
+  UPDATE cloned both strings even though no ART index entry could change.
+
+Change:
+
+- Add `StorageEngine::update_tuple_fast_no_index()` for callers that have
+  already proven the assignment cannot affect any ART index key.
+- Literal and parameterized fast UPDATE now evaluate all assignment values
+  against the original row, then:
+  - keep the old clone path when an indexed column is affected;
+  - otherwise move the existing row, clear transient `row_id`/`branch_id`
+    metadata before serialization, apply the replacement values in place, and
+    write without old-row index maintenance.
+- Logical WAL / HA behavior remains unchanged: strict configurations still log
+  the logical update before the storage write.
+
+Validation:
+
+```text
+cargo check --lib
+cargo test --lib fast_update -- --nocapture --test-threads=1
+cargo test --test parameterized_query_tests -- --nocapture --test-threads=1
+cargo test --test transaction_tests -- --nocapture --test-threads=1
+git diff --check
+```
+
+Focused TPS, embedded mem, `N=10000`, `M=2000`, time travel off:
+
+```text
+before recent clean run             param_update 114,622/s, param_delete 149,268/s
+after run 1                         param_update 120,498/s, param_delete 147,891/s
+after run 2                         param_update 118,013/s, param_delete 148,715/s
+
+before recent clean run             literal update 106,865/s, literal delete 137,663/s
+after literal run 1                 literal update 100,084/s, literal delete 138,099/s
+after literal run 2                 literal update 113,104/s, literal delete 140,435/s
+```
+
+Post-revert stability check, embedded mem, `N=50000`, `M=10000`, time travel
+off:
+
+```text
+param_update_by_pk                  112,251/s
+param_delete_by_pk                  145,726/s
+literal update_by_pk                106,079/s
+literal delete_by_pk                135,390/s
+```
+
+Interpretation: this is a small structural UPDATE-path cleanup, not the
+SQLite-closing lever. It removes avoidable full-row string clones from
+non-indexed payload updates, but the remaining ~2x SQLite UPDATE gap likely
+needs a larger design such as safer raw row patching, lighter read-before-write,
+or batch-oriented UPDATE execution rather than more metadata-cache work.
+
+Rejected follow-up: a raw fixed-width numeric row patch prototype avoided full
+tuple materialization for single-column non-indexed numeric UPDATEs, but it did
+not show a stable win (`param_update_by_pk` ranged from 117k/s to 128k/s in
+small runs and 122k/s in the larger run; literal update stayed around 109k/s).
+It was removed before handoff to keep the sprint on a stable, lower-risk code
+version.
+
+## Accepted Follow-Up: Defer DELETE Logical-WAL Key Allocation
+
+Finding:
+
+- Fast DELETE built the branch-aware data key before checking whether the
+  relaxed standalone path actually needed a logical WAL entry.
+- In the default no-logical-WAL fast path, that key allocation was dead work:
+  the storage delete path builds its own RocksDB data key for the physical
+  delete.
+
+Change:
+
+- `FastDeleteTarget` no longer carries a prebuilt data key.
+- Explicit transaction DELETE still builds the key because `Transaction::delete`
+  needs it.
+- Autocommit and parameterized fast DELETE now build the branch-aware logical
+  WAL key only when `fast_dml_requires_logical_wal()` is true.
+
+Validation:
+
+```text
+cargo check --lib
+cargo test --lib fast_update_delete -- --nocapture --test-threads=1
+cargo test --test parameterized_query_tests delete -- --nocapture --test-threads=1
+git diff --check
+```
+
+Focused TPS, embedded mem, `N=50000`, `M=10000`, time travel off:
+
+```text
+before stable check                 param_delete 145,726/s, literal delete 135,390/s
+after run 1                         param_delete 147,893/s, literal delete 139,604/s
+after focused repeat                param_delete 149,902/s, literal delete 138,250/s
+```
+
+Interpretation: this is a small but real DELETE hot-path cleanup. It narrows the
+SQLite DELETE gap slightly but does not close it; the remaining gap is likely
+RocksDB/ART per-row delete cost rather than logical-WAL key formatting alone.
+
+## Accepted Follow-Up: Projected Inner Hash Join Output
+
+Finding:
+
+- The TPS join shape is a pure inner equi-join under a simple projection:
+  `SELECT u.name, o.amount FROM users u INNER JOIN orders o ...`.
+- The existing hash join emitted a full combined left+right tuple, then the
+  parent `ProjectOperator` cloned only the two requested output columns.
+- Scan decode hints already reduce some input decoding, but the join/project
+  boundary still paid avoidable output tuple construction.
+
+Change:
+
+- Add a projected inner hash-join constructor used only for pure inner equi-joins
+  directly under a simple non-distinct projection.
+- Projection indexes are resolved against the normal combined join schema, but
+  emitted tuples contain only projected values.
+- Outer joins, lateral joins, cross joins, residual join predicates, DISTINCT,
+  and expression projections keep the existing path.
+
+Validation:
+
+```text
+cargo check --lib
+cargo test --test join_hardening_tests -- --nocapture --test-threads=1
+cargo test --test query_optimizer_tests -- --nocapture --test-threads=1
+git diff --check
+```
+
+Focused TPS, embedded mem, `N=10000`, `M=2000`, time travel on:
+
+```text
+before focused baseline             join_users_orders 58/s
+after focused run 1                 join_users_orders 64/s
+after focused repeat                join_users_orders 63/s
+mixed analytics run                 filter 212/s, aggregate 533/s, group 169/s, join 62/s, Top-N 433/s
+```
+
+Interpretation: this is a measurable join-boundary cleanup, roughly a 7-10%
+join gain on the current harness. SQLite still leads this workload by several
+times, so the larger remaining lever is still compact/vectorized scan-filter-join
+execution, but the projected join path removes one full-tuple materialization
+boundary for a common pure-equi projected join shape.
+
+## Accepted Follow-Up: Move Direct Projection Values
+
+Finding:
+
+- `ScanOperator` and `ProjectOperator` own the input tuple when applying simple
+  direct-column projections, but still cloned every selected `Value`.
+- That clone is unnecessary when projection indexes are unique and in bounds:
+  the selected values can be moved out of the owned tuple.
+
+Change:
+
+- For unique direct-column projections, move selected values out of the owned
+  tuple with `std::mem::replace(..., Value::Null)`.
+- The uniqueness/schema-bounds check is computed once when the scan/project
+  operator is built; each row only checks the precomputed max projection index
+  against the tuple width before using the move path.
+- Duplicate projections and out-of-bounds/error cases keep the previous clone
+  and validation paths, preserving existing semantics.
+
+Validation:
+
+```text
+cargo check --lib
+cargo test --test query_optimizer_tests -- --nocapture --test-threads=1
+cargo test --lib project -- --nocapture --test-threads=1
+```
+
+Focused TPS, embedded mem, `N=10000`, `M=2000`, time travel on:
+
+```text
+pre-change mixed reference          filter 212/s, aggregate 533/s, group 169/s, join 62/s
+after run 1                         filter 234/s, aggregate 580/s, group 178/s, join 67/s
+after repeat                        filter 232/s, aggregate 569/s, group 148/s, join 59/s
+after invariant-hoist run 1         filter 238/s, aggregate 530/s, group 160/s, join 55/s
+after invariant-hoist repeat        filter 234/s, aggregate 568/s, group 175/s, join 67/s
+```
+
+Interpretation: filter and aggregate gains held across two runs; group and join
+remained noisy and should not be claimed as improved by this change. This is a
+small executor clone-removal cleanup, not the SQLite-closing compact/vectorized
+pipeline.
+
+Rejected adjacent follow-up: projected hash-join output-source precomputation.
+The projected join path was changed to precompute `Left(idx)` / `Right(idx)`
+sources instead of interpreting combined output indexes on each emitted row.
+Correctness passed (`cargo check --lib`, `join_hardening_tests` 45/45, and
+`query_optimizer_tests` 14/14), but TPS was neutral/noisy: `join_users_orders`
+was 61/s then 65/s versus the current 63-67/s range. The change was removed.
+
+## Accepted Follow-Up: Columnar Range Predicate Pushdown
+
+Finding:
+
+- The in-memory `columnar_analytics` profile declared `age` and `balance` as
+  columnar, but `should_apply_columnar_predicates()` only pushed equality, `IN`,
+  `IS NULL`, or multiple predicates into the columnar scan.
+- The TPS filter shape has one simple range predicate (`age > 50`), so the
+  columnar scan materialized all rows and filtered afterward.
+
+Change:
+
+- Allow simple range predicates (`<`, `<=`, `>`, `>=`) to be evaluated inside
+  `scan_table_with_schema_columnar_columns_filtered`.
+- This remains gated by the existing columnar scan checks: all requested and
+  predicate columns must be columnar; row-store scans are unaffected.
+
+Validation:
+
+```text
+cargo check --lib
+cargo test --test query_optimizer_tests -- --nocapture --test-threads=1
+cargo test --test scan_prefix_decode -- --nocapture --test-threads=1
+```
+
+Focused TPS, embedded mem, `N=10000`, `M=2000`, time travel on:
+
+```text
+columnar before this change          filter 168/s, aggregate 1,975/s, Top-N 117/s
+columnar run 1                       filter 237/s, aggregate 2,058/s, group 104/s, join 55/s, Top-N 152/s
+columnar repeat                      filter 232/s, aggregate 2,012/s, group 109/s, join 57/s, Top-N 156/s
+row-store spot check                 filter 232/s, aggregate 558/s, Top-N 487/s
+```
+
+Interpretation: this makes the special in-memory columnar profile clearly useful
+for numeric aggregate and roughly similar to row-store for the simple filter
+shape. SQLite still leads the mirrored default filter and join workloads, so the
+remaining goal gap still needs a broader compact/vectorized scan-filter-join
+path rather than only columnar predicate gating.
+
+## Accepted Follow-Up: Direct Columnar Top-N
+
+Finding:
+
+- The storage-level direct Top-N path only handled row-store/default columns.
+- The `columnar_analytics` profile query
+  `SELECT age, balance FROM users ORDER BY balance DESC LIMIT 10` uses only
+  columnar output and sort columns, but fell back to the generic scan/sort path.
+
+Change:
+
+- Add `scan_table_topk_columnar_projected_columns`, a columnar analogue of the
+  compact row-store projected Top-N helper.
+- The existing direct Top-K planner now tries row-store Top-N first, then the
+  columnar helper when all output/sort columns are `STORAGE COLUMNAR`.
+- The helper scans live row keys for membership, reads only requested columnar
+  side-data, and keeps a bounded heap of projected output tuples.
+
+Validation:
+
+```text
+cargo check --lib
+cargo test --test pagination_tests -- --nocapture --test-threads=1
+cargo test --test query_optimizer_tests -- --nocapture --test-threads=1
+cargo test --test pagination_tests columnar_order_by_limit_is_deterministic -- --nocapture --test-threads=1
+```
+
+Focused TPS, embedded mem, `N=10000`, `M=2000`, time travel on:
+
+```text
+columnar Top-N before direct path    152-156/s
+columnar direct Top-N run 1          232/s
+columnar direct Top-N repeat         224/s
+columnar combined profile            filter 233/s, aggregate 2,035/s, group 107/s, join 53/s, Top-N 227/s
+row-store Top-N spot check           445/s
+```
+
+Interpretation: this substantially improves the gated columnar Top-N profile,
+but row-store remains faster for this small integer Top-N shape and SQLite is
+still ahead on the broad default embedded suite. The useful direction is still
+turning the columnar profile into a coherent analytics mode, not replacing the
+default row-store path.
+
+## Accepted Follow-Up: Small-Group Columnar Count/SUM Aggregates
+
+Finding:
+
+- Row-store grouped aggregate already avoids hash-table work for low-cardinality
+  groups by staging up to 64 groups in a linear vector.
+- Columnar grouped aggregate always cloned a `Vec<Value>` group key and hashed it
+  for every surviving row.
+- The TPS `group_by_status` shape has four text groups, so that hash path paid
+  avoidable per-row string clone/hash work.
+
+Change:
+
+- Add a small-group path to `aggregate_columnar_columns` for grouped columnar
+  aggregates. It compares current columnar batch values against staged group keys
+  by reference and only clones the group key when a new group is created.
+- If group cardinality exceeds 64, it falls back to the existing
+  `HashMap<Vec<Value>, Vec<ColumnarAggregateState>>` behavior.
+- Add a narrower direct path for the common `GROUP BY <column>, COUNT(*),
+  SUM(<integer>)` shape. It keeps `count` and integer `sum` in a small struct
+  instead of dispatching through `ColumnarAggregateState` for each row, and
+  falls back to the generic path for unsupported aggregate/type combinations.
+- Added a text-columnar `GROUP BY` regression test covering NULL and a deleted
+  row.
+
+Validation:
+
+```text
+cargo check --lib
+cargo test --test storage_modes_test columnar -- --nocapture --test-threads=1
+cargo test --test aggregate_hardening_tests group_by -- --nocapture --test-threads=1
+```
+
+Focused TPS, embedded mem, `N=10000`, `M=2000`, time travel on:
+
+```text
+columnar group_by_status before     105-107/s
+small-group focused                 130/s, 131/s
+count/sum direct focused            127/s, 137/s
+count/sum direct combined profile   filter 255/s, aggregate 2,174/s, group 126/s, join 52/s, Top-N 225/s
+```
+
+Interpretation: this is a real improvement for low-cardinality grouped
+columnar aggregates, but row-store is still faster on the TPS text group-by
+shape. It strengthens the gated columnar analytics profile without changing the
+broader conclusion: joins and default row-store analytical execution remain the
+main SQLite gaps.
+
+## Accepted Follow-Up: Gated In-Memory OLTP-Fast TPS Profile
+
+Finding:
+
+- The user clarified that special gated in-memory modes are acceptable when
+  they are explicit and caveated.
+- Existing `HELIOS_TPS_TIME_TRAVEL=0` runs showed that bound-parameter
+  `execute_many` can be similar to or faster than SQLite in-memory bulk insert,
+  but the mode was not first-class in the benchmark harness.
+
+Change:
+
+- Add `HELIOS_TPS_EMBEDDED_PROFILE=oltp_fast` to `tests/tps_workloads.rs`.
+- Gate it to `HELIOS_TPS_MODE=mem`, keep the ordinary row-store schema, default
+  time travel off, and turn off benchmark memory-quota accounting.
+- Wire the profile into both the literal and parameterized TPS harness output so
+  reported runs state the active profile and time-travel default.
+
+Validation:
+
+```text
+cargo check --lib
+cargo test --test tps_workloads run_tps_suite -- --nocapture --test-threads=1
+HELIOS_TPS=1 HELIOS_TPS_MODE=mem HELIOS_TPS_EMBEDDED_PROFILE=oltp_fast HELIOS_TPS_WORKLOADS=bulk_insert,autocommit_insert,point_lookup_pk,update_by_pk,delete_by_pk HELIOS_TPS_N=10000 HELIOS_TPS_M=2000 cargo test --profile perf --test tps_workloads run_tps_suite -- --nocapture --test-threads=1
+HELIOS_TPS_PARAMS=1 HELIOS_TPS_MODE=mem HELIOS_TPS_EMBEDDED_PROFILE=oltp_fast HELIOS_TPS_WORKLOADS=param_execute_many_insert,param_autocommit_insert,param_point_lookup_pk,param_update_by_pk,param_delete_by_pk HELIOS_TPS_N=10000 HELIOS_TPS_M=2000 cargo test --profile perf --test tps_workloads run_param_tps_suite -- --nocapture --test-threads=1
+```
+
+Focused TPS, embedded mem, `N=10000`, `M=2000`:
+
+```text
+rowstore default    bulk 135,979/s, autocommit insert 90,514/s, point lookup 263,388/s, update 106,977/s, delete 139,639/s
+oltp_fast           bulk 177,981/s, autocommit insert 166,859/s, point lookup 349,700/s, update 116,481/s, delete 137,440/s
+param oltp_fast     execute_many 482,609/s, autocommit insert 207,435/s, lookup 367,178/s, update 114,687/s, delete 145,171/s
+```
+
+Interpretation: `oltp_fast` is useful as a named embedded in-memory profile for
+clients willing to trade time travel and memory quota accounting for higher
+OLTP throughput. It moves bulk/autocommit insert and point lookup closer to the
+revised "surpass or similar" bar against SQLite, but it does not address the
+remaining UPDATE/DELETE and analytical row-store gaps.

@@ -22,7 +22,8 @@ fn tt_off_txn_read_returns_latest_not_stale_version() {
         c.storage.memory_only = false;
         c.storage.time_travel_enabled = true;
         let db = EmbeddedDatabase::with_config(c).unwrap();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+            .unwrap();
         db.execute("INSERT INTO t (id, v) VALUES (1, 10)").unwrap();
         db.execute("UPDATE t SET v = 20 WHERE id = 1").unwrap();
     }
@@ -58,11 +59,15 @@ fn tt_off_as_of_query_errors() {
     let mut c = Config::in_memory();
     c.storage.time_travel_enabled = false;
     let db = EmbeddedDatabase::with_config(c).unwrap();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
     db.execute("INSERT INTO t (id, v) VALUES (1, 10)").unwrap();
     db.execute("UPDATE t SET v = 20 WHERE id = 1").unwrap();
 
-    let res = db.query("SELECT v FROM t AS OF TIMESTAMP '2000-01-01 00:00:00' WHERE id = 1", &[]);
+    let res = db.query(
+        "SELECT v FROM t AS OF TIMESTAMP '2000-01-01 00:00:00' WHERE id = 1",
+        &[],
+    );
     assert!(
         res.is_err(),
         "AS OF query with time_travel_enabled=false must error, got: {:?}",
@@ -75,10 +80,14 @@ fn tt_off_as_of_query_errors() {
 #[test]
 fn tt_on_as_of_still_works() {
     let db = EmbeddedDatabase::new_in_memory().unwrap(); // TT on by default
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
     db.execute("INSERT INTO t (id, v) VALUES (1, 10)").unwrap();
     // A future timestamp resolves to the latest snapshot; query must succeed.
-    let res = db.query("SELECT v FROM t AS OF TIMESTAMP '2999-01-01 00:00:00' WHERE id = 1", &[]);
+    let res = db.query(
+        "SELECT v FROM t AS OF TIMESTAMP '2999-01-01 00:00:00' WHERE id = 1",
+        &[],
+    );
     assert!(res.is_ok(), "AS OF with TT-on must succeed, got: {:?}", res.err());
 }
 
@@ -87,7 +96,8 @@ fn tt_off_main_branch_context_does_not_force_versioned_insert() {
     let mut c = Config::in_memory();
     c.storage.time_travel_enabled = false;
     let db = EmbeddedDatabase::with_config(c).unwrap();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
 
     db.storage.set_current_branch(Some("main".to_string()));
     assert_eq!(
@@ -113,7 +123,8 @@ fn tt_off_direct_versioned_insert_skips_snapshot_write() {
     let mut c = Config::in_memory();
     c.storage.time_travel_enabled = false;
     let db = EmbeddedDatabase::with_config(c).unwrap();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
 
     let snapshots_before = db.storage.snapshot_manager().snapshot_count();
     db.storage

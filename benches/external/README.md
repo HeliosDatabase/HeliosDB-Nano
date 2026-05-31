@@ -14,6 +14,10 @@ pip install 'psycopg[binary]'
 For hosts that do not have `psql`, `mysql`, or Python DB drivers installed,
 `docker_sql_tps_mirror.py` can drive the client binaries inside existing
 PostgreSQL/MariaDB containers using only Python's standard library.
+For Docker-server apples-to-apples checks, prefer `--client-mode client-container`
+with a long-lived client container sharing the target server container's network
+namespace; `--client-mode network-container` is only a smoke-test mode because it
+starts a fresh client container for every timed workload.
 
 ## Pagination benchmark (`pagination_bench.py`)
 
@@ -82,6 +86,20 @@ python3 benches/external/docker_sql_tps_mirror.py \
 python3 benches/external/docker_sql_tps_mirror.py \
   --backend mysql --container hdb-sprint-gitea-mysql-db \
   --user gitea --password gitea --database gitea \
+  --n 10000 --m 2000 \
+  --workloads filter_scan,agg_count_sum_avg,group_by_status,join_users_orders,order_by_limit10
+```
+
+Example apples-to-apples Docker client-container run against a PG-wire server:
+
+```bash
+docker run -d --name codex-nano-pg-client \
+  --network container:codex-nano-tps postgres:17-bookworm sleep infinity
+
+python3 benches/external/docker_sql_tps_mirror.py \
+  --backend postgres --container codex-nano-tps \
+  --client-mode client-container --client-container codex-nano-pg-client \
+  --user postgres --password nano --database heliosdb \
   --n 10000 --m 2000 \
   --workloads filter_scan,agg_count_sum_avg,group_by_status,join_users_orders,order_by_limit10
 ```

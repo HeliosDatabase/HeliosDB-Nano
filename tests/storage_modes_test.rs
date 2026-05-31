@@ -276,7 +276,10 @@ fn test_columnar_native_aggregate_respects_live_rows() {
     assert_eq!(filtered_rows[0].values[0], Value::Int4(30));
 
     let empty = db
-        .query("SELECT COUNT(*), SUM(a), AVG(a), MAX(b) FROM metrics WHERE b > 100", &[])
+        .query(
+            "SELECT COUNT(*), SUM(a), AVG(a), MAX(b) FROM metrics WHERE b > 100",
+            &[],
+        )
         .unwrap();
     assert_eq!(empty.len(), 1);
     assert_eq!(
@@ -285,14 +288,54 @@ fn test_columnar_native_aggregate_respects_live_rows() {
     );
 
     let grouped = db
-        .query(
-            "SELECT e, COUNT(*), SUM(a) FROM metrics WHERE b >= 10 GROUP BY e",
-            &[],
-        )
+        .query("SELECT e, COUNT(*), SUM(a) FROM metrics WHERE b >= 10 GROUP BY e", &[])
         .unwrap();
     assert_eq!(grouped.len(), 2);
     assert_eq!(grouped[0].values, vec![Value::Int4(1), Value::Int8(2), Value::Int8(30)]);
     assert_eq!(grouped[1].values, vec![Value::Int4(2), Value::Int8(1), Value::Int8(30)]);
+}
+
+#[test]
+fn test_columnar_group_by_text_uses_live_rows() {
+    let db = test_db();
+
+    db.execute(
+        "CREATE TABLE orders (
+            id INT PRIMARY KEY,
+            status TEXT STORAGE COLUMNAR,
+            amount INT STORAGE COLUMNAR
+        )",
+    )
+    .unwrap();
+    db.execute("INSERT INTO orders (id, status, amount) VALUES (1, 'paid', 10)")
+        .unwrap();
+    db.execute("INSERT INTO orders (id, status, amount) VALUES (2, 'open', 20)")
+        .unwrap();
+    db.execute("INSERT INTO orders (id, status, amount) VALUES (3, 'paid', 30)")
+        .unwrap();
+    db.execute("INSERT INTO orders (id, status, amount) VALUES (4, 'void', 40)")
+        .unwrap();
+    db.execute("INSERT INTO orders (id, status, amount) VALUES (5, NULL, 50)")
+        .unwrap();
+    db.execute("DELETE FROM orders WHERE id = 4").unwrap();
+
+    let rows = db
+        .query(
+            "SELECT status, COUNT(*), SUM(amount) FROM orders GROUP BY status ORDER BY status",
+            &[],
+        )
+        .unwrap();
+
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].values, vec![Value::Null, Value::Int8(1), Value::Int8(50)]);
+    assert_eq!(
+        rows[1].values,
+        vec![Value::String("open".to_string()), Value::Int8(1), Value::Int8(20),]
+    );
+    assert_eq!(
+        rows[2].values,
+        vec![Value::String("paid".to_string()), Value::Int8(2), Value::Int8(40),]
+    );
 }
 
 #[test]
@@ -315,9 +358,7 @@ fn test_columnar_count_distinct_respects_sql_semantics() {
         .unwrap();
     db.execute("DELETE FROM metrics WHERE id = 6").unwrap();
 
-    let rows = db
-        .query("SELECT COUNT(DISTINCT val) FROM metrics", &[])
-        .unwrap();
+    let rows = db.query("SELECT COUNT(DISTINCT val) FROM metrics", &[]).unwrap();
     assert_eq!(rows[0].values, vec![Value::Int8(2)]);
 
     let filtered = db
