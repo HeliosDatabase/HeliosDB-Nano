@@ -51,6 +51,13 @@ regressions from the release batch.
     fast DML specs and invalidate result-cache entries once per batch;
   - focused in-memory parameterized DELETE is now close to SQLite's
     bound-parameter path on this host, while UPDATE remains a tracked gap.
+- Join read-path improvement:
+  - projected inner equi-joins now compact each direct scan input to the
+    qualified join-key, pushed-filter, and output columns before building the
+    hash table;
+  - this is a guarded extension of the projected join path and falls back for
+    outer/lateral joins, unqualified or complex expressions, subqueries, and
+    already-projected inputs.
 
 ## Release-Gate Fixes
 
@@ -91,9 +98,9 @@ caveats are explicit. Current status:
   batched DELETE versus SQLite params at about 491k/s bulk insert, 310k/s
   lookup, 243k/s UPDATE, and 266k/s DELETE. Row-store analytics remain behind
   SQLite on filter, aggregate, and join, although the final projected
-  `FilteredScan` follow-up nudged row-store filter to about 229/s and join to
-  about 64/s. The gated columnar profile wins the aggregate shape but not the
-  full analytics set.
+  `FilteredScan` and compact join-input follow-ups nudged row-store filter to
+  about 226-229/s and join to about 74-76/s. The gated columnar profile wins
+  the aggregate shape but not the full analytics set.
 
 This means the release meets the revised acceptance bar for publication:
 surpass-or-similar is achieved across the PostgreSQL/MariaDB Docker mirror and
@@ -135,7 +142,8 @@ These are release-accepted deferrals, not crates.io blockers:
 
 5. SQLite embedded analytical gap
    - The next real lever is a compact/vectorized scan-filter-project-join
-     pipeline, not another narrow tuple-boundary micro-optimization.
+     pipeline; the 3.34.0 branch now includes the first guarded compact join
+     input step, but SQLite still leads the full in-memory analytical set.
    - Keep `columnar_analytics` as a gated diagnostic profile until joins,
      filters, and Top-N are broadly competitive with the row-store profile.
 
