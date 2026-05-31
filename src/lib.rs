@@ -4123,8 +4123,10 @@ impl EmbeddedDatabase {
 
     /// Log slow queries at WARN level if they exceed the configured threshold
     fn log_slow_query(&self, sql: &str, elapsed: std::time::Duration, rows: u64) {
-        self.query_profiler
-            .record(query_trace::QueryTrace::new(sql, elapsed, rows));
+        if self.query_profiler.enabled() {
+            self.query_profiler
+                .record(query_trace::QueryTrace::new(sql, elapsed, rows));
+        }
         if let Some(threshold) = self.config.storage.slow_query_threshold_ms {
             let elapsed_ms = elapsed.as_millis() as u64;
             if elapsed_ms >= threshold {
