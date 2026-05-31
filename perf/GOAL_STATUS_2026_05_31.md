@@ -831,3 +831,67 @@ Rejected during the next pass:
   still the right bottleneck to revisit, but the fix needs broader costed join
   predicate pushdown or a true streaming scan/join pipeline, not a narrow
   projected-join special case.
+
+## Accepted Follow-Up: Row-Counter Stage Lookup
+
+Commit after this report: `perf: avoid row-counter stage key allocation`.
+
+Finding:
+
+- Fast explicit-transaction INSERTs already stage row counters outside the
+  transaction `DashMap`, so a large bulk insert writes only one `counter:<table>`
+  key at commit.
+- The staging helper still used `HashMap::entry(table_name.to_string())` on
+  every inserted row. For the common one-table bulk insert loop this allocated
+  and hashed a fresh `String` even though the table was already present after
+  the first row.
+
+Change:
+
+- `Transaction::stage_row_counter()` now probes the staged-counter map with the
+  borrowed `&str` table name first and only allocates a `String` when inserting
+  the first counter for a table.
+- Commit semantics are unchanged: the staged map still keeps the maximum row id
+  per table and emits the final counter in the transaction `WriteBatch`.
+
+Validation:
+
+```text
+cargo check --lib
+cargo test --lib test_row_counter_staging_commits_latest_without_write_set_overwrites -- --nocapture --test-threads=1
+git diff --check
+```
+
+Measured in-memory TPS, `N=10000`, `M=2000`, time-travel on:
+
+```text
+immediate pre-change baseline      bulk_insert_users(txn) 138,097/s, autocommit_insert 108,962/s
+after change run 1                 bulk_insert_users(txn) 142,886/s, autocommit_insert 110,399/s
+after change run 2                 bulk_insert_users(txn) 139,484/s, autocommit_insert 103,242/s
+```
+
+Interpretation: this is a small but mechanically clean allocation cut on the
+default explicit-transaction insert path. It does not change the overall goal
+status: SQLite still leads default in-memory bulk insert by several times, so
+the remaining write-path lever is deeper transaction/index/row materialization
+work rather than more metadata-cache layering.
+
+Rejected during the next pass:
+
+- Batched the `art_undo_log` write lock across multi-row explicit fast INSERT
+  loops so rollback undo entries were appended under one `RwLock` guard instead
+  of one lock/unlock per inserted row. Correctness checks passed
+  (`cargo check --lib`, `transaction_tests` 28/28, `savepoint_hardening_tests`
+  60/60), but TPS regressed: `bulk_insert_users(txn)` 136,781/s then 127,637/s
+  and `autocommit_insert` 101,124/s then 93,558/s versus the current committed
+  post-row-counter range of 139,484-142,886/s bulk and 103,242-110,399/s
+  autocommit. Reverted. The likely cost is not the uncontended undo-log lock;
+  larger remaining write-path costs are per-row ART/index value materialization,
+  row serialization, and transaction/rollback staging shape.
+- Special-cased `ArtIndexManager::on_insert_tuple_collect_index_values()` for
+  single-column indexes to avoid allocating a temporary `Vec<&Value>` before
+  encoding the key. Correctness checks passed (`cargo check --lib`, focused
+  tuple-backed ART insert test, `transaction_tests` 28/28), but TPS was flat to
+  worse: `bulk_insert_users(txn)` 140,943/s then 132,790/s and
+  `autocommit_insert` 101,954/s then 105,077/s. Reverted. The tiny temporary
+  value-vector allocation is not the missing SQLite-scale write lever.

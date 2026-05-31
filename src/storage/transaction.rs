@@ -404,9 +404,12 @@ impl Transaction {
         }
 
         let mut stages = self.row_counter_stages.write();
-        let current = stages.entry(table_name.to_string()).or_insert(row_id);
-        if row_id > *current {
-            *current = row_id;
+        if let Some(current) = stages.get_mut(table_name) {
+            if row_id > *current {
+                *current = row_id;
+            }
+        } else {
+            stages.insert(table_name.to_string(), row_id);
         }
         Ok(())
     }
