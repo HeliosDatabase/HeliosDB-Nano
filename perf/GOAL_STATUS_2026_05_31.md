@@ -816,3 +816,18 @@ run 2  filter 194/s, aggregate 447/s, group_by 171/s, join 59/s
 Interpretation: this closes most of the mirrored in-memory Top-N gap to
 SQLite's recorded 461/s result on this host. The remaining SQLite gap is now
 more concentrated in default bulk insert, aggregate scans, and joins.
+
+Rejected during the next pass:
+
+- Projected inner hash join with single-side filter pushdown. EXPLAIN for the
+  TPS join shape shows `Project -> Filter -> HashJoin -> Scan`, so the generic
+  path joins the full `users`/`orders` inputs and applies `o.status = 'paid'`
+  plus `u.age > 40` after the join. A narrow executor fast path pushed those
+  predicates into the two scan inputs and emitted only the projected join
+  columns, while preserving the existing hash-join build-side choice. It was
+  correctness-clean (`cargo check --lib`, `join_hardening_tests` 45/45), but
+  TPS was flat/noisy: `join_users_orders` 65/s then 62/s versus the current
+  committed 59-66/s range. Reverted. The planner-level predicate placement is
+  still the right bottleneck to revisit, but the fix needs broader costed join
+  predicate pushdown or a true streaming scan/join pipeline, not a narrow
+  projected-join special case.
