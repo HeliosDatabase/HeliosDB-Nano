@@ -2594,3 +2594,42 @@ It still does not close the broader SQLite embedded analytics gap: row-store
 filter/aggregate/join and columnar join remain below the SQLite reference, so
 the next real lever is still a compact/vectorized scan-filter-project-join
 pipeline rather than tuple-local tuning.
+
+## Rejected Follow-Ups: Analytics Configuration And Allocation Tweaks
+
+Experiments:
+
+- Changed the gated `columnar_analytics` profile so `users.name` used
+  `STORAGE COLUMNAR`, hoping the join could avoid row-store name decode on the
+  users side.
+- Pre-sized projected filtered-scan result vectors from the PK ART row count,
+  hoping to remove repeated `Vec` growth in filter and join scans.
+- Re-ran row-store analytics with `HELIOS_TPS_TIME_TRAVEL=0` to test whether
+  the existing TT-off mode materially changes the remaining read gap.
+
+Validation while present:
+
+```text
+cargo check --lib
+HELIOS_TPS=1 HELIOS_TPS_MODE=mem HELIOS_TPS_EMBEDDED_PROFILE=columnar_analytics HELIOS_TPS_WORKLOADS=filter_scan,group_by_status,join_users_orders,order_by_limit10 HELIOS_TPS_N=10000 HELIOS_TPS_M=2000 cargo test --profile perf --test tps_workloads run_tps_suite -- --nocapture --test-threads=1
+HELIOS_TPS=1 HELIOS_TPS_MODE=mem HELIOS_TPS_WORKLOADS=filter_scan,join_users_orders HELIOS_TPS_N=10000 HELIOS_TPS_M=2000 cargo test --profile perf --test tps_workloads run_tps_suite -- --nocapture --test-threads=1
+HELIOS_TPS=1 HELIOS_TPS_MODE=mem HELIOS_TPS_TIME_TRAVEL=0 HELIOS_TPS_WORKLOADS=filter_scan,agg_count_sum_avg,join_users_orders HELIOS_TPS_N=10000 HELIOS_TPS_M=2000 cargo test --profile perf --test tps_workloads run_tps_suite -- --nocapture --test-threads=1
+```
+
+Focused TPS, embedded mem, `N=10000`, `M=2000`, ops/s:
+
+```text
+columnar users.name prototype       filter 255/s, group_by 133/s, join 80/s, Top-N 218/s
+projected-scan pre-size prototype   rowstore filter 214/s, join 97/s
+rowstore TT-off config              filter 236/s, aggregate 540/s, join 100/s
+```
+
+Decision: reverted/not kept. Making `users.name` columnar regressed the gated
+join versus the accepted text-driver batch path (`96/s -> 80/s`). Pre-sizing
+scan result vectors hurt filter and did not improve join beyond noise. TT-off is
+a small read-side configuration bump, not a goal-closing analytics mode.
+Together these reinforce that the remaining SQLite embedded analytics gap is
+not in simple storage-mode decoration, time-travel metadata, or result-vector
+allocation. The next credible implementation remains a deeper compact/vectorized
+scan-filter-project-join path or a purpose-built PK lookup join with measured
+evidence.
