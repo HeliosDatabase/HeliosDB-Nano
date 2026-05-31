@@ -299,6 +299,23 @@ post-close projected filtered scan row-id gate
     focused filter_scan: 229/s
   HELIOS_TPS=1 HELIOS_TPS_MODE=mem HELIOS_TPS_WORKLOADS=filter_scan,join_users_orders HELIOS_TPS_N=10000 HELIOS_TPS_M=2000 cargo test --profile perf --test tps_workloads run_tps_suite -- --nocapture --test-threads=1
     mixed run: filter_scan 233/s, join_users_orders 81/s
+
+post-close predicate-first integer filtered scan gate
+  cargo check --lib
+    passed
+  cargo test --test scan_prefix_decode -- --nocapture --test-threads=1
+    passed; 8 tests passed
+  cargo test --test query_optimizer_tests -- --nocapture --test-threads=1
+    passed; 14 tests passed
+  cargo test --test join_hardening_tests test_inner_join_with_filter_only_columns -- --nocapture --test-threads=1
+    passed
+  HELIOS_TPS=1 HELIOS_TPS_MODE=mem HELIOS_TPS_WORKLOADS=filter_scan HELIOS_TPS_N=10000 HELIOS_TPS_M=2000 cargo test --profile perf --test tps_workloads run_tps_suite -- --nocapture --test-threads=1
+    focused filter_scan: 236/s
+  HELIOS_TPS=1 HELIOS_TPS_MODE=mem HELIOS_TPS_WORKLOADS=filter_scan,agg_count_sum_avg,join_users_orders HELIOS_TPS_N=10000 HELIOS_TPS_M=2000 cargo test --profile perf --test tps_workloads run_tps_suite -- --nocapture --test-threads=1
+    repeat mixed runs: filter_scan 236/s then 234/s; join_users_orders 82/s both runs
+  HELIOS_TPS=1 HELIOS_TPS_MODE=mem HELIOS_TPS_WORKLOADS=filter_scan,agg_count_sum_avg,group_by_status,join_users_orders,order_by_limit10 HELIOS_TPS_N=10000 HELIOS_TPS_M=2000 cargo test --profile perf --test tps_workloads run_tps_suite -- --nocapture --test-threads=1
+    full focused analytics: filter_scan 235/s, aggregate 524/s,
+    group_by_status 179/s, join_users_orders 82/s, order_by_limit10 477/s
 ```
 
 ## Recommended Publish Commands

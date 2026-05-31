@@ -2269,3 +2269,49 @@ mixed follow-up run        filter_scan 233/s, join_users_orders 81/s
 Interpretation: this is a small but clean boundary reduction on the remaining
 row-store filter path. It narrows but does not close the SQLite embedded
 in-memory filter gap.
+
+## Accepted Follow-Up: Predicate-First Integer Projected FilteredScan
+
+Finding:
+
+- `scan_table_with_schema_projected_filtered` decoded predicate and projection
+  columns together for every scanned row.
+- The default TPS filter shape is `SELECT id, name FROM users WHERE age > 50`,
+  so rejected rows paid to decode `id` and `name` even though only `age` was
+  needed to reject them.
+
+Change:
+
+- Add a narrow row-store fast path for exactly one simple integer predicate
+  (`=`, `<`, `<=`, `>`, `>=`) over default-storage columns.
+- Decode the integer predicate column first with
+  `decode_tuple_numeric_column_value`.
+- For rejected rows, skip projection decode entirely.
+- For matching rows, decode only the requested projected columns and emit the
+  same compact projected tuple as the existing read-only projected filtered
+  scan path.
+- Unsupported encodings or predicate shapes fall back to the existing generic
+  projected filtered scan.
+
+Validation:
+
+```text
+cargo check --lib
+cargo test --test scan_prefix_decode -- --nocapture --test-threads=1
+cargo test --test query_optimizer_tests -- --nocapture --test-threads=1
+cargo test --test join_hardening_tests test_inner_join_with_filter_only_columns -- --nocapture --test-threads=1
+```
+
+Focused TPS, embedded mem, `N=10000`, `M=2000`, ops/s:
+
+```text
+focused filter-only run        filter_scan 236/s
+mixed run 1                    filter_scan 236/s, aggregate 454/s, join 82/s
+mixed run 2                    filter_scan 234/s, aggregate 540/s, join 82/s
+full analytics run             filter_scan 235/s, aggregate 524/s, group_by 179/s, join 82/s, Top-N 477/s
+```
+
+Interpretation: this is another small but clean row-store filter improvement.
+It avoids wasted projection decode for rejected rows and keeps join/Top-N
+healthy, but it still does not close the broader SQLite embedded in-memory
+analytics gap.

@@ -15,7 +15,7 @@ use super::filter_index_delta::{FilterIndexConfig, FilterIndexDeltaTracker};
 use super::mv_scheduler::CpuMonitor;
 use super::parallel_filter::{ParallelFilterConfig, ParallelFilterEngine};
 use super::predicate_pushdown::{AnalyzedPredicate, PredicatePushdownManager, PushdownConfig};
-use super::simd_filter::FilterPredicate;
+use super::simd_filter::{FilterOp, FilterPredicate};
 use super::speculative_filter::{SpeculativeConfig, SpeculativeFilterManager};
 use super::wal::{WalOperation, WalSyncMode, WriteAheadLog};
 use super::zone_map::TableZoneMap;
@@ -174,6 +174,59 @@ fn row_values_match_filters(values: &[Value], predicates: &[FilterPredicate], po
         .iter()
         .zip(positions)
         .all(|(predicate, &pos)| values.get(pos).is_some_and(|value| predicate.evaluate(value)))
+}
+
+#[derive(Clone, Copy)]
+struct IntegerFilterCandidate {
+    column_index: usize,
+    op: FilterOp,
+    value: i64,
+}
+
+fn integer_filter_candidate(schema: &crate::Schema, predicates: &[FilterPredicate]) -> Option<IntegerFilterCandidate> {
+    let [predicate] = predicates else {
+        return None;
+    };
+    if !matches!(
+        predicate.op,
+        FilterOp::Eq | FilterOp::Lt | FilterOp::LtEq | FilterOp::Gt | FilterOp::GtEq
+    ) {
+        return None;
+    }
+    let column = schema.columns.get(predicate.column_index)?;
+    if !primitive_integer_data_type(&column.data_type) {
+        return None;
+    }
+    let value = match predicate.value {
+        Value::Int2(value) => i64::from(value),
+        Value::Int4(value) => i64::from(value),
+        Value::Int8(value) => value,
+        _ => return None,
+    };
+    Some(IntegerFilterCandidate {
+        column_index: predicate.column_index,
+        op: predicate.op,
+        value,
+    })
+}
+
+fn decoded_integer_matches_filter(
+    decoded: crate::storage::prefix_decode::DecodedNumericValue,
+    filter: IntegerFilterCandidate,
+) -> Option<bool> {
+    let value = match decoded {
+        crate::storage::prefix_decode::DecodedNumericValue::Null => return Some(false),
+        crate::storage::prefix_decode::DecodedNumericValue::Int(value) => value,
+        crate::storage::prefix_decode::DecodedNumericValue::Float(_) => return None,
+    };
+    Some(match filter.op {
+        FilterOp::Eq => value == filter.value,
+        FilterOp::Lt => value < filter.value,
+        FilterOp::LtEq => value <= filter.value,
+        FilterOp::Gt => value > filter.value,
+        FilterOp::GtEq => value >= filter.value,
+        _ => return None,
+    })
 }
 
 fn columnar_batch_value<'a>(
@@ -2493,6 +2546,14 @@ impl StorageEngine {
             }
         }
 
+        if let Some(candidate) = integer_filter_candidate(schema, &filter_predicates) {
+            if let Some(tuples) =
+                self.scan_table_with_schema_projected_integer_filtered(table_name, schema, projection, candidate)?
+            {
+                return Ok(Some(tuples));
+            }
+        }
+
         let requested_pos = |column_index: usize| -> Result<usize> {
             requested.binary_search(&column_index).map_err(|_| {
                 Error::storage(format!(
@@ -2542,6 +2603,88 @@ impl StorageEngine {
             // This compact projected path is used by read-only SELECT execution.
             // DML paths use row-id-preserving scans, so avoid parsing the data
             // key for every surviving row here.
+            tuples.push(Tuple::new(projected_values));
+        }
+
+        Ok(Some(tuples))
+    }
+
+    fn scan_table_with_schema_projected_integer_filtered(
+        &self,
+        table_name: &str,
+        schema: &crate::Schema,
+        projection: &[usize],
+        filter: IntegerFilterCandidate,
+    ) -> Result<Option<Vec<Tuple>>> {
+        let mut output_requested: Vec<usize> = projection.to_vec();
+        output_requested.sort_unstable();
+        output_requested.dedup();
+
+        let output_pos = |column_index: usize| -> Result<usize> {
+            output_requested.binary_search(&column_index).map_err(|_| {
+                Error::storage(format!(
+                    "Column index {} missing from projected integer filtered scan decode set for {}",
+                    column_index, table_name
+                ))
+            })
+        };
+        let projection_positions: Vec<usize> = projection
+            .iter()
+            .map(|&idx| output_pos(idx))
+            .collect::<Result<Vec<_>>>()?;
+
+        let prefix = format!("data:{}:", table_name);
+        let prefix_bytes = prefix.as_bytes();
+        let mut read_opts = ReadOptions::default();
+        read_opts.set_total_order_seek(true);
+        let iter = self
+            .db
+            .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read_opts);
+
+        let mut values = Vec::with_capacity(output_requested.len());
+        let mut tuples = Vec::new();
+        for item in iter {
+            let (key, raw_value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+            if !key.starts_with(prefix_bytes) {
+                break;
+            }
+
+            let decrypted;
+            let row_bytes = if let Some(km) = &self.key_manager {
+                decrypted = crypto::decrypt(km.key(), raw_value.as_ref())?;
+                decrypted.as_slice()
+            } else {
+                raw_value.as_ref()
+            };
+
+            let Some(decoded) =
+                crate::storage::prefix_decode::decode_tuple_numeric_column_value(row_bytes, filter.column_index)
+            else {
+                return Ok(None);
+            };
+            let Some(matches) = decoded_integer_matches_filter(decoded, filter) else {
+                return Ok(None);
+            };
+            if !matches {
+                continue;
+            }
+
+            crate::storage::prefix_decode::decode_tuple_column_values_into(
+                row_bytes,
+                &output_requested,
+                schema.columns.len(),
+                &mut values,
+            )
+            .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
+
+            let mut projected_values = Vec::with_capacity(projection_positions.len());
+            for &pos in &projection_positions {
+                if let Some(value) = values.get_mut(pos) {
+                    projected_values.push(std::mem::replace(value, Value::Null));
+                } else {
+                    projected_values.push(Value::Null);
+                }
+            }
             tuples.push(Tuple::new(projected_values));
         }
 
