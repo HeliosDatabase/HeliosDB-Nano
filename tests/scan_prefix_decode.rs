@@ -331,6 +331,32 @@ fn columnar_projected_filter_skips_deleted_rows() {
 }
 
 #[test]
+fn columnar_integer_projected_filter_skips_deleted_rows() {
+    let db = EmbeddedDatabase::new_in_memory().unwrap();
+    db.execute(
+        "CREATE TABLE columnar_people (
+            id INTEGER PRIMARY KEY,
+            age INTEGER STORAGE COLUMNAR,
+            balance INTEGER STORAGE COLUMNAR
+        )",
+    )
+    .unwrap();
+    db.execute("INSERT INTO columnar_people VALUES (1, 30, 100)").unwrap();
+    db.execute("INSERT INTO columnar_people VALUES (2, 55, 200)").unwrap();
+    db.execute("INSERT INTO columnar_people VALUES (3, 60, 300)").unwrap();
+    db.execute("DELETE FROM columnar_people WHERE id = 2").unwrap();
+
+    let rows = db
+        .query(
+            "SELECT age, balance FROM columnar_people WHERE age > 40 ORDER BY balance",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].values, vec![Value::Int4(60), Value::Int4(300)]);
+}
+
+#[test]
 fn storage_filter_pushdown_preserves_sql_null_predicates() {
     let db = EmbeddedDatabase::new_in_memory().unwrap();
     db.execute("CREATE TABLE f (id INTEGER PRIMARY KEY, x INTEGER, payload TEXT)")

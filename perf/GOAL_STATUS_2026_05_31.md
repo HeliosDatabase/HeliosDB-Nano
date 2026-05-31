@@ -2711,3 +2711,35 @@ Decision: kept. This is a small but real executor-state reduction on the common
 single-match hash-join path. It does not close the SQLite embedded join gap by
 itself; the remaining gap still points to a compact/vectorized scan-filter-join
 pipeline rather than more row-at-a-time lookup work.
+
+## Rejected Follow-Up: Integer Columnar Batch-Driver Filter
+
+Experiment:
+
+- Added a pure-columnar projected-filter path for integer predicates that drove
+  directly from the predicate column batches and avoided the row-key scan plus
+  per-row `HashMap` lookups.
+- Target shape: `columnar_analytics` `filter_scan(age > 50)`.
+- Added `columnar_integer_projected_filter_skips_deleted_rows` to cover the
+  important correctness invariant: deleted rows must not leak through integer
+  columnar projected filters.
+
+Validation while present:
+
+```text
+cargo check --lib
+cargo test --test scan_prefix_decode -- --nocapture --test-threads=1
+HELIOS_TPS=1 HELIOS_TPS_MODE=mem HELIOS_TPS_EMBEDDED_PROFILE=columnar_analytics HELIOS_TPS_WORKLOADS=filter_scan,join_users_orders HELIOS_TPS_N=10000 HELIOS_TPS_M=2000 cargo test --profile perf --test tps_workloads run_tps_suite -- --nocapture --test-threads=1
+```
+
+Focused TPS, embedded mem, `N=10000`, `M=2000`, ops/s:
+
+```text
+fresh pre-change columnar run      filter 260/s, join 97/s
+integer batch-driver prototype     filter 236/s, join 82/s
+```
+
+Decision: reverted the performance path and kept the deleted-row regression
+test. The current row-key-driven columnar integer filter remains faster on this
+shape. The next filter lever needs a broader selection-vector design that does
+not regress join-side columnar scans, not another direct per-value driver.
