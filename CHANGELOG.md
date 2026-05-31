@@ -5,7 +5,7 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [3.33.1] - 2026-05-27
+## [3.34.0] - 2026-05-31
 
 ### Performance — TPS release batch
 
@@ -44,9 +44,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Release notes
 
 - Crates.io currently has `heliosdb-nano` `3.33.0` as the latest published
-  version, so this verified release candidate can publish as `3.33.1`.
+  version. This verified release candidate is intentionally published as
+  `3.34.0` because the TPS batch is a broad performance release rather than a
+  patch-only fix.
 - Known deferred items for this release are documented in
-  `RELEASE_PENDING_3.33.1.md`: TRUNCATE affected-row count semantics and HNSW
+  `RELEASE_PENDING_3.34.0.md`: TRUNCATE affected-row count semantics and HNSW
   tombstone/physical-count test semantics. SQLite embedded analytical scans and
   bound-parameter UPDATE remain post-release performance targets. These are not
   regressions from the TPS batch.
