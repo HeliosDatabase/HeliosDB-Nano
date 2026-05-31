@@ -2671,7 +2671,6 @@ impl StorageEngine {
             .iter()
             .map(|&idx| output_pos(idx))
             .collect::<Result<Vec<_>>>()?;
-        let predicate_column = [filter.column_index];
 
         let prefix = format!("data:{}:", table_name);
         let prefix_bytes = prefix.as_bytes();
@@ -2681,7 +2680,6 @@ impl StorageEngine {
             .db
             .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read_opts);
 
-        let mut predicate_values = Vec::with_capacity(1);
         let mut values = Vec::with_capacity(output_requested.len());
         let mut tuples = Vec::new();
         for item in iter {
@@ -2698,20 +2696,11 @@ impl StorageEngine {
                 raw_value.as_ref()
             };
 
-            if crate::storage::prefix_decode::decode_tuple_column_values_into(
-                row_bytes,
-                &predicate_column,
-                schema.columns.len(),
-                &mut predicate_values,
-            )
-            .is_err()
-            {
+            let Some(matches) =
+                crate::storage::prefix_decode::tuple_string_column_eq(row_bytes, filter.column_index, filter.value)
+            else {
                 return Ok(None);
-            }
-
-            let matches = predicate_values
-                .first()
-                .is_some_and(|value| matches!(value, Value::String(actual) if actual == filter.value));
+            };
             if !matches {
                 continue;
             }

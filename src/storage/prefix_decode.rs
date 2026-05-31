@@ -274,6 +274,33 @@ pub(crate) fn decode_tuple_numeric_column_value(bytes: &[u8], column: usize) -> 
     Some(DecodedNumericValue::Null)
 }
 
+/// Compare one string column against a literal without materializing `Value`.
+pub(crate) fn tuple_string_column_eq(bytes: &[u8], column: usize, expected: &str) -> Option<bool> {
+    let mut cur = ByteCursor::new(bytes);
+    let stored_cols = cur.read_len()?;
+
+    for idx in 0..stored_cols {
+        if idx == column {
+            let tag = cur.read_u32()?;
+            return match tag {
+                0 => Some(false),
+                8 => {
+                    let len = cur.read_len()?;
+                    Some(cur.take(len)? == expected.as_bytes())
+                }
+                _ => None,
+            };
+        }
+        if idx < column {
+            skip_value(&mut cur)?;
+        } else {
+            break;
+        }
+    }
+
+    Some(false)
+}
+
 struct ByteCursor<'a> {
     bytes: &'a [u8],
     pos: usize,
@@ -652,6 +679,23 @@ mod tests {
             decode_tuple_numeric_column_value(&bytes, 9).unwrap(),
             DecodedNumericValue::Null
         );
+    }
+
+    #[test]
+    fn compact_string_eq_compares_without_materializing_value() {
+        let t = Tuple::new(vec![
+            Value::Int4(7),
+            Value::String("pending".into()),
+            Value::String("paid".into()),
+            Value::Null,
+        ]);
+        let bytes = bincode::serialize(&t).unwrap();
+
+        assert_eq!(tuple_string_column_eq(&bytes, 2, "paid"), Some(true));
+        assert_eq!(tuple_string_column_eq(&bytes, 1, "paid"), Some(false));
+        assert_eq!(tuple_string_column_eq(&bytes, 3, "paid"), Some(false));
+        assert_eq!(tuple_string_column_eq(&bytes, 9, "paid"), Some(false));
+        assert_eq!(tuple_string_column_eq(&bytes, 0, "paid"), None);
     }
 
     #[test]
