@@ -261,7 +261,25 @@ final release-close packaging gate on committed docs
   cargo check --workspace --all-targets
     passed on 3.34.0 metadata
   cargo package
-    passed; packaged 706 files, 12.7 MiB uncompressed, 2.5 MiB compressed
+    passed; packaged 706 files, 12.8 MiB uncompressed, 2.5 MiB compressed
+  cargo publish --dry-run
+    passed; dry-run aborted before upload as expected
+
+post-close join payload pruning gate
+  cargo check --lib
+    passed
+  cargo test --test query_optimizer_tests -- --nocapture --test-threads=1
+    passed; 14 tests passed
+  cargo test --test join_hardening_tests -- --nocapture --test-threads=1
+    passed; 46 tests passed
+  cargo check --workspace --all-targets
+    passed
+  HELIOS_TPS=1 HELIOS_TPS_MODE=mem HELIOS_TPS_WORKLOADS=join_users_orders HELIOS_TPS_N=10000 HELIOS_TPS_M=2000 cargo test --profile perf --test tps_workloads run_tps_suite -- --nocapture --test-threads=1
+    focused join_users_orders: 81/s
+  HELIOS_TPS=1 HELIOS_TPS_MODE=mem HELIOS_TPS_WORKLOADS=filter_scan,agg_count_sum_avg,join_users_orders HELIOS_TPS_N=10000 HELIOS_TPS_M=2000 cargo test --profile perf --test tps_workloads run_tps_suite -- --nocapture --test-threads=1
+    mixed run: filter_scan 234/s, aggregate 568/s, join_users_orders 78/s
+  cargo package
+    passed; packaged 706 files, 12.8 MiB uncompressed, 2.5 MiB compressed
   cargo publish --dry-run
     passed; dry-run aborted before upload as expected
 ```
