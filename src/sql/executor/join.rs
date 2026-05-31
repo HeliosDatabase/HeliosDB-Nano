@@ -309,14 +309,27 @@ enum JoinKey {
 impl JoinKey {
     fn from_values(mut values: Vec<crate::Value>) -> Self {
         if values.len() == 1 {
-            match values.pop().expect("single value exists") {
-                crate::Value::Int2(value) => Self::Int(i64::from(value)),
-                crate::Value::Int4(value) => Self::Int(i64::from(value)),
-                crate::Value::Int8(value) => Self::Int(value),
-                value => Self::Single(value),
-            }
+            Self::from_single_value(values.pop().expect("single value exists"))
         } else {
             Self::Composite(values)
+        }
+    }
+
+    fn from_single_value(value: crate::Value) -> Self {
+        match value {
+            crate::Value::Int2(value) => Self::Int(i64::from(value)),
+            crate::Value::Int4(value) => Self::Int(i64::from(value)),
+            crate::Value::Int8(value) => Self::Int(value),
+            value => Self::Single(value),
+        }
+    }
+
+    fn from_single_value_ref(value: &crate::Value) -> Self {
+        match value {
+            crate::Value::Int2(value) => Self::Int(i64::from(*value)),
+            crate::Value::Int4(value) => Self::Int(i64::from(*value)),
+            crate::Value::Int8(value) => Self::Int(*value),
+            value => Self::Single(value.clone()),
         }
     }
 
@@ -712,6 +725,17 @@ impl HashJoinOperator {
     fn extract_join_key(&self, tuple: &Tuple, is_right_side: bool) -> Result<Option<JoinKey>> {
         if let Some(indices) = &self.direct_key_indices {
             let key_indices = if is_right_side { &indices.right } else { &indices.left };
+            if key_indices.len() == 1 {
+                let value = tuple
+                    .values
+                    .get(key_indices[0])
+                    .ok_or_else(|| Error::query_execution("Join key index out of bounds"))?;
+                if matches!(value, crate::Value::Null) {
+                    return Ok(None);
+                }
+                return Ok(Some(JoinKey::from_single_value_ref(value)));
+            }
+
             let mut key_values = Vec::with_capacity(key_indices.len());
             for &idx in key_indices {
                 let value = tuple
