@@ -241,3 +241,36 @@ after change run 2                   filter_scan 183/s, join_users_orders 55/s
 ```
 
 This is a modest but clean read-path win. It does not change the larger conclusion: the remaining SQLite gap still needs compact/vectorized scan/filter/join execution rather than more tuple-boundary micro-tweaks.
+
+## Accepted Follow-Up: Single-Key Hash Join Key Extraction
+
+Commit after this report: `perf: avoid single-key hash join vec allocation`.
+
+Finding:
+
+- Direct single-column equi-joins already store integer join keys compactly, but the direct-key extraction path still allocated a one-element `Vec<Value>` for every build/probe row before converting it to `JoinKey::Int`.
+- The TPS join workload is exactly this shape: `users.id = orders.user_id`, after predicate pushdown on both inputs.
+
+Change:
+
+- `src/sql/executor/join.rs` now has a single-key direct path that constructs `JoinKey` directly from a borrowed tuple value.
+- Composite-key and non-direct expression joins keep the existing `Vec<Value>` path.
+
+Validation:
+
+```text
+cargo check --lib
+cargo test --test join_hardening_tests -- --nocapture --test-threads=1
+HELIOS_TPS=1 HELIOS_TPS_MODE=mem HELIOS_TPS_N=10000 HELIOS_TPS_M=2000 \
+  cargo test --profile perf --test tps_workloads run_tps_suite -- --nocapture --test-threads=1
+```
+
+Measured in-memory TPS, `N=10000`, `M=2000`, time-travel on:
+
+```text
+baseline after cache fix             join_users_orders 55-56/s
+after change run 1                   join_users_orders 59/s
+after change run 2                   join_users_orders 57/s
+```
+
+This is another modest executor win. It narrows the join gap, but SQLite still leads the mirrored workload at about 201/s, so the main remaining lever is still compact/vectorized scan/filter/join execution.
