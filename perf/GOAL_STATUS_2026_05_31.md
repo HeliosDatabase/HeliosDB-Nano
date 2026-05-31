@@ -450,3 +450,50 @@ final run 2                     point_lookup_pk 317k/s, hot 1.44M/s, aggregate 4
 ```
 
 This closes most of the in-memory random PK lookup gap to SQLite on this host (SQLite latest: ~324k/s) without sacrificing Nano's hot lookup lead.
+
+## Accepted Follow-Up: Direct Literal INSERT Materialization
+
+Commit after this report: `perf: materialize literal insert values directly`.
+
+Finding:
+
+- The literal fast INSERT path parsed VALUES into a temporary `Vec<Value>` and
+  then cloned each parsed value into the schema-aligned tuple.
+- Parameterized INSERT was already separate; this affects SQL text INSERTs such
+  as the default `bulk_insert_users(txn)` and `autocommit_insert` TPS workloads.
+
+Change:
+
+- `materialize_fast_literal_insert_tuple()` now streams each parsed literal
+  directly into the target tuple slot.
+- The old `fast_parse_values()` temporary vector helper was removed.
+
+Validation:
+
+```text
+cargo check --lib
+cargo check --test tps_workloads
+cargo test --lib fast_insert -- --nocapture --test-threads=1
+cargo test --test multi_row_insert_values -- --nocapture --test-threads=1
+cargo test --test vector_search_test test_vector_dimension_validation -- --nocapture --test-threads=1
+cargo test --test storage_modes_test test_columnar_storage_fast_insert_side_data -- --nocapture --test-threads=1
+cargo test --test storage_modes_test test_columnar_fast_insert_wal_logs_logical_tuple -- --nocapture --test-threads=1
+```
+
+Measured in-memory TPS, `N=10000`, `M=2000`, time-travel on:
+
+```text
+pre-change run                  bulk_insert 125,446/s, autocommit_insert 99,044/s
+direct materializer run 1        bulk_insert 127,189/s, autocommit_insert 103,062/s
+direct materializer run 2        bulk_insert 116,875/s, autocommit_insert 100,458/s
+```
+
+This is a small, noisy INSERT-path win, but it removes real per-row allocation
+and clone work from the literal fast path without changing WAL, HA, MVCC, vector
+dimension validation, columnar side-data, or multi-row INSERT behavior.
+
+Rejected in the same pass:
+
+- Avoiding the duplicate serialized logical-value clone in `insert_tuple_fast()`
+  was correctness-clean, but the TPS signal was flat/mixed (`autocommit_insert`
+  stayed ~99k/s and `bulk_insert` fell in the first run), so it was reverted.
