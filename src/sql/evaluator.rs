@@ -10,6 +10,8 @@ use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use std::sync::Arc;
 
+const ANY_ARRAY_MARKER_FUNCTION: &str = "__hdb_any_array";
+
 /// Expression evaluator
 ///
 /// Evaluates expressions in the context of a tuple and schema.
@@ -242,6 +244,44 @@ impl Evaluator {
                 let mut has_null = false;
 
                 for item in list {
+                    if let LogicalExpr::ScalarFunction { fun, args } = item {
+                        if fun == ANY_ARRAY_MARKER_FUNCTION {
+                            if args.len() != 1 {
+                                return Err(Error::query_execution("ANY array marker expects one argument"));
+                            }
+                            let array_value = self.evaluate(
+                                args.first()
+                                    .ok_or_else(|| Error::query_execution("ANY array marker missing argument"))?,
+                                tuple,
+                            )?;
+                            match array_value {
+                                Value::Array(values) => {
+                                    for item_value in values {
+                                        if matches!(item_value, Value::Null) {
+                                            has_null = true;
+                                            continue;
+                                        }
+                                        if self.values_equal(&value, &item_value) {
+                                            found = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                Value::Null => has_null = true,
+                                other => {
+                                    return Err(Error::query_execution(format!(
+                                        "ANY expects an array expression, got {:?}",
+                                        other
+                                    )))
+                                }
+                            }
+                            if found {
+                                break;
+                            }
+                            continue;
+                        }
+                    }
+
                     let item_value = self.evaluate(item, tuple)?;
                     if matches!(item_value, Value::Null) {
                         has_null = true;

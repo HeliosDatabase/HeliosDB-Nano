@@ -39,6 +39,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+const ANY_ARRAY_MARKER_FUNCTION: &str = "__hdb_any_array";
+
 /// Information about an aggregate plan needed to rewrite ORDER BY expressions.
 /// Contains the aggregate expressions and the corresponding output aliases from the
 /// wrapping Project layer, plus GROUP BY expressions and their aliases.
@@ -2588,6 +2590,35 @@ impl<'a> Planner<'a> {
         Ok(items)
     }
 
+    fn array_expr_to_list(&self, expr: &Expr) -> Result<Vec<LogicalExpr>> {
+        match expr {
+            Expr::Array(sqlparser::ast::Array { elem, .. }) => elem
+                .iter()
+                .map(|item| self.expr_to_logical(item))
+                .collect::<Result<Vec<_>>>(),
+            Expr::Cast { expr: inner, .. } => self.array_expr_to_list(inner),
+            _ => Err(Error::query_execution(format!(
+                "ANY(array): unsupported array expression: {:?}",
+                expr
+            ))),
+        }
+    }
+
+    fn runtime_any_array_expr(&self, expr: &Expr) -> Result<LogicalExpr> {
+        use sqlparser::ast::{Expr as SqlExpr, Value as SqlValue};
+
+        match expr {
+            SqlExpr::Value(SqlValue::Placeholder(_)) => self.expr_to_logical(expr),
+            SqlExpr::Cast { expr: inner, .. } if matches!(inner.as_ref(), SqlExpr::Value(SqlValue::Placeholder(_))) => {
+                self.expr_to_logical(inner)
+            }
+            _ => Err(Error::query_execution(format!(
+                "ANY(array): unsupported runtime array expression: {:?}",
+                expr
+            ))),
+        }
+    }
+
     fn expr_to_logical(&self, expr: &Expr) -> Result<LogicalExpr> {
         match expr {
             Expr::Identifier(ident) => Ok(LogicalExpr::Column {
@@ -2935,16 +2966,14 @@ impl<'a> Planner<'a> {
 
             // KanttBan #23 (v3.31.1 phase 2.3): `x = ANY(arr)` and
             // `x <> ANY(arr)` — equivalent to `x IN (a, b, …)`
-            // when the array is a literal. drizzle-kit's
-            // getColumnsInfoQuery uses
+            // for literal arrays, with runtime expansion for bound
+            // parameter arrays. drizzle-kit's getColumnsInfoQuery uses
             // `a.atttypid = ANY ('{int,int8,int2}'::regtype[])` for
             // SERIAL detection. Convert at plan time so the existing
             // InList operator handles evaluation.
             //
-            // Only the literal-array shape is rewritten; AnyOp over
-            // a column or subquery still errors via the catch-all
-            // (the executor would need true array support to handle
-            // those, which is a bigger lift).
+            // Column-array and subquery-array ANY still need true
+            // executor support and fall back in the AnyOp arm below.
             Expr::AnyOp {
                 left,
                 compare_op,
@@ -2953,32 +2982,40 @@ impl<'a> Planner<'a> {
             } => {
                 use sqlparser::ast::BinaryOperator;
                 let negated = matches!(compare_op, BinaryOperator::NotEq);
-                // KanttBan #23 phase 2.11: when the array is a literal
-                // we rewrite to InList. When it's a column reference
-                // or subquery (e.g. drizzle's `ANY(con.conkey)`), we
-                // don't have an array operator at execution time —
-                // gracefully fall back to a constant `false` so the
-                // surrounding expression evaluates without erroring.
-                // Real array support (column arrays + unnest in
-                // ANY context) is future work.
-                match self.literal_array_to_list(right) {
-                    Ok(list) => {
-                        let logical_expr = self.expr_to_logical(left)?;
-                        Ok(LogicalExpr::InList {
+                // Literal arrays become a normal InList. Parameter arrays use
+                // an internal marker that the InList evaluator expands at
+                // runtime after parameter binding. Column/subquery arrays
+                // still fall back to constant false; full array-column ANY
+                // support is a bigger executor feature.
+                let logical_expr = self.expr_to_logical(left)?;
+                match self
+                    .literal_array_to_list(right)
+                    .or_else(|_| self.array_expr_to_list(right))
+                {
+                    Ok(list) => Ok(LogicalExpr::InList {
+                        expr: Box::new(logical_expr),
+                        list,
+                        negated,
+                    }),
+                    Err(_) => match self.runtime_any_array_expr(right) {
+                        Ok(array_expr) => Ok(LogicalExpr::InList {
                             expr: Box::new(logical_expr),
-                            list,
+                            list: vec![LogicalExpr::ScalarFunction {
+                                fun: ANY_ARRAY_MARKER_FUNCTION.to_string(),
+                                args: vec![array_expr],
+                            }],
                             negated,
-                        })
-                    }
-                    Err(_) => {
-                        // The left expression may have side-effects
-                        // worth preserving in the plan; eagerly
-                        // evaluating to a constant boolean drops it.
-                        // For drizzle's usage the left is also a
-                        // simple column reference, so dropping is
-                        // benign.
-                        Ok(LogicalExpr::Literal(Value::Boolean(negated)))
-                    }
+                        }),
+                        Err(_) => {
+                            // The left expression may have side-effects
+                            // worth preserving in the plan; eagerly
+                            // evaluating to a constant boolean drops it.
+                            // For drizzle's usage the left is also a
+                            // simple column reference, so dropping is
+                            // benign.
+                            Ok(LogicalExpr::Literal(Value::Boolean(negated)))
+                        }
+                    },
                 }
             }
 
