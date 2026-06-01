@@ -26,6 +26,7 @@ impl BranchingParser {
         parent: Option<String>,
         as_of_str: &str,
         options_str: Option<&str>,
+        if_not_exists: bool,
     ) -> Result<LogicalPlan> {
         // Parse AS OF clause
         let as_of = Self::parse_as_of_clause(as_of_str)?;
@@ -39,6 +40,7 @@ impl BranchingParser {
 
         Ok(LogicalPlan::CreateBranch {
             branch_name,
+            if_not_exists,
             parent,
             as_of,
             options,
@@ -245,6 +247,7 @@ mod tests {
             None, // CURRENT
             "NOW",
             None,
+            false,
         )
         .unwrap();
 

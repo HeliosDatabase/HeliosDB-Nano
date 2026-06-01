@@ -1309,8 +1309,9 @@ impl Parser {
     /// Syntax variations:
     /// - CREATE DATABASE BRANCH `<name>` FROM `<parent>` AS OF NOW
     /// - CREATE BRANCH `<name>` AS OF NOW
+    /// - CREATE DATABASE BRANCH IF NOT EXISTS `<name>` FROM `<parent>` AS OF NOW
     /// - CREATE DATABASE BRANCH `<name>` WITH (option = value)
-    pub fn parse_create_branch_sql(sql: &str) -> Result<(String, Option<String>, String, Option<String>)> {
+    pub fn parse_create_branch_sql(sql: &str) -> Result<(String, Option<String>, String, Option<String>, bool)> {
         let cleaned = sql.trim().to_string();
         let upper = cleaned.to_uppercase();
 
@@ -1321,7 +1322,19 @@ impl Parser {
             "CREATE BRANCH".len()
         };
 
-        let after_create = cleaned[name_start..].trim_start();
+        let mut after_create = cleaned[name_start..].trim_start();
+        let if_not_exists = if after_create.to_uppercase().starts_with("IF NOT EXISTS") {
+            let after_clause = &after_create["IF NOT EXISTS".len()..];
+            if !after_clause.is_empty() && after_clause.chars().next().map(|c| c.is_whitespace()).unwrap_or(false) {
+                after_create = after_clause.trim_start();
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
         // Branch names accept three forms:
         //   - bare identifier:           CREATE BRANCH foo AS OF NOW
         //   - single-quoted string:      CREATE BRANCH 'foo' AS OF NOW
@@ -1422,7 +1435,7 @@ impl Parser {
             None
         };
 
-        Ok((branch_name, parent, as_of_clause, with_options))
+        Ok((branch_name, parent, as_of_clause, with_options, if_not_exists))
     }
 
     /// Parse DROP DATABASE BRANCH statement
