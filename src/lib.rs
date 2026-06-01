@@ -1833,7 +1833,7 @@ impl EmbeddedDatabase {
                                     // Skip this row silently
                                     continue;
                                 }
-                                Some(sql::logical_plan::OnConflictAction::DoUpdate { assignments }) => {
+                                Some(sql::logical_plan::OnConflictAction::DoUpdate { assignments, selection }) => {
                                     // Upsert: find existing row by the conflicting constraint and update it.
                                     // The conflict might be on PK or a UNIQUE key — extract which from the error.
                                     let err_msg = e.to_string();
@@ -1948,6 +1948,21 @@ impl EmbeddedDatabase {
                                     let update_evaluator = sql::Evaluator::new(std::sync::Arc::new(
                                         schema.clone().with_source_table_name(table_name),
                                     ));
+                                    if let Some(predicate) = selection {
+                                        let resolved_predicate = Self::resolve_excluded_refs(predicate, &excluded_map);
+                                        match update_evaluator.evaluate(&resolved_predicate, &existing_tuple)? {
+                                            Value::Boolean(true) => {}
+                                            Value::Boolean(false) | Value::Null => {
+                                                continue;
+                                            }
+                                            other => {
+                                                return Err(Error::query_execution(format!(
+                                                    "ON CONFLICT DO UPDATE WHERE expression evaluated to non-boolean value: {:?}",
+                                                    other
+                                                )));
+                                            }
+                                        }
+                                    }
                                     for (col_name, expr) in assignments {
                                         let target_idx = schema
                                             .columns
@@ -9962,7 +9977,7 @@ impl EmbeddedDatabase {
                         (Err(_), Some(sql::logical_plan::OnConflictAction::DoNothing)) => {
                             // Silent skip — no count increment.
                         }
-                        (Err(e), Some(sql::logical_plan::OnConflictAction::DoUpdate { assignments })) => {
+                        (Err(e), Some(sql::logical_plan::OnConflictAction::DoUpdate { assignments, selection })) => {
                             // Locate the existing row.
                             //
                             // KanttBan / Token-Dashboard Quirk I (v3.27):
@@ -10049,6 +10064,21 @@ impl EmbeddedDatabase {
                                 std::sync::Arc::new(schema.clone().with_source_table_name(table_name)),
                                 params.to_vec(),
                             );
+                            if let Some(predicate) = selection {
+                                let resolved_predicate = Self::resolve_excluded_refs(predicate, &excluded_map);
+                                match update_eval.evaluate(&resolved_predicate, &updated_tuple)? {
+                                    Value::Boolean(true) => {}
+                                    Value::Boolean(false) | Value::Null => {
+                                        continue;
+                                    }
+                                    other => {
+                                        return Err(Error::query_execution(format!(
+                                            "ON CONFLICT DO UPDATE WHERE expression evaluated to non-boolean value: {:?}",
+                                            other
+                                        )));
+                                    }
+                                }
+                            }
                             for (col_name, expr) in assignments {
                                 let target_idx = schema
                                     .columns

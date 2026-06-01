@@ -105,6 +105,9 @@ pub enum OnConflictAction {
         /// Column assignments (col_name, expression).
         /// Expressions may reference `EXCLUDED.col` for the proposed insert values.
         assignments: Vec<(String, LogicalExpr)>,
+        /// Optional `WHERE` predicate for the `DO UPDATE` arm.
+        /// May reference existing-row columns and `EXCLUDED.col`.
+        selection: Option<LogicalExpr>,
     },
 }
 
