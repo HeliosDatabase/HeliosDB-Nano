@@ -183,6 +183,59 @@ fn test_decode_binary_parameters() {
 }
 
 #[test]
+fn test_decode_binary_timestamp_parameter() {
+    // PostgreSQL binary TIMESTAMP is i64 microseconds since 2000-01-01 00:00:00.
+    let micros_since_pg_epoch = 86_401_234_567i64;
+    let timestamp = decode_parameter(&micros_since_pg_epoch.to_be_bytes(), 1, 1114).unwrap();
+    let expected_timestamp = chrono::DateTime::parse_from_rfc3339("2000-01-02T00:00:01.234567Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    assert_eq!(timestamp, Value::Timestamp(expected_timestamp));
+
+    let timestamptz = decode_parameter(&micros_since_pg_epoch.to_be_bytes(), 1, 1184).unwrap();
+    assert_eq!(timestamptz, Value::Timestamp(expected_timestamp));
+}
+
+#[test]
+fn test_decode_binary_uuid_parameter() {
+    // PostgreSQL binary UUID is the 16 RFC 4122 bytes, not a text string.
+    let uuid = uuid::Uuid::parse_str("12345678-1234-5678-9abc-def012345678").unwrap();
+    let decoded_uuid = decode_parameter(uuid.as_bytes(), 1, 2950).unwrap();
+    assert_eq!(decoded_uuid, Value::Uuid(uuid));
+}
+
+#[test]
+fn test_decode_binary_timestamp_uuid_reject_malformed_lengths() {
+    assert!(decode_parameter(&[0; 7], 1, 1114).is_err());
+    assert!(decode_parameter(&[0; 9], 1, 1114).is_err());
+    assert!(decode_parameter(&[0; 15], 1, 2950).is_err());
+    assert!(decode_parameter(&[0; 17], 1, 2950).is_err());
+
+    assert!(decode_parameter(&i64::MAX.to_be_bytes(), 1, 1114).is_err());
+    assert!(decode_parameter(&i64::MIN.to_be_bytes(), 1, 1114).is_err());
+}
+
+#[test]
+fn test_decode_binary_timestamp_uuid_stress() {
+    let micros_since_pg_epoch = 86_401_234_567i64.to_be_bytes();
+    let uuid = uuid::Uuid::parse_str("12345678-1234-5678-9abc-def012345678").unwrap();
+    let started = std::time::Instant::now();
+
+    for _ in 0..10_000 {
+        assert!(matches!(
+            decode_parameter(&micros_since_pg_epoch, 1, 1114).unwrap(),
+            Value::Timestamp(_)
+        ));
+        assert_eq!(decode_parameter(uuid.as_bytes(), 1, 2950).unwrap(), Value::Uuid(uuid));
+    }
+
+    eprintln!(
+        "A4 stress: decoded 10,000 timestamp+uuid binary parameter pairs in {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
 fn test_parameter_substitution() {
     // Simple substitution
     let sql = "SELECT * FROM users WHERE id = $1";

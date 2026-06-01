@@ -406,6 +406,30 @@ fn decode_binary_parameter(data: &[u8], type_oid: i32) -> Result<Value> {
             let val = f64::from_be_bytes(bytes);
             Ok(Value::Float8(val))
         }
+        1114 | 1184 => {
+            // Timestamp/Timestamptz (8-byte signed microseconds since 2000-01-01)
+            if data.len() != 8 {
+                return Err(Error::protocol("Invalid Timestamp parameter length"));
+            }
+            let bytes: [u8; 8] = data
+                .try_into()
+                .map_err(|_| Error::protocol("Invalid Timestamp parameter"))?;
+            const PG_EPOCH_OFFSET_MICROS: i64 = 946_684_800_000_000;
+            let unix_micros = i64::from_be_bytes(bytes)
+                .checked_add(PG_EPOCH_OFFSET_MICROS)
+                .ok_or_else(|| Error::protocol("Timestamp parameter out of range"))?;
+            let timestamp = chrono::DateTime::from_timestamp_micros(unix_micros)
+                .ok_or_else(|| Error::protocol("Timestamp parameter out of range"))?;
+            Ok(Value::Timestamp(timestamp))
+        }
+        2950 => {
+            // UUID (16 RFC 4122 bytes)
+            if data.len() != 16 {
+                return Err(Error::protocol("Invalid UUID parameter length"));
+            }
+            let bytes: [u8; 16] = data.try_into().map_err(|_| Error::protocol("Invalid UUID parameter"))?;
+            Ok(Value::Uuid(uuid::Uuid::from_bytes(bytes)))
+        }
         25 | 1043 => {
             // Text, Varchar (variable length, UTF-8)
             let text = std::str::from_utf8(data)
