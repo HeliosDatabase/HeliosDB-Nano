@@ -46,7 +46,7 @@ pub struct PgConnectionHandler<S = BufWriter<TcpStream>> {
     /// When `true`, `send_ready_for_query()` is a no-op. Used by
     /// multi-statement simple query dispatch to emit a single trailing
     /// ReadyForQuery after the whole `;`-separated batch.
-    suppress_ready_for_query: bool,
+    pub(super) suppress_ready_for_query: bool,
     /// Extended-query protocol requires ErrorResponse, then discarding input
     /// until Sync, then ReadyForQuery. Sending ReadyForQuery early can make
     /// drivers close or wedge the connection after an Execute-time error.
@@ -495,7 +495,7 @@ where
     /// unchanged from v3.12's behaviour.
     // SAFETY: results[0] is guarded by !results.is_empty() check.
     #[allow(clippy::indexing_slicing)]
-    async fn handle_single_query(&mut self, query: &str) -> Result<()> {
+    pub(super) async fn handle_single_query(&mut self, query: &str) -> Result<()> {
         tracing::debug!("Executing query: {}", query);
 
         // `DO $$ … $$` / `DO LANGUAGE … $$ … $$` blocks. sqlparser
@@ -547,6 +547,7 @@ where
                 })
                 .await?;
             } else {
+                self.rollback_failed_transaction_for_recovery()?;
                 // Begin transaction (isolation level would be applied if storage supported it)
                 // For now we just begin - isolation level is informational
                 self.database.begin()?;
@@ -645,8 +646,7 @@ where
             if self.transaction_status == TransactionStatus::InTransaction {
                 self.database.commit()?;
             } else if self.transaction_status == TransactionStatus::Failed {
-                self.database.rollback()?;
-                self.transaction_status = TransactionStatus::Idle;
+                self.rollback_failed_transaction_for_recovery()?;
                 self.send_command_complete("ROLLBACK").await?;
                 self.send_ready_for_query().await?;
                 return Ok(());
@@ -668,7 +668,9 @@ where
                 self.transaction_status,
                 TransactionStatus::InTransaction | TransactionStatus::Failed
             ) {
-                self.database.rollback()?;
+                if self.database.in_transaction() {
+                    self.database.rollback()?;
+                }
             } else {
                 self.send_message(BackendMessage::NoticeResponse {
                     severity: "WARNING".to_string(),
@@ -1396,14 +1398,13 @@ where
         detail: Option<String>,
         hint: Option<String>,
     ) -> Result<()> {
+        self.mark_transaction_failed_after_error();
         self.send_error_message(severity, code, message, detail, hint).await?;
         self.send_ready_for_query().await
     }
 
     async fn send_error_for_query(&mut self, error: &Error, wait_for_sync: bool) -> Result<()> {
-        if self.transaction_status == TransactionStatus::InTransaction {
-            self.transaction_status = TransactionStatus::Failed;
-        }
+        self.mark_transaction_failed_after_error();
         self.suppress_ready_for_query = false;
         let code = Self::sqlstate_for_error(error);
         if wait_for_sync {
@@ -1416,6 +1417,40 @@ where
         } else {
             self.send_error("ERROR", code, &error.to_string(), None, None).await
         }
+    }
+
+    fn mark_transaction_failed_after_error(&mut self) {
+        if self.transaction_status == TransactionStatus::InTransaction {
+            self.transaction_status = TransactionStatus::Failed;
+        }
+    }
+
+    fn rollback_failed_transaction_for_recovery(&mut self) -> Result<()> {
+        if self.transaction_status == TransactionStatus::Failed {
+            if self.database.in_transaction() {
+                self.database.rollback()?;
+            }
+            self.transaction_status = TransactionStatus::Idle;
+        }
+        Ok(())
+    }
+
+    pub(super) fn transaction_failed(&self) -> bool {
+        self.transaction_status == TransactionStatus::Failed
+    }
+
+    pub(super) async fn send_extended_failed_transaction_error(&mut self) -> Result<()> {
+        self.suppress_ready_for_query = false;
+        self.awaiting_sync_after_error = true;
+        self.send_error_message(
+            "ERROR",
+            "25P02",
+            "current transaction is aborted, commands ignored until end of transaction block",
+            None,
+            Some("Use ROLLBACK to clear the failed transaction state".to_string()),
+        )
+        .await?;
+        self.flush().await
     }
 
     fn sqlstate_for_error(error: &Error) -> &'static str {
@@ -2198,7 +2233,8 @@ mod failed_transaction_state_tests {
     #[tokio::test]
     async fn query_error_marks_open_transaction_failed_and_reenables_ready() {
         let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
-        let (mut handler, _client) = test_handler(db);
+        db.begin().expect("begin");
+        let (mut handler, _client) = test_handler(Arc::clone(&db));
         handler.transaction_status = TransactionStatus::InTransaction;
         handler.suppress_ready_for_query = true;
 
@@ -2209,6 +2245,30 @@ mod failed_transaction_state_tests {
 
         assert_eq!(handler.transaction_status, TransactionStatus::Failed);
         assert!(!handler.suppress_ready_for_query);
+        assert!(db.in_transaction());
+        handler
+            .handle_single_query("BEGIN")
+            .await
+            .expect("BEGIN recovers failed transaction");
+        assert_eq!(handler.transaction_status, TransactionStatus::InTransaction);
+        db.rollback().expect("rollback cleanup");
+    }
+
+    #[tokio::test]
+    async fn direct_error_response_marks_open_transaction_failed() {
+        let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+        db.begin().expect("begin");
+        let (mut handler, _client) = test_handler(Arc::clone(&db));
+        handler.transaction_status = TransactionStatus::InTransaction;
+
+        handler
+            .send_error("ERROR", "22023", "bad setting", None, None)
+            .await
+            .expect("send error");
+
+        assert_eq!(handler.transaction_status, TransactionStatus::Failed);
+        assert!(db.in_transaction());
+        db.rollback().expect("rollback cleanup");
     }
 
     #[tokio::test]

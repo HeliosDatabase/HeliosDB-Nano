@@ -171,6 +171,32 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
             .get_statement(&portal.statement_name)?
             .ok_or_else(|| Error::query_execution(format!("Statement '{}' not found", portal.statement_name)))?;
 
+        // Transaction-control statements need the connection-level state
+        // machine from the simple-query path. Letting extended Execute send
+        // BEGIN/COMMIT/ROLLBACK straight to the engine leaves the handler's
+        // TransactionStatus out of sync with the embedded transaction.
+        let trimmed_query = statement.query.trim();
+        let is_transaction_control = trimmed_query.eq_ignore_ascii_case("BEGIN")
+            || super::handler::starts_with_icase(trimmed_query, "BEGIN ")
+            || trimmed_query.eq_ignore_ascii_case("START TRANSACTION")
+            || super::handler::starts_with_icase(trimmed_query, "START TRANSACTION ")
+            || trimmed_query.eq_ignore_ascii_case("COMMIT")
+            || trimmed_query.eq_ignore_ascii_case("ROLLBACK");
+        if is_transaction_control {
+            let previous_suppress_ready = self.suppress_ready_for_query;
+            self.suppress_ready_for_query = true;
+            let result = self.handle_single_query(&statement.query).await;
+            self.suppress_ready_for_query = previous_suppress_ready;
+            result?;
+            self.prepared_statements
+                .update_portal_state(&portal_name, PortalState::Complete)?;
+            return Ok(());
+        }
+
+        if self.transaction_failed() {
+            return self.send_extended_failed_transaction_error().await;
+        }
+
         // Convert parameters from wire format to Value
         let mut param_values = Vec::new();
         for (i, param_data) in portal.params.iter().enumerate() {
