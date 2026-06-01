@@ -1629,6 +1629,63 @@ pub(super) fn schema_to_field_descriptions(schema: &Schema) -> Vec<FieldDescript
         .collect()
 }
 
+/// Convert Schema to FieldDescriptions, honoring requested result formats
+/// where this wire encoder has a matching binary representation.
+pub(super) fn schema_to_field_descriptions_with_formats(
+    schema: &Schema,
+    result_formats: &[i16],
+) -> Vec<FieldDescription> {
+    schema
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(index, col)| FieldDescription {
+            name: col.name.clone(),
+            table_oid: 0,
+            column_attr_num: 0,
+            data_type_oid: datatype_to_oid(&col.data_type),
+            data_type_size: datatype_to_size(&col.data_type),
+            type_modifier: -1,
+            format_code: effective_result_format(&col.data_type, result_formats, index),
+        })
+        .collect()
+}
+
+pub(super) fn requested_result_format(result_formats: &[i16], column_index: usize) -> i16 {
+    if result_formats.is_empty() {
+        0
+    } else if result_formats.len() == 1 {
+        result_formats[0]
+    } else {
+        result_formats.get(column_index).copied().unwrap_or(0)
+    }
+}
+
+fn effective_result_format(data_type: &crate::DataType, result_formats: &[i16], column_index: usize) -> i16 {
+    let requested = requested_result_format(result_formats, column_index);
+    if requested == 1 && datatype_has_binary_result(data_type) {
+        1
+    } else {
+        0
+    }
+}
+
+fn datatype_has_binary_result(data_type: &crate::DataType) -> bool {
+    matches!(
+        data_type,
+        crate::DataType::Boolean
+            | crate::DataType::Int2
+            | crate::DataType::Int4
+            | crate::DataType::Int8
+            | crate::DataType::Float4
+            | crate::DataType::Float8
+            | crate::DataType::Bytea
+            | crate::DataType::Text
+            | crate::DataType::Varchar(_)
+            | crate::DataType::Uuid
+    )
+}
+
 /// Convert DataType to PostgreSQL OID
 pub(super) fn datatype_to_oid(dt: &crate::DataType) -> i32 {
     match dt {
@@ -1640,6 +1697,7 @@ pub(super) fn datatype_to_oid(dt: &crate::DataType) -> i32 {
         crate::DataType::Float8 => 701,
         crate::DataType::Text => 25,
         crate::DataType::Varchar(_) => 1043,
+        crate::DataType::Bytea => 17,
         crate::DataType::Json => 114,
         crate::DataType::Jsonb => 3802,
         crate::DataType::Timestamp => 1114,
@@ -1749,6 +1807,42 @@ pub(super) fn tuple_to_pg_values(tuple: &Tuple) -> Vec<Option<Vec<u8>>> {
             }
         })
         .collect()
+}
+
+/// Convert Tuple to PostgreSQL wire-format values using portal result formats.
+pub(super) fn tuple_to_pg_values_with_formats(tuple: &Tuple, result_formats: &[i16]) -> Vec<Option<Vec<u8>>> {
+    tuple
+        .values
+        .iter()
+        .enumerate()
+        .map(|(index, val)| match val {
+            Value::Null => None,
+            _ if requested_result_format(result_formats, index) == 1 => {
+                value_to_pg_binary(val).or_else(|| single_value_to_pg_text(val))
+            }
+            _ => single_value_to_pg_text(val),
+        })
+        .collect()
+}
+
+fn single_value_to_pg_text(value: &Value) -> Option<Vec<u8>> {
+    let tuple = Tuple::new(vec![value.clone()]);
+    tuple_to_pg_values(&tuple).into_iter().next().flatten()
+}
+
+fn value_to_pg_binary(value: &Value) -> Option<Vec<u8>> {
+    match value {
+        Value::Boolean(value) => Some(vec![u8::from(*value)]),
+        Value::Int2(value) => Some(value.to_be_bytes().to_vec()),
+        Value::Int4(value) => Some(value.to_be_bytes().to_vec()),
+        Value::Int8(value) => Some(value.to_be_bytes().to_vec()),
+        Value::Float4(value) => Some(value.to_be_bytes().to_vec()),
+        Value::Float8(value) => Some(value.to_be_bytes().to_vec()),
+        Value::String(value) => Some(value.as_bytes().to_vec()),
+        Value::Bytes(value) => Some(value.clone()),
+        Value::Uuid(value) => Some(value.as_bytes().to_vec()),
+        _ => None,
+    }
 }
 
 /// Split a SQL string on `;` while respecting single-quoted strings

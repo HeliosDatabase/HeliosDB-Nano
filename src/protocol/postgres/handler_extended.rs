@@ -260,7 +260,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
                 self.prepared_statements
                     .update_portal_state(&portal_name, PortalState::Complete)?;
                 for row in &catalog_result.1 {
-                    let values = super::handler::tuple_to_pg_values(row);
+                    let values = super::handler::tuple_to_pg_values_with_formats(row, &portal.result_formats);
                     self.send_message(BackendMessage::DataRow { values }).await?;
                 }
                 let tag = format!("SELECT {}", catalog_result.1.len());
@@ -303,7 +303,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
 
             // Send DataRows
             for row in &results_to_send {
-                let values = super::handler::tuple_to_pg_values(row);
+                let values = super::handler::tuple_to_pg_values_with_formats(row, &portal.result_formats);
                 self.send_message(BackendMessage::DataRow { values }).await?;
             }
 
@@ -332,7 +332,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
                 // RowDescription was already sent during Describe; Execute
                 // only emits DataRows + CommandComplete.
                 for row in &tuples {
-                    let values = super::handler::tuple_to_pg_values(row);
+                    let values = super::handler::tuple_to_pg_values_with_formats(row, &portal.result_formats);
                     self.send_message(BackendMessage::DataRow { values }).await?;
                 }
                 let tag = if is_insert {
@@ -425,19 +425,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
 
                 // Send RowDescription or NoData
                 if let Some(schema) = &statement.result_schema {
-                    let fields: Vec<FieldDescription> = schema
-                        .columns
-                        .iter()
-                        .map(|col| FieldDescription {
-                            name: col.name.clone(),
-                            table_oid: 0,
-                            column_attr_num: 0,
-                            data_type_oid: super::handler::datatype_to_oid(&col.data_type),
-                            data_type_size: super::handler::datatype_to_size(&col.data_type),
-                            type_modifier: -1,
-                            format_code: 0,
-                        })
-                        .collect();
+                    let fields =
+                        super::handler::schema_to_field_descriptions_with_formats(schema, &portal.result_formats);
                     self.send_message(BackendMessage::RowDescription { fields }).await?;
                 } else {
                     self.send_message(BackendMessage::NoData).await?;
