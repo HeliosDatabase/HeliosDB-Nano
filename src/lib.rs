@@ -9806,6 +9806,7 @@ impl EmbeddedDatabase {
                 // Get table schema for column types
                 let catalog = self.storage.catalog();
                 let schema = catalog.get_table_schema(table_name)?;
+                let table_constraints = catalog.load_table_constraints(table_name)?;
 
                 // Create evaluator with parameters
                 let evaluator =
@@ -9892,6 +9893,7 @@ impl EmbeddedDatabase {
                     Self::apply_defaults_and_check_not_null(&mut tuple_values, &schema, &user_provided)?;
 
                     let tuple = Tuple::new(tuple_values);
+                    self.validate_check_constraints(&table_constraints, &schema, &tuple.values)?;
 
                     // Pre-check PK / UNIQUE constraints so a parameterised
                     // `INSERT ... ON CONFLICT(col) DO UPDATE` can route the
@@ -10076,6 +10078,8 @@ impl EmbeddedDatabase {
                                 }
                             }
 
+                            self.validate_check_constraints(&table_constraints, &schema, &updated_tuple.values)?;
+
                             // Write the updated row.  `update_tuple_fast`
                             // overwrites in place and updates ART
                             // indexes; sufficient for the conflict path.
@@ -10117,6 +10121,7 @@ impl EmbeddedDatabase {
 
                 let catalog = self.storage.catalog();
                 let schema = catalog.get_table_schema(table_name)?;
+                let table_constraints = catalog.load_table_constraints(table_name)?;
                 let evaluator = sql::Evaluator::new(std::sync::Arc::new(Schema { columns: vec![] }));
 
                 let column_indices: Option<Vec<usize>> = columns.as_ref().map(|cols| {
@@ -10174,6 +10179,7 @@ impl EmbeddedDatabase {
                     }
 
                     let tuple = Tuple::new(tuple_values);
+                    self.validate_check_constraints(&table_constraints, &schema, &tuple.values)?;
                     if has_returning {
                         if let Some(projected) = Self::project_returning_columns(&tuple, &schema, returning) {
                             returned_tuples.push(projected);
@@ -10193,6 +10199,7 @@ impl EmbeddedDatabase {
             } => {
                 let catalog = self.storage.catalog();
                 let schema = catalog.get_table_schema(table_name)?;
+                let table_constraints = catalog.load_table_constraints(table_name)?;
                 // Stamp source_table_name on every column so
                 // qualified predicates like `WHERE "t"."col" = $1`
                 // resolve against this evaluator schema (B31).
@@ -10288,6 +10295,7 @@ impl EmbeddedDatabase {
                             }
                         }
                         self.check_fk_constraints_on_write(table_name, &new_col_values, active_txn)?;
+                        self.validate_check_constraints(&table_constraints, &schema, &tuple.values)?;
 
                         let row_id = tuple.row_id.unwrap_or(0);
                         updates.push((row_id, old_tuple, tuple));
@@ -12905,6 +12913,24 @@ impl EmbeddedDatabase {
     ///
     /// Parses the CHECK expression and evaluates it against the provided values.
     /// Returns true if the constraint is satisfied, false otherwise.
+    fn validate_check_constraints(
+        &self,
+        table_constraints: &sql::TableConstraints,
+        schema: &Schema,
+        values: &[Value],
+    ) -> Result<()> {
+        for check in &table_constraints.check_constraints {
+            let check_result = self.evaluate_check_constraint(&check.expression, schema, values)?;
+            if !check_result {
+                return Err(Error::constraint_violation(format!(
+                    "CHECK constraint '{}' violated: expression '{}' evaluated to false",
+                    check.name, check.expression
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn evaluate_check_constraint(&self, expression: &str, schema: &Schema, values: &[Value]) -> Result<bool> {
         // Create a tuple from the values for evaluation
         let tuple = Tuple::new(values.to_vec());
