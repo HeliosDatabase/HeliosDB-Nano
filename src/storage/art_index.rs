@@ -422,19 +422,19 @@ impl AdaptiveRadixTree {
         // Handle inner nodes
         let header = node.header();
         let prefix_len = header.prefix_len as usize;
-        let prefix = header.get_prefix();
 
-        // Check prefix match
-        let mut mismatch_pos = 0;
-        while mismatch_pos < prefix_len.min(MAX_PREFIX_LEN)
-            && depth + mismatch_pos < key.len()
-            && prefix[mismatch_pos] == key[depth + mismatch_pos]
-        {
-            mismatch_pos += 1;
-        }
+        // Check prefix match. Long compressed prefixes store only the first
+        // MAX_PREFIX_LEN bytes in the node header, so compare the hidden tail
+        // against a descendant leaf before deciding that the full prefix
+        // matched. Otherwise keys with a long shared prefix can be routed to
+        // the wrong child and falsely collide in UNIQUE indexes.
+        let mismatch_pos = Self::prefix_mismatch_pos(&node, key, depth);
 
         // Prefix mismatch - need to split
         if mismatch_pos < prefix_len.min(MAX_PREFIX_LEN) {
+            return self.split_node(node, key, value, depth, mismatch_pos);
+        }
+        if mismatch_pos < prefix_len {
             return self.split_node(node, key, value, depth, mismatch_pos);
         }
 
@@ -561,24 +561,29 @@ impl AdaptiveRadixTree {
         mismatch_pos: usize,
     ) -> ArtResult<ArtNode> {
         let header = node.header();
-        let old_prefix = header.get_prefix().to_vec();
         let old_prefix_len = header.prefix_len as usize;
+        let old_stored_prefix = header.get_prefix().to_vec();
+        let representative_key = Self::first_leaf_key(&node).map(<[u8]>::to_vec);
 
         // Create new parent node with common prefix
-        let common_prefix = &old_prefix[..mismatch_pos];
+        let common_prefix = key
+            .get(depth..depth + mismatch_pos)
+            .ok_or_else(|| ArtIndexError::Internal("Invalid ART split prefix range".to_string()))?;
         let mut new_parent = Node4::with_prefix(common_prefix);
 
         // Update the old node's prefix
-        let remaining_prefix = if mismatch_pos + 1 < old_prefix_len {
-            old_prefix[mismatch_pos + 1..old_prefix_len.min(MAX_PREFIX_LEN)].to_vec()
-        } else {
-            vec![]
-        };
+        let remaining_prefix = Self::prefix_bytes_for_split(
+            depth,
+            mismatch_pos + 1,
+            old_prefix_len,
+            &old_stored_prefix,
+            representative_key.as_deref(),
+        )?;
         node.header_mut().set_prefix(&remaining_prefix);
-        node.header_mut().prefix_len = (old_prefix_len - mismatch_pos - 1) as u32;
 
         // Add old node as child
-        let old_key = old_prefix[mismatch_pos];
+        let old_key =
+            Self::prefix_byte_for_split(depth, mismatch_pos, &old_stored_prefix, representative_key.as_deref())?;
         new_parent.add_child(old_key, node);
 
         // Add new key - check if key is exhausted (one key is prefix of another)
@@ -597,6 +602,82 @@ impl AdaptiveRadixTree {
         self.stats.node4_count += 1;
 
         Ok(ArtNode::Node4(Box::new(new_parent)))
+    }
+
+    fn first_leaf_key(node: &ArtNode) -> Option<&[u8]> {
+        match node {
+            ArtNode::Leaf(leaf) => Some(&leaf.key),
+            ArtNode::Node4(n) => n.iter_children().find_map(|(_, child)| Self::first_leaf_key(child)),
+            ArtNode::Node16(n) => n.iter_children().find_map(|(_, child)| Self::first_leaf_key(child)),
+            ArtNode::Node48(n) => n.iter_children().find_map(|(_, child)| Self::first_leaf_key(child)),
+            ArtNode::Node256(n) => n.iter_children().find_map(|(_, child)| Self::first_leaf_key(child)),
+        }
+    }
+
+    fn prefix_mismatch_pos(node: &ArtNode, key: &[u8], depth: usize) -> usize {
+        let header = node.header();
+        let prefix_len = header.prefix_len as usize;
+        let prefix = header.get_prefix();
+
+        let mut mismatch_pos = 0;
+        while mismatch_pos < prefix.len()
+            && depth + mismatch_pos < key.len()
+            && prefix[mismatch_pos] == key[depth + mismatch_pos]
+        {
+            mismatch_pos += 1;
+        }
+
+        if mismatch_pos < prefix.len() || mismatch_pos >= prefix_len {
+            return mismatch_pos;
+        }
+
+        let Some(representative_key) = Self::first_leaf_key(node) else {
+            return mismatch_pos;
+        };
+
+        while mismatch_pos < prefix_len
+            && depth + mismatch_pos < key.len()
+            && depth + mismatch_pos < representative_key.len()
+            && representative_key[depth + mismatch_pos] == key[depth + mismatch_pos]
+        {
+            mismatch_pos += 1;
+        }
+
+        mismatch_pos
+    }
+
+    fn prefix_byte_for_split(
+        depth: usize,
+        prefix_pos: usize,
+        stored_prefix: &[u8],
+        representative_key: Option<&[u8]>,
+    ) -> ArtResult<u8> {
+        if let Some(byte) = stored_prefix.get(prefix_pos) {
+            return Ok(*byte);
+        }
+        representative_key
+            .and_then(|key| key.get(depth + prefix_pos))
+            .copied()
+            .ok_or_else(|| ArtIndexError::Internal("Cannot recover hidden ART prefix byte".to_string()))
+    }
+
+    fn prefix_bytes_for_split(
+        depth: usize,
+        start_prefix_pos: usize,
+        old_prefix_len: usize,
+        stored_prefix: &[u8],
+        representative_key: Option<&[u8]>,
+    ) -> ArtResult<Vec<u8>> {
+        let mut bytes = Vec::with_capacity(old_prefix_len.saturating_sub(start_prefix_pos));
+        for pos in start_prefix_pos..old_prefix_len {
+            bytes.push(Self::prefix_byte_for_split(
+                depth,
+                pos,
+                stored_prefix,
+                representative_key,
+            )?);
+        }
+        Ok(bytes)
     }
 
     /// Get the value for a key
@@ -619,13 +700,9 @@ impl AdaptiveRadixTree {
             _ => {
                 let header = node.header();
                 let prefix_len = header.prefix_len as usize;
-                let prefix = header.get_prefix();
 
-                // Check prefix
-                for i in 0..prefix_len.min(MAX_PREFIX_LEN) {
-                    if depth + i >= key.len() || prefix[i] != key[depth + i] {
-                        return None;
-                    }
+                if Self::prefix_mismatch_pos(node, key, depth) < prefix_len {
+                    return None;
                 }
 
                 let new_depth = depth + prefix_len;
@@ -663,12 +740,9 @@ impl AdaptiveRadixTree {
             _ => {
                 let header = node.header();
                 let prefix_len = header.prefix_len as usize;
-                let prefix = header.get_prefix();
 
-                for i in 0..prefix_len.min(MAX_PREFIX_LEN) {
-                    if depth + i >= key.len() || prefix[i] != key[depth + i] {
-                        return Vec::new();
-                    }
+                if Self::prefix_mismatch_pos(node, key, depth) < prefix_len {
+                    return Vec::new();
                 }
 
                 let new_depth = depth + prefix_len;
@@ -740,13 +814,9 @@ impl AdaptiveRadixTree {
             mut inner => {
                 let header = inner.header();
                 let prefix_len = header.prefix_len as usize;
-                let prefix = header.get_prefix().to_vec();
 
-                // Check prefix
-                for i in 0..prefix_len.min(MAX_PREFIX_LEN) {
-                    if depth + i >= key.len() || prefix[i] != key[depth + i] {
-                        return Ok((Some(inner), None));
-                    }
+                if Self::prefix_mismatch_pos(&inner, key, depth) < prefix_len {
+                    return Ok((Some(inner), None));
                 }
 
                 let new_depth = depth + prefix_len;
@@ -890,12 +960,9 @@ impl AdaptiveRadixTree {
             mut inner => {
                 let header = inner.header();
                 let prefix_len = header.prefix_len as usize;
-                let prefix = header.get_prefix().to_vec();
 
-                for i in 0..prefix_len.min(MAX_PREFIX_LEN) {
-                    if depth + i >= key.len() || prefix[i] != key[depth + i] {
-                        return Ok((Some(inner), false));
-                    }
+                if Self::prefix_mismatch_pos(&inner, key, depth) < prefix_len {
+                    return Ok((Some(inner), false));
                 }
 
                 let new_depth = depth + prefix_len;
