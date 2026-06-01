@@ -1286,6 +1286,27 @@ impl<'a> Executor<'a> {
         ))
     }
 
+    fn fast_path_storage_table_name(&self, table_name: &str) -> Result<String> {
+        let Some(storage) = self.storage else {
+            return Ok(table_name.to_string());
+        };
+
+        let mv_catalog = storage.mv_catalog();
+        if !mv_catalog.view_exists(table_name)? {
+            return Ok(table_name.to_string());
+        }
+
+        let mv_data_table = crate::storage::MaterializedViewCatalog::mv_data_table_name(table_name);
+        if !storage.catalog().table_exists(&mv_data_table)? {
+            return Err(Error::query_execution(format!(
+                "Materialized view '{}' exists but has never been refreshed. Run: REFRESH MATERIALIZED VIEW {}",
+                table_name, table_name
+            )));
+        }
+
+        Ok(mv_data_table)
+    }
+
     fn count_distinct_schema_operator(
         count: i64,
         group_by: &[crate::sql::LogicalExpr],
@@ -1351,8 +1372,9 @@ impl<'a> Executor<'a> {
             return Ok(None);
         }
 
+        let count_table_name = self.fast_path_storage_table_name(table_name)?;
         let count = match predicate {
-            None => storage.count_table_rows(table_name)?,
+            None => storage.count_table_rows(&count_table_name)?,
             Some(predicate) => match self.count_single_pk_predicate(table_name, schema, pk_col, predicate)? {
                 Some(count) => count,
                 None => return Ok(None),
@@ -1539,8 +1561,9 @@ impl<'a> Executor<'a> {
             return Ok(None);
         }
 
+        let storage_table_name = self.fast_path_storage_table_name(table_name)?;
         let tuples = storage.aggregate_columnar_columns(
-            table_name,
+            &storage_table_name,
             schema,
             &group_indices,
             &aggregate_specs,
@@ -1625,8 +1648,9 @@ impl<'a> Executor<'a> {
             return Ok(None);
         }
 
+        let storage_table_name = self.fast_path_storage_table_name(table_name)?;
         let Some(tuples) = storage.try_aggregate_row_columns(
-            table_name,
+            &storage_table_name,
             schema,
             &group_indices,
             &aggregate_specs,
@@ -2423,7 +2447,8 @@ impl<'a> Executor<'a> {
                             if let Some(table_name) = scan_table {
                                 if self.get_cte(table_name).is_none() {
                                     if let Some(storage) = self.storage {
-                                        let count = storage.count_table_rows(table_name)?;
+                                        let count_table_name = self.fast_path_storage_table_name(table_name)?;
+                                        let count = storage.count_table_rows(&count_table_name)?;
                                         let result_tuple = crate::Tuple::new(vec![crate::Value::Int8(count as i64)]);
                                         return Ok(Box::new(MaterializedOperator::new(
                                             vec![result_tuple],
