@@ -1175,9 +1175,20 @@ impl<'a> Planner<'a> {
             Self::collect_aggregates_from_logical(&having_logical, &mut aggr_exprs);
         }
         let has_aggregates = !aggr_exprs.is_empty();
+        // A GROUP BY without aggregate functions must still collapse each group to
+        // a single row (e.g. `SELECT a, b FROM t GROUP BY a, b` is equivalent to
+        // `SELECT DISTINCT a, b`). Route it through the aggregate path with empty
+        // aggr_exprs so the grouped operator dedupes by the group key; otherwise
+        // the GROUP BY is silently dropped and all base rows are returned
+        // (checklist T8). Note this is NOT a blanket DISTINCT on the projection:
+        // `SELECT a FROM t GROUP BY a, b` must emit one row per (a, b) group.
+        let has_group_by = matches!(
+            &select.group_by,
+            sqlparser::ast::GroupByExpr::Expressions(exprs, _) if !exprs.is_empty()
+        );
 
         // Handle GROUP BY or implicit aggregation (when aggregates are present without GROUP BY)
-        if has_aggregates {
+        if has_aggregates || has_group_by {
             let group_by = if let sqlparser::ast::GroupByExpr::Expressions(group_by_exprs, _) = &select.group_by {
                 if !group_by_exprs.is_empty() {
                     let num_select_items = select.projection.len();
