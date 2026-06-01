@@ -4231,7 +4231,12 @@ impl<'a> Planner<'a> {
                             Ok((col_name, expr))
                         })
                         .collect::<Result<Vec<_>>>()?;
-                    Ok(Some(OnConflictAction::DoUpdate { assignments }))
+                    let selection = do_update
+                        .selection
+                        .as_ref()
+                        .map(|expr| self.expr_to_logical(expr))
+                        .transpose()?;
+                    Ok(Some(OnConflictAction::DoUpdate { assignments, selection }))
                 }
             },
             sqlparser::ast::OnInsert::DuplicateKeyUpdate(assignments) => {
@@ -4246,6 +4251,7 @@ impl<'a> Planner<'a> {
                     .collect::<Result<Vec<_>>>()?;
                 Ok(Some(OnConflictAction::DoUpdate {
                     assignments: assign_pairs,
+                    selection: None,
                 }))
             }
             _ => {
