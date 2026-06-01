@@ -105,6 +105,7 @@ fn test_branching_sql_parsing() {
         Some("main".to_string()),
         "TIMESTAMP '2025-11-18 00:00:00'",
         None,
+        false,
     );
     assert!(plan.is_ok());
 

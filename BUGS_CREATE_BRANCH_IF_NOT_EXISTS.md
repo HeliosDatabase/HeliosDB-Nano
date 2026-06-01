@@ -1,8 +1,12 @@
 # BUG — `CREATE BRANCH IF NOT EXISTS` misparses the branch name
 
-**Severity:** MEDIUM | **Status:** OPEN (follow-up) | **Found:** v3.34 cross-agent
-fix loop, during T4 (Codex surfaced; Claude confirmed/characterized)
-**Not part of the 13-item v3.34 checklist** — filed as a separate follow-up.
+**Severity:** MEDIUM | **Status:** ✅ RESOLVED (cross-agent fix, converged) |
+**Found:** v3.34 cross-agent fix loop, during T4 (Codex surfaced; Claude
+confirmed/characterized) | **Fixed:** item IFNE — `parse_create_branch_sql` now
+strips `IF NOT EXISTS` and the executor no-ops when the branch exists. See
+`tests/ifne_create_branch_if_not_exists.rs`, `claude_results/IFNE.md`,
+`codex_results/IFNE.md`.
+**Was not part of the 13-item v3.34 checklist** — handled as a follow-up.
 
 ## Summary
 

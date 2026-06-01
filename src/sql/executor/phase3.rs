@@ -58,10 +58,11 @@ pub(super) fn handle_phase3_operation(
     match plan {
         LogicalPlan::CreateBranch {
             branch_name,
+            if_not_exists,
             parent,
             as_of,
             options,
-        } => handle_create_branch(executor, branch_name, parent, as_of, options),
+        } => handle_create_branch(executor, branch_name, *if_not_exists, parent, as_of, options),
         LogicalPlan::DropBranch { branch_name, if_exists } => handle_drop_branch(executor, branch_name, *if_exists),
         LogicalPlan::MergeBranch {
             source,
@@ -101,6 +102,7 @@ pub(super) fn handle_phase3_operation(
 fn handle_create_branch(
     executor: &Executor,
     branch_name: &str,
+    if_not_exists: bool,
     parent: &Option<String>,
     as_of: &crate::sql::logical_plan::AsOfClause,
     options: &[crate::sql::logical_plan::BranchOption],
@@ -108,14 +110,20 @@ fn handle_create_branch(
     use crate::storage::BranchOptions;
 
     tracing::info!(
-        "Executing CREATE BRANCH {} FROM {:?} AS OF {:?} WITH {:?}",
+        "Executing CREATE BRANCH {} (IF NOT EXISTS: {}) FROM {:?} AS OF {:?} WITH {:?}",
         branch_name,
+        if_not_exists,
         parent,
         as_of,
         options
     );
 
     if let Some(storage) = executor.storage() {
+        if if_not_exists && storage.get_branch(branch_name).is_ok() {
+            tracing::info!("Branch '{}' already exists (IF NOT EXISTS specified)", branch_name);
+            return Ok(empty_phase3_result(executor));
+        }
+
         // Parse branch options
         let mut branch_opts = BranchOptions::default();
         for option in options {
@@ -173,7 +181,11 @@ fn handle_create_branch(
     }
 
     // Return empty result set for DDL
-    Ok(Box::new(
+    Ok(empty_phase3_result(executor))
+}
+
+fn empty_phase3_result(executor: &Executor) -> Box<dyn PhysicalOperator> {
+    Box::new(
         ScanOperator::new(
             "".to_string(),
             Arc::new(crate::Schema { columns: vec![] }),
@@ -182,7 +194,7 @@ fn handle_create_branch(
             vec![],
         )
         .with_timeout(executor.timeout_ctx()),
-    ))
+    )
 }
 
 /// Handle DROP BRANCH

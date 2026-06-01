@@ -573,6 +573,8 @@ pub enum LogicalPlan {
     CreateBranch {
         /// Branch name
         branch_name: String,
+        /// If branch already exists, do nothing
+        if_not_exists: bool,
         /// Parent branch (None = CURRENT)
         parent: Option<String>,
         /// Creation point

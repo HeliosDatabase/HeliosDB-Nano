@@ -1346,12 +1346,14 @@ impl EmbeddedDatabase {
         // Check if this is a Phase 3 branching statement (before trying to parse with sqlparser)
         let plan = if sql::Parser::is_create_branch(sql) {
             // Parse CREATE DATABASE BRANCH statement
-            let (branch_name, parent, as_of_clause, with_options) = sql::Parser::parse_create_branch_sql(sql)?;
+            let (branch_name, parent, as_of_clause, with_options, if_not_exists) =
+                sql::Parser::parse_create_branch_sql(sql)?;
             sql::phase3::branching::BranchingParser::parse_create_branch(
                 branch_name,
                 parent,
                 &as_of_clause,
                 with_options.as_deref(),
+                if_not_exists,
             )?
         } else if sql::Parser::is_drop_branch(sql) {
             // Parse DROP DATABASE BRANCH statement
