@@ -47,6 +47,10 @@ pub struct PgConnectionHandler<S = BufWriter<TcpStream>> {
     /// multi-statement simple query dispatch to emit a single trailing
     /// ReadyForQuery after the whole `;`-separated batch.
     suppress_ready_for_query: bool,
+    /// Extended-query protocol requires ErrorResponse, then discarding input
+    /// until Sync, then ReadyForQuery. Sending ReadyForQuery early can make
+    /// drivers close or wedge the connection after an Execute-time error.
+    awaiting_sync_after_error: bool,
 }
 
 impl PgConnectionHandler<BufWriter<TcpStream>> {
@@ -75,6 +79,7 @@ impl PgConnectionHandler<BufWriter<TcpStream>> {
             scram_state: None,
             write_buf: BytesMut::with_capacity(4096),
             suppress_ready_for_query: false,
+            awaiting_sync_after_error: false,
         }
     }
 }
@@ -96,6 +101,7 @@ impl PgConnectionHandler<BufWriter<UnixStream>> {
             scram_state: None,
             write_buf: BytesMut::with_capacity(4096),
             suppress_ready_for_query: false,
+            awaiting_sync_after_error: false,
         }
     }
 }
@@ -143,6 +149,7 @@ impl PgConnectionHandler<BufWriter<SecureConnection<TcpStream>>> {
             scram_state: None,
             write_buf: BytesMut::with_capacity(4096),
             suppress_ready_for_query: false,
+            awaiting_sync_after_error: false,
         }
     }
 }
@@ -169,9 +176,18 @@ where
             match self.read_message().await {
                 Ok(Some(msg)) => {
                     tracing::debug!("Received message: {:?}", msg);
+                    if self.awaiting_sync_after_error {
+                        self.handle_message_while_awaiting_sync(msg).await?;
+                        continue;
+                    }
+
+                    let wait_for_sync = Self::message_requires_sync_after_error(&msg);
                     if let Err(e) = self.handle_message(msg).await {
                         tracing::error!("Error handling message: {}", e);
-                        self.send_error_for_query(&e).await?;
+                        self.send_error_for_query(&e, wait_for_sync).await?;
+                        if wait_for_sync {
+                            self.awaiting_sync_after_error = true;
+                        }
                     }
                 }
                 Ok(None) => {
@@ -187,6 +203,31 @@ where
         }
 
         Ok(())
+    }
+
+    async fn handle_message_while_awaiting_sync(&mut self, msg: FrontendMessage) -> Result<()> {
+        match msg {
+            FrontendMessage::Sync => {
+                self.awaiting_sync_after_error = false;
+                self.send_ready_for_query().await
+            }
+            FrontendMessage::Terminate => Ok(()),
+            _ => {
+                tracing::debug!("Discarding frontend message until Sync after extended-query error");
+                Ok(())
+            }
+        }
+    }
+
+    fn message_requires_sync_after_error(msg: &FrontendMessage) -> bool {
+        matches!(
+            msg,
+            FrontendMessage::Parse { .. }
+                | FrontendMessage::Bind { .. }
+                | FrontendMessage::Execute { .. }
+                | FrontendMessage::Describe { .. }
+                | FrontendMessage::Close { .. }
+        )
     }
 
     /// Handle startup sequence
@@ -1326,8 +1367,8 @@ where
             .await
     }
 
-    /// Send error response
-    async fn send_error(
+    /// Send error response (ErrorResponse only, no trailing ReadyForQuery)
+    async fn send_error_message(
         &mut self,
         severity: &str,
         code: &str,
@@ -1343,17 +1384,38 @@ where
             hint,
             position: None,
         })
-        .await?;
+        .await
+    }
+
+    /// Send error response followed by ReadyForQuery (simple-query path)
+    async fn send_error(
+        &mut self,
+        severity: &str,
+        code: &str,
+        message: &str,
+        detail: Option<String>,
+        hint: Option<String>,
+    ) -> Result<()> {
+        self.send_error_message(severity, code, message, detail, hint).await?;
         self.send_ready_for_query().await
     }
 
-    async fn send_error_for_query(&mut self, error: &Error) -> Result<()> {
+    async fn send_error_for_query(&mut self, error: &Error, wait_for_sync: bool) -> Result<()> {
         if self.transaction_status == TransactionStatus::InTransaction {
             self.transaction_status = TransactionStatus::Failed;
         }
         self.suppress_ready_for_query = false;
         let code = Self::sqlstate_for_error(error);
-        self.send_error("ERROR", code, &error.to_string(), None, None).await
+        if wait_for_sync {
+            // Extended-query protocol: emit ErrorResponse now and defer
+            // ReadyForQuery until the client's Sync, discarding messages in
+            // between. Sending ReadyForQuery early closes/wedges drivers.
+            self.send_error_message("ERROR", code, &error.to_string(), None, None)
+                .await?;
+            self.flush().await
+        } else {
+            self.send_error("ERROR", code, &error.to_string(), None, None).await
+        }
     }
 
     fn sqlstate_for_error(error: &Error) -> &'static str {
@@ -2127,6 +2189,7 @@ mod failed_transaction_state_tests {
                 scram_state: None,
                 write_buf: BytesMut::with_capacity(4096),
                 suppress_ready_for_query: false,
+                awaiting_sync_after_error: false,
             },
             client,
         )
@@ -2140,7 +2203,7 @@ mod failed_transaction_state_tests {
         handler.suppress_ready_for_query = true;
 
         handler
-            .send_error_for_query(&Error::constraint_violation("duplicate key"))
+            .send_error_for_query(&Error::constraint_violation("duplicate key"), false)
             .await
             .expect("send error");
 
