@@ -168,9 +168,14 @@ independently, then comparing and integrating the agreed best version here.
 
 ## Follow-ups
 
-- `BUGS_CREATE_BRANCH_IF_NOT_EXISTS.md` — `CREATE BRANCH IF NOT EXISTS` misparses
-  the name.
+- ✅ **RESOLVED** — `CREATE BRANCH IF NOT EXISTS` misparse
+  (`BUGS_CREATE_BRANCH_IF_NOT_EXISTS.md`): fixed as cross-agent item **IFNE**
+  (final commit `8663e3d`; converged identical fixes, Codex superset integrated).
+  See `{claude,codex}_results/IFNE.md`.
 - Pre-existing `hnsw` test failure and `streaming.rs:69` clippy deny (separate
   from this checklist).
+- A transient (non-`hnsw`) full-`--lib` flake was observed once by each agent
+  (`query_cache` expiration / a count test) and did not reproduce on rerun —
+  pre-existing suite flakiness to watch, not caused by this work.
 - A4 output-side binary encoding for non-scalar types (numeric/temporal/json)
   remains text-only (documented in `claude_results/A15.md`).
