@@ -232,12 +232,16 @@ impl HnswIndex {
 
     /// Get the number of vectors in the index
     pub fn len(&self) -> usize {
-        self.reverse_mapping.read().len()
+        // Physical entry count (includes tombstones): hnsw_rs cannot truly
+        // delete, so `delete` only drops the live `reverse_mapping` entry and the
+        // vector stays in the graph. `id_mapping` keeps one slot per insert and is
+        // never shrunk by delete, so it reflects the tombstone-inclusive size.
+        self.id_mapping.read().len()
     }
 
     /// Check if the index is empty
     pub fn is_empty(&self) -> bool {
-        self.reverse_mapping.read().is_empty()
+        self.id_mapping.read().is_empty()
     }
 
     /// Get the dimension of vectors in this index
@@ -407,11 +411,15 @@ impl CosineHnswIndex {
     }
 
     pub fn len(&self) -> usize {
-        self.reverse_mapping.read().len()
+        // Physical entry count (includes tombstones): hnsw_rs cannot truly
+        // delete, so `delete` only drops the live `reverse_mapping` entry and the
+        // vector stays in the graph. `id_mapping` keeps one slot per insert and is
+        // never shrunk by delete, so it reflects the tombstone-inclusive size.
+        self.id_mapping.read().len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.reverse_mapping.read().is_empty()
+        self.id_mapping.read().is_empty()
     }
 }
 
@@ -508,11 +516,15 @@ impl InnerProductHnswIndex {
     }
 
     pub fn len(&self) -> usize {
-        self.reverse_mapping.read().len()
+        // Physical entry count (includes tombstones): hnsw_rs cannot truly
+        // delete, so `delete` only drops the live `reverse_mapping` entry and the
+        // vector stays in the graph. `id_mapping` keeps one slot per insert and is
+        // never shrunk by delete, so it reflects the tombstone-inclusive size.
+        self.id_mapping.read().len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.reverse_mapping.read().is_empty()
+        self.id_mapping.read().is_empty()
     }
 }
 
