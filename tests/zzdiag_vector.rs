@@ -34,8 +34,28 @@ fn zzdiag_vector_readback_and_distance() -> Result<()> {
         eprintln!("{:?}", r.values);
     }
 
-    eprintln!("--- literal ORDER BY id list ---");
-    let ord = db.query("SELECT id FROM d ORDER BY vec <-> '[0.0,0.0,0.0]'", &[])?;
-    eprintln!("{:?}", ord.iter().map(|r| r.values.first().cloned()).collect::<Vec<_>>());
+    eprintln!("--- A) SELECT id ... ORDER BY vec<->lit (expr, vec NOT projected) ---");
+    let a = db.query("SELECT id FROM d ORDER BY vec <-> '[0.0,0.0,0.0]'", &[])?;
+    eprintln!("{:?}", a.iter().map(|r| r.values.first().cloned()).collect::<Vec<_>>());
+
+    eprintln!("--- B) SELECT id, dist ... ORDER BY dist (alias, dist projected) ---");
+    let b = db.query(
+        "SELECT id, vec <-> '[0.0,0.0,0.0]' AS dist FROM d ORDER BY dist",
+        &[],
+    )?;
+    eprintln!("{:?}", b.iter().map(|r| r.values.first().cloned()).collect::<Vec<_>>());
+
+    eprintln!("--- C) SELECT id, dist ... ORDER BY vec<->lit (expr, dist also projected) ---");
+    let c = db.query(
+        "SELECT id, vec <-> '[0.0,0.0,0.0]' AS dist FROM d ORDER BY vec <-> '[0.0,0.0,0.0]'",
+        &[],
+    )?;
+    eprintln!("{:?}", c.iter().map(|r| r.values.first().cloned()).collect::<Vec<_>>());
+
+    eprintln!("--- D) EXPLAIN of A ---");
+    let e = db.query("EXPLAIN SELECT id FROM d ORDER BY vec <-> '[0.0,0.0,0.0]'", &[])?;
+    for r in &e {
+        eprintln!("{:?}", r.values);
+    }
     Ok(())
 }
