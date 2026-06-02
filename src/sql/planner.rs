@@ -816,6 +816,22 @@ impl<'a> Planner<'a> {
                 let name = Self::normalize_object_name(&db_name);
                 Ok(LogicalPlan::CreateDatabase { name, if_not_exists })
             }
+            // CREATE SCHEMA [IF NOT EXISTS] <name>. HeliosDB uses a single flat
+            // namespace (schema.table resolves as a composite table name), so
+            // this is accepted as a namespace no-op rather than erroring. See
+            // the Token Dashboard outstanding item #5.
+            Statement::CreateSchema {
+                schema_name,
+                if_not_exists,
+            } => {
+                use sqlparser::ast::SchemaName;
+                let name = match schema_name {
+                    SchemaName::Simple(object_name) => Self::normalize_object_name(&object_name),
+                    SchemaName::NamedAuthorization(object_name, _) => Self::normalize_object_name(&object_name),
+                    SchemaName::UnnamedAuthorization(ident) => Self::normalize_ident(&ident),
+                };
+                Ok(LogicalPlan::CreateSchema { name, if_not_exists })
+            }
             // KanttBan #20 (v3.31.0): `CREATE TYPE <name> AS ENUM (…)`.
             // drizzle wraps this in an idempotent DO block — `DO $$
             // BEGIN CREATE TYPE foo AS ENUM ('a','b'); EXCEPTION WHEN

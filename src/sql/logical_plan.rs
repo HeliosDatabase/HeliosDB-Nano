@@ -431,6 +431,18 @@ pub enum LogicalPlan {
         if_exists: bool,
     },
 
+    /// `CREATE SCHEMA [IF NOT EXISTS] <name>` — accepted as a namespace
+    /// no-op. HeliosDB stores tables in a single flat namespace and lets
+    /// `schema.table` resolve as a composite table name, so this simply
+    /// succeeds instead of erroring (`Statement not yet supported`). See the
+    /// Token Dashboard outstanding item #5.
+    CreateSchema {
+        /// Schema name (already normalised).
+        name: String,
+        /// Silently succeed if the schema already exists.
+        if_not_exists: bool,
+    },
+
     /// `CREATE EXTENSION <name>` — install a named extension. For
     /// `hdb_code` this runs the code-graph bootstrap (see
     /// `src/code_graph/storage.rs::bootstrap_tables`). Unknown
@@ -1968,7 +1980,9 @@ impl LogicalPlan {
                     ],
                 })
             }
-            LogicalPlan::CreateEnumType { .. } | LogicalPlan::DropEnumType { .. } => {
+            LogicalPlan::CreateEnumType { .. }
+            | LogicalPlan::DropEnumType { .. }
+            | LogicalPlan::CreateSchema { .. } => {
                 // KanttBan #20 (v3.31.0): DDL — no output rows.
                 Arc::new(Schema { columns: vec![] })
             }
