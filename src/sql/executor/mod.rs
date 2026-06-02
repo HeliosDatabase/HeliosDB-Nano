@@ -2629,6 +2629,23 @@ impl<'a> Executor<'a> {
                     .with_timeout(self.timeout_ctx()),
                 ))
             }
+            LogicalPlan::CreateSchema { name, if_not_exists } => {
+                // HeliosDB has a single flat namespace; `schema.table` is just
+                // a composite table name. Accept CREATE SCHEMA as a no-op so
+                // migrations that issue it don't fail. `IF NOT EXISTS` is
+                // implicit here since nothing is created either way.
+                let _ = (name, if_not_exists);
+                Ok(Box::new(
+                    ScanOperator::new(
+                        String::new(),
+                        Arc::new(crate::Schema { columns: vec![] }),
+                        None,
+                        vec![],
+                        vec![],
+                    )
+                    .with_timeout(self.timeout_ctx()),
+                ))
+            }
             LogicalPlan::DropEnumType { name, if_exists } => {
                 let storage = self
                     .storage
