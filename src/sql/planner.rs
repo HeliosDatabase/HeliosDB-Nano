@@ -832,6 +832,23 @@ impl<'a> Planner<'a> {
                 };
                 Ok(LogicalPlan::CreateSchema { name, if_not_exists })
             }
+            // `SHOW BRANCHES` parses as a generic SHOW variable. Map it to the
+            // branch-listing plan here so it works through every query entry
+            // point — the textual pre-detect only covers some of them, so
+            // `db.query("SHOW BRANCHES")` previously errored "Statement not
+            // yet supported". Token Dashboard #4.
+            Statement::ShowVariable { variable } => {
+                let name = variable
+                    .iter()
+                    .map(|ident| ident.value.to_uppercase())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if name == "BRANCHES" || name == "DATABASE BRANCHES" {
+                    Ok(LogicalPlan::ShowBranches)
+                } else {
+                    Err(Error::query_execution(format!("SHOW {name} is not supported")))
+                }
+            }
             // KanttBan #20 (v3.31.0): `CREATE TYPE <name> AS ENUM (…)`.
             // drizzle wraps this in an idempotent DO block — `DO $$
             // BEGIN CREATE TYPE foo AS ENUM ('a','b'); EXCEPTION WHEN
