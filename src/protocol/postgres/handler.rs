@@ -14,6 +14,20 @@ pub(super) fn starts_with_icase(s: &str, prefix: &str) -> bool {
         s.len() >= prefix.len() && s.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
     }
 }
+
+/// True if the statement is a CTE (`WITH …` / `WITH RECURSIVE …`). These are
+/// almost always row-returning (`WITH … SELECT`) but do not start with
+/// `SELECT`, so the SELECT-prefix routing in both query paths used to misroute
+/// them to the command path and silently return zero rows over the wire
+/// (Token Dashboard #3). The trailing-char guard rejects `WITHIN` / `WITHOUT`.
+#[inline]
+pub(super) fn starts_with_cte(s: &str) -> bool {
+    let t = s.trim_start();
+    starts_with_icase(t, "WITH")
+        && t.as_bytes()
+            .get(4)
+            .map_or(true, |c| !c.is_ascii_alphanumeric() && *c != b'_')
+}
 use super::auth::{AuthManager, AuthMethod, ScramAuthState};
 use super::catalog::PgCatalog;
 use super::messages::{AuthenticationMessage, BackendMessage, FieldDescription, FrontendMessage, TransactionStatus};
@@ -796,7 +810,12 @@ where
 
         // Execute query through database
         let is_select = starts_with_icase(trimmed, "SELECT");
-        let is_dml_returning = !is_select && {
+        // A CTE (`WITH … SELECT …`) is row-returning but doesn't start with
+        // SELECT; route it through query_with_columns so it returns rows
+        // rather than a command tag (Token Dashboard #3). Skip the read cache
+        // so a data-modifying CTE still executes on every call.
+        let is_cte = !is_select && starts_with_cte(trimmed);
+        let is_dml_returning = !is_select && !is_cte && {
             let upper = trimmed.to_uppercase();
             (starts_with_icase(trimmed, "INSERT")
                 || starts_with_icase(trimmed, "UPDATE")
@@ -813,6 +832,10 @@ where
                 let schema = Self::schema_from_query_columns(&columns, &results);
                 self.send_query_result(schema, &results).await?;
             }
+        } else if is_cte {
+            let (results, columns) = self.database.query_with_columns(query)?;
+            let schema = Self::schema_from_query_columns(&columns, &results);
+            self.send_query_result(schema, &results).await?;
         } else if is_dml_returning {
             // DML with RETURNING clause - returns rows like a query
             let (affected, tuples) = self.database.execute_returning(query)?;

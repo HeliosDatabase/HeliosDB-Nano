@@ -144,6 +144,12 @@ enum Commands {
         /// `<dir>/.s.PGSQL.<port>` — the libpq default. Use with psql `-h /tmp`.
         #[arg(long)]
         pg_socket_dir: Option<PathBuf>,
+
+        /// Maximum number of concurrent client connections. The server
+        /// rejects new connections once this ceiling is reached. Raise it
+        /// for fleets that pool many connections (see NANO-DEFICIENCIES A9).
+        #[arg(long, default_value = "100")]
+        max_connections: usize,
     },
 
     /// Stop a running server
@@ -305,6 +311,7 @@ async fn main() -> Result<()> {
             mysql_listen,
             mysql_socket,
             pg_socket_dir,
+            max_connections,
         } => {
             // Validate that either --data-dir or --memory is specified
             if !memory && data_dir.is_none() {
@@ -360,6 +367,7 @@ async fn main() -> Result<()> {
                     auth,
                     password,
                     ha_config,
+                    max_connections,
                 )
                 .await
             } else {
@@ -379,6 +387,7 @@ async fn main() -> Result<()> {
                     mysql_listen,
                     mysql_socket,
                     pg_socket_dir,
+                    max_connections,
                 )
                 .await
             }
@@ -470,6 +479,7 @@ async fn start_server(
     mysql_listen: String,
     mysql_socket: Option<PathBuf>,
     pg_socket_dir: Option<PathBuf>,
+    max_connections: usize,
 ) -> Result<()> {
     use colored::Colorize;
     use heliosdb_nano::protocol::postgres::auth::{AuthManager, AuthMethod};
@@ -538,7 +548,7 @@ async fn start_server(
     // Build server config
     let mut pg_config = PgServerConfig::with_address(pg_addr)
         .with_auth_method(auth_method)
-        .with_max_connections(100);
+        .with_max_connections(max_connections);
 
     // Configure TLS if specified
     let tls_enabled = tls_cert.is_some();
@@ -1004,6 +1014,7 @@ async fn start_server_daemon(
     auth: String,
     password: Option<String>,
     ha_config: HAConfig,
+    max_connections: usize,
 ) -> Result<()> {
     use std::process::{Command, Stdio};
 
@@ -1042,6 +1053,8 @@ async fn start_server_daemon(
         port.to_string(),
         "--listen".to_string(),
         listen.clone(),
+        "--max-connections".to_string(),
+        max_connections.to_string(),
     ];
 
     if let Some(cfg) = config_path {

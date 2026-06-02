@@ -239,10 +239,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
 
         tracing::debug!("Executing query: {} (params: {})", statement.query, param_values.len());
 
-        // Execute query
+        // Execute query. A CTE (`WITH … SELECT …`) is row-returning but does
+        // not start with SELECT; route it through the params-aware query path
+        // too, otherwise it falls to execute_params and silently returns a
+        // command tag with zero rows over the wire (Token Dashboard #3).
         let is_select = {
             let t = statement.query.trim();
-            t.len() >= 6 && t.as_bytes()[..6].eq_ignore_ascii_case(b"SELECT")
+            (t.len() >= 6 && t.as_bytes()[..6].eq_ignore_ascii_case(b"SELECT"))
+                || super::handler::starts_with_cte(t)
         };
 
         if is_select {

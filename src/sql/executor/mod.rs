@@ -2363,6 +2363,7 @@ impl<'a> Executor<'a> {
                             sort_exprs,
                             sort_asc,
                             k,
+                            self.parameters.clone(),
                             self.timeout_ctx.clone(),
                         )?);
                         // Re-wrap with the Project on top, if we stripped one.
@@ -2402,6 +2403,7 @@ impl<'a> Executor<'a> {
                     input_op,
                     exprs.clone(),
                     asc.clone(),
+                    self.parameters.clone(),
                     self.timeout_ctx.clone(),
                 )?))
             }
@@ -2616,6 +2618,23 @@ impl<'a> Executor<'a> {
                     .storage
                     .ok_or_else(|| Error::query_execution("CREATE TYPE requires storage context".to_string()))?;
                 storage.catalog().register_enum_type(name, labels)?;
+                Ok(Box::new(
+                    ScanOperator::new(
+                        String::new(),
+                        Arc::new(crate::Schema { columns: vec![] }),
+                        None,
+                        vec![],
+                        vec![],
+                    )
+                    .with_timeout(self.timeout_ctx()),
+                ))
+            }
+            LogicalPlan::CreateSchema { name, if_not_exists } => {
+                // HeliosDB has a single flat namespace; `schema.table` is just
+                // a composite table name. Accept CREATE SCHEMA as a no-op so
+                // migrations that issue it don't fail. `IF NOT EXISTS` is
+                // implicit here since nothing is created either way.
+                let _ = (name, if_not_exists);
                 Ok(Box::new(
                     ScanOperator::new(
                         String::new(),

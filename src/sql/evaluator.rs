@@ -254,8 +254,20 @@ impl Evaluator {
                                     .ok_or_else(|| Error::query_execution("ANY array marker missing argument"))?,
                                 tuple,
                             )?;
-                            match array_value {
-                                Value::Array(values) => {
+                            // A bound list parameter for `col = ANY($1)` may
+                            // arrive either already decoded as `Value::Array`
+                            // or — for text-protocol clients like psycopg —
+                            // as the PostgreSQL array *text* literal
+                            // `{a,b,c}` in a `Value::String`. Accept both so
+                            // the parameter form behaves like an IN-list.
+                            // See NANO-DEFICIENCIES A1.
+                            let resolved_array: Option<Vec<Value>> = match &array_value {
+                                Value::Array(values) => Some(values.clone()),
+                                Value::String(s) => Self::parse_pg_text_array(s),
+                                _ => None,
+                            };
+                            match resolved_array {
+                                Some(values) => {
                                     for item_value in values {
                                         if matches!(item_value, Value::Null) {
                                             has_null = true;
@@ -267,13 +279,15 @@ impl Evaluator {
                                         }
                                     }
                                 }
-                                Value::Null => has_null = true,
-                                other => {
-                                    return Err(Error::query_execution(format!(
-                                        "ANY expects an array expression, got {:?}",
-                                        other
-                                    )))
-                                }
+                                None => match array_value {
+                                    Value::Null => has_null = true,
+                                    other => {
+                                        return Err(Error::query_execution(format!(
+                                            "ANY expects an array expression, got {:?}",
+                                            other
+                                        )))
+                                    }
+                                },
                             }
                             if found {
                                 break;
@@ -4612,6 +4626,11 @@ impl Evaluator {
     fn json_get_op(&self, json_val: &Value, key_val: &Value, as_text: bool) -> Result<Value> {
         let json_str = match json_val {
             Value::Json(j) => j,
+            // Lenient: allow `->`/`->>` directly on a TEXT column holding JSON.
+            // Many schemas store JSON-in-TEXT (no native JSON type) and expect
+            // `col->>'k'` to work without an explicit `::json` cast. The
+            // `serde_json::from_str` below validates it. See HELIOSDB_GAPS A2.
+            Value::String(s) => s,
             Value::Null => return Ok(Value::Null),
             _ => {
                 return Err(Error::query_execution(format!(
@@ -5215,6 +5234,68 @@ impl Evaluator {
     /// Compare two values for equality (used by IN list evaluation)
     /// Handles type coercion for common numeric comparisons
     #[allow(clippy::float_cmp)]
+    /// Parse a PostgreSQL array text literal (`{a,b,c}`, `{"x,y",NULL,z}`,
+    /// `{}`) into a vector of element `Value`s. Elements are returned as
+    /// `Value::String` (an unquoted, case-insensitive `NULL` becomes
+    /// `Value::Null`); `values_equal` then coerces them to the compared
+    /// column's type. Returns `None` if the string is not brace-delimited.
+    ///
+    /// Needed because text-protocol clients (psycopg) send a bound list
+    /// parameter for `col = ANY($1)` as this text form rather than a decoded
+    /// array. See NANO-DEFICIENCIES A1.
+    fn parse_pg_text_array(s: &str) -> Option<Vec<Value>> {
+        let inner = s.trim().strip_prefix('{')?.strip_suffix('}')?;
+        let mut out = Vec::new();
+        if inner.trim().is_empty() {
+            return Some(out);
+        }
+        let mut chars = inner.chars().peekable();
+        loop {
+            while matches!(chars.peek(), Some(c) if c.is_whitespace()) {
+                chars.next();
+            }
+            let mut elem = String::new();
+            let quoted = chars.peek() == Some(&'"');
+            if quoted {
+                chars.next(); // opening quote
+                while let Some(c) = chars.next() {
+                    match c {
+                        '\\' => {
+                            if let Some(escaped) = chars.next() {
+                                elem.push(escaped);
+                            }
+                        }
+                        '"' => break,
+                        _ => elem.push(c),
+                    }
+                }
+                // discard any whitespace up to the delimiter
+                while matches!(chars.peek(), Some(c) if *c != ',') {
+                    chars.next();
+                }
+            } else {
+                while let Some(&c) = chars.peek() {
+                    if c == ',' {
+                        break;
+                    }
+                    elem.push(c);
+                    chars.next();
+                }
+                elem = elem.trim().to_string();
+            }
+            if !quoted && elem.eq_ignore_ascii_case("NULL") {
+                out.push(Value::Null);
+            } else {
+                out.push(Value::String(elem));
+            }
+            match chars.next() {
+                Some(',') => continue,
+                _ => break,
+            }
+        }
+        Some(out)
+    }
+
     fn values_equal(&self, left: &Value, right: &Value) -> bool {
         match (left, right) {
             // Exact matches

@@ -5,6 +5,73 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.36.0] - 2026-06-02
+
+Deficiency-driven release working three field reports: ada-core's pg-wire
+workload (`NANO-DEFICIENCIES.md`), Markon (`HELIOSDB_GAPS_markon.md`), and the
+Token Dashboard integration (`HELIOSDB_v3_34_0_OUTSTANDING.md`). Focused fixes
+for several silent-wrong-result bugs plus operability knobs, each with
+regression coverage.
+
+### Fixed — SQL engine & planner
+
+- kNN `ORDER BY <vector-distance-expr>` now sorts correctly. Two bugs combined:
+  the Sort/TopK operators built their sort-key evaluator without query
+  parameters (so `ORDER BY embedding <=> $1` could not resolve `$1`), and the
+  planner places Sort above Project, so the ORDER-BY expression referenced a
+  base column the projection had already dropped — leaving rows unsorted
+  (silently wrong nearest neighbors). Parameters are now threaded into Sort/TopK,
+  and an ORDER-BY expression that matches a select-list expression is redirected
+  to the projected column. The canonical pgvector idiom
+  `SELECT id, embedding <=> $1 AS d … ORDER BY embedding <=> $1 [LIMIT k]` now
+  returns true nearest neighbors. (NANO-DEFICIENCIES A17)
+- `col = ANY($1)` where the bound parameter arrives as a PostgreSQL array text
+  literal (`{a,b,c}` — how text-protocol clients such as psycopg send a list)
+  now matches like `IN (…)` instead of erroring "ANY expects an array
+  expression, got String". (A1)
+- `->` and `->>` now accept a TEXT operand that holds JSON and parse it, so
+  `col->>'k'` works on JSON-in-TEXT columns without an explicit `::json` cast.
+  (Markon A2)
+- `CREATE SCHEMA [IF NOT EXISTS] <name>` is accepted as a flat-namespace no-op
+  instead of erroring "Statement not yet supported". (Token Dashboard #5)
+- `SHOW BRANCHES` is resolved in the planner, so it enumerates branches through
+  every query entry point, not only the textual pre-detect path. (Token
+  Dashboard #4)
+
+### Fixed — PostgreSQL wire protocol
+
+- A CTE (`WITH … SELECT …`) executed over the wire now returns its rows. Both the
+  simple- and extended-query handlers decided whether a statement returns rows by
+  a literal `SELECT` prefix, so a `WITH …` query fell through to the command path
+  and silently returned a command tag with zero rows — even though the engine
+  computed the rows correctly. Reproduced with pg8000 (extended protocol) and
+  fixed by routing CTEs through the row-returning path in both handlers. (Token
+  Dashboard #3)
+
+### Changed
+
+- New `--max-connections` flag on `heliosdb-nano start` (previously hardcoded to
+  100), forwarded through the daemon re-exec. (A9)
+- The hash-join build-side memory cap is raised from 100 MB to 1 GB and is now
+  overridable at runtime via the `HELIOSDB_HASH_JOIN_MEM_MB` environment variable
+  (value in MB); the over-limit error names the knob. (A2)
+
+### Verified — already correct on 3.35.x, regression coverage added
+
+- `INSERT/UPDATE/DELETE … RETURNING` (Markon A3).
+- Correlated `EXISTS` / `NOT EXISTS`, `IN` / `NOT IN (subquery)`, nested `IN`, and
+  the `LEFT JOIN … IS NULL` anti-join — verified embedded and over the wire.
+  `EXISTS`/`NOT EXISTS` evaluate per outer row (not via the hash join), giving a
+  reliable anti-join path. (Markon A6)
+
+### Known issues
+
+- Equi-joins can silently drop a small fraction of legitimately-matching rows on
+  certain large UUID-keyed datasets (Markon A5). It is data-and-scale-dependent
+  and not reproducible from a synthetic snippet, so it is under investigation
+  pending a reproducer; until it is resolved, validate via per-key equality
+  lookups or `EXISTS`/`NOT EXISTS` (which do not go through the hash join).
+
 ## [3.35.0] - 2026-06-02
 
 Hardening release. Two independent coding agents (Claude Code + Codex) worked the
