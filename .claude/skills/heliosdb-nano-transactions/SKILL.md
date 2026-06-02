@@ -126,4 +126,4 @@ for attempt in range(5):
 - `heliosdb-nano-query` — DML statements that participate in transactions.
 - `heliosdb-nano-schema` — multi-op `ALTER TABLE` (atomic per statement).
 - `heliosdb-nano-branches` — branches give you an alternative isolation surface for multi-step work.
-- `FEATURE_REQUEST_fk_in_txn.md` — historical FK-in-txn fix (closed in v3.22.1).
+- Historical FK-in-txn fix (closed in v3.22.1; see CHANGELOG v3.22.1).

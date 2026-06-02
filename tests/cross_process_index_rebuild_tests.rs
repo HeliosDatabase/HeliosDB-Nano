@@ -166,7 +166,7 @@ mod cross_process_rebuild {
 
     #[test]
     fn on_conflict_named_column_upserts_after_reopen() {
-        // FEATURE_REQUEST_cross_process_on_conflict.md repro.
+        // Cross-process ON CONFLICT duplication repro (fixed v3.22.2).
         //
         // `INSERT OR REPLACE` (translated to bare `ON CONFLICT DO UPDATE`)
         // is already covered by `insert_or_replace_upserts_across_reopens`.

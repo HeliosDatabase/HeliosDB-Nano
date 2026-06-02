@@ -1,6 +1,6 @@
 //! Persistent PQ-HNSW vector index (feature `vector-persist`).
 //!
-//! See `PROPOSAL_PERSISTENT_PQ_HNSW.md` for the full design. Implemented in phases:
+//! Persistent PQ-HNSW vector index design. Implemented in phases:
 //!
 //!   * **P1** — durable substrate: RocksDB key schema (`__vidx:<index_id>:…`),
 //!     write-through persistence with atomic `WriteBatch`, crash recovery via
