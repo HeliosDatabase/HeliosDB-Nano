@@ -884,8 +884,26 @@ enum JoinState {
 }
 
 impl HashJoinOperator {
-    /// Default memory limit: 100 MB
-    const DEFAULT_MEMORY_LIMIT: usize = 100 * 1024 * 1024;
+    /// Fallback hash-join build-side memory limit, in megabytes, used when an
+    /// operator is created without an explicit limit.
+    ///
+    /// A hard 100 MB cap previously aborted large analytic joins outright with
+    /// no recourse (NANO-DEFICIENCIES A2 — e.g. a 116K ⋈ 614K join). The
+    /// default is now raised to 1 GB and is overridable at runtime via the
+    /// `HELIOSDB_HASH_JOIN_MEM_MB` environment variable (value in MB), so
+    /// operators can size it to the host without recompiling.
+    const DEFAULT_MEMORY_LIMIT_MB: usize = 1024;
+
+    /// Resolve the default build-side memory limit (bytes), honoring the
+    /// `HELIOSDB_HASH_JOIN_MEM_MB` env override when set to a positive integer.
+    fn default_memory_limit() -> usize {
+        std::env::var("HELIOSDB_HASH_JOIN_MEM_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|mb| *mb > 0)
+            .unwrap_or(Self::DEFAULT_MEMORY_LIMIT_MB)
+            .saturating_mul(1024 * 1024)
+    }
 
     /// Create a new hash join operator with default memory limit
     pub fn new(
@@ -901,7 +919,7 @@ impl HashJoinOperator {
             join_type,
             on_condition,
             HashJoinBuildSide::Right,
-            Self::DEFAULT_MEMORY_LIMIT,
+            Self::default_memory_limit(),
             timeout_ctx,
         )
     }
@@ -922,7 +940,7 @@ impl HashJoinOperator {
             join_type,
             on_condition,
             HashJoinBuildSide::Left,
-            Self::DEFAULT_MEMORY_LIMIT,
+            Self::default_memory_limit(),
             timeout_ctx,
         )
     }
@@ -946,7 +964,7 @@ impl HashJoinOperator {
             crate::sql::JoinType::Inner,
             on_condition,
             build_side,
-            Self::DEFAULT_MEMORY_LIMIT,
+            Self::default_memory_limit(),
             timeout_ctx,
             Some(projection),
             Some(output_schema),
@@ -1093,8 +1111,10 @@ impl HashJoinOperator {
             // Check memory limit
             if self.memory_used + additional_memory > self.memory_limit {
                 return Err(Error::query_execution(format!(
-                    "Hash join exceeds memory limit ({} bytes). Consider using nested loop join or increasing limit.",
-                    self.memory_limit
+                    "Hash join exceeds memory limit ({} MB). Raise it by setting the \
+                     HELIOSDB_HASH_JOIN_MEM_MB environment variable, or rewrite the query \
+                     (e.g. add a more selective filter or join key).",
+                    self.memory_limit / (1024 * 1024)
                 )));
             }
 

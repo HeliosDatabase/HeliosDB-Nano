@@ -907,10 +907,15 @@ impl SortOperator {
         mut input: Box<dyn PhysicalOperator>,
         exprs: Vec<crate::sql::LogicalExpr>,
         asc: Vec<bool>,
+        parameters: Vec<crate::Value>,
         timeout_ctx: Option<TimeoutContext>,
     ) -> Result<Self> {
         let schema = input.schema();
-        let evaluator = crate::sql::Evaluator::new(schema.clone());
+        // Parameters must reach the sort-key evaluator: an `ORDER BY <expr>`
+        // key can reference a bound parameter (e.g. `ORDER BY embedding <=> $1`).
+        // Without them the key evaluates to an error for every row and the sort
+        // becomes a no-op — silently unsorted output. See NANO-DEFICIENCIES A17.
+        let evaluator = crate::sql::Evaluator::with_parameters(schema.clone(), parameters);
 
         // Collect all tuples from input (with timeout checking)
         let mut tuples = Vec::new();
