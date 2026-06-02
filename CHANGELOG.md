@@ -5,6 +5,82 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.35.0] - 2026-06-02
+
+Hardening release. Two independent coding agents (Claude Code + Codex) worked the
+v3.34.0 deficiency checklist item-by-item from a shared baseline — each
+baselining, fixing, and regression-testing independently — then integrated the
+stronger implementation of each. Of 13 checklist items, **10 were real bugs**
+(several deepening fixes first started in 3.34.0) and **3 were already correct**
+and gained regression coverage only. Also resolves the HNSW tombstone-count test
+deferred from 3.34.0. See `V334_CHECKLIST_RESULTS.md` for the per-item audit.
+
+### Fixed — SQL engine & planner
+
+- `col = ANY($param)` and `= ANY(ARRAY[...])` now match like `IN (...)` instead of
+  returning zero rows. The array expansion is confined to an internal marker, so
+  `IN ($1)` with an array parameter keeps its existing semantics. (A1)
+- CHECK constraints are now enforced on the parameterized write path
+  (`execute_params`), not only on the simple `execute()` path. (A5)
+- `COUNT(*)`, `COUNT(<col>)`, and single-PK count fast paths over a materialized
+  view now resolve the `__mv_<name>` backing table and return the correct count
+  instead of 0. (T2)
+- `GROUP BY` without aggregate functions now deduplicates by the grouping key
+  (the GROUP BY was previously dropped), affecting both direct queries and
+  materialized views. (T8)
+- `ON CONFLICT DO UPDATE … WHERE <predicate>` now evaluates the predicate
+  (including `excluded.*` references) before applying assignments; a false/NULL
+  predicate skips the update instead of always updating. (A11)
+
+### Fixed — PostgreSQL wire protocol
+
+- The extended-query protocol now recovers after an Execute-time error by
+  discarding messages until the client's `Sync`, instead of emitting an early
+  `ReadyForQuery` that wedged drivers (psycopg/asyncpg). (A8)
+- `BEGIN` after an in-transaction error no longer fails with "Transaction already
+  active": the aborted engine transaction is rolled back at BEGIN time, and the
+  extended path preserves PostgreSQL's 25P02 "transaction is aborted" semantics
+  until ROLLBACK. (A14)
+- Binary result formats requested via Bind/Describe are now honored on the
+  extended path (including uuid/bytea), instead of always emitting text rows. (A15)
+- Binary `TIMESTAMP`/`TIMESTAMPTZ` (OID 1114/1184) and `UUID` (OID 2950) parameter
+  inputs are now decoded (exact-length, PostgreSQL-epoch conversion) instead of
+  falling through to a bytes cast failure. (A4)
+
+### Fixed — Storage
+
+- Long shared-prefix `UNIQUE TEXT` values no longer trigger false duplicate
+  errors. The ART index now verifies the hidden path-compression prefix tail
+  against a representative leaf rather than trusting the truncated inner-node
+  prefix. (A7)
+- `CREATE BRANCH IF NOT EXISTS <name>` now parses the real branch name (instead of
+  creating a branch literally named `IF`) and is idempotent — a second identical
+  statement is a no-op. (Follow-up "IFNE"; see `BUGS_CREATE_BRANCH_IF_NOT_EXISTS.md`.)
+
+### Fixed — Vector index
+
+- `MultiMetricHnswIndex::len()` / `is_empty()` now report the physical
+  (tombstone-inclusive) entry count for all three metrics (L2/Cosine/InnerProduct),
+  matching the documented tombstone-on-delete semantics. Resolves the deferred
+  `test_vector_count_tracking` failure from `RELEASE_PENDING_3.34.0.md` and clears
+  the `cargo test --lib` release gate. Search results are unaffected (deleted ids
+  are still filtered out).
+
+### Tests — already-correct items hardened (no source change)
+
+- CTE + `$N` parameter binding, including recursive / UNION / joined / multi-param
+  forms. (T3)
+- `CREATE BRANCH … AS OF NOW` / `AS OF TIMESTAMP` name recording across all forms.
+  (T4)
+- `IS DISTINCT FROM` / `IS NOT DISTINCT FROM` NULL truth table, parameter, and
+  coercion behavior. (A10)
+
+### Known deferred
+
+- A4 output-side binary *encoding* for non-scalar types (numeric/temporal/json)
+  remains text-only.
+- TRUNCATE affected-row count semantics (carried from `RELEASE_PENDING_3.34.0.md`).
+
 ## [3.34.0] - 2026-05-31
 
 ### Performance — TPS release batch
