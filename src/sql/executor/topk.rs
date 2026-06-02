@@ -77,10 +77,17 @@ impl TopKOperator {
         exprs: Vec<crate::sql::LogicalExpr>,
         asc: Vec<bool>,
         k: usize,
+        parameters: Vec<Value>,
         timeout_ctx: Option<TimeoutContext>,
     ) -> Result<Self> {
         let schema = input.schema();
-        let evaluator = crate::sql::Evaluator::new(schema.clone());
+        // Must carry the query parameters: an `ORDER BY <expr>` key may
+        // reference a bound parameter (e.g. the kNN idiom
+        // `ORDER BY embedding <=> $1`). Without them the parameter resolves
+        // to an error, the sort key collapses to NULL for every row, and the
+        // heap returns rows in arbitrary order — silently wrong nearest
+        // neighbors. See NANO-DEFICIENCIES A17.
+        let evaluator = crate::sql::Evaluator::with_parameters(schema.clone(), parameters);
         let key_accessors: Vec<SortKeyAccessor> = exprs
             .into_iter()
             .map(|expr| match &expr {
