@@ -6,7 +6,7 @@
 
 HeliosDB-Nano is a row store: every scan reads each full row blob from
 `data:{table}:{rowid}`, bincode-decodes the **whole** `Vec<Value>`, and the
-operator pipeline runs row-at-a-time. The repo's own `PROPOSAL_COLUMNAR_STORAGE.md`
+operator pipeline runs row-at-a-time. The repo's own `docs/proposals/PROPOSAL_COLUMNAR_STORAGE.md`
 measured the gap vs SQLite on a 1 M-row table:
 
 | query | Nano | SQLite | gap |

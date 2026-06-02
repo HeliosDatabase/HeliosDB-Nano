@@ -5,7 +5,7 @@ sponsor: gpc001ca user (requested 2026-05-19)
 status: PROPOSAL — awaiting Nano-team triage
 related:
   - ENGINE_REGRESSION_BISECT_v3.28.0.md
-  - FEATURE_REQUEST_fk_in_txn.md
+  - FK-in-txn fix (CHANGELOG v3.22.1)
   - CHANGELOG.md v3.22.1 (DELETE in-txn fix), v3.28.0 (INSERT/UPDATE FK check), v3.30.0 (Quirk H ART path for non-txn)
 priority: P1 (regression closure) + P2 (ecosystem positioning)
 ---
@@ -372,7 +372,7 @@ Six workload classes × four candidate fixes (existing 3.30 + T1 + T1+T2 + T1+T2
 | **W1** | codekb corpus ingest (694 files / 18 952 symbols / 117 344 refs in one txn) | This regression's repro | The trigger; must close |
 | **W2** | KanttBan OLTP — agent register / task INSERT / event cascade UPDATE | `tests/kanttban_quirks_v3_27.rs` (existing) | Verifies T1 doesn't regress OLTP path that v3.28.0 was originally fixing |
 | **W3** | TPC-C-style banking transfer — single-row INSERTs, 2 FKs per row, 1000 concurrent sessions | `benches/conflict_detection_bench.rs` shape (existing infrastructure) | High-concurrency OLTP; tests T1 under load and T4's per-tenant isolation |
-| **W4** | Bulk DELETE 11k rows from FK-referenced child table (Quirk H's original case) | `BUGS_DASHBOARD_MIGRATION_TRIAGE.md` Quirk H | Verifies T1 doesn't regress the v3.30.0 fix |
+| **W4** | Bulk DELETE 11k rows from FK-referenced child table (Quirk H's original case) | dashboard-migration triage, Quirk H | Verifies T1 doesn't regress the v3.30.0 fix |
 | **W5** | pg_dump restore — `--data-only` for a 100k-row schema with FKs | New benchmark | Validates T2 `fk_validation = off` ergonomics |
 | **W6** | Multi-tenant ingest — 8 tenants × W1-shaped corpus in parallel | New benchmark | Validates T4 per-tenant cache isolation + horizontal scale |
 

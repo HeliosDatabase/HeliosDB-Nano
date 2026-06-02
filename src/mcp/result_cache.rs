@@ -1,6 +1,6 @@
 //! Server-side LRU cache for repeated MCP `tools/call` requests.
 //!
-//! Closes `FEATURE_REQUEST_tool_result_caching.md`. Within an
+//! Implements MCP tool-result caching. Within an
 //! agentic-coding session the same `helios_lsp_definition` /
 //! `helios_graphrag_search` / `heliosdb_hybrid_search` is often called
 //! several times in a row (refactor-then-verify loops, Read-then-confirm

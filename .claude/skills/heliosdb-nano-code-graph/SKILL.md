@@ -140,7 +140,7 @@ The branch guard restores the previous active branch on Drop, so any later queri
 - **Large repos**: first full index can take minutes. Subsequent commits are fast (Merkle-hashed file diffing skips unchanged files — `files_unchanged` in the stats).
 - **`bulk_insert_tuples` direct-write path**: ingest writes via the in-process bulk path, not via `INSERT … VALUES`. Don't try to ingest from outside the same OS process while the indexer is running.
 - **FK in transaction (v3.21.x bug, fixed in v3.22.1)**: cascading deletes inside a transaction once raised phantom FK violations. Pin to `>=3.22.1` for the per-file delete-stale path.
-- **Cross-process `INSERT … ON CONFLICT (path) DO UPDATE`** is still racy — see `FEATURE_REQUEST_cross_process_on_conflict.md`. The hook subcommand and SDK both run in-process, so this only matters if you wrap your own multi-process ingester.
+- **Cross-process `INSERT … ON CONFLICT (path) DO UPDATE`** is still racy. The hook subcommand and SDK both run in-process, so this only matters if you wrap your own multi-process ingester.
 
 ## See also
 - `heliosdb-nano-graph-rag` — wraps the symbol graph with seed/expand/rerank for RAG retrieval.

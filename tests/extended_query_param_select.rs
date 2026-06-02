@@ -2,7 +2,7 @@
 //! due to malformed RowDescription on the extended-query path.
 //!
 //! Branch: `fix/extended-query-rowdescription`. Tracked in
-//! `BUGS_DASHBOARD_MIGRATION_TRIAGE.md` (Bug 8, Bug 9).
+//! Dashboard-migration triage (Bug 8, Bug 9).
 //!
 //! These tests fail on v3.23.1 main and should pass once the schema-synthesis
 //! and/or RowDescription serialisation fix lands.

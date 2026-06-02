@@ -150,4 +150,4 @@ family, shard the four tables across N column families keyed by
   v3.21.0).
 - `FEATURE_REQUEST_streaming_pipeline.md` (orthogonal — overlap
   parse and write rather than parallelise within write).
-- `BUGS_CODE_INDEX_FK_VIOLATION_v3_21_1.md` (closed in v3.22.1).
+- Code-index FK-violation publish-blocker (closed in v3.22.1).

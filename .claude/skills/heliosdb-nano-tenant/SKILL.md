@@ -152,7 +152,7 @@ Limits per plan are at `src/tenant/mod.rs:494–510` (`ResourceLimits`); they're
 - **Connection pools and tenant context.** Use `SET LOCAL` (transaction-scoped) not `SET` (session-scoped) — without `LOCAL`, a recycled connection can leak the previous request's tenant context.
 - **`DatabasePerTenant` multiplies storage of cross-tenant lookup tables.** A 100 KB country-code table × 1 000 tenants = 100 MB of duplicated reference data. Use `SharedSchema` for catalogue-style data, `DatabasePerTenant` only for customer-scoped data.
 - **Plan deletion auto-downgrades.** If you delete the `pro` plan, every tenant on `pro` gets moved to the next-lower tier (`starter`). Read the cascade rules at `src/tenant/mod.rs:169+` (`PlanManager`) before deleting plans in production.
-- **`CREATE DATABASE` SQL DDL is not yet wired** to the tenant API as of v3.23.0 (tracked under `BUGS_DASHBOARD_MIGRATION_TRIAGE.md` Bug 1). Until that lands, use `\tenant create … db` (REPL) or the library API.
+- **`CREATE DATABASE` SQL DDL is not yet wired** to the tenant API as of v3.23.0 (tracked as dashboard-migration Bug 1). Until that lands, use `\tenant create … db` (REPL) or the library API.
 - **`current_tenant()` returns NULL when no context is set.** RLS predicates against NULL behave per SQL three-valued logic — typically meaning "no rows visible". For an unauthenticated public path, set a sentinel tenant or skip the policy on those tables.
 - **Cross-tenant queries.** RLS prevents them by default. Admin/reporting workflows that need cross-tenant aggregation must run as a privileged role that bypasses RLS — there is no per-query bypass syntax.
 
@@ -162,4 +162,4 @@ Limits per plan are at `src/tenant/mod.rs:494–510` (`ResourceLimits`); they're
 - `heliosdb-nano-branches` — branches are an orthogonal isolation tool (per-experiment, not per-customer); don't confuse the two.
 - `heliosdb-nano-deploy` — Fly.io / Railway / Render specifics for multi-tenant deployments.
 - `src/tenant/mod.rs` — authoritative source for plans, isolation modes, RLS policies.
-- `BUGS_DASHBOARD_MIGRATION_TRIAGE.md` Bug 1 — the SQL DDL surface (`CREATE DATABASE foo`) is queued for v3.26.0 and will map to this skill's tenant API.
+- Dashboard-migration Bug 1 — the SQL DDL surface (`CREATE DATABASE foo`) is queued for v3.26.0 and will map to this skill's tenant API.

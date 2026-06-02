@@ -236,7 +236,7 @@ fn cross_file_ref_resolves() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// BUGS_CODE_INDEX_FK_VIOLATION_v3_21_1.md acceptance fixtures
+// Code-index FK-violation acceptance fixtures (fixed v3.22.1)
 // ---------------------------------------------------------------------------
 //
 // Pilot client (`heliosdb-codekb-mcp`) reports that any `code_index`

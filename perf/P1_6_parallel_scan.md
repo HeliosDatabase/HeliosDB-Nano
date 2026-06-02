@@ -38,7 +38,7 @@ parts that stay serial dominate:
 - **Row-oriented full materialization**: every query builds a full `Vec<Value>`
   per row even when it needs 1–2 columns.
 
-This directly confirms `PROPOSAL_COLUMNAR_STORAGE.md`: the analytics gap vs SQLite
+This directly confirms `docs/proposals/PROPOSAL_COLUMNAR_STORAGE.md`: the analytics gap vs SQLite
 (6–89×) is a *row-store materialization* problem, not a decode-speed problem.
 Parallel decode is a real, safe, free-ish win but **not** the lever that closes
 the SQLite gap. The levers that would are **P1#5 columnar scan** (read only the

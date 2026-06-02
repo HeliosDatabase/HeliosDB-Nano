@@ -151,7 +151,7 @@ DROP TRIGGER IF EXISTS posts_audit ON posts;
 
 ## Pitfalls
 - **`INTEGER PRIMARY KEY AUTOINCREMENT` (SQLite-ism) is accepted** — translated to `BIGSERIAL` internally. Use freely in drop-in scenarios.
-- **FK violations inside a single transaction** were fixed in v3.22.1 — older versions could see phantom violations during cascading deletes (see `BUGS_CODE_INDEX_FK_VIOLATION_v3_21_1.md`).
+- **FK violations inside a single transaction** were fixed in v3.22.1 — older versions could see phantom violations during cascading deletes.
 - **`PRAGMA foreign_keys = ON;` is a no-op-with-ack** — Nano enforces FKs by default; the PRAGMA exists only for sqlite3 source compatibility.
 - **HNSW indexes require explicit `dim`** in `WITH (...)`. Mismatched embedding dimensions will fail at insert time, not at index creation.
 - **Triggers fire only for row-level operations** (`FOR EACH ROW`). Statement-level triggers are not supported.

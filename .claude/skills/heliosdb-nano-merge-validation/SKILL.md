@@ -135,7 +135,7 @@ For sub-millisecond measurements (the JOIN p50 in v3.23.0 was ~9 µs), a 5-sampl
 
 ## Phase 7 — Validation report
 
-Write a `<FEATURE>_REPORT.md` at the repo root (the v3.23.0 example is `PREDICATE_PUSHDOWN_REPORT.md`) capturing:
+Write a `<FEATURE>_REPORT.md` at the repo root capturing:
 
 ```markdown
 ---
@@ -226,7 +226,7 @@ The workflow gates again on `cargo test --lib + --doc`. If it fails here, you mi
 - `heliosdb-nano-observability` — `EXPLAIN ANALYZE`, slow-query log, and `\stats` for performance debugging during phases 4–6.
 - `heliosdb-nano-server` — production-affecting flags; phase-6 OLTP bench should mirror the auth/TLS/replication flags the deployment uses.
 - `~/.claude/projects/-home-app-Helios-Nano/memory/nano_release_process.md` — the saved memory for phase 8.
-- `PREDICATE_PUSHDOWN_REPORT.md` — the v3.23.0 worked example. Use as a template.
+- `<FEATURE>_REPORT.md` — the per-release validation report (template in Phase 7 above).
 - `examples/oltp_smoke.rs` — the OLTP workload harness from phase 6.
 - `benches/predicate_pushdown_bench.rs` — the targeted-feature bench template from phase 4.
 - `benches/external/pg_vs_helios.py` + `docs/BENCHMARK_PG_VS_HELIOS.txt` — historical PG-wire baselines for reconciling phase 6 numbers.

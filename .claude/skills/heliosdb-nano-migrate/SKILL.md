@@ -147,7 +147,7 @@ Acceptance bar: row counts identical, numeric aggregates within ≤ 0.01 % drift
 - **`fastembed_cache/`** is needed only if the importing app also uses `--features code-embed`; otherwise ignore it.
 - **`PRAGMA foreign_keys = OFF;` is a no-op-with-ack.** FKs are always enforced. If your old app relied on toggling this off mid-migration, restructure the migration as `BEGIN; … COMMIT;` (see `heliosdb-nano-transactions`).
 - **Per-`Connection` subprocess** in Python embedded mode means high request rates create many processes. For threaded servers prefer `mode='daemon'`.
-- **Cross-process `INSERT … ON CONFLICT (path) DO UPDATE`** has a known regression (`FEATURE_REQUEST_cross_process_on_conflict.md`). Single-process workflows are unaffected.
+- **Cross-process `INSERT … ON CONFLICT (path) DO UPDATE`** has a known regression. Single-process workflows are unaffected.
 - **Custom SQLite functions / collations** registered via `register_function` / `create_function` aren't supported. Reimplement as PL/pgSQL (`heliosdb-nano-schema` Recipe 6) or move that logic into the app.
 - **MySQL `ENGINE=InnoDB` and `CHARSET=…` clauses are accepted but ignored.** The storage engine is fixed; charset is UTF-8.
 

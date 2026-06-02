@@ -13,7 +13,7 @@ baselining, fixing, and regression-testing independently — then integrated the
 stronger implementation of each. Of 13 checklist items, **10 were real bugs**
 (several deepening fixes first started in 3.34.0) and **3 were already correct**
 and gained regression coverage only. Also resolves the HNSW tombstone-count test
-deferred from 3.34.0. See `V334_CHECKLIST_RESULTS.md` for the per-item audit.
+deferred from 3.34.0.
 
 ### Fixed — SQL engine & planner
 
@@ -55,14 +55,14 @@ deferred from 3.34.0. See `V334_CHECKLIST_RESULTS.md` for the per-item audit.
   prefix. (A7)
 - `CREATE BRANCH IF NOT EXISTS <name>` now parses the real branch name (instead of
   creating a branch literally named `IF`) and is idempotent — a second identical
-  statement is a no-op. (Follow-up "IFNE"; see `BUGS_CREATE_BRANCH_IF_NOT_EXISTS.md`.)
+  statement is a no-op. (Follow-up "IFNE".)
 
 ### Fixed — Vector index
 
 - `MultiMetricHnswIndex::len()` / `is_empty()` now report the physical
   (tombstone-inclusive) entry count for all three metrics (L2/Cosine/InnerProduct),
   matching the documented tombstone-on-delete semantics. Resolves the deferred
-  `test_vector_count_tracking` failure from `RELEASE_PENDING_3.34.0.md` and clears
+  `test_vector_count_tracking` failure from the 3.34.0 release gate and clears
   the `cargo test --lib` release gate. Search results are unaffected (deleted ids
   are still filtered out).
 
@@ -79,7 +79,7 @@ deferred from 3.34.0. See `V334_CHECKLIST_RESULTS.md` for the per-item audit.
 
 - A4 output-side binary *encoding* for non-scalar types (numeric/temporal/json)
   remains text-only.
-- TRUNCATE affected-row count semantics (carried from `RELEASE_PENDING_3.34.0.md`).
+- TRUNCATE affected-row count semantics (carried from the 3.34.0 release gate).
 
 ## [3.34.0] - 2026-05-31
 
@@ -135,8 +135,7 @@ deferred from 3.34.0. See `V334_CHECKLIST_RESULTS.md` for the per-item audit.
   version. This verified release candidate is intentionally published as
   `3.34.0` because the TPS batch is a broad performance release rather than a
   patch-only fix.
-- Known deferred items for this release are documented in
-  `RELEASE_PENDING_3.34.0.md`: TRUNCATE affected-row count semantics and HNSW
+- Known deferred items for this release: TRUNCATE affected-row count semantics and HNSW
   tombstone/physical-count test semantics. SQLite embedded analytical scans and
   bound-parameter UPDATE remain post-release performance targets. These are not
   regressions from the TPS batch.
@@ -179,7 +178,7 @@ On the reporter's 448k-row workload the in-process path is **1.5–4.7× faster 
 PG-wire** (the access mode their cutover currently uses): `COUNT(*)` 715→153 ms,
 `COUNT(DISTINCT)` 1489→725 ms, `GROUP BY+SUM` 1439→902 ms. It is **not** yet
 sqlite-competitive on full-table aggregates — that gap is the row-store reading and
-materializing whole rows, which needs columnar scans (see `PROPOSAL_COLUMNAR_STORAGE.md`),
+materializing whole rows, which needs columnar scans (see `docs/proposals/PROPOSAL_COLUMNAR_STORAGE.md`),
 not the access mode.
 
 ### Added — `EmbeddedDatabase::query_params_with_columns`
@@ -229,7 +228,7 @@ materialization can be exercised across the full LSM tree.
 
 ### Docs
 
-`PROPOSAL_PYO3_BINDING.md` — implementation plan for an in-process PyO3 binding
+Design notes for an in-process PyO3 binding
 over `EmbeddedDatabase` (issue #1: the shipped Python "embedded" mode is a REPL
 subprocess pipe that loses to sqlite3 on aggregates).
 
@@ -280,8 +279,8 @@ API: `heliosdb_nano::vector::persistent::PersistentVectorIndex`
 
 Validated: 26 unit tests; full lib suite green with the feature on (1796
 passed); head-to-head vs main shows performance parity on OLTP / vector paths
-(default binary unchanged). Design + reports on disk: `PROPOSAL_PERSISTENT_PQ_HNSW.md`,
-`VALIDATION_REPORT_persistent_pq_hnsw.md`, `BENCHMARK_main_vs_persistent_pq_hnsw.md`.
+(default binary unchanged). Design, validation, and head-to-head benchmark were
+completed during development.
 
 ## [3.31.2] - 2026-05-22
 
@@ -316,7 +315,7 @@ End-to-end validation on the same corpus and harness:
 ~321× speedup on the write phase; within 6% of the pre-v3.28.0
 baseline. The four-tier follow-up roadmap (session GUC
 `helios.fk_validation`, per-FK `NOT ENFORCED`, HeliosProxy `fk-cache`
-WASM plugin) is tracked in `PROPOSAL_FK_VALIDATION_OPTIMIZATION.md`.
+WASM plugin) is tracked in `docs/proposals/PROPOSAL_FK_VALIDATION_OPTIMIZATION.md`.
 
 ### Fixed — pgvector bare `::vector` cast accepts inferred dimension (ada-core)
 
@@ -1156,8 +1155,7 @@ deployments are unchanged.
 ### Validation
 
 Followed the 8-phase merge-validation methodology
-(`.claude/skills/heliosdb-nano-merge-validation/SKILL.md`). Full
-report at `VALIDATION_REPORT_v3.26.0.md`. Lib tests 1758/1758 pass,
+(`.claude/skills/heliosdb-nano-merge-validation/SKILL.md`). Lib tests 1758/1758 pass,
 all targeted tests pass, no regression in v3.24.0 / v3.25.0 surfaces.
 
 ## [3.25.0] - 2026-05-03
@@ -1213,8 +1211,7 @@ on a typo; clients using the libpq defaults are unaffected because
 ### Validation
 
 Followed the 8-phase merge-validation methodology
-(`.claude/skills/heliosdb-nano-merge-validation/SKILL.md`). Full
-report at `VALIDATION_REPORT_v3.25.0.md`. Lib tests 1758/1758 pass,
+(`.claude/skills/heliosdb-nano-merge-validation/SKILL.md`). Lib tests 1758/1758 pass,
 doc tests 47/47 pass, all targeted CREATE-DATABASE tests pass,
 v3.24.0 information_schema tests still pass (no regression).
 
@@ -1267,8 +1264,7 @@ file an issue and we'll add the placeholder.
 ### Validation
 
 Followed the 8-phase merge-validation methodology
-(`.claude/skills/heliosdb-nano-merge-validation/SKILL.md`). Full
-report at `VALIDATION_REPORT_v3.24.0.md`. Lib tests 1758/1758 pass,
+(`.claude/skills/heliosdb-nano-merge-validation/SKILL.md`). Lib tests 1758/1758 pass,
 doc tests 47/47 pass, info_schema completion 9/9 pass, system_views
 22/22 pass.
 
@@ -1296,7 +1292,7 @@ and `$N` forms for COUNT(*), COUNT(DISTINCT), aliased aggregates,
 and multi-column projections. The unit tests catch any future
 planner regression that would re-open Bug 8 / 9.
 
-### Updated — `BUGS_DASHBOARD_MIGRATION_TRIAGE.md`
+### Updated — dashboard-migration bug triage
 
 Re-triaged with the live verification table. Net status:
 - ✅ Fixed: 3, 6, 7 (simple-query), 8, 9, 10, 11 (and 4 basic shape).
@@ -1328,7 +1324,7 @@ already closed in v3.23.2**. Please re-test —
   validation methodology distilled from the v3.23.0 release work. Required
   reading before any non-trivial change to engine code (planner, executor,
   storage, parser, optimiser).
-- **`BUGS_DASHBOARD_MIGRATION_TRIAGE.md`** — full triage of the 11 bugs
+- **Dashboard-migration bug triage** — full triage of the 11 bugs
   filed by the Claude-Dashboard team against v3.19.1, verified against
   v3.23.0. Two bugs (10, 11 — column-projection / aggregate-alias) are
   confirmed already fixed in-range; the remaining nine are scheduled
@@ -1401,7 +1397,7 @@ INSERT and JOIN paths marginally faster.
 - `art_index_bench` runs at normal numbers — no regression on
   non-JOIN workloads.
 
-See `PREDICATE_PUSHDOWN_REPORT.md` for the full validation matrix.
+Validated across the full predicate-pushdown matrix with no non-JOIN regressions.
 
 ## [3.22.3] - 2026-05-01
 
@@ -1438,7 +1434,7 @@ don't need a repo checkout to publish skills globally.
 
 ### Fixed — cross-process `INSERT … ON CONFLICT` no longer duplicates rows
 
-Closes `FEATURE_REQUEST_cross_process_on_conflict.md`. A second
+Closes the cross-process `INSERT … ON CONFLICT` duplication bug. A second
 process attaching to a KB written by a prior process and issuing
 `INSERT … ON CONFLICT(col) DO UPDATE` (or any parameterised
 `INSERT` via `db.execute_params`) silently inserted duplicate
@@ -1508,8 +1504,8 @@ Commit `60f0460`.
 
 ### Fixed — phantom FK violation on `DELETE child; DELETE parent` inside a transaction
 
-Closes the publish-blocker filed in `BUGS_CODE_INDEX_FK_VIOLATION_v3_21_1.md`
-(also `FEATURE_REQUEST_fk_in_txn.md`): every `code_index` call against a
+Closes the code-index publish-blocker (phantom in-txn FK violation): every
+`code_index` call against a
 populated KB raised
 `fk__hdb_code_symbol_refs_from_symbol___hdb_code_symbols`
 on the second of a `DELETE child WHERE …; DELETE parent WHERE …;`
@@ -1558,7 +1554,7 @@ The pilot's silent-fail matrix is closed:
 The FK validator's `merge_with_write_set` walks the txn's
 DashMap write-set on every check. When the cross-process
 `INSERT ... ON CONFLICT (path) DO UPDATE` bug
-(`FEATURE_REQUEST_cross_process_on_conflict.md`) doubles the
+(the cross-process duplication regression) doubles the
 client's `src` table across re-runs, the indexer's
 duplicate-path defense triggers per-file delete-stale on the
 second occurrence of every path, and each FK check pays an

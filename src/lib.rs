@@ -13281,8 +13281,8 @@ impl EmbeddedDatabase {
         // Reached when no single-column ART index covers the FK target
         // (multi-column PKs, schemas without indexes registered). The
         // write-set merge preserves read-your-own-writes for the
-        // BEGIN; DELETE child; DELETE parent; pattern (filed in
-        // FEATURE_REQUEST_fk_in_txn.md, fixed in v3.22.1).
+        // BEGIN; DELETE child; DELETE parent; pattern (phantom FK
+        // violation fix, v3.22.1).
         let catalog = self.storage.catalog();
         let schema = catalog.get_table_schema(table_name)?;
         let base = self.storage.scan_table(table_name)?;

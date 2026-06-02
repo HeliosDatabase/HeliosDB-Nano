@@ -2,8 +2,7 @@
 
 ## Verdict
 
-**REAL BUG — fixed.** (Follow-up discovered during T4; see
-`BUGS_CREATE_BRANCH_IF_NOT_EXISTS.md`.) Both agents produced an **identical
+**REAL BUG — fixed.** (Follow-up discovered during T4.) Both agents produced an **identical
 production fix** independently; Codex's superset (cleaner helper + broader tests)
 is integrated.
 
