@@ -111,33 +111,51 @@ impl<'a> Catalog<'a> {
     /// If not found, it checks if it exists as a materialized view and
     /// returns the MV's schema if found.
     pub fn get_table_schema(&self, table_name: &str) -> Result<Schema> {
-        // Check in-memory cache first
-        if let Some(schema) = self.storage.get_cached_schema(table_name) {
-            return Ok(schema);
-        }
-
-        let key = Self::table_metadata_key(table_name);
-        match self.storage.get(&key)? {
-            Some(data) => {
-                let schema: Schema = bincode::deserialize(&data)
-                    .map_err(|e| Error::storage(format!("Failed to deserialize schema: {}", e)))?;
-                // Cache for future lookups
-                self.storage.cache_schema(table_name, schema.clone());
-                Ok(schema)
-            }
-            None => {
-                // Table not found, check if it's a materialized view
-                let mv_catalog = self.storage.mv_catalog();
-                if mv_catalog.view_exists(table_name)? {
-                    let mv_metadata = mv_catalog.get_view(table_name)?;
-                    // Cache MV schema too
-                    self.storage.cache_schema(table_name, mv_metadata.schema.clone());
-                    Ok(mv_metadata.schema)
-                } else {
-                    Err(Error::query_execution(format!("Table '{}' does not exist", table_name)))
+        // Resolve the raw schema (in-memory cache -> on-disk metadata -> materialized view).
+        let mut schema = if let Some(schema) = self.storage.get_cached_schema(table_name) {
+            schema
+        } else {
+            let key = Self::table_metadata_key(table_name);
+            match self.storage.get(&key)? {
+                Some(data) => {
+                    let schema: Schema = bincode::deserialize(&data)
+                        .map_err(|e| Error::storage(format!("Failed to deserialize schema: {}", e)))?;
+                    // Cache for future lookups
+                    self.storage.cache_schema(table_name, schema.clone());
+                    schema
+                }
+                None => {
+                    // Table not found, check if it's a materialized view
+                    let mv_catalog = self.storage.mv_catalog();
+                    if mv_catalog.view_exists(table_name)? {
+                        let mv_metadata = mv_catalog.get_view(table_name)?;
+                        // Cache MV schema too
+                        self.storage.cache_schema(table_name, mv_metadata.schema.clone());
+                        mv_metadata.schema
+                    } else {
+                        return Err(Error::query_execution(format!(
+                            "Table '{}' does not exist",
+                            table_name
+                        )));
+                    }
                 }
             }
+        };
+
+        // B31 backward-compat: a column always belongs to its table, but tables
+        // created by older binaries persisted columns with `source_table_name = None`.
+        // That breaks table-qualified column resolution (e.g. `SELECT t.col`) on the
+        // schema-derivation path used to build the extended-query RowDescription
+        // (`derive_result_schema` -> `LogicalPlan::schema()`): freshly-created tables
+        // resolve, but old ones raise `Column 't.col' not found in schema`. Stamp the
+        // canonical table name here so every consumer (Describe, planner, evaluator)
+        // resolves `t.col` regardless of the on-disk format.
+        for col in &mut schema.columns {
+            if col.source_table_name.is_none() {
+                col.source_table_name = Some(table_name.to_string());
+            }
         }
+        Ok(schema)
     }
 
     /// Update table schema (for ALTER TABLE operations)
@@ -1120,9 +1138,69 @@ mod tests {
         // Verify table exists
         assert!(catalog.table_exists("users").expect("Failed to check if table exists"));
 
-        // Verify schema
+        // Verify schema. B31: get_table_schema now stamps the owning table name on
+        // every column (so qualified `t.col` resolution works regardless of the
+        // on-disk format), so compare structurally and assert the stamp rather than
+        // requiring exact equality with the unstamped input.
         let retrieved_schema = catalog.get_table_schema("users").expect("Failed to get table schema");
-        assert_eq!(retrieved_schema, schema);
+        assert_eq!(retrieved_schema.columns.len(), schema.columns.len());
+        for (got, want) in retrieved_schema.columns.iter().zip(schema.columns.iter()) {
+            assert_eq!(got.name, want.name);
+            assert_eq!(got.data_type, want.data_type);
+            assert_eq!(got.source_table_name.as_deref(), Some("users"));
+        }
+    }
+
+    #[test]
+    fn b31_get_table_schema_stamps_source_table_name() {
+        // Regression for B31: tables persisted by older binaries stored columns with
+        // `source_table_name = None`, which broke `SELECT t.col` resolution on the
+        // extended-query schema-derivation path (`derive_result_schema` ->
+        // `LogicalPlan::schema()`). get_table_schema must stamp the owning table name
+        // so qualified resolution succeeds regardless of the on-disk format.
+        let config = Config::in_memory();
+        let storage = StorageEngine::open_in_memory(&config).expect("Failed to open in-memory storage");
+        let catalog = Catalog::new(&storage);
+
+        // Old-format schema: every column has source_table_name = None.
+        let schema = Schema::new(vec![
+            Column {
+                name: "id".to_string(),
+                data_type: DataType::Text,
+                nullable: false,
+                primary_key: true,
+                source_table: None,
+                source_table_name: None,
+                default_expr: None,
+                unique: false,
+                storage_mode: crate::ColumnStorageMode::Default,
+            },
+            Column {
+                name: "email".to_string(),
+                data_type: DataType::Text,
+                nullable: true,
+                primary_key: false,
+                source_table: None,
+                source_table_name: None,
+                default_expr: None,
+                unique: false,
+                storage_mode: crate::ColumnStorageMode::Default,
+            },
+        ]);
+        catalog.create_table("leads", schema).expect("Failed to create table");
+
+        let loaded = catalog.get_table_schema("leads").expect("Failed to get table schema");
+        assert!(
+            loaded.get_qualified_column_index(Some("leads"), "id").is_some(),
+            "qualified resolution of leads.id must succeed after B31 stamping"
+        );
+        assert!(
+            loaded.get_qualified_column_index(Some("leads"), "email").is_some(),
+            "qualified resolution of leads.email must succeed after B31 stamping"
+        );
+        for col in &loaded.columns {
+            assert_eq!(col.source_table_name.as_deref(), Some("leads"));
+        }
     }
 
     #[test]
