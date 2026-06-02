@@ -2363,6 +2363,7 @@ impl<'a> Executor<'a> {
                             sort_exprs,
                             sort_asc,
                             k,
+                            self.parameters.clone(),
                             self.timeout_ctx.clone(),
                         )?);
                         // Re-wrap with the Project on top, if we stripped one.
@@ -2402,6 +2403,7 @@ impl<'a> Executor<'a> {
                     input_op,
                     exprs.clone(),
                     asc.clone(),
+                    self.parameters.clone(),
                     self.timeout_ctx.clone(),
                 )?))
             }
