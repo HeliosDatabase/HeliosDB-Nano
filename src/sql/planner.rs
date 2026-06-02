@@ -1013,6 +1013,22 @@ impl<'a> Planner<'a> {
             // to column references that the Sort operator can evaluate.
             let aggregate_info = Self::extract_aggregate_info(&plan);
 
+            // The Sort is planned ABOVE the Project, so it only sees the
+            // projected output columns. An ORDER BY *expression* that
+            // references base columns the projection dropped (e.g.
+            // `ORDER BY embedding <=> $1` when the select list carries
+            // `embedding <=> $1 AS d` but not `embedding`) would otherwise
+            // fail to evaluate and silently leave the rows unsorted — the
+            // pgvector kNN idiom, NANO-DEFICIENCIES A17. Capture the
+            // projected (expr, alias) pairs so a matching ORDER BY
+            // expression can be redirected to the already-computed column.
+            let projection_outputs: Vec<(LogicalExpr, String)> = match &plan {
+                LogicalPlan::Project { exprs, aliases, .. } => {
+                    exprs.iter().cloned().zip(aliases.iter().cloned()).collect()
+                }
+                _ => Vec::new(),
+            };
+
             let exprs: Result<Vec<_>> = order_by
                 .exprs
                 .iter()
@@ -1042,11 +1058,14 @@ impl<'a> Planner<'a> {
 
                     // If the ORDER BY expression contains aggregate functions and
                     // we have an aggregate plan, rewrite them to column references
-                    if let Some(ref info) = aggregate_info {
-                        Ok(Self::rewrite_order_by_aggregates(&logical_expr, info))
+                    let resolved = if let Some(ref info) = aggregate_info {
+                        Self::rewrite_order_by_aggregates(&logical_expr, info)
                     } else {
-                        Ok(logical_expr)
-                    }
+                        logical_expr
+                    };
+                    // Redirect an expression that matches a projected select-list
+                    // expression to its output column (A17, see above).
+                    Ok(Self::rewrite_order_by_to_projection(resolved, &projection_outputs))
                 })
                 .collect();
             let asc: Vec<_> = order_by
@@ -1941,6 +1960,30 @@ impl<'a> Planner<'a> {
     /// For example, `SUM(val)` becomes `Column { name: "total" }` if that aggregate
     /// has alias "total" in the output schema.
     /// Also handles GROUP BY column references that need remapping.
+    /// Redirect an ORDER BY expression to a projected output column when it
+    /// structurally matches a select-list expression. The Sort runs above the
+    /// Project and can only see projected columns, so an ORDER BY expression
+    /// over a base column the projection dropped (the pgvector
+    /// `ORDER BY embedding <=> $1` idiom, with `embedding <=> $1 AS d` in the
+    /// select list) must be redirected to the already-computed column.
+    /// Plain column / literal sort keys are left untouched — they already
+    /// resolve, and redirecting a bare column could shadow a base column that
+    /// was projected under a different alias. See NANO-DEFICIENCIES A17.
+    fn rewrite_order_by_to_projection(expr: LogicalExpr, projection_outputs: &[(LogicalExpr, String)]) -> LogicalExpr {
+        if matches!(expr, LogicalExpr::Column { .. } | LogicalExpr::Literal(_)) {
+            return expr;
+        }
+        for (proj_expr, alias) in projection_outputs {
+            if !alias.is_empty() && proj_expr == &expr {
+                return LogicalExpr::Column {
+                    table: None,
+                    name: alias.clone(),
+                };
+            }
+        }
+        expr
+    }
+
     fn rewrite_order_by_aggregates(expr: &LogicalExpr, info: &AggregateInfo) -> LogicalExpr {
         match expr {
             LogicalExpr::AggregateFunction { fun, args, distinct } => {
