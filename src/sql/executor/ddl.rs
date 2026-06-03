@@ -11,6 +11,64 @@ use crate::{Error, Result};
 use rocksdb::{IteratorMode, ReadOptions};
 use std::sync::Arc;
 
+fn empty_ddl_result(executor: &Executor) -> Box<dyn PhysicalOperator> {
+    Box::new(
+        ScanOperator::new(
+            "".to_string(),
+            Arc::new(crate::Schema { columns: vec![] }),
+            None,
+            vec![],
+            vec![],
+        )
+        .with_timeout(executor.timeout_ctx()),
+    )
+}
+
+fn create_art_secondary_index(
+    storage: &crate::storage::StorageEngine,
+    name: &str,
+    table_name: &str,
+    column_name: &str,
+    if_not_exists: bool,
+) -> Result<Option<usize>> {
+    if storage.is_branch_active() {
+        return Err(Error::query_execution(
+            "CREATE INDEX for ART secondary indexes must run on the main branch",
+        ));
+    }
+
+    let art_manager = storage.art_indexes();
+    if art_manager.index_exists(name) {
+        if if_not_exists {
+            return Ok(None);
+        }
+        return Err(Error::query_execution(format!("ART index '{}' already exists", name)));
+    }
+
+    let catalog = storage.catalog();
+    let schema = catalog.get_table_schema(table_name)?;
+    if !schema.columns.iter().any(|c| c.name == column_name) {
+        return Err(Error::query_execution(format!(
+            "Column '{}' not found in table '{}'",
+            column_name, table_name
+        )));
+    }
+
+    let columns = vec![column_name.to_string()];
+    art_manager
+        .create_manual_index(name, table_name, &columns)
+        .map_err(|e| Error::query_execution(format!("Failed to create ART index: {}", e)))?;
+
+    let tuples = storage.scan_table_with_schema(table_name, &schema)?;
+    match art_manager.backfill_manual_index(name, &schema, &tuples) {
+        Ok(backfilled) => Ok(Some(backfilled)),
+        Err(e) => {
+            let _ = art_manager.drop_index(name);
+            Err(Error::query_execution(format!("Failed to backfill ART index: {}", e)))
+        }
+    }
+}
+
 /// Handle CREATE INDEX logical plan node
 pub(super) fn handle_create_index(executor: &Executor, plan: &LogicalPlan) -> Result<Box<dyn PhysicalOperator>> {
     if let LogicalPlan::CreateIndex {
@@ -22,63 +80,25 @@ pub(super) fn handle_create_index(executor: &Executor, plan: &LogicalPlan) -> Re
         options,
     } = plan
     {
-        // For now, return an empty result - actual index creation happens in storage layer
-        // This is a placeholder until we integrate proper DDL execution
         if let Some(storage) = executor.storage() {
-            // Check if it's a vector index (USING hnsw)
-            if let Some(idx_type) = index_type {
-                if idx_type == "art" {
-                    // Handle ART index creation
-                    let art_manager = storage.art_indexes();
-
-                    // Check if index already exists
-                    if art_manager.index_exists(name) {
-                        if *if_not_exists {
-                            return Ok(Box::new(
-                                ScanOperator::new(
-                                    "".to_string(),
-                                    Arc::new(crate::Schema { columns: vec![] }),
-                                    None,
-                                    vec![],
-                                    vec![],
-                                )
-                                .with_timeout(executor.timeout_ctx()),
-                            ));
-                        } else {
-                            return Err(Error::query_execution(format!("ART index '{}' already exists", name)));
-                        }
-                    }
-
-                    // Verify table exists
-                    let catalog = storage.catalog();
-                    let schema = catalog.get_table_schema(table_name)?;
-
-                    // Verify column exists
-                    if !schema.columns.iter().any(|c| c.name == *column_name) {
-                        return Err(Error::query_execution(format!(
-                            "Column '{}' not found in table '{}'",
-                            column_name, table_name
-                        )));
-                    }
-
-                    // Create manual ART index
-                    let columns = vec![column_name.clone()];
-                    art_manager
-                        .create_manual_index(name, table_name, &columns)
-                        .map_err(|e| Error::query_execution(format!("Failed to create ART index: {}", e)))?;
-
+            if matches!(index_type.as_deref(), None | Some("art" | "btree" | "hash")) {
+                if let Some(backfilled) =
+                    create_art_secondary_index(storage, name, table_name, column_name, *if_not_exists)?
+                {
                     tracing::info!(
-                        "Created ART index '{}' on table '{}' column '{}'",
+                        "Created ART index '{}' on table '{}' column '{}' with {} existing rows",
                         name,
                         table_name,
-                        column_name
+                        column_name,
+                        backfilled
                     );
 
-                    // Log to WAL for replication
                     if let Err(e) = storage.log_create_index(name, table_name, column_name, Some("art"), &[]) {
                         tracing::warn!("Failed to log CREATE INDEX to WAL: {}", e);
                     }
-                } else if idx_type == "gin" || idx_type == "gist" {
+                }
+            } else if let Some(idx_type) = index_type {
+                if idx_type == "gin" || idx_type == "gist" {
                     // Postgres FTS/GIN/GiST index.
                     //
                     // Accepted for syntactic compatibility (Django, Rails,
@@ -111,16 +131,7 @@ pub(super) fn handle_create_index(executor: &Executor, plan: &LogicalPlan) -> Re
                     if vector_indexes.index_exists(name) {
                         if *if_not_exists {
                             // IF NOT EXISTS specified, return silently
-                            return Ok(Box::new(
-                                ScanOperator::new(
-                                    "".to_string(),
-                                    Arc::new(crate::Schema { columns: vec![] }),
-                                    None,
-                                    vec![],
-                                    vec![],
-                                )
-                                .with_timeout(executor.timeout_ctx()),
-                            ));
+                            return Ok(empty_ddl_result(executor));
                         } else {
                             // Error: index already exists
                             return Err(Error::query_execution(format!("Index '{}' already exists", name)));
@@ -237,16 +248,7 @@ pub(super) fn handle_create_index(executor: &Executor, plan: &LogicalPlan) -> Re
                         {
                             tracing::warn!("Failed to log CREATE INDEX to WAL: {}", e);
                         }
-                        return Ok(Box::new(
-                            ScanOperator::new(
-                                "".to_string(),
-                                Arc::new(crate::Schema { columns: vec![] }),
-                                None,
-                                vec![],
-                                vec![],
-                            )
-                            .with_timeout(executor.timeout_ctx()),
-                        ));
+                        return Ok(empty_ddl_result(executor));
                     }
 
                     // Check if we should create a quantized index
@@ -331,16 +333,7 @@ pub(super) fn handle_create_index(executor: &Executor, plan: &LogicalPlan) -> Re
         }
 
         // Return empty result set for DDL
-        Ok(Box::new(
-            ScanOperator::new(
-                "".to_string(),
-                Arc::new(crate::Schema { columns: vec![] }),
-                None,
-                vec![],
-                vec![],
-            )
-            .with_timeout(executor.timeout_ctx()),
-        ))
+        Ok(empty_ddl_result(executor))
     } else {
         Err(Error::query_execution("Expected CreateIndex plan node"))
     }

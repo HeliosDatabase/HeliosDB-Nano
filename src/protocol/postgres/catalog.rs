@@ -1902,10 +1902,12 @@ impl PgCatalog {
         let catalog = db.storage.catalog();
         let mut rows = Vec::new();
         for name in catalog.list_tables()? {
+            let mut emitted = std::collections::HashSet::new();
             if let Ok(tschema) = catalog.get_table_schema(&name) {
                 let mut pos = 1;
                 for col in &tschema.columns {
                     if col.primary_key {
+                        emitted.insert((format!("{}_pkey", name), col.name.clone()));
                         rows.push(Tuple::new(vec![
                             Value::String("heliosdb".into()),
                             Value::String("public".into()),
@@ -1916,6 +1918,7 @@ impl PgCatalog {
                         ]));
                         pos += 1;
                     } else if col.unique {
+                        emitted.insert((format!("{}_{}_key", name, col.name), col.name.clone()));
                         rows.push(Tuple::new(vec![
                             Value::String("heliosdb".into()),
                             Value::String("public".into()),
@@ -1927,11 +1930,41 @@ impl PgCatalog {
                     }
                 }
             }
+            if let Ok(constraints) = catalog.load_table_constraints(&name) {
+                for unique in constraints.unique_constraints {
+                    for (idx, col) in unique.columns.iter().enumerate() {
+                        if emitted.insert((unique.name.clone(), col.clone())) {
+                            rows.push(Tuple::new(vec![
+                                Value::String("heliosdb".into()),
+                                Value::String("public".into()),
+                                Value::String(unique.name.clone()),
+                                Value::String(name.clone()),
+                                Value::String(col.clone()),
+                                Value::Int4((idx + 1) as i32),
+                            ]));
+                        }
+                    }
+                }
+                for fk in constraints.foreign_keys {
+                    for (idx, col) in fk.columns.iter().enumerate() {
+                        if emitted.insert((fk.name.clone(), col.clone())) {
+                            rows.push(Tuple::new(vec![
+                                Value::String("heliosdb".into()),
+                                Value::String("public".into()),
+                                Value::String(fk.name.clone()),
+                                Value::String(name.clone()),
+                                Value::String(col.clone()),
+                                Value::Int4((idx + 1) as i32),
+                            ]));
+                        }
+                    }
+                }
+            }
         }
         Ok((schema, rows))
     }
 
-    /// information_schema.table_constraints — PK and UNIQUE per table.
+    /// information_schema.table_constraints — PK, UNIQUE, CHECK, and FK per table.
     fn query_information_schema_table_constraints(&self) -> Result<(Schema, Vec<Tuple>)> {
         let schema = Schema::new(vec![
             Column::new("constraint_catalog", DataType::Text),
@@ -1947,24 +1980,68 @@ impl PgCatalog {
         let catalog = db.storage.catalog();
         let mut rows = Vec::new();
         for name in catalog.list_tables()? {
+            let mut emitted = std::collections::HashSet::new();
             if let Ok(tschema) = catalog.get_table_schema(&name) {
                 if tschema.columns.iter().any(|c| c.primary_key) {
+                    let constraint_name = format!("{}_pkey", name);
+                    emitted.insert(constraint_name.clone());
                     rows.push(Tuple::new(vec![
                         Value::String("heliosdb".into()),
                         Value::String("public".into()),
-                        Value::String(format!("{}_pkey", name)),
+                        Value::String(constraint_name),
                         Value::String(name.clone()),
                         Value::String("PRIMARY KEY".into()),
                     ]));
                 }
                 for col in &tschema.columns {
                     if col.unique && !col.primary_key {
+                        let constraint_name = format!("{}_{}_key", name, col.name);
+                        emitted.insert(constraint_name.clone());
                         rows.push(Tuple::new(vec![
                             Value::String("heliosdb".into()),
                             Value::String("public".into()),
-                            Value::String(format!("{}_{}_key", name, col.name)),
+                            Value::String(constraint_name),
                             Value::String(name.clone()),
                             Value::String("UNIQUE".into()),
+                        ]));
+                    }
+                }
+            }
+            if let Ok(constraints) = catalog.load_table_constraints(&name) {
+                for unique in constraints.unique_constraints {
+                    if emitted.insert(unique.name.clone()) {
+                        rows.push(Tuple::new(vec![
+                            Value::String("heliosdb".into()),
+                            Value::String("public".into()),
+                            Value::String(unique.name),
+                            Value::String(name.clone()),
+                            Value::String(if unique.is_primary_key {
+                                "PRIMARY KEY".into()
+                            } else {
+                                "UNIQUE".into()
+                            }),
+                        ]));
+                    }
+                }
+                for fk in constraints.foreign_keys {
+                    if emitted.insert(fk.name.clone()) {
+                        rows.push(Tuple::new(vec![
+                            Value::String("heliosdb".into()),
+                            Value::String("public".into()),
+                            Value::String(fk.name),
+                            Value::String(name.clone()),
+                            Value::String("FOREIGN KEY".into()),
+                        ]));
+                    }
+                }
+                for check in constraints.check_constraints {
+                    if emitted.insert(check.name.clone()) {
+                        rows.push(Tuple::new(vec![
+                            Value::String("heliosdb".into()),
+                            Value::String("public".into()),
+                            Value::String(check.name),
+                            Value::String(name.clone()),
+                            Value::String("CHECK".into()),
                         ]));
                     }
                 }
