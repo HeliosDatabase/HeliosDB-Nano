@@ -17,6 +17,12 @@ use std::sync::Arc;
 use super::predicate_pushdown::{AnalyzedPredicate, PredicateOp};
 use crate::{Schema, Tuple, Value};
 
+fn parse_uuid_literal(value: &str) -> Option<uuid::Uuid> {
+    uuid::Uuid::parse_str(value)
+        .ok()
+        .or_else(|| uuid::Uuid::parse_str(value.trim_matches('\'')).ok())
+}
+
 /// Filter operation types
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FilterOp {
@@ -230,8 +236,8 @@ impl FilterPredicate {
             // pushdown rejects the row even though the evaluator's
             // generic compare_values would accept it (root cause
             // of the CloudV2 admin_db persistence bug, #205).
-            (Value::Uuid(a), Value::String(b)) => uuid::Uuid::parse_str(b).map(|u| *a == u).unwrap_or(false),
-            (Value::String(a), Value::Uuid(b)) => uuid::Uuid::parse_str(a).map(|u| u == *b).unwrap_or(false),
+            (Value::Uuid(a), Value::String(b)) => parse_uuid_literal(b).is_some_and(|u| *a == u),
+            (Value::String(a), Value::Uuid(b)) => parse_uuid_literal(a).is_some_and(|u| u == *b),
             (Value::Timestamp(a), Value::Timestamp(b)) => a == b,
             (Value::Numeric(a), Value::Numeric(b)) => a == b,
             (Value::Json(a), Value::Json(b)) => a == b,

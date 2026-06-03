@@ -1162,123 +1162,6 @@ impl<'a> Executor<'a> {
         }
     }
 
-    /// Try to use PK ART index for a point lookup when we have Filter(Scan) with `pk_col = literal`.
-    /// Returns Some(operator) if successful, None if not applicable.
-    fn try_index_point_lookup(
-        &self,
-        input: &LogicalPlan,
-        predicate: &crate::sql::LogicalExpr,
-    ) -> Result<Option<Box<dyn PhysicalOperator>>> {
-        use crate::sql::BinaryOperator;
-        use crate::sql::LogicalExpr;
-
-        // Only works with a Scan input and storage available
-        let storage = match self.storage {
-            Some(s) => s,
-            None => return Ok(None),
-        };
-
-        let (table_name, alias, schema, projection, as_of) = match input {
-            LogicalPlan::Scan {
-                table_name,
-                alias,
-                schema,
-                projection,
-                as_of,
-            } => (table_name, alias, schema, projection, as_of),
-            _ => return Ok(None),
-        };
-
-        // Skip time-travel queries (need snapshot logic)
-        if as_of.is_some() {
-            return Ok(None);
-        }
-
-        // Skip when a transaction is active — PK index lookup reads the current
-        // value from storage, bypassing MVCC snapshot isolation. The transaction
-        // path in the scan operator uses scan_table_at_snapshot() instead.
-        if self.transaction.is_some() {
-            return Ok(None);
-        }
-
-        // Find the PK column
-        let pk_col = match schema.columns.iter().find(|c| c.primary_key) {
-            Some(c) => c,
-            None => return Ok(None),
-        };
-
-        // Check if predicate is `pk_col = literal` or `literal = pk_col`
-        let pk_value = match predicate {
-            LogicalExpr::BinaryExpr {
-                left,
-                op: BinaryOperator::Eq,
-                right,
-            } => {
-                match (left.as_ref(), right.as_ref()) {
-                    (LogicalExpr::Column { name, .. }, LogicalExpr::Literal(val)) if name == &pk_col.name => {
-                        Some(val.clone())
-                    }
-                    (LogicalExpr::Literal(val), LogicalExpr::Column { name, .. }) if name == &pk_col.name => {
-                        Some(val.clone())
-                    }
-                    // Handle parameterized query: pk_col = $1
-                    (LogicalExpr::Column { name, .. }, LogicalExpr::Parameter { index }) if name == &pk_col.name => {
-                        self.parameters.get(index.saturating_sub(1)).cloned()
-                    }
-                    _ => None,
-                }
-            }
-            _ => None,
-        };
-
-        let pk_value = match pk_value {
-            Some(v) => v,
-            None => return Ok(None),
-        };
-
-        // Coerce the literal to the PK column's declared type when
-        // a string literal targets a non-textual PK (UUID / DATE /
-        // TIMESTAMP).  Without this the ART index lookup encodes
-        // `Value::String("<uuid>")` while the stored PK is
-        // `Value::Uuid(...)`, the keys differ, the lookup misses,
-        // and the row appears invisible — the root cause of the
-        // CloudV2 admin_db persistence bug (#205).
-        let pk_value = self::coerce_literal_to_column_type(pk_value, &pk_col.data_type);
-
-        // Try the ART index lookup (pass pre-fetched schema to avoid redundant catalog lookup)
-        let tuple = storage.get_row_by_pk_with_schema(table_name, &pk_value, schema)?;
-
-        // Build schema with source_table set for JOIN disambiguation
-        let source_alias = alias.as_deref().unwrap_or(table_name);
-        let schema_cols: Vec<_> = schema
-            .columns
-            .iter()
-            .map(|col| {
-                let mut c = col.clone();
-                c.source_table = Some(source_alias.to_string());
-                c.source_table_name = Some(table_name.clone());
-                c
-            })
-            .collect();
-        let actual_schema = Arc::new(Schema { columns: schema_cols });
-
-        let tuples = match tuple {
-            Some(t) => vec![t],
-            None => vec![],
-        };
-
-        Ok(Some(Box::new(
-            scan::ScanOperator::new(
-                table_name.clone(),
-                actual_schema,
-                projection.clone(),
-                tuples,
-                self.parameters.clone(),
-            )
-            .with_timeout(self.timeout_ctx()),
-        )))
-    }
-
     fn count_star_schema_operator(count: i64) -> Box<dyn PhysicalOperator> {
         Box::new(MaterializedOperator::new(
             vec![crate::Tuple::new(vec![crate::Value::Int8(count)])],
@@ -1614,7 +1497,7 @@ impl<'a> Executor<'a> {
         if predicate.is_some() && analyzed_predicates.is_empty() {
             return Ok(None);
         }
-        if !Self::rowstore_aggregate_predicates_are_sql_safe(&analyzed_predicates) {
+        if !Self::rowstore_aggregate_predicates_are_sql_safe(schema, &analyzed_predicates) {
             return Ok(None);
         }
 
@@ -1664,9 +1547,14 @@ impl<'a> Executor<'a> {
     }
 
     fn rowstore_aggregate_predicates_are_sql_safe(
+        schema: &Schema,
         predicates: &[crate::storage::predicate_pushdown::AnalyzedPredicate],
     ) -> bool {
         use crate::storage::predicate_pushdown::PredicateOp;
+
+        if !scan::storage_predicates_are_sql_safe(schema, predicates) {
+            return false;
+        }
 
         predicates.iter().all(|predicate| match predicate.op {
             PredicateOp::Eq
@@ -2036,11 +1924,31 @@ impl<'a> Executor<'a> {
     pub(crate) fn plan_to_operator(&mut self, plan: &LogicalPlan) -> Result<Box<dyn PhysicalOperator>> {
         match plan {
             LogicalPlan::Scan { .. } => scan::handle_scan(self, plan),
+            LogicalPlan::FilteredScan {
+                table_name,
+                alias,
+                schema,
+                projection,
+                predicate: Some(predicate),
+                as_of,
+            } => {
+                let scan_plan = LogicalPlan::Scan {
+                    table_name: table_name.clone(),
+                    alias: alias.clone(),
+                    schema: schema.clone(),
+                    projection: projection.clone(),
+                    as_of: as_of.clone(),
+                };
+                if let Some(result) = scan::try_index_point_lookup_for_scan(self, &scan_plan, predicate)? {
+                    return Ok(result);
+                }
+                scan::handle_filtered_scan(self, plan)
+            }
             LogicalPlan::FilteredScan { .. } => scan::handle_filtered_scan(self, plan),
             LogicalPlan::TableFunction { .. } => scan::handle_table_function(self, plan),
             LogicalPlan::Filter { input, predicate } => {
-                // Try PK index-based point lookup for Filter(Scan) with equality predicate
-                if let Some(result) = self.try_index_point_lookup(input, predicate)? {
+                // Try ART index-based point lookup for Filter(Scan) equality predicates.
+                if let Some(result) = scan::try_index_point_lookup_for_scan(self, input, predicate)? {
                     return Ok(result);
                 }
                 let mut input_op = self.plan_to_operator(input)?;
@@ -2466,7 +2374,9 @@ impl<'a> Executor<'a> {
                                 predicate,
                             } = input.as_ref()
                             {
-                                if let Some(mut point_op) = self.try_index_point_lookup(filter_input, predicate)? {
+                                if let Some(mut point_op) =
+                                    scan::try_index_point_lookup_for_scan(self, filter_input, predicate)?
+                                {
                                     let mut count: i64 = 0;
                                     while let Some(_tuple) = point_op.next()? {
                                         count += 1;
@@ -2534,7 +2444,9 @@ impl<'a> Executor<'a> {
                                     projection: projection.clone(),
                                     as_of: as_of.clone(),
                                 };
-                                if let Some(mut point_op) = self.try_index_point_lookup(&scan_plan, predicate)? {
+                                if let Some(mut point_op) =
+                                    scan::try_index_point_lookup_for_scan(self, &scan_plan, predicate)?
+                                {
                                     let mut count: i64 = 0;
                                     while let Some(_tuple) = point_op.next()? {
                                         count += 1;

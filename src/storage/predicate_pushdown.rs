@@ -21,7 +21,7 @@ use crate::sql::logical_plan::{BinaryOperator, LogicalExpr};
 use crate::storage::bloom_filter::TableBloomFilters;
 use crate::storage::simd_filter::{FilterOp, FilterPredicate};
 use crate::storage::zone_map::{RangeOp, TableZoneMap, ZoneMapStats};
-use crate::{Schema, Tuple, Value};
+use crate::{DataType, Schema, Tuple, Value};
 
 /// Predicate pushdown capabilities
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,6 +123,19 @@ impl PushdownStats {
             self.pushdown_scans as f64 / self.total_scans as f64
         }
     }
+}
+
+fn coerce_literal_for_column(value: Value, data_type: &DataType) -> Value {
+    match (&value, data_type) {
+        (Value::String(s), DataType::Uuid) => parse_uuid_literal(s).map(Value::Uuid).unwrap_or(value),
+        _ => value,
+    }
+}
+
+fn parse_uuid_literal(value: &str) -> Option<uuid::Uuid> {
+    uuid::Uuid::parse_str(value)
+        .ok()
+        .or_else(|| uuid::Uuid::parse_str(value.trim_matches('\'')).ok())
 }
 
 /// Analyzed predicate ready for pushdown
@@ -324,6 +337,11 @@ impl PredicatePushdownManager {
                         (low.as_ref(), high.as_ref())
                     {
                         if let Some(col_idx) = schema.get_column_index(name) {
+                            let Some(column) = schema.columns.get(col_idx) else {
+                                return;
+                            };
+                            let low_value = coerce_literal_for_column(low_val.clone(), &column.data_type);
+                            let high_value = coerce_literal_for_column(high_val.clone(), &column.data_type);
                             predicates.push(AnalyzedPredicate {
                                 column_name: name.clone(),
                                 column_index: col_idx,
@@ -332,8 +350,8 @@ impl PredicatePushdownManager {
                                 } else {
                                     PredicateOp::Between
                                 },
-                                value: low_val.clone(),
-                                value2: Some(high_val.clone()),
+                                value: low_value,
+                                value2: Some(high_value),
                                 value_list: Vec::new(),
                                 selectivity: 0.2, // Estimate
                                 can_use_bloom: false,
@@ -345,19 +363,22 @@ impl PredicatePushdownManager {
             }
             LogicalExpr::InList { expr, list, negated } => {
                 if let LogicalExpr::Column { name, .. } = expr.as_ref() {
-                    let values: Vec<Value> = list
-                        .iter()
-                        .filter_map(|e| {
-                            if let LogicalExpr::Literal(v) = e {
-                                Some(v.clone())
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
+                    if let Some(col_idx) = schema.get_column_index(name) {
+                        let Some(column) = schema.columns.get(col_idx) else {
+                            return;
+                        };
+                        let values: Vec<Value> = list
+                            .iter()
+                            .filter_map(|e| {
+                                if let LogicalExpr::Literal(v) = e {
+                                    Some(coerce_literal_for_column(v.clone(), &column.data_type))
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
 
-                    if !values.is_empty() {
-                        if let Some(col_idx) = schema.get_column_index(name) {
+                        if !values.is_empty() {
                             predicates.push(AnalyzedPredicate {
                                 column_name: name.clone(),
                                 column_index: col_idx,
@@ -384,16 +405,17 @@ impl PredicatePushdownManager {
         op: &BinaryOperator,
         schema: &Schema,
     ) -> Option<AnalyzedPredicate> {
-        let (column_name, column_index) = match left {
+        let (column_name, column_index, column_type) = match left {
             LogicalExpr::Column { name, .. } => {
                 let idx = schema.get_column_index(name)?;
-                (name.clone(), idx)
+                let data_type = schema.columns.get(idx)?.data_type.clone();
+                (name.clone(), idx, data_type)
             }
             _ => return None,
         };
 
         let value = match right {
-            LogicalExpr::Literal(v) => v.clone(),
+            LogicalExpr::Literal(v) => coerce_literal_for_column(v.clone(), &column_type),
             _ => return None,
         };
 

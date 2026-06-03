@@ -303,6 +303,8 @@ fn compare_direct_values(left: &Value, right: &Value) -> Option<Ordering> {
         (Value::String(a), Value::String(b)) => Some(a.cmp(b)),
         (Value::Boolean(a), Value::Boolean(b)) => Some(a.cmp(b)),
         (Value::Uuid(a), Value::Uuid(b)) => Some(a.cmp(b)),
+        (Value::Uuid(a), Value::String(b)) => uuid::Uuid::parse_str(b).ok().map(|uuid| a.cmp(&uuid)),
+        (Value::String(a), Value::Uuid(b)) => uuid::Uuid::parse_str(a).ok().map(|uuid| uuid.cmp(b)),
         (Value::Timestamp(a), Value::Timestamp(b)) => Some(a.cmp(b)),
         (Value::Date(a), Value::Date(b)) => Some(a.cmp(b)),
         (Value::Time(a), Value::Time(b)) => Some(a.cmp(b)),

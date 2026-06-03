@@ -348,6 +348,41 @@ impl ArtIndexManager {
         Ok(name.to_string())
     }
 
+    /// Populate an existing manual index from already-materialized table rows.
+    ///
+    /// This is intentionally scoped to one named manual index. Calling the normal
+    /// table insert maintenance path would also touch PK/UNIQUE indexes and hit
+    /// duplicates for rows that were already present before CREATE INDEX.
+    pub fn backfill_manual_index(&self, name: &str, schema: &Schema, tuples: &[Tuple]) -> ArtResult<usize> {
+        let mut indexes = self.indexes.write().unwrap_or_else(|e| e.into_inner());
+        let index = indexes
+            .get_mut(name)
+            .ok_or_else(|| ArtIndexError::IndexNotFound(name.to_string()))?;
+        if index.index_type() != ArtIndexType::Manual {
+            return Err(ArtIndexError::Internal(format!(
+                "Index '{}' is not a manual secondary index",
+                name
+            )));
+        }
+
+        let mut inserted = 0usize;
+        for tuple in tuples {
+            let Some(row_id) = tuple.row_id else {
+                return Err(ArtIndexError::Internal(format!(
+                    "Cannot backfill index '{}' from tuple without row_id",
+                    name
+                )));
+            };
+            if let Some(values) = Self::index_value_refs_from_tuple(index.columns(), schema, tuple) {
+                let key = Self::encode_key_from_values(values.iter().copied());
+                index.insert(&key, row_id)?;
+                inserted += 1;
+            }
+        }
+
+        Ok(inserted)
+    }
+
     // =========================================================================
     // INDEX REMOVAL
     // =========================================================================
