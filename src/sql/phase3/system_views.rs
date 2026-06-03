@@ -8,9 +8,9 @@
 //! - pg_current_scn() - Current System Change Number
 //! - pg_compare_branches() - Compare two branches
 
-use crate::storage::StorageEngine;
+use crate::storage::{art_index::ArtIndexType, StorageEngine};
 use crate::{Column, ColumnStorageMode, DataType, Error, Result, Schema, Tuple, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// System view registry
 pub struct SystemViewRegistry {
@@ -879,6 +879,14 @@ impl SystemViewRegistry {
                         unique: false,
                         storage_mode: ColumnStorageMode::Default,
                     },
+                    sv_col("indnatts", DataType::Int2),
+                    sv_col("indnkeyatts", DataType::Int2),
+                    sv_col("indisclustered", DataType::Boolean),
+                    sv_col("indisvalid", DataType::Boolean),
+                    sv_col("indisready", DataType::Boolean),
+                    sv_col("indisreplident", DataType::Boolean),
+                    sv_col("indexprs", DataType::Text),
+                    sv_col("indpred", DataType::Text),
                 ],
             },
             description: "Catalog of indexes".to_string(),
@@ -955,6 +963,15 @@ impl SystemViewRegistry {
                         unique: false,
                         storage_mode: ColumnStorageMode::Default,
                     },
+                    sv_col("conindid", DataType::Int4),
+                    sv_col("conkey", DataType::Text),
+                    sv_col("confkey", DataType::Text),
+                    sv_col("confupdtype", DataType::Text),
+                    sv_col("confdeltype", DataType::Text),
+                    sv_col("confmatchtype", DataType::Text),
+                    sv_col("condeferrable", DataType::Boolean),
+                    sv_col("condeferred", DataType::Boolean),
+                    sv_col("convalidated", DataType::Boolean),
                 ],
             },
             description: "Catalog of constraints (primary key, foreign key, unique, check)".to_string(),
@@ -2482,6 +2499,140 @@ fn sv_col(name: &str, data_type: DataType) -> Column {
     }
 }
 
+const PG_TABLE_OID_BASE: i32 = 1000;
+const PG_INDEX_OID_BASE: i32 = 5000;
+const PG_CONSTRAINT_OID_BASE: i32 = 4000;
+const PG_PUBLIC_NAMESPACE_OID: i32 = 2200;
+
+fn pg_table_oid(table_idx: usize) -> i32 {
+    PG_TABLE_OID_BASE + table_idx as i32
+}
+
+fn pg_table_oid_by_name(tables: &[String], table_name: &str) -> Option<i32> {
+    tables
+        .iter()
+        .position(|name| name.eq_ignore_ascii_case(table_name))
+        .map(pg_table_oid)
+}
+
+fn sorted_art_indexes(storage: &StorageEngine) -> Vec<(String, String, ArtIndexType, Vec<String>)> {
+    let mut indexes = storage.art_indexes().list_indexes();
+    indexes.sort_by(|left, right| left.1.cmp(&right.1).then(left.0.cmp(&right.0)));
+    indexes
+}
+
+fn pg_index_oid(index_idx: usize) -> i32 {
+    PG_INDEX_OID_BASE + index_idx as i32
+}
+
+fn pg_index_oid_by_name(indexes: &[(String, String, ArtIndexType, Vec<String>)], index_name: &str) -> i32 {
+    indexes
+        .iter()
+        .position(|(name, _, _, _)| name.eq_ignore_ascii_case(index_name))
+        .map(pg_index_oid)
+        .unwrap_or(0)
+}
+
+fn pg_attnums(schema: &Schema, columns: &[String]) -> Vec<i32> {
+    columns
+        .iter()
+        .filter_map(|wanted| {
+            schema
+                .columns
+                .iter()
+                .position(|col| col.name.eq_ignore_ascii_case(wanted))
+                .map(|idx| idx as i32 + 1)
+        })
+        .collect()
+}
+
+fn pg_indkey(schema: &Schema, columns: &[String]) -> String {
+    pg_attnums(schema, columns)
+        .into_iter()
+        .map(|attnum| attnum.to_string())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn pg_conkey(schema: &Schema, columns: &[String]) -> Value {
+    let attnums = pg_attnums(schema, columns);
+    if attnums.is_empty() {
+        Value::Null
+    } else {
+        Value::String(format!(
+            "{{{}}}",
+            attnums
+                .into_iter()
+                .map(|attnum| attnum.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        ))
+    }
+}
+
+fn pg_fk_action_code(action: crate::sql::ReferentialAction) -> &'static str {
+    match action {
+        crate::sql::ReferentialAction::NoAction => "a",
+        crate::sql::ReferentialAction::Restrict => "r",
+        crate::sql::ReferentialAction::Cascade => "c",
+        crate::sql::ReferentialAction::SetNull => "n",
+        crate::sql::ReferentialAction::SetDefault => "d",
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_pg_constraint_row(
+    rows: &mut Vec<Tuple>,
+    next_oid: &mut i32,
+    seen: &mut HashSet<String>,
+    name: String,
+    contype: &str,
+    conrelid: i32,
+    confrelid: Option<i32>,
+    conindid: i32,
+    conkey: Value,
+    confkey: Value,
+    on_update: Option<crate::sql::ReferentialAction>,
+    on_delete: Option<crate::sql::ReferentialAction>,
+    deferrable: bool,
+    deferred: bool,
+    validated: bool,
+) {
+    let seen_key = format!("{conrelid}:{name}");
+    if !seen.insert(seen_key) {
+        return;
+    }
+
+    rows.push(Tuple::new(vec![
+        Value::Int4(*next_oid),
+        Value::String(name),
+        Value::Int4(PG_PUBLIC_NAMESPACE_OID),
+        Value::String(contype.to_string()),
+        Value::Int4(conrelid),
+        confrelid.map(Value::Int4).unwrap_or(Value::Null),
+        Value::Int4(conindid),
+        conkey,
+        confkey,
+        on_update
+            .map(pg_fk_action_code)
+            .map(|code| Value::String(code.to_string()))
+            .unwrap_or(Value::Null),
+        on_delete
+            .map(pg_fk_action_code)
+            .map(|code| Value::String(code.to_string()))
+            .unwrap_or(Value::Null),
+        if contype == "f" {
+            Value::String("s".to_string())
+        } else {
+            Value::Null
+        },
+        Value::Boolean(deferrable),
+        Value::Boolean(deferred),
+        Value::Boolean(validated),
+    ]));
+    *next_oid += 1;
+}
+
 impl SystemViewRegistry {
     /// Get system view schema
     pub fn get_schema(&self, view_name: &str) -> Option<&Schema> {
@@ -2770,20 +2921,32 @@ impl SystemViewRegistry {
         let catalog = storage.catalog();
         let tables = catalog.list_tables()?;
         let mut results = Vec::new();
-        let oid_counter = 1000i32;
 
         for (idx, table_name) in tables.iter().enumerate() {
-            let oid = oid_counter + (idx as i32);
+            let oid = pg_table_oid(idx);
             let tuple = Tuple::new(vec![
-                Value::Int4(oid),                  // oid
-                Value::String(table_name.clone()), // relname
-                Value::Int4(2200),                 // relnamespace (public schema)
-                Value::Int4(oid + 1000),           // reltype
-                Value::String("r".to_string()),    // relkind (r = relation/table)
-                Value::Int4(oid),                  // relfilenode
-                Value::Boolean(false),             // relrowsecurity (Nano RLS is via TenantManager, not pg_catalog)
+                Value::Int4(oid),                     // oid
+                Value::String(table_name.clone()),    // relname
+                Value::Int4(PG_PUBLIC_NAMESPACE_OID), // relnamespace (public schema)
+                Value::Int4(oid + 1000),              // reltype
+                Value::String("r".to_string()),       // relkind (r = relation/table)
+                Value::Int4(oid),                     // relfilenode
+                Value::Boolean(false),                // relrowsecurity (Nano RLS is via TenantManager, not pg_catalog)
             ]);
             results.push(tuple);
+        }
+
+        for (idx, (index_name, _table_name, _index_type, _columns)) in sorted_art_indexes(storage).iter().enumerate() {
+            let oid = pg_index_oid(idx);
+            results.push(Tuple::new(vec![
+                Value::Int4(oid),
+                Value::String(index_name.clone()),
+                Value::Int4(PG_PUBLIC_NAMESPACE_OID),
+                Value::Int4(0),
+                Value::String("i".to_string()),
+                Value::Int4(oid),
+                Value::Boolean(false),
+            ]));
         }
 
         Ok(results)
@@ -3013,24 +3176,68 @@ impl SystemViewRegistry {
         let catalog = storage.catalog();
         let mut rows = Vec::new();
         for name in catalog.list_tables()? {
+            let mut emitted = HashSet::new();
             if let Ok(tschema) = catalog.get_table_schema(&name) {
                 if tschema.columns.iter().any(|c| c.primary_key) {
+                    let constraint_name = format!("{}_pkey", name);
+                    emitted.insert(constraint_name.clone());
                     rows.push(Tuple::new(vec![
                         Value::String("heliosdb".into()),
                         Value::String("public".into()),
-                        Value::String(format!("{}_pkey", name)),
+                        Value::String(constraint_name),
                         Value::String(name.clone()),
                         Value::String("PRIMARY KEY".into()),
                     ]));
                 }
                 for col in &tschema.columns {
                     if col.unique && !col.primary_key {
+                        let constraint_name = format!("{}_{}_key", name, col.name);
+                        emitted.insert(constraint_name.clone());
                         rows.push(Tuple::new(vec![
                             Value::String("heliosdb".into()),
                             Value::String("public".into()),
-                            Value::String(format!("{}_{}_key", name, col.name)),
+                            Value::String(constraint_name),
                             Value::String(name.clone()),
                             Value::String("UNIQUE".into()),
+                        ]));
+                    }
+                }
+            }
+            if let Ok(constraints) = catalog.load_table_constraints(&name) {
+                for unique in constraints.unique_constraints {
+                    if emitted.insert(unique.name.clone()) {
+                        rows.push(Tuple::new(vec![
+                            Value::String("heliosdb".into()),
+                            Value::String("public".into()),
+                            Value::String(unique.name),
+                            Value::String(name.clone()),
+                            Value::String(if unique.is_primary_key {
+                                "PRIMARY KEY".into()
+                            } else {
+                                "UNIQUE".into()
+                            }),
+                        ]));
+                    }
+                }
+                for fk in constraints.foreign_keys {
+                    if emitted.insert(fk.name.clone()) {
+                        rows.push(Tuple::new(vec![
+                            Value::String("heliosdb".into()),
+                            Value::String("public".into()),
+                            Value::String(fk.name),
+                            Value::String(name.clone()),
+                            Value::String("FOREIGN KEY".into()),
+                        ]));
+                    }
+                }
+                for check in constraints.check_constraints {
+                    if emitted.insert(check.name.clone()) {
+                        rows.push(Tuple::new(vec![
+                            Value::String("heliosdb".into()),
+                            Value::String("public".into()),
+                            Value::String(check.name),
+                            Value::String(name.clone()),
+                            Value::String("CHECK".into()),
                         ]));
                     }
                 }
@@ -3099,10 +3306,12 @@ impl SystemViewRegistry {
         let catalog = storage.catalog();
         let mut rows = Vec::new();
         for name in catalog.list_tables()? {
+            let mut emitted = HashSet::new();
             if let Ok(tschema) = catalog.get_table_schema(&name) {
                 let mut pos: i32 = 1;
                 for col in &tschema.columns {
                     if col.primary_key {
+                        emitted.insert((format!("{}_pkey", name), col.name.clone()));
                         rows.push(Tuple::new(vec![
                             Value::String("heliosdb".into()),
                             Value::String("public".into()),
@@ -3113,6 +3322,7 @@ impl SystemViewRegistry {
                         ]));
                         pos += 1;
                     } else if col.unique {
+                        emitted.insert((format!("{}_{}_key", name, col.name), col.name.clone()));
                         rows.push(Tuple::new(vec![
                             Value::String("heliosdb".into()),
                             Value::String("public".into()),
@@ -3121,6 +3331,36 @@ impl SystemViewRegistry {
                             Value::String(col.name.clone()),
                             Value::Int4(1),
                         ]));
+                    }
+                }
+            }
+            if let Ok(constraints) = catalog.load_table_constraints(&name) {
+                for unique in constraints.unique_constraints {
+                    for (idx, col) in unique.columns.iter().enumerate() {
+                        if emitted.insert((unique.name.clone(), col.clone())) {
+                            rows.push(Tuple::new(vec![
+                                Value::String("heliosdb".into()),
+                                Value::String("public".into()),
+                                Value::String(unique.name.clone()),
+                                Value::String(name.clone()),
+                                Value::String(col.clone()),
+                                Value::Int4((idx + 1) as i32),
+                            ]));
+                        }
+                    }
+                }
+                for fk in constraints.foreign_keys {
+                    for (idx, col) in fk.columns.iter().enumerate() {
+                        if emitted.insert((fk.name.clone(), col.clone())) {
+                            rows.push(Tuple::new(vec![
+                                Value::String("heliosdb".into()),
+                                Value::String("public".into()),
+                                Value::String(fk.name.clone()),
+                                Value::String(name.clone()),
+                                Value::String(col.clone()),
+                                Value::Int4((idx + 1) as i32),
+                            ]));
+                        }
                     }
                 }
             }
@@ -3259,22 +3499,33 @@ impl SystemViewRegistry {
         let catalog = storage.catalog();
         let tables = catalog.list_tables()?;
         let mut results = Vec::new();
-        let mut index_oid = 5000i32;
-        let mut table_oid = 1000i32;
 
-        for _table_name in tables.iter() {
-            table_oid += 1;
-            // For each table, create a placeholder primary key index
-            let tuple = Tuple::new(vec![
-                Value::Int4(index_oid),         // indexrelid
-                Value::Int4(table_oid),         // indrelid
-                Value::Boolean(true),           // indisprimary
-                Value::Boolean(false),          // indisunique
-                Value::Boolean(false),          // indisexclusion
-                Value::String("1".to_string()), // indkey (column 1)
-            ]);
-            results.push(tuple);
-            index_oid += 1;
+        for (idx, (_index_name, table_name, index_type, columns)) in sorted_art_indexes(storage).iter().enumerate() {
+            let Some(table_oid) = pg_table_oid_by_name(&tables, table_name) else {
+                continue;
+            };
+            let schema = match catalog.get_table_schema(table_name) {
+                Ok(schema) => schema,
+                Err(_) => continue,
+            };
+            let indkey = pg_indkey(&schema, columns);
+            let column_count = columns.len() as i16;
+            results.push(Tuple::new(vec![
+                Value::Int4(pg_index_oid(idx)),                          // indexrelid
+                Value::Int4(table_oid),                                  // indrelid
+                Value::Boolean(*index_type == ArtIndexType::PrimaryKey), // indisprimary
+                Value::Boolean(matches!(*index_type, ArtIndexType::PrimaryKey | ArtIndexType::Unique)), // indisunique
+                Value::Boolean(false),                                   // indisexclusion
+                Value::String(indkey),                                   // indkey (space-separated attnums)
+                Value::Int2(column_count),                               // indnatts
+                Value::Int2(column_count),                               // indnkeyatts
+                Value::Boolean(false),                                   // indisclustered
+                Value::Boolean(true),                                    // indisvalid
+                Value::Boolean(true),                                    // indisready
+                Value::Boolean(false),                                   // indisreplident
+                Value::Null,                                             // indexprs
+                Value::Null,                                             // indpred
+            ]));
         }
 
         Ok(results)
@@ -3286,23 +3537,137 @@ impl SystemViewRegistry {
     fn execute_pg_constraint(storage: &StorageEngine) -> Result<Vec<Tuple>> {
         let catalog = storage.catalog();
         let tables = catalog.list_tables()?;
+        let indexes = sorted_art_indexes(storage);
         let mut results = Vec::new();
-        let mut constraint_oid = 4000i32;
-        let mut table_oid = 1000i32;
+        let mut constraint_oid = PG_CONSTRAINT_OID_BASE;
+        let mut seen = HashSet::new();
 
-        for _table_name in tables.iter() {
-            table_oid += 1;
-            // Add a primary key constraint for each table
-            let tuple = Tuple::new(vec![
-                Value::Int4(constraint_oid),                // oid
-                Value::String(format!("pk_{}", table_oid)), // conname
-                Value::Int4(2200),                          // connamespace
-                Value::String("p".to_string()),             // contype (p = primary key)
-                Value::Int4(table_oid),                     // conrelid
-                Value::Null,                                // confrelid (no foreign key)
-            ]);
-            results.push(tuple);
-            constraint_oid += 1;
+        for (table_idx, table_name) in tables.iter().enumerate() {
+            let table_oid = pg_table_oid(table_idx);
+            let schema = match catalog.get_table_schema(table_name) {
+                Ok(schema) => schema,
+                Err(_) => continue,
+            };
+
+            let pk_columns: Vec<String> = schema
+                .columns
+                .iter()
+                .filter(|col| col.primary_key)
+                .map(|col| col.name.clone())
+                .collect();
+            if !pk_columns.is_empty() {
+                let constraint_name = format!("{}_pkey", table_name);
+                push_pg_constraint_row(
+                    &mut results,
+                    &mut constraint_oid,
+                    &mut seen,
+                    constraint_name.clone(),
+                    "p",
+                    table_oid,
+                    None,
+                    pg_index_oid_by_name(&indexes, &constraint_name),
+                    pg_conkey(&schema, &pk_columns),
+                    Value::Null,
+                    None,
+                    None,
+                    false,
+                    false,
+                    true,
+                );
+            }
+
+            for col in &schema.columns {
+                if col.unique && !col.primary_key {
+                    let constraint_name = format!("{}_{}_key", table_name, col.name);
+                    push_pg_constraint_row(
+                        &mut results,
+                        &mut constraint_oid,
+                        &mut seen,
+                        constraint_name.clone(),
+                        "u",
+                        table_oid,
+                        None,
+                        pg_index_oid_by_name(&indexes, &constraint_name),
+                        pg_conkey(&schema, std::slice::from_ref(&col.name)),
+                        Value::Null,
+                        None,
+                        None,
+                        false,
+                        false,
+                        true,
+                    );
+                }
+            }
+
+            let constraints = match catalog.load_table_constraints(table_name) {
+                Ok(constraints) => constraints,
+                Err(_) => continue,
+            };
+
+            for unique in constraints.unique_constraints {
+                push_pg_constraint_row(
+                    &mut results,
+                    &mut constraint_oid,
+                    &mut seen,
+                    unique.name.clone(),
+                    if unique.is_primary_key { "p" } else { "u" },
+                    table_oid,
+                    None,
+                    pg_index_oid_by_name(&indexes, &unique.name),
+                    pg_conkey(&schema, &unique.columns),
+                    Value::Null,
+                    None,
+                    None,
+                    false,
+                    false,
+                    true,
+                );
+            }
+
+            for check in constraints.check_constraints {
+                push_pg_constraint_row(
+                    &mut results,
+                    &mut constraint_oid,
+                    &mut seen,
+                    check.name,
+                    "c",
+                    table_oid,
+                    None,
+                    0,
+                    Value::Null,
+                    Value::Null,
+                    None,
+                    None,
+                    false,
+                    false,
+                    true,
+                );
+            }
+
+            for fk in constraints.foreign_keys {
+                let ref_oid = pg_table_oid_by_name(&tables, &fk.references_table);
+                let ref_key = match catalog.get_table_schema(&fk.references_table) {
+                    Ok(ref_schema) => pg_conkey(&ref_schema, &fk.references_columns),
+                    Err(_) => Value::Null,
+                };
+                push_pg_constraint_row(
+                    &mut results,
+                    &mut constraint_oid,
+                    &mut seen,
+                    fk.name.clone(),
+                    "f",
+                    table_oid,
+                    ref_oid,
+                    0,
+                    pg_conkey(&schema, &fk.columns),
+                    ref_key,
+                    Some(fk.on_update),
+                    Some(fk.on_delete),
+                    fk.deferrable,
+                    fk.initially_deferred,
+                    !matches!(fk.enforcement, crate::sql::ConstraintEnforcement::NotEnforced),
+                );
+            }
         }
 
         Ok(results)
