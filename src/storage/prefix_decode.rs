@@ -511,7 +511,14 @@ fn skip_value(cur: &mut ByteCursor<'_>) -> Option<()> {
             let len = cur.read_len()?;
             cur.take(len).map(|_| ())
         }
-        10 => cur.take(16).map(|_| ()),
+        10 => {
+            let len = cur.read_len()?;
+            if len == 16 {
+                cur.take(len).map(|_| ())
+            } else {
+                None
+            }
+        }
         16 => {
             let len = cur.read_len()?;
             for _ in 0..len {
@@ -547,7 +554,11 @@ fn read_value(cur: &mut ByteCursor<'_>) -> Option<Value> {
             Some(Value::Bytes(cur.take(len)?.to_vec()))
         }
         10 => {
-            let bytes: [u8; 16] = cur.take(16)?.try_into().ok()?;
+            let len = cur.read_len()?;
+            if len != 16 {
+                return None;
+            }
+            let bytes: [u8; 16] = cur.take(len)?.try_into().ok()?;
             Some(Value::Uuid(uuid::Uuid::from_bytes(bytes)))
         }
         14 => Some(Value::Interval(cur.read_i64()?)),

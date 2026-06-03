@@ -464,12 +464,23 @@ fn hash_value_for_join<H: std::hash::Hasher>(value: &crate::Value, state: &mut H
             if let Ok(n) = s.parse::<i64>() {
                 2u8.hash(state);
                 n.hash(state);
+            } else if let Ok(uuid) = uuid::Uuid::parse_str(s) {
+                10u8.hash(state);
+                uuid.hash(state);
             } else {
                 value.hash(state);
             }
         }
+        Value::Uuid(uuid) => {
+            10u8.hash(state);
+            uuid.hash(state);
+        }
         _ => value.hash(state),
     }
+}
+
+fn string_equals_uuid(s: &str, uuid: &uuid::Uuid) -> bool {
+    uuid::Uuid::parse_str(s).is_ok_and(|parsed| parsed == *uuid)
 }
 
 /// Compare two values for join equality, with cross-type numeric coercion.
@@ -485,6 +496,8 @@ fn values_equal_for_join(a: &crate::Value, b: &crate::Value) -> bool {
         (Value::Int2(x), Value::Int4(y)) | (Value::Int4(y), Value::Int2(x)) => i64::from(*x) == i64::from(*y),
         (Value::Int2(x), Value::Int8(y)) | (Value::Int8(y), Value::Int2(x)) => i64::from(*x) == *y,
         (Value::Int4(x), Value::Int8(y)) | (Value::Int8(y), Value::Int4(x)) => i64::from(*x) == *y,
+        // UUID/string coercion
+        (Value::Uuid(uuid), Value::String(s)) | (Value::String(s), Value::Uuid(uuid)) => string_equals_uuid(s, uuid),
         // String comparison
         (Value::String(x), Value::String(y)) => x == y,
         // Cross-type string/int (MySQL does this freely)
