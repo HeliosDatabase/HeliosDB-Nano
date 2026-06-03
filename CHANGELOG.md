@@ -5,6 +5,46 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.36.1] - 2026-06-03
+
+Follow-up release closing the items deferred from the v3.36.0 deficiency batch:
+secondary-index point lookups, the Markon scan-path UUID-corruption bug, and
+`pg_catalog`/`information_schema` reflection. Additive or corrective only.
+
+### Fixed — Storage
+
+- **Selected-column UUID corruption.** The column prefix decoder read bincode's
+  UUID length prefix as UUID payload bytes, so `SELECT id FROM t` could return
+  values like `10000000-0000-0000-…` even though the stored data and per-key
+  `WHERE id = '<uuid>'` lookups were correct. Originally reported as a
+  hash-join row-drop (Markon A5); the real cause was the scan-path decoder.
+  Now fixed in `prefix_decode.rs`. (Markon A5)
+
+### Added — SQL engine & planner
+
+- **Secondary-index `=` point lookups.** `CREATE INDEX` now creates and
+  backfills scalar ART secondary indexes for the `=`, `USING art`,
+  `USING btree`, and `USING hash` forms, and filtered scans / `COUNT(*)` filter
+  fast paths use the ART index for equality point lookups (with a
+  residual-predicate recheck) instead of an O(table) full scan.
+  (NANO-DEFICIENCIES A3)
+- Hash-join key hashing/equality now keeps a native `UUID` and a UUID-shaped
+  `TEXT` value consistent, and `WHERE uuid_col = 'uuid-literal'` follows the
+  same coercion. (Markon A5b)
+
+### Added — Introspection / pg_catalog
+
+- `pg_index` now emits real ART index rows, including manual secondary indexes
+  from `CREATE INDEX`; `pg_class` exposes the matching index relations so
+  `pg_index.indexrelid = pg_class.oid` joins resolve index names.
+- `pg_constraint` emits real PRIMARY KEY / UNIQUE / CHECK / FOREIGN KEY
+  metadata (including FK target relation/key fields and referential action
+  codes).
+- `information_schema.table_constraints` and `key_column_usage` now include
+  foreign-key rows in both the planner-backed registry and the pg-wire
+  single-view catalog router — unblocking reflection / autogenerate tooling.
+  (Markon A4)
+
 ## [3.36.0] - 2026-06-02
 
 Deficiency-driven release working three field reports: ada-core's pg-wire
