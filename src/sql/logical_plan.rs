@@ -529,6 +529,16 @@ pub enum LogicalPlan {
         new_column_name: String,
     },
 
+    /// Change a column's NULL / NOT NULL metadata.
+    AlterTableAlterColumnNullability {
+        /// Table name
+        table_name: String,
+        /// Column name
+        column_name: String,
+        /// Whether the column should allow NULL values
+        nullable: bool,
+    },
+
     /// Rename a table
     AlterTableRename {
         /// Current table name
@@ -1715,6 +1725,7 @@ impl LogicalPlan {
                 // ALTER TABLE RENAME COLUMN doesn't have output schema
                 Arc::new(Schema { columns: vec![] })
             }
+            LogicalPlan::AlterTableAlterColumnNullability { .. } => Arc::new(Schema { columns: vec![] }),
             LogicalPlan::AlterTableRename { .. } => {
                 // ALTER TABLE RENAME doesn't have output schema
                 Arc::new(Schema { columns: vec![] })

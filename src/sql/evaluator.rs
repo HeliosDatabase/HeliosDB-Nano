@@ -5196,10 +5196,100 @@ impl Evaluator {
                 _ => Err(Error::query_execution(format!("Cannot cast {:?} to BYTEA", value))),
             },
 
+            DataType::Array(inner_type) => match value {
+                Value::Array(values) => values
+                    .into_iter()
+                    .map(|element| self.cast_value(element, inner_type))
+                    .collect::<Result<Vec<_>>>()
+                    .map(Value::Array),
+                Value::String(s) => Self::parse_pg_array_text_literal(&s)?
+                    .into_iter()
+                    .map(|element| self.cast_value(element, inner_type))
+                    .collect::<Result<Vec<_>>>()
+                    .map(Value::Array),
+                _ => Err(Error::query_execution(format!(
+                    "Cannot cast {:?} to {:?}",
+                    value, target_type
+                ))),
+            },
+
             _ => Err(Error::query_execution(format!(
                 "CAST to {:?} not yet implemented",
                 target_type
             ))),
+        }
+    }
+
+    fn parse_pg_array_text_literal(input: &str) -> Result<Vec<Value>> {
+        let trimmed = input.trim();
+        if !(trimmed.starts_with('{') && trimmed.ends_with('}')) {
+            return Err(Error::query_execution(format!(
+                "Cannot cast '{}' to array: expected PostgreSQL array literal",
+                input
+            )));
+        }
+        let inner = &trimmed[1..trimmed.len() - 1];
+        if inner.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut values = Vec::new();
+        let mut buf = String::new();
+        let mut in_quotes = false;
+        let mut escaped = false;
+        let mut quoted = false;
+
+        for ch in inner.chars() {
+            if escaped {
+                buf.push(ch);
+                escaped = false;
+                continue;
+            }
+
+            if in_quotes {
+                match ch {
+                    '\\' => escaped = true,
+                    '"' => in_quotes = false,
+                    _ => buf.push(ch),
+                }
+                continue;
+            }
+
+            match ch {
+                '"' => {
+                    in_quotes = true;
+                    quoted = true;
+                }
+                ',' => {
+                    values.push(Self::pg_array_element_to_value(&buf, quoted));
+                    buf.clear();
+                    quoted = false;
+                }
+                _ => buf.push(ch),
+            }
+        }
+
+        if in_quotes || escaped {
+            return Err(Error::query_execution(format!(
+                "Cannot cast '{}' to array: unterminated quoted element",
+                input
+            )));
+        }
+
+        values.push(Self::pg_array_element_to_value(&buf, quoted));
+        Ok(values)
+    }
+
+    fn pg_array_element_to_value(raw: &str, quoted: bool) -> Value {
+        if quoted {
+            Value::String(raw.to_string())
+        } else {
+            let value = raw.trim();
+            if value.eq_ignore_ascii_case("NULL") {
+                Value::Null
+            } else {
+                Value::String(value.to_string())
+            }
         }
     }
 
