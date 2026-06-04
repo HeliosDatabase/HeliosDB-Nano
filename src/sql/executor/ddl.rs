@@ -69,6 +69,92 @@ fn create_art_secondary_index(
     }
 }
 
+fn vector_distance_metric(options: &[crate::sql::logical_plan::IndexOption]) -> Result<crate::vector::DistanceMetric> {
+    use crate::sql::logical_plan::IndexOption;
+    use crate::vector::DistanceMetric;
+
+    let mut metric = DistanceMetric::L2;
+    for option in options {
+        if let IndexOption::DistanceMetric(name) = option {
+            metric = match name.as_str() {
+                "l2" | "euclidean" => DistanceMetric::L2,
+                "cosine" => DistanceMetric::Cosine,
+                "ip" | "inner_product" => DistanceMetric::InnerProduct,
+                other => {
+                    return Err(Error::query_execution(format!(
+                        "Unsupported vector index metric '{}'",
+                        other
+                    )))
+                }
+            };
+        }
+    }
+    Ok(metric)
+}
+
+fn collect_existing_vectors(
+    storage: &crate::storage::StorageEngine,
+    schema: &crate::Schema,
+    table_name: &str,
+    column_name: &str,
+    dimension: usize,
+) -> Result<Vec<(u64, crate::vector::Vector)>> {
+    let col_idx = schema
+        .get_column_index(column_name)
+        .ok_or_else(|| Error::query_execution(format!("Column '{}' not found in schema", column_name)))?;
+    let tuples = storage.scan_table_with_schema_columns(table_name, schema, &[col_idx])?;
+    let mut vectors = Vec::with_capacity(tuples.len());
+
+    for tuple in tuples {
+        match tuple.values.get(col_idx) {
+            Some(crate::Value::Vector(vec)) => {
+                if vec.len() != dimension {
+                    return Err(Error::query_execution(format!(
+                        "Vector dimension mismatch while backfilling '{}.{}': expected {}, got {}",
+                        table_name,
+                        column_name,
+                        dimension,
+                        vec.len()
+                    )));
+                }
+                let row_id = tuple.row_id.ok_or_else(|| {
+                    Error::query_execution(format!(
+                        "Cannot backfill vector index on '{}.{}' from tuple without row_id",
+                        table_name, column_name
+                    ))
+                })?;
+                vectors.push((row_id, vec.clone()));
+            }
+            Some(crate::Value::Null) | None => {}
+            Some(other) => {
+                return Err(Error::query_execution(format!(
+                    "Cannot backfill vector index on '{}.{}' from non-vector value {:?}",
+                    table_name, column_name, other
+                )))
+            }
+        }
+    }
+
+    Ok(vectors)
+}
+
+fn backfill_vector_index(
+    vector_indexes: &crate::storage::VectorIndexManager,
+    index_name: &str,
+    vectors: &[(u64, crate::vector::Vector)],
+) -> Result<usize> {
+    for (row_id, vector) in vectors {
+        if let Err(e) = vector_indexes.insert_vector(index_name, *row_id, vector) {
+            let _ = vector_indexes.drop_index(index_name);
+            return Err(Error::query_execution(format!(
+                "Failed to backfill HNSW index '{}': {}",
+                index_name, e
+            )));
+        }
+    }
+    Ok(vectors.len())
+}
+
 /// Handle CREATE INDEX logical plan node
 pub(super) fn handle_create_index(executor: &Executor, plan: &LogicalPlan) -> Result<Box<dyn PhysicalOperator>> {
     if let LogicalPlan::CreateIndex {
@@ -156,6 +242,9 @@ pub(super) fn handle_create_index(executor: &Executor, plan: &LogicalPlan) -> Re
                             )))
                         }
                     };
+                    let distance_metric = vector_distance_metric(options)?;
+                    let existing_vectors =
+                        collect_existing_vectors(storage, &schema, table_name, column_name, dimension)?;
 
                     // Parse quantization options
                     use crate::sql::logical_plan::{IndexOption, QuantizationType};
@@ -200,20 +289,8 @@ pub(super) fn handle_create_index(executor: &Executor, plan: &LogicalPlan) -> Re
                     }
 
                     if persistent {
-                        let tuples = storage.scan_table(table_name)?;
-                        let col_idx = schema.get_column_index(column_name).ok_or_else(|| {
-                            Error::query_execution(format!("Column '{}' not found in schema", column_name))
-                        })?;
-                        let training_vectors: Vec<crate::vector::Vector> = tuples
-                            .iter()
-                            .filter_map(|tuple| {
-                                if let Some(crate::Value::Vector(ref vec)) = tuple.values.get(col_idx) {
-                                    Some(vec.clone())
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect();
+                        let training_vectors: Vec<crate::vector::Vector> =
+                            existing_vectors.iter().map(|(_, vector)| vector.clone()).collect();
 
                         let pq_config = if quantization_type == QuantizationType::Product {
                             let mut cfg = crate::vector::ProductQuantizerConfig::default_for_dimension(dimension)
@@ -236,12 +313,20 @@ pub(super) fn handle_create_index(executor: &Executor, plan: &LogicalPlan) -> Re
                             table_name.clone(),
                             column_name.clone(),
                             dimension,
-                            crate::vector::DistanceMetric::L2,
+                            distance_metric,
                             pq_config,
                             rerank_precision,
                             &training_vectors,
                             storage.db(),
                         )?;
+                        let backfilled = backfill_vector_index(vector_indexes, name, &existing_vectors)?;
+                        tracing::info!(
+                            "Created persistent HNSW index '{}' on table '{}' column '{}' with {} existing vectors",
+                            name,
+                            table_name,
+                            column_name,
+                            backfilled
+                        );
 
                         if let Err(e) =
                             storage.log_create_index(name, table_name, column_name, Some("persistent_hnsw"), &[])
@@ -273,35 +358,26 @@ pub(super) fn handle_create_index(executor: &Executor, plan: &LogicalPlan) -> Re
                                 .validate()
                                 .map_err(|e| Error::query_execution(format!("Invalid PQ config: {}", e)))?;
 
-                            // Collect existing vectors from the table for PQ training
-                            let tuples = storage.scan_table(table_name)?;
-
-                            // Find the vector column index
-                            let col_idx = schema.get_column_index(column_name).ok_or_else(|| {
-                                Error::query_execution(format!("Column '{}' not found in schema", column_name))
-                            })?;
-
-                            // Extract vectors from tuples
-                            let training_vectors: Vec<crate::vector::Vector> = tuples
-                                .iter()
-                                .filter_map(|tuple| {
-                                    if let Some(crate::Value::Vector(ref vec)) = tuple.values.get(col_idx) {
-                                        Some(vec.clone())
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .collect();
+                            let training_vectors: Vec<crate::vector::Vector> =
+                                existing_vectors.iter().map(|(_, vector)| vector.clone()).collect();
 
                             vector_indexes.create_quantized_index(
                                 name.clone(),
                                 table_name.clone(),
                                 column_name.clone(),
                                 dimension,
-                                crate::vector::DistanceMetric::L2,
+                                distance_metric,
                                 pq_config,
                                 &training_vectors,
                             )?;
+                            let backfilled = backfill_vector_index(vector_indexes, name, &existing_vectors)?;
+                            tracing::info!(
+                                "Created quantized HNSW index '{}' on table '{}' column '{}' with {} existing vectors",
+                                name,
+                                table_name,
+                                column_name,
+                                backfilled
+                            );
 
                             // Log to WAL for replication
                             if let Err(e) =
@@ -317,8 +393,16 @@ pub(super) fn handle_create_index(executor: &Executor, plan: &LogicalPlan) -> Re
                                 table_name.clone(),
                                 column_name.clone(),
                                 dimension,
-                                crate::vector::DistanceMetric::L2,
+                                distance_metric,
                             )?;
+                            let backfilled = backfill_vector_index(vector_indexes, name, &existing_vectors)?;
+                            tracing::info!(
+                                "Created HNSW index '{}' on table '{}' column '{}' with {} existing vectors",
+                                name,
+                                table_name,
+                                column_name,
+                                backfilled
+                            );
 
                             // Log to WAL for replication
                             if let Err(e) =

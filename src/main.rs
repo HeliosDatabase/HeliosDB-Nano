@@ -662,7 +662,7 @@ async fn start_server(
         HAHandles::default()
     };
 
-    // Start HTTP health endpoint (for Docker health checks).
+    // Start HTTP endpoint (health checks, plus MCP routes when compiled in).
     //
     // KanttBan bug #2 (v3.27.0): a `--http-port` collision used to take
     // the entire server process down silently — `start_health_server`
@@ -672,7 +672,7 @@ async fn start_server(
     // failure at ERROR before the banner, and run the accept loop in a
     // detached task that the main `select!` never observes — so a
     // late-life health failure cannot tear down the database listener.
-    // `--http-port 0` opts out (no health endpoint, no listener).
+    // `--http-port 0` opts out (no HTTP endpoint, no listener).
     let http_health_disabled = ha_config.http_port == 0;
     if !http_health_disabled {
         let http_addr: SocketAddr = format!("{}:{}", listen, ha_config.http_port)
@@ -680,16 +680,17 @@ async fn start_server(
             .map_err(|e| Error::config(format!("Invalid HTTP address: {e}")))?;
         match tokio::net::TcpListener::bind(http_addr).await {
             Ok(listener) => {
-                info!("Health endpoint at http://{}/health", http_addr);
+                info!("HTTP endpoint at http://{} (/health)", http_addr);
+                let http_db = Arc::clone(&db);
                 tokio::spawn(async move {
-                    if let Err(e) = run_health_listener(listener).await {
-                        tracing::error!("Health server accept loop exited: {e}");
+                    if let Err(e) = run_http_listener(listener, http_db).await {
+                        tracing::error!("HTTP server accept loop exited: {e}");
                     }
                 });
             }
             Err(e) => {
                 tracing::error!(
-                    "Failed to bind HTTP health endpoint on {}: {} (os error {:?}). \
+                    "Failed to bind HTTP endpoint on {}: {} (os error {:?}). \
                      The database listener stays up; pass --http-port <free> or \
                      --http-port 0 to silence this.",
                     http_addr,
@@ -699,7 +700,7 @@ async fn start_server(
             }
         }
     } else {
-        info!("HTTP health endpoint disabled (--http-port 0)");
+        info!("HTTP endpoint disabled (--http-port 0)");
     }
 
     // Start MySQL listener if enabled
@@ -1564,27 +1565,98 @@ async fn start_ha_components(
     }
 }
 
-/// Simple HTTP health server for Docker health checks
-/// Drive the HTTP health-listener accept loop. Caller owns the
+/// HTTP listener for Docker health checks and, when compiled with
+/// `mcp-endpoint`, MCP-over-HTTP routes.
+/// Caller owns the
 /// already-bound `TcpListener` so bind failures are reported up front
 /// (see KanttBan bug #2 / v3.28.0 fix).
-async fn run_health_listener(listener: tokio::net::TcpListener) -> std::io::Result<()> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    loop {
-        let (mut socket, _) = listener.accept().await?;
-        tokio::spawn(async move {
-            let mut buf = [0u8; 1024];
-            if socket.read(&mut buf).await.is_ok() {
-                let body = r#"{"status":"ok"}"#;
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = socket.write_all(response.as_bytes()).await;
-                let _ = socket.flush().await;
-                let _ = socket.shutdown().await;
+async fn run_http_listener(
+    listener: tokio::net::TcpListener,
+    db: std::sync::Arc<EmbeddedDatabase>,
+) -> std::io::Result<()> {
+    use axum::{routing::get, Json, Router};
+
+    async fn health() -> Json<serde_json::Value> {
+        Json(serde_json::json!({ "status": "ok" }))
+    }
+
+    let app = Router::new().route("/", get(health)).route("/health", get(health));
+
+    #[cfg(feature = "mcp-endpoint")]
+    let app = {
+        let http_addr = listener.local_addr()?;
+        let state = heliosdb_nano::mcp::McpState::new(db);
+        match heliosdb_nano::mcp::bind_safety_check(http_addr, &state.auth) {
+            Ok(()) => {
+                tracing::info!("MCP endpoint mounted at http://{}/mcp", http_addr);
+                heliosdb_nano::mcp::attach_mcp_routes(app, state)
             }
+            Err(e) => {
+                tracing::warn!("{e}; MCP routes are not mounted on this listener");
+                app
+            }
+        }
+    };
+
+    #[cfg(not(feature = "mcp-endpoint"))]
+    let _ = db;
+
+    axum::serve(listener, app).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[cfg(feature = "mcp-endpoint")]
+    use serde_json::json;
+    use serde_json::Value;
+
+    #[tokio::test]
+    async fn daemon_http_listener_serves_health() {
+        let db = std::sync::Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = run_http_listener(listener, db).await;
         });
+
+        let body: Value = reqwest::get(format!("http://{addr}/health"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(body["status"], "ok");
+
+        handle.abort();
+    }
+
+    #[cfg(feature = "mcp-endpoint")]
+    #[tokio::test]
+    async fn daemon_http_listener_mounts_mcp_post() {
+        let db = std::sync::Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = run_http_listener(listener, db).await;
+        });
+
+        let resp: Value = reqwest::Client::new()
+            .post(format!("http://{addr}/mcp"))
+            .json(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {} }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(
+            resp["result"]["tools"]
+                .as_array()
+                .map_or(false, |tools| !tools.is_empty()),
+            "expected MCP tools/list response, got {resp}"
+        );
+
+        handle.abort();
     }
 }

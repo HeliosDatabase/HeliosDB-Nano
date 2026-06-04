@@ -5,6 +5,7 @@
 //! Many PostgreSQL clients query these system tables during connection
 //! and for introspection.
 
+use crate::storage::{ArtIndexType, VectorIndexType};
 use crate::{Column, DataType, EmbeddedDatabase, Result, Schema, Tuple, Value};
 use std::sync::Arc;
 
@@ -1738,6 +1739,47 @@ impl PgCatalog {
                     }
                 }
             }
+        }
+        for (index_name, table_name, index_type, columns) in db.storage.art_indexes().list_indexes() {
+            if index_type != ArtIndexType::Manual {
+                continue;
+            }
+            let def = format!(
+                "CREATE INDEX {} ON public.{} USING btree ({})",
+                index_name,
+                table_name,
+                columns.join(", ")
+            );
+            rows.push(Tuple::new(vec![
+                Value::String("public".into()),
+                Value::String(table_name),
+                Value::String(index_name),
+                Value::Null,
+                Value::String(def),
+            ]));
+        }
+        for metadata in db.storage.vector_indexes().list_all_metadata() {
+            let opclass = match metadata.distance_metric() {
+                crate::vector::DistanceMetric::Cosine => "vector_cosine_ops",
+                crate::vector::DistanceMetric::L2 => "vector_l2_ops",
+                crate::vector::DistanceMetric::InnerProduct => "vector_ip_ops",
+            };
+            let using = match &metadata.index_type {
+                VectorIndexType::Standard(_) => "hnsw",
+                VectorIndexType::Quantized(_) => "hnsw",
+                VectorIndexType::Persistent(_) => "hnsw",
+            };
+            let def = format!(
+                "CREATE INDEX {} ON public.{} USING {} ({} {})",
+                metadata.name, metadata.table_name, using, metadata.column_name, opclass
+            );
+            rows.push(Tuple::new(vec![
+                Value::String("public".into()),
+                Value::String(metadata.table_name),
+                Value::String(metadata.name),
+                Value::Null,
+                Value::String(def),
+            ]));
         }
         Ok((schema, rows))
     }

@@ -5,6 +5,41 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.37.0] - 2026-06-04
+
+Minor release for Token Dashboard MCP-over-HTTP support and the ada-core HNSW
+populated-table index build regression.
+
+### Added — MCP / HTTP
+
+- Daemon `--http-port` now serves the existing JSON health endpoint through
+  Axum and mounts MCP-over-HTTP routes (`/mcp`, `/mcp/ws`, `/mcp/sse`,
+  `/mcp/info`) when built with the `mcp-endpoint` feature. Non-loopback MCP
+  listeners still require explicit auth-safe binding.
+
+### Added — Code embeddings
+
+- SQL now exposes `CODE_EMBED(text)` / `HELIOSDB_CODE_EMBED(text)` when built
+  with the `code-embed` feature, returning a vector from the local code
+  embedder and a clear feature-gate error otherwise.
+
+### Fixed — Vector indexes / PostgreSQL compatibility
+
+- `CREATE INDEX ... USING hnsw` now backfills vectors already present in the
+  target table for standard, quantized, and persistent HNSW indexes, instead of
+  creating an empty index on populated data.
+- pgvector operator classes such as `vector_cosine_ops`, `vector_l2_ops`, and
+  `vector_ip_ops` are preserved as vector-index distance metrics.
+- `pg_indexes` now exposes manual scalar secondary indexes and HNSW vector
+  indexes over PostgreSQL-compatible introspection, including vector opclass
+  names in `indexdef`.
+
+### Fixed — SQL engine / planner
+
+- `ORDER BY` keys that reference columns not present in the final select list
+  now sort against the pre-projection input when possible, fixing LEFT JOIN
+  ordering cases such as `SELECT c.name ... ORDER BY c.id, o.id`.
+
 ## [3.36.2] - 2026-06-04
 
 Patch compatibility release for the ada-core v3.36.1 probe gaps plus the Token

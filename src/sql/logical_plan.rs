@@ -1478,6 +1478,8 @@ pub enum IndexOption {
     ShardCount(usize),
     /// persistent = true
     Persistent(bool),
+    /// metric = 'l2' | 'cosine' | 'inner_product'
+    DistanceMetric(String),
     /// rerank_precision = 'f32' | 'f16' | 'i8'
     RerankPrecision(String),
 }
