@@ -1,18 +1,17 @@
 //! Compatibility fixes from ada-core's
-//! `dm26:/home/app/ada-core/docs/HELIOSDB-NANO-COMPATIBILITY.md` report
-//! (v3.30.1 → v3.31.2). Covers the two tractable items from that doc:
+//! `/home/app/ada-core/docs/HELIOSDB-NANO-COMPATIBILITY.md` report.
+//! Covers compatibility fixes that let ada-core remove Nano-specific
+//! workarounds:
 //!
 //! 1. **Vector bare `::vector` cast** — pgvector accepts the bare form and
 //!    infers the dimension from the literal. v3.31.2 matches at CAST sites
 //!    (DDL still requires explicit `VECTOR(n)`).
 //! 2. **`CAST(uuid AS text)`** — was wrapping the result in single quotes
 //!    (`'<uuid>'`). v3.31.2 returns the bare canonical hex form.
-//!
-//! Items left documented as deferred: TEXT[] arrays, `interval`, LISTEN/
-//! NOTIFY, asyncpg binary wire, SQLAlchemy txn-frame compatibility,
-//! "Transaction already active" stuck state, ALTER COLUMN DROP NOT NULL.
+//! 3. **v3.36.2 B1/B2/B3/B6** — interval literals, `TEXT[]`, `ALTER COLUMN
+//!    DROP NOT NULL`, and qualified `ORDER BY` over LEFT JOIN projections.
 
-use heliosdb_nano::EmbeddedDatabase;
+use heliosdb_nano::{EmbeddedDatabase, Value};
 
 /// pgvector tutorial form: bare `::vector` cast on a string literal must
 /// infer the dimension from the literal's element count.
@@ -135,4 +134,89 @@ fn uuid_other_paths_unchanged() {
 
     let rows = db.execute("SELECT id FROM u").expect("select");
     assert_eq!(rows, 1, "uuid round-trip must still produce 1 row");
+}
+
+#[test]
+fn interval_literal_adds_to_now() {
+    let db = EmbeddedDatabase::new_in_memory().expect("db");
+    let rows = db
+        .query("SELECT now() + interval '1 hour'", &[])
+        .expect("interval literal should evaluate");
+    assert_eq!(rows.len(), 1);
+    assert!(matches!(rows[0].values.first(), Some(Value::Timestamp(_)),));
+}
+
+#[test]
+fn text_array_column_accepts_array_literal() {
+    let db = EmbeddedDatabase::new_in_memory().expect("db");
+    db.execute("CREATE TABLE b2(tags text[])").expect("create text[] table");
+    db.execute("INSERT INTO b2 VALUES (ARRAY['a','b','c'])")
+        .expect("insert text array literal");
+
+    let rows = db.query("SELECT tags FROM b2", &[]).expect("select text array");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].values[0],
+        Value::Array(vec![
+            Value::String("a".to_string()),
+            Value::String("b".to_string()),
+            Value::String("c".to_string()),
+        ])
+    );
+}
+
+#[test]
+fn text_array_column_accepts_postgres_array_text_param_shape() {
+    let db = EmbeddedDatabase::new_in_memory().expect("db");
+    db.execute("CREATE TABLE b2_param(tags text[])")
+        .expect("create text[] table");
+    db.execute("INSERT INTO b2_param VALUES ('{a,b,c}')")
+        .expect("insert PostgreSQL array text literal");
+
+    let rows = db.query("SELECT tags FROM b2_param", &[]).expect("select text array");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].values[0],
+        Value::Array(vec![
+            Value::String("a".to_string()),
+            Value::String("b".to_string()),
+            Value::String("c".to_string()),
+        ])
+    );
+}
+
+#[test]
+fn alter_column_drop_not_null_allows_null_insert() {
+    let db = EmbeddedDatabase::new_in_memory().expect("db");
+    db.execute("CREATE TABLE b3(x int NOT NULL)").expect("create b3");
+    db.execute("ALTER TABLE b3 ALTER COLUMN x DROP NOT NULL")
+        .expect("drop not null");
+    let inserted = db.execute("INSERT INTO b3 VALUES (NULL)").expect("insert null");
+    assert_eq!(inserted, 1);
+}
+
+#[test]
+fn left_join_order_by_qualified_projected_column_is_monotonic() {
+    let db = EmbeddedDatabase::new_in_memory().expect("db");
+    db.execute("CREATE TABLE b6a(id int)").expect("create b6a");
+    db.execute("CREATE TABLE b6b(id int, note text)").expect("create b6b");
+
+    let values = (0..500).map(|i| format!("({i})")).collect::<Vec<_>>().join(",");
+    db.execute(&format!("INSERT INTO b6a VALUES {values}"))
+        .expect("insert 500 b6 rows");
+
+    let rows = db
+        .query(
+            "SELECT a.id FROM b6a a LEFT JOIN b6b b ON b.id = a.id ORDER BY a.id",
+            &[],
+        )
+        .expect("ordered left join");
+    let ids = rows
+        .iter()
+        .map(|row| match row.values.first() {
+            Some(Value::Int4(id)) => *id,
+            other => panic!("expected Int4 id, got {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(ids, (0..500).collect::<Vec<_>>());
 }

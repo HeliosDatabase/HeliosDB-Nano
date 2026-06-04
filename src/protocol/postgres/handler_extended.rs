@@ -243,13 +243,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
         // not start with SELECT; route it through the params-aware query path
         // too, otherwise it falls to execute_params and silently returns a
         // command tag with zero rows over the wire (Token Dashboard #3).
-        let is_select = {
+        let is_row_returning_query = {
             let t = statement.query.trim();
             (t.len() >= 6 && t.as_bytes()[..6].eq_ignore_ascii_case(b"SELECT"))
                 || super::handler::starts_with_cte(t)
+                || crate::sql::Parser::is_show_branches(t)
         };
 
-        if is_select {
+        if is_row_returning_query {
             // Catalog fast path — `pg_catalog.pg_type` and friends must
             // resolve on the extended query protocol too, not just on
             // simple-Q. `postgres-js`, `pg`, `psycopg` all do their

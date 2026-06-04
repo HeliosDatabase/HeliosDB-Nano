@@ -192,6 +192,11 @@ impl<'a> Planner<'a> {
     pub fn parse_data_type_string(type_str: &str) -> Result<DataType> {
         let upper = type_str.trim().to_uppercase();
 
+        if let Some(base) = upper.strip_suffix("[]") {
+            let inner = Self::parse_data_type_string(base)?;
+            return Ok(DataType::Array(Box::new(inner)));
+        }
+
         // Handle parameterized types first
         if upper.starts_with("VARCHAR") || upper.starts_with("CHARACTER VARYING") {
             // Extract length if present: VARCHAR(255)
@@ -236,6 +241,7 @@ impl<'a> Planner<'a> {
             "DATE" => Ok(DataType::Date),
             "TIME" => Ok(DataType::Time),
             "TIMESTAMP" | "TIMESTAMPTZ" => Ok(DataType::Timestamp),
+            "INTERVAL" => Ok(DataType::Interval),
             "UUID" => Ok(DataType::Uuid),
             "JSON" => Ok(DataType::Json),
             "JSONB" => Ok(DataType::Jsonb),
@@ -1983,10 +1989,26 @@ impl<'a> Planner<'a> {
     /// over a base column the projection dropped (the pgvector
     /// `ORDER BY embedding <=> $1` idiom, with `embedding <=> $1 AS d` in the
     /// select list) must be redirected to the already-computed column.
-    /// Plain column / literal sort keys are left untouched — they already
+    /// Unqualified column / literal sort keys are left untouched — they already
     /// resolve, and redirecting a bare column could shadow a base column that
-    /// was projected under a different alias. See NANO-DEFICIENCIES A17.
+    /// was projected under a different alias. Qualified columns that match a
+    /// projected expression are redirected, because the Project output drops
+    /// table qualifiers (`SELECT a.id ... ORDER BY a.id`). See ada-core B6.
     fn rewrite_order_by_to_projection(expr: LogicalExpr, projection_outputs: &[(LogicalExpr, String)]) -> LogicalExpr {
+        if let LogicalExpr::Column {
+            table: Some(_), name, ..
+        } = &expr
+        {
+            for (proj_expr, alias) in projection_outputs {
+                if proj_expr == &expr {
+                    return LogicalExpr::Column {
+                        table: None,
+                        name: if alias.is_empty() { name.clone() } else { alias.clone() },
+                    };
+                }
+            }
+            return expr;
+        }
         if matches!(expr, LogicalExpr::Column { .. } | LogicalExpr::Literal(_)) {
             return expr;
         }
@@ -2942,6 +2964,10 @@ impl<'a> Planner<'a> {
                 })
             }
 
+            Expr::Interval(interval) => Ok(LogicalExpr::Literal(Value::Interval(Self::interval_to_micros(
+                interval,
+            )?))),
+
             // Array literals: ARRAY[1, 2, 3] or '[1.0, 2.0, 3.0]' (for vectors)
             Expr::Array(sqlparser::ast::Array { elem, .. }) => {
                 // Check if all elements are numeric - could be vector or array
@@ -3283,6 +3309,90 @@ impl<'a> Planner<'a> {
             Ok(decoded) if decoded != s => decoded,
             _ => s.to_string(),
         }
+    }
+
+    fn interval_to_micros(interval: &sqlparser::ast::Interval) -> Result<i64> {
+        let value = match interval.value.as_ref() {
+            Expr::Value(sqlparser::ast::Value::SingleQuotedString(s)) => Self::repair_sqlparser_string(s),
+            Expr::Value(sqlparser::ast::Value::Number(n, _)) => n.clone(),
+            other => {
+                return Err(Error::query_execution(format!(
+                    "Unsupported interval literal value: {other:?}"
+                )))
+            }
+        };
+
+        if let Some(field) = interval.leading_field.as_ref() {
+            let amount = value
+                .trim()
+                .parse::<f64>()
+                .map_err(|e| Error::query_execution(format!("Invalid interval value '{value}': {e}")))?;
+            return Self::interval_unit_to_micros(amount, field);
+        }
+
+        Self::parse_interval_text(&value)
+    }
+
+    fn parse_interval_text(value: &str) -> Result<i64> {
+        let tokens: Vec<&str> = value.split_whitespace().collect();
+        if tokens.is_empty() || tokens.len() % 2 != 0 {
+            return Err(Error::query_execution(format!(
+                "Unsupported interval literal '{value}'. Expected '<number> <unit>' pairs"
+            )));
+        }
+
+        let mut micros = 0f64;
+        for pair in tokens.chunks_exact(2) {
+            let amount = pair[0]
+                .parse::<f64>()
+                .map_err(|e| Error::query_execution(format!("Invalid interval amount '{}': {e}", pair[0])))?;
+            micros += Self::interval_unit_name_to_micros(amount, pair[1])? as f64;
+        }
+
+        Ok(micros.round() as i64)
+    }
+
+    fn interval_unit_to_micros(amount: f64, field: &sqlparser::ast::DateTimeField) -> Result<i64> {
+        use sqlparser::ast::DateTimeField;
+        let micros = match field {
+            DateTimeField::Week(_) => amount * 7.0 * 86_400_000_000.0,
+            DateTimeField::Day => amount * 86_400_000_000.0,
+            DateTimeField::Hour => amount * 3_600_000_000.0,
+            DateTimeField::Minute => amount * 60_000_000.0,
+            DateTimeField::Second => amount * 1_000_000.0,
+            DateTimeField::Millisecond | DateTimeField::Milliseconds => amount * 1_000.0,
+            DateTimeField::Microsecond | DateTimeField::Microseconds => amount,
+            DateTimeField::Custom(ident) => return Self::interval_unit_name_to_micros(amount, &ident.value),
+            other => {
+                return Err(Error::query_execution(format!(
+                    "Unsupported interval field {other}. Nano intervals are stored as microseconds"
+                )))
+            }
+        };
+        Ok(micros.round() as i64)
+    }
+
+    fn interval_unit_name_to_micros(amount: f64, unit: &str) -> Result<i64> {
+        let lower = unit.trim().to_ascii_lowercase();
+        let normalized = match lower.as_str() {
+            "ms" | "us" => lower.as_str(),
+            _ => lower.trim_end_matches('s'),
+        };
+        let micros = match normalized {
+            "us" | "usec" | "microsecond" => amount,
+            "ms" | "msec" | "millisecond" => amount * 1_000.0,
+            "s" | "sec" | "second" => amount * 1_000_000.0,
+            "m" | "min" | "minute" => amount * 60_000_000.0,
+            "h" | "hr" | "hour" => amount * 3_600_000_000.0,
+            "d" | "day" => amount * 86_400_000_000.0,
+            "w" | "week" => amount * 7.0 * 86_400_000_000.0,
+            _ => {
+                return Err(Error::query_execution(format!(
+                    "Unsupported interval unit '{unit}'. Nano intervals are stored as microseconds"
+                )))
+            }
+        };
+        Ok(micros.round() as i64)
     }
 
     /// Convert SQL value to internal Value
@@ -3771,6 +3881,14 @@ impl<'a> Planner<'a> {
                 table_name,
                 new_table_name: new_name.to_string(),
             }),
+            AlterTableOperation::AlterColumn {
+                column_name,
+                op: sqlparser::ast::AlterColumnOperation::DropNotNull,
+            } => Ok(LogicalPlan::AlterTableAlterColumnNullability {
+                table_name,
+                column_name: column_name.value,
+                nullable: true,
+            }),
             // ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY (KanttBan #5
             // against v3.27.0). drizzle-kit / Prisma / Flyway / Liquibase
             // all emit FKs as a separate ALTER TABLE step at the end of
@@ -3909,9 +4027,19 @@ impl<'a> Planner<'a> {
             SqlDataType::Date => Ok(DataType::Date),
             SqlDataType::Time(_, _) => Ok(DataType::Time),
             SqlDataType::Timestamp(_, _) => Ok(DataType::Timestamp),
+            SqlDataType::Interval => Ok(DataType::Interval),
             SqlDataType::Uuid => Ok(DataType::Uuid),
             SqlDataType::JSON => Ok(DataType::Json),
             SqlDataType::JSONB => Ok(DataType::Jsonb),
+            SqlDataType::Array(array_def) => {
+                let inner = match array_def {
+                    sqlparser::ast::ArrayElemTypeDef::SquareBracket(inner, _)
+                    | sqlparser::ast::ArrayElemTypeDef::AngleBracket(inner)
+                    | sqlparser::ast::ArrayElemTypeDef::Parenthesis(inner) => self.sql_data_type_to_data_type(inner)?,
+                    sqlparser::ast::ArrayElemTypeDef::None => DataType::Text,
+                };
+                Ok(DataType::Array(Box::new(inner)))
+            }
             // Handle NUMERIC/DECIMAL types (PostgreSQL arbitrary precision decimal)
             SqlDataType::Numeric(_) | SqlDataType::Decimal(_) => Ok(DataType::Numeric),
             // Handle PostgreSQL SERIAL types

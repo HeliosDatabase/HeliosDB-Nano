@@ -603,7 +603,7 @@ where
             self.send_command_complete("SET").await?;
             self.send_ready_for_query().await?;
             return Ok(());
-        } else if starts_with_icase(trimmed, "SHOW ") {
+        } else if starts_with_icase(trimmed, "SHOW ") && !crate::sql::Parser::is_show_branches(trimmed) {
             // Handle SHOW commands for client compatibility
             let param = trimmed[5..].trim().trim_end_matches(';').trim();
             let (col_name, value) = Self::resolve_show_parameter(param);
@@ -810,6 +810,7 @@ where
 
         // Execute query through database
         let is_select = starts_with_icase(trimmed, "SELECT");
+        let is_show_branches = crate::sql::Parser::is_show_branches(trimmed);
         // A CTE (`WITH … SELECT …`) is row-returning but doesn't start with
         // SELECT; route it through query_with_columns so it returns rows
         // rather than a command tag (Token Dashboard #3). Skip the read cache
@@ -823,8 +824,13 @@ where
                 && upper.contains("RETURNING")
         };
 
-        if is_select {
-            if let Some((cached_results, columns)) = self.database.try_cached_query_with_columns(query) {
+        if is_select || is_show_branches {
+            let cached_query = if is_show_branches {
+                None
+            } else {
+                self.database.try_cached_query_with_columns(query)
+            };
+            if let Some((cached_results, columns)) = cached_query {
                 let schema = Self::schema_from_query_columns(&columns, cached_results.as_slice());
                 self.send_query_result(schema, cached_results.as_slice()).await?;
             } else {
@@ -2401,5 +2407,149 @@ mod failed_transaction_state_tests {
             .expect("rollback after failed transaction");
 
         assert_eq!(handler.transaction_status, TransactionStatus::Idle);
+    }
+}
+
+#[cfg(test)]
+mod show_branches_wire_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+    use tokio::io::DuplexStream;
+
+    fn test_handler(db: Arc<EmbeddedDatabase>) -> (PgConnectionHandler<DuplexStream>, DuplexStream) {
+        let (stream, client) = tokio::io::duplex(4096);
+        (
+            PgConnectionHandler {
+                stream,
+                database: db.clone(),
+                auth_manager: Arc::new(AuthManager::new(AuthMethod::Trust)),
+                catalog: PgCatalog::with_database(db),
+                prepared_statements: PreparedStatementManager::new(),
+                authenticated: true,
+                transaction_status: TransactionStatus::Idle,
+                buffer: BytesMut::with_capacity(8192),
+                username: None,
+                scram_state: None,
+                write_buf: BytesMut::with_capacity(4096),
+                suppress_ready_for_query: false,
+                awaiting_sync_after_error: false,
+            },
+            client,
+        )
+    }
+
+    fn has_complete_ready_for_query(buf: &[u8]) -> bool {
+        let mut pos = 0;
+        while pos + 5 <= buf.len() {
+            let tag = buf[pos];
+            let len = i32::from_be_bytes([buf[pos + 1], buf[pos + 2], buf[pos + 3], buf[pos + 4]]) as usize;
+            let end = pos + 1 + len;
+            if end > buf.len() {
+                return false;
+            }
+            if tag == b'Z' {
+                return true;
+            }
+            pos = end;
+        }
+        false
+    }
+
+    async fn read_until_ready(mut client: DuplexStream) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut chunk = [0_u8; 2048];
+        loop {
+            let read = tokio::time::timeout(Duration::from_secs(1), client.read(&mut chunk))
+                .await
+                .expect("timed out waiting for PostgreSQL response")
+                .expect("read PostgreSQL response");
+            assert!(read > 0, "connection closed before ReadyForQuery; bytes={out:?}");
+            out.extend_from_slice(&chunk[..read]);
+            if has_complete_ready_for_query(&out) {
+                return out;
+            }
+        }
+    }
+
+    fn first_column_text_values(buf: &[u8]) -> Vec<Option<String>> {
+        let mut pos = 0;
+        let mut values = Vec::new();
+        while pos + 5 <= buf.len() {
+            let tag = buf[pos];
+            let len = i32::from_be_bytes([buf[pos + 1], buf[pos + 2], buf[pos + 3], buf[pos + 4]]) as usize;
+            let end = pos + 1 + len;
+            if end > buf.len() {
+                break;
+            }
+
+            if tag == b'D' {
+                let mut cur = pos + 5;
+                let columns = i16::from_be_bytes([buf[cur], buf[cur + 1]]) as usize;
+                cur += 2;
+                for idx in 0..columns {
+                    let value_len = i32::from_be_bytes([buf[cur], buf[cur + 1], buf[cur + 2], buf[cur + 3]]);
+                    cur += 4;
+                    if value_len < 0 {
+                        if idx == 0 {
+                            values.push(None);
+                        }
+                        continue;
+                    }
+                    let value_end = cur + value_len as usize;
+                    if idx == 0 {
+                        values.push(Some(
+                            std::str::from_utf8(&buf[cur..value_end])
+                                .expect("first column should be UTF-8 text")
+                                .to_string(),
+                        ));
+                    }
+                    cur = value_end;
+                }
+            }
+
+            pos = end;
+        }
+        values
+    }
+
+    #[tokio::test]
+    async fn show_branches_simple_query_returns_branch_registry_rows() {
+        let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+        db.execute("CREATE TABLE t(x INT)").expect("create table");
+        db.execute("INSERT INTO t VALUES(1),(2),(3)").expect("insert rows");
+        db.execute("CREATE BRANCH 'alpha' AS OF NOW").expect("create alpha");
+        db.execute("CREATE BRANCH 'beta' AS OF NOW").expect("create beta");
+
+        let (mut handler, client) = test_handler(db);
+        handler
+            .handle_single_query("SHOW BRANCHES")
+            .await
+            .expect("SHOW BRANCHES over PostgreSQL wire");
+
+        let response = read_until_ready(client).await;
+        let names = first_column_text_values(&response);
+        let rendered: Vec<String> = names
+            .iter()
+            .map(|name| name.clone().unwrap_or_else(|| "<NULL>".to_string()))
+            .collect();
+
+        assert!(
+            rendered.iter().any(|name| name == "main"),
+            "missing main; names={rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|name| name == "alpha"),
+            "missing alpha; names={rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|name| name == "beta"),
+            "missing beta; names={rendered:?}"
+        );
+        assert!(
+            rendered.iter().all(|name| !name.is_empty()),
+            "SHOW BRANCHES must not return a blank branch name; names={rendered:?}"
+        );
     }
 }

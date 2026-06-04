@@ -812,6 +812,7 @@ impl EmbeddedDatabase {
                 | sql::LogicalPlan::AlterTableDropColumn { .. }
                 | sql::LogicalPlan::AlterTableRename { .. }
                 | sql::LogicalPlan::AlterTableRenameColumn { .. }
+                | sql::LogicalPlan::AlterTableAlterColumnNullability { .. }
                 | sql::LogicalPlan::AlterTableAddForeignKey { .. }
                 | sql::LogicalPlan::AlterTableAlterConstraintEnforcement { .. }
                 | sql::LogicalPlan::AlterTableMulti { .. }
@@ -3659,6 +3660,11 @@ impl EmbeddedDatabase {
 
                 Ok(0)
             }
+            sql::LogicalPlan::AlterTableAlterColumnNullability {
+                table_name,
+                column_name,
+                nullable,
+            } => self.alter_table_set_column_nullability(table_name, column_name, *nullable),
             sql::LogicalPlan::AlterTableRename {
                 table_name,
                 new_table_name,
@@ -6468,6 +6474,37 @@ impl EmbeddedDatabase {
         }
     }
 
+    fn alter_table_set_column_nullability(&self, table_name: &str, column_name: &str, nullable: bool) -> Result<u64> {
+        let catalog = self.storage.catalog();
+        let mut schema = catalog.get_table_schema(table_name)?;
+        let col_idx = schema
+            .columns
+            .iter()
+            .position(|c| c.name == column_name)
+            .ok_or_else(|| {
+                Error::query_execution(format!(
+                    "Column '{}' does not exist in table '{}'",
+                    column_name, table_name
+                ))
+            })?;
+
+        let column = schema
+            .get_column_at_mut(col_idx)
+            .ok_or_else(|| Error::internal("column index out of bounds"))?;
+        if nullable && column.primary_key {
+            return Err(Error::query_execution(format!(
+                "Cannot drop NOT NULL from primary key column '{}'",
+                column_name
+            )));
+        }
+        if column.nullable == nullable {
+            return Ok(0);
+        }
+        column.nullable = nullable;
+        catalog.update_table_schema(table_name, &schema)?;
+        Ok(0)
+    }
+
     /// Execute a single ALTER TABLE operation from its logical plan.
     ///
     /// This is used by the `AlterTableMulti` handler to execute each sub-operation
@@ -6610,6 +6647,11 @@ impl EmbeddedDatabase {
 
                 Ok(0)
             }
+            sql::LogicalPlan::AlterTableAlterColumnNullability {
+                table_name,
+                column_name,
+                nullable,
+            } => self.alter_table_set_column_nullability(table_name, column_name, *nullable),
             sql::LogicalPlan::AlterTableRename {
                 table_name,
                 new_table_name,
@@ -9265,6 +9307,11 @@ impl EmbeddedDatabase {
                 catalog.update_table_schema(table_name, &schema)?;
                 Ok(0)
             }
+            sql::LogicalPlan::AlterTableAlterColumnNullability {
+                table_name,
+                column_name,
+                nullable,
+            } => self.alter_table_set_column_nullability(table_name, column_name, *nullable),
             sql::LogicalPlan::AlterTableRename {
                 table_name,
                 new_table_name,

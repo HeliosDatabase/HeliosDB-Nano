@@ -5,6 +5,40 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.36.2] - 2026-06-04
+
+Patch compatibility release for the ada-core v3.36.1 probe gaps plus the Token
+Dashboard `SHOW BRANCHES` regression that remained in v3.36.1.
+
+### Added — PostgreSQL compatibility
+
+- SQL `INTERVAL` literals such as `interval '1 hour'` now plan to Nano's
+  existing microsecond interval value and work with timestamp arithmetic
+  (`now() + interval '1 hour'`). Month/year-style intervals still require a
+  richer interval representation and remain unsupported.
+- PostgreSQL array column DDL now accepts forms such as `TEXT[]`, maps them to
+  Nano `Array(Text)`, and casts array values element-by-element on insert.
+- `ALTER TABLE ... ALTER COLUMN ... DROP NOT NULL` now updates catalog
+  nullability metadata for non-primary-key columns, allowing subsequent `NULL`
+  writes. (ada-core B3)
+- Qualified `ORDER BY` keys above projections now resolve to the projected
+  column when the select-list expression matches (for example
+  `SELECT a.id ... LEFT JOIN ... ORDER BY a.id`). This fixes ada-core's
+  LEFT JOIN keyset monotonicity failure. (ada-core B6)
+
+### Fixed — PostgreSQL wire protocol
+
+- `SHOW BRANCHES` over the PostgreSQL simple-query protocol now bypasses the
+  generic `SHOW <parameter>` compatibility handler. v3.36.1 treated
+  `branches` as an unknown parameter and returned a single blank row; it now
+  routes to the branch-listing query path and returns the actual branch names
+  (`main`, `alpha`, `beta`, etc.) on fresh and existing data directories.
+  (Token Dashboard #4)
+- The extended-query protocol also classifies `SHOW BRANCHES` as row-returning,
+  so prepared-statement clients see branch rows instead of a command tag.
+- Added fresh data-dir and PostgreSQL wire regressions that assert created
+  branch names appear, not just that `SHOW BRANCHES` returns a row.
+
 ## [3.36.1] - 2026-06-03
 
 Follow-up release closing the items deferred from the v3.36.0 deficiency batch:
