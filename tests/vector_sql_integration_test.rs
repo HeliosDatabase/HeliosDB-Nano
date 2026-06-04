@@ -2,7 +2,9 @@
 //!
 //! Tests for vector similarity search via SQL layer
 
-use heliosdb_nano::{EmbeddedDatabase, Result};
+use heliosdb_nano::{
+    sql::SystemViewRegistry, storage::VectorIndexType, vector::DistanceMetric, EmbeddedDatabase, Result, Value,
+};
 
 /// Test CREATE INDEX ... USING hnsw syntax
 #[test]
@@ -21,6 +23,59 @@ fn test_create_vector_index_sql() -> Result<()> {
     // Create HNSW index
     let result = db.execute("CREATE INDEX embedding_idx ON documents USING hnsw (embedding)");
     assert!(result.is_ok(), "Failed to create HNSW index: {:?}", result.err());
+
+    Ok(())
+}
+
+#[test]
+fn test_create_hnsw_index_on_populated_table_backfills_existing_rows() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+
+    db.execute("CREATE TABLE hnsw_populated (id INT4 PRIMARY KEY, embedding VECTOR(3))")?;
+    db.execute("INSERT INTO hnsw_populated VALUES (1, '[1.0, 0.0, 0.0]')")?;
+    db.execute("INSERT INTO hnsw_populated VALUES (2, '[0.9, 0.1, 0.0]')")?;
+    db.execute("INSERT INTO hnsw_populated VALUES (3, '[0.0, 1.0, 0.0]')")?;
+
+    db.execute(
+        "CREATE INDEX hnsw_populated_embedding_idx \
+         ON hnsw_populated USING hnsw (embedding vector_cosine_ops)",
+    )?;
+
+    let stats = db
+        .storage
+        .vector_indexes()
+        .get_index_stats("hnsw_populated_embedding_idx")?;
+    assert_eq!(stats.num_vectors, 3, "CREATE INDEX must backfill existing rows");
+
+    let metadata = db
+        .storage
+        .vector_indexes()
+        .get_metadata("hnsw_populated_embedding_idx")?;
+    match metadata.index_type {
+        VectorIndexType::Standard(config) => assert_eq!(config.distance_metric, DistanceMetric::Cosine),
+        other => panic!("expected standard HNSW metadata, got {other:?}"),
+    }
+
+    let hits = db
+        .storage
+        .vector_indexes()
+        .search("hnsw_populated_embedding_idx", &vec![1.0, 0.0, 0.0], 2)?;
+    assert_eq!(hits.len(), 2);
+    assert_eq!(
+        hits[0].0, 1,
+        "nearest row inserted before CREATE INDEX should be searchable"
+    );
+
+    let pg_indexes = SystemViewRegistry::new().execute("pg_indexes", &db.storage)?;
+    assert!(
+        pg_indexes.iter().any(|tuple| {
+            matches!(
+                tuple.values.get(2),
+                Some(Value::String(name)) if name == "hnsw_populated_embedding_idx"
+            )
+        }),
+        "pg_indexes should expose the created HNSW index"
+    );
 
     Ok(())
 }

@@ -66,6 +66,49 @@ fn pg_index_lists_manual_secondary_indexes_with_pg_class_relation() {
 }
 
 #[test]
+fn pg_indexes_lists_manual_and_vector_indexes() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    db.execute("CREATE TABLE a4_idx_users (id INT PRIMARY KEY, email TEXT)")
+        .unwrap();
+    db.execute("CREATE INDEX idx_a4_idx_users_email ON a4_idx_users(email)")
+        .unwrap();
+    db.execute("CREATE TABLE a4_idx_docs (id INT PRIMARY KEY, embedding VECTOR(3))")
+        .unwrap();
+    db.execute("INSERT INTO a4_idx_docs VALUES (1, '[1.0, 0.0, 0.0]')")
+        .unwrap();
+    db.execute(
+        "CREATE INDEX idx_a4_idx_docs_embedding \
+         ON a4_idx_docs USING hnsw (embedding vector_cosine_ops)",
+    )
+    .unwrap();
+
+    let catalog = PgCatalog::with_database(db);
+    let (_schema, rows) = catalog
+        .handle_query("SELECT * FROM pg_indexes")
+        .unwrap()
+        .expect("catalog should intercept pg_indexes");
+
+    let mut saw_manual = false;
+    let mut saw_vector = false;
+    for row in rows {
+        let name = as_text(&row.values[2]);
+        let def = as_text(&row.values[4]);
+        if name == "idx_a4_idx_users_email" {
+            saw_manual = true;
+            assert!(def.contains("USING btree"), "manual indexdef was {def}");
+        }
+        if name == "idx_a4_idx_docs_embedding" {
+            saw_vector = true;
+            assert!(def.contains("USING hnsw"), "vector indexdef was {def}");
+            assert!(def.contains("vector_cosine_ops"), "vector indexdef was {def}");
+        }
+    }
+
+    assert!(saw_manual, "pg_indexes did not expose the manual secondary index");
+    assert!(saw_vector, "pg_indexes did not expose the HNSW vector index");
+}
+
+#[test]
 fn pg_constraint_and_information_schema_expose_foreign_key_columns() {
     let db = EmbeddedDatabase::new_in_memory().unwrap();
     db.execute("CREATE TABLE a4_parent (id INT PRIMARY KEY)").unwrap();

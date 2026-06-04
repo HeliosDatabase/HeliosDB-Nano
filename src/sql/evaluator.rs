@@ -500,6 +500,7 @@ impl Evaluator {
             "cosine_distance" => self.vector_cosine_distance(&arg_values),
             "l2_distance" | "euclidean_distance" => self.vector_l2_distance(&arg_values),
             "inner_product" => self.vector_inner_product(&arg_values),
+            "code_embed" | "heliosdb_code_embed" => Self::code_embed(&arg_values),
 
             // Agentic database surface (MVP): local deterministic inference
             // smoke tests plus explicit provider hooks for LLM generation.
@@ -4429,6 +4430,44 @@ impl Evaluator {
             ));
         };
         self.vector_distance_op(a, b, crate::vector::inner_product_distance)
+    }
+
+    /// CODE_EMBED(text) - local code-embed feature SQL surface.
+    fn code_embed(args: &[Value]) -> Result<Value> {
+        let [text] = args else {
+            return Err(Error::query_execution("CODE_EMBED requires exactly 1 text argument"));
+        };
+        let text = match text {
+            Value::String(s) => s.as_str(),
+            Value::Null => return Ok(Value::Null),
+            other => {
+                return Err(Error::query_execution(format!(
+                    "CODE_EMBED requires a text argument, got {:?}",
+                    other
+                )))
+            }
+        };
+
+        #[cfg(feature = "code-embed")]
+        {
+            use crate::code_graph::{Embedder, FastEmbedder};
+            use once_cell::sync::OnceCell;
+
+            static EMBEDDER: OnceCell<FastEmbedder> = OnceCell::new();
+            let embedder = EMBEDDER.get_or_try_init(FastEmbedder::try_default)?;
+            match embedder.embed(text)? {
+                Some(vector) => Ok(Value::Vector(vector)),
+                None => Ok(Value::Null),
+            }
+        }
+
+        #[cfg(not(feature = "code-embed"))]
+        {
+            let _ = text;
+            Err(Error::query_execution(
+                "CODE_EMBED requires the 'code-embed' feature".to_string(),
+            ))
+        }
     }
 
     /// COALESCE(val1, val2, ...) - return first non-null value

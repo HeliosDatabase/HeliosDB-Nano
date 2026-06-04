@@ -6,7 +6,7 @@
 //! - P1-7: AS OF clause parsing in table scans
 
 use heliosdb_nano::sql::{LogicalPlan, Parser, Planner};
-use heliosdb_nano::{Error, Result};
+use heliosdb_nano::Result;
 
 /// Test P1-5: Branch deletion after merge
 ///
@@ -165,6 +165,24 @@ fn test_p1_6_create_index_with_options() -> Result<()> {
                 .iter()
                 .any(|opt| matches!(opt, heliosdb_nano::sql::logical_plan::IndexOption::PqCentroids(256)));
             assert!(has_centroids, "PQ centroids should be parsed");
+        }
+        _ => panic!("Expected CreateIndex plan"),
+    }
+
+    // Test 5: pgvector operator class should become a metric option
+    let sql_metric = r#"
+        CREATE INDEX embedding_idx ON documents USING hnsw (embedding vector_cosine_ops)
+    "#;
+
+    let statement = parser.parse_one(sql_metric)?;
+    let plan = planner.statement_to_plan(statement)?;
+
+    match plan {
+        LogicalPlan::CreateIndex { options, .. } => {
+            let has_metric = options.iter().any(
+                |opt| matches!(opt, heliosdb_nano::sql::logical_plan::IndexOption::DistanceMetric(s) if s == "cosine"),
+            );
+            assert!(has_metric, "vector_cosine_ops should be parsed as metric='cosine'");
         }
         _ => panic!("Expected CreateIndex plan"),
     }

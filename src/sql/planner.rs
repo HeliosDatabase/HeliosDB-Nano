@@ -1097,11 +1097,7 @@ impl<'a> Planner<'a> {
                 .map(|order_by_expr| order_by_expr.asc.unwrap_or(true))
                 .collect();
 
-            plan = LogicalPlan::Sort {
-                input: Box::new(plan),
-                exprs: exprs?,
-                asc,
-            };
+            plan = Self::place_order_by(plan, exprs?, asc);
         }
 
         // Handle LIMIT and OFFSET
@@ -2021,6 +2017,100 @@ impl<'a> Planner<'a> {
             }
         }
         expr
+    }
+
+    fn place_order_by(plan: LogicalPlan, exprs: Vec<LogicalExpr>, asc: Vec<bool>) -> LogicalPlan {
+        match plan {
+            LogicalPlan::Project {
+                input,
+                exprs: project_exprs,
+                aliases,
+                distinct,
+                distinct_on,
+            } if !distinct && distinct_on.is_none() => {
+                let input_schema = input.schema();
+                if Self::order_by_resolves_against_schema(&exprs, &input_schema) {
+                    return LogicalPlan::Project {
+                        input: Box::new(LogicalPlan::Sort { input, exprs, asc }),
+                        exprs: project_exprs,
+                        aliases,
+                        distinct,
+                        distinct_on,
+                    };
+                }
+
+                LogicalPlan::Sort {
+                    input: Box::new(LogicalPlan::Project {
+                        input,
+                        exprs: project_exprs,
+                        aliases,
+                        distinct,
+                        distinct_on,
+                    }),
+                    exprs,
+                    asc,
+                }
+            }
+            other => LogicalPlan::Sort {
+                input: Box::new(other),
+                exprs,
+                asc,
+            },
+        }
+    }
+
+    fn order_by_resolves_against_schema(exprs: &[LogicalExpr], schema: &Schema) -> bool {
+        exprs
+            .iter()
+            .all(|expr| Self::expr_resolves_against_schema(expr, schema))
+    }
+
+    fn expr_resolves_against_schema(expr: &LogicalExpr, schema: &Schema) -> bool {
+        match expr {
+            LogicalExpr::Column { table, name } => schema.get_qualified_column_index(table.as_deref(), name).is_some(),
+            LogicalExpr::Literal(_) | LogicalExpr::Parameter { .. } => true,
+            LogicalExpr::BinaryExpr { left, right, .. } => {
+                Self::expr_resolves_against_schema(left, schema) && Self::expr_resolves_against_schema(right, schema)
+            }
+            LogicalExpr::UnaryExpr { expr, .. } | LogicalExpr::Cast { expr, .. } | LogicalExpr::IsNull { expr, .. } => {
+                Self::expr_resolves_against_schema(expr, schema)
+            }
+            LogicalExpr::ScalarFunction { args, .. } => {
+                args.iter().all(|arg| Self::expr_resolves_against_schema(arg, schema))
+            }
+            LogicalExpr::Case {
+                expr,
+                when_then,
+                else_result,
+            } => {
+                expr.as_ref()
+                    .is_none_or(|inner| Self::expr_resolves_against_schema(inner, schema))
+                    && when_then.iter().all(|(when, then)| {
+                        Self::expr_resolves_against_schema(when, schema)
+                            && Self::expr_resolves_against_schema(then, schema)
+                    })
+                    && else_result
+                        .as_ref()
+                        .is_none_or(|inner| Self::expr_resolves_against_schema(inner, schema))
+            }
+            LogicalExpr::Between { expr, low, high, .. } => {
+                Self::expr_resolves_against_schema(expr, schema)
+                    && Self::expr_resolves_against_schema(low, schema)
+                    && Self::expr_resolves_against_schema(high, schema)
+            }
+            LogicalExpr::InList { expr, list, .. } => {
+                Self::expr_resolves_against_schema(expr, schema)
+                    && list.iter().all(|item| Self::expr_resolves_against_schema(item, schema))
+            }
+            LogicalExpr::InSet { expr, .. } => Self::expr_resolves_against_schema(expr, schema),
+            LogicalExpr::ArraySubscript { array, index } => {
+                Self::expr_resolves_against_schema(array, schema) && Self::expr_resolves_against_schema(index, schema)
+            }
+            LogicalExpr::Tuple { items } => items
+                .iter()
+                .all(|item| Self::expr_resolves_against_schema(item, schema)),
+            _ => false,
+        }
     }
 
     fn rewrite_order_by_aggregates(expr: &LogicalExpr, info: &AggregateInfo) -> LogicalExpr {
@@ -4192,6 +4282,7 @@ impl<'a> Planner<'a> {
     /// - pq_centroids = 256
     /// - m = 16 (HNSW M parameter)
     /// - ef_construction = 200
+    /// - metric = 'l2' | 'cosine' | 'inner_product'
     /// - sharding_strategy = 'hash'
     /// - shard_count = 16
     fn parse_index_options(&self, with_exprs: &[Expr]) -> Result<Vec<super::logical_plan::IndexOption>> {
@@ -4278,6 +4369,19 @@ impl<'a> Planner<'a> {
                         options.push(IndexOption::EfConstruction(ef));
                     } else {
                         return Err(Error::query_execution("ef_construction must be a number"));
+                    }
+                }
+                "metric" | "distance_metric" => {
+                    if let Expr::Value(sqlparser::ast::Value::SingleQuotedString(s)) = value {
+                        let metric = s.to_ascii_lowercase();
+                        if !matches!(metric.as_str(), "l2" | "euclidean" | "cosine" | "ip" | "inner_product") {
+                            return Err(Error::query_execution(
+                                "metric must be 'l2', 'euclidean', 'cosine', 'ip', or 'inner_product'",
+                            ));
+                        }
+                        options.push(IndexOption::DistanceMetric(metric));
+                    } else {
+                        return Err(Error::query_execution("metric must be a string"));
                     }
                 }
                 "sharding_strategy" => {

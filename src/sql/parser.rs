@@ -1196,12 +1196,13 @@ impl Parser {
                 if let Some(paren_end) = remaining[paren_content_start..].find(')') {
                     let paren_content = &remaining[paren_content_start..paren_content_start + paren_end];
 
-                    // Extract just the column name(s), stripping operator classes
-                    // Operator classes like "vector_l2_ops", "vector_cosine_ops" come after column name
-                    let column_spec = Self::strip_operator_classes(paren_content);
+                    // Extract just the column name(s), preserving vector
+                    // operator-class metric as a regular WITH option.
+                    let (column_spec, metric) = Self::strip_operator_classes(paren_content);
 
                     // Get anything after the closing paren (WITH clause, semicolon, etc.)
                     let after_paren = remaining[paren_content_start + paren_end + 1..].trim();
+                    let after_paren = Self::append_metric_index_option(after_paren, metric);
 
                     // Reconstruct: before_using + (column_spec) + after_paren
                     let cleaned_sql = if after_paren.is_empty() || after_paren == ";" {
@@ -1227,21 +1228,23 @@ impl Parser {
     /// Strip operator classes from column specification
     /// E.g., "embedding vector_l2_ops" -> "embedding"
     /// E.g., "col1, col2 vector_cosine_ops" -> "col1, col2"
-    fn strip_operator_classes(column_spec: &str) -> String {
+    fn strip_operator_classes(column_spec: &str) -> (String, Option<&'static str>) {
         // Known vector operator classes to strip
         let op_classes = [
-            "vector_l2_ops",
-            "vector_cosine_ops",
-            "vector_ip_ops",
-            "vector_inner_product_ops",
+            ("vector_l2_ops", "l2"),
+            ("vector_cosine_ops", "cosine"),
+            ("vector_ip_ops", "inner_product"),
+            ("vector_inner_product_ops", "inner_product"),
         ];
 
         let mut result = column_spec.to_string();
-        for op_class in &op_classes {
+        let mut metric = None;
+        for (op_class, op_metric) in &op_classes {
             // Case-insensitive removal
             let upper_result = result.to_uppercase();
             let upper_op = op_class.to_uppercase();
             if let Some(pos) = upper_result.find(&upper_op) {
+                metric.get_or_insert(*op_metric);
                 result = format!(
                     "{}{}",
                     result[..pos].trim_end(),
@@ -1249,7 +1252,29 @@ impl Parser {
                 );
             }
         }
-        result.trim().to_string()
+        (result.trim().to_string(), metric)
+    }
+
+    fn append_metric_index_option(after_paren: &str, metric: Option<&str>) -> String {
+        let Some(metric) = metric else {
+            return after_paren.to_string();
+        };
+        let trimmed = after_paren.trim().trim_end_matches(';').trim();
+        if trimmed.is_empty() {
+            return format!("WITH (metric = '{metric}')");
+        }
+
+        let upper = trimmed.to_uppercase();
+        if upper.starts_with("WITH") {
+            if let Some(close_pos) = trimmed.rfind(')') {
+                let before_close = trimmed[..close_pos].trim_end();
+                let after_close = trimmed[close_pos..].trim_start_matches(')');
+                let separator = if before_close.ends_with('(') { "" } else { ", " };
+                return format!("{before_close}{separator}metric = '{metric}'){after_close}");
+            }
+        }
+
+        format!("{trimmed} WITH (metric = '{metric}')")
     }
 
     /// Convert DECIMAL type to NUMERIC for sqlparser compatibility
