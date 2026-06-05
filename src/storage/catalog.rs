@@ -6,7 +6,39 @@ use super::compression::{CompressionConfig, CompressionStats};
 use super::statistics::TableStatistics;
 use super::StorageEngine;
 use crate::sql::{TriggerDefinition, TriggerPersistence};
-use crate::{Error, Result, Schema};
+use crate::{DataType, Error, Result, Schema, Value};
+use serde::{Deserialize, Serialize};
+
+/// Persisted CREATE INDEX definition.
+///
+/// The actual ART and non-persistent HNSW structures are rebuilt in memory on
+/// open; this record is the version-portable catalog entry that survives a
+/// binary swap against the same data directory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedIndexDefinition {
+    pub table_name: String,
+    pub column_name: String,
+    pub index_type: Option<String>,
+    #[serde(default)]
+    pub options: Vec<crate::sql::logical_plan::IndexOption>,
+}
+
+fn vector_distance_metric(options: &[crate::sql::logical_plan::IndexOption]) -> crate::vector::DistanceMetric {
+    use crate::sql::logical_plan::IndexOption;
+    use crate::vector::DistanceMetric;
+
+    options
+        .iter()
+        .find_map(|option| match option {
+            IndexOption::DistanceMetric(name) => match name.as_str() {
+                "cosine" => Some(DistanceMetric::Cosine),
+                "ip" | "inner_product" => Some(DistanceMetric::InnerProduct),
+                _ => Some(DistanceMetric::L2),
+            },
+            _ => None,
+        })
+        .unwrap_or(DistanceMetric::L2)
+}
 
 /// Catalog manager for table metadata
 pub struct Catalog<'a> {
@@ -133,10 +165,7 @@ impl<'a> Catalog<'a> {
                         self.storage.cache_schema(table_name, mv_metadata.schema.clone());
                         mv_metadata.schema
                     } else {
-                        return Err(Error::query_execution(format!(
-                            "Table '{}' does not exist",
-                            table_name
-                        )));
+                        return Err(Error::query_execution(format!("Table '{}' does not exist", table_name)));
                     }
                 }
             }
@@ -314,6 +343,76 @@ impl<'a> Catalog<'a> {
         Ok(tables)
     }
 
+    /// Persist a user-created index definition in the catalog.
+    pub fn save_index_definition(&self, index_name: &str, definition: &PersistedIndexDefinition) -> Result<()> {
+        let key = Self::index_metadata_key(index_name);
+        let value = bincode::serialize(definition)
+            .map_err(|e| Error::storage(format!("Failed to serialize index definition: {}", e)))?;
+        self.storage.put(&key, &value)
+    }
+
+    /// Drop a persisted user-created index definition.
+    pub fn drop_index_definition(&self, index_name: &str) -> Result<()> {
+        let key = Self::index_metadata_key(index_name);
+        self.storage.delete(&key)
+    }
+
+    /// List persisted CREATE INDEX definitions.
+    pub fn list_index_definitions(&self) -> Result<Vec<(String, PersistedIndexDefinition)>> {
+        let prefix = b"meta:index:";
+        let mut indexes = Vec::new();
+        let mut read_opts = rocksdb::ReadOptions::default();
+        read_opts.set_total_order_seek(true);
+        let iter = self.storage.db.iterator_opt(
+            rocksdb::IteratorMode::From(prefix, rocksdb::Direction::Forward),
+            read_opts,
+        );
+
+        for item in iter {
+            let (key, value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            let index_name = String::from_utf8_lossy(key.get(prefix.len()..).unwrap_or_default()).to_string();
+
+            let definition = match bincode::deserialize::<PersistedIndexDefinition>(&value) {
+                Ok(definition) => definition,
+                Err(_) => {
+                    // Backward-compatible decode for older WAL replay records
+                    // that stored `(table, column, index_type, options_bytes)`.
+                    let (table_name, column_name, index_type, options_bytes): (
+                        String,
+                        String,
+                        Option<String>,
+                        Vec<u8>,
+                    ) = bincode::deserialize(&value).map_err(|e| {
+                        Error::storage(format!(
+                            "Failed to deserialize index definition '{}': {}",
+                            index_name, e
+                        ))
+                    })?;
+                    let options = if options_bytes.is_empty() {
+                        Vec::new()
+                    } else {
+                        bincode::deserialize(&options_bytes).map_err(|e| {
+                            Error::storage(format!("Failed to deserialize index options '{}': {}", index_name, e))
+                        })?
+                    };
+                    PersistedIndexDefinition {
+                        table_name,
+                        column_name,
+                        index_type,
+                        options,
+                    }
+                }
+            };
+            indexes.push((index_name, definition));
+        }
+
+        indexes.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(indexes)
+    }
+
     /// Re-register and re-populate every ART index from on-disk state.
     ///
     /// Called once at engine startup so that a fresh process attaching to an
@@ -338,6 +437,7 @@ impl<'a> Catalog<'a> {
         let art_manager = self.storage.art_indexes();
         let mut total_rows: u64 = 0;
         let mut total_tables: u64 = 0;
+        let persisted_indexes = self.list_index_definitions()?;
 
         for table_name in self.list_tables()? {
             // Skip system / internal bookkeeping tables — they have no
@@ -404,6 +504,20 @@ impl<'a> Catalog<'a> {
                 }
             }
 
+            // (Re)register user-created scalar secondary indexes from the
+            // durable index catalog.
+            for (index_name, definition) in persisted_indexes
+                .iter()
+                .filter(|(_, definition)| definition.table_name == table_name)
+            {
+                if matches!(definition.index_type.as_deref(), None | Some("art" | "btree" | "hash")) {
+                    let columns = vec![definition.column_name.clone()];
+                    if let Err(e) = art_manager.create_manual_index(index_name, &table_name, &columns) {
+                        tracing::debug!("Index rebuild: manual index {} already registered: {}", index_name, e);
+                    }
+                }
+            }
+
             // Replay every existing row through on_insert so the indexes
             // know about pre-existing data.
             let tuples = match self.storage.scan_table_with_schema(&table_name, &schema) {
@@ -439,6 +553,8 @@ impl<'a> Catalog<'a> {
             total_tables += 1;
         }
 
+        self.rebuild_vector_indexes(&persisted_indexes)?;
+
         tracing::info!(
             "Index rebuild complete: {} tables, {} rows, {:.1}ms",
             total_tables,
@@ -446,6 +562,130 @@ impl<'a> Catalog<'a> {
             started.elapsed().as_secs_f64() * 1000.0,
         );
         Ok(())
+    }
+
+    fn rebuild_vector_indexes(&self, indexes: &[(String, PersistedIndexDefinition)]) -> Result<()> {
+        for (index_name, definition) in indexes {
+            if !matches!(
+                definition.index_type.as_deref(),
+                Some("hnsw" | "persistent_hnsw" | "hnsw_pq")
+            ) {
+                continue;
+            }
+
+            let schema = match self.get_table_schema(&definition.table_name) {
+                Ok(schema) => schema,
+                Err(e) => {
+                    tracing::warn!(
+                        "Vector index rebuild: skipping {} — schema load failed: {}",
+                        index_name,
+                        e
+                    );
+                    continue;
+                }
+            };
+            let Some(column) = schema.get_column(&definition.column_name) else {
+                tracing::warn!(
+                    "Vector index rebuild: skipping {} — column {}.{} not found",
+                    index_name,
+                    definition.table_name,
+                    definition.column_name
+                );
+                continue;
+            };
+            let DataType::Vector(dimension) = &column.data_type else {
+                tracing::warn!(
+                    "Vector index rebuild: skipping {} — {}.{} is not VECTOR",
+                    index_name,
+                    definition.table_name,
+                    definition.column_name
+                );
+                continue;
+            };
+
+            let vector_indexes = self.storage.vector_indexes();
+            if vector_indexes.index_exists(index_name) {
+                continue;
+            }
+            let metric = vector_distance_metric(&definition.options);
+            if let Err(e) = vector_indexes.create_index(
+                index_name.clone(),
+                definition.table_name.clone(),
+                definition.column_name.clone(),
+                *dimension,
+                metric,
+            ) {
+                tracing::warn!("Vector index rebuild: create {} failed: {}", index_name, e);
+                continue;
+            }
+
+            let vectors = match self.collect_existing_vectors(
+                &schema,
+                &definition.table_name,
+                &definition.column_name,
+                *dimension,
+            ) {
+                Ok(vectors) => vectors,
+                Err(e) => {
+                    let _ = vector_indexes.drop_index(index_name);
+                    tracing::warn!("Vector index rebuild: scan {} failed: {}", index_name, e);
+                    continue;
+                }
+            };
+            if let Err(e) = vector_indexes.insert_vectors_batch(index_name, &vectors) {
+                let _ = vector_indexes.drop_index(index_name);
+                tracing::warn!("Vector index rebuild: backfill {} failed: {}", index_name, e);
+            }
+        }
+        Ok(())
+    }
+
+    fn collect_existing_vectors(
+        &self,
+        schema: &Schema,
+        table_name: &str,
+        column_name: &str,
+        dimension: usize,
+    ) -> Result<Vec<(u64, crate::vector::Vector)>> {
+        let col_idx = schema
+            .get_column_index(column_name)
+            .ok_or_else(|| Error::query_execution(format!("Column '{}' not found in schema", column_name)))?;
+        let tuples = self
+            .storage
+            .scan_table_with_schema_columns(table_name, schema, &[col_idx])?;
+        let mut vectors = Vec::with_capacity(tuples.len());
+
+        for tuple in tuples {
+            match tuple.values.get(col_idx) {
+                Some(Value::Vector(vec)) => {
+                    if vec.len() != dimension {
+                        return Err(Error::query_execution(format!(
+                            "Vector dimension mismatch while rebuilding '{}.{}': expected {}, got {}",
+                            table_name,
+                            column_name,
+                            dimension,
+                            vec.len()
+                        )));
+                    }
+                    let row_id = tuple.row_id.ok_or_else(|| {
+                        Error::query_execution(format!(
+                            "Cannot rebuild vector index on '{}.{}' from tuple without row_id",
+                            table_name, column_name
+                        ))
+                    })?;
+                    vectors.push((row_id, vec.clone()));
+                }
+                Some(Value::Null) | None => {}
+                Some(other) => {
+                    return Err(Error::query_execution(format!(
+                        "Cannot rebuild vector index on '{}.{}' from non-vector value {:?}",
+                        table_name, column_name, other
+                    )))
+                }
+            }
+        }
+
+        Ok(vectors)
     }
 
     /// Rename a table atomically
@@ -578,6 +818,10 @@ impl<'a> Catalog<'a> {
     /// Build metadata key for table schema
     fn table_metadata_key(table_name: &str) -> Vec<u8> {
         format!("meta:table:{}", table_name).into_bytes()
+    }
+
+    fn index_metadata_key(index_name: &str) -> Vec<u8> {
+        format!("meta:index:{}", index_name).into_bytes()
     }
 
     // -------------------------------------------------------------------

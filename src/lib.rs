@@ -7985,7 +7985,7 @@ impl EmbeddedDatabase {
     }
 
     fn fast_param_or_literal_value(token: &str, params: &[Value], target_type: &DataType) -> Option<Result<Value>> {
-        let token = token.trim();
+        let token = Self::strip_fast_postgres_type_cast(token.trim());
         if let Some(index_str) = token.strip_prefix('$') {
             if !index_str.bytes().all(|b| b.is_ascii_digit()) {
                 return None;
@@ -8025,6 +8025,24 @@ impl EmbeddedDatabase {
 
         let (value, _) = Self::fast_parse_one_value(token, target_type)?;
         Some(Ok(value))
+    }
+
+    fn strip_fast_postgres_type_cast(token: &str) -> &str {
+        let Some(cast_pos) = token.find("::") else {
+            return token;
+        };
+        let suffix = token.get(cast_pos + 2..).unwrap_or_default().trim();
+        if suffix.is_empty() {
+            return token;
+        }
+        if suffix
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.')
+        {
+            token.get(..cast_pos).unwrap_or(token).trim_end()
+        } else {
+            token
+        }
     }
 
     /// Evaluate simple expressions like `col + 0.01`, `col - 5`, `col * 2`, `col || 'suffix'`

@@ -351,6 +351,7 @@ fn lookup_bound_value(expr: &LogicalExpr, parameters: &[Value]) -> Option<Value>
     match expr {
         LogicalExpr::Literal(value) => Some(value.clone()),
         LogicalExpr::Parameter { index } if *index > 0 => parameters.get(index - 1).cloned(),
+        LogicalExpr::Cast { expr, .. } => lookup_bound_value(expr, parameters),
         _ => None,
     }
 }
