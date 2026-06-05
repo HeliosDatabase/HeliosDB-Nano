@@ -127,6 +127,15 @@ pub struct CodeIndexOptions {
     /// peak memory at `n × avg_parsed_file_bytes` instead of
     /// `corpus_size × …`. Recommended for corpora ≥ 10 K files.
     pub chunk_size: Option<usize>,
+    /// Skip the corpus-wide unresolved-reference rebinding pass.
+    /// This leaves in-file references intact and keeps unresolved
+    /// cross-file refs queryable by name, but avoids a large serial
+    /// UPDATE workload on very large corpora.
+    pub skip_cross_file_resolve: bool,
+    /// Skip materialising `_hdb_code_symbol_refs`. Files and symbols
+    /// are still indexed, but call/import/reference graph edges are
+    /// omitted for fast first-pass KB builds.
+    pub skip_symbol_refs: bool,
 }
 
 impl CodeIndexOptions {
@@ -139,6 +148,8 @@ impl CodeIndexOptions {
             force_reparse: false,
             parallelism: None,
             chunk_size: None,
+            skip_cross_file_resolve: false,
+            skip_symbol_refs: false,
         }
     }
 
@@ -505,7 +516,7 @@ pub fn code_index_with_embedder(
     // batched UPDATE+SELECT chatter pays one fsync, not many.
     // Counted into the write timer because it's a serial DB
     // operation, not a parse one.
-    if touched {
+    if touched && !opts.skip_cross_file_resolve {
         let cross_started = std::time::Instant::now();
         if manage_txn {
             db.begin()?;
@@ -523,6 +534,8 @@ pub fn code_index_with_embedder(
             cross_result?;
         }
         stats.write_elapsed_ms += cross_started.elapsed().as_millis() as u64;
+    } else if touched {
+        tracing::debug!("code_index: skipped cross-file reference resolve");
     }
 
     Ok(stats)
@@ -607,7 +620,11 @@ fn drain_chunk(
     // its symbol_ids out of the flat result; convert per-file
     // ResolvedRef.from_idx / to_idx into absolute symbol_ids;
     // collect into one Tuple vec; one bulk_insert_tuples call.
-    let total_refs: usize = prepared.iter().map(|(_, p)| p.resolved.len()).sum();
+    let total_refs: usize = if opts.skip_symbol_refs {
+        0
+    } else {
+        prepared.iter().map(|(_, p)| p.resolved.len()).sum()
+    };
     if total_refs > 0 {
         let written = bulk_insert_refs_batched(db, &prepared, &symbol_ids, &sym_ranges)?;
         stats.refs_written += written;
@@ -1023,7 +1040,8 @@ fn cross_file_resolve(db: &EmbeddedDatabase, stats: &mut CodeIndexStats) -> Resu
         "SELECT edge_id, to_name FROM _hdb_code_symbol_refs WHERE resolution = 'unresolved'",
         &[],
     )?;
-    let mut rebound = 0u64;
+    let mut updates: std::collections::HashMap<(i64, &'static str), Vec<i64>> =
+        std::collections::HashMap::new();
     for row in unresolved {
         let edge_id = match row.values.first() {
             Some(Value::Int4(n)) => *n as i64,
@@ -1037,12 +1055,24 @@ fn cross_file_resolve(db: &EmbeddedDatabase, stats: &mut CodeIndexStats) -> Resu
         let bare = last_segment(&to_name);
         if let Some((id, count)) = first.get(bare) {
             let res = if *count == 1 { "exact" } else { "heuristic" };
+            updates.entry((*id, res)).or_default().push(edge_id);
+        }
+    }
+    let mut rebound = 0u64;
+    const UPDATE_BATCH: usize = 1_000;
+    for ((id, res), edge_ids) in updates {
+        for chunk in edge_ids.chunks(UPDATE_BATCH) {
+            let csv = chunk
+                .iter()
+                .map(|edge_id| edge_id.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
             db.execute(&format!(
                 "UPDATE _hdb_code_symbol_refs \
                    SET to_symbol = {id}, resolution = '{res}' \
-                 WHERE edge_id = {edge_id}"
+                 WHERE edge_id IN ({csv})"
             ))?;
-            rebound += 1;
+            rebound += chunk.len() as u64;
         }
     }
     let _ = rebound;

@@ -4549,6 +4549,8 @@ impl EmbeddedDatabase {
             force_reparse: false,
             parallelism: None,
             chunk_size: None,
+            skip_cross_file_resolve: !meta.resolve_cross_file,
+            skip_symbol_refs: false,
         };
         self.code_index(opts)?;
         Ok(0)
@@ -4614,6 +4616,8 @@ impl EmbeddedDatabase {
                 force_reparse: false,
                 parallelism: None,
                 chunk_size: None,
+                skip_cross_file_resolve: !idx.resolve_cross_file,
+                skip_symbol_refs: false,
             };
             let _ = self.code_index(opts);
         }
