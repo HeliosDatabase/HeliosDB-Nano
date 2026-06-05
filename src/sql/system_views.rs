@@ -13,8 +13,7 @@
 #![allow(unused_variables)]
 
 use crate::sql::SessionRegistry;
-use crate::storage::GlobalStatsCollector;
-use crate::storage::StorageEngine;
+use crate::storage::{ArtIndexType, GlobalStatsCollector, StorageEngine};
 use crate::{Column, DataType, Error, Result, Schema, Tuple, Value};
 use chrono::{DateTime, Utc};
 use lru::LruCache;
@@ -1127,19 +1126,45 @@ impl SystemViewRegistry {
     }
 
     fn execute_pg_indexes(&self, storage: &StorageEngine) -> Result<Vec<Tuple>> {
-        let vector_indexes = storage.vector_indexes();
-        let all_metadata = vector_indexes.list_all_metadata();
         let mut results = Vec::new();
 
-        for metadata in all_metadata {
+        for (index_name, table_name, index_type, columns) in storage.art_indexes().list_indexes() {
+            let (unique, using) = match index_type {
+                ArtIndexType::PrimaryKey | ArtIndexType::Unique => ("UNIQUE ", "btree"),
+                ArtIndexType::Manual => ("", "btree"),
+                ArtIndexType::ForeignKey => ("", "btree"),
+            };
+            let tuple = Tuple::new(vec![
+                Value::String("public".to_string()),
+                Value::String(table_name.clone()),
+                Value::String(index_name.clone()),
+                Value::Null,
+                Value::String(format!(
+                    "CREATE {}INDEX {} ON public.{} USING {} ({})",
+                    unique,
+                    index_name,
+                    table_name,
+                    using,
+                    columns.join(", ")
+                )),
+            ]);
+            results.push(tuple);
+        }
+
+        for metadata in storage.vector_indexes().list_all_metadata() {
+            let opclass = match metadata.distance_metric() {
+                crate::vector::DistanceMetric::Cosine => "vector_cosine_ops",
+                crate::vector::DistanceMetric::L2 => "vector_l2_ops",
+                crate::vector::DistanceMetric::InnerProduct => "vector_ip_ops",
+            };
             let tuple = Tuple::new(vec![
                 Value::String("public".to_string()),
                 Value::String(metadata.table_name.clone()),
                 Value::String(metadata.name.clone()),
                 Value::Null, // tablespace
                 Value::String(format!(
-                    "CREATE INDEX {} ON {} USING hnsw ({})",
-                    metadata.name, metadata.table_name, metadata.column_name
+                    "CREATE INDEX {} ON public.{} USING hnsw ({} {})",
+                    metadata.name, metadata.table_name, metadata.column_name, opclass
                 )),
             ]);
             results.push(tuple);

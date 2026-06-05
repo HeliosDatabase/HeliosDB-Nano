@@ -159,6 +159,27 @@ fn backfill_vector_index(
     Ok(vectors.len())
 }
 
+fn persist_index_definition(
+    storage: &crate::storage::StorageEngine,
+    name: &str,
+    table_name: &str,
+    column_name: &str,
+    index_type: Option<&str>,
+    options: &[crate::sql::logical_plan::IndexOption],
+) -> Result<()> {
+    let definition = crate::storage::PersistedIndexDefinition {
+        table_name: table_name.to_string(),
+        column_name: column_name.to_string(),
+        index_type: index_type.map(str::to_string),
+        options: options.to_vec(),
+    };
+    storage.catalog().save_index_definition(name, &definition)
+}
+
+fn encoded_index_options(options: &[crate::sql::logical_plan::IndexOption]) -> Vec<u8> {
+    bincode::serialize(options).unwrap_or_default()
+}
+
 /// Handle CREATE INDEX logical plan node
 pub(super) fn handle_create_index(executor: &Executor, plan: &LogicalPlan) -> Result<Box<dyn PhysicalOperator>> {
     if let LogicalPlan::CreateIndex {
@@ -182,8 +203,12 @@ pub(super) fn handle_create_index(executor: &Executor, plan: &LogicalPlan) -> Re
                         column_name,
                         backfilled
                     );
+                    persist_index_definition(storage, name, table_name, column_name, Some("art"), options)?;
 
-                    if let Err(e) = storage.log_create_index(name, table_name, column_name, Some("art"), &[]) {
+                    let encoded_options = encoded_index_options(options);
+                    if let Err(e) =
+                        storage.log_create_index(name, table_name, column_name, Some("art"), &encoded_options)
+                    {
                         tracing::warn!("Failed to log CREATE INDEX to WAL: {}", e);
                     }
                 }
@@ -210,9 +235,15 @@ pub(super) fn handle_create_index(executor: &Executor, plan: &LogicalPlan) -> Re
                         table_name,
                         column_name
                     );
-                    if let Err(e) =
-                        storage.log_create_index(name, table_name, column_name, Some(idx_type.as_str()), &[])
-                    {
+                    persist_index_definition(storage, name, table_name, column_name, Some(idx_type.as_str()), options)?;
+                    let encoded_options = encoded_index_options(options);
+                    if let Err(e) = storage.log_create_index(
+                        name,
+                        table_name,
+                        column_name,
+                        Some(idx_type.as_str()),
+                        &encoded_options,
+                    ) {
                         tracing::warn!("Failed to log CREATE INDEX to WAL: {}", e);
                     }
                 } else if idx_type == "hnsw" {
@@ -331,10 +362,23 @@ pub(super) fn handle_create_index(executor: &Executor, plan: &LogicalPlan) -> Re
                             column_name,
                             backfilled
                         );
+                        persist_index_definition(
+                            storage,
+                            name,
+                            table_name,
+                            column_name,
+                            Some("persistent_hnsw"),
+                            options,
+                        )?;
 
-                        if let Err(e) =
-                            storage.log_create_index(name, table_name, column_name, Some("persistent_hnsw"), &[])
-                        {
+                        let encoded_options = encoded_index_options(options);
+                        if let Err(e) = storage.log_create_index(
+                            name,
+                            table_name,
+                            column_name,
+                            Some("persistent_hnsw"),
+                            &encoded_options,
+                        ) {
                             tracing::warn!("Failed to log CREATE INDEX to WAL: {}", e);
                         }
                         return Ok(empty_ddl_result(executor));
@@ -382,11 +426,17 @@ pub(super) fn handle_create_index(executor: &Executor, plan: &LogicalPlan) -> Re
                                 column_name,
                                 backfilled
                             );
+                            persist_index_definition(storage, name, table_name, column_name, Some("hnsw_pq"), options)?;
 
                             // Log to WAL for replication
-                            if let Err(e) =
-                                storage.log_create_index(name, table_name, column_name, Some(idx_type.as_str()), &[])
-                            {
+                            let encoded_options = encoded_index_options(options);
+                            if let Err(e) = storage.log_create_index(
+                                name,
+                                table_name,
+                                column_name,
+                                Some("hnsw_pq"),
+                                &encoded_options,
+                            ) {
                                 tracing::warn!("Failed to log CREATE INDEX to WAL: {}", e);
                             }
                         }
@@ -407,11 +457,24 @@ pub(super) fn handle_create_index(executor: &Executor, plan: &LogicalPlan) -> Re
                                 column_name,
                                 backfilled
                             );
+                            persist_index_definition(
+                                storage,
+                                name,
+                                table_name,
+                                column_name,
+                                index_type.as_deref(),
+                                options,
+                            )?;
 
                             // Log to WAL for replication
-                            if let Err(e) =
-                                storage.log_create_index(name, table_name, column_name, index_type.as_deref(), &[])
-                            {
+                            let encoded_options = encoded_index_options(options);
+                            if let Err(e) = storage.log_create_index(
+                                name,
+                                table_name,
+                                column_name,
+                                index_type.as_deref(),
+                                &encoded_options,
+                            ) {
                                 tracing::warn!("Failed to log CREATE INDEX to WAL: {}", e);
                             }
                         }

@@ -5,6 +5,7 @@
 use heliosdb_nano::{
     sql::SystemViewRegistry, storage::VectorIndexType, vector::DistanceMetric, EmbeddedDatabase, Result, Value,
 };
+use tempfile::TempDir;
 
 /// Test CREATE INDEX ... USING hnsw syntax
 #[test]
@@ -75,6 +76,56 @@ fn test_create_hnsw_index_on_populated_table_backfills_existing_rows() -> Result
             )
         }),
         "pg_indexes should expose the created HNSW index"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_hnsw_index_definition_survives_reopen() -> Result<()> {
+    let temp = TempDir::new().unwrap();
+
+    {
+        let db = EmbeddedDatabase::new(temp.path())?;
+        db.execute("CREATE TABLE hnsw_reopen (id INT4 PRIMARY KEY, embedding VECTOR(3))")?;
+        db.execute("INSERT INTO hnsw_reopen VALUES (1, '[1.0, 0.0, 0.0]')")?;
+        db.execute("INSERT INTO hnsw_reopen VALUES (2, '[0.0, 1.0, 0.0]')")?;
+        db.execute(
+            "CREATE INDEX hnsw_reopen_embedding_idx \
+             ON hnsw_reopen USING hnsw (embedding vector_cosine_ops)",
+        )?;
+        let stats = db
+            .storage
+            .vector_indexes()
+            .get_index_stats("hnsw_reopen_embedding_idx")?;
+        assert_eq!(stats.num_vectors, 2);
+    }
+
+    let db = EmbeddedDatabase::new(temp.path())?;
+    let stats = db
+        .storage
+        .vector_indexes()
+        .get_index_stats("hnsw_reopen_embedding_idx")?;
+    assert_eq!(
+        stats.num_vectors, 2,
+        "HNSW index must be rebuilt from persisted metadata on reopen"
+    );
+
+    let metadata = db.storage.vector_indexes().get_metadata("hnsw_reopen_embedding_idx")?;
+    match metadata.index_type {
+        VectorIndexType::Standard(config) => assert_eq!(config.distance_metric, DistanceMetric::Cosine),
+        other => panic!("expected standard HNSW metadata after reopen, got {other:?}"),
+    }
+
+    let pg_indexes = SystemViewRegistry::new().execute("pg_indexes", &db.storage)?;
+    assert!(
+        pg_indexes.iter().any(|tuple| {
+            matches!(
+                tuple.values.get(2),
+                Some(Value::String(name)) if name == "hnsw_reopen_embedding_idx"
+            )
+        }),
+        "pg_indexes should expose rebuilt HNSW index after reopen"
     );
 
     Ok(())

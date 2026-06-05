@@ -7155,18 +7155,25 @@ impl StorageEngine {
                     "Replayed create index: name={}, table={}, column={}",
                     name, table, column
                 );
-                // Store index metadata for replication
-                let key = format!("meta:index:{}", name).into_bytes();
-                let index_def = bincode::serialize(&(table, column, index_type, options))
-                    .map_err(|e| Error::storage(format!("Failed to serialize index def: {}", e)))?;
-                self.put(&key, &index_def)?;
+                let decoded_options = if options.is_empty() {
+                    Vec::new()
+                } else {
+                    bincode::deserialize(&options)
+                        .map_err(|e| Error::storage(format!("Failed to deserialize index options: {}", e)))?
+                };
+                let definition = crate::storage::PersistedIndexDefinition {
+                    table_name: table,
+                    column_name: column,
+                    index_type,
+                    options: decoded_options,
+                };
+                Catalog::new(self).save_index_definition(&name, &definition)?;
                 Ok(())
             }
 
             WalOperation::DropIndex { name } => {
                 info!("Replayed drop index: name={}", name);
-                let key = format!("meta:index:{}", name).into_bytes();
-                self.delete(&key)?;
+                Catalog::new(self).drop_index_definition(&name)?;
                 Ok(())
             }
 

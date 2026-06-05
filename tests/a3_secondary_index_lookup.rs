@@ -1,8 +1,9 @@
 //! A3 regression coverage: scalar secondary indexes must be populated on
 //! CREATE INDEX and usable for equality point lookups.
 
-use heliosdb_nano::storage::ArtIndexManager;
+use heliosdb_nano::{sql::SystemViewRegistry, storage::ArtIndexManager};
 use heliosdb_nano::{EmbeddedDatabase, Tuple, Value};
+use tempfile::TempDir;
 
 fn int_values(rows: &[Tuple]) -> Vec<i64> {
     rows.iter()
@@ -109,4 +110,50 @@ fn indexed_equality_lookup_coerces_numeric_parameter_to_column_type() {
         )
         .unwrap();
     assert_eq!(int_values(&rows), vec![1, 2]);
+}
+
+#[test]
+fn manual_secondary_index_definition_survives_reopen_and_uuid_lookup_uses_art() {
+    let temp = TempDir::new().unwrap();
+    let uuid = uuid::Uuid::new_v4();
+
+    {
+        let db = EmbeddedDatabase::new(temp.path()).unwrap();
+        db.execute("CREATE TABLE a3_uuid_files (row_no INT PRIMARY KEY, id UUID, path TEXT)")
+            .unwrap();
+        db.execute(&format!("INSERT INTO a3_uuid_files VALUES (1, '{}', 'target')", uuid))
+            .unwrap();
+        db.execute("CREATE INDEX idx_a3_uuid_files_id ON a3_uuid_files(id)")
+            .unwrap();
+        assert_eq!(
+            index_row_count(&db, "idx_a3_uuid_files_id", Value::Uuid(uuid)),
+            1,
+            "UUID secondary index must be populated before close"
+        );
+    }
+
+    let db = EmbeddedDatabase::new(temp.path()).unwrap();
+    assert_eq!(
+        index_row_count(&db, "idx_a3_uuid_files_id", Value::Uuid(uuid)),
+        1,
+        "manual secondary index must be rebuilt from persisted metadata on reopen"
+    );
+
+    let indexes = SystemViewRegistry::new().execute("pg_indexes", &db.storage).unwrap();
+    assert!(
+        indexes.iter().any(|row| matches!(
+            row.values.get(2),
+            Some(Value::String(name)) if name == "idx_a3_uuid_files_id"
+        )),
+        "pg_indexes must expose persisted secondary indexes after reopen"
+    );
+
+    let rows = db
+        .query_params(
+            "SELECT path FROM a3_uuid_files WHERE id = $1::uuid",
+            &[Value::String(uuid.to_string())],
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].values.first(), Some(&Value::String("target".into())));
 }
