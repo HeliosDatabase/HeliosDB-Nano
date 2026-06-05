@@ -5,6 +5,26 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.37.1] - 2026-06-05
+
+Patch release for code-graph indexing throughput and HNSW vector-index planner
+follow-ups.
+
+### Added — Diagnostics
+
+- Added engine-regression bisect reports and a foreign-key validation
+  optimization proposal to preserve the current investigation context.
+
+### Fixed — Code graph
+
+- Batched cross-file code-graph reference rebinding and exposed skip-pass
+  options for faster large-repository indexing.
+
+### Fixed — Vector indexes
+
+- Added the HNSW kNN planner fast path and parallel `CREATE INDEX` backfill
+  coverage, including a regression test for populated vector indexes.
+
 ## [3.37.0] - 2026-06-04
 
 Minor release for Token Dashboard MCP-over-HTTP support and the ada-core HNSW
