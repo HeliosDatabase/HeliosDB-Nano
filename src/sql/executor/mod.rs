@@ -277,6 +277,58 @@ fn direct_expr_column_index(schema: &Schema, expr: &crate::sql::LogicalExpr) -> 
     }
 }
 
+/// Coerce a resolved constant `Value` into a query vector for kNN search.
+///
+/// Accepts the same shapes the vector-distance evaluator does:
+///   * `Value::Vector` — already a vector
+///   * `Value::Array` of numerics — e.g. an array literal bound as a param
+///   * `Value::String` in pgvector `[1,2,3]` text form
+///
+/// Returns `None` for anything that isn't vector-shaped so the caller falls
+/// back to the brute-force scan rather than mis-answering the query.
+fn value_to_query_vector(value: &crate::Value) -> Option<Vec<f32>> {
+    use crate::Value;
+    match value {
+        Value::Vector(v) => Some(v.clone()),
+        Value::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                out.push(value_to_f32(item)?);
+            }
+            Some(out)
+        }
+        Value::String(s) => {
+            let trimmed = s.trim();
+            if !trimmed.starts_with('[') || !trimmed.ends_with(']') {
+                return None;
+            }
+            let inner = trimmed.trim_start_matches('[').trim_end_matches(']').trim();
+            if inner.is_empty() {
+                return Some(Vec::new());
+            }
+            let mut out = Vec::new();
+            for elem in inner.split(',') {
+                out.push(elem.trim().parse::<f32>().ok()?);
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+fn value_to_f32(value: &crate::Value) -> Option<f32> {
+    use crate::Value;
+    match value {
+        Value::Float4(f) => Some(*f),
+        Value::Float8(f) => Some(*f as f32),
+        Value::Int2(i) => Some(*i as f32),
+        Value::Int4(i) => Some(*i as f32),
+        Value::Int8(i) => Some(*i as f32),
+        Value::Numeric(s) | Value::String(s) => s.trim().parse::<f32>().ok(),
+        _ => None,
+    }
+}
+
 fn resolve_sort_columns_to_base(
     sort_exprs: &[crate::sql::LogicalExpr],
     output_schema: &Schema,
@@ -517,6 +569,197 @@ impl<'a> Executor<'a> {
         }
 
         Ok(None)
+    }
+
+    /// Vector kNN fast path: `... ORDER BY col <distance-op> $const LIMIT k`.
+    ///
+    /// Detects the pgvector kNN idiom and, when an HNSW index exists on the
+    /// sorted vector column whose metric matches the distance operator,
+    /// answers the query out of the index instead of brute-force scanning
+    /// every row. Returns `None` (so the caller falls back to the generic
+    /// scan/top-k path) whenever the shape doesn't match or no suitable
+    /// index is present — non-indexed kNN must NOT regress.
+    ///
+    /// Plan shapes handled (mirrors `place_order_by` in the planner):
+    ///   * `Sort(Scan)`
+    ///   * `Project(Sort(Scan))`  — the common `SELECT id ... ORDER BY emb <=> $1` case
+    ///
+    /// The Sort must have a single ascending key `col <op> const`. We pull
+    /// `limit + offset` neighbours from the index, load the full tuples by
+    /// row_id, emit them already ordered by ascending distance through a
+    /// `VectorScanOperator`, re-apply any Project, and cap with the outer
+    /// `LimitOperator` (which applies the `offset` skip).
+    fn try_vector_knn_topk(
+        &self,
+        input: &LogicalPlan,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Option<Box<dyn PhysicalOperator>>> {
+        use crate::sql::{BinaryOperator, LogicalExpr};
+
+        if limit == usize::MAX || self.transaction.is_some() {
+            return Ok(None);
+        }
+        let Some(storage) = self.storage else {
+            return Ok(None);
+        };
+
+        // Peel an optional non-distinct Project off the top, remembering it so
+        // we can re-wrap the indexed scan with it afterwards.
+        let (project_wrap, sort_plan): (Option<(&[LogicalExpr], &[String])>, &LogicalPlan) = match input {
+            LogicalPlan::Sort { .. } => (None, input),
+            LogicalPlan::Project {
+                input: inner,
+                exprs,
+                aliases,
+                distinct: false,
+                distinct_on: None,
+            } if matches!(inner.as_ref(), LogicalPlan::Sort { .. }) => {
+                (Some((exprs.as_slice(), aliases.as_slice())), inner.as_ref())
+            }
+            _ => return Ok(None),
+        };
+
+        let LogicalPlan::Sort {
+            input: sort_input,
+            exprs: sort_exprs,
+            asc,
+        } = sort_plan
+        else {
+            return Ok(None);
+        };
+
+        // Single ascending sort key only. (kNN is always nearest-first; a
+        // DESC distance sort wants the *farthest* rows, which the HNSW index
+        // can't answer cheaply — let it fall through to the brute-force path.)
+        if sort_exprs.len() != 1 || asc.len() != 1 || !asc[0] {
+            return Ok(None);
+        }
+        let LogicalExpr::BinaryExpr { left, op, right } = &sort_exprs[0] else {
+            return Ok(None);
+        };
+        let metric = match op {
+            BinaryOperator::VectorCosineDistance => crate::vector::DistanceMetric::Cosine,
+            BinaryOperator::VectorL2Distance => crate::vector::DistanceMetric::L2,
+            BinaryOperator::VectorInnerProduct => crate::vector::DistanceMetric::InnerProduct,
+            _ => return Ok(None),
+        };
+
+        // The underlying plan must be a plain Scan of a real table.
+        let Some((table_name, scan_schema)) = self.direct_topk_scan_schema(sort_input)? else {
+            return Ok(None);
+        };
+
+        // Identify which operand is the indexed column and which is the query
+        // vector. pgvector writes `col <=> $1`, but `$1 <=> col` is equally
+        // valid and distance is symmetric for all three metrics.
+        let column_name = |expr: &LogicalExpr| -> Option<String> {
+            if let LogicalExpr::Column { name, .. } = expr {
+                if scan_schema.get_column_index(name).is_some() {
+                    return Some(name.clone());
+                }
+            }
+            None
+        };
+        let (col_name, query_expr): (String, &LogicalExpr) = if let Some(name) = column_name(left) {
+            (name, right.as_ref())
+        } else if let Some(name) = column_name(right) {
+            (name, left.as_ref())
+        } else {
+            return Ok(None);
+        };
+
+        // The query side must be a constant we can resolve right now (literal
+        // or bound parameter) — not another column, which would make this a
+        // row-dependent distance the index can't serve.
+        let query_vec = match self.resolve_const_query_vector(query_expr)? {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+
+        // Find an HNSW index on (table, column) whose metric matches the
+        // operator. A cosine index can't answer an L2 ORDER BY correctly.
+        let vector_indexes = storage.vector_indexes();
+        let mut chosen: Option<String> = None;
+        for index_name in vector_indexes.find_indexes(&table_name, &col_name) {
+            if let Ok(meta) = vector_indexes.get_metadata(&index_name) {
+                if meta.distance_metric() == metric && meta.dimension() == query_vec.len() {
+                    chosen = Some(index_name);
+                    break;
+                }
+            }
+        }
+        let Some(index_name) = chosen else {
+            return Ok(None);
+        };
+
+        // Pull k = limit + offset neighbours, already ordered ascending by
+        // distance, then load the full tuples by row_id.
+        let k = limit.saturating_add(offset);
+        let neighbours = vector_indexes.search(&index_name, &query_vec, k)?;
+        let mut results: Vec<(u64, f32)> = Vec::with_capacity(neighbours.len());
+        let mut tuples: Vec<Tuple> = Vec::with_capacity(neighbours.len());
+        for (row_id, distance) in neighbours {
+            if let Some(tuple) = storage.get_row_by_id(&table_name, row_id, scan_schema.as_ref())? {
+                results.push((row_id, distance));
+                tuples.push(tuple);
+            }
+        }
+
+        tracing::debug!(
+            "vector kNN fast path: index '{}' on {}.{} ({:?}) served {} of {} requested neighbours",
+            index_name,
+            table_name,
+            col_name,
+            metric,
+            tuples.len(),
+            k,
+        );
+
+        let scan: Box<dyn PhysicalOperator> =
+            Box::new(VectorScanOperator::new(table_name.clone(), scan_schema.clone(), results, tuples));
+
+        // Re-apply the Project we peeled off, if any.
+        let after_project: Box<dyn PhysicalOperator> = match project_wrap {
+            Some((exprs, aliases)) => {
+                let materialised: Vec<LogicalExpr> = exprs
+                    .iter()
+                    .map(|e| self.materialize_subqueries(e))
+                    .collect::<Result<Vec<_>>>()?;
+                Box::new(
+                    ProjectOperator::new(scan, materialised, aliases.to_vec(), false, self.parameters.clone())
+                        .with_timeout(self.timeout_ctx.clone()),
+                )
+            }
+            None => scan,
+        };
+
+        // VectorScanOperator already returns at most k rows ordered by
+        // ascending distance; the LimitOperator applies the offset skip and
+        // final limit.
+        Ok(Some(Box::new(
+            LimitOperator::new(after_project, limit, offset).with_timeout(self.timeout_ctx.clone()),
+        )))
+    }
+
+    /// Resolve an expression that should be a constant query vector (a vector
+    /// literal, a `[...]`-string literal, or a bound `$N` parameter) into a
+    /// concrete `Vec<f32>`. Returns `Ok(None)` for anything row-dependent or
+    /// not vector-shaped so the caller can fall back to the scan path.
+    fn resolve_const_query_vector(&self, expr: &crate::sql::LogicalExpr) -> Result<Option<Vec<f32>>> {
+        use crate::sql::LogicalExpr;
+        let value = match expr {
+            LogicalExpr::Literal(v) => v.clone(),
+            LogicalExpr::Parameter { index } => match self.parameters.get(index.saturating_sub(1)) {
+                Some(v) => v.clone(),
+                None => return Ok(None),
+            },
+            // `$1::vector` / `'[...]'::vector` — unwrap the cast and resolve
+            // the inner constant; the value is already vector-shaped.
+            LogicalExpr::Cast { expr, .. } => return self.resolve_const_query_vector(expr),
+            _ => return Ok(None),
+        };
+        Ok(value_to_query_vector(&value))
     }
 
     fn direct_topk_project_spec(
@@ -2261,6 +2504,13 @@ impl<'a> Executor<'a> {
                 let k = limit.saturating_add(*offset);
                 let real_bound = *limit != usize::MAX;
                 if real_bound {
+                    // Vector kNN fast path: `ORDER BY col <=>/<->/<#> $const`
+                    // backed by an HNSW index. Tried first because it's the
+                    // most specific shape; falls through (returns None) for
+                    // any non-indexed or non-kNN query so nothing regresses.
+                    if let Some(knn) = self.try_vector_knn_topk(input, *limit, *offset)? {
+                        return Ok(knn);
+                    }
                     if let Some(topk) = self.try_storage_direct_topk(input, *limit, *offset)? {
                         return Ok(topk);
                     }

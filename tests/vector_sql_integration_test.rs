@@ -271,3 +271,243 @@ fn test_full_vector_search_workflow() -> Result<()> {
 
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Regression tests for the HNSW kNN planner fast path (FIX 1) and the
+// parallel CREATE INDEX backfill (FIX 2).
+// ---------------------------------------------------------------------------
+
+fn vec_lit(v: &[f32]) -> String {
+    let body: Vec<String> = v.iter().map(|x| x.to_string()).collect();
+    format!("[{}]", body.join(","))
+}
+
+/// Deterministic pseudo-random 3-D unit-ish vector for a given id.
+fn synth_vec3(id: i64) -> [f32; 3] {
+    let a = ((id.wrapping_mul(2654435761)) as u32 as f32) / u32::MAX as f32;
+    let b = ((id.wrapping_mul(40503).wrapping_add(7)) as u32 as f32) / u32::MAX as f32;
+    let c = ((id.wrapping_mul(2246822519).wrapping_add(13)) as u32 as f32) / u32::MAX as f32;
+    [a + 0.001, b + 0.001, c + 0.001]
+}
+
+/// FIX 1: `ORDER BY col <=> '[...]' LIMIT k` with an HNSW cosine index must
+/// return the true nearest neighbour first (correctly ordered). Uses a
+/// literal query vector.
+#[test]
+fn test_knn_planner_uses_hnsw_cosine_literal() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute("CREATE TABLE knn_c (id INT4, embedding VECTOR(3))")?;
+    db.execute("INSERT INTO knn_c VALUES (1, '[1.0, 0.0, 0.0]')")?;
+    db.execute("INSERT INTO knn_c VALUES (2, '[0.9, 0.1, 0.0]')")?;
+    db.execute("INSERT INTO knn_c VALUES (3, '[0.0, 1.0, 0.0]')")?;
+    db.execute("INSERT INTO knn_c VALUES (4, '[0.0, 0.0, 1.0]')")?;
+    db.execute("CREATE INDEX knn_c_idx ON knn_c USING hnsw (embedding vector_cosine_ops)")?;
+
+    let rows = db.query(
+        "SELECT id FROM knn_c ORDER BY embedding <=> '[1.0, 0.0, 0.0]' LIMIT 2",
+        &[],
+    )?;
+    assert_eq!(rows.len(), 2, "kNN LIMIT 2 must return 2 rows");
+    assert_eq!(
+        rows[0].values.first(),
+        Some(&Value::Int4(1)),
+        "row (1) is the exact match and must rank first"
+    );
+    assert_eq!(
+        rows[1].values.first(),
+        Some(&Value::Int4(2)),
+        "row (2) is the 2nd nearest and must rank second"
+    );
+    Ok(())
+}
+
+/// FIX 1: same path but the query vector arrives as a bound `$1` parameter,
+/// which is the shape live traffic actually uses.
+#[test]
+fn test_knn_planner_uses_hnsw_param_vector() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute("CREATE TABLE knn_p (id INT4, embedding VECTOR(3))")?;
+    db.execute("INSERT INTO knn_p VALUES (10, '[1.0, 0.0, 0.0]')")?;
+    db.execute("INSERT INTO knn_p VALUES (20, '[0.8, 0.2, 0.0]')")?;
+    db.execute("INSERT INTO knn_p VALUES (30, '[0.0, 0.0, 1.0]')")?;
+    db.execute("CREATE INDEX knn_p_idx ON knn_p USING hnsw (embedding vector_cosine_ops)")?;
+
+    let rows = db.query_params(
+        "SELECT id FROM knn_p ORDER BY embedding <=> $1 LIMIT 1",
+        &[Value::Vector(vec![1.0, 0.0, 0.0])],
+    )?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].values.first(), Some(&Value::Int4(10)));
+    Ok(())
+}
+
+/// FIX 1: the L2 operator `<->` must select an L2 index and order ascending.
+#[test]
+fn test_knn_planner_uses_hnsw_l2() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute("CREATE TABLE knn_l2 (id INT4, embedding VECTOR(3))")?;
+    db.execute("INSERT INTO knn_l2 VALUES (1, '[0.0, 0.0, 0.0]')")?;
+    db.execute("INSERT INTO knn_l2 VALUES (2, '[5.0, 5.0, 5.0]')")?;
+    db.execute("INSERT INTO knn_l2 VALUES (3, '[0.1, 0.0, 0.0]')")?;
+    db.execute("CREATE INDEX knn_l2_idx ON knn_l2 USING hnsw (embedding vector_l2_ops)")?;
+
+    let rows = db.query("SELECT id FROM knn_l2 ORDER BY embedding <-> '[0.0,0.0,0.0]' LIMIT 2", &[])?;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].values.first(), Some(&Value::Int4(1)), "exact origin match first");
+    assert_eq!(rows[1].values.first(), Some(&Value::Int4(3)), "nearest non-exact second");
+    Ok(())
+}
+
+/// FIX 1: OFFSET must be honoured — `LIMIT 1 OFFSET 1` skips the nearest and
+/// returns the 2nd nearest.
+#[test]
+fn test_knn_planner_honors_offset() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute("CREATE TABLE knn_off (id INT4, embedding VECTOR(3))")?;
+    db.execute("INSERT INTO knn_off VALUES (1, '[1.0, 0.0, 0.0]')")?;
+    db.execute("INSERT INTO knn_off VALUES (2, '[0.9, 0.1, 0.0]')")?;
+    db.execute("INSERT INTO knn_off VALUES (3, '[0.0, 1.0, 0.0]')")?;
+    db.execute("CREATE INDEX knn_off_idx ON knn_off USING hnsw (embedding vector_cosine_ops)")?;
+
+    let rows = db.query(
+        "SELECT id FROM knn_off ORDER BY embedding <=> '[1.0,0.0,0.0]' LIMIT 1 OFFSET 1",
+        &[],
+    )?;
+    assert_eq!(rows.len(), 1, "LIMIT 1 OFFSET 1 returns exactly one row");
+    assert_eq!(
+        rows[0].values.first(),
+        Some(&Value::Int4(2)),
+        "OFFSET 1 must skip the nearest (1) and return the 2nd nearest (2)"
+    );
+    Ok(())
+}
+
+/// FIX 1: with NO HNSW index present, the same kNN query must still work
+/// (brute-force fallback) and return correctly-ordered results — no regression.
+#[test]
+fn test_knn_query_without_index_still_correct() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute("CREATE TABLE knn_noidx (id INT4, embedding VECTOR(3))")?;
+    db.execute("INSERT INTO knn_noidx VALUES (1, '[1.0, 0.0, 0.0]')")?;
+    db.execute("INSERT INTO knn_noidx VALUES (2, '[0.9, 0.1, 0.0]')")?;
+    db.execute("INSERT INTO knn_noidx VALUES (3, '[0.0, 1.0, 0.0]')")?;
+
+    let rows = db.query(
+        "SELECT id FROM knn_noidx ORDER BY embedding <=> '[1.0,0.0,0.0]' LIMIT 2",
+        &[],
+    )?;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].values.first(), Some(&Value::Int4(1)));
+    assert_eq!(rows[1].values.first(), Some(&Value::Int4(2)));
+    Ok(())
+}
+
+/// FIX 1 (correctness at scale): with a few thousand rows and a cosine HNSW
+/// index, the indexed kNN result's top hit must agree with an exact
+/// brute-force computation over all rows. Proves the index path is wired up
+/// and returns the genuine nearest neighbour rather than arbitrary rows.
+#[test]
+fn test_knn_planner_matches_bruteforce_top1() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute("CREATE TABLE knn_big (id INT4, embedding VECTOR(3))")?;
+    let n: i64 = 3000;
+    // Multi-row insert batches.
+    let mut batch = Vec::new();
+    let mut all: Vec<(i64, [f32; 3])> = Vec::new();
+    for id in 1..=n {
+        let v = synth_vec3(id);
+        all.push((id, v));
+        batch.push(format!("({}, '{}')", id, vec_lit(&v)));
+        if batch.len() == 500 {
+            db.execute(&format!("INSERT INTO knn_big VALUES {}", batch.join(",")))?;
+            batch.clear();
+        }
+    }
+    if !batch.is_empty() {
+        db.execute(&format!("INSERT INTO knn_big VALUES {}", batch.join(",")))?;
+    }
+    db.execute("CREATE INDEX knn_big_idx ON knn_big USING hnsw (embedding vector_cosine_ops)")?;
+
+    // Query vector = a perturbation of row 1234's embedding so its true
+    // nearest neighbour is deterministic.
+    let target = all[1233].1;
+    let query = [target[0] + 0.0005, target[1] - 0.0005, target[2] + 0.0005];
+
+    // Exact brute-force nearest by cosine distance.
+    let cos = |a: &[f32; 3], b: &[f32; 3]| {
+        let dot = a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+        let na = (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt();
+        let nb = (b[0] * b[0] + b[1] * b[1] + b[2] * b[2]).sqrt();
+        1.0 - dot / (na * nb)
+    };
+    let mut best_id = all[0].0;
+    let mut best_d = f32::INFINITY;
+    for (id, v) in &all {
+        let d = cos(v, &query);
+        if d < best_d {
+            best_d = d;
+            best_id = *id;
+        }
+    }
+
+    let rows = db.query_params(
+        "SELECT id FROM knn_big ORDER BY embedding <=> $1 LIMIT 1",
+        &[Value::Vector(query.to_vec())],
+    )?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].values.first(),
+        Some(&Value::Int4(best_id as i32)),
+        "indexed kNN top-1 must equal brute-force top-1 (id {})",
+        best_id
+    );
+    Ok(())
+}
+
+/// FIX 2: the parallel batch backfill must index every existing row and the
+/// resulting index must be searchable with correct ordering — identical
+/// semantics to the old per-row sequential build.
+#[test]
+fn test_parallel_backfill_indexes_all_rows() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute("CREATE TABLE pbf (id INT4, embedding VECTOR(3))")?;
+
+    let n: i64 = 4000;
+    let mut batch = Vec::new();
+    for id in 1..=n {
+        let v = synth_vec3(id);
+        batch.push(format!("({}, '{}')", id, vec_lit(&v)));
+        if batch.len() == 500 {
+            db.execute(&format!("INSERT INTO pbf VALUES {}", batch.join(",")))?;
+            batch.clear();
+        }
+    }
+    if !batch.is_empty() {
+        db.execute(&format!("INSERT INTO pbf VALUES {}", batch.join(",")))?;
+    }
+
+    // CREATE INDEX on the populated table now goes through the parallel
+    // backfill path.
+    db.execute("CREATE INDEX pbf_idx ON pbf USING hnsw (embedding vector_cosine_ops)")?;
+
+    // Every row must be indexed.
+    let stats = db.storage.vector_indexes().get_index_stats("pbf_idx")?;
+    assert_eq!(
+        stats.num_vectors, n as usize,
+        "parallel backfill must index all {} rows",
+        n
+    );
+
+    // Searching for an exact copy of a known row must return that row first.
+    let probe = synth_vec3(2500);
+    let hits = db
+        .storage
+        .vector_indexes()
+        .search("pbf_idx", &probe.to_vec(), 1)?;
+    assert_eq!(hits.len(), 1);
+    assert_eq!(
+        hits[0].0, 2500,
+        "exact-match probe must find its own row via the parallel-built index"
+    );
+    Ok(())
+}

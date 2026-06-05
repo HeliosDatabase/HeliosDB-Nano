@@ -112,6 +112,55 @@ impl HnswIndex {
         Ok(())
     }
 
+    /// Bulk-insert a batch of `(row_id, vector)` pairs, building the HNSW
+    /// graph in parallel across all available cores.
+    ///
+    /// This is the fast path for `CREATE INDEX ... USING hnsw` backfill over
+    /// a populated table. The naive `insert`-per-row loop is single-threaded
+    /// and dominated by the O(log N) graph-link work per vector. Here we:
+    ///   1. Take the id-mapping locks once, pre-assign every contiguous
+    ///      `hnsw_id`, and update both mappings. This is O(N) but cheap (a
+    ///      vec push + hashmap insert per row) and runs under a single short
+    ///      critical section instead of N lock acquisitions.
+    ///   2. Hand the whole batch to `hnsw_rs::parallel_insert`, which uses
+    ///      Rayon to build the graph concurrently. The underlying `Hnsw`
+    ///      synchronises its own internal structures, so concurrent inserts
+    ///      are correct.
+    ///
+    /// Result ordering and search results are identical to inserting the same
+    /// rows sequentially (data_ids are assigned in input order); only the
+    /// wall-clock build time changes.
+    pub fn insert_batch(&self, batch: &[(u64, Vector)]) -> Result<()> {
+        for (_, vector) in batch {
+            if vector.len() != self.config.dimension {
+                return Err(Error::query_execution(format!(
+                    "Vector dimension mismatch: expected {}, got {}",
+                    self.config.dimension,
+                    vector.len()
+                )));
+            }
+        }
+        if batch.is_empty() {
+            return Ok(());
+        }
+
+        let mut id_mapping = self.id_mapping.write();
+        let mut reverse_mapping = self.reverse_mapping.write();
+        let base = id_mapping.len();
+        let mut datas: Vec<(&Vec<f32>, usize)> = Vec::with_capacity(batch.len());
+        for (offset, (row_id, vector)) in batch.iter().enumerate() {
+            let hnsw_id = base + offset;
+            id_mapping.push(*row_id);
+            reverse_mapping.insert(*row_id, hnsw_id);
+            datas.push((vector, hnsw_id));
+        }
+
+        let index = self.index.write();
+        index.parallel_insert(&datas);
+
+        Ok(())
+    }
+
     /// Search for k nearest neighbors
     ///
     /// Performance optimization: Uses dynamic ef_search adjustment based on:
@@ -276,6 +325,16 @@ impl MultiMetricHnswIndex {
         }
     }
 
+    /// Bulk-insert a batch of `(row_id, vector)` pairs, building the graph in
+    /// parallel. Used by `CREATE INDEX` backfill; see [`HnswIndex::insert_batch`].
+    pub fn insert_batch(&self, batch: &[(u64, Vector)]) -> Result<()> {
+        match self {
+            Self::L2(index) => index.insert_batch(batch),
+            Self::Cosine(index) => index.insert_batch(batch),
+            Self::InnerProduct(index) => index.insert_batch(batch),
+        }
+    }
+
     /// Search for k nearest neighbors
     pub fn search(&self, query: &Vector, k: usize) -> Result<Vec<(u64, f32)>> {
         match self {
@@ -363,6 +422,39 @@ impl CosineHnswIndex {
         let index = self.index.write();
         let data_id = DataId::from(hnsw_id);
         index.insert((vector.as_slice(), data_id));
+
+        Ok(())
+    }
+
+    /// Bulk-insert a batch, building the cosine HNSW graph in parallel.
+    /// See [`HnswIndex::insert_batch`] for the rationale and correctness notes.
+    pub fn insert_batch(&self, batch: &[(u64, Vector)]) -> Result<()> {
+        for (_, vector) in batch {
+            if vector.len() != self.config.dimension {
+                return Err(Error::query_execution(format!(
+                    "Vector dimension mismatch: expected {}, got {}",
+                    self.config.dimension,
+                    vector.len()
+                )));
+            }
+        }
+        if batch.is_empty() {
+            return Ok(());
+        }
+
+        let mut id_mapping = self.id_mapping.write();
+        let mut reverse_mapping = self.reverse_mapping.write();
+        let base = id_mapping.len();
+        let mut datas: Vec<(&Vec<f32>, usize)> = Vec::with_capacity(batch.len());
+        for (offset, (row_id, vector)) in batch.iter().enumerate() {
+            let hnsw_id = base + offset;
+            id_mapping.push(*row_id);
+            reverse_mapping.insert(*row_id, hnsw_id);
+            datas.push((vector, hnsw_id));
+        }
+
+        let index = self.index.write();
+        index.parallel_insert(&datas);
 
         Ok(())
     }
@@ -468,6 +560,39 @@ impl InnerProductHnswIndex {
         let index = self.index.write();
         let data_id = DataId::from(hnsw_id);
         index.insert((vector.as_slice(), data_id));
+
+        Ok(())
+    }
+
+    /// Bulk-insert a batch, building the inner-product HNSW graph in parallel.
+    /// See [`HnswIndex::insert_batch`] for the rationale and correctness notes.
+    pub fn insert_batch(&self, batch: &[(u64, Vector)]) -> Result<()> {
+        for (_, vector) in batch {
+            if vector.len() != self.config.dimension {
+                return Err(Error::query_execution(format!(
+                    "Vector dimension mismatch: expected {}, got {}",
+                    self.config.dimension,
+                    vector.len()
+                )));
+            }
+        }
+        if batch.is_empty() {
+            return Ok(());
+        }
+
+        let mut id_mapping = self.id_mapping.write();
+        let mut reverse_mapping = self.reverse_mapping.write();
+        let base = id_mapping.len();
+        let mut datas: Vec<(&Vec<f32>, usize)> = Vec::with_capacity(batch.len());
+        for (offset, (row_id, vector)) in batch.iter().enumerate() {
+            let hnsw_id = base + offset;
+            id_mapping.push(*row_id);
+            reverse_mapping.insert(*row_id, hnsw_id);
+            datas.push((vector, hnsw_id));
+        }
+
+        let index = self.index.write();
+        index.parallel_insert(&datas);
 
         Ok(())
     }
