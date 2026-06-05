@@ -493,7 +493,7 @@ fn test_parallel_backfill_indexes_all_rows() -> Result<()> {
     // Every row must be indexed.
     let stats = db.storage.vector_indexes().get_index_stats("pbf_idx")?;
     assert_eq!(
-        stats.num_vectors, n as usize,
+        stats.num_vectors as i64, n,
         "parallel backfill must index all {} rows",
         n
     );
