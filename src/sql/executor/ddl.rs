@@ -143,14 +143,18 @@ fn backfill_vector_index(
     index_name: &str,
     vectors: &[(u64, crate::vector::Vector)],
 ) -> Result<usize> {
-    for (row_id, vector) in vectors {
-        if let Err(e) = vector_indexes.insert_vector(index_name, *row_id, vector) {
-            let _ = vector_indexes.drop_index(index_name);
-            return Err(Error::query_execution(format!(
-                "Failed to backfill HNSW index '{}': {}",
-                index_name, e
-            )));
-        }
+    // Parallel bulk build: hands the whole batch to the index, which uses
+    // Rayon (`parallel_insert`) to construct the HNSW graph across all cores.
+    // This replaces the old single-threaded per-row `insert_vector` loop and
+    // is the dominant cost of `CREATE INDEX ... USING hnsw` on a populated
+    // table (e.g. ~1120s → far less for 678k vectors). Results are identical
+    // to sequential insertion; only build wall-time changes.
+    if let Err(e) = vector_indexes.insert_vectors_batch(index_name, vectors) {
+        let _ = vector_indexes.drop_index(index_name);
+        return Err(Error::query_execution(format!(
+            "Failed to backfill HNSW index '{}': {}",
+            index_name, e
+        )));
     }
     Ok(vectors.len())
 }

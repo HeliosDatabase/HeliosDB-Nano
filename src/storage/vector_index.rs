@@ -313,6 +313,37 @@ impl VectorIndexManager {
         }
     }
 
+    /// Bulk-insert a batch of `(row_id, vector)` pairs into an index.
+    ///
+    /// For the standard (non-quantized) HNSW backend this builds the graph in
+    /// parallel across all cores via `parallel_insert`, which is dramatically
+    /// faster than the per-row `insert_vector` loop for `CREATE INDEX`
+    /// backfill. Quantized and persistent backends don't expose a parallel
+    /// build path here, so they fall back to the sequential per-row insert —
+    /// correctness is identical either way.
+    pub fn insert_vectors_batch(&self, index_name: &str, batch: &[(u64, Vector)]) -> Result<()> {
+        let indexes = self.indexes.read();
+        let Some(index) = indexes.get(index_name) else {
+            return Err(Error::query_execution(format!("Index '{}' not found", index_name)));
+        };
+        match index {
+            IndexStorage::Standard(idx) => idx.insert_batch(batch),
+            IndexStorage::Quantized(idx) => {
+                for (row_id, vector) in batch {
+                    idx.insert(*row_id, vector)?;
+                }
+                Ok(())
+            }
+            #[cfg(feature = "vector-persist")]
+            IndexStorage::Persistent(idx) => {
+                for (row_id, vector) in batch {
+                    idx.insert(*row_id, vector)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
     /// Search for nearest neighbors
     pub fn search(&self, index_name: &str, query: &Vector, k: usize) -> Result<Vec<(u64, f32)>> {
         let indexes = self.indexes.read();
