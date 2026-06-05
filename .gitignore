@@ -51,3 +51,5 @@ bench-data-predicate-pushdown/
 
 # Agent instructions (local only, not tracked in the repo)
 AGENTS.md
+
+.claude/settings.local.json
