@@ -12,11 +12,13 @@ Use your existing clients (`psql`, `mysql`), RESTful HTTP, drivers (`psycopg2`, 
 
 Nano is one of four products in the HeliosDB family. SDKs and integrations are cross-edition — the same client code works against Nano, Lite, and Full.
 
-- **[dimensigon/heliosdb-sdks](https://github.com/HeliosDatabase/HeliosDB-SDKs)** — Official client SDKs (Python, TypeScript, Rust, Go) + integrations (VS Code, n8n, Zapier, Make, Retool, AutoGen) + cross-platform CLI. Apache 2.0.
-- **[dimensigon/HDB-HeliosDB-Lite](https://github.com/HeliosDatabase/HeliosDB-Lite)** — Production self-hosted database with HeliosProxy + HeliosCore baked in. SSPL-1.0.
-- **[dimensigon/HDB-HeliosDB-Full](https://github.com/HeliosDatabase/HeliosDB-Full)** — Distributed enterprise database with 14 native wire protocols. SSPL-1.0.
-- **[dimensigon/HDB-HeliosDB-Proxy](https://github.com/HeliosDatabase/HeliosDB-Proxy)** — Programmable Postgres data-plane (PgBouncer drop-in + WASM plugins + zero-downtime PG-12→17 upgrade). Apache 2.0.
-- **[dimensigon/HDB-HeliosDB-Proxy-Plugins](https://github.com/HeliosDatabase/HeliosDB-Proxy-Plugins)** · **[Operator](https://github.com/HeliosDatabase/HeliosDB-Proxy-Operator)** · **[Terraform](https://github.com/HeliosDatabase/terraform-provider-HeliosDB-Proxy)** · **[Pulumi](https://github.com/HeliosDatabase/pulumi-HeliosDB-Proxy)** — Proxy ecosystem.
+- **[HeliosDatabase/HeliosDB-SDKs](https://github.com/HeliosDatabase/HeliosDB-SDKs)** — Official client SDKs (Python, TypeScript, Rust, Go) + integrations (VS Code, n8n, Zapier, Make, Retool, AutoGen) + cross-platform CLI. Apache 2.0.
+- **[HeliosDatabase/HeliosDB-Lite](https://github.com/HeliosDatabase/HeliosDB-Lite)** — Production self-hosted database with HeliosProxy + HeliosCore baked in. SSPL-1.0.
+- **[HeliosDatabase/HeliosDB-Full](https://github.com/HeliosDatabase/HeliosDB-Full)** — Distributed enterprise database with 14 native wire protocols. SSPL-1.0.
+- **[HeliosDatabase/HeliosDB-Proxy](https://github.com/HeliosDatabase/HeliosDB-Proxy)** — Programmable Postgres data-plane (PgBouncer drop-in + WASM plugins + zero-downtime PG-12→17 upgrade). Apache 2.0.
+- **[HeliosDatabase/HeliosDB-Proxy-Plugins](https://github.com/HeliosDatabase/HeliosDB-Proxy-Plugins)** · **[Operator](https://github.com/HeliosDatabase/HeliosDB-Proxy-Operator)** · **[Terraform](https://github.com/HeliosDatabase/terraform-provider-HeliosDB-Proxy)** · **[Pulumi](https://github.com/HeliosDatabase/pulumi-HeliosDB-Proxy)** — Proxy ecosystem.
+
+**[HeliosDatabase/HeliosDB-CodeKB-MCP](https://github.com/HeliosDatabase/HeliosDB-CodeKB-MCP)** provides an MCP server that turns HeliosDB codebases and docs into queryable technical knowledge for Claude Code, Codex, and other MCP clients.
 
 **Catalogue:** [heliosdb.com/sdks.html](https://www.heliosdb.com/sdks.html) · **Build with AI agents:** [heliosdb.com/build-with-agents.html](https://www.heliosdb.com/build-with-agents.html) · **LLM-discoverable index:** [heliosdb.com/llms.txt](https://www.heliosdb.com/llms.txt)
 
@@ -27,7 +29,7 @@ Nano is one of four products in the HeliosDB family. SDKs and integrations are c
 npx heliosdb start
 
 # Homebrew (macOS / Linux)
-brew install dimensigon/tap/heliosdb-nano
+brew install HeliosDatabase/tap/heliosdb-nano
 
 # Docker
 docker run -p 5432:5432 -p 3306:3306 -p 8080:8080 heliosdb/nano:latest
@@ -383,7 +385,7 @@ cargo build --release --features ha-full    # everything
 
 ### Connection Routing & Load Balancing
 
-For production deployments with multiple HeliosDB Nano instances, put **[HeliosProxy](https://github.com/dimensigon/heliosdb-proxy)** in front — a standalone binary providing:
+For production deployments with multiple HeliosDB Nano instances, put **[HeliosProxy](https://github.com/HeliosDatabase/HeliosDB-Proxy)** in front — a standalone binary providing:
 
 - Read/write splitting across primary + standbys
 - Automatic failover with transaction replay (Oracle TAF-style)

@@ -24,6 +24,9 @@ struct HAConfig {
     observer_hosts: Option<String>,
     sync_mode: String,
     http_port: u16,
+    http_listen: Option<String>,
+    mcp_token: Option<String>,
+    allow_remote_mcp: bool,
     node_id: Option<String>,
 }
 
@@ -118,9 +121,21 @@ enum Commands {
         #[arg(long, default_value = "async")]
         sync_mode: String,
 
-        /// HTTP API port for health checks (default: 8080)
+        /// HTTP API port for health checks and MCP-over-HTTP (default: 8080, 0 disables HTTP)
         #[arg(long, default_value = "8080")]
         http_port: u16,
+
+        /// HTTP API listen address. Defaults to --listen; use 127.0.0.1 for local MCP while PG listens remotely.
+        #[arg(long)]
+        http_listen: Option<String>,
+
+        /// Bearer token required for MCP-over-HTTP routes. Requires the mcp-endpoint feature.
+        #[arg(long)]
+        mcp_token: Option<String>,
+
+        /// Mount MCP-over-HTTP routes on a non-loopback HTTP listener without MCP auth. Requires mcp-endpoint; unsafe.
+        #[arg(long)]
+        allow_remote_mcp: bool,
 
         /// Node ID (UUID) - auto-generated if not provided
         #[arg(long)]
@@ -306,6 +321,9 @@ async fn main() -> Result<()> {
             observer_hosts,
             sync_mode,
             http_port,
+            http_listen,
+            mcp_token,
+            allow_remote_mcp,
             node_id,
             mysql,
             mysql_listen,
@@ -352,6 +370,9 @@ async fn main() -> Result<()> {
                 observer_hosts,
                 sync_mode,
                 http_port,
+                http_listen,
+                mcp_token,
+                allow_remote_mcp,
                 node_id,
             };
 
@@ -559,6 +580,10 @@ async fn start_server(
 
     println!("[3/4] Configuring server...");
     println!("      - Listen address: {pg_addr}");
+    if ha_config.http_port != 0 {
+        let http_listen = ha_config.http_listen.as_deref().unwrap_or(&listen);
+        println!("      - HTTP address: {http_listen}:{}", ha_config.http_port);
+    }
     println!("      - Max connections: 100");
     println!("      - Authentication: {auth_display}");
     println!("      - SSL/TLS: {}", if tls_enabled { "Enabled" } else { "Disabled" });
@@ -675,15 +700,18 @@ async fn start_server(
     // `--http-port 0` opts out (no HTTP endpoint, no listener).
     let http_health_disabled = ha_config.http_port == 0;
     if !http_health_disabled {
-        let http_addr: SocketAddr = format!("{}:{}", listen, ha_config.http_port)
+        let http_listen = ha_config.http_listen.as_deref().unwrap_or(&listen);
+        let http_addr: SocketAddr = format!("{}:{}", http_listen, ha_config.http_port)
             .parse()
             .map_err(|e| Error::config(format!("Invalid HTTP address: {e}")))?;
         match tokio::net::TcpListener::bind(http_addr).await {
             Ok(listener) => {
                 info!("HTTP endpoint at http://{} (/health)", http_addr);
                 let http_db = Arc::clone(&db);
+                let mcp_token = ha_config.mcp_token.clone();
+                let allow_remote_mcp = ha_config.allow_remote_mcp;
                 tokio::spawn(async move {
-                    if let Err(e) = run_http_listener(listener, http_db).await {
+                    if let Err(e) = run_http_listener(listener, http_db, mcp_token, allow_remote_mcp).await {
                         tracing::error!("HTTP server accept loop exited: {e}");
                     }
                 });
@@ -1090,6 +1118,17 @@ async fn start_server_daemon(
     args.push(ha_config.sync_mode.clone());
     args.push("--http-port".to_string());
     args.push(ha_config.http_port.to_string());
+    if let Some(http_listen) = ha_config.http_listen {
+        args.push("--http-listen".to_string());
+        args.push(http_listen);
+    }
+    if let Some(mcp_token) = ha_config.mcp_token {
+        args.push("--mcp-token".to_string());
+        args.push(mcp_token);
+    }
+    if ha_config.allow_remote_mcp {
+        args.push("--allow-remote-mcp".to_string());
+    }
     if let Some(primary) = ha_config.primary_host {
         args.push("--primary-host".to_string());
         args.push(primary);
@@ -1573,6 +1612,8 @@ async fn start_ha_components(
 async fn run_http_listener(
     listener: tokio::net::TcpListener,
     db: std::sync::Arc<EmbeddedDatabase>,
+    mcp_token: Option<String>,
+    allow_remote_mcp: bool,
 ) -> std::io::Result<()> {
     use axum::{routing::get, Json, Router};
 
@@ -1585,8 +1626,18 @@ async fn run_http_listener(
     #[cfg(feature = "mcp-endpoint")]
     let app = {
         let http_addr = listener.local_addr()?;
-        let state = heliosdb_nano::mcp::McpState::new(db);
-        match heliosdb_nano::mcp::bind_safety_check(http_addr, &state.auth) {
+        let state = if let Some(token) = mcp_token {
+            heliosdb_nano::mcp::McpState::new(db)
+                .with_auth(heliosdb_nano::mcp::McpAuth::BearerToken(std::sync::Arc::from(token)))
+        } else {
+            heliosdb_nano::mcp::McpState::new(db)
+        };
+        let bind_result = if allow_remote_mcp {
+            Ok(())
+        } else {
+            heliosdb_nano::mcp::bind_safety_check(http_addr, &state.auth)
+        };
+        match bind_result {
             Ok(()) => {
                 tracing::info!("MCP endpoint mounted at http://{}/mcp", http_addr);
                 heliosdb_nano::mcp::attach_mcp_routes(app, state)
@@ -1599,7 +1650,12 @@ async fn run_http_listener(
     };
 
     #[cfg(not(feature = "mcp-endpoint"))]
-    let _ = db;
+    {
+        if mcp_token.is_some() || allow_remote_mcp {
+            tracing::warn!("MCP HTTP flags were supplied, but this binary was not built with the mcp-endpoint feature");
+        }
+        let _ = db;
+    }
 
     axum::serve(listener, app).await
 }
@@ -1617,7 +1673,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let handle = tokio::spawn(async move {
-            let _ = run_http_listener(listener, db).await;
+            let _ = run_http_listener(listener, db, None, false).await;
         });
 
         let body: Value = reqwest::get(format!("http://{addr}/health"))
@@ -1638,7 +1694,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let handle = tokio::spawn(async move {
-            let _ = run_http_listener(listener, db).await;
+            let _ = run_http_listener(listener, db, None, false).await;
         });
 
         let resp: Value = reqwest::Client::new()
@@ -1656,6 +1712,65 @@ mod tests {
                 .map_or(false, |tools| !tools.is_empty()),
             "expected MCP tools/list response, got {resp}"
         );
+
+        handle.abort();
+    }
+
+    #[cfg(feature = "mcp-endpoint")]
+    #[tokio::test]
+    async fn daemon_http_listener_does_not_mount_remote_mcp_without_auth() {
+        let db = std::sync::Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let addr = format!("127.0.0.1:{port}");
+        let handle = tokio::spawn(async move {
+            let _ = run_http_listener(listener, db, None, false).await;
+        });
+
+        let health: Value = reqwest::get(format!("http://{addr}/health"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(health["status"], "ok");
+
+        let status = reqwest::get(format!("http://{addr}/mcp/info")).await.unwrap().status();
+        assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
+
+        handle.abort();
+    }
+
+    #[cfg(feature = "mcp-endpoint")]
+    #[tokio::test]
+    async fn daemon_http_listener_mounts_remote_mcp_with_bearer_token() {
+        let db = std::sync::Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let addr = format!("127.0.0.1:{port}");
+        let handle = tokio::spawn(async move {
+            let _ = run_http_listener(listener, db, Some("td8-secret".to_string()), false).await;
+        });
+
+        let client = reqwest::Client::new();
+        let unauth = client
+            .get(format!("http://{addr}/mcp/info"))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(unauth, reqwest::StatusCode::UNAUTHORIZED);
+
+        let info: Value = client
+            .get(format!("http://{addr}/mcp/info"))
+            .bearer_auth("td8-secret")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(info["serverInfo"]["name"], "heliosdb-nano");
 
         handle.abort();
     }

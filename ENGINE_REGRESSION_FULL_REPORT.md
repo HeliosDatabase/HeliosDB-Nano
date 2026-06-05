@@ -46,7 +46,7 @@ The line to compare across versions is:
 code_index ms : parse=<P> write=<W> workers=<N> chunks=<C>
 ```
 
-Plugin source (no edits required for repro): `https://github.com/dimensigon/heliosdb-codekb-mcp`, branch `main`, commit `af4f38e` or later.
+Plugin source (no edits required for repro): `https://github.com/HeliosDatabase/heliosdb-codekb-mcp`, branch `main`, commit `af4f38e` or later.
 
 ## Where the time goes (suspects)
 

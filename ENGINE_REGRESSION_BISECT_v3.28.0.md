@@ -77,7 +77,7 @@ Total ~1.15 billion tuple comparisons. At ~350M comparisons/sec (rough order on 
 
 ## v3.31.2 status (2026-05-19) — **T1 SHIPPED in PR #3, regression closed**
 
-Engine-side T1 fix landed at [Dimensigon/HDB-HeliosDB-Nano#3](https://github.com/dimensigon/HDB-HeliosDB-Nano/pull/3) and validated end-to-end against this report's repro corpus:
+Engine-side T1 fix landed at [HeliosDatabase/HDB-HeliosDB-Nano#3](https://github.com/HeliosDatabase/HDB-HeliosDB-Nano/pull/3) and validated end-to-end against this report's repro corpus:
 
 | Engine pin | `code_index ms write=` | Total ingest |
 |---|---|---|

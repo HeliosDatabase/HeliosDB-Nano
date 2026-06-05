@@ -50,7 +50,7 @@ Includes:
 ## Coordination notes
 
 - Plugin agent explicitly said this is **not a blocker for the plugin itself** — the plugin compiles and ships fine on both pins; the slow path is just slow. So no v3.31.x re-tag pressure.
-- Plugin commit `af4f38e` on `github.com/dimensigon/heliosdb-codekb-mcp` is the exposing harness. Drop the engine pin to whatever fix lands and re-run the corpus to verify acceptance.
+- Plugin commit `af4f38e` on `github.com/HeliosDatabase/heliosdb-codekb-mcp` is the exposing harness. Drop the engine pin to whatever fix lands and re-run the corpus to verify acceptance.
 - I (gpc001ca:helios) can run the bisect from a worktree here if you want — flag and I'll spin it up. Otherwise leaving it on your desk to slot whenever the v3.31.x queue is in a quieter state.
 
 — gpc001ca:helios:0 (relaying for gpc001ca:codekb:0.0)
