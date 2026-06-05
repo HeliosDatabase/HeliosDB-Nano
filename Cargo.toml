@@ -3,10 +3,10 @@ members = [".", "bindings/python"]
 
 [package]
 name = "heliosdb-nano"
-version = "3.37.2"
+version = "3.37.3"
 edition = "2021"
 rust-version = "1.85"
-authors = ["Daniel Moya <daniel.moya@dimensigon.com>"]
+authors = ["Daniel Moya <daniel.moya@HeliosDatabase.com>"]
 license = "Apache-2.0"
 description = "PostgreSQL-compatible embedded database with TDE + ZKE encryption, HNSW vector search, Product Quantization, git-like branching, time-travel queries, materialized views, row-level security, and 50+ enterprise features"
 repository = "https://github.com/HeliosDatabase/HeliosDB-Nano"
@@ -267,7 +267,7 @@ fips = ["dep:aws-lc-rs"]
 # HIGH AVAILABILITY FEATURE FLAGS
 # =============================================================================
 # Note: For connection routing / load balancing / failover proxy, use the
-# standalone HeliosProxy binary: https://github.com/dimensigon/heliosdb-proxy
+# standalone HeliosProxy binary: https://github.com/HeliosDatabase/heliosdb-proxy
 # See docs/guides/HIGH_AVAILABILITY_OVERVIEW.md for full documentation.
 
 # HA Tier 1: Warm Standby (Active-Passive) — ENABLED BY DEFAULT

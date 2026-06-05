@@ -17,12 +17,8 @@ fn first_string(rows: &[Tuple]) -> Option<String> {
 
 fn seed(db: &EmbeddedDatabase) -> Result<()> {
     db.execute("CREATE TABLE leads (id INT PRIMARY KEY, profile TEXT)")?;
-    db.execute(
-        "INSERT INTO leads VALUES (1, '{\"linkedin_url\": \"https://x.test/in/a\", \"score\": 7}')",
-    )?;
-    db.execute(
-        "INSERT INTO leads VALUES (2, '{\"linkedin_url\": \"https://x.test/in/b\", \"score\": 3}')",
-    )?;
+    db.execute("INSERT INTO leads VALUES (1, '{\"linkedin_url\": \"https://x.test/in/a\", \"score\": 7}')")?;
+    db.execute("INSERT INTO leads VALUES (2, '{\"linkedin_url\": \"https://x.test/in/b\", \"score\": 3}')")?;
     Ok(())
 }
 
@@ -31,17 +27,11 @@ fn json_text_operator_extracts_without_cast() -> Result<()> {
     let db = EmbeddedDatabase::new_in_memory()?;
     seed(&db)?;
 
-    let rows = db.query(
-        "SELECT profile->>'linkedin_url' FROM leads WHERE id = 1",
-        &[],
-    )?;
+    let rows = db.query("SELECT profile->>'linkedin_url' FROM leads WHERE id = 1", &[])?;
     assert_eq!(first_string(&rows).as_deref(), Some("https://x.test/in/a"));
 
     // The ::json cast must keep working too (no regression).
-    let rows_cast = db.query(
-        "SELECT profile::json->>'linkedin_url' FROM leads WHERE id = 1",
-        &[],
-    )?;
+    let rows_cast = db.query("SELECT profile::json->>'linkedin_url' FROM leads WHERE id = 1", &[])?;
     assert_eq!(first_string(&rows_cast).as_deref(), Some("https://x.test/in/a"));
     Ok(())
 }

@@ -4,6 +4,7 @@
 //! * unauthenticated requests get 401
 //! * read-scoped tokens succeed on `tools/list` but get 403 on `tools/call`
 //! * write-scoped tokens succeed on both
+//! * static Bearer tokens can protect operator-managed HTTP MCP routes
 //! * `bind_safety_check` refuses non-loopback binds when auth is disabled
 
 #![cfg(feature = "mcp-endpoint")]
@@ -119,6 +120,37 @@ async fn write_scope_passes_tools_call() {
     handle.abort();
 }
 
+#[tokio::test]
+async fn bearer_token_passes_tools_list() {
+    let (addr, handle) = bind_with_auth(McpAuth::BearerToken(Arc::from("td8-secret"))).await;
+    let resp: Value = reqwest::Client::new()
+        .post(format!("http://{addr}"))
+        .bearer_auth("td8-secret")
+        .json(&json!({ "jsonrpc": "2.0", "id": 5, "method": "tools/list", "params": {} }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(resp["result"]["tools"].is_array(), "got {resp}");
+    handle.abort();
+}
+
+#[tokio::test]
+async fn bearer_token_wrong_value_returns_401() {
+    let (addr, handle) = bind_with_auth(McpAuth::BearerToken(Arc::from("td8-secret"))).await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}"))
+        .bearer_auth("wrong")
+        .json(&json!({ "jsonrpc": "2.0", "id": 6, "method": "tools/list", "params": {} }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 401);
+    handle.abort();
+}
+
 #[test]
 fn bind_safety_loopback_with_disabled_ok() {
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
@@ -136,5 +168,12 @@ fn bind_safety_unspecified_disabled_refused() {
 fn bind_safety_unspecified_jwt_ok() {
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8080);
     let auth = McpAuth::Jwt(Arc::new(JwtManager::new(b"strong-secret")));
+    assert!(bind_safety_check(addr, &auth).is_ok());
+}
+
+#[test]
+fn bind_safety_unspecified_bearer_token_ok() {
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8080);
+    let auth = McpAuth::BearerToken(Arc::from("strong-token"));
     assert!(bind_safety_check(addr, &auth).is_ok());
 }

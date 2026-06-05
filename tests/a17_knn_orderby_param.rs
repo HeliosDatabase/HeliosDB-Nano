@@ -67,10 +67,7 @@ fn knn_orderby_expr_full_sort_sorts_by_distance() -> Result<()> {
     let q = vec![Value::Vector(vec![0.0, 0.0, 0.0])];
 
     // No LIMIT: plain SortOperator path.
-    let rows = db.query_params(
-        "SELECT id, vec <-> $1 AS d FROM knn_items ORDER BY vec <-> $1",
-        &q,
-    )?;
+    let rows = db.query_params("SELECT id, vec <-> $1 AS d FROM knn_items ORDER BY vec <-> $1", &q)?;
     assert_eq!(ids(&rows), vec![1, 2, 3, 4]);
     Ok(())
 }
@@ -86,10 +83,7 @@ fn knn_orderby_expr_matches_alias_form() -> Result<()> {
         "SELECT id, vec <-> $1 AS d FROM knn_items ORDER BY vec <-> $1 LIMIT 4",
         &q,
     )?;
-    let alias_form = db.query_params(
-        "SELECT id, vec <-> $1 AS d FROM knn_items ORDER BY d LIMIT 4",
-        &q,
-    )?;
+    let alias_form = db.query_params("SELECT id, vec <-> $1 AS d FROM knn_items ORDER BY d LIMIT 4", &q)?;
     assert_eq!(ids(&expr_form), ids(&alias_form));
     assert_eq!(ids(&expr_form), vec![1, 2, 3, 4]);
     Ok(())

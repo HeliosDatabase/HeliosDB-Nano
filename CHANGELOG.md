@@ -5,6 +5,27 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.37.3] - 2026-06-05
+
+Patch target for Token Dashboard TD#8: operator-safe MCP-over-HTTP
+non-loopback deployment without requiring a socat bridge.
+
+### Added — MCP / HTTP
+
+- Added `start --http-listen <addr>` so the HTTP health/MCP listener can bind
+  separately from the PostgreSQL wire listener configured by `--listen`.
+- Added `start --mcp-token <token>` to require Bearer-token auth on MCP HTTP
+  routes and permit non-loopback MCP route mounting through the existing bind
+  safety policy.
+- Added `start --allow-remote-mcp` as an explicit unsafe operator override for
+  unauthenticated non-loopback MCP route mounting. Prefer `--mcp-token`.
+
+### Fixed — MCP / HTTP
+
+- Preserved the safe default: non-loopback HTTP listeners still serve
+  `/health`, but MCP routes remain unmounted unless MCP auth or the explicit
+  unsafe override is configured.
+
 ## [3.37.1] - 2026-06-05
 
 Patch release for code-graph indexing throughput and HNSW vector-index planner

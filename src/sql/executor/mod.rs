@@ -716,8 +716,12 @@ impl<'a> Executor<'a> {
             k,
         );
 
-        let scan: Box<dyn PhysicalOperator> =
-            Box::new(VectorScanOperator::new(table_name.clone(), scan_schema.clone(), results, tuples));
+        let scan: Box<dyn PhysicalOperator> = Box::new(VectorScanOperator::new(
+            table_name.clone(),
+            scan_schema.clone(),
+            results,
+            tuples,
+        ));
 
         // Re-apply the Project we peeled off, if any.
         let after_project: Box<dyn PhysicalOperator> = match project_wrap {

@@ -5,8 +5,10 @@ use heliosdb_nano::EmbeddedDatabase;
 #[test]
 fn b31_qualified_select_via_query_params() {
     let db = EmbeddedDatabase::new_in_memory().unwrap();
-    db.execute("CREATE TABLE leads (id TEXT, email TEXT, first_name TEXT)").unwrap();
-    db.execute("INSERT INTO leads (id, email, first_name) VALUES ('x', 'e@x.com', 'n')").unwrap();
+    db.execute("CREATE TABLE leads (id TEXT, email TEXT, first_name TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO leads (id, email, first_name) VALUES ('x', 'e@x.com', 'n')")
+        .unwrap();
 
     // unqualified — known-good
     let r = db.query_params("SELECT id, email FROM leads", &[]).unwrap();

@@ -1040,8 +1040,7 @@ fn cross_file_resolve(db: &EmbeddedDatabase, stats: &mut CodeIndexStats) -> Resu
         "SELECT edge_id, to_name FROM _hdb_code_symbol_refs WHERE resolution = 'unresolved'",
         &[],
     )?;
-    let mut updates: std::collections::HashMap<(i64, &'static str), Vec<i64>> =
-        std::collections::HashMap::new();
+    let mut updates: std::collections::HashMap<(i64, &'static str), Vec<i64>> = std::collections::HashMap::new();
     for row in unresolved {
         let edge_id = match row.values.first() {
             Some(Value::Int4(n)) => *n as i64,

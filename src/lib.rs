@@ -302,7 +302,7 @@ pub mod mcp;
 pub mod replication;
 
 // Connection routing, load balancing, and failover proxy live in the
-// standalone HeliosProxy binary: https://github.com/dimensigon/heliosdb-proxy
+// standalone HeliosProxy binary: https://github.com/HeliosDatabase/heliosdb-proxy
 
 // Branch-Based A/B Testing
 #[cfg(feature = "ha-ab-testing")]

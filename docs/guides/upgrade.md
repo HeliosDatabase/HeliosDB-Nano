@@ -24,7 +24,7 @@ automatic via WAL replay.
 heliosdb-nano stop --data-dir ./mydata
 
 # Swap the binary (npx, brew, docker tag, or direct download)
-brew upgrade dimensigon/tap/heliosdb-nano   # macOS / Linux
+brew upgrade HeliosDatabase/tap/heliosdb-nano   # macOS / Linux
 # or
 docker pull heliosdb/nano:latest
 # or

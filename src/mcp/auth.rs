@@ -39,6 +39,10 @@ pub enum McpAuth {
     /// JWT-based: every request must carry a valid Bearer token with
     /// the appropriate `mcp:*` scope.
     Jwt(Arc<JwtManager>),
+    /// Static Bearer token auth for operator-managed deployments.
+    /// This does not encode scopes; a matching token authorizes both
+    /// read and write MCP methods.
+    BearerToken(Arc<str>),
 }
 
 impl std::fmt::Debug for McpAuth {
@@ -46,6 +50,7 @@ impl std::fmt::Debug for McpAuth {
         match self {
             McpAuth::Disabled => write!(f, "McpAuth::Disabled"),
             McpAuth::Jwt(_) => write!(f, "McpAuth::Jwt(<manager>)"),
+            McpAuth::BearerToken(_) => write!(f, "McpAuth::BearerToken(<redacted>)"),
         }
     }
 }
@@ -93,6 +98,18 @@ impl McpAuth {
                 }
                 Ok(Some(claims))
             }
+            McpAuth::BearerToken(expected) => {
+                let token = header_value
+                    .and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")))
+                    .ok_or(AuthError::MissingToken)?;
+                if token == expected.as_ref() {
+                    Ok(None)
+                } else {
+                    Err(AuthError::InvalidToken(Error::config(
+                        "bearer token mismatch".to_string(),
+                    )))
+                }
+            }
         }
     }
 }
@@ -126,8 +143,8 @@ impl AuthError {
 
 /// Refuse to bind a TCP listener on a non-loopback address unless an
 /// authenticator is configured. Stops the common footgun of running
-/// `--mcp-bind 0.0.0.0` against a default-built nano with no auth set
-/// up.
+/// `--http-listen 0.0.0.0` against a default-built nano with no MCP
+/// auth set up.
 pub fn bind_safety_check(addr: SocketAddr, auth: &McpAuth) -> Result<(), String> {
     let is_loopback = match addr.ip() {
         IpAddr::V4(v4) => v4.is_loopback(),
@@ -139,10 +156,11 @@ pub fn bind_safety_check(addr: SocketAddr, auth: &McpAuth) -> Result<(), String>
     match auth {
         McpAuth::Disabled => Err(format!(
             "refusing to bind MCP endpoint on non-loopback address {addr}: \
-             authentication is disabled. Configure McpAuth::Jwt(...) or bind \
-             to 127.0.0.1 / [::1] / a Unix socket instead."
+             authentication is disabled. Configure McpAuth::Jwt(...), \
+             McpAuth::BearerToken(...), or bind to 127.0.0.1 / [::1] / \
+             a Unix socket instead."
         )),
-        McpAuth::Jwt(_) => Ok(()),
+        McpAuth::Jwt(_) | McpAuth::BearerToken(_) => Ok(()),
     }
 }
 
@@ -239,6 +257,23 @@ mod tests {
     }
 
     #[test]
+    fn bearer_token_passes_for_read_and_write() {
+        let auth = McpAuth::BearerToken(Arc::from("test-token"));
+        assert!(auth.check(Some("Bearer test-token"), Scope::Read).is_ok());
+        assert!(auth.check(Some("bearer test-token"), Scope::Write).is_ok());
+    }
+
+    #[test]
+    fn bearer_token_rejects_missing_or_wrong_token() {
+        let auth = McpAuth::BearerToken(Arc::from("test-token"));
+        assert!(matches!(auth.check(None, Scope::Read), Err(AuthError::MissingToken)));
+        assert!(matches!(
+            auth.check(Some("Bearer wrong-token"), Scope::Read),
+            Err(AuthError::InvalidToken(_))
+        ));
+    }
+
+    #[test]
     fn loopback_bind_always_ok() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9000);
         assert!(bind_safety_check(addr, &McpAuth::Disabled).is_ok());
@@ -255,6 +290,13 @@ mod tests {
     fn public_bind_jwt_ok() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 9000);
         let auth = McpAuth::Jwt(Arc::new(JwtManager::new(b"strong-secret")));
+        assert!(bind_safety_check(addr, &auth).is_ok());
+    }
+
+    #[test]
+    fn public_bind_bearer_token_ok() {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 9000);
+        let auth = McpAuth::BearerToken(Arc::from("strong-token"));
         assert!(bind_safety_check(addr, &auth).is_ok());
     }
 

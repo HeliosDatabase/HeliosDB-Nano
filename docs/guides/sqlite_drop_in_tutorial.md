@@ -55,7 +55,7 @@ on traffic volume:
 | **Embedded** | Single-process scripts, CLIs, dev/CI fixtures, anything that opens one connection and holds it. | Default. Just install the SDK and ensure `heliosdb-nano` is on `PATH` (or set `HELIOSDB_BIN=`). |
 | **Daemon** | Long-running dashboards, web apps, anything that opens many short-lived connections. | Set `HELIOSDB_DSN=postgresql://user:pw@host:port/db` and pass `mode='daemon'` to `connect()`. |
 
-The PoC port for [token-dashboard](https://github.com/Dimensigon/token-dashboard)
+The PoC port for [token-dashboard](https://github.com/HeliosDatabase/token-dashboard)
 toggles modes from a single env var:
 
 ```python

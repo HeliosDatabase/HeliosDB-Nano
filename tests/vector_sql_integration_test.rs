@@ -402,10 +402,21 @@ fn test_knn_planner_uses_hnsw_l2() -> Result<()> {
     db.execute("INSERT INTO knn_l2 VALUES (3, '[0.1, 0.0, 0.0]')")?;
     db.execute("CREATE INDEX knn_l2_idx ON knn_l2 USING hnsw (embedding vector_l2_ops)")?;
 
-    let rows = db.query("SELECT id FROM knn_l2 ORDER BY embedding <-> '[0.0,0.0,0.0]' LIMIT 2", &[])?;
+    let rows = db.query(
+        "SELECT id FROM knn_l2 ORDER BY embedding <-> '[0.0,0.0,0.0]' LIMIT 2",
+        &[],
+    )?;
     assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0].values.first(), Some(&Value::Int4(1)), "exact origin match first");
-    assert_eq!(rows[1].values.first(), Some(&Value::Int4(3)), "nearest non-exact second");
+    assert_eq!(
+        rows[0].values.first(),
+        Some(&Value::Int4(1)),
+        "exact origin match first"
+    );
+    assert_eq!(
+        rows[1].values.first(),
+        Some(&Value::Int4(3)),
+        "nearest non-exact second"
+    );
     Ok(())
 }
 
@@ -551,10 +562,7 @@ fn test_parallel_backfill_indexes_all_rows() -> Result<()> {
 
     // Searching for an exact copy of a known row must return that row first.
     let probe = synth_vec3(2500);
-    let hits = db
-        .storage
-        .vector_indexes()
-        .search("pbf_idx", &probe.to_vec(), 1)?;
+    let hits = db.storage.vector_indexes().search("pbf_idx", &probe.to_vec(), 1)?;
     assert_eq!(hits.len(), 1);
     assert_eq!(
         hits[0].0, 2500,
