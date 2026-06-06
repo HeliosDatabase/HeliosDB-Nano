@@ -24,18 +24,87 @@ Nano is one of four products in the HeliosDB family. SDKs and integrations are c
 
 ## Install
 
+### Supported now: Cargo / crates.io
+
+Install Rust and Cargo first. On Linux, macOS, or WSL, the recommended installer
+is `rustup`:
+
 ```bash
-# npm (cross-platform, auto-downloads binary)
-npx heliosdb start
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+rustc --version
+cargo --version
+```
 
-# Homebrew (macOS / Linux)
-brew install HeliosDatabase/tap/heliosdb-nano
+On Windows, install Rust from [rustup.rs](https://rustup.rs/), then open a new
+terminal so `cargo` is on `PATH`.
 
-# Docker
-docker run -p 5432:5432 -p 3306:3306 -p 8080:8080 heliosdb/nano:latest
+Install the `heliosdb-nano` CLI binary from crates.io:
 
-# Binary release
-curl -L https://github.com/HeliosDatabase/HeliosDB-Nano/releases/latest/download/heliosdb-nano-$(uname -m)-$(uname -s | tr A-Z a-z).tar.gz | tar xz
+```bash
+cargo install heliosdb-nano --locked
+heliosdb-nano --version
+```
+
+Use Nano as an embedded Rust library:
+
+```bash
+cargo add heliosdb-nano
+```
+
+Enable optional crate features when installing or adding the dependency:
+
+```bash
+cargo install heliosdb-nano --locked --features code-graph,mcp-endpoint
+cargo add heliosdb-nano --features code-graph,mcp-endpoint
+```
+
+Build from source:
+
+```bash
+git clone https://github.com/HeliosDatabase/HeliosDB-Nano.git
+cd HeliosDB-Nano
+cargo build --release --locked
+./target/release/heliosdb-nano --version
+```
+
+### Channels Not Yet Active
+
+`npx`, Homebrew, Docker, and direct binary downloads are not active Nano release
+channels yet. Use Cargo for a verified install today.
+
+If those channels are announced in a future release, you can prepare your
+machine with the matching tool first. Installing these tools only makes your
+machine ready; it does not install Nano until the corresponding Nano package,
+formula, image, or binary asset has been published.
+
+For `npx`, install Node.js LTS from [nodejs.org](https://nodejs.org/) or with
+`nvm`, then verify:
+
+```bash
+node --version
+npx --version
+```
+
+For Homebrew, install `brew` from [brew.sh](https://brew.sh/), then verify:
+
+```bash
+brew --version
+```
+
+For Docker, install Docker Desktop, Docker Engine, or Podman, start the daemon,
+then verify:
+
+```bash
+docker --version
+```
+
+For direct binary downloads, use only archives and checksums attached to an
+official [GitHub Release](https://github.com/HeliosDatabase/HeliosDB-Nano/releases),
+then verify the extracted binary:
+
+```bash
+./heliosdb-nano --version
 ```
 
 ## Start the Server
