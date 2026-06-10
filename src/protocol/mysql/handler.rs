@@ -2596,7 +2596,9 @@ fn value_to_mysql_string(v: &Value) -> String {
 /// Map an error message to the appropriate MySQL error code and SQL state.
 fn map_error_code(err_msg: &str) -> (u16, &'static str) {
     let lower = err_msg.to_lowercase();
-    if lower.contains("duplicate") || lower.contains("unique") || lower.contains("already exists") {
+    if lower.contains("serialization failure") {
+        (1213, "40001") // ER_LOCK_DEADLOCK — clients retry the transaction
+    } else if lower.contains("duplicate") || lower.contains("unique") || lower.contains("already exists") {
         (1062, "23000") // ER_DUP_ENTRY
     } else if lower.contains("does not exist") || lower.contains("not found") || lower.contains("doesn't exist") {
         (1146, "42S02") // ER_NO_SUCH_TABLE

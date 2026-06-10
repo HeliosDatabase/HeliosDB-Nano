@@ -1156,7 +1156,13 @@ impl EmbeddedDatabase {
             self.validate_deferred_fk_checks(Some(txn))?;
         }
         if let Some(txn) = txn_ref.take() {
-            txn.commit()?;
+            // R0.2: commit at a FRESH timestamp — committing at the BEGIN
+            // snapshot timestamp recorded wrong version ordering for any
+            // transaction that overlapped other commits.
+            let written = txn.written_data_keys();
+            let commit_ts = self.storage.next_commit_timestamp(txn.has_tracked_writes());
+            txn.commit_with_timestamp(commit_ts)?;
+            self.invalidate_row_cache_for(&written);
             // Clear ART undo log (changes are now committed)
             self.art_undo_log.write().clear();
             self.deferred_fk_checks.lock().clear();
@@ -1198,6 +1204,13 @@ impl EmbeddedDatabase {
             None => {
                 self.art_undo_log.write().push(op);
             }
+        }
+    }
+
+    /// Invalidate row-cache entries for rows a transaction just committed.
+    fn invalidate_row_cache_for(&self, written: &[(String, u64)]) {
+        for (table, row_id) in written {
+            self.storage.row_cache().invalidate(table, *row_id);
         }
     }
 
@@ -2925,36 +2938,49 @@ impl EmbeddedDatabase {
                         .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
                     txn.put(key.clone(), value.clone())?;
 
-                    let mut old_col_values = std::collections::HashMap::with_capacity(schema.columns.len());
-                    let mut new_col_values = std::collections::HashMap::with_capacity(schema.columns.len());
-                    for (i, col) in schema.columns.iter().enumerate() {
-                        if let Some(v) = old_tuple.values.get(i) {
-                            old_col_values.insert(col.name.clone(), v.clone());
-                        }
-                        if let Some(v) = tuple.values.get(i) {
-                            new_col_values.insert(col.name.clone(), v.clone());
-                        }
-                    }
-                    if let Err(e) = self
+                    // R0.2: only touch ART when an indexed column changed.
+                    // The eager delete+reinsert pair opens a window where
+                    // concurrent PK probes miss the row entirely, and a
+                    // rollback replays the same gap — for payload-only
+                    // updates both are pure hazard with zero effect.
+                    if self
                         .storage
                         .art_indexes()
-                        .on_delete(table_name, *row_id, &old_col_values)
+                        .tuple_update_affects_indexes(table_name, &schema, old_tuple, tuple)
                     {
-                        tracing::debug!("ART index update/delete-old for '{}': {}", table_name, e);
+                        let mut old_col_values =
+                            std::collections::HashMap::with_capacity(schema.columns.len());
+                        let mut new_col_values =
+                            std::collections::HashMap::with_capacity(schema.columns.len());
+                        for (i, col) in schema.columns.iter().enumerate() {
+                            if let Some(v) = old_tuple.values.get(i) {
+                                old_col_values.insert(col.name.clone(), v.clone());
+                            }
+                            if let Some(v) = tuple.values.get(i) {
+                                new_col_values.insert(col.name.clone(), v.clone());
+                            }
+                        }
+                        if let Err(e) = self
+                            .storage
+                            .art_indexes()
+                            .on_delete(table_name, *row_id, &old_col_values)
+                        {
+                            tracing::debug!("ART index update/delete-old for '{}': {}", table_name, e);
+                        }
+                        if let Err(e) = self
+                            .storage
+                            .art_indexes()
+                            .on_insert(table_name, *row_id, &new_col_values)
+                        {
+                            tracing::debug!("ART index update/insert-new for '{}': {}", table_name, e);
+                        }
+                        self.push_art_undo(txn, ArtUndoOp::RestoreUpdated {
+                            table_name: table_name.clone(),
+                            row_id: *row_id,
+                            old_col_values,
+                            new_col_values,
+                        });
                     }
-                    if let Err(e) = self
-                        .storage
-                        .art_indexes()
-                        .on_insert(table_name, *row_id, &new_col_values)
-                    {
-                        tracing::debug!("ART index update/insert-new for '{}': {}", table_name, e);
-                    }
-                    self.push_art_undo(txn, ArtUndoOp::RestoreUpdated {
-                        table_name: table_name.clone(),
-                        row_id: *row_id,
-                        old_col_values,
-                        new_col_values,
-                    });
 
                     // P0#2: still append the logical WAL entry (so crash-recovery
                     // replay and logical replication stay consistent), but WITHOUT a
@@ -5119,7 +5145,7 @@ impl EmbeddedDatabase {
         }
 
         if !self.storage.fast_dml_requires_logical_wal() {
-            let txn = match self.storage.begin_transaction() {
+            let txn = match self.storage.begin_autocommit_transaction() {
                 Ok(txn) => txn,
                 Err(e) => return Some(Err(e)),
             };
@@ -6412,7 +6438,7 @@ impl EmbeddedDatabase {
     fn execute_with_implicit_transaction(&self, sql: &str) -> Result<u64> {
         // Begin implicit transaction
         let txn_start = std::time::Instant::now();
-        let txn = self.storage.begin_transaction()?;
+        let txn = self.storage.begin_autocommit_transaction()?;
         tracing::trace!(
             phase = "txn_begin",
             duration_us = txn_start.elapsed().as_micros() as u64,
@@ -9997,6 +10023,23 @@ impl EmbeddedDatabase {
                     sql::Evaluator::with_parameters(std::sync::Arc::new(Schema { columns: vec![] }), params.to_vec());
                 let empty_tuple = Tuple::new(vec![]);
 
+                // R0.2: resolve the active transaction so parameterized
+                // INSERTs stage through the write set. Previously this arm
+                // always wrote directly to storage — inside a transaction
+                // those rows survived ROLLBACK.
+                let mut _txn_guard = None;
+                let active_txn: Option<&storage::Transaction> = match session_txn {
+                    Some(txn) => Some(txn),
+                    None => {
+                        _txn_guard = Some(
+                            self.current_transaction
+                                .lock()
+                                .map_err(|_| Error::query_execution("Failed to lock transaction"))?,
+                        );
+                        _txn_guard.as_ref().and_then(|guard| guard.as_ref())
+                    }
+                };
+
                 let has_returning = returning.is_some();
                 let mut returned_tuples: Vec<Tuple> = Vec::new();
                 let mut count = 0;
@@ -10113,12 +10156,61 @@ impl EmbeddedDatabase {
                             // falls back to a committed-snapshot scan,
                             // which is correct for the autocommit /
                             // implicit-tx surface this path serves.
-                            self.check_fk_constraints_on_write(table_name, &col_values_map, None)?;
-                            let row_id = self.storage.insert_tuple_branch_aware_with_schema(
-                                table_name,
-                                tuple.clone(),
-                                &schema,
-                            )?;
+                            self.check_fk_constraints_on_write(table_name, &col_values_map, active_txn)?;
+                            let row_id = if let Some(txn) = active_txn {
+                                // Transactional staging (mirrors the
+                                // execute_in_transaction_inner INSERT arm):
+                                // the row lands in the write set, is visible
+                                // to read-your-writes, and rolls back.
+                                let row_id = catalog.next_row_id(table_name)?;
+                                let mut staged = tuple.clone();
+                                for (i, col) in schema.columns.iter().enumerate() {
+                                    if col.primary_key {
+                                        if let Some(Value::Null) = staged.values.get(i) {
+                                            if let Some(slot) = staged.values.get_mut(i) {
+                                                *slot = match col.data_type {
+                                                    DataType::Int2 => Value::Int2(row_id as i16),
+                                                    DataType::Int4 => Value::Int4(row_id as i32),
+                                                    _ => Value::Int8(row_id as i64),
+                                                };
+                                            }
+                                        }
+                                    }
+                                }
+                                let mut staged_col_values =
+                                    std::collections::HashMap::with_capacity(schema.columns.len());
+                                for (i, col) in schema.columns.iter().enumerate() {
+                                    if let Some(v) = staged.values.get(i) {
+                                        staged_col_values.insert(col.name.clone(), v.clone());
+                                    }
+                                }
+                                if self.storage.get_current_branch().is_none() {
+                                    self.storage.stage_tuple_for_column_storage_in_transaction(
+                                        table_name, row_id, &staged, &schema, txn,
+                                    )?;
+                                }
+                                let key = self.storage.branch_aware_data_key(table_name, row_id);
+                                let val =
+                                    bincode::serialize(&staged).map_err(|e| Error::storage(e.to_string()))?;
+                                txn.put(key, val)?;
+                                if let Err(e) =
+                                    self.storage.art_indexes().on_insert(table_name, row_id, &staged_col_values)
+                                {
+                                    tracing::debug!("ART index insert for '{}': {}", table_name, e);
+                                }
+                                self.push_art_undo(txn, ArtUndoOp::RemoveInserted {
+                                    table_name: table_name.clone(),
+                                    row_id,
+                                    col_values: staged_col_values,
+                                });
+                                row_id
+                            } else {
+                                self.storage.insert_tuple_branch_aware_with_schema(
+                                    table_name,
+                                    tuple.clone(),
+                                    &schema,
+                                )?
+                            };
                             if has_returning {
                                 let mut filled = tuple;
                                 for (i, col) in schema.columns.iter().enumerate() {
@@ -10531,36 +10623,46 @@ impl EmbeddedDatabase {
                             .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
                         txn.put(key.clone(), value)?;
 
-                        let mut old_col_values = std::collections::HashMap::with_capacity(schema.columns.len());
-                        let mut new_col_values = std::collections::HashMap::with_capacity(schema.columns.len());
-                        for (i, col) in schema.columns.iter().enumerate() {
-                            if let Some(v) = old_tuple.values.get(i) {
-                                old_col_values.insert(col.name.clone(), v.clone());
-                            }
-                            if let Some(v) = tuple.values.get(i) {
-                                new_col_values.insert(col.name.clone(), v.clone());
-                            }
-                        }
-                        if let Err(e) = self
+                        // R0.2: only touch ART when an indexed column
+                        // changed (see the text-path UPDATE arm).
+                        if self
                             .storage
                             .art_indexes()
-                            .on_delete(table_name, *row_id, &old_col_values)
+                            .tuple_update_affects_indexes(table_name, &schema, old_tuple, tuple)
                         {
-                            tracing::debug!("ART index update/delete-old for '{}': {}", table_name, e);
+                            let mut old_col_values =
+                                std::collections::HashMap::with_capacity(schema.columns.len());
+                            let mut new_col_values =
+                                std::collections::HashMap::with_capacity(schema.columns.len());
+                            for (i, col) in schema.columns.iter().enumerate() {
+                                if let Some(v) = old_tuple.values.get(i) {
+                                    old_col_values.insert(col.name.clone(), v.clone());
+                                }
+                                if let Some(v) = tuple.values.get(i) {
+                                    new_col_values.insert(col.name.clone(), v.clone());
+                                }
+                            }
+                            if let Err(e) = self
+                                .storage
+                                .art_indexes()
+                                .on_delete(table_name, *row_id, &old_col_values)
+                            {
+                                tracing::debug!("ART index update/delete-old for '{}': {}", table_name, e);
+                            }
+                            if let Err(e) = self
+                                .storage
+                                .art_indexes()
+                                .on_insert(table_name, *row_id, &new_col_values)
+                            {
+                                tracing::debug!("ART index update/insert-new for '{}': {}", table_name, e);
+                            }
+                            self.push_art_undo(txn, ArtUndoOp::RestoreUpdated {
+                                table_name: table_name.clone(),
+                                row_id: *row_id,
+                                old_col_values,
+                                new_col_values,
+                            });
                         }
-                        if let Err(e) = self
-                            .storage
-                            .art_indexes()
-                            .on_insert(table_name, *row_id, &new_col_values)
-                        {
-                            tracing::debug!("ART index update/insert-new for '{}': {}", table_name, e);
-                        }
-                        self.push_art_undo(txn, ArtUndoOp::RestoreUpdated {
-                            table_name: table_name.clone(),
-                            row_id: *row_id,
-                            old_col_values,
-                            new_col_values,
-                        });
                         self.storage.row_cache().invalidate(table_name, *row_id);
                     }
                     updates.len() as u64
@@ -11474,6 +11576,13 @@ impl EmbeddedDatabase {
         // (new_with_session defaults versioning on).
         txn.set_versioning_enabled(self.storage.time_travel_enabled());
         txn.set_rocksdb_wal_enabled(!self.storage.config().storage.memory_only);
+        // R0.2: record commits always; validate (first-committer-wins) for
+        // RepeatableRead/Serializable. ReadCommitted keeps PostgreSQL's
+        // blind-write semantics.
+        txn.set_conflict_registry(
+            self.storage.conflict_registry(),
+            session.isolation_level != crate::session::IsolationLevel::ReadCommitted,
+        );
 
         let txn_id = txn.snapshot_id();
         session.active_txn = Some(txn_id);
@@ -11511,7 +11620,19 @@ impl EmbeddedDatabase {
         if let Some((_, txn)) = self.session_transactions.remove(&session_id) {
             self.session_txn_count
                 .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-            txn.commit_with_timestamp(self.storage.next_timestamp())?;
+            let written = txn.written_data_keys();
+            let commit_ts = self.storage.next_commit_timestamp(txn.has_tracked_writes());
+            if let Err(e) = txn.commit_with_timestamp(commit_ts) {
+                // Failed commit (e.g. R0.2 serialization failure) behaves
+                // like ROLLBACK: undo eager ART mutations, clear the
+                // session's transaction state, count the abort.
+                self.finish_session_art_undo(session_id, true);
+                self.invalidate_result_cache();
+                session.active_txn = None;
+                session.stats.transactions_aborted += 1;
+                return Err(e);
+            }
+            self.invalidate_row_cache_for(&written);
             self.storage.increment_lsn();
         }
         // Changes are committed: the session's ART mutations are now permanent.
@@ -11623,12 +11744,19 @@ impl EmbeddedDatabase {
             // P0#1: session transactions must honor time_travel_enabled too.
             txn.set_versioning_enabled(self.storage.time_travel_enabled());
             txn.set_rocksdb_wal_enabled(!self.storage.config().storage.memory_only);
+            // R0.2: implicit single-statement session transactions record
+            // their commits so explicit transactions can validate against
+            // them; they never validate (statement-atomic, RC semantics).
+            txn.set_conflict_registry(self.storage.conflict_registry(), false);
 
             let result = self.execute_in_transaction_no_fast_path(sql, &txn);
 
             match result {
                 Ok(count) => {
-                    txn.commit_with_timestamp(self.storage.next_timestamp())?;
+                    let written = txn.written_data_keys();
+                    let commit_ts = self.storage.next_commit_timestamp(txn.has_tracked_writes());
+                    txn.commit_with_timestamp(commit_ts)?;
+                    self.invalidate_row_cache_for(&written);
                     self.storage.increment_lsn();
                     self.finish_session_art_undo(session_id, false);
                     Ok(count)
@@ -13334,7 +13462,7 @@ impl EmbeddedDatabase {
         }
 
         // Delete the matching rows
-        let txn = self.storage.begin_transaction()?;
+        let txn = self.storage.begin_autocommit_transaction()?;
         for (row_id, _) in &rows_to_delete {
             let key = self.storage.branch_aware_data_key(table_name, *row_id);
             self.storage
@@ -13412,7 +13540,7 @@ impl EmbeddedDatabase {
         }
 
         // Update the matching rows
-        let txn = self.storage.begin_transaction()?;
+        let txn = self.storage.begin_autocommit_transaction()?;
         for (row_id, new_tuple) in rows_to_update {
             let key = self.storage.branch_aware_data_key(table_name, row_id);
             if self.storage.get_current_branch().is_none() {
@@ -14600,7 +14728,12 @@ impl Transaction<'_> {
     /// Atomically applies all buffered writes to the database.
     /// After commit, the transaction is consumed and cannot be used.
     pub fn commit(self) -> Result<()> {
-        self.tx.commit()
+        // R0.2: fresh commit timestamp (see commit_internal).
+        let written = self.tx.written_data_keys();
+        let commit_ts = self.db.storage.next_commit_timestamp(self.tx.has_tracked_writes());
+        self.tx.commit_with_timestamp(commit_ts)?;
+        self.db.invalidate_row_cache_for(&written);
+        Ok(())
     }
 
     /// Rollback the transaction

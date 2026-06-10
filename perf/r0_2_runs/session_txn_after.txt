@@ -1,0 +1,9 @@
+=== session transaction bench (cycles per measurement: 2000) ===
+global_txn_cycle(1T)                          46497 txn/s
+session_txn_cycle( 1T)                        34244 txn/s  (2000 total)
+session_txn_cycle( 4T)                        78210 txn/s  (8000 total)
+session_txn_cycle(16T)                        75436 txn/s  (32000 total)
+session_autocommit_insert(1T)                 32562 ops/s
+autocommit_insert_with_open_session_txn      113299 ops/s
+
+ok

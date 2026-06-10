@@ -5,6 +5,7 @@
 //!
 //! v3.1.0: Enhanced with session-aware locking and isolation level support
 
+use super::conflict::WriteConflictRegistry;
 use super::dirty_tracker::DirtyTracker;
 use super::lock_manager::{LockGuard, LockManager, LockType};
 use super::time_travel::SnapshotManager;
@@ -109,6 +110,26 @@ pub struct Transaction {
     /// Disabled only for `memory_only` databases, where durability is not a
     /// contract and the temporary RocksDB directory is discarded on close.
     rocksdb_wal_enabled: bool,
+    /// Write-write conflict registry (R0.2). When present, commits record
+    /// their write-set keys; when `conflict_validation` is also set, commit
+    /// aborts with a serialization failure if any key was committed after
+    /// this transaction's snapshot (first-committer-wins).
+    conflict_registry: Option<Arc<WriteConflictRegistry>>,
+    conflict_validation: bool,
+}
+
+impl Drop for Transaction {
+    fn drop(&mut self) {
+        // Idempotent: deregister the snapshot however the transaction ends
+        // (commit, rollback, or dropped on an error path) so registry
+        // pruning is never blocked by a dead snapshot. Only validating
+        // transactions register (only they read `recent_writes`).
+        if self.conflict_validation {
+            if let Some(registry) = &self.conflict_registry {
+                registry.deregister_txn(self.transaction_id);
+            }
+        }
+    }
 }
 
 /// Transaction state captured by a SAVEPOINT.
@@ -147,6 +168,8 @@ impl Transaction {
             dirty_tracker: None,
             versioning_enabled: true,
             rocksdb_wal_enabled: true,
+            conflict_registry: None,
+            conflict_validation: false,
         })
     }
 
@@ -198,6 +221,8 @@ impl Transaction {
             dirty_tracker: Some(dirty_tracker),
             versioning_enabled: true,
             rocksdb_wal_enabled: true,
+            conflict_registry: None,
+            conflict_validation: false,
         })
     }
 
@@ -525,6 +550,41 @@ impl Transaction {
             return Err(Error::transaction("Transaction is not active"));
         }
 
+        // R0.2: first-committer-wins. Validate the write set against commits
+        // newer than our snapshot and record ours — atomically w.r.t. other
+        // committers. Runs before the batch is built; insert_log rows use
+        // never-reused engine row ids and skip the registry by design.
+        let inflight = self.has_tracked_writes();
+        if let Some(registry) = &self.conflict_registry {
+            if let Err((key, committed_ts)) = registry.validate_and_record(
+                &self.write_set,
+                self.conflict_validation,
+                self.snapshot_ts,
+                commit_ts,
+            ) {
+                if inflight {
+                    registry.end_commit(commit_ts);
+                }
+                self.acquired_locks.write().clear();
+                self.write_set.clear();
+                self.insert_log.write().clear();
+                self.row_counter_stages.write().clear();
+                self.state.store(TransactionState::Aborted.to_u8(), Ordering::Release);
+                warn!(
+                    txn_id = self.transaction_id,
+                    snapshot_ts = self.snapshot_ts,
+                    committed_ts = committed_ts,
+                    "Commit aborted: write-write conflict"
+                );
+                return Err(Error::transaction(format!(
+                    "serialization failure: write-write conflict on key '{}' (committed at ts {}, transaction snapshot ts {}); retry the transaction",
+                    String::from_utf8_lossy(&key),
+                    committed_ts,
+                    self.snapshot_ts
+                )));
+            }
+        }
+
         let reverse_ts = u64::MAX - commit_ts;
         let commit_ts_text = if self.versioning_enabled {
             let mut buf = itoa::Buffer::new();
@@ -608,6 +668,14 @@ impl Transaction {
             write_opts.disable_wal(true);
             self.db.write_opt(batch, &write_opts)
         };
+
+        // The write is applied (or definitively failed): new snapshots may
+        // proceed past this commit timestamp.
+        if inflight {
+            if let Some(registry) = &self.conflict_registry {
+                registry.end_commit(commit_ts);
+            }
+        }
 
         // Release all acquired locks
         self.acquired_locks.write().clear();
@@ -788,11 +856,66 @@ impl Transaction {
         self.session_id
     }
 
+    /// Attach the engine's write-conflict registry (R0.2). `validate`
+    /// enables first-committer-wins abort at commit; recording always
+    /// happens so other transactions can validate against this one.
+    ///
+    /// Applies the snapshot barrier: this transaction's snapshot timestamp
+    /// must not cover commits whose writes have not been applied yet, or
+    /// its reads would be stale while validating clean.
+    pub fn set_conflict_registry(&mut self, registry: Arc<WriteConflictRegistry>, validate: bool) {
+        registry.snapshot_barrier(self.snapshot_ts);
+        if validate {
+            registry.register_txn(self.transaction_id, self.snapshot_ts);
+        }
+        self.conflict_registry = Some(registry);
+        self.conflict_validation = validate;
+    }
+
+    /// True when this commit must be announced in flight (it will record
+    /// write-set keys in the conflict registry). INSERT-only transactions
+    /// (`insert_log`) skip the registry by design.
+    pub fn has_tracked_writes(&self) -> bool {
+        self.conflict_registry.is_some() && !self.write_set.is_empty()
+    }
+
+    /// (table, row_id) pairs written through the write set, parsed from
+    /// `data:{table}:{row_id}` keys. Commit callers use this to invalidate
+    /// row caches after the batch is applied — a transaction commit writes
+    /// RocksDB directly, and a stale row-cache entry would otherwise serve
+    /// pre-commit values to later snapshot-clean transactions (R0.2
+    /// lost-update vector via the UPDATE arm's PK point-lookup read).
+    pub fn written_data_keys(&self) -> Vec<(String, u64)> {
+        if self.write_set.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(self.write_set.len());
+        for entry in self.write_set.iter() {
+            let key = entry.key();
+            if let Some(rest) = key.strip_prefix(b"data:".as_slice()) {
+                if let Ok(text) = std::str::from_utf8(rest) {
+                    if let Some(pos) = text.rfind(':') {
+                        if let Ok(row_id) = text[pos + 1..].parse::<u64>() {
+                            out.push((text[..pos].to_string(), row_id));
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// Refresh the snapshot timestamp to the current database state
     ///
     /// Useful for READ COMMITTED isolation level where each statement
     /// should see a fresh snapshot of the database.
     pub fn refresh_snapshot(&mut self, new_ts: u64) {
+        if let Some(registry) = &self.conflict_registry {
+            registry.snapshot_barrier(new_ts);
+            if self.conflict_validation {
+                registry.refresh_txn(self.transaction_id, new_ts);
+            }
+        }
         self.snapshot_ts = new_ts;
         self.snapshot = Snapshot::new(new_ts);
     }

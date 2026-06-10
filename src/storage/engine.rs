@@ -904,6 +904,9 @@ pub struct StorageEngine {
     vector_indexes: Arc<VectorIndexManager>,
     /// Snapshot manager for time-travel queries
     snapshot_manager: Arc<SnapshotManager>,
+    /// Write-write conflict registry (R0.2): first-committer-wins
+    /// validation for snapshot-isolation transactions.
+    conflict_registry: Arc<super::conflict::WriteConflictRegistry>,
     /// Branch manager for database branching
     branch_manager: Arc<RwLock<Option<Arc<BranchManager>>>>,
     /// Write-ahead log for durability
@@ -1282,6 +1285,7 @@ impl StorageEngine {
             key_manager,
             vector_indexes: Arc::new(VectorIndexManager::new()),
             snapshot_manager,
+            conflict_registry: Arc::new(super::conflict::WriteConflictRegistry::new()),
             branch_manager,
             wal,
             stats,
@@ -1479,6 +1483,7 @@ impl StorageEngine {
             key_manager,
             vector_indexes: Arc::new(VectorIndexManager::new()),
             snapshot_manager,
+            conflict_registry: Arc::new(super::conflict::WriteConflictRegistry::new()),
             branch_manager,
             wal,
             stats,
@@ -2329,13 +2334,52 @@ impl StorageEngine {
         // P0#1: emit MVCC version-history at commit only when time-travel is on.
         txn.set_versioning_enabled(self.config.storage.time_travel_enabled);
         txn.set_rocksdb_wal_enabled(!self.config.storage.memory_only);
+        // R0.2: embedded global-slot transactions read from a snapshot, so
+        // complete those semantics with first-committer-wins validation.
+        txn.set_conflict_registry(self.conflict_registry(), true);
         Ok(txn)
+    }
+
+    /// Begin a transaction for a single autocommit statement (R0.2):
+    /// records its commit in the conflict registry (so snapshot-isolation
+    /// transactions detect it) but does not validate — autocommit
+    /// statements have ReadCommitted semantics. PostgreSQL parity: racing
+    /// read-then-write *autocommit* pairs are an application concern;
+    /// surfacing retryable serialization errors on plain autocommit DML
+    /// would break every driver's expectations.
+    pub fn begin_autocommit_transaction(&self) -> Result<Transaction> {
+        let snapshot_id = self.next_timestamp();
+        let mut txn = Transaction::new(Arc::clone(&self.db), snapshot_id, Arc::clone(&self.snapshot_manager))?;
+        txn.set_versioning_enabled(self.config.storage.time_travel_enabled);
+        txn.set_rocksdb_wal_enabled(!self.config.storage.memory_only);
+        txn.set_conflict_registry(self.conflict_registry(), false);
+        Ok(txn)
+    }
+
+    /// Write-write conflict registry shared by every transaction on this
+    /// engine (R0.2).
+    pub fn conflict_registry(&self) -> Arc<super::conflict::WriteConflictRegistry> {
+        Arc::clone(&self.conflict_registry)
     }
 
     /// Get next timestamp (for MVCC)
     pub fn next_timestamp(&self) -> u64 {
         let mut ts = self.timestamp.write();
         *ts += 1;
+        *ts
+    }
+
+    /// Allocate a COMMIT timestamp (R0.2). When `announce_inflight` is set,
+    /// the commit is registered as in-flight *inside the timestamp lock*,
+    /// so any snapshot allocated later is guaranteed to observe it and wait
+    /// at the snapshot barrier until the commit's write is applied. Pass
+    /// `Transaction::has_tracked_writes()`.
+    pub fn next_commit_timestamp(&self, announce_inflight: bool) -> u64 {
+        let mut ts = self.timestamp.write();
+        *ts += 1;
+        if announce_inflight {
+            self.conflict_registry.begin_commit(*ts);
+        }
         *ts
     }
 

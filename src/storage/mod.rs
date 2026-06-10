@@ -38,6 +38,7 @@ pub mod lockfree;
 
 // Per-column storage optimization modules
 pub mod columnar;
+pub mod conflict;
 pub mod compression;
 pub mod content_addr;
 pub mod dictionary;
