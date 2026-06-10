@@ -9,7 +9,7 @@
 //! cargo run --release --example oltp_smoke
 //! ```
 //!
-//! Compare numbers to `docs/BENCHMARK_PG_VS_HELIOS.txt`. Differences vs.
+//! Compare numbers to `perf/GOAL_STATUS_2026_05_31.md`. Differences vs.
 //! the documented PG-wire baseline reflect (PG wire overhead) +
 //! (in-process changes since that benchmark ran). For this branch in
 //! particular we want to confirm the JoinPredicatePushdownRule does not
@@ -272,6 +272,6 @@ fn main() -> Result<()> {
     bench_repeated_query(&db);
     println!();
 
-    println!("Done. Compare to docs/BENCHMARK_PG_VS_HELIOS.txt for historical numbers.");
+    println!("Done. Compare to perf/GOAL_STATUS_2026_05_31.md for current baseline numbers.");
     Ok(())
 }

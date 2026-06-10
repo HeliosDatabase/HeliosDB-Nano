@@ -354,9 +354,13 @@ async fn main() -> Result<()> {
                 )));
             }
 
-            // Note on dump_schedule: scheduled dumps are not yet implemented
+            // Scheduled dumps are not implemented. Fail hard instead of
+            // silently accepting the flag — a no-op here means an operator
+            // who relied on it has no backups (phantom-backup trap, C13).
             if dump_schedule.is_some() {
-                info!("Note: --dump-schedule is not yet implemented");
+                return Err(Error::config(
+                    "dump-schedule is not implemented yet; use OS cron with `heliosdb-nano dump`".to_string(),
+                ));
             }
 
             let resolved_data_dir = data_dir.unwrap_or_else(|| PathBuf::from("./heliosdb-data"));
@@ -382,12 +386,18 @@ async fn main() -> Result<()> {
                     port,
                     listen,
                     config,
+                    memory,
+                    dump_on_shutdown,
                     pid_file,
                     tls_cert,
                     tls_key,
                     auth,
                     password,
                     ha_config,
+                    mysql,
+                    mysql_listen,
+                    mysql_socket,
+                    pg_socket_dir,
                     max_connections,
                 )
                 .await
@@ -1037,12 +1047,18 @@ async fn start_server_daemon(
     port: u16,
     listen: String,
     config_path: Option<PathBuf>,
+    memory: bool,
+    dump_on_shutdown: bool,
     pid_file: PathBuf,
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
     auth: String,
     password: Option<String>,
     ha_config: HAConfig,
+    mysql: bool,
+    mysql_listen: String,
+    mysql_socket: Option<PathBuf>,
+    pg_socket_dir: Option<PathBuf>,
     max_connections: usize,
 ) -> Result<()> {
     use std::process::{Command, Stdio};
@@ -1089,6 +1105,30 @@ async fn start_server_daemon(
     if let Some(cfg) = config_path {
         args.push("--config".to_string());
         args.push(cfg.display().to_string());
+    }
+
+    // Forward in-memory / dump options (previously dropped by the re-exec,
+    // same bug class as the 3.36.0 --max-connections fix; see C13).
+    if memory {
+        args.push("--memory".to_string());
+    }
+    if dump_on_shutdown {
+        args.push("--dump-on-shutdown".to_string());
+    }
+
+    // Forward MySQL protocol and Unix-socket options (previously dropped).
+    if mysql {
+        args.push("--mysql".to_string());
+    }
+    args.push("--mysql-listen".to_string());
+    args.push(mysql_listen);
+    if let Some(sock) = mysql_socket {
+        args.push("--mysql-socket".to_string());
+        args.push(sock.display().to_string());
+    }
+    if let Some(dir) = pg_socket_dir {
+        args.push("--pg-socket-dir".to_string());
+        args.push(dir.display().to_string());
     }
 
     // Add TLS options

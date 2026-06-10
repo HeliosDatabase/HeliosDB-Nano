@@ -102,7 +102,7 @@ cargo bench --bench vector_search_bench -- --quick
 cargo bench --bench branch_performance -- --quick
 ```
 
-Compare numbers to the previous run if you have one cached (`target/criterion/`), or to the historical baseline in `docs/BENCHMARK_PG_VS_HELIOS.txt`. **A regression here means your "isolated" change leaked across module boundaries** — investigate before merging.
+Compare numbers to the previous run if you have one cached (`target/criterion/`), or to the current baseline in `perf/GOAL_STATUS_2026_05_31.md`. **A regression here means your "isolated" change leaked across module boundaries** — investigate before merging.
 
 ## Phase 6 — Head-to-head OLTP vs main
 
@@ -131,7 +131,7 @@ git checkout feat/<branch> -- examples/oltp_smoke.rs   # or stash/pop
 
 For sub-millisecond measurements (the JOIN p50 in v3.23.0 was ~9 µs), a 5-sample median is too noisy. Bump sample size to 1 000–2 000 and report **p50, mean, and p99**. The v3.23.0 INNER JOIN p50 looked like a 33% regression at n=5 and turned into 11% improvement at n=2000 — same code, just enough samples to see signal through noise.
 
-> **Reconcile against historical baselines**. If your branch's numbers diverge from `docs/BENCHMARK_PG_VS_HELIOS.txt`, understand WHY before assuming regression. The historical doc measures the **PG-wire / psycopg2** path; the embedded API in `oltp_smoke` is ~30× faster for OLTP workloads on localhost. That's wire-protocol overhead, not a property of the database core.
+> **Reconcile against historical baselines**. If your branch's numbers diverge from `perf/GOAL_STATUS_2026_05_31.md`, understand WHY before assuming regression. PG-wire / psycopg2 numbers include wire overhead; the embedded API in `oltp_smoke` is ~30× faster for OLTP workloads on localhost. That's wire-protocol overhead, not a property of the database core.
 
 ## Phase 7 — Validation report
 
@@ -229,4 +229,4 @@ The workflow gates again on `cargo test --lib + --doc`. If it fails here, you mi
 - `<FEATURE>_REPORT.md` — the per-release validation report (template in Phase 7 above).
 - `examples/oltp_smoke.rs` — the OLTP workload harness from phase 6.
 - `benches/predicate_pushdown_bench.rs` — the targeted-feature bench template from phase 4.
-- `benches/external/pg_vs_helios.py` + `docs/BENCHMARK_PG_VS_HELIOS.txt` — historical PG-wire baselines for reconciling phase 6 numbers.
+- `benches/external/pg_vs_helios.py` + `perf/GOAL_STATUS_2026_05_31.md` — PG-wire harness and current baselines for reconciling phase 6 numbers.

@@ -55,6 +55,12 @@ statement_timeout_ms = 0
 # - "SERIALIZABLE": Strictest isolation, may cause serialization failures
 transaction_isolation = "READ_COMMITTED"
 
+# Slow query log threshold in milliseconds.
+# Queries exceeding this threshold are logged at WARN level with their SQL
+# text (truncated to 200 chars), duration, and row count.
+# Omit for the default (1000 = 1 second); requires RUST_LOG to include WARN.
+slow_query_threshold_ms = 1000
+
 # ============================================================================
 # ENCRYPTION CONFIGURATION
 # ============================================================================
@@ -92,7 +98,8 @@ listen_addr = "127.0.0.1"
 # PostgreSQL protocol port
 port = 5432
 
-# Oracle TNS protocol port (None to disable Oracle protocol)
+# Oracle TNS protocol port. Currently unused/reserved: no Oracle listener is
+# started by `heliosdb-nano start`, and this value is never read at startup.
 oracle_port = 1521
 
 # Maximum concurrent connections
@@ -127,20 +134,38 @@ parallel_query = true
 # ============================================================================
 # AUDIT CONFIGURATION
 # ============================================================================
+# If the [audit] section is present, ALL fields below (including the
+# [audit.capture_metadata] sub-table) are required. Omit the whole section
+# to use the built-in defaults.
 [audit]
 # Enable audit logging
 enabled = false
 
-# Audit log file path
-# log_path = "/var/log/heliosdb/audit.log"
+# Event classes to log
+log_ddl = true           # CREATE, DROP, ALTER
+log_dml = true           # INSERT, UPDATE, DELETE
+log_select = false       # SELECT queries (can be very verbose)
+log_transactions = false # BEGIN, COMMIT, ROLLBACK
+log_auth = true          # Authentication events
 
-# Events to audit (comma-separated):
-# - "all": All events
-# - "auth": Authentication events
-# - "query": Query execution
-# - "ddl": Schema changes (CREATE, ALTER, DROP)
-# - "dml": Data modifications (INSERT, UPDATE, DELETE)
-# log_events = ["auth", "ddl"]
+# Retention period in days (0 = infinite)
+retention_days = 90
+
+# Async buffer size (number of events before flushing)
+async_buffer_size = 100
+
+# Enable cryptographic checksums on audit records
+enable_checksums = true
+
+# Truncate long queries to this length (0 = no truncation)
+max_query_length = 10000
+
+[audit.capture_metadata]
+capture_client_ip = true
+capture_application_name = true
+capture_database_name = true
+capture_execution_time = true
+capture_custom_fields = false
 
 # ============================================================================
 # OPTIMIZER CONFIGURATION (v2.1)
@@ -303,176 +328,9 @@ pq_bits = 8
 # [storage]
 # cache_size = 2147483648 # 2GB cache
 
-# ============================================================================
-# AI/LLM CONFIGURATION
-# ============================================================================
-[ai]
-# Enable AI features (schema inference, generation, chat)
-enabled = true
-
-[ai.llm]
-# LLM provider: "openai", "anthropic", "ollama", "local", "none"
-provider = "none"
-
-# Model selection (provider-specific)
-# OpenAI: "gpt-4-turbo", "gpt-4o", "gpt-3.5-turbo"
-# Anthropic: "claude-3-opus", "claude-3-sonnet", "claude-3-haiku"
-# Ollama: "llama3", "codellama", "mistral"
-model = "gpt-4-turbo"
-
-# API key environment variable (not the key itself!)
-api_key_env = "OPENAI_API_KEY"
-
-# Generation parameters
-temperature = 0.7
-top_p = 0.9
-max_tokens = 2048
-
-# Request configuration
-timeout_seconds = 60
-max_retries = 3
-
-# Rate limiting
-requests_per_minute = 60
-
-[ai.embedding]
-# Embedding provider (usually same as LLM provider)
-provider = "openai"
-
-# Embedding model
-# OpenAI: "text-embedding-3-large", "text-embedding-3-small", "text-embedding-ada-002"
-model = "text-embedding-3-small"
-
-# Embedding dimensions (must match vector column sizes)
-dimensions = 1536
-
-# Batch processing
-batch_size = 100
-
-# API configuration
-api_key_env = "OPENAI_API_KEY"
-timeout_seconds = 30
-
-# ============================================================================
-# RAG (RETRIEVAL-AUGMENTED GENERATION) CONFIGURATION
-# ============================================================================
-[rag]
-# Enable RAG features
-enabled = true
-
-# Document chunking strategy
-chunk_size = 512
-chunk_overlap = 100
-
-# Chunking method: "fixed", "sentence", "paragraph", "semantic"
-chunking_method = "sentence"
-
-# Similarity threshold for retrieval (0.0 - 1.0)
-similarity_threshold = 0.7
-
-# Context window configuration
-max_context_tokens = 4000
-max_chunks_per_query = 10
-
-# Store chunk embeddings automatically
-auto_embed_chunks = true
-
-# Reranking (requires compatible model)
-enable_reranking = false
-rerank_top_k = 20
-
-# ============================================================================
-# FULL-TEXT SEARCH CONFIGURATION
-# ============================================================================
-[search]
-# Enable full-text search
-enabled = true
-
-# Tokenizer: "simple", "english", "standard"
-tokenizer = "english"
-
-# Term length limits
-min_term_length = 2
-max_term_length = 64
-
-# Search features
-phrase_search_enabled = true
-proximity_search_enabled = true
-fuzzy_search_enabled = true
-
-# Fuzzy search configuration
-fuzzy_max_edits = 2
-
-# Result highlighting
-enable_highlighting = true
-highlight_tag_open = "<mark>"
-highlight_tag_close = "</mark>"
-
-# ============================================================================
-# WASM CONFIGURATION
-# ============================================================================
-[wasm]
-# Enable WebAssembly execution
-enabled = false
-
-# Security limits
-memory_limit_mb = 128
-timeout_seconds = 30
-max_stack_depth = 1000
-
-# Allowed WASM modules (empty = all allowed)
-# allowed_modules = ["trusted_module.wasm"]
-
-# ============================================================================
-# MCP (MODEL CONTEXT PROTOCOL) CONFIGURATION
-# ============================================================================
-[mcp]
-# Enable MCP server
-enabled = false
-
-# Server configuration
-host = "127.0.0.1"
-port = 3000
-
-# Resource limits
-resource_limit_mb = 100
-timeout_seconds = 30
-
-# Allowed hosts for connections
-allowed_hosts = ["localhost", "127.0.0.1"]
-
-# ============================================================================
-# ADVANCED STORAGE TUNING
-# ============================================================================
-[storage.tuning]
-# Write amplification target (RocksDB writes per logical write)
-# Lower = faster writes, higher = better space efficiency
-write_amplification_target = 10
-
-# MVCC snapshot retention policy: "auto", "manual", "aggressive"
-# auto: Keep snapshots based on usage patterns
-# manual: Keep all snapshots until explicitly deleted
-# aggressive: Minimize snapshot retention for space savings
-snapshot_retention_policy = "auto"
-
-# Maximum snapshot age in hours (for auto/aggressive policies)
-snapshot_max_age_hours = 168  # 7 days
-
-# Index building strategy
-parallel_index_builds = true
-max_concurrent_index_builds = 2
-
-# Batch operation sizing
-default_batch_size = 1000
-max_batch_size = 10000
-
-# Compaction settings
-enable_auto_compaction = true
-compaction_style = "level"  # "level", "universal", "fifo"
-
-# Memory-mapped I/O
-enable_mmap = true
-mmap_size_mb = 256
+# NOTE: The former [ai], [ai.llm], [ai.embedding], [rag], [search], [wasm],
+# [mcp], and [storage.tuning] sections are reserved for HeliosDB-Full and are
+# not read by HeliosDB Nano.
 
 # ============================================================================
 # SESSION CONFIGURATION (v3.1.0 - Multi-User ACID)
