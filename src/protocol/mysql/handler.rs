@@ -617,6 +617,17 @@ pub struct MySqlHandler<S: AsyncRead + AsyncWrite + Unpin + Send> {
     last_row_count: u64,
     /// Last auto-generated ID from INSERT (for `SELECT LAST_INSERT_ID()`)
     last_insert_id: u64,
+    /// Per-connection database session (R0.1): transactions opened by this
+    /// connection live in the session, not in the process-global slot.
+    session_id: crate::session::SessionId,
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin + Send> Drop for MySqlHandler<S> {
+    fn drop(&mut self) {
+        // Roll back any open transaction and release the session when the
+        // connection ends, however it ends.
+        let _ = self.database.destroy_session(self.session_id);
+    }
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
@@ -629,6 +640,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
         use rand::Rng;
         rand::thread_rng().fill(&mut auth_seed);
 
+        let session_id = database
+            .create_wire_session("mysql_wire")
+            .expect("wire session creation is infallible");
         Self {
             database,
             stream,
@@ -646,6 +660,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
             next_stmt_id: 1,
             last_row_count: 0,
             last_insert_id: 0,
+            session_id,
         }
     }
 
@@ -1012,7 +1027,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
 
     async fn handle_begin(&mut self) -> Result<()> {
         if !self.in_transaction {
-            self.database.begin()?;
+            self.database.begin_transaction_for_session(self.session_id)?;
             self.in_transaction = true;
             self.status_flags.set(StatusFlags::SERVER_STATUS_IN_TRANS);
         }
@@ -1021,7 +1036,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
 
     async fn handle_commit(&mut self) -> Result<()> {
         if self.in_transaction {
-            self.database.commit()?;
+            self.database.commit_transaction_for_session(self.session_id)?;
             self.in_transaction = false;
             self.status_flags.clear(StatusFlags::SERVER_STATUS_IN_TRANS);
         }
@@ -1030,7 +1045,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
 
     async fn handle_rollback(&mut self) -> Result<()> {
         if self.in_transaction {
-            self.database.rollback()?;
+            self.database.rollback_transaction_for_session(self.session_id)?;
             self.in_transaction = false;
             self.status_flags.clear(StatusFlags::SERVER_STATUS_IN_TRANS);
         }
@@ -1042,7 +1057,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
     // ------------------------------------------------------------------
 
     async fn execute_query(&mut self, sql: &str) -> Result<()> {
-        match self.database.query_with_columns(sql) {
+        match self.database.query_with_columns_for_session(self.session_id, sql) {
             Ok((rows, columns)) => {
                 self.last_row_count = rows.len() as u64;
                 self.send_result_set(&columns, &rows).await
@@ -1077,7 +1092,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
                 None
             };
 
-            match self.database.execute(stmt) {
+            match self.database.execute_for_session(self.session_id, stmt) {
                 Ok(affected) => {
                     total_affected += affected;
                     // After INSERT, try to capture the auto-generated ID
@@ -1112,7 +1127,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
     /// MySQL SQL and execute that instead.
     async fn handle_upsert_dml(&mut self, translated_sql: &str, raw_sql: &str) -> Result<()> {
         // Try the plain INSERT first
-        match self.database.execute(translated_sql) {
+        match self.database.execute_for_session(self.session_id, translated_sql) {
             Ok(affected) => {
                 let table_name = Self::extract_insert_table(translated_sql);
                 let insert_id = if affected > 0 {
@@ -1140,7 +1155,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
                     // Build an UPDATE from the ON DUPLICATE KEY UPDATE clause
                     if let Some(update_sql) = Self::build_upsert_update(raw_sql) {
                         let translated_update = super::translator::translate(&update_sql);
-                        match self.database.execute(&translated_update) {
+                        match self.database.execute_for_session(self.session_id, &translated_update) {
                             Ok(affected) => self.send_ok(affected, 0).await,
                             Err(ue) => {
                                 let umsg = ue.to_string();
@@ -1356,7 +1371,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
 
         // Query MAX(pk_col) — no double-quotes (they cause case-sensitive mismatch)
         let query = format!("SELECT MAX({}) FROM {}", pk_col, table_name);
-        match self.database.query_with_columns(&query) {
+        match self.database.query_with_columns_for_session(self.session_id, &query) {
             Ok((rows, _)) => {
                 let result = rows
                     .first()

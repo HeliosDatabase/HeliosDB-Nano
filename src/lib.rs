@@ -436,6 +436,17 @@ pub struct EmbeddedDatabase {
     /// ART index undo log for transaction rollback: (table, row_id, col_values)
     /// Cleared on commit, replayed as on_delete on rollback
     art_undo_log: std::sync::Arc<parking_lot::RwLock<Vec<ArtUndoOp>>>,
+    /// Per-session ART undo logs (R0.1). Session transactions mutate the ART
+    /// indexes eagerly just like the global transaction path; their undo
+    /// entries must be keyed by session so a session ROLLBACK replays exactly
+    /// its own entries and a session COMMIT clears them — routing them into
+    /// the global `art_undo_log` would let an unrelated global ROLLBACK
+    /// un-index committed session rows (latent pre-R0.1 bug).
+    session_art_undo: std::sync::Arc<dashmap::DashMap<crate::session::SessionId, Vec<ArtUndoOp>>>,
+    /// Count of open session transactions. `DashMap::is_empty()` sweeps every
+    /// shard lock (~128 on a 32-core host, ~1-2us) and sits on the per-statement
+    /// fast-path gates; this atomic keeps those gates to one load.
+    session_txn_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// Session-level FK validation mode used by embedded and protocol paths.
     fk_validation_mode: std::sync::Arc<parking_lot::RwLock<FkValidationMode>>,
     /// Source trusted for FK validation hints. Engine remains default.
@@ -453,6 +464,8 @@ impl Drop for EmbeddedDatabase {
 
         // Clear session transactions
         self.session_transactions.clear();
+        self.session_txn_count
+            .store(0, std::sync::atomic::Ordering::Release);
 
         // Clear prepared statements
         self.prepared_statements.write().clear();
@@ -1173,8 +1186,37 @@ impl EmbeddedDatabase {
         }
     }
 
+    /// Route an ART undo entry to the owning transaction's log: session
+    /// transactions get a per-session log (replayed by session ROLLBACK,
+    /// cleared by session COMMIT); the global-slot transaction keeps using
+    /// the shared `art_undo_log`.
+    fn push_art_undo(&self, txn: &storage::Transaction, op: ArtUndoOp) {
+        match txn.session_id() {
+            Some(session_id) => {
+                self.session_art_undo.entry(session_id).or_default().push(op);
+            }
+            None => {
+                self.art_undo_log.write().push(op);
+            }
+        }
+    }
+
     fn rollback_art_undo_log(&self) {
         let undo_entries: Vec<_> = self.art_undo_log.write().drain(..).collect();
+        self.replay_art_undo(undo_entries);
+    }
+
+    /// Drop a session's ART undo log, replaying it first on rollback
+    /// (`replay=true`) or discarding it on commit (`replay=false`).
+    fn finish_session_art_undo(&self, session_id: crate::session::SessionId, replay: bool) {
+        if let Some((_, entries)) = self.session_art_undo.remove(&session_id) {
+            if replay {
+                self.replay_art_undo(entries);
+            }
+        }
+    }
+
+    fn replay_art_undo(&self, undo_entries: Vec<ArtUndoOp>) {
         for op in undo_entries.into_iter().rev() {
             match op {
                 ArtUndoOp::RemoveInserted {
@@ -1310,21 +1352,28 @@ impl EmbeddedDatabase {
         // 3. Active session transactions exist (fast paths skip MVCC versioning,
         //    breaking snapshot isolation for other sessions)
         let has_savepoints = !self.savepoints.read().is_empty();
-        let has_session_txns = !self.session_transactions.is_empty();
+        let has_session_txns = self.any_session_txns();
+        // INSERT fast paths write MVCC version keys, so versioned session-txn
+        // snapshot reads stay correct while they run; they only need to yield
+        // when versioning is off. UPDATE/DELETE fast paths write no version
+        // history (roadmap C15) and stay disabled whenever any session
+        // transaction is open.
+        let insert_fast_paths_blocked = self.session_txns_block_fast_inserts();
         let use_fast_paths = !skip_fast_paths && !has_savepoints && !has_session_txns;
+        let use_insert_fast_paths = !skip_fast_paths && !has_savepoints && !insert_fast_paths_blocked;
 
         // Explicit transactions can still use transaction-aware INSERT fast
         // paths. These buffer rows in the transaction write set, so
         // COMMIT/ROLLBACK semantics are preserved while avoiding full
         // parser/planner and per-row counter persistence overhead.
-        if skip_fast_paths && !has_savepoints && !has_session_txns {
+        if skip_fast_paths && !has_savepoints && !insert_fast_paths_blocked {
             if let Some(result) = self.try_fast_insert_literal_in_transaction(sql, txn) {
                 return result;
             }
         }
 
         // Fast path: simple INSERT with literal values (skips full SQL parsing)
-        if use_fast_paths {
+        if use_insert_fast_paths {
             if let Some(result) = self.try_fast_insert(sql) {
                 return result;
             }
@@ -2162,7 +2211,7 @@ impl EmbeddedDatabase {
                         if let Err(e) = self.storage.art_indexes().on_insert(table_name, row_id, &col_values) {
                             tracing::debug!("ART index insert for '{}': {}", table_name, e);
                         }
-                        self.art_undo_log.write().push(ArtUndoOp::RemoveInserted {
+                        self.push_art_undo(txn, ArtUndoOp::RemoveInserted {
                             table_name: table_name.clone(),
                             row_id,
                             col_values,
@@ -2900,7 +2949,7 @@ impl EmbeddedDatabase {
                     {
                         tracing::debug!("ART index update/insert-new for '{}': {}", table_name, e);
                     }
-                    self.art_undo_log.write().push(ArtUndoOp::RestoreUpdated {
+                    self.push_art_undo(txn, ArtUndoOp::RestoreUpdated {
                         table_name: table_name.clone(),
                         row_id: *row_id,
                         old_col_values,
@@ -3249,7 +3298,7 @@ impl EmbeddedDatabase {
                     if let Err(e) = self.storage.art_indexes().on_delete(table_name, *row_id, &col_values) {
                         tracing::debug!("ART index delete for table '{}': {}", table_name, e);
                     }
-                    self.art_undo_log.write().push(ArtUndoOp::RestoreDeleted {
+                    self.push_art_undo(txn, ArtUndoOp::RestoreDeleted {
                         table_name: table_name.clone(),
                         row_id: *row_id,
                         col_values,
@@ -3927,6 +3976,8 @@ impl EmbeddedDatabase {
             fast_select_cache: Self::new_fast_select_cache(),
             query_profiler: std::sync::Arc::new(query_trace::QueryProfiler::new()),
             art_undo_log: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
+            session_art_undo: std::sync::Arc::new(dashmap::DashMap::new()),
+            session_txn_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             fk_validation_mode: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationMode::Enforced)),
             fk_validation_source: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationSource::Engine)),
             deferred_fk_checks: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
@@ -4003,6 +4054,8 @@ impl EmbeddedDatabase {
             fast_select_cache: Self::new_fast_select_cache(),
             query_profiler: std::sync::Arc::new(query_trace::QueryProfiler::new()),
             art_undo_log: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
+            session_art_undo: std::sync::Arc::new(dashmap::DashMap::new()),
+            session_txn_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             fk_validation_mode: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationMode::Enforced)),
             fk_validation_source: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationSource::Engine)),
             deferred_fk_checks: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
@@ -4102,6 +4155,8 @@ impl EmbeddedDatabase {
             fast_select_cache: Self::new_fast_select_cache(),
             query_profiler: std::sync::Arc::new(query_trace::QueryProfiler::new()),
             art_undo_log: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
+            session_art_undo: std::sync::Arc::new(dashmap::DashMap::new()),
+            session_txn_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             fk_validation_mode: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationMode::Enforced)),
             fk_validation_source: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationSource::Engine)),
             deferred_fk_checks: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
@@ -4903,11 +4958,26 @@ impl EmbeddedDatabase {
         self.execute_params_returning(sql, &[])
     }
 
+    /// Session transactions only block the autocommit INSERT fast paths when
+    /// time-travel versioning is off: fast inserts write MVCC version keys,
+    /// so versioned session-txn snapshot reads stay correct. With versioning
+    /// disabled there is no version metadata to filter by, and the fast
+    /// paths must yield to the fully snapshot-isolated slow path.
+    fn session_txns_block_fast_inserts(&self) -> bool {
+        self.any_session_txns() && !self.storage.time_travel_enabled()
+    }
+
+    /// Lock-free "any session transaction open?" check for hot-path gates.
+    #[inline]
+    fn any_session_txns(&self) -> bool {
+        self.session_txn_count.load(std::sync::atomic::Ordering::Acquire) > 0
+    }
+
     /// Execute eligible autocommit INSERTs without creating an empty implicit
     /// transaction around a direct fast-path storage write.
     fn try_autocommit_fast_insert(&self, sql: &str) -> Option<Result<u64>> {
         if !self.savepoints.read().is_empty()
-            || !self.session_transactions.is_empty()
+            || self.session_txns_block_fast_inserts()
             || self.tenant_manager.get_current_context().is_some()
         {
             return None;
@@ -4932,7 +5002,7 @@ impl EmbeddedDatabase {
     ) -> Option<Result<u64>> {
         if self.in_transaction()
             || !self.savepoints.read().is_empty()
-            || !self.session_transactions.is_empty()
+            || self.session_txns_block_fast_inserts()
             || self.tenant_manager.get_current_context().is_some()
             || self.storage.get_current_branch_id().is_some()
         {
@@ -4966,7 +5036,7 @@ impl EmbeddedDatabase {
     ) -> Option<Result<u64>> {
         if !self.in_transaction()
             || !self.savepoints.read().is_empty()
-            || !self.session_transactions.is_empty()
+            || self.any_session_txns()
             || self.tenant_manager.get_current_context().is_some()
         {
             return None;
@@ -4999,7 +5069,7 @@ impl EmbeddedDatabase {
             return Some(Ok(0));
         }
         if !self.savepoints.read().is_empty()
-            || !self.session_transactions.is_empty()
+            || self.session_txns_block_fast_inserts()
             || self.tenant_manager.get_current_context().is_some()
             || self.storage.get_current_branch_id().is_some()
         {
@@ -5517,7 +5587,7 @@ impl EmbeddedDatabase {
     ) -> Option<Result<u64>> {
         if self.in_transaction()
             || !self.savepoints.read().is_empty()
-            || !self.session_transactions.is_empty()
+            || self.any_session_txns()
             || self.tenant_manager.get_current_context().is_some()
             || self.storage.get_current_branch_id().is_some()
         {
@@ -5551,7 +5621,7 @@ impl EmbeddedDatabase {
         }
         if self.in_transaction()
             || !self.savepoints.read().is_empty()
-            || !self.session_transactions.is_empty()
+            || self.any_session_txns()
             || self.tenant_manager.get_current_context().is_some()
             || self.storage.get_current_branch_id().is_some()
         {
@@ -5629,7 +5699,7 @@ impl EmbeddedDatabase {
     fn try_autocommit_fast_update_delete_params_cached(&self, sql: &str, params: &[Value]) -> Option<Result<u64>> {
         if self.in_transaction()
             || !self.savepoints.read().is_empty()
-            || !self.session_transactions.is_empty()
+            || self.any_session_txns()
             || self.tenant_manager.get_current_context().is_some()
             || self.storage.get_current_branch_id().is_some()
         {
@@ -6316,7 +6386,7 @@ impl EmbeddedDatabase {
     /// otherwise-empty transaction wrapper.
     fn try_autocommit_fast_update_delete(&self, sql: &str) -> Option<Result<u64>> {
         if !self.savepoints.read().is_empty()
-            || !self.session_transactions.is_empty()
+            || self.any_session_txns()
             || self.tenant_manager.get_current_context().is_some()
         {
             return None;
@@ -7143,7 +7213,7 @@ impl EmbeddedDatabase {
             let _ = self.storage.art_indexes().on_delete(table_name, row_id, &col_values);
             return Err(e);
         }
-        self.art_undo_log.write().push(ArtUndoOp::RemoveInserted {
+        self.push_art_undo(txn, ArtUndoOp::RemoveInserted {
             table_name: table_name.to_string(),
             row_id,
             col_values,
@@ -7651,7 +7721,7 @@ impl EmbeddedDatabase {
                     col_values.insert(col.name.clone(), v.clone());
                 }
             }
-            self.art_undo_log.write().push(ArtUndoOp::RestoreDeleted {
+            self.push_art_undo(txn, ArtUndoOp::RestoreDeleted {
                 table_name: target.table_name.clone(),
                 row_id: target.row_id,
                 col_values,
@@ -9508,7 +9578,7 @@ impl EmbeddedDatabase {
             return Ok(count);
         }
 
-        let (count, _tuples) = self.execute_plan_with_params(&plan, params)?;
+        let (count, _tuples) = self.execute_plan_with_params(&plan, params, None)?;
         Ok(count)
     }
 
@@ -9581,7 +9651,7 @@ impl EmbeddedDatabase {
     pub fn execute_params_returning(&self, sql: &str, params: &[Value]) -> Result<(u64, Vec<Tuple>)> {
         let plan = self.parameterized_plan_cached(sql)?;
 
-        let out = self.execute_plan_with_params(&plan, params);
+        let out = self.execute_plan_with_params(&plan, params, None);
 
         // 4. Code-graph auto_reparse hook — same logic as `execute()`
         //    so parameterised DML updates stay in sync with declared
@@ -9847,8 +9917,13 @@ impl EmbeddedDatabase {
     ///
     /// Returns (rows_affected, returned_tuples) where returned_tuples is populated
     /// only when RETURNING clause is present in INSERT/UPDATE/DELETE statements.
-    fn execute_plan_with_params(&self, plan: &sql::LogicalPlan, params: &[Value]) -> Result<(u64, Vec<Tuple>)> {
-        let result = self.execute_plan_with_params_inner(plan, params);
+    fn execute_plan_with_params(
+        &self,
+        plan: &sql::LogicalPlan,
+        params: &[Value],
+        session_txn: Option<&storage::Transaction>,
+    ) -> Result<(u64, Vec<Tuple>)> {
+        let result = self.execute_plan_with_params_inner(plan, params, session_txn);
         // Invalidate the result cache on any successful mutating plan.
         // Without this, an earlier `SELECT ... WHERE col = 'v'` that
         // returned `[]` (e.g. a login probe before register) is served
@@ -9869,7 +9944,30 @@ impl EmbeddedDatabase {
         result
     }
 
-    fn execute_plan_with_params_inner(&self, plan: &sql::LogicalPlan, params: &[Value]) -> Result<(u64, Vec<Tuple>)> {
+    fn execute_plan_with_params_inner(
+        &self,
+        plan: &sql::LogicalPlan,
+        params: &[Value],
+        session_txn: Option<&storage::Transaction>,
+    ) -> Result<(u64, Vec<Tuple>)> {
+        // Session transactions manage their lifecycle through the session
+        // API; routing plan-level transaction control at the global slot
+        // from inside a session would corrupt both.
+        if session_txn.is_some()
+            && matches!(
+                plan,
+                sql::LogicalPlan::StartTransaction
+                    | sql::LogicalPlan::Commit
+                    | sql::LogicalPlan::Rollback
+                    | sql::LogicalPlan::Savepoint { .. }
+                    | sql::LogicalPlan::ReleaseSavepoint { .. }
+                    | sql::LogicalPlan::RollbackToSavepoint { .. }
+            )
+        {
+            return Err(Error::transaction(
+                "transaction control statements must go through the session API",
+            ));
+        }
         // CREATE DATABASE / DROP DATABASE are handled here, above the
         // executor, because they only touch the in-memory TenantManager
         // (no storage). Reserved names (`heliosdb`, `postgres`) are
@@ -10307,11 +10405,18 @@ impl EmbeddedDatabase {
                 let eval_schema = schema.clone().with_source_table_name(table_name);
                 let evaluator = sql::Evaluator::with_parameters(std::sync::Arc::new(eval_schema), params.to_vec());
 
-                let txn_guard = self
-                    .current_transaction
-                    .lock()
-                    .map_err(|_| Error::query_execution("Failed to lock transaction"))?;
-                let active_txn = txn_guard.as_ref();
+                let mut _txn_guard = None;
+                let active_txn: Option<&storage::Transaction> = match session_txn {
+                    Some(txn) => Some(txn),
+                    None => {
+                        _txn_guard = Some(
+                            self.current_transaction
+                                .lock()
+                                .map_err(|_| Error::query_execution("Failed to lock transaction"))?,
+                        );
+                        _txn_guard.as_ref().and_then(|guard| guard.as_ref())
+                    }
+                };
 
                 // Use branch-aware scan to read tuples, then merge any active
                 // transaction writes so parameterized UPDATE has the same
@@ -10450,7 +10555,7 @@ impl EmbeddedDatabase {
                         {
                             tracing::debug!("ART index update/insert-new for '{}': {}", table_name, e);
                         }
-                        self.art_undo_log.write().push(ArtUndoOp::RestoreUpdated {
+                        self.push_art_undo(txn, ArtUndoOp::RestoreUpdated {
                             table_name: table_name.clone(),
                             row_id: *row_id,
                             old_col_values,
@@ -10478,11 +10583,18 @@ impl EmbeddedDatabase {
                 let eval_schema = schema.clone().with_source_table_name(table_name);
                 let evaluator = sql::Evaluator::with_parameters(std::sync::Arc::new(eval_schema), params.to_vec());
 
-                let txn_guard = self
-                    .current_transaction
-                    .lock()
-                    .map_err(|_| Error::query_execution("Failed to lock transaction"))?;
-                let active_txn = txn_guard.as_ref();
+                let mut _txn_guard = None;
+                let active_txn: Option<&storage::Transaction> = match session_txn {
+                    Some(txn) => Some(txn),
+                    None => {
+                        _txn_guard = Some(
+                            self.current_transaction
+                                .lock()
+                                .map_err(|_| Error::query_execution("Failed to lock transaction"))?,
+                        );
+                        _txn_guard.as_ref().and_then(|guard| guard.as_ref())
+                    }
+                };
 
                 // Use branch-aware scan to read tuples, then merge any active
                 // transaction writes so parameterized DELETE has the same
@@ -10535,8 +10647,8 @@ impl EmbeddedDatabase {
                     if let Err(e) = self.storage.art_indexes().on_delete(table_name, *row_id, &col_values) {
                         tracing::debug!("ART index delete for table '{}': {}", table_name, e);
                     }
-                    if active_txn.is_some() {
-                        self.art_undo_log.write().push(ArtUndoOp::RestoreDeleted {
+                    if let Some(txn) = active_txn {
+                        self.push_art_undo(txn, ArtUndoOp::RestoreDeleted {
                             table_name: table_name.clone(),
                             row_id: *row_id,
                             col_values,
@@ -10659,7 +10771,7 @@ impl EmbeddedDatabase {
                         .map(|expr| evaluator.evaluate(expr, &empty_tuple))
                         .collect();
                     // Execute the prepared statement with parameters
-                    self.execute_plan_with_params(&plan, &param_values?)
+                    self.execute_plan_with_params(&plan, &param_values?, session_txn)
                 } else {
                     Err(Error::query_execution(format!(
                         "Prepared statement '{}' does not exist",
@@ -11317,6 +11429,14 @@ impl EmbeddedDatabase {
     ///
     /// * `session_id` - ID of the session to destroy
     pub fn destroy_session(&self, session_id: crate::session::SessionId) -> Result<()> {
+        // A dropped connection must not leak its open transaction (write-set
+        // buffers, row locks) or its eager ART index mutations.
+        if let Some((_, txn)) = self.session_transactions.remove(&session_id) {
+            self.session_txn_count
+                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            let _ = txn.rollback();
+        }
+        self.finish_session_art_undo(session_id, true);
         self.session_manager.destroy_session(session_id)
     }
 
@@ -11361,6 +11481,8 @@ impl EmbeddedDatabase {
 
         // Store transaction in map
         self.session_transactions.insert(session_id, txn);
+        self.session_txn_count
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
 
         Ok(())
     }
@@ -11387,9 +11509,13 @@ impl EmbeddedDatabase {
 
         // Retrieve and commit transaction with a FRESH commit timestamp
         if let Some((_, txn)) = self.session_transactions.remove(&session_id) {
+            self.session_txn_count
+                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
             txn.commit_with_timestamp(self.storage.next_timestamp())?;
             self.storage.increment_lsn();
         }
+        // Changes are committed: the session's ART mutations are now permanent.
+        self.finish_session_art_undo(session_id, false);
 
         // Invalidate result cache since committed data may affect cached query results
         self.invalidate_result_cache();
@@ -11422,8 +11548,13 @@ impl EmbeddedDatabase {
 
         // Retrieve and rollback transaction
         if let Some((_, txn)) = self.session_transactions.remove(&session_id) {
+            self.session_txn_count
+                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
             txn.rollback()?;
         }
+        // Undo the session's eager ART index mutations (insert/update/delete
+        // hooks run at statement time, not commit time).
+        self.finish_session_art_undo(session_id, true);
 
         // Invalidate result cache since rollback changes visible data state
         self.invalidate_result_cache();
@@ -11499,10 +11630,12 @@ impl EmbeddedDatabase {
                 Ok(count) => {
                     txn.commit_with_timestamp(self.storage.next_timestamp())?;
                     self.storage.increment_lsn();
+                    self.finish_session_art_undo(session_id, false);
                     Ok(count)
                 }
                 Err(e) => {
                     let _ = txn.rollback();
+                    self.finish_session_art_undo(session_id, true);
                     Err(e)
                 }
             }
@@ -11569,6 +11702,278 @@ impl EmbeddedDatabase {
         } else {
             self.query(sql, _params)
         }
+    }
+
+    // ================= R0.1: wire-session entry points =================
+    //
+    // One session per wire connection. Transaction control and in-transaction
+    // statements run through the per-session transaction API; autocommit
+    // statements take the exact same fast paths as `execute()`/`query*()`.
+    // This replaces routing wire statements through the global transaction
+    // slot, which folded every connection into one shared transaction.
+
+    /// True if this session currently has an open explicit transaction.
+    pub fn session_in_transaction(&self, session_id: crate::session::SessionId) -> bool {
+        self.session_transactions.contains_key(&session_id)
+    }
+
+    /// Create a session for a wire-protocol connection (one per connection).
+    ///
+    /// Skips the per-user `max_sessions` quota — wire connection counts are
+    /// bounded by the server's `max_connections` semaphore instead.
+    pub fn create_wire_session(&self, user_name: &str) -> Result<crate::session::SessionId> {
+        let user = crate::session::User::new_passwordless(user_name);
+        self.session_manager
+            .create_session_unchecked(&user, crate::session::IsolationLevel::ReadCommitted)
+    }
+
+    /// Set the isolation level used by the session's next transaction.
+    pub fn set_session_isolation(
+        &self,
+        session_id: crate::session::SessionId,
+        isolation: crate::session::IsolationLevel,
+    ) -> Result<()> {
+        if self.session_transactions.contains_key(&session_id) {
+            return Err(Error::transaction(
+                "cannot change isolation level inside an active transaction",
+            ));
+        }
+        let session_lock = self.session_manager.get_session(session_id)?;
+        session_lock.write().isolation_level = isolation;
+        Ok(())
+    }
+
+    /// Touch session stats and, for READ COMMITTED, refresh the open
+    /// transaction's snapshot so the next statement sees the latest commits.
+    fn touch_session_for_statement(&self, session_id: crate::session::SessionId) -> Result<()> {
+        let session_lock = self.session_manager.get_session(session_id)?;
+        let mut session = session_lock.write();
+        session.touch();
+        session.stats.queries_executed += 1;
+        if session.isolation_level == crate::session::IsolationLevel::ReadCommitted {
+            if let Some(mut txn) = self.session_transactions.get_mut(&session_id) {
+                txn.refresh_snapshot(self.storage.current_timestamp());
+            }
+        }
+        Ok(())
+    }
+
+    /// Handle BEGIN / COMMIT / ROLLBACK for a wire session with PostgreSQL's
+    /// lenient semantics: BEGIN inside a transaction and COMMIT/ROLLBACK
+    /// outside one succeed (the handler emits the WARNING notice).
+    pub fn handle_transaction_control_for_session(
+        &self,
+        session_id: crate::session::SessionId,
+        sql: &str,
+    ) -> Result<u64> {
+        let trimmed = sql.trim().trim_end_matches(';').trim();
+        if starts_with_icase(trimmed, "BEGIN") || starts_with_icase(trimmed, "START TRANSACTION") {
+            if !self.session_transactions.contains_key(&session_id) {
+                self.begin_transaction_for_session(session_id)?;
+            }
+            Ok(0)
+        } else if trimmed.eq_ignore_ascii_case("COMMIT") {
+            if self.session_transactions.contains_key(&session_id) {
+                self.commit_transaction_for_session(session_id)?;
+            }
+            Ok(0)
+        } else if trimmed.eq_ignore_ascii_case("ROLLBACK") {
+            if self.session_transactions.contains_key(&session_id) {
+                self.rollback_transaction_for_session(session_id)?;
+            }
+            Ok(0)
+        } else {
+            Err(Error::query_execution("Unknown transaction control statement"))
+        }
+    }
+
+    /// Execute a statement on behalf of a wire-protocol session.
+    pub fn execute_for_session(&self, session_id: crate::session::SessionId, sql: &str) -> Result<u64> {
+        if Self::is_transaction_control(sql) {
+            return self.handle_transaction_control_for_session(session_id, sql);
+        }
+        if !self.session_transactions.contains_key(&session_id) {
+            return self.execute(sql);
+        }
+
+        // SQLite-compat PRAGMA stub — parity with `execute()`.
+        if crate::sql::sqlite_compat::parse_pragma(sql).is_some() {
+            tracing::debug!("PRAGMA stubbed via execute_for_session(): {}", sql.trim());
+            return Ok(0);
+        }
+
+        let start = std::time::Instant::now();
+        self.touch_session_for_statement(session_id)?;
+        let txn = self
+            .session_transactions
+            .get(&session_id)
+            .ok_or_else(|| Error::transaction("Session transaction disappeared during execute"))?;
+        // Result-cache invalidation is deferred to COMMIT, mirroring the
+        // global-slot in-transaction arm of `execute()`.
+        let result = self.execute_in_transaction_no_fast_path(sql, &txn);
+        let rows = result.as_ref().copied().unwrap_or(0);
+        self.log_slow_query(sql, start.elapsed(), rows);
+        result
+    }
+
+    /// `query_with_columns` for a wire session. Inside an open session
+    /// transaction the query executes with that transaction attached, so it
+    /// sees the transaction's own uncommitted writes (read-your-writes —
+    /// which the global-slot wire path never provided); otherwise it takes
+    /// the regular cached autocommit path.
+    pub fn query_with_columns_for_session(
+        &self,
+        session_id: crate::session::SessionId,
+        sql: &str,
+    ) -> Result<(Vec<Tuple>, Vec<String>)> {
+        if !self.session_transactions.contains_key(&session_id) {
+            return self.query_with_columns(sql);
+        }
+
+        let start = std::time::Instant::now();
+        self.touch_session_for_statement(session_id)?;
+        let txn = self
+            .session_transactions
+            .get(&session_id)
+            .ok_or_else(|| Error::transaction("Session transaction disappeared during query"))?;
+
+        let (statement, _) = self.parse_cached(sql)?;
+        let catalog = self.storage.catalog();
+        let planner = sql::Planner::with_catalog(&catalog).with_sql(sql.to_string());
+        let plan = planner.statement_to_plan(statement)?;
+
+        let mut executor = sql::Executor::with_storage(&self.storage)
+            .with_timeout(self.config.storage.query_timeout_ms)
+            .with_transaction(&txn);
+        let result = executor.execute_with_columns(&plan);
+        if let Ok((rows, _)) = &result {
+            self.log_slow_query(sql, start.elapsed(), rows.len() as u64);
+        }
+        result
+    }
+
+    /// `execute_returning` for a wire session (simple-query DML … RETURNING).
+    pub fn execute_returning_for_session(
+        &self,
+        session_id: crate::session::SessionId,
+        sql: &str,
+    ) -> Result<(u64, Vec<Tuple>)> {
+        if Self::is_transaction_control(sql) {
+            let count = self.handle_transaction_control_for_session(session_id, sql)?;
+            return Ok((count, Vec::new()));
+        }
+        if !self.session_transactions.contains_key(&session_id) {
+            return self.execute_returning(sql);
+        }
+
+        self.touch_session_for_statement(session_id)?;
+        let txn = self
+            .session_transactions
+            .get(&session_id)
+            .ok_or_else(|| Error::transaction("Session transaction disappeared during execute"))?;
+        let plan = self.parameterized_plan_cached(sql)?;
+        let out = self.execute_plan_with_params(&plan, &[], Some(&txn));
+
+        #[cfg(feature = "code-graph")]
+        if out.is_ok() {
+            let touched = Self::touched_table_from_sql(sql);
+            self.maybe_auto_reparse(touched.as_deref());
+        }
+
+        out
+    }
+
+    /// `execute_params` for a wire session (extended-protocol DML).
+    pub fn execute_params_for_session(
+        &self,
+        session_id: crate::session::SessionId,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<u64> {
+        if Self::is_transaction_control(sql) {
+            return self.handle_transaction_control_for_session(session_id, sql);
+        }
+        if !self.session_transactions.contains_key(&session_id) {
+            return self.execute_params(sql, params);
+        }
+
+        self.touch_session_for_statement(session_id)?;
+        let txn = self
+            .session_transactions
+            .get(&session_id)
+            .ok_or_else(|| Error::transaction("Session transaction disappeared during execute"))?;
+        let plan = self.parameterized_plan_cached(sql)?;
+        if let Some(result) = self.try_session_txn_fast_insert_params(sql, &plan, params, &txn) {
+            return result;
+        }
+        let (count, _tuples) = self.execute_plan_with_params(&plan, params, Some(&txn))?;
+        Ok(count)
+    }
+
+    /// `query_params` for a wire session (extended-protocol SELECT, plus the
+    /// DML…RETURNING shapes drivers route through the query path).
+    pub fn query_params_for_session(
+        &self,
+        session_id: crate::session::SessionId,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Vec<Tuple>> {
+        if !self.session_transactions.contains_key(&session_id) {
+            return self.query_params(sql, params);
+        }
+
+        self.touch_session_for_statement(session_id)?;
+        let txn = self
+            .session_transactions
+            .get(&session_id)
+            .ok_or_else(|| Error::transaction("Session transaction disappeared during query"))?;
+        let plan = self.parameterized_plan_cached(sql)?;
+
+        if matches!(
+            &*plan,
+            sql::LogicalPlan::Insert { .. }
+                | sql::LogicalPlan::InsertSelect { .. }
+                | sql::LogicalPlan::Update { .. }
+                | sql::LogicalPlan::Delete { .. }
+        ) {
+            let (_count, returned) = self.execute_plan_with_params(&plan, params, Some(&txn))?;
+            return Ok(returned);
+        }
+
+        self.query_plan_with_params(&plan, params, Some(&txn))
+    }
+
+    /// Session-transaction variant of the parameterized fast INSERT path:
+    /// stages the row in the session transaction's write set without going
+    /// through the parser/planner. Concurrent session transactions stay
+    /// correct because commit writes MVCC versions (the gate requires
+    /// versioning on unless this is the only session transaction).
+    fn try_session_txn_fast_insert_params(
+        &self,
+        sql: &str,
+        plan: &sql::LogicalPlan,
+        params: &[Value],
+        txn: &storage::Transaction,
+    ) -> Option<Result<u64>> {
+        if !self.savepoints.read().is_empty()
+            || self.tenant_manager.get_current_context().is_some()
+            || self.storage.get_current_branch_id().is_some()
+            || !(self.storage.time_travel_enabled()
+                || self.session_txn_count.load(std::sync::atomic::Ordering::Acquire) <= 1)
+        {
+            return None;
+        }
+
+        let spec = match self.fast_param_insert_spec(sql, plan)? {
+            Ok(spec) => spec,
+            Err(e) => return Some(Err(e)),
+        };
+        let tuple = match Self::materialize_fast_param_insert_tuple(&spec, params) {
+            Ok(tuple) => tuple,
+            Err(e) => return Some(Err(e)),
+        };
+
+        Some(self.insert_validated_tuple_in_transaction(&spec.table_name, tuple, &spec.schema, txn))
     }
 
     /// Set session quota for a user
@@ -11685,14 +12090,14 @@ impl EmbeddedDatabase {
                 | sql::LogicalPlan::Update { .. }
                 | sql::LogicalPlan::Delete { .. }
         ) {
-            let (_count, returned) = self.execute_plan_with_params(&plan, params)?;
+            let (_count, returned) = self.execute_plan_with_params(&plan, params, None)?;
             self.log_slow_query(sql, start.elapsed(), returned.len() as u64);
             return Ok(returned);
         }
 
         // 4. Execute plan with parameters and return results
         let exec_start = std::time::Instant::now();
-        let results = self.query_plan_with_params(&plan, params)?;
+        let results = self.query_plan_with_params(&plan, params, None)?;
         tracing::debug!(
             phase = "execute",
             duration_us = exec_start.elapsed().as_micros() as u64,
@@ -11705,18 +12110,31 @@ impl EmbeddedDatabase {
     }
 
     /// Internal method to execute a query plan with parameters
-    fn query_plan_with_params(&self, plan: &sql::LogicalPlan, params: &[Value]) -> Result<Vec<Tuple>> {
+    fn query_plan_with_params(
+        &self,
+        plan: &sql::LogicalPlan,
+        params: &[Value],
+        session_txn: Option<&storage::Transaction>,
+    ) -> Result<Vec<Tuple>> {
         // Keep parameterized SELECT consistent with `query()`: explicit
         // transactions must see rows staged in the transaction write set.
-        let txn_lock = self
-            .current_transaction
-            .lock()
-            .map_err(|_| Error::query_execution("Failed to lock transaction"))?;
+        let mut _txn_guard = None;
+        let active_txn: Option<&storage::Transaction> = match session_txn {
+            Some(txn) => Some(txn),
+            None => {
+                _txn_guard = Some(
+                    self.current_transaction
+                        .lock()
+                        .map_err(|_| Error::query_execution("Failed to lock transaction"))?,
+                );
+                _txn_guard.as_ref().and_then(|guard| guard.as_ref())
+            }
+        };
 
         let mut executor = sql::Executor::with_storage(&self.storage)
             .with_timeout(self.config.storage.query_timeout_ms)
             .with_parameters(params.to_vec());
-        if let Some(txn_ref) = txn_lock.as_ref() {
+        if let Some(txn_ref) = active_txn {
             executor = executor.with_transaction(txn_ref);
         }
 
@@ -11791,7 +12209,7 @@ impl EmbeddedDatabase {
                 }
                 _ => Vec::new(),
             };
-            let (_count, rows) = self.execute_plan_with_params(&plan, params)?;
+            let (_count, rows) = self.execute_plan_with_params(&plan, params, None)?;
             return Ok((rows, columns));
         }
 
@@ -12788,6 +13206,8 @@ impl EmbeddedDatabase {
             fast_select_cache: self.fast_select_cache.clone(),
             query_profiler: self.query_profiler.clone(),
             art_undo_log: self.art_undo_log.clone(),
+            session_art_undo: self.session_art_undo.clone(),
+            session_txn_count: self.session_txn_count.clone(),
             fk_validation_mode: self.fk_validation_mode.clone(),
             fk_validation_source: self.fk_validation_source.clone(),
             deferred_fk_checks: self.deferred_fk_checks.clone(),
@@ -13465,7 +13885,7 @@ impl EmbeddedDatabase {
     /// that contain already-parsed logical plans.
     fn execute_plan_internal(&self, plan: &sql::LogicalPlan) -> Result<u64> {
         // Execute plan and extract just the row count (ignore returned tuples)
-        let (count, _tuples) = self.execute_plan_with_params(plan, &[])?;
+        let (count, _tuples) = self.execute_plan_with_params(plan, &[], None)?;
         Ok(count)
     }
 

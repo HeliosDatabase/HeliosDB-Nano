@@ -65,6 +65,18 @@ pub struct PgConnectionHandler<S = BufWriter<TcpStream>> {
     /// until Sync, then ReadyForQuery. Sending ReadyForQuery early can make
     /// drivers close or wedge the connection after an Execute-time error.
     awaiting_sync_after_error: bool,
+    /// Per-connection database session (R0.1). Transactions opened by this
+    /// connection live in the session, not in the process-global slot, so
+    /// concurrent connections get isolated transactions.
+    pub(super) session_id: crate::session::SessionId,
+}
+
+impl<S> Drop for PgConnectionHandler<S> {
+    fn drop(&mut self) {
+        // Roll back any open transaction and release the session when the
+        // connection ends, however it ends.
+        let _ = self.database.destroy_session(self.session_id);
+    }
 }
 
 impl PgConnectionHandler<BufWriter<TcpStream>> {
@@ -80,6 +92,9 @@ impl PgConnectionHandler<BufWriter<TcpStream>> {
             buffer.extend_from_slice(data);
         }
 
+        let session_id = database
+            .create_wire_session("pg_wire")
+            .expect("wire session creation is infallible");
         Self {
             stream: BufWriter::new(stream),
             database: database.clone(),
@@ -94,6 +109,7 @@ impl PgConnectionHandler<BufWriter<TcpStream>> {
             write_buf: BytesMut::with_capacity(4096),
             suppress_ready_for_query: false,
             awaiting_sync_after_error: false,
+            session_id,
         }
     }
 }
@@ -102,6 +118,9 @@ impl PgConnectionHandler<BufWriter<TcpStream>> {
 impl PgConnectionHandler<BufWriter<UnixStream>> {
     /// Create a new connection handler bound to a Unix domain socket stream.
     pub fn new_unix(stream: UnixStream, database: Arc<EmbeddedDatabase>, auth_manager: Arc<AuthManager>) -> Self {
+        let session_id = database
+            .create_wire_session("pg_wire")
+            .expect("wire session creation is infallible");
         Self {
             stream: BufWriter::new(stream),
             database: database.clone(),
@@ -116,6 +135,7 @@ impl PgConnectionHandler<BufWriter<UnixStream>> {
             write_buf: BytesMut::with_capacity(4096),
             suppress_ready_for_query: false,
             awaiting_sync_after_error: false,
+            session_id,
         }
     }
 }
@@ -150,6 +170,9 @@ impl PgConnectionHandler<BufWriter<SecureConnection<TcpStream>>> {
             buffer.extend_from_slice(data);
         }
 
+        let session_id = database
+            .create_wire_session("pg_wire")
+            .expect("wire session creation is infallible");
         Self {
             stream: BufWriter::new(stream),
             database: database.clone(),
@@ -164,6 +187,7 @@ impl PgConnectionHandler<BufWriter<SecureConnection<TcpStream>>> {
             write_buf: BytesMut::with_capacity(4096),
             suppress_ready_for_query: false,
             awaiting_sync_after_error: false,
+            session_id,
         }
     }
 }
@@ -562,15 +586,20 @@ where
                 .await?;
             } else {
                 self.rollback_failed_transaction_for_recovery()?;
-                // Begin transaction (isolation level would be applied if storage supported it)
-                // For now we just begin - isolation level is informational
-                self.database.begin()?;
-                self.transaction_status = TransactionStatus::InTransaction;
-
-                // Log the isolation level for debugging
-                if let Some(level) = isolation_level {
-                    tracing::debug!("Transaction started with isolation level: {}", level);
+                // Map the requested isolation level onto the session before
+                // BEGIN (READ UNCOMMITTED runs as READ COMMITTED, like
+                // PostgreSQL itself).
+                if let Some(level) = isolation_level.as_deref() {
+                    let mapped = match level {
+                        "SERIALIZABLE" => crate::session::IsolationLevel::Serializable,
+                        "REPEATABLE READ" => crate::session::IsolationLevel::RepeatableRead,
+                        _ => crate::session::IsolationLevel::ReadCommitted,
+                    };
+                    let _ = self.database.set_session_isolation(self.session_id, mapped);
+                    tracing::debug!("Transaction starting with isolation level: {}", level);
                 }
+                self.database.begin_transaction_for_session(self.session_id)?;
+                self.transaction_status = TransactionStatus::InTransaction;
             }
             self.send_command_complete("BEGIN").await?;
             self.send_ready_for_query().await?;
@@ -658,7 +687,7 @@ where
         } else if trimmed.eq_ignore_ascii_case("COMMIT") {
             // Handle commit even if no transaction active (PostgreSQL warns but succeeds)
             if self.transaction_status == TransactionStatus::InTransaction {
-                self.database.commit()?;
+                self.database.commit_transaction_for_session(self.session_id)?;
             } else if self.transaction_status == TransactionStatus::Failed {
                 self.rollback_failed_transaction_for_recovery()?;
                 self.send_command_complete("ROLLBACK").await?;
@@ -682,8 +711,8 @@ where
                 self.transaction_status,
                 TransactionStatus::InTransaction | TransactionStatus::Failed
             ) {
-                if self.database.in_transaction() {
-                    self.database.rollback()?;
+                if self.database.session_in_transaction(self.session_id) {
+                    self.database.rollback_transaction_for_session(self.session_id)?;
                 }
             } else {
                 self.send_message(BackendMessage::NoticeResponse {
@@ -825,7 +854,7 @@ where
         };
 
         if is_select || is_show_branches {
-            let cached_query = if is_show_branches {
+            let cached_query = if is_show_branches || self.database.session_in_transaction(self.session_id) {
                 None
             } else {
                 self.database.try_cached_query_with_columns(query)
@@ -834,17 +863,17 @@ where
                 let schema = Self::schema_from_query_columns(&columns, cached_results.as_slice());
                 self.send_query_result(schema, cached_results.as_slice()).await?;
             } else {
-                let (results, columns) = self.database.query_with_columns(query)?;
+                let (results, columns) = self.database.query_with_columns_for_session(self.session_id, query)?;
                 let schema = Self::schema_from_query_columns(&columns, &results);
                 self.send_query_result(schema, &results).await?;
             }
         } else if is_cte {
-            let (results, columns) = self.database.query_with_columns(query)?;
+            let (results, columns) = self.database.query_with_columns_for_session(self.session_id, query)?;
             let schema = Self::schema_from_query_columns(&columns, &results);
             self.send_query_result(schema, &results).await?;
         } else if is_dml_returning {
             // DML with RETURNING clause - returns rows like a query
-            let (affected, tuples) = self.database.execute_returning(query)?;
+            let (affected, tuples) = self.database.execute_returning_for_session(self.session_id, query)?;
             if tuples.is_empty() {
                 // No rows returned - send command complete with count
                 let tag = self.get_command_tag(query, affected);
@@ -861,7 +890,7 @@ where
                 self.send_query_result(schema, &tuples).await?;
             }
         } else {
-            let affected = self.database.execute(query)?;
+            let affected = self.database.execute_for_session(self.session_id, query)?;
             let tag = self.get_command_tag(query, affected);
             self.send_command_complete(&tag).await?;
         }
@@ -1364,7 +1393,7 @@ where
         let prev = self.suppress_ready_for_query;
         self.suppress_ready_for_query = true;
         for stmt in &statements {
-            if let Err(e) = self.database.execute(stmt) {
+            if let Err(e) = self.database.execute_for_session(self.session_id, stmt) {
                 if pg_exception_matches(&exception_codes, &e.to_string()) {
                     tracing::debug!("DO block: caught {:?} via EXCEPTION clause; continuing", e.to_string());
                     continue;
@@ -1456,8 +1485,8 @@ where
 
     fn rollback_failed_transaction_for_recovery(&mut self) -> Result<()> {
         if self.transaction_status == TransactionStatus::Failed {
-            if self.database.in_transaction() {
-                self.database.rollback()?;
+            if self.database.session_in_transaction(self.session_id) {
+                self.database.rollback_transaction_for_session(self.session_id)?;
             }
             self.transaction_status = TransactionStatus::Idle;
         }
@@ -2336,6 +2365,7 @@ mod failed_transaction_state_tests {
         (
             PgConnectionHandler {
                 stream,
+                session_id: db.create_wire_session("pg_wire_test").expect("wire session creation is infallible"),
                 database: db.clone(),
                 auth_manager: Arc::new(AuthManager::new(AuthMethod::Trust)),
                 catalog: PgCatalog::with_database(db),
@@ -2423,6 +2453,7 @@ mod show_branches_wire_tests {
         (
             PgConnectionHandler {
                 stream,
+                session_id: db.create_wire_session("pg_wire_test").expect("wire session creation is infallible"),
                 database: db.clone(),
                 auth_manager: Arc::new(AuthManager::new(AuthMethod::Trust)),
                 catalog: PgCatalog::with_database(db),

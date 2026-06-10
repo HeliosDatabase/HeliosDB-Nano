@@ -1,0 +1,82 @@
+warning: call to `.clone()` on a reference in this situation does nothing
+   --> src/sql/executor/phase3.rs:347:73
+    |
+347 |           .ok_or_else(|| Error::execution("No storage engine available"))?
+    |  _________________________________________________________________________^
+348 | |         .clone();
+    | |________________^
+    |
+    = note: the type `StorageEngine` does not implement `Clone`, so calling `clone` on `&StorageEngine` copies the reference, which does not do anything and can be removed
+    = note: `#[warn(noop_method_call)]` on by default
+help: remove this redundant call
+    |
+347 -         .ok_or_else(|| Error::execution("No storage engine available"))?
+348 -         .clone();
+347 +         .ok_or_else(|| Error::execution("No storage engine available"))?;
+    |
+help: if you meant to clone `StorageEngine`, implement `Clone` for it
+   --> src/storage/engine.rs:894:1
+    |
+894 + #[derive(Clone)]
+895 | pub struct StorageEngine {
+    |
+
+warning: call to `.clone()` on a reference in this situation does nothing
+   --> src/sql/executor/phase3.rs:597:73
+    |
+597 |           .ok_or_else(|| Error::execution("No storage engine available"))?
+    |  _________________________________________________________________________^
+598 | |         .clone();
+    | |________________^
+    |
+    = note: the type `StorageEngine` does not implement `Clone`, so calling `clone` on `&StorageEngine` copies the reference, which does not do anything and can be removed
+help: remove this redundant call
+    |
+597 -         .ok_or_else(|| Error::execution("No storage engine available"))?
+598 -         .clone();
+597 +         .ok_or_else(|| Error::execution("No storage engine available"))?;
+    |
+help: if you meant to clone `StorageEngine`, implement `Clone` for it
+   --> src/storage/engine.rs:894:1
+    |
+894 + #[derive(Clone)]
+895 | pub struct StorageEngine {
+    |
+
+warning: `heliosdb-nano` (lib) generated 2 warnings (run `cargo fix --lib -p heliosdb-nano` to apply 2 suggestions)
+warning: value assigned to `child_dead` is never read
+    --> src/main.rs:1180:21
+     |
+1180 |                     child_dead = true;
+     |                     ^^^^^^^^^^^^^^^^^
+     |
+     = help: maybe it is overwritten before being read?
+     = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: `heliosdb-nano` (bin "heliosdb-nano") generated 1 warning
+    Finished `perf` profile [optimized + debuginfo] target(s) in 0.34s
+     Running tests/tps_workloads.rs (target/perf/deps/tps_workloads-70e1976b437c9857)
+
+running 1 test
+test run_tps_suite ... 
+================ HeliosDB-Nano TPS suite ================
+mode=mem  profile=rowstore  N=10000  M=2000  time_travel=true  dir=/tmp/helios_tps_842739
+--------------------------------------------------------------------------------
+bulk_insert_users(txn)            10000 ops      0.058 s          172297 ops/s        5.80 us/op
+autocommit_insert                  2000 ops      0.015 s          129088 ops/s        7.75 us/op
+point_lookup_pk                    2000 ops      0.006 s          324853 ops/s        3.08 us/op
+point_lookup_hot                   2000 ops      0.001 s         1460489 ops/s        0.68 us/op
+update_by_pk                       2000 ops      0.010 s          203062 ops/s        4.92 us/op
+delete_by_pk                       2000 ops      0.006 s          312605 ops/s        3.20 us/op
+filter_scan(age>50)                  20 ops      0.105 s             191 ops/s     5229.57 us/op
+agg_count_sum_avg                    20 ops      0.048 s             417 ops/s     2398.11 us/op
+group_by_status                      20 ops      0.089 s             224 ops/s     4473.29 us/op
+join_users_orders                    10 ops      0.121 s              83 ops/s    12076.83 us/op
+order_by_limit10                     20 ops      0.118 s             170 ops/s     5885.38 us/op
+--------------------------------------------------------------------------------
+done.
+
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.74s
+
