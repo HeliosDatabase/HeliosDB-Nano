@@ -2201,7 +2201,7 @@ dependencies = [
 
 [[package]]
 name = "heliosdb-nano-py"
-version = "3.38.0"
+version = "3.39.0"
 dependencies = [
  "heliosdb-nano",
  "pyo3",
