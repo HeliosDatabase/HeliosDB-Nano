@@ -1106,3 +1106,116 @@ fn run_param_tps_suite() {
     println!("done.\n");
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// Per-session transaction benchmark (R0.1 direct workloads).
+///
+/// Measures the transaction-cycle shapes the wire handlers use, before and
+/// after the per-session-transaction migration:
+///   - global_txn_cycle(1T): BEGIN; INSERT; COMMIT through the global slot
+///     (the legacy wire path; >1 thread is impossible — second BEGIN errors)
+///   - session_txn_cycle(1/4/16T): the same cycle through the per-session API,
+///     one session per thread, disjoint key ranges
+///   - session_autocommit_insert(1T): execute_in_session with no open txn
+///     (the implicit-session-transaction arm)
+///   - autocommit_insert_with_open_session_txn(1T): plain execute() autocommit
+///     INSERT throughput while another session holds an open transaction
+///     (measures the fast-path kill-switch gate)
+///
+///   HELIOS_SESSION_TXN=1 cargo test --profile perf --test tps_workloads run_session_txn_bench -- --nocapture --test-threads=1
+#[test]
+fn run_session_txn_bench() {
+    if std::env::var("HELIOS_SESSION_TXN").is_err() {
+        eprintln!("skipping run_session_txn_bench (set HELIOS_SESSION_TXN=1)");
+        return;
+    }
+    use heliosdb_nano::session::IsolationLevel;
+
+    let cycles: usize = std::env::var("HELIOS_SESSION_TXN_M")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2000);
+
+    let db = EmbeddedDatabase::new_in_memory().unwrap();
+    db.execute("CREATE TABLE st (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+
+    println!("\n=== session transaction bench (cycles per measurement: {cycles}) ===");
+
+    // 1) Global-slot txn cycle, single thread (legacy wire shape).
+    let start = Instant::now();
+    for i in 0..cycles {
+        db.execute("BEGIN").unwrap();
+        db.execute(&format!("INSERT INTO st (id, v) VALUES ({i}, 1)")).unwrap();
+        db.execute("COMMIT").unwrap();
+    }
+    println!(
+        "global_txn_cycle(1T)                     {:>10.0} txn/s",
+        cycles as f64 / start.elapsed().as_secs_f64()
+    );
+
+    // 2) Per-session txn cycle at 1/4/16 threads, one session per thread.
+    for (round, &threads) in [1usize, 4, 16].iter().enumerate() {
+        let start = Instant::now();
+        std::thread::scope(|s| {
+            for t in 0..threads {
+                let dbr = &db;
+                let base = 1_000_000 * (round + 1) + t * cycles;
+                s.spawn(move || {
+                    let sid = dbr
+                        .create_session(&format!("bench_u{t}"), IsolationLevel::ReadCommitted)
+                        .unwrap();
+                    for i in 0..cycles {
+                        dbr.begin_transaction_for_session(sid).unwrap();
+                        dbr.execute_in_session(sid, &format!("INSERT INTO st (id, v) VALUES ({}, 2)", base + i))
+                            .unwrap();
+                        dbr.commit_transaction_for_session(sid).unwrap();
+                    }
+                    dbr.destroy_session(sid).unwrap();
+                });
+            }
+        });
+        let total = threads * cycles;
+        println!(
+            "session_txn_cycle({threads:>2}T)                   {:>10.0} txn/s  ({total} total)",
+            total as f64 / start.elapsed().as_secs_f64()
+        );
+    }
+
+    // 3) Session autocommit (implicit session transaction per statement).
+    {
+        let sid = db
+            .create_session("bench_autocommit", IsolationLevel::ReadCommitted)
+            .unwrap();
+        let start = Instant::now();
+        for i in 0..cycles {
+            db.execute_in_session(sid, &format!("INSERT INTO st (id, v) VALUES ({}, 3)", 8_000_000 + i))
+                .unwrap();
+        }
+        println!(
+            "session_autocommit_insert(1T)            {:>10.0} ops/s",
+            cycles as f64 / start.elapsed().as_secs_f64()
+        );
+        db.destroy_session(sid).unwrap();
+    }
+
+    // 4) Plain autocommit INSERT throughput while a session txn sits open.
+    {
+        let sid = db
+            .create_session("bench_holder", IsolationLevel::ReadCommitted)
+            .unwrap();
+        db.begin_transaction_for_session(sid).unwrap();
+        db.execute_in_session(sid, "INSERT INTO st (id, v) VALUES (9999999, 4)")
+            .unwrap();
+        let start = Instant::now();
+        for i in 0..cycles {
+            db.execute(&format!("INSERT INTO st (id, v) VALUES ({}, 5)", 9_000_000 + i))
+                .unwrap();
+        }
+        println!(
+            "autocommit_insert_with_open_session_txn  {:>10.0} ops/s",
+            cycles as f64 / start.elapsed().as_secs_f64()
+        );
+        db.rollback_transaction_for_session(sid).unwrap();
+        db.destroy_session(sid).unwrap();
+    }
+    println!();
+}

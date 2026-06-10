@@ -781,6 +781,13 @@ impl Transaction {
         self.snapshot_ts
     }
 
+    /// Session that owns this transaction, if it was created through the
+    /// per-session API (`new_with_session`). `None` for the embedded
+    /// global-slot transaction path.
+    pub fn session_id(&self) -> Option<SessionId> {
+        self.session_id
+    }
+
     /// Refresh the snapshot timestamp to the current database state
     ///
     /// Useful for READ COMMITTED isolation level where each statement

@@ -122,6 +122,20 @@ impl SessionManager {
         Ok(session_id)
     }
 
+    /// Create a session without enforcing the per-user `max_sessions` quota.
+    ///
+    /// Wire-protocol handlers create one session per connection and typically
+    /// authenticate every connection as the same database user; their
+    /// connection count is already bounded by the server's `max_connections`
+    /// semaphore, so the per-user quota (default 10) must not apply.
+    pub fn create_session_unchecked(&self, user: &User, isolation: IsolationLevel) -> Result<SessionId> {
+        let session = Session::new(user.id, isolation);
+        let session_id = session.id;
+        self.sessions
+            .insert(session_id, Arc::new(parking_lot::RwLock::new(session)));
+        Ok(session_id)
+    }
+
     /// Destroy a session
     pub fn destroy_session(&self, session_id: SessionId) -> Result<()> {
         self.sessions

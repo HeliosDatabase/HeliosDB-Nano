@@ -276,7 +276,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
             // SELECT query — pass parameters to the planner via
             // `query_params` so values stay value-shaped instead of
             // being spliced back into SQL.
-            let results = self.database.query_params(&statement.query, &param_values)?;
+            let results = self
+                .database
+                .query_params_for_session(self.session_id, &statement.query, &param_values)?;
 
             // Handle max_rows limit
             let results_to_send = if max_rows > 0 {
@@ -352,7 +354,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
             }
 
             // Non-SELECT query — params-aware execution.
-            let affected = self.database.execute_params(&statement.query, &param_values)?;
+            let affected = self
+                .database
+                .execute_params_for_session(self.session_id, &statement.query, &param_values)?;
             let tag = self.get_command_tag(&statement.query, affected);
             self.send_command_complete(&tag).await?;
 
