@@ -5,6 +5,65 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.38.0] - 2026-06-10
+
+Minor release: per-session transactions for the PostgreSQL and MySQL wire
+protocols (roadmap item R0.1). Every connection now gets an isolated
+transaction context; previously all wire connections shared one
+process-global transaction slot.
+
+### Fixed — Wire protocols / transactions
+
+- Fixed cross-connection transaction bleed: statements from one connection no
+  longer execute inside another connection's open transaction, and a BEGIN on
+  one connection no longer collides with BEGINs on others.
+- In-transaction SELECTs over the wire now see the transaction's own
+  uncommitted writes (read-your-writes) on both the simple-query and
+  extended-protocol (parameterized) paths.
+- Rolled-back session transactions no longer leave phantom ART index
+  entries, and unrelated rollbacks can no longer un-index committed session
+  rows (per-session index undo logs).
+- Dropped connections automatically roll back their open transaction and
+  release their session.
+
+### Added — Embedded API
+
+- Per-session statement execution surface: `create_wire_session`,
+  `session_in_transaction`, `set_session_isolation`, `execute_for_session`,
+  `query_with_columns_for_session`, `execute_returning_for_session`,
+  `execute_params_for_session`, `query_params_for_session`,
+  `handle_transaction_control_for_session`, and a
+  `Transaction::session_id()` accessor.
+- `BEGIN [TRANSACTION] ISOLATION LEVEL ...` over PG wire maps the requested
+  level onto the connection's session (READ UNCOMMITTED runs as READ
+  COMMITTED, matching PostgreSQL).
+
+### Performance
+
+- Concurrent wire transactions now scale: BEGIN/INSERT/COMMIT cycles measure
+  ~45.6k txn/s on one connection and ~161.8k txn/s aggregate across 16
+  connections (previously not correctly runnable above one connection).
+- Autocommit DML while another session holds an open transaction stays on
+  the fast path when time-travel versioning is enabled (was a global kill
+  switch): 12.9k -> 123k inserts/s on the mirrored workload.
+- Replaced per-statement session-map shard sweeps in the DML fast-path gates
+  with an atomic counter: embedded bulk INSERT +29%, autocommit INSERT +30%,
+  UPDATE +67%, DELETE +112% (mem TPS suite, N=10k); batch INSERT +42% in the
+  OLTP smoke head-to-head. Validation details:
+  `R0_1_SESSION_TRANSACTIONS_REPORT.md` and
+  `perf/R0_1_per_session_transactions.md`.
+
+### Known issues
+
+- SAVEPOINT inside a wire (session) transaction is rejected with an explicit
+  error; previously savepoints only ever applied to the embedded global
+  transaction. Follow-up tracked in the validation report.
+- Pre-merge validation surfaced pre-existing failures unrelated to this
+  release (reproduced on v3.37.3): one truncate_hardening test, one
+  v334_a11 test, two vector_store_api tests, plus environment-sensitive
+  hangs in postgres_ssl_tests and pq_storage_integration_test. See the
+  validation report for triage notes.
+
 ## [3.37.3] - 2026-06-05
 
 Patch target for Token Dashboard TD#8: operator-safe MCP-over-HTTP
