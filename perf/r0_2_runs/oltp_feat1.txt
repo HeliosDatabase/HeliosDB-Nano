@@ -1,0 +1,19 @@
+OLTP smoke bench — feat/predicate-pushdown
+============================================
+(Embedded API; mirrors pg_vs_helios.py shapes)
+
+Setup: 179 ms (10000 main + 5000 orders rows seeded)
+
+WRITE PERFORMANCE
+─────────────────
+  Batch INSERT (1000 rows)                       8.04 ms  (    124347 ops/s)
+  INSERT single + commit (median)                0.02 ms  (     47306 ops/s)
+
+READ PERFORMANCE
+────────────────
+  PK lookup (hot, median of 100)                 0.00 ms  (    697837 ops/s)
+  COUNT(*) (median of 5)                         0.00 ms  (    697837 ops/s)
+  INNER JOIN                               p50= 0.0232 ms  mean= 0.0368 ms  p99= 0.0347 ms  (n=2000)
+  Repeated query x100 (cached)                   0.14 ms  (    693044 ops/s)
+
+Done. Compare to docs/BENCHMARK_PG_VS_HELIOS.txt for historical numbers.
