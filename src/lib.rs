@@ -6772,10 +6772,16 @@ impl EmbeddedDatabase {
         }
 
         // Bail on complex features without allocating an uppercased copy.
-        if Self::contains_ascii_case_insensitive(trimmed, b"RETURNING")
-            || Self::contains_ascii_case_insensitive(trimmed, b"ON CONFLICT")
-            || Self::contains_ascii_case_insensitive(trimmed, b"DEFAULT")
-            || Self::contains_ascii_case_insensitive(trimmed, b"SELECT")
+        // Word-boundary + literal-aware (R1.2): a table named
+        // `default_settings` or a TEXT literal containing 'select' no longer
+        // bails. Real keyword uses still fall back gracefully even if missed
+        // here: INSERT…SELECT fails the `VALUES (` structural check,
+        // DEFAULT-in-VALUES fails `fast_parse_one_value`, and trailing
+        // RETURNING / ON CONFLICT fail the `after_values`-empty check.
+        if Self::contains_sql_keyword(trimmed, b"RETURNING")
+            || Self::contains_sql_keyword(trimmed, b"ON CONFLICT")
+            || Self::contains_sql_keyword(trimmed, b"DEFAULT")
+            || Self::contains_sql_keyword(trimmed, b"SELECT")
         {
             return None;
         }
@@ -7383,13 +7389,15 @@ impl EmbeddedDatabase {
             return None;
         }
 
-        // Bail on complex features
-        if Self::contains_ascii_case_insensitive(trimmed, b"RETURNING")
-            || Self::contains_ascii_case_insensitive(trimmed, b"JOIN")
-            || Self::contains_ascii_case_insensitive(trimmed, b"FROM")
-            || Self::contains_ascii_case_insensitive(trimmed, b"SELECT")
-            || Self::contains_ascii_case_insensitive(trimmed, b"CASE")
-            || Self::contains_ascii_case_insensitive(trimmed, b"COALESCE")
+        // Bail on complex features. Word-boundary + literal-aware (R1.2):
+        // `SET note = 'from paris'` or a table named `case_files` no longer
+        // bails; real RETURNING/JOIN/FROM/SELECT/CASE/COALESCE keywords do.
+        if Self::contains_sql_keyword(trimmed, b"RETURNING")
+            || Self::contains_sql_keyword(trimmed, b"JOIN")
+            || Self::contains_sql_keyword(trimmed, b"FROM")
+            || Self::contains_sql_keyword(trimmed, b"SELECT")
+            || Self::contains_sql_keyword(trimmed, b"CASE")
+            || Self::contains_sql_keyword(trimmed, b"COALESCE")
         {
             return None;
         }
@@ -7411,19 +7419,13 @@ impl EmbeddedDatabase {
         }
         let after_set = rest.get(3..)?.trim_start();
 
-        // Find WHERE keyword (case-insensitive)
-        let where_pos = {
-            let pos = Self::find_ascii_case_insensitive(after_set, b"WHERE")?;
-            // Ensure WHERE is word-bounded (preceded by whitespace)
-            if pos == 0 {
-                return None;
-            }
-            let prev = after_set.as_bytes().get(pos - 1)?;
-            if !prev.is_ascii_whitespace() {
-                return None;
-            }
-            pos
-        };
+        // Find WHERE keyword (case-insensitive, word-bounded, outside string
+        // literals — `SET msg = 'tell me where' WHERE id = 1` splits at the
+        // real WHERE, not the one inside the literal).
+        let where_pos = Self::find_sql_keyword(after_set, b"WHERE")?;
+        if where_pos == 0 {
+            return None; // Empty SET clause
+        }
 
         let set_clause = after_set.get(..where_pos)?.trim();
         let where_clause = after_set.get(where_pos + 5..)?.trim();
@@ -7442,11 +7444,13 @@ impl EmbeddedDatabase {
         // Parse WHERE clause: pk_col = pk_value
         // Strip trailing semicolon if present
         let where_clause = where_clause.strip_suffix(';').unwrap_or(where_clause).trim();
-        // Bail on complex WHERE (AND, OR, etc.)
-        if Self::contains_ascii_case_insensitive(where_clause, b"AND")
-            || Self::contains_ascii_case_insensitive(where_clause, b"OR")
-            || Self::contains_ascii_case_insensitive(where_clause, b"IN")
-            || Self::contains_ascii_case_insensitive(where_clause, b"BETWEEN")
+        // Bail on complex WHERE (AND, OR, etc.). Word-boundary + literal-aware
+        // (R1.2): `WHERE points = 5` (contains "in") and `WHERE order_id = 3`
+        // (contains "or") no longer bail; real AND/OR/IN/BETWEEN keywords do.
+        if Self::contains_sql_keyword(where_clause, b"AND")
+            || Self::contains_sql_keyword(where_clause, b"OR")
+            || Self::contains_sql_keyword(where_clause, b"IN")
+            || Self::contains_sql_keyword(where_clause, b"BETWEEN")
         {
             return None;
         }
@@ -7467,8 +7471,13 @@ impl EmbeddedDatabase {
             Err(e) => return Some(Err(e)),
         };
 
-        // Parse PK value
-        let (pk_value, _) = Self::fast_parse_one_value(pk_val_str, &spec.pk_data_type)?;
+        // Parse PK value. The literal must consume the whole token — trailing
+        // text (e.g. `WHERE id = 5 LIMIT 1`) means the fast parser didn't
+        // understand the full clause and must fall back to the planner.
+        let (pk_value, pk_rest) = Self::fast_parse_one_value(pk_val_str, &spec.pk_data_type)?;
+        if !pk_rest.trim().is_empty() {
+            return None;
+        }
 
         // Look up the existing row by PK (needed for both literal and expression SET)
         let existing_row =
@@ -7486,8 +7495,12 @@ impl EmbeddedDatabase {
             return None; // No row_id — can't do fast update
         }
 
-        // Parse SET value: try literal first, then simple expression (col +/- literal)
-        let new_value = if let Some((val, _)) = Self::fast_parse_one_value(set_val_str, &spec.set_data_type) {
+        // Parse SET value: try literal first, then simple expression (col +/- literal).
+        // A literal with trailing text (`SET x = 5 junk`) is not a literal —
+        // fall through to the expression/planner paths.
+        let new_value = if let Some(val) = Self::fast_parse_one_value(set_val_str, &spec.set_data_type)
+            .and_then(|(val, rest)| rest.trim().is_empty().then_some(val))
+        {
             val
         } else if let Some(val) =
             Self::fast_eval_simple_expr(set_val_str, &spec.set_col_name, spec.set_col_idx, &existing_row)
@@ -7577,11 +7590,14 @@ impl EmbeddedDatabase {
             return None;
         }
 
-        if Self::contains_ascii_case_insensitive(trimmed, b"RETURNING")
-            || Self::contains_ascii_case_insensitive(trimmed, b"USING")
-            || Self::contains_ascii_case_insensitive(trimmed, b"JOIN")
-            || Self::contains_ascii_case_insensitive(trimmed, b"SELECT")
-            || Self::contains_ascii_case_insensitive(trimmed, b"WITH")
+        // Word-boundary + literal-aware (R1.2): a table named `with_drawals`
+        // or a literal containing 'select' no longer bails; real
+        // RETURNING/USING/JOIN/SELECT/WITH keywords still do.
+        if Self::contains_sql_keyword(trimmed, b"RETURNING")
+            || Self::contains_sql_keyword(trimmed, b"USING")
+            || Self::contains_sql_keyword(trimmed, b"JOIN")
+            || Self::contains_sql_keyword(trimmed, b"SELECT")
+            || Self::contains_sql_keyword(trimmed, b"WITH")
         {
             return None;
         }
@@ -7605,11 +7621,13 @@ impl EmbeddedDatabase {
 
         let where_clause = rest.get(5..)?.trim_start();
         let where_clause = where_clause.strip_suffix(';').unwrap_or(where_clause).trim();
-        if Self::contains_ascii_case_insensitive(where_clause, b"AND")
-            || Self::contains_ascii_case_insensitive(where_clause, b"OR")
-            || Self::contains_ascii_case_insensitive(where_clause, b"IN")
-            || Self::contains_ascii_case_insensitive(where_clause, b"BETWEEN")
-            || Self::contains_ascii_case_insensitive(where_clause, b"LIKE")
+        // Word-boundary + literal-aware (R1.2): `WHERE finalized = 1`
+        // (contains "in") no longer bails; real AND/OR/IN/BETWEEN/LIKE do.
+        if Self::contains_sql_keyword(where_clause, b"AND")
+            || Self::contains_sql_keyword(where_clause, b"OR")
+            || Self::contains_sql_keyword(where_clause, b"IN")
+            || Self::contains_sql_keyword(where_clause, b"BETWEEN")
+            || Self::contains_sql_keyword(where_clause, b"LIKE")
         {
             return None;
         }
@@ -7643,7 +7661,12 @@ impl EmbeddedDatabase {
             Err(e) => return Some(Err(e)),
         };
 
-        let (pk_value, _) = Self::fast_parse_one_value(pk_val_str, &spec.pk_data_type)?;
+        // The PK literal must consume the whole token — trailing text means
+        // an unparsed construct; fall back to the planner.
+        let (pk_value, pk_rest) = Self::fast_parse_one_value(pk_val_str, &spec.pk_data_type)?;
+        if !pk_rest.trim().is_empty() {
+            return None;
+        }
         let pk_key = crate::storage::art_manager::ArtIndexManager::encode_key(std::slice::from_ref(&pk_value));
         let (row_id, existing_row) = if spec.pk_only_delete && !require_tuple {
             match self.storage.art_indexes().pk_index_lookup(&spec.table_name, &pk_key) {
@@ -7872,13 +7895,15 @@ impl EmbeddedDatabase {
         }
         let where_clause = rest.get(5..)?.trim_start();
 
-        // Bail on complex WHERE
-        if Self::contains_ascii_case_insensitive(where_clause, b"AND")
-            || Self::contains_ascii_case_insensitive(where_clause, b"OR")
-            || Self::contains_ascii_case_insensitive(where_clause, b"JOIN")
-            || Self::contains_ascii_case_insensitive(where_clause, b"ORDER")
-            || Self::contains_ascii_case_insensitive(where_clause, b"GROUP")
-            || Self::contains_ascii_case_insensitive(where_clause, b"LIMIT")
+        // Bail on complex WHERE. Word-boundary + literal-aware (R1.2):
+        // `WHERE order_id = 3` (contains "or"/"order") no longer bails;
+        // real AND/OR/JOIN/ORDER/GROUP/LIMIT keywords still do.
+        if Self::contains_sql_keyword(where_clause, b"AND")
+            || Self::contains_sql_keyword(where_clause, b"OR")
+            || Self::contains_sql_keyword(where_clause, b"JOIN")
+            || Self::contains_sql_keyword(where_clause, b"ORDER")
+            || Self::contains_sql_keyword(where_clause, b"GROUP")
+            || Self::contains_sql_keyword(where_clause, b"LIMIT")
         {
             return None;
         }
@@ -7897,8 +7922,12 @@ impl EmbeddedDatabase {
             Err(e) => return Some(Err(e)),
         };
 
-        // Parse PK value
-        let (pk_value, _) = Self::fast_parse_one_value(pk_val_str, &spec.pk_data_type)?;
+        // Parse PK value; trailing text after the literal means an unparsed
+        // construct — fall back to the planner.
+        let (pk_value, pk_rest) = Self::fast_parse_one_value(pk_val_str, &spec.pk_data_type)?;
+        if !pk_rest.trim().is_empty() {
+            return None;
+        }
 
         Some(Ok((spec, pk_value)))
     }
@@ -8016,12 +8045,13 @@ impl EmbeddedDatabase {
             return None;
         }
         let where_clause = rest.get(5..)?.trim_start();
-        if Self::contains_ascii_case_insensitive(where_clause, b"AND")
-            || Self::contains_ascii_case_insensitive(where_clause, b"OR")
-            || Self::contains_ascii_case_insensitive(where_clause, b"JOIN")
-            || Self::contains_ascii_case_insensitive(where_clause, b"ORDER")
-            || Self::contains_ascii_case_insensitive(where_clause, b"GROUP")
-            || Self::contains_ascii_case_insensitive(where_clause, b"LIMIT")
+        // Word-boundary + literal-aware (R1.2); see fast_select_lookup.
+        if Self::contains_sql_keyword(where_clause, b"AND")
+            || Self::contains_sql_keyword(where_clause, b"OR")
+            || Self::contains_sql_keyword(where_clause, b"JOIN")
+            || Self::contains_sql_keyword(where_clause, b"ORDER")
+            || Self::contains_sql_keyword(where_clause, b"GROUP")
+            || Self::contains_sql_keyword(where_clause, b"LIMIT")
         {
             return None;
         }
@@ -8093,7 +8123,12 @@ impl EmbeddedDatabase {
             return Some(Ok(value));
         }
 
-        let (value, _) = Self::fast_parse_one_value(token, target_type)?;
+        // The literal must consume the whole token — trailing text means an
+        // unparsed construct; fall back to the planner.
+        let (value, rest) = Self::fast_parse_one_value(token, target_type)?;
+        if !rest.trim().is_empty() {
+            return None;
+        }
         Some(Ok(value))
     }
 
@@ -8275,14 +8310,80 @@ impl EmbeddedDatabase {
                 .any(|window| window.eq_ignore_ascii_case(needle))
     }
 
-    fn find_ascii_case_insensitive(haystack: &str, needle: &[u8]) -> Option<usize> {
-        if needle.is_empty() {
+    /// True when `byte` can be part of a SQL identifier (`[A-Za-z0-9_$]`).
+    #[inline]
+    fn is_sql_ident_byte(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$'
+    }
+
+    /// Word-boundary, literal-aware SQL keyword search (R1.2).
+    ///
+    /// Returns the byte offset of the first occurrence of `keyword` in
+    /// `haystack` that is:
+    /// - OUTSIDE single-quoted string literals (doubled `''` escapes are
+    ///   handled, so `'it''s'` is one literal), and
+    /// - delimited by non-identifier characters on both sides (identifier
+    ///   characters are `[A-Za-z0-9_$]`), so `points` does not match `IN`
+    ///   and `order_id` does not match `OR`.
+    ///
+    /// Deliberate, conservative design choices:
+    /// - Double-quoted identifiers are scanned as plain text: a quoted
+    ///   identifier like `"my select"` still counts as containing `SELECT`.
+    ///   A false positive here only costs performance (the statement takes
+    ///   the full parse/plan path); it can never produce wrong results.
+    /// - An unterminated single-quoted literal swallows the rest of the
+    ///   haystack. The structural fast parsers reject unterminated literals
+    ///   anyway, so nothing incorrect can slip through.
+    /// - Multi-word needles (e.g. `ON CONFLICT`) match only the exact
+    ///   single-space spelling, like the previous raw substring check;
+    ///   other spellings are rejected structurally by the fast parsers.
+    ///
+    /// Allocation-free single pass.
+    #[allow(clippy::indexing_slicing)] // Safety: all accesses guarded by `i < bytes.len()`
+    fn find_sql_keyword(haystack: &str, keyword: &[u8]) -> Option<usize> {
+        if keyword.is_empty() {
             return None;
         }
-        haystack
-            .as_bytes()
-            .windows(needle.len())
-            .position(|window| window.eq_ignore_ascii_case(needle))
+        let bytes = haystack.as_bytes();
+        let klen = keyword.len();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'\'' {
+                // Skip the single-quoted literal, honoring '' escapes.
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\'' {
+                        if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                            i += 2; // escaped quote — still inside the literal
+                            continue;
+                        }
+                        i += 1; // closing quote
+                        break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            if i + klen <= bytes.len()
+                && bytes[i..i + klen].eq_ignore_ascii_case(keyword)
+                && (i == 0 || !Self::is_sql_ident_byte(bytes[i - 1]))
+                && (i + klen == bytes.len() || !Self::is_sql_ident_byte(bytes[i + klen]))
+            {
+                return Some(i);
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// True when `keyword` appears in `haystack` as a standalone word outside
+    /// single-quoted string literals. See [`Self::find_sql_keyword`] for the
+    /// exact boundary/escape semantics. Used by the fast-path eligibility
+    /// checks so identifiers like `points` (contains `IN`) or literals like
+    /// `'please select me'` no longer knock statements off the parse-skipping
+    /// fast paths (R1.2).
+    fn contains_sql_keyword(haystack: &str, keyword: &[u8]) -> bool {
+        Self::find_sql_keyword(haystack, keyword).is_some()
     }
 
     /// Parse one or more VALUES groups from a simple INSERT statement.
@@ -14715,6 +14816,184 @@ mod tests {
     fn test_embedded_database_creation() {
         let db = EmbeddedDatabase::new_in_memory();
         assert!(db.is_ok());
+    }
+
+    // ---- R1.2: word-boundary, literal-aware keyword matcher ----
+
+    fn has_kw(haystack: &str, keyword: &str) -> bool {
+        EmbeddedDatabase::contains_sql_keyword(haystack, keyword.as_bytes())
+    }
+
+    #[test]
+    fn test_contains_sql_keyword_word_boundaries() {
+        // Substrings of identifiers must NOT match.
+        assert!(!has_kw("points = 5", "IN"));
+        assert!(!has_kw("order_id = 3", "OR"));
+        assert!(!has_kw("order_id = 3", "ORDER"));
+        assert!(!has_kw("finalized = 1", "IN"));
+        assert!(!has_kw("brand = 'x'", "AND"));
+        assert!(!has_kw("INSERT INTO default_settings (id) VALUES (1)", "DEFAULT"));
+        assert!(!has_kw("selected_count = 2", "SELECT"));
+        assert!(!has_kw("groups = 1", "GROUP"));
+        assert!(!has_kw("$or = 1", "OR")); // $ is an identifier char
+        assert!(!has_kw("or2 = 1", "OR"));
+        assert!(!has_kw("_or = 1", "OR"));
+
+        // Standalone keywords MUST match, case-insensitively.
+        assert!(has_kw("a = 1 AND b = 2", "AND"));
+        assert!(has_kw("a = 1 and b = 2", "AND"));
+        assert!(has_kw("id IN (1,2)", "IN"));
+        assert!(has_kw("id in(1,2)", "IN")); // '(' is a boundary
+        assert!(has_kw("OR a = 1", "OR")); // start of haystack
+        assert!(has_kw("a = 1 OR", "OR")); // end of haystack
+        assert!(has_kw("id = 5 ORDER BY id", "ORDER"));
+        assert!(has_kw("INSERT INTO t SELECT * FROM s", "SELECT"));
+        assert!(has_kw("VALUES (DEFAULT)", "DEFAULT"));
+        assert!(has_kw("VALUES (1) ON CONFLICT DO NOTHING", "ON CONFLICT"));
+    }
+
+    #[test]
+    fn test_contains_sql_keyword_skips_string_literals() {
+        // Keywords inside single-quoted literals must NOT match.
+        assert!(!has_kw("msg = 'please select me'", "SELECT"));
+        assert!(!has_kw("msg = 'the default value'", "DEFAULT"));
+        assert!(!has_kw("msg = 'to be or not'", "OR"));
+        assert!(!has_kw("msg = 'in and out'", "IN"));
+        assert!(!has_kw("msg = 'in and out'", "AND"));
+        assert!(!has_kw("note = 'order by mail'", "ORDER"));
+        assert!(!has_kw("(1, 'returning soon')", "RETURNING"));
+
+        // Doubled-quote escape keeps us inside the literal.
+        assert!(!has_kw("msg = 'it''s an order'", "ORDER"));
+        assert!(!has_kw("msg = 'a''b'' or c'", "OR"));
+        // After the literal closes, keywords match again.
+        assert!(has_kw("msg = 'it''s' OR x = 1", "OR"));
+        assert!(has_kw("msg = 'quote''d' AND b = 2", "AND"));
+        // Keyword adjacent to a closing quote: boundary is the quote char.
+        assert!(has_kw("'abc'OR x = 1", "OR"));
+
+        // Unterminated literal swallows the rest (conservative: no match;
+        // structural parsers reject the statement anyway).
+        assert!(!has_kw("msg = 'unterminated or", "OR"));
+
+        // Conservative choice: double-quoted identifiers are scanned as
+        // plain text, so a quoted identifier containing a keyword bails.
+        assert!(has_kw("\"my select\" = 1", "SELECT"));
+    }
+
+    /// R1.2: the fast paths must now CLAIM (Some) the word-boundary shapes
+    /// that the old substring bail-words rejected, and must still BAIL (None)
+    /// on statements that genuinely use the keywords. `is_some()` here means
+    /// the statement executed on the fast path.
+    #[test]
+    fn test_r12_fast_path_eligibility_claims_and_bails() {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE scores (points INT PRIMARY KEY, val TEXT)").unwrap();
+        db.execute("CREATE TABLE orders (order_id INT PRIMARY KEY, status TEXT)").unwrap();
+        db.execute("CREATE TABLE default_settings (id INT PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("CREATE TABLE jobs (finalized INT PRIMARY KEY, name TEXT)").unwrap();
+
+        // --- INSERT ---
+        assert!(
+            db.try_fast_insert("INSERT INTO default_settings (id, name) VALUES (1, 'x')")
+                .is_some(),
+            "table name containing DEFAULT must stay fast-path eligible"
+        );
+        assert!(
+            db.try_fast_insert("INSERT INTO scores (points, val) VALUES (1, 'please select me')")
+                .is_some(),
+            "literal containing 'select' must stay fast-path eligible"
+        );
+        assert!(
+            db.try_fast_insert("INSERT INTO scores (points, val) SELECT points, val FROM scores")
+                .is_none(),
+            "INSERT ... SELECT must still bail"
+        );
+        assert!(
+            db.try_fast_insert("INSERT INTO default_settings (id, name) VALUES (2, DEFAULT)")
+                .is_none(),
+            "DEFAULT keyword in VALUES must still bail"
+        );
+        assert!(
+            db.try_fast_insert("INSERT INTO scores (points, val) VALUES (9, 'v') ON CONFLICT DO NOTHING")
+                .is_none(),
+            "ON CONFLICT must still bail"
+        );
+
+        // --- UPDATE ---
+        db.execute("INSERT INTO scores (points, val) VALUES (5, 'a')").unwrap();
+        db.execute("INSERT INTO orders (order_id, status) VALUES (3, 'open')").unwrap();
+        assert!(
+            db.try_fast_update("UPDATE scores SET val = 'z' WHERE points = 5").is_some(),
+            "WHERE points = 5 (contains 'in') must stay fast-path eligible"
+        );
+        assert!(
+            db.try_fast_update("UPDATE orders SET status = 'shipped' WHERE order_id = 3")
+                .is_some(),
+            "WHERE order_id = 3 (contains 'or') must stay fast-path eligible"
+        );
+        assert!(
+            db.try_fast_update("UPDATE scores SET val = 'q' WHERE points = 5 AND val = 'z'")
+                .is_none(),
+            "AND conjunction must still bail"
+        );
+        assert!(
+            db.try_fast_update("UPDATE scores SET val = 'q' WHERE points IN (5)").is_none(),
+            "IN list must still bail"
+        );
+        assert!(
+            db.try_fast_update("UPDATE scores SET val = 'q' WHERE points = 5 RETURNING val")
+                .is_none(),
+            "RETURNING must still bail"
+        );
+
+        // --- DELETE ---
+        db.execute("INSERT INTO jobs (finalized, name) VALUES (1, 'a')").unwrap();
+        db.execute("INSERT INTO jobs (finalized, name) VALUES (2, 'b')").unwrap();
+        assert!(
+            db.try_fast_delete_autocommit("DELETE FROM jobs WHERE finalized = 1").is_some(),
+            "WHERE finalized = 1 (contains 'in') must stay fast-path eligible"
+        );
+        assert!(
+            db.try_fast_delete_autocommit("DELETE FROM jobs WHERE finalized = 2 OR finalized = 3")
+                .is_none(),
+            "OR disjunction must still bail"
+        );
+
+        // --- SELECT ---
+        assert!(
+            db.try_fast_select("SELECT * FROM scores WHERE points = 5").is_some(),
+            "WHERE points = 5 must stay fast-path eligible"
+        );
+        assert!(
+            db.try_fast_select("SELECT * FROM orders WHERE order_id = 3").is_some(),
+            "WHERE order_id = 3 (contains 'order') must stay fast-path eligible"
+        );
+        assert!(
+            db.try_fast_select("SELECT * FROM scores WHERE points = 5 ORDER BY points")
+                .is_none(),
+            "ORDER BY must still bail"
+        );
+        assert!(
+            db.try_fast_select("SELECT * FROM scores WHERE points = 5 LIMIT 1").is_none(),
+            "LIMIT must still bail"
+        );
+        assert!(
+            db.try_fast_select_params("SELECT * FROM scores WHERE points = $1", &[Value::Int4(5)])
+                .is_some(),
+            "parameterized WHERE points = $1 must stay fast-path eligible"
+        );
+    }
+
+    #[test]
+    fn test_find_sql_keyword_positions() {
+        assert_eq!(
+            EmbeddedDatabase::find_sql_keyword("msg = 'x where y' WHERE id = 1", b"WHERE"),
+            Some(18)
+        );
+        assert_eq!(EmbeddedDatabase::find_sql_keyword("wherex = 1 WHERE id = 2", b"WHERE"), Some(11));
+        assert_eq!(EmbeddedDatabase::find_sql_keyword("a = 1", b"WHERE"), None);
+        assert_eq!(EmbeddedDatabase::find_sql_keyword("anything", b""), None);
     }
 
     #[test]
