@@ -2446,6 +2446,10 @@ impl StorageEngine {
                 }
             }
 
+            // R5.V1: maintain HNSW vector indexes (single atomic load when
+            // the table has none).
+            let _ = self.vector_indexes.on_row_insert(table_name, row_id, &schema, &tuple);
+
             // Skip delta tracking in bulk load mode for improved performance
             if !bulk_mode {
                 // Record delta for incremental MV refresh
@@ -7688,6 +7692,10 @@ impl StorageEngine {
             }
         }
 
+        // R5.V1: maintain HNSW vector indexes (single atomic load when the
+        // table has none).
+        let _ = self.vector_indexes.on_row_insert(table_name, row_id, schema, &tuple);
+
         if self.config.storage.time_travel_enabled {
             // Write versioned copy (for time-travel queries)
             let timestamp = self.next_timestamp();
@@ -7831,6 +7839,10 @@ impl StorageEngine {
         {
             tracing::debug!("ART index insert for table '{}': {}", table_name, e);
         }
+
+        // R5.V1: maintain HNSW vector indexes (single atomic load when the
+        // table has none).
+        let _ = self.vector_indexes.on_row_insert(table_name, row_id, schema, &tuple);
 
         // Periodically persist row counter (every 64 inserts) for crash safety
         if row_id % 64 == 0 {
@@ -7986,6 +7998,8 @@ impl StorageEngine {
             {
                 tracing::debug!("ART index batch insert for table '{}': {}", table_name, e);
             }
+            // R5.V1: maintain HNSW vector indexes.
+            let _ = self.vector_indexes.on_row_insert(table_name, *row_id, schema, tuple);
         }
 
         Ok(indexed_rows.len() as u64)
@@ -8163,6 +8177,14 @@ impl StorageEngine {
             }
         }
 
+        // R5.V1: maintain HNSW vector indexes. Deliberately independent of
+        // the ART `update_indexes` gate above — vector columns are not ART
+        // columns, so an UPDATE can change the vector while leaving every
+        // ART key untouched. The hook itself skips unchanged vector columns.
+        let _ = self
+            .vector_indexes
+            .on_row_update(table_name, row_id, schema, Some(old_tuple), &new_tuple);
+
         // Invalidate row cache for this row
         self.row_cache.invalidate(table_name, row_id);
 
@@ -8174,12 +8196,18 @@ impl StorageEngine {
     /// This keeps the common payload-column UPDATE path from cloning the old
     /// tuple just to prove indexes are unchanged. Callers must have already
     /// checked that no indexed column is modified.
+    /// `vector_old_tuple`: pre-update row for HNSW vector maintenance
+    /// (R5.V1). Callers that already checked
+    /// `vector_indexes().table_has_indexes(..)` returned `false` may pass
+    /// `None`; otherwise pass the old row so unchanged vector columns are
+    /// skipped instead of pointlessly re-indexed.
     pub fn update_tuple_fast_no_index(
         &self,
         table_name: &str,
         row_id: u64,
         new_tuple: Tuple,
         schema: &crate::Schema,
+        vector_old_tuple: Option<&Tuple>,
     ) -> Result<u64> {
         let value = if schema_uses_column_storage(schema) {
             let stored_tuple = self.transform_tuple_for_column_storage(table_name, row_id, &new_tuple, schema)?;
@@ -8191,6 +8219,17 @@ impl StorageEngine {
 
         let key = Self::build_data_key(table_name, row_id);
         self.put(&key, &value)?;
+
+        // R5.V1: callers proved no *ART* index column changed, which says
+        // nothing about vector columns; maintain HNSW indexes here. The
+        // `has_any_index` gate inside the hook keeps this free for
+        // non-vector tables.
+        if vector_old_tuple.is_some() || self.vector_indexes.table_has_indexes(table_name) {
+            let _ = self
+                .vector_indexes
+                .on_row_update(table_name, row_id, schema, vector_old_tuple, &new_tuple);
+        }
+
         self.row_cache.invalidate(table_name, row_id);
         Ok(1)
     }
@@ -8221,6 +8260,11 @@ impl StorageEngine {
         {
             tracing::debug!("ART index delete for table '{}': {}", table_name, e);
         }
+
+        // R5.V1: drop the row's entries from HNSW vector indexes.
+        let _ = self
+            .vector_indexes
+            .on_row_delete(table_name, row_id, Some(schema), Some(old_tuple));
 
         for column in schema
             .columns
@@ -8261,6 +8305,11 @@ impl StorageEngine {
         {
             tracing::debug!("ART PK delete for table '{}': {}", table_name, e);
         }
+
+        // R5.V1: drop the row's entries from HNSW vector indexes. No old
+        // tuple on this path (PK-only delete skips the row fetch); the hook
+        // deletes by row_id, which is all HNSW needs.
+        let _ = self.vector_indexes.on_row_delete(table_name, row_id, None, None);
 
         self.row_cache.invalidate(table_name, row_id);
         Ok(1)
@@ -9615,6 +9664,15 @@ impl StorageEngine {
                     .on_update(table_name, row_id, old_tuple, &tuple, &schema);
             }
 
+            // R5.V1: maintain HNSW vector indexes (main branch only — the
+            // vector index is process-wide and serves main-branch kNN, so
+            // branch-isolated overlay writes must not mutate it).
+            if branch_id.is_none() {
+                let _ = self
+                    .vector_indexes
+                    .on_row_update(table_name, row_id, &schema, old_tuple_for_delta.as_ref(), &tuple);
+            }
+
             // Update speculative filters (track new values)
             for (i, col) in schema.columns.iter().enumerate() {
                 if let Some(value) = tuple.values.get(i) {
@@ -9715,6 +9773,14 @@ impl StorageEngine {
                         self.filter_delta_tracker.on_delete(table_name, *row_id, tuple, schema);
                     }
                 }
+
+                // R5.V1: drop the row's entries from HNSW vector indexes.
+                let _ = self.vector_indexes.on_row_delete(
+                    table_name,
+                    *row_id,
+                    schema_result.as_ref().ok(),
+                    deleted_tuple_for_delta.as_ref(),
+                );
 
                 // Invalidate row cache entry (row deleted)
                 self.row_cache.invalidate(table_name, *row_id);

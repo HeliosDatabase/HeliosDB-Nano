@@ -515,6 +515,11 @@ enum ArtUndoOp {
         old_col_values: std::collections::HashMap<String, Value>,
         new_col_values: std::collections::HashMap<String, Value>,
     },
+    /// R5.V1: HNSW vector-index undo entries. Vector indexes are maintained
+    /// eagerly at statement time exactly like ART, so their undo ops ride the
+    /// same per-transaction (and per-session) log and are replayed by the
+    /// same ROLLBACK paths.
+    VectorUndo(Vec<storage::VectorIndexUndoOp>),
 }
 
 #[derive(Clone)]
@@ -1271,8 +1276,32 @@ impl EmbeddedDatabase {
                         tracing::debug!("ART rollback restore update for '{}' row {}: {}", table_name, row_id, e);
                     }
                 }
+                ArtUndoOp::VectorUndo(ops) => {
+                    for op in ops.iter().rev() {
+                        self.storage.vector_indexes().apply_undo(op);
+                    }
+                }
             }
         }
+    }
+
+    /// R5.V1: queue eager HNSW maintenance undo ops on the owning
+    /// transaction's undo log (same routing as ART entries). No-op for the
+    /// common empty case.
+    fn push_vector_undo(&self, txn: &storage::Transaction, ops: Vec<storage::VectorIndexUndoOp>) {
+        if !ops.is_empty() {
+            self.push_art_undo(txn, ArtUndoOp::VectorUndo(ops));
+        }
+    }
+
+    /// R5.V1 gate for the transactional (write-set) DML sites: vector
+    /// maintenance only applies when the table actually has a vector index
+    /// (one relaxed atomic load when none exists in the process) and we're
+    /// writing the main branch — the HNSW index is process-wide and serves
+    /// main-branch kNN, so branch-isolated overlay writes must not mutate it.
+    fn vector_dml_gate(&self, table_name: &str) -> bool {
+        self.storage.vector_indexes().table_has_indexes(table_name)
+            && self.storage.get_current_branch().is_none()
     }
 
     /// Try to parse HA switchover commands (ha-tier1 feature only)
@@ -2009,6 +2038,14 @@ impl EmbeddedDatabase {
                                         })?;
                                     existing_tuple.row_id = Some(existing_row_id);
 
+                                    // R5.V1: snapshot the pre-update row for HNSW vector
+                                    // maintenance (vector-indexed tables only).
+                                    let vector_pre_update_tuple = if self.vector_dml_gate(table_name) {
+                                        Some(existing_tuple.clone())
+                                    } else {
+                                        None
+                                    };
+
                                     // Apply assignments, resolving EXCLUDED references
                                     let update_evaluator = sql::Evaluator::new(std::sync::Arc::new(
                                         schema.clone().with_source_table_name(table_name),
@@ -2096,6 +2133,19 @@ impl EmbeddedDatabase {
                                             existing_row_id,
                                             &updated_col_values,
                                         );
+                                    }
+
+                                    // R5.V1: re-index the row's vector if the DO UPDATE
+                                    // changed it (undo on rollback).
+                                    if let Some(old_tuple) = &vector_pre_update_tuple {
+                                        let vops = self.storage.vector_indexes().on_row_update(
+                                            table_name,
+                                            existing_row_id,
+                                            &schema,
+                                            Some(old_tuple),
+                                            &existing_tuple,
+                                        );
+                                        self.push_vector_undo(txn, vops);
                                     }
 
                                     // Log to WAL for replication
@@ -2229,6 +2279,15 @@ impl EmbeddedDatabase {
                             row_id,
                             col_values,
                         });
+                    }
+
+                    // R5.V1: eagerly maintain HNSW vector indexes (undo on rollback)
+                    if self.vector_dml_gate(table_name) {
+                        let vops = self
+                            .storage
+                            .vector_indexes()
+                            .on_row_insert(table_name, row_id, &schema, &tuple);
+                        self.push_vector_undo(txn, vops);
                     }
 
                     count += 1;
@@ -2982,6 +3041,18 @@ impl EmbeddedDatabase {
                         });
                     }
 
+                    // R5.V1: eagerly maintain HNSW vector indexes (undo on rollback)
+                    if self.vector_dml_gate(table_name) {
+                        let vops = self.storage.vector_indexes().on_row_update(
+                            table_name,
+                            *row_id,
+                            &schema,
+                            Some(old_tuple),
+                            tuple,
+                        );
+                        self.push_vector_undo(txn, vops);
+                    }
+
                     // P0#2: still append the logical WAL entry (so crash-recovery
                     // replay and logical replication stay consistent), but WITHOUT a
                     // per-statement fsync by default — durability matches the RocksDB
@@ -3329,6 +3400,18 @@ impl EmbeddedDatabase {
                         row_id: *row_id,
                         col_values,
                     });
+
+                    // R5.V1: eagerly drop the row from HNSW vector indexes
+                    // (undo on rollback)
+                    if self.vector_dml_gate(table_name) {
+                        let vops = self.storage.vector_indexes().on_row_delete(
+                            table_name,
+                            *row_id,
+                            Some(&schema_arc),
+                            Some(tuple),
+                        );
+                        self.push_vector_undo(txn, vops);
+                    }
                 }
 
                 let _ = returned_tuples; // RETURNING clause results handled separately
@@ -5905,6 +5988,15 @@ impl EmbeddedDatabase {
                 Some(true),
             )
         } else {
+            // R5.V1: vector indexes aren't ART indexes, so this "no index
+            // change" path may still touch (or carry) a vector column. Keep
+            // the pre-update row for HNSW maintenance when the table has a
+            // vector index (one atomic load otherwise).
+            let vector_old_tuple = if self.storage.vector_indexes().table_has_indexes(&spec.table_name) {
+                Some(existing_row.clone())
+            } else {
+                None
+            };
             let mut new_tuple = existing_row;
             new_tuple.row_id = None;
             new_tuple.branch_id = None;
@@ -5926,8 +6018,13 @@ impl EmbeddedDatabase {
                     return Some(Err(e));
                 }
             }
-            self.storage
-                .update_tuple_fast_no_index(&spec.table_name, row_id, new_tuple, &spec.schema)
+            self.storage.update_tuple_fast_no_index(
+                &spec.table_name,
+                row_id,
+                new_tuple,
+                &spec.schema,
+                vector_old_tuple.as_ref(),
+            )
         };
         if result.is_ok() {
             self.storage.increment_lsn();
@@ -7251,6 +7348,15 @@ impl EmbeddedDatabase {
             col_values,
         });
 
+        // R5.V1: eagerly maintain HNSW vector indexes (undo on rollback)
+        if self.vector_dml_gate(table_name) {
+            let vops = self
+                .storage
+                .vector_indexes()
+                .on_row_insert(table_name, row_id, schema, &tuple);
+            self.push_vector_undo(txn, vops);
+        }
+
         Ok(())
     }
 
@@ -7581,6 +7687,13 @@ impl EmbeddedDatabase {
                 Some(true),
             )
         } else {
+            // R5.V1: keep the pre-update row for HNSW vector maintenance when
+            // the table has a vector index (one atomic load otherwise).
+            let vector_old_tuple = if self.storage.vector_indexes().table_has_indexes(&spec.table_name) {
+                Some(existing_row.clone())
+            } else {
+                None
+            };
             let mut new_tuple = existing_row;
             new_tuple.row_id = None;
             new_tuple.branch_id = None;
@@ -7602,8 +7715,13 @@ impl EmbeddedDatabase {
                 }
             }
 
-            self.storage
-                .update_tuple_fast_no_index(&spec.table_name, row_id, new_tuple, &spec.schema)
+            self.storage.update_tuple_fast_no_index(
+                &spec.table_name,
+                row_id,
+                new_tuple,
+                &spec.schema,
+                vector_old_tuple.as_ref(),
+            )
         };
 
         Some(result)
@@ -7775,6 +7893,17 @@ impl EmbeddedDatabase {
                 row_id: target.row_id,
                 col_values,
             });
+
+            // R5.V1: eagerly drop the row from HNSW vector indexes (undo on rollback)
+            if self.vector_dml_gate(&target.table_name) {
+                let vops = self.storage.vector_indexes().on_row_delete(
+                    &target.table_name,
+                    target.row_id,
+                    Some(&target.schema),
+                    Some(existing_row),
+                );
+                self.push_vector_undo(txn, vops);
+            }
 
             self.storage.row_cache().invalidate(&target.table_name, target.row_id);
             Ok(1)
@@ -10764,6 +10893,21 @@ impl EmbeddedDatabase {
                                 new_col_values,
                             });
                         }
+                        // R5.V1: eagerly maintain HNSW vector indexes (undo
+                        // on rollback). Runs outside the ART gate above —
+                        // on_row_update itself skips when the indexed vector
+                        // column is unchanged.
+                        if self.vector_dml_gate(table_name) {
+                            let vops = self.storage.vector_indexes().on_row_update(
+                                table_name,
+                                *row_id,
+                                &schema,
+                                Some(old_tuple),
+                                tuple,
+                            );
+                            self.push_vector_undo(txn, vops);
+                        }
+
                         self.storage.row_cache().invalidate(table_name, *row_id);
                     }
                     updates.len() as u64
@@ -10856,6 +11000,20 @@ impl EmbeddedDatabase {
                             row_id: *row_id,
                             col_values,
                         });
+
+                        // R5.V1: eagerly drop the row from HNSW vector indexes
+                        // (undo on rollback). Autocommit deletes go through
+                        // `delete_tuples_branch_aware`, whose engine-side hook
+                        // covers them — only the txn write-set path needs this.
+                        if self.vector_dml_gate(table_name) {
+                            let vops = self.storage.vector_indexes().on_row_delete(
+                                table_name,
+                                *row_id,
+                                Some(&schema),
+                                Some(tuple),
+                            );
+                            self.push_vector_undo(txn, vops);
+                        }
                     }
                 }
 
@@ -12679,6 +12837,15 @@ impl EmbeddedDatabase {
             let key = self.storage.branch_aware_data_key(table_name, row_id);
             self.storage.put(&key, &val)?;
 
+            // R5.V1: maintain HNSW vector indexes. Like the ART update below,
+            // this direct-write bulk path is not transactional (no undo).
+            if self.vector_dml_gate(table_name) {
+                let _ = self
+                    .storage
+                    .vector_indexes()
+                    .on_row_insert(table_name, row_id, &schema, &tuple);
+            }
+
             art_updates.push((row_id, col_values));
             row_ids.push(row_id);
         }
@@ -13582,6 +13749,14 @@ impl EmbeddedDatabase {
                 .on_delete_tuple(table_name, row_id, &schema, &tuple)
             {
                 tracing::debug!("ART index delete for cascade table '{}': {}", table_name, e);
+            }
+            // R5.V1: drop cascade-deleted rows from HNSW vector indexes
+            // (the cascade txn committed just above — no undo).
+            if self.vector_dml_gate(table_name) {
+                let _ = self
+                    .storage
+                    .vector_indexes()
+                    .on_row_delete(table_name, row_id, Some(&schema), Some(&tuple));
             }
             self.storage.row_cache().invalidate(table_name, row_id);
         }

@@ -288,6 +288,13 @@ impl HnswIndex {
         self.id_mapping.read().len()
     }
 
+    /// Live (tombstone-excluded) entry count: one entry per row currently
+    /// visible to `search`. `delete` removes the `reverse_mapping` entry, so
+    /// its size is the number of vectors a search can still return.
+    pub fn live_len(&self) -> usize {
+        self.reverse_mapping.read().len()
+    }
+
     /// Check if the index is empty
     pub fn is_empty(&self) -> bool {
         self.id_mapping.read().is_empty()
@@ -368,6 +375,15 @@ impl MultiMetricHnswIndex {
             Self::L2(index) => index.len(),
             Self::Cosine(index) => index.len(),
             Self::InnerProduct(index) => index.len(),
+        }
+    }
+
+    /// Live (tombstone-excluded) entry count — see [`HnswIndex::live_len`].
+    pub fn live_len(&self) -> usize {
+        match self {
+            Self::L2(index) => index.live_len(),
+            Self::Cosine(index) => index.live_len(),
+            Self::InnerProduct(index) => index.live_len(),
         }
     }
 
@@ -510,6 +526,11 @@ impl CosineHnswIndex {
         self.id_mapping.read().len()
     }
 
+    /// Live (tombstone-excluded) entry count — see [`HnswIndex::live_len`].
+    pub fn live_len(&self) -> usize {
+        self.reverse_mapping.read().len()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.id_mapping.read().is_empty()
     }
@@ -646,6 +667,11 @@ impl InnerProductHnswIndex {
         // vector stays in the graph. `id_mapping` keeps one slot per insert and is
         // never shrunk by delete, so it reflects the tombstone-inclusive size.
         self.id_mapping.read().len()
+    }
+
+    /// Live (tombstone-excluded) entry count — see [`HnswIndex::live_len`].
+    pub fn live_len(&self) -> usize {
+        self.reverse_mapping.read().len()
     }
 
     pub fn is_empty(&self) -> bool {

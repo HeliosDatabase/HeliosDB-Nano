@@ -695,25 +695,64 @@ impl<'a> Executor<'a> {
 
         // Pull k = limit + offset neighbours, already ordered ascending by
         // distance, then load the full tuples by row_id.
-        let k = limit.saturating_add(offset);
-        let neighbours = vector_indexes.search(&index_name, &query_vec, k)?;
-        let mut results: Vec<(u64, f32)> = Vec::with_capacity(neighbours.len());
-        let mut tuples: Vec<Tuple> = Vec::with_capacity(neighbours.len());
-        for (row_id, distance) in neighbours {
-            if let Some(tuple) = storage.get_row_by_id(&table_name, row_id, scan_schema.as_ref())? {
-                results.push((row_id, distance));
-                tuples.push(tuple);
+        //
+        // R5.V5: deletes leave tombstones in the HNSW graph (hnsw_rs cannot
+        // physically remove entries) and rows can also vanish without index
+        // maintenance (TRUNCATE, restored data dirs). Both would shrink a
+        // plain k-fetch below LIMIT. Over-fetch with a margin, drop dead
+        // row_ids (tombstone-filtered by the index, or `get_row_by_id` →
+        // None), and if still short retry once at the index's full physical
+        // size — so deletes never starve the LIMIT while live rows remain.
+        let k_target = limit.saturating_add(offset);
+        // Small indexes are served EXACTLY by the brute-force scan fallback:
+        // tiny hnsw graphs (bulk-built or tombstone-heavy) can miss live
+        // nodes regardless of ef_search, and an exact scan over <=256 rows
+        // is microseconds anyway.
+        const SMALL_INDEX_EXACT_THRESHOLD: usize = 256;
+        if vector_indexes
+            .index_live_size(&index_name)
+            .is_none_or(|live| live <= SMALL_INDEX_EXACT_THRESHOLD)
+        {
+            return Ok(None);
+        }
+        let physical_size = vector_indexes
+            .index_physical_size(&index_name)
+            .unwrap_or(k_target)
+            .max(k_target);
+        let mut fetch_k = k_target
+            .saturating_mul(2)
+            .max(k_target.saturating_add(16))
+            .min(physical_size);
+        let mut results: Vec<(u64, f32)> = Vec::new();
+        let mut tuples: Vec<Tuple> = Vec::new();
+        loop {
+            results.clear();
+            tuples.clear();
+            let neighbours = vector_indexes.search(&index_name, &query_vec, fetch_k)?;
+            for (row_id, distance) in neighbours {
+                if let Some(tuple) = storage.get_row_by_id(&table_name, row_id, scan_schema.as_ref())? {
+                    results.push((row_id, distance));
+                    tuples.push(tuple);
+                    if results.len() >= k_target {
+                        break;
+                    }
+                }
             }
+            if results.len() >= k_target || fetch_k >= physical_size {
+                break;
+            }
+            fetch_k = physical_size;
         }
 
         tracing::debug!(
-            "vector kNN fast path: index '{}' on {}.{} ({:?}) served {} of {} requested neighbours",
+            "vector kNN fast path: index '{}' on {}.{} ({:?}) served {} of {} requested neighbours (fetch_k {})",
             index_name,
             table_name,
             col_name,
             metric,
             tuples.len(),
-            k,
+            k_target,
+            fetch_k,
         );
 
         let scan: Box<dyn PhysicalOperator> = Box::new(VectorScanOperator::new(

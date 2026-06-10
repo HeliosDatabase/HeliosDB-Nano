@@ -92,7 +92,7 @@ pub use time_travel::{GcConfig, Scn, SnapshotManager, SnapshotMetadata, Transact
 pub use transaction::{Transaction, TransactionSavepointSnapshot};
 pub use vector_index::{
     StoredVectorRecord, StoredVectorSearchResult, VectorIndexManager, VectorIndexMetadata, VectorIndexStats,
-    VectorIndexType,
+    VectorIndexType, VectorIndexUndoOp,
 };
 pub use view_catalog::{ViewCatalog, ViewMetadata};
 pub use wal::{
