@@ -5,6 +5,29 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.41.0] - 2026-06-10
+
+Minor release: HNSW vector indexes are maintained by SQL DML (roadmap item
+R5.V1) — the flagship vector feature no longer serves stale results.
+
+### Fixed — Vector search
+
+- INSERT, UPDATE, and DELETE now maintain HNSW vector indexes at statement
+  time with full transactional undo (rollback leaves no phantom vectors).
+  Previously an index only ever contained the rows present at CREATE INDEX
+  time: rows inserted afterwards were silently invisible to indexed kNN,
+  and deleted rows kept being served until a process restart.
+- This also fixes two long-standing vector-store API bugs: deleted records
+  appearing in unfiltered search and upsert serving the replaced vector.
+- Indexed kNN over-fetches past tombstones (escalating to the index's
+  physical size) so DELETEs never shrink `LIMIT k` results.
+- Small indexes (≤256 live vectors) are answered by the exact scan path:
+  tiny HNSW graphs can be weakly connected and miss live rows regardless
+  of search effort; approximation now only engages at scales where its
+  recall is statistically sound.
+- Payload-only updates skip vector-index work entirely; tables without
+  vector indexes pay a single cheap gate check per statement.
+
 ## [3.40.0] - 2026-06-10
 
 Minor release bundling three independently developed tracks: fast-path
