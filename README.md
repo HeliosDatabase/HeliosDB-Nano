@@ -231,7 +231,7 @@ ORDER BY distance
 LIMIT 10;
 ```
 
-Distance operators: `<->` (cosine), `<~>` (L2), `<#>` (inner product).
+Distance operators: `<->` (L2), `<=>` (cosine), `<#>` (inner product).
 Vector store IDs are namespace-scoped, and metadata/namespace filters are
 applied before top-k selection in the REST/embedded vector-store API.
 
@@ -493,7 +493,7 @@ For in-process use (no network, no daemon), add the crate as a dependency:
 
 ```toml
 [dependencies]
-heliosdb-nano = "3.13"
+heliosdb-nano = "3.38"
 ```
 
 See **[the Rust API guide](https://docs.rs/heliosdb-nano)** for embedded usage and the [examples/](examples/) directory for working code.

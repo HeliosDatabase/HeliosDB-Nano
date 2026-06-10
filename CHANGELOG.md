@@ -136,6 +136,32 @@ non-loopback deployment without requiring a socat bridge.
   `/health`, but MCP routes remain unmounted unless MCP auth or the explicit
   unsafe override is configured.
 
+## [3.37.2] - 2026-06-05
+
+Patch release for the ada-core index-persistence and UUID point-lookup
+findings (`ISSUE-index-persistence-and-uuid-pointlookup.md`).
+
+### Fixed — Indexes / catalog
+
+- User-created secondary indexes (scalar ART and HNSW variants) are now
+  persisted in the catalog as version-portable definitions and rebuilt on
+  open, so they survive a restart or binary/version swap on the same
+  data-dir. Previously every non-PK index silently vanished from
+  `pg_indexes` after an upgrade and queries fell back to full scans.
+- `CREATE INDEX` options (e.g. the vector distance metric) are serialized
+  into the WAL record and restored on replay, instead of being dropped.
+- `pg_indexes` now also lists ART/btree indexes (primary-key, unique,
+  manual, and FK-backed) alongside HNSW vector indexes, with the vector
+  opclass name (`vector_cosine_ops` / `vector_l2_ops` / `vector_ip_ops`)
+  in `indexdef`.
+
+### Fixed — SQL engine / planner
+
+- Parameters with a PostgreSQL type cast (e.g. `WHERE id = $1::uuid`) stay
+  on the fast point-lookup path: the fast parameter decoder strips simple
+  `::type` casts, and indexed scans resolve bound values through `CAST`
+  expressions instead of degrading to a full scan.
+
 ## [3.37.1] - 2026-06-05
 
 Patch release for code-graph indexing throughput and HNSW vector-index planner

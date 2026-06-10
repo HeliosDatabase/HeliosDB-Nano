@@ -23,12 +23,11 @@ automatic via WAL replay.
 # Stop the running server (graceful)
 heliosdb-nano stop --data-dir ./mydata
 
-# Swap the binary (npx, brew, docker tag, or direct download)
-brew upgrade HeliosDatabase/tap/heliosdb-nano   # macOS / Linux
-# or
-docker pull heliosdb/nano:latest
-# or
-curl -L https://github.com/HeliosDatabase/HeliosDB-Nano/releases/latest/download/heliosdb-nano-$(uname -m)-$(uname -s | tr A-Z a-z).tar.gz | tar xz
+# Swap the binary. Cargo / crates.io is the only active release channel
+# today (Homebrew, Docker, npx, and prebuilt binaries are not published yet):
+cargo install heliosdb-nano --locked --force
+# or, from a source checkout:
+#   cargo build --release --locked
 
 # Start with the same data-dir
 heliosdb-nano start --data-dir ./mydata
@@ -93,7 +92,7 @@ the rehearsal succeeds.
 
 If your upgrade path isn't covered above (e.g. very old custom build,
 internal-fork branch), file an issue with the source version, target
-version, and a `heliosdb-nano start --data-dir … --check-only` log
-attached. The check-only mode runs WAL replay + catalog read + index
-verification without opening the PG / MySQL listeners, so it's safe to
-run against production data.
+version, and the startup log from a `heliosdb-nano start --data-dir …`
+run against a **copy** of the data directory. Always work on a copy
+(or take a `heliosdb-nano dump` first) — there is no check-only /
+dry-run startup mode yet.
