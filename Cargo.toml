@@ -34,6 +34,19 @@ exclude = [
     ".vscode/",
 ]
 
+# cargo-binstall support: `cargo binstall heliosdb-nano` downloads the
+# prebuilt archive attached to the GitHub Release instead of compiling.
+# Must stay in sync with the artifact naming in .github/workflows/release.yml
+# (build-binaries job): heliosdb-nano-vX.Y.Z-<target>.{tar.gz|zip}, with the
+# binary + LICENSE + README.md flat at the archive root.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ target }{ archive-suffix }"
+bin-dir = "{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
+
 [lib]
 name = "heliosdb_nano"
 path = "src/lib.rs"
