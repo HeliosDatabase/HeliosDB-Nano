@@ -1,0 +1,8 @@
+update_txn_cycle( 1T, disjoint)             21473 txn/s  (500 total)
+update_txn_cycle( 4T, disjoint)             36135 txn/s  (2000 total)
+update_txn_cycle(16T, disjoint)             41044 txn/s  (8000 total)
+contended_counter(8T)                         16589 commit/s  committed=4000 retries=488 final_v=3960 lost_updates=40
+update_txn_cycle( 1T, disjoint)             19728 txn/s  (2000 total)
+update_txn_cycle( 4T, disjoint)             41712 txn/s  (8000 total)
+update_txn_cycle(16T, disjoint)             47488 txn/s  (32000 total)
+contended_counter(8T)                         16835 commit/s  committed=16000 retries=1983 final_v=15829 lost_updates=171

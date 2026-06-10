@@ -1,0 +1,15 @@
+mode=mem  profile=rowstore  N=10000  M=2000  time_travel=true  dir=/tmp/helios_tps_2857474
+--------------------------------------------------------------------------------
+bulk_insert_users(txn)            10000 ops      0.056 s          177830 ops/s        5.62 us/op
+autocommit_insert                  2000 ops      0.017 s          120508 ops/s        8.30 us/op
+point_lookup_pk                    2000 ops      0.006 s          308759 ops/s        3.24 us/op
+point_lookup_hot                   2000 ops      0.002 s         1158020 ops/s        0.86 us/op
+update_by_pk                       2000 ops      0.010 s          192806 ops/s        5.19 us/op
+delete_by_pk                       2000 ops      0.007 s          268289 ops/s        3.73 us/op
+filter_scan(age>50)                  20 ops      0.102 s             196 ops/s     5107.44 us/op
+agg_count_sum_avg                    20 ops      0.044 s             456 ops/s     2193.25 us/op
+group_by_status                      20 ops      0.085 s             235 ops/s     4251.00 us/op
+join_users_orders                    10 ops      0.120 s              83 ops/s    12018.36 us/op
+order_by_limit10                     20 ops      0.129 s             154 ops/s     6473.04 us/op
+--------------------------------------------------------------------------------
+done.

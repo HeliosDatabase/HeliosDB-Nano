@@ -1219,3 +1219,142 @@ fn run_session_txn_bench() {
     }
     println!();
 }
+
+/// Write-write conflict benchmark (R0.2 direct workloads).
+///
+///   - update_txn_cycle(1/4/16T): BEGIN; UPDATE own row; COMMIT per thread —
+///     disjoint keys, measures commit-validation overhead + false positives
+///   - contended_counter(8T): all threads increment ONE row in RepeatableRead
+///     transactions with retry-on-serialization-failure. Reports committed
+///     cycles, retries, and lost updates (final - expected). At baseline
+///     (no conflict detection) lost updates are nonzero; after R0.2 they
+///     must be exactly zero.
+///
+///   HELIOS_CONFLICT=1 cargo test --profile perf --test tps_workloads run_conflict_bench -- --nocapture --test-threads=1
+#[test]
+fn run_conflict_bench() {
+    if std::env::var("HELIOS_CONFLICT").is_err() {
+        eprintln!("skipping run_conflict_bench (set HELIOS_CONFLICT=1)");
+        return;
+    }
+    use heliosdb_nano::session::IsolationLevel;
+
+    let cycles: usize = std::env::var("HELIOS_CONFLICT_M")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(500);
+
+    let db = EmbeddedDatabase::new_in_memory().unwrap();
+    db.execute("CREATE TABLE cf (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+    for i in 0..64 {
+        db.execute(&format!("INSERT INTO cf (id, v) VALUES ({i}, 0)")).unwrap();
+    }
+
+    println!("\n=== write-write conflict bench (cycles per measurement: {cycles}) ===");
+
+    // 1) Disjoint-key update transaction cycles (RepeatableRead).
+    for &threads in &[1usize, 4, 16] {
+        let start = Instant::now();
+        std::thread::scope(|s| {
+            for t in 0..threads {
+                let dbr = &db;
+                s.spawn(move || {
+                    let sid = dbr
+                        .create_session(&format!("upd_u{t}"), IsolationLevel::RepeatableRead)
+                        .unwrap();
+                    for _ in 0..cycles {
+                        dbr.begin_transaction_for_session(sid).unwrap();
+                        dbr.execute_in_session(sid, &format!("UPDATE cf SET v = v + 1 WHERE id = {t}"))
+                            .unwrap();
+                        dbr.commit_transaction_for_session(sid).unwrap();
+                    }
+                    dbr.destroy_session(sid).unwrap();
+                });
+            }
+        });
+        let total = threads * cycles;
+        println!(
+            "update_txn_cycle({threads:>2}T, disjoint)        {:>10.0} txn/s  ({total} total)",
+            total as f64 / start.elapsed().as_secs_f64()
+        );
+        // False-positive check: every disjoint commit must have applied.
+        for t in 0..threads {
+            let rows = db.query(&format!("SELECT * FROM cf WHERE id = {t}"), &[]).unwrap();
+            let v = match rows[0].values[1] {
+                Value::Int4(x) => x as i64,
+                Value::Int8(x) => x,
+                _ => -1,
+            };
+            assert!(v >= cycles as i64, "disjoint update lost rows: id={t} v={v} expected>={cycles}");
+        }
+    }
+
+    // 2) Contended counter: 8 threads increment one shared row, retrying on
+    //    serialization failure.
+    {
+        db.execute("UPDATE cf SET v = 0 WHERE id = 63").unwrap();
+        let threads = 8usize;
+        let committed = std::sync::atomic::AtomicU64::new(0);
+        let retries = std::sync::atomic::AtomicU64::new(0);
+        let zero_matches = std::sync::atomic::AtomicU64::new(0);
+        let start = Instant::now();
+        std::thread::scope(|s| {
+            for t in 0..threads {
+                let dbr = &db;
+                let committed = &committed;
+                let retries = &retries;
+                let zero_matches = &zero_matches;
+                s.spawn(move || {
+                    let sid = dbr
+                        .create_session(&format!("cnt_u{t}"), IsolationLevel::RepeatableRead)
+                        .unwrap();
+                    for _ in 0..cycles {
+                        loop {
+                            dbr.begin_transaction_for_session(sid).unwrap();
+                            match dbr.execute_in_session(sid, "UPDATE cf SET v = v + 1 WHERE id = 63") {
+                                Err(_) => {
+                                    let _ = dbr.rollback_transaction_for_session(sid);
+                                    retries.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    continue;
+                                }
+                                Ok(n) if n != 1 => {
+                                    zero_matches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    let _ = dbr.rollback_transaction_for_session(sid);
+                                    retries.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    continue;
+                                }
+                                Ok(_) => {}
+                            }
+                            match dbr.commit_transaction_for_session(sid) {
+                                Ok(()) => {
+                                    committed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    break;
+                                }
+                                Err(_) => {
+                                    retries.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                            }
+                        }
+                    }
+                    dbr.destroy_session(sid).unwrap();
+                });
+            }
+        });
+        let secs = start.elapsed().as_secs_f64();
+        let rows = db.query("SELECT * FROM cf WHERE id = 63", &[]).unwrap();
+        let v = match rows[0].values[1] {
+            Value::Int4(x) => x as i64,
+            Value::Int8(x) => x,
+            _ => -1,
+        };
+        let committed = committed.load(std::sync::atomic::Ordering::Relaxed) as i64;
+        println!(
+            "contended_counter(8T)                    {:>10.0} commit/s  committed={committed} retries={} zero_matches={} final_v={v} lost_updates={}",
+            committed as f64 / secs,
+            retries.load(std::sync::atomic::Ordering::Relaxed),
+            zero_matches.load(std::sync::atomic::Ordering::Relaxed),
+            committed - v,
+        );
+    }
+    println!();
+}

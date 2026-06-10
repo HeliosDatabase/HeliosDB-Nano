@@ -1527,7 +1527,15 @@ where
             }
             Error::SqlParse(_) => "42601",
             Error::TypeConversion(_) => "42804",
-            Error::Transaction(_) => "25000",
+            Error::Transaction(message) => {
+                if message.contains("serialization failure") {
+                    // First-committer-wins write-write conflict (R0.2):
+                    // drivers retry on serialization_failure.
+                    "40001"
+                } else {
+                    "25000"
+                }
+            }
             Error::Protocol(_) => "08P01",
             Error::QueryTimeout(_) => "57014",
             Error::QueryCancelled(_) => "57014",

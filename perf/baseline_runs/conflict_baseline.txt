@@ -1,0 +1,10 @@
+=== write-write conflict bench (cycles per measurement: 500) ===
+update_txn_cycle( 1T, disjoint)             32191 txn/s  (500 total)
+update_txn_cycle( 4T, disjoint)             72815 txn/s  (2000 total)
+update_txn_cycle(16T, disjoint)            112054 txn/s  (8000 total)
+contended_counter(8T)                         24723 commit/s  committed=4000 retries=0 final_v=791 lost_updates=3209
+
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.30s
+
