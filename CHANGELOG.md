@@ -5,6 +5,57 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.39.0] - 2026-06-10
+
+Minor release: write-write conflict detection for snapshot-isolation
+transactions (roadmap item R0.2). Concurrent transactions that would
+silently overwrite each other's committed updates now abort with a
+retryable serialization failure.
+
+### Fixed — Transactions / MVCC
+
+- First-committer-wins validation at commit for embedded transactions and
+  RepeatableRead/Serializable sessions: the contended-counter benchmark
+  went from 3,209 silently lost updates out of 4,000 commits (80%) to
+  exactly zero. Losers receive `serialization failure ... retry the
+  transaction` — SQLSTATE 40001 over the PostgreSQL wire, 1213/40001 over
+  MySQL — so driver retry logic works. READ COMMITTED sessions and
+  autocommit statements keep PostgreSQL's blind-write semantics (no new
+  errors for existing applications).
+- Transaction commits now invalidate the row cache for the rows they
+  wrote. Previously a PK point lookup could repopulate the cache with a
+  pre-commit value during the staging window and serve stale data to
+  later transactions with perfectly valid snapshots.
+- Commits use a fresh commit timestamp instead of the BEGIN snapshot
+  timestamp, fixing version-history ordering for overlapping transactions.
+- Parameterized (extended-protocol) INSERTs inside a transaction stage
+  through the transaction write set; previously they wrote directly to
+  storage and survived ROLLBACK. FK validation on that path now sees the
+  transaction's own writes.
+- Payload-only UPDATEs no longer delete and reinsert identical ART index
+  entries — eliminating a concurrency window where point lookups could
+  briefly miss the row, and removing pure index-maintenance overhead.
+- A failed session COMMIT (e.g. a serialization failure) now cleans up
+  like ROLLBACK: eager index mutations are undone and the session is
+  immediately usable for the retry.
+
+### Performance
+
+- New `run_conflict_bench` harness (HELIOS_CONFLICT=1) reporting lost
+  updates, retries, and zero-match anomalies under contention.
+- Disclosed cost: explicit write-transaction cycles pay 25-49% on
+  microbenchmarks for validation, commit-time cache invalidation, and the
+  snapshot barrier (the removed cache hits were serving stale data).
+  Bulk insert, autocommit DML, reads, and analytics are unaffected.
+  Recovery work is tracked in the roadmap (R2.x).
+
+### Known issues
+
+- SELECT FOR UPDATE remains unimplemented; READ COMMITTED lost-update
+  avoidance for racing autocommit read-then-write pairs is therefore an
+  application-level concern (as in PostgreSQL without FOR UPDATE).
+- Validation details: R0_2_CONFLICT_DETECTION_REPORT.md.
+
 ## [3.38.0] - 2026-06-10
 
 Minor release: per-session transactions for the PostgreSQL and MySQL wire
