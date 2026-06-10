@@ -5,6 +5,57 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.40.0] - 2026-06-10
+
+Minor release bundling three independently developed tracks: fast-path
+eligibility hardening (R1.2), the front-door truth sweep (D1), and prebuilt
+install channels (D2).
+
+### Fixed — Correctness
+
+- Fast-path literal parsers now reject trailing tokens after the parsed
+  literal: previously `... WHERE id = 5 LIMIT 1` could silently execute as
+  `id = 5` on the fast path (latent wrong-results bug; five sites hardened).
+- `--dump-schedule` is a hard startup error instead of a silent no-op that
+  let operators believe scheduled backups were running.
+- `start --daemon` now forwards `--mysql`, `--mysql-listen`,
+  `--mysql-socket`, `--pg-socket-dir`, `--memory`, and
+  `--dump-on-shutdown` to the daemonized child (previously dropped:
+  a daemon started with `--mysql` ran without a MySQL listener).
+- `config.example.toml` parses and boots again: the documented `[audit]`
+  section used field names the config loader rejects, and eight documented
+  sections were silently ignored phantoms. The example is regenerated from
+  the real Config struct and now includes `slow_query_threshold_ms`.
+
+### Changed — Performance (R1.2)
+
+- Fast-path eligibility bail-words are matched as SQL keywords (outside
+  string literals, at identifier boundaries) instead of raw substrings:
+  statements like `UPDATE t SET x=1 WHERE points = 5`, `WHERE order_id =
+  3`, tables named `default_settings`, and literals containing `select`
+  now stay on the parse-skipping fast paths (previously 10-50x slower via
+  the planner). The UPDATE WHERE-splitter no longer mis-splits on `WHERE`
+  inside string literals.
+
+### Added — Install channels (D2)
+
+- Release CI now builds and attaches prebuilt binaries (Linux
+  x86_64/aarch64-gnu, macOS arm64, Windows x86_64) with SHA256SUMS,
+  publishes a Docker image to ghcr.io, and ships `scripts/install.sh`;
+  `cargo binstall heliosdb-nano` metadata added. First-run caveats in
+  docs/guides/install-channels.md. musl targets deferred (openssl
+  dependency); glibc 2.39 baseline.
+
+### Documentation
+
+- README vector operators corrected to match the planner: `<->` L2,
+  `<=>` cosine, `<#>` inner product (the old table mislabeled `<->` as
+  cosine and documented a nonexistent `<~>`).
+- Stale `docs/BENCHMARK_PG_VS_HELIOS.txt` ("PostgreSQL wins 21/21",
+  Feb 2026) deleted; references now point at current measurements.
+- Missing [3.37.2] changelog entry reconstructed; upgrade guide no longer
+  instructs nonexistent brew/docker channels; README crate pin fixed.
+
 ## [3.39.0] - 2026-06-10
 
 Minor release: write-write conflict detection for snapshot-isolation
