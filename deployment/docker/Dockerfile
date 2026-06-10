@@ -15,14 +15,21 @@ RUN apt-get update && apt-get install -y \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy all source files
-COPY Cargo.toml ./
+# Copy all source files needed to build the root package.
+#   Cargo.lock        — reproducible dependency versions (--locked)
+#   bindings          — workspace member (bindings/python); cargo refuses to
+#                       load the workspace if a member manifest is missing
+#   benches, examples — [[bench]]/[[example]] targets are declared in
+#                       Cargo.toml, so the manifest fails to resolve if the
+#                       files are absent
+COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY benches ./benches
-COPY crates ./crates
+COPY examples ./examples
+COPY bindings ./bindings
 
 # Build final binary with needed features
-RUN cargo build --release --features "encryption,vector-search,ha-tier1"
+RUN cargo build --release --locked --features "encryption,vector-search,ha-tier1"
 
 # Runtime stage
 FROM debian:trixie-slim AS runtime
