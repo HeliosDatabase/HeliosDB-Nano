@@ -493,7 +493,7 @@ For in-process use (no network, no daemon), add the crate as a dependency:
 
 ```toml
 [dependencies]
-heliosdb-nano = "3.38"
+heliosdb-nano = "3.39"
 ```
 
 See **[the Rust API guide](https://docs.rs/heliosdb-nano)** for embedded usage and the [examples/](examples/) directory for working code.
