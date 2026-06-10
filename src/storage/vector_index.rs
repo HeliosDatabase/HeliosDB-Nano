@@ -86,6 +86,29 @@ impl VectorExternalKey {
     }
 }
 
+/// Undo descriptor for eager HNSW maintenance inside an open transaction
+/// (R5.V1). Mirrors the `ArtUndoOp` pattern in `lib.rs`: DML hooks mutate the
+/// index at statement time and return these ops so a ROLLBACK can revert the
+/// index to its pre-statement state via [`VectorIndexManager::apply_undo`].
+#[derive(Debug, Clone)]
+pub enum VectorIndexUndoOp {
+    /// An INSERT added this entry — rollback removes it.
+    RemoveInserted { index_name: String, row_id: u64 },
+    /// A DELETE removed this entry — rollback re-inserts the old vector.
+    RestoreDeleted {
+        index_name: String,
+        row_id: u64,
+        vector: Vector,
+    },
+    /// An UPDATE replaced (or removed/added) this entry — rollback deletes the
+    /// current entry and re-inserts the old vector when one existed.
+    RestoreUpdated {
+        index_name: String,
+        row_id: u64,
+        old_vector: Option<Vector>,
+    },
+}
+
 /// Vector index manager
 pub struct VectorIndexManager {
     /// Map from index name to index storage
@@ -96,6 +119,10 @@ pub struct VectorIndexManager {
     records: Arc<RwLock<HashMap<String, HashMap<u64, StoredVectorRecord>>>>,
     /// External API id + namespace -> row id mapping per index.
     external_ids: Arc<RwLock<HashMap<String, HashMap<VectorExternalKey, u64>>>>,
+    /// Number of live indexes. Lets the per-row DML hooks bail with a single
+    /// relaxed atomic load in the overwhelmingly common no-vector-index case,
+    /// instead of taking the `metadata` read lock on every INSERT/UPDATE/DELETE.
+    index_count: std::sync::atomic::AtomicUsize,
 }
 
 impl VectorIndexManager {
@@ -106,6 +133,7 @@ impl VectorIndexManager {
             metadata: Arc::new(RwLock::new(HashMap::new())),
             records: Arc::new(RwLock::new(HashMap::new())),
             external_ids: Arc::new(RwLock::new(HashMap::new())),
+            index_count: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -154,6 +182,7 @@ impl VectorIndexManager {
         metadata.insert(name.clone(), meta);
         self.records.write().entry(name.clone()).or_default();
         self.external_ids.write().entry(name).or_default();
+        self.index_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         Ok(())
     }
@@ -210,6 +239,7 @@ impl VectorIndexManager {
         metadata.insert(name.clone(), meta);
         self.records.write().entry(name.clone()).or_default();
         self.external_ids.write().entry(name).or_default();
+        self.index_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -278,6 +308,7 @@ impl VectorIndexManager {
         metadata.insert(name.clone(), meta);
         self.records.write().entry(name.clone()).or_default();
         self.external_ids.write().entry(name).or_default();
+        self.index_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         Ok(())
     }
@@ -401,6 +432,7 @@ impl VectorIndexManager {
         metadata.remove(name);
         self.records.write().remove(name);
         self.external_ids.write().remove(name);
+        self.index_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -612,6 +644,260 @@ impl VectorIndexManager {
         indexes.contains_key(name)
     }
 
+    /// Cheap gate for the per-row DML hooks: one relaxed atomic load.
+    /// `false` means no vector index exists in the process, so DML on any
+    /// table can skip vector maintenance entirely.
+    #[inline]
+    pub fn has_any_index(&self) -> bool {
+        self.index_count.load(std::sync::atomic::Ordering::Relaxed) > 0
+    }
+
+    /// `(index_name, column_name)` pairs for every vector index on `table_name`.
+    /// Returns an empty (non-allocating) Vec when the table has none.
+    pub fn indexes_on_table(&self, table_name: &str) -> Vec<(String, String)> {
+        if !self.has_any_index() {
+            return Vec::new();
+        }
+        let metadata = self.metadata.read();
+        let mut out = Vec::new();
+        for meta in metadata.values() {
+            if meta.table_name == table_name {
+                out.push((meta.name.clone(), meta.column_name.clone()));
+            }
+        }
+        out
+    }
+
+    /// True when `table_name` has at least one vector index. One atomic load
+    /// in the common case; a short metadata scan otherwise.
+    pub fn table_has_indexes(&self, table_name: &str) -> bool {
+        if !self.has_any_index() {
+            return false;
+        }
+        let metadata = self.metadata.read();
+        metadata.values().any(|meta| meta.table_name == table_name)
+    }
+
+    /// Physical (tombstone-inclusive) entry count for an index. Used by the
+    /// kNN fast path to bound its tombstone over-fetch (R5.V5): the graph can
+    /// never return more candidates than this.
+    pub fn index_physical_size(&self, name: &str) -> Option<usize> {
+        let indexes = self.indexes.read();
+        indexes.get(name).map(|index| match index {
+            IndexStorage::Standard(idx) => idx.len(),
+            IndexStorage::Quantized(idx) => idx.len(),
+            #[cfg(feature = "vector-persist")]
+            IndexStorage::Persistent(idx) => idx.len(),
+        })
+    }
+
+    /// Live (tombstone-excluded) entry count for an index. The kNN fast
+    /// path uses this to fall back to the EXACT scan path for small indexes:
+    /// hnsw_rs graphs at tiny sizes can be weakly connected (especially when
+    /// bulk-built) and may miss live nodes regardless of ef_search, so
+    /// approximate search is only engaged at scales where its recall is
+    /// statistically sound.
+    pub fn index_live_size(&self, name: &str) -> Option<usize> {
+        let indexes = self.indexes.read();
+        indexes.get(name).map(|index| match index {
+            IndexStorage::Standard(idx) => idx.live_len(),
+            IndexStorage::Quantized(idx) => idx.len(),
+            #[cfg(feature = "vector-persist")]
+            IndexStorage::Persistent(idx) => idx.len(),
+        })
+    }
+
+    // ---- R5.V1: SQL DML maintenance hooks --------------------------------
+    //
+    // These mirror the ART hooks (`ArtIndexManager::on_insert/on_delete/
+    // on_update`): they are called eagerly at statement time from every DML
+    // path that maintains ART, and return undo descriptors so transactional
+    // callers can push them onto the same per-transaction undo log the ART
+    // entries use. Autocommit callers simply drop the returned Vec.
+    //
+    // Maintenance is deliberately non-fatal: failures (e.g. dimension
+    // mismatch) are logged at debug level and never abort the DML, matching
+    // the established ART hook behaviour.
+
+    /// Extract the vector value for `column_name` from a tuple, if present
+    /// and non-NULL.
+    fn tuple_vector_value<'t>(
+        schema: &crate::Schema,
+        tuple: &'t crate::Tuple,
+        column_name: &str,
+    ) -> Option<&'t Vector> {
+        let idx = schema.get_column_index(column_name)?;
+        match tuple.values.get(idx) {
+            Some(crate::Value::Vector(v)) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// Row inserted: add its vector value (if any) to every vector index on
+    /// the table.
+    pub fn on_row_insert(
+        &self,
+        table_name: &str,
+        row_id: u64,
+        schema: &crate::Schema,
+        tuple: &crate::Tuple,
+    ) -> Vec<VectorIndexUndoOp> {
+        if !self.has_any_index() {
+            return Vec::new();
+        }
+        let mut undo = Vec::new();
+        for (index_name, column_name) in self.indexes_on_table(table_name) {
+            let Some(vector) = Self::tuple_vector_value(schema, tuple, &column_name) else {
+                continue; // NULL / missing vector: nothing to index
+            };
+            match self.insert_vector(&index_name, row_id, vector) {
+                Ok(()) => undo.push(VectorIndexUndoOp::RemoveInserted {
+                    index_name,
+                    row_id,
+                }),
+                Err(e) => {
+                    tracing::debug!(
+                        "vector index insert for '{}' row {} into '{}': {}",
+                        table_name,
+                        row_id,
+                        index_name,
+                        e
+                    );
+                }
+            }
+        }
+        undo
+    }
+
+    /// Row deleted: remove its entry from every vector index on the table.
+    /// `old_tuple` (when available) lets the undo op restore the exact old
+    /// vector on rollback; without it the delete still happens but cannot be
+    /// undone (only autocommit paths call it that way).
+    pub fn on_row_delete(
+        &self,
+        table_name: &str,
+        row_id: u64,
+        schema: Option<&crate::Schema>,
+        old_tuple: Option<&crate::Tuple>,
+    ) -> Vec<VectorIndexUndoOp> {
+        if !self.has_any_index() {
+            return Vec::new();
+        }
+        let mut undo = Vec::new();
+        for (index_name, column_name) in self.indexes_on_table(table_name) {
+            let old_vector = match (schema, old_tuple) {
+                (Some(schema), Some(tuple)) => Self::tuple_vector_value(schema, tuple, &column_name).cloned(),
+                _ => None,
+            };
+            // Tolerate missing entries (row's vector was NULL, or the row
+            // predates the index in ways backfill didn't cover).
+            if self.delete_vector(&index_name, row_id).is_ok() {
+                if let Some(vector) = old_vector {
+                    undo.push(VectorIndexUndoOp::RestoreDeleted {
+                        index_name,
+                        row_id,
+                        vector,
+                    });
+                }
+            }
+        }
+        undo
+    }
+
+    /// Row updated: if the indexed vector column changed, replace the entry
+    /// (HNSW has no in-place update: delete tombstones the old entry, insert
+    /// adds the new one). Unchanged vector columns are skipped entirely.
+    /// `old_tuple == None` means the caller couldn't supply the previous row
+    /// (engine fast paths that proved no *ART* index change); in that case the
+    /// entry is unconditionally replaced.
+    pub fn on_row_update(
+        &self,
+        table_name: &str,
+        row_id: u64,
+        schema: &crate::Schema,
+        old_tuple: Option<&crate::Tuple>,
+        new_tuple: &crate::Tuple,
+    ) -> Vec<VectorIndexUndoOp> {
+        if !self.has_any_index() {
+            return Vec::new();
+        }
+        let mut undo = Vec::new();
+        for (index_name, column_name) in self.indexes_on_table(table_name) {
+            let old_vector = old_tuple.and_then(|t| Self::tuple_vector_value(schema, t, &column_name));
+            let new_vector = Self::tuple_vector_value(schema, new_tuple, &column_name);
+
+            if old_tuple.is_some() {
+                if old_vector == new_vector {
+                    continue; // vector column untouched — common OLTP update
+                }
+            } else if new_vector.is_none() {
+                // Old state unknown and the new value is NULL/absent: drop any
+                // existing entry so the index never serves a stale vector.
+                let _ = self.delete_vector(&index_name, row_id);
+                continue;
+            }
+
+            let had_old_entry = self.delete_vector(&index_name, row_id).is_ok();
+            let inserted = match new_vector {
+                Some(vector) => match self.insert_vector(&index_name, row_id, vector) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        tracing::debug!(
+                            "vector index update for '{}' row {} into '{}': {}",
+                            table_name,
+                            row_id,
+                            index_name,
+                            e
+                        );
+                        false
+                    }
+                },
+                None => false,
+            };
+            if had_old_entry || inserted {
+                undo.push(VectorIndexUndoOp::RestoreUpdated {
+                    index_name,
+                    row_id,
+                    old_vector: if old_tuple.is_some() { old_vector.cloned() } else { None },
+                });
+            }
+        }
+        undo
+    }
+
+    /// Revert one eager maintenance op (transaction ROLLBACK). Failures are
+    /// logged and swallowed, mirroring ART undo replay.
+    pub fn apply_undo(&self, op: &VectorIndexUndoOp) {
+        match op {
+            VectorIndexUndoOp::RemoveInserted { index_name, row_id } => {
+                if let Err(e) = self.delete_vector(index_name, *row_id) {
+                    tracing::debug!("vector undo remove-insert '{}' row {}: {}", index_name, row_id, e);
+                }
+            }
+            VectorIndexUndoOp::RestoreDeleted {
+                index_name,
+                row_id,
+                vector,
+            } => {
+                if let Err(e) = self.insert_vector(index_name, *row_id, vector) {
+                    tracing::debug!("vector undo restore-delete '{}' row {}: {}", index_name, row_id, e);
+                }
+            }
+            VectorIndexUndoOp::RestoreUpdated {
+                index_name,
+                row_id,
+                old_vector,
+            } => {
+                let _ = self.delete_vector(index_name, *row_id);
+                if let Some(vector) = old_vector {
+                    if let Err(e) = self.insert_vector(index_name, *row_id, vector) {
+                        tracing::debug!("vector undo restore-update '{}' row {}: {}", index_name, row_id, e);
+                    }
+                }
+            }
+        }
+    }
+
     /// List all index metadata
     pub fn list_all_metadata(&self) -> Vec<VectorIndexMetadata> {
         let metadata = self.metadata.read();
@@ -692,6 +978,7 @@ impl VectorIndexManager {
 
         indexes.insert(persisted.metadata.name.clone(), index_storage);
         metadata.insert(persisted.metadata.name.clone(), persisted.metadata);
+        self.index_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         Ok(())
     }
@@ -704,12 +991,17 @@ impl VectorIndexManager {
         if let (Some(index), Some(meta)) = (indexes.get(name), metadata.get(name)) {
             let (num_vectors, dimensions, quantization, memory_bytes) = match index {
                 IndexStorage::Standard(idx) => {
-                    let num_vectors = idx.len();
+                    // Live count (tombstones excluded): deletes hide entries
+                    // from search, so stats must not keep counting them.
+                    // Memory is still estimated from the physical entry count
+                    // because hnsw_rs never frees tombstoned vectors.
+                    let num_vectors = idx.live_len();
+                    let physical = idx.len();
                     let dimensions = match &meta.index_type {
                         VectorIndexType::Standard(config) => config.dimension,
                         _ => 0,
                     } as i32;
-                    let memory_bytes = (num_vectors as i64) * (dimensions as i64) * 4 + 1024;
+                    let memory_bytes = (physical as i64) * (dimensions as i64) * 4 + 1024;
                     (num_vectors as i64, dimensions, "None".to_string(), memory_bytes)
                 }
                 IndexStorage::Quantized(idx) => {
