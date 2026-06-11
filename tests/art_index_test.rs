@@ -53,11 +53,12 @@ fn test_pk_index_auto_creation() {
     let art_manager = storage.art_indexes();
     assert!(art_manager.has_pk("test_pk"), "PK index should be auto-created");
 
-    // Verify index exists
+    // Verify index exists (returned as a shared Arc<RwLock<…>> handle)
     let pk_index = art_manager.get_pk_index("test_pk");
     assert!(pk_index.is_some(), "PK index should be retrievable");
 
     let pk_idx = pk_index.unwrap();
+    let pk_idx = pk_idx.read().unwrap();
     assert_eq!(pk_idx.index_type(), ArtIndexType::PrimaryKey);
     assert_eq!(pk_idx.table(), "test_pk");
 }
@@ -104,7 +105,7 @@ fn test_unique_index_auto_creation() {
     let unique_indexes = art_manager.get_unique_indexes("test_unique");
     assert!(!unique_indexes.is_empty(), "UNIQUE index should be auto-created");
 
-    let unique_idx = &unique_indexes[0];
+    let unique_idx = unique_indexes[0].read().unwrap();
     assert_eq!(unique_idx.index_type(), ArtIndexType::Unique);
 }
 
