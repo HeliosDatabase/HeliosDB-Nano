@@ -5,6 +5,49 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.48.0] - 2026-06-11
+
+Minor release: STORAGE COLUMNAR becomes production-adoptable (R3.3) and
+executor hot-path hygiene lands with two ORDER BY correctness fixes (R3.5).
+
+### Fixed — Query correctness (R3.5)
+
+- Alias-qualified ORDER BY keys on self-joins (`ORDER BY e.id`) could be
+  placed where they cannot resolve, silently returning UNSORTED rows; the
+  sort key placement now uses the runtime-stamped schema.
+- `GROUP BY expr ... ORDER BY <same expr>` left the sort key unresolvable
+  (same silent-no-sort outcome); whole-expression matching fixed.
+- Sort-key evaluation errors now surface as query errors instead of being
+  silently skipped (the mechanism that exposed both bugs above). Queries
+  with genuinely invalid sort keys now error rather than returning
+  unsorted rows.
+
+### Changed — Columnar storage (R3.3)
+
+- Multi-row writes group columnar values per batch: ONE read-modify-write
+  (and one zone-stats recompute) per touched batch per statement instead
+  of one whole-batch rewrite per value. Bulk-loading 200k rows into a
+  columnar table went from 12.9s to 0.77s (16.8x) — parity with the
+  row-store equivalent. The bulk fast-insert path now accepts columnar
+  schemas.
+- Per-batch presence bitmaps (`colp:` sidecar, transactional, lazily
+  backfilled, branch-aware fallback) replace the full row-keyspace
+  liveness walk in every columnar scan/aggregate path, including the
+  parallel ones; COUNT(*) sums cached live counts. Walk-bound query
+  shapes gain 1.1-1.6x; `HELIOS_COLP_OFF=1` restores the old path.
+- Also fixes a pre-existing race where concurrent single-value columnar
+  stores could lose writes (batch load moved under the stats lock).
+
+### Changed — Executor (R3.5)
+
+- ORDER BY computes sort keys once per row (decorate-sort-undecorate):
+  4.6x on expression sorts. Non-equi/nested-loop joins evaluate the ON
+  condition without materializing candidate tuples: 3.9-4.3x. Column
+  references bind to positions at operator construction (up to 14% on
+  sort/filter-heavy shapes); scalar function dispatch stops allocating
+  per row; CTE results are shared by reference instead of deep-cloned
+  per consumer.
+
 ## [3.47.0] - 2026-06-11
 
 Minor release: reads inside transactions stop falling off a cliff (R2.3),
