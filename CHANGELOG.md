@@ -5,6 +5,31 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.44.0] - 2026-06-11
+
+Minor release: opt-in power-loss-durable commits and a high-concurrency
+convoy fix (roadmap item R1.3 phase 1).
+
+### Added — Durability
+
+- `storage.durable_commit = true` fsyncs the commit WriteBatch, making
+  COMMIT power-loss durable (default remains process-crash-safe). Durable
+  commits scale with concurrent sessions — RocksDB's write groups
+  amortize the fsync: measured 47 commits/s at 1 session rising to 433/s
+  at 32 sessions on an ~21ms-fsync disk. A leader/follower pipeline with
+  an accumulation window is planned as phase 2.
+
+### Fixed — Concurrency
+
+- The snapshot barrier introduced in v3.39.0 yield-spun while commits
+  were applying; with session counts near the host's core count the
+  spinners starved the committing threads — plain disk-mode transaction
+  throughput collapsed from ~50k txn/s at 8 sessions to 73 txn/s at 32
+  sessions on a 32-core host. Bounded spin with sleep backoff removes
+  the convoy (36-51k txn/s flat through 32 sessions).
+- New `run_durable_commit_bench` harness (HELIOS_DURABLE=1) covers
+  1/8/16/24/32 sessions, durable on and off.
+
 ## [3.43.0] - 2026-06-11
 
 Minor release: snapshot metadata diet (roadmap item R1.4).
