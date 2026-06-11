@@ -5,6 +5,50 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.45.0] - 2026-06-11
+
+Minor release: index-layer concurrency (R2.2), configuration profiles with
+visible-by-default observability (D3), and standard SQLSTATEs (D4).
+
+### Fixed — Configuration (important)
+
+- **`start --config <file>` was parsed and then ignored in server mode** —
+  the server always ran on built-in defaults, silently discarding every
+  `[storage]` setting since the flag was introduced. The config file is now
+  actually applied (CLI `--data-dir`/`--memory` still override). Review
+  your config files: settings you believed active may take effect for the
+  first time.
+
+### Added — Profiles & observability (D3)
+
+- Top-level `profile = "safe" | "balanced" | "fast"` config bundles
+  (explicit `[storage]` keys always win; `safe`/`balanced` never downgrade
+  an explicit `durable_commit = true`).
+- The slow-query log and other warnings now print without `RUST_LOG`
+  (tracing defaults to `warn`).
+- A one-line durability-contract banner at startup, derived entirely from
+  the effective configuration.
+
+### Added — SQLSTATEs (D4)
+
+- Undefined table/column/function, duplicate table, deadlock, and
+  serialization failures now map to their standard codes (42P01, 42703,
+  42883, 42P07, 40P01, 40001) with detail/hint populated for the common
+  cases — ORMs and drivers stop classifying routine errors as internal
+  database failures, and retry loops engage on 40001/40P01. MySQL maps
+  deadlocks to 1213/"40001". Covered by unit tests plus end-to-end
+  assertions over a real PostgreSQL wire connection.
+
+### Changed — Index concurrency (R2.2)
+
+- ART indexes use per-tree locks behind a shared registry: writers on one
+  table no longer block reads or writes on any other table, TRUNCATE and
+  rename stopped cloning whole trees, and index-metadata queries
+  (including the per-UPDATE index-impact check) are now lock-free. A
+  structural lock-ordering invariant (never two tree locks) makes FK
+  cycles deadlock-free by construction; covered by a new concurrency
+  suite including a mutual-FK stress test.
+
 ## [3.44.0] - 2026-06-11
 
 Minor release: opt-in power-loss-durable commits and a high-concurrency
