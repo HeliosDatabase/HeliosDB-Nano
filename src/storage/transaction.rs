@@ -127,6 +127,12 @@ pub struct Transaction {
     rocksdb_wal_enabled: bool,
     /// R1.3: fsync the commit WriteBatch (power-loss durable commits).
     sync_commit: bool,
+    /// R1.3 phase 2: engine-wide leader/follower group committer. When set
+    /// (always, for engine/session-constructed transactions), a `sync_commit`
+    /// writes its batch UNSYNCED and then waits on ONE cohort-wide
+    /// `flush_wal(true)` instead of paying a private fsync. When absent,
+    /// falls back to the phase-1 per-commit synced WriteBatch.
+    group_committer: Option<Arc<super::group_commit::GroupCommitter>>,
     /// Write-write conflict registry (R0.2). When present, commits record
     /// their write-set keys; when `conflict_validation` is also set, commit
     /// aborts with a serialization failure if any key was committed after
@@ -188,6 +194,7 @@ impl Transaction {
             versioning_enabled: true,
             rocksdb_wal_enabled: true,
             sync_commit: false,
+            group_committer: None,
             conflict_registry: None,
             conflict_validation: false,
         })
@@ -202,6 +209,12 @@ impl Transaction {
     /// R1.3: request a synced (power-loss durable) commit WriteBatch.
     pub fn set_sync_commit(&mut self, enabled: bool) {
         self.sync_commit = enabled;
+    }
+
+    /// R1.3 phase 2: route this transaction's durability fsync through the
+    /// engine's leader/follower group committer (see field docs).
+    pub fn set_group_committer(&mut self, committer: Arc<super::group_commit::GroupCommitter>) {
+        self.group_committer = Some(committer);
     }
 
     pub fn set_rocksdb_wal_enabled(&mut self, enabled: bool) {
@@ -249,6 +262,7 @@ impl Transaction {
             versioning_enabled: true,
             rocksdb_wal_enabled: true,
             sync_commit: false,
+            group_committer: None,
             conflict_registry: None,
             conflict_validation: false,
         })
@@ -707,8 +721,22 @@ impl Transaction {
 
         for (table_name, row_id) in self.row_counter_stages.read().iter() {
             let key = format!("counter:{}", table_name);
-            let value = bincode::serialize(row_id)
-                .map_err(|e| Error::storage(format!("Failed to serialize counter: {}", e)))?;
+            let value = match bincode::serialize(row_id) {
+                Ok(value) => value,
+                Err(e) => {
+                    // Must NOT early-return with `?` here: an announced
+                    // in-flight commit that never reaches `end_commit` would
+                    // stall the snapshot barrier forever.
+                    if inflight {
+                        if let Some(registry) = &self.conflict_registry {
+                            registry.end_commit(commit_ts);
+                        }
+                    }
+                    self.acquired_locks.write().clear();
+                    self.state.store(TransactionState::Aborted.to_u8(), Ordering::Release);
+                    return Err(Error::storage(format!("Failed to serialize counter: {}", e)));
+                }
+            };
             batch.put(key.as_bytes(), value);
         }
 
@@ -716,10 +744,18 @@ impl Transaction {
         // stats sidecars are applied (no-op guard for non-columnar commits).
         let _columnar_stats_guard = touches_columnar.then(super::columnar::stats_write_lock);
 
+        // R1.3 phase 2: a durable commit with a group committer writes its
+        // batch UNSYNCED here and pays durability via ONE cohort-wide
+        // `flush_wal(true)` below — after the commit is applied, visible,
+        // and its locks are released, so the fsync wait never convoys the
+        // snapshot barrier or row-lock contenders. RocksDB's WAL is
+        // sequential: the group fsync covers every byte written before it.
+        let group_fsync = self.sync_commit && self.group_committer.is_some();
         let result = if self.rocksdb_wal_enabled {
-            if self.sync_commit {
-                // R1.3: one fsync per commit; RocksDB write groups amortize
-                // it across concurrent committers.
+            if self.sync_commit && !group_fsync {
+                // R1.3 phase 1 fallback (no group committer wired): one
+                // synced WriteBatch per commit; RocksDB write groups
+                // amortize it across concurrent committers.
                 let mut write_opts = WriteOptions::default();
                 write_opts.set_sync(true);
                 self.db.write_opt(batch, &write_opts)
@@ -758,6 +794,27 @@ impl Transaction {
             self.state.store(TransactionState::Aborted.to_u8(), Ordering::Release);
             Error::transaction(format!("Commit failed: {}", e))
         })?;
+
+        // R1.3 phase 2: group durability barrier. The commit is already
+        // applied and visible (memtable + unsynced WAL); block until a
+        // cohort fsync covering it completes. On failure the commit is NOT
+        // power-loss durable: report the error (RocksDB records the WAL-sync
+        // failure as a background error and rejects subsequent writes, so a
+        // lost generation cannot be silently followed by a "durable" one).
+        if group_fsync {
+            if let Some(committer) = &self.group_committer {
+                committer
+                    .wait_durable(|| self.db.flush_wal(true).map_err(|e| e.to_string()))
+                    .map_err(|e| {
+                        warn!(
+                            txn_id = self.transaction_id,
+                            error = %e,
+                            "Group WAL fsync failed; commit applied but not durable"
+                        );
+                        Error::transaction(format!("Commit failed: WAL group fsync failed: {}", e))
+                    })?;
+            }
+        }
 
         debug!(
             txn_id = self.transaction_id,
