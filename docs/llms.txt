@@ -1,0 +1,261 @@
+# HeliosDB-Nano
+
+> Apache-2.0 embedded ACID database in a single binary: PostgreSQL + MySQL wire
+> compatibility, HNSW vector search, copy-on-write database branching,
+> time-travel (AS OF) queries, BM25 full-text search, and a built-in MCP server
+> for AI agents. Use existing clients (psql, mysql, psycopg2, JDBC, ORMs) or
+> drive it entirely through MCP tool calls.
+
+<!--
+  GENERATED REFERENCE — sources:
+    - .claude/skills/heliosdb-nano-*/SKILL.md   (19 skills: frontmatter name +
+      description + key commands)
+    - .claude/skills/_index/verb-map.md          (verb catalogue)
+    - README.md                                  (install / connect / SQL notes)
+  Regenerate after changing any of those sources. Skill list extraction:
+    for f in .claude/skills/heliosdb-nano-*/SKILL.md; do
+      awk '/^name:|^description:/' "$f"; done
+  Then re-curate the sections below by hand (operators, dialect notes, and the
+  branch-merge warning are verified against src/ — see inline citations).
+-->
+
+## Why agents use Nano
+
+- `profile = "agent"` config bundle: group-commit writes + time-travel ON, so
+  branch sandboxes, AS OF reads, and vector search all work out of the box.
+- Branches = ephemeral fork-test-discard sandboxes: give every agent run its
+  own copy-on-write branch, test destructive changes, then drop the branch.
+- MCP server (`--features mcp-endpoint`) is the canonical agent path: 16 tools
+  over stdio / HTTP / WebSocket JSON-RPC 2.0 — no SQL string-building needed.
+- Embedded (in-process Rust) or server mode; in-memory mode for throwaway runs.
+
+## Install
+
+```bash
+cargo install heliosdb-nano --locked            # CLI binary from crates.io
+cargo add heliosdb-nano                         # embedded Rust library
+# Agent-relevant optional features:
+cargo install heliosdb-nano --locked --features mcp-endpoint              # MCP server
+cargo install heliosdb-nano --locked --features code-graph,mcp-endpoint   # + AST index
+```
+
+npx / Homebrew / Docker are NOT active install channels yet — use Cargo.
+Other features: `graph-rag` (knowledge graph), `code-embed` (local embedder),
+`vector-persist` (durable HNSW), `fips`, `ha-full`. See the
+`heliosdb-nano-install` skill or README "Building from Source".
+
+## Start and connect
+
+```bash
+heliosdb-nano start --data-dir ./mydata --mysql   # PG :5432, MySQL :3306, HTTP :8080
+heliosdb-nano start --memory --mysql              # in-memory (ideal for agent runs)
+heliosdb-nano repl --data-dir ./mydata            # interactive REPL, zero setup
+psql -h 127.0.0.1 -p 5432 -U postgres             # any PG client works unchanged
+mysql -h 127.0.0.1 -P 3306 -u root                # any MySQL client works unchanged
+curl "http://localhost:8080/rest/v1/<table>?select=*"   # REST (PostgREST-style)
+```
+
+Embedded (no server):
+
+```rust
+let db = heliosdb_nano::EmbeddedDatabase::new("./mydata")?;   // or new_in_memory()
+db.execute("CREATE TABLE t (id SERIAL PRIMARY KEY, x TEXT)")?;
+let rows = db.query("SELECT * FROM t WHERE x = $1", &["a".into()])?;
+```
+
+## Agent profile
+
+```toml
+# config.toml — pass via: heliosdb-nano start --config config.toml
+profile = "agent"   # group_commit WAL + time-travel ON: branch sandboxes,
+                    # AS OF queries, and HNSW vector search guaranteed enabled
+```
+
+Other profiles: `safe` (fsync everything), `balanced`, `fast` (no time-travel).
+A profile only fills in `[storage]` keys you do not set explicitly; add
+`durable_commit = true` if commits must survive power loss (not just crashes).
+See config.example.toml for every section.
+
+## MCP — the canonical agent path
+
+Requires a build with `--features mcp-endpoint`. 16 tools: `heliosdb_query`,
+`_schema`, `_list_tables`, `_create_table`, `_insert`,
+`heliosdb_branch_{create,list,merge}`, `heliosdb_search`, `_time_travel`,
+plus in-process RAG tools `_bm25_index`, `_hybrid_search`,
+`heliosdb_graph_{add_edge,traverse,path}` (graph-rag), `_embed_and_store`
+(code-embed).
+
+```bash
+# Wire into Claude Code:
+claude mcp add heliosdb -- heliosdb-nano mcp serve --data-dir ./mydata
+# HTTP / WebSocket transports for other agents:
+heliosdb-nano mcp serve --data-dir ./mydata --transport http --listen 127.0.0.1:9000
+```
+
+Notes: `tools/list` returns only what is compiled in; with stdio transport never
+log to stdout; `heliosdb_query` returns errors as a JSON `error` field, not an
+exception; drop `agent_run_*` branches when done — they persist otherwise.
+Full recipes: `.claude/skills/heliosdb-nano-mcp/SKILL.md`.
+
+## SQL dialect notes
+
+- Dialect autodetect: PostgreSQL syntax is canonical; MySQL type aliases
+  (`DATETIME`, `AUTO_INCREMENT`, `TINYINT(1)`, …) and SQLite-isms are accepted
+  (`?` placeholders, `INSERT OR REPLACE/IGNORE`, `INTEGER PRIMARY KEY
+  AUTOINCREMENT`, `sqlite_master`, `PRAGMA table_info` etc.).
+- Parameter styles: `?`, `$1`, `:name`, `@name` all work.
+- `INSERT … ON CONFLICT … DO UPDATE/NOTHING`, `INSERT/UPDATE/DELETE …
+  RETURNING`, CTEs, window functions, set ops, `EXPLAIN [ANALYZE]`.
+- Transactions: `BEGIN/COMMIT/ROLLBACK`, nested `SAVEPOINT … RELEASE/ROLLBACK
+  TO`. Bulk-load: wrap tens of thousands of INSERTs in one transaction.
+- Introspection: `information_schema.*`, `pg_class`, `sqlite_master`,
+  `PRAGMA table_info(t)`, REPL `\d [table]` / `\dt`.
+- JSONB operators `->`, `->>`, `@>`, `?`; FTS via `to_tsvector @@ to_tsquery`
+  + `ts_rank_cd` (BM25-backed).
+
+## Vector search
+
+Distance operators (verified against src/sql/planner.rs + src/vector/mod.rs):
+
+| Operator | Meaning | ORDER BY ascending returns |
+|----------|---------|----------------------------|
+| `<->` | L2 (Euclidean) distance | nearest first |
+| `<=>` | cosine distance | most similar first |
+| `<#>` | negative inner product | largest dot-product first |
+
+```sql
+CREATE TABLE docs (id SERIAL PRIMARY KEY, title TEXT, embedding VECTOR(1536));
+CREATE INDEX ON docs USING hnsw (embedding vector_cosine_ops);
+INSERT INTO docs (title, embedding) VALUES ('Intro', '[0.1, 0.2, ...]');
+
+SELECT title, embedding <=> '[0.15, 0.25, ...]' AS dist
+FROM docs ORDER BY dist LIMIT 10;                       -- k-NN
+
+-- Hybrid (vector + BM25) in one query:
+SELECT id, 0.7 * (1.0 - (embedding <=> $1::vector))
+         + 0.3 * ts_rank_cd(to_tsvector(text), plainto_tsquery($2)) AS score
+FROM chunks ORDER BY score DESC LIMIT 10;
+```
+
+Durable index variant (`--features vector-persist`):
+`CREATE INDEX … USING hnsw (embedding) WITH (persistent = true, quantization =
+'product', rerank_precision = 'i8')`. Library bulk API: `insert_vectors` /
+`delete_vectors` / `delete_vector_store`. Tuning: `[vector]` config
+(`hnsw_ef_construction`, `hnsw_m`, PQ knobs).
+
+## Branch sandboxes (fork — test — discard)
+
+Branches are copy-on-write forks of the database — the primitive for letting an
+agent execute arbitrary SQL against real data with zero write-risk to `main`.
+The recommended lifecycle is fork-test-discard:
+
+```sql
+CREATE DATABASE BRANCH agent_run_42 FROM main;   -- instant copy-on-write fork
+USE BRANCH agent_run_42;
+-- … run migrations, destructive UPDATEs, experiments; validate with SELECTs …
+USE BRANCH main;
+DROP DATABASE BRANCH agent_run_42;               -- discard; main never touched
+```
+
+Optionally anchor the fork in the past: `CREATE DATABASE BRANCH b FROM main AS
+OF TIMESTAMP '2026-06-01 09:00:00'` (needs time-travel ON — the agent profile
+guarantees it). Library API: `create_branch` / `switch_branch` / `drop_branch`
+/ `list_branches`. REPL: `\branches`, `\use <branch>`, `\show branch`.
+
+> WARNING — MERGE is currently unreliable. `MERGE DATABASE BRANCH x INTO main`
+> exists, but its three-way conflict detection over-reports and can mis-detect
+> conflicts (branch keys no longer carry timestamps, so the merge-base lookup
+> reads the latest value instead of the historical base). If you merge, verify
+> the merged rows yourself afterwards (e.g. diff row counts and spot-check
+> changed rows against the source branch). A full fix is tracked (audit C11).
+> Until then, prefer fork-test-discard: apply validated changes to `main`
+> directly (re-run the tested SQL) instead of merging the branch.
+
+## Time travel
+
+```sql
+SELECT * FROM products AS OF TIMESTAMP '2026-06-01 12:00:00';
+SELECT * FROM products AS OF TRANSACTION 12345;
+```
+
+Any read can be anchored to a past timestamp (audit, "what changed", recover
+values from before a bad UPDATE). Requires `time_travel_enabled = true`
+(default; ON in the `safe`, `balanced`, and `agent` profiles, OFF in `fast`).
+REPL: `\snapshots`.
+
+## Backup / restore
+
+```bash
+heliosdb-nano dump --data-dir ./mydata --output backup.hdb     # zstd default
+heliosdb-nano restore --data-dir ./newdata --input backup.hdb
+heliosdb-nano start … --dump-schedule "0 */6 * * *"            # periodic dumps
+```
+
+Library: `db.dump_full(path)` / `db.restore_from_dump(path)` /
+`db.restore_tables(path, [t…])`.
+
+## Skill catalogue (19 skills, .claude/skills/)
+
+Per-domain operating manuals for LLM agents (Claude Code picks them up
+automatically after `git clone`; install globally with
+`bash scripts/install-agent-skills.sh`). Name — scope — key commands:
+
+- heliosdb-nano-overview — top-level router to the other skills.
+- heliosdb-nano-install — crates.io / source install, every cargo feature
+  flag, data-dir init. `cargo install heliosdb-nano --locked`,
+  `heliosdb-nano init`.
+- heliosdb-nano-connect — five connection modes: embedded Rust, PG wire,
+  MySQL wire, REPL, Python sqlite3 drop-in; auth + TLS. `heliosdb-nano repl`,
+  `psql -h 127.0.0.1 -p 5432`, `mysql -h 127.0.0.1 -P 3306`.
+- heliosdb-nano-schema — DDL: tables, constraints, B-tree + HNSW indexes,
+  views, materialized views, triggers, PL/pgSQL; introspection. `\d`, `\dt`,
+  `\dS`, `\dmv`, `CREATE INDEX … USING hnsw`.
+- heliosdb-nano-query — DML: INSERT (OR REPLACE/IGNORE, ON CONFLICT,
+  RETURNING), UPDATE/DELETE RETURNING, parameter styles, CTEs, window
+  functions, EXPLAIN [ANALYZE], result cache.
+- heliosdb-nano-transactions — BEGIN/COMMIT/ROLLBACK, savepoints, RAII
+  `db.begin_transaction()`, deadlock detection, bulk-load pattern.
+- heliosdb-nano-branches — fork-test-discard agent sandboxes: `CREATE
+  DATABASE BRANCH … FROM main [AS OF …]`, `USE BRANCH`, `DROP DATABASE
+  BRANCH`; merge exists but see the MERGE warning above.
+- heliosdb-nano-time-travel — `SELECT … AS OF TIMESTAMP '…'`, snapshot
+  listing, bad-UPDATE recovery recipes. `\snapshots`.
+- heliosdb-nano-backup — `heliosdb-nano dump`/`restore`, zstd/gzip/brotli,
+  append (incremental) dumps, partial table restore, `--dump-schedule`.
+- heliosdb-nano-vector — HNSW DDL, `<->` / `<#>` / `<=>` operators, bulk
+  vector API, hybrid BM25+vector search, `[vector]` tuning.
+- heliosdb-nano-code-graph — tree-sitter AST symbol index over a repo
+  (`code-graph` feature): `code_index()`, `lsp_definition` / `lsp_references`
+  / `lsp_call_hierarchy` / `lsp_hover`, `_hdb_code_*` tables, git hook
+  (`heliosdb-nano code-graph hook`).
+- heliosdb-nano-graph-rag — `_hdb_graph_*` knowledge-graph schema +
+  seed/expand/rerank retrieval (`graph-rag` feature); ingestors for docs,
+  PDF, Office, audio, images, email, issues, Q&A. `graph_rag_search(q)`.
+- heliosdb-nano-mcp — the MCP server itself: transports, 16-tool catalog,
+  `claude mcp add heliosdb -- heliosdb-nano mcp serve --data-dir ./mydata`.
+- heliosdb-nano-server — daemon mode: `start | stop | status`, TOML config,
+  auth modes (trust/password/md5/scram-sha-256), TLS, HA roles
+  (primary/standby/observer), sync modes, user management.
+- heliosdb-nano-tenant — multi-tenant isolation: SharedSchema+RLS,
+  SchemaPerTenant, DatabasePerTenant; tiered plans, per-tenant quotas,
+  `current_tenant()` RLS policies.
+- heliosdb-nano-deploy — Dockerfile.binary, docker-compose, Fly.io, Railway,
+  Render templates (deployment/), install script, systemd unit.
+- heliosdb-nano-observability — RUST_LOG tracing, slow-query log (1 s WARN
+  default), `GET /health`, `\stats`, `\compression`, `\optimize`, `\indexes`.
+- heliosdb-nano-migrate — drop-in migration from SQLite (Python
+  `heliosdb_sqlite` SDK), PostgreSQL (any PG client), MySQL (`--mysql`,
+  WordPress/PHP); dialect gotchas.
+- heliosdb-nano-merge-validation — this repo's 8-phase pre-merge validation
+  methodology (contributors, not end users).
+
+Verb lookup (every CLI flag / REPL command / Rust API / MCP tool):
+`.claude/skills/_index/verb-map.md`. Feature-flag map:
+`.claude/skills/_index/feature-matrix.md`.
+
+## More
+
+- README.md — full feature tour, ORM/driver matrix, HA, deploy templates.
+- config.example.toml — every config key, annotated.
+- docs/guides/ — auth, upgrades, HA tutorial, SQLite drop-in, audit.
+- https://heliosdb.com/llms.txt — hosted ecosystem-wide index.

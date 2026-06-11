@@ -74,7 +74,7 @@ use std::path::PathBuf;
 /// before using the configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    /// Named settings bundle: "safe" | "balanced" | "fast" (D3).
+    /// Named settings bundle: "safe" | "balanced" | "fast" | "agent" (D3/D6).
     ///
     /// Applied by [`Config::from_file`] / [`Config::from_toml_str`] after the
     /// file is parsed: the profile fills in the bundled storage fields
@@ -371,6 +371,16 @@ pub enum ProfileConfig {
     /// `durable_commit = false`. Fastest writes: no version snapshots (no
     /// AS OF time-travel queries) and commits are process-crash-safe only.
     Fast,
+    /// AI-agent workload bundle (D6): `wal_sync_mode = "group_commit"`,
+    /// `time_travel_enabled = true`. Guarantees the features a 10-minute
+    /// agent session leans on stay enabled together: branchable sandboxes
+    /// (branching is always on — no flag needed — but `AS OF` branch
+    /// anchors require time-travel), `AS OF` time-travel reads, and HNSW
+    /// vector search (on by default), with group-commit write throughput
+    /// for chatty tool-call write patterns. Storage values match
+    /// `Balanced`; the named profile exists so agent deployments opt into
+    /// the documented bundle rather than individual knobs.
+    Agent,
 }
 
 /// Bundled storage values a profile applies (None = leave field untouched).
@@ -387,6 +397,7 @@ impl ProfileConfig {
             ProfileConfig::Safe => "safe",
             ProfileConfig::Balanced => "balanced",
             ProfileConfig::Fast => "fast",
+            ProfileConfig::Agent => "agent",
         }
     }
 
@@ -409,6 +420,16 @@ impl ProfileConfig {
                 wal_sync_mode: WalSyncModeConfig::GroupCommit,
                 time_travel_enabled: false,
                 durable_commit: Some(false),
+            },
+            // Agent: time-travel must stay on (AS OF reads + AS OF branch
+            // anchors are part of the agent bundle), writes use group
+            // commit. Branching and vector search need no storage knobs —
+            // both are always available. durable_commit stays None so an
+            // explicit operator opt-in is never silently downgraded.
+            ProfileConfig::Agent => ProfileStorageBundle {
+                wal_sync_mode: WalSyncModeConfig::GroupCommit,
+                time_travel_enabled: true,
+                durable_commit: None,
             },
         }
     }
@@ -1213,6 +1234,37 @@ mod tests {
     #[test]
     fn test_profile_balanced_applies_bundle() {
         let config = Config::from_toml_str("profile = \"balanced\"").expect("parse");
+        assert_eq!(config.storage.wal_sync_mode, WalSyncModeConfig::GroupCommit);
+        assert!(config.storage.time_travel_enabled);
+    }
+
+    #[test]
+    fn test_profile_agent_applies_bundle() {
+        // D6: the agent bundle = group-commit writes + time-travel ON
+        // (AS OF reads and AS OF branch anchors must keep working).
+        let config = Config::from_toml_str("profile = \"agent\"").expect("parse");
+        assert_eq!(config.profile, Some(ProfileConfig::Agent));
+        assert_eq!(config.storage.wal_sync_mode, WalSyncModeConfig::GroupCommit);
+        assert!(config.storage.time_travel_enabled);
+        // durable_commit untouched (defaults to false, but an explicit
+        // operator value must never be downgraded — see next test).
+        assert!(!config.storage.durable_commit);
+        assert_eq!(ProfileConfig::Agent.as_str(), "agent");
+    }
+
+    #[test]
+    fn test_agent_profile_does_not_downgrade_durable_commit() {
+        let config = Config::from_toml_str(
+            r#"
+            profile = "agent"
+
+            [storage]
+            durable_commit = true
+            "#,
+        )
+        .expect("parse");
+        assert!(config.storage.durable_commit);
+        // Bundled fields still come from the profile.
         assert_eq!(config.storage.wal_sync_mode, WalSyncModeConfig::GroupCommit);
         assert!(config.storage.time_travel_enabled);
     }
