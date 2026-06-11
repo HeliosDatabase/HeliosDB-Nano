@@ -13288,12 +13288,16 @@ impl EmbeddedDatabase {
                 &[],
                 self.storage.db(),
             )?,
-            "hnsw" => vector_mgr.create_index(
+            // R5.V6: construction parameters come from the `[vector]`
+            // config section instead of being hardcoded to 16/200.
+            "hnsw" => vector_mgr.create_index_with_params(
                 name.to_string(),
                 name.to_string(),
                 "embedding".to_string(),
                 dimensions as usize,
                 distance_metric,
+                self.storage.config().vector.hnsw_m,
+                self.storage.config().vector.hnsw_ef_construction,
             )?,
             other => {
                 return Err(Error::query_execution(format!(
