@@ -205,6 +205,33 @@ fn storage_filter_value_matches_type(data_type: &DataType, value: &Value) -> boo
     }
 }
 
+/// Borrowed-source variant of [`filter_tuples_with_evaluator`] for
+/// Arc-shared CTE tuples (R3.5 item 5): clones ONLY the rows that pass the
+/// predicate instead of deep-cloning the whole materialized set first.
+fn filter_shared_tuples_with_evaluator(
+    tuples: &[Tuple],
+    schema: Arc<Schema>,
+    predicate: &LogicalExpr,
+    parameters: &[Value],
+) -> Result<Vec<Tuple>> {
+    let evaluator = crate::sql::Evaluator::with_parameters(schema, parameters.to_vec());
+    let predicate = evaluator.bind(predicate.clone());
+    let mut filtered = Vec::new();
+    for tuple in tuples {
+        match evaluator.evaluate(&predicate, tuple)? {
+            Value::Boolean(true) => filtered.push(tuple.clone()),
+            Value::Boolean(false) | Value::Null => {}
+            result => {
+                return Err(Error::query_execution(format!(
+                    "Filter predicate must evaluate to boolean, got: {:?}",
+                    result
+                )));
+            }
+        }
+    }
+    Ok(filtered)
+}
+
 fn filter_tuples_with_evaluator(
     tuples: Vec<Tuple>,
     schema: Arc<Schema>,
@@ -1101,6 +1128,38 @@ fn collect_expr_columns(expr: &LogicalExpr, cols: &mut HashSet<String>, bail: &m
     }
 }
 
+/// Tuple source for [`ScanOperator`] (R3.5 item 5).
+///
+/// `Owned` is the historical mode: the operator owns the materialized rows
+/// and serves them destructively (`mem::take`, zero copies). `Shared` serves
+/// an `Arc`-shared materialization (CTE results) by cloning each row as it
+/// is emitted — same total clone count as the old upfront
+/// `cte_data.tuples.clone()` when fully consumed, but no second resident
+/// copy, nothing cloned for rows a LIMIT/TopK never pulls, and N references
+/// to the same CTE share one materialization.
+enum ScanTuples {
+    Owned(Vec<Tuple>),
+    Shared(Arc<Vec<Tuple>>),
+}
+
+impl ScanTuples {
+    fn len(&self) -> usize {
+        match self {
+            Self::Owned(tuples) => tuples.len(),
+            Self::Shared(tuples) => tuples.len(),
+        }
+    }
+
+    /// Serve the tuple at `index`: move it out of an owned source, clone it
+    /// from a shared one.
+    fn serve(&mut self, index: usize) -> Option<Tuple> {
+        match self {
+            Self::Owned(tuples) => tuples.get_mut(index).map(std::mem::take),
+            Self::Shared(tuples) => tuples.get(index).cloned(),
+        }
+    }
+}
+
 /// Table scan operator
 ///
 /// Reads tuples from a table.
@@ -1109,7 +1168,7 @@ pub struct ScanOperator {
     schema: Arc<Schema>,
     projection: Option<Vec<usize>>,
     projection_move_max_index: Option<usize>,
-    tuples: Vec<Tuple>,
+    tuples: ScanTuples,
     current_index: usize,
     timeout_ctx: Option<TimeoutContext>,
     #[allow(dead_code)]
@@ -1122,6 +1181,28 @@ impl ScanOperator {
         schema: Arc<Schema>,
         projection: Option<Vec<usize>>,
         tuples: Vec<Tuple>,
+        parameters: Vec<crate::Value>,
+    ) -> Self {
+        Self::with_source(table_name, schema, projection, ScanTuples::Owned(tuples), parameters)
+    }
+
+    /// Construct over an `Arc`-shared materialization without deep-cloning it
+    /// (R3.5 item 5; used for CTE references).
+    pub(super) fn new_shared(
+        table_name: String,
+        schema: Arc<Schema>,
+        projection: Option<Vec<usize>>,
+        tuples: Arc<Vec<Tuple>>,
+        parameters: Vec<crate::Value>,
+    ) -> Self {
+        Self::with_source(table_name, schema, projection, ScanTuples::Shared(tuples), parameters)
+    }
+
+    fn with_source(
+        table_name: String,
+        schema: Arc<Schema>,
+        projection: Option<Vec<usize>>,
+        tuples: ScanTuples,
         parameters: Vec<crate::Value>,
     ) -> Self {
         let projection_move_max_index = projection
@@ -1156,11 +1237,10 @@ impl PhysicalOperator for ScanOperator {
             return Ok(None);
         }
 
-        let mut tuple = std::mem::take(
-            self.tuples
-                .get_mut(self.current_index)
-                .ok_or_else(|| Error::query_execution("Scan index out of bounds"))?,
-        );
+        let mut tuple = self
+            .tuples
+            .serve(self.current_index)
+            .ok_or_else(|| Error::query_execution("Scan index out of bounds"))?;
         self.current_index += 1;
 
         // Apply projection if specified
@@ -1377,12 +1457,14 @@ pub(super) fn handle_scan(executor: &Executor, plan: &LogicalPlan) -> Result<Box
                 col.source_table_name = Some(table_name.clone());
             }
 
+            // R3.5 item 5: serve the Arc-shared materialization — no deep
+            // clone of the whole CTE result per reference.
             return Ok(Box::new(
-                ScanOperator::new(
+                ScanOperator::new_shared(
                     table_name.clone(),
                     Arc::new(schema_with_source),
                     projection.clone(),
-                    cte_data.tuples.clone(),
+                    Arc::clone(&cte_data.tuples),
                     executor.parameters().to_vec(),
                 )
                 .with_timeout(executor.timeout_ctx()),
@@ -1641,22 +1723,39 @@ pub(super) fn handle_filtered_scan(executor: &Executor, plan: &LogicalPlan) -> R
                 col.source_table_name = Some(table_name.clone());
             }
 
+            // R3.5 item 5: filter against the Arc-shared materialization,
+            // cloning only the rows that pass the predicate; without a
+            // predicate, serve the shared materialization directly.
             let schema_arc = Arc::new(schema_with_source);
-            let tuples = if let Some(pred) = &materialized_predicate {
-                filter_tuples_with_evaluator(cte_data.tuples.clone(), schema_arc.clone(), pred, executor.parameters())?
-            } else {
-                cte_data.tuples.clone()
-            };
-            let scan_op = Box::new(
-                ScanOperator::new(
-                    table_name.clone(),
+            let scan_op: Box<dyn PhysicalOperator> = if let Some(pred) = &materialized_predicate {
+                let tuples = filter_shared_tuples_with_evaluator(
+                    &cte_data.tuples,
                     schema_arc.clone(),
-                    projection.clone(),
-                    tuples,
-                    executor.parameters().to_vec(),
+                    pred,
+                    executor.parameters(),
+                )?;
+                Box::new(
+                    ScanOperator::new(
+                        table_name.clone(),
+                        schema_arc.clone(),
+                        projection.clone(),
+                        tuples,
+                        executor.parameters().to_vec(),
+                    )
+                    .with_timeout(executor.timeout_ctx()),
                 )
-                .with_timeout(executor.timeout_ctx()),
-            );
+            } else {
+                Box::new(
+                    ScanOperator::new_shared(
+                        table_name.clone(),
+                        schema_arc.clone(),
+                        projection.clone(),
+                        Arc::clone(&cte_data.tuples),
+                        executor.parameters().to_vec(),
+                    )
+                    .with_timeout(executor.timeout_ctx()),
+                )
+            };
 
             return Ok(scan_op);
         }
