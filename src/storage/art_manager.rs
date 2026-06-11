@@ -13,10 +13,11 @@
 
 use super::art_index::{AdaptiveRadixTree, ArtIndexError, ArtIndexStats, ArtIndexType, ArtResult};
 use super::art_node::RowId;
+use super::index_snapshot::ArtIndexSnapshot;
 use crate::{DataType, Schema, Tuple, Value};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 /// Shared handle to a single ART index tree.
@@ -199,11 +200,40 @@ pub struct ArtIndexManager {
     unique_indexes: RwLock<HashMap<String, Vec<String>>>,
     /// Statistics
     stats: AtomicArtManagerStats,
+    /// R4.2 durable-snapshot validity tracking. `true` means the persisted
+    /// snapshot markers (if any) still describe the current in-memory state.
+    /// The FIRST mutation after a checkpoint flips it and fires
+    /// `snapshot_invalidation_hook` exactly once, which durably deletes the
+    /// markers — so a crash can never leave a stale snapshot trusted.
+    /// Hot-path cost: one relaxed atomic load per index mutation.
+    snapshot_clean: AtomicBool,
+    /// Engine-wired callback that deletes the ART snapshot markers in RocksDB.
+    snapshot_invalidation_hook: RwLock<Option<InvalidationHook>>,
+}
+
+/// Opaque wrapper so the manager can keep `#[derive(Debug)]`.
+#[derive(Clone)]
+pub struct InvalidationHook(pub Arc<dyn Fn() + Send + Sync>);
+
+impl std::fmt::Debug for InvalidationHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("InvalidationHook")
+    }
 }
 
 impl Default for ArtIndexManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Stable on-disk tag for [`ArtIndexType`] (snapshot format).
+pub(crate) fn index_type_tag(index_type: ArtIndexType) -> u8 {
+    match index_type {
+        ArtIndexType::PrimaryKey => 0,
+        ArtIndexType::ForeignKey => 1,
+        ArtIndexType::Unique => 2,
+        ArtIndexType::Manual => 3,
     }
 }
 
@@ -228,7 +258,127 @@ impl ArtIndexManager {
             fk_info: RwLock::new(HashMap::new()),
             unique_indexes: RwLock::new(HashMap::new()),
             stats: AtomicArtManagerStats::default(),
+            // Armed at startup: markers from a previous clean shutdown must
+            // be invalidated by the first mutation of this process.
+            snapshot_clean: AtomicBool::new(true),
+            snapshot_invalidation_hook: RwLock::new(None),
         }
+    }
+
+    // =========================================================================
+    // R4.2: DURABLE SNAPSHOT SUPPORT
+    // =========================================================================
+
+    /// Wire the callback that durably deletes the persisted snapshot markers.
+    /// Called once by the storage engine at open.
+    pub fn set_snapshot_invalidation_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .snapshot_invalidation_hook
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(InvalidationHook(hook));
+    }
+
+    /// Re-arm the validity flag after a checkpoint wrote fresh markers.
+    pub fn mark_snapshot_clean(&self) {
+        self.snapshot_clean.store(true, Ordering::Release);
+    }
+
+    /// True when no index mutation happened since the last checkpoint /
+    /// `mark_snapshot_clean`. The checkpoint writer uses this to detect a
+    /// concurrent mutation racing the marker write.
+    pub fn snapshot_is_clean(&self) -> bool {
+        self.snapshot_clean.load(Ordering::Acquire)
+    }
+
+    /// Record an index mutation. The first call after a checkpoint fires the
+    /// invalidation hook (durable marker delete); subsequent calls are a
+    /// single relaxed atomic load.
+    #[inline]
+    fn note_mutation(&self) {
+        if self.snapshot_clean.load(Ordering::Relaxed) && self.snapshot_clean.swap(false, Ordering::AcqRel) {
+            let hook = self
+                .snapshot_invalidation_hook
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if let Some(hook) = hook {
+                (hook.0)();
+            }
+        }
+    }
+
+    /// Export every ART index registered on `table` as snapshot entries.
+    /// Each tree is read-locked one at a time (manager locking rules hold).
+    pub fn export_table_snapshot(&self, table: &str) -> Vec<ArtIndexSnapshot> {
+        let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
+        let mut out = Vec::new();
+        for (name, entry) in indexes.iter() {
+            if entry.table != table {
+                continue;
+            }
+            let tree = entry.tree.read().unwrap_or_else(|e| e.into_inner());
+            let mut entries: Vec<(Vec<u8>, Vec<u64>)> = Vec::new();
+            for (key, row_id) in tree.iter() {
+                match entries.last_mut() {
+                    Some((last_key, ids)) if *last_key == key => ids.push(row_id),
+                    _ => entries.push((key, vec![row_id])),
+                }
+            }
+            out.push(ArtIndexSnapshot {
+                name: name.clone(),
+                table: entry.table.clone(),
+                columns: entry.columns.clone(),
+                index_type: index_type_tag(entry.index_type),
+                entries,
+            });
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+
+    /// Bulk-load snapshot entries into an already-registered (empty) index.
+    ///
+    /// `dense_int_width` carries the byte width of a single-column integer
+    /// primary key so the dense-int range-count stats are restored exactly as
+    /// the scan path's `on_insert` would have built them.
+    pub fn load_index_entries(
+        &self,
+        name: &str,
+        entries: &[(Vec<u8>, Vec<u64>)],
+        dense_int_width: Option<usize>,
+    ) -> ArtResult<usize> {
+        let entry = {
+            let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
+            indexes
+                .get(name)
+                .cloned()
+                .ok_or_else(|| ArtIndexError::IndexNotFound(name.to_string()))?
+        };
+        let mut tree = entry.tree.write().unwrap_or_else(|e| e.into_inner());
+        if tree.len() != 0 {
+            return Err(ArtIndexError::Internal(format!(
+                "Refusing to load snapshot into non-empty index '{}' ({} entries)",
+                name,
+                tree.len()
+            )));
+        }
+        let mut loaded = 0usize;
+        for (key, row_ids) in entries {
+            for row_id in row_ids {
+                tree.insert(key, *row_id)?;
+                loaded += 1;
+            }
+            if entry.index_type == ArtIndexType::PrimaryKey {
+                if let Some(width) = dense_int_width {
+                    if key.len() == width {
+                        if let Some(value) = decode_int_key(key, width) {
+                            tree.record_dense_int_insert(width, value);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(loaded)
     }
 
     /// Generate index name for a primary key
@@ -252,6 +402,7 @@ impl ArtIndexManager {
 
     /// Create a primary key index (auto-called on CREATE TABLE with PRIMARY KEY)
     pub fn create_pk_index(&self, table: &str, columns: &[String]) -> ArtResult<String> {
+        self.note_mutation();
         let index_name = Self::pk_index_name(table);
 
         // Check if PK already exists for this table
@@ -293,6 +444,7 @@ impl ArtIndexManager {
         ref_columns: &[String],
         constraint_name: Option<&str>,
     ) -> ArtResult<String> {
+        self.note_mutation();
         let index_name = constraint_name
             .map(|n| n.to_string())
             .unwrap_or_else(|| Self::fk_index_name(table, columns));
@@ -352,6 +504,7 @@ impl ArtIndexManager {
         columns: &[String],
         constraint_name: Option<&str>,
     ) -> ArtResult<String> {
+        self.note_mutation();
         let index_name = constraint_name
             .map(|n| n.to_string())
             .unwrap_or_else(|| Self::unique_index_name(table, columns));
@@ -388,6 +541,7 @@ impl ArtIndexManager {
 
     /// Create a manual index (via CREATE INDEX ... USING ART)
     pub fn create_manual_index(&self, name: &str, table: &str, columns: &[String]) -> ArtResult<String> {
+        self.note_mutation();
         // Check if index already exists
         {
             let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
@@ -416,6 +570,7 @@ impl ArtIndexManager {
     /// table insert maintenance path would also touch PK/UNIQUE indexes and hit
     /// duplicates for rows that were already present before CREATE INDEX.
     pub fn backfill_manual_index(&self, name: &str, schema: &Schema, tuples: &[Tuple]) -> ArtResult<usize> {
+        self.note_mutation();
         // Global READ is enough: the registry is not changed, only one tree.
         let entry = {
             let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
@@ -456,6 +611,7 @@ impl ArtIndexManager {
 
     /// Drop an index by name
     pub fn drop_index(&self, name: &str) -> ArtResult<()> {
+        self.note_mutation();
         let index_type;
 
         // Remove from main index map
@@ -522,6 +678,7 @@ impl ArtIndexManager {
 
     /// Rename all indexes for a table (called on RENAME TABLE)
     pub fn rename_table_indexes(&self, old_table: &str, new_table: &str) -> ArtResult<()> {
+        self.note_mutation();
         // Move the entries under the global WRITE lock. Trees are renamed in
         // place (one tree lock at a time, see locking rules) — no tree clone.
         let mut renames: Vec<(String, String)> = Vec::new();
@@ -1171,6 +1328,7 @@ impl ArtIndexManager {
     /// Takes the global map lock as READ (concurrent across tables) and the
     /// per-tree WRITE locks one at a time (serializes only same-index writers).
     pub fn on_insert(&self, table: &str, row_id: RowId, column_values: &HashMap<String, Value>) -> ArtResult<()> {
+        self.note_mutation();
         let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
 
         // Update all indexes for this table (metadata filter, no tree lock)
@@ -1214,6 +1372,7 @@ impl ArtIndexManager {
 
     /// Update indexes after INSERT using an already-materialized tuple.
     pub fn on_insert_tuple(&self, table: &str, row_id: RowId, schema: &Schema, tuple: &Tuple) -> ArtResult<()> {
+        self.note_mutation();
         let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
 
         for entry in indexes.values() {
@@ -1252,6 +1411,7 @@ impl ArtIndexManager {
         schema: &Schema,
         tuple: &Tuple,
     ) -> ArtResult<HashMap<String, Value>> {
+        self.note_mutation();
         let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
         let mut indexed_values = HashMap::new();
 
@@ -1300,6 +1460,7 @@ impl ArtIndexManager {
     ///
     /// Global map lock as READ + per-tree WRITE locks one at a time.
     pub fn on_delete(&self, table: &str, row_id: RowId, column_values: &HashMap<String, Value>) -> ArtResult<()> {
+        self.note_mutation();
         let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
 
         for entry in indexes.values() {
@@ -1339,6 +1500,7 @@ impl ArtIndexManager {
 
     /// Update indexes after DELETE using the already-materialized tuple.
     pub fn on_delete_tuple(&self, table: &str, row_id: RowId, schema: &Schema, tuple: &Tuple) -> ArtResult<()> {
+        self.note_mutation();
         let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
 
         for entry in indexes.values() {
@@ -1372,6 +1534,7 @@ impl ArtIndexManager {
     /// the encoded PK key. This avoids fetching/deserializing the old row for
     /// PK-only DELETE fast paths.
     pub fn remove_single_pk_key(&self, table: &str, key: &[u8], row_id: RowId, pk_value: &Value) -> ArtResult<bool> {
+        self.note_mutation();
         let pk_name = {
             let pk_indexes = self.pk_indexes.read().unwrap_or_else(|e| e.into_inner());
             match pk_indexes.get(table) {
@@ -1487,6 +1650,7 @@ impl ArtIndexManager {
     /// The registry itself is unchanged, so the global lock is taken as READ;
     /// each table tree is write-locked one at a time.
     pub fn clear_table_indexes(&self, table: &str) {
+        self.note_mutation();
         let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
         for entry in indexes.values() {
             if entry.table == table {
