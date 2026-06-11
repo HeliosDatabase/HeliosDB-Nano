@@ -1766,6 +1766,21 @@ impl EmbeddedDatabase {
                         .collect()
                 });
 
+                // R3.3: columnar side-data is staged grouped by (column,
+                // batch) AFTER the row loop — one staged read-modify-write
+                // per touched batch per statement instead of one per value.
+                // Rows are appended here exactly where the old per-row
+                // staging happened, so apply order (and therefore last-write-
+                // wins for ON CONFLICT DO UPDATE of a row inserted earlier in
+                // the same statement) is preserved.
+                let stage_columnar_grouped = self.storage.get_current_branch().is_none()
+                    && schema
+                        .columns
+                        .iter()
+                        .any(|c| c.storage_mode == ColumnStorageMode::Columnar);
+                let mut pending_columnar: Vec<(u64, Tuple)> = Vec::new();
+
+                let loop_result: Result<u64> = (|| {
                 let mut count = 0;
                 for value_row in values {
                     // Initialize tuple values for ALL columns (use None as placeholder)
@@ -2098,18 +2113,12 @@ impl EmbeddedDatabase {
                                         }
                                     }
 
-                                    // Write updated tuple back and stage columnar side-data
-                                    // inside the same transaction. Keep the row bytes logical
-                                    // in the write set so read-your-own-writes returns values,
-                                    // not storage references.
-                                    if self.storage.get_current_branch().is_none() {
-                                        self.storage.stage_tuple_for_column_storage_in_transaction(
-                                            table_name,
-                                            existing_row_id,
-                                            &existing_tuple,
-                                            &schema,
-                                            txn,
-                                        )?;
+                                    // Write updated tuple back; columnar side-data is staged
+                                    // grouped after the row loop (R3.3). Keep the row bytes
+                                    // logical in the write set so read-your-own-writes returns
+                                    // values, not storage references.
+                                    if stage_columnar_grouped {
+                                        pending_columnar.push((existing_row_id, existing_tuple.clone()));
                                     }
                                     let updated_val = bincode::serialize(&existing_tuple)
                                         .map_err(|err| Error::storage(err.to_string()))?;
@@ -2264,11 +2273,11 @@ impl EmbeddedDatabase {
                     // the same transaction (read-your-own-writes).
                     self.check_fk_constraints_on_write(table_name, &col_values, Some(txn))?;
 
-                    // Stage columnar side-data in the transaction write set,
-                    // but keep the row value logical for read-your-own-writes.
-                    if self.storage.get_current_branch().is_none() {
-                        self.storage
-                            .stage_tuple_for_column_storage_in_transaction(table_name, row_id, &tuple, &schema, txn)?;
+                    // Columnar side-data is staged grouped after the row loop
+                    // (R3.3); the row value stays logical for
+                    // read-your-own-writes.
+                    if stage_columnar_grouped {
+                        pending_columnar.push((row_id, tuple.clone()));
                     }
                     let val = bincode::serialize(&tuple).map_err(|e| Error::storage(e.to_string()))?;
                     txn.put(key.clone(), val.clone())?;
@@ -2371,8 +2380,23 @@ impl EmbeddedDatabase {
                         }
                     }
                 }
-                // Return count (RETURNING clause results handled separately)
                 Ok(count)
+                })();
+
+                // R3.3: stage the grouped columnar writes (values + presence
+                // bits) for every row that reached the write set — ALSO when
+                // the loop errored mid-statement, so rows already buffered in
+                // the transaction keep their columnar side-data consistent
+                // (matching the old per-row staging order of effects).
+                if !pending_columnar.is_empty() {
+                    let row_refs: Vec<(u64, &Tuple)> =
+                        pending_columnar.iter().map(|(row_id, tuple)| (*row_id, tuple)).collect();
+                    self.storage
+                        .stage_columnar_rows_grouped_in_transaction(table_name, &row_refs, &schema, txn, true)?;
+                }
+
+                // Return count (RETURNING clause results handled separately)
+                loop_result
             }
             sql::LogicalPlan::InsertSelect {
                 table_name,
@@ -2999,15 +3023,21 @@ impl EmbeddedDatabase {
                 }
 
                 let update_count = updates.len() as u64;
+                // R3.3: stage columnar side-data grouped by (column, batch) —
+                // one staged read-modify-write per touched batch per
+                // statement. UPDATEs keep their row ids, so presence is
+                // untouched (`mark_present = false`).
+                if !on_branch {
+                    let row_refs: Vec<(u64, &Tuple)> =
+                        updates.iter().map(|(row_id, _, tuple)| (*row_id, tuple)).collect();
+                    self.storage
+                        .stage_columnar_rows_grouped_in_transaction(table_name, &row_refs, &schema, txn, false)?;
+                }
                 // Buffer updates in transaction write set for ACID guarantees
                 // Updates are only visible after transaction commits
                 // Use branch-aware keys so updates on branches don't pollute main
                 for (row_id, old_tuple, tuple) in &updates {
                     let key = self.storage.branch_aware_data_key(table_name, *row_id);
-                    if !on_branch {
-                        self.storage
-                            .stage_tuple_for_column_storage_in_transaction(table_name, *row_id, tuple, &schema, txn)?;
-                    }
                     let value = bincode::serialize(tuple)
                         .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
                     txn.put(key.clone(), value.clone())?;
@@ -3364,11 +3394,16 @@ impl EmbeddedDatabase {
                         self.storage.row_cache().invalidate(table_name, *row_id);
                     }
                 } else {
-                    // Main branch: actual key deletion
-                    for (row_id, _) in &deleted_tuples {
-                        self.storage
-                            .stage_columnar_delete_in_transaction(table_name, *row_id, &schema_arc, txn)?;
-                    }
+                    // Main branch: actual key deletion. R3.3: null the
+                    // columnar slots and clear presence bits grouped by batch
+                    // — one staged read-modify-write per touched batch.
+                    let columnar_row_ids: Vec<u64> = deleted_tuples.iter().map(|(row_id, _)| *row_id).collect();
+                    self.storage.stage_columnar_deletes_grouped_in_transaction(
+                        table_name,
+                        &columnar_row_ids,
+                        &schema_arc,
+                        txn,
+                    )?;
                     for row_id in &row_ids_to_delete {
                         let key = format!("data:{}:{}", table_name, row_id).into_bytes();
                         txn.delete(key.clone())?;
@@ -3763,11 +3798,15 @@ impl EmbeddedDatabase {
                         }
 
                         // Remove column from schema
+                        let was_columnar = schema
+                            .get_column_at(idx)
+                            .is_some_and(|c| c.storage_mode == ColumnStorageMode::Columnar);
                         schema.columns.remove(idx);
                         catalog.update_table_schema(table_name, &schema)?;
 
                         // Update existing rows by removing the column value
                         let rows_updated = self.storage.drop_column_from_rows(table_name, idx)?;
+                        self.cleanup_columnar_after_drop_column(table_name, column_name, was_columnar, &schema)?;
 
                         tracing::info!(
                             "Dropped column '{}' from table '{}', updated {} rows",
@@ -3966,17 +4005,29 @@ impl EmbeddedDatabase {
                 // TRUNCATE within a transaction: buffer all row deletes in write set
                 // so they can be rolled back if the transaction is aborted
                 let catalog = self.storage.catalog();
-                let _schema = catalog.get_table_schema(table_name)?;
+                let schema = catalog.get_table_schema(table_name)?;
                 let rows = self.storage.scan_table(table_name)?;
                 let mut count = 0u64;
+                let mut truncated_row_ids = Vec::with_capacity(rows.len());
                 for tuple in &rows {
                     if let Some(row_id) = tuple.row_id {
                         let key = format!("data:{}:{}", table_name, row_id).into_bytes();
                         txn.delete(key)?;
                         // Invalidate row cache
                         self.storage.row_cache().invalidate(table_name, row_id);
+                        truncated_row_ids.push(row_id);
                         count += 1;
                     }
+                }
+                // R3.3: rollback-safe columnar truncation — stage Null values
+                // and presence clears through the write set, grouped per batch.
+                if self.storage.get_current_branch().is_none() {
+                    self.storage.stage_columnar_deletes_grouped_in_transaction(
+                        table_name,
+                        &truncated_row_ids,
+                        &schema,
+                        txn,
+                    )?;
                 }
                 // Clear ART indexes for this table (will be rebuilt if transaction commits)
                 self.storage.art_indexes().clear_table_indexes(table_name);
@@ -5304,10 +5355,15 @@ impl EmbeddedDatabase {
     }
 
     fn fast_insert_batch_can_use_direct_write(schema: &Schema) -> bool {
-        schema
-            .columns
-            .iter()
-            .all(|column| column.storage_mode == ColumnStorageMode::Default)
+        // R3.3: STORAGE COLUMNAR schemas take the direct WriteBatch path too
+        // (grouped batch writes ride the same WriteBatch as the rows);
+        // dictionary/CAS still require the per-row transform.
+        schema.columns.iter().all(|column| {
+            matches!(
+                column.storage_mode,
+                ColumnStorageMode::Default | ColumnStorageMode::Columnar
+            )
+        })
     }
 
     fn fast_literal_insert_cache_key(table_name: &str, columns: Option<&[&str]>) -> String {
@@ -6766,10 +6822,14 @@ impl EmbeddedDatabase {
                             )));
                         }
 
+                        let was_columnar = schema
+                            .get_column_at(idx)
+                            .is_some_and(|c| c.storage_mode == ColumnStorageMode::Columnar);
                         schema.columns.remove(idx);
                         catalog.update_table_schema(table_name, &schema)?;
 
                         let rows_updated = self.storage.drop_column_from_rows(table_name, idx)?;
+                        self.cleanup_columnar_after_drop_column(table_name, column_name, was_columnar, &schema)?;
 
                         tracing::info!(
                             "Dropped column '{}' from table '{}', updated {} rows",
@@ -7093,6 +7153,33 @@ impl EmbeddedDatabase {
         Some(self.insert_validated_tuples_in_transaction(&spec.table_name, tuples, &spec.schema, txn))
     }
 
+    /// R3.3: after `ALTER TABLE … DROP COLUMN` of a `STORAGE COLUMNAR`
+    /// column, drop its `col:`/`colz:`/`colzm:` side-data (a later column
+    /// re-created under the same name must not read stale batches) and, when
+    /// the table no longer has ANY columnar column, purge the live-row
+    /// presence sidecar — presence stops being maintained for row-only
+    /// tables, so a stale manifest must not survive a future re-columnarize.
+    fn cleanup_columnar_after_drop_column(
+        &self,
+        table_name: &str,
+        column_name: &str,
+        was_columnar: bool,
+        schema_after: &Schema,
+    ) -> Result<()> {
+        if !was_columnar {
+            return Ok(());
+        }
+        storage::ColumnarStore::drop_column(&self.storage.db(), table_name, column_name)?;
+        if !schema_after
+            .columns
+            .iter()
+            .any(|c| c.storage_mode == ColumnStorageMode::Columnar)
+        {
+            storage::ColumnarStore::purge_presence(&self.storage.db(), table_name)?;
+        }
+        Ok(())
+    }
+
     fn tuple_column_values(schema: &Schema, tuple: &Tuple) -> std::collections::HashMap<String, Value> {
         let mut col_values = std::collections::HashMap::with_capacity(schema.columns.len());
         for (i, col) in schema.columns.iter().enumerate() {
@@ -7223,10 +7310,19 @@ impl EmbeddedDatabase {
 
         self.validate_fast_insert_batch(table_name, schema, &prepared)?;
 
+        // R3.3: stage columnar side-data grouped by (column, batch) — one
+        // staged read-modify-write per touched batch per statement instead of
+        // one per value — including the live-row presence bits.
+        if self.storage.get_current_branch().is_none() {
+            let row_refs: Vec<(u64, &Tuple)> = prepared.iter().map(|(row_id, tuple)| (*row_id, tuple)).collect();
+            self.storage
+                .stage_columnar_rows_grouped_in_transaction(table_name, &row_refs, schema, txn, true)?;
+        }
+
         let mut inserted = 0_u64;
         let mut final_row_id = None;
         for (row_id, tuple) in prepared {
-            self.insert_prepared_tuple_in_transaction(table_name, row_id, tuple, schema, txn, true)?;
+            self.insert_prepared_tuple_in_transaction(table_name, row_id, tuple, schema, txn, true, false)?;
             final_row_id = Some(row_id);
             inserted += 1;
         }
@@ -7259,7 +7355,7 @@ impl EmbeddedDatabase {
         txn: &storage::Transaction,
     ) -> Result<u64> {
         let (row_id, tuple) = self.prepare_tuple_for_transaction_insert(table_name, tuple, schema);
-        self.insert_prepared_tuple_in_transaction(table_name, row_id, tuple, schema, txn, false)?;
+        self.insert_prepared_tuple_in_transaction(table_name, row_id, tuple, schema, txn, false, true)?;
         self.storage.stage_row_counter_in_transaction(table_name, row_id, txn)?;
         Ok(1)
     }
@@ -7289,6 +7385,7 @@ impl EmbeddedDatabase {
         (row_id, tuple)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn insert_prepared_tuple_in_transaction(
         &self,
         table_name: &str,
@@ -7297,6 +7394,7 @@ impl EmbeddedDatabase {
         schema: &Schema,
         txn: &storage::Transaction,
         constraints_prechecked: bool,
+        stage_columnar: bool,
     ) -> Result<()> {
         // Callers reach this helper only through the fast INSERT paths, which
         // already reject tables with FK/CHECK constraints while building their
@@ -7316,11 +7414,17 @@ impl EmbeddedDatabase {
             Err(e) => return Err(Error::constraint_violation(e.to_string())),
         };
 
-        if self.storage.get_current_branch().is_none() {
-            if let Err(e) = self
-                .storage
-                .stage_tuple_for_column_storage_in_transaction(table_name, row_id, &tuple, schema, txn)
-            {
+        // R3.3: multi-row callers stage columnar side-data grouped per batch
+        // BEFORE this per-row loop (`stage_columnar = false`); single-row
+        // callers stage here (grouped staging marks presence too).
+        if stage_columnar && self.storage.get_current_branch().is_none() {
+            if let Err(e) = self.storage.stage_columnar_rows_grouped_in_transaction(
+                table_name,
+                &[(row_id, &tuple)],
+                schema,
+                txn,
+                true,
+            ) {
                 let _ = self.storage.art_indexes().on_delete(table_name, row_id, &col_values);
                 return Err(e);
             }
@@ -9428,6 +9532,12 @@ impl EmbeddedDatabase {
                     self.storage.delete(key)?;
                 }
 
+                // R3.3: purge columnar sidecars (col:/colz:/colzm:/colp:/colpm:)
+                // with the rows — otherwise batch-driven columnar reads and the
+                // presence sidecar would resurrect truncated rows. No-op prefix
+                // seeks for tables without columnar columns.
+                storage::ColumnarStore::purge_table_sidecars(&self.storage.db(), table_name)?;
+
                 // Invalidate all cached rows for this table
                 self.storage.row_cache().invalidate_table(table_name);
 
@@ -9589,9 +9699,13 @@ impl EmbeddedDatabase {
                             )));
                         }
 
+                        let was_columnar = schema
+                            .get_column_at(idx)
+                            .is_some_and(|c| c.storage_mode == ColumnStorageMode::Columnar);
                         schema.columns.remove(idx);
                         catalog.update_table_schema(table_name, &schema)?;
                         let rows_updated = self.storage.drop_column_from_rows(table_name, idx)?;
+                        self.cleanup_columnar_after_drop_column(table_name, column_name, was_columnar, &schema)?;
                         Ok(rows_updated as u64)
                     }
                     None => {
@@ -10401,8 +10515,14 @@ impl EmbeddedDatabase {
                                     }
                                 }
                                 if self.storage.get_current_branch().is_none() {
-                                    self.storage.stage_tuple_for_column_storage_in_transaction(
-                                        table_name, row_id, &staged, &schema, txn,
+                                    // R3.3: grouped staging marks presence too
+                                    // (single-row INSERT).
+                                    self.storage.stage_columnar_rows_grouped_in_transaction(
+                                        table_name,
+                                        &[(row_id, &staged)],
+                                        &schema,
+                                        txn,
+                                        true,
                                     )?;
                                 }
                                 let key = self.storage.branch_aware_data_key(table_name, row_id);
@@ -10828,13 +10948,16 @@ impl EmbeddedDatabase {
 
                 let count = if let Some(txn) = active_txn {
                     let on_branch = self.storage.get_current_branch().is_some();
+                    // R3.3: stage columnar side-data grouped per touched batch
+                    // (UPDATE — presence untouched).
+                    if !on_branch {
+                        let row_refs: Vec<(u64, &Tuple)> =
+                            updates.iter().map(|(row_id, _, tuple)| (*row_id, tuple)).collect();
+                        self.storage
+                            .stage_columnar_rows_grouped_in_transaction(table_name, &row_refs, &schema, txn, false)?;
+                    }
                     for (row_id, old_tuple, tuple) in &updates {
                         let key = self.storage.branch_aware_data_key(table_name, *row_id);
-                        if !on_branch {
-                            self.storage.stage_tuple_for_column_storage_in_transaction(
-                                table_name, *row_id, tuple, &schema, txn,
-                            )?;
-                        }
                         let value = bincode::serialize(tuple)
                             .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
                         txn.put(key.clone(), value)?;
@@ -11005,12 +11128,18 @@ impl EmbeddedDatabase {
 
                 let count = if let Some(txn) = active_txn {
                     let on_branch = self.storage.get_current_branch().is_some();
+                    // R3.3: null columnar slots + clear presence bits grouped
+                    // per touched batch.
+                    if !on_branch {
+                        self.storage.stage_columnar_deletes_grouped_in_transaction(
+                            table_name,
+                            &row_ids_to_delete,
+                            &schema,
+                            txn,
+                        )?;
+                    }
                     for row_id in &row_ids_to_delete {
                         let key = self.storage.branch_aware_data_key(table_name, *row_id);
-                        if !on_branch {
-                            self.storage
-                                .stage_columnar_delete_in_transaction(table_name, *row_id, &schema, txn)?;
-                        }
                         txn.delete(key.clone())?;
                         self.storage.row_cache().invalidate(table_name, *row_id);
                     }
@@ -13684,10 +13813,12 @@ impl EmbeddedDatabase {
 
         // Delete the matching rows
         let txn = self.storage.begin_autocommit_transaction()?;
+        // R3.3: null columnar slots + clear presence bits grouped per batch.
+        let cascade_row_ids: Vec<u64> = rows_to_delete.iter().map(|(row_id, _)| *row_id).collect();
+        self.storage
+            .stage_columnar_deletes_grouped_in_transaction(table_name, &cascade_row_ids, &schema, &txn)?;
         for (row_id, _) in &rows_to_delete {
             let key = self.storage.branch_aware_data_key(table_name, *row_id);
-            self.storage
-                .stage_columnar_delete_in_transaction(table_name, *row_id, &schema, &txn)?;
             txn.delete(key.clone())?;
 
             // Log to WAL for crash recovery
@@ -13768,14 +13899,16 @@ impl EmbeddedDatabase {
             }
         }
 
-        // Update the matching rows
+        // Update the matching rows. R3.3: stage columnar side-data grouped
+        // per touched batch (UPDATE — presence untouched).
         let txn = self.storage.begin_autocommit_transaction()?;
+        if self.storage.get_current_branch().is_none() {
+            let row_refs: Vec<(u64, &Tuple)> = rows_to_update.iter().map(|(row_id, tuple)| (*row_id, tuple)).collect();
+            self.storage
+                .stage_columnar_rows_grouped_in_transaction(table_name, &row_refs, &schema, &txn, false)?;
+        }
         for (row_id, new_tuple) in rows_to_update {
             let key = self.storage.branch_aware_data_key(table_name, row_id);
-            if self.storage.get_current_branch().is_none() {
-                self.storage
-                    .stage_tuple_for_column_storage_in_transaction(table_name, row_id, &new_tuple, &schema, &txn)?;
-            }
             let val = bincode::serialize(&new_tuple).map_err(|e| Error::storage(e.to_string()))?;
             txn.put(key.clone(), val.clone())?;
 

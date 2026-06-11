@@ -273,6 +273,11 @@ impl<'a> Catalog<'a> {
             self.storage.delete(&key)?;
         }
 
+        // R3.3: purge columnar sidecars (col:/colz:/colzm:/colp:/colpm:) so a
+        // re-created table with the same name never reads stale batches, zone
+        // stats or live-row presence. No-op prefix seeks for row-only tables.
+        super::ColumnarStore::purge_table_sidecars(&self.storage.db, table_name)?;
+
         Ok(())
     }
 

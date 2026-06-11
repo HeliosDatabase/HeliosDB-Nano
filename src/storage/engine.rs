@@ -7,7 +7,7 @@
 
 use super::art_manager::ArtIndexManager;
 use super::bloom_filter::TableBloomFilters;
-use super::columnar::{BatchStats, ColumnBatch, ColumnarStore, BATCH_SIZE};
+use super::columnar::{BatchPresence, BatchStats, ColumnBatch, ColumnarStore, BATCH_SIZE};
 use super::content_addr::ContentAddressedStore;
 use super::dictionary::DictionaryManager;
 use super::filter_consolidation_worker::{ConsolidationConfig, FilterConsolidationWorker};
@@ -96,6 +96,102 @@ fn zone_map_pruning_enabled() -> bool {
     static ZONE_MAP_OFF: once_cell::sync::Lazy<bool> =
         once_cell::sync::Lazy::new(|| std::env::var("HELIOS_ZONE_MAP_OFF").is_ok());
     !*ZONE_MAP_OFF
+}
+
+/// R3.3 kill switch for presence-bitmap liveness on columnar reads
+/// (mirroring `HELIOS_ZONE_MAP_OFF`). `HELIOS_COLP_OFF` restores the
+/// pre-R3.3 `data:{table}:` row-keyspace walk. Presence sidecars are still
+/// maintained on writes when the table's `colpm:` manifest marker already
+/// exists, so flipping the switch back on does not require a re-backfill;
+/// tables without a marker stay unmaintained (and untrusted) while it is set.
+fn columnar_presence_enabled() -> bool {
+    static COLP_OFF: once_cell::sync::Lazy<bool> =
+        once_cell::sync::Lazy::new(|| std::env::var("HELIOS_COLP_OFF").is_ok());
+    !*COLP_OFF
+}
+
+/// Does the schema have at least one `STORAGE COLUMNAR` column? (Narrower
+/// than `schema_uses_column_storage`, which also covers dictionary/CAS.)
+fn schema_has_columnar_columns(schema: &crate::Schema) -> bool {
+    schema
+        .columns
+        .iter()
+        .any(|column| column.storage_mode == ColumnStorageMode::Columnar)
+}
+
+/// R3.3: group columnar values of multi-row DML by (column index, batch id).
+/// Vec order within a group follows `rows` order, so later writes to the same
+/// slot win — exactly like the per-value stores they replace.
+fn group_columnar_row_values(
+    schema: &crate::Schema,
+    rows: &[(u64, &Tuple)],
+) -> std::collections::BTreeMap<(usize, u64), Vec<(u64, Value)>> {
+    let mut grouped: std::collections::BTreeMap<(usize, u64), Vec<(u64, Value)>> = std::collections::BTreeMap::new();
+    for (row_id, tuple) in rows {
+        let (batch_id, _) = ColumnarStore::batch_location(*row_id);
+        for (idx, column) in schema.columns.iter().enumerate() {
+            if column.storage_mode != ColumnStorageMode::Columnar {
+                continue;
+            }
+            let Some(value) = tuple.values.get(idx) else {
+                continue;
+            };
+            grouped.entry((idx, batch_id)).or_default().push((*row_id, value.clone()));
+        }
+    }
+    grouped
+}
+
+/// Group row ids by their columnar batch id (for presence updates).
+fn group_row_ids_by_batch(row_ids: impl IntoIterator<Item = u64>) -> std::collections::BTreeMap<u64, Vec<u64>> {
+    let mut grouped: std::collections::BTreeMap<u64, Vec<u64>> = std::collections::BTreeMap::new();
+    for row_id in row_ids {
+        grouped.entry(row_id / BATCH_SIZE as u64).or_default().push(row_id);
+    }
+    grouped
+}
+
+/// R3.3 + R3.2: run `body` over every live `(batch_id, offset)` of the
+/// presence sidecar in rayon chunks of whole batches (mirroring the parallel
+/// chunking of the row-keyspace walk it replaces) and return the per-chunk
+/// partial accumulators for the caller to merge. `live` must already exclude
+/// zone-pruned batches. Serial callers iterate the presence map inline
+/// instead (their accumulators may not support merge, e.g. DISTINCT).
+fn presence_parallel_partials<T, I, B>(
+    live: &[(u64, &BatchPresence)],
+    batches_per_chunk: usize,
+    init: I,
+    body: B,
+) -> Result<Vec<T>>
+where
+    T: Send,
+    I: Fn() -> T + Sync,
+    B: Fn(&mut T, u64, usize) -> Result<()> + Sync + Send,
+{
+    use rayon::prelude::*;
+    live.par_chunks(batches_per_chunk.max(1))
+        .map(|chunk| {
+            let mut acc = init();
+            for (batch_id, presence) in chunk {
+                for offset in presence.iter_live() {
+                    body(&mut acc, *batch_id, offset)?;
+                }
+            }
+            Ok(acc)
+        })
+        .collect()
+}
+
+/// Filter a presence map down to non-pruned batches (borrowed view).
+fn presence_live_view<'a>(
+    presence: &'a [(u64, BatchPresence)],
+    pruned: &HashSet<u64>,
+) -> Vec<(u64, &'a BatchPresence)> {
+    presence
+        .iter()
+        .filter(|(batch_id, _)| !pruned.contains(batch_id))
+        .map(|(batch_id, batch_presence)| (*batch_id, batch_presence))
+        .collect()
 }
 
 /// R3.1: can any slot of a batch with these zone stats satisfy `predicate`?
@@ -2826,7 +2922,8 @@ impl StorageEngine {
             // Check bulk load mode early - skip some operations if enabled
             let bulk_mode = self.is_bulk_load_mode();
 
-            let stored_tuple = self.transform_tuple_for_column_storage(table_name, row_id, &tuple, &schema)?;
+            let stored_tuple =
+                self.transform_tuple_for_column_storage_opts(table_name, row_id, &tuple, &schema, true)?;
 
             // Serialize transformed tuple (RocksDB LZ4 handles compression at block level)
             let value = bincode::serialize(&stored_tuple)
@@ -2924,6 +3021,10 @@ impl StorageEngine {
         for key in keys_to_delete {
             self.delete(&key)?;
         }
+        // R3.3: drop any columnar sidecars with the rows (no-op prefix seeks
+        // for tables without side storage) so refilled tables never read
+        // stale batches, zone stats or presence.
+        ColumnarStore::purge_table_sidecars(&self.db, table_name)?;
         if removed > 0 {
             tracing::debug!(
                 "purge_table_data: removed {} orphaned rows for '{}'",
@@ -3346,6 +3447,43 @@ impl StorageEngine {
                 idx,
                 load_columnar_batch_index(&self.db, table_name, &column.name, &pruned)?,
             );
+        }
+
+        // R3.3: when no default-storage column is projected the row walk is
+        // liveness-only — replace it with the presence sidecar. When default
+        // columns ARE projected the walk is the data source (each live row's
+        // bytes are decoded), so it stays.
+        if default_requested.is_empty() {
+            if let Some(presence) = self.columnar_live_presence(table_name) {
+                let mut tuples = Vec::new();
+                for (batch_id, batch_presence) in &presence {
+                    // R3.1: rows in pruned batches provably fail the
+                    // predicate conjunction.
+                    if pruned.contains(batch_id) {
+                        continue;
+                    }
+                    for offset in batch_presence.iter_live() {
+                        if !columnar_row_matches_filters(&column_batches, *batch_id, offset, filter_predicates) {
+                            continue;
+                        }
+                        let mut projected_values = Vec::with_capacity(projection_sources.len());
+                        for source in &projection_sources {
+                            match source {
+                                MixedProjectionSource::Default(_) => projected_values.push(Value::Null),
+                                MixedProjectionSource::Columnar(idx) => {
+                                    projected_values.push(
+                                        columnar_batch_value(&column_batches, *idx, *batch_id, offset)
+                                            .cloned()
+                                            .unwrap_or(Value::Null),
+                                    );
+                                }
+                            }
+                        }
+                        tuples.push(Tuple::new(projected_values));
+                    }
+                }
+                return Ok(Some(tuples));
+            }
         }
 
         let prefix = format!("data:{}:", table_name);
@@ -3813,27 +3951,9 @@ impl StorageEngine {
             .collect::<Result<Vec<_>>>()?;
         let asc = Arc::new(asc.to_vec());
 
-        let prefix = format!("data:{}:", table_name);
-        let prefix_bytes = prefix.as_bytes();
-        let mut read_opts = ReadOptions::default();
-        read_opts.set_total_order_seek(true);
-        let iter = self
-            .db
-            .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read_opts);
-
         let mut heap = std::collections::BinaryHeap::with_capacity(k.saturating_add(1));
         let mut values = Vec::with_capacity(requested.len());
-        for item in iter {
-            let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
-            if !key.starts_with(prefix_bytes) {
-                break;
-            }
-            let Some(row_id) = Self::parse_row_id_after_prefix(&key, prefix_bytes.len()) else {
-                continue;
-            };
-            let batch_id = row_id / BATCH_SIZE as u64;
-            let offset = (row_id % BATCH_SIZE as u64) as usize;
-
+        let mut consider_row = |batch_id: u64, offset: usize| {
             values.clear();
             for &idx in &requested {
                 values.push(
@@ -3862,6 +3982,33 @@ impl StorageEngine {
                     tuple: build_projected_tuple(&values, &output_positions),
                     asc: Arc::clone(&asc),
                 });
+            }
+        };
+
+        // R3.3: liveness from the presence sidecar; row-keyspace walk fallback.
+        if let Some(presence) = self.columnar_live_presence(table_name) {
+            for (batch_id, batch_presence) in &presence {
+                for offset in batch_presence.iter_live() {
+                    consider_row(*batch_id, offset);
+                }
+            }
+        } else {
+            let prefix = format!("data:{}:", table_name);
+            let prefix_bytes = prefix.as_bytes();
+            let mut read_opts = ReadOptions::default();
+            read_opts.set_total_order_seek(true);
+            let iter = self
+                .db
+                .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read_opts);
+            for item in iter {
+                let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+                if !key.starts_with(prefix_bytes) {
+                    break;
+                }
+                let Some(row_id) = Self::parse_row_id_after_prefix(&key, prefix_bytes.len()) else {
+                    continue;
+                };
+                consider_row(row_id / BATCH_SIZE as u64, (row_id % BATCH_SIZE as u64) as usize);
             }
         }
 
@@ -3991,33 +4138,15 @@ impl StorageEngine {
             }
         }
 
-        let prefix = format!("data:{}:", table_name);
-        let prefix_bytes = prefix.as_bytes();
-        let mut read_opts = ReadOptions::default();
-        read_opts.set_total_order_seek(true);
-        let iter = self
-            .db
-            .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read_opts);
-
         let mut tuples = Vec::new();
-        for item in iter {
-            let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
-            if !key.starts_with(prefix_bytes) {
-                break;
-            }
-            let Some(row_id) = Self::parse_row_id_after_prefix(&key, prefix_bytes.len()) else {
-                continue;
-            };
-            let batch_id = row_id / BATCH_SIZE as u64;
-            let offset = (row_id % BATCH_SIZE as u64) as usize;
-            // R3.1: rows in pruned batches provably fail the predicates.
+        let mut emit_row = |batch_id: u64, offset: usize| {
             if pruned.contains(&batch_id) {
-                continue;
+                // R3.1: rows in pruned batches provably fail the predicates.
+                return;
             }
             if !columnar_row_matches_filters(&column_batches, batch_id, offset, &filter_predicates) {
-                continue;
+                return;
             }
-
             let mut values = Vec::with_capacity(projection.len());
             for &idx in projection {
                 values.push(
@@ -4027,8 +4156,38 @@ impl StorageEngine {
                 );
             }
             let mut tuple = Tuple::new(values);
-            tuple.row_id = Some(row_id);
+            tuple.row_id = Some(batch_id * BATCH_SIZE as u64 + offset as u64);
             tuples.push(tuple);
+        };
+
+        // R3.3: liveness from the presence sidecar; row-keyspace walk fallback.
+        if let Some(presence) = self.columnar_live_presence(table_name) {
+            for (batch_id, batch_presence) in &presence {
+                if pruned.contains(batch_id) {
+                    continue; // pruned batches need no presence iteration
+                }
+                for offset in batch_presence.iter_live() {
+                    emit_row(*batch_id, offset);
+                }
+            }
+        } else {
+            let prefix = format!("data:{}:", table_name);
+            let prefix_bytes = prefix.as_bytes();
+            let mut read_opts = ReadOptions::default();
+            read_opts.set_total_order_seek(true);
+            let iter = self
+                .db
+                .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read_opts);
+            for item in iter {
+                let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+                if !key.starts_with(prefix_bytes) {
+                    break;
+                }
+                let Some(row_id) = Self::parse_row_id_after_prefix(&key, prefix_bytes.len()) else {
+                    continue;
+                };
+                emit_row(row_id / BATCH_SIZE as u64, (row_id % BATCH_SIZE as u64) as usize);
+            }
         }
 
         Ok(Some(tuples))
@@ -4077,33 +4236,15 @@ impl StorageEngine {
             );
         }
 
-        let prefix = format!("data:{}:", table_name);
-        let prefix_bytes = prefix.as_bytes();
         let mut tuples = Vec::new();
-
-        let mut read_opts = ReadOptions::default();
-        read_opts.set_total_order_seek(true);
-        let iter = self
-            .db
-            .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read_opts);
-        for item in iter {
-            let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
-            if !key.starts_with(prefix_bytes) {
-                break;
-            }
-            let Some(row_id) = Self::parse_row_id_after_prefix(&key, prefix_bytes.len()) else {
-                continue;
-            };
-            let batch_id = row_id / BATCH_SIZE as u64;
-            let offset = (row_id % BATCH_SIZE as u64) as usize;
-            // R3.1: rows in pruned batches provably fail the predicates.
+        let mut emit_row = |batch_id: u64, offset: usize| {
             if pruned.contains(&batch_id) {
-                continue;
+                // R3.1: rows in pruned batches provably fail the predicates.
+                return;
             }
             if !columnar_row_matches_filters(&column_batches, batch_id, offset, &filter_predicates) {
-                continue;
+                return;
             }
-
             let mut values = vec![Value::Null; schema.columns.len()];
             for &idx in &requested {
                 if let Some(value) = columnar_batch_value(&column_batches, idx, batch_id, offset) {
@@ -4111,8 +4252,41 @@ impl StorageEngine {
                 }
             }
             let mut tuple = Tuple::new(values);
-            tuple.row_id = Some(row_id);
+            tuple.row_id = Some(batch_id * BATCH_SIZE as u64 + offset as u64);
             tuples.push(tuple);
+        };
+
+        // R3.3: liveness from the presence sidecar; fall back to the
+        // `data:{table}:` row-keyspace walk when unavailable.
+        if let Some(presence) = self.columnar_live_presence(table_name) {
+            for (batch_id, batch_presence) in &presence {
+                if pruned.contains(batch_id) {
+                    continue; // pruned batches need no presence iteration
+                }
+                for offset in batch_presence.iter_live() {
+                    emit_row(*batch_id, offset);
+                }
+            }
+        } else {
+            let prefix = format!("data:{}:", table_name);
+            let prefix_bytes = prefix.as_bytes();
+            let mut read_opts = ReadOptions::default();
+            read_opts.set_total_order_seek(true);
+            let iter = self
+                .db
+                .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read_opts);
+            for item in iter {
+                let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+                if !key.starts_with(prefix_bytes) {
+                    break;
+                }
+                let Some(row_id) = Self::parse_row_id_after_prefix(&key, prefix_bytes.len()) else {
+                    continue;
+                };
+                let batch_id = row_id / BATCH_SIZE as u64;
+                let offset = (row_id % BATCH_SIZE as u64) as usize;
+                emit_row(batch_id, offset);
+            }
         }
 
         tracing::debug!(
@@ -4508,7 +4682,49 @@ impl StorageEngine {
 
             // R3.2: parallel partial aggregation over per-shard prefix iterators.
             let row_count_hint = self.art_index_manager.pk_index_len(table_name);
-            if !has_distinct && row_count_hint.is_some_and(agg_parallel_rows_met) {
+            let parallel = !has_distinct && row_count_hint.is_some_and(agg_parallel_rows_met);
+
+            // R3.3: presence-sidecar liveness replaces the row walk in BOTH
+            // the serial and parallel paths; pruned batches are skipped
+            // before their presence is even iterated.
+            let presence = self.columnar_live_presence(table_name);
+            if let Some(presence) = &presence {
+                let live = presence_live_view(presence, &pruned);
+                let update_states = |states: &mut Vec<ColumnarAggregateState>, batch_id: u64, offset: usize| {
+                    if !columnar_row_matches_filters(&column_batches, batch_id, offset, &filter_predicates) {
+                        return Ok(());
+                    }
+                    for (state, aggregate) in states.iter_mut().zip(aggregates) {
+                        let value = aggregate
+                            .column_index
+                            .and_then(|idx| columnar_batch_value(&column_batches, idx, batch_id, offset));
+                        state.update(aggregate.op, value)?;
+                    }
+                    Ok(())
+                };
+                if parallel {
+                    let partials: Vec<Vec<ColumnarAggregateState>> = presence_parallel_partials(
+                        &live,
+                        batches_per_chunk,
+                        || {
+                            aggregates
+                                .iter()
+                                .map(|aggregate| ColumnarAggregateState::new(aggregate.op))
+                                .collect()
+                        },
+                        update_states,
+                    )?;
+                    for partial in partials {
+                        merge_columnar_aggregate_states(&mut states, partial)?;
+                    }
+                } else {
+                    for (batch_id, batch_presence) in &live {
+                        for offset in batch_presence.iter_live() {
+                            update_states(&mut states, *batch_id, offset)?;
+                        }
+                    }
+                }
+            } else if parallel {
                 let partials: Vec<Vec<ColumnarAggregateState>> = self.par_prefix_shard_results(&prefix, |iter| {
                     let mut states: Vec<ColumnarAggregateState> = aggregates
                         .iter()
@@ -4598,7 +4814,48 @@ impl StorageEngine {
 
         // R3.2: parallel partial aggregation over per-shard prefix iterators.
         let row_count_hint = self.art_index_manager.pk_index_len(table_name);
-        if !has_distinct && row_count_hint.is_some_and(agg_parallel_rows_met) {
+        let parallel = !has_distinct && row_count_hint.is_some_and(agg_parallel_rows_met);
+
+        // R3.3: presence-sidecar liveness replaces the row walk in BOTH the
+        // serial and parallel paths (groups merge through the same hash map
+        // the parallel walk used; output order is unaffected — grouped
+        // results are sorted below either way).
+        let presence = self.columnar_live_presence(table_name);
+        if let Some(presence) = &presence {
+            let live = presence_live_view(presence, &pruned);
+            let update_groups = |groups: &mut HashMap<Vec<Value>, Vec<ColumnarAggregateState>>,
+                                 batch_id: u64,
+                                 offset: usize| {
+                if !columnar_row_matches_filters(&column_batches, batch_id, offset, &filter_predicates) {
+                    return Ok(());
+                }
+                let group_key = build_columnar_group_key(&column_batches, group_by_columns, batch_id, offset);
+                let states = groups.entry(group_key).or_insert_with(|| {
+                    aggregates
+                        .iter()
+                        .map(|aggregate| ColumnarAggregateState::new(aggregate.op))
+                        .collect()
+                });
+                update_columnar_aggregate_states(states, aggregates, &column_batches, batch_id, offset)
+            };
+            if parallel {
+                let partials: Vec<HashMap<Vec<Value>, Vec<ColumnarAggregateState>>> =
+                    presence_parallel_partials(&live, batches_per_chunk, HashMap::new, update_groups)?;
+                let mut merged: HashMap<Vec<Value>, Vec<ColumnarAggregateState>> = HashMap::new();
+                for partial in partials {
+                    merge_columnar_group_map(&mut merged, partial)?;
+                }
+                hash_groups = Some(merged);
+            } else {
+                let mut groups: HashMap<Vec<Value>, Vec<ColumnarAggregateState>> = HashMap::new();
+                for (batch_id, batch_presence) in &live {
+                    for offset in batch_presence.iter_live() {
+                        update_groups(&mut groups, *batch_id, offset)?;
+                    }
+                }
+                hash_groups = Some(groups);
+            }
+        } else if parallel {
             let partials: Vec<HashMap<Vec<Value>, Vec<ColumnarAggregateState>>> =
                 self.par_prefix_shard_results(&prefix, |iter| {
                     let mut groups: HashMap<Vec<Value>, Vec<ColumnarAggregateState>> = HashMap::new();
@@ -4773,7 +5030,44 @@ impl StorageEngine {
         // rayon (column batches are shared read-only), partial-aggregate per
         // shard, then merge. The shared sort below keeps output order.
         let row_count_hint = self.art_index_manager.pk_index_len(table_name);
-        if row_count_hint.is_some_and(agg_parallel_rows_met) {
+        let parallel = row_count_hint.is_some_and(agg_parallel_rows_met);
+
+        // R3.3: presence-sidecar liveness replaces the row walk in BOTH the
+        // serial and parallel paths.
+        let presence = self.columnar_live_presence(table_name);
+        if let Some(presence) = &presence {
+            let live = presence_live_view(presence, pruned);
+            let update_groups = |groups: &mut HashMap<Value, CountSumIntState>, batch_id: u64, offset: usize| {
+                if !columnar_row_matches_filters(column_batches, batch_id, offset, filter_predicates) {
+                    return Ok(());
+                }
+                let sum_value = columnar_batch_value(column_batches, sum_column, batch_id, offset);
+                let group_key = columnar_batch_value(column_batches, group_column, batch_id, offset)
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let state = groups.entry(group_key).or_insert_with(CountSumIntState::new);
+                state.update_count();
+                state.update_sum(sum_value)
+            };
+            if parallel {
+                let batches_per_chunk = (AGG_PARALLEL_CHUNK / BATCH_SIZE).max(1);
+                let partials: Vec<HashMap<Value, CountSumIntState>> =
+                    presence_parallel_partials(&live, batches_per_chunk, HashMap::new, update_groups)?;
+                let mut merged: HashMap<Value, CountSumIntState> = HashMap::new();
+                for partial in partials {
+                    merge_count_sum_group_map(&mut merged, partial)?;
+                }
+                hash_groups = Some(merged);
+            } else {
+                let mut groups: HashMap<Value, CountSumIntState> = HashMap::new();
+                for (batch_id, batch_presence) in &live {
+                    for offset in batch_presence.iter_live() {
+                        update_groups(&mut groups, *batch_id, offset)?;
+                    }
+                }
+                hash_groups = Some(groups);
+            }
+        } else if parallel {
             let partials: Vec<HashMap<Value, CountSumIntState>> = self.par_prefix_shard_results(&prefix, |iter| {
                 let mut groups: HashMap<Value, CountSumIntState> = HashMap::new();
                 for item in iter {
@@ -5916,6 +6210,28 @@ impl StorageEngine {
             }
         }
 
+        // R3.3: columnar tables with a complete presence manifest answer
+        // COUNT(*) from the per-batch live counts — equivalent to (and
+        // maintained in lockstep with) the `data:{table}:` walk below. No
+        // lazy backfill here: this path also serves non-columnar tables,
+        // which must never grow presence sidecars.
+        if columnar_presence_enabled()
+            && on_main_branch
+            && ColumnarStore::presence_manifest_complete(&self.db, table_name)
+        {
+            let count: usize = ColumnarStore::load_presence_map(&self.db, table_name)?
+                .iter()
+                .map(|(_, presence)| presence.live_count as usize)
+                .sum();
+            tracing::debug!(
+                phase = "count_presence_path",
+                table = table_name,
+                count = count,
+                "COUNT(*) presence-sidecar fast path completed"
+            );
+            return Ok(count);
+        }
+
         let prefix = format!("data:{}:", table_name);
         let prefix_bytes = prefix.as_bytes();
         let mut read_opts = ReadOptions::default();
@@ -6633,6 +6949,14 @@ impl StorageEngine {
         // Flush dictionary changes if we're using dictionary mode
         if new_mode == ColumnStorageMode::Dictionary {
             self.dict_manager.flush(&self.db)?;
+        }
+
+        // R3.3: storage-mode changes touching COLUMNAR invalidate the
+        // presence sidecar (a table that only now became columnar — or that
+        // just lost its last columnar column — must not trust any stale
+        // `colp:` records). The next columnar read re-backfills lazily.
+        if old_mode == ColumnStorageMode::Columnar || new_mode == ColumnStorageMode::Columnar {
+            ColumnarStore::purge_presence(&self.db, table_name)?;
         }
 
         tracing::info!(
@@ -8647,7 +8971,7 @@ impl StorageEngine {
         // Check bulk load mode early - skip some operations if enabled
         let bulk_mode = self.is_bulk_load_mode();
 
-        let stored_tuple = self.transform_tuple_for_column_storage(table_name, row_id, &tuple, schema)?;
+        let stored_tuple = self.transform_tuple_for_column_storage_opts(table_name, row_id, &tuple, schema, true)?;
         // Serialize transformed tuple directly (RocksDB LZ4 handles compression at block level)
         let value = bincode::serialize(&stored_tuple)
             .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
@@ -8768,7 +9092,8 @@ impl StorageEngine {
 
         let uses_side_storage = schema_uses_column_storage(schema);
         let value = if uses_side_storage {
-            let stored_tuple = self.transform_tuple_for_column_storage(table_name, row_id, &tuple, schema)?;
+            let stored_tuple =
+                self.transform_tuple_for_column_storage_opts(table_name, row_id, &tuple, schema, true)?;
             bincode::serialize(&stored_tuple)
                 .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?
         } else {
@@ -8872,13 +9197,22 @@ impl StorageEngine {
         Ok(row_id)
     }
 
-    /// Fast autocommit batch INSERT for already-validated default-storage rows.
+    /// Fast autocommit batch INSERT for already-validated rows in default or
+    /// columnar row storage.
     ///
     /// This is intentionally narrower than `insert_tuple_fast`: it is only for
     /// callers that have already materialized row IDs, checked PK/UNIQUE
     /// constraints, and proven that logical WAL/HA broadcast is not required.
     /// It avoids staging every row through Transaction::write_set while keeping
     /// data keys, version keys, and the row counter in one RocksDB WriteBatch.
+    ///
+    /// R3.3: `STORAGE COLUMNAR` schemas are supported (previously rejected).
+    /// Columnar values are grouped by (column, batch) — ONE read-modify-write
+    /// and ONE zone-stats recompute per touched batch per statement — and the
+    /// `col:`/`colz:`/`colp:` puts ride the SAME WriteBatch as the rows, so
+    /// rows, batches, stats and presence commit atomically. The write happens
+    /// under the zone-stats write lock (R3.1 contract: sidecars derive from
+    /// the post-write image under the lock).
     pub fn insert_prepared_tuples_fast_batch(
         &self,
         table_name: &str,
@@ -8893,11 +9227,34 @@ impl StorageEngine {
                 "fast batch insert requires Transaction path when logical WAL is active",
             ));
         }
-        if schema_uses_column_storage(schema) {
+        if schema
+            .columns
+            .iter()
+            .any(|column| matches!(column.storage_mode, ColumnStorageMode::Dictionary | ColumnStorageMode::ContentAddressed))
+        {
             return Err(Error::internal(
-                "fast batch insert direct WriteBatch requires default row storage",
+                "fast batch insert direct WriteBatch requires default or columnar row storage",
             ));
         }
+        let uses_columnar = schema_has_columnar_columns(schema);
+        let columnar_indices: Vec<usize> = if uses_columnar {
+            schema
+                .columns
+                .iter()
+                .enumerate()
+                .filter(|(_, column)| column.storage_mode == ColumnStorageMode::Columnar)
+                .map(|(idx, _)| idx)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        // Resolve presence maintenance (and any one-time backfill) BEFORE
+        // taking the zone-stats lock below — backfill locks internally.
+        let maintain_presence = if uses_columnar {
+            self.columnar_presence_writes_active(table_name)?
+        } else {
+            false
+        };
 
         let commit_ts = if self.config.storage.time_travel_enabled {
             Some(self.next_timestamp())
@@ -8912,6 +9269,23 @@ impl StorageEngine {
         let mut row_id_buf = itoa::Buffer::new();
         let mut key_buf = Vec::with_capacity(data_prefix.len() + 32);
 
+        // Serialize the storage-format row: columnar slots are replaced by
+        // `ColumnarRef` markers; the values themselves travel through the
+        // grouped batch writes appended to the same WriteBatch below.
+        let serialize_stored = |tuple: &Tuple| -> Result<Vec<u8>> {
+            if uses_columnar {
+                let mut stored = tuple.clone();
+                for &idx in &columnar_indices {
+                    if let Some(val) = stored.values.get_mut(idx) {
+                        *val = crate::Value::ColumnarRef;
+                    }
+                }
+                bincode::serialize(&stored).map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))
+            } else {
+                bincode::serialize(tuple).map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))
+            }
+        };
+
         if let (Some(ts), Some(reverse_ts)) = (commit_ts, reverse_ts) {
             let version_prefix = format!("v:{}:", table_name);
             let version_suffix = format!(":{}", ts);
@@ -8921,8 +9295,15 @@ impl StorageEngine {
             let mut version_index_key_buf = Vec::with_capacity(version_index_prefix.len() + 64);
 
             for (row_id, tuple) in prepared {
-                let value = bincode::serialize(&tuple)
-                    .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
+                let value = serialize_stored(&tuple)?;
+                // Version history stays logical (full values, like
+                // insert_tuple_fast): AS OF reads must not see ColumnarRef.
+                let logical_value = if uses_columnar {
+                    bincode::serialize(&tuple)
+                        .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?
+                } else {
+                    value.clone()
+                };
                 let row_id_str = row_id_buf.format(row_id);
 
                 key_buf.clear();
@@ -8934,7 +9315,7 @@ impl StorageEngine {
                 version_key_buf.extend_from_slice(version_prefix.as_bytes());
                 version_key_buf.extend_from_slice(row_id_str.as_bytes());
                 version_key_buf.extend_from_slice(version_suffix.as_bytes());
-                batch.put(&version_key_buf, &value);
+                batch.put(&version_key_buf, &logical_value);
 
                 version_index_key_buf.clear();
                 version_index_key_buf.extend_from_slice(version_index_prefix.as_bytes());
@@ -8952,8 +9333,7 @@ impl StorageEngine {
             }
         } else {
             for (row_id, tuple) in prepared {
-                let value = bincode::serialize(&tuple)
-                    .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
+                let value = serialize_stored(&tuple)?;
                 let row_id_str = row_id_buf.format(row_id);
 
                 key_buf.clear();
@@ -8973,11 +9353,33 @@ impl StorageEngine {
             batch.put(counter_key.as_bytes(), counter_value);
         }
 
+        // R3.3: append the grouped columnar writes to the same WriteBatch.
+        let columnar_guard = if uses_columnar {
+            let row_refs: Vec<(u64, &Tuple)> = indexed_rows.iter().map(|(row_id, tuple)| (*row_id, tuple)).collect();
+            let guard = crate::storage::columnar::stats_write_lock();
+            for ((idx, batch_id), values) in group_columnar_row_values(schema, &row_refs) {
+                let column = schema
+                    .columns
+                    .get(idx)
+                    .ok_or_else(|| Error::internal("column index out of bounds in fast batch insert"))?;
+                ColumnarStore::apply_batch_values(&self.db, &mut batch, table_name, &column.name, batch_id, &values)?;
+            }
+            if maintain_presence {
+                for (batch_id, set) in group_row_ids_by_batch(indexed_rows.iter().map(|(row_id, _)| *row_id)) {
+                    ColumnarStore::apply_presence_updates(&self.db, &mut batch, table_name, batch_id, &set, &[])?;
+                }
+            }
+            Some(guard)
+        } else {
+            None
+        };
+
         let result = if let Some(opts) = &self.memory_write_options {
             self.db.write_opt(batch, opts)
         } else {
             self.db.write(batch)
         };
+        drop(columnar_guard);
         result.map_err(|e| Error::storage(format!("Fast batch insert failed: {}", e)))?;
 
         if let Some(ts) = commit_ts {
@@ -9004,6 +9406,20 @@ impl StorageEngine {
         row_id: u64,
         tuple: &Tuple,
         schema: &crate::Schema,
+    ) -> Result<Tuple> {
+        self.transform_tuple_for_column_storage_opts(table_name, row_id, tuple, schema, false)
+    }
+
+    /// `new_row = true` for INSERT call sites (marks the row live in the R3.3
+    /// presence sidecar); `false` for UPDATE call sites (same row_id — row
+    /// liveness is unchanged, so presence must not be touched).
+    fn transform_tuple_for_column_storage_opts(
+        &self,
+        table_name: &str,
+        row_id: u64,
+        tuple: &Tuple,
+        schema: &crate::Schema,
+        new_row: bool,
     ) -> Result<Tuple> {
         if !schema_uses_column_storage(schema) {
             return Ok(tuple.clone());
@@ -9036,12 +9452,9 @@ impl StorageEngine {
                     }
                 }
                 ColumnStorageMode::Columnar => {
-                    let cur_val = transformed
-                        .values
-                        .get(idx)
-                        .ok_or_else(|| Error::internal("index out of bounds in columnar transform"))?
-                        .clone();
-                    ColumnarStore::store(&self.db, table_name, &column.name, row_id, cur_val)?;
+                    // R3.3: the value is written through the grouped store
+                    // below (one WriteBatch for all columnar columns of the
+                    // row instead of one read-modify-write per column).
                     if let Some(val) = transformed.values.get_mut(idx) {
                         *val = crate::Value::ColumnarRef;
                     }
@@ -9050,12 +9463,230 @@ impl StorageEngine {
             }
         }
 
+        if schema_has_columnar_columns(schema) {
+            self.store_columnar_rows_grouped(table_name, &[(row_id, tuple)], schema, new_row)?;
+        }
+
         if used_dictionary {
             self.dict_manager.flush(&self.db)?;
         }
         Ok(transformed)
     }
 
+    /// R3.3: should presence sidecars be written for this table right now?
+    /// With presence enabled, a missing manifest is backfilled first (so
+    /// writers always read-modify-write complete images); with the
+    /// `HELIOS_COLP_OFF` kill switch set, existing complete sidecars are kept
+    /// fresh (mirroring how zone stats stay maintained under
+    /// `HELIOS_ZONE_MAP_OFF`) but no backfill ever runs and tables without a
+    /// marker are left alone.
+    fn columnar_presence_writes_active(&self, table_name: &str) -> Result<bool> {
+        if columnar_presence_enabled() {
+            if !ColumnarStore::presence_manifest_complete(&self.db, table_name) {
+                ColumnarStore::backfill_presence(&self.db, table_name)?;
+            }
+            Ok(true)
+        } else {
+            Ok(ColumnarStore::presence_manifest_complete(&self.db, table_name))
+        }
+    }
+
+    /// R3.3 read-side liveness: the table's live-row presence map, or `None`
+    /// when callers must fall back to the `data:{table}:` row-keyspace walk
+    /// (kill switch set, non-main branch, or backfill failure). A missing
+    /// manifest is lazily backfilled here — one row walk, after which every
+    /// columnar read skips the walk for good (mirrors the R3.1 `colzm:`
+    /// pattern).
+    pub(crate) fn columnar_live_presence(&self, table_name: &str) -> Option<Vec<(u64, BatchPresence)>> {
+        if !columnar_presence_enabled() {
+            return None;
+        }
+        {
+            let branch = self.current_branch.lock();
+            if branch.as_deref().is_some_and(|name| name != "main") {
+                return None;
+            }
+        }
+        match ColumnarStore::presence_scan_map(&self.db, table_name) {
+            Ok(map) => Some(map),
+            Err(e) => {
+                tracing::warn!(table = table_name, error = %e, "Columnar presence load failed; using row walk");
+                None
+            }
+        }
+    }
+
+    /// R3.3 grouped autocommit columnar write: ONE read-modify-write and ONE
+    /// zone-stats recompute per (column, batch) touched by `rows`, plus one
+    /// presence update per touched batch when `mark_present` (INSERTs), all in
+    /// a single RocksDB `WriteBatch` under the zone-stats write lock. Batch
+    /// image, stats and presence therefore always derive from the post-write
+    /// state under the lock (preserving the R3.1 race-hardening contract).
+    pub(crate) fn store_columnar_rows_grouped(
+        &self,
+        table_name: &str,
+        rows: &[(u64, &Tuple)],
+        schema: &crate::Schema,
+        mark_present: bool,
+    ) -> Result<()> {
+        if rows.is_empty() || !schema_has_columnar_columns(schema) {
+            return Ok(());
+        }
+        let maintain_presence = mark_present && self.columnar_presence_writes_active(table_name)?;
+        let grouped = group_columnar_row_values(schema, rows);
+        if grouped.is_empty() && !maintain_presence {
+            return Ok(());
+        }
+
+        let _guard = crate::storage::columnar::stats_write_lock();
+        let mut write_batch = WriteBatch::default();
+        for ((idx, batch_id), values) in &grouped {
+            let column = schema
+                .columns
+                .get(*idx)
+                .ok_or_else(|| Error::internal("column index out of bounds in grouped columnar store"))?;
+            ColumnarStore::apply_batch_values(&self.db, &mut write_batch, table_name, &column.name, *batch_id, values)?;
+        }
+        if maintain_presence {
+            for (batch_id, set) in group_row_ids_by_batch(rows.iter().map(|(row_id, _)| *row_id)) {
+                ColumnarStore::apply_presence_updates(&self.db, &mut write_batch, table_name, batch_id, &set, &[])?;
+            }
+        }
+        self.db
+            .write(write_batch)
+            .map_err(|e| Error::storage(format!("Grouped columnar store failed: {}", e)))
+    }
+
+    /// R3.3 grouped autocommit columnar delete: store `Null` into every
+    /// columnar column slot of `row_ids` (one read-modify-write per touched
+    /// (column, batch)) and clear their presence bits, in one `WriteBatch`
+    /// under the zone-stats write lock.
+    pub(crate) fn delete_columnar_rows_grouped(
+        &self,
+        table_name: &str,
+        row_ids: &[u64],
+        schema: &crate::Schema,
+    ) -> Result<()> {
+        if row_ids.is_empty() || !schema_has_columnar_columns(schema) {
+            return Ok(());
+        }
+        let maintain_presence = self.columnar_presence_writes_active(table_name)?;
+        let by_batch = group_row_ids_by_batch(row_ids.iter().copied());
+
+        let _guard = crate::storage::columnar::stats_write_lock();
+        let mut write_batch = WriteBatch::default();
+        for column in schema
+            .columns
+            .iter()
+            .filter(|column| column.storage_mode == ColumnStorageMode::Columnar)
+        {
+            for (batch_id, batch_rows) in &by_batch {
+                let values: Vec<(u64, Value)> = batch_rows.iter().map(|row_id| (*row_id, Value::Null)).collect();
+                ColumnarStore::apply_batch_values(
+                    &self.db,
+                    &mut write_batch,
+                    table_name,
+                    &column.name,
+                    *batch_id,
+                    &values,
+                )?;
+            }
+        }
+        if maintain_presence {
+            for (batch_id, clear) in &by_batch {
+                ColumnarStore::apply_presence_updates(&self.db, &mut write_batch, table_name, *batch_id, &[], clear)?;
+            }
+        }
+        self.db
+            .write(write_batch)
+            .map_err(|e| Error::storage(format!("Grouped columnar delete failed: {}", e)))
+    }
+
+    /// R3.3 grouped staged columnar write: the transaction counterpart of
+    /// `store_columnar_rows_grouped`. Batches, stats and presence ride the
+    /// transaction write set (staged once per touched batch per statement),
+    /// so rollback discards them and commit applies them atomically with the
+    /// rows. `mark_present` only for INSERT statements; UPDATE statements keep
+    /// their row ids and must not touch presence.
+    pub(crate) fn stage_columnar_rows_grouped_in_transaction(
+        &self,
+        table_name: &str,
+        rows: &[(u64, &Tuple)],
+        schema: &crate::Schema,
+        txn: &Transaction,
+        mark_present: bool,
+    ) -> Result<()> {
+        if rows.is_empty() || !schema_has_columnar_columns(schema) {
+            return Ok(());
+        }
+        let maintain_presence = mark_present && self.columnar_presence_writes_active(table_name)?;
+        let grouped = group_columnar_row_values(schema, rows);
+        for ((idx, batch_id), values) in &grouped {
+            let column = schema
+                .columns
+                .get(*idx)
+                .ok_or_else(|| Error::internal("column index out of bounds in grouped columnar stage"))?;
+            ColumnarStore::stage_batch_values_in_transaction(
+                &self.db,
+                txn,
+                table_name,
+                &column.name,
+                *batch_id,
+                values,
+            )?;
+        }
+        if maintain_presence {
+            for (batch_id, set) in group_row_ids_by_batch(rows.iter().map(|(row_id, _)| *row_id)) {
+                ColumnarStore::stage_presence_updates_in_transaction(&self.db, txn, table_name, batch_id, &set, &[])?;
+            }
+        }
+        Ok(())
+    }
+
+    /// R3.3 grouped staged columnar delete: `Null` every columnar slot of
+    /// `row_ids` and clear their presence bits through the transaction write
+    /// set — one staged read-modify-write per touched batch per statement.
+    pub(crate) fn stage_columnar_deletes_grouped_in_transaction(
+        &self,
+        table_name: &str,
+        row_ids: &[u64],
+        schema: &crate::Schema,
+        txn: &Transaction,
+    ) -> Result<()> {
+        if row_ids.is_empty() || !schema_has_columnar_columns(schema) {
+            return Ok(());
+        }
+        let maintain_presence = self.columnar_presence_writes_active(table_name)?;
+        let by_batch = group_row_ids_by_batch(row_ids.iter().copied());
+        for column in schema
+            .columns
+            .iter()
+            .filter(|column| column.storage_mode == ColumnStorageMode::Columnar)
+        {
+            for (batch_id, batch_rows) in &by_batch {
+                let values: Vec<(u64, Value)> = batch_rows.iter().map(|row_id| (*row_id, Value::Null)).collect();
+                ColumnarStore::stage_batch_values_in_transaction(
+                    &self.db,
+                    txn,
+                    table_name,
+                    &column.name,
+                    *batch_id,
+                    &values,
+                )?;
+            }
+        }
+        if maintain_presence {
+            for (batch_id, clear) in &by_batch {
+                ColumnarStore::stage_presence_updates_in_transaction(&self.db, txn, table_name, *batch_id, &[], clear)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Stage one row's columnar side-data in the transaction write set
+    /// WITHOUT touching presence — for UPDATE call sites (row liveness is
+    /// unchanged). INSERT call sites must use
+    /// `stage_columnar_rows_grouped_in_transaction(.., mark_present = true)`.
     pub(crate) fn stage_tuple_for_column_storage_in_transaction(
         &self,
         table_name: &str,
@@ -9067,22 +9698,7 @@ impl StorageEngine {
         if !schema_uses_column_storage(schema) {
             return Ok(());
         }
-
-        for (idx, column) in schema.columns.iter().enumerate() {
-            if idx >= tuple.values.len() {
-                break;
-            }
-            if column.storage_mode == ColumnStorageMode::Columnar {
-                let cur_val = tuple
-                    .values
-                    .get(idx)
-                    .ok_or_else(|| Error::internal("index out of bounds in columnar transaction stage"))?
-                    .clone();
-                ColumnarStore::store_in_transaction(&self.db, txn, table_name, &column.name, row_id, cur_val)?;
-            }
-        }
-
-        Ok(())
+        self.stage_columnar_rows_grouped_in_transaction(table_name, &[(row_id, tuple)], schema, txn, false)
     }
 
     pub(crate) fn stage_columnar_delete_in_transaction(
@@ -9095,16 +9711,7 @@ impl StorageEngine {
         if !schema_uses_column_storage(schema) {
             return Ok(());
         }
-
-        for column in schema
-            .columns
-            .iter()
-            .filter(|column| column.storage_mode == ColumnStorageMode::Columnar)
-        {
-            ColumnarStore::store_in_transaction(&self.db, txn, table_name, &column.name, row_id, Value::Null)?;
-        }
-
-        Ok(())
+        self.stage_columnar_deletes_grouped_in_transaction(table_name, &[row_id], schema, txn)
     }
 
     /// Fast UPDATE: overwrites a row in-place, updates ART indexes, invalidates row cache.
@@ -9259,13 +9866,9 @@ impl StorageEngine {
             .vector_indexes
             .on_row_delete(table_name, row_id, Some(schema), Some(old_tuple));
 
-        for column in schema
-            .columns
-            .iter()
-            .filter(|column| column.storage_mode == ColumnStorageMode::Columnar)
-        {
-            ColumnarStore::delete(&self.db, table_name, &column.name, row_id)?;
-        }
+        // R3.3: one grouped write nulls every columnar column slot and clears
+        // the row's presence bit (previously one read-modify-write per column).
+        self.delete_columnar_rows_grouped(table_name, &[row_id], schema)?;
 
         self.row_cache.invalidate(table_name, row_id);
         Ok(1)
@@ -10781,6 +11384,14 @@ impl StorageEngine {
                 self.row_cache.invalidate(table_name, *row_id);
 
                 delete_count += 1;
+            }
+
+            // R3.3: null the deleted rows' columnar slots and clear their
+            // presence bits in one grouped write. (Pre-R3.3 this path left
+            // stale values in `col:` batches; the row-walk masked them, the
+            // presence sidecar must not.)
+            if let Ok(ref schema) = schema_result {
+                self.delete_columnar_rows_grouped(table_name, &row_ids, schema)?;
             }
 
             // Register snapshot for main branch delete
