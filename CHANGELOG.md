@@ -5,6 +5,22 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.43.0] - 2026-06-11
+
+Minor release: snapshot metadata diet (roadmap item R1.4).
+
+### Changed — Write path / MVCC
+
+- Snapshot metadata writes one `snapshot:` key instead of three: the
+  `txn_map:`/`scn_map:` mappings were write-only (recovery rebuilds every
+  in-memory map from the `snapshot:` entries alone), costing two keys of
+  write amplification per autocommit statement and two extra RocksDB write
+  calls per transaction commit. Garbage collection still removes legacy
+  mapping keys from databases written by earlier versions.
+- Measured: durable autocommit INSERT +15% (46.2k → 53.0k ops/s on the
+  disk suite); time-travel `AS OF` across restart covered by a new
+  regression test.
+
 ## [3.42.0] - 2026-06-11
 
 Minor release: the plan-arm INSERT fsync fix (roadmap item R1.1) — the
