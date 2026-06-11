@@ -42,6 +42,9 @@ pub mod conflict;
 pub mod compression;
 pub mod content_addr;
 pub mod dictionary;
+// R3.4 typed columnar batch format v2 + vectorized kernels
+pub mod typed_batch;
+pub mod typed_kernels;
 
 // Row-level caching
 pub mod row_cache;

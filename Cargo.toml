@@ -62,10 +62,6 @@ rocksdb = { version = "0.22", default-features = false, features = ["snappy", "z
 # SQL Parsing
 sqlparser = { version = "0.53", features = ["visitor"] }
 
-# Columnar Format
-arrow = { version = "52", features = ["prettyprint"] }
-parquet = { version = "52" }
-
 # Async Runtime
 tokio = { version = "1.40", features = ["full"] }
 async-trait = "0.1"
