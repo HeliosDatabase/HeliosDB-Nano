@@ -264,10 +264,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
                 // directly against the catalog-emulated result.
                 self.prepared_statements
                     .update_portal_state(&portal_name, PortalState::Complete)?;
-                for row in &catalog_result.1 {
-                    let values = super::handler::tuple_to_pg_values_with_formats(row, &portal.result_formats);
-                    self.send_message(BackendMessage::DataRow { values }).await?;
-                }
+                self.send_data_rows_with_formats(&catalog_result.1, &portal.result_formats)
+                    .await?;
                 let tag = format!("SELECT {}", catalog_result.1.len());
                 self.send_command_complete(&tag).await?;
                 return Ok(());
@@ -308,11 +306,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
             // In extended protocol, RowDescription was already sent during Describe.
             // Execute only sends DataRows and CommandComplete.
 
-            // Send DataRows
-            for row in &results_to_send {
-                let values = super::handler::tuple_to_pg_values_with_formats(row, &portal.result_formats);
-                self.send_message(BackendMessage::DataRow { values }).await?;
-            }
+            // Send DataRows — direct encoder for text formats (R5.W1),
+            // legacy per-row conversion when binary formats are requested.
+            self.send_data_rows_with_formats(&results_to_send, &portal.result_formats)
+                .await?;
 
             // Send CommandComplete
             let tag = format!("SELECT {}", results_to_send.len());
@@ -338,10 +335,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
                     .update_portal_state(&portal_name, PortalState::Complete)?;
                 // RowDescription was already sent during Describe; Execute
                 // only emits DataRows + CommandComplete.
-                for row in &tuples {
-                    let values = super::handler::tuple_to_pg_values_with_formats(row, &portal.result_formats);
-                    self.send_message(BackendMessage::DataRow { values }).await?;
-                }
+                self.send_data_rows_with_formats(&tuples, &portal.result_formats)
+                    .await?;
                 let tag = if is_insert {
                     format!("INSERT 0 {}", affected)
                 } else if is_update {

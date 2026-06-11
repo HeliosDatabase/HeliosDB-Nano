@@ -63,6 +63,8 @@ pub mod catalog;
 pub mod certs;
 pub mod handler;
 mod handler_extended;
+#[cfg(test)]
+mod wire_tests;
 pub mod messages;
 pub mod password_store;
 pub mod prepared;

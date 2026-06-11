@@ -196,6 +196,31 @@ impl<S> PgConnectionHandler<S>
 where
     S: AsyncReadExt + AsyncWriteExt + Unpin,
 {
+    /// Test-only constructor over an arbitrary stream, pre-authenticated.
+    /// Used by the in-crate wire tests (`wire_tests.rs`) — fields are
+    /// private, so tests outside this module need a builder.
+    #[cfg(test)]
+    pub(super) fn new_for_tests(database: Arc<EmbeddedDatabase>, stream: S) -> Self {
+        Self {
+            stream,
+            session_id: database
+                .create_wire_session("pg_wire_test")
+                .expect("wire session creation is infallible"),
+            database: Arc::clone(&database),
+            auth_manager: Arc::new(AuthManager::new(AuthMethod::Trust)),
+            catalog: PgCatalog::with_database(database),
+            prepared_statements: PreparedStatementManager::new(),
+            authenticated: true,
+            transaction_status: TransactionStatus::Idle,
+            buffer: BytesMut::with_capacity(8192),
+            username: None,
+            scram_state: None,
+            write_buf: BytesMut::with_capacity(4096),
+            suppress_ready_for_query: false,
+            awaiting_sync_after_error: false,
+        }
+    }
+
     /// Handle connection lifecycle
     pub async fn handle(&mut self) -> Result<()> {
         tracing::info!("New PostgreSQL connection");
@@ -1080,8 +1105,41 @@ where
         let fields = schema_to_field_descriptions(&schema);
         self.send_message(BackendMessage::RowDescription { fields }).await?;
 
-        // Encode DataRows into chunks before writing. This keeps the direct
-        // Tuple encoder while avoiding one async write per result row.
+        self.send_data_rows_direct(rows).await?;
+
+        // Send CommandComplete
+        let tag = format!("SELECT {}", rows.len());
+        self.send_command_complete(&tag).await?;
+
+        Ok(())
+    }
+
+    /// Extended-protocol DataRow emission honouring the portal's result
+    /// formats (R5.W1): all-text format requests stream through the direct
+    /// encoder; any binary format code falls back to the legacy per-row
+    /// conversion path, where the existing binary value encoders
+    /// (`value_to_pg_binary`) live. Wire output is identical either way for
+    /// text formats — both encoders share the same per-type text forms.
+    pub(super) async fn send_data_rows_with_formats(&mut self, rows: &[Tuple], result_formats: &[i16]) -> Result<()> {
+        if formats_request_text_only(result_formats) {
+            return self.send_data_rows_direct(rows).await;
+        }
+        for row in rows {
+            let values = tuple_to_pg_values_with_formats(row, result_formats);
+            self.send_message(BackendMessage::DataRow { values }).await?;
+        }
+        Ok(())
+    }
+
+    /// Stream DataRows through the direct Tuple encoder (text format).
+    ///
+    /// Encodes rows into chunks before writing — keeps the zero-clone
+    /// per-value encoding of [`Self::encode_data_row_direct`] while avoiding
+    /// one async write per result row. Used by the simple-query path and,
+    /// since R5.W1, by extended-protocol Execute whenever every requested
+    /// result format is text (format code 0) — which is what mainstream
+    /// drivers request.
+    pub(super) async fn send_data_rows_direct(&mut self, rows: &[Tuple]) -> Result<()> {
         const DATA_ROW_FLUSH_AT: usize = 64 * 1024;
         self.write_buf.clear();
         for row in rows {
@@ -1101,11 +1159,6 @@ where
                 .map_err(|e| Error::network(format!("Failed to send query rows: {}", e)))?;
             self.write_buf.clear();
         }
-
-        // Send CommandComplete
-        let tag = format!("SELECT {}", rows.len());
-        self.send_command_complete(&tag).await?;
-
         Ok(())
     }
 
@@ -1685,6 +1738,13 @@ pub(super) fn schema_to_field_descriptions_with_formats(
             format_code: effective_result_format(&col.data_type, result_formats, index),
         })
         .collect()
+}
+
+/// True when the portal's result-format codes request text for every column
+/// (empty list, all zeros, or the single-`0` shorthand) — the precondition
+/// for routing extended-protocol rows through the direct encoder (R5.W1).
+pub(super) fn formats_request_text_only(result_formats: &[i16]) -> bool {
+    result_formats.iter().all(|f| *f == 0)
 }
 
 pub(super) fn requested_result_format(result_formats: &[i16], column_index: usize) -> i16 {
