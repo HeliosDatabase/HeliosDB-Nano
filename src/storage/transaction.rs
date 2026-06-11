@@ -642,8 +642,15 @@ impl Transaction {
         }
 
         // Iterate over DashMap entries
+        let mut touches_columnar = false;
         for entry in self.write_set.iter() {
             let (key, value) = (entry.key(), entry.value());
+            // R3.1: columnar batches stage a zone-stats sidecar alongside the
+            // batch. Applying them under the zone-stats write lock (below)
+            // keeps lazy stats backfill from racing this commit.
+            if !touches_columnar && key.starts_with(b"col:") {
+                touches_columnar = true;
+            }
             match value {
                 Some(val) => {
                     Self::put_versioned_batch(
@@ -668,6 +675,10 @@ impl Transaction {
                 .map_err(|e| Error::storage(format!("Failed to serialize counter: {}", e)))?;
             batch.put(key.as_bytes(), value);
         }
+
+        // R3.1: exclude zone-stats backfill while columnar batches + their
+        // stats sidecars are applied (no-op guard for non-columnar commits).
+        let _columnar_stats_guard = touches_columnar.then(super::columnar::stats_write_lock);
 
         let result = if self.rocksdb_wal_enabled {
             if self.sync_commit {
