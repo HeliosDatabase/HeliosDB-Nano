@@ -1,0 +1,76 @@
+name: Perf smoke gate
+
+# Catches order-of-magnitude perf regressions (the v3.28.0 338x in-txn FK
+# cliff class) before they ship — NOT a precision benchmark. The gate runs the
+# small TPS suite (mem, N=1000, M=200) plus the in-txn FK bulk-insert shape,
+# best-of-3, and fails only when a workload is >2.5x slower than the stored
+# baseline (benches/public/ci_baseline.json, itself pre-scaled down ~2x from
+# the workstation that generated it). Total headroom vs the baseline host is
+# therefore ~5x: GH runners are slow and noisy, and this gate must never cry
+# wolf over 20% drift.
+#
+# If the gate fails on a PR that should not change performance:
+#   1. Re-run the job once (runner noise).
+#   2. If it fails consistently across the board (every workload, similar
+#      ratio), the runner hardware class likely changed — regenerate the
+#      baseline: `benches/public/regen_ci_baseline.sh` and commit the JSON
+#      with an explanation. The FIRST run of this workflow on new runner
+#      hardware may need exactly this refresh.
+#   3. If ONE workload fails by a large factor, treat it as a real
+#      regression — that is this gate's reason to exist.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'benches/public/**'
+      - '.github/workflows/perf-gate.yml'
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'benches/public/**'
+      - '.github/workflows/perf-gate.yml'
+
+concurrency:
+  group: perf-gate-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  perf-smoke:
+    name: Perf smoke (TPS N=1000 + in-txn FK bulk insert)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        # rust-toolchain.toml pins channel + components automatically
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: perf-gate
+
+      - name: Run perf smoke gate
+        run: benches/public/ci_perf_smoke.sh
+
+      - name: Upload measured results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-gate-results
+          path: benches/public/results/ci_smoke_*/
+          retention-days: 30
+          if-no-files-found: ignore

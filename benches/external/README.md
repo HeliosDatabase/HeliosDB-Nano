@@ -1,5 +1,10 @@
 # External (wire-protocol) Benchmarks
 
+> For the one-command, reproducible public benchmark suite (SQLite mirror at
+> two scales, durable-writes gauntlet, concurrency benches, CI perf gate) see
+> `benches/public/` — those scripts wrap the SQLite mirror here end-to-end
+> and emit stamped markdown + JSON results.
+
 Scripts here connect to a **running** server over the PostgreSQL or MySQL
 wire protocol and measure end-to-end query latency. They're
 engine-agnostic: point them at HeliosDB Nano, PostgreSQL, CockroachDB,
