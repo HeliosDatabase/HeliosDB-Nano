@@ -209,7 +209,9 @@ impl FilterPredicate {
         }
     }
 
-    fn compare_eq(a: &Value, b: &Value) -> bool {
+    /// Equality comparison used by `evaluate` (pub(crate) so the R3.1 zone-map
+    /// pruner proves batch disjointness with exactly these semantics).
+    pub(crate) fn compare_eq(a: &Value, b: &Value) -> bool {
         match (a, b) {
             (Value::Null, Value::Null) => true,
             (Value::Null, _) | (_, Value::Null) => false,
@@ -251,7 +253,9 @@ impl FilterPredicate {
         }
     }
 
-    fn compare_lt(a: &Value, b: &Value) -> bool {
+    /// Less-than comparison used by `evaluate`; returns false for
+    /// incomparable type pairs (see `compare_eq` note on R3.1 reuse).
+    pub(crate) fn compare_lt(a: &Value, b: &Value) -> bool {
         match (a, b) {
             (Value::Null, _) | (_, Value::Null) => false,
             (Value::Boolean(a), Value::Boolean(b)) => !a && *b,
@@ -282,7 +286,9 @@ impl FilterPredicate {
         }
     }
 
-    fn compare_gt(a: &Value, b: &Value) -> bool {
+    /// Greater-than comparison used by `evaluate`; returns false for
+    /// incomparable type pairs (see `compare_eq` note on R3.1 reuse).
+    pub(crate) fn compare_gt(a: &Value, b: &Value) -> bool {
         match (a, b) {
             (Value::Null, _) | (_, Value::Null) => false,
             (Value::Boolean(a), Value::Boolean(b)) => *a && !b,
