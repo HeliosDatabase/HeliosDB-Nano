@@ -329,6 +329,13 @@ impl Parser {
         upper.starts_with("SHOW BRANCHES") || upper.starts_with("SHOW DATABASE BRANCHES")
     }
 
+    /// R4.3: check if SQL is a `VACUUM VERSIONS` statement (manual MVCC
+    /// version-history collection pass).
+    pub fn is_vacuum_versions(sql: &str) -> bool {
+        let upper = sql.trim().trim_end_matches(';').trim().to_uppercase();
+        upper == "VACUUM VERSIONS"
+    }
+
     /// Check if SQL is a REFRESH MATERIALIZED VIEW statement
     pub fn is_refresh_materialized_view(sql: &str) -> bool {
         let upper = sql.trim().to_uppercase();
