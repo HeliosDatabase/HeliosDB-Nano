@@ -74,6 +74,18 @@ use std::path::PathBuf;
 /// before using the configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    /// Named settings bundle: "safe" | "balanced" | "fast" (D3).
+    ///
+    /// Applied by [`Config::from_file`] / [`Config::from_toml_str`] after the
+    /// file is parsed: the profile fills in the bundled storage fields
+    /// (`wal_sync_mode`, `time_travel_enabled`, `durable_commit`) **only when
+    /// the file does not set them explicitly** — an explicit per-field value
+    /// in the file always wins over the profile.
+    ///
+    /// Must be the first field so TOML serialization emits the scalar before
+    /// any `[section]` tables.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<ProfileConfig>,
     /// Storage configuration
     #[serde(default)]
     pub storage: StorageConfig,
@@ -127,6 +139,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            profile: None,
             storage: StorageConfig::default(),
             encryption: EncryptionConfig::default(),
             server: ServerConfig::default(),
@@ -165,9 +178,59 @@ impl Config {
     /// Load configuration from file
     pub fn from_file(path: impl AsRef<std::path::Path>) -> crate::Result<Self> {
         let content = std::fs::read_to_string(path)?;
-        let config: Config =
-            toml::from_str(&content).map_err(|e| crate::Error::config(format!("Failed to parse config: {}", e)))?;
+        Self::from_toml_str(&content)
+    }
+
+    /// Parse configuration from a TOML string, applying the `profile` bundle.
+    ///
+    /// Precedence (lowest to highest):
+    /// 1. struct defaults,
+    /// 2. the `profile` bundle (if the file sets `profile = "..."`),
+    /// 3. explicit per-field values in the file.
+    ///
+    /// i.e. the profile only fills in bundled fields the file did not set
+    /// explicitly — an explicit `[storage]` key in the file always wins.
+    pub fn from_toml_str(content: &str) -> crate::Result<Self> {
+        let mut config: Config =
+            toml::from_str(content).map_err(|e| crate::Error::config(format!("Failed to parse config: {}", e)))?;
+        if let Some(profile) = config.profile {
+            // Re-parse as a raw TOML document to learn which [storage] keys
+            // the file set explicitly — after serde deserialization a default
+            // is indistinguishable from an explicit value.
+            let raw: toml::Value = toml::from_str(content)
+                .map_err(|e| crate::Error::config(format!("Failed to parse config: {}", e)))?;
+            config.apply_profile_defaults(profile, |key| {
+                raw.get("storage").and_then(|s| s.get(key)).is_some()
+            });
+        }
         Ok(config)
+    }
+
+    /// Default configuration with a named profile bundle applied.
+    pub fn with_profile(profile: ProfileConfig) -> Self {
+        let mut config = Config {
+            profile: Some(profile),
+            ..Config::default()
+        };
+        config.apply_profile_defaults(profile, |_| false);
+        config
+    }
+
+    /// Apply a profile's bundled storage settings, skipping any field for
+    /// which `explicitly_set(key)` returns true (explicit fields win).
+    fn apply_profile_defaults(&mut self, profile: ProfileConfig, explicitly_set: impl Fn(&str) -> bool) {
+        let bundle = profile.storage_bundle();
+        if !explicitly_set("wal_sync_mode") {
+            self.storage.wal_sync_mode = bundle.wal_sync_mode;
+        }
+        if !explicitly_set("time_travel_enabled") {
+            self.storage.time_travel_enabled = bundle.time_travel_enabled;
+        }
+        if let Some(durable_commit) = bundle.durable_commit {
+            if !explicitly_set("durable_commit") {
+                self.storage.durable_commit = durable_commit;
+            }
+        }
     }
 
     /// Save configuration to file
@@ -286,6 +349,67 @@ impl Default for StorageConfig {
             slow_query_threshold_ms: Some(1000), // 1 second default
             logical_wal_per_statement: false, // rely on RocksDB WAL at commit (see field docs)
             durable_commit: false,
+        }
+    }
+}
+
+/// Named configuration profile (D3): a one-key bundle of durability /
+/// versioning settings. See [`Config::profile`] for precedence semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProfileConfig {
+    /// `wal_sync_mode = "sync"`, `time_travel_enabled = true` (the current
+    /// built-in defaults). Slowest writes; every operation fsyncs. Users who
+    /// also need power-loss durable transaction commits should additionally
+    /// set `storage.durable_commit = true` (off by default, v3.44.0+).
+    Safe,
+    /// `wal_sync_mode = "group_commit"`, `time_travel_enabled = true`.
+    /// Batches WAL syncs across writers: a process crash keeps committed
+    /// data (RocksDB WAL), a power loss may lose the last commit window.
+    Balanced,
+    /// `wal_sync_mode = "group_commit"`, `time_travel_enabled = false`,
+    /// `durable_commit = false`. Fastest writes: no version snapshots (no
+    /// AS OF time-travel queries) and commits are process-crash-safe only.
+    Fast,
+}
+
+/// Bundled storage values a profile applies (None = leave field untouched).
+pub(crate) struct ProfileStorageBundle {
+    pub wal_sync_mode: WalSyncModeConfig,
+    pub time_travel_enabled: bool,
+    pub durable_commit: Option<bool>,
+}
+
+impl ProfileConfig {
+    /// Lowercase name as written in TOML.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ProfileConfig::Safe => "safe",
+            ProfileConfig::Balanced => "balanced",
+            ProfileConfig::Fast => "fast",
+        }
+    }
+
+    pub(crate) fn storage_bundle(&self) -> ProfileStorageBundle {
+        match self {
+            // Safe/Balanced leave durable_commit at its default/file value so
+            // an operator's explicit `durable_commit = true` (power-loss
+            // durability, v3.44.0+) is never silently downgraded.
+            ProfileConfig::Safe => ProfileStorageBundle {
+                wal_sync_mode: WalSyncModeConfig::Sync,
+                time_travel_enabled: true,
+                durable_commit: None,
+            },
+            ProfileConfig::Balanced => ProfileStorageBundle {
+                wal_sync_mode: WalSyncModeConfig::GroupCommit,
+                time_travel_enabled: true,
+                durable_commit: None,
+            },
+            ProfileConfig::Fast => ProfileStorageBundle {
+                wal_sync_mode: WalSyncModeConfig::GroupCommit,
+                time_travel_enabled: false,
+                durable_commit: Some(false),
+            },
         }
     }
 }
@@ -1072,6 +1196,110 @@ fn generate_random_secret() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ------------------------------------------------------------------
+    // D3: profile bundles
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_profile_fast_applies_bundle() {
+        let config = Config::from_toml_str("profile = \"fast\"").expect("parse");
+        assert_eq!(config.profile, Some(ProfileConfig::Fast));
+        assert_eq!(config.storage.wal_sync_mode, WalSyncModeConfig::GroupCommit);
+        assert!(!config.storage.time_travel_enabled);
+        assert!(!config.storage.durable_commit);
+    }
+
+    #[test]
+    fn test_profile_balanced_applies_bundle() {
+        let config = Config::from_toml_str("profile = \"balanced\"").expect("parse");
+        assert_eq!(config.storage.wal_sync_mode, WalSyncModeConfig::GroupCommit);
+        assert!(config.storage.time_travel_enabled);
+    }
+
+    #[test]
+    fn test_profile_safe_matches_defaults() {
+        let config = Config::from_toml_str("profile = \"safe\"").expect("parse");
+        let defaults = Config::default();
+        assert_eq!(config.storage.wal_sync_mode, defaults.storage.wal_sync_mode);
+        assert_eq!(config.storage.time_travel_enabled, defaults.storage.time_travel_enabled);
+        assert_eq!(config.storage.durable_commit, defaults.storage.durable_commit);
+    }
+
+    #[test]
+    fn test_explicit_field_wins_over_profile() {
+        // Precedence: explicit [storage] keys in the file beat the profile.
+        let config = Config::from_toml_str(
+            r#"
+            profile = "fast"
+
+            [storage]
+            time_travel_enabled = true
+            wal_sync_mode = "sync"
+            "#,
+        )
+        .expect("parse");
+        assert!(config.storage.time_travel_enabled, "explicit field must win");
+        assert_eq!(config.storage.wal_sync_mode, WalSyncModeConfig::Sync);
+        // Non-explicit bundled field still comes from the profile.
+        assert!(!config.storage.durable_commit);
+    }
+
+    #[test]
+    fn test_safe_profile_does_not_downgrade_durable_commit() {
+        let config = Config::from_toml_str(
+            r#"
+            profile = "safe"
+
+            [storage]
+            durable_commit = true
+            "#,
+        )
+        .expect("parse");
+        assert!(config.storage.durable_commit);
+    }
+
+    #[test]
+    fn test_no_profile_keeps_defaults() {
+        let config = Config::from_toml_str("").expect("parse");
+        assert_eq!(config.profile, None);
+        assert_eq!(config.storage.wal_sync_mode, WalSyncModeConfig::Sync);
+        assert!(config.storage.time_travel_enabled);
+    }
+
+    #[test]
+    fn test_with_profile_constructor() {
+        let config = Config::with_profile(ProfileConfig::Fast);
+        assert_eq!(config.profile, Some(ProfileConfig::Fast));
+        assert_eq!(config.storage.wal_sync_mode, WalSyncModeConfig::GroupCommit);
+        assert!(!config.storage.time_travel_enabled);
+    }
+
+    #[test]
+    fn test_unknown_profile_rejected() {
+        let err = Config::from_toml_str("profile = \"ludicrous\"").expect_err("must fail");
+        assert!(err.to_string().contains("Failed to parse config"));
+    }
+
+    #[test]
+    fn test_config_example_toml_parses() {
+        // The shipped example config must always load (D3 validation gate).
+        let content = include_str!("../config.example.toml");
+        let config = Config::from_toml_str(content).expect("config.example.toml must parse");
+        config.validate().expect("config.example.toml must validate");
+        // The example documents the safe profile semantics explicitly.
+        assert_eq!(config.storage.wal_sync_mode, WalSyncModeConfig::Sync);
+    }
+
+    #[test]
+    fn test_profile_round_trips_through_serialization() {
+        let config = Config::with_profile(ProfileConfig::Balanced);
+        let toml_str = toml::to_string(&config).expect("serialize");
+        assert!(toml_str.starts_with("profile = \"balanced\""), "profile must be first: {toml_str}");
+        let back = Config::from_toml_str(&toml_str).expect("reparse");
+        assert_eq!(back.profile, Some(ProfileConfig::Balanced));
+        assert_eq!(back.storage.wal_sync_mode, WalSyncModeConfig::GroupCommit);
+    }
 
     #[test]
     fn test_session_config_default() {
