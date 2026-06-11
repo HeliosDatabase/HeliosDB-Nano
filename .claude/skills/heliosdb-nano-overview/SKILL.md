@@ -21,7 +21,7 @@ Single-binary embedded database (Rust). PostgreSQL- and MySQL-wire compatible. O
 | Tables / indexes / views / triggers / introspection | `heliosdb-nano-schema` |
 | INSERT / UPDATE / DELETE / SELECT / EXPLAIN | `heliosdb-nano-query` |
 | BEGIN / COMMIT / SAVEPOINT / bulk-load patterns | `heliosdb-nano-transactions` |
-| Branching: create / switch / merge / drop / AS OF clones | `heliosdb-nano-branches` |
+| Branching: fork-test-discard sandboxes, create / switch / drop / AS OF forks (merge: see warning there) | `heliosdb-nano-branches` |
 | Time-travel queries (`AS OF <ts>`), snapshots, LSN | `heliosdb-nano-time-travel` |
 | Backup / restore (dump / restore subcommands) | `heliosdb-nano-backup` |
 | HNSW vector indexes, similarity search, hybrid search | `heliosdb-nano-vector` |
