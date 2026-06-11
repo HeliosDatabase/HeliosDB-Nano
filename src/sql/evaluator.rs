@@ -91,6 +91,25 @@ impl Evaluator {
     }
 }
 
+/// Normalize a scalar function name into the evaluator's dispatch form:
+/// lowercase, with any `pg_catalog.` prefix stripped (R3.5 item 3). The
+/// per-row dispatch performs exactly this transformation; doing it once at
+/// bind time lets the hot path skip the `to_lowercase()` allocation.
+fn normalize_function_name(fun: String) -> String {
+    if !fun.is_ascii() || fun.bytes().any(|b| b.is_ascii_uppercase()) {
+        let lowered = fun.to_lowercase();
+        match lowered.strip_prefix("pg_catalog.") {
+            Some(stripped) => stripped.to_string(),
+            None => lowered,
+        }
+    } else {
+        match fun.strip_prefix("pg_catalog.") {
+            Some(stripped) => stripped.to_string(),
+            None => fun,
+        }
+    }
+}
+
 /// Recursively rewrite resolvable `Column` nodes into `BoundColumn` nodes.
 /// See [`Evaluator::bind`] for the contract.
 pub fn bind_expr_columns(expr: LogicalExpr, schema: &Schema) -> LogicalExpr {
@@ -149,8 +168,11 @@ pub fn bind_expr_columns(expr: LogicalExpr, schema: &Schema) -> LogicalExpr {
             expr: bind_box(expr),
             data_type,
         },
+        // R3.5 item 3: normalize the function name ONCE at bind time
+        // (lowercase + `pg_catalog.` prefix strip) so the per-row dispatch in
+        // `evaluate_scalar_function` takes its allocation-free fast path.
         LogicalExpr::ScalarFunction { fun, args } => LogicalExpr::ScalarFunction {
-            fun,
+            fun: normalize_function_name(fun),
             args: bind_vec(args),
         },
         LogicalExpr::ArraySubscript { array, index } => LogicalExpr::ArraySubscript {
@@ -561,8 +583,18 @@ impl Evaluator {
         // pgAdmin call several pg_catalog helpers both with and
         // without the `pg_catalog.` prefix. Strip it so the dispatch
         // arms only need to list the bare name.
-        let fun_lower = fun.to_lowercase();
-        let fun_dispatch = fun_lower.strip_prefix("pg_catalog.").unwrap_or(&fun_lower);
+        //
+        // R3.5 item 3: when the name is already in dispatch form (ASCII with
+        // no uppercase — guaranteed after `Evaluator::bind` normalization),
+        // skip the per-row `to_lowercase()` String allocation entirely.
+        let fun_lowered: String;
+        let fun_dispatch: &str = if !fun.is_ascii() || fun.bytes().any(|b| b.is_ascii_uppercase()) {
+            fun_lowered = fun.to_lowercase();
+            &fun_lowered
+        } else {
+            fun
+        };
+        let fun_dispatch = fun_dispatch.strip_prefix("pg_catalog.").unwrap_or(fun_dispatch);
         match fun_dispatch {
             // JSONB extraction functions
             "jsonb_extract_path" | "json_extract_path" => self.jsonb_extract_path(&arg_values),
