@@ -711,6 +711,16 @@ fn starts_with_icase(s: &str, prefix: &str) -> bool {
     }
 }
 
+/// Case-insensitive `strip_prefix` without allocating a new String.
+#[inline]
+fn strip_prefix_icase<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    if starts_with_icase(s, prefix) {
+        s.get(prefix.len()..)
+    } else {
+        None
+    }
+}
+
 /// RAII guard that swaps the active branch for the duration of a
 /// query when the FR-3 `ON BRANCH '<name>'` directive is present in
 /// an `lsp_*` call. Restores the previous branch on Drop so every
@@ -908,6 +918,69 @@ impl EmbeddedDatabase {
             Ok(0)
         } else {
             Err(Error::query_execution("Unknown transaction control statement"))
+        }
+    }
+
+    /// R1.3-p2: parse a session `synchronous_commit` statement (PostgreSQL-
+    /// compatible). Recognizes `SET [LOCAL|SESSION] synchronous_commit
+    /// {=|TO} <value>` and `RESET synchronous_commit`.
+    ///
+    /// Returns:
+    /// - `Ok(None)` — not a synchronous_commit statement
+    /// - `Ok(Some(Some(bool)))` — SET to on (true) / off (false)
+    /// - `Ok(Some(None))` — RESET (inherit `storage.durable_commit`)
+    /// - `Err(_)` — it IS a synchronous_commit SET but the value is invalid
+    ///
+    /// Values follow PostgreSQL: `off|false|0|no` disable the commit-fsync
+    /// wait; `on|true|1|yes` and the replication-oriented `local`,
+    /// `remote_write`, `remote_apply` all wait (we have no standby levels
+    /// to distinguish).
+    pub(crate) fn parse_synchronous_commit_statement(sql: &str) -> Result<Option<Option<bool>>> {
+        let trimmed = sql.trim().trim_end_matches(';').trim();
+        if let Some(rest) = strip_prefix_icase(trimmed, "RESET ") {
+            if rest.trim().eq_ignore_ascii_case("synchronous_commit") {
+                return Ok(Some(None));
+            }
+            return Ok(None);
+        }
+        let Some(mut body) = strip_prefix_icase(trimmed, "SET ") else {
+            return Ok(None);
+        };
+        body = body.trim();
+        if let Some(rest) = strip_prefix_icase(body, "LOCAL ") {
+            // SET LOCAL is transaction-scoped in PostgreSQL; we apply it to
+            // the session (documented simplification, matching the existing
+            // SET LOCAL handling for helios.* settings).
+            body = rest.trim();
+        } else if let Some(rest) = strip_prefix_icase(body, "SESSION ") {
+            body = rest.trim();
+        }
+        // `SET name = value` or `SET name TO value`.
+        let (name, value) = if let Some(eq_pos) = body.find('=') {
+            (body[..eq_pos].trim(), body[eq_pos + 1..].trim())
+        } else {
+            let mut parts = body.splitn(3, char::is_whitespace);
+            let name = parts.next().unwrap_or("");
+            let to = parts.next().unwrap_or("");
+            let value = parts.next().unwrap_or("").trim();
+            if !to.eq_ignore_ascii_case("TO") {
+                return Ok(None);
+            }
+            (name, value)
+        };
+        if !name.eq_ignore_ascii_case("synchronous_commit") {
+            return Ok(None);
+        }
+        let normalized = value.trim_matches('\'').trim_matches('"').to_ascii_lowercase();
+        match normalized.as_str() {
+            "off" | "false" | "0" | "no" => Ok(Some(Some(false))),
+            "on" | "true" | "1" | "yes" | "local" | "remote_write" | "remote_apply" => {
+                Ok(Some(Some(true)))
+            }
+            _ => Err(Error::query_execution(format!(
+                "invalid value for parameter \"synchronous_commit\": \"{}\"",
+                value
+            ))),
         }
     }
 
@@ -11969,8 +12042,14 @@ impl EmbeddedDatabase {
         // (new_with_session defaults versioning on).
         txn.set_versioning_enabled(self.storage.time_travel_enabled());
         txn.set_rocksdb_wal_enabled(!self.storage.config().storage.memory_only);
+        // R1.3-p2: the session's SET synchronous_commit overrides
+        // storage.durable_commit (off = skip the group-fsync wait; on =
+        // wait even when the storage default is non-durable).
         txn.set_sync_commit(
-            self.storage.config().storage.durable_commit && !self.storage.config().storage.memory_only,
+            session
+                .synchronous_commit
+                .unwrap_or(self.storage.config().storage.durable_commit)
+                && !self.storage.config().storage.memory_only,
         );
         // R1.3-p2: durable commits share one group fsync per cohort.
         txn.set_group_committer(self.storage.group_committer());
@@ -12102,6 +12181,11 @@ impl EmbeddedDatabase {
     ///
     /// Number of rows affected by the statement
     pub fn execute_in_session(&self, session_id: crate::session::SessionId, sql: &str) -> Result<u64> {
+        // R1.3-p2: session-scoped SET/RESET synchronous_commit. Must run
+        // BEFORE the session write lock below (the handler re-locks it).
+        if let Some(handled) = self.try_handle_session_synchronous_commit(session_id, sql)? {
+            return Ok(handled);
+        }
         let session_lock = self.session_manager.get_session(session_id)?;
         let mut session = session_lock.write();
         session.touch();
@@ -12142,8 +12226,12 @@ impl EmbeddedDatabase {
             // P0#1: session transactions must honor time_travel_enabled too.
             txn.set_versioning_enabled(self.storage.time_travel_enabled());
             txn.set_rocksdb_wal_enabled(!self.storage.config().storage.memory_only);
+            // R1.3-p2: the session's SET synchronous_commit overrides
+            // storage.durable_commit for this statement's commit.
             txn.set_sync_commit(
-                self.storage.config().storage.durable_commit
+                session
+                    .synchronous_commit
+                    .unwrap_or(self.storage.config().storage.durable_commit)
                     && !self.storage.config().storage.memory_only,
             );
             // R1.3-p2: durable commits share one group fsync per cohort.
@@ -12275,6 +12363,67 @@ impl EmbeddedDatabase {
         Ok(())
     }
 
+    /// R1.3-p2: set (or with `None` reset) the session's
+    /// `synchronous_commit` override. PostgreSQL semantics: takes effect
+    /// immediately, including for a transaction already in progress (the
+    /// open transaction's commit honors the latest setting).
+    pub fn set_session_synchronous_commit(
+        &self,
+        session_id: crate::session::SessionId,
+        value: Option<bool>,
+    ) -> Result<()> {
+        let session_lock = self.session_manager.get_session(session_id)?;
+        session_lock.write().synchronous_commit = value;
+        // Apply to an already-open transaction too: its sync flag was
+        // captured at BEGIN.
+        if let Some(mut txn) = self.session_transactions.get_mut(&session_id) {
+            let storage_cfg = &self.storage.config().storage;
+            txn.set_sync_commit(value.unwrap_or(storage_cfg.durable_commit) && !storage_cfg.memory_only);
+        }
+        Ok(())
+    }
+
+    /// R1.3-p2: the session's raw `synchronous_commit` override
+    /// (`None` = inherit `storage.durable_commit`).
+    pub fn session_synchronous_commit(
+        &self,
+        session_id: crate::session::SessionId,
+    ) -> Result<Option<bool>> {
+        let session_lock = self.session_manager.get_session(session_id)?;
+        let value = session_lock.read().synchronous_commit;
+        Ok(value)
+    }
+
+    /// R1.3-p2: the session's EFFECTIVE `synchronous_commit` (override or
+    /// the `storage.durable_commit` default; always false in memory mode).
+    pub fn session_synchronous_commit_effective(
+        &self,
+        session_id: crate::session::SessionId,
+    ) -> Result<bool> {
+        let storage_cfg = &self.storage.config().storage;
+        Ok(self
+            .session_synchronous_commit(session_id)?
+            .unwrap_or(storage_cfg.durable_commit)
+            && !storage_cfg.memory_only)
+    }
+
+    /// R1.3-p2: intercept `SET/RESET synchronous_commit` for a session.
+    /// Returns `Some(0)` when handled, `None` when the statement is
+    /// something else.
+    fn try_handle_session_synchronous_commit(
+        &self,
+        session_id: crate::session::SessionId,
+        sql: &str,
+    ) -> Result<Option<u64>> {
+        match Self::parse_synchronous_commit_statement(sql)? {
+            Some(value) => {
+                self.set_session_synchronous_commit(session_id, value)?;
+                Ok(Some(0))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Touch session stats and, for READ COMMITTED, refresh the open
     /// transaction's snapshot so the next statement sees the latest commits.
     fn touch_session_for_statement(&self, session_id: crate::session::SessionId) -> Result<()> {
@@ -12319,12 +12468,34 @@ impl EmbeddedDatabase {
         }
     }
 
+    /// R1.3-p2: when the session has a `synchronous_commit` override,
+    /// install the engine thread-local override for the duration of one
+    /// statement that routes through the global (non-session) execute
+    /// paths, so the autocommit durability barrier and autocommit
+    /// transactions honor the session's setting. Returns `None` (no guard,
+    /// zero TLS traffic) when the session has no override.
+    fn session_durability_override_guard(
+        &self,
+        session_id: crate::session::SessionId,
+    ) -> Option<storage::SynchronousCommitOverrideGuard> {
+        let session_lock = self.session_manager.get_session(session_id).ok()?;
+        let value = session_lock.read().synchronous_commit?;
+        Some(storage::StorageEngine::synchronous_commit_override_guard(Some(value)))
+    }
+
     /// Execute a statement on behalf of a wire-protocol session.
     pub fn execute_for_session(&self, session_id: crate::session::SessionId, sql: &str) -> Result<u64> {
         if Self::is_transaction_control(sql) {
             return self.handle_transaction_control_for_session(session_id, sql);
         }
+        // R1.3-p2: session-scoped SET/RESET synchronous_commit (the PG
+        // simple-query handler intercepts SET itself; RESET and the
+        // extended protocol land here).
+        if let Some(handled) = self.try_handle_session_synchronous_commit(session_id, sql)? {
+            return Ok(handled);
+        }
         if !self.session_transactions.contains_key(&session_id) {
+            let _sync_override = self.session_durability_override_guard(session_id);
             return self.execute(sql);
         }
 
@@ -12394,7 +12565,11 @@ impl EmbeddedDatabase {
             let count = self.handle_transaction_control_for_session(session_id, sql)?;
             return Ok((count, Vec::new()));
         }
+        if let Some(handled) = self.try_handle_session_synchronous_commit(session_id, sql)? {
+            return Ok((handled, Vec::new()));
+        }
         if !self.session_transactions.contains_key(&session_id) {
+            let _sync_override = self.session_durability_override_guard(session_id);
             return self.execute_returning(sql);
         }
 
@@ -12447,7 +12622,11 @@ impl EmbeddedDatabase {
         if Self::is_transaction_control(sql) {
             return self.handle_transaction_control_for_session(session_id, sql);
         }
+        if let Some(handled) = self.try_handle_session_synchronous_commit(session_id, sql)? {
+            return Ok(handled);
+        }
         if !self.session_transactions.contains_key(&session_id) {
+            let _sync_override = self.session_durability_override_guard(session_id);
             return self.execute_params_inner(sql, params, plan_override);
         }
 
@@ -15418,6 +15597,39 @@ mod tests {
     fn test_embedded_database_creation() {
         let db = EmbeddedDatabase::new_in_memory();
         assert!(db.is_ok());
+    }
+
+    // ---- R1.3-p2: SET synchronous_commit parser ----
+
+    #[test]
+    fn parse_synchronous_commit_statement_forms() {
+        let p = EmbeddedDatabase::parse_synchronous_commit_statement;
+        // SET = / TO, casing, quoting, prefixes, trailing semicolon.
+        assert_eq!(p("SET synchronous_commit = off").unwrap(), Some(Some(false)));
+        assert_eq!(p("set SYNCHRONOUS_COMMIT to ON;").unwrap(), Some(Some(true)));
+        assert_eq!(p("SET synchronous_commit = 'off'").unwrap(), Some(Some(false)));
+        assert_eq!(p("SET LOCAL synchronous_commit = false").unwrap(), Some(Some(false)));
+        assert_eq!(p("SET SESSION synchronous_commit TO true").unwrap(), Some(Some(true)));
+        // PG replication-oriented values all mean "wait" here.
+        for v in ["local", "remote_write", "remote_apply", "1", "yes"] {
+            assert_eq!(
+                p(&format!("SET synchronous_commit = {v}")).unwrap(),
+                Some(Some(true)),
+                "value {v}"
+            );
+        }
+        // RESET.
+        assert_eq!(p("RESET synchronous_commit").unwrap(), Some(None));
+        assert_eq!(p("reset SYNCHRONOUS_COMMIT ;").unwrap(), Some(None));
+        // Not ours.
+        assert_eq!(p("SET client_encoding = 'UTF8'").unwrap(), None);
+        assert_eq!(p("RESET client_encoding").unwrap(), None);
+        assert_eq!(p("SET synchronous_commit_extra = off").unwrap(), None);
+        assert_eq!(p("INSERT INTO t VALUES (1)").unwrap(), None);
+        assert_eq!(p("SET synchronous_commit off").unwrap(), None); // missing = / TO
+        // Ours but invalid value.
+        assert!(p("SET synchronous_commit = sideways").is_err());
+        assert!(p("SET synchronous_commit = ").is_err());
     }
 
     // ---- R1.2: word-boundary, literal-aware keyword matcher ----
