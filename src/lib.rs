@@ -12413,6 +12413,77 @@ impl EmbeddedDatabase {
         self.query_plan_with_params(&plan, params, Some(&txn))
     }
 
+    /// `query_params_with_columns` for a wire session — the column-aware,
+    /// parameter-aware entry point the MySQL binary protocol
+    /// (COM_STMT_EXECUTE, R5.W4) routes through. Mirrors
+    /// [`query_params_for_session`](Self::query_params_for_session) but also
+    /// returns the output column names so wire handlers can build result-set
+    /// metadata without a second planning pass.
+    pub fn query_params_with_columns_for_session(
+        &self,
+        session_id: crate::session::SessionId,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<(Vec<Tuple>, Vec<String>)> {
+        if !self.session_transactions.contains_key(&session_id) {
+            return self.query_params_with_columns(sql, params);
+        }
+
+        self.touch_session_for_statement(session_id)?;
+        let txn = self
+            .session_transactions
+            .get(&session_id)
+            .ok_or_else(|| Error::transaction("Session transaction disappeared during query"))?;
+        let plan = self.parameterized_plan_cached(sql)?;
+
+        if matches!(
+            &*plan,
+            sql::LogicalPlan::Insert { .. }
+                | sql::LogicalPlan::InsertSelect { .. }
+                | sql::LogicalPlan::Update { .. }
+                | sql::LogicalPlan::Delete { .. }
+        ) {
+            let columns = match &*plan {
+                sql::LogicalPlan::Insert {
+                    table_name,
+                    returning: Some(items),
+                    ..
+                }
+                | sql::LogicalPlan::InsertSelect {
+                    table_name,
+                    returning: Some(items),
+                    ..
+                }
+                | sql::LogicalPlan::Update {
+                    table_name,
+                    returning: Some(items),
+                    ..
+                }
+                | sql::LogicalPlan::Delete {
+                    table_name,
+                    returning: Some(items),
+                    ..
+                } => {
+                    let schema = self.storage.catalog().get_table_schema(table_name)?;
+                    Self::returning_schema(&schema, items)
+                        .columns
+                        .into_iter()
+                        .map(|c| c.name)
+                        .collect()
+                }
+                _ => Vec::new(),
+            };
+            let (_count, returned) = self.execute_plan_with_params(&plan, params, Some(&txn))?;
+            return Ok((returned, columns));
+        }
+
+        let mut executor = sql::Executor::with_storage(&self.storage)
+            .with_timeout(self.config.storage.query_timeout_ms)
+            .with_parameters(params.to_vec())
+            .with_transaction(&txn);
+        executor.execute_with_columns(&plan)
+    }
+
     /// Session-transaction variant of the parameterized fast INSERT path:
     /// stages the row in the session transaction's write set without going
     /// through the parser/planner. Concurrent session transactions stay
