@@ -645,8 +645,25 @@ where
             return Ok(());
         } else if starts_with_icase(trimmed, "SET ")
             && !starts_with_icase(trimmed, "SET TRANSACTION")
-            && !starts_with_icase(trimmed, "SET SESSION")
+            && !starts_with_icase(trimmed, "SET SESSION CHARACTERISTICS")
         {
+            // R1.3-p2: session-scoped synchronous_commit (PG-compatible).
+            match EmbeddedDatabase::parse_synchronous_commit_statement(trimmed) {
+                Ok(Some(value)) => {
+                    if let Err(e) = self.database.set_session_synchronous_commit(self.session_id, value) {
+                        self.send_error("ERROR", "22023", &e.to_string(), None, None).await?;
+                        return Ok(());
+                    }
+                    self.send_command_complete("SET").await?;
+                    self.send_ready_for_query().await?;
+                    return Ok(());
+                }
+                Err(e) => {
+                    self.send_error("ERROR", "22023", &e.to_string(), None, None).await?;
+                    return Ok(());
+                }
+                Ok(None) => {}
+            }
             if EmbeddedDatabase::is_fk_setting_statement(trimmed) {
                 if let Err(e) = self.database.execute(trimmed) {
                     self.send_error("ERROR", "22023", &e.to_string(), None, None).await?;
@@ -657,10 +674,33 @@ where
             self.send_command_complete("SET").await?;
             self.send_ready_for_query().await?;
             return Ok(());
+        } else if starts_with_icase(trimmed, "RESET ")
+            && trimmed[6..].trim().trim_end_matches(';').trim().eq_ignore_ascii_case("synchronous_commit")
+        {
+            // R1.3-p2: back to the storage.durable_commit default.
+            if let Err(e) = self.database.set_session_synchronous_commit(self.session_id, None) {
+                self.send_error("ERROR", "22023", &e.to_string(), None, None).await?;
+                return Ok(());
+            }
+            self.send_command_complete("RESET").await?;
+            self.send_ready_for_query().await?;
+            return Ok(());
         } else if starts_with_icase(trimmed, "SHOW ") && !crate::sql::Parser::is_show_branches(trimmed) {
             // Handle SHOW commands for client compatibility
             let param = trimmed[5..].trim().trim_end_matches(';').trim();
-            let (col_name, value) = Self::resolve_show_parameter(param);
+            let (col_name, value) = if param.eq_ignore_ascii_case("synchronous_commit") {
+                // R1.3-p2: effective per-session value.
+                let effective = self
+                    .database
+                    .session_synchronous_commit_effective(self.session_id)
+                    .unwrap_or(false);
+                (
+                    "synchronous_commit".to_string(),
+                    if effective { "on".to_string() } else { "off".to_string() },
+                )
+            } else {
+                Self::resolve_show_parameter(param)
+            };
             let schema = Schema::new(vec![crate::Column::new(&col_name, crate::DataType::Text)]);
             let row = Tuple::new(vec![Value::String(value)]);
             let rows = vec![row];
