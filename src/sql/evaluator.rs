@@ -3138,7 +3138,7 @@ impl Evaluator {
     }
 
     /// Evaluate a binary operation
-    fn evaluate_binary_op(&self, left: &Value, op: &super::BinaryOperator, right: &Value) -> Result<Value> {
+    pub(crate) fn evaluate_binary_op(&self, left: &Value, op: &super::BinaryOperator, right: &Value) -> Result<Value> {
         use super::BinaryOperator;
 
         match op {
@@ -3233,7 +3233,7 @@ impl Evaluator {
     }
 
     /// Evaluate a unary operation
-    fn evaluate_unary_op(&self, op: &super::UnaryOperator, value: &Value) -> Result<Value> {
+    pub(crate) fn evaluate_unary_op(&self, op: &super::UnaryOperator, value: &Value) -> Result<Value> {
         use super::UnaryOperator;
 
         match op {
