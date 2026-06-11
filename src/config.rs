@@ -253,6 +253,13 @@ pub struct StorageConfig {
     /// INSERT/UPDATE/DELETE, including a per-statement fsync.
     #[serde(default)]
     pub logical_wal_per_statement: bool,
+    /// R1.3: fsync the RocksDB WriteBatch at transaction COMMIT, making
+    /// commits power-loss durable. RocksDB's leader/follower write groups
+    /// amortize one fsync across concurrent committers, so durable-commit
+    /// throughput scales with connection count. Default false (process-
+    /// crash-safe commits, matching the historical contract); flip per
+    /// deployment when power-loss durability is required.
+    pub durable_commit: bool,
 }
 
 fn default_slow_query_threshold() -> Option<u64> {
@@ -278,6 +285,7 @@ impl Default for StorageConfig {
             transaction_isolation: TransactionIsolation::ReadCommitted, // PostgreSQL default
             slow_query_threshold_ms: Some(1000), // 1 second default
             logical_wal_per_statement: false, // rely on RocksDB WAL at commit (see field docs)
+            durable_commit: false,
         }
     }
 }

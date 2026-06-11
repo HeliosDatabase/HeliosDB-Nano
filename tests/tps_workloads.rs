@@ -1410,3 +1410,67 @@ fn run_returning_bench() {
         }
     }
 }
+
+/// Durable-commit scaling benchmark (R1.3 probe).
+///
+/// Measures BEGIN;INSERT;COMMIT cycles on disk with power-loss-durable
+/// commits (storage.durable_commit = fsync per commit WriteBatch) at 1/8/32
+/// concurrent sessions, against the non-durable default. If RocksDB's
+/// leader/follower write groups amortize the fsync, durable throughput
+/// scales with the session count instead of being fsync-bound per commit.
+///
+///   HELIOS_DURABLE=1 cargo test --profile perf --test tps_workloads run_durable_commit_bench -- --nocapture --test-threads=1
+#[test]
+fn run_durable_commit_bench() {
+    if std::env::var("HELIOS_DURABLE").is_err() {
+        eprintln!("skipping run_durable_commit_bench (set HELIOS_DURABLE=1)");
+        return;
+    }
+    use heliosdb_nano::session::IsolationLevel;
+    let cycles: usize = std::env::var("HELIOS_DURABLE_M")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100);
+
+    for durable in [false, true] {
+        let tmp = std::env::temp_dir().join(format!("helios_dur_{}_{durable}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let mut c = Config::default();
+        c.storage.path = Some(tmp.clone());
+        c.storage.memory_only = false;
+        c.storage.wal_enabled = true;
+        c.storage.durable_commit = durable;
+        let db = EmbeddedDatabase::with_config(c).unwrap();
+        db.execute("CREATE TABLE d (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+
+        for &threads in &[1usize, 8, 16, 24, 32] {
+            let start = Instant::now();
+            std::thread::scope(|s| {
+                for t in 0..threads {
+                    let dbr = &db;
+                    let base = 1_000_000 * (threads) + t * cycles + if durable { 50_000_000 } else { 0 };
+                    s.spawn(move || {
+                        let sid = dbr
+                            .create_session(&format!("dur_u{t}"), IsolationLevel::ReadCommitted)
+                            .unwrap();
+                        for i in 0..cycles {
+                            dbr.begin_transaction_for_session(sid).unwrap();
+                            dbr.execute_in_session(sid, &format!("INSERT INTO d (id, v) VALUES ({}, 1)", base + i))
+                                .unwrap();
+                            dbr.commit_transaction_for_session(sid).unwrap();
+                        }
+                        dbr.destroy_session(sid).unwrap();
+                    });
+                }
+            });
+            let total = threads * cycles;
+            println!(
+                "durable={durable:<5} {threads:>2}T   {:>10.0} txn/s  ({total} commits)",
+                total as f64 / start.elapsed().as_secs_f64()
+            );
+        }
+        drop(db);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+    println!();
+}

@@ -110,6 +110,8 @@ pub struct Transaction {
     /// Disabled only for `memory_only` databases, where durability is not a
     /// contract and the temporary RocksDB directory is discarded on close.
     rocksdb_wal_enabled: bool,
+    /// R1.3: fsync the commit WriteBatch (power-loss durable commits).
+    sync_commit: bool,
     /// Write-write conflict registry (R0.2). When present, commits record
     /// their write-set keys; when `conflict_validation` is also set, commit
     /// aborts with a serialization failure if any key was committed after
@@ -168,6 +170,7 @@ impl Transaction {
             dirty_tracker: None,
             versioning_enabled: true,
             rocksdb_wal_enabled: true,
+            sync_commit: false,
             conflict_registry: None,
             conflict_validation: false,
         })
@@ -177,6 +180,11 @@ impl Transaction {
     /// Set by the engine from `StorageConfig::time_travel_enabled`.
     pub fn set_versioning_enabled(&mut self, enabled: bool) {
         self.versioning_enabled = enabled;
+    }
+
+    /// R1.3: request a synced (power-loss durable) commit WriteBatch.
+    pub fn set_sync_commit(&mut self, enabled: bool) {
+        self.sync_commit = enabled;
     }
 
     pub fn set_rocksdb_wal_enabled(&mut self, enabled: bool) {
@@ -221,6 +229,7 @@ impl Transaction {
             dirty_tracker: Some(dirty_tracker),
             versioning_enabled: true,
             rocksdb_wal_enabled: true,
+            sync_commit: false,
             conflict_registry: None,
             conflict_validation: false,
         })
@@ -661,7 +670,15 @@ impl Transaction {
         }
 
         let result = if self.rocksdb_wal_enabled {
-            self.db.write(batch)
+            if self.sync_commit {
+                // R1.3: one fsync per commit; RocksDB write groups amortize
+                // it across concurrent committers.
+                let mut write_opts = WriteOptions::default();
+                write_opts.set_sync(true);
+                self.db.write_opt(batch, &write_opts)
+            } else {
+                self.db.write(batch)
+            }
         } else {
             let mut write_opts = WriteOptions::default();
             write_opts.set_sync(false);
