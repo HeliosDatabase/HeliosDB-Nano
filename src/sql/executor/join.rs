@@ -31,6 +31,157 @@ pub struct NestedLoopJoinOperator {
     right_matched: Vec<bool>,       // Which right tuples have been matched?
     emitting_unmatched_right: bool, // Are we emitting unmatched right tuples?
     unmatched_right_index: usize,   // Index into right_tuples for unmatched emission
+    // R3.5 item 4: when true, the ON condition can be evaluated against a
+    // borrowed (left, right) pair view without materializing the combined
+    // tuple — output is allocated only for matching pairs.
+    condition_pair_evaluable: bool,
+}
+
+/// Borrowed (left, right) tuple pair, indexed as if the two value vectors
+/// were concatenated — the shape `NestedLoopJoinOperator` previously
+/// materialized (with two full `Vec<Value>` clones) for EVERY probed pair
+/// just to evaluate the ON condition (R3.5 item 4).
+struct PairView<'a> {
+    left: &'a Tuple,
+    right: &'a Tuple,
+}
+
+impl PairView<'_> {
+    fn get(&self, index: usize) -> Option<&crate::Value> {
+        let split = self.left.values.len();
+        if index < split {
+            self.left.get(index)
+        } else {
+            self.right.get(index - split)
+        }
+    }
+}
+
+/// Can `expr` be evaluated by [`eval_condition_on_pair`]? Decided ONCE at
+/// operator construction on the *bound* condition. Anything outside the
+/// supported set (subqueries, CASE, functions, parameters, unresolved
+/// columns, row constructors…) keeps the materialize-then-evaluate path,
+/// byte-identical to the previous behavior.
+fn pair_evaluable(expr: &crate::sql::LogicalExpr) -> bool {
+    use crate::sql::LogicalExpr;
+    match expr {
+        LogicalExpr::Literal(_) | LogicalExpr::BoundColumn { .. } => true,
+        LogicalExpr::BinaryExpr { left, op: _, right } => {
+            // Row-constructor comparisons `(a,b) < (c,d)` are intercepted
+            // structurally by the full evaluator — leave them on the
+            // fallback path.
+            !matches!(left.as_ref(), LogicalExpr::Tuple { .. })
+                && !matches!(right.as_ref(), LogicalExpr::Tuple { .. })
+                && pair_evaluable(left)
+                && pair_evaluable(right)
+        }
+        LogicalExpr::UnaryExpr { expr, .. } | LogicalExpr::IsNull { expr, .. } => pair_evaluable(expr),
+        _ => false,
+    }
+}
+
+/// Evaluate a pair-evaluable ON condition against a borrowed pair view,
+/// mirroring `Evaluator::evaluate` semantics exactly (including SQL
+/// three-valued AND/OR short-circuit and its error messages) while only
+/// cloning the individual column values the condition actually touches.
+fn eval_condition_on_pair(
+    evaluator: &crate::sql::Evaluator,
+    expr: &crate::sql::LogicalExpr,
+    pair: &PairView<'_>,
+) -> Result<crate::Value> {
+    use crate::sql::{BinaryOperator, LogicalExpr};
+    use crate::Value;
+    match expr {
+        LogicalExpr::Literal(value) => Ok(value.clone()),
+        LogicalExpr::BoundColumn { index, .. } => pair
+            .get(*index)
+            .cloned()
+            .ok_or_else(|| Error::query_execution(format!("Column index {} out of bounds in tuple", index))),
+        LogicalExpr::BinaryExpr { left, op, right } => match op {
+            BinaryOperator::And => {
+                let left_val = eval_condition_on_pair(evaluator, left, pair)?;
+                match &left_val {
+                    Value::Boolean(false) => Ok(Value::Boolean(false)),
+                    Value::Boolean(true) => {
+                        let right_val = eval_condition_on_pair(evaluator, right, pair)?;
+                        match &right_val {
+                            Value::Boolean(b) => Ok(Value::Boolean(*b)),
+                            Value::Null => Ok(Value::Null),
+                            _ => Err(Error::query_execution(format!(
+                                "Cannot convert {:?} to boolean",
+                                right_val
+                            ))),
+                        }
+                    }
+                    Value::Null => {
+                        let right_val = eval_condition_on_pair(evaluator, right, pair)?;
+                        match &right_val {
+                            Value::Boolean(false) => Ok(Value::Boolean(false)),
+                            Value::Boolean(true) | Value::Null => Ok(Value::Null),
+                            _ => Err(Error::query_execution(format!(
+                                "Cannot convert {:?} to boolean",
+                                right_val
+                            ))),
+                        }
+                    }
+                    _ => Err(Error::query_execution(format!(
+                        "Cannot convert {:?} to boolean",
+                        left_val
+                    ))),
+                }
+            }
+            BinaryOperator::Or => {
+                let left_val = eval_condition_on_pair(evaluator, left, pair)?;
+                match &left_val {
+                    Value::Boolean(true) => Ok(Value::Boolean(true)),
+                    Value::Boolean(false) => {
+                        let right_val = eval_condition_on_pair(evaluator, right, pair)?;
+                        match &right_val {
+                            Value::Boolean(b) => Ok(Value::Boolean(*b)),
+                            Value::Null => Ok(Value::Null),
+                            _ => Err(Error::query_execution(format!(
+                                "Cannot convert {:?} to boolean",
+                                right_val
+                            ))),
+                        }
+                    }
+                    Value::Null => {
+                        let right_val = eval_condition_on_pair(evaluator, right, pair)?;
+                        match &right_val {
+                            Value::Boolean(true) => Ok(Value::Boolean(true)),
+                            Value::Boolean(false) | Value::Null => Ok(Value::Null),
+                            _ => Err(Error::query_execution(format!(
+                                "Cannot convert {:?} to boolean",
+                                right_val
+                            ))),
+                        }
+                    }
+                    _ => Err(Error::query_execution(format!(
+                        "Cannot convert {:?} to boolean",
+                        left_val
+                    ))),
+                }
+            }
+            _ => {
+                let left_val = eval_condition_on_pair(evaluator, left, pair)?;
+                let right_val = eval_condition_on_pair(evaluator, right, pair)?;
+                evaluator.evaluate_binary_op(&left_val, op, &right_val)
+            }
+        },
+        LogicalExpr::UnaryExpr { op, expr } => {
+            let val = eval_condition_on_pair(evaluator, expr, pair)?;
+            evaluator.evaluate_unary_op(op, &val)
+        }
+        LogicalExpr::IsNull { expr, is_null } => {
+            let val = eval_condition_on_pair(evaluator, expr, pair)?;
+            Ok(Value::Boolean(matches!(val, Value::Null) == *is_null))
+        }
+        // Unreachable: gated by pair_evaluable at construction.
+        other => Err(Error::query_execution(format!(
+            "Internal error: expression not pair-evaluable: {:?}",
+            other
+        ))),
+    }
 }
 
 impl NestedLoopJoinOperator {
@@ -54,6 +205,13 @@ impl NestedLoopJoinOperator {
 
         // Create evaluator with output schema for evaluating join conditions
         let evaluator = crate::sql::Evaluator::new(output_schema.clone());
+
+        // R3.5 items 1+4: bind the ON condition once against the combined
+        // schema (safe here — unlike HashJoin, NLJ evaluates the condition
+        // against the combined shape only), then decide once whether it can
+        // be evaluated against a borrowed pair view without materializing.
+        let on_condition = on_condition.map(|condition| evaluator.bind(condition));
+        let condition_pair_evaluable = on_condition.as_ref().map(pair_evaluable).unwrap_or(false);
 
         // Materialize all right tuples upfront (with timeout checking)
         let mut right_tuples = Vec::new();
@@ -83,6 +241,7 @@ impl NestedLoopJoinOperator {
             right_matched: vec![false; right_count],
             emitting_unmatched_right: false,
             unmatched_right_index: 0,
+            condition_pair_evaluable,
         })
     }
 
@@ -136,18 +295,32 @@ impl PhysicalOperator for NestedLoopJoinOperator {
                     .ok_or_else(|| Error::query_execution("Right tuple index out of bounds"))?;
                 self.right_index += 1;
 
-                // Combine left and right tuples
                 let left_tuple = self
                     .left_tuple
                     .as_ref()
                     .ok_or_else(|| Error::query_execution("Left tuple unexpectedly None"))?;
-                let mut combined_values = left_tuple.values.clone();
-                combined_values.extend(right_tuple.values.clone());
-                let combined_tuple = Tuple::new(combined_values);
 
-                // Check join condition
+                // Check the join condition. R3.5 item 4: for pair-evaluable
+                // conditions, evaluate against a borrowed (left, right) view
+                // — the combined tuple is allocated ONLY for matching pairs.
+                // `materialized` carries the combined tuple when the fallback
+                // path had to build one, so a match doesn't re-combine.
+                let mut materialized: Option<Tuple> = None;
                 let matches = if let Some(condition) = &self.on_condition {
-                    let result = self.evaluator.evaluate(condition, &combined_tuple)?;
+                    let result = if self.condition_pair_evaluable {
+                        let pair = PairView {
+                            left: left_tuple,
+                            right: right_tuple,
+                        };
+                        eval_condition_on_pair(&self.evaluator, condition, &pair)?
+                    } else {
+                        let mut combined_values = left_tuple.values.clone();
+                        combined_values.extend(right_tuple.values.iter().cloned());
+                        let combined_tuple = Tuple::new(combined_values);
+                        let result = self.evaluator.evaluate(condition, &combined_tuple)?;
+                        materialized = Some(combined_tuple);
+                        result
+                    };
                     match result {
                         crate::Value::Boolean(b) => b,
                         _ => false,
@@ -158,6 +331,16 @@ impl PhysicalOperator for NestedLoopJoinOperator {
                 };
 
                 if matches {
+                    let combined_tuple = match materialized {
+                        Some(tuple) => tuple,
+                        None => {
+                            let mut combined_values =
+                                Vec::with_capacity(left_tuple.values.len() + right_tuple.values.len());
+                            combined_values.extend_from_slice(&left_tuple.values);
+                            combined_values.extend_from_slice(&right_tuple.values);
+                            Tuple::new(combined_values)
+                        }
+                    };
                     self.left_matched = true;
                     // Mark right tuple as matched (for RIGHT/FULL joins)
                     if matches!(self.join_type, JoinType::Right | JoinType::Full) {
@@ -753,6 +936,9 @@ fn collect_join_input_expr_columns_inner(
         | LogicalExpr::Exists { .. }
         | LogicalExpr::NewRow { .. }
         | LogicalExpr::OldRow { .. } => None,
+        // Physical-only node (R3.5): never present in plan expressions, which
+        // is what this collector walks. Fall back to the old path if seen.
+        LogicalExpr::BoundColumn { .. } => None,
     }
 }
 

@@ -254,8 +254,9 @@ pub trait PhysicalOperator {
 pub struct CteData {
     /// CTE name
     pub name: String,
-    /// Materialized tuples
-    pub tuples: Vec<Tuple>,
+    /// Materialized tuples, `Arc`-shared so each CTE reference serves the
+    /// same materialization instead of deep-cloning it (R3.5 item 5)
+    pub tuples: Arc<Vec<Tuple>>,
     /// Schema of the CTE
     pub schema: Arc<Schema>,
 }
@@ -3025,7 +3026,7 @@ impl<'a> Executor<'a> {
                         // First iteration: register empty CTE, then execute to get base results
                         self.add_cte(CteData {
                             name: cte_name.clone(),
-                            tuples: vec![],
+                            tuples: Arc::new(vec![]),
                             schema: cte_schema.clone(),
                         });
 
@@ -3045,7 +3046,7 @@ impl<'a> Executor<'a> {
                             // Update the CTE with the working table (new_tuples from last iteration)
                             self.add_cte(CteData {
                                 name: cte_name.clone(),
-                                tuples: new_tuples.clone(),
+                                tuples: Arc::new(new_tuples.clone()),
                                 schema: cte_schema.clone(),
                             });
 
@@ -3073,7 +3074,7 @@ impl<'a> Executor<'a> {
                         // Store final results
                         self.add_cte(CteData {
                             name: cte_name.clone(),
-                            tuples: all_tuples,
+                            tuples: Arc::new(all_tuples),
                             schema: cte_schema,
                         });
                     } else {
@@ -3087,7 +3088,7 @@ impl<'a> Executor<'a> {
                         // Store the CTE in context for later lookup during scans
                         self.add_cte(CteData {
                             name: cte_name.clone(),
-                            tuples,
+                            tuples: Arc::new(tuples),
                             schema: cte_schema,
                         });
                     }
