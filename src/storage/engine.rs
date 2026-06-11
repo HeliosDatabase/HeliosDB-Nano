@@ -7,7 +7,7 @@
 
 use super::art_manager::ArtIndexManager;
 use super::bloom_filter::TableBloomFilters;
-use super::columnar::{ColumnBatch, ColumnarStore, BATCH_SIZE};
+use super::columnar::{BatchStats, ColumnBatch, ColumnarStore, BATCH_SIZE};
 use super::content_addr::ContentAddressedStore;
 use super::dictionary::DictionaryManager;
 use super::filter_consolidation_worker::{ConsolidationConfig, FilterConsolidationWorker};
@@ -87,6 +87,159 @@ fn columnar_filter_predicate(predicate: &AnalyzedPredicate) -> Option<FilterPred
             _ => None,
         },
     })
+}
+
+/// R3.1 kill switch for zone-map batch pruning on columnar reads.
+/// `HELIOS_ZONE_MAP_OFF` restores the eager pre-R3.1 read path (stats are
+/// still written on every store so the sidecar stays fresh either way).
+fn zone_map_pruning_enabled() -> bool {
+    static ZONE_MAP_OFF: once_cell::sync::Lazy<bool> =
+        once_cell::sync::Lazy::new(|| std::env::var("HELIOS_ZONE_MAP_OFF").is_ok());
+    !*ZONE_MAP_OFF
+}
+
+/// R3.1: can any slot of a batch with these zone stats satisfy `predicate`?
+///
+/// Returns `false` only when the batch is PROVABLY disjoint from the
+/// predicate — i.e. no slot (NULL or otherwise) can pass
+/// `FilterPredicate::evaluate`. A fresh function rather than an adaptation of
+/// `BlockZoneSummary::can_satisfy` (columnar_zone_summary.rs) for two
+/// reasons: (a) the columnar read paths hold `FilterPredicate`s, while
+/// `can_satisfy` takes `AnalyzedPredicate`s plus a per-column
+/// `HashMap<String, ColumnZoneSummary>` that would have to be allocated per
+/// batch per check; (b) pruning must mirror `FilterPredicate::evaluate`
+/// EXACTLY (it decides whole batches), so it reuses that type's own
+/// comparators (`compare_eq/lt/gt`) instead of `ColumnZoneSummary`'s parallel
+/// value comparison code. The Impossible-case logic itself follows
+/// `BlockZoneSummary::evaluate_predicate_against_summary`.
+///
+/// NULL handling: deleted rows are stored as `Value::Null` and rows beyond a
+/// batch's value vector read as NULL, so when the batch contains NULL slots
+/// and the predicate accepts NULL (e.g. IS NULL, != under simd-filter
+/// semantics) the batch must be kept regardless of min/max.
+pub(crate) fn batch_can_match(stats: &BatchStats, predicate: &FilterPredicate) -> bool {
+    if stats.null_count > 0 && predicate.evaluate(&Value::Null) {
+        return true;
+    }
+    if stats.null_count >= stats.row_count {
+        // Every slot is NULL and NULL does not match (checked above).
+        return false;
+    }
+    let (Some(min), Some(max)) = (&stats.min, &stats.max) else {
+        // Unorderable batch (unsupported type, mixed families, NaN): no
+        // min/max pruning. NULL-only pruning above still applies.
+        return true;
+    };
+
+    let lt = FilterPredicate::compare_lt;
+    let gt = FilterPredicate::compare_gt;
+    let eq = FilterPredicate::compare_eq;
+    let value = &predicate.value;
+
+    match predicate.op {
+        // value outside [min, max] -> impossible
+        FilterOp::Eq => !(lt(value, min) || gt(value, max)),
+        // only impossible when every value equals the excluded one
+        FilterOp::NotEq => !(eq(min, max) && eq(value, min)),
+        // col < v: impossible when v <= min
+        FilterOp::Lt => !(lt(value, min) || eq(value, min)),
+        // col <= v: impossible when v < min
+        FilterOp::LtEq => !lt(value, min),
+        // col > v: impossible when v >= max
+        FilterOp::Gt => !(gt(value, max) || eq(value, max)),
+        // col >= v: impossible when v > max
+        FilterOp::GtEq => !gt(value, max),
+        FilterOp::Between => match &predicate.value2 {
+            // [low, high] disjoint from [min, max] -> impossible
+            Some(high) => !(lt(high, min) || gt(value, max)),
+            // evaluate() rejects every value when value2 is missing
+            None => false,
+        },
+        FilterOp::NotBetween => match &predicate.value2 {
+            // impossible only when [min, max] provably lies inside [low, high]
+            Some(high) => !((gt(min, value) || eq(min, value)) && (lt(max, high) || eq(max, high))),
+            // evaluate() accepts every value when value2 is missing
+            None => true,
+        },
+        // impossible when every IN candidate is outside [min, max]
+        // (empty list matches nothing -> prune)
+        FilterOp::In => predicate
+            .value_list
+            .iter()
+            .any(|item| !(lt(item, min) || gt(item, max))),
+        // only impossible when every value equals one excluded candidate
+        FilterOp::NotIn => !(eq(min, max) && predicate.value_list.iter().any(|item| eq(item, min))),
+        // non-null slots exist but none can be NULL
+        FilterOp::IsNull => false,
+        // null_count < row_count, so non-null slots exist
+        FilterOp::IsNotNull => true,
+        // no prefix analysis: never prune on pattern matches
+        FilterOp::Like | FilterOp::NotLike => true,
+    }
+}
+
+/// R3.1: compute the set of batch ids that provably cannot satisfy the pushed
+/// predicate conjunction, by evaluating each predicate against its column's
+/// `colz:` zone-stats sidecar. Best-effort: stats load failures and batches
+/// without stats simply do not prune. Batch ids are shared across columns
+/// (`row_id / BATCH_SIZE`), so a batch pruned via ANY predicate column
+/// excludes that id for every column of the scan.
+fn compute_zone_pruned_batches(
+    db: &DB,
+    table_name: &str,
+    schema: &crate::Schema,
+    predicates: &[FilterPredicate],
+) -> HashSet<u64> {
+    let mut pruned = HashSet::new();
+    if predicates.is_empty() || !zone_map_pruning_enabled() {
+        return pruned;
+    }
+
+    let mut by_column: HashMap<usize, Vec<&FilterPredicate>> = HashMap::new();
+    for predicate in predicates {
+        by_column.entry(predicate.column_index).or_default().push(predicate);
+    }
+
+    for (column_index, column_predicates) in by_column {
+        let Some(column) = schema.columns.get(column_index) else {
+            continue;
+        };
+        if column.storage_mode != ColumnStorageMode::Columnar {
+            continue;
+        }
+        let stats_map = match ColumnarStore::load_stats_map(db, table_name, &column.name) {
+            Ok(map) => map,
+            Err(e) => {
+                tracing::warn!(table = table_name, column = column.name.as_str(), error = %e,
+                    "Zone-stats load failed; scanning column unpruned");
+                continue;
+            }
+        };
+        for (batch_id, stats) in &stats_map {
+            if column_predicates.iter().any(|predicate| !batch_can_match(stats, predicate)) {
+                pruned.insert(*batch_id);
+            }
+        }
+    }
+
+    pruned
+}
+
+/// R3.1: load one column's batches as a `ColumnarBatchIndex`, skipping pruned
+/// batch ids (lazily — pruned batches are not fetched or decoded). With the
+/// kill switch engaged this is exactly the pre-R3.1 eager scan.
+fn load_columnar_batch_index(
+    db: &DB,
+    table_name: &str,
+    column_name: &str,
+    pruned: &HashSet<u64>,
+) -> Result<ColumnarBatchIndex> {
+    let batches = if zone_map_pruning_enabled() {
+        ColumnarStore::scan_column_batches_pruned(db, table_name, column_name, pruned)?
+    } else {
+        ColumnarStore::scan_column_batches(db, table_name, column_name)?
+    };
+    Ok(ColumnarBatchIndex::from_batches(batches))
 }
 
 enum ColumnarBatchIndex {
@@ -3182,11 +3335,17 @@ impl StorageEngine {
             })
             .collect::<Result<Vec<_>>>()?;
 
+        // R3.1: zone-map pruning — batches provably disjoint from the pushed
+        // predicates are skipped before any batch fetch/decode.
+        let pruned = compute_zone_pruned_batches(&self.db, table_name, schema, filter_predicates);
+
         let mut column_batches: HashMap<usize, ColumnarBatchIndex> = HashMap::with_capacity(columnar_requested.len());
         for &idx in &columnar_requested {
             let column = &schema.columns[idx];
-            let batches = ColumnarStore::scan_column_batches(&self.db, table_name, &column.name)?;
-            column_batches.insert(idx, ColumnarBatchIndex::from_batches(batches));
+            column_batches.insert(
+                idx,
+                load_columnar_batch_index(&self.db, table_name, &column.name, &pruned)?,
+            );
         }
 
         let prefix = format!("data:{}:", table_name);
@@ -3209,6 +3368,12 @@ impl StorageEngine {
             };
             let batch_id = row_id / BATCH_SIZE as u64;
             let offset = (row_id % BATCH_SIZE as u64) as usize;
+            // R3.1: rows in pruned batches provably fail the predicate
+            // conjunction (their batches were not loaded, so the NULL
+            // fallback below must not see them).
+            if pruned.contains(&batch_id) {
+                continue;
+            }
             if !columnar_row_matches_filters(&column_batches, batch_id, offset, filter_predicates) {
                 continue;
             }
@@ -3771,11 +3936,17 @@ impl StorageEngine {
             return Ok(None);
         }
 
+        // R3.1: prune provably-disjoint batches before fetching any column
+        // (the driver-batch loop below then iterates surviving batches only).
+        let pruned = compute_zone_pruned_batches(&self.db, table_name, schema, &filter_predicates);
+
         let mut column_batches: HashMap<usize, ColumnarBatchIndex> = HashMap::with_capacity(requested.len());
         for &idx in &requested {
             let column = &schema.columns[idx];
-            let batches = ColumnarStore::scan_column_batches(&self.db, table_name, &column.name)?;
-            column_batches.insert(idx, ColumnarBatchIndex::from_batches(batches));
+            column_batches.insert(
+                idx,
+                load_columnar_batch_index(&self.db, table_name, &column.name, &pruned)?,
+            );
         }
 
         if let Some(driver_predicate) = null_rejecting_filter_predicate(&filter_predicates)
@@ -3839,6 +4010,10 @@ impl StorageEngine {
             };
             let batch_id = row_id / BATCH_SIZE as u64;
             let offset = (row_id % BATCH_SIZE as u64) as usize;
+            // R3.1: rows in pruned batches provably fail the predicates.
+            if pruned.contains(&batch_id) {
+                continue;
+            }
             if !columnar_row_matches_filters(&column_batches, batch_id, offset, &filter_predicates) {
                 continue;
             }
@@ -3884,18 +4059,23 @@ impl StorageEngine {
             }
         }
 
-        let mut column_batches: HashMap<usize, ColumnarBatchIndex> = HashMap::with_capacity(requested.len());
-        for &idx in &requested {
-            let column = &schema.columns[idx];
-            let batches = ColumnarStore::scan_column_batches(&self.db, table_name, &column.name)?;
-            column_batches.insert(idx, ColumnarBatchIndex::from_batches(batches));
-        }
-
         let filter_predicates: Vec<FilterPredicate> = predicates
             .iter()
             .filter(|predicate| requested.binary_search(&predicate.column_index).is_ok())
             .filter_map(columnar_filter_predicate)
             .collect();
+
+        // R3.1: prune provably-disjoint batches before fetching any column.
+        let pruned = compute_zone_pruned_batches(&self.db, table_name, schema, &filter_predicates);
+
+        let mut column_batches: HashMap<usize, ColumnarBatchIndex> = HashMap::with_capacity(requested.len());
+        for &idx in &requested {
+            let column = &schema.columns[idx];
+            column_batches.insert(
+                idx,
+                load_columnar_batch_index(&self.db, table_name, &column.name, &pruned)?,
+            );
+        }
 
         let prefix = format!("data:{}:", table_name);
         let prefix_bytes = prefix.as_bytes();
@@ -3916,6 +4096,10 @@ impl StorageEngine {
             };
             let batch_id = row_id / BATCH_SIZE as u64;
             let offset = (row_id % BATCH_SIZE as u64) as usize;
+            // R3.1: rows in pruned batches provably fail the predicates.
+            if pruned.contains(&batch_id) {
+                continue;
+            }
             if !columnar_row_matches_filters(&column_batches, batch_id, offset, &filter_predicates) {
                 continue;
             }
@@ -3979,14 +4163,22 @@ impl StorageEngine {
             }
         }
 
+        let filter_predicates: Vec<FilterPredicate> = predicates.iter().filter_map(columnar_filter_predicate).collect();
+
+        // R3.1: prune provably-disjoint batches before fetching any column.
+        // This composes with the R3.2 parallel paths below: the driver-batch
+        // chunking and per-shard row walks all operate on the already-pruned
+        // batch set.
+        let pruned = compute_zone_pruned_batches(&self.db, table_name, schema, &filter_predicates);
+
         let mut column_batches: HashMap<usize, ColumnarBatchIndex> = HashMap::with_capacity(requested.len());
         for &idx in &requested {
             let column = &schema.columns[idx];
-            let batches = ColumnarStore::scan_column_batches(&self.db, table_name, &column.name)?;
-            column_batches.insert(idx, ColumnarBatchIndex::from_batches(batches));
+            column_batches.insert(
+                idx,
+                load_columnar_batch_index(&self.db, table_name, &column.name, &pruned)?,
+            );
         }
-
-        let filter_predicates: Vec<FilterPredicate> = predicates.iter().filter_map(columnar_filter_predicate).collect();
 
         if let Some(tuples) = self.try_aggregate_columnar_group_count_sum_int(
             table_name,
@@ -3995,6 +4187,7 @@ impl StorageEngine {
             aggregates,
             &filter_predicates,
             &column_batches,
+            &pruned,
         )? {
             tracing::debug!(
                 phase = "storage_columnar_aggregate",
@@ -4328,6 +4521,10 @@ impl StorageEngine {
                         };
                         let batch_id = row_id / BATCH_SIZE as u64;
                         let offset = (row_id % BATCH_SIZE as u64) as usize;
+                        // R3.1: rows in pruned batches provably fail the predicates.
+                        if pruned.contains(&batch_id) {
+                            continue;
+                        }
                         if !columnar_row_matches_filters(&column_batches, batch_id, offset, &filter_predicates) {
                             continue;
                         }
@@ -4360,6 +4557,10 @@ impl StorageEngine {
 
                     let batch_id = row_id / BATCH_SIZE as u64;
                     let offset = (row_id % BATCH_SIZE as u64) as usize;
+                    // R3.1: rows in pruned batches provably fail the predicates.
+                    if pruned.contains(&batch_id) {
+                        continue;
+                    }
                     if !columnar_row_matches_filters(&column_batches, batch_id, offset, &filter_predicates) {
                         continue;
                     }
@@ -4408,6 +4609,10 @@ impl StorageEngine {
                         };
                         let batch_id = row_id / BATCH_SIZE as u64;
                         let offset = (row_id % BATCH_SIZE as u64) as usize;
+                        // R3.1: rows in pruned batches provably fail the predicates.
+                        if pruned.contains(&batch_id) {
+                            continue;
+                        }
                         if !columnar_row_matches_filters(&column_batches, batch_id, offset, &filter_predicates) {
                             continue;
                         }
@@ -4444,6 +4649,10 @@ impl StorageEngine {
 
                 let batch_id = row_id / BATCH_SIZE as u64;
                 let offset = (row_id % BATCH_SIZE as u64) as usize;
+                // R3.1: rows in pruned batches provably fail the predicates.
+                if pruned.contains(&batch_id) {
+                    continue;
+                }
                 if !columnar_row_matches_filters(&column_batches, batch_id, offset, &filter_predicates) {
                     continue;
                 }
@@ -4521,6 +4730,7 @@ impl StorageEngine {
         Ok(tuples)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn try_aggregate_columnar_group_count_sum_int(
         &self,
         table_name: &str,
@@ -4529,6 +4739,7 @@ impl StorageEngine {
         aggregates: &[ColumnarAggregateSpec],
         filter_predicates: &[FilterPredicate],
         column_batches: &HashMap<usize, ColumnarBatchIndex>,
+        pruned: &HashSet<u64>,
     ) -> Result<Option<Vec<Tuple>>> {
         if group_by_columns.len() != 1 || aggregates.len() != 2 {
             return Ok(None);
@@ -4572,6 +4783,10 @@ impl StorageEngine {
                     };
                     let batch_id = row_id / BATCH_SIZE as u64;
                     let offset = (row_id % BATCH_SIZE as u64) as usize;
+                    // R3.1: rows in pruned batches provably fail the predicates.
+                    if pruned.contains(&batch_id) {
+                        continue;
+                    }
                     if !columnar_row_matches_filters(column_batches, batch_id, offset, filter_predicates) {
                         continue;
                     }
@@ -4607,6 +4822,10 @@ impl StorageEngine {
 
                 let batch_id = row_id / BATCH_SIZE as u64;
                 let offset = (row_id % BATCH_SIZE as u64) as usize;
+                // R3.1: rows in pruned batches provably fail the predicates.
+                if pruned.contains(&batch_id) {
+                    continue;
+                }
                 if !columnar_row_matches_filters(column_batches, batch_id, offset, filter_predicates) {
                     continue;
                 }
