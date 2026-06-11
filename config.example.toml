@@ -15,6 +15,13 @@
 # - "fast":     group_commit, time_travel OFF, durable_commit off — fastest
 #               writes; no AS OF time-travel queries, power loss can lose
 #               recent commits.
+# - "agent":    wal_sync_mode=group_commit, time_travel on — for AI-agent
+#               workloads: branchable sandboxes (CREATE DATABASE BRANCH —
+#               branching is always available; AS OF branch anchors need
+#               time_travel), AS OF time-travel queries, and HNSW vector
+#               search, with group-commit throughput for chatty tool-call
+#               write patterns. Storage values match "balanced"; the named
+#               profile pins the agent feature bundle. See docs/llms.txt.
 # Precedence: a profile only fills in [storage] keys you do NOT set
 # explicitly below — explicit per-field values always win.
 # NOTE: none of the profiles force power-loss durable commits. If you need

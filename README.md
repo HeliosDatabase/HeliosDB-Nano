@@ -304,20 +304,36 @@ inside the tuple. See
 [pagination-performance.html](https://heliosdb.com/pagination-performance.html)
 for measured numbers and reproduction recipe.
 
-## Git-Like Branching
+## Git-Like Branching — Fork-Test-Discard Sandboxes
 
-Isolated copy-on-write branches for dev, test, and A/B experiments.
+Isolated copy-on-write branches: fork the database in an instant, test a
+destructive change (a migration, an experiment, an AI agent's writes) against
+real data, then discard the branch. `main` is never touched. This is the
+recommended pattern for giving every agent run its own sandbox.
 
 ```sql
-CREATE BRANCH staging FROM main;
-USE BRANCH staging;
+CREATE BRANCH agent_run_42 FROM main;
+USE BRANCH agent_run_42;
 
 -- Changes here are invisible to main
 INSERT INTO products (name, price) VALUES ('Test', 0.01);
+UPDATE products SET price = price * 1.1;   -- rehearse the scary change
+SELECT COUNT(*), SUM(price) FROM products; -- validate it
 
-MERGE BRANCH staging INTO main;
-DROP BRANCH staging;
+USE BRANCH main;
+DROP BRANCH agent_run_42;                  -- discard; main never changed
 ```
+
+Branches can also fork from a past point in time:
+`CREATE BRANCH rewind FROM main AS OF TIMESTAMP '2026-06-01 09:00:00'`
+(requires time-travel, which the `agent` profile keeps enabled).
+
+> **Warning — `MERGE BRANCH` is currently unreliable.** `MERGE BRANCH x INTO
+> main` exists, but its three-way conflict detection over-reports and can
+> mis-detect conflicts (the merge-base lookup reads the latest value instead of
+> the historical base). If you do merge, verify the merged rows afterwards;
+> a full fix is tracked (audit C11). Until then, prefer fork-test-discard:
+> re-run the validated SQL on `main` instead of merging the branch.
 
 ## Time-Travel Queries
 
@@ -543,7 +559,23 @@ const { data } = await db.from('products').select('*').lt('price', 50)
 
 ## Agentic Operations (Claude Code, Codex CLI, MCP-aware tools)
 
-HeliosDB-Nano ships an **agentic-operations skill catalogue** — 17 SKILL.md files that give an LLM-driven coding agent a full A→Z catalogue of "verbs" for operating the database (install, connect, schema, DML, transactions, branches, time-travel, backup, vector, code-graph, graph-rag, MCP, server, deploy, observability, migrate). For Codex / generic agents the same content is aggregated at [`AGENTS.md`](AGENTS.md) at the project root.
+**The canonical way for an AI agent to operate Nano is MCP**: build with
+`--features mcp-endpoint`, then `claude mcp add heliosdb -- heliosdb-nano mcp
+serve --data-dir ./mydata` (stdio; HTTP and WebSocket transports also
+available). The agent gets 16 structured tools — query, schema, insert, branch
+create/list/merge, time-travel, hybrid search — instead of building SQL
+strings. See the `heliosdb-nano-mcp` skill for the full catalog and recipes.
+
+For any LLM that ingests a single reference file, [`docs/llms.txt`](docs/llms.txt)
+condenses install, connect, the SQL dialect, vector operators, branch
+sandboxes, time-travel, and the skill catalogue into one agent-readable page.
+
+For agent deployments, set `profile = "agent"` in the config (see
+[config.example.toml](config.example.toml)): group-commit writes plus
+time-travel kept ON, so branchable sandboxes, `AS OF` queries, and vector
+search all work out of the box.
+
+HeliosDB-Nano also ships an **agentic-operations skill catalogue** — 19 SKILL.md files that give an LLM-driven coding agent a full A→Z catalogue of "verbs" for operating the database (install, connect, schema, DML, transactions, branches, time-travel, backup, vector, code-graph, graph-rag, MCP, server, tenant, deploy, observability, migrate).
 
 ```bash
 # After git clone, Claude Code automatically picks up .claude/skills/ in this project.
@@ -557,13 +589,13 @@ Existing `~/.claude/skills/heliosdb-nano-*` directories are backed up to `*.bak.
 
 | Skill | What it covers |
 |-------|---------------|
-| `heliosdb-nano-overview` | Top-level navigation; routes to one of the 16 domain skills |
+| `heliosdb-nano-overview` | Top-level navigation; routes to the domain skills |
 | `heliosdb-nano-install` | crates.io, source, feature flags (code-graph, mcp-endpoint, fips, ha-full…) |
 | `heliosdb-nano-connect` | Embedded library, REPL, PG wire, MySQL wire, Python sqlite3 drop-in, TLS |
 | `heliosdb-nano-schema` | DDL: tables, indexes (B-tree + HNSW), views, triggers, PL/pgSQL |
 | `heliosdb-nano-query` | DML, parameter styles (`?` `$1` `:name` `@name`), `ON CONFLICT`, `RETURNING` |
 | `heliosdb-nano-transactions` | BEGIN/COMMIT/ROLLBACK, savepoints, bulk-load patterns |
-| `heliosdb-nano-branches` | `CREATE/USE/MERGE/DROP DATABASE BRANCH`, `AS OF` clones |
+| `heliosdb-nano-branches` | Fork-test-discard sandboxes: `CREATE/USE/DROP DATABASE BRANCH`, `AS OF` forks |
 | `heliosdb-nano-time-travel` | `SELECT … AS OF TIMESTAMP '…'`, `\snapshots` |
 | `heliosdb-nano-backup` | `dump`/`restore`, compression, append, partial restore, `--dump-schedule` |
 | `heliosdb-nano-vector` | HNSW indexes, `<-> <#> <=>` operators, hybrid search |
@@ -571,9 +603,11 @@ Existing `~/.claude/skills/heliosdb-nano-*` directories are backed up to `*.bak.
 | `heliosdb-nano-graph-rag` | Knowledge graph + RAG ingest pipeline (`graph-rag` feature) |
 | `heliosdb-nano-mcp` | MCP server, 16-tool catalog, stdio/HTTP/WS (`mcp-endpoint` feature) |
 | `heliosdb-nano-server` | Daemon, TLS, auth, HA tier 1/2/3, user management |
+| `heliosdb-nano-tenant` | Multi-tenant isolation modes, tiered plans, RLS policies |
 | `heliosdb-nano-deploy` | Docker, Fly.io, Railway, Render, systemd template |
 | `heliosdb-nano-observability` | Tracing, slow-query log, `/health`, `\stats`, `\optimize`, `\indexes` |
 | `heliosdb-nano-migrate` | sqlite3 / Postgres / MySQL drop-in checklists |
+| `heliosdb-nano-merge-validation` | This repo's 8-phase pre-merge validation methodology (contributors) |
 
 Lookups: [`.claude/skills/_index/verb-map.md`](.claude/skills/_index/verb-map.md) (every CLI flag / REPL meta-command / public Rust API method / MCP tool) · [`.claude/skills/_index/feature-matrix.md`](.claude/skills/_index/feature-matrix.md) (cargo feature ↔ skill).
 

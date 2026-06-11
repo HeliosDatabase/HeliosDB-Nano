@@ -126,16 +126,19 @@ Result: JSON shape with `columns: [...]` + `rows: [[...]]` (or `error: {…}`).
 }
 ```
 
-### Recipe 7: Tool call — branch ops
+### Recipe 7: Tool call — branch sandbox (fork-test-discard)
 ```jsonrpc
 { "name":"heliosdb_branch_create",
   "arguments":{"name":"agent_run_42","parent":"main"} }
 
-// … agent does work …
+// … agent does work on the branch, validates results …
 
-{ "name":"heliosdb_branch_merge",
-  "arguments":{"source":"agent_run_42","target":"main"} }
+// Discard the sandbox when done (no dedicated drop tool — use SQL):
+{ "name":"heliosdb_query",
+  "arguments":{"sql":"DROP DATABASE BRANCH agent_run_42"} }
 ```
+`heliosdb_branch_merge` exists (`{"source":"agent_run_42","target":"main"}`)
+but its conflict detection is currently unreliable — see Pitfalls below.
 
 ### Recipe 8: Resources (cached query results, session state)
 The MCP server also exposes Resources via `resources/list` and `resources/read`. Common patterns:
@@ -148,7 +151,8 @@ The MCP server also exposes Resources via `resources/list` and `resources/read`.
 - **Subcommand naming differs across builds**. Some builds expose MCP through `heliosdb-nano start --mcp-stdio`, others through a distinct `heliosdb-nano mcp serve …`. Run `--help` to confirm.
 - **Stdio transport conflicts with stdout logging.** When using stdio MCP, redirect tracing to stderr (`RUST_LOG=warn` and never log to stdout).
 - **`heliosdb_query` returns errors as JSON, not exceptions.** Agents must check the `error` field.
-- **Branches created via MCP persist** — agents that don't clean up `agent_run_*` branches leak state. Wrap agent runs with `branch_create … branch_merge` (or drop the branch in a `finally` block).
+- **Branches created via MCP persist** — agents that don't clean up `agent_run_*` branches leak state. Treat branches as fork-test-discard sandboxes: wrap agent runs with `branch_create` and always drop the branch in a `finally` block.
+- **`heliosdb_branch_merge` conflict detection is currently unreliable** (see the MERGE warning in `heliosdb-nano-branches`). Prefer discarding the branch and re-applying validated SQL via `heliosdb_query`; if you merge, verify the merged rows afterwards.
 - **`heliosdb_embed_and_store` downloads a model on first call** (`code-embed`). Provision the model into `./.fastembed_cache/` ahead of time in CI.
 
 ## See also
