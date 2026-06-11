@@ -344,6 +344,120 @@ fn build_group_key(values: &[Value], positions: &[usize]) -> Vec<Value> {
         .collect()
 }
 
+/// R3.2: rows handled per rayon task during parallel partial aggregation.
+/// Each chunk is partial-aggregated into thread-local state; the partials are
+/// merged serially afterwards (merge cost is O(groups), not O(rows)).
+const AGG_PARALLEL_CHUNK: usize = 16_384;
+
+/// R3.2 gate for parallel partial aggregation. Returns the row threshold at
+/// which the aggregate pushdowns switch to chunked rayon partial aggregation,
+/// or `None` when parallelism is disabled. `HELIOS_AGG_SERIAL` is the kill
+/// switch (mirrors `HELIOS_SCAN_SERIAL`); `HELIOS_AGG_PARALLEL_THRESHOLD`
+/// tunes the default 65536-row gate.
+fn agg_parallel_threshold() -> Option<usize> {
+    static AGG_SERIAL: once_cell::sync::Lazy<bool> =
+        once_cell::sync::Lazy::new(|| std::env::var("HELIOS_AGG_SERIAL").is_ok());
+    static AGG_THRESHOLD: once_cell::sync::Lazy<usize> = once_cell::sync::Lazy::new(|| {
+        std::env::var("HELIOS_AGG_PARALLEL_THRESHOLD")
+            .ok()
+            .and_then(|raw| raw.trim().parse().ok())
+            .unwrap_or(65_536)
+    });
+    if *AGG_SERIAL {
+        None
+    } else {
+        Some(*AGG_THRESHOLD)
+    }
+}
+
+/// R3.2: true when `row_count` rows are enough to justify chunked parallel
+/// partial aggregation (and the kill switch is not engaged).
+fn agg_parallel_rows_met(row_count: usize) -> bool {
+    agg_parallel_threshold().is_some_and(|threshold| row_count >= threshold)
+}
+
+/// R3.2: merge a chunk's partial aggregate states into the running states.
+/// Both sides come from the same aggregate spec list, so they zip positionally.
+fn merge_columnar_aggregate_states(
+    into: &mut [ColumnarAggregateState],
+    from: Vec<ColumnarAggregateState>,
+) -> Result<()> {
+    for (state, partial) in into.iter_mut().zip(from) {
+        state.merge(partial)?;
+    }
+    Ok(())
+}
+
+/// R3.2: merge a chunk's per-group partial aggregate states into the running map.
+fn merge_columnar_group_map(
+    into: &mut HashMap<Vec<Value>, Vec<ColumnarAggregateState>>,
+    from: HashMap<Vec<Value>, Vec<ColumnarAggregateState>>,
+) -> Result<()> {
+    for (key, states) in from {
+        match into.entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                merge_columnar_aggregate_states(entry.get_mut(), states)?;
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(states);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// R3.2: lexicographic shard bounds for parallel iteration of a table's
+/// `data:{table}:` keyspace. Row keys carry *unpadded* decimal row ids, so
+/// numeric ranges are not contiguous — but splitting on the first one/two id
+/// digits yields 100 contiguous lexicographic shards that exactly cover the
+/// prefix range: [prefix,"1"), ["1","10"), ["10","11"), …, ["99", prefix_end).
+/// Each shard can be iterated by an independent RocksDB iterator, which
+/// parallelizes the iteration itself (the dominant aggregate-pushdown cost),
+/// not just the per-row decode.
+fn prefix_shard_bounds(prefix: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let prefix_bytes = prefix.as_bytes();
+    debug_assert!(prefix_bytes.last() == Some(&b':'));
+    // Exclusive end of the whole prefix range: bump the trailing ':' to ';'.
+    let mut prefix_end = prefix_bytes.to_vec();
+    if let Some(last) = prefix_end.last_mut() {
+        *last += 1;
+    }
+
+    let mut boundaries: Vec<Vec<u8>> = Vec::with_capacity(92);
+    boundaries.push(prefix_bytes.to_vec()); // first shard covers row id "0"
+    for first in b'1'..=b'9' {
+        let mut one_digit = prefix_bytes.to_vec();
+        one_digit.push(first);
+        boundaries.push(one_digit.clone());
+        for second in b'0'..=b'9' {
+            let mut two_digit = one_digit.clone();
+            two_digit.push(second);
+            boundaries.push(two_digit);
+        }
+    }
+    boundaries.push(prefix_end);
+
+    let ends = boundaries.iter().skip(1).cloned().collect::<Vec<_>>();
+    boundaries.truncate(ends.len());
+    boundaries.into_iter().zip(ends).collect()
+}
+
+/// R3.2: merge a chunk's per-group count/sum partials into the running map.
+fn merge_count_sum_group_map<K: std::hash::Hash + Eq>(
+    into: &mut HashMap<K, CountSumIntState>,
+    from: HashMap<K, CountSumIntState>,
+) -> Result<()> {
+    for (key, state) in from {
+        match into.entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => entry.get_mut().merge(state)?,
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(state);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn columnar_group_key_matches(
     key: &[Value],
     column_batches: &HashMap<usize, ColumnarBatchIndex>,
@@ -511,6 +625,21 @@ enum ColumnarSumState {
     Decimal(rust_decimal::Decimal),
 }
 
+impl ColumnarSumState {
+    /// R3.2: fold another chunk's partial sum into this one. Reuses the same
+    /// promotion rules (Int → Decimal) as the serial per-value update path.
+    fn merge(&mut self, other: Self) -> Result<()> {
+        match other {
+            Self::Empty => Ok(()),
+            Self::Int(value) => update_columnar_int_sum(self, value),
+            Self::Decimal(value) => {
+                update_columnar_decimal_sum(self, value);
+                Ok(())
+            }
+        }
+    }
+}
+
 enum ColumnarAggregateState {
     Count(i64),
     CountDistinct(HashSet<Value>),
@@ -563,6 +692,15 @@ impl CountSumIntState {
             .checked_add(add)
             .ok_or_else(|| Error::query_execution("integer overflow: BIGINT SUM"))?;
         self.sum_seen = true;
+        Ok(())
+    }
+
+    /// R3.2: fold another chunk's partial count/sum into this one.
+    fn merge(&mut self, other: Self) -> Result<()> {
+        self.count += other.count;
+        if other.sum_seen {
+            self.update_sum_int(Some(other.sum))?;
+        }
         Ok(())
     }
 
@@ -645,6 +783,43 @@ impl PrimitiveRowAggregateState {
                 Ok(())
             }
             _ => Err(Error::query_execution("Invalid primitive row aggregate state")),
+        }
+    }
+
+    /// R3.2: fold another chunk's partial state into this one.
+    fn merge(&mut self, other: Self) -> Result<()> {
+        match (self, other) {
+            (Self::Count(count), Self::Count(other)) => {
+                *count += other;
+                Ok(())
+            }
+            (
+                Self::SumInt { sum, seen },
+                Self::SumInt {
+                    sum: other_sum,
+                    seen: other_seen,
+                },
+            ) => {
+                if other_seen {
+                    *sum = sum
+                        .checked_add(other_sum)
+                        .ok_or_else(|| Error::query_execution("integer overflow: BIGINT SUM"))?;
+                    *seen = true;
+                }
+                Ok(())
+            }
+            (
+                Self::Avg { sum, count },
+                Self::Avg {
+                    sum: other_sum,
+                    count: other_count,
+                },
+            ) => {
+                *sum += other_sum;
+                *count += other_count;
+                Ok(())
+            }
+            _ => Err(Error::query_execution("Invalid primitive row aggregate merge")),
         }
     }
 
@@ -780,6 +955,61 @@ impl ColumnarAggregateState {
                 Ok(())
             }
             _ => Err(Error::query_execution("Invalid columnar aggregate state")),
+        }
+    }
+
+    /// R3.2: fold another chunk's partial state into this one. COUNT/SUM/AVG/
+    /// MIN/MAX are all commutative-mergeable; COUNT(DISTINCT) merges as a set
+    /// union (though the parallel paths bail to serial for DISTINCT today).
+    fn merge(&mut self, other: Self) -> Result<()> {
+        match (self, other) {
+            (Self::Count(count), Self::Count(other)) => {
+                *count += other;
+                Ok(())
+            }
+            (Self::CountDistinct(values), Self::CountDistinct(other)) => {
+                values.extend(other);
+                Ok(())
+            }
+            (Self::Sum(state), Self::Sum(other)) => state.merge(other),
+            (
+                Self::Avg { sum, count },
+                Self::Avg {
+                    sum: other_sum,
+                    count: other_count,
+                },
+            ) => {
+                *sum += other_sum;
+                *count += other_count;
+                Ok(())
+            }
+            (Self::Min(current), Self::Min(other)) => {
+                if let Some(value) = other {
+                    match current {
+                        None => *current = Some(value),
+                        Some(existing) => {
+                            if crate::sql::executor::compare_values(&value, existing) == std::cmp::Ordering::Less {
+                                *current = Some(value);
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            }
+            (Self::Max(current), Self::Max(other)) => {
+                if let Some(value) = other {
+                    match current {
+                        None => *current = Some(value),
+                        Some(existing) => {
+                            if crate::sql::executor::compare_values(&value, existing) == std::cmp::Ordering::Greater {
+                                *current = Some(value);
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            }
+            _ => Err(Error::query_execution("Invalid columnar aggregate merge")),
         }
     }
 
@@ -1113,6 +1343,33 @@ impl StorageEngine {
             row_id = row_id.checked_mul(10)?.checked_add(u64::from(byte - b'0'))?;
         }
         Some(row_id)
+    }
+
+    /// R3.2: run `per_shard` over lexicographically-bounded sub-iterators of
+    /// the `prefix` keyspace on rayon, collecting per-shard partial results
+    /// for the caller to merge. All shards read from one RocksDB snapshot so
+    /// the parallel aggregate sees the same point-in-time state a single
+    /// serial iterator would. See `prefix_shard_bounds` for the sharding.
+    fn par_prefix_shard_results<T, F>(&self, prefix: &str, per_shard: F) -> Result<Vec<T>>
+    where
+        T: Send,
+        F: for<'a> Fn(rocksdb::DBIteratorWithThreadMode<'a, DB>) -> Result<T> + Sync,
+    {
+        use rayon::prelude::*;
+        let snapshot = self.db.snapshot();
+        prefix_shard_bounds(prefix)
+            .par_iter()
+            .map(|(start, end)| {
+                let mut read_opts = ReadOptions::default();
+                read_opts.set_total_order_seek(true);
+                read_opts.set_iterate_upper_bound(end.clone());
+                read_opts.set_snapshot(&snapshot);
+                let iter = self
+                    .db
+                    .iterator_opt(IteratorMode::From(start, rocksdb::Direction::Forward), read_opts);
+                per_shard(iter)
+            })
+            .collect()
     }
 
     /// Open a storage engine
@@ -3751,6 +4008,15 @@ impl StorageEngine {
             return Ok(tuples);
         }
 
+        // R3.2 gate: chunked parallel partial aggregation for the columnar
+        // paths. DISTINCT aggregates stay serial; batches are shared read-only
+        // so chunks aggregate independently and merge afterwards.
+        let has_distinct = aggregates
+            .iter()
+            .any(|aggregate| matches!(aggregate.op, ColumnarAggregateOp::CountDistinct));
+        // Whole columnar batches per rayon task (batches hold up to BATCH_SIZE rows).
+        let batches_per_chunk = (AGG_PARALLEL_CHUNK / BATCH_SIZE).max(1);
+
         if group_by_columns.is_empty() && filter_predicates.is_empty() {
             let mut values = Vec::with_capacity(aggregates.len());
             for aggregate in aggregates {
@@ -3762,9 +4028,32 @@ impl StorageEngine {
                 let mut state = ColumnarAggregateState::new(aggregate.op);
                 if let Some(column_index) = aggregate.column_index {
                     if let Some(batches) = column_batches.get(&column_index) {
-                        for (_, batch) in batches.ordered_batches() {
-                            for value in &batch.values {
-                                state.update(aggregate.op, Some(value))?;
+                        let ordered = batches.ordered_batches();
+                        let total_rows: usize = ordered.iter().map(|(_, batch)| batch.values.len()).sum();
+                        if !matches!(aggregate.op, ColumnarAggregateOp::CountDistinct)
+                            && agg_parallel_rows_met(total_rows)
+                        {
+                            use rayon::prelude::*;
+                            let partials: Vec<ColumnarAggregateState> = ordered
+                                .par_chunks(batches_per_chunk)
+                                .map(|chunk| {
+                                    let mut state = ColumnarAggregateState::new(aggregate.op);
+                                    for (_, batch) in chunk {
+                                        for value in &batch.values {
+                                            state.update(aggregate.op, Some(value))?;
+                                        }
+                                    }
+                                    Ok(state)
+                                })
+                                .collect::<Result<Vec<_>>>()?;
+                            for partial in partials {
+                                state.merge(partial)?;
+                            }
+                        } else {
+                            for (_, batch) in ordered {
+                                for value in &batch.values {
+                                    state.update(aggregate.op, Some(value))?;
+                                }
                             }
                         }
                     }
@@ -3788,25 +4077,71 @@ impl StorageEngine {
 
         if let Some(driver_predicate) = null_rejecting_filter_predicate(&filter_predicates) {
             if let Some(driver_batches) = column_batches.get(&driver_predicate.column_index) {
+                let ordered_driver = driver_batches.ordered_batches();
+                let driver_rows: usize = ordered_driver.iter().map(|(_, batch)| batch.values.len()).sum();
+                let parallel = !has_distinct && agg_parallel_rows_met(driver_rows);
+
                 if group_by_columns.is_empty() {
                     let mut states: Vec<ColumnarAggregateState> = aggregates
                         .iter()
                         .map(|aggregate| ColumnarAggregateState::new(aggregate.op))
                         .collect();
 
-                    for (batch_id, batch) in driver_batches.ordered_batches() {
-                        for (offset, value) in batch.values.iter().enumerate() {
-                            if !driver_predicate.evaluate(value)
-                                || !columnar_row_matches_filters(&column_batches, batch_id, offset, &filter_predicates)
-                            {
-                                continue;
-                            }
+                    if parallel {
+                        use rayon::prelude::*;
+                        let partials: Vec<Vec<ColumnarAggregateState>> = ordered_driver
+                            .par_chunks(batches_per_chunk)
+                            .map(|chunk| {
+                                let mut states: Vec<ColumnarAggregateState> = aggregates
+                                    .iter()
+                                    .map(|aggregate| ColumnarAggregateState::new(aggregate.op))
+                                    .collect();
+                                for &(batch_id, batch) in chunk {
+                                    for (offset, value) in batch.values.iter().enumerate() {
+                                        if !driver_predicate.evaluate(value)
+                                            || !columnar_row_matches_filters(
+                                                &column_batches,
+                                                batch_id,
+                                                offset,
+                                                &filter_predicates,
+                                            )
+                                        {
+                                            continue;
+                                        }
+                                        for (state, aggregate) in states.iter_mut().zip(aggregates) {
+                                            let value = aggregate.column_index.and_then(|idx| {
+                                                columnar_batch_value(&column_batches, idx, batch_id, offset)
+                                            });
+                                            state.update(aggregate.op, value)?;
+                                        }
+                                    }
+                                }
+                                Ok(states)
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        for partial in partials {
+                            merge_columnar_aggregate_states(&mut states, partial)?;
+                        }
+                    } else {
+                        for (batch_id, batch) in ordered_driver {
+                            for (offset, value) in batch.values.iter().enumerate() {
+                                if !driver_predicate.evaluate(value)
+                                    || !columnar_row_matches_filters(
+                                        &column_batches,
+                                        batch_id,
+                                        offset,
+                                        &filter_predicates,
+                                    )
+                                {
+                                    continue;
+                                }
 
-                            for (state, aggregate) in states.iter_mut().zip(aggregates) {
-                                let value = aggregate
-                                    .column_index
-                                    .and_then(|idx| columnar_batch_value(&column_batches, idx, batch_id, offset));
-                                state.update(aggregate.op, value)?;
+                                for (state, aggregate) in states.iter_mut().zip(aggregates) {
+                                    let value = aggregate
+                                        .column_index
+                                        .and_then(|idx| columnar_batch_value(&column_batches, idx, batch_id, offset));
+                                    state.update(aggregate.op, value)?;
+                                }
                             }
                         }
                     }
@@ -3832,52 +4167,109 @@ impl StorageEngine {
                 let mut small_groups: Vec<(Vec<Value>, Vec<ColumnarAggregateState>)> = Vec::new();
                 let mut hash_groups: Option<HashMap<Vec<Value>, Vec<ColumnarAggregateState>>> = None;
 
-                for (batch_id, batch) in driver_batches.ordered_batches() {
-                    for (offset, value) in batch.values.iter().enumerate() {
-                        if !driver_predicate.evaluate(value)
-                            || !columnar_row_matches_filters(&column_batches, batch_id, offset, &filter_predicates)
-                        {
-                            continue;
-                        }
+                if parallel {
+                    use rayon::prelude::*;
+                    let partials: Vec<HashMap<Vec<Value>, Vec<ColumnarAggregateState>>> = ordered_driver
+                        .par_chunks(batches_per_chunk)
+                        .map(|chunk| {
+                            let mut groups: HashMap<Vec<Value>, Vec<ColumnarAggregateState>> = HashMap::new();
+                            for &(batch_id, batch) in chunk {
+                                for (offset, value) in batch.values.iter().enumerate() {
+                                    if !driver_predicate.evaluate(value)
+                                        || !columnar_row_matches_filters(
+                                            &column_batches,
+                                            batch_id,
+                                            offset,
+                                            &filter_predicates,
+                                        )
+                                    {
+                                        continue;
+                                    }
+                                    let group_key =
+                                        build_columnar_group_key(&column_batches, group_by_columns, batch_id, offset);
+                                    let states = groups.entry(group_key).or_insert_with(|| {
+                                        aggregates
+                                            .iter()
+                                            .map(|aggregate| ColumnarAggregateState::new(aggregate.op))
+                                            .collect()
+                                    });
+                                    update_columnar_aggregate_states(
+                                        states,
+                                        aggregates,
+                                        &column_batches,
+                                        batch_id,
+                                        offset,
+                                    )?;
+                                }
+                            }
+                            Ok(groups)
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    let mut merged: HashMap<Vec<Value>, Vec<ColumnarAggregateState>> = HashMap::new();
+                    for partial in partials {
+                        merge_columnar_group_map(&mut merged, partial)?;
+                    }
+                    hash_groups = Some(merged);
+                } else {
+                    for (batch_id, batch) in ordered_driver {
+                        for (offset, value) in batch.values.iter().enumerate() {
+                            if !driver_predicate.evaluate(value)
+                                || !columnar_row_matches_filters(&column_batches, batch_id, offset, &filter_predicates)
+                            {
+                                continue;
+                            }
 
-                        if let Some(groups) = hash_groups.as_mut() {
-                            let group_key =
-                                build_columnar_group_key(&column_batches, group_by_columns, batch_id, offset);
-                            let states = groups.entry(group_key).or_insert_with(|| {
-                                aggregates
+                            if let Some(groups) = hash_groups.as_mut() {
+                                let group_key =
+                                    build_columnar_group_key(&column_batches, group_by_columns, batch_id, offset);
+                                let states = groups.entry(group_key).or_insert_with(|| {
+                                    aggregates
+                                        .iter()
+                                        .map(|aggregate| ColumnarAggregateState::new(aggregate.op))
+                                        .collect()
+                                });
+                                update_columnar_aggregate_states(
+                                    states,
+                                    aggregates,
+                                    &column_batches,
+                                    batch_id,
+                                    offset,
+                                )?;
+                            } else if let Some(idx) = small_groups.iter().position(|(group_key, _)| {
+                                columnar_group_key_matches(
+                                    group_key,
+                                    &column_batches,
+                                    group_by_columns,
+                                    batch_id,
+                                    offset,
+                                )
+                            }) {
+                                update_columnar_aggregate_states(
+                                    &mut small_groups[idx].1,
+                                    aggregates,
+                                    &column_batches,
+                                    batch_id,
+                                    offset,
+                                )?;
+                            } else {
+                                let mut states: Vec<ColumnarAggregateState> = aggregates
                                     .iter()
                                     .map(|aggregate| ColumnarAggregateState::new(aggregate.op))
-                                    .collect()
-                            });
-                            update_columnar_aggregate_states(states, aggregates, &column_batches, batch_id, offset)?;
-                        } else if let Some(idx) = small_groups.iter().position(|(group_key, _)| {
-                            columnar_group_key_matches(group_key, &column_batches, group_by_columns, batch_id, offset)
-                        }) {
-                            update_columnar_aggregate_states(
-                                &mut small_groups[idx].1,
-                                aggregates,
-                                &column_batches,
-                                batch_id,
-                                offset,
-                            )?;
-                        } else {
-                            let mut states: Vec<ColumnarAggregateState> = aggregates
-                                .iter()
-                                .map(|aggregate| ColumnarAggregateState::new(aggregate.op))
-                                .collect();
-                            update_columnar_aggregate_states(
-                                &mut states,
-                                aggregates,
-                                &column_batches,
-                                batch_id,
-                                offset,
-                            )?;
-                            small_groups.push((
-                                build_columnar_group_key(&column_batches, group_by_columns, batch_id, offset),
-                                states,
-                            ));
-                            if small_groups.len() > LINEAR_GROUP_LIMIT {
-                                hash_groups = Some(small_groups.drain(..).collect());
+                                    .collect();
+                                update_columnar_aggregate_states(
+                                    &mut states,
+                                    aggregates,
+                                    &column_batches,
+                                    batch_id,
+                                    offset,
+                                )?;
+                                small_groups.push((
+                                    build_columnar_group_key(&column_batches, group_by_columns, batch_id, offset),
+                                    states,
+                                ));
+                                if small_groups.len() > LINEAR_GROUP_LIMIT {
+                                    hash_groups = Some(small_groups.drain(..).collect());
+                                }
                             }
                         }
                     }
@@ -3920,32 +4312,64 @@ impl StorageEngine {
 
             let prefix = format!("data:{}:", table_name);
             let prefix_bytes = prefix.as_bytes();
-            let mut read_opts = ReadOptions::default();
-            read_opts.set_total_order_seek(true);
-            let iter = self
-                .db
-                .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read_opts);
 
-            for item in iter {
-                let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
-                if !key.starts_with(prefix_bytes) {
-                    break;
+            // R3.2: parallel partial aggregation over per-shard prefix iterators.
+            let row_count_hint = self.art_index_manager.pk_index_len(table_name);
+            if !has_distinct && row_count_hint.is_some_and(agg_parallel_rows_met) {
+                let partials: Vec<Vec<ColumnarAggregateState>> = self.par_prefix_shard_results(&prefix, |iter| {
+                    let mut states: Vec<ColumnarAggregateState> = aggregates
+                        .iter()
+                        .map(|aggregate| ColumnarAggregateState::new(aggregate.op))
+                        .collect();
+                    for item in iter {
+                        let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+                        let Some(row_id) = Self::parse_row_id_after_prefix(&key, prefix_bytes.len()) else {
+                            continue;
+                        };
+                        let batch_id = row_id / BATCH_SIZE as u64;
+                        let offset = (row_id % BATCH_SIZE as u64) as usize;
+                        if !columnar_row_matches_filters(&column_batches, batch_id, offset, &filter_predicates) {
+                            continue;
+                        }
+                        for (state, aggregate) in states.iter_mut().zip(aggregates) {
+                            let value = aggregate
+                                .column_index
+                                .and_then(|idx| columnar_batch_value(&column_batches, idx, batch_id, offset));
+                            state.update(aggregate.op, value)?;
+                        }
+                    }
+                    Ok(states)
+                })?;
+                for partial in partials {
+                    merge_columnar_aggregate_states(&mut states, partial)?;
                 }
-                let Some(row_id) = Self::parse_row_id_after_prefix(&key, prefix_bytes.len()) else {
-                    continue;
-                };
+            } else {
+                let mut read_opts = ReadOptions::default();
+                read_opts.set_total_order_seek(true);
+                let iter = self
+                    .db
+                    .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read_opts);
+                for item in iter {
+                    let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+                    if !key.starts_with(prefix_bytes) {
+                        break;
+                    }
+                    let Some(row_id) = Self::parse_row_id_after_prefix(&key, prefix_bytes.len()) else {
+                        continue;
+                    };
 
-                let batch_id = row_id / BATCH_SIZE as u64;
-                let offset = (row_id % BATCH_SIZE as u64) as usize;
-                if !columnar_row_matches_filters(&column_batches, batch_id, offset, &filter_predicates) {
-                    continue;
-                }
+                    let batch_id = row_id / BATCH_SIZE as u64;
+                    let offset = (row_id % BATCH_SIZE as u64) as usize;
+                    if !columnar_row_matches_filters(&column_batches, batch_id, offset, &filter_predicates) {
+                        continue;
+                    }
 
-                for (state, aggregate) in states.iter_mut().zip(aggregates) {
-                    let value = aggregate
-                        .column_index
-                        .and_then(|idx| columnar_batch_value(&column_batches, idx, batch_id, offset));
-                    state.update(aggregate.op, value)?;
+                    for (state, aggregate) in states.iter_mut().zip(aggregates) {
+                        let value = aggregate
+                            .column_index
+                            .and_then(|idx| columnar_batch_value(&column_batches, idx, batch_id, offset));
+                        state.update(aggregate.op, value)?;
+                    }
                 }
             }
 
@@ -3970,58 +4394,92 @@ impl StorageEngine {
 
         let prefix = format!("data:{}:", table_name);
         let prefix_bytes = prefix.as_bytes();
-        let mut read_opts = ReadOptions::default();
-        read_opts.set_total_order_seek(true);
-        let iter = self
-            .db
-            .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read_opts);
 
-        for item in iter {
-            let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
-            if !key.starts_with(prefix_bytes) {
-                break;
+        // R3.2: parallel partial aggregation over per-shard prefix iterators.
+        let row_count_hint = self.art_index_manager.pk_index_len(table_name);
+        if !has_distinct && row_count_hint.is_some_and(agg_parallel_rows_met) {
+            let partials: Vec<HashMap<Vec<Value>, Vec<ColumnarAggregateState>>> =
+                self.par_prefix_shard_results(&prefix, |iter| {
+                    let mut groups: HashMap<Vec<Value>, Vec<ColumnarAggregateState>> = HashMap::new();
+                    for item in iter {
+                        let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+                        let Some(row_id) = Self::parse_row_id_after_prefix(&key, prefix_bytes.len()) else {
+                            continue;
+                        };
+                        let batch_id = row_id / BATCH_SIZE as u64;
+                        let offset = (row_id % BATCH_SIZE as u64) as usize;
+                        if !columnar_row_matches_filters(&column_batches, batch_id, offset, &filter_predicates) {
+                            continue;
+                        }
+                        let group_key = build_columnar_group_key(&column_batches, group_by_columns, batch_id, offset);
+                        let states = groups.entry(group_key).or_insert_with(|| {
+                            aggregates
+                                .iter()
+                                .map(|aggregate| ColumnarAggregateState::new(aggregate.op))
+                                .collect()
+                        });
+                        update_columnar_aggregate_states(states, aggregates, &column_batches, batch_id, offset)?;
+                    }
+                    Ok(groups)
+                })?;
+            let mut merged: HashMap<Vec<Value>, Vec<ColumnarAggregateState>> = HashMap::new();
+            for partial in partials {
+                merge_columnar_group_map(&mut merged, partial)?;
             }
-            let Some(row_id) = Self::parse_row_id_after_prefix(&key, prefix_bytes.len()) else {
-                continue;
-            };
+            hash_groups = Some(merged);
+        } else {
+            let mut read_opts = ReadOptions::default();
+            read_opts.set_total_order_seek(true);
+            let iter = self
+                .db
+                .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read_opts);
+            for item in iter {
+                let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+                if !key.starts_with(prefix_bytes) {
+                    break;
+                }
+                let Some(row_id) = Self::parse_row_id_after_prefix(&key, prefix_bytes.len()) else {
+                    continue;
+                };
 
-            let batch_id = row_id / BATCH_SIZE as u64;
-            let offset = (row_id % BATCH_SIZE as u64) as usize;
-            if !columnar_row_matches_filters(&column_batches, batch_id, offset, &filter_predicates) {
-                continue;
-            }
+                let batch_id = row_id / BATCH_SIZE as u64;
+                let offset = (row_id % BATCH_SIZE as u64) as usize;
+                if !columnar_row_matches_filters(&column_batches, batch_id, offset, &filter_predicates) {
+                    continue;
+                }
 
-            if let Some(groups) = hash_groups.as_mut() {
-                let group_key = build_columnar_group_key(&column_batches, group_by_columns, batch_id, offset);
-                let states = groups.entry(group_key).or_insert_with(|| {
-                    aggregates
+                if let Some(groups) = hash_groups.as_mut() {
+                    let group_key = build_columnar_group_key(&column_batches, group_by_columns, batch_id, offset);
+                    let states = groups.entry(group_key).or_insert_with(|| {
+                        aggregates
+                            .iter()
+                            .map(|aggregate| ColumnarAggregateState::new(aggregate.op))
+                            .collect()
+                    });
+                    update_columnar_aggregate_states(states, aggregates, &column_batches, batch_id, offset)?;
+                } else if let Some(idx) = small_groups.iter().position(|(group_key, _)| {
+                    columnar_group_key_matches(group_key, &column_batches, group_by_columns, batch_id, offset)
+                }) {
+                    update_columnar_aggregate_states(
+                        &mut small_groups[idx].1,
+                        aggregates,
+                        &column_batches,
+                        batch_id,
+                        offset,
+                    )?;
+                } else {
+                    let mut states: Vec<ColumnarAggregateState> = aggregates
                         .iter()
                         .map(|aggregate| ColumnarAggregateState::new(aggregate.op))
-                        .collect()
-                });
-                update_columnar_aggregate_states(states, aggregates, &column_batches, batch_id, offset)?;
-            } else if let Some(idx) = small_groups.iter().position(|(group_key, _)| {
-                columnar_group_key_matches(group_key, &column_batches, group_by_columns, batch_id, offset)
-            }) {
-                update_columnar_aggregate_states(
-                    &mut small_groups[idx].1,
-                    aggregates,
-                    &column_batches,
-                    batch_id,
-                    offset,
-                )?;
-            } else {
-                let mut states: Vec<ColumnarAggregateState> = aggregates
-                    .iter()
-                    .map(|aggregate| ColumnarAggregateState::new(aggregate.op))
-                    .collect();
-                update_columnar_aggregate_states(&mut states, aggregates, &column_batches, batch_id, offset)?;
-                small_groups.push((
-                    build_columnar_group_key(&column_batches, group_by_columns, batch_id, offset),
-                    states,
-                ));
-                if small_groups.len() > LINEAR_GROUP_LIMIT {
-                    hash_groups = Some(small_groups.drain(..).collect());
+                        .collect();
+                    update_columnar_aggregate_states(&mut states, aggregates, &column_batches, batch_id, offset)?;
+                    small_groups.push((
+                        build_columnar_group_key(&column_batches, group_by_columns, batch_id, offset),
+                        states,
+                    ));
+                    if small_groups.len() > LINEAR_GROUP_LIMIT {
+                        hash_groups = Some(small_groups.drain(..).collect());
+                    }
                 }
             }
         }
@@ -4099,52 +4557,86 @@ impl StorageEngine {
 
         let prefix = format!("data:{}:", table_name);
         let prefix_bytes = prefix.as_bytes();
-        let mut read_opts = ReadOptions::default();
-        read_opts.set_total_order_seek(true);
-        let iter = self
-            .db
-            .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read_opts);
 
-        for item in iter {
-            let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
-            if !key.starts_with(prefix_bytes) {
-                break;
+        // R3.2: large tables iterate the prefix in lexicographic shards on
+        // rayon (column batches are shared read-only), partial-aggregate per
+        // shard, then merge. The shared sort below keeps output order.
+        let row_count_hint = self.art_index_manager.pk_index_len(table_name);
+        if row_count_hint.is_some_and(agg_parallel_rows_met) {
+            let partials: Vec<HashMap<Value, CountSumIntState>> = self.par_prefix_shard_results(&prefix, |iter| {
+                let mut groups: HashMap<Value, CountSumIntState> = HashMap::new();
+                for item in iter {
+                    let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+                    let Some(row_id) = Self::parse_row_id_after_prefix(&key, prefix_bytes.len()) else {
+                        continue;
+                    };
+                    let batch_id = row_id / BATCH_SIZE as u64;
+                    let offset = (row_id % BATCH_SIZE as u64) as usize;
+                    if !columnar_row_matches_filters(column_batches, batch_id, offset, filter_predicates) {
+                        continue;
+                    }
+                    let sum_value = columnar_batch_value(column_batches, sum_column, batch_id, offset);
+                    let group_key = columnar_batch_value(column_batches, group_column, batch_id, offset)
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    let state = groups.entry(group_key).or_insert_with(CountSumIntState::new);
+                    state.update_count();
+                    state.update_sum(sum_value)?;
+                }
+                Ok(groups)
+            })?;
+            let mut merged: HashMap<Value, CountSumIntState> = HashMap::new();
+            for partial in partials {
+                merge_count_sum_group_map(&mut merged, partial)?;
             }
-            let Some(row_id) = Self::parse_row_id_after_prefix(&key, prefix_bytes.len()) else {
-                continue;
-            };
+            hash_groups = Some(merged);
+        } else {
+            let mut read_opts = ReadOptions::default();
+            read_opts.set_total_order_seek(true);
+            let iter = self
+                .db
+                .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read_opts);
+            for item in iter {
+                let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+                if !key.starts_with(prefix_bytes) {
+                    break;
+                }
+                let Some(row_id) = Self::parse_row_id_after_prefix(&key, prefix_bytes.len()) else {
+                    continue;
+                };
 
-            let batch_id = row_id / BATCH_SIZE as u64;
-            let offset = (row_id % BATCH_SIZE as u64) as usize;
-            if !columnar_row_matches_filters(column_batches, batch_id, offset, filter_predicates) {
-                continue;
-            }
+                let batch_id = row_id / BATCH_SIZE as u64;
+                let offset = (row_id % BATCH_SIZE as u64) as usize;
+                if !columnar_row_matches_filters(column_batches, batch_id, offset, filter_predicates) {
+                    continue;
+                }
 
-            let sum_value = columnar_batch_value(column_batches, sum_column, batch_id, offset);
-            if let Some(groups) = hash_groups.as_mut() {
-                let group_key = columnar_batch_value(column_batches, group_column, batch_id, offset)
-                    .cloned()
-                    .unwrap_or(Value::Null);
-                let state = groups.entry(group_key).or_insert_with(CountSumIntState::new);
-                state.update_count();
-                state.update_sum(sum_value)?;
-            } else if let Some(idx) = small_groups.iter().position(|(group_key, _)| {
-                columnar_batch_value(column_batches, group_column, batch_id, offset)
-                    .map_or(matches!(group_key, Value::Null), |actual| group_key == actual)
-            }) {
-                let state = &mut small_groups[idx].1;
-                state.update_count();
-                state.update_sum(sum_value)?;
-            } else {
-                let group_key = columnar_batch_value(column_batches, group_column, batch_id, offset)
-                    .cloned()
-                    .unwrap_or(Value::Null);
-                let mut state = CountSumIntState::new();
-                state.update_count();
-                state.update_sum(sum_value)?;
-                small_groups.push((group_key, state));
-                if small_groups.len() > LINEAR_GROUP_LIMIT {
-                    hash_groups = Some(small_groups.drain(..).collect());
+                let sum_value = columnar_batch_value(column_batches, sum_column, batch_id, offset);
+                if let Some(groups) = hash_groups.as_mut() {
+                    let group_key = columnar_batch_value(column_batches, group_column, batch_id, offset)
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    let state = groups.entry(group_key).or_insert_with(CountSumIntState::new);
+                    state.update_count();
+                    state.update_sum(sum_value)?;
+                } else if let Some(idx) = small_groups.iter().position(|(group_key, _)| {
+                    columnar_batch_value(column_batches, group_column, batch_id, offset)
+                        .map_or(matches!(group_key, Value::Null), |actual| group_key == actual)
+                }) {
+                    let state = &mut small_groups[idx].1;
+                    state.update_count();
+                    state.update_sum(sum_value)?;
+                } else {
+                    let group_key = columnar_batch_value(column_batches, group_column, batch_id, offset)
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    let mut state = CountSumIntState::new();
+                    state.update_count();
+                    state.update_sum(sum_value)?;
+                    small_groups.push((group_key, state));
+                    if small_groups.len() > LINEAR_GROUP_LIMIT {
+                        hash_groups = Some(small_groups.drain(..).collect());
+                    }
                 }
             }
         }
@@ -4211,49 +4703,103 @@ impl StorageEngine {
 
         let prefix = format!("data:{}:", table_name);
         let prefix_bytes = prefix.as_bytes();
-        let mut read_opts = ReadOptions::default();
-        read_opts.set_total_order_seek(true);
-        let iter = self
-            .db
-            .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read_opts);
 
-        for item in iter {
-            let (key, raw_value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
-            if !key.starts_with(prefix_bytes) {
-                break;
+        // R3.2: large tables iterate the prefix in lexicographic shards on
+        // rayon (parallelizing the RocksDB iteration itself), partial-aggregate
+        // per shard, then merge the per-shard groups. Output order is
+        // unaffected: both paths sort the merged groups below.
+        let row_count_hint = self.art_index_manager.pk_index_len(table_name);
+        if row_count_hint.is_some_and(agg_parallel_rows_met) {
+            let partials: Vec<Option<HashMap<Option<String>, CountSumIntState>>> = self
+                .par_prefix_shard_results(&prefix, |iter| {
+                    let mut shard_small: Vec<(Option<String>, CountSumIntState)> = Vec::new();
+                    let mut shard_hash: Option<HashMap<Option<String>, CountSumIntState>> = None;
+                    for item in iter {
+                        let (_, raw_value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+                        let decrypted;
+                        let bytes: &[u8] = if let Some(km) = &self.key_manager {
+                            decrypted = crypto::decrypt(km.key(), &raw_value)?;
+                            &decrypted
+                        } else {
+                            &raw_value
+                        };
+                        let Some((group_key, sum_value)) =
+                            crate::storage::prefix_decode::decode_tuple_text_and_int_columns(
+                                bytes,
+                                group_column,
+                                sum_column,
+                            )
+                        else {
+                            // Undecodable row: signal the caller to fall back
+                            // to the generic grouped path (same as serial).
+                            return Ok(None);
+                        };
+                        update_text_count_sum_group(
+                            group_key,
+                            sum_value,
+                            &mut shard_small,
+                            &mut shard_hash,
+                            LINEAR_GROUP_LIMIT,
+                        )?;
+                    }
+                    Ok(Some(match shard_hash {
+                        Some(groups) => groups,
+                        None => shard_small.into_iter().collect(),
+                    }))
+                })?;
+
+            let mut merged: HashMap<Option<String>, CountSumIntState> = HashMap::new();
+            for partial in partials {
+                let Some(partial) = partial else {
+                    return Ok(None);
+                };
+                merge_count_sum_group_map(&mut merged, partial)?;
             }
+            hash_groups = Some(merged);
+        } else {
+            let mut read_opts = ReadOptions::default();
+            read_opts.set_total_order_seek(true);
+            let iter = self
+                .db
+                .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read_opts);
+            for item in iter {
+                let (key, raw_value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+                if !key.starts_with(prefix_bytes) {
+                    break;
+                }
 
-            if let Some(km) = &self.key_manager {
-                let decrypted = crypto::decrypt(km.key(), &raw_value)?;
-                let Some((group_key, sum_value)) = crate::storage::prefix_decode::decode_tuple_text_and_int_columns(
-                    &decrypted,
-                    group_column,
-                    sum_column,
-                ) else {
-                    return Ok(None);
-                };
-                update_text_count_sum_group(
-                    group_key,
-                    sum_value,
-                    &mut small_groups,
-                    &mut hash_groups,
-                    LINEAR_GROUP_LIMIT,
-                )?;
-            } else {
-                let Some((group_key, sum_value)) = crate::storage::prefix_decode::decode_tuple_text_and_int_columns(
-                    &raw_value,
-                    group_column,
-                    sum_column,
-                ) else {
-                    return Ok(None);
-                };
-                update_text_count_sum_group(
-                    group_key,
-                    sum_value,
-                    &mut small_groups,
-                    &mut hash_groups,
-                    LINEAR_GROUP_LIMIT,
-                )?;
+                if let Some(km) = &self.key_manager {
+                    let decrypted = crypto::decrypt(km.key(), &raw_value)?;
+                    let Some((group_key, sum_value)) = crate::storage::prefix_decode::decode_tuple_text_and_int_columns(
+                        &decrypted,
+                        group_column,
+                        sum_column,
+                    ) else {
+                        return Ok(None);
+                    };
+                    update_text_count_sum_group(
+                        group_key,
+                        sum_value,
+                        &mut small_groups,
+                        &mut hash_groups,
+                        LINEAR_GROUP_LIMIT,
+                    )?;
+                } else {
+                    let Some((group_key, sum_value)) = crate::storage::prefix_decode::decode_tuple_text_and_int_columns(
+                        &raw_value,
+                        group_column,
+                        sum_column,
+                    ) else {
+                        return Ok(None);
+                    };
+                    update_text_count_sum_group(
+                        group_key,
+                        sum_value,
+                        &mut small_groups,
+                        &mut hash_groups,
+                        LINEAR_GROUP_LIMIT,
+                    )?;
+                }
             }
         }
 
@@ -4374,41 +4920,88 @@ impl StorageEngine {
 
         let prefix = format!("data:{}:", table_name);
         let prefix_bytes = prefix.as_bytes();
-        let mut read_opts = ReadOptions::default();
-        read_opts.set_total_order_seek(true);
-        let iter = self
-            .db
-            .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read_opts);
 
         let mut states: Vec<PrimitiveRowAggregateState> =
             plan.iter().copied().map(PrimitiveRowAggregateState::new).collect();
-        let mut values = Vec::with_capacity(requested.len());
-        for item in iter {
-            let (key, raw_value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
-            if !key.starts_with(prefix_bytes) {
-                break;
-            }
 
-            let decoded = if let Some(km) = &self.key_manager {
-                let decrypted = crypto::decrypt(km.key(), &raw_value)?;
-                crate::storage::prefix_decode::decode_tuple_numeric_column_values_into(
-                    &decrypted,
-                    &requested,
-                    &mut values,
-                )
-            } else {
-                crate::storage::prefix_decode::decode_tuple_numeric_column_values_into(
-                    &raw_value,
-                    &requested,
-                    &mut values,
-                )
-            };
-            if decoded.is_none() {
-                return Ok(None);
-            }
+        // R3.2: parallel partial aggregation for large tables — per-shard
+        // RocksDB iterators on rayon, merged afterwards.
+        let row_count_hint = self.art_index_manager.pk_index_len(table_name);
+        if row_count_hint.is_some_and(agg_parallel_rows_met) {
+            let partials: Vec<Option<Vec<PrimitiveRowAggregateState>>> =
+                self.par_prefix_shard_results(&prefix, |iter| {
+                    let mut states: Vec<PrimitiveRowAggregateState> =
+                        plan.iter().copied().map(PrimitiveRowAggregateState::new).collect();
+                    let mut values = Vec::with_capacity(requested.len());
+                    for item in iter {
+                        let (_, raw_value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+                        let decoded = if let Some(km) = &self.key_manager {
+                            let decrypted = crypto::decrypt(km.key(), &raw_value)?;
+                            crate::storage::prefix_decode::decode_tuple_numeric_column_values_into(
+                                &decrypted,
+                                &requested,
+                                &mut values,
+                            )
+                        } else {
+                            crate::storage::prefix_decode::decode_tuple_numeric_column_values_into(
+                                &raw_value,
+                                &requested,
+                                &mut values,
+                            )
+                        };
+                        if decoded.is_none() {
+                            return Ok(None);
+                        }
 
-            for (state, aggregate) in states.iter_mut().zip(&plan) {
-                state.update(*aggregate, &values)?;
+                        for (state, aggregate) in states.iter_mut().zip(&plan) {
+                            state.update(*aggregate, &values)?;
+                        }
+                    }
+                    Ok(Some(states))
+                })?;
+
+            for partial in partials {
+                let Some(partial) = partial else {
+                    return Ok(None);
+                };
+                for (state, chunk_state) in states.iter_mut().zip(partial) {
+                    state.merge(chunk_state)?;
+                }
+            }
+        } else {
+            let mut read_opts = ReadOptions::default();
+            read_opts.set_total_order_seek(true);
+            let iter = self
+                .db
+                .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read_opts);
+            let mut values = Vec::with_capacity(requested.len());
+            for item in iter {
+                let (key, raw_value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+                if !key.starts_with(prefix_bytes) {
+                    break;
+                }
+
+                let decoded = if let Some(km) = &self.key_manager {
+                    let decrypted = crypto::decrypt(km.key(), &raw_value)?;
+                    crate::storage::prefix_decode::decode_tuple_numeric_column_values_into(
+                        &decrypted,
+                        &requested,
+                        &mut values,
+                    )
+                } else {
+                    crate::storage::prefix_decode::decode_tuple_numeric_column_values_into(
+                        &raw_value,
+                        &requested,
+                        &mut values,
+                    )
+                };
+                if decoded.is_none() {
+                    return Ok(None);
+                }
+
+                for (state, aggregate) in states.iter_mut().zip(&plan) {
+                    state.update(*aggregate, &values)?;
+                }
             }
         }
 
@@ -4435,60 +5028,133 @@ impl StorageEngine {
     ) -> Result<Option<Tuple>> {
         let prefix = format!("data:{}:", table_name);
         let prefix_bytes = prefix.as_bytes();
-        let mut read_opts = ReadOptions::default();
-        read_opts.set_total_order_seek(true);
-        let iter = self
-            .db
-            .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read_opts);
 
         let mut count = 0_i64;
         let mut sum = 0_i64;
         let mut sum_seen = false;
         let mut avg_sum = 0.0_f64;
         let mut avg_count = 0_u64;
-        let mut values = Vec::with_capacity(requested.len());
 
-        for item in iter {
-            let (key, raw_value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
-            if !key.starts_with(prefix_bytes) {
-                break;
-            }
+        // R3.2: parallel partial aggregation for large tables — iterate the
+        // prefix in lexicographic shards on rayon, accumulate per shard, then
+        // merge the partials.
+        let row_count_hint = self.art_index_manager.pk_index_len(table_name);
+        if row_count_hint.is_some_and(agg_parallel_rows_met) {
+            let partials: Vec<Option<(i64, i64, bool, f64, u64)>> =
+                self.par_prefix_shard_results(&prefix, |iter| {
+                    let mut count = 0_i64;
+                    let mut sum = 0_i64;
+                    let mut sum_seen = false;
+                    let mut avg_sum = 0.0_f64;
+                    let mut avg_count = 0_u64;
+                    let mut values = Vec::with_capacity(requested.len());
+                    for item in iter {
+                        let (_, raw_value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+                        let decoded = if let Some(km) = &self.key_manager {
+                            let decrypted = crypto::decrypt(km.key(), &raw_value)?;
+                            crate::storage::prefix_decode::decode_tuple_numeric_column_values_into(
+                                &decrypted,
+                                requested,
+                                &mut values,
+                            )
+                        } else {
+                            crate::storage::prefix_decode::decode_tuple_numeric_column_values_into(
+                                &raw_value,
+                                requested,
+                                &mut values,
+                            )
+                        };
+                        if decoded.is_none() {
+                            return Ok(None);
+                        }
 
-            let decoded = if let Some(km) = &self.key_manager {
-                let decrypted = crypto::decrypt(km.key(), &raw_value)?;
-                crate::storage::prefix_decode::decode_tuple_numeric_column_values_into(
-                    &decrypted,
-                    requested,
-                    &mut values,
-                )
-            } else {
-                crate::storage::prefix_decode::decode_tuple_numeric_column_values_into(
-                    &raw_value,
-                    requested,
-                    &mut values,
-                )
-            };
-            if decoded.is_none() {
-                return Ok(None);
-            }
+                        count += 1;
+                        if let Some(crate::storage::prefix_decode::DecodedNumericValue::Int(value)) =
+                            values.get(sum_position)
+                        {
+                            sum = sum
+                                .checked_add(*value)
+                                .ok_or_else(|| Error::query_execution("integer overflow: BIGINT SUM"))?;
+                            sum_seen = true;
+                        }
+                        match values.get(avg_position) {
+                            Some(crate::storage::prefix_decode::DecodedNumericValue::Int(value)) => {
+                                avg_sum += *value as f64;
+                                avg_count += 1;
+                            }
+                            Some(crate::storage::prefix_decode::DecodedNumericValue::Float(value)) => {
+                                avg_sum += *value;
+                                avg_count += 1;
+                            }
+                            _ => {}
+                        }
+                    }
+                    Ok(Some((count, sum, sum_seen, avg_sum, avg_count)))
+                })?;
 
-            count += 1;
-            if let Some(crate::storage::prefix_decode::DecodedNumericValue::Int(value)) = values.get(sum_position) {
-                sum = sum
-                    .checked_add(*value)
-                    .ok_or_else(|| Error::query_execution("integer overflow: BIGINT SUM"))?;
-                sum_seen = true;
-            }
-            match values.get(avg_position) {
-                Some(crate::storage::prefix_decode::DecodedNumericValue::Int(value)) => {
-                    avg_sum += *value as f64;
-                    avg_count += 1;
+            for partial in partials {
+                let Some((chunk_count, chunk_sum, chunk_sum_seen, chunk_avg_sum, chunk_avg_count)) = partial else {
+                    return Ok(None);
+                };
+                count += chunk_count;
+                if chunk_sum_seen {
+                    sum = sum
+                        .checked_add(chunk_sum)
+                        .ok_or_else(|| Error::query_execution("integer overflow: BIGINT SUM"))?;
+                    sum_seen = true;
                 }
-                Some(crate::storage::prefix_decode::DecodedNumericValue::Float(value)) => {
-                    avg_sum += *value;
-                    avg_count += 1;
+                avg_sum += chunk_avg_sum;
+                avg_count += chunk_avg_count;
+            }
+        } else {
+            let mut read_opts = ReadOptions::default();
+            read_opts.set_total_order_seek(true);
+            let iter = self
+                .db
+                .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read_opts);
+            let mut values = Vec::with_capacity(requested.len());
+            for item in iter {
+                let (key, raw_value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+                if !key.starts_with(prefix_bytes) {
+                    break;
                 }
-                _ => {}
+
+                let decoded = if let Some(km) = &self.key_manager {
+                    let decrypted = crypto::decrypt(km.key(), &raw_value)?;
+                    crate::storage::prefix_decode::decode_tuple_numeric_column_values_into(
+                        &decrypted,
+                        requested,
+                        &mut values,
+                    )
+                } else {
+                    crate::storage::prefix_decode::decode_tuple_numeric_column_values_into(
+                        &raw_value,
+                        requested,
+                        &mut values,
+                    )
+                };
+                if decoded.is_none() {
+                    return Ok(None);
+                }
+
+                count += 1;
+                if let Some(crate::storage::prefix_decode::DecodedNumericValue::Int(value)) = values.get(sum_position) {
+                    sum = sum
+                        .checked_add(*value)
+                        .ok_or_else(|| Error::query_execution("integer overflow: BIGINT SUM"))?;
+                    sum_seen = true;
+                }
+                match values.get(avg_position) {
+                    Some(crate::storage::prefix_decode::DecodedNumericValue::Int(value)) => {
+                        avg_sum += *value as f64;
+                        avg_count += 1;
+                    }
+                    Some(crate::storage::prefix_decode::DecodedNumericValue::Float(value)) => {
+                        avg_sum += *value;
+                        avg_count += 1;
+                    }
+                    _ => {}
+                }
             }
         }
 
@@ -4599,33 +5265,76 @@ impl StorageEngine {
 
         let prefix = format!("data:{}:", table_name);
         let prefix_bytes = prefix.as_bytes();
-        let mut read_opts = ReadOptions::default();
-        read_opts.set_total_order_seek(true);
-        let iter = self
-            .db
-            .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read_opts);
+
+        // R3.2 gate: parallel partial aggregation over per-shard RocksDB
+        // iterators for large tables. DISTINCT aggregates stay serial
+        // (set-union partials are not worth it today); HELIOS_AGG_SERIAL /
+        // HELIOS_AGG_PARALLEL_THRESHOLD control the gate via
+        // agg_parallel_rows_met.
+        let has_distinct = aggregates
+            .iter()
+            .any(|aggregate| matches!(aggregate.op, ColumnarAggregateOp::CountDistinct));
+        let row_count_hint = self.art_index_manager.pk_index_len(table_name);
+        let parallel = !has_distinct && row_count_hint.is_some_and(agg_parallel_rows_met);
 
         if group_by_columns.is_empty() {
             let mut states: Vec<ColumnarAggregateState> = aggregates
                 .iter()
                 .map(|aggregate| ColumnarAggregateState::new(aggregate.op))
                 .collect();
-            let mut values = Vec::with_capacity(requested.len());
 
-            for item in iter {
-                let (key, raw_value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
-                if !key.starts_with(prefix_bytes) {
-                    break;
+            if parallel {
+                let partials: Vec<Vec<ColumnarAggregateState>> = self.par_prefix_shard_results(&prefix, |iter| {
+                    let mut states: Vec<ColumnarAggregateState> = aggregates
+                        .iter()
+                        .map(|aggregate| ColumnarAggregateState::new(aggregate.op))
+                        .collect();
+                    let mut values = Vec::with_capacity(requested.len());
+                    for item in iter {
+                        let (_, raw_value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+                        self.decode_rowstore_column_values_into(
+                            &raw_value,
+                            &requested,
+                            schema.columns.len(),
+                            &mut values,
+                        )?;
+                        if !row_values_match_filters(&values, &filter_predicates, &filter_positions) {
+                            continue;
+                        }
+                        for ((state, aggregate), position) in
+                            states.iter_mut().zip(aggregates).zip(&aggregate_positions)
+                        {
+                            let value = position.and_then(|pos| values.get(pos));
+                            state.update(aggregate.op, value)?;
+                        }
+                    }
+                    Ok(states)
+                })?;
+                for partial in partials {
+                    merge_columnar_aggregate_states(&mut states, partial)?;
                 }
+            } else {
+                let mut read_opts = ReadOptions::default();
+                read_opts.set_total_order_seek(true);
+                let iter = self
+                    .db
+                    .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read_opts);
+                let mut values = Vec::with_capacity(requested.len());
+                for item in iter {
+                    let (key, raw_value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+                    if !key.starts_with(prefix_bytes) {
+                        break;
+                    }
 
-                self.decode_rowstore_column_values_into(&raw_value, &requested, schema.columns.len(), &mut values)?;
-                if !row_values_match_filters(&values, &filter_predicates, &filter_positions) {
-                    continue;
-                }
+                    self.decode_rowstore_column_values_into(&raw_value, &requested, schema.columns.len(), &mut values)?;
+                    if !row_values_match_filters(&values, &filter_predicates, &filter_positions) {
+                        continue;
+                    }
 
-                for ((state, aggregate), position) in states.iter_mut().zip(aggregates).zip(&aggregate_positions) {
-                    let value = position.and_then(|pos| values.get(pos));
-                    state.update(aggregate.op, value)?;
+                    for ((state, aggregate), position) in states.iter_mut().zip(aggregates).zip(&aggregate_positions) {
+                        let value = position.and_then(|pos| values.get(pos));
+                        state.update(aggregate.op, value)?;
+                    }
                 }
             }
 
@@ -4646,51 +5355,96 @@ impl StorageEngine {
         const LINEAR_GROUP_LIMIT: usize = 64;
         let mut small_groups: Vec<(Vec<Value>, Vec<ColumnarAggregateState>)> = Vec::new();
         let mut hash_groups: Option<HashMap<Vec<Value>, Vec<ColumnarAggregateState>>> = None;
-        let mut values = Vec::with_capacity(requested.len());
-        for item in iter {
-            let (key, raw_value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
-            if !key.starts_with(prefix_bytes) {
-                break;
+        if parallel {
+            // R3.2: per-shard hash partials merged into one map; ordering is
+            // unchanged because the shared tail below sorts the merged groups.
+            let partials: Vec<HashMap<Vec<Value>, Vec<ColumnarAggregateState>>> =
+                self.par_prefix_shard_results(&prefix, |iter| {
+                    let mut groups: HashMap<Vec<Value>, Vec<ColumnarAggregateState>> = HashMap::new();
+                    let mut values = Vec::with_capacity(requested.len());
+                    for item in iter {
+                        let (_, raw_value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+                        self.decode_rowstore_column_values_into(
+                            &raw_value,
+                            &requested,
+                            schema.columns.len(),
+                            &mut values,
+                        )?;
+                        if !row_values_match_filters(&values, &filter_predicates, &filter_positions) {
+                            continue;
+                        }
+                        let states = groups.entry(build_group_key(&values, &group_positions)).or_insert_with(|| {
+                            aggregates
+                                .iter()
+                                .map(|aggregate| ColumnarAggregateState::new(aggregate.op))
+                                .collect()
+                        });
+                        for ((state, aggregate), position) in
+                            states.iter_mut().zip(aggregates).zip(&aggregate_positions)
+                        {
+                            let value = position.and_then(|pos| values.get(pos));
+                            state.update(aggregate.op, value)?;
+                        }
+                    }
+                    Ok(groups)
+                })?;
+            let mut merged: HashMap<Vec<Value>, Vec<ColumnarAggregateState>> = HashMap::new();
+            for partial in partials {
+                merge_columnar_group_map(&mut merged, partial)?;
             }
+            hash_groups = Some(merged);
+        } else {
+            let mut read_opts = ReadOptions::default();
+            read_opts.set_total_order_seek(true);
+            let iter = self
+                .db
+                .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read_opts);
+            let mut values = Vec::with_capacity(requested.len());
+            for item in iter {
+                let (key, raw_value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+                if !key.starts_with(prefix_bytes) {
+                    break;
+                }
 
-            self.decode_rowstore_column_values_into(&raw_value, &requested, schema.columns.len(), &mut values)?;
-            if !row_values_match_filters(&values, &filter_predicates, &filter_positions) {
-                continue;
-            }
+                self.decode_rowstore_column_values_into(&raw_value, &requested, schema.columns.len(), &mut values)?;
+                if !row_values_match_filters(&values, &filter_predicates, &filter_positions) {
+                    continue;
+                }
 
-            if let Some(groups) = hash_groups.as_mut() {
-                let group_key = build_group_key(&values, &group_positions);
-                let states = groups.entry(group_key).or_insert_with(|| {
-                    aggregates
+                if let Some(groups) = hash_groups.as_mut() {
+                    let group_key = build_group_key(&values, &group_positions);
+                    let states = groups.entry(group_key).or_insert_with(|| {
+                        aggregates
+                            .iter()
+                            .map(|aggregate| ColumnarAggregateState::new(aggregate.op))
+                            .collect()
+                    });
+                    for ((state, aggregate), position) in states.iter_mut().zip(aggregates).zip(&aggregate_positions) {
+                        let value = position.and_then(|pos| values.get(pos));
+                        state.update(aggregate.op, value)?;
+                    }
+                } else if let Some(idx) = small_groups
+                    .iter()
+                    .position(|(group_key, _)| group_key_matches_values(group_key, &values, &group_positions))
+                {
+                    let states = &mut small_groups[idx].1;
+                    for ((state, aggregate), position) in states.iter_mut().zip(aggregates).zip(&aggregate_positions) {
+                        let value = position.and_then(|pos| values.get(pos));
+                        state.update(aggregate.op, value)?;
+                    }
+                } else {
+                    let mut states: Vec<ColumnarAggregateState> = aggregates
                         .iter()
                         .map(|aggregate| ColumnarAggregateState::new(aggregate.op))
-                        .collect()
-                });
-                for ((state, aggregate), position) in states.iter_mut().zip(aggregates).zip(&aggregate_positions) {
-                    let value = position.and_then(|pos| values.get(pos));
-                    state.update(aggregate.op, value)?;
-                }
-            } else if let Some(idx) = small_groups
-                .iter()
-                .position(|(group_key, _)| group_key_matches_values(group_key, &values, &group_positions))
-            {
-                let states = &mut small_groups[idx].1;
-                for ((state, aggregate), position) in states.iter_mut().zip(aggregates).zip(&aggregate_positions) {
-                    let value = position.and_then(|pos| values.get(pos));
-                    state.update(aggregate.op, value)?;
-                }
-            } else {
-                let mut states: Vec<ColumnarAggregateState> = aggregates
-                    .iter()
-                    .map(|aggregate| ColumnarAggregateState::new(aggregate.op))
-                    .collect();
-                for ((state, aggregate), position) in states.iter_mut().zip(aggregates).zip(&aggregate_positions) {
-                    let value = position.and_then(|pos| values.get(pos));
-                    state.update(aggregate.op, value)?;
-                }
-                small_groups.push((build_group_key(&values, &group_positions), states));
-                if small_groups.len() > LINEAR_GROUP_LIMIT {
-                    hash_groups = Some(small_groups.drain(..).collect());
+                        .collect();
+                    for ((state, aggregate), position) in states.iter_mut().zip(aggregates).zip(&aggregate_positions) {
+                        let value = position.and_then(|pos| values.get(pos));
+                        state.update(aggregate.op, value)?;
+                    }
+                    small_groups.push((build_group_key(&values, &group_positions), states));
+                    if small_groups.len() > LINEAR_GROUP_LIMIT {
+                        hash_groups = Some(small_groups.drain(..).collect());
+                    }
                 }
             }
         }
