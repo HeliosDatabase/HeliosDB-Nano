@@ -57,6 +57,12 @@ impl TypeInference for LogicalExpr {
                 .map(|col| col.data_type.clone())
                 .ok_or_else(|| Error::type_conversion(format!("Column '{}' not found in schema", name))),
 
+            // Pre-bound column reference (R3.5): positional lookup
+            LogicalExpr::BoundColumn { index, name, .. } => schema
+                .get_column_at(*index)
+                .map(|col| col.data_type.clone())
+                .ok_or_else(|| Error::type_conversion(format!("Column '{}' not found in schema", name))),
+
             // Literal: get type from value
             LogicalExpr::Literal(value) => Ok(value.data_type()),
 
@@ -310,6 +316,11 @@ impl TypeInference for LogicalExpr {
             // Column: check schema for nullability
             LogicalExpr::Column { name, .. } => {
                 schema.get_column(name).map(|col| col.nullable).unwrap_or(true) // Default to nullable if not found
+            }
+
+            // Pre-bound column reference (R3.5): positional lookup
+            LogicalExpr::BoundColumn { index, .. } => {
+                schema.get_column_at(*index).map(|col| col.nullable).unwrap_or(true)
             }
 
             // Literal: only NULL is nullable

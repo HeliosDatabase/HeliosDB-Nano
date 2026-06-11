@@ -779,6 +779,9 @@ fn collect_expr_columns_by_table(
             }
         }
         LogicalExpr::NewRow { .. } | LogicalExpr::OldRow { .. } => *bail = true,
+        // Physical-only node (R3.5): never present in plan expressions, which
+        // is what this collector walks. Bail to a full decode if ever seen.
+        LogicalExpr::BoundColumn { .. } => *bail = true,
         LogicalExpr::Wildcard => {
             for (table_idx, table) in tables.iter().enumerate() {
                 collect_all_schema_indices(&table.schema, &mut needed[table_idx]);
@@ -1013,7 +1016,7 @@ fn collect_expr_columns(expr: &LogicalExpr, cols: &mut HashSet<String>, bail: &m
         return;
     }
     match expr {
-        LogicalExpr::Column { name, .. } => {
+        LogicalExpr::Column { name, .. } | LogicalExpr::BoundColumn { name, .. } => {
             cols.insert(name.clone());
         }
         LogicalExpr::NewRow { column } | LogicalExpr::OldRow { column } => {
