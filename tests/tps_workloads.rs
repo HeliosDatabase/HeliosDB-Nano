@@ -1443,6 +1443,19 @@ fn run_durable_commit_bench() {
         let db = EmbeddedDatabase::with_config(c).unwrap();
         db.execute("CREATE TABLE d (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
 
+        // D5 follow-up: autocommit fast-path inserts must honor durable_commit
+        // (one WAL fsync barrier per statement).
+        {
+            let start = Instant::now();
+            let n = 50usize;
+            for i in 0..n {
+                db.execute(&format!("INSERT INTO d (id, v) VALUES ({}, 9)", 90_000_000 + i)).unwrap();
+            }
+            println!(
+                "durable={durable:<5} autocommit   {:>10.0} ops/s  ({n} inserts)",
+                n as f64 / start.elapsed().as_secs_f64()
+            );
+        }
         for &threads in &[1usize, 8, 16, 24, 32] {
             let start = Instant::now();
             std::thread::scope(|s| {

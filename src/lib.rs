@@ -5175,6 +5175,9 @@ impl EmbeddedDatabase {
 
         let result = self.try_fast_insert(sql)?;
         if result.is_ok() {
+            if let Err(e) = self.storage.durable_autocommit_barrier() {
+                return Some(Err(e));
+            }
             self.storage.increment_lsn();
         }
         Some(result)
@@ -5213,6 +5216,9 @@ impl EmbeddedDatabase {
             .insert_tuple_fast(&spec.table_name, tuple, &spec.schema)
             .map(|_| 1);
         if result.is_ok() {
+            if let Err(e) = self.storage.durable_autocommit_barrier() {
+                return Some(Err(e));
+            }
             self.storage.increment_lsn();
         }
         Some(result)
@@ -5304,6 +5310,9 @@ impl EmbeddedDatabase {
                     Ok(inserted) => inserted,
                     Err(e) => return Some(Err(e)),
                 };
+            if let Err(e) = self.storage.durable_autocommit_barrier() {
+                return Some(Err(e));
+            }
             self.storage.increment_lsn();
             return Some(Ok(inserted));
         }
@@ -5349,6 +5358,9 @@ impl EmbeddedDatabase {
                 return Some(Err(e));
             }
             inserted += 1;
+            if let Err(e) = self.storage.durable_autocommit_barrier() {
+                return Some(Err(e));
+            }
             self.storage.increment_lsn();
         }
         Some(Ok(inserted))
@@ -6099,6 +6111,9 @@ impl EmbeddedDatabase {
             )
         };
         if result.is_ok() {
+            if let Err(e) = self.storage.durable_autocommit_barrier() {
+                return Some(Err(e));
+            }
             self.storage.increment_lsn();
         }
         Some(result)
@@ -6177,6 +6192,9 @@ impl EmbeddedDatabase {
             }
         })();
         if result.is_ok() {
+            if let Err(e) = self.storage.durable_autocommit_barrier() {
+                return Some(Err(e));
+            }
             self.storage.increment_lsn();
         }
         Some(result)
@@ -6590,6 +6608,9 @@ impl EmbeddedDatabase {
         };
 
         if result.is_ok() {
+            if let Err(e) = self.storage.durable_autocommit_barrier() {
+                return Some(Err(e));
+            }
             self.storage.increment_lsn();
         }
         Some(result)
