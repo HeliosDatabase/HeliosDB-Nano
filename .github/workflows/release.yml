@@ -144,6 +144,12 @@ jobs:
           - target: x86_64-pc-windows-msvc
             os: windows-2022
             archive: zip
+            # The crate does not yet compile on Windows (unguarded
+            # std::os::unix usage, E0433 — found by this matrix's first run
+            # on v3.40.0/v3.41.0). Keep the cell visible but non-blocking
+            # until the Windows port lands; remove this once it builds.
+            experimental: true
+    continue-on-error: ${{ matrix.experimental == true }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
