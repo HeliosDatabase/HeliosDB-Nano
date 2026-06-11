@@ -17,8 +17,19 @@
 //!   snapshots wait until no in-flight commit is at-or-below their
 //!   timestamp — otherwise a fresh transaction could read pre-commit data
 //!   while its snapshot claims to include the commit, and then validate
-//!   clean (the lost-update leak this versions fixes). The wait costs one
-//!   atomic load when no commit is in flight.
+//!   clean (the lost-update leak this versions fixes).
+//!
+//!   R1.3 phase 2 (replacing the R0.2 bounded-spin barrier): in-flight
+//!   commits live in a commit-ordered ledger (`BTreeMap<commit_ts, applied>`
+//!   — insertion is monotonic because commit timestamps are allocated under
+//!   the engine timestamp lock). `end_commit` marks its entry applied and
+//!   pops the contiguous applied prefix, advancing `applied_watermark` =
+//!   highest commit_ts such that ALL commits <= it have applied.
+//!   `snapshot_barrier(ts)` returns immediately when nothing is pending or
+//!   `ts <= applied_watermark` (two atomic loads), and otherwise parks on a
+//!   condvar signaled by `end_commit` — no spinning, so barrier waiters can
+//!   never starve the committing threads they wait on (the 680x convoy the
+//!   R0.2 spin fix worked around).
 //! - INSERT-only transactions (insert_log) use engine-allocated row ids
 //!   that are never reused; they skip the registry entirely, keeping bulk
 //!   ingest registry-free.
@@ -35,6 +46,8 @@
 //! transactions read `recent_writes`, so only they need to register.
 
 use dashmap::DashMap;
+use parking_lot::{Condvar, Mutex};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use super::Key;
@@ -48,10 +61,20 @@ pub struct WriteConflictRegistry {
     recent_writes: DashMap<Key, u64>,
     /// Snapshots of active VALIDATING transactions (txn_id -> snapshot_ts).
     active_snapshots: DashMap<u64, u64>,
-    /// Commit timestamps allocated but not yet applied to storage.
-    inflight_commits: DashMap<u64, ()>,
-    /// Fast-path counter mirroring `inflight_commits` size.
-    inflight_count: AtomicUsize,
+    /// Commit-ordered in-flight ledger: commit_ts -> applied?. Keys are
+    /// strictly increasing at insertion (`begin_commit` runs inside the
+    /// engine timestamp lock). `end_commit` marks entries applied and pops
+    /// the contiguous applied prefix; entries that applied out of order
+    /// stay (marked) until the gap before them fills.
+    inflight: Mutex<BTreeMap<u64, bool>>,
+    /// Signaled by `end_commit` whenever an entry becomes applied.
+    inflight_cv: Condvar,
+    /// Number of PENDING (begun, not yet ended) commits. 0 = barrier fast
+    /// path: nothing to wait for.
+    pending_count: AtomicUsize,
+    /// Highest commit_ts such that every in-flight commit <= it has
+    /// applied. Monotonic; second barrier fast path.
+    applied_watermark: AtomicU64,
     /// Recorded commits since creation (drives pruning cadence).
     commit_count: AtomicU64,
 }
@@ -73,48 +96,78 @@ impl WriteConflictRegistry {
         self.active_snapshots.remove(&txn_id);
     }
 
-    /// Snapshot barrier: spin until every in-flight commit at or below
-    /// `snapshot_ts` has been applied. One atomic load when nothing is in
-    /// flight (the overwhelmingly common case).
+    /// Snapshot barrier: block until every in-flight commit at or below
+    /// `snapshot_ts` has been applied. Two atomic loads when nothing is
+    /// pending or the watermark already covers the snapshot (the
+    /// overwhelmingly common cases); otherwise parks on a condvar that
+    /// `end_commit` signals — no spinning (R1.3 phase 2).
+    ///
+    /// Correctness (unchanged contract from R0.2): a snapshot must never be
+    /// taken covering an unapplied commit. Any commit with ts <= snapshot_ts
+    /// ran `begin_commit` inside the engine timestamp lock BEFORE this
+    /// snapshot's ts was allocated under the same lock, so its ledger entry
+    /// (and `pending_count` increment) are visible here — the fast paths
+    /// cannot miss it.
     pub fn snapshot_barrier(&self, snapshot_ts: u64) {
-        let mut spins: u32 = 0;
-        loop {
-            if self.inflight_count.load(Ordering::Acquire) == 0 {
-                return;
-            }
-            let pending = self
-                .inflight_commits
-                .iter()
-                .any(|entry| *entry.key() <= snapshot_ts);
-            if !pending {
-                return;
-            }
-            // Bounded spin, then sleep-backoff: with waiter counts near the
-            // core count, pure yield-spinning starves the committing thread
-            // the barrier is waiting on (measured: 49.6k txn/s at 8 sessions
-            // collapsing to 73 txn/s at 32 sessions on a 32-core host).
-            spins += 1;
-            if spins < 64 {
-                std::thread::yield_now();
-            } else {
-                std::thread::sleep(std::time::Duration::from_micros(50));
-            }
+        if self.pending_count.load(Ordering::Acquire) == 0 {
+            return;
         }
+        if self.applied_watermark.load(Ordering::Acquire) >= snapshot_ts {
+            return;
+        }
+        let mut inflight = self.inflight.lock();
+        while inflight.range(..=snapshot_ts).any(|(_, applied)| !applied) {
+            self.inflight_cv.wait(&mut inflight);
+        }
+    }
+
+    /// Highest commit timestamp such that every in-flight commit at or
+    /// below it has been applied (diagnostics/tests).
+    pub fn applied_watermark(&self) -> u64 {
+        self.applied_watermark.load(Ordering::Acquire)
     }
 
     /// Announce a commit whose write set is about to be validated/applied.
     /// MUST be paired with `end_commit` on every path (use try/finally
-    /// discipline in the caller).
+    /// discipline in the caller). Called with strictly increasing
+    /// `commit_ts` (inside the engine timestamp lock).
     pub fn begin_commit(&self, commit_ts: u64) {
-        self.inflight_commits.insert(commit_ts, ());
-        self.inflight_count.fetch_add(1, Ordering::AcqRel);
+        let mut inflight = self.inflight.lock();
+        inflight.insert(commit_ts, false);
+        self.pending_count.fetch_add(1, Ordering::AcqRel);
     }
 
     /// The commit's RocksDB write has been applied (or the commit aborted).
+    /// Marks the ledger entry applied, advances the watermark past the
+    /// contiguous applied prefix, and wakes barrier waiters. Tolerates
+    /// unknown timestamps and double calls (no-ops).
     pub fn end_commit(&self, commit_ts: u64) {
-        if self.inflight_commits.remove(&commit_ts).is_some() {
-            self.inflight_count.fetch_sub(1, Ordering::AcqRel);
+        let mut inflight = self.inflight.lock();
+        match inflight.get_mut(&commit_ts) {
+            Some(applied) if !*applied => *applied = true,
+            _ => return, // unknown ts or already ended
         }
+        self.pending_count.fetch_sub(1, Ordering::AcqRel);
+        // Advance the watermark past leading applied entries. Entries that
+        // applied out of order surface here once the gap before them fills.
+        let mut watermark = None;
+        while let Some(entry) = inflight.first_entry() {
+            if *entry.get() {
+                watermark = Some(*entry.key());
+                entry.remove();
+            } else {
+                break;
+            }
+        }
+        if let Some(w) = watermark {
+            self.applied_watermark.fetch_max(w, Ordering::AcqRel);
+        }
+        drop(inflight);
+        // Wake all waiters: an entry became applied, so any barrier whose
+        // last blocking entry this was can now pass (watermark advance
+        // alone is not enough — a waiter below an out-of-order gap may
+        // unblock without the prefix moving).
+        self.inflight_cv.notify_all();
     }
 
     /// First-committer-wins gate, per-key atomic. For each key: conflict if
@@ -266,5 +319,136 @@ mod tests {
         reg.begin_commit(100);
         reg.snapshot_barrier(50);
         reg.end_commit(100);
+    }
+
+    #[test]
+    fn watermark_advances_past_contiguous_applied_prefix() {
+        let reg = WriteConflictRegistry::new();
+        reg.begin_commit(10);
+        reg.begin_commit(20);
+        reg.begin_commit(30);
+        assert_eq!(reg.applied_watermark(), 0);
+        reg.end_commit(10);
+        assert_eq!(reg.applied_watermark(), 10);
+        reg.end_commit(20);
+        assert_eq!(reg.applied_watermark(), 20);
+        reg.end_commit(30);
+        assert_eq!(reg.applied_watermark(), 30);
+    }
+
+    #[test]
+    fn out_of_order_end_commit_holds_watermark_until_gap_fills() {
+        let reg = std::sync::Arc::new(WriteConflictRegistry::new());
+        reg.begin_commit(10);
+        reg.begin_commit(20);
+        reg.begin_commit(30);
+        // 30 and 20 apply before 10: watermark must NOT pass the pending 10.
+        reg.end_commit(30);
+        reg.end_commit(20);
+        assert_eq!(reg.applied_watermark(), 0);
+        let r2 = reg.clone();
+        let h = std::thread::spawn(move || r2.snapshot_barrier(25));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(!h.is_finished(), "barrier(25) returned while commit 10 pending");
+        // The gap fills: the whole applied prefix pops in one advance.
+        reg.end_commit(10);
+        h.join().unwrap();
+        assert_eq!(reg.applied_watermark(), 30);
+    }
+
+    #[test]
+    fn barrier_ignores_gaps_from_never_begun_timestamps() {
+        // Timestamps allocated to read-only/insert-only transactions never
+        // call begin_commit; the ledger must not wait on those gaps.
+        let reg = std::sync::Arc::new(WriteConflictRegistry::new());
+        reg.begin_commit(10);
+        reg.begin_commit(40); // 11..=39 never begun
+        let r2 = reg.clone();
+        let h = std::thread::spawn(move || r2.snapshot_barrier(25));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(!h.is_finished(), "barrier(25) returned while commit 10 pending");
+        reg.end_commit(10);
+        // Barrier at 25 must pass with 40 still pending.
+        h.join().unwrap();
+        assert_eq!(reg.applied_watermark(), 10);
+        // A barrier above the pending 40 still waits.
+        let r3 = reg.clone();
+        let h2 = std::thread::spawn(move || r3.snapshot_barrier(45));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(!h2.is_finished(), "barrier(45) returned while commit 40 pending");
+        reg.end_commit(40);
+        h2.join().unwrap();
+        assert_eq!(reg.applied_watermark(), 40);
+    }
+
+    #[test]
+    fn end_commit_is_idempotent_and_ignores_unknown_ts() {
+        let reg = WriteConflictRegistry::new();
+        reg.begin_commit(10);
+        reg.begin_commit(20);
+        reg.end_commit(999); // never begun: no-op
+        reg.end_commit(20);
+        reg.end_commit(20); // double end: no-op (pending_count stays balanced)
+        assert_eq!(reg.applied_watermark(), 0);
+        reg.end_commit(10);
+        assert_eq!(reg.applied_watermark(), 20);
+        // pending_count balanced => barrier fast path returns immediately.
+        reg.snapshot_barrier(u64::MAX);
+    }
+
+    #[test]
+    fn concurrent_begin_end_barrier_stress() {
+        // Hammer the ledger from committers + barrier threads and verify
+        // every barrier respects the contract (no snapshot passes a pending
+        // commit at-or-below its ts). Timestamp allocation and begin_commit
+        // share one mutex, mirroring the engine timestamp lock (commit
+        // announcement is atomic with ts allocation; see
+        // StorageEngine::next_commit_timestamp).
+        let reg = std::sync::Arc::new(WriteConflictRegistry::new());
+        let alloc = std::sync::Arc::new(Mutex::new(0u64));
+        let committers = 8;
+        let per_thread = 500;
+        std::thread::scope(|s| {
+            for _ in 0..committers {
+                let reg = std::sync::Arc::clone(&reg);
+                let alloc = std::sync::Arc::clone(&alloc);
+                s.spawn(move || {
+                    for i in 0..per_thread {
+                        let ts = {
+                            let mut next = alloc.lock();
+                            *next += 1;
+                            reg.begin_commit(*next);
+                            *next
+                        };
+                        if i % 3 == 0 {
+                            std::thread::yield_now();
+                        }
+                        reg.end_commit(ts);
+                    }
+                });
+            }
+            for _ in 0..4 {
+                let reg = std::sync::Arc::clone(&reg);
+                let alloc = std::sync::Arc::clone(&alloc);
+                s.spawn(move || {
+                    for _ in 0..per_thread {
+                        let snap = {
+                            let mut next = alloc.lock();
+                            *next += 1;
+                            *next
+                        };
+                        reg.snapshot_barrier(snap);
+                        // After the barrier no pending commit <= snap exists.
+                        let inflight = reg.inflight.lock();
+                        assert!(
+                            inflight.range(..=snap).all(|(_, applied)| *applied),
+                            "barrier passed a pending commit <= its snapshot"
+                        );
+                    }
+                });
+            }
+        });
+        reg.snapshot_barrier(u64::MAX);
+        assert!(reg.inflight.lock().is_empty(), "ledger must drain");
     }
 }
