@@ -736,20 +736,14 @@ impl SnapshotManager {
         batch.put(index_key.as_bytes(), timestamp.to_be_bytes());
 
         if self.persist_metadata {
+            // R1.4: snapshot: alone — txn_map:/scn_map: were write-only
+            // (recover_snapshots rebuilds every in-memory map from the
+            // snapshot: entries; nothing ever read the other two), costing
+            // two keys of write amplification per autocommit statement.
             let snapshot_key = format!("snapshot:{}", metadata.timestamp);
             let snapshot_value = bincode::serialize(&metadata)
                 .map_err(|e| Error::storage(format!("Failed to serialize metadata: {}", e)))?;
             batch.put(snapshot_key.as_bytes(), snapshot_value);
-
-            let txn_key = format!("txn_map:{}", metadata.transaction_id);
-            let txn_value = bincode::serialize(&metadata.timestamp)
-                .map_err(|e| Error::storage(format!("Failed to serialize txn mapping: {}", e)))?;
-            batch.put(txn_key.as_bytes(), txn_value);
-
-            let scn_key = format!("scn_map:{}", metadata.scn);
-            let scn_value = bincode::serialize(&metadata.timestamp)
-                .map_err(|e| Error::storage(format!("Failed to serialize scn mapping: {}", e)))?;
-            batch.put(scn_key.as_bytes(), scn_value);
         }
 
         Ok(())
@@ -824,6 +818,12 @@ impl SnapshotManager {
     }
 
     /// Persist snapshot metadata to disk
+    ///
+    /// R1.4: one `snapshot:` put. The former `txn_map:`/`scn_map:` mappings
+    /// were write-only — recovery rebuilds every in-memory map from the
+    /// `snapshot:` entries alone — so each commit paid two extra RocksDB
+    /// write calls for nothing. GC still deletes legacy keys from databases
+    /// written by older versions.
     fn persist_snapshot_metadata(&self, metadata: &SnapshotMetadata) -> Result<()> {
         let key = format!("snapshot:{}", metadata.timestamp);
         let value =
@@ -831,24 +831,7 @@ impl SnapshotManager {
 
         self.db
             .put(key.as_bytes(), value)
-            .map_err(|e| Error::storage(format!("Failed to persist metadata: {}", e)))?;
-
-        // Also persist mappings
-        let txn_key = format!("txn_map:{}", metadata.transaction_id);
-        let txn_value = bincode::serialize(&metadata.timestamp)
-            .map_err(|e| Error::storage(format!("Failed to serialize txn mapping: {}", e)))?;
-        self.db
-            .put(txn_key.as_bytes(), txn_value)
-            .map_err(|e| Error::storage(format!("Failed to persist txn mapping: {}", e)))?;
-
-        let scn_key = format!("scn_map:{}", metadata.scn);
-        let scn_value = bincode::serialize(&metadata.timestamp)
-            .map_err(|e| Error::storage(format!("Failed to serialize scn mapping: {}", e)))?;
-        self.db
-            .put(scn_key.as_bytes(), scn_value)
-            .map_err(|e| Error::storage(format!("Failed to persist scn mapping: {}", e)))?;
-
-        Ok(())
+            .map_err(|e| Error::storage(format!("Failed to persist metadata: {}", e)))
     }
 
     /// Garbage collect old snapshots
