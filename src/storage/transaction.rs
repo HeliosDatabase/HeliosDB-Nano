@@ -12,10 +12,10 @@ use super::time_travel::SnapshotManager;
 use super::{Key, Snapshot, SnapshotId};
 use crate::session::{IsolationLevel, SessionId};
 use crate::{Error, Result, Tuple};
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use parking_lot::RwLock;
 use rocksdb::{WriteOptions, DB};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use tracing::{debug, trace, warn};
 
@@ -88,6 +88,21 @@ pub struct Transaction {
     /// so keeping it out of `write_set` avoids a redundant DashMap overwrite on
     /// every inserted row in large explicit transactions.
     row_counter_stages: Arc<RwLock<std::collections::HashMap<String, u64>>>,
+    /// R2.3: tables touched by this transaction's staged writes (parsed from
+    /// `data:{table}:{row_id}` keys in `put`/`put_insert_fast`/`delete`, plus
+    /// `stage_row_counter` tables). Lets the executor answer
+    /// [`has_writes_for_table`](Self::has_writes_for_table) in O(1) instead of
+    /// scanning `write_set`/`insert_log` on every SELECT gate check.
+    ///
+    /// Deliberately monotonic: ROLLBACK TO SAVEPOINT does not shrink it. An
+    /// over-approximation only keeps a table on the slow (write-set-merging)
+    /// read path, which is always correct.
+    written_tables: DashSet<String>,
+    /// R2.3: set when a staged write's key is not a parseable `data:` key
+    /// (e.g. raw `counter:`/meta keys via `put`). From then on
+    /// `has_writes_for_table` answers `true` for every table — conservative,
+    /// keeps all reads on the slow path.
+    has_unattributed_writes: AtomicBool,
     /// Transaction state - uses AtomicU8 for lock-free state checking
     state: AtomicU8,
     /// Session ID (for multi-user support)
@@ -162,6 +177,8 @@ impl Transaction {
             write_set: Arc::new(DashMap::new()),
             insert_log: Arc::new(RwLock::new(Vec::new())),
             row_counter_stages: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            written_tables: DashSet::new(),
+            has_unattributed_writes: AtomicBool::new(false),
             state: AtomicU8::new(TransactionState::Active.to_u8()),
             session_id: None,
             isolation_level: IsolationLevel::ReadCommitted,
@@ -221,6 +238,8 @@ impl Transaction {
             write_set: Arc::new(DashMap::new()),
             insert_log: Arc::new(RwLock::new(Vec::new())),
             row_counter_stages: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            written_tables: DashSet::new(),
+            has_unattributed_writes: AtomicBool::new(false),
             state: AtomicU8::new(TransactionState::Active.to_u8()),
             session_id: Some(session_id),
             isolation_level,
@@ -398,6 +417,10 @@ impl Transaction {
             }
         }
 
+        // R2.3: attribute the staged write to its table for the executor's
+        // write-set-empty fast-path gate.
+        self.note_written_key(&key);
+
         // Lock-free write_set insert using DashMap
         self.write_set.insert(key, Some(value));
         Ok(())
@@ -419,6 +442,8 @@ impl Transaction {
             return self.put(key, value);
         }
 
+        // R2.3: attribute the staged insert to its table (see `written_tables`).
+        self.note_written_key(&key);
         self.insert_log.write().push((key, value));
         Ok(())
     }
@@ -435,6 +460,11 @@ impl Transaction {
         let state = TransactionState::from_u8(state_value);
         if state != TransactionState::Active {
             return Err(Error::transaction("Transaction is not active"));
+        }
+
+        // R2.3: a staged row counter implies staged rows for this table.
+        if !self.written_tables.contains(table_name) {
+            self.written_tables.insert(table_name.to_string());
         }
 
         let mut stages = self.row_counter_stages.write();
@@ -459,6 +489,9 @@ impl Transaction {
         if state != TransactionState::Active {
             return Err(Error::transaction("Transaction is not active"));
         }
+
+        // R2.3: attribute the staged tombstone to its table (see `written_tables`).
+        self.note_written_key(&key);
 
         // Lock-free write_set insert (tombstone) using DashMap
         self.write_set.insert(key, None);
@@ -920,6 +953,47 @@ impl Transaction {
             }
         }
         out
+    }
+
+    /// R2.3: record which table a staged write belongs to.
+    ///
+    /// Keys shaped `data:{table}:{suffix}` are attributed to `{table}`; any
+    /// other key flips `has_unattributed_writes`, which conservatively makes
+    /// [`has_writes_for_table`](Self::has_writes_for_table) report `true` for
+    /// every table (the staged write could affect anything, so every read in
+    /// this transaction must stay on the write-set-merging slow path).
+    fn note_written_key(&self, key: &[u8]) {
+        if let Some(rest) = key.strip_prefix(b"data:".as_slice()) {
+            if let Ok(text) = std::str::from_utf8(rest) {
+                if let Some(pos) = text.find(':') {
+                    let table = &text[..pos];
+                    if !self.written_tables.contains(table) {
+                        self.written_tables.insert(table.to_string());
+                    }
+                    return;
+                }
+            }
+        }
+        self.has_unattributed_writes.store(true, Ordering::Release);
+    }
+
+    /// R2.3: does this transaction hold staged writes that could affect reads
+    /// of `table`?
+    ///
+    /// O(1): answered from the `written_tables` side-set maintained by
+    /// `put`/`put_insert_fast`/`delete`/`stage_row_counter`, never by scanning
+    /// `write_set` or `insert_log`. May over-approximate after
+    /// ROLLBACK TO SAVEPOINT (the set is monotonic) and answers `true` for
+    /// all tables once any non-`data:` key was staged — both directions of
+    /// imprecision only force the (always-correct) slow read path.
+    pub fn has_writes_for_table(&self, table: &str) -> bool {
+        self.has_unattributed_writes.load(Ordering::Acquire) || self.written_tables.contains(table)
+    }
+
+    /// Isolation level this transaction runs under (R2.3: the executor's
+    /// fast-path read gates are isolation-aware).
+    pub fn isolation_level(&self) -> IsolationLevel {
+        self.isolation_level
     }
 
     /// Refresh the snapshot timestamp to the current database state

@@ -369,7 +369,11 @@ impl AggregateOperator {
 
     /// Rewrite HAVING expression to replace aggregate functions with column references
     /// This allows the HAVING clause to reference already-computed aggregate values
-    fn rewrite_having_expr(
+    ///
+    /// `pub(crate)`: R2.3 reuses this from the aggregate-pushdown fast paths
+    /// (`Executor::apply_having_post_filter`) so HAVING semantics stay
+    /// identical between the slow and pushdown paths.
+    pub(crate) fn rewrite_having_expr(
         expr: &crate::sql::LogicalExpr,
         aggr_exprs: &[crate::sql::LogicalExpr],
     ) -> crate::sql::LogicalExpr {

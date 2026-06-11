@@ -237,7 +237,7 @@ pub(super) fn try_index_point_lookup_for_scan(
         Some(storage) => storage,
         None => return Ok(None),
     };
-    if executor.transaction().is_some() || storage.is_branch_active() {
+    if storage.is_branch_active() {
         return Ok(None);
     }
 
@@ -251,6 +251,13 @@ pub(super) fn try_index_point_lookup_for_scan(
     else {
         return Ok(None);
     };
+    // R2.3: inside a transaction the ART probe stays enabled only for
+    // ReadCommitted session transactions with no staged writes touching this
+    // table (statement-fresh snapshot ⇒ current-storage probe is equivalent;
+    // staged writes ⇒ slow path for read-your-writes).
+    if executor.txn_forces_slow_reads_for_table(table_name) {
+        return Ok(None);
+    }
     if as_of.is_some()
         || executor.get_cte(table_name).is_some()
         || storage.mv_catalog().view_exists(table_name)?
