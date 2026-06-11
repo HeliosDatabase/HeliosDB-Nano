@@ -14,6 +14,8 @@
 
 use crate::{Error, Result};
 use std::fs;
+// PermissionsExt (chmod) is unix-only; on Windows hooks are written without an exec bit (no-op).
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
