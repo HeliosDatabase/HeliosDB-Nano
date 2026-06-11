@@ -310,6 +310,7 @@ pub mod ab_testing;
 
 // Internal modules
 mod error;
+mod sharded_lru;
 mod types;
 // `config` was originally private but the encryption / sync
 // benchmarks reference its `KeySource` enum directly.  Promoted
@@ -365,6 +366,13 @@ pub struct EmbeddedDatabase {
     config: Config,
     /// Current active transaction (if any)
     current_transaction: std::sync::Arc<std::sync::Mutex<Option<storage::Transaction>>>,
+    /// "Global transaction open" fast-out (R2.1). Mirrors
+    /// `current_transaction.is_some()` and is updated *only* while holding
+    /// the `current_transaction` mutex (begin/commit/rollback internals are
+    /// the sole `Some`/`None` transition points). Lets the per-statement
+    /// query/execute entry skip the mutex entirely in autocommit mode —
+    /// the same pattern as `result_cache_nonempty`.
+    global_txn_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Tenant manager for multi-tenancy and RLS (optional)
     pub tenant_manager: std::sync::Arc<crate::tenant::TenantManager>,
     /// Trigger registry for trigger management and execution
@@ -389,12 +397,12 @@ pub struct EmbeddedDatabase {
     prepared_statements: std::sync::Arc<parking_lot::RwLock<std::collections::HashMap<String, sql::LogicalPlan>>>,
     /// Active savepoints stack (name -> transaction state)
     savepoints: std::sync::Arc<parking_lot::RwLock<Vec<SavepointState>>>,
-    /// Plan cache: SQL string → `Arc<LogicalPlan>` (LRU, skips parse+plan for repeated queries)
-    plan_cache: std::sync::Arc<std::sync::Mutex<lru::LruCache<String, std::sync::Arc<sql::LogicalPlan>>>>,
-    /// Parse cache: SQL string → AST Statement (LRU, skips SQL parsing for repeated queries)
-    parse_cache: std::sync::Arc<std::sync::Mutex<lru::LruCache<String, sqlparser::ast::Statement>>>,
+    /// Plan cache: SQL string → `Arc<LogicalPlan>` (sharded LRU, skips parse+plan for repeated queries)
+    plan_cache: std::sync::Arc<sharded_lru::ShardedLruCache<String, std::sync::Arc<sql::LogicalPlan>>>,
+    /// Parse cache: SQL string → AST Statement (sharded LRU, skips SQL parsing for repeated queries)
+    parse_cache: std::sync::Arc<sharded_lru::ShardedLruCache<String, sqlparser::ast::Statement>>,
     /// Query result cache: SQL string → cached results (invalidated on DML per-table)
-    result_cache: std::sync::Arc<std::sync::Mutex<lru::LruCache<String, std::sync::Arc<Vec<Tuple>>>>>,
+    result_cache: std::sync::Arc<sharded_lru::ShardedLruCache<String, std::sync::Arc<Vec<Tuple>>>>,
     /// Fast DML invalidation gate; avoids taking the result-cache mutex when
     /// no query has populated it since the last invalidation.
     result_cache_nonempty: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -403,34 +411,36 @@ pub struct EmbeddedDatabase {
     /// repeated hot-key queries after the second consecutive hit.
     last_fast_select_fingerprint: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Repeated parameterized INSERT metadata cache. Invalidated with the plan cache on DDL.
-    fast_param_insert_cache:
-        std::sync::Arc<std::sync::Mutex<lru::LruCache<String, std::sync::Arc<FastParamInsertSpec>>>>,
+    fast_param_insert_cache: std::sync::Arc<sharded_lru::ShardedLruCache<String, std::sync::Arc<FastParamInsertSpec>>>,
     /// Repeated literal INSERT shape cache. Literal values differ per statement,
     /// but table/column metadata is stable until DDL.
     fast_literal_insert_cache:
-        std::sync::Arc<std::sync::Mutex<lru::LruCache<String, std::sync::Arc<FastLiteralInsertSpec>>>>,
+        std::sync::Arc<sharded_lru::ShardedLruCache<String, std::sync::Arc<FastLiteralInsertSpec>>>,
     /// Repeated parameterized UPDATE metadata cache. Invalidated with the plan cache on DDL.
-    fast_param_update_cache:
-        std::sync::Arc<std::sync::Mutex<lru::LruCache<String, std::sync::Arc<FastParamUpdateSpec>>>>,
+    fast_param_update_cache: std::sync::Arc<sharded_lru::ShardedLruCache<String, std::sync::Arc<FastParamUpdateSpec>>>,
     /// Last repeated parameterized UPDATE fast spec. Avoids the LRU mutex for hot prepared-style loops.
     hot_fast_param_update_spec:
         std::sync::Arc<parking_lot::RwLock<Option<(String, std::sync::Arc<FastParamUpdateSpec>)>>>,
     /// Repeated literal UPDATE shape cache. Literal values differ per statement,
     /// but table/column metadata is stable until DDL.
     fast_literal_update_cache:
-        std::sync::Arc<std::sync::Mutex<lru::LruCache<String, std::sync::Arc<FastLiteralUpdateSpec>>>>,
+        std::sync::Arc<sharded_lru::ShardedLruCache<String, std::sync::Arc<FastLiteralUpdateSpec>>>,
     /// Repeated parameterized DELETE metadata cache. Invalidated with the plan cache on DDL.
-    fast_param_delete_cache:
-        std::sync::Arc<std::sync::Mutex<lru::LruCache<String, std::sync::Arc<FastParamDeleteSpec>>>>,
+    fast_param_delete_cache: std::sync::Arc<sharded_lru::ShardedLruCache<String, std::sync::Arc<FastParamDeleteSpec>>>,
     /// Last repeated parameterized DELETE fast spec. Key includes FK validation mode/source.
     hot_fast_param_delete_spec:
         std::sync::Arc<parking_lot::RwLock<Option<(String, std::sync::Arc<FastParamDeleteSpec>)>>>,
     /// Repeated literal DELETE shape cache. Literal PK values differ per statement.
     fast_literal_delete_cache:
-        std::sync::Arc<std::sync::Mutex<lru::LruCache<String, std::sync::Arc<FastLiteralDeleteSpec>>>>,
+        std::sync::Arc<sharded_lru::ShardedLruCache<String, std::sync::Arc<FastLiteralDeleteSpec>>>,
     /// Repeated simple PK SELECT metadata cache. Literal/parameter values differ
     /// per statement, but table/PK metadata is stable until DDL.
-    fast_select_cache: std::sync::Arc<std::sync::Mutex<lru::LruCache<String, std::sync::Arc<FastSelectSpec>>>>,
+    fast_select_cache: std::sync::Arc<sharded_lru::ShardedLruCache<String, std::sync::Arc<FastSelectSpec>>>,
+    /// Last fast SELECT spec served (R2.1). Hot point-lookup workloads hit one
+    /// (table, pk) spec on every statement; a read-mostly slot in front of the
+    /// sharded LRU keeps that lookup off any mutex (mirrors
+    /// `hot_fast_param_update_spec`). Cleared with the plan cache on DDL.
+    hot_fast_select_spec: std::sync::Arc<parking_lot::RwLock<Option<(String, std::sync::Arc<FastSelectSpec>)>>>,
     /// Lightweight SQL-visible query profiler, disabled by default.
     query_profiler: std::sync::Arc<query_trace::QueryProfiler>,
     /// ART index undo log for transaction rollback: (table, row_id, col_values)
@@ -471,14 +481,10 @@ impl Drop for EmbeddedDatabase {
         self.prepared_statements.write().clear();
 
         // Clear plan cache
-        if let Ok(mut cache) = self.plan_cache.lock() {
-            cache.clear();
-        }
+        self.plan_cache.clear();
 
         // Clear parse cache
-        if let Ok(mut cache) = self.parse_cache.lock() {
-            cache.clear();
-        }
+        self.parse_cache.clear();
 
         // Clear savepoints
         self.savepoints.write().clear();
@@ -765,59 +771,44 @@ impl<'a> Drop for CodeGraphBranchGuard<'a> {
 
 impl EmbeddedDatabase {
     #[allow(clippy::expect_used)] // Safety: cache size is a non-zero compile-time constant.
+    fn new_spec_cache<V: Clone>() -> std::sync::Arc<sharded_lru::ShardedLruCache<String, V>> {
+        std::sync::Arc::new(sharded_lru::ShardedLruCache::new(
+            std::num::NonZeroUsize::new(128).expect("128 is non-zero"),
+        ))
+    }
+
     fn new_fast_param_insert_cache(
-    ) -> std::sync::Arc<std::sync::Mutex<lru::LruCache<String, std::sync::Arc<FastParamInsertSpec>>>> {
-        std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(
-            std::num::NonZeroUsize::new(128).expect("128 is non-zero"),
-        )))
+    ) -> std::sync::Arc<sharded_lru::ShardedLruCache<String, std::sync::Arc<FastParamInsertSpec>>> {
+        Self::new_spec_cache()
     }
 
-    #[allow(clippy::expect_used)] // Safety: cache size is a non-zero compile-time constant.
     fn new_fast_literal_insert_cache(
-    ) -> std::sync::Arc<std::sync::Mutex<lru::LruCache<String, std::sync::Arc<FastLiteralInsertSpec>>>> {
-        std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(
-            std::num::NonZeroUsize::new(128).expect("128 is non-zero"),
-        )))
+    ) -> std::sync::Arc<sharded_lru::ShardedLruCache<String, std::sync::Arc<FastLiteralInsertSpec>>> {
+        Self::new_spec_cache()
     }
 
-    #[allow(clippy::expect_used)] // Safety: cache size is a non-zero compile-time constant.
     fn new_fast_param_update_cache(
-    ) -> std::sync::Arc<std::sync::Mutex<lru::LruCache<String, std::sync::Arc<FastParamUpdateSpec>>>> {
-        std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(
-            std::num::NonZeroUsize::new(128).expect("128 is non-zero"),
-        )))
+    ) -> std::sync::Arc<sharded_lru::ShardedLruCache<String, std::sync::Arc<FastParamUpdateSpec>>> {
+        Self::new_spec_cache()
     }
 
-    #[allow(clippy::expect_used)] // Safety: cache size is a non-zero compile-time constant.
     fn new_fast_literal_update_cache(
-    ) -> std::sync::Arc<std::sync::Mutex<lru::LruCache<String, std::sync::Arc<FastLiteralUpdateSpec>>>> {
-        std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(
-            std::num::NonZeroUsize::new(128).expect("128 is non-zero"),
-        )))
+    ) -> std::sync::Arc<sharded_lru::ShardedLruCache<String, std::sync::Arc<FastLiteralUpdateSpec>>> {
+        Self::new_spec_cache()
     }
 
-    #[allow(clippy::expect_used)] // Safety: cache size is a non-zero compile-time constant.
     fn new_fast_param_delete_cache(
-    ) -> std::sync::Arc<std::sync::Mutex<lru::LruCache<String, std::sync::Arc<FastParamDeleteSpec>>>> {
-        std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(
-            std::num::NonZeroUsize::new(128).expect("128 is non-zero"),
-        )))
+    ) -> std::sync::Arc<sharded_lru::ShardedLruCache<String, std::sync::Arc<FastParamDeleteSpec>>> {
+        Self::new_spec_cache()
     }
 
-    #[allow(clippy::expect_used)] // Safety: cache size is a non-zero compile-time constant.
     fn new_fast_literal_delete_cache(
-    ) -> std::sync::Arc<std::sync::Mutex<lru::LruCache<String, std::sync::Arc<FastLiteralDeleteSpec>>>> {
-        std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(
-            std::num::NonZeroUsize::new(128).expect("128 is non-zero"),
-        )))
+    ) -> std::sync::Arc<sharded_lru::ShardedLruCache<String, std::sync::Arc<FastLiteralDeleteSpec>>> {
+        Self::new_spec_cache()
     }
 
-    #[allow(clippy::expect_used)] // Safety: cache size is a non-zero compile-time constant.
-    fn new_fast_select_cache() -> std::sync::Arc<std::sync::Mutex<lru::LruCache<String, std::sync::Arc<FastSelectSpec>>>>
-    {
-        std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(
-            std::num::NonZeroUsize::new(128).expect("128 is non-zero"),
-        )))
+    fn new_fast_select_cache() -> std::sync::Arc<sharded_lru::ShardedLruCache<String, std::sync::Arc<FastSelectSpec>>> {
+        Self::new_spec_cache()
     }
 
     fn plan_invalidates_sql_caches(plan: &sql::LogicalPlan) -> bool {
@@ -873,11 +864,9 @@ impl EmbeddedDatabase {
             return;
         }
 
-        if let Ok(mut cache) = self.result_cache.lock() {
-            cache.put(sql.to_string(), std::sync::Arc::new(results.to_vec()));
-            self.result_cache_nonempty
-                .store(true, std::sync::atomic::Ordering::Release);
-        }
+        self.result_cache.put(sql.to_string(), std::sync::Arc::new(results.to_vec()));
+        self.result_cache_nonempty
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     fn query_is_non_deterministic(sql: &str) -> bool {
@@ -1147,6 +1136,10 @@ impl EmbeddedDatabase {
         }
         let txn = self.storage.begin_transaction()?;
         *txn_ref = Some(txn);
+        // Updated under the mutex: readers that skip the lock on a `false`
+        // load behave exactly as if they had locked before this BEGIN.
+        self.global_txn_active
+            .store(true, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 
@@ -1161,6 +1154,10 @@ impl EmbeddedDatabase {
             self.validate_deferred_fk_checks(Some(txn))?;
         }
         if let Some(txn) = txn_ref.take() {
+            // The slot is empty from here on (even if the commit below
+            // errors, `txn` is consumed) — clear the fast-out immediately.
+            self.global_txn_active
+                .store(false, std::sync::atomic::Ordering::Release);
             // R0.2: commit at a FRESH timestamp — committing at the BEGIN
             // snapshot timestamp recorded wrong version ordering for any
             // transaction that overlapped other commits.
@@ -1188,6 +1185,10 @@ impl EmbeddedDatabase {
             .lock()
             .map_lock_err("Failed to acquire transaction lock for rollback")?;
         if let Some(txn) = txn_ref.take() {
+            // Slot emptied (the transaction is consumed even if rollback
+            // errors) — clear the fast-out immediately.
+            self.global_txn_active
+                .store(false, std::sync::atomic::Ordering::Release);
             txn.rollback()?;
             self.rollback_art_undo_log();
             self.deferred_fk_checks.lock().clear();
@@ -4065,6 +4066,7 @@ impl EmbeddedDatabase {
             storage,
             config,
             current_transaction: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            global_txn_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tenant_manager: std::sync::Arc::new(crate::tenant::TenantManager::new()),
             trigger_registry: std::sync::Arc::new(sql::TriggerRegistry::new()),
             function_registry: std::sync::Arc::new(sql::FunctionRegistry::new()),
@@ -4077,15 +4079,15 @@ impl EmbeddedDatabase {
             session_transactions: std::sync::Arc::new(dashmap::DashMap::new()),
             prepared_statements: std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             savepoints: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
-            plan_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(
+            plan_cache: std::sync::Arc::new(sharded_lru::ShardedLruCache::new(
                 std::num::NonZeroUsize::new(256).expect("256 is non-zero"),
-            ))),
-            parse_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(
+            )),
+            parse_cache: std::sync::Arc::new(sharded_lru::ShardedLruCache::new(
                 std::num::NonZeroUsize::new(512).expect("512 is non-zero"),
-            ))),
-            result_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(
+            )),
+            result_cache: std::sync::Arc::new(sharded_lru::ShardedLruCache::new(
                 std::num::NonZeroUsize::new(128).expect("128 is non-zero"),
-            ))),
+            )),
             result_cache_nonempty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_fast_select_fingerprint: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             fast_param_insert_cache: Self::new_fast_param_insert_cache(),
@@ -4097,6 +4099,7 @@ impl EmbeddedDatabase {
             hot_fast_param_delete_spec: std::sync::Arc::new(parking_lot::RwLock::new(None)),
             fast_literal_delete_cache: Self::new_fast_literal_delete_cache(),
             fast_select_cache: Self::new_fast_select_cache(),
+            hot_fast_select_spec: std::sync::Arc::new(parking_lot::RwLock::new(None)),
             query_profiler: std::sync::Arc::new(query_trace::QueryProfiler::new()),
             art_undo_log: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
             session_art_undo: std::sync::Arc::new(dashmap::DashMap::new()),
@@ -4143,6 +4146,7 @@ impl EmbeddedDatabase {
             storage,
             config,
             current_transaction: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            global_txn_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tenant_manager: std::sync::Arc::new(crate::tenant::TenantManager::new()),
             trigger_registry: std::sync::Arc::new(sql::TriggerRegistry::new()),
             function_registry: std::sync::Arc::new(sql::FunctionRegistry::new()),
@@ -4155,15 +4159,15 @@ impl EmbeddedDatabase {
             session_transactions: std::sync::Arc::new(dashmap::DashMap::new()),
             prepared_statements: std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             savepoints: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
-            plan_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(
+            plan_cache: std::sync::Arc::new(sharded_lru::ShardedLruCache::new(
                 std::num::NonZeroUsize::new(256).expect("256 is non-zero"),
-            ))),
-            parse_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(
+            )),
+            parse_cache: std::sync::Arc::new(sharded_lru::ShardedLruCache::new(
                 std::num::NonZeroUsize::new(512).expect("512 is non-zero"),
-            ))),
-            result_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(
+            )),
+            result_cache: std::sync::Arc::new(sharded_lru::ShardedLruCache::new(
                 std::num::NonZeroUsize::new(128).expect("128 is non-zero"),
-            ))),
+            )),
             result_cache_nonempty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_fast_select_fingerprint: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             fast_param_insert_cache: Self::new_fast_param_insert_cache(),
@@ -4175,6 +4179,7 @@ impl EmbeddedDatabase {
             hot_fast_param_delete_spec: std::sync::Arc::new(parking_lot::RwLock::new(None)),
             fast_literal_delete_cache: Self::new_fast_literal_delete_cache(),
             fast_select_cache: Self::new_fast_select_cache(),
+            hot_fast_select_spec: std::sync::Arc::new(parking_lot::RwLock::new(None)),
             query_profiler: std::sync::Arc::new(query_trace::QueryProfiler::new()),
             art_undo_log: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
             session_art_undo: std::sync::Arc::new(dashmap::DashMap::new()),
@@ -4244,6 +4249,7 @@ impl EmbeddedDatabase {
             storage,
             config,
             current_transaction: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            global_txn_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tenant_manager: std::sync::Arc::new(crate::tenant::TenantManager::new()),
             trigger_registry: std::sync::Arc::new(sql::TriggerRegistry::new()),
             function_registry: std::sync::Arc::new(sql::FunctionRegistry::new()),
@@ -4256,15 +4262,15 @@ impl EmbeddedDatabase {
             session_transactions: std::sync::Arc::new(dashmap::DashMap::new()),
             prepared_statements: std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             savepoints: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
-            plan_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(
+            plan_cache: std::sync::Arc::new(sharded_lru::ShardedLruCache::new(
                 std::num::NonZeroUsize::new(256).expect("256 is non-zero"),
-            ))),
-            parse_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(
+            )),
+            parse_cache: std::sync::Arc::new(sharded_lru::ShardedLruCache::new(
                 std::num::NonZeroUsize::new(512).expect("512 is non-zero"),
-            ))),
-            result_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(
+            )),
+            result_cache: std::sync::Arc::new(sharded_lru::ShardedLruCache::new(
                 std::num::NonZeroUsize::new(128).expect("128 is non-zero"),
-            ))),
+            )),
             result_cache_nonempty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_fast_select_fingerprint: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             fast_param_insert_cache: Self::new_fast_param_insert_cache(),
@@ -4276,6 +4282,7 @@ impl EmbeddedDatabase {
             hot_fast_param_delete_spec: std::sync::Arc::new(parking_lot::RwLock::new(None)),
             fast_literal_delete_cache: Self::new_fast_literal_delete_cache(),
             fast_select_cache: Self::new_fast_select_cache(),
+            hot_fast_select_spec: std::sync::Arc::new(parking_lot::RwLock::new(None)),
             query_profiler: std::sync::Arc::new(query_trace::QueryProfiler::new()),
             art_undo_log: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
             session_art_undo: std::sync::Arc::new(dashmap::DashMap::new()),
@@ -5007,11 +5014,20 @@ impl EmbeddedDatabase {
         }
 
         let (result, defer_cache_invalidation) = {
-            let txn_lock = self
-                .current_transaction
-                .lock()
-                .map_lock_err("Failed to acquire transaction lock for execute")?;
-            if let Some(txn_ref) = txn_lock.as_ref() {
+            // R2.1: only touch the global-transaction mutex when the
+            // fast-out flag says a transaction is open (flag transitions
+            // happen under that mutex, so a `false` load is exactly the
+            // "locked and found None" outcome without the lock).
+            let txn_lock = if self.global_txn_active.load(std::sync::atomic::Ordering::Acquire) {
+                Some(
+                    self.current_transaction
+                        .lock()
+                        .map_lock_err("Failed to acquire transaction lock for execute")?,
+                )
+            } else {
+                None
+            };
+            if let Some(txn_ref) = txn_lock.as_ref().and_then(|guard| guard.as_ref()) {
                 // Execute within existing transaction context.
                 (self.execute_in_transaction_no_fast_path(sql, txn_ref), true)
             } else {
@@ -5321,13 +5337,11 @@ impl EmbeddedDatabase {
         }
 
         let cache_key = Self::fast_literal_insert_cache_key(table_name, explicit_columns);
-        if let Ok(mut cache) = self.fast_literal_insert_cache.lock() {
-            if let Some(spec) = cache.get(&cache_key) {
-                if value_count.map_or(true, |count| spec.target_types.len() == count) {
-                    return Some(Ok(std::sync::Arc::clone(spec)));
-                }
-                return None;
+        if let Some(spec) = self.fast_literal_insert_cache.get(&cache_key) {
+            if value_count.map_or(true, |count| spec.target_types.len() == count) {
+                return Some(Ok(spec));
             }
+            return None;
         }
 
         let catalog = self.storage.catalog();
@@ -5379,9 +5393,7 @@ impl EmbeddedDatabase {
             target_types,
             all_columns_explicit_no_default: provided_columns.iter().all(|provided| *provided),
         });
-        if let Ok(mut cache) = self.fast_literal_insert_cache.lock() {
-            cache.put(cache_key, std::sync::Arc::clone(&spec));
-        }
+        self.fast_literal_insert_cache.put(cache_key, std::sync::Arc::clone(&spec));
         Some(Ok(spec))
     }
 
@@ -5448,19 +5460,15 @@ impl EmbeddedDatabase {
         plan: &sql::LogicalPlan,
     ) -> Option<Result<std::sync::Arc<FastParamInsertSpec>>> {
         let cache_key = format!("\0fast_param_insert\0{sql}");
-        if let Ok(mut cache) = self.fast_param_insert_cache.lock() {
-            if let Some(spec) = cache.get(&cache_key) {
-                return Some(Ok(std::sync::Arc::clone(spec)));
-            }
+        if let Some(spec) = self.fast_param_insert_cache.get(&cache_key) {
+            return Some(Ok(spec));
         }
 
         let spec = match self.build_fast_param_insert_spec(plan)? {
             Ok(spec) => std::sync::Arc::new(spec),
             Err(e) => return Some(Err(e)),
         };
-        if let Ok(mut cache) = self.fast_param_insert_cache.lock() {
-            cache.put(cache_key, std::sync::Arc::clone(&spec));
-        }
+        self.fast_param_insert_cache.put(cache_key, std::sync::Arc::clone(&spec));
         Some(Ok(spec))
     }
 
@@ -5840,10 +5848,7 @@ impl EmbeddedDatabase {
             {
                 spec
             } else {
-                self.fast_param_update_cache
-                    .lock()
-                    .ok()
-                    .and_then(|mut cache| cache.get(sql).map(std::sync::Arc::clone))?
+                self.fast_param_update_cache.get(sql)?
             };
             if self.tenant_manager.should_apply_rls(&spec.table_name, "UPDATE")
                 || self.trigger_registry.has_triggers_for_table(&spec.table_name)
@@ -5865,10 +5870,7 @@ impl EmbeddedDatabase {
             {
                 spec
             } else {
-                self.fast_param_delete_cache
-                    .lock()
-                    .ok()
-                    .and_then(|mut cache| cache.get(&cache_key).map(std::sync::Arc::clone))?
+                self.fast_param_delete_cache.get(&cache_key)?
             };
             if self.tenant_manager.should_apply_rls(&spec.table_name, "DELETE")
                 || self.trigger_registry.has_triggers_for_table(&spec.table_name)
@@ -6140,19 +6142,15 @@ impl EmbeddedDatabase {
             return None;
         }
 
-        if let Ok(mut cache) = self.fast_param_update_cache.lock() {
-            if let Some(spec) = cache.get(sql) {
-                return Some(Ok(std::sync::Arc::clone(spec)));
-            }
+        if let Some(spec) = self.fast_param_update_cache.get(sql) {
+            return Some(Ok(spec));
         }
 
         let spec = match self.build_fast_param_update_spec(table_name, assignments, selection, returning)? {
             Ok(spec) => std::sync::Arc::new(spec),
             Err(e) => return Some(Err(e)),
         };
-        if let Ok(mut cache) = self.fast_param_update_cache.lock() {
-            cache.put(sql.to_string(), std::sync::Arc::clone(&spec));
-        }
+        self.fast_param_update_cache.put(sql.to_string(), std::sync::Arc::clone(&spec));
         *self.hot_fast_param_update_spec.write() = Some((sql.to_string(), std::sync::Arc::clone(&spec)));
         Some(Ok(spec))
     }
@@ -6240,19 +6238,15 @@ impl EmbeddedDatabase {
         let fk_mode = *self.fk_validation_mode.read();
         let fk_source = *self.fk_validation_source.read();
         let cache_key = format!("\0fast_param_delete\0{fk_mode:?}\0{fk_source:?}\0{sql}");
-        if let Ok(mut cache) = self.fast_param_delete_cache.lock() {
-            if let Some(spec) = cache.get(&cache_key) {
-                return Some(Ok(std::sync::Arc::clone(spec)));
-            }
+        if let Some(spec) = self.fast_param_delete_cache.get(&cache_key) {
+            return Some(Ok(spec));
         }
 
         let spec = match self.build_fast_param_delete_spec(table_name, selection, returning, fk_mode, fk_source)? {
             Ok(spec) => std::sync::Arc::new(spec),
             Err(e) => return Some(Err(e)),
         };
-        if let Ok(mut cache) = self.fast_param_delete_cache.lock() {
-            cache.put(cache_key.clone(), std::sync::Arc::clone(&spec));
-        }
+        self.fast_param_delete_cache.put(cache_key.clone(), std::sync::Arc::clone(&spec));
         *self.hot_fast_param_delete_spec.write() = Some((cache_key, std::sync::Arc::clone(&spec)));
         Some(Ok(spec))
     }
@@ -6598,36 +6592,19 @@ impl EmbeddedDatabase {
 
     /// Invalidate the plan cache (call after DDL operations)
     fn invalidate_plan_cache(&self) {
-        if let Ok(mut cache) = self.plan_cache.lock() {
-            cache.clear();
-        }
+        self.plan_cache.clear();
         // Also invalidate parse cache since schema changes may affect SQL interpretation
-        if let Ok(mut cache) = self.parse_cache.lock() {
-            cache.clear();
-        }
-        if let Ok(mut cache) = self.fast_param_insert_cache.lock() {
-            cache.clear();
-        }
-        if let Ok(mut cache) = self.fast_literal_insert_cache.lock() {
-            cache.clear();
-        }
-        if let Ok(mut cache) = self.fast_param_update_cache.lock() {
-            cache.clear();
-        }
+        self.parse_cache.clear();
+        self.fast_param_insert_cache.clear();
+        self.fast_literal_insert_cache.clear();
+        self.fast_param_update_cache.clear();
         *self.hot_fast_param_update_spec.write() = None;
-        if let Ok(mut cache) = self.fast_literal_update_cache.lock() {
-            cache.clear();
-        }
-        if let Ok(mut cache) = self.fast_param_delete_cache.lock() {
-            cache.clear();
-        }
+        self.fast_literal_update_cache.clear();
+        self.fast_param_delete_cache.clear();
         *self.hot_fast_param_delete_spec.write() = None;
-        if let Ok(mut cache) = self.fast_literal_delete_cache.lock() {
-            cache.clear();
-        }
-        if let Ok(mut cache) = self.fast_select_cache.lock() {
-            cache.clear();
-        }
+        self.fast_literal_delete_cache.clear();
+        self.fast_select_cache.clear();
+        *self.hot_fast_select_spec.write() = None;
         // Also invalidate result cache since schema changes affect query results
         self.invalidate_result_cache();
     }
@@ -6640,9 +6617,7 @@ impl EmbeddedDatabase {
         {
             return;
         }
-        if let Ok(mut cache) = self.result_cache.lock() {
-            cache.clear();
-        }
+        self.result_cache.clear();
     }
 
     /// Handle SQLite `PRAGMA` queries from the embedded path. Returns
@@ -7391,10 +7366,8 @@ impl EmbeddedDatabase {
         }
 
         let cache_key = Self::fast_literal_update_cache_key(table_name, set_col, pk_col);
-        if let Ok(mut cache) = self.fast_literal_update_cache.lock() {
-            if let Some(spec) = cache.get(&cache_key) {
-                return Some(Ok(std::sync::Arc::clone(spec)));
-            }
+        if let Some(spec) = self.fast_literal_update_cache.get(&cache_key) {
+            return Some(Ok(spec));
         }
 
         let catalog = self.storage.catalog();
@@ -7443,9 +7416,7 @@ impl EmbeddedDatabase {
             set_nullable,
             assignment_affects_indexes,
         });
-        if let Ok(mut cache) = self.fast_literal_update_cache.lock() {
-            cache.put(cache_key, std::sync::Arc::clone(&spec));
-        }
+        self.fast_literal_update_cache.put(cache_key, std::sync::Arc::clone(&spec));
         Some(Ok(spec))
     }
 
@@ -7473,10 +7444,8 @@ impl EmbeddedDatabase {
         }
 
         let cache_key = Self::fast_literal_delete_cache_key(table_name, pk_col, fk_mode, fk_source);
-        if let Ok(mut cache) = self.fast_literal_delete_cache.lock() {
-            if let Some(spec) = cache.get(&cache_key) {
-                return Some(Ok(std::sync::Arc::clone(spec)));
-            }
+        if let Some(spec) = self.fast_literal_delete_cache.get(&cache_key) {
+            return Some(Ok(spec));
         }
 
         let catalog = self.storage.catalog();
@@ -7511,9 +7480,7 @@ impl EmbeddedDatabase {
             schema,
             pk_data_type,
         });
-        if let Ok(mut cache) = self.fast_literal_delete_cache.lock() {
-            cache.put(cache_key, std::sync::Arc::clone(&spec));
-        }
+        self.fast_literal_delete_cache.put(cache_key, std::sync::Arc::clone(&spec));
         Some(Ok(spec))
     }
 
@@ -7973,10 +7940,22 @@ impl EmbeddedDatabase {
         }
 
         let cache_key = Self::fast_select_cache_key(table_name, pk_col);
-        if let Ok(mut cache) = self.fast_select_cache.lock() {
-            if let Some(spec) = cache.get(&cache_key) {
-                return Some(Ok(std::sync::Arc::clone(spec)));
-            }
+        // R2.1: hot single-slot front. Point-lookup workloads resolve the
+        // same (table, pk) spec on every statement; a shared-read slot keeps
+        // the per-statement path off any mutex (an LRU `get` always needs
+        // exclusive access for recency bookkeeping, so even a sharded cache
+        // serializes on one hot key).
+        if let Some(spec) = self
+            .hot_fast_select_spec
+            .read()
+            .as_ref()
+            .and_then(|(hot_key, spec)| (hot_key == &cache_key).then(|| std::sync::Arc::clone(spec)))
+        {
+            return Some(Ok(spec));
+        }
+        if let Some(spec) = self.fast_select_cache.get(&cache_key) {
+            *self.hot_fast_select_spec.write() = Some((cache_key, std::sync::Arc::clone(&spec)));
+            return Some(Ok(spec));
         }
 
         let catalog = self.storage.catalog();
@@ -7997,9 +7976,8 @@ impl EmbeddedDatabase {
             schema,
             pk_data_type,
         });
-        if let Ok(mut cache) = self.fast_select_cache.lock() {
-            cache.put(cache_key, std::sync::Arc::clone(&spec));
-        }
+        self.fast_select_cache.put(cache_key.clone(), std::sync::Arc::clone(&spec));
+        *self.hot_fast_select_spec.write() = Some((cache_key, std::sync::Arc::clone(&spec)));
         Some(Ok(spec))
     }
 
@@ -8764,17 +8742,13 @@ impl EmbeddedDatabase {
     /// Parse SQL with caching. Returns (statement, was_cached).
     pub(crate) fn parse_cached(&self, sql: &str) -> Result<(sqlparser::ast::Statement, bool)> {
         // Check parse cache first
-        if let Ok(mut cache) = self.parse_cache.lock() {
-            if let Some(stmt) = cache.get(sql) {
-                return Ok((stmt.clone(), true));
-            }
+        if let Some(stmt) = self.parse_cache.get(sql) {
+            return Ok((stmt, true));
         }
         // Cache miss — parse and cache
         let parser = sql::Parser::new();
         let statement = parser.parse_one(sql)?;
-        if let Ok(mut cache) = self.parse_cache.lock() {
-            cache.put(sql.to_string(), statement.clone());
-        }
+        self.parse_cache.put(sql.to_string(), statement.clone());
         Ok((statement, false))
     }
 
@@ -8782,19 +8756,15 @@ impl EmbeddedDatabase {
     /// collide with the non-parameterized `query()` plan cache entries.
     fn parameterized_plan_cached(&self, sql: &str) -> Result<std::sync::Arc<sql::LogicalPlan>> {
         let cache_key = format!("\0params\0{sql}");
-        if let Ok(mut cache) = self.plan_cache.lock() {
-            if let Some(plan) = cache.get(&cache_key) {
-                return Ok(std::sync::Arc::clone(plan));
-            }
+        if let Some(plan) = self.plan_cache.get(&cache_key) {
+            return Ok(plan);
         }
 
         let (statement, _) = self.parse_cached(sql)?;
         let catalog = self.storage.catalog();
         let planner = sql::Planner::with_catalog(&catalog).with_sql(sql.to_string());
         let plan = std::sync::Arc::new(planner.statement_to_plan(statement)?);
-        if let Ok(mut cache) = self.plan_cache.lock() {
-            cache.put(cache_key, std::sync::Arc::clone(&plan));
-        }
+        self.plan_cache.put(cache_key, std::sync::Arc::clone(&plan));
         Ok(plan)
     }
 
@@ -11261,23 +11231,21 @@ impl EmbeddedDatabase {
 
         // If there's an active transaction, execute through the transaction
         // so that uncommitted writes (in the write set) are visible to reads.
-        {
+        // R2.1: the `global_txn_active` fast-out (updated under the same
+        // mutex by begin/commit/rollback) keeps autocommit reads off the
+        // `current_transaction` mutex entirely, and the active-transaction
+        // path now takes the lock exactly once (previously a `has_active_txn`
+        // probe lock was followed by a second lock for execution). If the
+        // transaction ends between the flag load and the lock, we simply
+        // fall through to the autocommit path — same outcome as locking
+        // after that commit/rollback.
+        if self.global_txn_active.load(std::sync::atomic::Ordering::Acquire) {
             use crate::error::LockResultExt;
-            let has_active_txn = {
-                let txn_lock = self
-                    .current_transaction
-                    .lock()
-                    .map_lock_err("Failed to acquire transaction lock for query")?;
-                txn_lock.is_some()
-            };
-            if has_active_txn {
-                let txn_lock = self
-                    .current_transaction
-                    .lock()
-                    .map_lock_err("Failed to acquire transaction lock for query")?;
-                let txn_ref = txn_lock
-                    .as_ref()
-                    .ok_or_else(|| Error::transaction("Transaction lock in invalid state"))?;
+            let txn_lock = self
+                .current_transaction
+                .lock()
+                .map_lock_err("Failed to acquire transaction lock for query")?;
+            if let Some(txn_ref) = txn_lock.as_ref() {
                 // Parse and execute through transaction-aware executor
                 let (statement, _) = self.parse_cached(sql)?;
                 let catalog = self.storage.catalog();
@@ -11317,12 +11285,7 @@ impl EmbeddedDatabase {
         // would serve stale rows to the caller.
         let is_non_deterministic = Self::query_is_non_deterministic(sql);
         if !is_non_deterministic && result_cache_nonempty {
-            if let Some(cached_results) = self
-                .result_cache
-                .lock()
-                .ok()
-                .and_then(|mut cache| cache.get(sql).map(std::sync::Arc::clone))
-            {
+            if let Some(cached_results) = self.result_cache.get(sql) {
                 tracing::debug!(phase = "result_cache", "Result cache hit");
                 self.log_slow_query(sql, start.elapsed(), cached_results.len() as u64);
                 return Ok((*cached_results).clone());
@@ -11339,11 +11302,7 @@ impl EmbeddedDatabase {
         }
 
         // Check plan cache (Arc::clone is O(1))
-        let cached_plan = self
-            .plan_cache
-            .lock()
-            .ok()
-            .and_then(|mut cache| cache.get(sql).map(std::sync::Arc::clone));
+        let cached_plan = self.plan_cache.get(sql);
 
         if let Some(arc_plan) = cached_plan {
             tracing::debug!(phase = "parse", duration_us = 0_u64, "SQL parsed (cached)");
@@ -11360,11 +11319,9 @@ impl EmbeddedDatabase {
                     );
                     self.log_slow_query(sql, start.elapsed(), results.len() as u64);
                     if !is_non_deterministic {
-                        if let Ok(mut cache) = self.result_cache.lock() {
-                            cache.put(sql.to_string(), std::sync::Arc::new(results.clone()));
-                            self.result_cache_nonempty
-                                .store(true, std::sync::atomic::Ordering::Release);
-                        }
+                        self.result_cache.put(sql.to_string(), std::sync::Arc::new(results.clone()));
+                        self.result_cache_nonempty
+                            .store(true, std::sync::atomic::Ordering::Release);
                     }
                     return Ok(results);
                 }
@@ -11384,11 +11341,9 @@ impl EmbeddedDatabase {
                 // queries already bypass lookup above and should not pay to
                 // clone rows into a cache they can never read from.
                 if !is_non_deterministic {
-                    if let Ok(mut cache) = self.result_cache.lock() {
-                        cache.put(sql.to_string(), std::sync::Arc::new(results.clone()));
-                        self.result_cache_nonempty
-                            .store(true, std::sync::atomic::Ordering::Release);
-                    }
+                    self.result_cache.put(sql.to_string(), std::sync::Arc::new(results.clone()));
+                    self.result_cache_nonempty
+                        .store(true, std::sync::atomic::Ordering::Release);
                 }
                 return Ok(results);
             }
@@ -11452,9 +11407,7 @@ impl EmbeddedDatabase {
         };
 
         // 4. Cache the optimized plan
-        if let Ok(mut cache) = self.plan_cache.lock() {
-            cache.put(sql.to_string(), std::sync::Arc::new(plan.clone()));
-        }
+        self.plan_cache.put(sql.to_string(), std::sync::Arc::new(plan.clone()));
 
         // 5. Apply RLS policies
         let plan = self.apply_rls_to_plan(plan)?;
@@ -11477,11 +11430,9 @@ impl EmbeddedDatabase {
         // already bypass lookup above, so caching them only adds clone/lock
         // overhead and risks serving stale rows if the lookup gate changes.
         if !is_non_deterministic {
-            if let Ok(mut cache) = self.result_cache.lock() {
-                cache.put(sql.to_string(), std::sync::Arc::new(results.clone()));
-                self.result_cache_nonempty
-                    .store(true, std::sync::atomic::Ordering::Release);
-            }
+            self.result_cache.put(sql.to_string(), std::sync::Arc::new(results.clone()));
+            self.result_cache_nonempty
+                .store(true, std::sync::atomic::Ordering::Release);
         }
 
         Ok(results)
@@ -11500,16 +11451,8 @@ impl EmbeddedDatabase {
             return None;
         }
 
-        let cached_results = self
-            .result_cache
-            .lock()
-            .ok()
-            .and_then(|mut cache| cache.get(sql).map(std::sync::Arc::clone))?;
-        let arc_plan = self
-            .plan_cache
-            .lock()
-            .ok()
-            .and_then(|mut cache| cache.get(sql).map(std::sync::Arc::clone))?;
+        let cached_results = self.result_cache.get(sql)?;
+        let arc_plan = self.plan_cache.get(sql)?;
         let columns = arc_plan
             .schema()
             .columns
@@ -11536,21 +11479,14 @@ impl EmbeddedDatabase {
         // produces rows instead of "Statement not yet supported".
         let plan = if sql::Parser::is_show_branches(sql) {
             sql::LogicalPlan::ShowBranches
-        } else if let Some(arc_plan) = self
-            .plan_cache
-            .lock()
-            .ok()
-            .and_then(|mut cache| cache.get(sql).map(std::sync::Arc::clone))
-        {
+        } else if let Some(arc_plan) = self.plan_cache.get(sql) {
             let mut executor =
                 sql::Executor::with_storage(&self.storage).with_timeout(self.config.storage.query_timeout_ms);
             let result = executor.execute_with_columns(&arc_plan)?;
             if cacheable {
-                if let Ok(mut cache) = self.result_cache.lock() {
-                    cache.put(sql.to_string(), std::sync::Arc::new(result.0.clone()));
-                    self.result_cache_nonempty
-                        .store(true, std::sync::atomic::Ordering::Release);
-                }
+                self.result_cache.put(sql.to_string(), std::sync::Arc::new(result.0.clone()));
+                self.result_cache_nonempty
+                    .store(true, std::sync::atomic::Ordering::Release);
             }
             return Ok(result);
         } else {
@@ -11573,20 +11509,16 @@ impl EmbeddedDatabase {
             opt.optimize_recursive(plan)?
         };
         if !matches!(plan, sql::LogicalPlan::ShowBranches) {
-            if let Ok(mut cache) = self.plan_cache.lock() {
-                cache.put(sql.to_string(), std::sync::Arc::new(plan.clone()));
-            }
+            self.plan_cache.put(sql.to_string(), std::sync::Arc::new(plan.clone()));
         }
 
         let mut executor =
             sql::Executor::with_storage(&self.storage).with_timeout(self.config.storage.query_timeout_ms);
         let result = executor.execute_with_columns(&plan)?;
         if cacheable && !matches!(plan, sql::LogicalPlan::ShowBranches) {
-            if let Ok(mut cache) = self.result_cache.lock() {
-                cache.put(sql.to_string(), std::sync::Arc::new(result.0.clone()));
-                self.result_cache_nonempty
-                    .store(true, std::sync::atomic::Ordering::Release);
-            }
+            self.result_cache.put(sql.to_string(), std::sync::Arc::new(result.0.clone()));
+            self.result_cache_nonempty
+                .store(true, std::sync::atomic::Ordering::Release);
         }
         Ok(result)
     }
@@ -12759,10 +12691,9 @@ impl EmbeddedDatabase {
     /// # }
     /// ```
     pub fn in_transaction(&self) -> bool {
-        self.current_transaction
-            .lock()
-            .map(|txn| txn.is_some())
-            .unwrap_or(false)
+        // R2.1: lock-free — the flag mirrors `current_transaction.is_some()`
+        // and is only flipped while that mutex is held.
+        self.global_txn_active.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Bulk-insert pre-built `Tuple` rows into a table, bypassing the
@@ -12883,9 +12814,7 @@ impl EmbeddedDatabase {
         // Subsequent SELECT/DELETE/UPDATE statements on this table
         // would otherwise plan against stale state.
         self.invalidate_result_cache();
-        if let Ok(mut cache) = self.plan_cache.lock() {
-            cache.clear();
-        }
+        self.plan_cache.clear();
 
         Ok(row_ids)
     }
@@ -13596,6 +13525,7 @@ impl EmbeddedDatabase {
             storage: self.storage.clone(),
             config: self.config.clone(),
             current_transaction: self.current_transaction.clone(),
+            global_txn_active: self.global_txn_active.clone(),
             tenant_manager: self.tenant_manager.clone(),
             trigger_registry: self.trigger_registry.clone(),
             function_registry: self.function_registry.clone(),
@@ -13622,6 +13552,7 @@ impl EmbeddedDatabase {
             hot_fast_param_delete_spec: self.hot_fast_param_delete_spec.clone(),
             fast_literal_delete_cache: self.fast_literal_delete_cache.clone(),
             fast_select_cache: self.fast_select_cache.clone(),
+            hot_fast_select_spec: self.hot_fast_select_spec.clone(),
             query_profiler: self.query_profiler.clone(),
             art_undo_log: self.art_undo_log.clone(),
             session_art_undo: self.session_art_undo.clone(),
@@ -15469,7 +15400,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get(1), Some(&Value::String("before".to_string())));
         assert!(
-            !db.result_cache.lock().unwrap().contains(sql),
+            !db.result_cache.contains(sql),
             "one-off fast SELECT should not populate the result cache"
         );
 
@@ -15477,7 +15408,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get(1), Some(&Value::String("before".to_string())));
         assert!(
-            db.result_cache.lock().unwrap().contains(sql),
+            db.result_cache.contains(sql),
             "repeated fast SELECT should populate the result cache"
         );
 
@@ -15504,7 +15435,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get(1), Some(&Value::String("value".to_string())));
         assert!(
-            !db.fast_select_cache.lock().unwrap().is_empty(),
+            !db.fast_select_cache.is_empty(),
             "query_with_columns should populate fast SELECT metadata"
         );
 
@@ -15528,24 +15459,18 @@ mod tests {
         assert_eq!(columns, vec!["id".to_string(), "val".to_string()]);
         assert_eq!(rows.len(), 2);
         assert!(
-            db.plan_cache.lock().unwrap().contains(sql),
+            db.plan_cache.contains(sql),
             "query_with_columns should cache optimized non-fast SELECT plans"
         );
         assert!(
-            db.result_cache.lock().unwrap().contains(sql),
+            db.result_cache.contains(sql),
             "query_with_columns should share the deterministic SELECT result cache"
         );
         let cached_rows = db
             .try_cached_query_with_columns(sql)
             .expect("cached query_with_columns rows should be available to protocol handlers")
             .0;
-        let result_cache_rows = db
-            .result_cache
-            .lock()
-            .unwrap()
-            .get(sql)
-            .map(std::sync::Arc::clone)
-            .unwrap();
+        let result_cache_rows = db.result_cache.get(sql).unwrap();
         assert!(
             std::sync::Arc::ptr_eq(&cached_rows, &result_cache_rows),
             "crate-internal query_with_columns cache path should avoid cloning cached row vectors"
@@ -15557,7 +15482,7 @@ mod tests {
 
         db.execute("INSERT INTO qwc_plan_cache VALUES (3, 30)").unwrap();
         assert!(
-            !db.result_cache.lock().unwrap().contains(sql),
+            !db.result_cache.contains(sql),
             "DML should invalidate query_with_columns result-cache entries"
         );
         let (rows, columns) = db.query_with_columns(sql).unwrap();
@@ -15578,7 +15503,7 @@ mod tests {
         let rows = db.query(sql, &[]).unwrap();
         assert_eq!(rows[0].get(1), Some(&Value::String("before".to_string())));
         assert!(
-            db.result_cache.lock().unwrap().contains(sql),
+            db.result_cache.contains(sql),
             "repeated SELECT should populate the result cache before the transaction"
         );
 
@@ -15588,7 +15513,7 @@ mod tests {
         db.execute("COMMIT").unwrap();
 
         assert!(
-            !db.result_cache.lock().unwrap().contains(sql),
+            !db.result_cache.contains(sql),
             "COMMIT of transactional DML must invalidate cached pre-transaction results"
         );
         let rows = db.query(sql, &[]).unwrap();
@@ -15609,7 +15534,7 @@ mod tests {
         let rows = db.query(sql, &[]).unwrap();
         assert_eq!(rows.len(), 1);
         assert!(
-            !db.result_cache.lock().unwrap().contains(sql),
+            !db.result_cache.contains(sql),
             "non-deterministic queries bypass and must not populate the result cache"
         );
     }
@@ -15624,13 +15549,13 @@ mod tests {
         let rows = db.query("SELECT * FROM fast_select_meta WHERE id = 1", &[]).unwrap();
         assert_eq!(rows.len(), 1);
         assert!(
-            !db.fast_select_cache.lock().unwrap().is_empty(),
+            !db.fast_select_cache.is_empty(),
             "fast SELECT should cache stable table/PK metadata"
         );
 
         db.execute("DROP TABLE fast_select_meta").unwrap();
         assert!(
-            db.fast_select_cache.lock().unwrap().is_empty(),
+            db.fast_select_cache.is_empty(),
             "DDL must clear fast SELECT metadata"
         );
 
