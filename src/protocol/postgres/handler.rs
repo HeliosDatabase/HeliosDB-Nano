@@ -1464,16 +1464,17 @@ where
     async fn send_error_for_query(&mut self, error: &Error, wait_for_sync: bool) -> Result<()> {
         self.mark_transaction_failed_after_error();
         self.suppress_ready_for_query = false;
-        let code = Self::sqlstate_for_error(error);
+        let code = sqlstate_for_error(error);
+        let (detail, hint) = detail_hint_for_error(code, error);
         if wait_for_sync {
             // Extended-query protocol: emit ErrorResponse now and defer
             // ReadyForQuery until the client's Sync, discarding messages in
             // between. Sending ReadyForQuery early closes/wedges drivers.
-            self.send_error_message("ERROR", code, &error.to_string(), None, None)
+            self.send_error_message("ERROR", code, &error.to_string(), detail, hint)
                 .await?;
             self.flush().await
         } else {
-            self.send_error("ERROR", code, &error.to_string(), None, None).await
+            self.send_error("ERROR", code, &error.to_string(), detail, hint).await
         }
     }
 
@@ -1511,37 +1512,6 @@ where
         self.flush().await
     }
 
-    fn sqlstate_for_error(error: &Error) -> &'static str {
-        match error {
-            Error::ConstraintViolation(message) => {
-                let lower = message.to_ascii_lowercase();
-                if lower.contains("duplicate") || lower.contains("unique") {
-                    "23505"
-                } else if lower.contains("foreign key") {
-                    "23503"
-                } else if lower.contains("check") {
-                    "23514"
-                } else {
-                    "23000"
-                }
-            }
-            Error::SqlParse(_) => "42601",
-            Error::TypeConversion(_) => "42804",
-            Error::Transaction(message) => {
-                if message.contains("serialization failure") {
-                    // First-committer-wins write-write conflict (R0.2):
-                    // drivers retry on serialization_failure.
-                    "40001"
-                } else {
-                    "25000"
-                }
-            }
-            Error::Protocol(_) => "08P01",
-            Error::QueryTimeout(_) => "57014",
-            Error::QueryCancelled(_) => "57014",
-            _ => "XX000",
-        }
-    }
 
     /// SQLite-shaped `PRAGMA table_info(t)` rows.
     ///
@@ -2315,6 +2285,122 @@ mod plpgsql_detection_tests {
     }
 }
 
+// ============================================================================
+// SQLSTATE mapping (D4 phase 1)
+// ============================================================================
+
+/// Map an [`Error`] to the SQLSTATE the wire reports (D4 phase 1).
+///
+/// Pattern-matches the engine's existing message shapes (same approach as
+/// the constraint sniffing that predates it); codes come from the shared
+/// constants in [`crate::network::protocol::sqlstate`]. Phase 2 will carry
+/// structured codes from the raise sites instead of sniffing text.
+pub(crate) fn sqlstate_for_error(error: &Error) -> &'static str {
+    use crate::network::protocol::sqlstate;
+
+    match error {
+        Error::ConstraintViolation(message) => {
+            let lower = message.to_ascii_lowercase();
+            if lower.contains("duplicate") || lower.contains("unique") {
+                sqlstate::UNIQUE_VIOLATION // 23505
+            } else if lower.contains("foreign key") {
+                sqlstate::FOREIGN_KEY_VIOLATION // 23503
+            } else if lower.contains("check") {
+                sqlstate::CHECK_VIOLATION // 23514
+            } else {
+                sqlstate::INTEGRITY_CONSTRAINT_VIOLATION // 23000
+            }
+        }
+        Error::SqlParse(_) => sqlstate::SYNTAX_ERROR, // 42601
+        Error::TypeConversion(_) => sqlstate::DATATYPE_MISMATCH, // 42804
+        Error::Transaction(message) => {
+            let lower = message.to_ascii_lowercase();
+            if lower.contains("serialization failure") {
+                // First-committer-wins write-write conflict (R0.2):
+                // drivers retry on serialization_failure.
+                sqlstate::SERIALIZATION_FAILURE // 40001
+            } else if lower.contains("deadlock") {
+                // LockManager aborts the victim with "Deadlock detected for
+                // transaction N" (storage/lock_manager.rs).
+                sqlstate::DEADLOCK_DETECTED // 40P01
+            } else {
+                sqlstate::INVALID_TRANSACTION_STATE // 25000
+            }
+        }
+        Error::Protocol(_) => sqlstate::PROTOCOL_VIOLATION, // 08P01
+        Error::QueryTimeout(_) | Error::QueryCancelled(_) => sqlstate::QUERY_CANCELED, // 57014
+        // Catalog/executor errors surface as QueryExecution with stable
+        // message shapes ("Table 'x' does not exist", "Column 'x' not
+        // found", "Table 'x' already exists", "Unknown scalar function").
+        Error::QueryExecution(message) => sqlstate_for_query_execution_message(message),
+        _ => sqlstate::INTERNAL_ERROR, // XX000
+    }
+}
+
+/// Classify a `QueryExecution` message into a SQLSTATE.
+///
+/// Order matters: function and column shapes are checked before table
+/// shapes because messages like `Column 'c' not found in table 't'`
+/// mention both.
+fn sqlstate_for_query_execution_message(message: &str) -> &'static str {
+    use crate::network::protocol::sqlstate;
+
+    let lower = message.to_ascii_lowercase();
+    let not_found =
+        lower.contains("not found") || lower.contains("does not exist") || lower.contains("doesn't exist");
+
+    if lower.contains("function") && (not_found || lower.contains("unknown")) {
+        sqlstate::UNDEFINED_FUNCTION // 42883
+    } else if lower.contains("column") && (not_found || lower.contains("unknown")) {
+        sqlstate::UNDEFINED_COLUMN // 42703
+    } else if (lower.contains("table") || lower.contains("relation")) && lower.contains("already exists") {
+        sqlstate::DUPLICATE_TABLE // 42P07
+    } else if (lower.contains("table") || lower.contains("relation")) && not_found {
+        sqlstate::UNDEFINED_TABLE // 42P01
+    } else {
+        sqlstate::INTERNAL_ERROR // XX000
+    }
+}
+
+/// Detail/hint fields for the ErrorResponse, keyed on the mapped SQLSTATE.
+///
+/// Populated where they help a client act: retry guidance for
+/// serialization failures/deadlocks, and the offending name for undefined
+/// table/column (extracted from the engine's quoted message).
+pub(crate) fn detail_hint_for_error(code: &str, error: &Error) -> (Option<String>, Option<String>) {
+    use crate::network::protocol::sqlstate;
+
+    let message = error.to_string();
+    match code {
+        sqlstate::SERIALIZATION_FAILURE => (
+            Some("Another transaction committed a conflicting write first (first-committer-wins).".to_string()),
+            Some("Retry the transaction.".to_string()),
+        ),
+        sqlstate::DEADLOCK_DETECTED => (
+            Some("This transaction was chosen as the deadlock victim and rolled back.".to_string()),
+            Some("Retry the transaction.".to_string()),
+        ),
+        sqlstate::UNDEFINED_TABLE => (
+            first_single_quoted(&message).map(|name| format!("Table '{name}' does not exist in the catalog.")),
+            Some("Check the table name, or create the table first.".to_string()),
+        ),
+        sqlstate::UNDEFINED_COLUMN => (
+            first_single_quoted(&message).map(|name| format!("Column '{name}' does not exist.")),
+            Some("Check the column name against the table definition.".to_string()),
+        ),
+        _ => (None, None),
+    }
+}
+
+/// First single-quoted token in an engine error message
+/// (`Table 'users' does not exist` → `users`).
+fn first_single_quoted(message: &str) -> Option<&str> {
+    let start = message.find('\'')? + 1;
+    let rest = message.get(start..)?;
+    let end = rest.find('\'')?;
+    rest.get(..end)
+}
+
 #[cfg(test)]
 mod do_block_split_tests {
     use super::pg_split_exception;
@@ -2590,5 +2676,151 @@ mod show_branches_wire_tests {
             rendered.iter().all(|name| !name.is_empty()),
             "SHOW BRANCHES must not return a blank branch name; names={rendered:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod sqlstate_mapping_unit_tests {
+    //! D4 phase 1: the SQLSTATE mapping, exercised with error values
+    //! produced by real SQL against an EmbeddedDatabase wherever the
+    //! embedded API can produce the shape (undefined table/column,
+    //! duplicate table, unknown function, unique violation,
+    //! serialization failure). Deadlock uses the constructor the
+    //! LockManager itself uses (a second OS-level session race is not
+    //! reproducible deterministically in a unit test).
+
+    use super::{detail_hint_for_error, first_single_quoted, sqlstate_for_error};
+    use crate::session::IsolationLevel;
+    use crate::{EmbeddedDatabase, Error};
+
+    fn sql_error(db: &EmbeddedDatabase, sql: &str) -> Error {
+        db.execute(sql).expect_err("statement must fail")
+    }
+
+    /// SELECTs must go through the query path: `execute` does not
+    /// evaluate result expressions, which is what surfaces undefined
+    /// column errors.
+    fn query_error(db: &EmbeddedDatabase, sql: &str) -> Error {
+        db.query(sql, &[]).expect_err("query must fail")
+    }
+
+    #[test]
+    fn undefined_table_maps_to_42p01_with_detail() {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        let err = query_error(&db, "SELECT * FROM no_such_table");
+        let code = sqlstate_for_error(&err);
+        assert_eq!(code, "42P01", "got error: {err}");
+        let (detail, hint) = detail_hint_for_error(code, &err);
+        assert!(
+            detail.as_deref().unwrap_or_default().contains("no_such_table"),
+            "detail must carry the table name; got {detail:?} for {err}"
+        );
+        assert!(hint.is_some());
+    }
+
+    #[test]
+    fn undefined_column_maps_to_42703_with_detail() {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE t42703 (id INTEGER PRIMARY KEY)").unwrap();
+        // Need a row: projection expressions are evaluated per-row, so an
+        // empty table would return Ok([]) instead of the column error.
+        db.execute("INSERT INTO t42703 VALUES (1)").unwrap();
+        let err = query_error(&db, "SELECT no_such_col FROM t42703");
+        let code = sqlstate_for_error(&err);
+        assert_eq!(code, "42703", "got error: {err}");
+        let (detail, hint) = detail_hint_for_error(code, &err);
+        assert!(
+            detail.as_deref().unwrap_or_default().contains("no_such_col"),
+            "detail must carry the column name; got {detail:?} for {err}"
+        );
+        assert!(hint.is_some());
+    }
+
+    #[test]
+    fn duplicate_table_maps_to_42p07() {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE t42p07 (id INTEGER PRIMARY KEY)").unwrap();
+        let err = sql_error(&db, "CREATE TABLE t42p07 (id INTEGER PRIMARY KEY)");
+        assert_eq!(sqlstate_for_error(&err), "42P07", "got error: {err}");
+    }
+
+    #[test]
+    fn undefined_function_maps_to_42883() {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE t42883 (id INTEGER PRIMARY KEY)").unwrap();
+        db.execute("INSERT INTO t42883 VALUES (1)").unwrap();
+        let err = query_error(&db, "SELECT definitely_not_a_function(id) FROM t42883");
+        assert_eq!(sqlstate_for_error(&err), "42883", "got error: {err}");
+    }
+
+    #[test]
+    fn unique_violation_still_maps_to_23505() {
+        // Regression guard: the pre-D4 constraint sniffing must not change.
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE t23505 (id INTEGER PRIMARY KEY)").unwrap();
+        db.execute("INSERT INTO t23505 VALUES (1)").unwrap();
+        let err = sql_error(&db, "INSERT INTO t23505 VALUES (1)");
+        assert_eq!(sqlstate_for_error(&err), "23505", "got error: {err}");
+    }
+
+    #[test]
+    fn serialization_failure_maps_to_40001_with_retry_hint() {
+        // Real first-committer-wins conflict via two REPEATABLE READ
+        // sessions (R0.2).
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE t40001 (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+        db.execute("INSERT INTO t40001 VALUES (1, 100)").unwrap();
+
+        let a = db.create_session("a", IsolationLevel::RepeatableRead).unwrap();
+        let b = db.create_session("b", IsolationLevel::RepeatableRead).unwrap();
+        db.begin_transaction_for_session(a).unwrap();
+        db.begin_transaction_for_session(b).unwrap();
+        db.execute_in_session(a, "UPDATE t40001 SET v = 101 WHERE id = 1").unwrap();
+        db.commit_transaction_for_session(a).unwrap();
+        db.execute_in_session(b, "UPDATE t40001 SET v = 150 WHERE id = 1").unwrap();
+        let err = db.commit_transaction_for_session(b).expect_err("conflicting commit must fail");
+
+        let code = sqlstate_for_error(&err);
+        assert_eq!(code, "40001", "got error: {err}");
+        let (detail, hint) = detail_hint_for_error(code, &err);
+        assert!(detail.is_some());
+        assert!(
+            hint.as_deref().unwrap_or_default().to_ascii_lowercase().contains("retry"),
+            "hint must suggest retrying; got {hint:?}"
+        );
+
+        db.destroy_session(a).unwrap();
+        db.destroy_session(b).unwrap();
+    }
+
+    #[test]
+    fn deadlock_maps_to_40p01_with_retry_hint() {
+        // Same constructor the LockManager victim path uses
+        // (storage/lock_manager.rs: Error::deadlock("Deadlock detected
+        // for transaction N")).
+        let err = Error::deadlock("Deadlock detected for transaction 7");
+        let code = sqlstate_for_error(&err);
+        assert_eq!(code, "40P01");
+        let (_, hint) = detail_hint_for_error(code, &err);
+        assert!(hint.as_deref().unwrap_or_default().to_ascii_lowercase().contains("retry"));
+    }
+
+    #[test]
+    fn non_serialization_transaction_error_keeps_25000() {
+        let err = Error::transaction("no transaction in progress");
+        assert_eq!(sqlstate_for_error(&err), "25000");
+    }
+
+    #[test]
+    fn unknown_query_execution_error_stays_internal() {
+        let err = Error::query_execution("something exotic went wrong");
+        assert_eq!(sqlstate_for_error(&err), "XX000");
+    }
+
+    #[test]
+    fn quoted_name_extraction() {
+        assert_eq!(first_single_quoted("Table 'users' does not exist"), Some("users"));
+        assert_eq!(first_single_quoted("no quotes here"), None);
+        assert_eq!(first_single_quoted("dangling 'quote"), None);
     }
 }

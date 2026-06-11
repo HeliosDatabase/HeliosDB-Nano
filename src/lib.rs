@@ -319,7 +319,7 @@ pub mod config;
 mod embedded_db_dump;
 
 // Re-exports
-pub use config::{Config, KeySource, ZkeEncryptionConfig, ZkeMode};
+pub use config::{Config, KeySource, ProfileConfig, ZkeEncryptionConfig, ZkeMode};
 pub use crypto::{
     NonceTracker, TimestampValidator, ZeroKnowledgeSession, ZkeConfig, ZkeDerivedKeys, ZkeKeyDerivation,
     ZkeRequestContext,
