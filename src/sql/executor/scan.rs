@@ -1567,6 +1567,10 @@ pub(super) fn handle_scan(executor: &Executor, plan: &LogicalPlan) -> Result<Box
 
                     tracing::debug!("Resolved VERSIONS BETWEEN timestamps: {} to {}", start_ts, end_ts);
 
+                    // R4.3: pin the range start so version GC cannot prune
+                    // inside the range while it is being scanned.
+                    let _gc_pin = storage.pin_historical_snapshot(start_ts)?;
+
                     // Scan all versions in range
                     let versions = snapshot_mgr.scan_versions_between(&actual_table_name, start_ts, end_ts)?;
 
@@ -1617,6 +1621,10 @@ pub(super) fn handle_scan(executor: &Executor, plan: &LogicalPlan) -> Result<Box
                         snapshot_ts,
                         table_name
                     );
+
+                    // R4.3: pin the snapshot so the version GC cannot
+                    // advance past it while this statement reads history.
+                    let _gc_pin = storage.pin_historical_snapshot(snapshot_ts)?;
 
                     // Scan at historical snapshot (use actual_table_name for MV support)
                     let result = storage.scan_table_at_snapshot(&actual_table_name, snapshot_ts)?;
@@ -1872,6 +1880,10 @@ pub(super) fn handle_filtered_scan(executor: &Executor, plan: &LogicalPlan) -> R
                 // Resolve AS OF clause to snapshot timestamp
                 let snapshot_mgr = storage.snapshot_manager();
                 let snapshot_ts = snapshot_mgr.resolve_as_of(as_of_clause)?;
+
+                // R4.3: pin the snapshot so the version GC cannot advance
+                // past it while this statement reads version history.
+                let _gc_pin = storage.pin_historical_snapshot(snapshot_ts)?;
 
                 // Scan at historical snapshot, then apply filtering
                 let base_tuples = storage.scan_table_at_snapshot(&actual_table_name, snapshot_ts)?;
