@@ -750,7 +750,7 @@ impl Transaction {
         // and its locks are released, so the fsync wait never convoys the
         // snapshot barrier or row-lock contenders. RocksDB's WAL is
         // sequential: the group fsync covers every byte written before it.
-        let group_fsync = self.sync_commit && self.group_committer.is_some();
+        let group_fsync = self.sync_commit && self.rocksdb_wal_enabled && self.group_committer.is_some();
         let result = if self.rocksdb_wal_enabled {
             if self.sync_commit && !group_fsync {
                 // R1.3 phase 1 fallback (no group committer wired): one
