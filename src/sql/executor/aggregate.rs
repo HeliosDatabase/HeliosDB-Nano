@@ -462,6 +462,15 @@ impl AggregateOperator {
 
     /// Compute GROUP BY aggregates in one pass for non-DISTINCT streamable
     /// aggregates. Avoids storing every tuple inside each group.
+    ///
+    /// R3.2 note: this path is intentionally NOT parallelized. The large
+    /// simple GROUP BY shapes (plain table scan + simple predicates, no
+    /// HAVING/transaction/branch) are intercepted by the storage pushdowns
+    /// (`try_aggregate_row_columns` / `aggregate_columnar_columns`), which do
+    /// chunked rayon partial aggregation. What remains here is either small
+    /// or would require materializing the pull-based operator input into a
+    /// Vec, trading away this path's O(groups) memory contract. Revisit if
+    /// profiling shows large HAVING/expression-keyed GROUP BYs are hot.
     fn streaming_grouped_aggregate(
         input: &mut Box<dyn PhysicalOperator>,
         group_by: &[crate::sql::LogicalExpr],
