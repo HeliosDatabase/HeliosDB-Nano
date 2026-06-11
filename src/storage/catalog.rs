@@ -40,6 +40,27 @@ fn vector_distance_metric(options: &[crate::sql::logical_plan::IndexOption]) -> 
         .unwrap_or(DistanceMetric::L2)
 }
 
+/// R5.V6: HNSW construction parameters for an index — persisted
+/// `WITH (m = .., ef_construction = ..)` options win, the `[vector]`
+/// config section supplies the defaults.
+fn hnsw_construction_params(
+    options: &[crate::sql::logical_plan::IndexOption],
+    config: &crate::config::Config,
+) -> (usize, usize) {
+    use crate::sql::logical_plan::IndexOption;
+
+    let mut m = config.vector.hnsw_m;
+    let mut ef_construction = config.vector.hnsw_ef_construction;
+    for option in options {
+        match option {
+            IndexOption::HnswM(n) => m = *n,
+            IndexOption::EfConstruction(n) => ef_construction = *n,
+            _ => {}
+        }
+    }
+    (m, ef_construction)
+}
+
 /// Catalog manager for table metadata
 pub struct Catalog<'a> {
     storage: &'a StorageEngine,
@@ -613,12 +634,18 @@ impl<'a> Catalog<'a> {
                 continue;
             }
             let metric = vector_distance_metric(&definition.options);
-            if let Err(e) = vector_indexes.create_index(
+            // R5.V6: rebuild with the same construction parameters the index
+            // was created with — persisted `WITH (m = .., ef_construction = ..)`
+            // options first, the `[vector]` config section as the default.
+            let (m, ef_construction) = hnsw_construction_params(&definition.options, self.storage.config());
+            if let Err(e) = vector_indexes.create_index_with_params(
                 index_name.clone(),
                 definition.table_name.clone(),
                 definition.column_name.clone(),
                 *dimension,
                 metric,
+                m,
+                ef_construction,
             ) {
                 tracing::warn!("Vector index rebuild: create {} failed: {}", index_name, e);
                 continue;

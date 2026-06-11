@@ -288,6 +288,13 @@ pub(super) fn handle_create_index(executor: &Executor, plan: &LogicalPlan) -> Re
                     let mut pq_subquantizers: Option<usize> = None;
                     let mut pq_centroids: Option<usize> = None;
                     let mut persistent = false;
+                    // R5.V6: HNSW construction parameters default from the
+                    // `[vector]` config section; `WITH (m = ..,
+                    // ef_construction = ..)` overrides per index. These were
+                    // parsed but silently ignored (hardcoded 16/200) before.
+                    let vector_cfg = &storage.config().vector;
+                    let mut hnsw_m = vector_cfg.hnsw_m;
+                    let mut hnsw_ef_construction = vector_cfg.hnsw_ef_construction;
                     #[cfg(feature = "vector-persist")]
                     let mut rerank_precision: Option<crate::vector::persistent::VectorPrecision> = None;
                     #[cfg(not(feature = "vector-persist"))]
@@ -298,6 +305,8 @@ pub(super) fn handle_create_index(executor: &Executor, plan: &LogicalPlan) -> Re
                             IndexOption::Quantization(qt) => quantization_type = *qt,
                             IndexOption::PqSubquantizers(n) => pq_subquantizers = Some(*n),
                             IndexOption::PqCentroids(n) => pq_centroids = Some(*n),
+                            IndexOption::HnswM(n) => hnsw_m = *n,
+                            IndexOption::EfConstruction(n) => hnsw_ef_construction = *n,
                             IndexOption::Persistent(enabled) => persistent = *enabled,
                             IndexOption::RerankPrecision(precision) => {
                                 #[cfg(feature = "vector-persist")]
@@ -409,7 +418,7 @@ pub(super) fn handle_create_index(executor: &Executor, plan: &LogicalPlan) -> Re
                             let training_vectors: Vec<crate::vector::Vector> =
                                 existing_vectors.iter().map(|(_, vector)| vector.clone()).collect();
 
-                            vector_indexes.create_quantized_index(
+                            vector_indexes.create_quantized_index_with_params(
                                 name.clone(),
                                 table_name.clone(),
                                 column_name.clone(),
@@ -417,6 +426,8 @@ pub(super) fn handle_create_index(executor: &Executor, plan: &LogicalPlan) -> Re
                                 distance_metric,
                                 pq_config,
                                 &training_vectors,
+                                hnsw_m,
+                                hnsw_ef_construction,
                             )?;
                             let backfilled = backfill_vector_index(vector_indexes, name, &existing_vectors)?;
                             tracing::info!(
@@ -442,12 +453,14 @@ pub(super) fn handle_create_index(executor: &Executor, plan: &LogicalPlan) -> Re
                         }
                         _ => {
                             // Create standard non-quantized index
-                            vector_indexes.create_index(
+                            vector_indexes.create_index_with_params(
                                 name.clone(),
                                 table_name.clone(),
                                 column_name.clone(),
                                 dimension,
                                 distance_metric,
+                                hnsw_m,
+                                hnsw_ef_construction,
                             )?;
                             let backfilled = backfill_vector_index(vector_indexes, name, &existing_vectors)?;
                             tracing::info!(

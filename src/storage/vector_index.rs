@@ -17,6 +17,14 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
+/// Default HNSW `M` (max connections per node) when neither the `[vector]`
+/// config section nor `CREATE INDEX ... WITH (m = ...)` specify one.
+/// Mirrors `VectorConfig::default().hnsw_m`.
+pub const DEFAULT_HNSW_M: usize = 16;
+/// Default HNSW `ef_construction` companion to [`DEFAULT_HNSW_M`].
+/// Mirrors `VectorConfig::default().hnsw_ef_construction`.
+pub const DEFAULT_HNSW_EF_CONSTRUCTION: usize = 200;
+
 /// Vector index type
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum VectorIndexType {
@@ -137,7 +145,8 @@ impl VectorIndexManager {
         }
     }
 
-    /// Create a new standard (non-quantized) vector index
+    /// Create a new standard (non-quantized) vector index with the default
+    /// HNSW construction parameters (`M = 16`, `ef_construction = 200`).
     pub fn create_index(
         &self,
         name: String,
@@ -145,6 +154,32 @@ impl VectorIndexManager {
         column_name: String,
         dimension: usize,
         distance_metric: DistanceMetric,
+    ) -> Result<()> {
+        self.create_index_with_params(
+            name,
+            table_name,
+            column_name,
+            dimension,
+            distance_metric,
+            DEFAULT_HNSW_M,
+            DEFAULT_HNSW_EF_CONSTRUCTION,
+        )
+    }
+
+    /// Create a new standard (non-quantized) vector index with explicit HNSW
+    /// construction parameters — R5.V6: plumbed from the `[vector]` config
+    /// section (`hnsw_m` / `hnsw_ef_construction`) and overridable per index
+    /// via `CREATE INDEX ... WITH (m = ..., ef_construction = ...)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_index_with_params(
+        &self,
+        name: String,
+        table_name: String,
+        column_name: String,
+        dimension: usize,
+        distance_metric: DistanceMetric,
+        m: usize,
+        ef_construction: usize,
     ) -> Result<()> {
         let mut indexes = self.indexes.write();
         let mut metadata = self.metadata.write();
@@ -158,8 +193,8 @@ impl VectorIndexManager {
         let config = HnswConfig {
             dimension,
             distance_metric,
-            max_connections: 16,
-            ef_construction: 200,
+            max_connections: m,
+            ef_construction,
             // Performance optimization: Dynamic ef_search tuning
             ef_search_base: 200,
             dynamic_ef_search: true,
@@ -262,7 +297,8 @@ impl VectorIndexManager {
         ))
     }
 
-    /// Create a new quantized vector index
+    /// Create a new quantized vector index with the default HNSW
+    /// construction parameters (`M = 16`, `ef_construction = 200`).
     pub fn create_quantized_index(
         &self,
         name: String,
@@ -272,6 +308,34 @@ impl VectorIndexManager {
         distance_metric: DistanceMetric,
         pq_config: ProductQuantizerConfig,
         training_vectors: &[Vector],
+    ) -> Result<()> {
+        self.create_quantized_index_with_params(
+            name,
+            table_name,
+            column_name,
+            dimension,
+            distance_metric,
+            pq_config,
+            training_vectors,
+            DEFAULT_HNSW_M,
+            DEFAULT_HNSW_EF_CONSTRUCTION,
+        )
+    }
+
+    /// Create a new quantized vector index with explicit HNSW construction
+    /// parameters — R5.V6, same plumbing as [`Self::create_index_with_params`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_quantized_index_with_params(
+        &self,
+        name: String,
+        table_name: String,
+        column_name: String,
+        dimension: usize,
+        distance_metric: DistanceMetric,
+        pq_config: ProductQuantizerConfig,
+        training_vectors: &[Vector],
+        m: usize,
+        ef_construction: usize,
     ) -> Result<()> {
         let mut indexes = self.indexes.write();
         let mut metadata = self.metadata.write();
@@ -283,8 +347,8 @@ impl VectorIndexManager {
 
         // Create Quantized HNSW configuration
         let config = QuantizedHnswConfig {
-            max_connections: 16,
-            ef_construction: 200,
+            max_connections: m,
+            ef_construction,
             ef_search: 200,
             dimension,
             distance_metric,
@@ -1100,31 +1164,22 @@ fn metadata_matches(
     filter.iter().all(|(key, value)| metadata.get(key) == Some(value))
 }
 
+/// Exact distance between two raw vectors, dispatched through the in-house
+/// SIMD kernels (AVX2+FMA when the CPU supports them, scalar fallback
+/// otherwise) — R5.V6; this was the last hand-rolled scalar distance loop.
+/// Semantics match the kernels' scalar fallbacks exactly: L2 takes the
+/// square root, cosine returns 1.0 when either norm is zero, inner product
+/// returns the negated dot product. The dimension-mismatch guard stays here
+/// because the kernels assert equal lengths while exact scans historically
+/// rank mismatched records last via +INF.
 fn exact_distance(metric: DistanceMetric, a: &Vector, b: &Vector) -> f32 {
     if a.len() != b.len() {
         return f32::INFINITY;
     }
     match metric {
-        DistanceMetric::L2 => a
-            .iter()
-            .zip(b.iter())
-            .map(|(x, y)| {
-                let d = x - y;
-                d * d
-            })
-            .sum::<f32>()
-            .sqrt(),
-        DistanceMetric::Cosine => {
-            let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-            let na = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-            let nb = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-            if na == 0.0 || nb == 0.0 {
-                1.0
-            } else {
-                1.0 - dot / (na * nb)
-            }
-        }
-        DistanceMetric::InnerProduct => -a.iter().zip(b.iter()).map(|(x, y)| x * y).sum::<f32>(),
+        DistanceMetric::L2 => crate::vector::l2_distance(a, b),
+        DistanceMetric::Cosine => crate::vector::cosine_distance(a, b),
+        DistanceMetric::InnerProduct => crate::vector::inner_product_distance(a, b),
     }
 }
 
