@@ -9,7 +9,11 @@
 //! # Key Format
 //!
 //! ```text
-//! col:{table}:{column}:{batch_id}  -> bincode ColumnBatch (up to 1024 values)
+//! col:{table}:{column}:{batch_id}  -> v1: bincode ColumnBatch (up to 1024
+//!                                     values) OR v2: typed batch (R3.4, see
+//!                                     `typed_batch` — magic-prefixed fixed
+//!                                     width buffers + validity bitmap +
+//!                                     embedded stats). Readers handle both.
 //! colz:{table}:{column}:{batch_id} -> bincode BatchStats (zone-map sidecar, R3.1)
 //! colzm:{table}:{column}           -> [1] manifest marker: every col: batch of
 //!                                     this column has a colz: sidecar entry
@@ -99,6 +103,13 @@ pub const BATCH_SIZE: usize = 1024;
 ///
 /// Each batch contains up to BATCH_SIZE values for a single column,
 /// stored contiguously for better compression and sequential access.
+///
+/// R3.4: `values` is always fully materialized regardless of the stored
+/// format (v1 bincode or v2 typed — see `typed_batch`), so every
+/// row-at-a-time consumer works unchanged. Batches decoded from v2 storage
+/// additionally carry the `typed` companion buffers the vectorized kernels
+/// operate on. The field is `serde(skip)` so the v1 bincode encoding is
+/// byte-identical to every pre-R3.4 release.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ColumnBatch {
     /// Column name (for verification)
@@ -107,6 +118,10 @@ pub struct ColumnBatch {
     pub start_row_id: u64,
     /// Values in order, indexed by (row_id - start_row_id)
     pub values: Vec<Value>,
+    /// R3.4 typed companion (present iff decoded from a v2-encoded batch).
+    /// Invalidated by any mutation (`set`); never serialized.
+    #[serde(skip)]
+    pub typed: Option<super::typed_batch::TypedBatch>,
 }
 
 impl ColumnBatch {
@@ -116,6 +131,7 @@ impl ColumnBatch {
             column: column.to_string(),
             start_row_id,
             values: vec![Value::Null; BATCH_SIZE],
+            typed: None,
         }
     }
 
@@ -137,6 +153,10 @@ impl ColumnBatch {
         if offset >= BATCH_SIZE {
             return false;
         }
+
+        // R3.4: any mutation invalidates the typed companion (it is
+        // re-derived from `values` at encode time).
+        self.typed = None;
 
         // Ensure vector is large enough
         while self.values.len() <= offset {
@@ -627,8 +647,7 @@ impl ColumnarStore {
             .get(&key)
             .map_err(|e| Error::storage(format!("Columnar load failed: {}", e)))?
         {
-            Some(data) => bincode::deserialize(&data)
-                .map_err(|e| Error::storage(format!("Columnar deserialize failed: {}", e)))?,
+            Some(data) => super::typed_batch::decode_column_batch(&data)?,
             None => ColumnBatch::new(column, batch_id * BATCH_SIZE as u64),
         };
 
@@ -641,9 +660,11 @@ impl ColumnarStore {
             }
         }
 
-        let data =
-            bincode::serialize(&batch).map_err(|e| Error::storage(format!("Columnar serialize failed: {}", e)))?;
+        // R3.4: encode v2 when the (post-RMW) value set is homogeneously
+        // typed, v1 otherwise — so an RMW that mixes an incompatible value
+        // into a v2 batch downgrades it to v1 automatically.
         let stats = BatchStats::from_batch(&batch);
+        let data = super::typed_batch::encode_column_batch(&batch, &stats)?;
         let stats_data = bincode::serialize(&stats)
             .map_err(|e| Error::storage(format!("Columnar stats serialize failed: {}", e)))?;
         write_batch.put(&key, &data);
@@ -720,14 +741,12 @@ impl ColumnarStore {
     ) -> Result<()> {
         let key = Self::batch_key(table, column, batch_id);
         let mut batch = match txn.get(&key)? {
-            Some(data) => bincode::deserialize(&data)
-                .map_err(|e| Error::storage(format!("Columnar deserialize failed: {}", e)))?,
+            Some(data) => super::typed_batch::decode_column_batch(&data)?,
             None => match db
                 .get(&key)
                 .map_err(|e| Error::storage(format!("Columnar load failed: {}", e)))?
             {
-                Some(data) => bincode::deserialize(&data)
-                    .map_err(|e| Error::storage(format!("Columnar deserialize failed: {}", e)))?,
+                Some(data) => super::typed_batch::decode_column_batch(&data)?,
                 None => ColumnBatch::new(column, batch_id * BATCH_SIZE as u64),
             },
         };
@@ -741,13 +760,13 @@ impl ColumnarStore {
             }
         }
 
-        let data =
-            bincode::serialize(&batch).map_err(|e| Error::storage(format!("Columnar serialize failed: {}", e)))?;
         // Stage the zone-stats sidecar alongside the batch: the commit applies
         // the whole write set in one RocksDB WriteBatch (and takes the
         // zone-stats write lock when columnar keys are staged), so batch and
-        // stats stay consistent across commit/rollback.
+        // stats stay consistent across commit/rollback. R3.4: same v2/v1
+        // format choice (and RMW downgrade) as the autocommit path.
         let stats = BatchStats::from_batch(&batch);
+        let data = super::typed_batch::encode_column_batch(&batch, &stats)?;
         let stats_data = bincode::serialize(&stats)
             .map_err(|e| Error::storage(format!("Columnar stats serialize failed: {}", e)))?;
         txn.put(Self::stats_key(table, column, batch_id), stats_data)?;
@@ -824,11 +843,44 @@ impl ColumnarStore {
             .map_err(|e| Error::storage(format!("Columnar load failed: {}", e)))?
         {
             Some(data) => {
-                let batch: ColumnBatch = bincode::deserialize(&data)
-                    .map_err(|e| Error::storage(format!("Columnar deserialize failed: {}", e)))?;
+                let batch = super::typed_batch::decode_column_batch(&data)?;
                 Ok(batch.get(row_id).cloned())
             }
             None => Ok(None),
+        }
+    }
+
+    /// R3.4 lazy migration (HELIOS_BATCH_V2_MIGRATE=1): best-effort rewrite
+    /// of a v1 batch that a scan just decoded as v2. Same safety as the R3.1
+    /// stats backfill: the write happens under the zone-stats write lock and
+    /// only when the committed bytes still equal the image we decoded (a
+    /// concurrent writer otherwise wins). Failures are logged and ignored —
+    /// the batch simply stays v1 until the next scan.
+    fn maybe_migrate_v1_batch(db: &DB, table: &str, column: &str, batch_id: u64, original_raw: &[u8], batch: &ColumnBatch) {
+        use super::typed_batch as tb;
+        if batch.typed.is_some() || !tb::batch_v2_migrate_enabled() || !tb::batch_v2_write_enabled() {
+            return;
+        }
+        if !tb::batch_is_v2_eligible(batch) {
+            return;
+        }
+        let key = Self::batch_key(table, column, batch_id);
+        let _guard = stats_write_lock();
+        match db.get(&key) {
+            Ok(Some(current)) if current.as_slice() == original_raw => {
+                let stats = BatchStats::from_batch(batch);
+                match tb::encode_column_batch(batch, &stats) {
+                    Ok(encoded) => {
+                        if let Err(e) = db.put(&key, encoded) {
+                            tracing::warn!(table, column, batch_id, error = %e, "Batch v2 migration write failed");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(table, column, batch_id, error = %e, "Batch v2 migration encode failed");
+                    }
+                }
+            }
+            _ => {} // moved underneath us or unreadable: skip
         }
     }
 
@@ -856,8 +908,12 @@ impl ColumnarStore {
                 break;
             }
 
-            let batch: ColumnBatch = bincode::deserialize(&value)
-                .map_err(|e| Error::storage(format!("Columnar deserialize failed: {}", e)))?;
+            let batch = super::typed_batch::decode_column_batch(&value)?;
+            if super::typed_batch::batch_v2_migrate_enabled() {
+                if let Some(batch_id) = Self::parse_batch_id(&key, prefix.len()) {
+                    Self::maybe_migrate_v1_batch(db, table, column, batch_id, &value, &batch);
+                }
+            }
 
             // Collect non-null values
             for (i, val) in batch.values.iter().enumerate() {
@@ -888,9 +944,11 @@ impl ColumnarStore {
                 break;
             }
 
-            let batch: ColumnBatch = bincode::deserialize(&value)
-                .map_err(|e| Error::storage(format!("Columnar deserialize failed: {}", e)))?;
+            let batch = super::typed_batch::decode_column_batch(&value)?;
             let batch_id = batch.start_row_id / BATCH_SIZE as u64;
+            if super::typed_batch::batch_v2_migrate_enabled() {
+                Self::maybe_migrate_v1_batch(db, table, column, batch_id, &value, &batch);
+            }
             batches.push((batch_id, batch));
         }
 
@@ -978,8 +1036,10 @@ impl ColumnarStore {
                 // A manifest entry without a batch should not happen (writes
                 // are atomic); treat it like an absent batch.
                 if let Some(data) = data {
-                    let batch: ColumnBatch = bincode::deserialize(&data)
-                        .map_err(|e| Error::storage(format!("Columnar deserialize failed: {}", e)))?;
+                    let batch = super::typed_batch::decode_column_batch(&data)?;
+                    if super::typed_batch::batch_v2_migrate_enabled() {
+                        Self::maybe_migrate_v1_batch(db, table, column, *batch_id, &data, &batch);
+                    }
                     batches.push((*batch_id, batch));
                 }
             }
@@ -1023,8 +1083,10 @@ impl ColumnarStore {
             if pruned.contains(&batch_id) {
                 continue;
             }
-            let batch: ColumnBatch = bincode::deserialize(&value)
-                .map_err(|e| Error::storage(format!("Columnar deserialize failed: {}", e)))?;
+            let batch = super::typed_batch::decode_column_batch(&value)?;
+            if super::typed_batch::batch_v2_migrate_enabled() {
+                Self::maybe_migrate_v1_batch(db, table, column, batch_id, &value, &batch);
+            }
             batches.push((batch_id, batch));
         }
 
@@ -1061,8 +1123,7 @@ impl ColumnarStore {
         else {
             return Ok(()); // batch deleted meanwhile
         };
-        let batch: ColumnBatch = bincode::deserialize(&data)
-            .map_err(|e| Error::storage(format!("Columnar deserialize failed: {}", e)))?;
+        let batch = super::typed_batch::decode_column_batch(&data)?;
         let stats_data = bincode::serialize(&BatchStats::from_batch(&batch))
             .map_err(|e| Error::storage(format!("Columnar stats serialize failed: {}", e)))?;
         db.put(&stats_key, &stats_data)
@@ -1128,8 +1189,7 @@ impl ColumnarStore {
                 break;
             }
 
-            let batch: ColumnBatch = bincode::deserialize(&value)
-                .map_err(|e| Error::storage(format!("Columnar deserialize failed: {}", e)))?;
+            let batch = super::typed_batch::decode_column_batch(&value)?;
 
             total_batches += 1;
             total_values += batch.values.len();
