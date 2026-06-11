@@ -5,6 +5,25 @@
 # as needed for your deployment.
 
 # ============================================================================
+# PROFILE (top-level key — must appear before any [section])
+# ============================================================================
+# Named settings bundle. One-line tradeoffs:
+# - "safe":     wal_sync_mode=sync, time_travel on — slowest writes, fsync per
+#               operation (the built-in defaults).
+# - "balanced": wal_sync_mode=group_commit, time_travel on — process-crash
+#               safe; a power loss can lose the last commit window.
+# - "fast":     group_commit, time_travel OFF, durable_commit off — fastest
+#               writes; no AS OF time-travel queries, power loss can lose
+#               recent commits.
+# Precedence: a profile only fills in [storage] keys you do NOT set
+# explicitly below — explicit per-field values always win.
+# NOTE: none of the profiles force power-loss durable commits. If you need
+# commits to survive power loss (not just process crashes), also set
+# storage.durable_commit = true (available since v3.44.0; "safe" profile
+# users typically want this).
+# profile = "balanced"
+
+# ============================================================================
 # STORAGE CONFIGURATION
 # ============================================================================
 [storage]
@@ -58,8 +77,16 @@ transaction_isolation = "READ_COMMITTED"
 # Slow query log threshold in milliseconds.
 # Queries exceeding this threshold are logged at WARN level with their SQL
 # text (truncated to 200 chars), duration, and row count.
-# Omit for the default (1000 = 1 second); requires RUST_LOG to include WARN.
+# Omit for the default (1000 = 1 second). Visible by default: the server
+# logs at WARN level when RUST_LOG is unset (set RUST_LOG to override).
 slow_query_threshold_ms = 1000
+
+# Fsync the RocksDB WriteBatch at transaction COMMIT, making commits
+# power-loss durable (v3.44.0+). Default false: commits are process-crash
+# safe (RocksDB WAL) but a power loss can lose the last commit window.
+# Recommended together with profile = "safe" when durability matters more
+# than write latency.
+durable_commit = false
 
 # ============================================================================
 # ENCRYPTION CONFIGURATION
