@@ -1358,3 +1358,55 @@ fn run_conflict_bench() {
     }
     println!();
 }
+
+/// Plan-arm INSERT benchmark (R1.1 direct workload).
+///
+/// `INSERT ... RETURNING id` always bails off the fast INSERT path to the
+/// plan arm, which (pre-R1.1) paid TWO fsyncs per row under the default
+/// wal_sync_mode=Sync: next_row_id's UpdateCounter WAL append plus
+/// log_data_insert. This is the statement shape ORMs emit by default.
+///
+///   HELIOS_RETURNING=1 cargo test --profile perf --test tps_workloads run_returning_bench -- --nocapture --test-threads=1
+#[test]
+fn run_returning_bench() {
+    if std::env::var("HELIOS_RETURNING").is_err() {
+        eprintln!("skipping run_returning_bench (set HELIOS_RETURNING=1)");
+        return;
+    }
+    let cycles: usize = std::env::var("HELIOS_RETURNING_M")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(200);
+
+    for mode in ["mem", "disk"] {
+        let tmp = std::env::temp_dir().join(format!("helios_ret_{}", std::process::id()));
+        let db = if mode == "mem" {
+            EmbeddedDatabase::new_in_memory().unwrap()
+        } else {
+            let _ = std::fs::remove_dir_all(&tmp);
+            let mut config = Config::default();
+            config.storage.path = Some(tmp.clone());
+            config.storage.memory_only = false;
+            config.storage.wal_enabled = true;
+            config.storage.wal_sync_mode = WalSyncModeConfig::Sync;
+            EmbeddedDatabase::with_config(config).unwrap()
+        };
+        db.execute("CREATE TABLE r (id INTEGER PRIMARY KEY, v TEXT)").unwrap();
+
+        let start = Instant::now();
+        for i in 0..cycles {
+            let (_, rows) = db
+                .execute_returning(&format!("INSERT INTO r (id, v) VALUES ({i}, 'x') RETURNING id"))
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+        }
+        println!(
+            "insert_returning({mode:>4})   {:>10.0} ops/s  ({cycles} rows)",
+            cycles as f64 / start.elapsed().as_secs_f64()
+        );
+        drop(db);
+        if mode == "disk" {
+            let _ = std::fs::remove_dir_all(&tmp);
+        }
+    }
+}

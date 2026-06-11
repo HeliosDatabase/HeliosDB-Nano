@@ -2404,8 +2404,9 @@ impl StorageEngine {
             // Use legacy non-versioned path (faster, no time-travel support)
             let catalog = Catalog::new(self);
 
-            // Get next row ID
-            let row_id = catalog.next_row_id(table_name)?;
+            // R1.1: volatile row id + post-write flush (see
+            // insert_tuple_versioned_with_schema).
+            let row_id = self.next_row_id_volatile(table_name);
 
             // Get table schema
             let schema = catalog.get_table_schema(table_name)?;
@@ -2429,9 +2430,14 @@ impl StorageEngine {
 
             // Store transformed tuple
             self.put(&key, &value)?;
+            self.flush_row_counter(table_name)?;
 
-            // Log to WAL for durability/replication
-            self.log_data_insert(table_name, &key, &logical_value)?;
+            // R1.1: nosync logical-WAL append by default (P0#2 contract).
+            if self.fast_dml_requires_logical_wal() {
+                self.log_data_insert(table_name, &key, &logical_value)?;
+            } else {
+                self.log_data_insert_nosync(table_name, &key, &logical_value)?;
+            }
 
             // Update ART index for PK/unique constraint indexes
             {
@@ -7612,8 +7618,13 @@ impl StorageEngine {
     ) -> Result<u64> {
         let catalog = Catalog::new(self);
 
-        // Get next row ID
-        let row_id = catalog.next_row_id(table_name)?;
+        // R1.1: allocate the row id from the volatile counter — the durable
+        // next_row_id() pays a counter put PLUS a synced WAL UpdateCounter
+        // append per row (one of the two fsyncs that capped plan-arm INSERT
+        // at ~34 rows/s on an 11ms-fsync disk). The counter is flushed
+        // (non-synced put) after the row lands, matching the fast-path
+        // durability contract.
+        let row_id = self.next_row_id_volatile(table_name);
 
         // Fill NULL PK columns with auto-generated row_id (SERIAL semantics)
         let mut tuple = tuple;
@@ -7675,9 +7686,16 @@ impl StorageEngine {
         // Write current version (for fast non-time-travel queries)
         let key = Self::build_data_key(table_name, row_id);
         self.put(&key, &value)?;
+        self.flush_row_counter(table_name)?;
 
-        // Log to WAL for durability/replication
-        self.log_data_insert(table_name, &key, &logical_value)?;
+        // R1.1: logical-WAL append without a per-statement fsync by default
+        // (P0#2 contract); strict per-statement durability is opt-in via
+        // storage.logical_wal_per_statement.
+        if self.fast_dml_requires_logical_wal() {
+            self.log_data_insert(table_name, &key, &logical_value)?;
+        } else {
+            self.log_data_insert_nosync(table_name, &key, &logical_value)?;
+        }
 
         // Update ART index for PK/unique constraint indexes
         {
@@ -9479,8 +9497,9 @@ impl StorageEngine {
         };
         let catalog = Catalog::new(self);
 
-        // Get next row ID (shared across branches for consistency)
-        let row_id = catalog.next_row_id(table_name)?;
+        // R1.1: volatile row id (shared across branches for consistency);
+        // flushed after the row write.
+        let row_id = self.next_row_id_volatile(table_name);
 
         // Fill NULL PK columns with auto-generated row_id (SERIAL semantics)
         let mut tuple = tuple;
@@ -9512,6 +9531,7 @@ impl StorageEngine {
         // Write to branch-specific key
         let key = format!("bdata:{}:{}:{}", branch_id, table_name, row_id).into_bytes();
         self.put(&key, &value)?;
+        self.flush_row_counter(table_name)?;
 
         // Get current timestamp for versioning
         let timestamp = self.next_timestamp();

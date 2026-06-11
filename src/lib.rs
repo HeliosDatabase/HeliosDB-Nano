@@ -2150,7 +2150,12 @@ impl EmbeddedDatabase {
 
                                     // Log to WAL for replication
                                     if !skip_fast_paths && self.storage.is_wal_enabled() {
-                                        self.storage.log_data_insert(table_name, &existing_key, &updated_val)?;
+                                        if self.storage.fast_dml_requires_logical_wal() {
+                                            self.storage.log_data_insert(table_name, &existing_key, &updated_val)?;
+                                        } else {
+                                            self.storage
+                                                .log_data_insert_nosync(table_name, &existing_key, &updated_val)?;
+                                        }
                                     }
 
                                     // Invalidate result cache on update
@@ -2210,8 +2215,12 @@ impl EmbeddedDatabase {
                         }
                     }
 
-                    // Transactional insert (branch-aware)
-                    let row_id = catalog.next_row_id(table_name)?;
+                    // Transactional insert (branch-aware).
+                    // R1.1: volatile row id + counter staged in the txn —
+                    // the durable next_row_id() paid a synced WAL append per
+                    // row on the plan arm (INSERT ... RETURNING et al).
+                    let row_id = self.storage.next_row_id_volatile(table_name);
+                    self.storage.stage_row_counter_in_transaction(table_name, row_id, txn)?;
                     let key = self.storage.branch_aware_data_key(table_name, row_id);
 
                     // Fill NULL values in SERIAL/BIGSERIAL PK columns with the auto-generated row_id.
@@ -2264,9 +2273,14 @@ impl EmbeddedDatabase {
                     txn.put(key.clone(), val.clone())?;
 
                     // Log to WAL for replication (skip in explicit transactions —
-                    // WAL entries should only reflect committed changes)
+                    // WAL entries should only reflect committed changes).
+                    // R1.1: nosync append by default (P0#2 contract).
                     if !skip_fast_paths && self.storage.is_wal_enabled() {
-                        self.storage.log_data_insert(table_name, &key, &val)?;
+                        if self.storage.fast_dml_requires_logical_wal() {
+                            self.storage.log_data_insert(table_name, &key, &val)?;
+                        } else {
+                            self.storage.log_data_insert_nosync(table_name, &key, &val)?;
+                        }
                     }
 
                     // Update ART index for PK/unique constraint lookups
@@ -10392,7 +10406,9 @@ impl EmbeddedDatabase {
                                 // execute_in_transaction_inner INSERT arm):
                                 // the row lands in the write set, is visible
                                 // to read-your-writes, and rolls back.
-                                let row_id = catalog.next_row_id(table_name)?;
+                                // R1.1: volatile row id + counter staged in the txn.
+                                let row_id = self.storage.next_row_id_volatile(table_name);
+                                self.storage.stage_row_counter_in_transaction(table_name, row_id, txn)?;
                                 let mut staged = tuple.clone();
                                 for (i, col) in schema.columns.iter().enumerate() {
                                     if col.primary_key {
