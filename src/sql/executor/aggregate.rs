@@ -933,32 +933,30 @@ impl SortOperator {
         // instead of a per-comparison linear schema scan.
         let exprs: Vec<crate::sql::LogicalExpr> = exprs.into_iter().map(|e| evaluator.bind(e)).collect();
 
-        // Collect all tuples from input (with timeout checking)
-        let mut tuples = Vec::new();
+        // R3.5 item 2: decorate-sort-undecorate. Evaluate each sort key ONCE
+        // per row during materialization (like TopKOperator) instead of
+        // O(N log N) times inside the comparator, and SURFACE evaluation
+        // errors instead of silently skipping the comparison — the old
+        // `continue`-on-error produced silently mis-sorted output.
+        let mut decorated: Vec<(Vec<crate::Value>, Tuple)> = Vec::new();
         while let Some(tuple) = input.next()? {
             // Check timeout during materialization (blocking operation)
             if let Some(ref ctx) = timeout_ctx {
                 ctx.check_timeout()?;
             }
-            tuples.push(tuple);
+            let mut key = Vec::with_capacity(exprs.len());
+            for expr in &exprs {
+                key.push(evaluator.evaluate(expr, &tuple)?);
+            }
+            decorated.push((key, tuple));
         }
 
-        // Sort tuples
-        tuples.sort_by(|a, b| {
-            for (i, expr) in exprs.iter().enumerate() {
-                // Evaluate expression for both tuples
-                let val_a = evaluator.evaluate(expr, a);
-                let val_b = evaluator.evaluate(expr, b);
-
-                // Handle evaluation errors
-                let (val_a, val_b) = match (val_a, val_b) {
-                    (Ok(a), Ok(b)) => (a, b),
-                    _ => continue, // Skip comparison on error
-                };
-
-                // Compare values
-                use std::cmp::Ordering;
-                let cmp = compare_values(&val_a, &val_b);
+        // Sort by the precomputed keys. `sort_by` is stable, so rows with
+        // equal keys keep their input order exactly as before.
+        decorated.sort_by(|(key_a, _), (key_b, _)| {
+            use std::cmp::Ordering;
+            for (i, (val_a, val_b)) in key_a.iter().zip(key_b.iter()).enumerate() {
+                let cmp = compare_values(val_a, val_b);
 
                 // Apply ascending/descending
                 let cmp = if asc.get(i).copied().unwrap_or(true) {
@@ -971,8 +969,10 @@ impl SortOperator {
                     return cmp;
                 }
             }
-            std::cmp::Ordering::Equal
+            Ordering::Equal
         });
+
+        let tuples: Vec<Tuple> = decorated.into_iter().map(|(_, tuple)| tuple).collect();
 
         Ok(Self {
             sorted_tuples: tuples,
