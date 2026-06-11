@@ -292,9 +292,14 @@ enum CodeGraphAction {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize tracing
+    // Initialize tracing. Default to WARN when RUST_LOG is unset so
+    // operator-facing diagnostics (e.g. the slow-query log) are visible
+    // out of the box instead of silently filtered (D3).
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
         .init();
 
     let cli = Cli::parse();
@@ -493,6 +498,40 @@ async fn main() -> Result<()> {
     }
 }
 
+/// One-line durability contract derived from the active configuration (D3).
+///
+/// Never hardcoded: every clause is computed from `config.storage` so the
+/// banner cannot drift from what the engine actually does.
+fn durability_contract(config: &Config) -> String {
+    use heliosdb_nano::config::WalSyncModeConfig;
+
+    let s = &config.storage;
+    let profile = config
+        .profile
+        .map(|p| format!("profile: {}; ", p.as_str()))
+        .unwrap_or_default();
+
+    if s.memory_only || !s.wal_enabled {
+        return format!("{profile}durability: none (in-memory / WAL disabled) — data does not survive process exit");
+    }
+
+    let sync_mode = match s.wal_sync_mode {
+        WalSyncModeConfig::Sync => "sync",
+        WalSyncModeConfig::Async => "async",
+        WalSyncModeConfig::GroupCommit => "group_commit",
+    };
+
+    if s.durable_commit {
+        format!(
+            "{profile}durability: power-loss durable commits (fsync at COMMIT, storage.durable_commit=on; wal_sync_mode={sync_mode})"
+        )
+    } else {
+        format!(
+            "{profile}durability: process-crash-safe (RocksDB WAL, wal_sync_mode={sync_mode}); power-loss durable commits: off (storage.durable_commit)"
+        )
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn start_server(
     data_dir: PathBuf,
@@ -533,7 +572,7 @@ async fn start_server(
     println!();
 
     // Load config
-    let _db_config = if let Some(ref path) = config_path {
+    let mut db_config = if let Some(ref path) = config_path {
         println!("[1/4] Loading configuration from {}...", path.display());
         Config::from_file(path.clone())?
     } else {
@@ -541,13 +580,28 @@ async fn start_server(
         Config::default()
     };
 
+    // CLI flags win over the config file for storage location/mode.
+    if memory_mode {
+        db_config.storage.memory_only = true;
+        db_config.storage.path = None;
+        db_config.storage.wal_enabled = false;
+    } else {
+        db_config.storage.memory_only = false;
+        db_config.storage.path = Some(data_dir.clone());
+    }
+
+    // D3: one-line durability contract, derived from the active config.
+    let durability_line = durability_contract(&db_config);
+    println!("      {durability_line}");
+    info!("{durability_line}");
+
     // Open database (in-memory mode avoids disk I/O for all operations)
     let db = if memory_mode {
         println!("[2/4] Initializing in-memory database...");
-        Arc::new(EmbeddedDatabase::new_in_memory()?)
+        Arc::new(EmbeddedDatabase::with_config(db_config)?)
     } else {
         println!("[2/4] Initializing database at {}...", data_dir.display());
-        Arc::new(EmbeddedDatabase::new(&data_dir)?)
+        Arc::new(EmbeddedDatabase::with_config(db_config)?)
     };
     println!("      Database initialized successfully");
 

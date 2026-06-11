@@ -2596,8 +2596,13 @@ fn value_to_mysql_string(v: &Value) -> String {
 /// Map an error message to the appropriate MySQL error code and SQL state.
 fn map_error_code(err_msg: &str) -> (u16, &'static str) {
     let lower = err_msg.to_lowercase();
-    if lower.contains("serialization failure") {
-        (1213, "40001") // ER_LOCK_DEADLOCK — clients retry the transaction
+    if lower.contains("serialization failure") || lower.contains("deadlock") {
+        // ER_LOCK_DEADLOCK — clients retry the transaction. Covers both the
+        // R0.2 first-committer-wins conflict ("serialization failure: ...")
+        // and the LockManager victim path ("Deadlock detected for
+        // transaction N", storage/lock_manager.rs). MySQL reports SQLSTATE
+        // 40001 for deadlocks (no 40P01 in MySQL).
+        (1213, "40001")
     } else if lower.contains("duplicate") || lower.contains("unique") || lower.contains("already exists") {
         (1062, "23000") // ER_DUP_ENTRY
     } else if lower.contains("does not exist") || lower.contains("not found") || lower.contains("doesn't exist") {
@@ -2875,6 +2880,25 @@ mod tests {
         let (code, state) = map_error_code("duplicate key value violates unique constraint");
         assert_eq!(code, 1062);
         assert_eq!(state, "23000");
+    }
+
+    #[test]
+    fn test_map_error_code_serialization_failure() {
+        // R0.2 first-committer-wins conflict text (storage/transaction.rs).
+        let (code, state) = map_error_code(
+            "Transaction error: serialization failure: write-write conflict on key 'k' \
+             (committed at ts 9, transaction snapshot ts 7); retry the transaction",
+        );
+        assert_eq!(code, 1213);
+        assert_eq!(state, "40001");
+    }
+
+    #[test]
+    fn test_map_error_code_deadlock() {
+        // LockManager victim wording (storage/lock_manager.rs:226).
+        let (code, state) = map_error_code("Transaction error: Deadlock: Deadlock detected for transaction 7");
+        assert_eq!(code, 1213);
+        assert_eq!(state, "40001");
     }
 
     #[test]
