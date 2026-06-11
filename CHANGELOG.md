@@ -5,6 +5,54 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.49.0] - 2026-06-11
+
+Minor release: public reproducible benchmarks with a CI performance gate
+(D5), the wire-protocol track (R5.W), and a durability-contract fix the
+new benchmarks caught.
+
+### Fixed — Durability
+
+- `storage.durable_commit = true` now covers AUTOCOMMIT statements: each
+  fast-path statement ends with one WAL fsync barrier. Previously only
+  explicit transaction commits were power-loss durable — found by the new
+  durability gauntlet showing identical throughput with the flag on/off.
+  Default configuration is unchanged (zero overhead with the flag off).
+
+### Added — MySQL prepared statements (R5.W4)
+
+- COM_STMT_EXECUTE decodes binary parameters (full type table: ints,
+  floats, decimal, strings/blobs, date/datetime/timestamp/time, JSON,
+  BIT, NULL bitmap) and returns binary result rows, as the MySQL protocol
+  requires after a prepared execute — previously bound parameters were
+  silently DISCARDED and raw SQL replayed. Parameter counting is now
+  quote-aware ('?' inside string literals no longer miscounts).
+  This unblocks sysbench's default prepared-statement mode and
+  libmysqlclient-family drivers.
+
+### Changed — PostgreSQL wire performance (R5.W1, R5.W2)
+
+- Extended-protocol results use the direct row encoder (text formats):
+  1.65x on wide result sets; byte-identical output pinned by wire tests.
+- Prepared statements pin their plan at first Execute and cache the
+  catalog-dispatch decision at Parse (epoch-validated against DDL):
+  10-20% on prepared point reads.
+- The legacy network stack (accepts any password; drops DML parameters)
+  is no longer compiled by default (`legacy-network` feature).
+
+### Added — Public benchmarks & CI gate (D5)
+
+- `benches/public/`: runnable, stamped benchmark scripts (SQLite mirror
+  at two scales, durability gauntlet with honest tier labels, concurrency
+  suite) and `docs/benchmarks/` with measured results. Headline:
+  large-N analytics flipped — GROUP BY 16.1x and aggregates 3.78x FASTER
+  than SQLite at 200k rows (both were losses before v3.46); top-N, join,
+  and filter-scan losses documented with diagnoses.
+- CI performance gate (perf-gate.yml): mem suite + the in-transaction FK
+  bulk-insert shape (the v3.28.0 338x regression class), failing PRs at
+  >2.5x below baseline.
+- Optional p50/p95/p99 in the TPS harness (HELIOS_TPS_PERCENTILES=1).
+
 ## [3.48.0] - 2026-06-11
 
 Minor release: STORAGE COLUMNAR becomes production-adoptable (R3.3) and
