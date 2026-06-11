@@ -16,6 +16,10 @@
 //!   oltp_fast            -> in-memory-only OLTP ceiling: rowstore schema,
 //!                           time travel off by default, memory quota accounting off
 //! HELIOS_TPS_TIME_TRAVEL=0 disables MVCC version-key maintenance for write-path diagnosis.
+//! HELIOS_TPS_DURABLE=1 enables fsync-per-commit durability (storage.durable_commit) on disk modes.
+//! HELIOS_TPS_PERCENTILES=1 times each single-op statement individually and appends
+//!   p50/p95/p99 latency to the per-op workload lines (adds ~tens of ns timing
+//!   overhead per op — leave off when comparing aggregate ops/s across engines).
 
 use heliosdb_nano::config::WalSyncModeConfig;
 use heliosdb_nano::{Config, EmbeddedDatabase, Result, Value};
@@ -316,6 +320,50 @@ fn bench<F: FnMut() -> Result<()>>(label: &str, ops: usize, mut f: F) {
     );
 }
 
+/// Per-op bench wrapper. Identical timing/output to `bench` unless
+/// HELIOS_TPS_PERCENTILES=1, in which case every op is timed individually
+/// and p50/p95/p99 latencies are appended to the output line (same
+/// percentile indexing as benches/external/pagination_bench.py).
+///
+/// Per-op timing adds two `Instant::now()` calls per op (~tens of ns), so
+/// leave it OFF when comparing aggregate ops/s against other engines or
+/// against stored CI baselines.
+fn bench_per_op<F: FnMut(usize) -> Result<()>>(label: &str, ops: usize, mut f: F) {
+    if !env_bool_enabled("HELIOS_TPS_PERCENTILES", false) {
+        bench(label, ops, || {
+            for i in 0..ops {
+                f(i)?;
+            }
+            Ok(())
+        });
+        return;
+    }
+    let mut samples: Vec<u64> = Vec::with_capacity(ops);
+    let start = Instant::now();
+    for i in 0..ops {
+        let t = Instant::now();
+        f(i).expect("workload failed");
+        samples.push(t.elapsed().as_nanos() as u64);
+    }
+    let secs = start.elapsed().as_secs_f64();
+    samples.sort_unstable();
+    let pct = |p: f64| {
+        let idx = ((samples.len() as f64) * p) as usize;
+        samples[idx.min(samples.len() - 1)] as f64 / 1000.0
+    };
+    println!(
+        "{:<28} {:>10} ops  {:>9.3} s  {:>14.0} ops/s  {:>10.2} us/op  p50={:.2}us p95={:.2}us p99={:.2}us",
+        label,
+        ops,
+        secs,
+        ops as f64 / secs,
+        secs * 1e6 / ops as f64,
+        pct(0.50),
+        pct(0.95),
+        pct(0.99)
+    );
+}
+
 fn selected_workloads_env(name: &str) -> Option<HashSet<String>> {
     let raw = std::env::var(name).ok()?;
     let selected: HashSet<String> = raw
@@ -462,6 +510,11 @@ fn env_bool_enabled(name: &str, default: bool) -> bool {
 fn apply_tps_overrides(config: &mut Config, embedded_profile: TpsEmbeddedProfile) {
     config.storage.time_travel_enabled =
         env_bool_enabled("HELIOS_TPS_TIME_TRAVEL", embedded_profile.default_time_travel());
+    // HELIOS_TPS_DURABLE=1 enables fsync-per-commit WriteBatch durability
+    // (storage.durable_commit, v3.44.0+) — the power-loss-durable tier.
+    // Only meaningful for the disk modes; harmless no-op for mem.
+    config.storage.durable_commit =
+        env_bool_enabled("HELIOS_TPS_DURABLE", config.storage.durable_commit);
     embedded_profile.apply_config(config);
 }
 
@@ -688,9 +741,10 @@ fn run_tps_suite() {
 
     println!("\n================ HeliosDB-Nano TPS suite ================");
     println!(
-        "mode={mode}  profile={}  N={n}  M={m}  time_travel={}  dir={}",
+        "mode={mode}  profile={}  N={n}  M={m}  time_travel={}  durable_commit={}  dir={}",
         embedded_profile.label(),
         env_bool_enabled("HELIOS_TPS_TIME_TRAVEL", embedded_profile.default_time_travel()),
+        env_bool_enabled("HELIOS_TPS_DURABLE", false),
         tmp.display()
     );
     println!("{}", "-".repeat(80));
@@ -753,29 +807,27 @@ fn run_tps_suite() {
     }
 
     // 2) Autocommit insert M rows (each its own implicit txn) — the durable OLTP write TPS.
-    let load_autocommit_rows = || -> Result<()> {
-        for i in 0..m {
-            let id = n + i;
-            db.execute(&format!(
-                "INSERT INTO users (id, name, email, age, balance) VALUES ({id}, 'AC{id}', 'ac{id}@ex.com', 33, 500)"
-            ))?;
-        }
+    let autocommit_row = |i: usize| -> Result<()> {
+        let id = n + i;
+        db.execute(&format!(
+            "INSERT INTO users (id, name, email, age, balance) VALUES ({id}, 'AC{id}', 'ac{id}@ex.com', 33, 500)"
+        ))?;
         Ok(())
     };
     if run_autocommit {
-        bench("autocommit_insert", m, load_autocommit_rows);
+        bench_per_op("autocommit_insert", m, autocommit_row);
     } else if run_delete {
-        load_autocommit_rows().unwrap();
+        for i in 0..m {
+            autocommit_row(i).unwrap();
+        }
     }
 
     // 3) Point lookup by PK (read TPS).
     if run_point {
-        bench("point_lookup_pk", m, || {
-            for i in 0..m {
-                let id = (i * 2654435761usize) % n;
-                let r = db.query(&format!("SELECT * FROM users WHERE id = {id}"), &[])?;
-                assert!(!r.is_empty());
-            }
+        bench_per_op("point_lookup_pk", m, |i| {
+            let id = (i * 2654435761usize) % n;
+            let r = db.query(&format!("SELECT * FROM users WHERE id = {id}"), &[])?;
+            assert!(!r.is_empty());
             Ok(())
         });
     }
@@ -784,32 +836,26 @@ fn run_tps_suite() {
     let hot_id = 12345usize.min(n - 1);
     let hot_sql = format!("SELECT * FROM users WHERE id = {hot_id}");
     if run_hot {
-        bench("point_lookup_hot", m, || {
-            for _ in 0..m {
-                let _ = db.query(&hot_sql, &[])?;
-            }
+        bench_per_op("point_lookup_hot", m, |_| {
+            let _ = db.query(&hot_sql, &[])?;
             Ok(())
         });
     }
 
     // 5) Update by PK (autocommit) — durable write TPS for updates.
     if run_update {
-        bench("update_by_pk", m, || {
-            for i in 0..m {
-                let id = (i * 40503usize) % n;
-                db.execute(&format!("UPDATE users SET balance = balance + 1 WHERE id = {id}"))?;
-            }
+        bench_per_op("update_by_pk", m, |i| {
+            let id = (i * 40503usize) % n;
+            db.execute(&format!("UPDATE users SET balance = balance + 1 WHERE id = {id}"))?;
             Ok(())
         });
     }
 
     // 6) Delete by PK (autocommit) — delete the autocommit-inserted rows.
     if run_delete {
-        bench("delete_by_pk", m, || {
-            for i in 0..m {
-                let id = n + i;
-                db.execute(&format!("DELETE FROM users WHERE id = {id}"))?;
-            }
+        bench_per_op("delete_by_pk", m, |i| {
+            let id = n + i;
+            db.execute(&format!("DELETE FROM users WHERE id = {id}"))?;
             Ok(())
         });
     }
@@ -1473,4 +1519,65 @@ fn run_durable_commit_bench() {
         let _ = std::fs::remove_dir_all(&tmp);
     }
     println!();
+}
+
+/// In-transaction FK bulk-insert benchmark — the v3.28.0 338× regression class
+/// (see ENGINE_REGRESSION_BISECT_v3.28.0.md and
+/// PROPOSAL_FK_VALIDATION_OPTIMIZATION.md workload W1; correctness pins live in
+/// tests/fk_in_txn_perf_regression.rs).
+///
+/// Inserts `HELIOS_FK_PARENTS` parent rows, then `HELIOS_FK_CHILDREN`
+/// FK-bearing child rows, all inside ONE transaction. Only the child loop is
+/// timed: that is the path that regressed O(parents × children) when FK
+/// validation fell off the ART fast path. Used by the CI perf gate
+/// (.github/workflows/perf-gate.yml) because this shape shipped ~2 weeks
+/// undetected in v3.28.0.
+///
+///   HELIOS_FK_BULK=1 cargo test --profile perf --test tps_workloads run_fk_bulk_insert_bench -- --nocapture --test-threads=1
+#[test]
+fn run_fk_bulk_insert_bench() {
+    if std::env::var("HELIOS_FK_BULK").is_err() {
+        eprintln!("skipping run_fk_bulk_insert_bench (set HELIOS_FK_BULK=1)");
+        return;
+    }
+    let parents: usize = std::env::var("HELIOS_FK_PARENTS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1_000);
+    let children: usize = std::env::var("HELIOS_FK_CHILDREN")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2_000);
+
+    let db = EmbeddedDatabase::new_in_memory().unwrap();
+    db.execute("CREATE TABLE fkp (id INTEGER PRIMARY KEY)").unwrap();
+    db.execute("CREATE TABLE fkc (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES fkp(id))")
+        .unwrap();
+
+    println!("\n================ in-txn FK bulk insert ================");
+    println!("parents={parents}  children={children}  mode=mem (single transaction)");
+    println!("{}", "-".repeat(80));
+
+    db.execute("BEGIN").unwrap();
+    for i in 0..parents {
+        db.execute(&format!("INSERT INTO fkp (id) VALUES ({i})")).unwrap();
+    }
+    bench("fk_child_insert_txn", children, || {
+        for i in 0..children {
+            let pid = i % parents;
+            db.execute(&format!("INSERT INTO fkc (id, parent_id) VALUES ({i}, {pid})"))?;
+        }
+        Ok(())
+    });
+    db.execute("COMMIT").unwrap();
+
+    let committed = db.query("SELECT COUNT(*) FROM fkc", &[]).unwrap();
+    let count = match committed[0].values[0] {
+        Value::Int4(x) => x as usize,
+        Value::Int8(x) => x as usize,
+        _ => 0,
+    };
+    assert_eq!(count, children, "all FK child rows must commit");
+    println!("{}", "-".repeat(80));
+    println!("done.\n");
 }

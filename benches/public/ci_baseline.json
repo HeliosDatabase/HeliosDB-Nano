@@ -1,0 +1,70 @@
+{
+  "note": "CI perf-gate baseline: best-of-3 of run_tps_suite (mem, N=1000, M=200) + run_fk_bulk_insert_bench (1000 parents / 2000 children, one txn), rates pre-scaled by 0.5 for slower runners. Regenerate with benches/public/regen_ci_baseline.sh.",
+  "generated_at": "2026-06-11T09:08:35+00:00",
+  "commit": "e129247-dirty",
+  "host_cpu": "AMD EPYC 7371 16-Core Processor",
+  "scale_applied": 0.5,
+  "threshold_default": 2.5,
+  "workloads": {
+    "agg_count_sum_avg": {
+      "ops_per_sec": 2264.0,
+      "measured_ops_per_sec": 4528.0,
+      "unit": "ops/s"
+    },
+    "autocommit_insert": {
+      "ops_per_sec": 59298.5,
+      "measured_ops_per_sec": 118597.0,
+      "unit": "ops/s"
+    },
+    "bulk_insert_users(txn)": {
+      "ops_per_sec": 96525.0,
+      "measured_ops_per_sec": 193050.0,
+      "unit": "ops/s"
+    },
+    "delete_by_pk": {
+      "ops_per_sec": 131765.0,
+      "measured_ops_per_sec": 263530.0,
+      "unit": "ops/s"
+    },
+    "filter_scan(age>50)": {
+      "ops_per_sec": 988.5,
+      "measured_ops_per_sec": 1977.0,
+      "unit": "ops/s"
+    },
+    "fk_child_insert_txn": {
+      "ops_per_sec": 16291.0,
+      "measured_ops_per_sec": 32582.0,
+      "unit": "ops/s"
+    },
+    "group_by_status": {
+      "ops_per_sec": 1225.0,
+      "measured_ops_per_sec": 2450.0,
+      "unit": "ops/s"
+    },
+    "join_users_orders": {
+      "ops_per_sec": 456.0,
+      "measured_ops_per_sec": 912.0,
+      "unit": "ops/s"
+    },
+    "order_by_limit10": {
+      "ops_per_sec": 883.0,
+      "measured_ops_per_sec": 1766.0,
+      "unit": "ops/s"
+    },
+    "point_lookup_hot": {
+      "ops_per_sec": 716630.0,
+      "measured_ops_per_sec": 1433260.0,
+      "unit": "ops/s"
+    },
+    "point_lookup_pk": {
+      "ops_per_sec": 145813.0,
+      "measured_ops_per_sec": 291626.0,
+      "unit": "ops/s"
+    },
+    "update_by_pk": {
+      "ops_per_sec": 95953.0,
+      "measured_ops_per_sec": 191906.0,
+      "unit": "ops/s"
+    }
+  }
+}
