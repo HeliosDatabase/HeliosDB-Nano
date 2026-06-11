@@ -19,9 +19,23 @@ pub struct PreparedStatement {
     pub param_types: Vec<i32>,
     /// Result schema (if available)
     pub result_schema: Option<Schema>,
-    /// Cached logical plan (avoids re-parsing on each Execute)
-    /// The plan contains Parameter nodes that are resolved at execution time
-    pub cached_plan: Option<LogicalPlan>,
+    /// Cached logical plan, populated at first Execute (R5.W2). The plan
+    /// contains Parameter nodes that are resolved at execution time, so it
+    /// is reusable across Executes with different bound values.
+    pub cached_plan: Option<Arc<LogicalPlan>>,
+    /// Plan-cache invalidation epoch captured when `cached_plan` was
+    /// populated. If the engine's plan cache has been cleared since (DDL),
+    /// the cached plan is considered stale and re-fetched.
+    pub cached_plan_epoch: u64,
+    /// Catalog-dispatcher decision made once at Parse (R5.W2):
+    /// - `Some(true)`  — the pg_catalog / information_schema emulator
+    ///   serves this query; Execute runs the (substituted) catalog path.
+    /// - `Some(false)` — engine query; Execute skips both the per-Execute
+    ///   `substitute_parameters` call and the catalog regex scan.
+    /// - `None` — undecided (Parse-time probe errored, or the statement
+    ///   was created outside `handle_parse_extended`); Execute keeps the
+    ///   legacy per-Execute scan.
+    pub is_catalog: Option<bool>,
 }
 
 /// Portal (bound statement ready for execution)
@@ -209,6 +223,21 @@ impl PreparedStatementManager {
         } else {
             Err(Error::query_execution(format!("Portal '{}' not found", name)))
         }
+    }
+
+    /// Populate (or refresh) a statement's cached plan (R5.W2).
+    /// No-op if the statement has been evicted in the meantime.
+    pub fn set_cached_plan(&self, name: &str, plan: Arc<LogicalPlan>, epoch: u64) -> Result<()> {
+        use crate::error::LockResultExt;
+        let mut statements = self
+            .statements
+            .write()
+            .map_lock_err("Failed to acquire write lock on statements")?;
+        if let Some(stmt) = statements.get_mut(name) {
+            stmt.cached_plan = Some(plan);
+            stmt.cached_plan_epoch = epoch;
+        }
+        Ok(())
     }
 
     /// Remove a portal
@@ -523,6 +552,8 @@ mod tests {
             param_types: vec![23], // INT4
             result_schema: None,
             cached_plan: None,
+            cached_plan_epoch: 0,
+            is_catalog: None,
         };
 
         manager.store_statement(stmt.clone()).unwrap();
@@ -623,6 +654,8 @@ mod tests {
                 param_types: vec![],
                 result_schema: None,
                 cached_plan: None,
+                cached_plan_epoch: 0,
+                is_catalog: None,
             };
             manager.store_statement(stmt).unwrap();
         }
@@ -634,6 +667,8 @@ mod tests {
             param_types: vec![],
             result_schema: None,
             cached_plan: None,
+            cached_plan_epoch: 0,
+            is_catalog: None,
         };
         let result = manager.store_statement(stmt);
         assert!(result.is_ok(), "LRU eviction should allow new statement");
