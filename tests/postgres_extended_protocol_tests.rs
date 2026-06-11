@@ -26,6 +26,8 @@ fn test_prepared_statement_manager() {
         param_types: vec![23], // INT4
         result_schema: None,
         cached_plan: None,
+        cached_plan_epoch: 0,
+        is_catalog: None,
     };
 
     manager.store_statement(stmt.clone()).unwrap();
@@ -85,6 +87,8 @@ fn test_capacity_limits() {
             param_types: vec![],
             result_schema: None,
             cached_plan: None,
+            cached_plan_epoch: 0,
+            is_catalog: None,
         };
         manager.store_statement(stmt).unwrap();
     }
@@ -96,6 +100,8 @@ fn test_capacity_limits() {
         param_types: vec![],
         result_schema: None,
         cached_plan: None,
+        cached_plan_epoch: 0,
+        is_catalog: None,
     };
     manager.store_statement(stmt).unwrap();
     // stmt0 should have been evicted
@@ -281,6 +287,8 @@ fn test_clear_all() {
             param_types: vec![],
             result_schema: None,
             cached_plan: None,
+            cached_plan_epoch: 0,
+            is_catalog: None,
         };
         manager.store_statement(stmt).unwrap();
 
@@ -353,6 +361,8 @@ fn test_unnamed_statement_and_portal() {
         param_types: vec![23],
         result_schema: None,
         cached_plan: None,
+        cached_plan_epoch: 0,
+        is_catalog: None,
     };
 
     manager.store_statement(stmt).unwrap();

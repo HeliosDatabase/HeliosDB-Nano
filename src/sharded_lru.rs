@@ -27,6 +27,7 @@ use std::borrow::Borrow;
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hash};
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 /// Number of shards. Power of two so shard selection is a mask, sized to
@@ -39,6 +40,11 @@ const SHARD_COUNT: usize = 16;
 pub(crate) struct ShardedLruCache<K: Hash + Eq, V> {
     shards: Box<[Mutex<lru::LruCache<K, V>>]>,
     hasher: RandomState,
+    /// Bumped on every `clear()`. Lets long-lived holders of cached
+    /// entries (e.g. prepared statements pinning an `Arc<LogicalPlan>`,
+    /// R5.W2) cheaply detect that the cache was invalidated (DDL) and
+    /// refresh, without re-keying into the cache per use.
+    epoch: AtomicU64,
 }
 
 impl<K: Hash + Eq, V: Clone> ShardedLruCache<K, V> {
@@ -53,6 +59,7 @@ impl<K: Hash + Eq, V: Clone> ShardedLruCache<K, V> {
         Self {
             shards: shards.into_boxed_slice(),
             hasher: RandomState::new(),
+            epoch: AtomicU64::new(0),
         }
     }
 
@@ -103,9 +110,17 @@ impl<K: Hash + Eq, V: Clone> ShardedLruCache<K, V> {
     /// readers of an already-cleared shard simply miss (same guarantee the
     /// global mutex gave: an invalidated entry is never served afterwards).
     pub(crate) fn clear(&self) {
+        self.epoch.fetch_add(1, Ordering::Release);
         for shard in self.shards.iter() {
             Self::lock_shard(shard).clear();
         }
+    }
+
+    /// Invalidation epoch: incremented by every `clear()`. An entry
+    /// captured together with `epoch()` is safe to reuse for as long as
+    /// the epoch is unchanged.
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
     }
 
     /// True when every shard is empty.

@@ -8872,6 +8872,25 @@ impl EmbeddedDatabase {
         Ok(plan)
     }
 
+    /// Plan-cache invalidation epoch — wire handlers pin `Arc<LogicalPlan>`s
+    /// in prepared statements (R5.W2) and use this to detect that DDL
+    /// cleared the plan cache since the plan was captured.
+    pub(crate) fn wire_plan_epoch(&self) -> u64 {
+        self.plan_cache.epoch()
+    }
+
+    /// Fetch (or build) the parameterized plan for `sql` together with the
+    /// plan-cache epoch observed *before* the fetch — the pair a prepared
+    /// statement needs to pin the plan and later detect invalidation.
+    /// The plan is exactly `parameterized_plan_cached` output: no extra
+    /// optimizer passes run here (R5.W3 is explicitly out of scope; the
+    /// 3.37.3 index-probe behavior must not be bypassed).
+    pub(crate) fn wire_parameterized_plan(&self, sql: &str) -> Result<(std::sync::Arc<sql::LogicalPlan>, u64)> {
+        let epoch = self.plan_cache.epoch();
+        let plan = self.parameterized_plan_cached(sql)?;
+        Ok((plan, epoch))
+    }
+
     /// Internal execute method without transaction management
     fn execute_internal(&self, sql: &str) -> Result<u64> {
         // 1. Record query for quota tracking (QPS enforcement)
@@ -9909,13 +9928,30 @@ impl EmbeddedDatabase {
     /// This method prevents SQL injection by treating parameters as data, not code.
     /// Even malicious input like `"'; DROP TABLE users; --"` is safely handled.
     pub fn execute_params(&self, sql: &str, params: &[Value]) -> Result<u64> {
+        self.execute_params_inner(sql, params, None)
+    }
+
+    /// `execute_params` with an optional pre-fetched parameterized plan
+    /// (R5.W2). Every fast path below runs unchanged — only the plan-cache
+    /// lookup is replaced by the pinned plan. The plan is the unmodified
+    /// `parameterized_plan_cached` output, so DML keeps the exact planning
+    /// behavior (no extra optimizer passes — see the W3 caveat).
+    fn execute_params_inner(
+        &self,
+        sql: &str,
+        params: &[Value],
+        plan_override: Option<&std::sync::Arc<sql::LogicalPlan>>,
+    ) -> Result<u64> {
         if let Some(result) = self.try_autocommit_fast_update_delete_params_cached(sql, params) {
             let count = result?;
             self.invalidate_result_cache();
             return Ok(count);
         }
 
-        let plan = self.parameterized_plan_cached(sql)?;
+        let plan = match plan_override {
+            Some(p) => std::sync::Arc::clone(p),
+            None => self.parameterized_plan_cached(sql)?,
+        };
 
         if let Some(result) = self.try_transaction_fast_insert_params(sql, &plan, params) {
             let count = result?;
@@ -12360,11 +12396,33 @@ impl EmbeddedDatabase {
         sql: &str,
         params: &[Value],
     ) -> Result<u64> {
+        self.execute_params_for_session_inner(session_id, sql, params, None)
+    }
+
+    /// `execute_params_for_session` with a pinned prepared-statement plan
+    /// (R5.W2) — skips the per-Execute plan-cache lookup.
+    pub(crate) fn execute_params_for_session_with_plan(
+        &self,
+        session_id: crate::session::SessionId,
+        sql: &str,
+        params: &[Value],
+        plan: &std::sync::Arc<sql::LogicalPlan>,
+    ) -> Result<u64> {
+        self.execute_params_for_session_inner(session_id, sql, params, Some(plan))
+    }
+
+    fn execute_params_for_session_inner(
+        &self,
+        session_id: crate::session::SessionId,
+        sql: &str,
+        params: &[Value],
+        plan_override: Option<&std::sync::Arc<sql::LogicalPlan>>,
+    ) -> Result<u64> {
         if Self::is_transaction_control(sql) {
             return self.handle_transaction_control_for_session(session_id, sql);
         }
         if !self.session_transactions.contains_key(&session_id) {
-            return self.execute_params(sql, params);
+            return self.execute_params_inner(sql, params, plan_override);
         }
 
         self.touch_session_for_statement(session_id)?;
@@ -12372,7 +12430,10 @@ impl EmbeddedDatabase {
             .session_transactions
             .get(&session_id)
             .ok_or_else(|| Error::transaction("Session transaction disappeared during execute"))?;
-        let plan = self.parameterized_plan_cached(sql)?;
+        let plan = match plan_override {
+            Some(p) => std::sync::Arc::clone(p),
+            None => self.parameterized_plan_cached(sql)?,
+        };
         if let Some(result) = self.try_session_txn_fast_insert_params(sql, &plan, params, &txn) {
             return result;
         }
@@ -12388,8 +12449,30 @@ impl EmbeddedDatabase {
         sql: &str,
         params: &[Value],
     ) -> Result<Vec<Tuple>> {
+        self.query_params_for_session_inner(session_id, sql, params, None)
+    }
+
+    /// `query_params_for_session` with a pinned prepared-statement plan
+    /// (R5.W2) — skips the per-Execute plan-cache lookup.
+    pub(crate) fn query_params_for_session_with_plan(
+        &self,
+        session_id: crate::session::SessionId,
+        sql: &str,
+        params: &[Value],
+        plan: &std::sync::Arc<sql::LogicalPlan>,
+    ) -> Result<Vec<Tuple>> {
+        self.query_params_for_session_inner(session_id, sql, params, Some(plan))
+    }
+
+    fn query_params_for_session_inner(
+        &self,
+        session_id: crate::session::SessionId,
+        sql: &str,
+        params: &[Value],
+        plan_override: Option<&std::sync::Arc<sql::LogicalPlan>>,
+    ) -> Result<Vec<Tuple>> {
         if !self.session_transactions.contains_key(&session_id) {
-            return self.query_params(sql, params);
+            return self.query_params_inner(sql, params, plan_override);
         }
 
         self.touch_session_for_statement(session_id)?;
@@ -12397,7 +12480,10 @@ impl EmbeddedDatabase {
             .session_transactions
             .get(&session_id)
             .ok_or_else(|| Error::transaction("Session transaction disappeared during query"))?;
-        let plan = self.parameterized_plan_cached(sql)?;
+        let plan = match plan_override {
+            Some(p) => std::sync::Arc::clone(p),
+            None => self.parameterized_plan_cached(sql)?,
+        };
 
         if matches!(
             &*plan,
@@ -12597,11 +12683,29 @@ impl EmbeddedDatabase {
     /// This method prevents SQL injection by treating parameters as data, not code.
     /// Even malicious input is safely handled as a literal value.
     pub fn query_params(&self, sql: &str, params: &[Value]) -> Result<Vec<Tuple>> {
+        self.query_params_inner(sql, params, None)
+    }
+
+    /// `query_params` with an optional pre-fetched parameterized plan
+    /// (R5.W2 — prepared statements pin the `parameterized_plan_cached`
+    /// output and skip the per-Execute cache lookup). The override is the
+    /// *pre-RLS* plan; RLS is still applied per execution below, exactly
+    /// as on the no-override path.
+    fn query_params_inner(
+        &self,
+        sql: &str,
+        params: &[Value],
+        plan_override: Option<&std::sync::Arc<sql::LogicalPlan>>,
+    ) -> Result<Vec<Tuple>> {
         // Code-graph pre-parser: see `maybe_rewrite_code_graph`.
         // `ON BRANCH '…'` directives swap the active branch via a
         // Drop guard for the duration of this query.
         #[cfg(feature = "code-graph")]
         let (rewritten_owned, _branch_guard) = self.rewrite_and_scope(sql);
+        // A code-graph rewrite changes the SQL the plan must come from —
+        // a pinned plan for the unrewritten text would be wrong.
+        #[cfg(feature = "code-graph")]
+        let plan_override = if rewritten_owned == sql { plan_override } else { None };
         #[cfg(feature = "code-graph")]
         let sql: &str = &rewritten_owned;
         #[cfg(not(feature = "code-graph"))]
@@ -12615,7 +12719,10 @@ impl EmbeddedDatabase {
         }
 
         let plan_start = std::time::Instant::now();
-        let mut plan = (*self.parameterized_plan_cached(sql)?).clone();
+        let mut plan = match plan_override {
+            Some(p) => (**p).clone(),
+            None => (*self.parameterized_plan_cached(sql)?).clone(),
+        };
         tracing::debug!(
             phase = "plan",
             duration_us = plan_start.elapsed().as_micros() as u64,

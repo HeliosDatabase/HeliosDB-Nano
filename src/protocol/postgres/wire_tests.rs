@@ -213,6 +213,163 @@ async fn extended_select_binary_format_fallback() {
     );
 }
 
+/// R5.W2: repeated Executes of the same prepared statement must keep
+/// returning correct (identical) rows — the pinned plan serves every
+/// Execute after the first.
+#[tokio::test]
+async fn repeated_execute_serves_identical_rows() {
+    let db = wide_test_db(20);
+    let (mut handler, mut client) = test_handler(db);
+
+    handler
+        .handle_parse_extended(
+            "rep".into(),
+            "SELECT id, a, c FROM wide WHERE id = $1 OR id = $2 ORDER BY id".into(),
+            vec![23, 23],
+        )
+        .await
+        .expect("parse");
+
+    let mut first_rows = None;
+    for i in 0..5 {
+        let portal = format!("rp{i}");
+        handler
+            .handle_bind_extended(
+                portal.clone(),
+                "rep".into(),
+                vec![0, 0],
+                vec![Some(b"3".to_vec()), Some(b"7".to_vec())],
+                vec![],
+            )
+            .await
+            .expect("bind");
+        handler.handle_execute_extended(portal, 0).await.expect("execute");
+        let rows = data_rows(&drain(&mut client).await);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0].as_deref(), Some(b"3".as_ref()));
+        assert_eq!(rows[1][0].as_deref(), Some(b"7".as_ref()));
+        match &first_rows {
+            None => first_rows = Some(rows),
+            Some(expected) => assert_eq!(&rows, expected, "execute #{i} diverged"),
+        }
+    }
+}
+
+/// R5.W2: DDL between Executes clears the engine plan cache (epoch bump);
+/// the pinned plan must be re-fetched, not served stale.
+#[tokio::test]
+async fn ddl_between_executes_invalidates_pinned_plan() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    db.execute("CREATE TABLE evolve (id INT PRIMARY KEY)").expect("create");
+    db.execute("INSERT INTO evolve VALUES (1)").expect("insert");
+
+    let (mut handler, mut client) = test_handler(Arc::clone(&db));
+    handler
+        .handle_parse_extended("ev".into(), "SELECT * FROM evolve".into(), vec![])
+        .await
+        .expect("parse");
+    handler
+        .handle_bind_extended("evp1".into(), "ev".into(), vec![], vec![], vec![])
+        .await
+        .expect("bind");
+    handler.handle_execute_extended("evp1".into(), 0).await.expect("execute");
+    let rows = data_rows(&drain(&mut client).await);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].len(), 1, "one column before DDL");
+
+    // Schema change through the embedded API (bumps the plan-cache epoch)
+    db.execute("ALTER TABLE evolve ADD COLUMN extra TEXT").expect("alter");
+
+    handler
+        .handle_bind_extended("evp2".into(), "ev".into(), vec![], vec![], vec![])
+        .await
+        .expect("bind");
+    handler.handle_execute_extended("evp2".into(), 0).await.expect("execute");
+    let rows = data_rows(&drain(&mut client).await);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].len(),
+        2,
+        "SELECT * must see the new column — stale pinned plan detected"
+    );
+}
+
+/// R5.W2: catalog-emulated queries (decided at Parse) must still be served
+/// by the catalog dispatcher on the extended path.
+#[tokio::test]
+async fn catalog_query_still_served_after_parse_decision() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut handler, mut client) = test_handler(db);
+
+    handler
+        .handle_parse_extended("cat".into(), "SELECT version()".into(), vec![])
+        .await
+        .expect("parse");
+    handler
+        .handle_bind_extended("catp".into(), "cat".into(), vec![], vec![], vec![])
+        .await
+        .expect("bind");
+    handler.handle_execute_extended("catp".into(), 0).await.expect("execute");
+
+    let rows = data_rows(&drain(&mut client).await);
+    assert_eq!(rows.len(), 1);
+    let version = String::from_utf8(rows[0][0].clone().expect("version text")).expect("utf8");
+    assert!(version.contains("PostgreSQL"), "catalog version() reply: {version}");
+}
+
+/// Foreground timing probe for R5.W2 — run with:
+/// `cargo test --release --lib probe_w2 -- --ignored --nocapture`
+/// Measures repeated Bind+Execute of a prepared two-parameter SELECT.
+#[tokio::test]
+#[ignore]
+async fn probe_w2_repeated_prepared_execute() {
+    let db = wide_test_db(1_000);
+    let (server, mut client) = tokio::io::duplex(1 << 20);
+    let mut handler = PgConnectionHandler::new_for_tests(db, server);
+
+    let drain_task = tokio::spawn(async move {
+        let mut buf = vec![0u8; 1 << 20];
+        let mut total = 0u64;
+        while let Ok(n) = client.read(&mut buf).await {
+            if n == 0 {
+                break;
+            }
+            total += n as u64;
+        }
+        total
+    });
+
+    handler
+        .handle_parse_extended(
+            "probe2".into(),
+            "SELECT id, a, c FROM wide WHERE id = $1".into(),
+            vec![23],
+        )
+        .await
+        .expect("parse");
+
+    const ITERS: usize = 20_000;
+    let start = std::time::Instant::now();
+    for i in 0..ITERS {
+        let a = (i % 1000).to_string().into_bytes();
+        handler
+            .handle_bind_extended("".into(), "probe2".into(), vec![0], vec![Some(a)], vec![])
+            .await
+            .expect("bind");
+        handler.handle_execute_extended("".into(), 0).await.expect("execute");
+    }
+    let elapsed = start.elapsed();
+    drop(handler);
+    let bytes = drain_task.await.expect("drain");
+
+    println!(
+        "W2 probe: {ITERS} Bind+Execute of prepared point-SELECT in {:?} ({:.1} us/exec, {:.1} KB total)",
+        elapsed,
+        elapsed.as_secs_f64() * 1e6 / ITERS as f64,
+        bytes as f64 / 1024.0
+    );
+}
+
 /// Foreground timing probe for R5.W1 — run with:
 /// `cargo test --release -p heliosdb-nano --lib probe_w1 -- --ignored --nocapture`
 /// Measures repeated extended-protocol Executes of a 10k-row × 12-column
