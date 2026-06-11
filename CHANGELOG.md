@@ -5,6 +5,47 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.50.0] - 2026-06-11
+
+Minor release: filtered vector search, Windows compilation, and the
+agent-native bundle (R5.V remainder, D6, Windows port).
+
+### Fixed — Vector search
+
+- Indexed kNN with a LIMIT larger than the HNSW search beam could silently
+  return fewer rows than available (LIMIT 100 returning 48 with 5,000 live
+  vectors); saturated searches now fall back to the exact path.
+- `CREATE INDEX ... WITH (m = .., ef_construction = ..)` options were
+  parsed and silently ignored; they now reach the index (with `[vector]`
+  config defaults) and survive restarts.
+
+### Added — Filtered vector search (R5.V4)
+
+- kNN with simple WHERE predicates (column-vs-constant comparisons, AND
+  combinations, parameters) stays on the HNSW fast path via post-filtered
+  over-fetch with match-rate-adaptive escalation: 18-102x on selective
+  filtered searches. Exactness is guaranteed — any round that cannot
+  prove a strict candidate superset hands the query to the exact scan, so
+  low-selectivity and fewer-than-k-match filters are always correct.
+  Exact record-search distances now use the SIMD kernels.
+
+### Added — Windows (first compile ever)
+
+- All unix-only code paths (unix sockets, daemonization, file permissions)
+  are cfg-gated with clear runtime errors on other platforms; the crate
+  passes a full windows-gnu cross-check, and the windows-msvc release
+  binary is no longer marked experimental — this release's tag is its
+  first real CI proof.
+
+### Added — Agent-native bundle (D6)
+
+- `profile = "agent"` configuration bundle; `docs/llms.txt` (single-file
+  agent-ingestible reference generated from the 19 skills, with verified
+  SQL dialect and vector-operator documentation); MCP documented as the
+  canonical agent connection path; database branches repositioned as
+  fork-test-discard agent sandboxes with an honest warning on MERGE
+  reliability (fix tracked).
+
 ## [3.49.0] - 2026-06-11
 
 Minor release: public reproducible benchmarks with a CI performance gate
