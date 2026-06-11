@@ -28,6 +28,9 @@ impl FilterOperator {
         let schema = input.schema();
         let direct_filter = DirectFilterPredicate::try_from_expr(&schema, &predicate, &parameters);
         let evaluator = crate::sql::Evaluator::with_parameters(schema, parameters);
+        // R3.5 item 1: resolve column refs to positional indices once, instead
+        // of a per-row linear schema scan inside the evaluator.
+        let predicate = evaluator.bind(predicate);
         Self {
             input,
             predicate,

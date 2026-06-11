@@ -2019,6 +2019,48 @@ impl<'a> Planner<'a> {
         expr
     }
 
+    /// Plan-time approximation of the schema the EXECUTOR will expose for
+    /// `plan`'s output, for ORDER BY placement decisions (R3.5 item 2).
+    ///
+    /// `handle_scan` stamps each scanned column's `source_table` (alias) and
+    /// `source_table_name` at runtime, but plan-time Scan schemas come
+    /// straight from the catalog with no stamping. The placement check in
+    /// `place_order_by` therefore concluded that qualified sort keys
+    /// (`ORDER BY e.id` on a self-join) could not resolve below the Project
+    /// and hoisted the Sort above it — where the qualifier really is
+    /// unresolvable. The old comparator then silently skipped the per-row
+    /// evaluation error and emitted *unsorted* output; with sort-key errors
+    /// surfaced, those queries would fail instead. Stamping here lets the
+    /// Sort be placed below the Project, where the key resolves and the sort
+    /// is actually performed.
+    fn runtime_stamped_schema(plan: &LogicalPlan) -> Arc<Schema> {
+        match plan {
+            LogicalPlan::Scan {
+                table_name, alias, ..
+            }
+            | LogicalPlan::FilteredScan {
+                table_name, alias, ..
+            } => {
+                // `plan.schema()` already applies any scan projection.
+                let mut schema = (*plan.schema()).clone();
+                let source_name = alias.as_ref().unwrap_or(table_name);
+                for col in &mut schema.columns {
+                    // Mirror handle_scan: unconditional stamp.
+                    col.source_table = Some(source_name.clone());
+                    col.source_table_name = Some(table_name.clone());
+                }
+                Arc::new(schema)
+            }
+            LogicalPlan::Filter { input, .. } => Self::runtime_stamped_schema(input),
+            LogicalPlan::Join { left, right, .. } => {
+                let mut columns = Self::runtime_stamped_schema(left).columns.clone();
+                columns.extend(Self::runtime_stamped_schema(right).columns.clone());
+                Arc::new(Schema { columns })
+            }
+            other => other.schema(),
+        }
+    }
+
     fn place_order_by(plan: LogicalPlan, exprs: Vec<LogicalExpr>, asc: Vec<bool>) -> LogicalPlan {
         match plan {
             LogicalPlan::Project {
@@ -2028,7 +2070,7 @@ impl<'a> Planner<'a> {
                 distinct,
                 distinct_on,
             } if !distinct && distinct_on.is_none() => {
-                let input_schema = input.schema();
+                let input_schema = Self::runtime_stamped_schema(&input);
                 if Self::order_by_resolves_against_schema(&exprs, &input_schema) {
                     return LogicalPlan::Project {
                         input: Box::new(LogicalPlan::Sort { input, exprs, asc }),
@@ -2114,6 +2156,22 @@ impl<'a> Planner<'a> {
     }
 
     fn rewrite_order_by_aggregates(expr: &LogicalExpr, info: &AggregateInfo) -> LogicalExpr {
+        // Whole-expression GROUP BY match first (R3.5 item 2): for
+        // `GROUP BY id % 2 ORDER BY id % 2` the sort key must redirect to the
+        // computed group output column. Recursing into the expression cannot
+        // discover this — `id` alone does not match the group expression, so
+        // the key previously reached the Sort unresolved, errored per row,
+        // and the error-skipping comparator silently left rows unsorted.
+        for (i, group_expr) in info.group_by_exprs.iter().enumerate() {
+            if group_expr == expr {
+                if let Some(alias) = info.group_by_aliases.get(i) {
+                    return LogicalExpr::Column {
+                        table: None,
+                        name: alias.clone(),
+                    };
+                }
+            }
+        }
         match expr {
             LogicalExpr::AggregateFunction { fun, args, distinct } => {
                 // Find this aggregate in the plan's aggregate expressions

@@ -69,6 +69,125 @@ impl Evaluator {
         &self.schema
     }
 
+    /// Bind column references in `expr` to positional indices against this
+    /// evaluator's schema (R3.5 item 1).
+    ///
+    /// Today the evaluator resolves every `LogicalExpr::Column` by a *per-row
+    /// linear string scan* of the schema (`get_qualified_column_index`). A
+    /// 3-column predicate over 1M rows is ~3M string scans. Calling `bind`
+    /// once at physical-operator construction rewrites each resolvable
+    /// `Column` into a `BoundColumn { index }`, which evaluates as a direct
+    /// `tuple.get(index)`.
+    ///
+    /// Semantics are preserved exactly: resolution uses the *same* schema and
+    /// the *same* lookup the per-row path would use, and columns that do not
+    /// resolve at bind time are left untouched so the per-row error path (and
+    /// its message) is unchanged. Sub-plans (scalar/IN/EXISTS subqueries) and
+    /// operator-managed nodes (aggregate/window functions) are not descended
+    /// into — their column references resolve against different schemas or
+    /// are handled by dedicated operators.
+    pub fn bind(&self, expr: LogicalExpr) -> LogicalExpr {
+        bind_expr_columns(expr, &self.schema)
+    }
+}
+
+/// Normalize a scalar function name into the evaluator's dispatch form:
+/// lowercase, with any `pg_catalog.` prefix stripped (R3.5 item 3). The
+/// per-row dispatch performs exactly this transformation; doing it once at
+/// bind time lets the hot path skip the `to_lowercase()` allocation.
+fn normalize_function_name(fun: String) -> String {
+    if !fun.is_ascii() || fun.bytes().any(|b| b.is_ascii_uppercase()) {
+        let lowered = fun.to_lowercase();
+        match lowered.strip_prefix("pg_catalog.") {
+            Some(stripped) => stripped.to_string(),
+            None => lowered,
+        }
+    } else {
+        match fun.strip_prefix("pg_catalog.") {
+            Some(stripped) => stripped.to_string(),
+            None => fun,
+        }
+    }
+}
+
+/// Recursively rewrite resolvable `Column` nodes into `BoundColumn` nodes.
+/// See [`Evaluator::bind`] for the contract.
+pub fn bind_expr_columns(expr: LogicalExpr, schema: &Schema) -> LogicalExpr {
+    let bind = |e: LogicalExpr| bind_expr_columns(e, schema);
+    let bind_box = |e: Box<LogicalExpr>| Box::new(bind_expr_columns(*e, schema));
+    let bind_vec = |es: Vec<LogicalExpr>| es.into_iter().map(|e| bind_expr_columns(e, schema)).collect();
+
+    match expr {
+        LogicalExpr::Column { table, name } => match schema.get_qualified_column_index(table.as_deref(), &name) {
+            Some(index) => LogicalExpr::BoundColumn { index, table, name },
+            // Unresolvable here — keep the by-name node so per-row behavior
+            // (including the error message) is byte-identical.
+            None => LogicalExpr::Column { table, name },
+        },
+        LogicalExpr::BinaryExpr { left, op, right } => LogicalExpr::BinaryExpr {
+            left: bind_box(left),
+            op,
+            right: bind_box(right),
+        },
+        LogicalExpr::UnaryExpr { op, expr } => LogicalExpr::UnaryExpr { op, expr: bind_box(expr) },
+        LogicalExpr::IsNull { expr, is_null } => LogicalExpr::IsNull {
+            expr: bind_box(expr),
+            is_null,
+        },
+        LogicalExpr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => LogicalExpr::Between {
+            expr: bind_box(expr),
+            low: bind_box(low),
+            high: bind_box(high),
+            negated,
+        },
+        LogicalExpr::InList { expr, list, negated } => LogicalExpr::InList {
+            expr: bind_box(expr),
+            list: bind_vec(list),
+            negated,
+        },
+        LogicalExpr::InSet { expr, values, negated } => LogicalExpr::InSet {
+            expr: bind_box(expr),
+            values,
+            negated,
+        },
+        LogicalExpr::Case {
+            expr,
+            when_then,
+            else_result,
+        } => LogicalExpr::Case {
+            expr: expr.map(bind_box),
+            when_then: when_then.into_iter().map(|(w, t)| (bind(w), bind(t))).collect(),
+            else_result: else_result.map(bind_box),
+        },
+        LogicalExpr::Cast { expr, data_type } => LogicalExpr::Cast {
+            expr: bind_box(expr),
+            data_type,
+        },
+        // R3.5 item 3: normalize the function name ONCE at bind time
+        // (lowercase + `pg_catalog.` prefix strip) so the per-row dispatch in
+        // `evaluate_scalar_function` takes its allocation-free fast path.
+        LogicalExpr::ScalarFunction { fun, args } => LogicalExpr::ScalarFunction {
+            fun: normalize_function_name(fun),
+            args: bind_vec(args),
+        },
+        LogicalExpr::ArraySubscript { array, index } => LogicalExpr::ArraySubscript {
+            array: bind_box(array),
+            index: bind_box(index),
+        },
+        LogicalExpr::Tuple { items } => LogicalExpr::Tuple { items: bind_vec(items) },
+        // Leaves and operator-managed / sub-plan nodes: returned unchanged.
+        // AggregateFunction & WindowFunction are evaluated by their dedicated
+        // operators; subquery plans resolve against their own schemas.
+        other => other,
+    }
+}
+
+impl Evaluator {
     /// Evaluate an expression against a tuple
     pub fn evaluate(&self, expr: &LogicalExpr, tuple: &Tuple) -> Result<Value> {
         match expr {
@@ -114,6 +233,15 @@ impl Evaluator {
                 // Get value from tuple
                 tuple
                     .get(index)
+                    .cloned()
+                    .ok_or_else(|| Error::query_execution(format!("Column index {} out of bounds in tuple", index)))
+            }
+
+            LogicalExpr::BoundColumn { index, .. } => {
+                // Pre-resolved column reference (see Evaluator::bind): the
+                // schema lookup already happened once at operator construction.
+                tuple
+                    .get(*index)
                     .cloned()
                     .ok_or_else(|| Error::query_execution(format!("Column index {} out of bounds in tuple", index)))
             }
@@ -455,8 +583,18 @@ impl Evaluator {
         // pgAdmin call several pg_catalog helpers both with and
         // without the `pg_catalog.` prefix. Strip it so the dispatch
         // arms only need to list the bare name.
-        let fun_lower = fun.to_lowercase();
-        let fun_dispatch = fun_lower.strip_prefix("pg_catalog.").unwrap_or(&fun_lower);
+        //
+        // R3.5 item 3: when the name is already in dispatch form (ASCII with
+        // no uppercase — guaranteed after `Evaluator::bind` normalization),
+        // skip the per-row `to_lowercase()` String allocation entirely.
+        let fun_lowered: String;
+        let fun_dispatch: &str = if !fun.is_ascii() || fun.bytes().any(|b| b.is_ascii_uppercase()) {
+            fun_lowered = fun.to_lowercase();
+            &fun_lowered
+        } else {
+            fun
+        };
+        let fun_dispatch = fun_dispatch.strip_prefix("pg_catalog.").unwrap_or(fun_dispatch);
         match fun_dispatch {
             // JSONB extraction functions
             "jsonb_extract_path" | "json_extract_path" => self.jsonb_extract_path(&arg_values),
@@ -3000,7 +3138,7 @@ impl Evaluator {
     }
 
     /// Evaluate a binary operation
-    fn evaluate_binary_op(&self, left: &Value, op: &super::BinaryOperator, right: &Value) -> Result<Value> {
+    pub(crate) fn evaluate_binary_op(&self, left: &Value, op: &super::BinaryOperator, right: &Value) -> Result<Value> {
         use super::BinaryOperator;
 
         match op {
@@ -3095,7 +3233,7 @@ impl Evaluator {
     }
 
     /// Evaluate a unary operation
-    fn evaluate_unary_op(&self, op: &super::UnaryOperator, value: &Value) -> Result<Value> {
+    pub(crate) fn evaluate_unary_op(&self, op: &super::UnaryOperator, value: &Value) -> Result<Value> {
         use super::UnaryOperator;
 
         match op {

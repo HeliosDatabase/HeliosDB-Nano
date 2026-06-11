@@ -502,7 +502,7 @@ impl ProjectionPruningRule {
     /// Collect columns used by expressions
     fn collect_used_columns(expr: &LogicalExpr, columns: &mut HashSet<String>) {
         match expr {
-            LogicalExpr::Column { name, .. } => {
+            LogicalExpr::Column { name, .. } | LogicalExpr::BoundColumn { name, .. } => {
                 columns.insert(name.clone());
             }
             LogicalExpr::BinaryExpr { left, right, .. } => {

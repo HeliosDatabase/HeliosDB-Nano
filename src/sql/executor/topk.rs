@@ -91,11 +91,15 @@ impl TopKOperator {
         let key_accessors: Vec<SortKeyAccessor> = exprs
             .into_iter()
             .map(|expr| match &expr {
-                crate::sql::LogicalExpr::Column { table, name } => schema
-                    .get_qualified_column_index(table.as_deref(), name)
-                    .map(SortKeyAccessor::Column)
-                    .unwrap_or_else(|| SortKeyAccessor::Expr(expr)),
-                _ => SortKeyAccessor::Expr(expr),
+                crate::sql::LogicalExpr::Column { table, name } => {
+                    match schema.get_qualified_column_index(table.as_deref(), name) {
+                        Some(index) => SortKeyAccessor::Column(index),
+                        // R3.5 item 1: bind column refs inside fallback
+                        // expressions once at construction.
+                        None => SortKeyAccessor::Expr(evaluator.bind(expr)),
+                    }
+                }
+                _ => SortKeyAccessor::Expr(evaluator.bind(expr)),
             })
             .collect();
         let asc = Arc::new(asc);
