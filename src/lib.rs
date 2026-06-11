@@ -467,6 +467,21 @@ pub struct EmbeddedDatabase {
 
 impl Drop for EmbeddedDatabase {
     fn drop(&mut self) {
+        // R4.2: checkpoint ART/HNSW index snapshots at clean shutdown so the
+        // next open loads them instead of re-scanning every table. Skipped
+        // when any transaction is still open — its eagerly-applied index
+        // entries are not committed data and must not be snapshotted (the
+        // next open rebuilds from rows instead, which is always correct).
+        let txn_open = self.global_txn_active.load(std::sync::atomic::Ordering::Acquire)
+            || self.session_txn_count.load(std::sync::atomic::Ordering::Acquire) > 0;
+        if !txn_open && self.storage.index_snapshots_on_close() {
+            if let Err(e) = self.storage.persist_index_snapshots() {
+                tracing::warn!("index snapshot checkpoint at close failed: {}", e);
+            }
+        } else if txn_open {
+            tracing::debug!("skipping index snapshot checkpoint: transaction still open at drop");
+        }
+
         // Signal the auto-refresh worker to stop (non-blocking)
         if let Some(ref worker) = *self.auto_refresh_worker.read() {
             worker.request_stop();

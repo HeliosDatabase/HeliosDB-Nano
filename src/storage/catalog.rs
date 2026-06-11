@@ -463,7 +463,14 @@ impl<'a> Catalog<'a> {
         let art_manager = self.storage.art_indexes();
         let mut total_rows: u64 = 0;
         let mut total_tables: u64 = 0;
+        let mut report = super::index_snapshot::IndexOpenReport::default();
         let persisted_indexes = self.list_index_definitions()?;
+
+        // R4.2: read every valid snapshot BEFORE registering any index — the
+        // registrations below count as mutations and consume the validity
+        // markers, so the read phase must come first.
+        let art_snapshots = self.storage.load_art_table_snapshots();
+        let vector_sidecars = self.storage.load_vector_sidecars();
 
         for table_name in self.list_tables()? {
             // Skip system / internal bookkeeping tables — they have no
@@ -544,6 +551,29 @@ impl<'a> Catalog<'a> {
                 }
             }
 
+            // R4.2 fast path: a valid snapshot whose index set matches the
+            // registrations above is bulk-loaded directly into the trees —
+            // no row scan, no tuple deserialization.
+            if let Some(snapshot) = art_snapshots.get(&table_name) {
+                match self.load_table_from_snapshot(&table_name, &schema, snapshot) {
+                    Ok(entries) => {
+                        report.entries_loaded += entries;
+                        report.tables_from_snapshot += 1;
+                        total_tables += 1;
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Index rebuild: snapshot load for '{}' failed ({}) — falling back to scan",
+                            table_name,
+                            e
+                        );
+                        // Drop any partially loaded entries; registrations stay.
+                        art_manager.clear_table_indexes(&table_name);
+                    }
+                }
+            }
+
             // Replay every existing row through on_insert so the indexes
             // know about pre-existing data.
             let tuples = match self.storage.scan_table_with_schema(&table_name, &schema) {
@@ -576,21 +606,100 @@ impl<'a> Catalog<'a> {
                 total_rows += 1;
             }
 
+            report.tables_scanned += 1;
             total_tables += 1;
         }
 
-        self.rebuild_vector_indexes(&persisted_indexes)?;
+        self.rebuild_vector_indexes(&persisted_indexes, &vector_sidecars, &mut report)?;
 
+        report.tables_total = total_tables;
+        report.rows_scanned = total_rows;
+        report.elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
         tracing::info!(
-            "Index rebuild complete: {} tables, {} rows, {:.1}ms",
-            total_tables,
-            total_rows,
-            started.elapsed().as_secs_f64() * 1000.0,
+            "Index rebuild complete: {} tables ({} from snapshot, {} scanned, {} rows), \
+             vector: {} reloaded / {} rebuilt / {} reopened / {} degraded, {:.1}ms",
+            report.tables_total,
+            report.tables_from_snapshot,
+            report.tables_scanned,
+            report.rows_scanned,
+            report.vector_reloaded,
+            report.vector_rebuilt,
+            report.vector_reopened_persistent,
+            report.vector_degraded,
+            report.elapsed_ms,
         );
+        self.storage.set_last_index_open_report(report);
         Ok(())
     }
 
-    fn rebuild_vector_indexes(&self, indexes: &[(String, PersistedIndexDefinition)]) -> Result<()> {
+    /// R4.2: load one table's ART indexes from a snapshot. Fails (and the
+    /// caller falls back to the scan rebuild) when the snapshot's index set
+    /// does not exactly match the registered set — e.g. an index was created
+    /// or dropped between the checkpoint and a crash.
+    fn load_table_from_snapshot(
+        &self,
+        table_name: &str,
+        schema: &Schema,
+        snapshot: &super::index_snapshot::ArtTableSnapshot,
+    ) -> Result<u64> {
+        use super::art_manager::index_type_tag;
+
+        let art_manager = self.storage.art_indexes();
+        let mut registered: Vec<(String, u8, Vec<String>)> = art_manager
+            .list_table_indexes(table_name)
+            .into_iter()
+            .map(|(name, index_type, columns)| (name, index_type_tag(index_type), columns))
+            .collect();
+        registered.sort_by(|a, b| a.0.cmp(&b.0));
+        let snapshotted: Vec<(String, u8, Vec<String>)> = snapshot
+            .indexes
+            .iter()
+            .map(|s| (s.name.clone(), s.index_type, s.columns.clone()))
+            .collect();
+        if registered != snapshotted {
+            return Err(Error::storage(format!(
+                "snapshot index set mismatch (registered {:?} vs snapshot {:?})",
+                registered.iter().map(|(n, _, _)| n).collect::<Vec<_>>(),
+                snapshotted.iter().map(|(n, _, _)| n).collect::<Vec<_>>(),
+            )));
+        }
+
+        // Byte width for dense-int PK stats (single-column integer PKs only).
+        let pk_int_width = {
+            let pk_cols: Vec<&crate::Column> = schema.columns.iter().filter(|c| c.primary_key).collect();
+            match pk_cols.as_slice() {
+                [col] => match col.data_type {
+                    DataType::Int2 => Some(2),
+                    DataType::Int4 => Some(4),
+                    DataType::Int8 => Some(8),
+                    _ => None,
+                },
+                _ => None,
+            }
+        };
+
+        let mut loaded: u64 = 0;
+        for index_snapshot in &snapshot.indexes {
+            let width = if index_snapshot.index_type == index_type_tag(crate::storage::ArtIndexType::PrimaryKey) {
+                pk_int_width
+            } else {
+                None
+            };
+            loaded += art_manager
+                .load_index_entries(&index_snapshot.name, &index_snapshot.entries, width)
+                .map_err(|e| Error::storage(format!("loading '{}': {}", index_snapshot.name, e)))?
+                as u64;
+        }
+        Ok(loaded)
+    }
+
+    fn rebuild_vector_indexes(
+        &self,
+        indexes: &[(String, PersistedIndexDefinition)],
+        sidecars: &std::collections::HashMap<String, super::index_snapshot::VectorGraphSidecar>,
+        report: &mut super::index_snapshot::IndexOpenReport,
+    ) -> Result<()> {
+        let dump_dir = self.storage.hnsw_snapshot_dir();
         for (index_name, definition) in indexes {
             if !matches!(
                 definition.index_type.as_deref(),
@@ -607,6 +716,10 @@ impl<'a> Catalog<'a> {
                         index_name,
                         e
                     );
+                    self.storage
+                        .vector_indexes()
+                        .mark_degraded(index_name, format!("schema load failed at open: {e}"));
+                    report.vector_degraded += 1;
                     continue;
                 }
             };
@@ -633,6 +746,62 @@ impl<'a> Catalog<'a> {
             if vector_indexes.index_exists(index_name) {
                 continue;
             }
+
+            // R4.2 / R5.V2: reopen RocksDB-backed persistent indexes in place
+            // instead of downgrading them to a rebuilt in-memory Standard
+            // index (the catalog downgrade flagged by the fastest-HTAP audit).
+            #[cfg(feature = "vector-persist")]
+            if matches!(definition.index_type.as_deref(), Some("persistent_hnsw")) {
+                let metric = vector_distance_metric(&definition.options);
+                let config = super::vector_index::PersistentVectorConfig {
+                    dimension: *dimension,
+                    distance_metric: metric,
+                    pq_enabled: false,
+                    rerank_precision: "f32".to_string(),
+                };
+                match vector_indexes.reopen_persistent_index(
+                    index_name,
+                    &definition.table_name,
+                    &definition.column_name,
+                    config,
+                    std::sync::Arc::clone(&self.storage.db),
+                ) {
+                    Ok(()) => {
+                        report.vector_reopened_persistent += 1;
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Vector index rebuild: persistent reopen of '{}' failed: {} — rebuilding in memory",
+                            index_name,
+                            e
+                        );
+                    }
+                }
+            }
+
+            // R4.2 fast path: reload a dumped HNSW graph instead of
+            // re-scanning the table and rebuilding the graph from scratch.
+            if matches!(definition.index_type.as_deref(), Some("hnsw")) {
+                if let (Some(sidecar), Some(dir)) = (sidecars.get(index_name), dump_dir.as_ref()) {
+                    match vector_indexes.reload_standard_index(sidecar, dir) {
+                        Ok(()) => {
+                            report.vector_reloaded += 1;
+                            continue;
+                        }
+                        Err(e) => {
+                            // Surface loudly and fall back to the full rebuild —
+                            // never leave a silently empty index behind.
+                            tracing::warn!(
+                                "Vector index rebuild: graph reload of '{}' failed: {} — rebuilding from rows",
+                                index_name,
+                                e
+                            );
+                        }
+                    }
+                }
+            }
+
             let metric = vector_distance_metric(&definition.options);
             // R5.V6: rebuild with the same construction parameters the index
             // was created with — persisted `WITH (m = .., ef_construction = ..)`
@@ -648,6 +817,8 @@ impl<'a> Catalog<'a> {
                 ef_construction,
             ) {
                 tracing::warn!("Vector index rebuild: create {} failed: {}", index_name, e);
+                vector_indexes.mark_degraded(index_name, format!("create failed at open: {e}"));
+                report.vector_degraded += 1;
                 continue;
             }
 
@@ -661,13 +832,20 @@ impl<'a> Catalog<'a> {
                 Err(e) => {
                     let _ = vector_indexes.drop_index(index_name);
                     tracing::warn!("Vector index rebuild: scan {} failed: {}", index_name, e);
+                    vector_indexes.mark_degraded(index_name, format!("backfill scan failed at open: {e}"));
+                    report.vector_degraded += 1;
                     continue;
                 }
             };
             if let Err(e) = vector_indexes.insert_vectors_batch(index_name, &vectors) {
                 let _ = vector_indexes.drop_index(index_name);
                 tracing::warn!("Vector index rebuild: backfill {} failed: {}", index_name, e);
+                vector_indexes.mark_degraded(index_name, format!("backfill failed at open: {e}"));
+                report.vector_degraded += 1;
+                continue;
             }
+            vector_indexes.clear_degraded(index_name);
+            report.vector_rebuilt += 1;
         }
         Ok(())
     }
