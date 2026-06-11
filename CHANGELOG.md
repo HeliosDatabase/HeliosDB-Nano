@@ -5,6 +5,40 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.47.0] - 2026-06-11
+
+Minor release: reads inside transactions stop falling off a cliff (R2.3),
+and zone-map pruning goes live for columnar scans (R3.1).
+
+### Changed — In-transaction reads (R2.3)
+
+- Index point lookups, COUNT fast paths, kNN, and aggregate/filter
+  pushdowns now stay enabled inside READ COMMITTED transactions for
+  tables the transaction has not written — previously ANY open
+  transaction (the default for psycopg2, JDBC, npgsql sessions) degraded
+  every SELECT to a full scan. Measured: in-transaction point lookups on
+  a 100k-row table went from 658ms to 65µs (~10,000x). Safety: READ
+  COMMITTED refreshes its snapshot per statement and the v3.39 barrier
+  guarantees applied state; REPEATABLE READ/SERIALIZABLE and tables with
+  staged writes keep the snapshot-merging slow path (read-your-writes
+  unchanged, pinned by tests).
+- HAVING no longer disables aggregate pushdown — it runs as a post-filter
+  over the aggregate output with identical semantics.
+
+### Changed — Columnar pruning (R3.1)
+
+- Per-batch min/max/null statistics (`colz:` sidecar, written atomically
+  with each batch; lazily backfilled for existing data) let columnar
+  scans and aggregates skip batches that cannot match a pushed predicate
+  — skipping fetch I/O, not just decode. Measured on 500k clustered
+  rows: 2%-selective filtered aggregates 60.6ms → 2.15ms (28x); point
+  equality 105x; non-matching ranges 112x; full-selectivity queries
+  unchanged. Gains require physically clustered data; unclustered
+  columns see no change. Disclosed cost: columnar-heavy bulk inserts pay
+  ~19% for stats maintenance (the dominant write cost there remains the
+  pre-existing whole-batch rewrite, tracked as R3.3).
+- `HELIOS_ZONE_MAP_OFF=1` restores the previous read path.
+
 ## [3.46.0] - 2026-06-11
 
 Minor release: multicore reads and parallel analytics — the two largest
