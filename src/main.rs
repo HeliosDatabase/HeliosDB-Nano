@@ -881,9 +881,15 @@ async fn start_server(
     } else {
         None
     };
+    // Unix-domain sockets don't exist on this platform — reject the flag loudly instead of silently ignoring it.
     #[cfg(not(unix))]
     let mysql_unix_handle: Option<tokio::task::JoinHandle<()>> = None;
-    let _ = &mysql_socket; // silence unused on non-unix
+    #[cfg(not(unix))]
+    if mysql_socket.is_some() {
+        return Err(Error::io(
+            "unix sockets are not available on this platform (--mysql-socket); use the TCP listener instead",
+        ));
+    }
 
     // Start PostgreSQL Unix domain socket listener if requested.
     // libpq uses `<dir>/.s.PGSQL.<port>` when host starts with `/`.
@@ -929,9 +935,15 @@ async fn start_server(
     } else {
         None
     };
+    // Unix-domain sockets don't exist on this platform — reject the flag loudly instead of silently ignoring it.
     #[cfg(not(unix))]
     let pg_unix_handle: Option<tokio::task::JoinHandle<()>> = None;
-    let _ = &pg_socket_dir;
+    #[cfg(not(unix))]
+    if pg_socket_dir.is_some() {
+        return Err(Error::io(
+            "unix sockets are not available on this platform (--pg-socket-dir); use the TCP listener instead",
+        ));
+    }
 
     // Start server with graceful shutdown handling. The health
     // server runs in its own detached task (see above) so a failure
@@ -1115,9 +1127,12 @@ async fn start_server_daemon(
     pg_socket_dir: Option<PathBuf>,
     max_connections: usize,
 ) -> Result<()> {
+    // Process management (kill -0 liveness probe, daemon re-exec) is unix-only.
+    #[cfg(unix)]
     use std::process::{Command, Stdio};
 
-    // Check if server is already running
+    // Check if server is already running — the stale-PID probe shells out to kill(1), unix-only.
+    #[cfg(unix)]
     if pid_file.exists() {
         if let Ok(pid_str) = std::fs::read_to_string(&pid_file) {
             if let Ok(pid) = pid_str.trim().parse::<i32>() {
@@ -1340,9 +1355,15 @@ async fn start_server_daemon(
         Ok(())
     }
 
+    // Daemonization (re-exec + detach + SIGTERM management) is unix-only; on Windows run in the
+    // foreground or wrap the process in a service manager.
     #[cfg(not(unix))]
     {
-        Err(Error::io("Daemon mode is only supported on Unix systems"))
+        let _ = &pid_file; // only the unix path reads/writes the PID file
+        Err(Error::io(
+            "daemon mode is not available on this platform; run 'heliosdb-nano start' in the \
+             foreground or use a service wrapper (e.g. a Windows service / NSSM)",
+        ))
     }
 }
 

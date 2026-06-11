@@ -144,12 +144,12 @@ jobs:
           - target: x86_64-pc-windows-msvc
             os: windows-2022
             archive: zip
-            # The crate does not yet compile on Windows (unguarded
-            # std::os::unix usage, E0433 — found by this matrix's first run
-            # on v3.40.0/v3.41.0). Keep the cell visible but non-blocking
-            # until the Windows port lands; remove this once it builds.
-            experimental: true
-    continue-on-error: ${{ matrix.experimental == true }}
+            # Windows port: unix-only code paths are cfg(unix)-gated as of
+            # fix/windows-port; verified via a full
+            # `cargo check --bins --lib --target x86_64-pc-windows-gnu`
+            # cross-check (mingw). This msvc cell is now a regular,
+            # blocking matrix cell — fail-fast is already false, so a
+            # failure here cannot block the other artifacts.
     steps:
       - name: Checkout
         uses: actions/checkout@v5
