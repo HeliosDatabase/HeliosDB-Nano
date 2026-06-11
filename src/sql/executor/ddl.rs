@@ -574,6 +574,11 @@ pub(super) fn handle_truncate(executor: &Executor, table_name: &str) -> Result<B
             storage.delete(key)?;
         }
 
+        // R3.3: purge columnar sidecars (col:/colz:/colzm:/colp:/colpm:) with
+        // the rows — stale batches or live-row presence must not resurrect
+        // truncated rows. No-op prefix seeks for row-only tables.
+        crate::storage::ColumnarStore::purge_table_sidecars(&storage.db, table_name)?;
+
         // Clear ART index entries for this table so that stale PK/UNIQUE
         // values do not block re-insertion of the same values.
         // Skip clearing if branches exist or time-travel snapshots are

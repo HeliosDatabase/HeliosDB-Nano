@@ -678,10 +678,13 @@ impl Transaction {
         let mut touches_columnar = false;
         for entry in self.write_set.iter() {
             let (key, value) = (entry.key(), entry.value());
-            // R3.1: columnar batches stage a zone-stats sidecar alongside the
-            // batch. Applying them under the zone-stats write lock (below)
-            // keeps lazy stats backfill from racing this commit.
-            if !touches_columnar && key.starts_with(b"col:") {
+            // R3.1/R3.3: columnar batches stage zone-stats (`colz:`) and
+            // live-row presence (`colp:`) sidecars alongside the batch.
+            // Applying them under the zone-stats write lock (below) keeps
+            // lazy stats/presence backfill from racing this commit.
+            if !touches_columnar
+                && (key.starts_with(b"col:") || key.starts_with(b"colz:") || key.starts_with(b"colp:"))
+            {
                 touches_columnar = true;
             }
             match value {

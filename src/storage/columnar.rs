@@ -13,6 +13,9 @@
 //! colz:{table}:{column}:{batch_id} -> bincode BatchStats (zone-map sidecar, R3.1)
 //! colzm:{table}:{column}           -> [1] manifest marker: every col: batch of
 //!                                     this column has a colz: sidecar entry
+//! colp:{table}:{batch_id}          -> bincode BatchPresence (live-row bitmap, R3.3)
+//! colpm:{table}                    -> [1] manifest marker: the colp: sidecar
+//!                                     fully describes the table's live rows
 //! ```
 //!
 //! The `colz:` sidecar is written in the same RocksDB `WriteBatch` as the
@@ -21,13 +24,41 @@
 //! materialized batch on every store — O(BATCH_SIZE) per written value, which
 //! is marginal next to the existing whole-batch read-modify-write.
 //!
+//! R3.3 adds two things on top:
+//!
+//! - **Grouped writes** (`apply_batch_values` / `stage_batch_values_in_transaction`):
+//!   multi-row statements group values by (column, batch) and pay ONE
+//!   read-modify-write + ONE zone-stats recompute per touched batch instead
+//!   of one per value (~1024x write amplification removed).
+//! - **Live-row presence** (`colp:` / `colpm:`): a per-batch bitmap of live
+//!   row offsets, maintained on insert/delete (never on update — updates keep
+//!   their row_id). Columnar scans/aggregates use it for liveness instead of
+//!   walking the whole `data:{table}:` row keyspace. Presence writes go
+//!   through the same two channels as `col:` batches — direct `WriteBatch`
+//!   under the zone-stats write lock for autocommit, or the transaction write
+//!   set (full-image read-modify-write) for staged DML — so rollback discards
+//!   them and commit applies them atomically with the rows. Non-main branches
+//!   never touch presence (branch DML lives in `bdata:`/`bdel:` keyspaces and
+//!   columnar reads bail to row scans there).
+//!
+//! Presence completeness contract: a `colp:` record may only be created when
+//! the `colpm:` manifest marker is present (writers RMW complete images) or
+//! by `backfill_presence`, which builds every record from a full row-keyspace
+//! walk under the zone-stats write lock and then sets the marker. Writers that
+//! find the marker absent first run the backfill (when presence is enabled) or
+//! skip maintenance entirely (when `HELIOS_COLP_OFF` is set — reads use the
+//! row-walk then, so a stale-but-markerless sidecar is never trusted).
+//!
 //! Downgrade caveat: a binary older than R3.1 writes `col:` batches without
 //! maintaining `colz:`/`colzm:`. Running such a binary against a data
 //! directory that already has manifest markers, then upgrading again, can
 //! leave markers that overstate sidecar completeness (wrong pruning).
 //! Binary downgrades against a live data directory are unsupported; if one
 //! happened, deleting the `colzm:` markers (or setting `HELIOS_ZONE_MAP_OFF`)
-//! restores correctness and the next scans re-backfill.
+//! restores correctness and the next scans re-backfill. The same applies to
+//! `colp:`/`colpm:` (pre-R3.3 binaries insert/delete rows without maintaining
+//! presence): delete the `colpm:` markers (or set `HELIOS_COLP_OFF`) and the
+//! next columnar read re-backfills.
 //!
 //! # Example
 //!
@@ -209,6 +240,88 @@ impl BatchStats {
     }
 }
 
+/// R3.3 per-batch live-row presence, stored as a `colp:{table}:{batch_id}`
+/// sidecar. One bit per batch slot: set = a `data:{table}:{row_id}` key exists
+/// for `row_id = batch_id * BATCH_SIZE + offset`. `live_count` caches the
+/// popcount so COUNT(*) can sum sidecars without touching the bitmaps.
+///
+/// Presence is per TABLE (row liveness), not per column — all columnar
+/// columns of a table share batch ids (`row_id / BATCH_SIZE`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BatchPresence {
+    /// Number of set bits.
+    pub live_count: u32,
+    /// `BATCH_SIZE / 8` bytes, bit `offset % 8` of byte `offset / 8`.
+    pub bits: Vec<u8>,
+}
+
+impl BatchPresence {
+    /// An all-absent presence record.
+    pub fn new() -> Self {
+        Self {
+            live_count: 0,
+            bits: vec![0u8; BATCH_SIZE / 8],
+        }
+    }
+
+    /// Mark `offset` live. Idempotent.
+    pub fn set(&mut self, offset: usize) {
+        if offset >= BATCH_SIZE {
+            return;
+        }
+        if self.bits.len() < BATCH_SIZE / 8 {
+            self.bits.resize(BATCH_SIZE / 8, 0);
+        }
+        if let Some(byte) = self.bits.get_mut(offset / 8) {
+            let mask = 1u8 << (offset % 8);
+            if *byte & mask == 0 {
+                *byte |= mask;
+                self.live_count += 1;
+            }
+        }
+    }
+
+    /// Mark `offset` absent. Idempotent.
+    pub fn clear(&mut self, offset: usize) {
+        if let Some(byte) = self.bits.get_mut(offset / 8) {
+            let mask = 1u8 << (offset % 8);
+            if *byte & mask != 0 {
+                *byte &= !mask;
+                self.live_count = self.live_count.saturating_sub(1);
+            }
+        }
+    }
+
+    /// Is `offset` live?
+    pub fn is_live(&self, offset: usize) -> bool {
+        self.bits
+            .get(offset / 8)
+            .is_some_and(|byte| byte & (1u8 << (offset % 8)) != 0)
+    }
+
+    /// Iterate live offsets in ascending order (bit-trick scan, skips zero
+    /// bytes — cheap on sparse batches).
+    pub fn iter_live(&self) -> impl Iterator<Item = usize> + '_ {
+        self.bits.iter().enumerate().flat_map(|(byte_idx, &byte)| {
+            let mut remaining = byte;
+            std::iter::from_fn(move || {
+                if remaining == 0 {
+                    return None;
+                }
+                let bit = remaining.trailing_zeros() as usize;
+                remaining &= remaining - 1;
+                Some(byte_idx * 8 + bit)
+            })
+        })
+    }
+}
+
+impl Default for BatchPresence {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Total-order comparison restricted to the zone-map orderable families:
 /// integers (cross-width), finite floats (cross-width), text, timestamp and
 /// date. Returns `None` for any other type, for mixed families, and for
@@ -294,10 +407,272 @@ impl ColumnarStore {
     }
 
     /// Calculate batch_id and offset for a row_id
-    fn batch_location(row_id: u64) -> (u64, usize) {
+    pub fn batch_location(row_id: u64) -> (u64, usize) {
         let batch_id = row_id / BATCH_SIZE as u64;
         let offset = (row_id % BATCH_SIZE as u64) as usize;
         (batch_id, offset)
+    }
+
+    /// Build the RocksDB key for a table's per-batch presence sidecar (R3.3)
+    ///
+    /// Format: `colp:{table}:{batch_id}`
+    fn presence_key(table: &str, batch_id: u64) -> Vec<u8> {
+        format!("colp:{}:{}", table, batch_id).into_bytes()
+    }
+
+    /// Build prefix for scanning all presence entries of a table
+    fn presence_prefix(table: &str) -> Vec<u8> {
+        format!("colp:{}:", table).into_bytes()
+    }
+
+    /// Presence manifest marker key: present iff the `colp:` sidecar fully
+    /// describes the table's live rows (written by `backfill_presence`,
+    /// maintained by every subsequent insert/delete).
+    fn presence_marker_key(table: &str) -> Vec<u8> {
+        format!("colpm:{}", table).into_bytes()
+    }
+
+    /// True when the presence sidecar is a complete manifest of the table's
+    /// live rows.
+    pub fn presence_manifest_complete(db: &DB, table: &str) -> bool {
+        db.get(Self::presence_marker_key(table)).ok().flatten().is_some()
+    }
+
+    /// Load one batch's presence record from the transaction overlay, then the
+    /// database, then default to all-absent.
+    fn load_presence_for_write(db: &DB, txn: Option<&Transaction>, table: &str, batch_id: u64) -> Result<BatchPresence> {
+        let key = Self::presence_key(table, batch_id);
+        let raw = match txn {
+            Some(txn) => match txn.get(&key)? {
+                Some(data) => Some(data),
+                None => db
+                    .get(&key)
+                    .map_err(|e| Error::storage(format!("Columnar presence load failed: {}", e)))?,
+            },
+            None => db
+                .get(&key)
+                .map_err(|e| Error::storage(format!("Columnar presence load failed: {}", e)))?,
+        };
+        match raw {
+            Some(data) => bincode::deserialize(&data)
+                .map_err(|e| Error::storage(format!("Columnar presence deserialize failed: {}", e))),
+            None => Ok(BatchPresence::new()),
+        }
+    }
+
+    /// Load the full presence map for a table, sorted by batch id.
+    pub fn load_presence_map(db: &DB, table: &str) -> Result<Vec<(u64, BatchPresence)>> {
+        let prefix = Self::presence_prefix(table);
+        let mut map = Vec::new();
+        let iter = db.prefix_iterator(&prefix);
+        for item in iter {
+            let (key, value) = item.map_err(|e| Error::storage(format!("Columnar presence iterator error: {}", e)))?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            let Some(batch_id) = Self::parse_batch_id(&key, prefix.len()) else {
+                continue;
+            };
+            let presence: BatchPresence = bincode::deserialize(&value)
+                .map_err(|e| Error::storage(format!("Columnar presence deserialize failed: {}", e)))?;
+            map.push((batch_id, presence));
+        }
+        map.sort_by_key(|(batch_id, _)| *batch_id);
+        Ok(map)
+    }
+
+    /// Build presence records for every batch of `table` from a full
+    /// `data:{table}:` row-keyspace walk, write them plus the `colpm:` marker
+    /// in one `WriteBatch`, and return the built map.
+    ///
+    /// Holds the zone-stats write lock across the ENTIRE walk + write: every
+    /// presence writer (autocommit grouped writes, transaction commits that
+    /// stage columnar keys) serializes on the same lock, so the backfilled
+    /// image can never be clobbered by a write computed from a pre-backfill
+    /// view, and writers that start after the backfill see the marker and
+    /// read-modify-write complete images. One-time cost per legacy table.
+    pub fn backfill_presence(db: &DB, table: &str) -> Result<Vec<(u64, BatchPresence)>> {
+        let _guard = stats_write_lock();
+        Self::backfill_presence_locked(db, table)
+    }
+
+    /// Inner backfill; caller must hold the zone-stats write lock.
+    fn backfill_presence_locked(db: &DB, table: &str) -> Result<Vec<(u64, BatchPresence)>> {
+        // Re-check under the lock: a concurrent backfill may have completed.
+        if Self::presence_manifest_complete(db, table) {
+            return Self::load_presence_map(db, table);
+        }
+
+        let prefix = format!("data:{}:", table).into_bytes();
+        let mut read_opts = rocksdb::ReadOptions::default();
+        read_opts.set_total_order_seek(true);
+        let iter = db.iterator_opt(
+            rocksdb::IteratorMode::From(&prefix, rocksdb::Direction::Forward),
+            read_opts,
+        );
+
+        let mut map: HashMap<u64, BatchPresence> = HashMap::new();
+        for item in iter {
+            let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            let Some(digits) = key.get(prefix.len()..) else {
+                continue;
+            };
+            let Some(row_id) = std::str::from_utf8(digits).ok().and_then(|s| s.parse::<u64>().ok()) else {
+                continue;
+            };
+            let (batch_id, offset) = Self::batch_location(row_id);
+            map.entry(batch_id).or_default().set(offset);
+        }
+
+        // Purge any stale records (e.g. left behind by an invalidation that
+        // removed only the marker) before writing the rebuilt image.
+        let mut write_batch = rocksdb::WriteBatch::default();
+        let presence_prefix = Self::presence_prefix(table);
+        let iter = db.prefix_iterator(&presence_prefix);
+        for item in iter {
+            let (key, _) = item.map_err(|e| Error::storage(format!("Columnar presence iterator error: {}", e)))?;
+            if !key.starts_with(&presence_prefix) {
+                break;
+            }
+            write_batch.delete(&key);
+        }
+
+        let mut built: Vec<(u64, BatchPresence)> = map.into_iter().collect();
+        built.sort_by_key(|(batch_id, _)| *batch_id);
+        for (batch_id, presence) in &built {
+            let data = bincode::serialize(presence)
+                .map_err(|e| Error::storage(format!("Columnar presence serialize failed: {}", e)))?;
+            write_batch.put(Self::presence_key(table, *batch_id), data);
+        }
+        write_batch.put(Self::presence_marker_key(table), [1u8]);
+        db.write(write_batch)
+            .map_err(|e| Error::storage(format!("Columnar presence backfill failed: {}", e)))?;
+        Ok(built)
+    }
+
+    /// Read-side presence lookup: `Some(map)` when the manifest is complete
+    /// (loading it) or after lazily backfilling it; callers fall back to the
+    /// row-keyspace walk on `None` (which only happens on backfill failure).
+    pub fn presence_scan_map(db: &DB, table: &str) -> Result<Vec<(u64, BatchPresence)>> {
+        if Self::presence_manifest_complete(db, table) {
+            return Self::load_presence_map(db, table);
+        }
+        Self::backfill_presence(db, table)
+    }
+
+    /// Remove the presence sidecar and marker for a table (storage-mode
+    /// migrations, truncate, drop). The next columnar read re-backfills.
+    pub fn purge_presence(db: &DB, table: &str) -> Result<()> {
+        let _guard = stats_write_lock();
+        let mut write_batch = rocksdb::WriteBatch::default();
+        let prefix = Self::presence_prefix(table);
+        let iter = db.prefix_iterator(&prefix);
+        for item in iter {
+            let (key, _) = item.map_err(|e| Error::storage(format!("Columnar presence iterator error: {}", e)))?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            write_batch.delete(&key);
+        }
+        write_batch.delete(Self::presence_marker_key(table));
+        db.write(write_batch)
+            .map_err(|e| Error::storage(format!("Columnar presence purge failed: {}", e)))
+    }
+
+    /// Purge every columnar sidecar of a table: `col:` batches, `colz:` stats,
+    /// `colzm:` markers, `colp:` presence and the `colpm:` marker. Used by
+    /// TRUNCATE / DROP TABLE / orphan purges so recreated or refilled tables
+    /// never observe stale side-data.
+    pub fn purge_table_sidecars(db: &DB, table: &str) -> Result<()> {
+        let _guard = stats_write_lock();
+        let mut write_batch = rocksdb::WriteBatch::default();
+        for prefix in [
+            format!("col:{}:", table).into_bytes(),
+            format!("colz:{}:", table).into_bytes(),
+            format!("colzm:{}:", table).into_bytes(),
+            Self::presence_prefix(table),
+        ] {
+            let iter = db.prefix_iterator(&prefix);
+            for item in iter {
+                let (key, _) = item.map_err(|e| Error::storage(format!("Columnar iterator error: {}", e)))?;
+                if !key.starts_with(&prefix) {
+                    break;
+                }
+                write_batch.delete(&key);
+            }
+        }
+        write_batch.delete(Self::presence_marker_key(table));
+        db.write(write_batch)
+            .map_err(|e| Error::storage(format!("Columnar sidecar purge failed: {}", e)))
+    }
+
+    /// R3.3 grouped write: apply `values` (in order — later entries win) to ONE
+    /// column batch, recompute its zone stats ONCE, and append batch + stats to
+    /// `write_batch`. Caller must hold the zone-stats write lock (the load
+    /// happens under it so no concurrent writer's image is lost) and write
+    /// `write_batch` before releasing it.
+    pub fn apply_batch_values(
+        db: &DB,
+        write_batch: &mut rocksdb::WriteBatch,
+        table: &str,
+        column: &str,
+        batch_id: u64,
+        values: &[(u64, Value)],
+    ) -> Result<()> {
+        let key = Self::batch_key(table, column, batch_id);
+        let mut batch = match db
+            .get(&key)
+            .map_err(|e| Error::storage(format!("Columnar load failed: {}", e)))?
+        {
+            Some(data) => bincode::deserialize(&data)
+                .map_err(|e| Error::storage(format!("Columnar deserialize failed: {}", e)))?,
+            None => ColumnBatch::new(column, batch_id * BATCH_SIZE as u64),
+        };
+
+        for (row_id, value) in values {
+            if !batch.set(*row_id, value.clone()) {
+                return Err(Error::storage(format!(
+                    "Invalid row_id {} for batch starting at {}",
+                    row_id, batch.start_row_id
+                )));
+            }
+        }
+
+        let data =
+            bincode::serialize(&batch).map_err(|e| Error::storage(format!("Columnar serialize failed: {}", e)))?;
+        let stats = BatchStats::from_batch(&batch);
+        let stats_data = bincode::serialize(&stats)
+            .map_err(|e| Error::storage(format!("Columnar stats serialize failed: {}", e)))?;
+        write_batch.put(&key, &data);
+        write_batch.put(Self::stats_key(table, column, batch_id), &stats_data);
+        Ok(())
+    }
+
+    /// R3.3 grouped presence update: set/clear offsets of ONE presence batch
+    /// and append the updated record to `write_batch`. Caller must hold the
+    /// zone-stats write lock and write `write_batch` before releasing it.
+    pub fn apply_presence_updates(
+        db: &DB,
+        write_batch: &mut rocksdb::WriteBatch,
+        table: &str,
+        batch_id: u64,
+        set: &[u64],
+        clear: &[u64],
+    ) -> Result<()> {
+        let mut presence = Self::load_presence_for_write(db, None, table, batch_id)?;
+        for row_id in set {
+            presence.set((row_id % BATCH_SIZE as u64) as usize);
+        }
+        for row_id in clear {
+            presence.clear((row_id % BATCH_SIZE as u64) as usize);
+        }
+        let data = bincode::serialize(&presence)
+            .map_err(|e| Error::storage(format!("Columnar presence serialize failed: {}", e)))?;
+        write_batch.put(Self::presence_key(table, batch_id), data);
+        Ok(())
     }
 
     /// Store a value in columnar format
@@ -310,42 +685,99 @@ impl ColumnarStore {
     /// * `value` - Value to store
     pub fn store(db: &DB, table: &str, column: &str, row_id: u64, value: Value) -> Result<()> {
         let (batch_id, _offset) = Self::batch_location(row_id);
-        let key = Self::batch_key(table, column, batch_id);
 
-        // Load or create batch
-        let mut batch = match db
-            .get(&key)
-            .map_err(|e| Error::storage(format!("Columnar load failed: {}", e)))?
-        {
-            Some(data) => bincode::deserialize(&data)
-                .map_err(|e| Error::storage(format!("Columnar deserialize failed: {}", e)))?,
-            None => ColumnBatch::new(column, batch_id * BATCH_SIZE as u64),
-        };
-
-        // Update value
-        if !batch.set(row_id, value) {
-            return Err(Error::storage(format!(
-                "Invalid row_id {} for batch starting at {}",
-                row_id, batch.start_row_id
-            )));
-        }
-
-        // Save batch + zone-stats sidecar in one atomic WriteBatch (R3.1).
-        let data =
-            bincode::serialize(&batch).map_err(|e| Error::storage(format!("Columnar serialize failed: {}", e)))?;
-        let stats = BatchStats::from_batch(&batch);
-        let stats_data = bincode::serialize(&stats)
-            .map_err(|e| Error::storage(format!("Columnar stats serialize failed: {}", e)))?;
-
-        let mut write_batch = rocksdb::WriteBatch::default();
-        write_batch.put(&key, &data);
-        write_batch.put(Self::stats_key(table, column, batch_id), &stats_data);
-
+        // Load-modify-write entirely under the zone-stats write lock so a
+        // concurrent writer/backfill never works from (or is clobbered by) a
+        // stale batch image (R3.3 — pre-R3.3 the load ran before the lock).
         let _guard = stats_write_lock();
+        let mut write_batch = rocksdb::WriteBatch::default();
+        Self::apply_batch_values(
+            db,
+            &mut write_batch,
+            table,
+            column,
+            batch_id,
+            std::slice::from_ref(&(row_id, value)),
+        )?;
         db.write(write_batch)
             .map_err(|e| Error::storage(format!("Columnar store failed: {}", e)))?;
 
         Ok(())
+    }
+
+    /// R3.3 grouped staged write: the transaction-write-set counterpart of
+    /// `apply_batch_values`. Reads any previously staged batch through the
+    /// transaction first (read-your-own-writes within the statement/txn),
+    /// applies `values` in order, recomputes zone stats once and stages batch
+    /// + stats with `txn.put()` — rollback discards both.
+    pub fn stage_batch_values_in_transaction(
+        db: &DB,
+        txn: &Transaction,
+        table: &str,
+        column: &str,
+        batch_id: u64,
+        values: &[(u64, Value)],
+    ) -> Result<()> {
+        let key = Self::batch_key(table, column, batch_id);
+        let mut batch = match txn.get(&key)? {
+            Some(data) => bincode::deserialize(&data)
+                .map_err(|e| Error::storage(format!("Columnar deserialize failed: {}", e)))?,
+            None => match db
+                .get(&key)
+                .map_err(|e| Error::storage(format!("Columnar load failed: {}", e)))?
+            {
+                Some(data) => bincode::deserialize(&data)
+                    .map_err(|e| Error::storage(format!("Columnar deserialize failed: {}", e)))?,
+                None => ColumnBatch::new(column, batch_id * BATCH_SIZE as u64),
+            },
+        };
+
+        for (row_id, value) in values {
+            if !batch.set(*row_id, value.clone()) {
+                return Err(Error::storage(format!(
+                    "Invalid row_id {} for batch starting at {}",
+                    row_id, batch.start_row_id
+                )));
+            }
+        }
+
+        let data =
+            bincode::serialize(&batch).map_err(|e| Error::storage(format!("Columnar serialize failed: {}", e)))?;
+        // Stage the zone-stats sidecar alongside the batch: the commit applies
+        // the whole write set in one RocksDB WriteBatch (and takes the
+        // zone-stats write lock when columnar keys are staged), so batch and
+        // stats stay consistent across commit/rollback.
+        let stats = BatchStats::from_batch(&batch);
+        let stats_data = bincode::serialize(&stats)
+            .map_err(|e| Error::storage(format!("Columnar stats serialize failed: {}", e)))?;
+        txn.put(Self::stats_key(table, column, batch_id), stats_data)?;
+        txn.put(key, data)
+    }
+
+    /// R3.3 staged presence update: read-modify-write ONE presence record
+    /// through the transaction overlay and stage it with `txn.put()`. The
+    /// staged image composes the transaction's own earlier updates with the
+    /// committed state; cross-transaction overlaps on the same batch are the
+    /// same write-write hazard as staged `col:` batches and are caught by the
+    /// conflict registry when enabled.
+    pub fn stage_presence_updates_in_transaction(
+        db: &DB,
+        txn: &Transaction,
+        table: &str,
+        batch_id: u64,
+        set: &[u64],
+        clear: &[u64],
+    ) -> Result<()> {
+        let mut presence = Self::load_presence_for_write(db, Some(txn), table, batch_id)?;
+        for row_id in set {
+            presence.set((row_id % BATCH_SIZE as u64) as usize);
+        }
+        for row_id in clear {
+            presence.clear((row_id % BATCH_SIZE as u64) as usize);
+        }
+        let data = bincode::serialize(&presence)
+            .map_err(|e| Error::storage(format!("Columnar presence serialize failed: {}", e)))?;
+        txn.put(Self::presence_key(table, batch_id), data)
     }
 
     /// Stage a value in columnar format inside a transaction write set.
@@ -363,39 +795,14 @@ impl ColumnarStore {
         value: Value,
     ) -> Result<()> {
         let (batch_id, _offset) = Self::batch_location(row_id);
-        let key = Self::batch_key(table, column, batch_id);
-
-        let mut batch = match txn.get(&key)? {
-            Some(data) => bincode::deserialize(&data)
-                .map_err(|e| Error::storage(format!("Columnar deserialize failed: {}", e)))?,
-            None => match db
-                .get(&key)
-                .map_err(|e| Error::storage(format!("Columnar load failed: {}", e)))?
-            {
-                Some(data) => bincode::deserialize(&data)
-                    .map_err(|e| Error::storage(format!("Columnar deserialize failed: {}", e)))?,
-                None => ColumnBatch::new(column, batch_id * BATCH_SIZE as u64),
-            },
-        };
-
-        if !batch.set(row_id, value) {
-            return Err(Error::storage(format!(
-                "Invalid row_id {} for batch starting at {}",
-                row_id, batch.start_row_id
-            )));
-        }
-
-        let data =
-            bincode::serialize(&batch).map_err(|e| Error::storage(format!("Columnar serialize failed: {}", e)))?;
-        // Stage the zone-stats sidecar alongside the batch: the commit applies
-        // the whole write set in one RocksDB WriteBatch (and takes the
-        // zone-stats write lock when columnar keys are staged), so batch and
-        // stats stay consistent across commit/rollback.
-        let stats = BatchStats::from_batch(&batch);
-        let stats_data = bincode::serialize(&stats)
-            .map_err(|e| Error::storage(format!("Columnar stats serialize failed: {}", e)))?;
-        txn.put(Self::stats_key(table, column, batch_id), stats_data)?;
-        txn.put(key, data)
+        Self::stage_batch_values_in_transaction(
+            db,
+            txn,
+            table,
+            column,
+            batch_id,
+            std::slice::from_ref(&(row_id, value)),
+        )
     }
 
     /// Retrieve a value from columnar storage
