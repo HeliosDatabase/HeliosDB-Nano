@@ -42,6 +42,7 @@ pub mod conflict;
 pub mod compression;
 pub mod content_addr;
 pub mod dictionary;
+pub mod group_commit;
 
 // Row-level caching
 pub mod row_cache;

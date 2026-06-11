@@ -11972,6 +11972,8 @@ impl EmbeddedDatabase {
         txn.set_sync_commit(
             self.storage.config().storage.durable_commit && !self.storage.config().storage.memory_only,
         );
+        // R1.3-p2: durable commits share one group fsync per cohort.
+        txn.set_group_committer(self.storage.group_committer());
         // R0.2: record commits always; validate (first-committer-wins) for
         // RepeatableRead/Serializable. ReadCommitted keeps PostgreSQL's
         // blind-write semantics.
@@ -12140,9 +12142,12 @@ impl EmbeddedDatabase {
             // P0#1: session transactions must honor time_travel_enabled too.
             txn.set_versioning_enabled(self.storage.time_travel_enabled());
             txn.set_rocksdb_wal_enabled(!self.storage.config().storage.memory_only);
-        txn.set_sync_commit(
-            self.storage.config().storage.durable_commit && !self.storage.config().storage.memory_only,
-        );
+            txn.set_sync_commit(
+                self.storage.config().storage.durable_commit
+                    && !self.storage.config().storage.memory_only,
+            );
+            // R1.3-p2: durable commits share one group fsync per cohort.
+            txn.set_group_committer(self.storage.group_committer());
             // R0.2: implicit single-statement session transactions record
             // their commits so explicit transactions can validate against
             // them; they never validate (statement-atomic, RC semantics).

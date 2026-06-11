@@ -1460,10 +1460,13 @@ fn run_returning_bench() {
 /// Durable-commit scaling benchmark (R1.3 probe).
 ///
 /// Measures BEGIN;INSERT;COMMIT cycles on disk with power-loss-durable
-/// commits (storage.durable_commit = fsync per commit WriteBatch) at 1/8/32
-/// concurrent sessions, against the non-durable default. If RocksDB's
-/// leader/follower write groups amortize the fsync, durable throughput
-/// scales with the session count instead of being fsync-bound per commit.
+/// commits at 1/8/16/24/32 concurrent sessions, against the non-durable
+/// default. Phase 1 leaned on RocksDB's internal write groups (one synced
+/// WriteBatch per commit); phase 2 routes commits through the engine
+/// leader/follower group committer (unsynced batch + ONE cohort
+/// `flush_wal(true)` per accumulation window), so this bench also sweeps
+/// `storage.group_commit_window_us` (HELIOS_DURABLE_WINDOWS, comma list,
+/// default "0,200,1000") and reports per-COMMIT p50/p99 latency.
 ///
 ///   HELIOS_DURABLE=1 cargo test --profile perf --test tps_workloads run_durable_commit_bench -- --nocapture --test-threads=1
 #[test]
@@ -1477,20 +1480,46 @@ fn run_durable_commit_bench() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(100);
+    let windows: Vec<u64> = std::env::var("HELIOS_DURABLE_WINDOWS")
+        .unwrap_or_else(|_| "0,200,1000".to_string())
+        .split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
 
-    for durable in [false, true] {
-        let tmp = std::env::temp_dir().join(format!("helios_dur_{}_{durable}", std::process::id()));
+    fn pctile(sorted_us: &[u64], p: f64) -> u64 {
+        if sorted_us.is_empty() {
+            return 0;
+        }
+        let idx = ((sorted_us.len() as f64 - 1.0) * p).round() as usize;
+        sorted_us[idx.min(sorted_us.len() - 1)]
+    }
+
+    // (durable, group_commit_window_us): non-durable once, durable per window.
+    let mut configs: Vec<(bool, u64)> = vec![(false, 0)];
+    configs.extend(windows.iter().map(|&w| (true, w)));
+
+    for (durable, window_us) in configs {
+        let tmp = std::env::temp_dir().join(format!(
+            "helios_dur_{}_{durable}_{window_us}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&tmp);
         let mut c = Config::default();
         c.storage.path = Some(tmp.clone());
         c.storage.memory_only = false;
         c.storage.wal_enabled = true;
         c.storage.durable_commit = durable;
+        c.storage.group_commit_window_us = window_us;
         let db = EmbeddedDatabase::with_config(c).unwrap();
         db.execute("CREATE TABLE d (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+        let label = if durable {
+            format!("durable=true  w={window_us:<4}")
+        } else {
+            "durable=false       ".to_string()
+        };
 
         // D5 follow-up: autocommit fast-path inserts must honor durable_commit
-        // (one WAL fsync barrier per statement).
+        // (one WAL fsync barrier per statement, grouped in phase 2).
         {
             let start = Instant::now();
             let n = 50usize;
@@ -1498,34 +1527,45 @@ fn run_durable_commit_bench() {
                 db.execute(&format!("INSERT INTO d (id, v) VALUES ({}, 9)", 90_000_000 + i)).unwrap();
             }
             println!(
-                "durable={durable:<5} autocommit   {:>10.0} ops/s  ({n} inserts)",
+                "{label} autocommit   {:>10.0} ops/s  ({n} inserts)",
                 n as f64 / start.elapsed().as_secs_f64()
             );
         }
         for &threads in &[1usize, 8, 16, 24, 32] {
+            let commit_lat_us = std::sync::Mutex::new(Vec::<u64>::with_capacity(threads * cycles));
             let start = Instant::now();
             std::thread::scope(|s| {
                 for t in 0..threads {
                     let dbr = &db;
-                    let base = 1_000_000 * (threads) + t * cycles + if durable { 50_000_000 } else { 0 };
+                    let lat = &commit_lat_us;
+                    let base = 1_000_000 * (threads) + t * cycles + if durable { 50_000_000 } else { 0 }
+                        + window_us as usize * 3_000_000;
                     s.spawn(move || {
                         let sid = dbr
                             .create_session(&format!("dur_u{t}"), IsolationLevel::ReadCommitted)
                             .unwrap();
+                        let mut local = Vec::with_capacity(cycles);
                         for i in 0..cycles {
                             dbr.begin_transaction_for_session(sid).unwrap();
                             dbr.execute_in_session(sid, &format!("INSERT INTO d (id, v) VALUES ({}, 1)", base + i))
                                 .unwrap();
+                            let c0 = Instant::now();
                             dbr.commit_transaction_for_session(sid).unwrap();
+                            local.push(c0.elapsed().as_micros() as u64);
                         }
                         dbr.destroy_session(sid).unwrap();
+                        lat.lock().unwrap().extend(local);
                     });
                 }
             });
             let total = threads * cycles;
+            let mut lat = commit_lat_us.into_inner().unwrap();
+            lat.sort_unstable();
             println!(
-                "durable={durable:<5} {threads:>2}T   {:>10.0} txn/s  ({total} commits)",
-                total as f64 / start.elapsed().as_secs_f64()
+                "{label} {threads:>2}T   {:>10.0} txn/s  ({total} commits)  commit p50={:>6}us p99={:>7}us",
+                total as f64 / start.elapsed().as_secs_f64(),
+                pctile(&lat, 0.50),
+                pctile(&lat, 0.99),
             );
         }
         drop(db);
