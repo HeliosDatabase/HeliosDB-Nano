@@ -77,6 +77,7 @@ impl WriteConflictRegistry {
     /// `snapshot_ts` has been applied. One atomic load when nothing is in
     /// flight (the overwhelmingly common case).
     pub fn snapshot_barrier(&self, snapshot_ts: u64) {
+        let mut spins: u32 = 0;
         loop {
             if self.inflight_count.load(Ordering::Acquire) == 0 {
                 return;
@@ -88,7 +89,16 @@ impl WriteConflictRegistry {
             if !pending {
                 return;
             }
-            std::thread::yield_now();
+            // Bounded spin, then sleep-backoff: with waiter counts near the
+            // core count, pure yield-spinning starves the committing thread
+            // the barrier is waiting on (measured: 49.6k txn/s at 8 sessions
+            // collapsing to 73 txn/s at 32 sessions on a 32-core host).
+            spins += 1;
+            if spins < 64 {
+                std::thread::yield_now();
+            } else {
+                std::thread::sleep(std::time::Duration::from_micros(50));
+            }
         }
     }
 

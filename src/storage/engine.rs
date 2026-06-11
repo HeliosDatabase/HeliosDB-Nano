@@ -2334,6 +2334,7 @@ impl StorageEngine {
         // P0#1: emit MVCC version-history at commit only when time-travel is on.
         txn.set_versioning_enabled(self.config.storage.time_travel_enabled);
         txn.set_rocksdb_wal_enabled(!self.config.storage.memory_only);
+        txn.set_sync_commit(self.config.storage.durable_commit && !self.config.storage.memory_only);
         // R0.2: embedded global-slot transactions read from a snapshot, so
         // complete those semantics with first-committer-wins validation.
         txn.set_conflict_registry(self.conflict_registry(), true);
@@ -2352,6 +2353,7 @@ impl StorageEngine {
         let mut txn = Transaction::new(Arc::clone(&self.db), snapshot_id, Arc::clone(&self.snapshot_manager))?;
         txn.set_versioning_enabled(self.config.storage.time_travel_enabled);
         txn.set_rocksdb_wal_enabled(!self.config.storage.memory_only);
+        txn.set_sync_commit(self.config.storage.durable_commit && !self.config.storage.memory_only);
         txn.set_conflict_registry(self.conflict_registry(), false);
         Ok(txn)
     }
