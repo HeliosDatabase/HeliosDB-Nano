@@ -1450,6 +1450,9 @@ pub struct StorageEngine {
     /// Write options for non-durable memory-only data. Disk-backed modes keep
     /// RocksDB's WAL enabled for crash recovery.
     memory_write_options: Option<WriteOptions>,
+    /// R1.3/D5 follow-up: storage.durable_commit also covers AUTOCOMMIT
+    /// fast-path statements via a per-statement WAL fsync barrier.
+    durable_commit_enabled: bool,
     /// In-memory schema cache (avoids repeated RocksDB get + bincode deserialize)
     schema_cache: Arc<parking_lot::Mutex<std::collections::HashMap<String, crate::Schema>>>,
     /// In-memory table-constraints cache (avoids repeated metadata gets on DML)
@@ -1822,6 +1825,7 @@ impl StorageEngine {
             write_counter: Arc::new(AtomicU64::new(0)),
             db_path: Some(db_path),
             memory_write_options: None,
+            durable_commit_enabled: config.storage.durable_commit && !config.storage.memory_only,
             schema_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             constraints_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             referencing_fk_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
@@ -2021,6 +2025,7 @@ impl StorageEngine {
             write_counter: Arc::new(AtomicU64::new(0)),
             db_path: None, // No disk space check for in-memory mode
             memory_write_options: Some(Self::memory_only_write_options()),
+            durable_commit_enabled: false,
             schema_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             constraints_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             referencing_fk_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
@@ -2862,6 +2867,25 @@ impl StorageEngine {
         txn.set_sync_commit(self.config.storage.durable_commit && !self.config.storage.memory_only);
         txn.set_conflict_registry(self.conflict_registry(), false);
         Ok(txn)
+    }
+
+    /// Power-loss durability barrier for AUTOCOMMIT fast-path statements.
+    ///
+    /// With `storage.durable_commit`, transactional commits fsync their own
+    /// WriteBatch (`sync_commit`), but the autocommit fast paths write with
+    /// default options and were not power-loss durable (found by the D5
+    /// durability gauntlet: identical throughput with the flag on/off).
+    /// RocksDB's WAL is sequential, so ONE `flush_wal(sync)` after the
+    /// statement's writes persists everything the statement wrote — rows,
+    /// columnar sidecars, counters — in a single fsync. No-op when
+    /// durable_commit is off or in memory mode.
+    pub fn durable_autocommit_barrier(&self) -> Result<()> {
+        if self.durable_commit_enabled {
+            self.db
+                .flush_wal(true)
+                .map_err(|e| Error::storage(format!("WAL fsync failed: {}", e)))?;
+        }
+        Ok(())
     }
 
     /// Write-write conflict registry shared by every transaction on this
