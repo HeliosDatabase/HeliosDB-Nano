@@ -5,6 +5,38 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.46.0] - 2026-06-11
+
+Minor release: multicore reads and parallel analytics — the two largest
+performance items of the roadmap's concurrency and OLAP tiers (R2.1, R3.2).
+
+### Changed — Multicore reads (R2.1)
+
+- The per-statement query-entry caches (plan, parse, result, and all
+  fast-path spec caches — ten in total) moved from single global mutexes to
+  16-way sharded LRU caches, the global-transaction check became a
+  lock-free atomic, and `query()`'s double transaction-lock acquisition
+  (which could surface a spurious "Transaction lock in invalid state"
+  error under contention) is gone. Hot point lookups now scale with
+  cores: 1.0M lookups/s at 1 thread to 2.58M at 16 threads — previously
+  16 threads were SLOWER than one (0.93x). Cache invalidation semantics
+  are unchanged and covered by the existing invalidation test matrix.
+
+### Changed — Parallel analytics (R3.2)
+
+- Large GROUP BY / aggregate queries parallelize across cores: the
+  row-store keyspace is sharded into contiguous ranges scanned by
+  independent RocksDB iterators on a single point-in-time snapshot, with
+  per-chunk partial aggregation and explicit accumulator merging
+  (COUNT/SUM/AVG/MIN/MAX; DISTINCT stays serial). Measured at 200k rows:
+  COUNT/SUM/AVG 41.9ms -> 6.1ms per query (~6.7x), text GROUP BY
+  93.1ms -> 7.4ms (~12.5x). Engages at >=65,536 rows
+  (HELIOS_AGG_PARALLEL_THRESHOLD); HELIOS_AGG_SERIAL=1 restores the
+  serial path. Small queries are unchanged.
+- Design note: simple collect-then-parallelize lost 1.8x on these paths
+  (iteration dominates, not decode) — the shipped design parallelizes the
+  iteration itself.
+
 ## [3.45.0] - 2026-06-11
 
 Minor release: index-layer concurrency (R2.2), configuration profiles with
