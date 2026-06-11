@@ -54,6 +54,23 @@ pub struct WriteConflictRegistry {
     inflight_count: AtomicUsize,
     /// Recorded commits since creation (drives pruning cadence).
     commit_count: AtomicU64,
+    /// R4.3: snapshots pinned against MVCC version GC (pin_id ->
+    /// snapshot_ts). Covers EVERY transaction holding this registry (not
+    /// just validating ones — ReadCommitted session transactions also scan
+    /// at their snapshot) plus statement-scoped historical (`AS OF`)
+    /// readers and in-flight `CREATE BRANCH ... AS OF` anchors. The GC
+    /// horizon never advances past `min(gc_pins)`; a horizon EQUAL to a
+    /// pin is safe (the newest version at-or-below the horizon is kept).
+    ///
+    /// Design note: this deliberately extends the conflict registry rather
+    /// than adding a separate reader-registry object — every Transaction
+    /// already receives this registry (`set_conflict_registry`), so pinning
+    /// reuses existing plumbing, and the GC consults one place. Pins use
+    /// their own id space because the two `Transaction` constructors keep
+    /// independent txn-id counters whose ids can collide.
+    gc_pins: DashMap<u64, u64>,
+    /// Pin id allocator for `gc_pins`.
+    next_gc_pin: AtomicU64,
 }
 
 impl WriteConflictRegistry {
@@ -192,6 +209,61 @@ impl WriteConflictRegistry {
     pub fn tracked_keys(&self) -> usize {
         self.recent_writes.len()
     }
+
+    /// R4.3: pin a snapshot against MVCC version GC. Returns a pin id that
+    /// MUST be released with [`unpin_snapshot`](Self::unpin_snapshot)
+    /// (RAII-wrap it in the caller — leaked pins block GC forever).
+    pub fn pin_snapshot(&self, snapshot_ts: u64) -> u64 {
+        let id = self.next_gc_pin.fetch_add(1, Ordering::Relaxed);
+        self.gc_pins.insert(id, snapshot_ts);
+        id
+    }
+
+    /// R4.3: release a GC pin.
+    pub fn unpin_snapshot(&self, pin_id: u64) {
+        self.gc_pins.remove(&pin_id);
+    }
+
+    /// R4.3: oldest snapshot any active transaction or historical reader
+    /// is pinned to. The version-GC horizon must not exceed this value.
+    /// Includes `active_snapshots` defensively (validating transactions are
+    /// also in `gc_pins`, but a direct `register_txn` caller would not be).
+    pub fn min_pinned_snapshot(&self) -> Option<u64> {
+        let pin_min = self.gc_pins.iter().map(|e| *e.value()).min();
+        let active_min = self.active_snapshots.iter().map(|e| *e.value()).min();
+        match (pin_min, active_min) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }
+    }
+
+    /// Test/diagnostic surface: number of live GC pins.
+    pub fn gc_pin_count(&self) -> usize {
+        self.gc_pins.len()
+    }
+}
+
+/// RAII guard for an R4.3 version-GC snapshot pin: releases the pin on drop.
+/// Held by statement-scoped historical (`AS OF`) readers and by
+/// `CREATE BRANCH ... AS OF` while the branch anchor is being persisted.
+pub struct GcPinGuard {
+    registry: std::sync::Arc<WriteConflictRegistry>,
+    pin_id: u64,
+}
+
+impl GcPinGuard {
+    pub fn new(registry: std::sync::Arc<WriteConflictRegistry>, snapshot_ts: u64) -> Self {
+        let pin_id = registry.pin_snapshot(snapshot_ts);
+        Self { registry, pin_id }
+    }
+}
+
+impl Drop for GcPinGuard {
+    fn drop(&mut self) {
+        self.registry.unpin_snapshot(self.pin_id);
+    }
 }
 
 #[cfg(test)]
@@ -247,6 +319,28 @@ mod tests {
         // Entries at ts >= 50 survive; the prune ran at least once.
         assert!(reg.tracked_keys() > 0);
         reg.deregister_txn(1);
+    }
+
+    #[test]
+    fn gc_pins_track_min_snapshot() {
+        let reg = std::sync::Arc::new(WriteConflictRegistry::new());
+        assert_eq!(reg.min_pinned_snapshot(), None);
+
+        let p1 = reg.pin_snapshot(100);
+        let _p2 = reg.pin_snapshot(50);
+        reg.register_txn(7, 80);
+        assert_eq!(reg.min_pinned_snapshot(), Some(50));
+
+        reg.unpin_snapshot(p1);
+        assert_eq!(reg.min_pinned_snapshot(), Some(50));
+        reg.deregister_txn(7);
+
+        // RAII guard releases on drop.
+        {
+            let _g = GcPinGuard::new(reg.clone(), 10);
+            assert_eq!(reg.min_pinned_snapshot(), Some(10));
+        }
+        assert_eq!(reg.min_pinned_snapshot(), Some(50));
     }
 
     #[test]

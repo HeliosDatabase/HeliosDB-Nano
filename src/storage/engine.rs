@@ -1691,7 +1691,13 @@ impl StorageEngine {
             warn!("Failed to recover snapshots: {}", e);
         }
 
-        let timestamp = Arc::new(RwLock::new(1));
+        // R4.3: seed the logical MVCC timestamp counter from recovered
+        // snapshot metadata so timestamps stay monotonic across reopens.
+        // Restarting at 1 (the historical behavior) reuses timestamps that
+        // already exist in `v:` version keys and snapshot metadata, which
+        // breaks AS OF resolution ("AS OF NOW" resolves to the prior run's
+        // max) and would make any watermark-based version GC unsound.
+        let timestamp = Arc::new(RwLock::new(snapshot_manager.max_snapshot_timestamp().unwrap_or(1).max(1)));
 
         // Initialize branch manager
         debug!("Initializing BranchManager");
