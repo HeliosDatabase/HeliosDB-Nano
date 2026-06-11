@@ -1,4 +1,8 @@
-//! Network protocol tests
+//! Network protocol tests (legacy `src/network/` stack — R5.W6).
+//!
+//! The legacy listener is feature-gated; these tests only build with
+//! `--features legacy-network`.
+#![cfg(feature = "legacy-network")]
 
 use heliosdb_nano::{network::PgServer, EmbeddedDatabase};
 use std::sync::Arc;

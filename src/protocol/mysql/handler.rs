@@ -522,8 +522,280 @@ impl HandshakeResponse {
 #[derive(Debug, Clone)]
 struct PreparedStatement {
     id: u32,
+    /// Translated SQL with `?` placeholders intact (replayed for the
+    /// zero-parameter compatibility path: SHOW / SET / BEGIN / …).
     sql: String,
+    /// Same SQL with `?` placeholders rewritten to the `$N` form the
+    /// engine's parameter binding expects (quote-aware).
+    param_sql: String,
     num_params: u16,
+    /// Parameter types from the most recent COM_STMT_EXECUTE that had the
+    /// new-params-bound flag set: `(mysql_type, is_unsigned)`. Reused on
+    /// subsequent executes where the client sends new-params-bound = 0.
+    param_types: Vec<(u8, bool)>,
+}
+
+/// Rewrite `?` placeholders to PostgreSQL-style `$1..$N` (the form the
+/// engine's positional-parameter binding expects) and return the rewritten
+/// SQL together with the placeholder count.
+///
+/// The scan is quote-aware: `?` inside single-quoted strings (with `''` and
+/// backslash escapes), double-quoted identifiers, and backtick identifiers
+/// is left untouched and NOT counted — the previous naive
+/// `sql.matches('?').count()` overcounted placeholders for statements like
+/// `INSERT INTO t VALUES ('what?', ?)`, which broke COM_STMT_PREPARE's
+/// reported parameter count.
+fn convert_qmark_placeholders(sql: &str) -> (String, u16) {
+    let mut out = String::with_capacity(sql.len() + 8);
+    let mut count: u16 = 0;
+    let mut chars = sql.chars().peekable();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut in_backtick = false;
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\'' if !in_double && !in_backtick => {
+                if in_single {
+                    out.push(ch);
+                    // `''` escape — stay inside the string
+                    if chars.peek() == Some(&'\'') {
+                        out.push(chars.next().unwrap_or('\''));
+                    } else {
+                        in_single = false;
+                    }
+                } else {
+                    in_single = true;
+                    out.push(ch);
+                }
+            }
+            '\\' if in_single => {
+                // Backslash escape inside a string — copy both chars
+                out.push(ch);
+                if let Some(next) = chars.next() {
+                    out.push(next);
+                }
+            }
+            '"' if !in_single && !in_backtick => {
+                in_double = !in_double;
+                out.push(ch);
+            }
+            '`' if !in_single && !in_double => {
+                in_backtick = !in_backtick;
+                out.push(ch);
+            }
+            '?' if !in_single && !in_double && !in_backtick => {
+                count = count.saturating_add(1);
+                out.push('$');
+                out.push_str(itoa::Buffer::new().format(count));
+            }
+            _ => out.push(ch),
+        }
+    }
+
+    (out, count)
+}
+
+/// Decode one binary-protocol parameter value (COM_STMT_EXECUTE) into a
+/// crate [`Value`]. `unsigned` is the 0x80 bit from the parameter type pair.
+///
+/// Type coverage (MySQL binary wire encodings → crate values):
+/// - TINY/SHORT/YEAR/INT24/LONG/LONGLONG → Int2/Int4/Int8 (width-matched;
+///   unsigned values that overflow the signed container widen, and an
+///   unsigned LONGLONG above `i64::MAX` becomes `Numeric` to avoid wrap)
+/// - FLOAT → Float4, DOUBLE → Float8
+/// - NULL → Null (clients normally signal NULL via the bitmap instead)
+/// - DECIMAL/NEWDECIMAL → Numeric (length-encoded decimal string)
+/// - VARCHAR/VAR_STRING/STRING and the BLOB family → String when valid
+///   UTF-8, Bytes otherwise (string params are routinely tagged BLOB by
+///   client libraries, so a strict Bytes mapping would break text equality)
+/// - DATE → Date; DATETIME/TIMESTAMP → Timestamp (UTC);
+///   TIME → Time (day-spanning / negative TIME becomes Interval)
+/// - JSON → Json, BIT → Int8 for ≤ 8 bytes (big-endian), Bytes otherwise
+// SAFETY: every fixed-width read is guarded by a `remaining()` check.
+#[allow(clippy::indexing_slicing)]
+fn decode_binary_param(payload: &mut Bytes, mysql_type: u8, unsigned: bool) -> Result<Value> {
+    const TYPE_DECIMAL: u8 = 0x00;
+    const TYPE_TINY: u8 = 0x01;
+    const TYPE_SHORT: u8 = 0x02;
+    const TYPE_LONG: u8 = 0x03;
+    const TYPE_FLOAT: u8 = 0x04;
+    const TYPE_DOUBLE: u8 = 0x05;
+    const TYPE_NULL: u8 = 0x06;
+    const TYPE_TIMESTAMP: u8 = 0x07;
+    const TYPE_LONGLONG: u8 = 0x08;
+    const TYPE_INT24: u8 = 0x09;
+    const TYPE_DATE: u8 = 0x0a;
+    const TYPE_TIME: u8 = 0x0b;
+    const TYPE_DATETIME: u8 = 0x0c;
+    const TYPE_YEAR: u8 = 0x0d;
+    const TYPE_VARCHAR: u8 = 0x0f;
+    const TYPE_BIT: u8 = 0x10;
+    const TYPE_JSON: u8 = 0xf5;
+    const TYPE_NEWDECIMAL: u8 = 0xf6;
+    const TYPE_TINY_BLOB: u8 = 0xf9;
+    const TYPE_MEDIUM_BLOB: u8 = 0xfa;
+    const TYPE_LONG_BLOB: u8 = 0xfb;
+    const TYPE_BLOB: u8 = 0xfc;
+    const TYPE_VAR_STRING: u8 = 0xfd;
+    const TYPE_STRING: u8 = 0xfe;
+
+    fn need(payload: &Bytes, n: usize, what: &str) -> Result<()> {
+        if payload.remaining() < n {
+            return Err(MySqlError::Protocol(format!(
+                "COM_STMT_EXECUTE truncated in {what} parameter"
+            )));
+        }
+        Ok(())
+    }
+
+    match mysql_type {
+        TYPE_NULL => Ok(Value::Null),
+        TYPE_TINY => {
+            need(payload, 1, "TINY")?;
+            let b = payload.get_u8();
+            Ok(Value::Int2(if unsigned { b as i16 } else { b as i8 as i16 }))
+        }
+        TYPE_SHORT | TYPE_YEAR => {
+            need(payload, 2, "SHORT")?;
+            let v = payload.get_u16_le();
+            if unsigned {
+                Ok(Value::Int4(v as i32))
+            } else {
+                Ok(Value::Int2(v as i16))
+            }
+        }
+        TYPE_LONG | TYPE_INT24 => {
+            need(payload, 4, "LONG")?;
+            let v = payload.get_u32_le();
+            if unsigned {
+                Ok(Value::Int8(v as i64))
+            } else {
+                Ok(Value::Int4(v as i32))
+            }
+        }
+        TYPE_LONGLONG => {
+            need(payload, 8, "LONGLONG")?;
+            let v = payload.get_u64_le();
+            if unsigned && v > i64::MAX as u64 {
+                // No unsigned 64-bit container — preserve the value as an
+                // arbitrary-precision numeric instead of wrapping negative.
+                Ok(Value::Numeric(v.to_string()))
+            } else {
+                Ok(Value::Int8(v as i64))
+            }
+        }
+        TYPE_FLOAT => {
+            need(payload, 4, "FLOAT")?;
+            Ok(Value::Float4(payload.get_f32_le()))
+        }
+        TYPE_DOUBLE => {
+            need(payload, 8, "DOUBLE")?;
+            Ok(Value::Float8(payload.get_f64_le()))
+        }
+        TYPE_DECIMAL | TYPE_NEWDECIMAL => {
+            let bytes = read_lenenc_bytes(payload)?;
+            let s = String::from_utf8(bytes)
+                .map_err(|_| MySqlError::Protocol("DECIMAL parameter is not valid UTF-8".into()))?;
+            Ok(Value::Numeric(s))
+        }
+        TYPE_JSON => {
+            let bytes = read_lenenc_bytes(payload)?;
+            let s = String::from_utf8(bytes)
+                .map_err(|_| MySqlError::Protocol("JSON parameter is not valid UTF-8".into()))?;
+            Ok(Value::Json(s))
+        }
+        TYPE_BIT => {
+            let bytes = read_lenenc_bytes(payload)?;
+            if bytes.len() <= 8 {
+                let mut v: u64 = 0;
+                for b in &bytes {
+                    v = (v << 8) | u64::from(*b);
+                }
+                Ok(Value::Int8(v as i64))
+            } else {
+                Ok(Value::Bytes(bytes))
+            }
+        }
+        TYPE_VARCHAR | TYPE_VAR_STRING | TYPE_STRING | TYPE_TINY_BLOB | TYPE_MEDIUM_BLOB | TYPE_LONG_BLOB
+        | TYPE_BLOB => {
+            let bytes = read_lenenc_bytes(payload)?;
+            match String::from_utf8(bytes) {
+                Ok(s) => Ok(Value::String(s)),
+                Err(e) => Ok(Value::Bytes(e.into_bytes())),
+            }
+        }
+        TYPE_DATE | TYPE_DATETIME | TYPE_TIMESTAMP => {
+            need(payload, 1, "DATE/DATETIME length byte of")?;
+            let len = payload.get_u8() as usize;
+            need(payload, len, "DATE/DATETIME body of")?;
+            if len == 0 {
+                // MySQL zero-date — Nano has no zero-date; closest is NULL.
+                return Ok(Value::Null);
+            }
+            if len < 4 {
+                return Err(MySqlError::Protocol("Invalid binary DATE length".into()));
+            }
+            let year = payload.get_u16_le() as i32;
+            let month = payload.get_u8() as u32;
+            let day = payload.get_u8() as u32;
+            let date = chrono::NaiveDate::from_ymd_opt(year, month, day)
+                .ok_or_else(|| MySqlError::Protocol("Invalid binary DATE value".into()))?;
+            if mysql_type == TYPE_DATE && len == 4 {
+                return Ok(Value::Date(date));
+            }
+            let (hour, min, sec) = if len >= 7 {
+                (payload.get_u8() as u32, payload.get_u8() as u32, payload.get_u8() as u32)
+            } else {
+                (0, 0, 0)
+            };
+            let micros = if len >= 11 { payload.get_u32_le() } else { 0 };
+            let time = chrono::NaiveTime::from_hms_micro_opt(hour, min, sec, micros)
+                .ok_or_else(|| MySqlError::Protocol("Invalid binary DATETIME time".into()))?;
+            let ndt = chrono::NaiveDateTime::new(date, time);
+            if mysql_type == TYPE_DATE {
+                // DATE wire value with time payload — truncate to the date.
+                Ok(Value::Date(date))
+            } else {
+                Ok(Value::Timestamp(chrono::DateTime::from_naive_utc_and_offset(
+                    ndt,
+                    chrono::Utc,
+                )))
+            }
+        }
+        TYPE_TIME => {
+            need(payload, 1, "TIME length byte of")?;
+            let len = payload.get_u8() as usize;
+            need(payload, len, "TIME body of")?;
+            if len == 0 {
+                return Ok(Value::Time(chrono::NaiveTime::MIN));
+            }
+            if len < 8 {
+                return Err(MySqlError::Protocol("Invalid binary TIME length".into()));
+            }
+            let negative = payload.get_u8() != 0;
+            let days = payload.get_u32_le() as i64;
+            let hour = payload.get_u8() as i64;
+            let min = payload.get_u8() as i64;
+            let sec = payload.get_u8() as i64;
+            let micros = if len >= 12 { payload.get_u32_le() as i64 } else { 0 };
+            if !negative && days == 0 {
+                let time =
+                    chrono::NaiveTime::from_hms_micro_opt(hour as u32, min as u32, sec as u32, micros as u32)
+                        .ok_or_else(|| MySqlError::Protocol("Invalid binary TIME value".into()))?;
+                Ok(Value::Time(time))
+            } else {
+                // MySQL TIME spans -838h..838h — beyond a time-of-day.
+                // Represent day-spanning / negative values as an interval.
+                let total =
+                    (((days * 24 + hour) * 60 + min) * 60 + sec) * 1_000_000 + micros;
+                Ok(Value::Interval(if negative { -total } else { total }))
+            }
+        }
+        other => Err(MySqlError::Protocol(format!(
+            "Unsupported binary parameter type: 0x{other:02x}"
+        ))),
+    }
 }
 
 // ============================================================================
@@ -2336,14 +2608,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
         let stmt_id = self.next_stmt_id;
         self.next_stmt_id += 1;
 
-        let num_params = sql.matches('?').count() as u16;
+        // Quote-aware placeholder scan: `?` inside string literals or quoted
+        // identifiers must not count as a parameter (and the `$N` rewrite
+        // must skip it).
+        let (param_sql, num_params) = convert_qmark_placeholders(&sql);
 
         self.prepared_statements.insert(
             stmt_id,
             PreparedStatement {
                 id: stmt_id,
                 sql,
+                param_sql,
                 num_params,
+                param_types: Vec::new(),
             },
         );
 
@@ -2386,10 +2663,140 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
 
         debug!("COM_STMT_EXECUTE: id={} sql={}", stmt_id, stmt.sql);
 
-        // For a full implementation we would parse the null-bitmap and
-        // parameter values here.  For now, route through COM_QUERY logic.
-        let sql_bytes = Bytes::from(stmt.sql.clone());
-        self.handle_com_query(sql_bytes).await
+        // ---- Binary-protocol parameter section (C6 / R5.W4) ----
+        // Layout (when num_params > 0):
+        //   NULL bitmap   : (num_params + 7) / 8 bytes, bit i = param i NULL
+        //   new-params    : 1 byte; 1 = type pairs follow, 0 = reuse previous
+        //   [type pairs]  : num_params × (type u8, flags u8 — 0x80 = unsigned)
+        //   values        : binary-encoded, non-NULL params only, in order
+        let num_params = stmt.num_params as usize;
+        let params: Vec<Value> = if num_params > 0 {
+            let bitmap_len = num_params.div_ceil(8);
+            if payload.remaining() < bitmap_len + 1 {
+                return Err(MySqlError::Protocol(
+                    "COM_STMT_EXECUTE truncated before NULL bitmap".into(),
+                ));
+            }
+            let null_bitmap = payload.copy_to_bytes(bitmap_len);
+            let new_params_bound = payload.get_u8();
+
+            let types: Vec<(u8, bool)> = if new_params_bound == 1 {
+                if payload.remaining() < num_params * 2 {
+                    return Err(MySqlError::Protocol(
+                        "COM_STMT_EXECUTE truncated in parameter type pairs".into(),
+                    ));
+                }
+                let mut types = Vec::with_capacity(num_params);
+                for _ in 0..num_params {
+                    let ty = payload.get_u8();
+                    let flags = payload.get_u8();
+                    types.push((ty, flags & 0x80 != 0));
+                }
+                // Persist for subsequent executes (new-params-bound = 0)
+                if let Some(entry) = self.prepared_statements.get_mut(&stmt_id) {
+                    entry.param_types = types.clone();
+                }
+                types
+            } else {
+                if stmt.param_types.len() != num_params {
+                    return Err(MySqlError::Protocol(
+                        "COM_STMT_EXECUTE: new-params-bound = 0 but no parameter types are cached".into(),
+                    ));
+                }
+                stmt.param_types.clone()
+            };
+
+            let mut params = Vec::with_capacity(num_params);
+            for (i, &(ty, unsigned)) in types.iter().enumerate() {
+                let null_byte = null_bitmap.get(i / 8).copied().unwrap_or(0);
+                if null_byte & (1 << (i % 8)) != 0 {
+                    params.push(Value::Null);
+                } else {
+                    params.push(decode_binary_param(&mut payload, ty, unsigned)?);
+                }
+            }
+            params
+        } else {
+            Vec::new()
+        };
+
+        let trimmed = stmt.param_sql.trim();
+        let is_row_returning = starts_with_icase(trimmed, "SELECT")
+            || starts_with_icase(trimmed, "WITH")
+            || starts_with_icase(trimmed, "VALUES")
+            || starts_with_icase(trimmed, "TABLE ");
+
+        // Statements the text dispatcher intercepts before reaching the
+        // engine (SHOW / SET / BEGIN / @@vars / FOUND_ROWS() / …) keep the
+        // COM_QUERY replay route when they carry no parameters. Engine-bound
+        // SELECTs go through the binary result-set path below so
+        // binary-protocol clients receive protocol-correct rows.
+        let needs_text_dispatch = !is_row_returning || {
+            let upper = trimmed.to_uppercase();
+            upper.contains("@@")
+                || upper.contains("FOUND_ROWS()")
+                || upper.contains("LAST_INSERT_ID()")
+                || upper.contains("VERSION()")
+                || upper.contains("INFORMATION_SCHEMA")
+        };
+
+        if params.is_empty() && needs_text_dispatch {
+            let sql_bytes = Bytes::from(stmt.sql.clone());
+            return self.handle_com_query(sql_bytes).await;
+        }
+
+        if is_row_returning {
+            // Note: an intercepted shape (@@vars etc.) that nevertheless
+            // carries parameters cannot use the text replay path without
+            // dropping its params (the C6 bug), so it also lands here and
+            // surfaces whatever the engine says.
+            match self
+                .database
+                .query_params_with_columns_for_session(self.session_id, trimmed, &params)
+            {
+                Ok((rows, columns)) => {
+                    self.last_row_count = rows.len() as u64;
+                    self.send_binary_result_set(&columns, &rows).await
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    let (code, state) = map_error_code(&msg);
+                    self.send_error(code, state, &msg).await
+                }
+            }
+        } else {
+            // DML / DDL with bound parameters
+            let is_insert = starts_with_icase(trimmed, "INSERT");
+            let table_name = if is_insert {
+                Self::extract_insert_table(trimmed)
+            } else {
+                None
+            };
+            match self
+                .database
+                .execute_params_for_session(self.session_id, trimmed, &params)
+            {
+                Ok(affected) => {
+                    let mut insert_id = 0;
+                    if is_insert && affected > 0 {
+                        if let Some(ref tbl) = table_name {
+                            let id = self.query_last_serial_id(tbl);
+                            if id > 0 {
+                                insert_id = id;
+                                self.last_insert_id = id;
+                            }
+                        }
+                    }
+                    self.last_row_count = affected;
+                    self.send_ok(affected, insert_id).await
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    let (code, state) = map_error_code(&msg);
+                    self.send_error(code, state, &msg).await
+                }
+            }
+        }
     }
 
     fn handle_stmt_close(&mut self, mut payload: Bytes) {
@@ -2487,6 +2894,81 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
         self.write_pkt(&p).await
     }
 
+    /// Encode and send a full **binary-protocol** result set
+    /// (COM_STMT_EXECUTE responses must use binary row encoding — text rows
+    /// after a prepared execute corrupt libmysqlclient / Connector family
+    /// decoders).
+    async fn send_binary_result_set(&mut self, columns: &[String], rows: &[Tuple]) -> Result<()> {
+        let ncols = columns.len();
+
+        // 1. Column count
+        {
+            let mut buf = BytesMut::new();
+            write_lenenc_int(&mut buf, ncols as u64);
+            self.write_pkt(&buf).await?;
+        }
+
+        // 2. Column definitions — same inference as the text path so both
+        // protocols advertise identical metadata. The inferred type also
+        // dictates each column's binary value encoding below.
+        let mut col_types = Vec::with_capacity(ncols);
+        for (i, col_name) in columns.iter().enumerate() {
+            let col_type = rows
+                .iter()
+                .filter_map(|r| r.values.get(i))
+                .find(|v| !matches!(v, Value::Null))
+                .map(ColumnType::from_value)
+                .unwrap_or(ColumnType::VarString);
+            col_types.push(col_type);
+            self.send_column_def(col_name, col_type).await?;
+        }
+
+        // 3. EOF after column defs (unless CLIENT_DEPRECATE_EOF)
+        if !self.capabilities.has(CapabilityFlags::CLIENT_DEPRECATE_EOF) {
+            self.send_eof().await?;
+        }
+
+        // 4. Binary row data
+        for row in rows {
+            self.send_binary_result_row(row, &col_types).await?;
+        }
+
+        // 5. Closing EOF / OK
+        if self.capabilities.has(CapabilityFlags::CLIENT_DEPRECATE_EOF) {
+            self.send_ok(0, 0).await
+        } else {
+            self.send_eof().await
+        }
+    }
+
+    /// Encode one binary-protocol result row:
+    /// `0x00` header, NULL bitmap (offset 2), then non-NULL values encoded
+    /// per the column type advertised in the column definitions.
+    // SAFETY: bitmap indices are bounded by the pre-sized bitmap region.
+    #[allow(clippy::indexing_slicing)]
+    async fn send_binary_result_row(&mut self, row: &Tuple, col_types: &[ColumnType]) -> Result<()> {
+        let ncols = col_types.len();
+        let mut p = BytesMut::new();
+        p.put_u8(0x00); // binary row header
+
+        // NULL bitmap with bit offset 2 (protocol-mandated for result rows)
+        let bitmap_len = (ncols + 7 + 2) / 8;
+        let bitmap_start = p.len();
+        p.resize(bitmap_start + bitmap_len, 0);
+
+        for (i, col_type) in col_types.iter().enumerate() {
+            let val = row.values.get(i).unwrap_or(&Value::Null);
+            if matches!(val, Value::Null) {
+                let pos = i + 2;
+                p[bitmap_start + pos / 8] |= 1 << (pos % 8);
+            } else {
+                put_binary_value(&mut p, *col_type, val);
+            }
+        }
+
+        self.write_pkt(&p).await
+    }
+
     // ------------------------------------------------------------------
     // OK / ERR / EOF packets
     // ------------------------------------------------------------------
@@ -2546,6 +3028,104 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
 /// MySQL text protocol sends everything as length-encoded strings (except
 /// NULL which uses the 0xFB sentinel).  This is analogous to the PG
 /// handler's `send_data_row_direct`.
+/// Best-effort signed-integer view of a value (binary row encoding).
+fn value_as_i64(v: &Value) -> i64 {
+    match v {
+        Value::Boolean(b) => i64::from(*b),
+        Value::Int2(i) => i64::from(*i),
+        Value::Int4(i) => i64::from(*i),
+        Value::Int8(i) => *i,
+        Value::Float4(f) => *f as i64,
+        Value::Float8(f) => *f as i64,
+        Value::Numeric(s) | Value::String(s) => s.parse::<i64>().unwrap_or(0),
+        Value::DictRef { dict_id } => i64::from(*dict_id),
+        _ => 0,
+    }
+}
+
+/// Best-effort float view of a value (binary row encoding).
+fn value_as_f64(v: &Value) -> f64 {
+    match v {
+        Value::Boolean(b) => f64::from(*b),
+        Value::Int2(i) => f64::from(*i),
+        Value::Int4(i) => f64::from(*i),
+        Value::Int8(i) => *i as f64,
+        Value::Float4(f) => f64::from(*f),
+        Value::Float8(f) => *f,
+        Value::Numeric(s) | Value::String(s) => s.parse::<f64>().unwrap_or(0.0),
+        _ => 0.0,
+    }
+}
+
+/// Encode one non-NULL value for a binary-protocol result row, following the
+/// column type advertised in the column definition packet (clients decode
+/// strictly by that type, so the encoding here must match it byte-for-byte).
+fn put_binary_value(p: &mut BytesMut, col_type: ColumnType, val: &Value) {
+    match col_type {
+        ColumnType::Tiny => p.put_i8(value_as_i64(val) as i8),
+        ColumnType::Short | ColumnType::Year => p.put_i16_le(value_as_i64(val) as i16),
+        ColumnType::Long | ColumnType::Int24 => p.put_i32_le(value_as_i64(val) as i32),
+        ColumnType::LongLong => p.put_i64_le(value_as_i64(val)),
+        ColumnType::Float => p.put_f32_le(value_as_f64(val) as f32),
+        ColumnType::Double => p.put_f64_le(value_as_f64(val)),
+        ColumnType::Date => {
+            // length 4: year u16le, month u8, day u8
+            if let Value::Date(d) = val {
+                use chrono::Datelike;
+                p.put_u8(4);
+                p.put_u16_le(d.year() as u16);
+                p.put_u8(d.month() as u8);
+                p.put_u8(d.day() as u8);
+            } else {
+                p.put_u8(0); // zero-date for non-date values in a DATE column
+            }
+        }
+        ColumnType::Timestamp | ColumnType::DateTime => {
+            if let Value::Timestamp(ts) = val {
+                use chrono::{Datelike, Timelike};
+                let ndt = ts.naive_utc();
+                let micros = (ndt.nanosecond() % 1_000_000_000) / 1000;
+                p.put_u8(if micros > 0 { 11 } else { 7 });
+                p.put_u16_le(ndt.year() as u16);
+                p.put_u8(ndt.month() as u8);
+                p.put_u8(ndt.day() as u8);
+                p.put_u8(ndt.hour() as u8);
+                p.put_u8(ndt.minute() as u8);
+                p.put_u8(ndt.second() as u8);
+                if micros > 0 {
+                    p.put_u32_le(micros);
+                }
+            } else {
+                p.put_u8(0);
+            }
+        }
+        ColumnType::Time => {
+            if let Value::Time(t) = val {
+                use chrono::Timelike;
+                let micros = (t.nanosecond() % 1_000_000_000) / 1000;
+                p.put_u8(if micros > 0 { 12 } else { 8 });
+                p.put_u8(0); // not negative
+                p.put_u32_le(0); // days
+                p.put_u8(t.hour() as u8);
+                p.put_u8(t.minute() as u8);
+                p.put_u8(t.second() as u8);
+                if micros > 0 {
+                    p.put_u32_le(micros);
+                }
+            } else {
+                p.put_u8(0);
+            }
+        }
+        // Everything else (VarString / String / Blob / NewDecimal / Json /
+        // Bit / VarChar / Decimal / Null) travels as a length-encoded string
+        // of the same text form the text protocol uses.
+        _ => {
+            let s = value_to_mysql_string(val);
+            write_lenenc_str(p, &s);
+        }
+    }
+}
+
 fn value_to_mysql_string(v: &Value) -> String {
     match v {
         Value::Null => String::new(), // Should not be called for NULL (handled above)

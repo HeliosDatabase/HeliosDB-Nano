@@ -55,12 +55,23 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
         // catalog emulator so Describe returns the right
         // RowDescription. Otherwise fall through to plan-based
         // derivation + the AST-based fallback.
-        let catalog_schema = self
-            .catalog
-            .handle_query(&query)
-            .ok()
-            .flatten()
-            .map(|(schema, _)| schema);
+        // R5.W2: this Parse-time probe doubles as the cached
+        // is-catalog-query decision, so Execute no longer re-runs the
+        // ~31-pattern catalog scan (nor `substitute_parameters`, which only
+        // existed to feed it) on every Execute of an engine query. The
+        // decision keys off table references (`pg_catalog.` /
+        // `information_schema.` / `version()` …), which parameter
+        // substitution cannot change — if anything, deciding on the
+        // unsubstituted text is safer, since a parameter *value* containing
+        // "pg_catalog." can no longer flip an engine query into the
+        // catalog dispatcher.
+        let (is_catalog, catalog_schema) = match self.catalog.handle_query(&query) {
+            Ok(Some((schema, _rows))) => (Some(true), Some(schema)),
+            Ok(None) => (Some(false), None),
+            // Probe failed — leave the decision open; Execute keeps the
+            // legacy per-Execute scan for this statement.
+            Err(_) => (None, None),
+        };
         let result_schema = if let Some(s) = catalog_schema {
             Some(s)
         } else {
@@ -86,7 +97,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
             query: query.clone(),
             param_types: inferred_param_types,
             result_schema,
-            cached_plan: None, // Plan will be parsed and cached on first execute
+            cached_plan: None, // Populated at first Execute (R5.W2)
+            cached_plan_epoch: 0,
+            is_catalog,
         };
 
         // Store in prepared statement manager
@@ -231,11 +244,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
         // form ONLY for the catalog dispatcher (which is regex-based
         // and predates parameters), and route everything else through
         // `query_params` / `execute_params_returning` / `execute_params`.
-        let substituted_for_catalog = if param_values.is_empty() {
-            statement.query.clone()
-        } else {
-            substitute_parameters(&statement.query, &param_values)?
-        };
+        // R5.W2: the is-catalog decision was made once at Parse. For engine
+        // queries (`Some(false)`) both the substitution and the catalog scan
+        // are skipped on every Execute; for catalog queries (and undecided
+        // legacy statements) the substituted text is still rebuilt per
+        // Execute because the catalog handlers extract WHERE filters from
+        // the query text, which depends on the bound values.
+        let maybe_catalog = statement.is_catalog != Some(false);
 
         tracing::debug!("Executing query: {} (params: {})", statement.query, param_values.len());
 
@@ -258,27 +273,43 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
             // Execute; without this route, every driver gets a
             // spurious `Table 'pg_catalog.pg_type' does not exist`.
             // Catalog is regex-driven and doesn't speak parameters, so
-            // it sees the substituted form.
-            if let Some(catalog_result) = self.catalog.handle_query(&substituted_for_catalog)? {
-                // Mark the portal complete and emit DataRows + CommandComplete
-                // directly against the catalog-emulated result.
-                self.prepared_statements
-                    .update_portal_state(&portal_name, PortalState::Complete)?;
-                for row in &catalog_result.1 {
-                    let values = super::handler::tuple_to_pg_values_with_formats(row, &portal.result_formats);
-                    self.send_message(BackendMessage::DataRow { values }).await?;
+            // it sees the substituted form. Skipped entirely when Parse
+            // already decided this is an engine query (R5.W2).
+            if maybe_catalog {
+                let substituted_for_catalog = if param_values.is_empty() {
+                    statement.query.clone()
+                } else {
+                    substitute_parameters(&statement.query, &param_values)?
+                };
+                if let Some(catalog_result) = self.catalog.handle_query(&substituted_for_catalog)? {
+                    // Mark the portal complete and emit DataRows + CommandComplete
+                    // directly against the catalog-emulated result.
+                    self.prepared_statements
+                        .update_portal_state(&portal_name, PortalState::Complete)?;
+                    self.send_data_rows_with_formats(&catalog_result.1, &portal.result_formats)
+                        .await?;
+                    let tag = format!("SELECT {}", catalog_result.1.len());
+                    self.send_command_complete(&tag).await?;
+                    return Ok(());
                 }
-                let tag = format!("SELECT {}", catalog_result.1.len());
-                self.send_command_complete(&tag).await?;
-                return Ok(());
             }
 
             // SELECT query — pass parameters to the planner via
             // `query_params` so values stay value-shaped instead of
-            // being spliced back into SQL.
-            let results = self
-                .database
-                .query_params_for_session(self.session_id, &statement.query, &param_values)?;
+            // being spliced back into SQL. The pinned plan (populated at
+            // first Execute, revalidated against the plan-cache epoch)
+            // skips the per-Execute plan-cache lookup (R5.W2).
+            let results = match self.pinned_plan_for(&statement) {
+                Some(plan) => self.database.query_params_for_session_with_plan(
+                    self.session_id,
+                    &statement.query,
+                    &param_values,
+                    &plan,
+                )?,
+                None => self
+                    .database
+                    .query_params_for_session(self.session_id, &statement.query, &param_values)?,
+            };
 
             // Handle max_rows limit
             let results_to_send = if max_rows > 0 {
@@ -308,11 +339,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
             // In extended protocol, RowDescription was already sent during Describe.
             // Execute only sends DataRows and CommandComplete.
 
-            // Send DataRows
-            for row in &results_to_send {
-                let values = super::handler::tuple_to_pg_values_with_formats(row, &portal.result_formats);
-                self.send_message(BackendMessage::DataRow { values }).await?;
-            }
+            // Send DataRows — direct encoder for text formats (R5.W1),
+            // legacy per-row conversion when binary formats are requested.
+            self.send_data_rows_with_formats(&results_to_send, &portal.result_formats)
+                .await?;
 
             // Send CommandComplete
             let tag = format!("SELECT {}", results_to_send.len());
@@ -338,10 +368,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
                     .update_portal_state(&portal_name, PortalState::Complete)?;
                 // RowDescription was already sent during Describe; Execute
                 // only emits DataRows + CommandComplete.
-                for row in &tuples {
-                    let values = super::handler::tuple_to_pg_values_with_formats(row, &portal.result_formats);
-                    self.send_message(BackendMessage::DataRow { values }).await?;
-                }
+                self.send_data_rows_with_formats(&tuples, &portal.result_formats)
+                    .await?;
                 let tag = if is_insert {
                     format!("INSERT 0 {}", affected)
                 } else if is_update {
@@ -354,9 +382,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
             }
 
             // Non-SELECT query — params-aware execution.
-            let affected = self
-                .database
-                .execute_params_for_session(self.session_id, &statement.query, &param_values)?;
+            let affected = match self.pinned_plan_for(&statement) {
+                Some(plan) => self.database.execute_params_for_session_with_plan(
+                    self.session_id,
+                    &statement.query,
+                    &param_values,
+                    &plan,
+                )?,
+                None => self
+                    .database
+                    .execute_params_for_session(self.session_id, &statement.query, &param_values)?,
+            };
             let tag = self.get_command_tag(&statement.query, affected);
             self.send_command_complete(&tag).await?;
 
@@ -366,6 +402,30 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
         }
 
         Ok(())
+    }
+
+    /// Plan pinning for prepared statements (R5.W2): reuse the statement's
+    /// cached `Arc<LogicalPlan>` while the engine's plan-cache epoch is
+    /// unchanged; on first Execute (or after DDL cleared the plan cache)
+    /// fetch the plan once and store it back on the statement. The plan is
+    /// the unmodified `parameterized_plan_cached` output — no extra
+    /// optimizer passes (W3 is out of scope; DML must keep the 3.37.3
+    /// index-probe behavior). Returns `None` when planning fails so the
+    /// caller falls back to the legacy path, which either surfaces the real
+    /// error or handles shapes that don't pre-plan (e.g. code-graph
+    /// rewrites, SHOW BRANCHES).
+    fn pinned_plan_for(&self, statement: &PreparedStatement) -> Option<std::sync::Arc<crate::sql::LogicalPlan>> {
+        let current_epoch = self.database.wire_plan_epoch();
+        if let Some(plan) = &statement.cached_plan {
+            if statement.cached_plan_epoch == current_epoch {
+                return Some(std::sync::Arc::clone(plan));
+            }
+        }
+        let (plan, epoch) = self.database.wire_parameterized_plan(&statement.query).ok()?;
+        let _ = self
+            .prepared_statements
+            .set_cached_plan(&statement.name, std::sync::Arc::clone(&plan), epoch);
+        Some(plan)
     }
 
     /// Handle Describe message (extended protocol) with full implementation
