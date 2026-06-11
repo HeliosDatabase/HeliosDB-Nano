@@ -119,7 +119,7 @@ group_by (16.14x Nano); full table in the script output.
   covering rowid lookup.
 - `order_by_limit10` (top-N) is the worst large-N loss (0.08x): 175 ms vs
   13.7 ms per query over 200k rows. SQLite scans+heaps in C; Nano's top-N at
-  this scale appears to fully sort/materialize. Optimization target.
+Diagnosed post-publication: top-N scales linearly with N (O(N log k) is engaged); the deficit is row-decode SCAN RATE (~1.6M rows/s vs SQLite's ~15M on this shape) — the known row-materialization gap, addressed by the typed-batch roadmap item (R3.4). Optimization target.
 
 ## Honest notes
 
