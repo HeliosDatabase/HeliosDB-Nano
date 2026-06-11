@@ -522,7 +522,8 @@ impl<'a> Executor<'a> {
         limit: usize,
         offset: usize,
     ) -> Result<Option<Box<dyn PhysicalOperator>>> {
-        if limit == usize::MAX || self.transaction.is_some() {
+        // R2.3: transaction check is per-table once the scan target is known.
+        if limit == usize::MAX || self.txn_forces_slow_reads() {
             return Ok(None);
         }
         let Some(storage) = self.storage else {
@@ -541,6 +542,9 @@ impl<'a> Executor<'a> {
         }
 
         if let Some(spec) = self.direct_topk_project_spec(sort_input, sort_exprs)? {
+            if self.txn_forces_slow_reads_for_table(&spec.table_name) {
+                return Ok(None);
+            }
             let tuples = if let Some(tuples) = storage.scan_table_topk_projected_columns(
                 &spec.table_name,
                 &spec.scan_schema,
@@ -597,7 +601,8 @@ impl<'a> Executor<'a> {
     ) -> Result<Option<Box<dyn PhysicalOperator>>> {
         use crate::sql::{BinaryOperator, LogicalExpr};
 
-        if limit == usize::MAX || self.transaction.is_some() {
+        // R2.3: transaction check is per-table once the scan target is known.
+        if limit == usize::MAX || self.txn_forces_slow_reads() {
             return Ok(None);
         }
         let Some(storage) = self.storage else {
@@ -649,6 +654,12 @@ impl<'a> Executor<'a> {
         let Some((table_name, scan_schema)) = self.direct_topk_scan_schema(sort_input)? else {
             return Ok(None);
         };
+        // R2.3: kNN out of the HNSW index is allowed inside a transaction only
+        // for ReadCommitted session txns with no staged writes on this table
+        // (HNSW, like ART, only reflects this txn's writes at commit).
+        if self.txn_forces_slow_reads_for_table(&table_name) {
+            return Ok(None);
+        }
 
         // Identify which operand is the indexed column and which is the query
         // vector. pgvector writes `col <=> $1`, but `$1 <=> col` is equally
@@ -1498,7 +1509,8 @@ impl<'a> Executor<'a> {
         use crate::sql::logical_plan::AggregateFunction;
         use crate::sql::LogicalExpr;
 
-        if !group_by.is_empty() || having.is_some() || aggr_exprs.len() != 1 || self.transaction.is_some() {
+        // R2.3: transaction check is per-table once the scan target is known.
+        if !group_by.is_empty() || having.is_some() || aggr_exprs.len() != 1 || self.txn_forces_slow_reads() {
             return Ok(None);
         }
         let storage = match self.storage {
@@ -1527,7 +1539,7 @@ impl<'a> Executor<'a> {
         let Some((table_name, schema, predicate, as_of)) = Self::columnar_aggregate_input(input) else {
             return Ok(None);
         };
-        if as_of.is_some() || self.get_cte(table_name).is_some() {
+        if as_of.is_some() || self.get_cte(table_name).is_some() || self.txn_forces_slow_reads_for_table(table_name) {
             return Ok(None);
         }
 
@@ -1542,6 +1554,11 @@ impl<'a> Executor<'a> {
         }
 
         let count_table_name = self.fast_path_storage_table_name(table_name)?;
+        // R2.3: `table_name` may be a materialized view resolved to its
+        // backing data table — staged writes are attributed to the latter.
+        if self.txn_forces_slow_reads_for_table(&count_table_name) {
+            return Ok(None);
+        }
         let count = match predicate {
             None => storage.count_table_rows(&count_table_name)?,
             Some(predicate) => match self.count_single_pk_predicate(table_name, schema, pk_col, predicate)? {
@@ -1656,6 +1673,33 @@ impl<'a> Executor<'a> {
         }
     }
 
+    /// R2.3 item 2: apply HAVING as a post-filter over the (small) output of
+    /// an aggregate pushdown, mirroring the slow path in
+    /// `AggregateOperator::new` exactly: aggregate calls are rewritten to
+    /// `agg_{i}` column references and groups whose predicate doesn't
+    /// evaluate to `Boolean(true)` are dropped (including evaluation errors —
+    /// identical semantics in and out of transactions).
+    fn apply_having_post_filter(
+        &mut self,
+        tuples: Vec<crate::Tuple>,
+        output_schema: &Arc<Schema>,
+        having: &Option<crate::sql::LogicalExpr>,
+        aggr_exprs: &[crate::sql::LogicalExpr],
+    ) -> Result<Vec<crate::Tuple>> {
+        let Some(having_expr) = having else {
+            return Ok(tuples);
+        };
+        // Same pre-step the slow path performs before AggregateOperator::new:
+        // (sub)queries in HAVING must be materialized or every group drops.
+        let having_expr = self.materialize_subqueries(having_expr)?;
+        let rewritten = AggregateOperator::rewrite_having_expr(&having_expr, aggr_exprs);
+        let evaluator = crate::sql::Evaluator::new(output_schema.clone());
+        Ok(tuples
+            .into_iter()
+            .filter(|tuple| matches!(evaluator.evaluate(&rewritten, tuple), Ok(crate::Value::Boolean(true))))
+            .collect())
+    }
+
     fn try_columnar_aggregate(
         &mut self,
         input: &LogicalPlan,
@@ -1663,7 +1707,9 @@ impl<'a> Executor<'a> {
         aggr_exprs: &[crate::sql::LogicalExpr],
         having: &Option<crate::sql::LogicalExpr>,
     ) -> Result<Option<Box<dyn PhysicalOperator>>> {
-        if having.is_some() || self.transaction.is_some() {
+        // R2.3: HAVING is handled as a post-filter; the transaction check is
+        // per-table once the scan target is known.
+        if self.txn_forces_slow_reads() {
             return Ok(None);
         }
         let storage = match self.storage {
@@ -1677,7 +1723,7 @@ impl<'a> Executor<'a> {
         let Some((table_name, schema, predicate, as_of)) = Self::columnar_aggregate_input(input) else {
             return Ok(None);
         };
-        if as_of.is_some() || self.get_cte(table_name).is_some() {
+        if as_of.is_some() || self.get_cte(table_name).is_some() || self.txn_forces_slow_reads_for_table(table_name) {
             return Ok(None);
         }
 
@@ -1731,6 +1777,11 @@ impl<'a> Executor<'a> {
         }
 
         let storage_table_name = self.fast_path_storage_table_name(table_name)?;
+        // R2.3: `table_name` may be a materialized view resolved to its
+        // backing data table — staged writes are attributed to the latter.
+        if self.txn_forces_slow_reads_for_table(&storage_table_name) {
+            return Ok(None);
+        }
         let tuples = storage.aggregate_columnar_columns(
             &storage_table_name,
             schema,
@@ -1739,6 +1790,7 @@ impl<'a> Executor<'a> {
             &analyzed_predicates,
         )?;
         let output_schema = AggregateOperator::output_schema(group_by, aggr_exprs, schema);
+        let tuples = self.apply_having_post_filter(tuples, &output_schema, having, aggr_exprs)?;
         Ok(Some(Box::new(MaterializedOperator::new(tuples, output_schema))))
     }
 
@@ -1749,7 +1801,9 @@ impl<'a> Executor<'a> {
         aggr_exprs: &[crate::sql::LogicalExpr],
         having: &Option<crate::sql::LogicalExpr>,
     ) -> Result<Option<Box<dyn PhysicalOperator>>> {
-        if having.is_some() || self.transaction.is_some() {
+        // R2.3: HAVING is handled as a post-filter; the transaction check is
+        // per-table once the scan target is known.
+        if self.txn_forces_slow_reads() {
             return Ok(None);
         }
         let storage = match self.storage {
@@ -1763,7 +1817,7 @@ impl<'a> Executor<'a> {
         let Some((table_name, schema, predicate, as_of)) = Self::columnar_aggregate_input(input) else {
             return Ok(None);
         };
-        if as_of.is_some() || self.get_cte(table_name).is_some() {
+        if as_of.is_some() || self.get_cte(table_name).is_some() || self.txn_forces_slow_reads_for_table(table_name) {
             return Ok(None);
         }
 
@@ -1818,6 +1872,11 @@ impl<'a> Executor<'a> {
         }
 
         let storage_table_name = self.fast_path_storage_table_name(table_name)?;
+        // R2.3: `table_name` may be a materialized view resolved to its
+        // backing data table — staged writes are attributed to the latter.
+        if self.txn_forces_slow_reads_for_table(&storage_table_name) {
+            return Ok(None);
+        }
         let Some(tuples) = storage.try_aggregate_row_columns(
             &storage_table_name,
             schema,
@@ -1829,6 +1888,7 @@ impl<'a> Executor<'a> {
             return Ok(None);
         };
         let output_schema = AggregateOperator::output_schema(group_by, aggr_exprs, schema);
+        let tuples = self.apply_having_post_filter(tuples, &output_schema, having, aggr_exprs)?;
         Ok(Some(Box::new(MaterializedOperator::new(tuples, output_schema))))
     }
 
@@ -2017,7 +2077,8 @@ impl<'a> Executor<'a> {
         if self.storage.is_none() {
             return Ok(None);
         }
-        if self.transaction.is_some() {
+        // R2.3: transaction check is per-table once the scan target is known.
+        if self.txn_forces_slow_reads() {
             return Ok(None);
         }
 
@@ -2044,7 +2105,7 @@ impl<'a> Executor<'a> {
             } => (table_name, schema, predicate, as_of),
             _ => return Ok(None),
         };
-        if as_of.is_some() || self.get_cte(table_name).is_some() {
+        if as_of.is_some() || self.get_cte(table_name).is_some() || self.txn_forces_slow_reads_for_table(table_name) {
             return Ok(None);
         }
 
@@ -3110,6 +3171,50 @@ impl<'a> Executor<'a> {
     /// Get transaction context (for submodules)
     pub(crate) fn transaction(&self) -> Option<&'a crate::storage::Transaction> {
         self.transaction
+    }
+
+    /// R2.3: is the attached transaction's snapshot guaranteed to be as fresh
+    /// as current storage at statement start?
+    ///
+    /// True only for **ReadCommitted session transactions**: every session
+    /// statement path (`touch_session_for_statement`, the inline refresh in
+    /// `query_in_session` / `execute_in_session`) calls
+    /// `Transaction::refresh_snapshot` before executing, and the v3.39
+    /// conflict-registry snapshot barrier guarantees the refreshed snapshot's
+    /// data is fully applied — so an index probe / pushdown against CURRENT
+    /// storage returns the same committed state the snapshot read would.
+    ///
+    /// Everything else stays on the slow path:
+    /// - RepeatableRead/Serializable keep their BEGIN snapshot; current
+    ///   storage may contain later commits, which a pushdown would leak
+    ///   (documented R2.3 decision: no cheap no-commit-since-snapshot proof,
+    ///   so RR/Serializable always bail).
+    /// - Embedded global-slot transactions (`session_id() == None`) are
+    ///   nominally ReadCommitted but never refresh per statement, so their
+    ///   de-facto snapshot reads must not be widened to current storage.
+    fn txn_snapshot_is_statement_fresh(txn: &crate::storage::Transaction) -> bool {
+        txn.isolation_level() == crate::session::IsolationLevel::ReadCommitted && txn.session_id().is_some()
+    }
+
+    /// R2.3 coarse fast-path gate, for sites that haven't resolved the target
+    /// table yet: true when an attached transaction rules out index probes
+    /// and pushdowns regardless of which table the query reads.
+    pub(crate) fn txn_forces_slow_reads(&self) -> bool {
+        self.transaction
+            .is_some_and(|txn| !Self::txn_snapshot_is_statement_fresh(txn))
+    }
+
+    /// R2.3 per-table fast-path gate: true when reads of `table` must take
+    /// the slow Volcano + write-set-merge path because of the attached
+    /// transaction. That is the case when the snapshot freshness argument of
+    /// [`txn_snapshot_is_statement_fresh`] doesn't hold, or when the
+    /// transaction has staged writes touching `table` (read-your-writes must
+    /// come from the write set / insert_log — index and base storage only
+    /// reflect them at commit).
+    pub(crate) fn txn_forces_slow_reads_for_table(&self, table: &str) -> bool {
+        self.transaction.is_some_and(|txn| {
+            !Self::txn_snapshot_is_statement_fresh(txn) || txn.has_writes_for_table(table)
+        })
     }
 }
 
