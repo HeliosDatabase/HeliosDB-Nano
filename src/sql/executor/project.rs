@@ -78,6 +78,12 @@ impl ProjectOperator {
         // Create evaluator with input schema and parameters
         let evaluator = crate::sql::Evaluator::with_parameters(input_schema, parameters);
 
+        // R3.5 item 1: bind column refs to positional indices once. Must run
+        // AFTER type inference and direct-index extraction above (both
+        // pattern-match on `LogicalExpr::Column`).
+        let exprs: Vec<crate::sql::LogicalExpr> = exprs.into_iter().map(|e| evaluator.bind(e)).collect();
+        let distinct_on = distinct_on.map(|exprs| exprs.into_iter().map(|e| evaluator.bind(e)).collect::<Vec<_>>());
+
         Self {
             input,
             exprs,

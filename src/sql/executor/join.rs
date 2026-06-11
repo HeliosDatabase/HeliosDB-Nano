@@ -753,6 +753,9 @@ fn collect_join_input_expr_columns_inner(
         | LogicalExpr::Exists { .. }
         | LogicalExpr::NewRow { .. }
         | LogicalExpr::OldRow { .. } => None,
+        // Physical-only node (R3.5): never present in plan expressions, which
+        // is what this collector walks. Fall back to the old path if seen.
+        LogicalExpr::BoundColumn { .. } => None,
     }
 }
 

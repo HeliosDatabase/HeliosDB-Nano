@@ -1159,6 +1159,25 @@ pub enum LogicalExpr {
         /// Window frame specification
         frame: Option<WindowFrame>,
     },
+
+    /// Column reference pre-resolved to a tuple position (R3.5 item 1).
+    ///
+    /// Produced only by [`crate::sql::Evaluator::bind`] at *physical operator
+    /// construction* time — never by the planner or optimizer, and never
+    /// persisted. Replaces the per-row linear schema scan that a plain
+    /// [`LogicalExpr::Column`] costs with a direct `tuple.get(index)`.
+    ///
+    /// NOTE: must stay the LAST variant — `LogicalExpr` is bincode-serialized
+    /// in persisted artifacts (view definitions, column defaults) and bincode
+    /// encodes enums by variant index.
+    BoundColumn {
+        /// Resolved positional index into the operator's input tuples
+        index: usize,
+        /// Original optional table qualifier (kept for error messages)
+        table: Option<String>,
+        /// Original column name (kept for error messages)
+        name: String,
+    },
 }
 
 /// Window function type

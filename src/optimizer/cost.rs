@@ -462,7 +462,7 @@ impl CostEstimator {
     /// Estimate expression complexity (for cost calculation)
     fn estimate_expr_complexity(expr: &LogicalExpr) -> f64 {
         match expr {
-            LogicalExpr::Column { .. } | LogicalExpr::Literal(_) => 1.0,
+            LogicalExpr::Column { .. } | LogicalExpr::BoundColumn { .. } | LogicalExpr::Literal(_) => 1.0,
             LogicalExpr::BinaryExpr { left, right, .. } => {
                 2.0 + Self::estimate_expr_complexity(left) + Self::estimate_expr_complexity(right)
             }

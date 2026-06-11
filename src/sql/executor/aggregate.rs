@@ -929,6 +929,9 @@ impl SortOperator {
         // Without them the key evaluates to an error for every row and the sort
         // becomes a no-op — silently unsorted output. See NANO-DEFICIENCIES A17.
         let evaluator = crate::sql::Evaluator::with_parameters(schema.clone(), parameters);
+        // R3.5 item 1: resolve sort-key column refs to positional indices once
+        // instead of a per-comparison linear schema scan.
+        let exprs: Vec<crate::sql::LogicalExpr> = exprs.into_iter().map(|e| evaluator.bind(e)).collect();
 
         // Collect all tuples from input (with timeout checking)
         let mut tuples = Vec::new();
