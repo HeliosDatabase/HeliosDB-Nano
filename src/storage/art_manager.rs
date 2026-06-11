@@ -17,7 +17,42 @@ use crate::{DataType, Schema, Tuple, Value};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
+
+/// Shared handle to a single ART index tree.
+///
+/// Callers must keep the read/write lock scope as tight as possible and must
+/// follow the locking rules documented on [`ArtIndexManager`].
+pub type SharedArtIndex = Arc<RwLock<AdaptiveRadixTree>>;
+
+/// A registered index: per-registration metadata plus the shared tree handle.
+///
+/// The metadata mirrors the immutable identity fields inside the tree
+/// (`table`, `columns`, `index_type`) so hot paths can answer "which indexes
+/// belong to this table?" without taking any tree lock. The metadata is only
+/// mutated while holding the global `indexes` WRITE lock (table rename).
+#[derive(Debug, Clone)]
+struct IndexEntry {
+    /// Table this index belongs to (mirrors `tree.table()`).
+    table: String,
+    /// Indexed columns (mirrors `tree.columns()`).
+    columns: Vec<String>,
+    /// Index kind (mirrors `tree.index_type()`).
+    index_type: ArtIndexType,
+    /// The actual tree, individually locked.
+    tree: SharedArtIndex,
+}
+
+impl IndexEntry {
+    fn new(tree: AdaptiveRadixTree) -> Self {
+        Self {
+            table: tree.table().to_string(),
+            columns: tree.columns().to_vec(),
+            index_type: tree.index_type(),
+            tree: Arc::new(RwLock::new(tree)),
+        }
+    }
+}
 
 /// Metadata about a foreign key constraint
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -123,10 +158,37 @@ impl AtomicArtManagerStats {
 /// ART Index Manager
 ///
 /// Thread-safe manager for all ART indexes in the database.
+///
+/// # Locking rules (deadlock safety)
+///
+/// Each index tree carries its own `RwLock` (see [`SharedArtIndex`]) so that
+/// writers on one table no longer block readers/writers on unrelated tables.
+///
+/// 1. The global `indexes` map lock is taken as READ on all DML/lookup paths
+///    (concurrent across tables). It is taken as WRITE only for registry
+///    changes: create, drop, and rename.
+/// 2. Lock order is strictly `global map lock -> (at most one) tree lock`.
+///    A tree lock may be acquired while holding the global lock, but the
+///    global lock must NEVER be acquired while holding a tree lock.
+/// 3. INVARIANT: never hold two tree locks simultaneously. Iteration loops
+///    (`on_insert*`, `on_delete*`, constraint checks, `clear_table_indexes`)
+///    lock one tree, release it, then lock the next. In particular, the FK
+///    existence check (`check_fk_constraints` / `unique_key_exists` reading
+///    another table's PK index) acquires the referenced tree's lock only
+///    while holding no other tree lock. Because no thread ever waits on a
+///    tree lock while holding another tree lock, no lock-cycle (deadlock)
+///    can form regardless of table/FK topology.
+/// 4. The name maps (`pk_indexes`, `fk_indexes`, `fk_info`, `unique_indexes`)
+///    are leaf locks: clone the names you need and release them before
+///    taking the global map lock or any tree lock.
+/// 5. Per-table filtering uses the metadata cached in [`IndexEntry`]
+///    (no tree lock needed). The per-table name maps do not cover Manual
+///    (plain secondary) indexes, so iteration loops filter the entry map by
+///    `entry.table` instead of relying on those maps.
 #[derive(Debug)]
 pub struct ArtIndexManager {
     /// All indexes by name
-    indexes: RwLock<HashMap<String, AdaptiveRadixTree>>,
+    indexes: RwLock<HashMap<String, IndexEntry>>,
     /// Primary key index name by table
     pk_indexes: RwLock<HashMap<String, String>>,
     /// Foreign key indexes by table (table -> list of FK index names)
@@ -209,7 +271,7 @@ impl ArtIndexManager {
         // Register the index
         {
             let mut indexes = self.indexes.write().unwrap_or_else(|e| e.into_inner());
-            indexes.insert(index_name.clone(), index);
+            indexes.insert(index_name.clone(), IndexEntry::new(index));
         }
 
         {
@@ -262,7 +324,7 @@ impl ArtIndexManager {
         // Register everything
         {
             let mut indexes = self.indexes.write().unwrap_or_else(|e| e.into_inner());
-            indexes.insert(index_name.clone(), index);
+            indexes.insert(index_name.clone(), IndexEntry::new(index));
         }
 
         {
@@ -308,7 +370,7 @@ impl ArtIndexManager {
         // Register the index
         {
             let mut indexes = self.indexes.write().unwrap_or_else(|e| e.into_inner());
-            indexes.insert(index_name.clone(), index);
+            indexes.insert(index_name.clone(), IndexEntry::new(index));
         }
 
         {
@@ -340,7 +402,7 @@ impl ArtIndexManager {
         // Register the index
         {
             let mut indexes = self.indexes.write().unwrap_or_else(|e| e.into_inner());
-            indexes.insert(name.to_string(), index);
+            indexes.insert(name.to_string(), IndexEntry::new(index));
         }
 
         self.stats.add_index(ArtIndexType::Manual);
@@ -354,17 +416,22 @@ impl ArtIndexManager {
     /// table insert maintenance path would also touch PK/UNIQUE indexes and hit
     /// duplicates for rows that were already present before CREATE INDEX.
     pub fn backfill_manual_index(&self, name: &str, schema: &Schema, tuples: &[Tuple]) -> ArtResult<usize> {
-        let mut indexes = self.indexes.write().unwrap_or_else(|e| e.into_inner());
-        let index = indexes
-            .get_mut(name)
-            .ok_or_else(|| ArtIndexError::IndexNotFound(name.to_string()))?;
-        if index.index_type() != ArtIndexType::Manual {
+        // Global READ is enough: the registry is not changed, only one tree.
+        let entry = {
+            let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
+            indexes
+                .get(name)
+                .cloned()
+                .ok_or_else(|| ArtIndexError::IndexNotFound(name.to_string()))?
+        };
+        if entry.index_type != ArtIndexType::Manual {
             return Err(ArtIndexError::Internal(format!(
                 "Index '{}' is not a manual secondary index",
                 name
             )));
         }
 
+        let mut index = entry.tree.write().unwrap_or_else(|e| e.into_inner());
         let mut inserted = 0usize;
         for tuple in tuples {
             let Some(row_id) = tuple.row_id else {
@@ -373,7 +440,7 @@ impl ArtIndexManager {
                     name
                 )));
             };
-            if let Some(values) = Self::index_value_refs_from_tuple(index.columns(), schema, tuple) {
+            if let Some(values) = Self::index_value_refs_from_tuple(&entry.columns, schema, tuple) {
                 let key = Self::encode_key_from_values(values.iter().copied());
                 index.insert(&key, row_id)?;
                 inserted += 1;
@@ -394,8 +461,8 @@ impl ArtIndexManager {
         // Remove from main index map
         {
             let mut indexes = self.indexes.write().unwrap_or_else(|e| e.into_inner());
-            if let Some(idx) = indexes.remove(name) {
-                index_type = idx.index_type();
+            if let Some(entry) = indexes.remove(name) {
+                index_type = entry.index_type;
             } else {
                 return Err(ArtIndexError::IndexNotFound(name.to_string()));
             }
@@ -435,11 +502,11 @@ impl ArtIndexManager {
     pub fn drop_table_indexes(&self, table: &str) -> ArtResult<()> {
         let mut to_drop = Vec::new();
 
-        // Collect all indexes for this table
+        // Collect all indexes for this table (metadata only, no tree locks)
         {
             let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
-            for (name, idx) in indexes.iter() {
-                if idx.table() == table {
+            for (name, entry) in indexes.iter() {
+                if entry.table == table {
                     to_drop.push(name.clone());
                 }
             }
@@ -455,37 +522,41 @@ impl ArtIndexManager {
 
     /// Rename all indexes for a table (called on RENAME TABLE)
     pub fn rename_table_indexes(&self, old_table: &str, new_table: &str) -> ArtResult<()> {
-        // Collect indexes to rename
-        let mut renames: Vec<(String, String, AdaptiveRadixTree)> = Vec::new();
+        // Move the entries under the global WRITE lock. Trees are renamed in
+        // place (one tree lock at a time, see locking rules) — no tree clone.
+        let mut renames: Vec<(String, String)> = Vec::new();
 
         {
-            let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
-            for (name, idx) in indexes.iter() {
-                if idx.table() == old_table {
-                    // Generate new index name by replacing table name
-                    let new_name = name
-                        .replace(&format!("_{}_", old_table), &format!("_{}_", new_table))
-                        .replace(&format!("pk_{}", old_table), &format!("pk_{}", new_table))
-                        .replace(&format!("fk_{}", old_table), &format!("fk_{}", new_table))
-                        .replace(&format!("unique_{}", old_table), &format!("unique_{}", new_table));
+            let mut indexes = self.indexes.write().unwrap_or_else(|e| e.into_inner());
 
-                    // Clone and rename the index
-                    let mut new_idx = idx.clone();
-                    new_idx.rename(new_table.to_string(), new_name.clone());
-                    renames.push((name.clone(), new_name, new_idx));
+            let matching: Vec<String> = indexes
+                .iter()
+                .filter(|(_, entry)| entry.table == old_table)
+                .map(|(name, _)| name.clone())
+                .collect();
+
+            for old_name in matching {
+                // Generate new index name by replacing table name
+                let new_name = old_name
+                    .replace(&format!("_{}_", old_table), &format!("_{}_", new_table))
+                    .replace(&format!("pk_{}", old_table), &format!("pk_{}", new_table))
+                    .replace(&format!("fk_{}", old_table), &format!("fk_{}", new_table))
+                    .replace(&format!("unique_{}", old_table), &format!("unique_{}", new_table));
+
+                if let Some(mut entry) = indexes.remove(&old_name) {
+                    {
+                        let mut tree = entry.tree.write().unwrap_or_else(|e| e.into_inner());
+                        tree.rename(new_table.to_string(), new_name.clone());
+                    }
+                    entry.table = new_table.to_string();
+                    indexes.insert(new_name.clone(), entry);
+                    renames.push((old_name, new_name));
                 }
             }
         }
 
-        // Apply renames
-        for (old_name, new_name, new_idx) in renames {
-            // Remove old index
-            {
-                let mut indexes = self.indexes.write().unwrap_or_else(|e| e.into_inner());
-                indexes.remove(&old_name);
-                indexes.insert(new_name.clone(), new_idx);
-            }
-
+        // Apply name-map updates (leaf locks, taken one at a time)
+        for (old_name, new_name) in renames {
             // Update pk_indexes mapping
             {
                 let mut pk_indexes = self.pk_indexes.write().unwrap_or_else(|e| e.into_inner());
@@ -529,14 +600,17 @@ impl ArtIndexManager {
     // INDEX ACCESS
     // =========================================================================
 
-    /// Get a reference to an index by name
-    pub fn get_index(&self, name: &str) -> Option<AdaptiveRadixTree> {
+    /// Get a shared handle to an index by name.
+    ///
+    /// Returns an `Arc<RwLock<…>>` handle instead of cloning the whole tree.
+    /// Keep the lock scope on the returned handle as tight as possible.
+    pub fn get_index(&self, name: &str) -> Option<SharedArtIndex> {
         let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
-        indexes.get(name).cloned()
+        indexes.get(name).map(|entry| Arc::clone(&entry.tree))
     }
 
     /// Get the primary key index for a table
-    pub fn get_pk_index(&self, table: &str) -> Option<AdaptiveRadixTree> {
+    pub fn get_pk_index(&self, table: &str) -> Option<SharedArtIndex> {
         let pk_name = {
             let pk_indexes = self.pk_indexes.read().unwrap_or_else(|e| e.into_inner());
             pk_indexes.get(table).cloned()
@@ -546,7 +620,7 @@ impl ArtIndexManager {
     }
 
     /// Get all foreign key indexes for a table
-    pub fn get_fk_indexes(&self, table: &str) -> Vec<AdaptiveRadixTree> {
+    pub fn get_fk_indexes(&self, table: &str) -> Vec<SharedArtIndex> {
         let fk_names = {
             let fk_indexes = self.fk_indexes.read().unwrap_or_else(|e| e.into_inner());
             fk_indexes.get(table).cloned().unwrap_or_default()
@@ -556,7 +630,7 @@ impl ArtIndexManager {
     }
 
     /// Get all unique indexes for a table
-    pub fn get_unique_indexes(&self, table: &str) -> Vec<AdaptiveRadixTree> {
+    pub fn get_unique_indexes(&self, table: &str) -> Vec<SharedArtIndex> {
         let unique_names = {
             let unique_indexes = self.unique_indexes.read().unwrap_or_else(|e| e.into_inner());
             unique_indexes.get(table).cloned().unwrap_or_default()
@@ -575,13 +649,13 @@ impl ArtIndexManager {
     pub fn list_indexes(&self) -> Vec<(String, String, ArtIndexType, Vec<String>)> {
         let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
         indexes
-            .values()
-            .map(|idx| {
+            .iter()
+            .map(|(name, entry)| {
                 (
-                    idx.name().to_string(),
-                    idx.table().to_string(),
-                    idx.index_type(),
-                    idx.columns().to_vec(),
+                    name.clone(),
+                    entry.table.clone(),
+                    entry.index_type,
+                    entry.columns.clone(),
                 )
             })
             .collect()
@@ -590,11 +664,11 @@ impl ArtIndexManager {
     /// Find an index for a specific column in a table (returns index name if found)
     pub fn find_column_index(&self, table: &str, column: &str) -> Option<String> {
         let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
-        for idx in indexes.values() {
-            if idx.table() == table && idx.columns().len() == 1 {
-                if let Some(col) = idx.columns().first() {
+        for (name, entry) in indexes.iter() {
+            if entry.table == table && entry.columns.len() == 1 {
+                if let Some(col) = entry.columns.first() {
                     if col == column {
-                        return Some(idx.name().to_string());
+                        return Some(name.clone());
                     }
                 }
             }
@@ -605,8 +679,9 @@ impl ArtIndexManager {
     /// Look up all row_ids for a key in a named index (avoids cloning the entire tree)
     pub fn index_get_all(&self, index_name: &str, key: &[u8]) -> Vec<RowId> {
         let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
-        if let Some(idx) = indexes.get(index_name) {
-            idx.get_all(key)
+        if let Some(entry) = indexes.get(index_name) {
+            let tree = entry.tree.read().unwrap_or_else(|e| e.into_inner());
+            tree.get_all(key)
         } else {
             Vec::new()
         }
@@ -620,7 +695,10 @@ impl ArtIndexManager {
         };
         pk_name.and_then(|name| {
             let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
-            indexes.get(&name).and_then(|idx| idx.get(key))
+            indexes.get(&name).and_then(|entry| {
+                let tree = entry.tree.read().unwrap_or_else(|e| e.into_inner());
+                tree.get(key)
+            })
         })
     }
 
@@ -632,7 +710,10 @@ impl ArtIndexManager {
         };
         pk_name.map(|name| {
             let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
-            indexes.get(&name).is_some_and(|idx| idx.contains(key))
+            indexes.get(&name).is_some_and(|entry| {
+                let tree = entry.tree.read().unwrap_or_else(|e| e.into_inner());
+                tree.contains(key)
+            })
         })
     }
 
@@ -646,7 +727,10 @@ impl ArtIndexManager {
             pk_indexes.get(table).cloned()
         }?;
         let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
-        indexes.get(&pk_name).map(|idx| idx.len() as usize)
+        indexes.get(&pk_name).map(|entry| {
+            let tree = entry.tree.read().unwrap_or_else(|e| e.into_inner());
+            tree.len() as usize
+        })
     }
 
     /// Return true when the table has exactly one ART index: a single-column
@@ -656,9 +740,9 @@ impl ArtIndexManager {
         let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
         let mut pk_count = 0usize;
 
-        for index in indexes.values().filter(|idx| idx.table() == table) {
-            match index.index_type() {
-                ArtIndexType::PrimaryKey if index.columns().len() == 1 => {
+        for entry in indexes.values().filter(|entry| entry.table == table) {
+            match entry.index_type {
+                ArtIndexType::PrimaryKey if entry.columns.len() == 1 => {
                     pk_count += 1;
                 }
                 _ => return false,
@@ -689,10 +773,11 @@ impl ArtIndexManager {
             pk_indexes.get(table).cloned()
         }?;
         let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
-        let index = indexes.get(&pk_name)?;
-        if index.columns().len() != 1 {
+        let entry = indexes.get(&pk_name)?;
+        if entry.columns.len() != 1 {
             return None;
         }
+        let index = entry.tree.read().unwrap_or_else(|e| e.into_inner());
         if let Some(count) = index.dense_int_count(key_width, lower, upper) {
             return Some(count);
         }
@@ -730,9 +815,9 @@ impl ArtIndexManager {
     pub fn list_table_indexes(&self, table: &str) -> Vec<(String, ArtIndexType, Vec<String>)> {
         let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
         indexes
-            .values()
-            .filter(|idx| idx.table() == table)
-            .map(|idx| (idx.name().to_string(), idx.index_type(), idx.columns().to_vec()))
+            .iter()
+            .filter(|(_, entry)| entry.table == table)
+            .map(|(name, entry)| (name.clone(), entry.index_type, entry.columns.clone()))
             .collect()
     }
 
@@ -817,13 +902,17 @@ impl ArtIndexManager {
             }
         }
 
-        let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
-        let pk_indexes = self.pk_indexes.read().unwrap_or_else(|e| e.into_inner());
+        let pk_name = {
+            let pk_indexes = self.pk_indexes.read().unwrap_or_else(|e| e.into_inner());
+            pk_indexes.get(table).cloned()
+        };
 
-        if let Some(pk_name) = pk_indexes.get(table) {
-            if let Some(index) = indexes.get(pk_name) {
+        if let Some(pk_name) = pk_name {
+            let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(entry) = indexes.get(&pk_name) {
                 let key = Self::encode_key(key_values);
-                if index.contains(&key) {
+                let tree = entry.tree.read().unwrap_or_else(|e| e.into_inner());
+                if tree.contains(&key) {
                     return Err(ArtIndexError::DuplicateKey(format!(
                         "Duplicate key value violates PRIMARY KEY constraint \"{}\"",
                         pk_name
@@ -842,74 +931,79 @@ impl ArtIndexManager {
     /// Also checks the PRIMARY KEY index (which is stored separately from
     /// UNIQUE indexes) so that a single call covers both constraint kinds.
     pub fn check_unique_constraints(&self, table: &str, column_values: &HashMap<String, Value>) -> ArtResult<()> {
+        // Resolve names from the leaf maps first (released before tree locks).
+        let pk_name = {
+            let pk_indexes = self.pk_indexes.read().unwrap_or_else(|e| e.into_inner());
+            pk_indexes.get(table).cloned()
+        };
+        let unique_names: Vec<String> = {
+            let unique_indexes = self.unique_indexes.read().unwrap_or_else(|e| e.into_inner());
+            unique_indexes.get(table).cloned().unwrap_or_default()
+        };
+
         let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
 
         // --- Check PK index (stored separately in pk_indexes) ---
-        {
-            let pk_indexes = self.pk_indexes.read().unwrap_or_else(|e| e.into_inner());
-            if let Some(pk_name) = pk_indexes.get(table) {
-                if let Some(pk_index) = indexes.get(pk_name) {
-                    let columns = pk_index.columns();
-                    let mut has_null = false;
-                    let mut values = Vec::new();
+        if let Some(pk_name) = pk_name {
+            if let Some(entry) = indexes.get(&pk_name) {
+                let columns = &entry.columns;
+                let mut has_null = false;
+                let mut values = Vec::new();
 
-                    for col in columns {
-                        if let Some(v) = column_values.get(col) {
-                            if matches!(v, Value::Null) {
-                                has_null = true;
-                                break;
-                            }
-                            values.push(v.clone());
+                for col in columns {
+                    if let Some(v) = column_values.get(col) {
+                        if matches!(v, Value::Null) {
+                            has_null = true;
+                            break;
                         }
+                        values.push(v.clone());
                     }
+                }
 
-                    if !has_null && values.len() == columns.len() {
-                        let key = Self::encode_key(&values);
-                        if pk_index.contains(&key) {
-                            return Err(ArtIndexError::DuplicateKey(format!(
-                                "Duplicate key value violates PRIMARY KEY constraint \"{}\"",
-                                pk_name
-                            )));
-                        }
+                if !has_null && values.len() == columns.len() {
+                    let key = Self::encode_key(&values);
+                    let tree = entry.tree.read().unwrap_or_else(|e| e.into_inner());
+                    if tree.contains(&key) {
+                        return Err(ArtIndexError::DuplicateKey(format!(
+                            "Duplicate key value violates PRIMARY KEY constraint \"{}\"",
+                            pk_name
+                        )));
                     }
                 }
             }
         }
 
-        // --- Check UNIQUE indexes ---
-        let unique_indexes = self.unique_indexes.read().unwrap_or_else(|e| e.into_inner());
+        // --- Check UNIQUE indexes (one tree lock at a time) ---
+        for unique_name in &unique_names {
+            if let Some(entry) = indexes.get(unique_name) {
+                // Extract values for this unique constraint's columns
+                let columns = &entry.columns;
+                let mut has_null = false;
+                let mut values = Vec::new();
 
-        if let Some(unique_names) = unique_indexes.get(table) {
-            for unique_name in unique_names {
-                if let Some(index) = indexes.get(unique_name) {
-                    // Extract values for this unique constraint's columns
-                    let columns = index.columns();
-                    let mut has_null = false;
-                    let mut values = Vec::new();
-
-                    for col in columns {
-                        if let Some(v) = column_values.get(col) {
-                            if matches!(v, Value::Null) {
-                                has_null = true;
-                                break;
-                            }
-                            values.push(v.clone());
+                for col in columns {
+                    if let Some(v) = column_values.get(col) {
+                        if matches!(v, Value::Null) {
+                            has_null = true;
+                            break;
                         }
+                        values.push(v.clone());
                     }
+                }
 
-                    // NULL values are allowed in UNIQUE constraints
-                    if has_null {
-                        continue;
-                    }
+                // NULL values are allowed in UNIQUE constraints
+                if has_null {
+                    continue;
+                }
 
-                    if values.len() == columns.len() {
-                        let key = Self::encode_key(&values);
-                        if index.contains(&key) {
-                            return Err(ArtIndexError::DuplicateKey(format!(
-                                "Duplicate key value violates UNIQUE constraint \"{}\"",
-                                unique_name
-                            )));
-                        }
+                if values.len() == columns.len() {
+                    let key = Self::encode_key(&values);
+                    let tree = entry.tree.read().unwrap_or_else(|e| e.into_inner());
+                    if tree.contains(&key) {
+                        return Err(ArtIndexError::DuplicateKey(format!(
+                            "Duplicate key value violates UNIQUE constraint \"{}\"",
+                            unique_name
+                        )));
                     }
                 }
             }
@@ -925,42 +1019,48 @@ impl ArtIndexManager {
     /// This avoids building a column-name map for every inserted row when the
     /// values are already available in schema order.
     pub fn check_unique_constraints_tuple(&self, table: &str, schema: &Schema, tuple: &Tuple) -> ArtResult<()> {
+        // Resolve names from the leaf maps first (released before tree locks).
+        let pk_name = {
+            let pk_indexes = self.pk_indexes.read().unwrap_or_else(|e| e.into_inner());
+            pk_indexes.get(table).cloned()
+        };
+        let unique_names: Vec<String> = {
+            let unique_indexes = self.unique_indexes.read().unwrap_or_else(|e| e.into_inner());
+            unique_indexes.get(table).cloned().unwrap_or_default()
+        };
+
         let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
 
-        {
-            let pk_indexes = self.pk_indexes.read().unwrap_or_else(|e| e.into_inner());
-            if let Some(pk_name) = pk_indexes.get(table) {
-                if let Some(pk_index) = indexes.get(pk_name) {
-                    if let Some(values) = Self::index_value_refs_from_tuple(pk_index.columns(), schema, tuple) {
-                        if !values.iter().any(|v| matches!(**v, Value::Null)) {
-                            let key = Self::encode_key_from_values(values.iter().copied());
-                            if pk_index.contains(&key) {
-                                return Err(ArtIndexError::DuplicateKey(format!(
-                                    "Duplicate key value violates PRIMARY KEY constraint \"{}\"",
-                                    pk_name
-                                )));
-                            }
+        if let Some(pk_name) = pk_name {
+            if let Some(entry) = indexes.get(&pk_name) {
+                if let Some(values) = Self::index_value_refs_from_tuple(&entry.columns, schema, tuple) {
+                    if !values.iter().any(|v| matches!(**v, Value::Null)) {
+                        let key = Self::encode_key_from_values(values.iter().copied());
+                        let tree = entry.tree.read().unwrap_or_else(|e| e.into_inner());
+                        if tree.contains(&key) {
+                            return Err(ArtIndexError::DuplicateKey(format!(
+                                "Duplicate key value violates PRIMARY KEY constraint \"{}\"",
+                                pk_name
+                            )));
                         }
                     }
                 }
             }
         }
 
-        let unique_indexes = self.unique_indexes.read().unwrap_or_else(|e| e.into_inner());
-        if let Some(unique_names) = unique_indexes.get(table) {
-            for unique_name in unique_names {
-                if let Some(index) = indexes.get(unique_name) {
-                    if let Some(values) = Self::index_value_refs_from_tuple(index.columns(), schema, tuple) {
-                        if values.iter().any(|v| matches!(**v, Value::Null)) {
-                            continue;
-                        }
-                        let key = Self::encode_key_from_values(values.iter().copied());
-                        if index.contains(&key) {
-                            return Err(ArtIndexError::DuplicateKey(format!(
-                                "Duplicate key value violates UNIQUE constraint \"{}\"",
-                                unique_name
-                            )));
-                        }
+        for unique_name in &unique_names {
+            if let Some(entry) = indexes.get(unique_name) {
+                if let Some(values) = Self::index_value_refs_from_tuple(&entry.columns, schema, tuple) {
+                    if values.iter().any(|v| matches!(**v, Value::Null)) {
+                        continue;
+                    }
+                    let key = Self::encode_key_from_values(values.iter().copied());
+                    let tree = entry.tree.read().unwrap_or_else(|e| e.into_inner());
+                    if tree.contains(&key) {
+                        return Err(ArtIndexError::DuplicateKey(format!(
+                            "Duplicate key value violates UNIQUE constraint \"{}\"",
+                            unique_name
+                        )));
                     }
                 }
             }
@@ -976,57 +1076,82 @@ impl ArtIndexManager {
         let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
         let key = Self::encode_key(values);
 
-        indexes.values().any(|index| {
-            index.table() == table
-                && matches!(index.index_type(), ArtIndexType::PrimaryKey | ArtIndexType::Unique)
-                && index.columns() == columns
-                && index.contains(&key)
+        // Metadata filter first; tree locks taken one at a time.
+        indexes.values().any(|entry| {
+            entry.table == table
+                && matches!(entry.index_type, ArtIndexType::PrimaryKey | ArtIndexType::Unique)
+                && entry.columns == columns
+                && {
+                    let tree = entry.tree.read().unwrap_or_else(|e| e.into_inner());
+                    tree.contains(&key)
+                }
         })
     }
 
     /// Check foreign key constraint before INSERT/UPDATE
+    ///
+    /// Deadlock safety: the referenced table's PK tree lock is the ONLY tree
+    /// lock this function ever holds, and it is released before the next FK
+    /// is checked. Leaf name maps are snapshotted up front and released
+    /// before any tree lock is taken.
     pub fn check_fk_constraints(&self, table: &str, column_values: &HashMap<String, Value>) -> ArtResult<()> {
-        let fk_indexes = self.fk_indexes.read().unwrap_or_else(|e| e.into_inner());
-        let fk_info_map = self.fk_info.read().unwrap_or_else(|e| e.into_inner());
-        let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
+        // Snapshot FK metadata from the leaf maps (released before tree locks).
+        let fk_names: Vec<String> = {
+            let fk_indexes = self.fk_indexes.read().unwrap_or_else(|e| e.into_inner());
+            fk_indexes.get(table).cloned().unwrap_or_default()
+        };
 
-        if let Some(fk_names) = fk_indexes.get(table) {
-            for fk_name in fk_names {
-                if let Some(fk_info) = fk_info_map.get(fk_name) {
-                    // Extract values for FK columns
-                    let mut values = Vec::new();
-                    let mut has_null = false;
+        if !fk_names.is_empty() {
+            let fk_infos: Vec<ForeignKeyInfo> = {
+                let fk_info_map = self.fk_info.read().unwrap_or_else(|e| e.into_inner());
+                fk_names
+                    .iter()
+                    .filter_map(|name| fk_info_map.get(name).cloned())
+                    .collect()
+            };
 
-                    for col in &fk_info.columns {
-                        if let Some(v) = column_values.get(col) {
-                            if matches!(v, Value::Null) {
-                                has_null = true;
-                                break;
-                            }
-                            values.push(v.clone());
+            for fk_info in &fk_infos {
+                // Extract values for FK columns
+                let mut values = Vec::new();
+                let mut has_null = false;
+
+                for col in &fk_info.columns {
+                    if let Some(v) = column_values.get(col) {
+                        if matches!(v, Value::Null) {
+                            has_null = true;
+                            break;
                         }
+                        values.push(v.clone());
                     }
+                }
 
-                    // NULL values in FK columns are allowed (no reference check)
-                    if has_null {
-                        continue;
-                    }
+                // NULL values in FK columns are allowed (no reference check)
+                if has_null {
+                    continue;
+                }
 
-                    // Check if referenced row exists in parent table's PK index
-                    let ref_table = &fk_info.ref_table;
+                // Check if referenced row exists in parent table's PK index
+                let ref_table = &fk_info.ref_table;
+                let ref_pk_name = {
                     let pk_indexes = self.pk_indexes.read().unwrap_or_else(|e| e.into_inner());
+                    pk_indexes.get(ref_table).cloned()
+                };
 
-                    if let Some(ref_pk_name) = pk_indexes.get(ref_table) {
-                        if let Some(ref_index) = indexes.get(ref_pk_name) {
+                if let Some(ref_pk_name) = ref_pk_name {
+                    let contains = {
+                        let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
+                        indexes.get(&ref_pk_name).map(|entry| {
                             let key = Self::encode_key(&values);
-                            if !ref_index.contains(&key) {
-                                self.stats.violations_caught.fetch_add(1, Ordering::Relaxed);
-                                return Err(ArtIndexError::ForeignKeyViolation(format!(
-                                    "Key ({:?}) not present in table \"{}\"",
-                                    values, ref_table
-                                )));
-                            }
-                        }
+                            let tree = entry.tree.read().unwrap_or_else(|e| e.into_inner());
+                            tree.contains(&key)
+                        })
+                    };
+                    if contains == Some(false) {
+                        self.stats.violations_caught.fetch_add(1, Ordering::Relaxed);
+                        return Err(ArtIndexError::ForeignKeyViolation(format!(
+                            "Key ({:?}) not present in table \"{}\"",
+                            values, ref_table
+                        )));
                     }
                 }
             }
@@ -1042,31 +1167,35 @@ impl ArtIndexManager {
     // =========================================================================
 
     /// Update indexes after INSERT
+    ///
+    /// Takes the global map lock as READ (concurrent across tables) and the
+    /// per-tree WRITE locks one at a time (serializes only same-index writers).
     pub fn on_insert(&self, table: &str, row_id: RowId, column_values: &HashMap<String, Value>) -> ArtResult<()> {
-        let mut indexes = self.indexes.write().unwrap_or_else(|e| e.into_inner());
+        let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
 
-        // Update all indexes for this table
-        for index in indexes.values_mut() {
-            if index.table() != table {
+        // Update all indexes for this table (metadata filter, no tree lock)
+        for entry in indexes.values() {
+            if entry.table != table {
                 continue;
             }
 
             // Extract values for indexed columns
-            let columns = index.columns().to_vec();
-            let values: Vec<Value> = columns
+            let values: Vec<Value> = entry
+                .columns
                 .iter()
                 .filter_map(|col| column_values.get(col).cloned())
                 .collect();
 
-            if values.len() == columns.len() {
+            if values.len() == entry.columns.len() {
                 let key = Self::encode_key(&values);
                 // Note: Constraint checking should have already been done
                 // For non-unique indexes, we allow "duplicates" (same key, different row_id)
-                match index.index_type() {
+                let mut index = entry.tree.write().unwrap_or_else(|e| e.into_inner());
+                match entry.index_type {
                     ArtIndexType::PrimaryKey | ArtIndexType::Unique => {
                         // Already checked, just insert
                         index.insert(&key, row_id)?;
-                        if index.index_type() == ArtIndexType::PrimaryKey && values.len() == 1 {
+                        if entry.index_type == ArtIndexType::PrimaryKey && values.len() == 1 {
                             if let Some((value, key_width)) = Self::int_value_width(&values[0]) {
                                 index.record_dense_int_insert(key_width, value);
                             }
@@ -1085,19 +1214,20 @@ impl ArtIndexManager {
 
     /// Update indexes after INSERT using an already-materialized tuple.
     pub fn on_insert_tuple(&self, table: &str, row_id: RowId, schema: &Schema, tuple: &Tuple) -> ArtResult<()> {
-        let mut indexes = self.indexes.write().unwrap_or_else(|e| e.into_inner());
+        let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
 
-        for index in indexes.values_mut() {
-            if index.table() != table {
+        for entry in indexes.values() {
+            if entry.table != table {
                 continue;
             }
 
-            if let Some(values) = Self::index_value_refs_from_tuple(index.columns(), schema, tuple) {
+            if let Some(values) = Self::index_value_refs_from_tuple(&entry.columns, schema, tuple) {
                 let key = Self::encode_key_from_values(values.iter().copied());
-                match index.index_type() {
+                let mut index = entry.tree.write().unwrap_or_else(|e| e.into_inner());
+                match entry.index_type {
                     ArtIndexType::PrimaryKey | ArtIndexType::Unique => {
                         index.insert(&key, row_id)?;
-                        if index.index_type() == ArtIndexType::PrimaryKey && values.len() == 1 {
+                        if entry.index_type == ArtIndexType::PrimaryKey && values.len() == 1 {
                             if let Some((value, key_width)) = Self::int_value_width(values[0]) {
                                 index.record_dense_int_insert(key_width, value);
                             }
@@ -1122,16 +1252,16 @@ impl ArtIndexManager {
         schema: &Schema,
         tuple: &Tuple,
     ) -> ArtResult<HashMap<String, Value>> {
-        let mut indexes = self.indexes.write().unwrap_or_else(|e| e.into_inner());
+        let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
         let mut indexed_values = HashMap::new();
 
-        for index in indexes.values_mut() {
-            if index.table() != table {
+        for entry in indexes.values() {
+            if entry.table != table {
                 continue;
             }
 
-            let mut values = Vec::with_capacity(index.columns().len());
-            for column in index.columns() {
+            let mut values = Vec::with_capacity(entry.columns.len());
+            for column in &entry.columns {
                 let Some(idx) = schema.get_column_index(column) else {
                     values.clear();
                     break;
@@ -1144,12 +1274,13 @@ impl ArtIndexManager {
                 values.push(value);
             }
 
-            if values.len() == index.columns().len() {
+            if values.len() == entry.columns.len() {
                 let key = Self::encode_key_from_values(values.iter().copied());
-                match index.index_type() {
+                let mut index = entry.tree.write().unwrap_or_else(|e| e.into_inner());
+                match entry.index_type {
                     ArtIndexType::PrimaryKey | ArtIndexType::Unique => {
                         index.insert(&key, row_id)?;
-                        if index.index_type() == ArtIndexType::PrimaryKey && values.len() == 1 {
+                        if entry.index_type == ArtIndexType::PrimaryKey && values.len() == 1 {
                             if let Some((value, key_width)) = Self::int_value_width(&values[0]) {
                                 index.record_dense_int_insert(key_width, value);
                             }
@@ -1166,27 +1297,30 @@ impl ArtIndexManager {
     }
 
     /// Update indexes after DELETE
+    ///
+    /// Global map lock as READ + per-tree WRITE locks one at a time.
     pub fn on_delete(&self, table: &str, row_id: RowId, column_values: &HashMap<String, Value>) -> ArtResult<()> {
-        let mut indexes = self.indexes.write().unwrap_or_else(|e| e.into_inner());
+        let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
 
-        for index in indexes.values_mut() {
-            if index.table() != table {
+        for entry in indexes.values() {
+            if entry.table != table {
                 continue;
             }
 
-            let columns = index.columns().to_vec();
-            let values: Vec<Value> = columns
+            let values: Vec<Value> = entry
+                .columns
                 .iter()
                 .filter_map(|col| column_values.get(col).cloned())
                 .collect();
 
-            if values.len() == columns.len() {
+            if values.len() == entry.columns.len() {
                 let key = Self::encode_key(&values);
-                match index.index_type() {
+                let mut index = entry.tree.write().unwrap_or_else(|e| e.into_inner());
+                match entry.index_type {
                     ArtIndexType::PrimaryKey | ArtIndexType::Unique => {
                         // Unique indexes: remove entire key entry
                         let removed = index.remove(&key)?.is_some();
-                        if removed && index.index_type() == ArtIndexType::PrimaryKey && values.len() == 1 {
+                        if removed && entry.index_type == ArtIndexType::PrimaryKey && values.len() == 1 {
                             if let Some((value, _)) = Self::int_value_width(&values[0]) {
                                 index.record_dense_int_delete(value);
                             }
@@ -1205,19 +1339,20 @@ impl ArtIndexManager {
 
     /// Update indexes after DELETE using the already-materialized tuple.
     pub fn on_delete_tuple(&self, table: &str, row_id: RowId, schema: &Schema, tuple: &Tuple) -> ArtResult<()> {
-        let mut indexes = self.indexes.write().unwrap_or_else(|e| e.into_inner());
+        let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
 
-        for index in indexes.values_mut() {
-            if index.table() != table {
+        for entry in indexes.values() {
+            if entry.table != table {
                 continue;
             }
 
-            if let Some(values) = Self::index_value_refs_from_tuple(index.columns(), schema, tuple) {
+            if let Some(values) = Self::index_value_refs_from_tuple(&entry.columns, schema, tuple) {
                 let key = Self::encode_key_from_values(values.iter().copied());
-                match index.index_type() {
+                let mut index = entry.tree.write().unwrap_or_else(|e| e.into_inner());
+                match entry.index_type {
                     ArtIndexType::PrimaryKey | ArtIndexType::Unique => {
                         let removed = index.remove(&key)?.is_some();
-                        if removed && index.index_type() == ArtIndexType::PrimaryKey && values.len() == 1 {
+                        if removed && entry.index_type == ArtIndexType::PrimaryKey && values.len() == 1 {
                             if let Some((value, _)) = Self::int_value_width(&values[0]) {
                                 index.record_dense_int_delete(value);
                             }
@@ -1245,14 +1380,16 @@ impl ArtIndexManager {
             }
         };
 
-        let mut indexes = self.indexes.write().unwrap_or_else(|e| e.into_inner());
-        let Some(index) = indexes.get_mut(&pk_name) else {
+        let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
+        let Some(entry) = indexes.get(&pk_name) else {
             return Ok(false);
         };
-        if !matches!(index.index_type(), ArtIndexType::PrimaryKey)
-            || index.columns().len() != 1
-            || index.get(key) != Some(row_id)
-        {
+        if !matches!(entry.index_type, ArtIndexType::PrimaryKey) || entry.columns.len() != 1 {
+            return Ok(false);
+        }
+
+        let mut index = entry.tree.write().unwrap_or_else(|e| e.into_inner());
+        if index.get(key) != Some(row_id) {
             return Ok(false);
         }
 
@@ -1291,14 +1428,15 @@ impl ArtIndexManager {
         old_tuple: &Tuple,
         new_tuple: &Tuple,
     ) -> bool {
+        // Metadata-only check: no tree locks needed.
         let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
 
-        for index in indexes.values() {
-            if index.table() != table {
+        for entry in indexes.values() {
+            if entry.table != table {
                 continue;
             }
 
-            for column_name in index.columns() {
+            for column_name in &entry.columns {
                 let Some(idx) = schema.get_column_index(column_name) else {
                     return true;
                 };
@@ -1319,13 +1457,14 @@ impl ArtIndexManager {
             return false;
         }
 
+        // Metadata-only check: no tree locks needed.
         let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
-        for index in indexes.values() {
-            if index.table() != table {
+        for entry in indexes.values() {
+            if entry.table != table {
                 continue;
             }
 
-            for indexed_column in index.columns() {
+            for indexed_column in &entry.columns {
                 if column_names
                     .iter()
                     .any(|name| name.eq_ignore_ascii_case(indexed_column))
@@ -1344,11 +1483,15 @@ impl ArtIndexManager {
     /// the PK/FK/UNIQUE/Manual index registrations intact. After clearing,
     /// the indexes are empty but still exist, so new inserts will correctly
     /// populate them.
+    ///
+    /// The registry itself is unchanged, so the global lock is taken as READ;
+    /// each table tree is write-locked one at a time.
     pub fn clear_table_indexes(&self, table: &str) {
-        let mut indexes = self.indexes.write().unwrap_or_else(|e| e.into_inner());
-        for index in indexes.values_mut() {
-            if index.table() == table {
-                index.clear();
+        let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
+        for entry in indexes.values() {
+            if entry.table == table {
+                let mut tree = entry.tree.write().unwrap_or_else(|e| e.into_inner());
+                tree.clear();
             }
         }
     }
@@ -1374,7 +1517,10 @@ impl ArtIndexManager {
     /// Get statistics for a specific index
     pub fn index_stats(&self, name: &str) -> Option<ArtIndexStats> {
         let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
-        indexes.get(name).map(|idx| idx.stats().clone())
+        indexes.get(name).map(|entry| {
+            let tree = entry.tree.read().unwrap_or_else(|e| e.into_inner());
+            tree.stats().clone()
+        })
     }
 
     /// Check if a table has foreign key indexes
