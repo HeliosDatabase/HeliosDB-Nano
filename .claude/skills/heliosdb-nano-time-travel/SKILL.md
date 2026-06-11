@@ -59,6 +59,10 @@ CREATE TABLE accounts_restored AS
 SELECT * FROM accounts WHERE id IN (1,2,3);
 
 -- 3. Merge the holding table back into main
+--    ⚠️ MERGE conflict detection is currently unreliable (see the MERGE
+--    warning in heliosdb-nano-branches) — verify accounts_restored after the
+--    merge, or skip the merge: run the CREATE TABLE AS in step 2 with an
+--    AS OF subquery directly on main instead.
 USE BRANCH main;
 MERGE DATABASE BRANCH undo INTO main;            -- brings accounts_restored over
 
