@@ -5,6 +5,28 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.42.0] - 2026-06-11
+
+Minor release: the plan-arm INSERT fsync fix (roadmap item R1.1) — the
+single largest durable-write win since the P0 series.
+
+### Fixed — Write path / durability
+
+- INSERT statements that take the planner path (RETURNING, ON CONFLICT,
+  DEFAULT, expression values — the default shapes from SQLAlchemy, Rails,
+  Drizzle, and friends) no longer pay up to two fsyncs per row under the
+  default `wal_sync_mode = "sync"`. Row ids come from the volatile counter
+  (staged in the transaction or flushed with a non-synced put after the
+  row write), and plan-arm logical-WAL appends use the established nosync
+  gate; strict per-statement durability remains opt-in via
+  `storage.logical_wal_per_statement`.
+- Measured on an 11ms-fsync disk: `INSERT ... RETURNING` went from
+  **34 rows/s to ~9,500 rows/s (~280x)**; in-memory the same shape gained
+  ~50% from the removed per-row counter write.
+- Crash-recovery contract unchanged: wal_crash_recovery (18) and
+  crash_recovery_e2e (4) suites green; counters recover from flushed
+  `counter:` keys exactly like the existing fast INSERT path.
+
 ## [3.41.0] - 2026-06-10
 
 Minor release: HNSW vector indexes are maintained by SQL DML (roadmap item
