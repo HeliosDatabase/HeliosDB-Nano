@@ -570,3 +570,98 @@ fn test_parallel_backfill_indexes_all_rows() -> Result<()> {
     );
     Ok(())
 }
+
+/// R5.V6: `CREATE INDEX ... WITH (m = .., ef_construction = ..)` must reach
+/// the HnswConfig instead of being parsed and silently dropped (the index
+/// was always built with the hardcoded 16/200 before).
+#[test]
+fn hnsw_with_options_override_construction_params() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute("CREATE TABLE hnsw_opts (id INT4 PRIMARY KEY, embedding VECTOR(3))")?;
+    db.execute("INSERT INTO hnsw_opts VALUES (1, '[1.0, 0.0, 0.0]')")?;
+    db.execute("INSERT INTO hnsw_opts VALUES (2, '[0.0, 1.0, 0.0]')")?;
+    db.execute(
+        "CREATE INDEX hnsw_opts_idx ON hnsw_opts USING hnsw (embedding vector_l2_ops) \
+         WITH (m = 8, ef_construction = 64)",
+    )?;
+
+    let metadata = db.storage.vector_indexes().get_metadata("hnsw_opts_idx")?;
+    match metadata.index_type {
+        VectorIndexType::Standard(config) => {
+            assert_eq!(config.max_connections, 8, "WITH (m = 8) must reach HnswConfig");
+            assert_eq!(
+                config.ef_construction, 64,
+                "WITH (ef_construction = 64) must reach HnswConfig"
+            );
+        }
+        other => panic!("expected standard HNSW metadata, got {other:?}"),
+    }
+
+    // The index built with custom parameters must still answer kNN.
+    let rows = db.query(
+        "SELECT id FROM hnsw_opts ORDER BY embedding <-> '[0.9, 0.1, 0.0]' LIMIT 1",
+        &[],
+    )?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].values.first(), Some(&Value::Int4(1)));
+    Ok(())
+}
+
+/// R5.V6: without WITH options the construction parameters come from the
+/// `[vector]` config section (hnsw_m / hnsw_ef_construction), not from
+/// hardcoded constants.
+#[test]
+fn hnsw_construction_params_default_from_vector_config() -> Result<()> {
+    let mut config = heliosdb_nano::Config::in_memory();
+    config.vector.hnsw_m = 24;
+    config.vector.hnsw_ef_construction = 120;
+    let db = EmbeddedDatabase::with_config(config)?;
+
+    db.execute("CREATE TABLE hnsw_cfg (id INT4 PRIMARY KEY, embedding VECTOR(3))")?;
+    db.execute("CREATE INDEX hnsw_cfg_idx ON hnsw_cfg USING hnsw (embedding vector_l2_ops)")?;
+
+    let metadata = db.storage.vector_indexes().get_metadata("hnsw_cfg_idx")?;
+    match metadata.index_type {
+        VectorIndexType::Standard(config) => {
+            assert_eq!(config.max_connections, 24, "[vector].hnsw_m must be the default M");
+            assert_eq!(
+                config.ef_construction, 120,
+                "[vector].hnsw_ef_construction must be the default ef_construction"
+            );
+        }
+        other => panic!("expected standard HNSW metadata, got {other:?}"),
+    }
+    Ok(())
+}
+
+/// R5.V6: WITH options are persisted with the index definition, so the
+/// startup rebuild recreates the index with the same construction
+/// parameters (not the config defaults).
+#[test]
+fn hnsw_with_options_survive_reopen() -> Result<()> {
+    let temp = TempDir::new().unwrap();
+
+    {
+        let db = EmbeddedDatabase::new(temp.path())?;
+        db.execute("CREATE TABLE hnsw_opt_reopen (id INT4 PRIMARY KEY, embedding VECTOR(3))")?;
+        db.execute("INSERT INTO hnsw_opt_reopen VALUES (1, '[1.0, 0.0, 0.0]')")?;
+        db.execute(
+            "CREATE INDEX hnsw_opt_reopen_idx ON hnsw_opt_reopen USING hnsw (embedding vector_l2_ops) \
+             WITH (m = 8, ef_construction = 64)",
+        )?;
+    }
+
+    let db = EmbeddedDatabase::new(temp.path())?;
+    let metadata = db.storage.vector_indexes().get_metadata("hnsw_opt_reopen_idx")?;
+    match metadata.index_type {
+        VectorIndexType::Standard(config) => {
+            assert_eq!(config.max_connections, 8, "persisted WITH (m = 8) must survive reopen");
+            assert_eq!(
+                config.ef_construction, 64,
+                "persisted WITH (ef_construction = 64) must survive reopen"
+            );
+        }
+        other => panic!("expected standard HNSW metadata after reopen, got {other:?}"),
+    }
+    Ok(())
+}

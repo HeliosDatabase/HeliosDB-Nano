@@ -585,15 +585,20 @@ impl<'a> Executor<'a> {
     /// scan/top-k path) whenever the shape doesn't match or no suitable
     /// index is present — non-indexed kNN must NOT regress.
     ///
-    /// Plan shapes handled (mirrors `place_order_by` in the planner):
-    ///   * `Sort(Scan)`
-    ///   * `Project(Sort(Scan))`  — the common `SELECT id ... ORDER BY emb <=> $1` case
+    /// Plan shapes handled (mirrors `place_order_by` in the planner; the
+    /// optional Project may be absent in each):
+    ///   * `Project(Sort(Scan))`          — the common `SELECT id ... ORDER BY emb <=> $1` case
+    ///   * `Project(Sort(Filter(Scan)))`  — R5.V4: WHERE kept at executor level
+    ///   * `Project(Sort(FilteredScan))`  — R5.V4: WHERE pushed to storage
+    ///   * `Project(Sort(Filter(FilteredScan)))` — R5.V4: split conjuncts
     ///
     /// The Sort must have a single ascending key `col <op> const`. We pull
     /// `limit + offset` neighbours from the index, load the full tuples by
-    /// row_id, emit them already ordered by ascending distance through a
-    /// `VectorScanOperator`, re-apply any Project, and cap with the outer
-    /// `LimitOperator` (which applies the `offset` skip).
+    /// row_id, post-apply the WHERE predicate when one is present
+    /// (escalating the over-fetch while matches run short — see
+    /// `knn_scan_with_filter`), emit survivors already ordered by ascending
+    /// distance through a `VectorScanOperator`, re-apply any Project, and
+    /// cap with the outer `LimitOperator` (which applies the `offset` skip).
     fn try_vector_knn_topk(
         &self,
         input: &LogicalPlan,
@@ -602,6 +607,11 @@ impl<'a> Executor<'a> {
     ) -> Result<Option<Box<dyn PhysicalOperator>>> {
         use crate::sql::{BinaryOperator, LogicalExpr};
 
+        // Diagnostic / testing kill switch: forces the brute-force scan+sort
+        // fallback so results can be compared against the index-served path.
+        if std::env::var_os("HELIOS_KNN_FAST_OFF").is_some() {
+            return Ok(None);
+        }
         // R2.3: transaction check is per-table once the scan target is known.
         if limit == usize::MAX || self.txn_forces_slow_reads() {
             return Ok(None);
@@ -651,8 +661,10 @@ impl<'a> Executor<'a> {
             _ => return Ok(None),
         };
 
-        // The underlying plan must be a plain Scan of a real table.
-        let Some((table_name, scan_schema)) = self.direct_topk_scan_schema(sort_input)? else {
+        // The underlying plan must be a (possibly filtered) scan of a real
+        // table. R5.V4: a simple WHERE clause no longer disqualifies the
+        // fast path — ANN candidates are post-filtered below.
+        let Some((table_name, scan_schema, post_predicate)) = self.knn_scan_with_filter(sort_input)? else {
             return Ok(None);
         };
         // R2.3: kNN out of the HNSW index is allowed inside a transaction only
@@ -735,25 +747,122 @@ impl<'a> Executor<'a> {
             .saturating_mul(2)
             .max(k_target.saturating_add(16))
             .min(physical_size);
+
+        // R5.V4 post-filter: evaluate the WHERE predicate on each candidate
+        // tuple with the same evaluator `FilterOperator` uses, so semantics
+        // (NULL handling, coercions) are identical to the brute-force path.
+        let post_filter = post_predicate.map(|pred| {
+            let evaluator = crate::sql::Evaluator::with_parameters(scan_schema.clone(), self.parameters.clone());
+            let bound = evaluator.bind(pred);
+            (evaluator, bound)
+        });
+        // The filtered path only serves answers found by a strict-subset
+        // over-fetch (see the escalation note in the loop); without headroom
+        // between the base fetch and the index size there is nothing to
+        // over-fetch from, so let the brute-force path handle it.
+        if post_filter.is_some() && fetch_k >= physical_size {
+            return Ok(None);
+        }
+
         let mut results: Vec<(u64, f32)> = Vec::new();
         let mut tuples: Vec<Tuple> = Vec::new();
+        // Candidate count of the previous round: when a wider fetch stops
+        // producing more candidates the graph search has saturated —
+        // hnsw_rs's beam can terminate well below the requested k on
+        // unfavourable topologies — and escalating further cannot surface
+        // anything new.
+        let mut prev_candidates = 0usize;
         loop {
             results.clear();
             tuples.clear();
             let neighbours = vector_indexes.search(&index_name, &query_vec, fetch_k)?;
+            let candidates = neighbours.len();
             for (row_id, distance) in neighbours {
-                if let Some(tuple) = storage.get_row_by_id(&table_name, row_id, scan_schema.as_ref())? {
-                    results.push((row_id, distance));
-                    tuples.push(tuple);
-                    if results.len() >= k_target {
-                        break;
+                let Some(tuple) = storage.get_row_by_id(&table_name, row_id, scan_schema.as_ref())? else {
+                    continue;
+                };
+                if let Some((evaluator, pred)) = &post_filter {
+                    match evaluator.evaluate(pred, &tuple)? {
+                        crate::Value::Boolean(true) => {}
+                        crate::Value::Boolean(false) | crate::Value::Null => continue,
+                        other => {
+                            // Same error FilterOperator raises for the
+                            // brute-force path: behaviour stays identical.
+                            return Err(Error::query_execution(format!(
+                                "Filter predicate must evaluate to boolean, got: {:?}",
+                                other
+                            )));
+                        }
                     }
                 }
+                results.push((row_id, distance));
+                tuples.push(tuple);
+                if results.len() >= k_target {
+                    break;
+                }
             }
-            if results.len() >= k_target || fetch_k >= physical_size {
+            if results.len() >= k_target {
                 break;
             }
-            fetch_k = physical_size;
+            match &post_filter {
+                // R5.V4 selectivity guard: escalate the over-fetch while the
+                // filter keeps fewer than k rows, but only while a wider
+                // round can actually produce more candidates AND stays a
+                // strict subset of the index. A full-size graph search is
+                // NOT exact — HNSW recall misses nodes even at
+                // k = physical_size — so the "fetch everything" round could
+                // silently drop matching rows precisely when the filter is
+                // selective and every match counts. Saturated or exhausted
+                // queries are handed back to the brute-force scan+sort
+                // path, which is exact by construction.
+                Some(_) => {
+                    if candidates <= prev_candidates {
+                        return Ok(None);
+                    }
+                    let next = if results.is_empty() {
+                        // No selectivity signal yet — escalate blind.
+                        fetch_k.saturating_mul(4)
+                    } else {
+                        // Selectivity-aware: `results.len()` of `candidates`
+                        // matched, so ~`k_target * candidates / matches`
+                        // candidates should contain k matches. Take a 2x
+                        // safety margin, and never less than doubling, so
+                        // one more round usually settles it.
+                        candidates
+                            .saturating_mul(k_target)
+                            .checked_div(results.len())
+                            .unwrap_or(usize::MAX)
+                            .saturating_mul(2)
+                            .max(fetch_k.saturating_mul(2))
+                    };
+                    if next >= physical_size {
+                        return Ok(None);
+                    }
+                    prev_candidates = candidates;
+                    fetch_k = next;
+                }
+                // Unfiltered misses are tombstone-driven and rare — one
+                // retry at the full physical size settles them (pre-V4
+                // behaviour, V5 semantics).
+                None => {
+                    if fetch_k >= physical_size {
+                        // The full-size round still came up short. A short
+                        // result is correct when the index genuinely holds
+                        // fewer live rows than the LIMIT — but when more
+                        // live rows exist the graph search saturated, and
+                        // returning the truncated set would silently drop
+                        // rows the brute-force path finds. Fall back.
+                        if vector_indexes
+                            .index_live_size(&index_name)
+                            .is_some_and(|live| live > results.len())
+                        {
+                            return Ok(None);
+                        }
+                        break;
+                    }
+                    fetch_k = physical_size;
+                }
+            }
         }
 
         tracing::debug!(
@@ -934,6 +1043,126 @@ impl<'a> Executor<'a> {
             column.source_table_name = Some(table_name.clone());
         }
         Ok(Some((table_name.clone(), Arc::new(scan_schema))))
+    }
+
+    /// R5.V4: resolve the plan under a kNN Sort to a base-table scan plus an
+    /// optional row-local WHERE predicate for post-filtering ANN candidates.
+    ///
+    /// Accepted shapes (all reading a single real table):
+    ///   * `Scan`                 — unfiltered kNN (pre-V4 behaviour)
+    ///   * `Filter(Scan)`         — WHERE the optimizer left at executor level
+    ///   * `FilteredScan`         — WHERE pushed to storage
+    ///   * `Filter(FilteredScan)` — pushable + residual conjuncts split
+    ///
+    /// Any predicate must pass [`Self::is_simple_knn_filter`] so that
+    /// post-applying it to candidate tuples is guaranteed equivalent to the
+    /// brute-force scan path. Returns `None` for every other shape so the
+    /// caller falls back to scan+sort.
+    fn knn_scan_with_filter(
+        &self,
+        input: &LogicalPlan,
+    ) -> Result<Option<(String, Arc<Schema>, Option<crate::sql::LogicalExpr>)>> {
+        use crate::sql::{BinaryOperator, LogicalExpr};
+
+        // Peel one optional executor-level Filter off the top.
+        let (residual, scan_plan): (Option<&LogicalExpr>, &LogicalPlan) = match input {
+            LogicalPlan::Filter {
+                input: inner,
+                predicate,
+            } => (Some(predicate), inner.as_ref()),
+            other => (None, other),
+        };
+
+        let (table_name, scan_schema, pushed): (String, Arc<Schema>, Option<&LogicalExpr>) = match scan_plan {
+            LogicalPlan::Scan { .. } => match self.direct_topk_scan_schema(scan_plan)? {
+                Some((table_name, scan_schema)) => (table_name, scan_schema, None),
+                None => return Ok(None),
+            },
+            LogicalPlan::FilteredScan {
+                table_name,
+                alias,
+                schema,
+                predicate,
+                as_of,
+                ..
+            } => {
+                // Mirrors the `direct_topk_scan_schema` eligibility checks
+                // for the storage-pushdown scan variant.
+                let Some(storage) = self.storage else {
+                    return Ok(None);
+                };
+                if as_of.is_some()
+                    || self.get_cte(table_name).is_some()
+                    || storage.mv_catalog().view_exists(table_name)?
+                    || !storage.catalog().table_exists(table_name)?
+                {
+                    return Ok(None);
+                }
+                let source_name = alias.as_ref().unwrap_or(table_name);
+                let mut scan_schema = schema.as_ref().clone();
+                for column in &mut scan_schema.columns {
+                    column.source_table = Some(source_name.clone());
+                    column.source_table_name = Some(table_name.clone());
+                }
+                (table_name.clone(), Arc::new(scan_schema), predicate.as_ref())
+            }
+            _ => return Ok(None),
+        };
+
+        // Recombine the pushed-down and residual conjuncts; the fast path
+        // evaluates the whole predicate itself against candidate tuples.
+        let combined: Option<LogicalExpr> = match (pushed, residual) {
+            (None, None) => None,
+            (Some(p), None) => Some(p.clone()),
+            (None, Some(r)) => Some(r.clone()),
+            (Some(p), Some(r)) => Some(LogicalExpr::BinaryExpr {
+                left: Box::new(p.clone()),
+                op: BinaryOperator::And,
+                right: Box::new(r.clone()),
+            }),
+        };
+        if let Some(pred) = &combined {
+            if !Self::is_simple_knn_filter(pred, scan_schema.as_ref()) {
+                return Ok(None);
+            }
+        }
+        Ok(Some((table_name, scan_schema, combined)))
+    }
+
+    /// A predicate the kNN fast path may post-apply to candidate tuples:
+    /// `column <cmp> constant` (either operand order; constant = literal or
+    /// bound parameter) where the column resolves in the scan schema, or a
+    /// conjunction (`AND`) of such comparisons. Everything else — OR, NOT,
+    /// LIKE, functions, subqueries, column-vs-column — sends the query back
+    /// to the brute-force path.
+    fn is_simple_knn_filter(expr: &crate::sql::LogicalExpr, schema: &Schema) -> bool {
+        use crate::sql::{BinaryOperator, LogicalExpr};
+
+        let is_const = |e: &LogicalExpr| matches!(e, LogicalExpr::Literal(_) | LogicalExpr::Parameter { .. });
+        let is_column = |e: &LogicalExpr| {
+            if let LogicalExpr::Column { table, name } = e {
+                schema.get_qualified_column_index(table.as_deref(), name).is_some()
+            } else {
+                false
+            }
+        };
+        match expr {
+            LogicalExpr::BinaryExpr { left, op, right } => match op {
+                BinaryOperator::And => {
+                    Self::is_simple_knn_filter(left, schema) && Self::is_simple_knn_filter(right, schema)
+                }
+                BinaryOperator::Eq
+                | BinaryOperator::NotEq
+                | BinaryOperator::Lt
+                | BinaryOperator::LtEq
+                | BinaryOperator::Gt
+                | BinaryOperator::GtEq => {
+                    (is_column(left) && is_const(right)) || (is_const(left) && is_column(right))
+                }
+                _ => false,
+            },
+            _ => false,
+        }
     }
 
     /// Materialize IN subqueries by executing them and converting to InList
