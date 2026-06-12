@@ -344,6 +344,43 @@ fn explain_shows_index_range_scan() {
 }
 
 #[test]
+fn explain_shows_ordered_index_topk() {
+    let db = EmbeddedDatabase::new_in_memory().unwrap();
+    build_pair(&db);
+
+    // ORDER BY indexed_col ASC LIMIT k → the Sort node is replaced by the
+    // ordered index iteration and EXPLAIN must say so.
+    let plan = db
+        .query("EXPLAIN SELECT id, score FROM rt_indexed ORDER BY score LIMIT 5", &[])
+        .unwrap();
+    let text = rows_exact(&plan).join("\n");
+    assert!(
+        text.contains("Index Ordered Scan using idx_rt_score"),
+        "EXPLAIN must surface the ordered index top-k, got:\n{text}"
+    );
+
+    // DESC is not served by the fast path — EXPLAIN must keep the Sort.
+    let plan = db
+        .query("EXPLAIN SELECT id, score FROM rt_indexed ORDER BY score DESC LIMIT 5", &[])
+        .unwrap();
+    let text = rows_exact(&plan).join("\n");
+    assert!(
+        !text.contains("Index Ordered Scan"),
+        "DESC must not be advertised as ordered index iteration, got:\n{text}"
+    );
+
+    // The twin (no index) must not claim it either.
+    let plan = db
+        .query("EXPLAIN SELECT id, score FROM rt_twin ORDER BY score LIMIT 5", &[])
+        .unwrap();
+    let text = rows_exact(&plan).join("\n");
+    assert!(
+        !text.contains("Index Ordered Scan"),
+        "twin EXPLAIN must not show ordered index iteration, got:\n{text}"
+    );
+}
+
+#[test]
 fn high_selectivity_range_falls_back_to_scan_but_stays_correct() {
     let db = EmbeddedDatabase::new_in_memory().unwrap();
     build_pair(&db);

@@ -184,10 +184,33 @@ fn annotate_index_range_scans(executor: &Executor, plan: &LogicalPlan, node: &mu
                 annotate(node, table_name, &spec);
             }
         }
+        LogicalPlan::Limit { input, .. } => {
+            // R4.4: `ORDER BY indexed_col ASC LIMIT k` served by ordered
+            // index iteration — rewrite the rendered Sort node the fast path
+            // eliminates (same detection the executor runs; display only).
+            if let Ok(Some(spec)) = executor.index_ordered_topk_detect(input) {
+                if let Some(sort_node) = find_node_mut(node, "Sort") {
+                    sort_node.node_type = "IndexOrderedScan".to_string();
+                    sort_node.operation = format!(
+                        "Index Ordered Scan using {} on {} (ORDER BY {} ASC, no sort)",
+                        spec.index_name,
+                        spec.table_name(),
+                        spec.column_name
+                    );
+                    sort_node.details.insert("index".to_string(), spec.index_name.clone());
+                    sort_node
+                        .details
+                        .insert("order".to_string(), format!("{} ASC", spec.column_name));
+                    return;
+                }
+            }
+            if let Some(child) = node.children.first_mut() {
+                annotate_index_range_scans(executor, input, child);
+            }
+        }
         LogicalPlan::Project { input, .. }
         | LogicalPlan::Aggregate { input, .. }
-        | LogicalPlan::Sort { input, .. }
-        | LogicalPlan::Limit { input, .. } => {
+        | LogicalPlan::Sort { input, .. } => {
             if let Some(child) = node.children.first_mut() {
                 annotate_index_range_scans(executor, input, child);
             }
@@ -203,6 +226,17 @@ fn annotate_index_range_scans(executor: &Executor, plan: &LogicalPlan, node: &mu
         }
         _ => {}
     }
+}
+
+/// Depth-first search for the first rendered node of the given type.
+fn find_node_mut<'n>(
+    node: &'n mut crate::sql::explain::PlanNode,
+    node_type: &str,
+) -> Option<&'n mut crate::sql::explain::PlanNode> {
+    if node.node_type == node_type {
+        return Some(node);
+    }
+    node.children.iter_mut().find_map(|child| find_node_mut(child, node_type))
 }
 
 /// Execute the query for EXPLAIN ANALYZE

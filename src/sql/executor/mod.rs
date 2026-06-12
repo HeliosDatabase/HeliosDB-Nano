@@ -343,6 +343,45 @@ fn resolve_sort_columns_to_base(
     Some(sort_columns)
 }
 
+/// R4.4: detection result for the ordered-index top-k fast path
+/// (`ORDER BY indexed_col ASC LIMIT k` → ordered index iteration, no sort).
+/// Produced by [`Executor::index_ordered_topk_detect`] without executing
+/// anything; consumed by the executor fast path (which then iterates) and by
+/// the EXPLAIN annotator (display only).
+pub(super) struct OrderedTopkSpec<'p> {
+    table_name: &'p String,
+    alias: &'p Option<String>,
+    schema: &'p Arc<Schema>,
+    projection: &'p Option<Vec<usize>>,
+    /// Raw (unmaterialized) scan predicate, re-applied residually at
+    /// execution time after subquery materialization.
+    predicate: Option<&'p crate::sql::LogicalExpr>,
+    /// `Project(Sort(..))` wrapper parameters to re-wrap around the output.
+    #[allow(clippy::type_complexity)]
+    project_wrap: Option<(
+        Vec<crate::sql::LogicalExpr>,
+        Vec<String>,
+        bool,
+        Option<Vec<crate::sql::LogicalExpr>>,
+    )>,
+    /// Sort column's index in the scan schema.
+    col_idx: usize,
+    pub(super) column_name: String,
+    pub(super) index_name: String,
+    /// Total index entries (== table row count, per the completeness gate).
+    entry_count: u64,
+    /// Encoded iteration bounds from a range predicate on the sort column.
+    lower: Option<(Vec<u8>, bool)>,
+    upper: Option<(Vec<u8>, bool)>,
+}
+
+impl OrderedTopkSpec<'_> {
+    /// Table the ordered iteration scans (for EXPLAIN display).
+    pub(super) fn table_name(&self) -> &str {
+        self.table_name
+    }
+}
+
 /// Query executor
 ///
 /// Converts logical plans into physical operators and executes them.
@@ -576,20 +615,18 @@ impl<'a> Executor<'a> {
         Ok(None)
     }
 
-    /// R4.4: `ORDER BY indexed_col ASC LIMIT k` served by ordered index
-    /// iteration — no sort. Handles `Sort(Scan)` and `Project(Sort(Scan))`
-    /// (non-distinct), optionally with a WHERE clause: a range predicate on
-    /// the sort column bounds the index iteration, anything else is applied
-    /// as a residual filter while iterating in index order. NULL sort keys
-    /// honour the engine's ASC semantics (`compare_values` sorts NULL below
-    /// every value, i.e. NULLS FIRST). DESC falls through to the generic
-    /// top-k path.
-    fn try_index_ordered_topk(
-        &self,
-        input: &LogicalPlan,
-        limit: usize,
-        offset: usize,
-    ) -> Result<Option<Box<dyn PhysicalOperator>>> {
+    /// R4.4: detection half of the ordered-index top-k fast path — decides
+    /// whether `ORDER BY indexed_col ASC LIMIT k` (the `Limit` node's input)
+    /// will be served by ordered index iteration, WITHOUT executing anything:
+    /// no subquery materialization, no row fetches. Shared by the executor
+    /// fast path and the EXPLAIN annotator so the displayed plan is the
+    /// executed plan.
+    ///
+    /// Bounds are derived from the RAW predicate (only literals, parameters,
+    /// and casts qualify — `scan::lookup_bound_value`); a predicate whose
+    /// only range bound on the sort column is a subquery therefore falls
+    /// back to the generic top-k path instead of being materialized here.
+    pub(super) fn index_ordered_topk_detect<'p>(&self, input: &'p LogicalPlan) -> Result<Option<OrderedTopkSpec<'p>>> {
         use crate::sql::LogicalExpr;
 
         if scan::index_range_fast_path_disabled() {
@@ -699,9 +736,9 @@ impl<'a> Executor<'a> {
         }
 
         // Optional WHERE: a range on the sort column bounds the iteration;
-        // everything (including the range itself) is re-applied residually.
-        let materialized_predicate = predicate.map(|p| self.materialize_subqueries(p)).transpose()?;
-        let (lower, upper) = match &materialized_predicate {
+        // everything (including the range itself) is re-applied residually
+        // at execution time.
+        let (lower, upper) = match predicate {
             Some(pred) => {
                 match scan::indexed_range_lookup(storage, table_name, schema.as_ref(), pred, &self.parameters) {
                     Some(spec) if spec.column_name == column.name => (spec.lower, spec.upper),
@@ -713,6 +750,62 @@ impl<'a> Executor<'a> {
             }
             None => (None, None),
         };
+
+        Ok(Some(OrderedTopkSpec {
+            table_name,
+            alias,
+            schema,
+            projection,
+            predicate,
+            project_wrap,
+            col_idx,
+            column_name: column.name.clone(),
+            index_name,
+            entry_count,
+            lower,
+            upper,
+        }))
+    }
+
+    /// R4.4: `ORDER BY indexed_col ASC LIMIT k` served by ordered index
+    /// iteration — no sort. Handles `Sort(Scan)` and `Project(Sort(Scan))`
+    /// (non-distinct), optionally with a WHERE clause: a range predicate on
+    /// the sort column bounds the index iteration, anything else is applied
+    /// as a residual filter while iterating in index order. NULL sort keys
+    /// honour the engine's ASC semantics (`compare_values` sorts NULL below
+    /// every value, i.e. NULLS FIRST). DESC falls through to the generic
+    /// top-k path. Detection lives in [`Self::index_ordered_topk_detect`].
+    fn try_index_ordered_topk(
+        &self,
+        input: &LogicalPlan,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Option<Box<dyn PhysicalOperator>>> {
+        let Some(spec) = self.index_ordered_topk_detect(input)? else {
+            return Ok(None);
+        };
+        let Some(storage) = self.storage else {
+            return Ok(None);
+        };
+        let art = storage.art_indexes();
+        let OrderedTopkSpec {
+            table_name,
+            alias,
+            schema,
+            projection,
+            predicate,
+            project_wrap,
+            col_idx,
+            column_name,
+            index_name,
+            entry_count,
+            lower,
+            upper,
+        } = spec;
+
+        // Residual filter: the FULL (materialized) predicate is re-applied
+        // per row, so bound semantics stay identical to the generic path.
+        let materialized_predicate = predicate.map(|p| self.materialize_subqueries(p)).transpose()?;
 
         let source_name = alias.as_ref().unwrap_or(table_name);
         let actual_schema = Arc::new(scan::schema_with_source(schema.as_ref(), source_name, table_name));
@@ -795,7 +888,7 @@ impl<'a> Executor<'a> {
             "ordered index top-k: '{}' on {}.{} served {} of {} requested rows (no sort)",
             index_name,
             table_name,
-            column.name,
+            column_name,
             ordered.len(),
             k_target,
         );
