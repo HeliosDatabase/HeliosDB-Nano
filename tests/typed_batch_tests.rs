@@ -59,8 +59,9 @@ mod typed_batches {
             if !key.starts_with(prefix.as_bytes()) {
                 break;
             }
-            let mut batch: ColumnBatch = decode_column_batch(&value).unwrap();
-            batch.typed = None;
+            // Serialize ignores the typed companion entirely (3-field v1
+            // layout), so this produces exactly the pre-R3.4 bytes.
+            let batch: ColumnBatch = decode_column_batch(&value).unwrap();
             rewrites.push((key.to_vec(), bincode::serialize(&batch).unwrap()));
         }
         for (key, value) in rewrites {

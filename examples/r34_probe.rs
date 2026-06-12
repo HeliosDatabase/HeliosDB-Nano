@@ -46,16 +46,24 @@ fn build(db: &EmbeddedDatabase, table: &str, columnar: bool, rows: i64) {
 }
 
 fn time_query(db: &EmbeddedDatabase, sql: &str) -> (f64, String) {
-    // Warm up twice, then report the median of 5 runs.
+    // Warm up twice, then report the median of 5 runs. Every execution gets
+    // a unique trailing comment so neither the result cache nor the plan
+    // cache can serve it (identical overhead in both builds).
+    let mut counter = 0u64;
+    let mut unique = |sql: &str| {
+        counter += 1;
+        format!("{sql} /* probe-{counter} */")
+    };
     let mut digest = String::new();
     for _ in 0..2 {
-        let rows = db.query(sql, &[]).unwrap();
+        let rows = db.query(&unique(sql), &[]).unwrap();
         digest = format!("{} rows; first={:?}", rows.len(), rows.first().map(|t| &t.values));
     }
     let mut samples = Vec::with_capacity(5);
     for _ in 0..5 {
+        let stamped = unique(sql);
         let start = Instant::now();
-        let rows = db.query(sql, &[]).unwrap();
+        let rows = db.query(&stamped, &[]).unwrap();
         samples.push(start.elapsed().as_secs_f64() * 1000.0);
         std::hint::black_box(rows);
     }
