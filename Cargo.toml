@@ -62,10 +62,6 @@ rocksdb = { version = "0.22", default-features = false, features = ["snappy", "z
 # SQL Parsing
 sqlparser = { version = "0.53", features = ["visitor"] }
 
-# Columnar Format
-arrow = { version = "52", features = ["prettyprint"] }
-parquet = { version = "52" }
-
 # Async Runtime
 tokio = { version = "1.40", features = ["full"] }
 async-trait = "0.1"
@@ -181,6 +177,7 @@ terminal_size = "0.4"
 indicatif = "0.17"
 
 [dev-dependencies]
+bincode = "1.3" # craft legacy v1 columnar batches in typed_batch_tests
 criterion = "0.5"
 proptest = "1.5"
 tokio-postgres = "0.7"
