@@ -237,13 +237,19 @@ pub(crate) fn index_type_tag(index_type: ArtIndexType) -> u8 {
     }
 }
 
+/// Decode a sign-flipped big-endian integer key (encoding v2 — the inverse of
+/// `ArtIndexManager::encode_value_into` for `Int2/Int4/Int8`).
 fn decode_int_key(key: &[u8], width: usize) -> Option<i64> {
     match width {
-        2 if key.len() == 2 => Some(i64::from(i16::from_be_bytes([key[0], key[1]]))),
-        4 if key.len() == 4 => Some(i64::from(i32::from_be_bytes([key[0], key[1], key[2], key[3]]))),
-        8 if key.len() == 8 => Some(i64::from_be_bytes([
-            key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7],
-        ])),
+        2 if key.len() == 2 => Some(i64::from((u16::from_be_bytes([key[0], key[1]]) ^ 0x8000) as i16)),
+        4 if key.len() == 4 => Some(i64::from(
+            (u32::from_be_bytes([key[0], key[1], key[2], key[3]]) ^ 0x8000_0000) as i32,
+        )),
+        8 if key.len() == 8 => Some(
+            (u64::from_be_bytes([
+                key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7],
+            ]) ^ 0x8000_0000_0000_0000) as i64,
+        ),
         _ => None,
     }
 }
@@ -844,6 +850,37 @@ impl ArtIndexManager {
         }
     }
 
+    /// R4.4: ordered, bounded range scan over a named index.
+    ///
+    /// Bounds are ENCODED keys (`encode_key_from_values` of a single value of
+    /// the indexed column's type — encoding v2 is order-preserving per type).
+    /// Returns `(key, row_id)` pairs in ascending key order.
+    pub fn index_range_scan(
+        &self,
+        index_name: &str,
+        lower: Option<(&[u8], bool)>,
+        upper: Option<(&[u8], bool)>,
+        limit: Option<usize>,
+    ) -> Vec<(Vec<u8>, RowId)> {
+        let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = indexes.get(index_name) {
+            let tree = entry.tree.read().unwrap_or_else(|e| e.into_inner());
+            tree.range_scan(lower, upper, limit)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Total `(key, row_id)` entry count of a named index (one entry per
+    /// indexed row, including NULL-keyed entries).
+    pub fn index_entry_count(&self, index_name: &str) -> Option<u64> {
+        let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
+        indexes.get(index_name).map(|entry| {
+            let tree = entry.tree.read().unwrap_or_else(|e| e.into_inner());
+            tree.len()
+        })
+    }
+
     /// PK index point lookup without cloning the tree (~50μs saved vs get_pk_index)
     pub fn pk_index_lookup(&self, table: &str, key: &[u8]) -> Option<RowId> {
         let pk_name = {
@@ -991,50 +1028,115 @@ impl ArtIndexManager {
     ///
     /// Hot insert validation paths often already hold references into a tuple;
     /// this avoids cloning strings/arrays solely to call `encode_key`.
+    ///
+    /// R4.4 — encoding v2, ORDER-PRESERVING for the range-scannable types:
+    /// unsigned byte-wise comparison of two encoded single-column keys of the
+    /// same column type matches SQL value order. Concretely:
+    /// - integers: sign-flipped big-endian (`v XOR MIN` reinterpreted
+    ///   unsigned), so negatives sort before positives;
+    /// - floats: IEEE-754 total-order transform (positive: flip sign bit;
+    ///   negative: flip all bits);
+    /// - TEXT/BYTEA: raw bytes (UTF-8 byte order == code-point order).
+    /// Composite (multi-column) keys additionally escape `0x00 -> 0x00 0xFF`
+    /// inside variable-length values so a value byte can never collide with
+    /// the `0x00` column separator. Single-column keys are NEVER escaped —
+    /// range scans rely on their raw byte order.
+    ///
+    /// Persisted index snapshots stamp this version
+    /// (`index_snapshot::ART_KEY_ENCODING_VERSION`); a snapshot written with
+    /// a different version is ignored and rebuilt from rows, so the encoding
+    /// can evolve without an on-disk migration step.
     pub fn encode_key_from_values<'a>(values: impl IntoIterator<Item = &'a Value>) -> Vec<u8> {
         let mut key = Vec::new();
-        for (i, value) in values.into_iter().enumerate() {
-            if i > 0 {
-                key.push(0); // Separator
-            }
-            match value {
-                Value::Null => key.extend_from_slice(b"\x00"),
-                Value::Boolean(b) => key.push(if *b { 1 } else { 0 }),
-                Value::Int2(v) => key.extend_from_slice(&v.to_be_bytes()),
-                Value::Int4(v) => key.extend_from_slice(&v.to_be_bytes()),
-                Value::Int8(v) => key.extend_from_slice(&v.to_be_bytes()),
-                Value::Float4(v) => key.extend_from_slice(&v.to_be_bytes()),
-                Value::Float8(v) => key.extend_from_slice(&v.to_be_bytes()),
-                Value::String(s) => key.extend_from_slice(s.as_bytes()),
-                Value::Bytes(b) => key.extend_from_slice(b),
-                Value::Uuid(u) => key.extend_from_slice(u.as_bytes()),
-                Value::Numeric(d) => key.extend_from_slice(d.as_bytes()),
-                Value::Date(d) => key.extend_from_slice(d.to_string().as_bytes()),
-                Value::Time(t) => key.extend_from_slice(t.to_string().as_bytes()),
-                Value::Timestamp(ts) => key.extend_from_slice(ts.to_rfc3339().as_bytes()),
-                Value::Array(arr) => {
-                    // Recursively encode array elements
-                    let nested = Self::encode_key_from_values(arr.iter());
-                    key.extend_from_slice(&nested);
-                }
-                Value::Json(j) => key.extend_from_slice(j.as_bytes()),
-                Value::Vector(v) => {
-                    for f in v {
-                        key.extend_from_slice(&f.to_be_bytes());
-                    }
-                }
-                // Handle storage mode references
-                Value::DictRef { dict_id } => key.extend_from_slice(&dict_id.to_be_bytes()),
-                Value::CasRef { hash } => key.extend_from_slice(hash),
-                Value::ColumnarRef => {
-                    // Columnar reference doesn't have direct key encoding
-                    // The actual value should be resolved before indexing
-                    key.extend_from_slice(b"columnar_ref");
-                }
-                Value::Interval(iv) => key.extend_from_slice(&iv.to_be_bytes()), // Encode interval microseconds
-            }
+        let mut iter = values.into_iter();
+        let Some(first) = iter.next() else {
+            return key;
+        };
+        let Some(second) = iter.next() else {
+            // Single-column key: no separator, no escaping.
+            Self::encode_value_into(&mut key, first, false);
+            return key;
+        };
+        Self::encode_value_into(&mut key, first, true);
+        key.push(0); // Separator
+        Self::encode_value_into(&mut key, second, true);
+        for value in iter {
+            key.push(0); // Separator
+            Self::encode_value_into(&mut key, value, true);
         }
         key
+    }
+
+    /// Append one value's encoding to `key`. `escape` is true in composite
+    /// (multi-column) keys: `0x00` bytes inside variable-length values are
+    /// escaped as `0x00 0xFF` so they cannot collide with the separator.
+    fn encode_value_into(key: &mut Vec<u8>, value: &Value, escape: bool) {
+        match value {
+            Value::Null => key.extend_from_slice(b"\x00"),
+            Value::Boolean(b) => key.push(if *b { 1 } else { 0 }),
+            // Sign-flip: maps signed integer order onto unsigned byte order.
+            Value::Int2(v) => key.extend_from_slice(&((*v as u16) ^ 0x8000).to_be_bytes()),
+            Value::Int4(v) => key.extend_from_slice(&((*v as u32) ^ 0x8000_0000).to_be_bytes()),
+            Value::Int8(v) => key.extend_from_slice(&((*v as u64) ^ 0x8000_0000_0000_0000).to_be_bytes()),
+            // IEEE-754 total order: positive floats get the sign bit set,
+            // negative floats are bitwise inverted.
+            Value::Float4(v) => {
+                let bits = v.to_bits();
+                let ordered = if bits & 0x8000_0000 == 0 { bits ^ 0x8000_0000 } else { !bits };
+                key.extend_from_slice(&ordered.to_be_bytes());
+            }
+            Value::Float8(v) => {
+                let bits = v.to_bits();
+                let ordered = if bits & 0x8000_0000_0000_0000 == 0 {
+                    bits ^ 0x8000_0000_0000_0000
+                } else {
+                    !bits
+                };
+                key.extend_from_slice(&ordered.to_be_bytes());
+            }
+            Value::String(s) => Self::extend_maybe_escaped(key, s.as_bytes(), escape),
+            Value::Bytes(b) => Self::extend_maybe_escaped(key, b, escape),
+            Value::Uuid(u) => key.extend_from_slice(u.as_bytes()),
+            Value::Numeric(d) => Self::extend_maybe_escaped(key, d.as_bytes(), escape),
+            Value::Date(d) => key.extend_from_slice(d.to_string().as_bytes()),
+            Value::Time(t) => key.extend_from_slice(t.to_string().as_bytes()),
+            Value::Timestamp(ts) => key.extend_from_slice(ts.to_rfc3339().as_bytes()),
+            Value::Array(arr) => {
+                // Recursively encode array elements
+                let nested = Self::encode_key_from_values(arr.iter());
+                Self::extend_maybe_escaped(key, &nested, escape);
+            }
+            Value::Json(j) => Self::extend_maybe_escaped(key, j.as_bytes(), escape),
+            Value::Vector(v) => {
+                for f in v {
+                    key.extend_from_slice(&f.to_be_bytes());
+                }
+            }
+            // Handle storage mode references
+            Value::DictRef { dict_id } => key.extend_from_slice(&dict_id.to_be_bytes()),
+            Value::CasRef { hash } => key.extend_from_slice(hash),
+            Value::ColumnarRef => {
+                // Columnar reference doesn't have direct key encoding
+                // The actual value should be resolved before indexing
+                key.extend_from_slice(b"columnar_ref");
+            }
+            Value::Interval(iv) => key.extend_from_slice(&iv.to_be_bytes()), // Encode interval microseconds
+        }
+    }
+
+    fn extend_maybe_escaped(key: &mut Vec<u8>, bytes: &[u8], escape: bool) {
+        if !escape || !bytes.contains(&0) {
+            key.extend_from_slice(bytes);
+            return;
+        }
+        for &b in bytes {
+            if b == 0 {
+                key.push(0);
+                key.push(0xFF);
+            } else {
+                key.push(b);
+            }
+        }
     }
 
     fn index_value_refs_from_tuple<'a>(

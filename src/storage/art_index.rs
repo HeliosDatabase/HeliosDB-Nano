@@ -1080,15 +1080,150 @@ impl AdaptiveRadixTree {
         ArtIterator::new(self)
     }
 
-    /// Range scan from start (inclusive) to end (exclusive)
-    pub fn range<'a>(&'a self, start: &'a [u8], end: &'a [u8]) -> impl Iterator<Item = (Vec<u8>, RowId)> + 'a {
-        self.iter()
-            .filter(move |(k, _)| k.as_slice() >= start && k.as_slice() < end)
+    /// Range scan from start (inclusive) to end (exclusive).
+    ///
+    /// R4.4: now a tree-guided bounded scan (subtree pruning) instead of a
+    /// full-tree iteration + filter — O(log n + k) instead of O(n).
+    pub fn range(&self, start: &[u8], end: &[u8]) -> impl Iterator<Item = (Vec<u8>, RowId)> {
+        self.range_scan(Some((start, true)), Some((end, false)), None).into_iter()
     }
 
     /// Prefix scan - find all keys with the given prefix
     pub fn prefix_scan<'a>(&'a self, prefix: &'a [u8]) -> impl Iterator<Item = (Vec<u8>, RowId)> + 'a {
         self.iter().filter(move |(k, _)| k.starts_with(prefix))
+    }
+
+    /// R4.4: ordered, bounded range scan.
+    ///
+    /// Returns `(key, row_id)` pairs in ascending key order, restricted to
+    /// `lower`/`upper` (each `(bound, inclusive)`, `None` = unbounded), with
+    /// an optional result cap. Subtrees that cannot intersect the bounds are
+    /// pruned at descent time, so cost is O(log n + k) rather than the full
+    /// tree walk `range()` used to do. Encoding v2 keys are order-preserving
+    /// per column type, so key order here equals value order.
+    pub fn range_scan(
+        &self,
+        lower: Option<(&[u8], bool)>,
+        upper: Option<(&[u8], bool)>,
+        limit: Option<usize>,
+    ) -> Vec<(Vec<u8>, RowId)> {
+        let mut out = Vec::new();
+        let Some(root) = &self.root else {
+            return out;
+        };
+        let cap = limit.unwrap_or(usize::MAX);
+        if cap == 0 {
+            return out;
+        }
+        let mut stack: VecDeque<(&ArtNode, Vec<u8>)> = VecDeque::new();
+        stack.push_front((root, Vec::new()));
+
+        while let Some((node, key_prefix)) = stack.pop_front() {
+            if out.len() >= cap {
+                break;
+            }
+            if let ArtNode::Leaf(leaf) = node {
+                if Self::key_in_range(&leaf.key, lower, upper) {
+                    for v in leaf.values_iter() {
+                        out.push((leaf.key.clone(), v));
+                        if out.len() >= cap {
+                            break;
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // Inner node: extend the accumulated key with this node's
+            // compressed prefix, then prune the whole subtree if possible.
+            let header = node.header();
+            let mut node_key = key_prefix;
+            node_key.extend_from_slice(header.get_prefix());
+            if !Self::prefix_may_intersect(&node_key, lower, upper) {
+                continue;
+            }
+
+            // Inner-node values represent the key == node_key itself, which
+            // sorts before every extension below it.
+            if !header.values.is_empty() && Self::key_in_range(&node_key, lower, upper) {
+                for &v in &header.values {
+                    out.push((node_key.clone(), v));
+                    if out.len() >= cap {
+                        break;
+                    }
+                }
+            }
+
+            let mut children: Vec<(u8, &ArtNode)> = match node {
+                ArtNode::Node4(n) => n.iter_children().collect(),
+                ArtNode::Node16(n) => n.iter_children().collect(),
+                ArtNode::Node48(n) => n.iter_children().collect(),
+                ArtNode::Node256(n) => n.iter_children().collect(),
+                ArtNode::Leaf(_) => unreachable!("leaf handled above"),
+            };
+            // Node4/16 store children in insertion order; sort so the DFS
+            // yields keys in ascending byte order.
+            children.sort_unstable_by_key(|(byte, _)| *byte);
+            for (byte, child) in children.into_iter().rev() {
+                let mut child_key = node_key.clone();
+                child_key.push(byte);
+                if Self::prefix_may_intersect(&child_key, lower, upper) {
+                    stack.push_front((child, child_key));
+                }
+            }
+        }
+        out
+    }
+
+    /// Exact bound check for a complete key.
+    fn key_in_range(key: &[u8], lower: Option<(&[u8], bool)>, upper: Option<(&[u8], bool)>) -> bool {
+        if let Some((bound, inclusive)) = lower {
+            match key.cmp(bound) {
+                std::cmp::Ordering::Less => return false,
+                std::cmp::Ordering::Equal if !inclusive => return false,
+                _ => {}
+            }
+        }
+        if let Some((bound, inclusive)) = upper {
+            match key.cmp(bound) {
+                std::cmp::Ordering::Greater => return false,
+                std::cmp::Ordering::Equal if !inclusive => return false,
+                _ => {}
+            }
+        }
+        true
+    }
+
+    /// Conservative subtree pruning test: every key in the subtree starts
+    /// with `prefix`, so the subtree's smallest possible key is `prefix`
+    /// itself and its keys are unbounded above within that prefix. Returns
+    /// false only when NO key with this prefix can satisfy the bounds; exact
+    /// per-key filtering still happens in [`Self::key_in_range`].
+    fn prefix_may_intersect(prefix: &[u8], lower: Option<(&[u8], bool)>, upper: Option<(&[u8], bool)>) -> bool {
+        if let Some((bound, _)) = lower {
+            let m = prefix.len().min(bound.len());
+            // If the prefix is already byte-wise below the bound's prefix,
+            // every extension stays below the bound.
+            #[allow(clippy::indexing_slicing)] // SAFETY: m = min(lengths)
+            if prefix[..m] < bound[..m] {
+                return false;
+            }
+        }
+        if let Some((bound, inclusive)) = upper {
+            let m = prefix.len().min(bound.len());
+            #[allow(clippy::indexing_slicing)] // SAFETY: m = min(lengths)
+            match prefix[..m].cmp(&bound[..m]) {
+                std::cmp::Ordering::Greater => return false,
+                std::cmp::Ordering::Equal => {
+                    // prefix extends past (or equals) the bound: prefix >= bound.
+                    if prefix.len() > bound.len() || (prefix.len() == bound.len() && !inclusive) {
+                        return false;
+                    }
+                }
+                std::cmp::Ordering::Less => {}
+            }
+        }
+        true
     }
 
     /// Clear all entries from the index
@@ -1159,7 +1294,10 @@ impl Iterator for ArtIterator<'_> {
                         }
                     }
 
-                    let children: Vec<_> = n.iter_children().collect();
+                    // R4.4: Node4 stores children in insertion order — sort
+                    // by key byte so iteration yields ascending key order.
+                    let mut children: Vec<_> = n.iter_children().collect();
+                    children.sort_unstable_by_key(|(byte, _)| *byte);
                     for (byte, child) in children.into_iter().rev() {
                         let mut child_key = node_key.clone();
                         child_key.push(byte);
@@ -1178,7 +1316,10 @@ impl Iterator for ArtIterator<'_> {
                         self.pending_values.push_back((node_key.clone(), v));
                     }
 
-                    let children: Vec<_> = n.iter_children().collect();
+                    // R4.4: Node16 stores children in insertion order — sort
+                    // by key byte so iteration yields ascending key order.
+                    let mut children: Vec<_> = n.iter_children().collect();
+                    children.sort_unstable_by_key(|(byte, _)| *byte);
                     for (byte, child) in children.into_iter().rev() {
                         let mut child_key = node_key.clone();
                         child_key.push(byte);

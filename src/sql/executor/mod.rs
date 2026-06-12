@@ -576,6 +576,258 @@ impl<'a> Executor<'a> {
         Ok(None)
     }
 
+    /// R4.4: `ORDER BY indexed_col ASC LIMIT k` served by ordered index
+    /// iteration — no sort. Handles `Sort(Scan)` and `Project(Sort(Scan))`
+    /// (non-distinct), optionally with a WHERE clause: a range predicate on
+    /// the sort column bounds the index iteration, anything else is applied
+    /// as a residual filter while iterating in index order. NULL sort keys
+    /// honour the engine's ASC semantics (`compare_values` sorts NULL below
+    /// every value, i.e. NULLS FIRST). DESC falls through to the generic
+    /// top-k path.
+    fn try_index_ordered_topk(
+        &self,
+        input: &LogicalPlan,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Option<Box<dyn PhysicalOperator>>> {
+        use crate::sql::LogicalExpr;
+
+        if scan::index_range_fast_path_disabled() {
+            return Ok(None);
+        }
+        let Some(storage) = self.storage else {
+            return Ok(None);
+        };
+        if storage.is_branch_active() {
+            return Ok(None);
+        }
+
+        let Some((sort_exprs, sort_asc, sort_input, project_wrap)) = Self::extract_sort_for_topk(input) else {
+            return Ok(None);
+        };
+        // Single ascending key only; DESC needs reverse iteration (future work).
+        if sort_exprs.len() != 1 || sort_asc.len() != 1 || !sort_asc[0] {
+            return Ok(None);
+        }
+        if let Some((_, _, distinct, distinct_on)) = &project_wrap {
+            if *distinct || distinct_on.is_some() {
+                return Ok(None);
+            }
+        }
+        let LogicalExpr::Column { name: sort_column, .. } = &sort_exprs[0] else {
+            return Ok(None);
+        };
+
+        // Underlying plan: a (possibly filtered) scan of a real table.
+        let (table_name, alias, schema, projection, as_of, predicate): (
+            &String,
+            &Option<String>,
+            &Arc<Schema>,
+            &Option<Vec<usize>>,
+            _,
+            Option<&LogicalExpr>,
+        ) = match sort_input {
+            LogicalPlan::Scan {
+                table_name,
+                alias,
+                schema,
+                projection,
+                as_of,
+            } => (table_name, alias, schema, projection, as_of, None),
+            LogicalPlan::FilteredScan {
+                table_name,
+                alias,
+                schema,
+                projection,
+                predicate,
+                as_of,
+            } => (table_name, alias, schema, projection, as_of, predicate.as_ref()),
+            LogicalPlan::Filter { input, predicate } => {
+                if let LogicalPlan::Scan {
+                    table_name,
+                    alias,
+                    schema,
+                    projection,
+                    as_of,
+                } = input.as_ref()
+                {
+                    (table_name, alias, schema, projection, as_of, Some(predicate))
+                } else {
+                    return Ok(None);
+                }
+            }
+            _ => return Ok(None),
+        };
+        if as_of.is_some() {
+            return Ok(None);
+        }
+
+        // Cheap in-memory disqualifiers first (column type, index presence);
+        // the catalog/MV gates below involve storage reads.
+        let Some(col_idx) = schema.get_column_index(sort_column) else {
+            return Ok(None);
+        };
+        let Some(column) = schema.columns.get(col_idx) else {
+            return Ok(None);
+        };
+        if !scan::range_scannable_type(&column.data_type) {
+            return Ok(None);
+        }
+        let art = storage.art_indexes();
+        let Some(index_name) = art.find_column_index(table_name, &column.name) else {
+            return Ok(None);
+        };
+
+        if self.txn_forces_slow_reads_for_table(table_name)
+            || self.get_cte(table_name).is_some()
+            || storage.mv_catalog().view_exists(table_name)?
+            || !storage.catalog().table_exists(table_name)?
+        {
+            return Ok(None);
+        }
+
+        // Completeness gate: ordered iteration replaces the sort, so the
+        // index must cover EVERY row (including NULL keys). Rows missing
+        // from the index (e.g. tuples predating an ALTER TABLE ADD COLUMN)
+        // would silently vanish — fall back instead.
+        let Some(entry_count) = art.index_entry_count(&index_name) else {
+            return Ok(None);
+        };
+        let table_rows = storage.count_table_rows(table_name)? as u64;
+        if entry_count != table_rows {
+            return Ok(None);
+        }
+
+        // Optional WHERE: a range on the sort column bounds the iteration;
+        // everything (including the range itself) is re-applied residually.
+        let materialized_predicate = predicate.map(|p| self.materialize_subqueries(p)).transpose()?;
+        let (lower, upper) = match &materialized_predicate {
+            Some(pred) => {
+                match scan::indexed_range_lookup(storage, table_name, schema.as_ref(), pred, &self.parameters) {
+                    Some(spec) if spec.column_name == column.name => (spec.lower, spec.upper),
+                    // Predicate is not a range on the sort column: the
+                    // residual filter could discard arbitrarily many rows
+                    // per index step — let the generic top-k path handle it.
+                    _ => return Ok(None),
+                }
+            }
+            None => (None, None),
+        };
+
+        let source_name = alias.as_ref().unwrap_or(table_name);
+        let actual_schema = Arc::new(scan::schema_with_source(schema.as_ref(), source_name, table_name));
+        let residual = materialized_predicate.as_ref().map(|pred| {
+            let evaluator = crate::sql::Evaluator::with_parameters(actual_schema.clone(), self.parameters.clone());
+            let bound = evaluator.bind(pred.clone());
+            (evaluator, bound)
+        });
+
+        let k_target = limit.saturating_add(offset);
+        let total = entry_count as usize;
+        let mut fetch_k = k_target.saturating_mul(2).max(k_target.saturating_add(8)).min(total);
+        let mut non_null: Vec<Tuple>;
+        let mut null_head: Vec<Tuple>;
+        loop {
+            non_null = Vec::with_capacity(k_target.min(fetch_k));
+            null_head = Vec::new();
+            // The engine's `compare_values` sorts NULL below every value, so
+            // ASC means NULLS FIRST. NULL keys encode as the 1-byte 0x00 and
+            // cluster at the front of the index; only the empty string (and
+            // a literal "\0") can share that region, so all NULL rows have
+            // been seen once a key > [0x00] goes by. Rows are classified by
+            // the actual tuple value (never by key) to keep "\0"/"" exact.
+            let mut nulls_complete = false;
+            let pairs = art.index_range_scan(
+                &index_name,
+                lower.as_ref().map(|(key, inclusive)| (key.as_slice(), *inclusive)),
+                upper.as_ref().map(|(key, inclusive)| (key.as_slice(), *inclusive)),
+                Some(fetch_k),
+            );
+            let exhausted = pairs.len() < fetch_k;
+            for (key, row_id) in &pairs {
+                if key.as_slice() > [0u8].as_slice() {
+                    nulls_complete = true;
+                }
+                let Some(tuple) = storage.get_row_by_id(table_name, *row_id, schema.as_ref())? else {
+                    continue;
+                };
+                if let Some((evaluator, pred)) = &residual {
+                    match evaluator.evaluate(pred, &tuple)? {
+                        crate::Value::Boolean(true) => {}
+                        crate::Value::Boolean(false) | crate::Value::Null => continue,
+                        other => {
+                            return Err(Error::query_execution(format!(
+                                "Filter predicate must evaluate to boolean, got: {:?}",
+                                other
+                            )));
+                        }
+                    }
+                }
+                if matches!(tuple.values.get(col_idx), Some(crate::Value::Null) | None) {
+                    null_head.push(tuple);
+                    continue;
+                }
+                non_null.push(tuple);
+                if nulls_complete && null_head.len() + non_null.len() >= k_target {
+                    break;
+                }
+            }
+            // Enough rows only counts as done once every NULL row is in hand
+            // (`nulls_complete`), or when NULLs alone already fill the top-k:
+            // empty-string keys sort BEFORE the NULL key, so a batch can hit
+            // `k_target` on ""-rows while NULL rows (which precede them in
+            // the output) are still unfetched beyond `fetch_k`.
+            if exhausted
+                || fetch_k >= total
+                || (null_head.len() + non_null.len() >= k_target
+                    && (nulls_complete || null_head.len() >= k_target))
+            {
+                break;
+            }
+            fetch_k = fetch_k.saturating_mul(4).min(total);
+        }
+        // NULLS FIRST (engine ASC semantics), then values in index order.
+        let mut ordered = null_head;
+        ordered.append(&mut non_null);
+        ordered.truncate(k_target);
+
+        tracing::debug!(
+            "ordered index top-k: '{}' on {}.{} served {} of {} requested rows (no sort)",
+            index_name,
+            table_name,
+            column.name,
+            ordered.len(),
+            k_target,
+        );
+
+        let scan_op: Box<dyn PhysicalOperator> = Box::new(
+            scan::ScanOperator::new(
+                table_name.clone(),
+                actual_schema,
+                projection.clone(),
+                ordered,
+                self.parameters.clone(),
+            )
+            .with_timeout(self.timeout_ctx.clone()),
+        );
+        let after_project: Box<dyn PhysicalOperator> = match project_wrap {
+            Some((exprs, aliases, _, _)) => {
+                let materialised: Vec<crate::sql::LogicalExpr> = exprs
+                    .iter()
+                    .map(|e| self.materialize_subqueries(e))
+                    .collect::<Result<Vec<_>>>()?;
+                Box::new(
+                    ProjectOperator::new(scan_op, materialised, aliases, false, self.parameters.clone())
+                        .with_timeout(self.timeout_ctx.clone()),
+                )
+            }
+            None => scan_op,
+        };
+        Ok(Some(Box::new(
+            LimitOperator::new(after_project, limit, offset).with_timeout(self.timeout_ctx.clone()),
+        )))
+    }
+
     /// Vector kNN fast path: `... ORDER BY col <distance-op> $const LIMIT k`.
     ///
     /// Detects the pgvector kNN idiom and, when an HNSW index exists on the
@@ -2519,6 +2771,11 @@ impl<'a> Executor<'a> {
                 if let Some(result) = scan::try_index_point_lookup_for_scan(self, &scan_plan, predicate)? {
                     return Ok(result);
                 }
+                // R4.4: range predicates on an indexed column become an
+                // ordered bounded index scan instead of scan + filter.
+                if let Some(result) = scan::try_index_range_scan_for_scan(self, &scan_plan, predicate)? {
+                    return Ok(result);
+                }
                 scan::handle_filtered_scan(self, plan)
             }
             LogicalPlan::FilteredScan { .. } => scan::handle_filtered_scan(self, plan),
@@ -2526,6 +2783,10 @@ impl<'a> Executor<'a> {
             LogicalPlan::Filter { input, predicate } => {
                 // Try ART index-based point lookup for Filter(Scan) equality predicates.
                 if let Some(result) = scan::try_index_point_lookup_for_scan(self, input, predicate)? {
+                    return Ok(result);
+                }
+                // R4.4: index range scan for Filter(Scan) range predicates.
+                if let Some(result) = scan::try_index_range_scan_for_scan(self, input, predicate)? {
                     return Ok(result);
                 }
                 let mut input_op = self.plan_to_operator(input)?;
@@ -2844,6 +3105,11 @@ impl<'a> Executor<'a> {
                     // any non-indexed or non-kNN query so nothing regresses.
                     if let Some(knn) = self.try_vector_knn_topk(input, *limit, *offset)? {
                         return Ok(knn);
+                    }
+                    // R4.4: ORDER BY indexed_col ASC LIMIT k via ordered
+                    // index iteration (no sort, no full scan).
+                    if let Some(ordered) = self.try_index_ordered_topk(input, *limit, *offset)? {
+                        return Ok(ordered);
                     }
                     if let Some(topk) = self.try_storage_direct_topk(input, *limit, *offset)? {
                         return Ok(topk);

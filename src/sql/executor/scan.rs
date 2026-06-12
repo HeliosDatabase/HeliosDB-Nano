@@ -334,6 +334,375 @@ pub(super) fn try_index_point_lookup_for_scan(
     )))
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// R4.4: index range scans — `col > / >= / < / <= / BETWEEN bound` predicates
+// on a single-column ART-indexed column become an ordered, bounded index
+// iteration (seek + bounded iterate) instead of a full scan + filter.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Detected index range scan: encoded bounds plus display strings for EXPLAIN.
+pub(super) struct IndexRangeSpec {
+    pub(super) index_name: String,
+    pub(super) column_name: String,
+    /// Encoded `(bound, inclusive)` — `None` = unbounded on that side.
+    pub(super) lower: Option<(Vec<u8>, bool)>,
+    pub(super) upper: Option<(Vec<u8>, bool)>,
+    /// Human-readable bound description, e.g. `score > 10 AND score <= 90`.
+    pub(super) display: String,
+}
+
+/// Diagnostic / safety kill switch for the index range scan and ordered
+/// index top-k fast paths (mirrors `HELIOS_KNN_FAST_OFF`).
+pub(super) fn index_range_fast_path_disabled() -> bool {
+    std::env::var_os("HELIOS_INDEX_RANGE_OFF").is_some()
+}
+
+/// Column types whose v2 key encoding is order-preserving, i.e. byte order of
+/// encoded keys == SQL value order. Range scans are only planned for these.
+pub(super) fn range_scannable_type(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Int2
+            | DataType::Int4
+            | DataType::Int8
+            | DataType::Float4
+            | DataType::Float8
+            | DataType::Text
+            | DataType::Varchar(_)
+            | DataType::Char(_)
+    )
+}
+
+fn flatten_and<'a>(expr: &'a LogicalExpr, out: &mut Vec<&'a LogicalExpr>) {
+    use crate::sql::BinaryOperator;
+    if let LogicalExpr::BinaryExpr {
+        left,
+        op: BinaryOperator::And,
+        right,
+    } = expr
+    {
+        flatten_and(left, out);
+        flatten_and(right, out);
+    } else {
+        out.push(expr);
+    }
+}
+
+fn range_column_ref<'a>(schema: &'a Schema, expr: &LogicalExpr) -> Option<&'a crate::Column> {
+    let LogicalExpr::Column { table, name } = expr else {
+        return None;
+    };
+    let idx = schema
+        .get_qualified_column_index(table.as_deref(), name)
+        .or_else(|| schema.get_column_index(name))?;
+    schema.columns.get(idx)
+}
+
+#[derive(Default)]
+struct RawColumnBounds {
+    /// `(bound value, inclusive)`
+    lowers: Vec<(Value, bool)>,
+    uppers: Vec<(Value, bool)>,
+}
+
+/// Analyze an (already materialized) predicate for range constraints on a
+/// single-column-indexed, range-scannable column. Returns the spec with
+/// encoded + tightened bounds, or `None` when no conjunct qualifies (mixed /
+/// uncoercible bound types simply fall back to the normal scan path).
+pub(super) fn indexed_range_lookup(
+    storage: &crate::storage::StorageEngine,
+    table_name: &str,
+    schema: &Schema,
+    predicate: &LogicalExpr,
+    parameters: &[Value],
+) -> Option<IndexRangeSpec> {
+    use crate::sql::BinaryOperator;
+
+    let mut conjuncts = Vec::new();
+    flatten_and(predicate, &mut conjuncts);
+
+    let mut by_column: std::collections::HashMap<String, RawColumnBounds> = std::collections::HashMap::new();
+    for conjunct in &conjuncts {
+        match conjunct {
+            LogicalExpr::BinaryExpr { left, op, right } => {
+                let (column, value_expr, op) = if let Some(col) = range_column_ref(schema, left) {
+                    (col, right.as_ref(), *op)
+                } else if let Some(col) = range_column_ref(schema, right) {
+                    // `bound < col` ≡ `col > bound`: flip the comparison.
+                    let flipped = match op {
+                        BinaryOperator::Lt => BinaryOperator::Gt,
+                        BinaryOperator::LtEq => BinaryOperator::GtEq,
+                        BinaryOperator::Gt => BinaryOperator::Lt,
+                        BinaryOperator::GtEq => BinaryOperator::LtEq,
+                        other => *other,
+                    };
+                    (col, left.as_ref(), flipped)
+                } else {
+                    continue;
+                };
+                let Some(raw) = lookup_bound_value(value_expr, parameters) else {
+                    continue;
+                };
+                if matches!(raw, Value::Null) {
+                    continue;
+                }
+                let bounds = by_column.entry(column.name.clone()).or_default();
+                match op {
+                    BinaryOperator::Gt => bounds.lowers.push((raw, false)),
+                    BinaryOperator::GtEq => bounds.lowers.push((raw, true)),
+                    BinaryOperator::Lt => bounds.uppers.push((raw, false)),
+                    BinaryOperator::LtEq => bounds.uppers.push((raw, true)),
+                    _ => {}
+                }
+            }
+            LogicalExpr::Between {
+                expr,
+                low,
+                high,
+                negated: false,
+            } => {
+                let Some(column) = range_column_ref(schema, expr) else {
+                    continue;
+                };
+                let (Some(low), Some(high)) = (
+                    lookup_bound_value(low, parameters),
+                    lookup_bound_value(high, parameters),
+                ) else {
+                    continue;
+                };
+                if matches!(low, Value::Null) || matches!(high, Value::Null) {
+                    continue;
+                }
+                let bounds = by_column.entry(column.name.clone()).or_default();
+                bounds.lowers.push((low, true));
+                bounds.uppers.push((high, true));
+            }
+            _ => {}
+        }
+    }
+    if by_column.is_empty() {
+        return None;
+    }
+
+    // Choose the first qualifying column in schema order (deterministic).
+    for column in &schema.columns {
+        let Some(raw_bounds) = by_column.get(&column.name) else {
+            continue;
+        };
+        if !range_scannable_type(&column.data_type) {
+            continue;
+        }
+        let Some(index_name) = storage.art_indexes().find_column_index(table_name, &column.name) else {
+            continue;
+        };
+
+        // Coerce every bound to the column type; any failure (mixed types
+        // the evaluator may still accept or reject) disqualifies the column
+        // and falls back to the normal scan path.
+        let mut encoded_lowers: Vec<(Vec<u8>, bool, String)> = Vec::new();
+        let mut encoded_uppers: Vec<(Vec<u8>, bool, String)> = Vec::new();
+        let mut ok = true;
+        for (raw, inclusive) in &raw_bounds.lowers {
+            match coerce_index_lookup_value(raw.clone(), &column.data_type) {
+                Some(v) if !matches!(v, Value::Null) => {
+                    let key = crate::storage::ArtIndexManager::encode_key_from_values(std::iter::once(&v));
+                    encoded_lowers.push((key, *inclusive, format!("{v}")));
+                }
+                _ => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok {
+            for (raw, inclusive) in &raw_bounds.uppers {
+                match coerce_index_lookup_value(raw.clone(), &column.data_type) {
+                    Some(v) if !matches!(v, Value::Null) => {
+                        let key = crate::storage::ArtIndexManager::encode_key_from_values(std::iter::once(&v));
+                        encoded_uppers.push((key, *inclusive, format!("{v}")));
+                    }
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+        }
+        if !ok || (encoded_lowers.is_empty() && encoded_uppers.is_empty()) {
+            continue;
+        }
+
+        // Tighten: max lower / min upper (exclusive beats inclusive on ties).
+        // Encoded byte order == value order for range-scannable types, so the
+        // comparison happens on the encoded form.
+        let lower = encoded_lowers
+            .into_iter()
+            .max_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)))
+            .map(|(key, inclusive, text)| (key, inclusive, text));
+        let upper = encoded_uppers
+            .into_iter()
+            .min_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)))
+            .map(|(key, inclusive, text)| (key, inclusive, text));
+
+        let mut parts = Vec::new();
+        if let Some((_, inclusive, text)) = &lower {
+            parts.push(format!("{} {} {}", column.name, if *inclusive { ">=" } else { ">" }, text));
+        }
+        if let Some((_, inclusive, text)) = &upper {
+            parts.push(format!("{} {} {}", column.name, if *inclusive { "<=" } else { "<" }, text));
+        }
+        let display = parts.join(" AND ");
+
+        // Fixed-width types: synthesize an unbounded-side lower bound at the
+        // type minimum so the 1-byte NULL key (0x00) is never visited.
+        let lower = lower.map(|(key, inclusive, _)| (key, inclusive)).or_else(|| {
+            let width = match column.data_type {
+                DataType::Int2 => Some(2),
+                DataType::Int4 => Some(4),
+                DataType::Int8 | DataType::Float8 => Some(8),
+                DataType::Float4 => Some(4),
+                _ => None,
+            };
+            width.map(|w| (vec![0u8; w], true))
+        });
+        let upper = upper.map(|(key, inclusive, _)| (key, inclusive));
+
+        return Some(IndexRangeSpec {
+            index_name,
+            column_name: column.name.clone(),
+            lower,
+            upper,
+            display,
+        });
+    }
+    None
+}
+
+/// Execute a `Filter`/`FilteredScan` predicate over a base table as an index
+/// range scan when one qualifies. Candidate rows are fetched by row id in
+/// index (== value) order, then the FULL predicate is re-applied — so NULL
+/// handling, residual conjuncts, and exact bound semantics are byte-for-byte
+/// identical to the scan path the planner would have used.
+pub(super) fn try_index_range_scan_for_scan(
+    executor: &Executor,
+    input: &LogicalPlan,
+    predicate: &LogicalExpr,
+) -> Result<Option<Box<dyn PhysicalOperator>>> {
+    if index_range_fast_path_disabled() {
+        return Ok(None);
+    }
+    let storage = match executor.storage() {
+        Some(storage) => storage,
+        None => return Ok(None),
+    };
+    let LogicalPlan::Scan {
+        table_name,
+        alias,
+        schema,
+        projection,
+        as_of,
+    } = input
+    else {
+        return Ok(None);
+    };
+    if as_of.is_some() {
+        return Ok(None);
+    }
+
+    // Detect a qualifying range FIRST: pure in-memory predicate analysis, so
+    // queries whose WHERE carries no indexed range bound pay (almost)
+    // nothing here. The catalog/MV/transaction gates below involve storage
+    // reads and only run once a range was actually found. Detection needs no
+    // subquery materialization — only literals, parameters, and casts
+    // qualify as bounds.
+    let Some(spec) = indexed_range_lookup(storage, table_name, schema.as_ref(), predicate, executor.parameters())
+    else {
+        return Ok(None);
+    };
+
+    if storage.is_branch_active() {
+        return Ok(None);
+    }
+    // Same transaction / snapshot gates as the point-lookup fast path.
+    if executor.txn_forces_slow_reads_for_table(table_name) {
+        return Ok(None);
+    }
+    if executor.get_cte(table_name).is_some()
+        || storage.mv_catalog().view_exists(table_name)?
+        || !storage.catalog().table_exists(table_name)?
+    {
+        return Ok(None);
+    }
+
+    let materialized_predicate = executor.materialize_subqueries(predicate)?;
+
+    let Some(pairs) = guarded_range_pairs(storage, &spec) else {
+        return Ok(None);
+    };
+
+    let mut tuples = Vec::with_capacity(pairs.len());
+    for (_, row_id) in pairs {
+        if let Some(tuple) = storage.get_row_by_id(table_name, row_id, schema.as_ref())? {
+            tuples.push(tuple);
+        }
+    }
+
+    let source_name = alias.as_ref().unwrap_or(table_name);
+    let actual_schema = Arc::new(schema_with_source(schema.as_ref(), source_name, table_name));
+    let tuples = filter_tuples_with_evaluator(
+        tuples,
+        actual_schema.clone(),
+        &materialized_predicate,
+        executor.parameters(),
+    )?;
+
+    tracing::debug!(
+        "index range scan: '{}' on {}.{} ({}) served {} rows",
+        spec.index_name,
+        table_name,
+        spec.column_name,
+        spec.display,
+        tuples.len(),
+    );
+
+    Ok(Some(Box::new(
+        ScanOperator::new(
+            table_name.clone(),
+            actual_schema,
+            projection.clone(),
+            tuples,
+            executor.parameters().to_vec(),
+        )
+        .with_timeout(executor.timeout_ctx()),
+    )))
+}
+
+/// Run the bounded index scan for `spec` with the selectivity guard applied:
+/// point-fetching more than 25% of the table loses to one sequential scan, so
+/// the walk is capped at `total/4 + 1` entries and `None` (= "use the normal
+/// scan path") is returned the moment the cap is hit — rejection costs
+/// O(total/4), never a full index walk. Shared by the executor fast path and
+/// the EXPLAIN annotator so the displayed plan is the executed plan. The kill
+/// switch `HELIOS_INDEX_RANGE_OFF` covers pathological cases.
+pub(super) fn guarded_range_pairs(
+    storage: &crate::storage::StorageEngine,
+    spec: &IndexRangeSpec,
+) -> Option<Vec<(Vec<u8>, crate::storage::RowId)>> {
+    let art = storage.art_indexes();
+    let total = art.index_entry_count(&spec.index_name)?;
+    let cap = usize::try_from(total / 4 + 1).ok()?;
+    let pairs = art.index_range_scan(
+        &spec.index_name,
+        spec.lower.as_ref().map(|(key, inclusive)| (key.as_slice(), *inclusive)),
+        spec.upper.as_ref().map(|(key, inclusive)| (key.as_slice(), *inclusive)),
+        Some(cap),
+    );
+    if total > 0 && (pairs.len() as u64).saturating_mul(4) > total {
+        return None;
+    }
+    Some(pairs)
+}
+
 fn indexed_equality_lookup(
     storage: &crate::storage::StorageEngine,
     table_name: &str,
@@ -497,7 +866,7 @@ fn parse_date_for_index(value: &str) -> Option<chrono::NaiveDate> {
         .or_else(|| parse_timestamp_for_index(value).map(|ts| ts.date_naive()))
 }
 
-fn schema_with_source(schema: &Schema, source_name: &str, table_name: &str) -> Schema {
+pub(super) fn schema_with_source(schema: &Schema, source_name: &str, table_name: &str) -> Schema {
     Schema {
         columns: schema
             .columns
