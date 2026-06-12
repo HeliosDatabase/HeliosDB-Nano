@@ -370,13 +370,17 @@ fn watermark_survives_reopen_and_collection_is_idempotent() {
 }
 
 // ---------------------------------------------------------------------------
-// 8. Mixed indexed/un-indexed chains: the statement-level (autocommit)
-//    UPDATE path writes `v:` versions WITHOUT `v_idx:` entries, while
-//    snapshot reads resolve through `v_idx:` only (C15 interaction). When
-//    the newest version at-or-below the horizon is un-indexed, the
-//    collector must also keep the newest INDEXED version at-or-below the
-//    horizon — otherwise an AS OF read at t >= horizon silently changes
-//    its answer after GC (falls back to the current data key here).
+// 8. Mixed indexed/un-indexed chains: the PARAMETERIZED autocommit
+//    UPDATE path (`execute_params` with no open transaction — the
+//    extended-query wire path) runs `update_tuples_branch_aware`, which
+//    writes `v:` versions WITHOUT `v_idx:` entries, while snapshot reads
+//    resolve through `v_idx:` only (C15 interaction). The simple-query
+//    `execute()` path wraps DML in an implicit transaction whose commit
+//    writes fully indexed chains, so it cannot reproduce this. When the
+//    newest version at-or-below the horizon is un-indexed, the collector
+//    must also keep the newest INDEXED version at-or-below the horizon —
+//    otherwise an AS OF read at t >= horizon silently changes its answer
+//    after GC (falls back to the current data key here).
 // ---------------------------------------------------------------------------
 #[test]
 fn gc_preserves_indexed_reads_over_unindexed_autocommit_versions() {
@@ -386,8 +390,8 @@ fn gc_preserves_indexed_reads_over_unindexed_autocommit_versions() {
 
     update_rounds(&db, "m", 1); // val=1, transactional commit => indexed version
     sleep_secs(1.2);
-    // Statement-level autocommit update: un-indexed `v:` versions only.
-    db.execute("UPDATE m SET val = val + 10").unwrap(); // val=11
+    // Parameterized autocommit update: un-indexed `v:` version only.
+    db.execute_params("UPDATE m SET val = val + 10", &[]).unwrap(); // val=11
     sleep_secs(1.2);
     let ts_probe = now_sql_timestamp(); // resolves AT the horizon after GC
 
@@ -418,12 +422,19 @@ fn gc_preserves_indexed_reads_over_unindexed_autocommit_versions() {
     );
 
     // Chain rule for mixed chains: the un-indexed newest <= horizon AND
-    // the newest indexed <= horizon both survive (2 versions per row).
+    // the newest indexed <= horizon both survive (2 versions per row);
+    // older fully-indexed versions (the INSERT's) are collected.
     let stats = db.version_storage_stats().unwrap();
     assert_eq!(
         stats.version_keys,
         (ROWS * 2) as u64,
         "expected keep + keep_indexed per row, stats: {:?}",
+        stats
+    );
+    assert_eq!(
+        stats.version_index_keys,
+        ROWS as u64,
+        "expected exactly the keep_indexed index entry per row, stats: {:?}",
         stats
     );
 
