@@ -12053,6 +12053,9 @@ impl EmbeddedDatabase {
         );
         // R1.3-p2: durable commits share one group fsync per cohort.
         txn.set_group_committer(self.storage.group_committer());
+        // R1.3-p2: invalidate written rows inside commit, before the
+        // snapshot barrier lifts (stale-row-cache lost-update fence).
+        txn.set_row_cache(std::sync::Arc::clone(self.storage.row_cache()));
         // R0.2: record commits always; validate (first-committer-wins) for
         // RepeatableRead/Serializable. ReadCommitted keeps PostgreSQL's
         // blind-write semantics.
@@ -12236,6 +12239,8 @@ impl EmbeddedDatabase {
             );
             // R1.3-p2: durable commits share one group fsync per cohort.
             txn.set_group_committer(self.storage.group_committer());
+            // R1.3-p2: stale-row-cache lost-update fence (see above).
+            txn.set_row_cache(std::sync::Arc::clone(self.storage.row_cache()));
             // R0.2: implicit single-statement session transactions record
             // their commits so explicit transactions can validate against
             // them; they never validate (statement-atomic, RC semantics).
