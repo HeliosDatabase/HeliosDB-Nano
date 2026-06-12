@@ -5,6 +5,44 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.51.0] - 2026-06-12
+
+Minor release: typed columnar batches, lock-free commit fast paths, version
+garbage collection, and durable/range index infrastructure (R3.4, R1.3-p2,
+R4.3, R4.2/R4.4).
+
+### Changed - Columnar execution (R3.4)
+
+- Columnar storage can write typed batch format v2 for integer, float,
+  boolean, and text-heavy batches while retaining the legacy v1 fallback for
+  mixed or unsupported values. Vectorized typed kernels cover scans,
+  aggregates, and grouped paths, with environment switches preserved for
+  A/B validation (`HELIOS_BATCH_V2_OFF`, `HELIOS_COLP_OFF`,
+  `HELIOS_ZONE_MAP_OFF`).
+
+### Changed - Commit pipeline (R1.3-p2)
+
+- Commit watermark tracking moves to a lock-free fast path and removes the
+  session transaction map shard deadlock exposed by contended conflict
+  workloads. The release gate includes two contended `HELIOS_CONFLICT=1`
+  runs with `lost_updates=0`.
+- Group commit plumbing is available for durable commit window sweeps while
+  preserving the existing safe defaults.
+
+### Added - Index durability and range scans (R4.2/R4.4)
+
+- ART index snapshots can be persisted and recovered across restarts, keeping
+  primary-key and secondary-index probes on indexed paths after reopening a
+  database.
+- Ordered ART range iteration supports multi-selectivity range-scan paths and
+  adaptive cold-storage fallback for large result sets.
+
+### Added - Version garbage collection (R4.3)
+
+- Historical MVCC versions are tracked and reclaimed after snapshots no longer
+  pin them, reducing long-chain overhead while preserving `AS OF` visibility
+  semantics.
+
 ## [3.50.0] - 2026-06-11
 
 Minor release: filtered vector search, Windows compilation, and the
