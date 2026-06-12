@@ -360,6 +360,22 @@ fn convert_logical_referential_action(
 /// # Ok(())
 /// # }
 /// ```
+/// Slot holding one session's open transaction (R1.3-p2 deadlock fix).
+///
+/// The `session_transactions` DashMap used to store `Transaction` values
+/// directly, and statements held the shard READ guard for their whole
+/// execution — including row-lock waits (60s sleep-retry). COMMIT/ROLLBACK
+/// need the shard WRITE lock (`remove`), so a committer holding row locks
+/// could park behind executors of *other* sessions that hash to the same
+/// shard while those executors waited on the committer's row locks: a
+/// cross-session deadlock the row-lock wait-graph cannot see (observed as
+/// a multi-minute livelock in `run_conflict_bench`'s contended_counter,
+/// ~30% of runs; pre-existing on v3.50.0, exposed deterministically by the
+/// R1.3-p2 gates). Wrapping the transaction in its own slot means shard
+/// guards are held only for the map operation itself; statements borrow
+/// through the slot's RwLock, which only same-session work ever contends.
+type SessionTxnSlot = std::sync::Arc<parking_lot::RwLock<Option<storage::Transaction>>>;
+
 pub struct EmbeddedDatabase {
     /// Storage engine (public for REPL access)
     pub storage: std::sync::Arc<storage::StorageEngine>,
@@ -391,8 +407,9 @@ pub struct EmbeddedDatabase {
     pub lock_manager: std::sync::Arc<storage::LockManager>,
     /// Dirty tracker for tracking uncommitted changes
     pub dirty_tracker: std::sync::Arc<storage::DirtyTracker>,
-    /// Active transactions per session
-    session_transactions: std::sync::Arc<dashmap::DashMap<crate::session::SessionId, storage::Transaction>>,
+    /// Active transactions per session. See [`SessionTxnSlot`] for why the
+    /// transaction lives behind a per-session slot lock.
+    session_transactions: std::sync::Arc<dashmap::DashMap<crate::session::SessionId, SessionTxnSlot>>,
     /// Prepared statements storage (name -> plan)
     prepared_statements: std::sync::Arc<parking_lot::RwLock<std::collections::HashMap<String, sql::LogicalPlan>>>,
     /// Active savepoints stack (name -> transaction state)
@@ -11998,11 +12015,15 @@ impl EmbeddedDatabase {
     /// * `session_id` - ID of the session to destroy
     pub fn destroy_session(&self, session_id: crate::session::SessionId) -> Result<()> {
         // A dropped connection must not leak its open transaction (write-set
-        // buffers, row locks) or its eager ART index mutations.
-        if let Some((_, txn)) = self.session_transactions.remove(&session_id) {
+        // buffers, row locks) or its eager ART index mutations. Taking the
+        // slot's write lock waits out any statement still borrowing the
+        // transaction before rolling it back.
+        if let Some((_, slot)) = self.session_transactions.remove(&session_id) {
             self.session_txn_count
                 .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-            let _ = txn.rollback();
+            if let Some(txn) = slot.write().take() {
+                let _ = txn.rollback();
+            }
         }
         self.finish_session_art_undo(session_id, true);
         self.session_manager.destroy_session(session_id)
@@ -12069,11 +12090,21 @@ impl EmbeddedDatabase {
         session.stats.transactions_started += 1;
 
         // Store transaction in map
-        self.session_transactions.insert(session_id, txn);
+        self.session_transactions
+            .insert(session_id, std::sync::Arc::new(parking_lot::RwLock::new(Some(txn))));
         self.session_txn_count
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
 
         Ok(())
+    }
+
+    /// Clone the session's transaction slot out of the map. The DashMap
+    /// shard guard is held only for this lookup — NEVER across statement
+    /// execution or row-lock waits (see [`SessionTxnSlot`]).
+    fn session_txn_slot(&self, session_id: crate::session::SessionId) -> Option<SessionTxnSlot> {
+        self.session_transactions
+            .get(&session_id)
+            .map(|entry| std::sync::Arc::clone(entry.value()))
     }
 
     /// Commit transaction for a specific session
@@ -12096,10 +12127,22 @@ impl EmbeddedDatabase {
             return Err(Error::transaction("Session has no active transaction to commit"));
         }
 
-        // Retrieve and commit transaction with a FRESH commit timestamp
-        if let Some((_, txn)) = self.session_transactions.remove(&session_id) {
+        // Retrieve and commit transaction with a FRESH commit timestamp.
+        // The slot's write lock waits out any statement still borrowing the
+        // transaction; the DashMap shard guard itself is released by the
+        // time `remove` returns (deadlock fix — see [`SessionTxnSlot`]).
+        if let Some((_, slot)) = self.session_transactions.remove(&session_id) {
             self.session_txn_count
                 .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            let Some(txn) = slot.write().take() else {
+                // Slot already drained (concurrent commit/rollback race) —
+                // treat like the missing-entry case below.
+                self.finish_session_art_undo(session_id, false);
+                self.invalidate_result_cache();
+                session.active_txn = None;
+                session.stats.transactions_committed += 1;
+                return Ok(());
+            };
             let written = txn.written_data_keys();
             let commit_ts = self.storage.next_commit_timestamp(txn.has_tracked_writes());
             if let Err(e) = txn.commit_with_timestamp(commit_ts) {
@@ -12147,11 +12190,13 @@ impl EmbeddedDatabase {
             return Err(Error::transaction("Session has no active transaction to rollback"));
         }
 
-        // Retrieve and rollback transaction
-        if let Some((_, txn)) = self.session_transactions.remove(&session_id) {
+        // Retrieve and rollback transaction (slot semantics as in commit).
+        if let Some((_, slot)) = self.session_transactions.remove(&session_id) {
             self.session_txn_count
                 .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-            txn.rollback()?;
+            if let Some(txn) = slot.write().take() {
+                txn.rollback()?;
+            }
         }
         // Undo the session's eager ART index mutations (insert/update/delete
         // hooks run at statement time, not commit time).
@@ -12195,21 +12240,20 @@ impl EmbeddedDatabase {
         session.stats.queries_executed += 1;
 
         // Check if session has an active transaction
-        if self.session_transactions.contains_key(&session_id) {
+        if let Some(slot) = self.session_txn_slot(session_id) {
             // For READ COMMITTED, each statement gets a fresh snapshot.
-            // Hold the DashMap write guard only briefly for the mutable refresh.
+            // Hold the slot's write lock only briefly for the mutable refresh.
             if session.isolation_level == crate::session::IsolationLevel::ReadCommitted {
-                if let Some(mut txn) = self.session_transactions.get_mut(&session_id) {
+                if let Some(txn) = slot.write().as_mut() {
                     txn.refresh_snapshot(self.storage.current_timestamp());
                 }
             }
 
-            // Use a read guard (shared) during execution to avoid blocking
-            // other sessions that may hash to the same DashMap shard
-            let txn = self
-                .session_transactions
-                .get(&session_id)
-                .ok_or_else(|| Error::transaction("Session transaction disappeared during execute"))?;
+            // Borrow the transaction through the slot for the statement's
+            // duration — no DashMap shard guard is held across execution or
+            // row-lock waits (deadlock fix, see [`SessionTxnSlot`]).
+            let txn = parking_lot::RwLockReadGuard::try_map(slot.read(), |t| t.as_ref())
+                .map_err(|_| Error::transaction("Session transaction disappeared during execute"))?;
 
             // Skip fast paths for session transactions — writes must go through
             // the transaction write set for proper isolation and rollback support
@@ -12294,21 +12338,19 @@ impl EmbeddedDatabase {
         session.stats.queries_executed += 1;
 
         // Check if session has an active transaction
-        if self.session_transactions.contains_key(&session_id) {
+        if let Some(slot) = self.session_txn_slot(session_id) {
             // For READ COMMITTED, each statement gets a fresh snapshot.
-            // Hold the DashMap write guard only briefly for the mutable refresh.
+            // Hold the slot's write lock only briefly for the mutable refresh.
             if session.isolation_level == crate::session::IsolationLevel::ReadCommitted {
-                if let Some(mut txn) = self.session_transactions.get_mut(&session_id) {
+                if let Some(txn) = slot.write().as_mut() {
                     txn.refresh_snapshot(self.storage.current_timestamp());
                 }
             }
 
-            // Use a read guard (shared) during execution to avoid blocking
-            // other sessions that may hash to the same DashMap shard
-            let txn = self
-                .session_transactions
-                .get(&session_id)
-                .ok_or_else(|| Error::transaction("Session transaction disappeared during query"))?;
+            // Borrow through the slot — no shard guard held across the query
+            // (deadlock fix, see [`SessionTxnSlot`]).
+            let txn = parking_lot::RwLockReadGuard::try_map(slot.read(), |t| t.as_ref())
+                .map_err(|_| Error::transaction("Session transaction disappeared during query"))?;
 
             // Parse SQL with cache
             let (statement, _) = self.parse_cached(sql)?;
@@ -12381,9 +12423,11 @@ impl EmbeddedDatabase {
         session_lock.write().synchronous_commit = value;
         // Apply to an already-open transaction too: its sync flag was
         // captured at BEGIN.
-        if let Some(mut txn) = self.session_transactions.get_mut(&session_id) {
-            let storage_cfg = &self.storage.config().storage;
-            txn.set_sync_commit(value.unwrap_or(storage_cfg.durable_commit) && !storage_cfg.memory_only);
+        if let Some(slot) = self.session_txn_slot(session_id) {
+            if let Some(txn) = slot.write().as_mut() {
+                let storage_cfg = &self.storage.config().storage;
+                txn.set_sync_commit(value.unwrap_or(storage_cfg.durable_commit) && !storage_cfg.memory_only);
+            }
         }
         Ok(())
     }
@@ -12437,8 +12481,10 @@ impl EmbeddedDatabase {
         session.touch();
         session.stats.queries_executed += 1;
         if session.isolation_level == crate::session::IsolationLevel::ReadCommitted {
-            if let Some(mut txn) = self.session_transactions.get_mut(&session_id) {
-                txn.refresh_snapshot(self.storage.current_timestamp());
+            if let Some(slot) = self.session_txn_slot(session_id) {
+                if let Some(txn) = slot.write().as_mut() {
+                    txn.refresh_snapshot(self.storage.current_timestamp());
+                }
             }
         }
         Ok(())
@@ -12512,10 +12558,11 @@ impl EmbeddedDatabase {
 
         let start = std::time::Instant::now();
         self.touch_session_for_statement(session_id)?;
-        let txn = self
-            .session_transactions
-            .get(&session_id)
+        let slot = self
+            .session_txn_slot(session_id)
             .ok_or_else(|| Error::transaction("Session transaction disappeared during execute"))?;
+        let txn = parking_lot::RwLockReadGuard::try_map(slot.read(), |t| t.as_ref())
+            .map_err(|_| Error::transaction("Session transaction disappeared during execute"))?;
         // Result-cache invalidation is deferred to COMMIT, mirroring the
         // global-slot in-transaction arm of `execute()`.
         let result = self.execute_in_transaction_no_fast_path(sql, &txn);
@@ -12540,10 +12587,11 @@ impl EmbeddedDatabase {
 
         let start = std::time::Instant::now();
         self.touch_session_for_statement(session_id)?;
-        let txn = self
-            .session_transactions
-            .get(&session_id)
+        let slot = self
+            .session_txn_slot(session_id)
             .ok_or_else(|| Error::transaction("Session transaction disappeared during query"))?;
+        let txn = parking_lot::RwLockReadGuard::try_map(slot.read(), |t| t.as_ref())
+            .map_err(|_| Error::transaction("Session transaction disappeared during query"))?;
 
         let (statement, _) = self.parse_cached(sql)?;
         let catalog = self.storage.catalog();
@@ -12579,10 +12627,11 @@ impl EmbeddedDatabase {
         }
 
         self.touch_session_for_statement(session_id)?;
-        let txn = self
-            .session_transactions
-            .get(&session_id)
+        let slot = self
+            .session_txn_slot(session_id)
             .ok_or_else(|| Error::transaction("Session transaction disappeared during execute"))?;
+        let txn = parking_lot::RwLockReadGuard::try_map(slot.read(), |t| t.as_ref())
+            .map_err(|_| Error::transaction("Session transaction disappeared during execute"))?;
         let plan = self.parameterized_plan_cached(sql)?;
         let out = self.execute_plan_with_params(&plan, &[], Some(&txn));
 
@@ -12636,10 +12685,11 @@ impl EmbeddedDatabase {
         }
 
         self.touch_session_for_statement(session_id)?;
-        let txn = self
-            .session_transactions
-            .get(&session_id)
+        let slot = self
+            .session_txn_slot(session_id)
             .ok_or_else(|| Error::transaction("Session transaction disappeared during execute"))?;
+        let txn = parking_lot::RwLockReadGuard::try_map(slot.read(), |t| t.as_ref())
+            .map_err(|_| Error::transaction("Session transaction disappeared during execute"))?;
         let plan = match plan_override {
             Some(p) => std::sync::Arc::clone(p),
             None => self.parameterized_plan_cached(sql)?,
@@ -12686,10 +12736,11 @@ impl EmbeddedDatabase {
         }
 
         self.touch_session_for_statement(session_id)?;
-        let txn = self
-            .session_transactions
-            .get(&session_id)
+        let slot = self
+            .session_txn_slot(session_id)
             .ok_or_else(|| Error::transaction("Session transaction disappeared during query"))?;
+        let txn = parking_lot::RwLockReadGuard::try_map(slot.read(), |t| t.as_ref())
+            .map_err(|_| Error::transaction("Session transaction disappeared during query"))?;
         let plan = match plan_override {
             Some(p) => std::sync::Arc::clone(p),
             None => self.parameterized_plan_cached(sql)?,
@@ -12726,10 +12777,11 @@ impl EmbeddedDatabase {
         }
 
         self.touch_session_for_statement(session_id)?;
-        let txn = self
-            .session_transactions
-            .get(&session_id)
+        let slot = self
+            .session_txn_slot(session_id)
             .ok_or_else(|| Error::transaction("Session transaction disappeared during query"))?;
+        let txn = parking_lot::RwLockReadGuard::try_map(slot.read(), |t| t.as_ref())
+            .map_err(|_| Error::transaction("Session transaction disappeared during query"))?;
         let plan = self.parameterized_plan_cached(sql)?;
 
         if matches!(
