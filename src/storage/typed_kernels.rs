@@ -24,19 +24,32 @@
 //!   `pred.evaluate` itself (≤1024 entries per batch), so ANY operator
 //!   (LIKE, IN, …) over a dictionary-coded batch is exact by construction.
 //!
-//! # Autovectorization notes (per kernel, verified on x86_64 AVX2)
+//! # Autovectorization notes (per kernel, asm-verified at the workspace's
+//! # baseline x86-64 target — SSE2; no `target-cpu` override is set)
 //!
-//! The comparison kernels (`mask_int_cmp`, `mask_float_cmp`, validity/
-//! presence expansion, popcounts, f64/i64 masked sums) are written as
-//! branchless select-style loops over equal-length slices, which LLVM
-//! autovectorizes. The dictionary/grouped kernels are gather/scatter loops
-//! (data-dependent indices) that no SIMD ISA expresses profitably at this
-//! batch size; their win comes from replacing a per-row
-//! `Vec<Value>`-key hash-map probe with an array index. The existing AVX2
-//! intrinsics in `simd_filter.rs` (i32-only, index-materializing) were
-//! measured against the autovectorized i64 mask loop and lost (they emit a
-//! `Vec<usize>` of indices instead of a mask and only cover i32), so no
-//! hand-written intrinsics are used here.
+//! The comparison kernels (`mask_int_cmp`, `mask_float_cmp`), validity/
+//! presence expansion, counts and the small-magnitude i64 masked sum are
+//! written as branchless select-style loops over equal-length slices, which
+//! LLVM autovectorizes (pcmpgt/pand/por masks, pmuludq/paddq sums). Two
+//! caveats discovered by inspecting the generated asm:
+//!
+//! - This workspace builds release with `overflow-checks = true`
+//!   (`.cargo/config.toml`); the panic edge of any checked `+=` in a loop
+//!   body blocks the vectorizer. Kernels therefore use wrapping arithmetic
+//!   exactly where overflow is structurally impossible (0/1 lanes, the
+//!   SUM_I64_SAFE_BOUND magnitude precondition) — semantics are identical.
+//! - The f64 sums and float MIN/MAX stay scalar BY DESIGN: vectorizing
+//!   reassociates FP additions / reorders NaN comparisons, which would
+//!   change results vs the engine's scalar paths. LLVM (correctly) refuses
+//!   without fast-math, and we do not want fast-math.
+//!
+//! The dictionary/grouped kernels are gather/scatter loops (data-dependent
+//! indices) that no SIMD ISA expresses profitably at this batch size; their
+//! win comes from replacing a per-row `Vec<Value>`-key hash-map probe with
+//! an array index. The existing AVX2 intrinsics in `simd_filter.rs`
+//! (i32-only, index-materializing) were measured against the autovectorized
+//! i64 mask loop and lost (they emit a `Vec<usize>` of indices instead of a
+//! mask and only cover i32), so no hand-written intrinsics are used here.
 
 use super::columnar::{ColumnBatch, BATCH_SIZE};
 use super::simd_filter::{FilterOp, FilterPredicate};
@@ -302,13 +315,34 @@ fn mask_text_lut(codes: &[u32], validity: &[u8], lut: &[u8], null_result: u8, ma
 // ---------------------------------------------------------------------------
 
 /// COUNT(*) over the mask (autovectorized byte sum).
+///
+/// Wrapping arithmetic throughout these kernels is NOT for speed of the adds
+/// themselves: this workspace enables `overflow-checks = true` in release
+/// (`.cargo/config.toml`), and the panic branch of every checked add blocks
+/// LLVM's loop vectorizer (verified: the checked forms compile to scalar
+/// loops with panic edges; the wrapping forms vectorize). Overflow is
+/// structurally impossible — mask/validity lanes are 0/1, so these counters
+/// grow by at most 1 per lane.
 pub(crate) fn count_selected(mask: &[u8]) -> u64 {
-    mask.iter().map(|&m| m as u64).sum()
+    // u32 chunk partials (≤256 lanes of 0/1 each) widen once per chunk —
+    // this shape vectorizes where a straight u64 fold does not.
+    let mut n: u64 = 0;
+    for chunk in mask.chunks(256) {
+        let mut part: u32 = 0;
+        for &m in chunk {
+            part = part.wrapping_add(m as u32);
+        }
+        n = n.wrapping_add(part as u64);
+    }
+    n
 }
 
 /// COUNT(col): selected AND non-NULL lanes.
 pub(crate) fn count_selected_valid(validity: &[u8], mask: &[u8]) -> u64 {
-    validity.iter().zip(mask).map(|(&ok, &m)| (ok & m) as u64).sum()
+    validity
+        .iter()
+        .zip(mask)
+        .fold(0u64, |acc, (&ok, &m)| acc.wrapping_add((ok & m) as u64))
 }
 
 /// Magnitude bound under which a whole batch can be summed in plain i64
@@ -326,19 +360,26 @@ pub(crate) const SUM_I64_SAFE_BOUND: i64 = i64::MAX / (BATCH_SIZE as i64 + 1);
 pub(crate) fn sum_int_selected(data: &[i64], validity: &[u8], mask: &[u8], small_magnitude: bool) -> (i128, u64) {
     let mut n: u64 = 0;
     if small_magnitude {
+        // Wrapping ops so the release overflow checks don't block
+        // vectorization (see `count_selected`): `sel` is 0/1, and the
+        // caller-checked SUM_I64_SAFE_BOUND magnitude bound makes i64
+        // overflow impossible over ≤ BATCH_SIZE terms, so wrapping ==
+        // checked here. Verified codegen: pmuludq/paddq lanes.
         let mut sum: i64 = 0;
         for ((&v, &ok), &m) in data.iter().zip(validity).zip(mask) {
             let sel = (ok & m) as i64;
-            sum += sel * v;
-            n += sel as u64;
+            sum = sum.wrapping_add(sel.wrapping_mul(v));
+            n = n.wrapping_add(sel as u64);
         }
         (sum as i128, n)
     } else {
+        // i128 accumulation is inherently scalar; wrapping on the 0/1
+        // counter still removes its panic edge from the loop.
         let mut sum: i128 = 0;
         for ((&v, &ok), &m) in data.iter().zip(validity).zip(mask) {
             let sel = (ok & m) as i128;
             sum += sel * v as i128;
-            n += (ok & m) as u64;
+            n = n.wrapping_add((ok & m) as u64);
         }
         (sum, n)
     }
@@ -364,25 +405,30 @@ pub(crate) fn min_max_int_selected(data: &[i64], validity: &[u8], mask: &[u8]) -
 /// Mirrors the scalar `*sum += v` accumulation per lane in slot order;
 /// batch-level partials merge like R3.2 chunk partials.
 pub(crate) fn sum_f64_selected(data: &[f64], validity: &[u8], mask: &[u8]) -> (f64, u64) {
+    // The f64 accumulation stays scalar BY DESIGN: vectorizing would
+    // reassociate the additions and change results bit-for-bit vs the
+    // scalar path (LLVM refuses without fast-math, correctly). The wrapping
+    // counter just removes the overflow-check panic edge from the loop.
     let mut sum = 0.0f64;
     let mut n: u64 = 0;
     for ((&v, &ok), &m) in data.iter().zip(validity).zip(mask) {
         let sel = ok & m;
         sum += if sel != 0 { v } else { 0.0 };
-        n += sel as u64;
+        n = n.wrapping_add(sel as u64);
     }
     (sum, n)
 }
 
 /// AVG partial over selected non-NULL int lanes (each int converted to f64,
-/// matching the scalar AVG update).
+/// matching the scalar AVG update). Scalar f64 accumulation by design — see
+/// `sum_f64_selected`.
 pub(crate) fn sum_f64_from_int_selected(data: &[i64], validity: &[u8], mask: &[u8]) -> (f64, u64) {
     let mut sum = 0.0f64;
     let mut n: u64 = 0;
     for ((&v, &ok), &m) in data.iter().zip(validity).zip(mask) {
         let sel = ok & m;
         sum += if sel != 0 { v as f64 } else { 0.0 };
-        n += sel as u64;
+        n = n.wrapping_add(sel as u64);
     }
     (sum, n)
 }
