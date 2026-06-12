@@ -1,0 +1,37 @@
+=== repro run 1 09:21:26 ===
+rc=124
+WEDGE-OR-FAIL on run 1
+=== repro run 2 09:22:56 ===
+rc=0
+contended_counter(8T)                         14063 commit/s  committed=4000 retries=477 zero_matches=0 final_v=4000 lost_updates=0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.48s
+=== repro run 3 09:22:57 ===
+rc=0
+contended_counter(8T)                         14390 commit/s  committed=4000 retries=538 zero_matches=0 final_v=4000 lost_updates=0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.48s
+=== repro run 4 09:22:57 ===
+rc=0
+contended_counter(8T)                         14060 commit/s  committed=4000 retries=526 zero_matches=0 final_v=4000 lost_updates=0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.49s
+=== repro run 5 09:22:58 ===
+rc=0
+contended_counter(8T)                         14323 commit/s  committed=4000 retries=512 zero_matches=0 final_v=4000 lost_updates=0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.47s
+=== repro run 6 09:22:58 ===
+rc=124
+WEDGE-OR-FAIL on run 6
+=== repro run 7 09:24:28 ===
+rc=0
+contended_counter(8T)                         14484 commit/s  committed=4000 retries=397 zero_matches=0 final_v=4000 lost_updates=0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.48s
+=== repro run 8 09:24:29 ===
+rc=0
+contended_counter(8T)                         13999 commit/s  committed=4000 retries=505 zero_matches=0 final_v=4000 lost_updates=0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.48s
+=== repro run 9 09:24:29 ===
+rc=0
+contended_counter(8T)                         14013 commit/s  committed=4000 retries=501 zero_matches=0 final_v=4000 lost_updates=0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.52s
+=== repro run 10 09:24:30 ===
+rc=124
+WEDGE-OR-FAIL on run 10

@@ -1,0 +1,10 @@
+run 1 rc=0 contended_counter(8T)                         11813 commit/s  committed=4000 retries=626 zero_matches=0 final_v=4000 lost_updates=0
+run 2 rc=0 contended_counter(8T)                         12612 commit/s  committed=4000 retries=514 zero_matches=0 final_v=4000 lost_updates=0
+run 3 rc=0 contended_counter(8T)                         12541 commit/s  committed=4000 retries=535 zero_matches=0 final_v=4000 lost_updates=0
+run 4 rc=0 contended_counter(8T)                         12307 commit/s  committed=4000 retries=532 zero_matches=0 final_v=4000 lost_updates=0
+run 5 rc=0 contended_counter(8T)                         12123 commit/s  committed=4000 retries=524 zero_matches=0 final_v=4000 lost_updates=0
+run 6 rc=0 contended_counter(8T)                         11737 commit/s  committed=4000 retries=593 zero_matches=0 final_v=4000 lost_updates=0
+run 7 rc=0 contended_counter(8T)                         12504 commit/s  committed=4000 retries=498 zero_matches=0 final_v=4000 lost_updates=0
+run 8 rc=0 contended_counter(8T)                         11566 commit/s  committed=4000 retries=609 zero_matches=0 final_v=4000 lost_updates=0
+run 9 rc=0 contended_counter(8T)                         12421 commit/s  committed=4000 retries=515 zero_matches=0 final_v=4000 lost_updates=0
+run 10 rc=0 contended_counter(8T)                         11863 commit/s  committed=4000 retries=574 zero_matches=0 final_v=4000 lost_updates=0

@@ -1,0 +1,21 @@
+=== postfix conflict run 1 ===
+update_txn_cycle( 1T, disjoint)             14359 txn/s  (500 total)
+update_txn_cycle( 4T, disjoint)             37429 txn/s  (2000 total)
+update_txn_cycle(16T, disjoint)             62973 txn/s  (8000 total)
+contended_counter(8T)                         12271 commit/s  committed=4000 retries=607 zero_matches=0 final_v=4000 lost_updates=0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.57s
+rc=0
+=== postfix conflict run 2 ===
+update_txn_cycle( 1T, disjoint)             14902 txn/s  (500 total)
+update_txn_cycle( 4T, disjoint)             38423 txn/s  (2000 total)
+update_txn_cycle(16T, disjoint)             64945 txn/s  (8000 total)
+contended_counter(8T)                         12137 commit/s  committed=4000 retries=515 zero_matches=0 final_v=4000 lost_updates=0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.56s
+rc=0
+=== postfix conflict run 3 ===
+update_txn_cycle( 1T, disjoint)             14406 txn/s  (500 total)
+update_txn_cycle( 4T, disjoint)             41465 txn/s  (2000 total)
+update_txn_cycle(16T, disjoint)             66192 txn/s  (8000 total)
+contended_counter(8T)                         12503 commit/s  committed=4000 retries=532 zero_matches=0 final_v=4000 lost_updates=0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.55s
+rc=0
