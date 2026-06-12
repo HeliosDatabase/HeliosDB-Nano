@@ -304,6 +304,81 @@ impl HnswIndex {
     pub fn dimension(&self) -> usize {
         self.config.dimension
     }
+
+    /// R4.2: dump the graph via `hnsw_rs` (`{basename}.hnsw.graph` +
+    /// `{basename}.hnsw.data` inside `dir`).
+    pub fn dump_graph(&self, dir: &std::path::Path, basename: &str) -> Result<()> {
+        dump_graph_impl(&self.index.read(), dir, basename)
+    }
+
+    /// R4.2: snapshot the row-id mappings for the persistence sidecar.
+    pub fn export_mappings(&self) -> (Vec<u64>, Vec<(u64, u64)>) {
+        export_mappings_impl(&self.id_mapping.read(), &self.reverse_mapping.read())
+    }
+
+    /// R4.2: reconstruct the index from a graph dump + sidecar mappings.
+    pub fn reload_from_dump(
+        config: HnswConfig,
+        dir: &std::path::Path,
+        basename: &str,
+        id_mapping: Vec<u64>,
+        reverse_pairs: &[(u64, u64)],
+    ) -> Result<Self> {
+        let graph: Hnsw<'static, f32, DistL2> = reload_graph(dir, basename)?;
+        Ok(Self {
+            index: Arc::new(RwLock::new(graph)),
+            config,
+            id_mapping: Arc::new(RwLock::new(id_mapping)),
+            reverse_mapping: Arc::new(RwLock::new(reverse_pairs_to_map(reverse_pairs))),
+        })
+    }
+}
+
+// ---- R4.2 graph persistence helpers (shared by the three metric wrappers) ----
+
+fn dump_graph_impl<D>(index: &Hnsw<'static, f32, D>, dir: &std::path::Path, basename: &str) -> Result<()>
+where
+    D: Distance<f32> + Send + Sync,
+{
+    use hnsw_rs::api::AnnT;
+    let dumped = index
+        .file_dump(dir, basename)
+        .map_err(|e| Error::storage(format!("HNSW graph dump failed: {e}")))?;
+    if dumped != basename {
+        // file_dump uniquifies the basename instead of overwriting when the
+        // datamap option is active; we always build in-memory graphs, so this
+        // signals an unexpected configuration rather than a partial dump.
+        return Err(Error::storage(format!(
+            "HNSW graph dump wrote basename '{dumped}' instead of '{basename}'"
+        )));
+    }
+    Ok(())
+}
+
+fn export_mappings_impl(
+    id_mapping: &[u64],
+    reverse_mapping: &std::collections::HashMap<u64, usize>,
+) -> (Vec<u64>, Vec<(u64, u64)>) {
+    let reverse = reverse_mapping.iter().map(|(row, hnsw)| (*row, *hnsw as u64)).collect();
+    (id_mapping.to_vec(), reverse)
+}
+
+fn reverse_pairs_to_map(pairs: &[(u64, u64)]) -> std::collections::HashMap<u64, usize> {
+    pairs.iter().map(|(row, hnsw)| (*row, *hnsw as usize)).collect()
+}
+
+/// Reload a dumped graph. The `HnswIo` loader owns buffers the reloaded
+/// graph borrows from, so it is intentionally leaked to give the graph the
+/// `'static` lifetime the wrappers require — one small leak per index per
+/// process open (the reload path runs only at startup).
+fn reload_graph<D>(dir: &std::path::Path, basename: &str) -> Result<Hnsw<'static, f32, D>>
+where
+    D: Distance<f32> + Default + Send + Sync,
+{
+    let io: &'static mut hnsw_rs::hnswio::HnswIo =
+        Box::leak(Box::new(hnsw_rs::hnswio::HnswIo::new(dir, basename)));
+    io.load_hnsw::<f32, D>()
+        .map_err(|e| Error::storage(format!("HNSW graph reload failed: {e}")))
 }
 
 /// Multi-metric HNSW index that supports different distance metrics
@@ -390,6 +465,59 @@ impl MultiMetricHnswIndex {
     /// Check if the index is empty
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// R4.2: dump the graph to `{dir}/{basename}.hnsw.{graph,data}`.
+    pub fn dump_graph(&self, dir: &std::path::Path, basename: &str) -> Result<()> {
+        match self {
+            Self::L2(index) => index.dump_graph(dir, basename),
+            Self::Cosine(index) => index.dump_graph(dir, basename),
+            Self::InnerProduct(index) => index.dump_graph(dir, basename),
+        }
+    }
+
+    /// R4.2: snapshot the row-id mappings for the persistence sidecar.
+    pub fn export_mappings(&self) -> (Vec<u64>, Vec<(u64, u64)>) {
+        match self {
+            Self::L2(index) => index.export_mappings(),
+            Self::Cosine(index) => index.export_mappings(),
+            Self::InnerProduct(index) => index.export_mappings(),
+        }
+    }
+
+    /// R4.2: reconstruct an index from a graph dump + sidecar mappings.
+    /// The metric is taken from `config.distance_metric` and must match the
+    /// metric the graph was built with (the caller persists it in the sidecar).
+    pub fn reload_from_dump(
+        config: HnswConfig,
+        dir: &std::path::Path,
+        basename: &str,
+        id_mapping: Vec<u64>,
+        reverse_pairs: &[(u64, u64)],
+    ) -> Result<Self> {
+        match config.distance_metric {
+            DistanceMetric::L2 => Ok(Self::L2(HnswIndex::reload_from_dump(
+                config,
+                dir,
+                basename,
+                id_mapping,
+                reverse_pairs,
+            )?)),
+            DistanceMetric::Cosine => Ok(Self::Cosine(CosineHnswIndex::reload_from_dump(
+                config,
+                dir,
+                basename,
+                id_mapping,
+                reverse_pairs,
+            )?)),
+            DistanceMetric::InnerProduct => Ok(Self::InnerProduct(InnerProductHnswIndex::reload_from_dump(
+                config,
+                dir,
+                basename,
+                id_mapping,
+                reverse_pairs,
+            )?)),
+        }
     }
 }
 
@@ -534,6 +662,33 @@ impl CosineHnswIndex {
     pub fn is_empty(&self) -> bool {
         self.id_mapping.read().is_empty()
     }
+
+    /// R4.2: dump the graph — see [`HnswIndex::dump_graph`].
+    pub fn dump_graph(&self, dir: &std::path::Path, basename: &str) -> Result<()> {
+        dump_graph_impl(&self.index.read(), dir, basename)
+    }
+
+    /// R4.2: snapshot the row-id mappings — see [`HnswIndex::export_mappings`].
+    pub fn export_mappings(&self) -> (Vec<u64>, Vec<(u64, u64)>) {
+        export_mappings_impl(&self.id_mapping.read(), &self.reverse_mapping.read())
+    }
+
+    /// R4.2: reconstruct from a graph dump — see [`HnswIndex::reload_from_dump`].
+    pub fn reload_from_dump(
+        config: HnswConfig,
+        dir: &std::path::Path,
+        basename: &str,
+        id_mapping: Vec<u64>,
+        reverse_pairs: &[(u64, u64)],
+    ) -> Result<Self> {
+        let graph: Hnsw<'static, f32, DistCosine> = reload_graph(dir, basename)?;
+        Ok(Self {
+            index: Arc::new(RwLock::new(graph)),
+            config,
+            id_mapping: Arc::new(RwLock::new(id_mapping)),
+            reverse_mapping: Arc::new(RwLock::new(reverse_pairs_to_map(reverse_pairs))),
+        })
+    }
 }
 
 /// HNSW index for inner product (dot product)
@@ -676,6 +831,33 @@ impl InnerProductHnswIndex {
 
     pub fn is_empty(&self) -> bool {
         self.id_mapping.read().is_empty()
+    }
+
+    /// R4.2: dump the graph — see [`HnswIndex::dump_graph`].
+    pub fn dump_graph(&self, dir: &std::path::Path, basename: &str) -> Result<()> {
+        dump_graph_impl(&self.index.read(), dir, basename)
+    }
+
+    /// R4.2: snapshot the row-id mappings — see [`HnswIndex::export_mappings`].
+    pub fn export_mappings(&self) -> (Vec<u64>, Vec<(u64, u64)>) {
+        export_mappings_impl(&self.id_mapping.read(), &self.reverse_mapping.read())
+    }
+
+    /// R4.2: reconstruct from a graph dump — see [`HnswIndex::reload_from_dump`].
+    pub fn reload_from_dump(
+        config: HnswConfig,
+        dir: &std::path::Path,
+        basename: &str,
+        id_mapping: Vec<u64>,
+        reverse_pairs: &[(u64, u64)],
+    ) -> Result<Self> {
+        let graph: Hnsw<'static, f32, DistDot> = reload_graph(dir, basename)?;
+        Ok(Self {
+            index: Arc::new(RwLock::new(graph)),
+            config,
+            id_mapping: Arc::new(RwLock::new(id_mapping)),
+            reverse_mapping: Arc::new(RwLock::new(reverse_pairs_to_map(reverse_pairs))),
+        })
     }
 }
 

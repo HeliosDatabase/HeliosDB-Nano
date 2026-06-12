@@ -1714,6 +1714,13 @@ pub struct StorageEngine {
     /// In-memory reverse-FK cache (referenced table -> constraints that point at it)
     referencing_fk_cache:
         Arc<parking_lot::Mutex<std::collections::HashMap<String, Vec<crate::sql::ForeignKeyConstraint>>>>,
+    /// R4.2: write durable index snapshots at clean shutdown. Disabled by
+    /// crash-recovery tests to simulate a process that died without
+    /// checkpointing.
+    index_snapshots_on_close: Arc<AtomicBool>,
+    /// R4.2: how the last `rebuild_all_indexes` populated the in-memory
+    /// indexes (snapshot-loaded vs scanned). Diagnostics + test surface.
+    last_index_open_report: Arc<RwLock<Option<super::index_snapshot::IndexOpenReport>>>,
 }
 
 /// Minimum free disk space threshold (100 MB)
@@ -2105,10 +2112,17 @@ impl StorageEngine {
             schema_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             constraints_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             referencing_fk_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+            index_snapshots_on_close: Arc::new(AtomicBool::new(true)),
+            last_index_open_report: Arc::new(RwLock::new(None)),
         };
 
         // Load counters from storage
         engine.load_counters()?;
+
+        // R4.2: arm the snapshot invalidation hooks BEFORE any mutation can
+        // run (WAL replay below included), so post-checkpoint mutations
+        // durably invalidate stale index snapshots.
+        engine.wire_index_snapshot_hooks();
 
         // Replay WAL entries for crash recovery
         if engine.wal.is_some() {
@@ -2319,6 +2333,8 @@ impl StorageEngine {
             schema_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             constraints_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             referencing_fk_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+            index_snapshots_on_close: Arc::new(AtomicBool::new(true)),
+            last_index_open_report: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -7912,6 +7928,268 @@ impl StorageEngine {
         self.db
             .flush()
             .map_err(|e| Error::storage(format!("Flush failed: {}", e)))
+    }
+
+    // =========================================================================
+    // R4.2: durable index snapshots (see `storage::index_snapshot` for the
+    // format and the crash-correctness argument)
+    // =========================================================================
+
+    /// Directory holding `hnsw_rs` graph dumps; `None` for in-memory engines.
+    pub fn hnsw_snapshot_dir(&self) -> Option<std::path::PathBuf> {
+        self.db_path
+            .as_ref()
+            .map(|p| p.join(super::index_snapshot::HNSW_SNAPSHOT_DIR))
+    }
+
+    /// Arm the snapshot-invalidation hooks on both index managers. Called
+    /// once at open, before WAL replay or any other mutation can run.
+    fn wire_index_snapshot_hooks(&self) {
+        let db = Arc::clone(&self.db);
+        self.art_index_manager.set_snapshot_invalidation_hook(Arc::new(move || {
+            Self::delete_prefix_raw(&db, super::index_snapshot::ART_SNAPSHOT_MARKER_PREFIX.as_bytes());
+        }));
+        let db = Arc::clone(&self.db);
+        self.vector_indexes.set_snapshot_invalidation_hook(Arc::new(move || {
+            Self::delete_prefix_raw(&db, super::index_snapshot::VEC_SNAPSHOT_MARKER_PREFIX.as_bytes());
+        }));
+    }
+
+    /// Delete every key under `prefix`. Used by the invalidation hooks, which
+    /// only have the raw DB handle (keys are plaintext even with encryption).
+    fn delete_prefix_raw(db: &DB, prefix: &[u8]) {
+        let mut read_opts = ReadOptions::default();
+        read_opts.set_total_order_seek(true);
+        let iter = db.iterator_opt(IteratorMode::From(prefix, rocksdb::Direction::Forward), read_opts);
+        let mut batch = WriteBatch::default();
+        for item in iter {
+            let Ok((key, _)) = item else { break };
+            if !key.starts_with(prefix) {
+                break;
+            }
+            batch.delete(key);
+        }
+        if let Err(e) = db.write(batch) {
+            warn!("index snapshot marker invalidation failed: {}", e);
+        }
+    }
+
+    /// Durably invalidate all ART snapshot markers.
+    pub fn invalidate_art_snapshot_markers(&self) {
+        Self::delete_prefix_raw(&self.db, super::index_snapshot::ART_SNAPSHOT_MARKER_PREFIX.as_bytes());
+    }
+
+    /// Durably invalidate all vector snapshot markers.
+    pub fn invalidate_vector_snapshot_markers(&self) {
+        Self::delete_prefix_raw(&self.db, super::index_snapshot::VEC_SNAPSHOT_MARKER_PREFIX.as_bytes());
+    }
+
+    /// Enable/disable snapshot persistence at clean shutdown. Crash-recovery
+    /// tests disable it to simulate a process killed mid-run.
+    pub fn set_index_snapshots_on_close(&self, enabled: bool) {
+        self.index_snapshots_on_close.store(enabled, Ordering::Release);
+    }
+
+    /// Whether the close path should persist index snapshots.
+    pub fn index_snapshots_on_close(&self) -> bool {
+        self.index_snapshots_on_close.load(Ordering::Acquire)
+    }
+
+    /// Stash the report of how the last open populated the indexes.
+    pub(crate) fn set_last_index_open_report(&self, report: super::index_snapshot::IndexOpenReport) {
+        *self.last_index_open_report.write() = Some(report);
+    }
+
+    /// How the last open populated the in-memory indexes (None before the
+    /// first `rebuild_all_indexes` of this process).
+    pub fn last_index_open_report(&self) -> Option<super::index_snapshot::IndexOpenReport> {
+        self.last_index_open_report.read().clone()
+    }
+
+    /// Checkpoint: persist ART entries and standard HNSW graphs so the next
+    /// open can skip the O(table-size) rebuild.
+    ///
+    /// Write order per artifact is snapshot-then-marker through the
+    /// encrypting `put` path, so a crash mid-checkpoint leaves at worst a
+    /// marker-less snapshot (ignored at open → scan rebuild). Should be
+    /// called quiescent (the embedded close path checks for open
+    /// transactions); a racing mutation is detected after the marker writes
+    /// and re-invalidates them.
+    ///
+    /// Note: HNSW graph dumps are plain files under
+    /// `{data_dir}/hnsw_snapshots/` and are not covered by at-rest encryption
+    /// (the vectors themselves; row data stays in RocksDB). ART snapshots go
+    /// through the encrypted keyspace.
+    pub fn persist_index_snapshots(&self) -> Result<super::index_snapshot::IndexSnapshotPersistReport> {
+        use super::index_snapshot as snap;
+
+        let started = std::time::Instant::now();
+        let mut report = snap::IndexSnapshotPersistReport::default();
+        let Some(dump_dir) = self.hnsw_snapshot_dir() else {
+            // In-memory engine: nothing survives the process anyway.
+            return Ok(report);
+        };
+
+        // Re-arm validity BEFORE exporting. A mutation racing this checkpoint
+        // flips the flag (and deletes whatever markers exist); the post-write
+        // check below then removes the markers written here.
+        self.art_index_manager.mark_snapshot_clean();
+        self.vector_indexes.mark_snapshot_clean();
+
+        let catalog = super::Catalog::new(self);
+        let marker = snap::SnapshotMarker::current();
+        let marker_bytes =
+            bincode::serialize(&marker).map_err(|e| Error::storage(format!("marker serialize: {e}")))?;
+
+        for table_name in catalog.list_tables()? {
+            if table_name.starts_with("helios_") {
+                continue;
+            }
+            let indexes = self.art_index_manager.export_table_snapshot(&table_name);
+            report.art_entries += indexes
+                .iter()
+                .map(|i| i.entries.iter().map(|(_, ids)| ids.len() as u64).sum::<u64>())
+                .sum::<u64>();
+            let table_snap = snap::ArtTableSnapshot {
+                format_version: snap::INDEX_SNAPSHOT_FORMAT_VERSION,
+                key_encoding_version: snap::ART_KEY_ENCODING_VERSION,
+                indexes,
+            };
+            let blob =
+                bincode::serialize(&table_snap).map_err(|e| Error::storage(format!("snapshot serialize: {e}")))?;
+            // Snapshot first, marker second: a crash in between leaves no
+            // marker and the snapshot is ignored.
+            self.put(&snap::art_snapshot_key(&table_name), &blob)?;
+            self.put(&snap::art_snapshot_marker_key(&table_name), &marker_bytes)?;
+            report.art_tables += 1;
+        }
+
+        let vector_metas = self.vector_indexes.list_all_metadata();
+        if vector_metas
+            .iter()
+            .any(|m| matches!(m.index_type, super::VectorIndexType::Standard(_)))
+        {
+            if let Err(e) = std::fs::create_dir_all(&dump_dir) {
+                warn!("could not create HNSW snapshot dir {:?}: {}", dump_dir, e);
+            }
+        }
+        for meta in vector_metas {
+            if !matches!(meta.index_type, super::VectorIndexType::Standard(_)) {
+                continue; // persistent backend is already durable; PQ has its own path
+            }
+            match self.vector_indexes.dump_standard_index(&meta.name, &dump_dir) {
+                Ok(Some(sidecar)) => {
+                    let blob = bincode::serialize(&sidecar)
+                        .map_err(|e| Error::storage(format!("sidecar serialize: {e}")))?;
+                    self.put(&snap::vec_snapshot_key(&meta.name), &blob)?;
+                    self.put(&snap::vec_snapshot_marker_key(&meta.name), &marker_bytes)?;
+                    report.vector_graphs += 1;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    warn!("HNSW snapshot dump for '{}' failed: {} — it will rebuild on open", meta.name, e);
+                    report.vector_dump_failures += 1;
+                }
+            }
+        }
+
+        // Detect a mutation that raced the checkpoint and drop the markers.
+        if !self.art_index_manager.snapshot_is_clean() {
+            self.invalidate_art_snapshot_markers();
+        }
+        if !self.vector_indexes.snapshot_is_clean() {
+            self.invalidate_vector_snapshot_markers();
+        }
+
+        report.persisted = true;
+        report.elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+        info!(
+            "index snapshot checkpoint: {} tables ({} ART entries), {} HNSW graphs, {:.1}ms",
+            report.art_tables, report.art_entries, report.vector_graphs, report.elapsed_ms
+        );
+        Ok(report)
+    }
+
+    /// Read every valid ART table snapshot (marker present + versions match).
+    /// Called once at the START of `rebuild_all_indexes`, before index
+    /// registration consumes the markers.
+    pub(crate) fn load_art_table_snapshots(
+        &self,
+    ) -> std::collections::HashMap<String, super::index_snapshot::ArtTableSnapshot> {
+        use super::index_snapshot as snap;
+        let mut out = std::collections::HashMap::new();
+        for table in self.keys_with_prefix_suffixes(snap::ART_SNAPSHOT_MARKER_PREFIX) {
+            let Ok(Some(marker_bytes)) = self.get(&snap::art_snapshot_marker_key(&table)) else {
+                continue;
+            };
+            let Ok(marker) = bincode::deserialize::<snap::SnapshotMarker>(&marker_bytes) else {
+                continue;
+            };
+            if !marker.matches_current() {
+                continue;
+            }
+            let Ok(Some(blob)) = self.get(&snap::art_snapshot_key(&table)) else {
+                continue;
+            };
+            let Ok(table_snap) = bincode::deserialize::<snap::ArtTableSnapshot>(&blob) else {
+                warn!("ART snapshot for '{}' is unreadable — falling back to scan rebuild", table);
+                continue;
+            };
+            if table_snap.format_version != snap::INDEX_SNAPSHOT_FORMAT_VERSION
+                || table_snap.key_encoding_version != snap::ART_KEY_ENCODING_VERSION
+            {
+                continue;
+            }
+            out.insert(table, table_snap);
+        }
+        out
+    }
+
+    /// Read every valid HNSW graph sidecar (marker present + versions match).
+    pub(crate) fn load_vector_sidecars(
+        &self,
+    ) -> std::collections::HashMap<String, super::index_snapshot::VectorGraphSidecar> {
+        use super::index_snapshot as snap;
+        let mut out = std::collections::HashMap::new();
+        for index in self.keys_with_prefix_suffixes(snap::VEC_SNAPSHOT_MARKER_PREFIX) {
+            let Ok(Some(marker_bytes)) = self.get(&snap::vec_snapshot_marker_key(&index)) else {
+                continue;
+            };
+            let Ok(marker) = bincode::deserialize::<snap::SnapshotMarker>(&marker_bytes) else {
+                continue;
+            };
+            if !marker.matches_current() {
+                continue;
+            }
+            let Ok(Some(blob)) = self.get(&snap::vec_snapshot_key(&index)) else {
+                continue;
+            };
+            let Ok(sidecar) = bincode::deserialize::<snap::VectorGraphSidecar>(&blob) else {
+                warn!("HNSW sidecar for '{}' is unreadable — falling back to rebuild", index);
+                continue;
+            };
+            out.insert(index, sidecar);
+        }
+        out
+    }
+
+    /// Key suffixes (after `prefix`) of every key under `prefix`.
+    fn keys_with_prefix_suffixes(&self, prefix: &str) -> Vec<String> {
+        let prefix_bytes = prefix.as_bytes();
+        let mut read_opts = ReadOptions::default();
+        read_opts.set_total_order_seek(true);
+        let iter = self
+            .db
+            .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read_opts);
+        let mut out = Vec::new();
+        for item in iter {
+            let Ok((key, _)) = item else { break };
+            if !key.starts_with(prefix_bytes) {
+                break;
+            }
+            out.push(String::from_utf8_lossy(key.get(prefix_bytes.len()..).unwrap_or_default()).to_string());
+        }
+        out
     }
 
     /// Get database statistics

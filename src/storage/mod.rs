@@ -55,6 +55,9 @@ pub mod art_index;
 pub mod art_manager;
 pub mod art_node;
 
+// Durable index snapshots (R4.2)
+pub mod index_snapshot;
+
 // Self-Maintaining Filter Index (SMFI) modules - Phase 1-4
 pub mod columnar_zone_summary;
 pub mod filter_consolidation_worker;
@@ -69,6 +72,7 @@ pub use branch::{
 };
 pub use catalog::Catalog;
 pub use dirty_tracker::{Change, ChangeType, DirtyTracker, DirtyTrackerError};
+pub use index_snapshot::{IndexOpenReport, IndexSnapshotPersistReport};
 pub use dump::{
     CompressionType as DumpCompressionType, DumpManager, DumpMetadata, DumpMode, DumpOptions, DumpOutputFormat,
     DumpReport, DumpType, RestoreOptions, RestoreReport,
