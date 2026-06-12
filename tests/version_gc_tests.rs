@@ -370,7 +370,73 @@ fn watermark_survives_reopen_and_collection_is_idempotent() {
 }
 
 // ---------------------------------------------------------------------------
-// 8. Background worker collects on its own (no manual VACUUM).
+// 8. Mixed indexed/un-indexed chains: the statement-level (autocommit)
+//    UPDATE path writes `v:` versions WITHOUT `v_idx:` entries, while
+//    snapshot reads resolve through `v_idx:` only (C15 interaction). When
+//    the newest version at-or-below the horizon is un-indexed, the
+//    collector must also keep the newest INDEXED version at-or-below the
+//    horizon — otherwise an AS OF read at t >= horizon silently changes
+//    its answer after GC (falls back to the current data key here).
+// ---------------------------------------------------------------------------
+#[test]
+fn gc_preserves_indexed_reads_over_unindexed_autocommit_versions() {
+    let db = db_with_retention("1s");
+    const ROWS: usize = 5;
+    setup_rows(&db, "m", ROWS);
+
+    update_rounds(&db, "m", 1); // val=1, transactional commit => indexed version
+    sleep_secs(1.2);
+    // Statement-level autocommit update: un-indexed `v:` versions only.
+    db.execute("UPDATE m SET val = val + 10").unwrap(); // val=11
+    sleep_secs(1.2);
+    let ts_probe = now_sql_timestamp(); // resolves AT the horizon after GC
+
+    let as_of = format!("SELECT id, val FROM m AS OF TIMESTAMP '{}'", ts_probe);
+    let snapshot_of = |db: &EmbeddedDatabase| -> Vec<(i64, i64)> {
+        let mut rows: Vec<(i64, i64)> = db
+            .query(&as_of, &[])
+            .unwrap()
+            .iter()
+            .map(|r| (as_i64(&r.values[0]), as_i64(&r.values[1])))
+            .collect();
+        rows.sort_unstable();
+        rows
+    };
+
+    let before = snapshot_of(&db);
+    assert_eq!(before.len(), ROWS);
+
+    sleep_secs(2.0); // age the whole history past the 1s retention
+    let collected = db.vacuum_versions().unwrap();
+    assert!(collected > 0);
+
+    // The AS OF answer at t >= horizon is EXACTLY what it was before GC.
+    assert_eq!(
+        snapshot_of(&db),
+        before,
+        "GC must not change indexed AS OF results at t >= horizon"
+    );
+
+    // Chain rule for mixed chains: the un-indexed newest <= horizon AND
+    // the newest indexed <= horizon both survive (2 versions per row).
+    let stats = db.version_storage_stats().unwrap();
+    assert_eq!(
+        stats.version_keys,
+        (ROWS * 2) as u64,
+        "expected keep + keep_indexed per row, stats: {:?}",
+        stats
+    );
+
+    // Current reads unaffected.
+    let rows = db.query("SELECT val FROM m", &[]).unwrap();
+    assert_eq!(rows.len(), ROWS);
+    for row in &rows {
+        assert_eq!(as_i64(&row.values[0]), 11);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 9. Background worker collects on its own (no manual VACUUM).
 // ---------------------------------------------------------------------------
 #[test]
 fn background_worker_collects_without_vacuum() {
