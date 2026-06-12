@@ -237,6 +237,54 @@ fn probe_order_by_limit() {
     }
 }
 
+/// Diagnostic: cold-row range cost. The row cache holds 10k entries, so
+/// disjoint 1% slices (10k rows each at 1M) are always fetched cold — this
+/// measures the true first-touch cost of the index path (k point gets)
+/// against the sequential scan, before and after RocksDB compaction, and is
+/// what the selectivity guard must be judged against.
+#[test]
+#[ignore = "foreground probe — run with --release --ignored --nocapture"]
+fn probe_cold_range_cost_and_compaction() {
+    let rows = probe_rows();
+    let db = EmbeddedDatabase::new_in_memory().unwrap();
+    db.execute("CREATE TABLE p_cold (id INT PRIMARY KEY, score INT, name TEXT)")
+        .unwrap();
+    fill_rows(&db, "p_cold", rows);
+    db.execute("CREATE INDEX idx_p_cold_score ON p_cold(score)").unwrap();
+
+    let slice_sql =
+        |r: usize| format!("SELECT id FROM p_cold WHERE score >= {} AND score < {}", 10 * r, 10 * r + 10);
+    let run_one = |sql: &str| -> (f64, usize) {
+        let stmt = uncached(sql);
+        let started = Instant::now();
+        let n = db.query(&stmt, &[]).unwrap().len();
+        (started.elapsed().as_secs_f64() * 1000.0, n)
+    };
+
+    println!("\ncold 1% slices @ {} rows (each slice touched once):", rows);
+    for r in 0..3 {
+        let (ms, n) = run_one(&slice_sql(r));
+        println!("  uncompacted indexed slice {r}: {ms:>10.0}ms ({n} rows)");
+    }
+    std::env::set_var("HELIOS_INDEX_RANGE_OFF", "1");
+    let (ms, n) = run_one(&slice_sql(3));
+    std::env::remove_var("HELIOS_INDEX_RANGE_OFF");
+    println!("  uncompacted full-scan slice 3: {ms:>9.0}ms ({n} rows)");
+
+    let started = Instant::now();
+    db.storage.vacuum().unwrap();
+    println!("  vacuum/compaction: {:.1}s", started.elapsed().as_secs_f64());
+
+    for r in 4..7 {
+        let (ms, n) = run_one(&slice_sql(r));
+        println!("  compacted indexed slice {r}:   {ms:>10.0}ms ({n} rows)");
+    }
+    std::env::set_var("HELIOS_INDEX_RANGE_OFF", "1");
+    let (ms, n) = run_one(&slice_sql(7));
+    std::env::remove_var("HELIOS_INDEX_RANGE_OFF");
+    println!("  compacted full-scan slice 7:   {ms:>9.0}ms ({n} rows)");
+}
+
 /// R4 parity probe: point lookups and DML on an indexed table — the R4.2
 /// steady-state cost is one relaxed atomic load per index mutation plus a
 /// one-time marker delete after each checkpoint, so DML throughput must be
