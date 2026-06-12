@@ -1,0 +1,62 @@
+# Provenance: original R1.3-p2 session (resumed), 2026-06-12 ~10:00 UTC, quiet box (load <5).
+# tps_base = genuine v3.50.0 (6f40481) built clean in detached worktree /tmp/nano-base-v3500 (2m40s real rebuild, dep cache shared).
+# tps_postfix = HEAD a8658fb perf binary (verified current via cargo --no-run no-op).
+# Independent confirmations this session:
+#  - pre-fix HEAD wedged in stall-loop at run 11/25; gdb dump matched 4d5dbde diagnosis (committer in shard lock_exclusive_slow, executors in acquire_lock holding shard read guards, 4 threads stuck in create_session/enforce_quota).
+#  - BASE v3.50.0 wedged at run 2/15 of same loop => deadlock pre-existing, not introduced by branch.
+#  - post-fix anti-wedge 15/15 clean (timeout 60s), lost_updates=0 all runs, 12.1-13.3k commit/s band.
+ 10:00:39 up 11:02,  1 user,  load average: 4.16, 4.99, 12.14
+--- base run 1 ---
+update_txn_cycle( 1T, disjoint)             16487 txn/s  (500 total)
+update_txn_cycle( 4T, disjoint)             46964 txn/s  (2000 total)
+update_txn_cycle(16T, disjoint)             85518 txn/s  (8000 total)
+contended_counter(8T)                         14579 commit/s  committed=4000 retries=611 zero_matches=0 final_v=4000 lost_updates=0
+global_txn_cycle(1T)                          33021 txn/s
+session_txn_cycle( 1T)                        21512 txn/s  (2000 total)
+session_txn_cycle( 4T)                        45660 txn/s  (8000 total)
+session_txn_cycle(16T)                        64650 txn/s  (32000 total)
+--- postfix run 1 ---
+update_txn_cycle( 1T, disjoint)             14840 txn/s  (500 total)
+update_txn_cycle( 4T, disjoint)             42415 txn/s  (2000 total)
+update_txn_cycle(16T, disjoint)             67045 txn/s  (8000 total)
+contended_counter(8T)                         12658 commit/s  committed=4000 retries=502 zero_matches=0 final_v=4000 lost_updates=0
+global_txn_cycle(1T)                          31413 txn/s
+session_txn_cycle( 1T)                        18687 txn/s  (2000 total)
+session_txn_cycle( 4T)                        40454 txn/s  (8000 total)
+session_txn_cycle(16T)                        53054 txn/s  (32000 total)
+--- base run 2 ---
+update_txn_cycle( 1T, disjoint)             16476 txn/s  (500 total)
+update_txn_cycle( 4T, disjoint)             49034 txn/s  (2000 total)
+update_txn_cycle(16T, disjoint)             84537 txn/s  (8000 total)
+contended_counter(8T)                         14947 commit/s  committed=4000 retries=493 zero_matches=0 final_v=4000 lost_updates=0
+global_txn_cycle(1T)                          34564 txn/s
+session_txn_cycle( 1T)                        22557 txn/s  (2000 total)
+session_txn_cycle( 4T)                        47418 txn/s  (8000 total)
+session_txn_cycle(16T)                        69042 txn/s  (32000 total)
+--- postfix run 2 ---
+update_txn_cycle( 1T, disjoint)             14305 txn/s  (500 total)
+update_txn_cycle( 4T, disjoint)             40471 txn/s  (2000 total)
+update_txn_cycle(16T, disjoint)             59380 txn/s  (8000 total)
+contended_counter(8T)                         12124 commit/s  committed=4000 retries=596 zero_matches=0 final_v=4000 lost_updates=0
+global_txn_cycle(1T)                          31461 txn/s
+session_txn_cycle( 1T)                        18177 txn/s  (2000 total)
+session_txn_cycle( 4T)                        41036 txn/s  (8000 total)
+session_txn_cycle(16T)                        54538 txn/s  (32000 total)
+--- base run 3 ---
+update_txn_cycle( 1T, disjoint)             18002 txn/s  (500 total)
+update_txn_cycle( 4T, disjoint)             47046 txn/s  (2000 total)
+update_txn_cycle(16T, disjoint)             86655 txn/s  (8000 total)
+contended_counter(8T)                         14894 commit/s  committed=4000 retries=488 zero_matches=0 final_v=4000 lost_updates=0
+global_txn_cycle(1T)                          33460 txn/s
+session_txn_cycle( 1T)                        22221 txn/s  (2000 total)
+session_txn_cycle( 4T)                        44077 txn/s  (8000 total)
+session_txn_cycle(16T)                        65860 txn/s  (32000 total)
+--- postfix run 3 ---
+update_txn_cycle( 1T, disjoint)             14722 txn/s  (500 total)
+update_txn_cycle( 4T, disjoint)             42714 txn/s  (2000 total)
+update_txn_cycle(16T, disjoint)             65604 txn/s  (8000 total)
+contended_counter(8T)                         12369 commit/s  committed=4000 retries=523 zero_matches=0 final_v=4000 lost_updates=0
+global_txn_cycle(1T)                          32541 txn/s
+session_txn_cycle( 1T)                        18516 txn/s  (2000 total)
+session_txn_cycle( 4T)                        45100 txn/s  (8000 total)
+session_txn_cycle(16T)                        53226 txn/s  (32000 total)

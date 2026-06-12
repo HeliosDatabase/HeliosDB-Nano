@@ -46,6 +46,7 @@ pub mod dictionary;
 // R3.4 typed columnar batch format v2 + vectorized kernels
 pub mod typed_batch;
 pub mod typed_kernels;
+pub mod group_commit;
 
 // Row-level caching
 pub mod row_cache;
@@ -78,7 +79,7 @@ pub use dump::{
     DumpReport, DumpType, RestoreOptions, RestoreReport,
 };
 pub(crate) use engine::{ColumnarAggregateOp, ColumnarAggregateSpec};
-pub use engine::{DirectBulkLoadResult, StorageEngine, StorageStats};
+pub use engine::{DirectBulkLoadResult, StorageEngine, StorageStats, SynchronousCommitOverrideGuard};
 pub use gin_index::{GinIndex, GinIndexStats};
 pub use lock_manager::{LockGuard, LockManager, LockState, LockType};
 pub use materialized_view::{MaterializedViewCatalog, MaterializedViewMetadata};

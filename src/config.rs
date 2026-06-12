@@ -352,6 +352,16 @@ pub struct StorageConfig {
     /// Default: 50_000.
     #[serde(default = "default_version_gc_max_per_cycle")]
     pub version_gc_max_per_cycle: usize,
+    /// R1.3 phase 2: group-commit accumulation window in microseconds.
+    ///
+    /// Durable commits write their batch unsynced and enqueue on the
+    /// engine's group committer; the first committer of a generation leads,
+    /// accumulates joiners for this window, then issues ONE WAL fsync for
+    /// the whole cohort. `0` disables the accumulation wait (commits still
+    /// group behind any in-flight fsync). Only meaningful with
+    /// `durable_commit = true` (or sessions running
+    /// `SET synchronous_commit = on`). Default: 200.
+    pub group_commit_window_us: u64,
 }
 
 fn default_slow_query_threshold() -> Option<u64> {
@@ -436,6 +446,7 @@ impl Default for StorageConfig {
             version_retention: None, // infinite retention: version GC disabled (R4.3)
             version_gc_interval_secs: None, // auto: off without retention, 300s with it
             version_gc_max_per_cycle: default_version_gc_max_per_cycle(),
+            group_commit_window_us: 200,
         }
     }
 }

@@ -360,6 +360,22 @@ fn convert_logical_referential_action(
 /// # Ok(())
 /// # }
 /// ```
+/// Slot holding one session's open transaction (R1.3-p2 deadlock fix).
+///
+/// The `session_transactions` DashMap used to store `Transaction` values
+/// directly, and statements held the shard READ guard for their whole
+/// execution — including row-lock waits (60s sleep-retry). COMMIT/ROLLBACK
+/// need the shard WRITE lock (`remove`), so a committer holding row locks
+/// could park behind executors of *other* sessions that hash to the same
+/// shard while those executors waited on the committer's row locks: a
+/// cross-session deadlock the row-lock wait-graph cannot see (observed as
+/// a multi-minute livelock in `run_conflict_bench`'s contended_counter,
+/// ~30% of runs; pre-existing on v3.50.0, exposed deterministically by the
+/// R1.3-p2 gates). Wrapping the transaction in its own slot means shard
+/// guards are held only for the map operation itself; statements borrow
+/// through the slot's RwLock, which only same-session work ever contends.
+type SessionTxnSlot = std::sync::Arc<parking_lot::RwLock<Option<storage::Transaction>>>;
+
 pub struct EmbeddedDatabase {
     /// Storage engine (public for REPL access)
     pub storage: std::sync::Arc<storage::StorageEngine>,
@@ -391,8 +407,9 @@ pub struct EmbeddedDatabase {
     pub lock_manager: std::sync::Arc<storage::LockManager>,
     /// Dirty tracker for tracking uncommitted changes
     pub dirty_tracker: std::sync::Arc<storage::DirtyTracker>,
-    /// Active transactions per session
-    session_transactions: std::sync::Arc<dashmap::DashMap<crate::session::SessionId, storage::Transaction>>,
+    /// Active transactions per session. See [`SessionTxnSlot`] for why the
+    /// transaction lives behind a per-session slot lock.
+    session_transactions: std::sync::Arc<dashmap::DashMap<crate::session::SessionId, SessionTxnSlot>>,
     /// Prepared statements storage (name -> plan)
     prepared_statements: std::sync::Arc<parking_lot::RwLock<std::collections::HashMap<String, sql::LogicalPlan>>>,
     /// Active savepoints stack (name -> transaction state)
@@ -726,6 +743,16 @@ fn starts_with_icase(s: &str, prefix: &str) -> bool {
     }
 }
 
+/// Case-insensitive `strip_prefix` without allocating a new String.
+#[inline]
+fn strip_prefix_icase<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    if starts_with_icase(s, prefix) {
+        s.get(prefix.len()..)
+    } else {
+        None
+    }
+}
+
 /// RAII guard that swaps the active branch for the duration of a
 /// query when the FR-3 `ON BRANCH '<name>'` directive is present in
 /// an `lsp_*` call. Restores the previous branch on Drop so every
@@ -947,6 +974,69 @@ impl EmbeddedDatabase {
     /// keyspaces (`v:` values, `v_idx:` reverse-index entries).
     pub fn version_storage_stats(&self) -> Result<storage::VersionStorageStats> {
         self.storage.version_storage_stats()
+    }
+
+    /// R1.3-p2: parse a session `synchronous_commit` statement (PostgreSQL-
+    /// compatible). Recognizes `SET [LOCAL|SESSION] synchronous_commit
+    /// {=|TO} <value>` and `RESET synchronous_commit`.
+    ///
+    /// Returns:
+    /// - `Ok(None)` — not a synchronous_commit statement
+    /// - `Ok(Some(Some(bool)))` — SET to on (true) / off (false)
+    /// - `Ok(Some(None))` — RESET (inherit `storage.durable_commit`)
+    /// - `Err(_)` — it IS a synchronous_commit SET but the value is invalid
+    ///
+    /// Values follow PostgreSQL: `off|false|0|no` disable the commit-fsync
+    /// wait; `on|true|1|yes` and the replication-oriented `local`,
+    /// `remote_write`, `remote_apply` all wait (we have no standby levels
+    /// to distinguish).
+    pub(crate) fn parse_synchronous_commit_statement(sql: &str) -> Result<Option<Option<bool>>> {
+        let trimmed = sql.trim().trim_end_matches(';').trim();
+        if let Some(rest) = strip_prefix_icase(trimmed, "RESET ") {
+            if rest.trim().eq_ignore_ascii_case("synchronous_commit") {
+                return Ok(Some(None));
+            }
+            return Ok(None);
+        }
+        let Some(mut body) = strip_prefix_icase(trimmed, "SET ") else {
+            return Ok(None);
+        };
+        body = body.trim();
+        if let Some(rest) = strip_prefix_icase(body, "LOCAL ") {
+            // SET LOCAL is transaction-scoped in PostgreSQL; we apply it to
+            // the session (documented simplification, matching the existing
+            // SET LOCAL handling for helios.* settings).
+            body = rest.trim();
+        } else if let Some(rest) = strip_prefix_icase(body, "SESSION ") {
+            body = rest.trim();
+        }
+        // `SET name = value` or `SET name TO value`.
+        let (name, value) = if let Some(eq_pos) = body.find('=') {
+            (body[..eq_pos].trim(), body[eq_pos + 1..].trim())
+        } else {
+            let mut parts = body.splitn(3, char::is_whitespace);
+            let name = parts.next().unwrap_or("");
+            let to = parts.next().unwrap_or("");
+            let value = parts.next().unwrap_or("").trim();
+            if !to.eq_ignore_ascii_case("TO") {
+                return Ok(None);
+            }
+            (name, value)
+        };
+        if !name.eq_ignore_ascii_case("synchronous_commit") {
+            return Ok(None);
+        }
+        let normalized = value.trim_matches('\'').trim_matches('"').to_ascii_lowercase();
+        match normalized.as_str() {
+            "off" | "false" | "0" | "no" => Ok(Some(Some(false))),
+            "on" | "true" | "1" | "yes" | "local" | "remote_write" | "remote_apply" => {
+                Ok(Some(Some(true)))
+            }
+            _ => Err(Error::query_execution(format!(
+                "invalid value for parameter \"synchronous_commit\": \"{}\"",
+                value
+            ))),
+        }
     }
 
     pub(crate) fn is_fk_setting_statement(sql: &str) -> bool {
@@ -1199,10 +1289,14 @@ impl EmbeddedDatabase {
             // R0.2: commit at a FRESH timestamp — committing at the BEGIN
             // snapshot timestamp recorded wrong version ordering for any
             // transaction that overlapped other commits.
-            let written = txn.written_data_keys();
+            // R1.3-p2: commit itself runs the row-cache fence when the cache
+            // is wired; only unwired transactions need the caller-side sweep.
+            let written = if txn.has_row_cache() { Vec::new() } else { txn.written_data_keys() };
             let commit_ts = self.storage.next_commit_timestamp(txn.has_tracked_writes());
             txn.commit_with_timestamp(commit_ts)?;
-            self.invalidate_row_cache_for(&written);
+            if !written.is_empty() {
+                self.invalidate_row_cache_for(&written);
+            }
             // Clear ART undo log (changes are now committed)
             self.art_undo_log.write().clear();
             self.deferred_fk_checks.lock().clear();
@@ -11991,11 +12085,15 @@ impl EmbeddedDatabase {
     /// * `session_id` - ID of the session to destroy
     pub fn destroy_session(&self, session_id: crate::session::SessionId) -> Result<()> {
         // A dropped connection must not leak its open transaction (write-set
-        // buffers, row locks) or its eager ART index mutations.
-        if let Some((_, txn)) = self.session_transactions.remove(&session_id) {
+        // buffers, row locks) or its eager ART index mutations. Taking the
+        // slot's write lock waits out any statement still borrowing the
+        // transaction before rolling it back.
+        if let Some((_, slot)) = self.session_transactions.remove(&session_id) {
             self.session_txn_count
                 .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-            let _ = txn.rollback();
+            if let Some(txn) = slot.write().take() {
+                let _ = txn.rollback();
+            }
         }
         self.finish_session_art_undo(session_id, true);
         self.session_manager.destroy_session(session_id)
@@ -12035,9 +12133,20 @@ impl EmbeddedDatabase {
         // (new_with_session defaults versioning on).
         txn.set_versioning_enabled(self.storage.time_travel_enabled());
         txn.set_rocksdb_wal_enabled(!self.storage.config().storage.memory_only);
+        // R1.3-p2: the session's SET synchronous_commit overrides
+        // storage.durable_commit (off = skip the group-fsync wait; on =
+        // wait even when the storage default is non-durable).
         txn.set_sync_commit(
-            self.storage.config().storage.durable_commit && !self.storage.config().storage.memory_only,
+            session
+                .synchronous_commit
+                .unwrap_or(self.storage.config().storage.durable_commit)
+                && !self.storage.config().storage.memory_only,
         );
+        // R1.3-p2: durable commits share one group fsync per cohort.
+        txn.set_group_committer(self.storage.group_committer());
+        // R1.3-p2: invalidate written rows inside commit, before the
+        // snapshot barrier lifts (stale-row-cache lost-update fence).
+        txn.set_row_cache(std::sync::Arc::clone(self.storage.row_cache()));
         // R0.2: record commits always; validate (first-committer-wins) for
         // RepeatableRead/Serializable. ReadCommitted keeps PostgreSQL's
         // blind-write semantics.
@@ -12051,11 +12160,21 @@ impl EmbeddedDatabase {
         session.stats.transactions_started += 1;
 
         // Store transaction in map
-        self.session_transactions.insert(session_id, txn);
+        self.session_transactions
+            .insert(session_id, std::sync::Arc::new(parking_lot::RwLock::new(Some(txn))));
         self.session_txn_count
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
 
         Ok(())
+    }
+
+    /// Clone the session's transaction slot out of the map. The DashMap
+    /// shard guard is held only for this lookup — NEVER across statement
+    /// execution or row-lock waits (see [`SessionTxnSlot`]).
+    fn session_txn_slot(&self, session_id: crate::session::SessionId) -> Option<SessionTxnSlot> {
+        self.session_transactions
+            .get(&session_id)
+            .map(|entry| std::sync::Arc::clone(entry.value()))
     }
 
     /// Commit transaction for a specific session
@@ -12078,11 +12197,25 @@ impl EmbeddedDatabase {
             return Err(Error::transaction("Session has no active transaction to commit"));
         }
 
-        // Retrieve and commit transaction with a FRESH commit timestamp
-        if let Some((_, txn)) = self.session_transactions.remove(&session_id) {
+        // Retrieve and commit transaction with a FRESH commit timestamp.
+        // The slot's write lock waits out any statement still borrowing the
+        // transaction; the DashMap shard guard itself is released by the
+        // time `remove` returns (deadlock fix — see [`SessionTxnSlot`]).
+        if let Some((_, slot)) = self.session_transactions.remove(&session_id) {
             self.session_txn_count
                 .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-            let written = txn.written_data_keys();
+            let Some(txn) = slot.write().take() else {
+                // Slot already drained (concurrent commit/rollback race) —
+                // treat like the missing-entry case below.
+                self.finish_session_art_undo(session_id, false);
+                self.invalidate_result_cache();
+                session.active_txn = None;
+                session.stats.transactions_committed += 1;
+                return Ok(());
+            };
+            // R1.3-p2: commit itself runs the row-cache fence when the cache
+            // is wired; only unwired transactions need the caller-side sweep.
+            let written = if txn.has_row_cache() { Vec::new() } else { txn.written_data_keys() };
             let commit_ts = self.storage.next_commit_timestamp(txn.has_tracked_writes());
             if let Err(e) = txn.commit_with_timestamp(commit_ts) {
                 // Failed commit (e.g. R0.2 serialization failure) behaves
@@ -12094,7 +12227,9 @@ impl EmbeddedDatabase {
                 session.stats.transactions_aborted += 1;
                 return Err(e);
             }
-            self.invalidate_row_cache_for(&written);
+            if !written.is_empty() {
+                self.invalidate_row_cache_for(&written);
+            }
             self.storage.increment_lsn();
         }
         // Changes are committed: the session's ART mutations are now permanent.
@@ -12129,11 +12264,13 @@ impl EmbeddedDatabase {
             return Err(Error::transaction("Session has no active transaction to rollback"));
         }
 
-        // Retrieve and rollback transaction
-        if let Some((_, txn)) = self.session_transactions.remove(&session_id) {
+        // Retrieve and rollback transaction (slot semantics as in commit).
+        if let Some((_, slot)) = self.session_transactions.remove(&session_id) {
             self.session_txn_count
                 .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-            txn.rollback()?;
+            if let Some(txn) = slot.write().take() {
+                txn.rollback()?;
+            }
         }
         // Undo the session's eager ART index mutations (insert/update/delete
         // hooks run at statement time, not commit time).
@@ -12166,27 +12303,31 @@ impl EmbeddedDatabase {
     ///
     /// Number of rows affected by the statement
     pub fn execute_in_session(&self, session_id: crate::session::SessionId, sql: &str) -> Result<u64> {
+        // R1.3-p2: session-scoped SET/RESET synchronous_commit. Must run
+        // BEFORE the session write lock below (the handler re-locks it).
+        if let Some(handled) = self.try_handle_session_synchronous_commit(session_id, sql)? {
+            return Ok(handled);
+        }
         let session_lock = self.session_manager.get_session(session_id)?;
         let mut session = session_lock.write();
         session.touch();
         session.stats.queries_executed += 1;
 
         // Check if session has an active transaction
-        if self.session_transactions.contains_key(&session_id) {
+        if let Some(slot) = self.session_txn_slot(session_id) {
             // For READ COMMITTED, each statement gets a fresh snapshot.
-            // Hold the DashMap write guard only briefly for the mutable refresh.
+            // Hold the slot's write lock only briefly for the mutable refresh.
             if session.isolation_level == crate::session::IsolationLevel::ReadCommitted {
-                if let Some(mut txn) = self.session_transactions.get_mut(&session_id) {
+                if let Some(txn) = slot.write().as_mut() {
                     txn.refresh_snapshot(self.storage.current_timestamp());
                 }
             }
 
-            // Use a read guard (shared) during execution to avoid blocking
-            // other sessions that may hash to the same DashMap shard
-            let txn = self
-                .session_transactions
-                .get(&session_id)
-                .ok_or_else(|| Error::transaction("Session transaction disappeared during execute"))?;
+            // Borrow the transaction through the slot for the statement's
+            // duration — no DashMap shard guard is held across execution or
+            // row-lock waits (deadlock fix, see [`SessionTxnSlot`]).
+            let txn = parking_lot::RwLockReadGuard::try_map(slot.read(), |t| t.as_ref())
+                .map_err(|_| Error::transaction("Session transaction disappeared during execute"))?;
 
             // Skip fast paths for session transactions — writes must go through
             // the transaction write set for proper isolation and rollback support
@@ -12206,9 +12347,18 @@ impl EmbeddedDatabase {
             // P0#1: session transactions must honor time_travel_enabled too.
             txn.set_versioning_enabled(self.storage.time_travel_enabled());
             txn.set_rocksdb_wal_enabled(!self.storage.config().storage.memory_only);
-        txn.set_sync_commit(
-            self.storage.config().storage.durable_commit && !self.storage.config().storage.memory_only,
-        );
+            // R1.3-p2: the session's SET synchronous_commit overrides
+            // storage.durable_commit for this statement's commit.
+            txn.set_sync_commit(
+                session
+                    .synchronous_commit
+                    .unwrap_or(self.storage.config().storage.durable_commit)
+                    && !self.storage.config().storage.memory_only,
+            );
+            // R1.3-p2: durable commits share one group fsync per cohort.
+            txn.set_group_committer(self.storage.group_committer());
+            // R1.3-p2: stale-row-cache lost-update fence (see above).
+            txn.set_row_cache(std::sync::Arc::clone(self.storage.row_cache()));
             // R0.2: implicit single-statement session transactions record
             // their commits so explicit transactions can validate against
             // them; they never validate (statement-atomic, RC semantics).
@@ -12218,10 +12368,14 @@ impl EmbeddedDatabase {
 
             match result {
                 Ok(count) => {
-                    let written = txn.written_data_keys();
+                    // R1.3-p2: commit runs the row-cache fence itself when
+                    // the cache is wired (it always is on this path).
+                    let written = if txn.has_row_cache() { Vec::new() } else { txn.written_data_keys() };
                     let commit_ts = self.storage.next_commit_timestamp(txn.has_tracked_writes());
                     txn.commit_with_timestamp(commit_ts)?;
-                    self.invalidate_row_cache_for(&written);
+                    if !written.is_empty() {
+                        self.invalidate_row_cache_for(&written);
+                    }
                     self.storage.increment_lsn();
                     self.finish_session_art_undo(session_id, false);
                     Ok(count)
@@ -12262,21 +12416,19 @@ impl EmbeddedDatabase {
         session.stats.queries_executed += 1;
 
         // Check if session has an active transaction
-        if self.session_transactions.contains_key(&session_id) {
+        if let Some(slot) = self.session_txn_slot(session_id) {
             // For READ COMMITTED, each statement gets a fresh snapshot.
-            // Hold the DashMap write guard only briefly for the mutable refresh.
+            // Hold the slot's write lock only briefly for the mutable refresh.
             if session.isolation_level == crate::session::IsolationLevel::ReadCommitted {
-                if let Some(mut txn) = self.session_transactions.get_mut(&session_id) {
+                if let Some(txn) = slot.write().as_mut() {
                     txn.refresh_snapshot(self.storage.current_timestamp());
                 }
             }
 
-            // Use a read guard (shared) during execution to avoid blocking
-            // other sessions that may hash to the same DashMap shard
-            let txn = self
-                .session_transactions
-                .get(&session_id)
-                .ok_or_else(|| Error::transaction("Session transaction disappeared during query"))?;
+            // Borrow through the slot — no shard guard held across the query
+            // (deadlock fix, see [`SessionTxnSlot`]).
+            let txn = parking_lot::RwLockReadGuard::try_map(slot.read(), |t| t.as_ref())
+                .map_err(|_| Error::transaction("Session transaction disappeared during query"))?;
 
             // Parse SQL with cache
             let (statement, _) = self.parse_cached(sql)?;
@@ -12336,6 +12488,69 @@ impl EmbeddedDatabase {
         Ok(())
     }
 
+    /// R1.3-p2: set (or with `None` reset) the session's
+    /// `synchronous_commit` override. PostgreSQL semantics: takes effect
+    /// immediately, including for a transaction already in progress (the
+    /// open transaction's commit honors the latest setting).
+    pub fn set_session_synchronous_commit(
+        &self,
+        session_id: crate::session::SessionId,
+        value: Option<bool>,
+    ) -> Result<()> {
+        let session_lock = self.session_manager.get_session(session_id)?;
+        session_lock.write().synchronous_commit = value;
+        // Apply to an already-open transaction too: its sync flag was
+        // captured at BEGIN.
+        if let Some(slot) = self.session_txn_slot(session_id) {
+            if let Some(txn) = slot.write().as_mut() {
+                let storage_cfg = &self.storage.config().storage;
+                txn.set_sync_commit(value.unwrap_or(storage_cfg.durable_commit) && !storage_cfg.memory_only);
+            }
+        }
+        Ok(())
+    }
+
+    /// R1.3-p2: the session's raw `synchronous_commit` override
+    /// (`None` = inherit `storage.durable_commit`).
+    pub fn session_synchronous_commit(
+        &self,
+        session_id: crate::session::SessionId,
+    ) -> Result<Option<bool>> {
+        let session_lock = self.session_manager.get_session(session_id)?;
+        let value = session_lock.read().synchronous_commit;
+        Ok(value)
+    }
+
+    /// R1.3-p2: the session's EFFECTIVE `synchronous_commit` (override or
+    /// the `storage.durable_commit` default; always false in memory mode).
+    pub fn session_synchronous_commit_effective(
+        &self,
+        session_id: crate::session::SessionId,
+    ) -> Result<bool> {
+        let storage_cfg = &self.storage.config().storage;
+        Ok(self
+            .session_synchronous_commit(session_id)?
+            .unwrap_or(storage_cfg.durable_commit)
+            && !storage_cfg.memory_only)
+    }
+
+    /// R1.3-p2: intercept `SET/RESET synchronous_commit` for a session.
+    /// Returns `Some(0)` when handled, `None` when the statement is
+    /// something else.
+    fn try_handle_session_synchronous_commit(
+        &self,
+        session_id: crate::session::SessionId,
+        sql: &str,
+    ) -> Result<Option<u64>> {
+        match Self::parse_synchronous_commit_statement(sql)? {
+            Some(value) => {
+                self.set_session_synchronous_commit(session_id, value)?;
+                Ok(Some(0))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Touch session stats and, for READ COMMITTED, refresh the open
     /// transaction's snapshot so the next statement sees the latest commits.
     fn touch_session_for_statement(&self, session_id: crate::session::SessionId) -> Result<()> {
@@ -12344,8 +12559,10 @@ impl EmbeddedDatabase {
         session.touch();
         session.stats.queries_executed += 1;
         if session.isolation_level == crate::session::IsolationLevel::ReadCommitted {
-            if let Some(mut txn) = self.session_transactions.get_mut(&session_id) {
-                txn.refresh_snapshot(self.storage.current_timestamp());
+            if let Some(slot) = self.session_txn_slot(session_id) {
+                if let Some(txn) = slot.write().as_mut() {
+                    txn.refresh_snapshot(self.storage.current_timestamp());
+                }
             }
         }
         Ok(())
@@ -12380,12 +12597,34 @@ impl EmbeddedDatabase {
         }
     }
 
+    /// R1.3-p2: when the session has a `synchronous_commit` override,
+    /// install the engine thread-local override for the duration of one
+    /// statement that routes through the global (non-session) execute
+    /// paths, so the autocommit durability barrier and autocommit
+    /// transactions honor the session's setting. Returns `None` (no guard,
+    /// zero TLS traffic) when the session has no override.
+    fn session_durability_override_guard(
+        &self,
+        session_id: crate::session::SessionId,
+    ) -> Option<storage::SynchronousCommitOverrideGuard> {
+        let session_lock = self.session_manager.get_session(session_id).ok()?;
+        let value = session_lock.read().synchronous_commit?;
+        Some(storage::StorageEngine::synchronous_commit_override_guard(Some(value)))
+    }
+
     /// Execute a statement on behalf of a wire-protocol session.
     pub fn execute_for_session(&self, session_id: crate::session::SessionId, sql: &str) -> Result<u64> {
         if Self::is_transaction_control(sql) {
             return self.handle_transaction_control_for_session(session_id, sql);
         }
+        // R1.3-p2: session-scoped SET/RESET synchronous_commit (the PG
+        // simple-query handler intercepts SET itself; RESET and the
+        // extended protocol land here).
+        if let Some(handled) = self.try_handle_session_synchronous_commit(session_id, sql)? {
+            return Ok(handled);
+        }
         if !self.session_transactions.contains_key(&session_id) {
+            let _sync_override = self.session_durability_override_guard(session_id);
             return self.execute(sql);
         }
 
@@ -12397,10 +12636,11 @@ impl EmbeddedDatabase {
 
         let start = std::time::Instant::now();
         self.touch_session_for_statement(session_id)?;
-        let txn = self
-            .session_transactions
-            .get(&session_id)
+        let slot = self
+            .session_txn_slot(session_id)
             .ok_or_else(|| Error::transaction("Session transaction disappeared during execute"))?;
+        let txn = parking_lot::RwLockReadGuard::try_map(slot.read(), |t| t.as_ref())
+            .map_err(|_| Error::transaction("Session transaction disappeared during execute"))?;
         // Result-cache invalidation is deferred to COMMIT, mirroring the
         // global-slot in-transaction arm of `execute()`.
         let result = self.execute_in_transaction_no_fast_path(sql, &txn);
@@ -12425,10 +12665,11 @@ impl EmbeddedDatabase {
 
         let start = std::time::Instant::now();
         self.touch_session_for_statement(session_id)?;
-        let txn = self
-            .session_transactions
-            .get(&session_id)
+        let slot = self
+            .session_txn_slot(session_id)
             .ok_or_else(|| Error::transaction("Session transaction disappeared during query"))?;
+        let txn = parking_lot::RwLockReadGuard::try_map(slot.read(), |t| t.as_ref())
+            .map_err(|_| Error::transaction("Session transaction disappeared during query"))?;
 
         let (statement, _) = self.parse_cached(sql)?;
         let catalog = self.storage.catalog();
@@ -12455,15 +12696,20 @@ impl EmbeddedDatabase {
             let count = self.handle_transaction_control_for_session(session_id, sql)?;
             return Ok((count, Vec::new()));
         }
+        if let Some(handled) = self.try_handle_session_synchronous_commit(session_id, sql)? {
+            return Ok((handled, Vec::new()));
+        }
         if !self.session_transactions.contains_key(&session_id) {
+            let _sync_override = self.session_durability_override_guard(session_id);
             return self.execute_returning(sql);
         }
 
         self.touch_session_for_statement(session_id)?;
-        let txn = self
-            .session_transactions
-            .get(&session_id)
+        let slot = self
+            .session_txn_slot(session_id)
             .ok_or_else(|| Error::transaction("Session transaction disappeared during execute"))?;
+        let txn = parking_lot::RwLockReadGuard::try_map(slot.read(), |t| t.as_ref())
+            .map_err(|_| Error::transaction("Session transaction disappeared during execute"))?;
         let plan = self.parameterized_plan_cached(sql)?;
         let out = self.execute_plan_with_params(&plan, &[], Some(&txn));
 
@@ -12508,15 +12754,20 @@ impl EmbeddedDatabase {
         if Self::is_transaction_control(sql) {
             return self.handle_transaction_control_for_session(session_id, sql);
         }
+        if let Some(handled) = self.try_handle_session_synchronous_commit(session_id, sql)? {
+            return Ok(handled);
+        }
         if !self.session_transactions.contains_key(&session_id) {
+            let _sync_override = self.session_durability_override_guard(session_id);
             return self.execute_params_inner(sql, params, plan_override);
         }
 
         self.touch_session_for_statement(session_id)?;
-        let txn = self
-            .session_transactions
-            .get(&session_id)
+        let slot = self
+            .session_txn_slot(session_id)
             .ok_or_else(|| Error::transaction("Session transaction disappeared during execute"))?;
+        let txn = parking_lot::RwLockReadGuard::try_map(slot.read(), |t| t.as_ref())
+            .map_err(|_| Error::transaction("Session transaction disappeared during execute"))?;
         let plan = match plan_override {
             Some(p) => std::sync::Arc::clone(p),
             None => self.parameterized_plan_cached(sql)?,
@@ -12563,10 +12814,11 @@ impl EmbeddedDatabase {
         }
 
         self.touch_session_for_statement(session_id)?;
-        let txn = self
-            .session_transactions
-            .get(&session_id)
+        let slot = self
+            .session_txn_slot(session_id)
             .ok_or_else(|| Error::transaction("Session transaction disappeared during query"))?;
+        let txn = parking_lot::RwLockReadGuard::try_map(slot.read(), |t| t.as_ref())
+            .map_err(|_| Error::transaction("Session transaction disappeared during query"))?;
         let plan = match plan_override {
             Some(p) => std::sync::Arc::clone(p),
             None => self.parameterized_plan_cached(sql)?,
@@ -12603,10 +12855,11 @@ impl EmbeddedDatabase {
         }
 
         self.touch_session_for_statement(session_id)?;
-        let txn = self
-            .session_transactions
-            .get(&session_id)
+        let slot = self
+            .session_txn_slot(session_id)
             .ok_or_else(|| Error::transaction("Session transaction disappeared during query"))?;
+        let txn = parking_lot::RwLockReadGuard::try_map(slot.read(), |t| t.as_ref())
+            .map_err(|_| Error::transaction("Session transaction disappeared during query"))?;
         let plan = self.parameterized_plan_cached(sql)?;
 
         if matches!(
@@ -15360,10 +15613,13 @@ impl Transaction<'_> {
     /// After commit, the transaction is consumed and cannot be used.
     pub fn commit(self) -> Result<()> {
         // R0.2: fresh commit timestamp (see commit_internal).
-        let written = self.tx.written_data_keys();
+        // R1.3-p2: commit runs the row-cache fence itself when wired.
+        let written = if self.tx.has_row_cache() { Vec::new() } else { self.tx.written_data_keys() };
         let commit_ts = self.db.storage.next_commit_timestamp(self.tx.has_tracked_writes());
         self.tx.commit_with_timestamp(commit_ts)?;
-        self.db.invalidate_row_cache_for(&written);
+        if !written.is_empty() {
+            self.db.invalidate_row_cache_for(&written);
+        }
         Ok(())
     }
 
@@ -15479,6 +15735,39 @@ mod tests {
     fn test_embedded_database_creation() {
         let db = EmbeddedDatabase::new_in_memory();
         assert!(db.is_ok());
+    }
+
+    // ---- R1.3-p2: SET synchronous_commit parser ----
+
+    #[test]
+    fn parse_synchronous_commit_statement_forms() {
+        let p = EmbeddedDatabase::parse_synchronous_commit_statement;
+        // SET = / TO, casing, quoting, prefixes, trailing semicolon.
+        assert_eq!(p("SET synchronous_commit = off").unwrap(), Some(Some(false)));
+        assert_eq!(p("set SYNCHRONOUS_COMMIT to ON;").unwrap(), Some(Some(true)));
+        assert_eq!(p("SET synchronous_commit = 'off'").unwrap(), Some(Some(false)));
+        assert_eq!(p("SET LOCAL synchronous_commit = false").unwrap(), Some(Some(false)));
+        assert_eq!(p("SET SESSION synchronous_commit TO true").unwrap(), Some(Some(true)));
+        // PG replication-oriented values all mean "wait" here.
+        for v in ["local", "remote_write", "remote_apply", "1", "yes"] {
+            assert_eq!(
+                p(&format!("SET synchronous_commit = {v}")).unwrap(),
+                Some(Some(true)),
+                "value {v}"
+            );
+        }
+        // RESET.
+        assert_eq!(p("RESET synchronous_commit").unwrap(), Some(None));
+        assert_eq!(p("reset SYNCHRONOUS_COMMIT ;").unwrap(), Some(None));
+        // Not ours.
+        assert_eq!(p("SET client_encoding = 'UTF8'").unwrap(), None);
+        assert_eq!(p("RESET client_encoding").unwrap(), None);
+        assert_eq!(p("SET synchronous_commit_extra = off").unwrap(), None);
+        assert_eq!(p("INSERT INTO t VALUES (1)").unwrap(), None);
+        assert_eq!(p("SET synchronous_commit off").unwrap(), None); // missing = / TO
+        // Ours but invalid value.
+        assert!(p("SET synchronous_commit = sideways").is_err());
+        assert!(p("SET synchronous_commit = ").is_err());
     }
 
     // ---- R1.2: word-boundary, literal-aware keyword matcher ----

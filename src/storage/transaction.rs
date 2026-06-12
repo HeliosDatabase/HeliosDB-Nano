@@ -127,6 +127,21 @@ pub struct Transaction {
     rocksdb_wal_enabled: bool,
     /// R1.3: fsync the commit WriteBatch (power-loss durable commits).
     sync_commit: bool,
+    /// R1.3 phase 2: engine-wide leader/follower group committer. When set
+    /// (always, for engine/session-constructed transactions), a `sync_commit`
+    /// writes its batch UNSYNCED and then waits on ONE cohort-wide
+    /// `flush_wal(true)` instead of paying a private fsync. When absent,
+    /// falls back to the phase-1 per-commit synced WriteBatch.
+    group_committer: Option<Arc<super::group_commit::GroupCommitter>>,
+    /// Engine row cache (R1.3-p2 correctness fix). Written rows are
+    /// invalidated INSIDE commit — after the batch applies, BEFORE
+    /// `end_commit` lifts the snapshot barrier — so a fresh snapshot that
+    /// passes the barrier can never hit a stale cached pre-commit row (the
+    /// R0.2 lost-update vector via the UPDATE arm's PK point-lookup; the
+    /// caller-side invalidation after commit returns was too late, and the
+    /// R1.3-p2 group-fsync wait would have widened that window to a whole
+    /// fsync).
+    row_cache: Option<Arc<super::RowCache>>,
     /// Write-write conflict registry (R0.2). When present, commits record
     /// their write-set keys; when `conflict_validation` is also set, commit
     /// aborts with a serialization failure if any key was committed after
@@ -200,6 +215,8 @@ impl Transaction {
             versioning_enabled: true,
             rocksdb_wal_enabled: true,
             sync_commit: false,
+            group_committer: None,
+            row_cache: None,
             conflict_registry: None,
             conflict_validation: false,
             gc_pin_id: None,
@@ -215,6 +232,26 @@ impl Transaction {
     /// R1.3: request a synced (power-loss durable) commit WriteBatch.
     pub fn set_sync_commit(&mut self, enabled: bool) {
         self.sync_commit = enabled;
+    }
+
+    /// R1.3 phase 2: route this transaction's durability fsync through the
+    /// engine's leader/follower group committer (see field docs).
+    pub fn set_group_committer(&mut self, committer: Arc<super::group_commit::GroupCommitter>) {
+        self.group_committer = Some(committer);
+    }
+
+    /// Attach the engine row cache so commit can invalidate written rows
+    /// BEFORE lifting the snapshot barrier (see field docs).
+    pub fn set_row_cache(&mut self, cache: Arc<super::RowCache>) {
+        self.row_cache = Some(cache);
+    }
+
+    /// True when the engine row cache is wired into this transaction, i.e.
+    /// commit itself runs the stale-row fence and the caller-side
+    /// `invalidate_row_cache_for` sweep would be redundant work on the
+    /// commit hot path (R1.3-p2).
+    pub fn has_row_cache(&self) -> bool {
+        self.row_cache.is_some()
     }
 
     pub fn set_rocksdb_wal_enabled(&mut self, enabled: bool) {
@@ -262,6 +299,8 @@ impl Transaction {
             versioning_enabled: true,
             rocksdb_wal_enabled: true,
             sync_commit: false,
+            group_committer: None,
+            row_cache: None,
             conflict_registry: None,
             conflict_validation: false,
             gc_pin_id: None,
@@ -721,8 +760,22 @@ impl Transaction {
 
         for (table_name, row_id) in self.row_counter_stages.read().iter() {
             let key = format!("counter:{}", table_name);
-            let value = bincode::serialize(row_id)
-                .map_err(|e| Error::storage(format!("Failed to serialize counter: {}", e)))?;
+            let value = match bincode::serialize(row_id) {
+                Ok(value) => value,
+                Err(e) => {
+                    // Must NOT early-return with `?` here: an announced
+                    // in-flight commit that never reaches `end_commit` would
+                    // stall the snapshot barrier forever.
+                    if inflight {
+                        if let Some(registry) = &self.conflict_registry {
+                            registry.end_commit(commit_ts);
+                        }
+                    }
+                    self.acquired_locks.write().clear();
+                    self.state.store(TransactionState::Aborted.to_u8(), Ordering::Release);
+                    return Err(Error::storage(format!("Failed to serialize counter: {}", e)));
+                }
+            };
             batch.put(key.as_bytes(), value);
         }
 
@@ -730,10 +783,18 @@ impl Transaction {
         // stats sidecars are applied (no-op guard for non-columnar commits).
         let _columnar_stats_guard = touches_columnar.then(super::columnar::stats_write_lock);
 
+        // R1.3 phase 2: a durable commit with a group committer writes its
+        // batch UNSYNCED here and pays durability via ONE cohort-wide
+        // `flush_wal(true)` below — after the commit is applied, visible,
+        // and its locks are released, so the fsync wait never convoys the
+        // snapshot barrier or row-lock contenders. RocksDB's WAL is
+        // sequential: the group fsync covers every byte written before it.
+        let group_fsync = self.sync_commit && self.rocksdb_wal_enabled && self.group_committer.is_some();
         let result = if self.rocksdb_wal_enabled {
-            if self.sync_commit {
-                // R1.3: one fsync per commit; RocksDB write groups amortize
-                // it across concurrent committers.
+            if self.sync_commit && !group_fsync {
+                // R1.3 phase 1 fallback (no group committer wired): one
+                // synced WriteBatch per commit; RocksDB write groups
+                // amortize it across concurrent committers.
                 let mut write_opts = WriteOptions::default();
                 write_opts.set_sync(true);
                 self.db.write_opt(batch, &write_opts)
@@ -746,6 +807,32 @@ impl Transaction {
             write_opts.disable_wal(true);
             self.db.write_opt(batch, &write_opts)
         };
+
+        // Stale-row-cache fence: written rows must leave the row cache
+        // BEFORE end_commit lifts the snapshot barrier, or a fresh snapshot
+        // could pass the barrier and the UPDATE arm's PK point-lookup would
+        // serve the cached pre-commit value — both transactions then pass
+        // first-committer-wins validation and an update is lost (observed
+        // ~10-50% per contended bench run on a loaded 32-core host). Callers
+        // skip their post-commit `invalidate_row_cache_for` sweep when this
+        // fence is wired (`has_row_cache`), so this is the only invalidation
+        // pass on the hot path; the table name is borrowed straight out of
+        // the key to avoid `written_data_keys`'s per-row String allocation.
+        if result.is_ok() && !self.write_set.is_empty() {
+            if let Some(cache) = &self.row_cache {
+                for entry in self.write_set.iter() {
+                    if let Some(rest) = entry.key().strip_prefix(b"data:".as_slice()) {
+                        if let Ok(text) = std::str::from_utf8(rest) {
+                            if let Some(pos) = text.rfind(':') {
+                                if let Ok(row_id) = text[pos + 1..].parse::<u64>() {
+                                    cache.invalidate(&text[..pos], row_id);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         // The write is applied (or definitively failed): new snapshots may
         // proceed past this commit timestamp.
@@ -772,6 +859,27 @@ impl Transaction {
             self.state.store(TransactionState::Aborted.to_u8(), Ordering::Release);
             Error::transaction(format!("Commit failed: {}", e))
         })?;
+
+        // R1.3 phase 2: group durability barrier. The commit is already
+        // applied and visible (memtable + unsynced WAL); block until a
+        // cohort fsync covering it completes. On failure the commit is NOT
+        // power-loss durable: report the error (RocksDB records the WAL-sync
+        // failure as a background error and rejects subsequent writes, so a
+        // lost generation cannot be silently followed by a "durable" one).
+        if group_fsync {
+            if let Some(committer) = &self.group_committer {
+                committer
+                    .wait_durable(|| self.db.flush_wal(true).map_err(|e| e.to_string()))
+                    .map_err(|e| {
+                        warn!(
+                            txn_id = self.transaction_id,
+                            error = %e,
+                            "Group WAL fsync failed; commit applied but not durable"
+                        );
+                        Error::transaction(format!("Commit failed: WAL group fsync failed: {}", e))
+                    })?;
+            }
+        }
 
         debug!(
             txn_id = self.transaction_id,
