@@ -17,6 +17,8 @@ use super::parallel_filter::{ParallelFilterConfig, ParallelFilterEngine};
 use super::predicate_pushdown::{AnalyzedPredicate, PredicatePushdownManager, PushdownConfig};
 use super::simd_filter::{FilterOp, FilterPredicate};
 use super::speculative_filter::{SpeculativeConfig, SpeculativeFilterManager};
+use super::typed_batch::TypedValues;
+use super::typed_kernels::{self as tk, CompiledPredicate};
 use super::wal::{WalOperation, WalSyncMode, WriteAheadLog};
 use super::zone_map::TableZoneMap;
 use super::{
@@ -409,9 +411,9 @@ fn columnar_row_matches_filters(
         if let Some(value) = column_batches
             .get(&predicate.column_index)
             .and_then(|by_batch| by_batch.get(batch_id))
-            .and_then(|batch| batch.values.get(offset))
+            .and_then(|batch| batch.value_at(offset))
         {
-            predicate.evaluate(value)
+            predicate.evaluate(&value)
         } else {
             predicate.evaluate(&Value::Null)
         }
@@ -519,16 +521,20 @@ fn decoded_integer_matches_filter(
     })
 }
 
-fn columnar_batch_value<'a>(
-    column_batches: &'a HashMap<usize, ColumnarBatchIndex>,
+/// Read one columnar cell. R3.4: returns an OWNED value built on the fly
+/// from the typed buffers (no whole-batch materialization); `None` when the
+/// batch or slot is absent (callers treat that as NULL), `Some(Value::Null)`
+/// for NULL slots — exactly the previous `values.get(offset).cloned()`.
+fn columnar_batch_value(
+    column_batches: &HashMap<usize, ColumnarBatchIndex>,
     column_index: usize,
     batch_id: u64,
     offset: usize,
-) -> Option<&'a Value> {
+) -> Option<Value> {
     column_batches
         .get(&column_index)
         .and_then(|by_batch| by_batch.get(batch_id))
-        .and_then(|batch| batch.values.get(offset))
+        .and_then(|batch| batch.value_at(offset))
 }
 
 fn compare_value_slices(left: &[Value], right: &[Value]) -> std::cmp::Ordering {
@@ -717,7 +723,7 @@ fn columnar_group_key_matches(
     key.len() == group_by_columns.len()
         && key.iter().zip(group_by_columns).all(|(expected, &idx)| {
             columnar_batch_value(column_batches, idx, batch_id, offset)
-                .map_or(matches!(expected, Value::Null), |actual| expected == actual)
+                .map_or(matches!(expected, Value::Null), |actual| *expected == actual)
         })
 }
 
@@ -731,7 +737,6 @@ fn build_columnar_group_key(
         .iter()
         .map(|&idx| {
             columnar_batch_value(column_batches, idx, batch_id, offset)
-                .cloned()
                 .unwrap_or(Value::Null)
         })
         .collect()
@@ -748,7 +753,251 @@ fn update_columnar_aggregate_states(
         let value = aggregate
             .column_index
             .and_then(|idx| columnar_batch_value(column_batches, idx, batch_id, offset));
-        state.update(aggregate.op, value)?;
+        state.update(aggregate.op, value.as_ref())?;
+    }
+    Ok(())
+}
+
+/// R3.4: extract i64 bounds from a typed batch's embedded stats (any int width).
+fn stats_int_bounds(stats: &BatchStats) -> Option<(i64, i64)> {
+    fn as_int(v: &Option<Value>) -> Option<i64> {
+        match v {
+            Some(Value::Int2(x)) => Some(*x as i64),
+            Some(Value::Int4(x)) => Some(*x as i64),
+            Some(Value::Int8(x)) => Some(*x),
+            _ => None,
+        }
+    }
+    Some((as_int(&stats.min)?, as_int(&stats.max)?))
+}
+
+/// R3.4: AND every compiled predicate into `mask` for one batch id.
+fn apply_compiled_predicates(
+    compiled: &[CompiledPredicate<'_>],
+    column_batches: &HashMap<usize, ColumnarBatchIndex>,
+    batch_id: u64,
+    mask: &mut [u8],
+) {
+    for cp in compiled {
+        let batch = column_batches.get(&cp.pred.column_index).and_then(|by| by.get(batch_id));
+        cp.apply_to_mask(batch, mask);
+    }
+}
+
+/// R3.4: fold one batch's selected lanes into `state` with a typed kernel.
+/// Returns `Ok(false)` when this (op, batch) pair has no kernel — the caller
+/// then runs the per-lane scalar update (bit-exact pre-R3.4 behavior) for
+/// this batch. Partial results merge through the same `merge()` paths the
+/// R3.2 parallel chunks use, so semantics (incl. int-SUM overflow errors and
+/// MIN/MAX NaN ordering) match the chunked scalar path.
+fn kernel_update_aggregate(
+    state: &mut ColumnarAggregateState,
+    op: ColumnarAggregateOp,
+    batch: Option<&ColumnBatch>,
+    mask: &[u8],
+) -> Result<bool> {
+    if matches!(op, ColumnarAggregateOp::CountStar) {
+        state.merge(ColumnarAggregateState::Count(tk::count_selected(mask) as i64))?;
+        return Ok(true);
+    }
+    let Some(batch) = batch else {
+        // Absent batch: every lane reads NULL — a no-op for every aggregate
+        // except COUNT(*) above.
+        return Ok(true);
+    };
+    let Some(typed) = &batch.typed else {
+        return Ok(false); // v1 batch: existing per-lane path
+    };
+    match (op, &typed.data) {
+        (ColumnarAggregateOp::Count, _) => {
+            state.merge(ColumnarAggregateState::Count(
+                tk::count_selected_valid(&typed.validity, mask) as i64,
+            ))?;
+            Ok(true)
+        }
+        (ColumnarAggregateOp::Sum, TypedValues::Int { data, .. }) => {
+            let small = stats_int_bounds(&typed.stats)
+                .is_some_and(|(mn, mx)| mn >= -tk::SUM_I64_SAFE_BOUND && mx <= tk::SUM_I64_SAFE_BOUND);
+            let (sum, contributing) = tk::sum_int_selected(data, &typed.validity, mask, small);
+            if contributing > 0 {
+                let sum =
+                    i64::try_from(sum).map_err(|_| Error::query_execution("integer overflow: BIGINT SUM"))?;
+                state.merge(ColumnarAggregateState::Sum(ColumnarSumState::Int(sum)))?;
+            }
+            Ok(true)
+        }
+        (ColumnarAggregateOp::Avg, TypedValues::Int { data, .. }) => {
+            let (sum, count) = tk::sum_f64_from_int_selected(data, &typed.validity, mask);
+            if count > 0 {
+                state.merge(ColumnarAggregateState::Avg { sum, count })?;
+            }
+            Ok(true)
+        }
+        (ColumnarAggregateOp::Avg, TypedValues::Float { data, .. }) => {
+            let (sum, count) = tk::sum_f64_selected(data, &typed.validity, mask);
+            if count > 0 {
+                state.merge(ColumnarAggregateState::Avg { sum, count })?;
+            }
+            Ok(true)
+        }
+        (ColumnarAggregateOp::Min | ColumnarAggregateOp::Max, TypedValues::Int { width, data }) => {
+            if let Some((mn, mx)) = tk::min_max_int_selected(data, &typed.validity, mask) {
+                if matches!(op, ColumnarAggregateOp::Min) {
+                    state.merge(ColumnarAggregateState::Min(Some(width.value(mn))))?;
+                } else {
+                    state.merge(ColumnarAggregateState::Max(Some(width.value(mx))))?;
+                }
+            }
+            Ok(true)
+        }
+        (ColumnarAggregateOp::Min | ColumnarAggregateOp::Max, TypedValues::Float { width, data }) => {
+            let (mn, mx) = tk::min_max_float_selected(data, &typed.validity, mask);
+            if matches!(op, ColumnarAggregateOp::Min) {
+                if let Some(mn) = mn {
+                    state.merge(ColumnarAggregateState::Min(Some(width.value(mn))))?;
+                }
+            } else if let Some(mx) = mx {
+                state.merge(ColumnarAggregateState::Max(Some(width.value(mx))))?;
+            }
+            Ok(true)
+        }
+        (ColumnarAggregateOp::Min | ColumnarAggregateOp::Max, TypedValues::Text { dict, codes }) => {
+            let mut used = vec![0u8; dict.len()];
+            tk::mark_used_codes(codes, &typed.validity, mask, &mut used);
+            let mut best: Option<&String> = None;
+            for (entry, &u) in dict.iter().zip(&used) {
+                if u == 0 {
+                    continue;
+                }
+                best = Some(match best {
+                    None => entry,
+                    Some(current) => {
+                        let replace = if matches!(op, ColumnarAggregateOp::Min) {
+                            entry < current
+                        } else {
+                            entry > current
+                        };
+                        if replace {
+                            entry
+                        } else {
+                            current
+                        }
+                    }
+                });
+            }
+            if let Some(best) = best {
+                let value = Value::String(best.clone());
+                if matches!(op, ColumnarAggregateOp::Min) {
+                    state.merge(ColumnarAggregateState::Min(Some(value)))?;
+                } else {
+                    state.merge(ColumnarAggregateState::Max(Some(value)))?;
+                }
+            }
+            Ok(true)
+        }
+        // SUM over float batches keeps the per-lane Decimal accumulation
+        // (slot-order exact), bool aggregates and COUNT(DISTINCT) keep the
+        // scalar path.
+        _ => Ok(false),
+    }
+}
+
+/// R3.4: update every aggregate state from one batch's selection mask —
+/// typed kernels where available, per-lane scalar updates otherwise.
+fn update_states_for_batch_kernel(
+    states: &mut [ColumnarAggregateState],
+    aggregates: &[ColumnarAggregateSpec],
+    column_batches: &HashMap<usize, ColumnarBatchIndex>,
+    batch_id: u64,
+    mask: &[u8],
+) -> Result<()> {
+    for (state, aggregate) in states.iter_mut().zip(aggregates) {
+        let batch = aggregate
+            .column_index
+            .and_then(|idx| column_batches.get(&idx).and_then(|by| by.get(batch_id)));
+        if !kernel_update_aggregate(state, aggregate.op, batch, mask)? {
+            for (offset, &m) in mask.iter().enumerate() {
+                if m != 0 {
+                    let value = batch.and_then(|b| b.value_at(offset));
+                    state.update(aggregate.op, value.as_ref())?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// R3.4: grouped-aggregate update for one batch's selection mask.
+///
+/// Single text group column over a dictionary-coded batch routes lanes by
+/// dictionary code (array index instead of a per-row `Vec<Value>` hash-map
+/// probe — the text GROUP BY win); everything else keeps the per-lane group
+/// key build. Group keys merge into `groups` by value equality, identical to
+/// the per-row path.
+fn update_groups_for_batch_kernel(
+    groups: &mut HashMap<Vec<Value>, Vec<ColumnarAggregateState>>,
+    aggregates: &[ColumnarAggregateSpec],
+    group_by_columns: &[usize],
+    column_batches: &HashMap<usize, ColumnarBatchIndex>,
+    batch_id: u64,
+    mask: &[u8],
+) -> Result<()> {
+    if let [group_col] = group_by_columns {
+        let gbatch = column_batches.get(group_col).and_then(|by| by.get(batch_id));
+        if let Some(gtyped) = gbatch.and_then(|b| b.typed.as_ref()) {
+            if let TypedValues::Text { dict, codes } = &gtyped.data {
+                let null_slot = dict.len();
+                let mut per_code: Vec<Option<Vec<ColumnarAggregateState>>> =
+                    (0..dict.len() + 1).map(|_| None).collect();
+                for (offset, &m) in mask.iter().enumerate() {
+                    if m == 0 {
+                        continue;
+                    }
+                    let idx = match (codes.get(offset), gtyped.validity.get(offset)) {
+                        (Some(&code), Some(&ok)) if ok != 0 => (code as usize).min(null_slot),
+                        _ => null_slot,
+                    };
+                    let Some(slot) = per_code.get_mut(idx) else { continue };
+                    let states = slot.get_or_insert_with(|| {
+                        aggregates
+                            .iter()
+                            .map(|aggregate| ColumnarAggregateState::new(aggregate.op))
+                            .collect()
+                    });
+                    update_columnar_aggregate_states(states, aggregates, column_batches, batch_id, offset)?;
+                }
+                for (code, states) in per_code.into_iter().enumerate() {
+                    let Some(states) = states else { continue };
+                    let key = match dict.get(code) {
+                        Some(entry) if code < null_slot => vec![Value::String(entry.clone())],
+                        _ => vec![Value::Null],
+                    };
+                    match groups.entry(key) {
+                        std::collections::hash_map::Entry::Occupied(mut entry) => {
+                            merge_columnar_aggregate_states(entry.get_mut(), states)?;
+                        }
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            entry.insert(states);
+                        }
+                    }
+                }
+                return Ok(());
+            }
+        }
+    }
+
+    for (offset, &m) in mask.iter().enumerate() {
+        if m == 0 {
+            continue;
+        }
+        let group_key = build_columnar_group_key(column_batches, group_by_columns, batch_id, offset);
+        let states = groups.entry(group_key).or_insert_with(|| {
+            aggregates
+                .iter()
+                .map(|aggregate| ColumnarAggregateState::new(aggregate.op))
+                .collect()
+        });
+        update_columnar_aggregate_states(states, aggregates, column_batches, batch_id, offset)?;
     }
     Ok(())
 }
@@ -3497,7 +3746,6 @@ impl StorageEngine {
                                 MixedProjectionSource::Columnar(idx) => {
                                     projected_values.push(
                                         columnar_batch_value(&column_batches, *idx, *batch_id, offset)
-                                            .cloned()
                                             .unwrap_or(Value::Null),
                                     );
                                 }
@@ -3571,7 +3819,6 @@ impl StorageEngine {
                     MixedProjectionSource::Columnar(idx) => {
                         projected_values.push(
                             columnar_batch_value(&column_batches, *idx, batch_id, offset)
-                                .cloned()
                                 .unwrap_or(Value::Null),
                         );
                     }
@@ -3982,7 +4229,6 @@ impl StorageEngine {
             for &idx in &requested {
                 values.push(
                     columnar_batch_value(&column_batches, idx, batch_id, offset)
-                        .cloned()
                         .unwrap_or(Value::Null),
                 );
             }
@@ -4126,7 +4372,7 @@ impl StorageEngine {
             if let Some(driver_batches) = column_batches.get(&driver_predicate.column_index) {
                 let mut tuples = Vec::new();
                 for (_, batch) in driver_batches.ordered_batches() {
-                    for (offset, driver_value) in batch.values.iter().enumerate() {
+                    for (offset, driver_value) in batch.values().iter().enumerate() {
                         if !driver_predicate.evaluate(driver_value) {
                             continue;
                         }
@@ -4148,7 +4394,6 @@ impl StorageEngine {
                         for &idx in projection {
                             values.push(
                                 columnar_batch_value(&column_batches, idx, batch_id, batch_offset)
-                                    .cloned()
                                     .unwrap_or(Value::Null),
                             );
                         }
@@ -4163,38 +4408,49 @@ impl StorageEngine {
         }
 
         let mut tuples = Vec::new();
-        let mut emit_row = |batch_id: u64, offset: usize| {
-            if pruned.contains(&batch_id) {
-                // R3.1: rows in pruned batches provably fail the predicates.
-                return;
-            }
-            if !columnar_row_matches_filters(&column_batches, batch_id, offset, &filter_predicates) {
-                return;
-            }
-            let mut values = Vec::with_capacity(projection.len());
-            for &idx in projection {
-                values.push(
-                    columnar_batch_value(&column_batches, idx, batch_id, offset)
-                        .cloned()
-                        .unwrap_or(Value::Null),
-                );
-            }
-            let mut tuple = Tuple::new(values);
-            tuple.row_id = Some(batch_id * BATCH_SIZE as u64 + offset as u64);
-            tuples.push(tuple);
-        };
+        let emit_projected =
+            |tuples: &mut Vec<Tuple>, batch_id: u64, offset: usize| {
+                let mut values = Vec::with_capacity(projection.len());
+                for &idx in projection {
+                    values.push(
+                        columnar_batch_value(&column_batches, idx, batch_id, offset)
+                            .unwrap_or(Value::Null),
+                    );
+                }
+                let mut tuple = Tuple::new(values);
+                tuple.row_id = Some(batch_id * BATCH_SIZE as u64 + offset as u64);
+                tuples.push(tuple);
+            };
 
         // R3.3: liveness from the presence sidecar; row-keyspace walk fallback.
         if let Some(presence) = self.columnar_live_presence(table_name) {
+            // R3.4: prune (skip) → presence (mask init) → predicate kernels
+            // (per-lane scalar fallback on v1 batches) → emit selected lanes.
+            let compiled = tk::compile_predicates(&filter_predicates);
+            let mut mask = vec![0u8; BATCH_SIZE];
             for (batch_id, batch_presence) in &presence {
                 if pruned.contains(batch_id) {
                     continue; // pruned batches need no presence iteration
                 }
-                for offset in batch_presence.iter_live() {
-                    emit_row(*batch_id, offset);
+                tk::expand_bitmap_to_mask(&batch_presence.bits, &mut mask);
+                apply_compiled_predicates(&compiled, &column_batches, *batch_id, &mut mask);
+                for (offset, &m) in mask.iter().enumerate() {
+                    if m != 0 {
+                        emit_projected(&mut tuples, *batch_id, offset);
+                    }
                 }
             }
         } else {
+            let mut emit_row = |batch_id: u64, offset: usize| {
+                if pruned.contains(&batch_id) {
+                    // R3.1: rows in pruned batches provably fail the predicates.
+                    return;
+                }
+                if !columnar_row_matches_filters(&column_batches, batch_id, offset, &filter_predicates) {
+                    return;
+                }
+                emit_projected(&mut tuples, batch_id, offset);
+            };
             let prefix = format!("data:{}:", table_name);
             let prefix_bytes = prefix.as_bytes();
             let mut read_opts = ReadOptions::default();
@@ -4261,37 +4517,50 @@ impl StorageEngine {
         }
 
         let mut tuples = Vec::new();
-        let mut emit_row = |batch_id: u64, offset: usize| {
-            if pruned.contains(&batch_id) {
-                // R3.1: rows in pruned batches provably fail the predicates.
-                return;
-            }
-            if !columnar_row_matches_filters(&column_batches, batch_id, offset, &filter_predicates) {
-                return;
-            }
+        let emit_full_width = |tuples: &mut Vec<Tuple>, batch_id: u64, offset: usize| {
             let mut values = vec![Value::Null; schema.columns.len()];
             for &idx in &requested {
-                if let Some(value) = columnar_batch_value(&column_batches, idx, batch_id, offset) {
-                    values[idx] = value.clone();
+                if let (Some(value), Some(slot)) = (
+                    columnar_batch_value(&column_batches, idx, batch_id, offset),
+                    values.get_mut(idx),
+                ) {
+                    *slot = value.clone();
                 }
             }
             let mut tuple = Tuple::new(values);
             tuple.row_id = Some(batch_id * BATCH_SIZE as u64 + offset as u64);
             tuples.push(tuple);
         };
-
         // R3.3: liveness from the presence sidecar; fall back to the
         // `data:{table}:` row-keyspace walk when unavailable.
         if let Some(presence) = self.columnar_live_presence(table_name) {
+            // R3.4: prune (skip) → presence (mask init) → predicate kernels
+            // (per-lane scalar fallback on v1 batches) → emit selected lanes.
+            let compiled = tk::compile_predicates(&filter_predicates);
+            let mut mask = vec![0u8; BATCH_SIZE];
             for (batch_id, batch_presence) in &presence {
                 if pruned.contains(batch_id) {
                     continue; // pruned batches need no presence iteration
                 }
-                for offset in batch_presence.iter_live() {
-                    emit_row(*batch_id, offset);
+                tk::expand_bitmap_to_mask(&batch_presence.bits, &mut mask);
+                apply_compiled_predicates(&compiled, &column_batches, *batch_id, &mut mask);
+                for (offset, &m) in mask.iter().enumerate() {
+                    if m != 0 {
+                        emit_full_width(&mut tuples, *batch_id, offset);
+                    }
                 }
             }
         } else {
+            let mut emit_row = |batch_id: u64, offset: usize| {
+                if pruned.contains(&batch_id) {
+                    // R3.1: rows in pruned batches provably fail the predicates.
+                    return;
+                }
+                if !columnar_row_matches_filters(&column_batches, batch_id, offset, &filter_predicates) {
+                    return;
+                }
+                emit_full_width(&mut tuples, batch_id, offset);
+            };
             let prefix = format!("data:{}:", table_name);
             let prefix_bytes = prefix.as_bytes();
             let mut read_opts = ReadOptions::default();
@@ -4420,32 +4689,35 @@ impl StorageEngine {
                 if let Some(column_index) = aggregate.column_index {
                     if let Some(batches) = column_batches.get(&column_index) {
                         let ordered = batches.ordered_batches();
-                        let total_rows: usize = ordered.iter().map(|(_, batch)| batch.values.len()).sum();
+                        let total_rows: usize = ordered.iter().map(|(_, batch)| batch.slot_count()).sum();
+                        // R3.4: per-batch typed kernel over all slots
+                        // (deleted rows are NULL slots and skipped by
+                        // validity, exactly like the per-value scalar
+                        // update); v1 batches keep the per-value loop.
+                        let fold_chunk = |chunk: &[(u64, &ColumnBatch)]| -> Result<ColumnarAggregateState> {
+                            let mut state = ColumnarAggregateState::new(aggregate.op);
+                            for (_, batch) in chunk {
+                                if !kernel_update_aggregate(&mut state, aggregate.op, Some(batch), &tk::ALL_SELECTED)? {
+                                    for value in batch.values() {
+                                        state.update(aggregate.op, Some(value))?;
+                                    }
+                                }
+                            }
+                            Ok(state)
+                        };
                         if !matches!(aggregate.op, ColumnarAggregateOp::CountDistinct)
                             && agg_parallel_rows_met(total_rows)
                         {
                             use rayon::prelude::*;
                             let partials: Vec<ColumnarAggregateState> = ordered
                                 .par_chunks(batches_per_chunk)
-                                .map(|chunk| {
-                                    let mut state = ColumnarAggregateState::new(aggregate.op);
-                                    for (_, batch) in chunk {
-                                        for value in &batch.values {
-                                            state.update(aggregate.op, Some(value))?;
-                                        }
-                                    }
-                                    Ok(state)
-                                })
+                                .map(fold_chunk)
                                 .collect::<Result<Vec<_>>>()?;
                             for partial in partials {
                                 state.merge(partial)?;
                             }
                         } else {
-                            for (_, batch) in ordered {
-                                for value in &batch.values {
-                                    state.update(aggregate.op, Some(value))?;
-                                }
-                            }
+                            state = fold_chunk(&ordered)?;
                         }
                     }
                 }
@@ -4469,8 +4741,13 @@ impl StorageEngine {
         if let Some(driver_predicate) = null_rejecting_filter_predicate(&filter_predicates) {
             if let Some(driver_batches) = column_batches.get(&driver_predicate.column_index) {
                 let ordered_driver = driver_batches.ordered_batches();
-                let driver_rows: usize = ordered_driver.iter().map(|(_, batch)| batch.values.len()).sum();
+                let driver_rows: usize = ordered_driver.iter().map(|(_, batch)| batch.slot_count()).sum();
                 let parallel = !has_distinct && agg_parallel_rows_met(driver_rows);
+                // R3.4: per-batch selection masks (typed kernels per
+                // predicate, scalar per-lane fallback on v1 batches). The
+                // null-rejecting driver predicate zeroes deleted-row lanes
+                // exactly like the per-slot evaluate it replaces.
+                let compiled = tk::compile_predicates(&filter_predicates);
 
                 if group_by_columns.is_empty() {
                     let mut states: Vec<ColumnarAggregateState> = aggregates
@@ -4478,63 +4755,31 @@ impl StorageEngine {
                         .map(|aggregate| ColumnarAggregateState::new(aggregate.op))
                         .collect();
 
+                    let fold_chunk = |chunk: &[(u64, &ColumnBatch)]| -> Result<Vec<ColumnarAggregateState>> {
+                        let mut states: Vec<ColumnarAggregateState> = aggregates
+                            .iter()
+                            .map(|aggregate| ColumnarAggregateState::new(aggregate.op))
+                            .collect();
+                        let mut mask = vec![0u8; BATCH_SIZE];
+                        for &(batch_id, _) in chunk {
+                            mask.fill(1);
+                            apply_compiled_predicates(&compiled, &column_batches, batch_id, &mut mask);
+                            update_states_for_batch_kernel(&mut states, aggregates, &column_batches, batch_id, &mask)?;
+                        }
+                        Ok(states)
+                    };
+
                     if parallel {
                         use rayon::prelude::*;
                         let partials: Vec<Vec<ColumnarAggregateState>> = ordered_driver
                             .par_chunks(batches_per_chunk)
-                            .map(|chunk| {
-                                let mut states: Vec<ColumnarAggregateState> = aggregates
-                                    .iter()
-                                    .map(|aggregate| ColumnarAggregateState::new(aggregate.op))
-                                    .collect();
-                                for &(batch_id, batch) in chunk {
-                                    for (offset, value) in batch.values.iter().enumerate() {
-                                        if !driver_predicate.evaluate(value)
-                                            || !columnar_row_matches_filters(
-                                                &column_batches,
-                                                batch_id,
-                                                offset,
-                                                &filter_predicates,
-                                            )
-                                        {
-                                            continue;
-                                        }
-                                        for (state, aggregate) in states.iter_mut().zip(aggregates) {
-                                            let value = aggregate.column_index.and_then(|idx| {
-                                                columnar_batch_value(&column_batches, idx, batch_id, offset)
-                                            });
-                                            state.update(aggregate.op, value)?;
-                                        }
-                                    }
-                                }
-                                Ok(states)
-                            })
+                            .map(fold_chunk)
                             .collect::<Result<Vec<_>>>()?;
                         for partial in partials {
                             merge_columnar_aggregate_states(&mut states, partial)?;
                         }
                     } else {
-                        for (batch_id, batch) in ordered_driver {
-                            for (offset, value) in batch.values.iter().enumerate() {
-                                if !driver_predicate.evaluate(value)
-                                    || !columnar_row_matches_filters(
-                                        &column_batches,
-                                        batch_id,
-                                        offset,
-                                        &filter_predicates,
-                                    )
-                                {
-                                    continue;
-                                }
-
-                                for (state, aggregate) in states.iter_mut().zip(aggregates) {
-                                    let value = aggregate
-                                        .column_index
-                                        .and_then(|idx| columnar_batch_value(&column_batches, idx, batch_id, offset));
-                                    state.update(aggregate.op, value)?;
-                                }
-                            }
-                        }
+                        states = fold_chunk(&ordered_driver)?;
                     }
 
                     let tuple_values: Result<Vec<Value>> =
@@ -4554,122 +4799,44 @@ impl StorageEngine {
                     return Ok(tuples);
                 }
 
-                const LINEAR_GROUP_LIMIT: usize = 64;
-                let mut small_groups: Vec<(Vec<Value>, Vec<ColumnarAggregateState>)> = Vec::new();
-                let mut hash_groups: Option<HashMap<Vec<Value>, Vec<ColumnarAggregateState>>> = None;
+                // R3.4: per-batch mask + grouped kernel (dictionary-code
+                // routing for single text group columns); the pre-R3.4
+                // small-group linear scan is subsumed by the per-batch group
+                // accumulation (output is sorted below either way).
+                let fold_chunk = |chunk: &[(u64, &ColumnBatch)]| -> Result<HashMap<Vec<Value>, Vec<ColumnarAggregateState>>> {
+                    let mut groups: HashMap<Vec<Value>, Vec<ColumnarAggregateState>> = HashMap::new();
+                    let mut mask = vec![0u8; BATCH_SIZE];
+                    for &(batch_id, _) in chunk {
+                        mask.fill(1);
+                        apply_compiled_predicates(&compiled, &column_batches, batch_id, &mut mask);
+                        update_groups_for_batch_kernel(
+                            &mut groups,
+                            aggregates,
+                            group_by_columns,
+                            &column_batches,
+                            batch_id,
+                            &mask,
+                        )?;
+                    }
+                    Ok(groups)
+                };
 
-                if parallel {
+                let hash_groups: HashMap<Vec<Value>, Vec<ColumnarAggregateState>> = if parallel {
                     use rayon::prelude::*;
                     let partials: Vec<HashMap<Vec<Value>, Vec<ColumnarAggregateState>>> = ordered_driver
                         .par_chunks(batches_per_chunk)
-                        .map(|chunk| {
-                            let mut groups: HashMap<Vec<Value>, Vec<ColumnarAggregateState>> = HashMap::new();
-                            for &(batch_id, batch) in chunk {
-                                for (offset, value) in batch.values.iter().enumerate() {
-                                    if !driver_predicate.evaluate(value)
-                                        || !columnar_row_matches_filters(
-                                            &column_batches,
-                                            batch_id,
-                                            offset,
-                                            &filter_predicates,
-                                        )
-                                    {
-                                        continue;
-                                    }
-                                    let group_key =
-                                        build_columnar_group_key(&column_batches, group_by_columns, batch_id, offset);
-                                    let states = groups.entry(group_key).or_insert_with(|| {
-                                        aggregates
-                                            .iter()
-                                            .map(|aggregate| ColumnarAggregateState::new(aggregate.op))
-                                            .collect()
-                                    });
-                                    update_columnar_aggregate_states(
-                                        states,
-                                        aggregates,
-                                        &column_batches,
-                                        batch_id,
-                                        offset,
-                                    )?;
-                                }
-                            }
-                            Ok(groups)
-                        })
+                        .map(fold_chunk)
                         .collect::<Result<Vec<_>>>()?;
                     let mut merged: HashMap<Vec<Value>, Vec<ColumnarAggregateState>> = HashMap::new();
                     for partial in partials {
                         merge_columnar_group_map(&mut merged, partial)?;
                     }
-                    hash_groups = Some(merged);
+                    merged
                 } else {
-                    for (batch_id, batch) in ordered_driver {
-                        for (offset, value) in batch.values.iter().enumerate() {
-                            if !driver_predicate.evaluate(value)
-                                || !columnar_row_matches_filters(&column_batches, batch_id, offset, &filter_predicates)
-                            {
-                                continue;
-                            }
-
-                            if let Some(groups) = hash_groups.as_mut() {
-                                let group_key =
-                                    build_columnar_group_key(&column_batches, group_by_columns, batch_id, offset);
-                                let states = groups.entry(group_key).or_insert_with(|| {
-                                    aggregates
-                                        .iter()
-                                        .map(|aggregate| ColumnarAggregateState::new(aggregate.op))
-                                        .collect()
-                                });
-                                update_columnar_aggregate_states(
-                                    states,
-                                    aggregates,
-                                    &column_batches,
-                                    batch_id,
-                                    offset,
-                                )?;
-                            } else if let Some(idx) = small_groups.iter().position(|(group_key, _)| {
-                                columnar_group_key_matches(
-                                    group_key,
-                                    &column_batches,
-                                    group_by_columns,
-                                    batch_id,
-                                    offset,
-                                )
-                            }) {
-                                update_columnar_aggregate_states(
-                                    &mut small_groups[idx].1,
-                                    aggregates,
-                                    &column_batches,
-                                    batch_id,
-                                    offset,
-                                )?;
-                            } else {
-                                let mut states: Vec<ColumnarAggregateState> = aggregates
-                                    .iter()
-                                    .map(|aggregate| ColumnarAggregateState::new(aggregate.op))
-                                    .collect();
-                                update_columnar_aggregate_states(
-                                    &mut states,
-                                    aggregates,
-                                    &column_batches,
-                                    batch_id,
-                                    offset,
-                                )?;
-                                small_groups.push((
-                                    build_columnar_group_key(&column_batches, group_by_columns, batch_id, offset),
-                                    states,
-                                ));
-                                if small_groups.len() > LINEAR_GROUP_LIMIT {
-                                    hash_groups = Some(small_groups.drain(..).collect());
-                                }
-                            }
-                        }
-                    }
-                }
-
-                let mut grouped: Vec<(Vec<Value>, Vec<ColumnarAggregateState>)> = match hash_groups {
-                    Some(groups) => groups.into_iter().collect(),
-                    None => small_groups,
+                    fold_chunk(&ordered_driver)?
                 };
+
+                let mut grouped: Vec<(Vec<Value>, Vec<ColumnarAggregateState>)> = hash_groups.into_iter().collect();
                 grouped.sort_by(|(left, _), (right, _)| compare_value_slices(left, right));
 
                 let mut tuples = Vec::with_capacity(grouped.len());
@@ -4714,39 +4881,35 @@ impl StorageEngine {
             let presence = self.columnar_live_presence(table_name);
             if let Some(presence) = &presence {
                 let live = presence_live_view(presence, &pruned);
-                let update_states = |states: &mut Vec<ColumnarAggregateState>, batch_id: u64, offset: usize| {
-                    if !columnar_row_matches_filters(&column_batches, batch_id, offset, &filter_predicates) {
-                        return Ok(());
+                // R3.4: prune first (presence_live_view), then presence
+                // (mask init), then kernels — per-batch masks over the live
+                // bitmap with typed kernels per aggregate (per-lane scalar
+                // fallback on v1 batches).
+                let compiled = tk::compile_predicates(&filter_predicates);
+                let fold_chunk = |chunk: &[(u64, &BatchPresence)]| -> Result<Vec<ColumnarAggregateState>> {
+                    let mut states: Vec<ColumnarAggregateState> = aggregates
+                        .iter()
+                        .map(|aggregate| ColumnarAggregateState::new(aggregate.op))
+                        .collect();
+                    let mut mask = vec![0u8; BATCH_SIZE];
+                    for (batch_id, batch_presence) in chunk {
+                        tk::expand_bitmap_to_mask(&batch_presence.bits, &mut mask);
+                        apply_compiled_predicates(&compiled, &column_batches, *batch_id, &mut mask);
+                        update_states_for_batch_kernel(&mut states, aggregates, &column_batches, *batch_id, &mask)?;
                     }
-                    for (state, aggregate) in states.iter_mut().zip(aggregates) {
-                        let value = aggregate
-                            .column_index
-                            .and_then(|idx| columnar_batch_value(&column_batches, idx, batch_id, offset));
-                        state.update(aggregate.op, value)?;
-                    }
-                    Ok(())
+                    Ok(states)
                 };
                 if parallel {
-                    let partials: Vec<Vec<ColumnarAggregateState>> = presence_parallel_partials(
-                        &live,
-                        batches_per_chunk,
-                        || {
-                            aggregates
-                                .iter()
-                                .map(|aggregate| ColumnarAggregateState::new(aggregate.op))
-                                .collect()
-                        },
-                        update_states,
-                    )?;
+                    use rayon::prelude::*;
+                    let partials: Vec<Vec<ColumnarAggregateState>> = live
+                        .par_chunks(batches_per_chunk.max(1))
+                        .map(fold_chunk)
+                        .collect::<Result<Vec<_>>>()?;
                     for partial in partials {
                         merge_columnar_aggregate_states(&mut states, partial)?;
                     }
                 } else {
-                    for (batch_id, batch_presence) in &live {
-                        for offset in batch_presence.iter_live() {
-                            update_states(&mut states, *batch_id, offset)?;
-                        }
-                    }
+                    states = fold_chunk(&live)?;
                 }
             } else if parallel {
                 let partials: Vec<Vec<ColumnarAggregateState>> = self.par_prefix_shard_results(&prefix, |iter| {
@@ -4772,7 +4935,7 @@ impl StorageEngine {
                             let value = aggregate
                                 .column_index
                                 .and_then(|idx| columnar_batch_value(&column_batches, idx, batch_id, offset));
-                            state.update(aggregate.op, value)?;
+                            state.update(aggregate.op, value.as_ref())?;
                         }
                     }
                     Ok(states)
@@ -4809,7 +4972,7 @@ impl StorageEngine {
                         let value = aggregate
                             .column_index
                             .and_then(|idx| columnar_batch_value(&column_batches, idx, batch_id, offset));
-                        state.update(aggregate.op, value)?;
+                        state.update(aggregate.op, value.as_ref())?;
                     }
                 }
             }
@@ -4847,37 +5010,39 @@ impl StorageEngine {
         let presence = self.columnar_live_presence(table_name);
         if let Some(presence) = &presence {
             let live = presence_live_view(presence, &pruned);
-            let update_groups = |groups: &mut HashMap<Vec<Value>, Vec<ColumnarAggregateState>>,
-                                 batch_id: u64,
-                                 offset: usize| {
-                if !columnar_row_matches_filters(&column_batches, batch_id, offset, &filter_predicates) {
-                    return Ok(());
+            // R3.4: prune → presence mask → predicate kernels → grouped
+            // kernel (dictionary-code routing for single text group columns).
+            let compiled = tk::compile_predicates(&filter_predicates);
+            let fold_chunk = |chunk: &[(u64, &BatchPresence)]| -> Result<HashMap<Vec<Value>, Vec<ColumnarAggregateState>>> {
+                let mut groups: HashMap<Vec<Value>, Vec<ColumnarAggregateState>> = HashMap::new();
+                let mut mask = vec![0u8; BATCH_SIZE];
+                for (batch_id, batch_presence) in chunk {
+                    tk::expand_bitmap_to_mask(&batch_presence.bits, &mut mask);
+                    apply_compiled_predicates(&compiled, &column_batches, *batch_id, &mut mask);
+                    update_groups_for_batch_kernel(
+                        &mut groups,
+                        aggregates,
+                        group_by_columns,
+                        &column_batches,
+                        *batch_id,
+                        &mask,
+                    )?;
                 }
-                let group_key = build_columnar_group_key(&column_batches, group_by_columns, batch_id, offset);
-                let states = groups.entry(group_key).or_insert_with(|| {
-                    aggregates
-                        .iter()
-                        .map(|aggregate| ColumnarAggregateState::new(aggregate.op))
-                        .collect()
-                });
-                update_columnar_aggregate_states(states, aggregates, &column_batches, batch_id, offset)
+                Ok(groups)
             };
             if parallel {
-                let partials: Vec<HashMap<Vec<Value>, Vec<ColumnarAggregateState>>> =
-                    presence_parallel_partials(&live, batches_per_chunk, HashMap::new, update_groups)?;
+                use rayon::prelude::*;
+                let partials: Vec<HashMap<Vec<Value>, Vec<ColumnarAggregateState>>> = live
+                    .par_chunks(batches_per_chunk.max(1))
+                    .map(fold_chunk)
+                    .collect::<Result<Vec<_>>>()?;
                 let mut merged: HashMap<Vec<Value>, Vec<ColumnarAggregateState>> = HashMap::new();
                 for partial in partials {
                     merge_columnar_group_map(&mut merged, partial)?;
                 }
                 hash_groups = Some(merged);
             } else {
-                let mut groups: HashMap<Vec<Value>, Vec<ColumnarAggregateState>> = HashMap::new();
-                for (batch_id, batch_presence) in &live {
-                    for offset in batch_presence.iter_live() {
-                        update_groups(&mut groups, *batch_id, offset)?;
-                    }
-                }
-                hash_groups = Some(groups);
+                hash_groups = Some(fold_chunk(&live)?);
             }
         } else if parallel {
             let partials: Vec<HashMap<Vec<Value>, Vec<ColumnarAggregateState>>> =
@@ -5011,6 +5176,144 @@ impl StorageEngine {
         Ok(tuples)
     }
 
+    /// R3.4: fully-kernelized COUNT(*)+SUM(int) grouped fold for one chunk of
+    /// presence batches. Per batch: presence mask → predicate kernels → a
+    /// dense per-dictionary-code (text group keys) or per-small-int-range
+    /// (integer group keys, range from the embedded stats) accumulation —
+    /// merged into the value-keyed map at batch end. Batches without a typed
+    /// group/sum buffer fall back to the per-lane scalar updates (bit-exact
+    /// pre-R3.4 behavior, including SUM type errors).
+    #[allow(clippy::too_many_arguments)]
+    fn count_sum_kernel_chunk(
+        chunk: &[(u64, &BatchPresence)],
+        compiled: &[CompiledPredicate<'_>],
+        column_batches: &HashMap<usize, ColumnarBatchIndex>,
+        group_column: usize,
+        sum_column: usize,
+    ) -> Result<HashMap<Value, CountSumIntState>> {
+        /// Max dense slots for integer group keys (beyond this the generic
+        /// per-lane path takes over — a GROUP BY with >64k distinct keys per
+        /// 1024-row batch is degenerate anyway).
+        const MAX_DENSE_INT_GROUPS: i64 = 65_536;
+
+        fn fold_groups(
+            groups: &mut HashMap<Value, CountSumIntState>,
+            counts: &[i64],
+            sums: &[i128],
+            seen: &[u8],
+            key_of: impl Fn(usize) -> Value,
+        ) -> Result<()> {
+            for (idx, ((&count, &sum), &sum_seen)) in counts.iter().zip(sums).zip(seen).enumerate() {
+                if count == 0 && sum_seen == 0 {
+                    continue;
+                }
+                let state = groups.entry(key_of(idx)).or_insert_with(CountSumIntState::new);
+                state.count += count;
+                if sum_seen != 0 {
+                    let sum =
+                        i64::try_from(sum).map_err(|_| Error::query_execution("integer overflow: BIGINT SUM"))?;
+                    state.update_sum_int(Some(sum))?;
+                }
+            }
+            Ok(())
+        }
+
+        let mut groups: HashMap<Value, CountSumIntState> = HashMap::new();
+        let mut mask = vec![0u8; BATCH_SIZE];
+        for (batch_id, batch_presence) in chunk {
+            tk::expand_bitmap_to_mask(&batch_presence.bits, &mut mask);
+            apply_compiled_predicates(compiled, column_batches, *batch_id, &mut mask);
+
+            let gbatch = column_batches.get(&group_column).and_then(|by| by.get(*batch_id));
+            let sbatch = column_batches.get(&sum_column).and_then(|by| by.get(*batch_id));
+
+            // SUM operand for the kernels: typed int buffer, or None when
+            // the sum batch is absent (every lane reads NULL). Any other
+            // shape (v1 batch, non-int values) forces the per-lane fallback
+            // so error semantics are preserved.
+            let sum_arg: Option<Option<(&[i64], &[u8])>> = match sbatch {
+                None => Some(None),
+                Some(batch) => batch.typed.as_ref().and_then(|typed| match &typed.data {
+                    TypedValues::Int { data, .. } => Some(Some((data.as_slice(), typed.validity.as_slice()))),
+                    _ => None,
+                }),
+            };
+
+            let mut kernelized = false;
+            if let Some(sum) = sum_arg {
+                if let Some(gtyped) = gbatch.and_then(|b| b.typed.as_ref()) {
+                    match &gtyped.data {
+                        TypedValues::Text { dict, codes } => {
+                            let slots = dict.len() + 1;
+                            let mut counts = vec![0i64; slots];
+                            let mut sums = vec![0i128; slots];
+                            let mut seen = vec![0u8; slots];
+                            tk::group_count_sum_by_code(
+                                codes,
+                                &gtyped.validity,
+                                &mask,
+                                sum,
+                                &mut counts,
+                                &mut sums,
+                                &mut seen,
+                            );
+                            fold_groups(&mut groups, &counts, &sums, &seen, |idx| {
+                                dict.get(idx).map_or(Value::Null, |s| Value::String(s.clone()))
+                            })?;
+                            kernelized = true;
+                        }
+                        TypedValues::Int { width, data } => {
+                            if let Some((mn, mx)) = stats_int_bounds(&gtyped.stats) {
+                                if let Some(range) =
+                                    mx.checked_sub(mn).filter(|r| (0..MAX_DENSE_INT_GROUPS).contains(r))
+                                {
+                                    let slots = range as usize + 2;
+                                    let mut counts = vec![0i64; slots];
+                                    let mut sums = vec![0i128; slots];
+                                    let mut seen = vec![0u8; slots];
+                                    tk::group_count_sum_by_small_int(
+                                        data,
+                                        &gtyped.validity,
+                                        mn,
+                                        &mask,
+                                        sum,
+                                        &mut counts,
+                                        &mut sums,
+                                        &mut seen,
+                                    );
+                                    fold_groups(&mut groups, &counts, &sums, &seen, |idx| {
+                                        if idx + 1 == slots {
+                                            Value::Null
+                                        } else {
+                                            width.value(mn + idx as i64)
+                                        }
+                                    })?;
+                                    kernelized = true;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            if !kernelized {
+                for (offset, &m) in mask.iter().enumerate() {
+                    if m == 0 {
+                        continue;
+                    }
+                    let sum_value = columnar_batch_value(column_batches, sum_column, *batch_id, offset);
+                    let group_key = columnar_batch_value(column_batches, group_column, *batch_id, offset)
+                        .unwrap_or(Value::Null);
+                    let state = groups.entry(group_key).or_insert_with(CountSumIntState::new);
+                    state.update_count();
+                    state.update_sum(sum_value.as_ref())?;
+                }
+            }
+        }
+        Ok(groups)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn try_aggregate_columnar_group_count_sum_int(
         &self,
@@ -5061,35 +5364,30 @@ impl StorageEngine {
         let presence = self.columnar_live_presence(table_name);
         if let Some(presence) = &presence {
             let live = presence_live_view(presence, pruned);
-            let update_groups = |groups: &mut HashMap<Value, CountSumIntState>, batch_id: u64, offset: usize| {
-                if !columnar_row_matches_filters(column_batches, batch_id, offset, filter_predicates) {
-                    return Ok(());
-                }
-                let sum_value = columnar_batch_value(column_batches, sum_column, batch_id, offset);
-                let group_key = columnar_batch_value(column_batches, group_column, batch_id, offset)
-                    .cloned()
-                    .unwrap_or(Value::Null);
-                let state = groups.entry(group_key).or_insert_with(CountSumIntState::new);
-                state.update_count();
-                state.update_sum(sum_value)
-            };
+            // R3.4: prune → presence mask → predicate kernels → dense
+            // per-code / per-small-int grouped COUNT+SUM kernel (the text
+            // GROUP BY win); v1 batches fall back per-lane inside the chunk.
+            let compiled = tk::compile_predicates(filter_predicates);
             if parallel {
+                use rayon::prelude::*;
                 let batches_per_chunk = (AGG_PARALLEL_CHUNK / BATCH_SIZE).max(1);
-                let partials: Vec<HashMap<Value, CountSumIntState>> =
-                    presence_parallel_partials(&live, batches_per_chunk, HashMap::new, update_groups)?;
+                let partials: Vec<HashMap<Value, CountSumIntState>> = live
+                    .par_chunks(batches_per_chunk)
+                    .map(|chunk| Self::count_sum_kernel_chunk(chunk, &compiled, column_batches, group_column, sum_column))
+                    .collect::<Result<Vec<_>>>()?;
                 let mut merged: HashMap<Value, CountSumIntState> = HashMap::new();
                 for partial in partials {
                     merge_count_sum_group_map(&mut merged, partial)?;
                 }
                 hash_groups = Some(merged);
             } else {
-                let mut groups: HashMap<Value, CountSumIntState> = HashMap::new();
-                for (batch_id, batch_presence) in &live {
-                    for offset in batch_presence.iter_live() {
-                        update_groups(&mut groups, *batch_id, offset)?;
-                    }
-                }
-                hash_groups = Some(groups);
+                hash_groups = Some(Self::count_sum_kernel_chunk(
+                    &live,
+                    &compiled,
+                    column_batches,
+                    group_column,
+                    sum_column,
+                )?);
             }
         } else if parallel {
             let partials: Vec<HashMap<Value, CountSumIntState>> = self.par_prefix_shard_results(&prefix, |iter| {
@@ -5110,11 +5408,10 @@ impl StorageEngine {
                     }
                     let sum_value = columnar_batch_value(column_batches, sum_column, batch_id, offset);
                     let group_key = columnar_batch_value(column_batches, group_column, batch_id, offset)
-                        .cloned()
                         .unwrap_or(Value::Null);
                     let state = groups.entry(group_key).or_insert_with(CountSumIntState::new);
                     state.update_count();
-                    state.update_sum(sum_value)?;
+                    state.update_sum(sum_value.as_ref())?;
                 }
                 Ok(groups)
             })?;
@@ -5151,25 +5448,23 @@ impl StorageEngine {
                 let sum_value = columnar_batch_value(column_batches, sum_column, batch_id, offset);
                 if let Some(groups) = hash_groups.as_mut() {
                     let group_key = columnar_batch_value(column_batches, group_column, batch_id, offset)
-                        .cloned()
                         .unwrap_or(Value::Null);
                     let state = groups.entry(group_key).or_insert_with(CountSumIntState::new);
                     state.update_count();
-                    state.update_sum(sum_value)?;
+                    state.update_sum(sum_value.as_ref())?;
                 } else if let Some(idx) = small_groups.iter().position(|(group_key, _)| {
                     columnar_batch_value(column_batches, group_column, batch_id, offset)
-                        .map_or(matches!(group_key, Value::Null), |actual| group_key == actual)
+                        .map_or(matches!(group_key, Value::Null), |actual| *group_key == actual)
                 }) {
                     let state = &mut small_groups[idx].1;
                     state.update_count();
-                    state.update_sum(sum_value)?;
+                    state.update_sum(sum_value.as_ref())?;
                 } else {
                     let group_key = columnar_batch_value(column_batches, group_column, batch_id, offset)
-                        .cloned()
                         .unwrap_or(Value::Null);
                     let mut state = CountSumIntState::new();
                     state.update_count();
-                    state.update_sum(sum_value)?;
+                    state.update_sum(sum_value.as_ref())?;
                     small_groups.push((group_key, state));
                     if small_groups.len() > LINEAR_GROUP_LIMIT {
                         hash_groups = Some(small_groups.drain(..).collect());
