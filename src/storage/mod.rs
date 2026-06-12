@@ -24,6 +24,7 @@ mod stats;
 pub mod time_travel;
 mod transaction;
 mod vector_index;
+pub mod version_gc;
 mod view_catalog;
 mod wal;
 
@@ -93,6 +94,7 @@ pub use statistics::{ColumnStatistics, StatisticsAnalyzer, StatisticsCache, Tabl
 pub use stats::{DatabaseStats, GlobalStatsCollector, ReplicationRole, StatsSnapshot};
 pub use time_travel::{GcConfig, Scn, SnapshotManager, SnapshotMetadata, TransactionId};
 pub use transaction::{Transaction, TransactionSavepointSnapshot};
+pub use version_gc::{VersionGcConfig, VersionGcCycleStats, VersionStorageStats};
 pub use vector_index::{
     StoredVectorRecord, StoredVectorSearchResult, VectorIndexManager, VectorIndexMetadata, VectorIndexStats,
     VectorIndexType, VectorIndexUndoOp,

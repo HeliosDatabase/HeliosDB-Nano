@@ -32,6 +32,7 @@ use rocksdb::{WriteBatch, WriteOptions, DB};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// System Change Number (Oracle-compatible)
@@ -101,6 +102,12 @@ pub struct SnapshotManager {
     /// Persist snapshot metadata keys. Memory-only databases keep this metadata
     /// in process and do not need it for recovery.
     persist_metadata: bool,
+    /// R4.3: version-GC low watermark — the highest GC horizon ever applied
+    /// (persisted as `vgc:low_watermark` by the collector). Historical reads
+    /// (`AS OF` / `VERSIONS BETWEEN` starts / branch anchors) BELOW this
+    /// timestamp fail with a clear error instead of reconstructing state
+    /// from a partially collected version chain. `0` = GC never ran.
+    gc_low_watermark: AtomicU64,
 }
 
 /// Snapshot cache configuration
@@ -160,6 +167,7 @@ impl SnapshotManager {
             cache_config,
             gc_config: GcConfig::default(),
             non_durable_writes: false,
+            gc_low_watermark: AtomicU64::new(0),
             persist_metadata: true,
         }
     }
@@ -189,6 +197,7 @@ impl SnapshotManager {
             cache_config,
             gc_config,
             non_durable_writes: false,
+            gc_low_watermark: AtomicU64::new(0),
             persist_metadata: true,
         }
     }
@@ -209,6 +218,7 @@ impl SnapshotManager {
             cache_config,
             gc_config,
             non_durable_writes: false,
+            gc_low_watermark: AtomicU64::new(0),
             persist_metadata: true,
         }
     }
@@ -306,9 +316,24 @@ impl SnapshotManager {
                 // Get current timestamp
                 Ok(self.get_current_timestamp())
             }
-            AsOfClause::Timestamp(ts_str) => self.resolve_timestamp(ts_str),
-            AsOfClause::Transaction(txn_id) => self.resolve_transaction(*txn_id),
-            AsOfClause::Scn(scn) => self.resolve_scn(*scn),
+            // R4.3: every explicit historical anchor must be at or above
+            // the version-GC low watermark — below it the version chain may
+            // be partially collected and the answer would be wrong.
+            AsOfClause::Timestamp(ts_str) => {
+                let ts = self.resolve_timestamp(ts_str)?;
+                self.check_gc_horizon(ts)?;
+                Ok(ts)
+            }
+            AsOfClause::Transaction(txn_id) => {
+                let ts = self.resolve_transaction(*txn_id)?;
+                self.check_gc_horizon(ts)?;
+                Ok(ts)
+            }
+            AsOfClause::Scn(scn) => {
+                let ts = self.resolve_scn(*scn)?;
+                self.check_gc_horizon(ts)?;
+                Ok(ts)
+            }
             AsOfClause::VersionsBetween { .. } => {
                 // VersionsBetween cannot be resolved to a single timestamp
                 // The executor should handle this variant separately
@@ -363,7 +388,23 @@ impl SnapshotManager {
     ///
     /// Returns internal LSN timestamp for use in version range queries.
     /// For timestamps, finds the nearest snapshot or uses boundary values.
+    ///
+    /// R4.3: a range START below the version-GC low watermark errors — the
+    /// versions in that part of the range may have been collected, and a
+    /// silently partial history is worse than a clear error.
     pub fn resolve_timestamp_for_range(
+        &self,
+        as_of: &crate::sql::logical_plan::AsOfClause,
+        is_start: bool,
+    ) -> Result<u64> {
+        let ts = self.resolve_timestamp_for_range_inner(as_of, is_start)?;
+        if is_start {
+            self.check_gc_horizon(ts)?;
+        }
+        Ok(ts)
+    }
+
+    fn resolve_timestamp_for_range_inner(
         &self,
         as_of: &crate::sql::logical_plan::AsOfClause,
         is_start: bool,
@@ -469,6 +510,58 @@ impl SnapshotManager {
     fn get_current_timestamp(&self) -> u64 {
         // Get the latest snapshot timestamp
         self.snapshots.read().values().map(|m| m.timestamp).max().unwrap_or(1)
+    }
+
+    /// R4.3: set the version-GC low watermark (highest horizon ever applied).
+    /// Monotonic: never moves backwards.
+    pub fn set_gc_low_watermark(&self, ts: u64) {
+        self.gc_low_watermark.fetch_max(ts, Ordering::SeqCst);
+    }
+
+    /// R4.3: current version-GC low watermark (0 = GC never ran).
+    pub fn gc_low_watermark(&self) -> u64 {
+        self.gc_low_watermark.load(Ordering::SeqCst)
+    }
+
+    /// R4.3: reject historical reads below the version-GC low watermark.
+    /// Reads AT the watermark are exact (the collector always keeps the
+    /// newest version at-or-below the horizon for every row); reads below
+    /// it could silently reconstruct from a pruned chain, so they error.
+    pub fn check_gc_horizon(&self, ts: u64) -> Result<()> {
+        let watermark = self.gc_low_watermark();
+        if ts < watermark {
+            return Err(Error::query_execution(format!(
+                "historical read at timestamp {} is older than the version-GC low watermark {}: \
+                 versions beyond the configured storage.version_retention have been garbage \
+                 collected (increase version_retention to keep more history)",
+                ts, watermark
+            )));
+        }
+        Ok(())
+    }
+
+    /// R4.3: newest recovered/registered snapshot timestamp, if any.
+    /// Used to seed the engine's logical timestamp counter at startup so
+    /// timestamps stay monotonic across reopens.
+    pub fn max_snapshot_timestamp(&self) -> Option<u64> {
+        self.snapshots.read().keys().max().copied()
+    }
+
+    /// R4.3: largest snapshot timestamp whose wall-clock registration time
+    /// is at or before `cutoff_unix_secs`. This is the snapshot-metadata
+    /// half of the retention horizon's wall-clock → logical-ts mapping (the
+    /// version GC's persisted time anchors are the other half).
+    pub fn max_snapshot_ts_at_or_before_wallclock(&self, cutoff_unix_secs: i64) -> Option<u64> {
+        let snapshots = self.snapshots.read();
+        let mut best: Option<u64> = None;
+        for metadata in snapshots.values() {
+            if let Ok(snap_time) = DateTime::parse_from_rfc3339(&metadata.wall_clock_time) {
+                if snap_time.timestamp() <= cutoff_unix_secs {
+                    best = Some(best.map_or(metadata.timestamp, |b: u64| b.max(metadata.timestamp)));
+                }
+            }
+        }
+        best
     }
 
     /// Read a versioned value at a specific snapshot (legacy - linear scan)

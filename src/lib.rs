@@ -911,6 +911,29 @@ impl EmbeddedDatabase {
         }
     }
 
+    /// R4.3: intercept `VACUUM VERSIONS` — run a full MVCC version-GC pass
+    /// and return the number of version values reclaimed. Honors the same
+    /// retention/watermark contract as the background collector; with
+    /// `storage.version_retention` unset it is a no-op returning 0.
+    fn try_handle_vacuum_versions(&self, sql: &str) -> Result<Option<u64>> {
+        if !sql::Parser::is_vacuum_versions(sql) {
+            return Ok(None);
+        }
+        Ok(Some(self.storage.vacuum_versions()?))
+    }
+
+    /// R4.3: run a full MVCC version-GC pass (the library twin of the
+    /// `VACUUM VERSIONS` SQL statement). Returns reclaimed version count.
+    pub fn vacuum_versions(&self) -> Result<u64> {
+        self.storage.vacuum_versions()
+    }
+
+    /// R4.3: counts and approximate byte footprint of the MVCC version
+    /// keyspaces (`v:` values, `v_idx:` reverse-index entries).
+    pub fn version_storage_stats(&self) -> Result<storage::VersionStorageStats> {
+        self.storage.version_storage_stats()
+    }
+
     pub(crate) fn is_fk_setting_statement(sql: &str) -> bool {
         let trimmed = sql.trim().trim_end_matches(';').trim();
         let upper = trimmed.to_ascii_uppercase();
@@ -5056,6 +5079,11 @@ impl EmbeddedDatabase {
         }
 
         if let Some(count) = self.try_handle_fk_setting(sql)? {
+            return Ok(count);
+        }
+
+        // R4.3: VACUUM VERSIONS — manual MVCC version-history collection.
+        if let Some(count) = self.try_handle_vacuum_versions(sql)? {
             return Ok(count);
         }
 
@@ -11393,6 +11421,17 @@ impl EmbeddedDatabase {
             return Ok(rows);
         }
 
+        // R4.3: VACUUM VERSIONS — manual MVCC version-history collection;
+        // returns a single row with the reclaimed version count.
+        if sql::Parser::is_vacuum_versions(sql) {
+            let collected = self.storage.vacuum_versions()?;
+            return Ok(vec![Tuple {
+                values: vec![Value::Int8(collected as i64)],
+                row_id: None,
+                branch_id: None,
+            }]);
+        }
+
         // DML belongs on the write executor.  `query()` is commonly used
         // by client adapters as a generic SQL entry point; without this
         // guard, INSERT/UPDATE/DELETE without RETURNING fall into the
@@ -11652,6 +11691,18 @@ impl EmbeddedDatabase {
     pub fn query_with_columns(&self, sql: &str) -> Result<(Vec<Tuple>, Vec<String>)> {
         if let Some(result) = self.try_fast_select_with_columns(sql) {
             return result;
+        }
+
+        // R4.3: VACUUM VERSIONS over the result-set surface (REPL/wire
+        // protocols) — one row with the reclaimed version count.
+        if sql::Parser::is_vacuum_versions(sql) {
+            let collected = self.storage.vacuum_versions()?;
+            let row = Tuple {
+                values: vec![Value::Int8(collected as i64)],
+                row_id: None,
+                branch_id: None,
+            };
+            return Ok((vec![row], vec!["versions_collected".to_string()]));
         }
 
         let cacheable = !self.in_transaction() && !Self::query_is_non_deterministic(sql);
