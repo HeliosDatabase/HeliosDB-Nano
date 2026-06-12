@@ -78,13 +78,24 @@ fn fill_vectors(db: &EmbeddedDatabase, table: &str, n: usize, dim: usize) {
     }
 }
 
+/// Monotonic counter so every issued statement is textually unique: the
+/// result cache is keyed on the exact SQL string, and repeated identical
+/// SELECTs would otherwise measure LRU result-cache hits, not execution.
+static QUERY_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn uncached(sql: &str) -> String {
+    let n = QUERY_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{sql} /* probe {n} */")
+}
+
 fn time_query(db: &EmbeddedDatabase, sql: &str, reps: usize) -> (f64, usize) {
     // Warm once, then take the best of `reps` (quiet-machine convention).
-    let rows = db.query(sql, &[]).unwrap().len();
+    let rows = db.query(&uncached(sql), &[]).unwrap().len();
     let mut best = f64::MAX;
     for _ in 0..reps {
+        let stmt = uncached(sql);
         let started = Instant::now();
-        let got = db.query(sql, &[]).unwrap().len();
+        let got = db.query(&stmt, &[]).unwrap().len();
         assert_eq!(got, rows);
         best = best.min(started.elapsed().as_secs_f64() * 1000.0);
     }
