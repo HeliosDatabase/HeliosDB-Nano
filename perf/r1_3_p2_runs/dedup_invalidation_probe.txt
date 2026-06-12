@@ -1,0 +1,36 @@
+--- dedup conflict run 1 ---
+update_txn_cycle( 1T, disjoint)             18057 txn/s  (500 total)
+update_txn_cycle( 4T, disjoint)             39225 txn/s  (2000 total)
+update_txn_cycle(16T, disjoint)             61362 txn/s  (8000 total)
+contended_counter(8T)                         15148 commit/s  committed=4000 retries=532 zero_matches=0 final_v=4000 lost_updates=0
+--- dedup session run 1 ---
+global_txn_cycle(1T)                          33871 txn/s
+session_txn_cycle( 1T)                        21651 txn/s  (2000 total)
+session_txn_cycle( 4T)                        41423 txn/s  (8000 total)
+session_txn_cycle(16T)                        52369 txn/s  (32000 total)
+session_autocommit_insert(1T)                 22005 ops/s
+autocommit_insert_with_open_session_txn      103311 ops/s
+--- dedup conflict run 2 ---
+update_txn_cycle( 1T, disjoint)             16004 txn/s  (500 total)
+update_txn_cycle( 4T, disjoint)             41759 txn/s  (2000 total)
+update_txn_cycle(16T, disjoint)             67412 txn/s  (8000 total)
+contended_counter(8T)                         14092 commit/s  committed=4000 retries=536 zero_matches=0 final_v=4000 lost_updates=0
+--- dedup session run 2 ---
+global_txn_cycle(1T)                          32557 txn/s
+session_txn_cycle( 1T)                        23689 txn/s  (2000 total)
+session_txn_cycle( 4T)                        43567 txn/s  (8000 total)
+session_txn_cycle(16T)                        52766 txn/s  (32000 total)
+session_autocommit_insert(1T)                 22329 ops/s
+autocommit_insert_with_open_session_txn      123488 ops/s
+--- dedup conflict run 3 ---
+update_txn_cycle( 1T, disjoint)             18525 txn/s  (500 total)
+update_txn_cycle( 4T, disjoint)             43976 txn/s  (2000 total)
+update_txn_cycle(16T, disjoint)             69933 txn/s  (8000 total)
+contended_counter(8T)                         15289 commit/s  committed=4000 retries=474 zero_matches=0 final_v=4000 lost_updates=0
+--- dedup session run 3 ---
+global_txn_cycle(1T)                          33953 txn/s
+session_txn_cycle( 1T)                        24424 txn/s  (2000 total)
+session_txn_cycle( 4T)                        43438 txn/s  (8000 total)
+session_txn_cycle(16T)                        51460 txn/s  (32000 total)
+session_autocommit_insert(1T)                 23244 ops/s
+autocommit_insert_with_open_session_txn      130754 ops/s

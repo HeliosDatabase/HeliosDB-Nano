@@ -1251,10 +1251,14 @@ impl EmbeddedDatabase {
             // R0.2: commit at a FRESH timestamp — committing at the BEGIN
             // snapshot timestamp recorded wrong version ordering for any
             // transaction that overlapped other commits.
-            let written = txn.written_data_keys();
+            // R1.3-p2: commit itself runs the row-cache fence when the cache
+            // is wired; only unwired transactions need the caller-side sweep.
+            let written = if txn.has_row_cache() { Vec::new() } else { txn.written_data_keys() };
             let commit_ts = self.storage.next_commit_timestamp(txn.has_tracked_writes());
             txn.commit_with_timestamp(commit_ts)?;
-            self.invalidate_row_cache_for(&written);
+            if !written.is_empty() {
+                self.invalidate_row_cache_for(&written);
+            }
             // Clear ART undo log (changes are now committed)
             self.art_undo_log.write().clear();
             self.deferred_fk_checks.lock().clear();
@@ -12143,7 +12147,9 @@ impl EmbeddedDatabase {
                 session.stats.transactions_committed += 1;
                 return Ok(());
             };
-            let written = txn.written_data_keys();
+            // R1.3-p2: commit itself runs the row-cache fence when the cache
+            // is wired; only unwired transactions need the caller-side sweep.
+            let written = if txn.has_row_cache() { Vec::new() } else { txn.written_data_keys() };
             let commit_ts = self.storage.next_commit_timestamp(txn.has_tracked_writes());
             if let Err(e) = txn.commit_with_timestamp(commit_ts) {
                 // Failed commit (e.g. R0.2 serialization failure) behaves
@@ -12155,7 +12161,9 @@ impl EmbeddedDatabase {
                 session.stats.transactions_aborted += 1;
                 return Err(e);
             }
-            self.invalidate_row_cache_for(&written);
+            if !written.is_empty() {
+                self.invalidate_row_cache_for(&written);
+            }
             self.storage.increment_lsn();
         }
         // Changes are committed: the session's ART mutations are now permanent.
@@ -12294,10 +12302,14 @@ impl EmbeddedDatabase {
 
             match result {
                 Ok(count) => {
-                    let written = txn.written_data_keys();
+                    // R1.3-p2: commit runs the row-cache fence itself when
+                    // the cache is wired (it always is on this path).
+                    let written = if txn.has_row_cache() { Vec::new() } else { txn.written_data_keys() };
                     let commit_ts = self.storage.next_commit_timestamp(txn.has_tracked_writes());
                     txn.commit_with_timestamp(commit_ts)?;
-                    self.invalidate_row_cache_for(&written);
+                    if !written.is_empty() {
+                        self.invalidate_row_cache_for(&written);
+                    }
                     self.storage.increment_lsn();
                     self.finish_session_art_undo(session_id, false);
                     Ok(count)
@@ -15535,10 +15547,13 @@ impl Transaction<'_> {
     /// After commit, the transaction is consumed and cannot be used.
     pub fn commit(self) -> Result<()> {
         // R0.2: fresh commit timestamp (see commit_internal).
-        let written = self.tx.written_data_keys();
+        // R1.3-p2: commit runs the row-cache fence itself when wired.
+        let written = if self.tx.has_row_cache() { Vec::new() } else { self.tx.written_data_keys() };
         let commit_ts = self.db.storage.next_commit_timestamp(self.tx.has_tracked_writes());
         self.tx.commit_with_timestamp(commit_ts)?;
-        self.db.invalidate_row_cache_for(&written);
+        if !written.is_empty() {
+            self.db.invalidate_row_cache_for(&written);
+        }
         Ok(())
     }
 

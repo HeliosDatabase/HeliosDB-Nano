@@ -233,6 +233,14 @@ impl Transaction {
         self.row_cache = Some(cache);
     }
 
+    /// True when the engine row cache is wired into this transaction, i.e.
+    /// commit itself runs the stale-row fence and the caller-side
+    /// `invalidate_row_cache_for` sweep would be redundant work on the
+    /// commit hot path (R1.3-p2).
+    pub fn has_row_cache(&self) -> bool {
+        self.row_cache.is_some()
+    }
+
     pub fn set_rocksdb_wal_enabled(&mut self, enabled: bool) {
         self.rocksdb_wal_enabled = enabled;
     }
@@ -791,13 +799,23 @@ impl Transaction {
         // could pass the barrier and the UPDATE arm's PK point-lookup would
         // serve the cached pre-commit value — both transactions then pass
         // first-committer-wins validation and an update is lost (observed
-        // ~10-50% per contended bench run on a loaded 32-core host; the
-        // caller-side invalidation after commit returns is kept as belt and
-        // braces but ran too late).
+        // ~10-50% per contended bench run on a loaded 32-core host). Callers
+        // skip their post-commit `invalidate_row_cache_for` sweep when this
+        // fence is wired (`has_row_cache`), so this is the only invalidation
+        // pass on the hot path; the table name is borrowed straight out of
+        // the key to avoid `written_data_keys`'s per-row String allocation.
         if result.is_ok() && !self.write_set.is_empty() {
             if let Some(cache) = &self.row_cache {
-                for (table, row_id) in self.written_data_keys() {
-                    cache.invalidate(&table, row_id);
+                for entry in self.write_set.iter() {
+                    if let Some(rest) = entry.key().strip_prefix(b"data:".as_slice()) {
+                        if let Ok(text) = std::str::from_utf8(rest) {
+                            if let Some(pos) = text.rfind(':') {
+                                if let Ok(row_id) = text[pos + 1..].parse::<u64>() {
+                                    cache.invalidate(&text[..pos], row_id);
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
