@@ -640,9 +640,43 @@ pub(super) fn try_index_range_scan_for_scan(
         return Ok(None);
     };
 
-    let mut tuples = Vec::with_capacity(pairs.len());
-    for (_, row_id) in pairs {
-        if let Some(tuple) = storage.get_row_by_id(table_name, row_id, schema.as_ref())? {
+    // Fetch candidates in ROW-ID order, not index-key order: storage data
+    // keys are row-id ordered, so sorted access turns random block reads
+    // into near-sequential ones and stops LRU row-cache thrash on large
+    // ranges. This path carries no ordering contract — the full predicate is
+    // re-applied below, and any ORDER BY is a separate plan node above this
+    // scan (the ordered top-k fast path does its own bounded iteration).
+    let mut row_ids: Vec<crate::storage::RowId> = pairs.into_iter().map(|(_, row_id)| row_id).collect();
+    row_ids.sort_unstable();
+
+    // Adaptive cold-storage abort: point gets are µs-scale when rows sit in
+    // the row cache / memtable but can be ms-scale per get on cold blocks
+    // (R4.1 keyspace reality: zero bloom selectivity, one shared CF). For
+    // large fetch sets, give the fetch a time budget comparable to one
+    // sequential scan; if it blows the budget, hand the query back to the
+    // scan path (`Ok(None)`), whose cost is bounded by table size. Small
+    // fetch sets never abort — their worst case is already bounded. EXPLAIN
+    // shows the planned index path; this abort is a runtime fallback only.
+    const ABORT_MIN_ROWS: usize = 256;
+    const ABORT_BUDGET: std::time::Duration = std::time::Duration::from_millis(100);
+    let fetch_started = std::time::Instant::now();
+
+    let mut tuples = Vec::with_capacity(row_ids.len());
+    for (i, row_id) in row_ids.iter().enumerate() {
+        if row_ids.len() >= ABORT_MIN_ROWS && i & 0x3F == 0x3F && fetch_started.elapsed() > ABORT_BUDGET {
+            tracing::debug!(
+                "index range scan aborted after {} of {} fetches in {:?} (cold storage); \
+                 falling back to sequential scan for '{}' on {} ({})",
+                i + 1,
+                row_ids.len(),
+                fetch_started.elapsed(),
+                spec.index_name,
+                table_name,
+                spec.display,
+            );
+            return Ok(None);
+        }
+        if let Some(tuple) = storage.get_row_by_id(table_name, *row_id, schema.as_ref())? {
             tuples.push(tuple);
         }
     }

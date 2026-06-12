@@ -820,6 +820,17 @@ impl<'a> Executor<'a> {
         let mut fetch_k = k_target.saturating_mul(2).max(k_target.saturating_add(8)).min(total);
         let mut non_null: Vec<Tuple>;
         let mut null_head: Vec<Tuple>;
+        // Adaptive cold-storage abort (mirrors the range-scan fetch): when a
+        // residual filter rejects heavily, `fetch_k` can grow toward the
+        // whole table, and point gets on cold blocks are ms-scale. Give the
+        // whole iteration a time budget once it has demonstrably done real
+        // work; on blowing it, fall back to the generic sort path, whose
+        // cost is bounded by one sequential scan. EXPLAIN shows the planned
+        // ordered-index path; this abort is a runtime fallback only.
+        const ABORT_MIN_FETCHES: usize = 512;
+        const ABORT_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
+        let budget_started = std::time::Instant::now();
+        let mut fetched = 0usize;
         loop {
             non_null = Vec::with_capacity(k_target.min(fetch_k));
             null_head = Vec::new();
@@ -840,6 +851,19 @@ impl<'a> Executor<'a> {
             for (key, row_id) in &pairs {
                 if key.as_slice() > [0u8].as_slice() {
                     nulls_complete = true;
+                }
+                fetched += 1;
+                if fetched >= ABORT_MIN_FETCHES && fetched & 0x3F == 0 && budget_started.elapsed() > ABORT_BUDGET {
+                    tracing::debug!(
+                        "ordered index top-k aborted after {} fetches in {:?} (cold storage); \
+                         falling back to generic sort for '{}' on {}.{}",
+                        fetched,
+                        budget_started.elapsed(),
+                        index_name,
+                        table_name,
+                        column_name,
+                    );
+                    return Ok(None);
                 }
                 let Some(tuple) = storage.get_row_by_id(table_name, *row_id, schema.as_ref())? else {
                     continue;
