@@ -160,7 +160,7 @@ impl<'a> CompiledPredicate<'a> {
             }
         }
 
-        mask_scalar(self.pred, &batch.values, mask);
+        mask_scalar(self.pred, batch.values(), mask);
     }
 }
 
@@ -525,12 +525,7 @@ mod tests {
 
     /// Build a decoded-from-v2 batch (typed populated) from values.
     fn typed_batch(values: Vec<Value>) -> ColumnBatch {
-        let batch = ColumnBatch {
-            column: "v".to_string(),
-            start_row_id: 0,
-            values,
-            typed: None,
-        };
+        let batch = ColumnBatch::from_values("v".to_string(), 0, values);
         let stats = BatchStats::from_batch(&batch);
         let encoded = encode_column_batch(&batch, &stats).unwrap();
         let decoded = decode_column_batch(&encoded).unwrap();

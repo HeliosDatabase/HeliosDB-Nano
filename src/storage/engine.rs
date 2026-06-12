@@ -411,9 +411,9 @@ fn columnar_row_matches_filters(
         if let Some(value) = column_batches
             .get(&predicate.column_index)
             .and_then(|by_batch| by_batch.get(batch_id))
-            .and_then(|batch| batch.values.get(offset))
+            .and_then(|batch| batch.value_at(offset))
         {
-            predicate.evaluate(value)
+            predicate.evaluate(&value)
         } else {
             predicate.evaluate(&Value::Null)
         }
@@ -521,16 +521,20 @@ fn decoded_integer_matches_filter(
     })
 }
 
-fn columnar_batch_value<'a>(
-    column_batches: &'a HashMap<usize, ColumnarBatchIndex>,
+/// Read one columnar cell. R3.4: returns an OWNED value built on the fly
+/// from the typed buffers (no whole-batch materialization); `None` when the
+/// batch or slot is absent (callers treat that as NULL), `Some(Value::Null)`
+/// for NULL slots — exactly the previous `values.get(offset).cloned()`.
+fn columnar_batch_value(
+    column_batches: &HashMap<usize, ColumnarBatchIndex>,
     column_index: usize,
     batch_id: u64,
     offset: usize,
-) -> Option<&'a Value> {
+) -> Option<Value> {
     column_batches
         .get(&column_index)
         .and_then(|by_batch| by_batch.get(batch_id))
-        .and_then(|batch| batch.values.get(offset))
+        .and_then(|batch| batch.value_at(offset))
 }
 
 fn compare_value_slices(left: &[Value], right: &[Value]) -> std::cmp::Ordering {
@@ -719,7 +723,7 @@ fn columnar_group_key_matches(
     key.len() == group_by_columns.len()
         && key.iter().zip(group_by_columns).all(|(expected, &idx)| {
             columnar_batch_value(column_batches, idx, batch_id, offset)
-                .map_or(matches!(expected, Value::Null), |actual| expected == actual)
+                .map_or(matches!(expected, Value::Null), |actual| *expected == actual)
         })
 }
 
@@ -733,7 +737,6 @@ fn build_columnar_group_key(
         .iter()
         .map(|&idx| {
             columnar_batch_value(column_batches, idx, batch_id, offset)
-                .cloned()
                 .unwrap_or(Value::Null)
         })
         .collect()
@@ -750,7 +753,7 @@ fn update_columnar_aggregate_states(
         let value = aggregate
             .column_index
             .and_then(|idx| columnar_batch_value(column_batches, idx, batch_id, offset));
-        state.update(aggregate.op, value)?;
+        state.update(aggregate.op, value.as_ref())?;
     }
     Ok(())
 }
@@ -915,7 +918,8 @@ fn update_states_for_batch_kernel(
         if !kernel_update_aggregate(state, aggregate.op, batch, mask)? {
             for (offset, &m) in mask.iter().enumerate() {
                 if m != 0 {
-                    state.update(aggregate.op, batch.and_then(|b| b.values.get(offset)))?;
+                    let value = batch.and_then(|b| b.value_at(offset));
+                    state.update(aggregate.op, value.as_ref())?;
                 }
             }
         }
@@ -3742,7 +3746,6 @@ impl StorageEngine {
                                 MixedProjectionSource::Columnar(idx) => {
                                     projected_values.push(
                                         columnar_batch_value(&column_batches, *idx, *batch_id, offset)
-                                            .cloned()
                                             .unwrap_or(Value::Null),
                                     );
                                 }
@@ -3816,7 +3819,6 @@ impl StorageEngine {
                     MixedProjectionSource::Columnar(idx) => {
                         projected_values.push(
                             columnar_batch_value(&column_batches, *idx, batch_id, offset)
-                                .cloned()
                                 .unwrap_or(Value::Null),
                         );
                     }
@@ -4227,7 +4229,6 @@ impl StorageEngine {
             for &idx in &requested {
                 values.push(
                     columnar_batch_value(&column_batches, idx, batch_id, offset)
-                        .cloned()
                         .unwrap_or(Value::Null),
                 );
             }
@@ -4371,7 +4372,7 @@ impl StorageEngine {
             if let Some(driver_batches) = column_batches.get(&driver_predicate.column_index) {
                 let mut tuples = Vec::new();
                 for (_, batch) in driver_batches.ordered_batches() {
-                    for (offset, driver_value) in batch.values.iter().enumerate() {
+                    for (offset, driver_value) in batch.values().iter().enumerate() {
                         if !driver_predicate.evaluate(driver_value) {
                             continue;
                         }
@@ -4393,7 +4394,6 @@ impl StorageEngine {
                         for &idx in projection {
                             values.push(
                                 columnar_batch_value(&column_batches, idx, batch_id, batch_offset)
-                                    .cloned()
                                     .unwrap_or(Value::Null),
                             );
                         }
@@ -4414,7 +4414,6 @@ impl StorageEngine {
                 for &idx in projection {
                     values.push(
                         columnar_batch_value(&column_batches, idx, batch_id, offset)
-                            .cloned()
                             .unwrap_or(Value::Null),
                     );
                 }
@@ -4690,7 +4689,7 @@ impl StorageEngine {
                 if let Some(column_index) = aggregate.column_index {
                     if let Some(batches) = column_batches.get(&column_index) {
                         let ordered = batches.ordered_batches();
-                        let total_rows: usize = ordered.iter().map(|(_, batch)| batch.values.len()).sum();
+                        let total_rows: usize = ordered.iter().map(|(_, batch)| batch.slot_count()).sum();
                         // R3.4: per-batch typed kernel over all slots
                         // (deleted rows are NULL slots and skipped by
                         // validity, exactly like the per-value scalar
@@ -4699,7 +4698,7 @@ impl StorageEngine {
                             let mut state = ColumnarAggregateState::new(aggregate.op);
                             for (_, batch) in chunk {
                                 if !kernel_update_aggregate(&mut state, aggregate.op, Some(batch), &tk::ALL_SELECTED)? {
-                                    for value in &batch.values {
+                                    for value in batch.values() {
                                         state.update(aggregate.op, Some(value))?;
                                     }
                                 }
@@ -4742,7 +4741,7 @@ impl StorageEngine {
         if let Some(driver_predicate) = null_rejecting_filter_predicate(&filter_predicates) {
             if let Some(driver_batches) = column_batches.get(&driver_predicate.column_index) {
                 let ordered_driver = driver_batches.ordered_batches();
-                let driver_rows: usize = ordered_driver.iter().map(|(_, batch)| batch.values.len()).sum();
+                let driver_rows: usize = ordered_driver.iter().map(|(_, batch)| batch.slot_count()).sum();
                 let parallel = !has_distinct && agg_parallel_rows_met(driver_rows);
                 // R3.4: per-batch selection masks (typed kernels per
                 // predicate, scalar per-lane fallback on v1 batches). The
@@ -4936,7 +4935,7 @@ impl StorageEngine {
                             let value = aggregate
                                 .column_index
                                 .and_then(|idx| columnar_batch_value(&column_batches, idx, batch_id, offset));
-                            state.update(aggregate.op, value)?;
+                            state.update(aggregate.op, value.as_ref())?;
                         }
                     }
                     Ok(states)
@@ -4973,7 +4972,7 @@ impl StorageEngine {
                         let value = aggregate
                             .column_index
                             .and_then(|idx| columnar_batch_value(&column_batches, idx, batch_id, offset));
-                        state.update(aggregate.op, value)?;
+                        state.update(aggregate.op, value.as_ref())?;
                     }
                 }
             }
@@ -5305,11 +5304,10 @@ impl StorageEngine {
                     }
                     let sum_value = columnar_batch_value(column_batches, sum_column, *batch_id, offset);
                     let group_key = columnar_batch_value(column_batches, group_column, *batch_id, offset)
-                        .cloned()
                         .unwrap_or(Value::Null);
                     let state = groups.entry(group_key).or_insert_with(CountSumIntState::new);
                     state.update_count();
-                    state.update_sum(sum_value)?;
+                    state.update_sum(sum_value.as_ref())?;
                 }
             }
         }
@@ -5410,11 +5408,10 @@ impl StorageEngine {
                     }
                     let sum_value = columnar_batch_value(column_batches, sum_column, batch_id, offset);
                     let group_key = columnar_batch_value(column_batches, group_column, batch_id, offset)
-                        .cloned()
                         .unwrap_or(Value::Null);
                     let state = groups.entry(group_key).or_insert_with(CountSumIntState::new);
                     state.update_count();
-                    state.update_sum(sum_value)?;
+                    state.update_sum(sum_value.as_ref())?;
                 }
                 Ok(groups)
             })?;
@@ -5451,25 +5448,23 @@ impl StorageEngine {
                 let sum_value = columnar_batch_value(column_batches, sum_column, batch_id, offset);
                 if let Some(groups) = hash_groups.as_mut() {
                     let group_key = columnar_batch_value(column_batches, group_column, batch_id, offset)
-                        .cloned()
                         .unwrap_or(Value::Null);
                     let state = groups.entry(group_key).or_insert_with(CountSumIntState::new);
                     state.update_count();
-                    state.update_sum(sum_value)?;
+                    state.update_sum(sum_value.as_ref())?;
                 } else if let Some(idx) = small_groups.iter().position(|(group_key, _)| {
                     columnar_batch_value(column_batches, group_column, batch_id, offset)
-                        .map_or(matches!(group_key, Value::Null), |actual| group_key == actual)
+                        .map_or(matches!(group_key, Value::Null), |actual| *group_key == actual)
                 }) {
                     let state = &mut small_groups[idx].1;
                     state.update_count();
-                    state.update_sum(sum_value)?;
+                    state.update_sum(sum_value.as_ref())?;
                 } else {
                     let group_key = columnar_batch_value(column_batches, group_column, batch_id, offset)
-                        .cloned()
                         .unwrap_or(Value::Null);
                     let mut state = CountSumIntState::new();
                     state.update_count();
-                    state.update_sum(sum_value)?;
+                    state.update_sum(sum_value.as_ref())?;
                     small_groups.push((group_key, state));
                     if small_groups.len() > LINEAR_GROUP_LIMIT {
                         hash_groups = Some(small_groups.drain(..).collect());

@@ -218,9 +218,10 @@ pub enum TypedValues {
 }
 
 /// In-memory typed companion of a `ColumnBatch` decoded from v2 storage.
-/// Carried alongside the materialized `values` vector (which keeps every
-/// existing row-at-a-time path working unchanged); the vectorized kernels
-/// operate on these buffers instead.
+/// The vectorized kernels operate on these buffers; the batch's
+/// `Vec<Value>` view stays unmaterialized until a consumer asks for it
+/// (`ColumnBatch::values`) or reads single lanes (`ColumnBatch::value_at`,
+/// which builds one `Value` on the fly).
 #[derive(Debug, Clone)]
 pub struct TypedBatch {
     /// One 0/1 byte per slot (1 ⇔ non-NULL). Length == slot count; slots
@@ -230,6 +231,67 @@ pub struct TypedBatch {
     pub stats: BatchStats,
     /// The typed buffers.
     pub data: TypedValues,
+}
+
+impl TypedBatch {
+    /// Number of slots covered.
+    pub fn slot_count(&self) -> usize {
+        self.validity.len()
+    }
+
+    /// Build one slot's `Value` on the fly: `None` beyond the slot count,
+    /// `Some(Value::Null)` for NULL slots (and corrupt dictionary codes,
+    /// matching the materializing decoder).
+    pub fn value_at(&self, offset: usize) -> Option<Value> {
+        let ok = *self.validity.get(offset)?;
+        if ok == 0 {
+            return Some(Value::Null);
+        }
+        Some(match &self.data {
+            TypedValues::Int { width, data } => data.get(offset).map_or(Value::Null, |&v| width.value(v)),
+            TypedValues::Float { width, data } => data.get(offset).map_or(Value::Null, |&v| width.value(v)),
+            TypedValues::Bool { data } => data.get(offset).map_or(Value::Null, |&v| Value::Boolean(v != 0)),
+            TypedValues::Text { dict, codes } => codes
+                .get(offset)
+                .and_then(|&code| dict.get(code as usize))
+                .map_or(Value::Null, |s| Value::String(s.clone())),
+        })
+    }
+
+    /// Materialize the full `Vec<Value>` view (used by `ColumnBatch::values`
+    /// on first access).
+    pub fn materialize_values(&self) -> Vec<Value> {
+        match &self.data {
+            TypedValues::Int { width, data } => data
+                .iter()
+                .zip(&self.validity)
+                .map(|(&v, &ok)| if ok != 0 { width.value(v) } else { Value::Null })
+                .collect(),
+            TypedValues::Float { width, data } => data
+                .iter()
+                .zip(&self.validity)
+                .map(|(&v, &ok)| if ok != 0 { width.value(v) } else { Value::Null })
+                .collect(),
+            TypedValues::Bool { data } => data
+                .iter()
+                .zip(&self.validity)
+                .map(|(&v, &ok)| if ok != 0 { Value::Boolean(v != 0) } else { Value::Null })
+                .collect(),
+            TypedValues::Text { dict, codes } => codes
+                .iter()
+                .zip(&self.validity)
+                .map(|(&code, &ok)| {
+                    if ok != 0 {
+                        dict.get(code as usize)
+                            .map(|s| Value::String(s.clone()))
+                            .unwrap_or(Value::Null)
+                    } else {
+                        Value::Null
+                    }
+                })
+                .collect(),
+        }
+    }
 }
 
 /// Expand a bit-packed bitmap into one 0/1 byte per slot.
@@ -383,16 +445,17 @@ fn build_typed_data(values: &[Value]) -> Option<TypedData> {
 /// sidecar write so the embedded and sidecar copies are identical).
 pub fn encode_column_batch(batch: &ColumnBatch, stats: &BatchStats) -> crate::Result<Vec<u8>> {
     if batch_v2_write_enabled() {
-        if let Some(data) = build_typed_data(&batch.values) {
+        let values = batch.values();
+        if let Some(data) = build_typed_data(values) {
             let v2 = BatchV2 {
                 column: batch.column.clone(),
                 start_row_id: batch.start_row_id,
-                slot_count: batch.values.len() as u32,
-                validity: pack_bits(batch.values.iter().map(|v| !matches!(v, Value::Null))),
+                slot_count: values.len() as u32,
+                validity: pack_bits(values.iter().map(|v| !matches!(v, Value::Null))),
                 stats: stats.clone(),
                 data,
             };
-            let mut out = Vec::with_capacity(64 + batch.values.len() * 8);
+            let mut out = Vec::with_capacity(64 + values.len() * 8);
             out.extend_from_slice(&BATCH_V2_MAGIC);
             bincode::serialize_into(&mut out, &v2)
                 .map_err(|e| crate::Error::storage(format!("Columnar v2 serialize failed: {}", e)))?;
@@ -405,13 +468,13 @@ pub fn encode_column_batch(batch: &ColumnBatch, stats: &BatchStats) -> crate::Re
 /// Would `batch` encode as v2? (Used by the lazy-migration path to avoid
 /// taking the write lock for ineligible batches.)
 pub fn batch_is_v2_eligible(batch: &ColumnBatch) -> bool {
-    build_typed_data(&batch.values).is_some()
+    build_typed_data(batch.values()).is_some()
 }
 
 /// Decode a stored batch of either format. v2 batches come back with the
-/// `typed` companion populated **and** `values` fully materialized, so every
-/// pre-R3.4 row-at-a-time consumer keeps working unchanged; v1 batches come
-/// back exactly as before (`typed == None` ⇒ scalar paths).
+/// `typed` companion populated and the `Vec<Value>` view LAZY (built only if
+/// a row-at-a-time consumer asks for it); v1 batches come back exactly as
+/// before (`typed == None` ⇒ scalar paths).
 pub fn decode_column_batch(raw: &[u8]) -> crate::Result<ColumnBatch> {
     if raw.len() >= BATCH_V2_MAGIC.len() && raw[..BATCH_V2_MAGIC.len()] == BATCH_V2_MAGIC {
         let v2: BatchV2 = bincode::deserialize(&raw[BATCH_V2_MAGIC.len()..])
@@ -419,60 +482,24 @@ pub fn decode_column_batch(raw: &[u8]) -> crate::Result<ColumnBatch> {
         let slots = v2.slot_count as usize;
         let validity = expand_bits(&v2.validity, slots);
 
-        let (values, data) = match v2.data {
-            TypedData::Int { width, data } => {
-                let values: Vec<Value> = data
-                    .iter()
-                    .zip(&validity)
-                    .map(|(&v, &ok)| if ok != 0 { width.value(v) } else { Value::Null })
-                    .collect();
-                (values, TypedValues::Int { width, data })
-            }
-            TypedData::Float { width, data } => {
-                let values: Vec<Value> = data
-                    .iter()
-                    .zip(&validity)
-                    .map(|(&v, &ok)| if ok != 0 { width.value(v) } else { Value::Null })
-                    .collect();
-                (values, TypedValues::Float { width, data })
-            }
-            TypedData::Bool { bits } => {
-                let data = expand_bits(&bits, slots);
-                let values: Vec<Value> = data
-                    .iter()
-                    .zip(&validity)
-                    .map(|(&v, &ok)| if ok != 0 { Value::Boolean(v != 0) } else { Value::Null })
-                    .collect();
-                (values, TypedValues::Bool { data })
-            }
-            TypedData::Text { dict, codes } => {
-                let values: Vec<Value> = codes
-                    .iter()
-                    .zip(&validity)
-                    .map(|(&code, &ok)| {
-                        if ok != 0 {
-                            dict.get(code as usize)
-                                .map(|s| Value::String(s.clone()))
-                                .unwrap_or(Value::Null)
-                        } else {
-                            Value::Null
-                        }
-                    })
-                    .collect();
-                (values, TypedValues::Text { dict, codes })
-            }
+        let data = match v2.data {
+            TypedData::Int { width, data } => TypedValues::Int { width, data },
+            TypedData::Float { width, data } => TypedValues::Float { width, data },
+            TypedData::Bool { bits } => TypedValues::Bool {
+                data: expand_bits(&bits, slots),
+            },
+            TypedData::Text { dict, codes } => TypedValues::Text { dict, codes },
         };
 
-        return Ok(ColumnBatch {
-            column: v2.column,
-            start_row_id: v2.start_row_id,
-            values,
-            typed: Some(TypedBatch {
+        return Ok(ColumnBatch::from_typed(
+            v2.column,
+            v2.start_row_id,
+            TypedBatch {
                 validity,
                 stats: v2.stats,
                 data,
-            }),
-        });
+            },
+        ));
     }
 
     bincode::deserialize(raw).map_err(|e| crate::Error::storage(format!("Columnar deserialize failed: {}", e)))
@@ -483,12 +510,7 @@ mod tests {
     use super::*;
 
     fn batch_of(values: Vec<Value>) -> ColumnBatch {
-        ColumnBatch {
-            column: "v".to_string(),
-            start_row_id: 0,
-            values,
-            typed: None,
-        }
+        ColumnBatch::from_values("v".to_string(), 0, values)
     }
 
     fn roundtrip(values: Vec<Value>) -> ColumnBatch {
@@ -506,7 +528,7 @@ mod tests {
             vec![Value::Int8(i64::MAX), Value::Null, Value::Int8(-1)],
         ] {
             let decoded = roundtrip(values.clone());
-            assert_eq!(decoded.values, values);
+            assert_eq!(*decoded.values(), values);
             assert!(decoded.typed.is_some(), "expected v2 for {values:?}");
         }
     }
@@ -514,16 +536,16 @@ mod tests {
     #[test]
     fn floats_bools_text_roundtrip() {
         let floats = vec![Value::Float8(1.5), Value::Null, Value::Float8(-0.25)];
-        assert_eq!(roundtrip(floats.clone()).values, floats);
+        assert_eq!(*roundtrip(floats.clone()).values(), floats);
 
         let f4 = vec![Value::Float4(2.5), Value::Float4(f32::NAN), Value::Null];
         let decoded = roundtrip(f4);
-        assert!(matches!(decoded.values[0], Value::Float4(x) if x == 2.5));
-        assert!(matches!(decoded.values[1], Value::Float4(x) if x.is_nan()));
-        assert!(matches!(decoded.values[2], Value::Null));
+        assert!(matches!(decoded.values()[0], Value::Float4(x) if x == 2.5));
+        assert!(matches!(decoded.values()[1], Value::Float4(x) if x.is_nan()));
+        assert!(matches!(decoded.values()[2], Value::Null));
 
         let bools = vec![Value::Boolean(true), Value::Null, Value::Boolean(false)];
-        assert_eq!(roundtrip(bools.clone()).values, bools);
+        assert_eq!(*roundtrip(bools.clone()).values(), bools);
 
         let text = vec![
             Value::String("a".into()),
@@ -532,7 +554,7 @@ mod tests {
             Value::String("a".into()),
         ];
         let decoded = roundtrip(text.clone());
-        assert_eq!(decoded.values, text);
+        assert_eq!(*decoded.values(), text);
         match &decoded.typed.unwrap().data {
             TypedValues::Text { dict, codes } => {
                 assert_eq!(dict, &vec!["a".to_string(), "b".to_string()]);
@@ -560,7 +582,7 @@ mod tests {
                 "expected v1 for {values:?}"
             );
             let decoded = decode_column_batch(&encoded).unwrap();
-            assert_eq!(decoded.values, values);
+            assert_eq!(*decoded.values(), values);
             assert!(decoded.typed.is_none());
         }
     }
