@@ -1635,6 +1635,11 @@ pub struct StorageEngine {
     /// Write-write conflict registry (R0.2): first-committer-wins
     /// validation for snapshot-isolation transactions.
     conflict_registry: Arc<super::conflict::WriteConflictRegistry>,
+    /// R4.3: MVCC version garbage collector (watermark + collector state).
+    version_gc: Arc<super::version_gc::VersionGc>,
+    /// R4.3: background version-GC thread; joined on engine drop. None
+    /// when retention is infinite or the interval resolves to 0.
+    version_gc_worker: Option<super::version_gc::VersionGcWorker>,
     /// Branch manager for database branching
     branch_manager: Arc<RwLock<Option<Arc<BranchManager>>>>,
     /// Write-ahead log for durability
@@ -1940,7 +1945,13 @@ impl StorageEngine {
             warn!("Failed to recover snapshots: {}", e);
         }
 
-        let timestamp = Arc::new(RwLock::new(1));
+        // R4.3: seed the logical MVCC timestamp counter from recovered
+        // snapshot metadata so timestamps stay monotonic across reopens.
+        // Restarting at 1 (the historical behavior) reuses timestamps that
+        // already exist in `v:` version keys and snapshot metadata, which
+        // breaks AS OF resolution ("AS OF NOW" resolves to the prior run's
+        // max) and would make any watermark-based version GC unsound.
+        let timestamp = Arc::new(RwLock::new(snapshot_manager.max_snapshot_timestamp().unwrap_or(1).max(1)));
 
         // Initialize branch manager
         debug!("Initializing BranchManager");
@@ -2036,6 +2047,20 @@ impl StorageEngine {
         };
 
         let row_counters = Arc::new(dashmap::DashMap::new());
+
+        // R4.3: MVCC version GC (watermark recovery + optional background
+        // collector). Retention parse errors fail the open: a misread
+        // retention must not silently disable (or enable) collection.
+        let conflict_registry = Arc::new(super::conflict::WriteConflictRegistry::new());
+        let (version_gc, version_gc_worker) = Self::init_version_gc(
+            &config,
+            Arc::clone(&db),
+            Arc::clone(&snapshot_manager),
+            Arc::clone(&conflict_registry),
+            Arc::clone(&branch_manager),
+            Arc::clone(&timestamp),
+        )?;
+
         let engine = Self {
             db: Arc::clone(&db),
             config: config.clone(),
@@ -2043,7 +2068,9 @@ impl StorageEngine {
             key_manager,
             vector_indexes: Arc::new(VectorIndexManager::new()),
             snapshot_manager,
-            conflict_registry: Arc::new(super::conflict::WriteConflictRegistry::new()),
+            conflict_registry,
+            version_gc,
+            version_gc_worker,
             branch_manager,
             wal,
             stats,
@@ -2235,6 +2262,18 @@ impl StorageEngine {
             (None, uuid::Uuid::new_v4())
         };
 
+        // R4.3: MVCC version GC (also active for memory-only databases —
+        // version keys accumulate in the tmpfs RocksDB all the same).
+        let conflict_registry = Arc::new(super::conflict::WriteConflictRegistry::new());
+        let (version_gc, version_gc_worker) = Self::init_version_gc(
+            &config,
+            Arc::clone(&db),
+            Arc::clone(&snapshot_manager),
+            Arc::clone(&conflict_registry),
+            Arc::clone(&branch_manager),
+            Arc::clone(&timestamp),
+        )?;
+
         Ok(Self {
             db: Arc::clone(&db),
             config: config.clone(),
@@ -2242,7 +2281,9 @@ impl StorageEngine {
             key_manager,
             vector_indexes: Arc::new(VectorIndexManager::new()),
             snapshot_manager,
-            conflict_registry: Arc::new(super::conflict::WriteConflictRegistry::new()),
+            conflict_registry,
+            version_gc,
+            version_gc_worker,
             branch_manager,
             wal,
             stats,
@@ -3141,6 +3182,80 @@ impl StorageEngine {
     /// engine (R0.2).
     pub fn conflict_registry(&self) -> Arc<super::conflict::WriteConflictRegistry> {
         Arc::clone(&self.conflict_registry)
+    }
+
+    /// R4.3: build the version GC (recovers the persisted low watermark)
+    /// and start the background worker when configured.
+    fn init_version_gc(
+        config: &Config,
+        db: Arc<DB>,
+        snapshot_manager: Arc<SnapshotManager>,
+        conflict_registry: Arc<super::conflict::WriteConflictRegistry>,
+        branch_manager: Arc<RwLock<Option<Arc<BranchManager>>>>,
+        timestamp: Arc<RwLock<u64>>,
+    ) -> Result<(
+        Arc<super::version_gc::VersionGc>,
+        Option<super::version_gc::VersionGcWorker>,
+    )> {
+        let retention_secs = config.storage.version_retention_secs()?;
+        let interval_secs = config.storage.effective_version_gc_interval_secs()?;
+        let gc_config = super::version_gc::VersionGcConfig {
+            retention_secs,
+            interval_secs,
+            max_versions_per_cycle: config.storage.version_gc_max_per_cycle,
+        };
+        let version_gc = Arc::new(super::version_gc::VersionGc::new(
+            db,
+            snapshot_manager,
+            conflict_registry,
+            branch_manager,
+            timestamp,
+            gc_config,
+        ));
+        let worker = if interval_secs > 0 {
+            info!(
+                interval_secs,
+                retention_secs = retention_secs.unwrap_or(0),
+                "starting MVCC version-GC worker"
+            );
+            Some(super::version_gc::VersionGcWorker::start(
+                Arc::clone(&version_gc),
+                interval_secs,
+            ))
+        } else {
+            None
+        };
+        Ok((version_gc, worker))
+    }
+
+    /// R4.3: run `VACUUM VERSIONS` — a full collection pass over the MVCC
+    /// version keyspace. Returns the number of version values reclaimed.
+    /// No-op (returns 0) when `storage.version_retention` is unset.
+    pub fn vacuum_versions(&self) -> Result<u64> {
+        self.version_gc.vacuum()
+    }
+
+    /// R4.3: one bounded version-GC cycle (test/diagnostic surface).
+    pub fn version_gc_cycle(&self) -> Result<super::version_gc::VersionGcCycleStats> {
+        self.version_gc.run_cycle()
+    }
+
+    /// R4.3: counts/approximate bytes of the `v:`/`v_idx:` keyspaces.
+    pub fn version_storage_stats(&self) -> Result<super::version_gc::VersionStorageStats> {
+        super::version_gc::version_storage_stats(&self.db)
+    }
+
+    /// R4.3: pin a historical snapshot against version GC for the lifetime
+    /// of the returned guard (statement-scoped `AS OF` readers, branch
+    /// anchor persistence). Pin-then-validate: the pin is taken first, then
+    /// checked against the GC low watermark — together with the collector's
+    /// publish-watermark-then-re-read-pins ordering this closes the race
+    /// where GC advances between resolving an AS OF timestamp and reading
+    /// the versions.
+    pub fn pin_historical_snapshot(&self, snapshot_ts: u64) -> Result<super::conflict::GcPinGuard> {
+        let guard = super::conflict::GcPinGuard::new(self.conflict_registry(), snapshot_ts);
+        self.snapshot_manager.check_gc_horizon(snapshot_ts)?;
+        Ok(guard)
     }
 
     /// Get next timestamp (for MVCC)

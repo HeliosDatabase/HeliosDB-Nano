@@ -133,6 +133,12 @@ pub struct Transaction {
     /// this transaction's snapshot (first-committer-wins).
     conflict_registry: Option<Arc<WriteConflictRegistry>>,
     conflict_validation: bool,
+    /// R4.3: id of this transaction's version-GC snapshot pin in the
+    /// conflict registry. EVERY transaction with a registry pins its
+    /// snapshot (ReadCommitted session transactions also scan at their
+    /// snapshot via `scan_table_at_snapshot`), so the version GC never
+    /// reclaims a version an open transaction may still read.
+    gc_pin_id: Option<u64>,
 }
 
 impl Drop for Transaction {
@@ -144,6 +150,12 @@ impl Drop for Transaction {
         if self.conflict_validation {
             if let Some(registry) = &self.conflict_registry {
                 registry.deregister_txn(self.transaction_id);
+            }
+        }
+        // R4.3: release the version-GC pin on every exit path.
+        if let Some(pin_id) = self.gc_pin_id.take() {
+            if let Some(registry) = &self.conflict_registry {
+                registry.unpin_snapshot(pin_id);
             }
         }
     }
@@ -190,6 +202,7 @@ impl Transaction {
             sync_commit: false,
             conflict_registry: None,
             conflict_validation: false,
+            gc_pin_id: None,
         })
     }
 
@@ -251,6 +264,7 @@ impl Transaction {
             sync_commit: false,
             conflict_registry: None,
             conflict_validation: false,
+            gc_pin_id: None,
         })
     }
 
@@ -932,6 +946,10 @@ impl Transaction {
         if validate {
             registry.register_txn(self.transaction_id, self.snapshot_ts);
         }
+        // R4.3: pin this snapshot against MVCC version GC regardless of
+        // isolation level — snapshot scans (`scan_table_at_snapshot`) read
+        // version history for every transaction kind. Released in Drop.
+        self.gc_pin_id = Some(registry.pin_snapshot(self.snapshot_ts));
         self.conflict_registry = Some(registry);
         self.conflict_validation = validate;
     }

@@ -142,15 +142,22 @@ fn handle_create_branch(
         }
 
         // Resolve AS OF clause to actual snapshot ID
+        let mut _gc_pin = None;
         let snapshot_id = match as_of {
             crate::sql::logical_plan::AsOfClause::Now => {
                 // Use current timestamp (latest snapshot)
                 None
             }
             other_as_of => {
-                // Resolve timestamp/transaction/SCN to snapshot ID
+                // Resolve timestamp/transaction/SCN to snapshot ID.
+                // R4.3: resolve_as_of errors when the anchor lies below the
+                // version-GC low watermark (history already collected), and
+                // the pin guard keeps GC from advancing past the anchor
+                // until the branch metadata is persisted (after which the
+                // branch itself pins its anchor).
                 let snapshot_manager = storage.snapshot_manager();
                 let resolved_snapshot = snapshot_manager.resolve_as_of(other_as_of)?;
+                _gc_pin = Some(storage.pin_historical_snapshot(resolved_snapshot)?);
 
                 tracing::debug!("Resolved AS OF {:?} to snapshot ID {}", other_as_of, resolved_snapshot);
 

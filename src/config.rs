@@ -323,10 +323,94 @@ pub struct StorageConfig {
     /// crash-safe commits, matching the historical contract); flip per
     /// deployment when power-loss durability is required.
     pub durable_commit: bool,
+    /// R4.3: how long MVCC version history (`v:` / `v_idx:` keys written on
+    /// every versioned INSERT/UPDATE/DELETE) is retained before the version
+    /// garbage collector may reclaim it.
+    ///
+    /// Accepts a plain number of seconds (`"86400"`) or a humantime-style
+    /// suffix: `"90s"`, `"15m"`, `"24h"`, `"7d"`, `"2w"`.
+    ///
+    /// Default: `None` = infinite retention = version GC fully disabled
+    /// (exactly the pre-R4.3 behavior). Time-travel (`AS OF`) reads older
+    /// than the retention window fail with a clear error once GC has
+    /// advanced past them, instead of returning wrong data.
+    #[serde(default)]
+    pub version_retention: Option<String>,
+    /// R4.3: background version-GC cycle interval in seconds.
+    ///
+    /// - `None` (default): automatic — no background GC when
+    ///   `version_retention` is unset; every 300s when it is set.
+    /// - `Some(0)`: background GC off even with retention set (history is
+    ///   then only reclaimed by explicit `VACUUM VERSIONS`).
+    /// - `Some(n)`: run a bounded GC cycle every `n` seconds.
+    #[serde(default)]
+    pub version_gc_interval_secs: Option<u64>,
+    /// R4.3: maximum number of dead versions reclaimed per background GC
+    /// cycle, bounding per-cycle work so the collector never causes latency
+    /// spikes. `VACUUM VERSIONS` loops cycles until a full pass completes.
+    ///
+    /// Default: 50_000.
+    #[serde(default = "default_version_gc_max_per_cycle")]
+    pub version_gc_max_per_cycle: usize,
 }
 
 fn default_slow_query_threshold() -> Option<u64> {
     Some(1000)
+}
+
+fn default_version_gc_max_per_cycle() -> usize {
+    50_000
+}
+
+impl StorageConfig {
+    /// R4.3: parse `version_retention` into seconds. `None` = infinite
+    /// retention (version GC disabled). Errors on unparseable values so a
+    /// misconfigured retention never silently disables (or enables) GC.
+    pub fn version_retention_secs(&self) -> crate::Result<Option<u64>> {
+        match &self.version_retention {
+            None => Ok(None),
+            Some(raw) => parse_retention_duration_secs(raw).map(Some),
+        }
+    }
+
+    /// R4.3: effective background GC interval in seconds (0 = no worker).
+    /// See `version_gc_interval_secs` field docs for the `None`/`Some(0)`
+    /// semantics.
+    pub fn effective_version_gc_interval_secs(&self) -> crate::Result<u64> {
+        if self.version_retention_secs()?.is_none() {
+            return Ok(0);
+        }
+        Ok(self.version_gc_interval_secs.unwrap_or(300))
+    }
+}
+
+/// Parse a humantime-style duration into whole seconds: plain seconds
+/// (`"900"`) or a single `s`/`m`/`h`/`d`/`w` suffix (`"90s"`, `"15m"`,
+/// `"24h"`, `"7d"`, `"2w"`).
+pub fn parse_retention_duration_secs(raw: &str) -> crate::Result<u64> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return Err(crate::Error::config(
+            "storage.version_retention is empty; use e.g. \"24h\", \"7d\" or a number of seconds",
+        ));
+    }
+    let (digits, multiplier) = match s.chars().last() {
+        Some('s') | Some('S') => (&s[..s.len() - 1], 1u64),
+        Some('m') | Some('M') => (&s[..s.len() - 1], 60u64),
+        Some('h') | Some('H') => (&s[..s.len() - 1], 3_600u64),
+        Some('d') | Some('D') => (&s[..s.len() - 1], 86_400u64),
+        Some('w') | Some('W') => (&s[..s.len() - 1], 604_800u64),
+        _ => (s, 1u64),
+    };
+    let value: u64 = digits.trim().parse().map_err(|_| {
+        crate::Error::config(format!(
+            "invalid storage.version_retention '{}': expected seconds or <n>[s|m|h|d|w]",
+            raw
+        ))
+    })?;
+    value.checked_mul(multiplier).ok_or_else(|| {
+        crate::Error::config(format!("storage.version_retention '{}' overflows u64 seconds", raw))
+    })
 }
 
 fn default_idle_timeout_secs() -> u64 {
@@ -349,6 +433,9 @@ impl Default for StorageConfig {
             slow_query_threshold_ms: Some(1000), // 1 second default
             logical_wal_per_statement: false, // rely on RocksDB WAL at commit (see field docs)
             durable_commit: false,
+            version_retention: None, // infinite retention: version GC disabled (R4.3)
+            version_gc_interval_secs: None, // auto: off without retention, 300s with it
+            version_gc_max_per_cycle: default_version_gc_max_per_cycle(),
         }
     }
 }
