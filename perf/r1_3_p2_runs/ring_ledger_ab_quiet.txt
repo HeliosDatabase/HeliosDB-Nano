@@ -1,0 +1,146 @@
+# Provenance: ring-ledger session, 2026-06-12 ~10:45 UTC, quiet box (load gate <5, load1 2.4-2.9 during rounds).
+# Three-way interleaved A/B/C, 3 rounds, same protocol as postfix_ab_quiet.txt:
+#   base    = genuine v3.50.0 (6f40481), clean perf build in detached worktree /tmp/nano-base-6f40481
+#   prefix  = afd8c94 (branch tip before this fix: Mutex+BTreeMap inflight ledger)
+#   postfix = afd8c94 + lock-free ring ledger (this commit), verified rebuilt
+# Medians (3 rounds):
+#   update_txn_cycle 16T: base 87.4k | prefix 70.0k (-20%) | postfix 93.6k (+7% vs base)
+#   session_txn_cycle 16T: base 68.9k | prefix 55.2k (-20%) | postfix 83.8k (+22% vs base)
+#   update 4T: base 46.5k | prefix 47.8k | postfix 51.5k;  1T cycles: par across all three
+#   contended_counter: base ~14.7k | prefix ~15.4k | postfix ~15.6k; lost_updates=0 every run
+# Mechanism note: the 'INSERT-only' session bench announces too — columnar-adoptable
+# tables stage col:/colz: sidecar keys through the write set, so has_tracked_writes()
+# is true and EVERY commit paid the prefix ledger mutex (once nested in the timestamp
+# lock, once at end-of-apply). That is why all three 16T cycles shared the regression.
+# 2026-06-12 10:45:53 interleaved A/B/C, load gate <5,  10:45:53 up 11:47,  1 user,  load average: 2.86, 6.52, 16.60
+--- base run 1 (conflict) ---
+update_txn_cycle( 1T, disjoint)             11519 txn/s  (500 total)
+update_txn_cycle( 4T, disjoint)             46230 txn/s  (2000 total)
+update_txn_cycle(16T, disjoint)             88173 txn/s  (8000 total)
+contended_counter(8T)                         13951 commit/s  committed=4000 retries=560 zero_matches=0 final_v=4000 lost_updates=0
+--- base run 1 (session) ---
+global_txn_cycle(1T)                          34465 txn/s
+session_txn_cycle( 1T)                        23196 txn/s  (2000 total)
+session_txn_cycle( 4T)                        46035 txn/s  (8000 total)
+session_txn_cycle(16T)                        68935 txn/s  (32000 total)
+session_autocommit_insert(1T)                 22420 ops/s
+autocommit_insert_with_open_session_txn      114278 ops/s
+--- prefix run 1 (conflict) ---
+update_txn_cycle( 1T, disjoint)             10834 txn/s  (500 total)
+update_txn_cycle( 4T, disjoint)             46564 txn/s  (2000 total)
+update_txn_cycle(16T, disjoint)             69991 txn/s  (8000 total)
+contended_counter(8T)                         14841 commit/s  committed=4000 retries=528 zero_matches=0 final_v=4000 lost_updates=0
+--- prefix run 1 (session) ---
+global_txn_cycle(1T)                          31646 txn/s
+session_txn_cycle( 1T)                        23767 txn/s  (2000 total)
+session_txn_cycle( 4T)                        45303 txn/s  (8000 total)
+session_txn_cycle(16T)                        55192 txn/s  (32000 total)
+session_autocommit_insert(1T)                 23375 ops/s
+autocommit_insert_with_open_session_txn      132329 ops/s
+--- postfix run 1 (conflict) ---
+update_txn_cycle( 1T, disjoint)             17917 txn/s  (500 total)
+update_txn_cycle( 4T, disjoint)             51602 txn/s  (2000 total)
+update_txn_cycle(16T, disjoint)             93603 txn/s  (8000 total)
+contended_counter(8T)                         15855 commit/s  committed=4000 retries=452 zero_matches=0 final_v=4000 lost_updates=0
+--- postfix run 1 (session) ---
+global_txn_cycle(1T)                          33852 txn/s
+session_txn_cycle( 1T)                        22215 txn/s  (2000 total)
+session_txn_cycle( 4T)                        44574 txn/s  (8000 total)
+session_txn_cycle(16T)                        83782 txn/s  (32000 total)
+session_autocommit_insert(1T)                 23020 ops/s
+autocommit_insert_with_open_session_txn      113798 ops/s
+--- base run 2 (conflict) ---
+update_txn_cycle( 1T, disjoint)             17604 txn/s  (500 total)
+update_txn_cycle( 4T, disjoint)             48348 txn/s  (2000 total)
+update_txn_cycle(16T, disjoint)             87447 txn/s  (8000 total)
+contended_counter(8T)                         14780 commit/s  committed=4000 retries=504 zero_matches=0 final_v=4000 lost_updates=0
+--- base run 2 (session) ---
+global_txn_cycle(1T)                          33378 txn/s
+session_txn_cycle( 1T)                        21535 txn/s  (2000 total)
+session_txn_cycle( 4T)                        44868 txn/s  (8000 total)
+session_txn_cycle(16T)                        68916 txn/s  (32000 total)
+session_autocommit_insert(1T)                 18682 ops/s
+autocommit_insert_with_open_session_txn      115910 ops/s
+--- prefix run 2 (conflict) ---
+update_txn_cycle( 1T, disjoint)             19234 txn/s  (500 total)
+update_txn_cycle( 4T, disjoint)             47771 txn/s  (2000 total)
+update_txn_cycle(16T, disjoint)             70805 txn/s  (8000 total)
+contended_counter(8T)                         15792 commit/s  committed=4000 retries=476 zero_matches=0 final_v=4000 lost_updates=0
+--- prefix run 2 (session) ---
+global_txn_cycle(1T)                          34078 txn/s
+session_txn_cycle( 1T)                        22383 txn/s  (2000 total)
+session_txn_cycle( 4T)                        43296 txn/s  (8000 total)
+session_txn_cycle(16T)                        55811 txn/s  (32000 total)
+session_autocommit_insert(1T)                 23324 ops/s
+autocommit_insert_with_open_session_txn      114700 ops/s
+--- postfix run 2 (conflict) ---
+update_txn_cycle( 1T, disjoint)             18454 txn/s  (500 total)
+update_txn_cycle( 4T, disjoint)             51465 txn/s  (2000 total)
+update_txn_cycle(16T, disjoint)             93439 txn/s  (8000 total)
+contended_counter(8T)                         15484 commit/s  committed=4000 retries=433 zero_matches=0 final_v=4000 lost_updates=0
+--- postfix run 2 (session) ---
+global_txn_cycle(1T)                          34700 txn/s
+session_txn_cycle( 1T)                        22136 txn/s  (2000 total)
+session_txn_cycle( 4T)                        48262 txn/s  (8000 total)
+session_txn_cycle(16T)                        82464 txn/s  (32000 total)
+session_autocommit_insert(1T)                 23459 ops/s
+autocommit_insert_with_open_session_txn      126124 ops/s
+--- base run 3 (conflict) ---
+update_txn_cycle( 1T, disjoint)             17189 txn/s  (500 total)
+update_txn_cycle( 4T, disjoint)             46476 txn/s  (2000 total)
+update_txn_cycle(16T, disjoint)             86826 txn/s  (8000 total)
+contended_counter(8T)                         14725 commit/s  committed=4000 retries=571 zero_matches=0 final_v=4000 lost_updates=0
+--- base run 3 (session) ---
+global_txn_cycle(1T)                          35554 txn/s
+session_txn_cycle( 1T)                        23000 txn/s  (2000 total)
+session_txn_cycle( 4T)                        46270 txn/s  (8000 total)
+session_txn_cycle(16T)                        67389 txn/s  (32000 total)
+session_autocommit_insert(1T)                 20456 ops/s
+autocommit_insert_with_open_session_txn      104262 ops/s
+--- prefix run 3 (conflict) ---
+update_txn_cycle( 1T, disjoint)             18382 txn/s  (500 total)
+update_txn_cycle( 4T, disjoint)             47847 txn/s  (2000 total)
+update_txn_cycle(16T, disjoint)             69598 txn/s  (8000 total)
+contended_counter(8T)                         15382 commit/s  committed=4000 retries=520 zero_matches=0 final_v=4000 lost_updates=0
+--- prefix run 3 (session) ---
+global_txn_cycle(1T)                          34706 txn/s
+session_txn_cycle( 1T)                        24351 txn/s  (2000 total)
+session_txn_cycle( 4T)                        46935 txn/s  (8000 total)
+session_txn_cycle(16T)                        53623 txn/s  (32000 total)
+session_autocommit_insert(1T)                 21922 ops/s
+autocommit_insert_with_open_session_txn      112051 ops/s
+--- postfix run 3 (conflict) ---
+update_txn_cycle( 1T, disjoint)             17774 txn/s  (500 total)
+update_txn_cycle( 4T, disjoint)             48356 txn/s  (2000 total)
+update_txn_cycle(16T, disjoint)             94914 txn/s  (8000 total)
+contended_counter(8T)                         15582 commit/s  committed=4000 retries=502 zero_matches=0 final_v=4000 lost_updates=0
+--- postfix run 3 (session) ---
+global_txn_cycle(1T)                          35441 txn/s
+session_txn_cycle( 1T)                        24285 txn/s  (2000 total)
+session_txn_cycle( 4T)                        46332 txn/s  (8000 total)
+session_txn_cycle(16T)                        84734 txn/s  (32000 total)
+session_autocommit_insert(1T)                 23531 ops/s
+autocommit_insert_with_open_session_txn      138755 ops/s
+# done 2026-06-12 10:46:08
+
+# Post-refactor confirmation round (slot() helper cleanup, same binary semantics):
+# confirmation round post-refactor, load 5.28
+update_txn_cycle( 1T, disjoint)             16207 txn/s  (500 total)
+update_txn_cycle( 4T, disjoint)             54169 txn/s  (2000 total)
+update_txn_cycle(16T, disjoint)             93822 txn/s  (8000 total)
+contended_counter(8T)                         15933 commit/s  committed=4000 retries=441 zero_matches=0 final_v=4000 lost_updates=0
+global_txn_cycle(1T)                          29250 txn/s
+session_txn_cycle( 1T)                        22671 txn/s  (2000 total)
+session_txn_cycle( 4T)                        47883 txn/s  (8000 total)
+session_txn_cycle(16T)                        82622 txn/s  (32000 total)
+
+# Dedicated contended gate, 3x postfix (lib tests running concurrently, load ~9):
+contended_counter(8T)  14150 commit/s  lost_updates=0
+contended_counter(8T)  14788 commit/s  lost_updates=0
+contended_counter(8T)  15065 commit/s  lost_updates=0
+
+# Durable re-verify, postfix binary, window=200us (quiet, load 2.1):
+durable=false         8T        49095 txn/s   16T 60012   32T 50787
+durable=true  w=200   8T          506 txn/s   16T   603   24T  1201   32T  1683
+# Durable wins hold: >=506 at 8T, 1683 at 32T (pre-group-commit reference 433;
+# prior sweep w=200: 8T 492, 32T 1393).
