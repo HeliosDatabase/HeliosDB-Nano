@@ -1618,6 +1618,33 @@ fn row_blob_fast_skip_supported(data_type: &crate::DataType) -> bool {
     )
 }
 
+thread_local! {
+    /// R1.3 phase 2: per-session `SET synchronous_commit` override, scoped
+    /// to one statement executed on this thread. The Database session
+    /// wrappers install it (via [`StorageEngine::synchronous_commit_override_guard`])
+    /// around autocommit statements that route through the global execute
+    /// paths, so the engine's durability decisions
+    /// ([`StorageEngine::durable_autocommit_barrier`],
+    /// [`StorageEngine::begin_autocommit_transaction`]) can honor the
+    /// session's setting without threading a parameter through every path.
+    /// Safe under async runtimes: the guarded calls are synchronous (no
+    /// await points), so a task cannot migrate threads mid-override.
+    static SYNCHRONOUS_COMMIT_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// RAII guard restoring the previous thread-local `synchronous_commit`
+/// override (see [`StorageEngine::synchronous_commit_override_guard`]).
+pub struct SynchronousCommitOverrideGuard {
+    previous: Option<bool>,
+}
+
+impl Drop for SynchronousCommitOverrideGuard {
+    fn drop(&mut self) {
+        SYNCHRONOUS_COMMIT_OVERRIDE.with(|cell| cell.set(self.previous));
+    }
+}
+
 /// Storage engine
 pub struct StorageEngine {
     /// RocksDB instance
@@ -1707,6 +1734,11 @@ pub struct StorageEngine {
     /// R1.3/D5 follow-up: storage.durable_commit also covers AUTOCOMMIT
     /// fast-path statements via a per-statement WAL fsync barrier.
     durable_commit_enabled: bool,
+    /// R1.3 phase 2: leader/follower group committer. Every durable commit
+    /// (transactional `sync_commit` and the autocommit barrier) routes its
+    /// WAL fsync through this, so concurrent committers share one fsync per
+    /// accumulation window (`storage.group_commit_window_us`).
+    group_committer: Arc<super::group_commit::GroupCommitter>,
     /// In-memory schema cache (avoids repeated RocksDB get + bincode deserialize)
     schema_cache: Arc<parking_lot::Mutex<std::collections::HashMap<String, crate::Schema>>>,
     /// In-memory table-constraints cache (avoids repeated metadata gets on DML)
@@ -2109,6 +2141,9 @@ impl StorageEngine {
             db_path: Some(db_path),
             memory_write_options: None,
             durable_commit_enabled: config.storage.durable_commit && !config.storage.memory_only,
+            group_committer: Arc::new(super::group_commit::GroupCommitter::new(
+                std::time::Duration::from_micros(config.storage.group_commit_window_us),
+            )),
             schema_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             constraints_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             referencing_fk_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
@@ -2330,6 +2365,9 @@ impl StorageEngine {
             db_path: None, // No disk space check for in-memory mode
             memory_write_options: Some(Self::memory_only_write_options()),
             durable_commit_enabled: false,
+            group_committer: Arc::new(super::group_commit::GroupCommitter::new(
+                std::time::Duration::from_micros(config.storage.group_commit_window_us),
+            )),
             schema_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             constraints_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             referencing_fk_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
@@ -3151,7 +3189,9 @@ impl StorageEngine {
         // P0#1: emit MVCC version-history at commit only when time-travel is on.
         txn.set_versioning_enabled(self.config.storage.time_travel_enabled);
         txn.set_rocksdb_wal_enabled(!self.config.storage.memory_only);
-        txn.set_sync_commit(self.config.storage.durable_commit && !self.config.storage.memory_only);
+        txn.set_sync_commit(self.statement_durability_required());
+        txn.set_group_committer(self.group_committer());
+        txn.set_row_cache(Arc::clone(self.row_cache()));
         // R0.2: embedded global-slot transactions read from a snapshot, so
         // complete those semantics with first-committer-wins validation.
         txn.set_conflict_registry(self.conflict_registry(), true);
@@ -3170,7 +3210,9 @@ impl StorageEngine {
         let mut txn = Transaction::new(Arc::clone(&self.db), snapshot_id, Arc::clone(&self.snapshot_manager))?;
         txn.set_versioning_enabled(self.config.storage.time_travel_enabled);
         txn.set_rocksdb_wal_enabled(!self.config.storage.memory_only);
-        txn.set_sync_commit(self.config.storage.durable_commit && !self.config.storage.memory_only);
+        txn.set_sync_commit(self.statement_durability_required());
+        txn.set_group_committer(self.group_committer());
+        txn.set_row_cache(Arc::clone(self.row_cache()));
         txn.set_conflict_registry(self.conflict_registry(), false);
         Ok(txn)
     }
@@ -3185,13 +3227,45 @@ impl StorageEngine {
     /// statement's writes persists everything the statement wrote — rows,
     /// columnar sidecars, counters — in a single fsync. No-op when
     /// durable_commit is off or in memory mode.
+    /// R1.3 phase 2: the statement's writes are already in the (unsynced)
+    /// WAL, so the barrier enqueues on the engine group committer and ONE
+    /// cohort fsync covers every concurrent autocommit statement and
+    /// transactional commit in the same generation.
     pub fn durable_autocommit_barrier(&self) -> Result<()> {
-        if self.durable_commit_enabled {
-            self.db
-                .flush_wal(true)
+        if self.statement_durability_required() {
+            self.group_committer
+                .wait_durable(|| self.db.flush_wal(true).map_err(|e| e.to_string()))
                 .map_err(|e| Error::storage(format!("WAL fsync failed: {}", e)))?;
         }
         Ok(())
+    }
+
+    /// Effective per-statement durability: `storage.durable_commit` unless a
+    /// session-scoped `SET synchronous_commit` override is installed for the
+    /// current thread (R1.3 phase 2). Never durable in memory-only mode.
+    fn statement_durability_required(&self) -> bool {
+        !self.config.storage.memory_only
+            && Self::synchronous_commit_override().unwrap_or(self.durable_commit_enabled)
+    }
+
+    /// R1.3 phase 2: engine-wide leader/follower group committer (shared by
+    /// transactional durable commits and the autocommit durability barrier).
+    pub fn group_committer(&self) -> Arc<super::group_commit::GroupCommitter> {
+        Arc::clone(&self.group_committer)
+    }
+
+    /// Read the current thread's session `synchronous_commit` override
+    /// (installed by the Database session wrappers around one statement).
+    pub fn synchronous_commit_override() -> Option<bool> {
+        SYNCHRONOUS_COMMIT_OVERRIDE.with(|cell| cell.get())
+    }
+
+    /// Install a per-statement `synchronous_commit` override for the current
+    /// thread (R1.3 phase 2, per-session durability). Restored on drop.
+    /// `None` clears any outer override for the guard's scope.
+    pub fn synchronous_commit_override_guard(value: Option<bool>) -> SynchronousCommitOverrideGuard {
+        let previous = SYNCHRONOUS_COMMIT_OVERRIDE.with(|cell| cell.replace(value));
+        SynchronousCommitOverrideGuard { previous }
     }
 
     /// Write-write conflict registry shared by every transaction on this

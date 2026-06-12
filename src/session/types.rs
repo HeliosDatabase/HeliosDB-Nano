@@ -202,6 +202,13 @@ pub struct Session {
     pub user_id: UserId,
     /// Transaction isolation level for this session
     pub isolation_level: IsolationLevel,
+    /// R1.3-p2: per-session `synchronous_commit` override (PostgreSQL-
+    /// compatible: `SET synchronous_commit = off|on`). `None` inherits
+    /// `storage.durable_commit`; `Some(false)` skips the group-fsync wait
+    /// (commits visible immediately, durable at the next group flush);
+    /// `Some(true)` waits on the group fsync even when the storage default
+    /// is non-durable.
+    pub synchronous_commit: Option<bool>,
     /// Active transaction ID (None if no transaction in progress)
     pub active_txn: Option<u64>,
     /// Session creation timestamp (Unix epoch seconds)
@@ -224,6 +231,7 @@ impl Session {
             id: SessionId::new(),
             user_id,
             isolation_level,
+            synchronous_commit: None,
             active_txn: None,
             created_at: now,
             last_activity: now,
