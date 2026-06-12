@@ -5,6 +5,44 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.51.0] - 2026-06-12
+
+Minor release: typed batches, commit-pipeline hardening, MVCC version GC,
+durable ART/HNSW index snapshots, and ordered index range scans.
+
+### Added - R3.4 typed batches
+
+- Typed row batches and columnar sidecars reduce decode overhead on scan-heavy
+  paths, with the post-merge gate showing 2-3x scan speedups on targeted
+  analytical shapes.
+- Kill-switch coverage remains available for typed batch writers, columnar
+  pushdown, zone maps, and parallel aggregation so regressions can be isolated
+  without removing the feature work.
+
+### Changed - R1.3-p2 commit pipeline
+
+- Group-commit plumbing and a lock-free commit barrier reduce watermark-ledger
+  contention while preserving transaction ordering and conflict validation.
+- The contended conflict bench passed twice with `lost_updates=0`.
+
+### Added - R4.3 MVCC version GC
+
+- Version-history garbage collection reclaims obsolete row versions while
+  preserving snapshot and `AS OF` semantics.
+
+### Added - R4.2/R4.4 durable and range indexes
+
+- ART and HNSW indexes now survive clean restarts through durable index
+  snapshots instead of requiring rebuilds.
+- Ordered ART range scans support multi-selectivity index probes and top-k
+  planning paths.
+
+### Validation
+
+- Post-merge gate battery passed: targeted conflict/session/transaction/CRUD
+  suites, `cargo test --lib` at 1896/1896, and two contended conflict runs with
+  `lost_updates=0`.
+
 ## [3.50.0] - 2026-06-11
 
 Minor release: filtered vector search, Windows compilation, and the
