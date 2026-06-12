@@ -390,6 +390,15 @@ impl VersionGc {
                 Ok(())
             };
 
+        let index_key_for = |prefix: &[u8], ts: u64| -> Vec<u8> {
+            // v_idx:{table}:{row}:{(MAX-ts):020}
+            let mut ikey = Vec::with_capacity(prefix.len() + 26);
+            ikey.extend_from_slice(b"v_idx:");
+            ikey.extend_from_slice(&prefix[2..]);
+            ikey.extend_from_slice(format!("{:020}", u64::MAX - ts).as_bytes());
+            ikey
+        };
+
         let process_group_fn = |prefix: &[u8],
                                  versions: &mut Vec<u64>,
                                  batch: &mut WriteBatch,
@@ -398,19 +407,45 @@ impl VersionGc {
          -> Result<()> {
             if versions.len() > 1 {
                 if let Some(keep) = versions.iter().copied().filter(|ts| *ts <= horizon).max() {
+                    // C15 interaction: the autocommit UPDATE/DELETE paths
+                    // write `v:` versions WITHOUT `v_idx:` entries, and
+                    // `read_at_snapshot` resolves through `v_idx:` only.
+                    // If the newest version <= horizon is un-indexed, also
+                    // keep the newest INDEXED version <= horizon so indexed
+                    // reads at t >= horizon return exactly what they did
+                    // before GC. One bloom-backed point lookup per kept
+                    // version; a walk only when the newest is un-indexed.
+                    let mut keep_indexed: Option<u64> = None;
+                    let keep_has_index = self
+                        .db
+                        .get(index_key_for(prefix, keep))
+                        .map_err(|e| Error::storage(format!("version-gc index probe: {}", e)))?
+                        .is_some();
+                    if !keep_has_index {
+                        let mut candidates: Vec<u64> =
+                            versions.iter().copied().filter(|ts| *ts <= horizon && *ts != keep).collect();
+                        candidates.sort_unstable_by(|a, b| b.cmp(a)); // newest first
+                        for ts in candidates {
+                            let indexed = self
+                                .db
+                                .get(index_key_for(prefix, ts))
+                                .map_err(|e| Error::storage(format!("version-gc index probe: {}", e)))?
+                                .is_some();
+                            if indexed {
+                                keep_indexed = Some(ts);
+                                break;
+                            }
+                        }
+                    }
+
                     for ts in versions.iter().copied() {
-                        if ts <= horizon && ts != keep {
+                        if ts <= horizon && ts != keep && Some(ts) != keep_indexed {
                             // v:{table}:{row}:{ts}
                             let mut vkey = Vec::with_capacity(prefix.len() + 20);
                             vkey.extend_from_slice(prefix);
                             vkey.extend_from_slice(ts.to_string().as_bytes());
                             batch.delete(&vkey);
-                            // v_idx:{table}:{row}:{(MAX-ts):020}
-                            let mut ikey = Vec::with_capacity(prefix.len() + 26);
-                            ikey.extend_from_slice(b"v_idx:");
-                            ikey.extend_from_slice(&prefix[2..]);
-                            ikey.extend_from_slice(format!("{:020}", u64::MAX - ts).as_bytes());
-                            batch.delete(&ikey);
+                            batch.delete(index_key_for(prefix, ts));
                             stats.versions_deleted += 1;
                             stats.index_entries_deleted += 1;
                             *batch_keys += 2;
