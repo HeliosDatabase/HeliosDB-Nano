@@ -2885,6 +2885,7 @@ impl StorageEngine {
         txn.set_rocksdb_wal_enabled(!self.config.storage.memory_only);
         txn.set_sync_commit(self.statement_durability_required());
         txn.set_group_committer(self.group_committer());
+        txn.set_row_cache(Arc::clone(self.row_cache()));
         // R0.2: embedded global-slot transactions read from a snapshot, so
         // complete those semantics with first-committer-wins validation.
         txn.set_conflict_registry(self.conflict_registry(), true);
@@ -2905,6 +2906,7 @@ impl StorageEngine {
         txn.set_rocksdb_wal_enabled(!self.config.storage.memory_only);
         txn.set_sync_commit(self.statement_durability_required());
         txn.set_group_committer(self.group_committer());
+        txn.set_row_cache(Arc::clone(self.row_cache()));
         txn.set_conflict_registry(self.conflict_registry(), false);
         Ok(txn)
     }

@@ -133,6 +133,15 @@ pub struct Transaction {
     /// `flush_wal(true)` instead of paying a private fsync. When absent,
     /// falls back to the phase-1 per-commit synced WriteBatch.
     group_committer: Option<Arc<super::group_commit::GroupCommitter>>,
+    /// Engine row cache (R1.3-p2 correctness fix). Written rows are
+    /// invalidated INSIDE commit — after the batch applies, BEFORE
+    /// `end_commit` lifts the snapshot barrier — so a fresh snapshot that
+    /// passes the barrier can never hit a stale cached pre-commit row (the
+    /// R0.2 lost-update vector via the UPDATE arm's PK point-lookup; the
+    /// caller-side invalidation after commit returns was too late, and the
+    /// R1.3-p2 group-fsync wait would have widened that window to a whole
+    /// fsync).
+    row_cache: Option<Arc<super::RowCache>>,
     /// Write-write conflict registry (R0.2). When present, commits record
     /// their write-set keys; when `conflict_validation` is also set, commit
     /// aborts with a serialization failure if any key was committed after
@@ -195,6 +204,7 @@ impl Transaction {
             rocksdb_wal_enabled: true,
             sync_commit: false,
             group_committer: None,
+            row_cache: None,
             conflict_registry: None,
             conflict_validation: false,
         })
@@ -215,6 +225,12 @@ impl Transaction {
     /// engine's leader/follower group committer (see field docs).
     pub fn set_group_committer(&mut self, committer: Arc<super::group_commit::GroupCommitter>) {
         self.group_committer = Some(committer);
+    }
+
+    /// Attach the engine row cache so commit can invalidate written rows
+    /// BEFORE lifting the snapshot barrier (see field docs).
+    pub fn set_row_cache(&mut self, cache: Arc<super::RowCache>) {
+        self.row_cache = Some(cache);
     }
 
     pub fn set_rocksdb_wal_enabled(&mut self, enabled: bool) {
@@ -263,6 +279,7 @@ impl Transaction {
             rocksdb_wal_enabled: true,
             sync_commit: false,
             group_committer: None,
+            row_cache: None,
             conflict_registry: None,
             conflict_validation: false,
         })
@@ -768,6 +785,22 @@ impl Transaction {
             write_opts.disable_wal(true);
             self.db.write_opt(batch, &write_opts)
         };
+
+        // Stale-row-cache fence: written rows must leave the row cache
+        // BEFORE end_commit lifts the snapshot barrier, or a fresh snapshot
+        // could pass the barrier and the UPDATE arm's PK point-lookup would
+        // serve the cached pre-commit value — both transactions then pass
+        // first-committer-wins validation and an update is lost (observed
+        // ~10-50% per contended bench run on a loaded 32-core host; the
+        // caller-side invalidation after commit returns is kept as belt and
+        // braces but ran too late).
+        if result.is_ok() && !self.write_set.is_empty() {
+            if let Some(cache) = &self.row_cache {
+                for (table, row_id) in self.written_data_keys() {
+                    cache.invalidate(&table, row_id);
+                }
+            }
+        }
 
         // The write is applied (or definitively failed): new snapshots may
         // proceed past this commit timestamp.
