@@ -1,0 +1,18 @@
+=== conflict run 1 ===
+update_txn_cycle( 1T, disjoint)             12724 txn/s  (500 total)
+update_txn_cycle( 4T, disjoint)             24330 txn/s  (2000 total)
+update_txn_cycle(16T, disjoint)             33210 txn/s  (8000 total)
+contended_counter(8T)                         11083 commit/s  committed=4000 retries=757 zero_matches=0 final_v=4000 lost_updates=0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.75s
+=== conflict run 2 ===
+update_txn_cycle( 1T, disjoint)             15536 txn/s  (500 total)
+update_txn_cycle( 4T, disjoint)             41082 txn/s  (2000 total)
+update_txn_cycle(16T, disjoint)             49651 txn/s  (8000 total)
+contended_counter(8T)                         11284 commit/s  committed=4000 retries=634 zero_matches=0 final_v=4000 lost_updates=0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.62s
+=== conflict run 3 ===
+update_txn_cycle( 1T, disjoint)             12769 txn/s  (500 total)
+update_txn_cycle( 4T, disjoint)             37665 txn/s  (2000 total)
+update_txn_cycle(16T, disjoint)             45761 txn/s  (8000 total)
+contended_counter(8T)                          9882 commit/s  committed=4000 retries=806 zero_matches=0 final_v=4000 lost_updates=0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.71s

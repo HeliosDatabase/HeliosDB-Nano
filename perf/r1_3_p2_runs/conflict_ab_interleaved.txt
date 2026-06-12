@@ -1,0 +1,20 @@
+--- baseline conflict run 1 ---
+update_txn_cycle( 1T, disjoint)              5118 txn/s  (500 total)
+update_txn_cycle( 4T, disjoint)             10660 txn/s  (2000 total)
+update_txn_cycle(16T, disjoint)             23341 txn/s  (8000 total)
+contended_counter(8T)                          9001 commit/s  committed=4000 retries=720 zero_matches=0 final_v=3999 lost_updates=1
+--- HEAD conflict run 1 ---
+update_txn_cycle( 1T, disjoint)              9142 txn/s  (500 total)
+update_txn_cycle( 4T, disjoint)             13355 txn/s  (2000 total)
+update_txn_cycle(16T, disjoint)             17491 txn/s  (8000 total)
+contended_counter(8T)                          9643 commit/s  committed=4000 retries=558 zero_matches=0 final_v=4000 lost_updates=0
+--- baseline conflict run 2 ---
+update_txn_cycle( 1T, disjoint)              9592 txn/s  (500 total)
+update_txn_cycle( 4T, disjoint)             13861 txn/s  (2000 total)
+update_txn_cycle(16T, disjoint)              8387 txn/s  (8000 total)
+contended_counter(8T)                          8871 commit/s  committed=4000 retries=667 zero_matches=0 final_v=3999 lost_updates=1
+--- HEAD conflict run 2 ---
+update_txn_cycle( 1T, disjoint)             11178 txn/s  (500 total)
+update_txn_cycle( 4T, disjoint)             11748 txn/s  (2000 total)
+update_txn_cycle(16T, disjoint)             14883 txn/s  (8000 total)
+contended_counter(8T)                          8435 commit/s  committed=4000 retries=879 zero_matches=0 final_v=4000 lost_updates=0

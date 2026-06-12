@@ -1,0 +1,18 @@
+test run_durable_commit_bench ... durable=false        autocommit        43839 ops/s  (50 inserts)
+durable=false         1T         4768 txn/s  (100 commits)  commit p50=    79us p99=    115us
+durable=false         8T        12985 txn/s  (800 commits)  commit p50=   174us p99=    383us
+durable=false        16T        18254 txn/s  (1600 commits)  commit p50=   256us p99=   1013us
+durable=false        24T        13223 txn/s  (2400 commits)  commit p50=   489us p99=   6730us
+durable=false        32T        12591 txn/s  (3200 commits)  commit p50=   694us p99=   8342us
+durable=true  w=200  autocommit           46 ops/s  (50 inserts)
+durable=true  w=200   1T           29 txn/s  (100 commits)  commit p50= 29330us p99=  77789us
+durable=true  w=200   8T          168 txn/s  (800 commits)  commit p50= 42789us p99= 107749us
+durable=true  w=200  16T          304 txn/s  (1600 commits)  commit p50= 44628us p99= 117969us
+durable=true  w=200  24T          547 txn/s  (2400 commits)  commit p50= 36928us p99=  98463us
+durable=true  w=200  32T          389 txn/s  (3200 commits)  commit p50= 57418us p99= 403809us
+durable=true  w=1000 autocommit           43 ops/s  (50 inserts)
+durable=true  w=1000  1T           40 txn/s  (100 commits)  commit p50= 19986us p99=  56965us
+durable=true  w=1000  8T          293 txn/s  (800 commits)  commit p50= 23855us p99=  60226us
+durable=true  w=1000 16T          593 txn/s  (1600 commits)  commit p50= 21865us p99=  65980us
+durable=true  w=1000 24T          426 txn/s  (2400 commits)  commit p50= 46011us p99= 215370us
+durable=true  w=1000 32T          954 txn/s  (3200 commits)  commit p50= 28733us p99=  73846us

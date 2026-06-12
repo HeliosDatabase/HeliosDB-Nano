@@ -1,0 +1,28 @@
+--- baseline session run 1 ---
+global_txn_cycle(1T)                          15578 txn/s
+session_txn_cycle( 1T)                        11063 txn/s  (2000 total)
+session_txn_cycle( 4T)                        14967 txn/s  (8000 total)
+session_txn_cycle(16T)                        14295 txn/s  (32000 total)
+session_autocommit_insert(1T)                  6393 ops/s
+autocommit_insert_with_open_session_txn       60746 ops/s
+--- HEAD session run 1 ---
+global_txn_cycle(1T)                          11327 txn/s
+session_txn_cycle( 1T)                         7568 txn/s  (2000 total)
+session_txn_cycle( 4T)                        15143 txn/s  (8000 total)
+session_txn_cycle(16T)                        20103 txn/s  (32000 total)
+session_autocommit_insert(1T)                 14194 ops/s
+autocommit_insert_with_open_session_txn       69563 ops/s
+--- baseline session run 2 ---
+global_txn_cycle(1T)                          15506 txn/s
+session_txn_cycle( 1T)                        13415 txn/s  (2000 total)
+session_txn_cycle( 4T)                        16366 txn/s  (8000 total)
+session_txn_cycle(16T)                         7461 txn/s  (32000 total)
+session_autocommit_insert(1T)                 14004 ops/s
+autocommit_insert_with_open_session_txn       70083 ops/s
+--- HEAD session run 2 ---
+global_txn_cycle(1T)                          12065 txn/s
+session_txn_cycle( 1T)                        14018 txn/s  (2000 total)
+session_txn_cycle( 4T)                        14174 txn/s  (8000 total)
+session_txn_cycle(16T)                        24341 txn/s  (32000 total)
+session_autocommit_insert(1T)                 12377 ops/s
+autocommit_insert_with_open_session_txn       69194 ops/s

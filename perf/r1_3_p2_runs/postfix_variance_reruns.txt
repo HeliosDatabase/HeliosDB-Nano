@@ -1,0 +1,31 @@
+--- session rerun 1 ---
+global_txn_cycle(1T)                          31750 txn/s
+session_txn_cycle( 1T)                        18204 txn/s  (2000 total)
+session_txn_cycle( 4T)                        42015 txn/s  (8000 total)
+session_txn_cycle(16T)                        55735 txn/s  (32000 total)
+session_autocommit_insert(1T)                 17737 ops/s
+autocommit_insert_with_open_session_txn      134607 ops/s
+--- session rerun 2 ---
+global_txn_cycle(1T)                          32075 txn/s
+session_txn_cycle( 1T)                        18491 txn/s  (2000 total)
+session_txn_cycle( 4T)                        44790 txn/s  (8000 total)
+session_txn_cycle(16T)                        54228 txn/s  (32000 total)
+session_autocommit_insert(1T)                 17780 ops/s
+autocommit_insert_with_open_session_txn      120528 ops/s
+--- session rerun 3 ---
+global_txn_cycle(1T)                          32499 txn/s
+session_txn_cycle( 1T)                        18616 txn/s  (2000 total)
+session_txn_cycle( 4T)                        41599 txn/s  (8000 total)
+session_txn_cycle(16T)                        55757 txn/s  (32000 total)
+session_autocommit_insert(1T)                 18400 ops/s
+autocommit_insert_with_open_session_txn      134174 ops/s
+--- conflict rerun 1 ---
+update_txn_cycle( 1T, disjoint)             15046 txn/s  (500 total)
+update_txn_cycle( 4T, disjoint)             41402 txn/s  (2000 total)
+update_txn_cycle(16T, disjoint)             63861 txn/s  (8000 total)
+contended_counter(8T)                         12369 commit/s  committed=4000 retries=529 zero_matches=0 final_v=4000 lost_updates=0
+--- conflict rerun 2 ---
+update_txn_cycle( 1T, disjoint)             14247 txn/s  (500 total)
+update_txn_cycle( 4T, disjoint)             38419 txn/s  (2000 total)
+update_txn_cycle(16T, disjoint)             64959 txn/s  (8000 total)
+contended_counter(8T)                         12259 commit/s  committed=4000 retries=567 zero_matches=0 final_v=4000 lost_updates=0
