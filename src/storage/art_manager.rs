@@ -13,10 +13,11 @@
 
 use super::art_index::{AdaptiveRadixTree, ArtIndexError, ArtIndexStats, ArtIndexType, ArtResult};
 use super::art_node::RowId;
+use super::index_snapshot::ArtIndexSnapshot;
 use crate::{DataType, Schema, Tuple, Value};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 /// Shared handle to a single ART index tree.
@@ -199,6 +200,25 @@ pub struct ArtIndexManager {
     unique_indexes: RwLock<HashMap<String, Vec<String>>>,
     /// Statistics
     stats: AtomicArtManagerStats,
+    /// R4.2 durable-snapshot validity tracking. `true` means the persisted
+    /// snapshot markers (if any) still describe the current in-memory state.
+    /// The FIRST mutation after a checkpoint flips it and fires
+    /// `snapshot_invalidation_hook` exactly once, which durably deletes the
+    /// markers — so a crash can never leave a stale snapshot trusted.
+    /// Hot-path cost: one relaxed atomic load per index mutation.
+    snapshot_clean: AtomicBool,
+    /// Engine-wired callback that deletes the ART snapshot markers in RocksDB.
+    snapshot_invalidation_hook: RwLock<Option<InvalidationHook>>,
+}
+
+/// Opaque wrapper so the manager can keep `#[derive(Debug)]`.
+#[derive(Clone)]
+pub struct InvalidationHook(pub Arc<dyn Fn() + Send + Sync>);
+
+impl std::fmt::Debug for InvalidationHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("InvalidationHook")
+    }
 }
 
 impl Default for ArtIndexManager {
@@ -207,13 +227,29 @@ impl Default for ArtIndexManager {
     }
 }
 
+/// Stable on-disk tag for [`ArtIndexType`] (snapshot format).
+pub(crate) fn index_type_tag(index_type: ArtIndexType) -> u8 {
+    match index_type {
+        ArtIndexType::PrimaryKey => 0,
+        ArtIndexType::ForeignKey => 1,
+        ArtIndexType::Unique => 2,
+        ArtIndexType::Manual => 3,
+    }
+}
+
+/// Decode a sign-flipped big-endian integer key (encoding v2 — the inverse of
+/// `ArtIndexManager::encode_value_into` for `Int2/Int4/Int8`).
 fn decode_int_key(key: &[u8], width: usize) -> Option<i64> {
     match width {
-        2 if key.len() == 2 => Some(i64::from(i16::from_be_bytes([key[0], key[1]]))),
-        4 if key.len() == 4 => Some(i64::from(i32::from_be_bytes([key[0], key[1], key[2], key[3]]))),
-        8 if key.len() == 8 => Some(i64::from_be_bytes([
-            key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7],
-        ])),
+        2 if key.len() == 2 => Some(i64::from((u16::from_be_bytes([key[0], key[1]]) ^ 0x8000) as i16)),
+        4 if key.len() == 4 => Some(i64::from(
+            (u32::from_be_bytes([key[0], key[1], key[2], key[3]]) ^ 0x8000_0000) as i32,
+        )),
+        8 if key.len() == 8 => Some(
+            (u64::from_be_bytes([
+                key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7],
+            ]) ^ 0x8000_0000_0000_0000) as i64,
+        ),
         _ => None,
     }
 }
@@ -228,7 +264,127 @@ impl ArtIndexManager {
             fk_info: RwLock::new(HashMap::new()),
             unique_indexes: RwLock::new(HashMap::new()),
             stats: AtomicArtManagerStats::default(),
+            // Armed at startup: markers from a previous clean shutdown must
+            // be invalidated by the first mutation of this process.
+            snapshot_clean: AtomicBool::new(true),
+            snapshot_invalidation_hook: RwLock::new(None),
         }
+    }
+
+    // =========================================================================
+    // R4.2: DURABLE SNAPSHOT SUPPORT
+    // =========================================================================
+
+    /// Wire the callback that durably deletes the persisted snapshot markers.
+    /// Called once by the storage engine at open.
+    pub fn set_snapshot_invalidation_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .snapshot_invalidation_hook
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(InvalidationHook(hook));
+    }
+
+    /// Re-arm the validity flag after a checkpoint wrote fresh markers.
+    pub fn mark_snapshot_clean(&self) {
+        self.snapshot_clean.store(true, Ordering::Release);
+    }
+
+    /// True when no index mutation happened since the last checkpoint /
+    /// `mark_snapshot_clean`. The checkpoint writer uses this to detect a
+    /// concurrent mutation racing the marker write.
+    pub fn snapshot_is_clean(&self) -> bool {
+        self.snapshot_clean.load(Ordering::Acquire)
+    }
+
+    /// Record an index mutation. The first call after a checkpoint fires the
+    /// invalidation hook (durable marker delete); subsequent calls are a
+    /// single relaxed atomic load.
+    #[inline]
+    fn note_mutation(&self) {
+        if self.snapshot_clean.load(Ordering::Relaxed) && self.snapshot_clean.swap(false, Ordering::AcqRel) {
+            let hook = self
+                .snapshot_invalidation_hook
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if let Some(hook) = hook {
+                (hook.0)();
+            }
+        }
+    }
+
+    /// Export every ART index registered on `table` as snapshot entries.
+    /// Each tree is read-locked one at a time (manager locking rules hold).
+    pub fn export_table_snapshot(&self, table: &str) -> Vec<ArtIndexSnapshot> {
+        let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
+        let mut out = Vec::new();
+        for (name, entry) in indexes.iter() {
+            if entry.table != table {
+                continue;
+            }
+            let tree = entry.tree.read().unwrap_or_else(|e| e.into_inner());
+            let mut entries: Vec<(Vec<u8>, Vec<u64>)> = Vec::new();
+            for (key, row_id) in tree.iter() {
+                match entries.last_mut() {
+                    Some((last_key, ids)) if *last_key == key => ids.push(row_id),
+                    _ => entries.push((key, vec![row_id])),
+                }
+            }
+            out.push(ArtIndexSnapshot {
+                name: name.clone(),
+                table: entry.table.clone(),
+                columns: entry.columns.clone(),
+                index_type: index_type_tag(entry.index_type),
+                entries,
+            });
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+
+    /// Bulk-load snapshot entries into an already-registered (empty) index.
+    ///
+    /// `dense_int_width` carries the byte width of a single-column integer
+    /// primary key so the dense-int range-count stats are restored exactly as
+    /// the scan path's `on_insert` would have built them.
+    pub fn load_index_entries(
+        &self,
+        name: &str,
+        entries: &[(Vec<u8>, Vec<u64>)],
+        dense_int_width: Option<usize>,
+    ) -> ArtResult<usize> {
+        let entry = {
+            let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
+            indexes
+                .get(name)
+                .cloned()
+                .ok_or_else(|| ArtIndexError::IndexNotFound(name.to_string()))?
+        };
+        let mut tree = entry.tree.write().unwrap_or_else(|e| e.into_inner());
+        if tree.len() != 0 {
+            return Err(ArtIndexError::Internal(format!(
+                "Refusing to load snapshot into non-empty index '{}' ({} entries)",
+                name,
+                tree.len()
+            )));
+        }
+        let mut loaded = 0usize;
+        for (key, row_ids) in entries {
+            for row_id in row_ids {
+                tree.insert(key, *row_id)?;
+                loaded += 1;
+            }
+            if entry.index_type == ArtIndexType::PrimaryKey {
+                if let Some(width) = dense_int_width {
+                    if key.len() == width {
+                        if let Some(value) = decode_int_key(key, width) {
+                            tree.record_dense_int_insert(width, value);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(loaded)
     }
 
     /// Generate index name for a primary key
@@ -252,6 +408,7 @@ impl ArtIndexManager {
 
     /// Create a primary key index (auto-called on CREATE TABLE with PRIMARY KEY)
     pub fn create_pk_index(&self, table: &str, columns: &[String]) -> ArtResult<String> {
+        self.note_mutation();
         let index_name = Self::pk_index_name(table);
 
         // Check if PK already exists for this table
@@ -293,6 +450,7 @@ impl ArtIndexManager {
         ref_columns: &[String],
         constraint_name: Option<&str>,
     ) -> ArtResult<String> {
+        self.note_mutation();
         let index_name = constraint_name
             .map(|n| n.to_string())
             .unwrap_or_else(|| Self::fk_index_name(table, columns));
@@ -352,6 +510,7 @@ impl ArtIndexManager {
         columns: &[String],
         constraint_name: Option<&str>,
     ) -> ArtResult<String> {
+        self.note_mutation();
         let index_name = constraint_name
             .map(|n| n.to_string())
             .unwrap_or_else(|| Self::unique_index_name(table, columns));
@@ -388,6 +547,7 @@ impl ArtIndexManager {
 
     /// Create a manual index (via CREATE INDEX ... USING ART)
     pub fn create_manual_index(&self, name: &str, table: &str, columns: &[String]) -> ArtResult<String> {
+        self.note_mutation();
         // Check if index already exists
         {
             let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
@@ -416,6 +576,7 @@ impl ArtIndexManager {
     /// table insert maintenance path would also touch PK/UNIQUE indexes and hit
     /// duplicates for rows that were already present before CREATE INDEX.
     pub fn backfill_manual_index(&self, name: &str, schema: &Schema, tuples: &[Tuple]) -> ArtResult<usize> {
+        self.note_mutation();
         // Global READ is enough: the registry is not changed, only one tree.
         let entry = {
             let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
@@ -456,6 +617,7 @@ impl ArtIndexManager {
 
     /// Drop an index by name
     pub fn drop_index(&self, name: &str) -> ArtResult<()> {
+        self.note_mutation();
         let index_type;
 
         // Remove from main index map
@@ -522,6 +684,7 @@ impl ArtIndexManager {
 
     /// Rename all indexes for a table (called on RENAME TABLE)
     pub fn rename_table_indexes(&self, old_table: &str, new_table: &str) -> ArtResult<()> {
+        self.note_mutation();
         // Move the entries under the global WRITE lock. Trees are renamed in
         // place (one tree lock at a time, see locking rules) — no tree clone.
         let mut renames: Vec<(String, String)> = Vec::new();
@@ -687,6 +850,37 @@ impl ArtIndexManager {
         }
     }
 
+    /// R4.4: ordered, bounded range scan over a named index.
+    ///
+    /// Bounds are ENCODED keys (`encode_key_from_values` of a single value of
+    /// the indexed column's type — encoding v2 is order-preserving per type).
+    /// Returns `(key, row_id)` pairs in ascending key order.
+    pub fn index_range_scan(
+        &self,
+        index_name: &str,
+        lower: Option<(&[u8], bool)>,
+        upper: Option<(&[u8], bool)>,
+        limit: Option<usize>,
+    ) -> Vec<(Vec<u8>, RowId)> {
+        let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = indexes.get(index_name) {
+            let tree = entry.tree.read().unwrap_or_else(|e| e.into_inner());
+            tree.range_scan(lower, upper, limit)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Total `(key, row_id)` entry count of a named index (one entry per
+    /// indexed row, including NULL-keyed entries).
+    pub fn index_entry_count(&self, index_name: &str) -> Option<u64> {
+        let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
+        indexes.get(index_name).map(|entry| {
+            let tree = entry.tree.read().unwrap_or_else(|e| e.into_inner());
+            tree.len()
+        })
+    }
+
     /// PK index point lookup without cloning the tree (~50μs saved vs get_pk_index)
     pub fn pk_index_lookup(&self, table: &str, key: &[u8]) -> Option<RowId> {
         let pk_name = {
@@ -834,50 +1028,115 @@ impl ArtIndexManager {
     ///
     /// Hot insert validation paths often already hold references into a tuple;
     /// this avoids cloning strings/arrays solely to call `encode_key`.
+    ///
+    /// R4.4 — encoding v2, ORDER-PRESERVING for the range-scannable types:
+    /// unsigned byte-wise comparison of two encoded single-column keys of the
+    /// same column type matches SQL value order. Concretely:
+    /// - integers: sign-flipped big-endian (`v XOR MIN` reinterpreted
+    ///   unsigned), so negatives sort before positives;
+    /// - floats: IEEE-754 total-order transform (positive: flip sign bit;
+    ///   negative: flip all bits);
+    /// - TEXT/BYTEA: raw bytes (UTF-8 byte order == code-point order).
+    /// Composite (multi-column) keys additionally escape `0x00 -> 0x00 0xFF`
+    /// inside variable-length values so a value byte can never collide with
+    /// the `0x00` column separator. Single-column keys are NEVER escaped —
+    /// range scans rely on their raw byte order.
+    ///
+    /// Persisted index snapshots stamp this version
+    /// (`index_snapshot::ART_KEY_ENCODING_VERSION`); a snapshot written with
+    /// a different version is ignored and rebuilt from rows, so the encoding
+    /// can evolve without an on-disk migration step.
     pub fn encode_key_from_values<'a>(values: impl IntoIterator<Item = &'a Value>) -> Vec<u8> {
         let mut key = Vec::new();
-        for (i, value) in values.into_iter().enumerate() {
-            if i > 0 {
-                key.push(0); // Separator
-            }
-            match value {
-                Value::Null => key.extend_from_slice(b"\x00"),
-                Value::Boolean(b) => key.push(if *b { 1 } else { 0 }),
-                Value::Int2(v) => key.extend_from_slice(&v.to_be_bytes()),
-                Value::Int4(v) => key.extend_from_slice(&v.to_be_bytes()),
-                Value::Int8(v) => key.extend_from_slice(&v.to_be_bytes()),
-                Value::Float4(v) => key.extend_from_slice(&v.to_be_bytes()),
-                Value::Float8(v) => key.extend_from_slice(&v.to_be_bytes()),
-                Value::String(s) => key.extend_from_slice(s.as_bytes()),
-                Value::Bytes(b) => key.extend_from_slice(b),
-                Value::Uuid(u) => key.extend_from_slice(u.as_bytes()),
-                Value::Numeric(d) => key.extend_from_slice(d.as_bytes()),
-                Value::Date(d) => key.extend_from_slice(d.to_string().as_bytes()),
-                Value::Time(t) => key.extend_from_slice(t.to_string().as_bytes()),
-                Value::Timestamp(ts) => key.extend_from_slice(ts.to_rfc3339().as_bytes()),
-                Value::Array(arr) => {
-                    // Recursively encode array elements
-                    let nested = Self::encode_key_from_values(arr.iter());
-                    key.extend_from_slice(&nested);
-                }
-                Value::Json(j) => key.extend_from_slice(j.as_bytes()),
-                Value::Vector(v) => {
-                    for f in v {
-                        key.extend_from_slice(&f.to_be_bytes());
-                    }
-                }
-                // Handle storage mode references
-                Value::DictRef { dict_id } => key.extend_from_slice(&dict_id.to_be_bytes()),
-                Value::CasRef { hash } => key.extend_from_slice(hash),
-                Value::ColumnarRef => {
-                    // Columnar reference doesn't have direct key encoding
-                    // The actual value should be resolved before indexing
-                    key.extend_from_slice(b"columnar_ref");
-                }
-                Value::Interval(iv) => key.extend_from_slice(&iv.to_be_bytes()), // Encode interval microseconds
-            }
+        let mut iter = values.into_iter();
+        let Some(first) = iter.next() else {
+            return key;
+        };
+        let Some(second) = iter.next() else {
+            // Single-column key: no separator, no escaping.
+            Self::encode_value_into(&mut key, first, false);
+            return key;
+        };
+        Self::encode_value_into(&mut key, first, true);
+        key.push(0); // Separator
+        Self::encode_value_into(&mut key, second, true);
+        for value in iter {
+            key.push(0); // Separator
+            Self::encode_value_into(&mut key, value, true);
         }
         key
+    }
+
+    /// Append one value's encoding to `key`. `escape` is true in composite
+    /// (multi-column) keys: `0x00` bytes inside variable-length values are
+    /// escaped as `0x00 0xFF` so they cannot collide with the separator.
+    fn encode_value_into(key: &mut Vec<u8>, value: &Value, escape: bool) {
+        match value {
+            Value::Null => key.extend_from_slice(b"\x00"),
+            Value::Boolean(b) => key.push(if *b { 1 } else { 0 }),
+            // Sign-flip: maps signed integer order onto unsigned byte order.
+            Value::Int2(v) => key.extend_from_slice(&((*v as u16) ^ 0x8000).to_be_bytes()),
+            Value::Int4(v) => key.extend_from_slice(&((*v as u32) ^ 0x8000_0000).to_be_bytes()),
+            Value::Int8(v) => key.extend_from_slice(&((*v as u64) ^ 0x8000_0000_0000_0000).to_be_bytes()),
+            // IEEE-754 total order: positive floats get the sign bit set,
+            // negative floats are bitwise inverted.
+            Value::Float4(v) => {
+                let bits = v.to_bits();
+                let ordered = if bits & 0x8000_0000 == 0 { bits ^ 0x8000_0000 } else { !bits };
+                key.extend_from_slice(&ordered.to_be_bytes());
+            }
+            Value::Float8(v) => {
+                let bits = v.to_bits();
+                let ordered = if bits & 0x8000_0000_0000_0000 == 0 {
+                    bits ^ 0x8000_0000_0000_0000
+                } else {
+                    !bits
+                };
+                key.extend_from_slice(&ordered.to_be_bytes());
+            }
+            Value::String(s) => Self::extend_maybe_escaped(key, s.as_bytes(), escape),
+            Value::Bytes(b) => Self::extend_maybe_escaped(key, b, escape),
+            Value::Uuid(u) => key.extend_from_slice(u.as_bytes()),
+            Value::Numeric(d) => Self::extend_maybe_escaped(key, d.as_bytes(), escape),
+            Value::Date(d) => key.extend_from_slice(d.to_string().as_bytes()),
+            Value::Time(t) => key.extend_from_slice(t.to_string().as_bytes()),
+            Value::Timestamp(ts) => key.extend_from_slice(ts.to_rfc3339().as_bytes()),
+            Value::Array(arr) => {
+                // Recursively encode array elements
+                let nested = Self::encode_key_from_values(arr.iter());
+                Self::extend_maybe_escaped(key, &nested, escape);
+            }
+            Value::Json(j) => Self::extend_maybe_escaped(key, j.as_bytes(), escape),
+            Value::Vector(v) => {
+                for f in v {
+                    key.extend_from_slice(&f.to_be_bytes());
+                }
+            }
+            // Handle storage mode references
+            Value::DictRef { dict_id } => key.extend_from_slice(&dict_id.to_be_bytes()),
+            Value::CasRef { hash } => key.extend_from_slice(hash),
+            Value::ColumnarRef => {
+                // Columnar reference doesn't have direct key encoding
+                // The actual value should be resolved before indexing
+                key.extend_from_slice(b"columnar_ref");
+            }
+            Value::Interval(iv) => key.extend_from_slice(&iv.to_be_bytes()), // Encode interval microseconds
+        }
+    }
+
+    fn extend_maybe_escaped(key: &mut Vec<u8>, bytes: &[u8], escape: bool) {
+        if !escape || !bytes.contains(&0) {
+            key.extend_from_slice(bytes);
+            return;
+        }
+        for &b in bytes {
+            if b == 0 {
+                key.push(0);
+                key.push(0xFF);
+            } else {
+                key.push(b);
+            }
+        }
     }
 
     fn index_value_refs_from_tuple<'a>(
@@ -1171,6 +1430,7 @@ impl ArtIndexManager {
     /// Takes the global map lock as READ (concurrent across tables) and the
     /// per-tree WRITE locks one at a time (serializes only same-index writers).
     pub fn on_insert(&self, table: &str, row_id: RowId, column_values: &HashMap<String, Value>) -> ArtResult<()> {
+        self.note_mutation();
         let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
 
         // Update all indexes for this table (metadata filter, no tree lock)
@@ -1214,6 +1474,7 @@ impl ArtIndexManager {
 
     /// Update indexes after INSERT using an already-materialized tuple.
     pub fn on_insert_tuple(&self, table: &str, row_id: RowId, schema: &Schema, tuple: &Tuple) -> ArtResult<()> {
+        self.note_mutation();
         let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
 
         for entry in indexes.values() {
@@ -1252,6 +1513,7 @@ impl ArtIndexManager {
         schema: &Schema,
         tuple: &Tuple,
     ) -> ArtResult<HashMap<String, Value>> {
+        self.note_mutation();
         let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
         let mut indexed_values = HashMap::new();
 
@@ -1300,6 +1562,7 @@ impl ArtIndexManager {
     ///
     /// Global map lock as READ + per-tree WRITE locks one at a time.
     pub fn on_delete(&self, table: &str, row_id: RowId, column_values: &HashMap<String, Value>) -> ArtResult<()> {
+        self.note_mutation();
         let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
 
         for entry in indexes.values() {
@@ -1339,6 +1602,7 @@ impl ArtIndexManager {
 
     /// Update indexes after DELETE using the already-materialized tuple.
     pub fn on_delete_tuple(&self, table: &str, row_id: RowId, schema: &Schema, tuple: &Tuple) -> ArtResult<()> {
+        self.note_mutation();
         let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
 
         for entry in indexes.values() {
@@ -1372,6 +1636,7 @@ impl ArtIndexManager {
     /// the encoded PK key. This avoids fetching/deserializing the old row for
     /// PK-only DELETE fast paths.
     pub fn remove_single_pk_key(&self, table: &str, key: &[u8], row_id: RowId, pk_value: &Value) -> ArtResult<bool> {
+        self.note_mutation();
         let pk_name = {
             let pk_indexes = self.pk_indexes.read().unwrap_or_else(|e| e.into_inner());
             match pk_indexes.get(table) {
@@ -1487,6 +1752,7 @@ impl ArtIndexManager {
     /// The registry itself is unchanged, so the global lock is taken as READ;
     /// each table tree is write-locked one at a time.
     pub fn clear_table_indexes(&self, table: &str) {
+        self.note_mutation();
         let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
         for entry in indexes.values() {
             if entry.table == table {

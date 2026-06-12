@@ -131,6 +131,16 @@ pub struct VectorIndexManager {
     /// relaxed atomic load in the overwhelmingly common no-vector-index case,
     /// instead of taking the `metadata` read lock on every INSERT/UPDATE/DELETE.
     index_count: std::sync::atomic::AtomicUsize,
+    /// R4.2: true while the persisted HNSW snapshot markers still describe the
+    /// in-memory graphs. First mutation after a checkpoint flips it and fires
+    /// `snapshot_invalidation_hook` once (durable marker delete).
+    snapshot_clean: std::sync::atomic::AtomicBool,
+    /// Engine-wired callback that deletes the vector snapshot markers in RocksDB.
+    snapshot_invalidation_hook: RwLock<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// R4.2: indexes whose rebuild/reload failed at open, with the reason.
+    /// Surfaced instead of silently degrading to an empty/missing index
+    /// (the ISSUE-08 incident class).
+    degraded: RwLock<HashMap<String, String>>,
 }
 
 impl VectorIndexManager {
@@ -142,7 +152,64 @@ impl VectorIndexManager {
             records: Arc::new(RwLock::new(HashMap::new())),
             external_ids: Arc::new(RwLock::new(HashMap::new())),
             index_count: std::sync::atomic::AtomicUsize::new(0),
+            snapshot_clean: std::sync::atomic::AtomicBool::new(true),
+            snapshot_invalidation_hook: RwLock::new(None),
+            degraded: RwLock::new(HashMap::new()),
         }
+    }
+
+    // ---- R4.2: durable snapshot validity tracking --------------------------
+
+    /// Wire the callback that durably deletes the persisted vector snapshot
+    /// markers. Called once by the storage engine at open.
+    pub fn set_snapshot_invalidation_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.snapshot_invalidation_hook.write() = Some(hook);
+    }
+
+    /// Re-arm the validity flag after a checkpoint wrote fresh markers.
+    pub fn mark_snapshot_clean(&self) {
+        self.snapshot_clean.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// True when no vector index mutation happened since the last checkpoint.
+    pub fn snapshot_is_clean(&self) -> bool {
+        self.snapshot_clean.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Record a vector index mutation; the first one after a checkpoint
+    /// durably invalidates the snapshot markers.
+    #[inline]
+    fn note_mutation(&self) {
+        use std::sync::atomic::Ordering;
+        if self.snapshot_clean.load(Ordering::Relaxed) && self.snapshot_clean.swap(false, Ordering::AcqRel) {
+            let hook = self.snapshot_invalidation_hook.read().clone();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+    }
+
+    /// Record an index as degraded (rebuild/reload failed at open). The index
+    /// is *not* registered, so queries fall back to exact scans — but the
+    /// failure is now queryable instead of silent.
+    pub fn mark_degraded(&self, name: &str, reason: impl Into<String>) {
+        let reason = reason.into();
+        tracing::warn!("vector index '{}' degraded: {}", name, reason);
+        self.degraded.write().insert(name.to_string(), reason);
+    }
+
+    /// Clear a degraded flag (e.g. after a successful later rebuild).
+    pub fn clear_degraded(&self, name: &str) {
+        self.degraded.write().remove(name);
+    }
+
+    /// `(index_name, reason)` for every index that failed to rebuild/reload.
+    pub fn degraded_indexes(&self) -> Vec<(String, String)> {
+        self.degraded
+            .read()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
     }
 
     /// Create a new standard (non-quantized) vector index with the default
@@ -181,6 +248,7 @@ impl VectorIndexManager {
         m: usize,
         ef_construction: usize,
     ) -> Result<()> {
+        self.note_mutation();
         let mut indexes = self.indexes.write();
         let mut metadata = self.metadata.write();
 
@@ -236,6 +304,7 @@ impl VectorIndexManager {
         training_vectors: &[Vector],
         db: Arc<rocksdb::DB>,
     ) -> Result<()> {
+        self.note_mutation();
         let mut indexes = self.indexes.write();
         let mut metadata = self.metadata.write();
 
@@ -337,6 +406,7 @@ impl VectorIndexManager {
         m: usize,
         ef_construction: usize,
     ) -> Result<()> {
+        self.note_mutation();
         let mut indexes = self.indexes.write();
         let mut metadata = self.metadata.write();
 
@@ -392,6 +462,7 @@ impl VectorIndexManager {
 
     /// Insert a vector into an index
     pub fn insert_vector(&self, index_name: &str, row_id: u64, vector: &Vector) -> Result<()> {
+        self.note_mutation();
         let indexes = self.indexes.read();
         if let Some(index) = indexes.get(index_name) {
             match index {
@@ -417,6 +488,7 @@ impl VectorIndexManager {
     /// build path here, so they fall back to the sequential per-row insert —
     /// correctness is identical either way.
     pub fn insert_vectors_batch(&self, index_name: &str, batch: &[(u64, Vector)]) -> Result<()> {
+        self.note_mutation();
         let indexes = self.indexes.read();
         let Some(index) = indexes.get(index_name) else {
             return Err(Error::query_execution(format!("Index '{}' not found", index_name)));
@@ -456,6 +528,7 @@ impl VectorIndexManager {
 
     /// Delete a vector from an index
     pub fn delete_vector(&self, index_name: &str, row_id: u64) -> Result<()> {
+        self.note_mutation();
         let indexes = self.indexes.read();
         if let Some(index) = indexes.get(index_name) {
             match index {
@@ -481,6 +554,7 @@ impl VectorIndexManager {
 
     /// Drop an index
     pub fn drop_index(&self, name: &str) -> Result<()> {
+        self.note_mutation();
         let mut indexes = self.indexes.write();
         let mut metadata = self.metadata.write();
 
@@ -1111,6 +1185,166 @@ impl VectorIndexManager {
         } else {
             Err(Error::query_execution(format!("Index '{}' not found", name)))
         }
+    }
+
+    // ---- R4.2: standard HNSW graph dump / reload ---------------------------
+
+    /// Dump a standard (non-quantized, non-persistent) HNSW index's graph to
+    /// `dir` and return the sidecar describing it. Returns `Ok(None)` for
+    /// non-Standard backends (quantized/persistent have their own paths).
+    pub fn dump_standard_index(
+        &self,
+        name: &str,
+        dir: &std::path::Path,
+    ) -> Result<Option<super::index_snapshot::VectorGraphSidecar>> {
+        let indexes = self.indexes.read();
+        let metadata = self.metadata.read();
+        let (Some(index), Some(meta)) = (indexes.get(name), metadata.get(name)) else {
+            return Err(Error::query_execution(format!("Index '{}' not found", name)));
+        };
+        let IndexStorage::Standard(index) = index else {
+            return Ok(None);
+        };
+        let VectorIndexType::Standard(config) = &meta.index_type else {
+            return Ok(None);
+        };
+
+        let basename = graph_dump_basename(name);
+        index.dump_graph(dir, &basename)?;
+        let (id_mapping, reverse_mapping) = index.export_mappings();
+
+        Ok(Some(super::index_snapshot::VectorGraphSidecar {
+            format_version: super::index_snapshot::INDEX_SNAPSHOT_FORMAT_VERSION,
+            index_name: name.to_string(),
+            table_name: meta.table_name.clone(),
+            column_name: meta.column_name.clone(),
+            dimension: config.dimension,
+            metric: metric_name(config.distance_metric).to_string(),
+            m: config.max_connections,
+            ef_construction: config.ef_construction,
+            basename,
+            id_mapping,
+            reverse_mapping,
+        }))
+    }
+
+    /// Reconstruct a standard HNSW index from a graph dump + sidecar, instead
+    /// of rebuilding it from a table scan. Errors surface to the caller, which
+    /// falls back to the scan rebuild (and never leaves an empty index behind).
+    pub fn reload_standard_index(
+        &self,
+        sidecar: &super::index_snapshot::VectorGraphSidecar,
+        dir: &std::path::Path,
+    ) -> Result<()> {
+        if sidecar.format_version != super::index_snapshot::INDEX_SNAPSHOT_FORMAT_VERSION {
+            return Err(Error::storage(format!(
+                "vector snapshot format {} != supported {}",
+                sidecar.format_version,
+                super::index_snapshot::INDEX_SNAPSHOT_FORMAT_VERSION
+            )));
+        }
+        let distance_metric = metric_from_name(&sidecar.metric)?;
+        let config = HnswConfig {
+            dimension: sidecar.dimension,
+            distance_metric,
+            max_connections: sidecar.m,
+            ef_construction: sidecar.ef_construction,
+            ef_search_base: 200,
+            dynamic_ef_search: true,
+            ef_search_min: 50,
+            ef_search_max: 500,
+        };
+
+        // Reload the graph BEFORE registering anything: a failure here must
+        // leave the manager exactly as it was (no empty index registered).
+        let index = MultiMetricHnswIndex::reload_from_dump(
+            config.clone(),
+            dir,
+            &sidecar.basename,
+            sidecar.id_mapping.clone(),
+            &sidecar.reverse_mapping,
+        )?;
+
+        let mut indexes = self.indexes.write();
+        let mut metadata = self.metadata.write();
+        if indexes.contains_key(&sidecar.index_name) {
+            return Err(Error::query_execution(format!(
+                "Index '{}' already exists",
+                sidecar.index_name
+            )));
+        }
+        let meta = VectorIndexMetadata {
+            name: sidecar.index_name.clone(),
+            table_name: sidecar.table_name.clone(),
+            column_name: sidecar.column_name.clone(),
+            index_type: VectorIndexType::Standard(config),
+        };
+        indexes.insert(sidecar.index_name.clone(), IndexStorage::Standard(index));
+        metadata.insert(sidecar.index_name.clone(), meta);
+        self.records.write().entry(sidecar.index_name.clone()).or_default();
+        self.external_ids.write().entry(sidecar.index_name.clone()).or_default();
+        self.index_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.clear_degraded(&sidecar.index_name);
+        Ok(())
+    }
+
+    /// R4.2 / R5.V2: reopen a RocksDB-backed persistent vector index in place
+    /// instead of downgrading it to a freshly rebuilt in-memory Standard index.
+    #[cfg(feature = "vector-persist")]
+    pub fn reopen_persistent_index(
+        &self,
+        name: &str,
+        table_name: &str,
+        column_name: &str,
+        config: PersistentVectorConfig,
+        db: Arc<rocksdb::DB>,
+    ) -> Result<()> {
+        let index_id = stable_index_id(name);
+        let index = crate::vector::persistent::PersistentVectorIndex::open(db, index_id)?;
+
+        let mut indexes = self.indexes.write();
+        let mut metadata = self.metadata.write();
+        if indexes.contains_key(name) {
+            return Err(Error::query_execution(format!("Index '{}' already exists", name)));
+        }
+        let meta = VectorIndexMetadata {
+            name: name.to_string(),
+            table_name: table_name.to_string(),
+            column_name: column_name.to_string(),
+            index_type: VectorIndexType::Persistent(config),
+        };
+        indexes.insert(name.to_string(), IndexStorage::Persistent(index));
+        metadata.insert(name.to_string(), meta);
+        self.records.write().entry(name.to_string()).or_default();
+        self.external_ids.write().entry(name.to_string()).or_default();
+        self.index_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.clear_degraded(name);
+        Ok(())
+    }
+}
+
+/// Filesystem-safe dump basename for an index name.
+fn graph_dump_basename(index_name: &str) -> String {
+    index_name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect()
+}
+
+fn metric_name(metric: DistanceMetric) -> &'static str {
+    match metric {
+        DistanceMetric::L2 => "l2",
+        DistanceMetric::Cosine => "cosine",
+        DistanceMetric::InnerProduct => "ip",
+    }
+}
+
+fn metric_from_name(name: &str) -> Result<DistanceMetric> {
+    match name {
+        "l2" => Ok(DistanceMetric::L2),
+        "cosine" => Ok(DistanceMetric::Cosine),
+        "ip" => Ok(DistanceMetric::InnerProduct),
+        other => Err(Error::storage(format!("unknown vector metric '{other}' in snapshot"))),
     }
 }
 
