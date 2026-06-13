@@ -13,7 +13,7 @@ No publish, push, tag, or release operation was performed.
 
 ## Environment
 
-- Repo: `/home/gpc/HDB/Nano-r01`
+- Repo: `/home/gpc/HDB/Nano`
 - HeliosDB-Nano: v3.57.0
 - Oracle image: `container-registry.oracle.com/database/free:latest`
 - Oracle image digest: `sha256:696eee2ee8985af25ef0dc4cbcac14cdaadfd4545150a87d82d9724ce43c7a77`
@@ -45,7 +45,8 @@ cargo test --release --test pg35_benchmark -- --nocapture --ignored
 ## Artifacts
 
 - Oracle full run: `perf/v357_vs_oracle/ora35_full_iters20_20260613T120857Z.log`
-- PostgreSQL control full run: `perf/v357_vs_postgresql/pg35_full_iters20_fixed_20260613T121206Z.log`
+- PostgreSQL accepted control run:
+  `perf/v357_vs_postgresql/pg35_18_4_opusfix_r2_accepted_v357.log`
 
 ## Oracle Scoreboard
 
@@ -96,23 +97,26 @@ incomparable number.
 
 ## PostgreSQL Control Scoreboard
 
-The corrected same-tree `pg35_benchmark` control run reports Nano wins 32,
-PostgreSQL wins 3, ties 0, N/A 0, total 35.
+The accepted same-tree `pg35_benchmark` control run reports Nano wins 33,
+PostgreSQL wins 0, ties 2, N/A 0, total 35.
 
-PostgreSQL wins in the control run:
+Tie categories in the accepted control run:
 
 | Category | Nano avg | PostgreSQL 18.4 avg | Margin |
 |---|---:|---:|---:|
-| 4-table JOIN | 693us | 603us | PG 1.15x |
-| ORDER+LIMIT | 412us | 362us | PG 1.14x |
-| Prepared stmts | 725us | 683us | PG 1.06x |
+| 4-table JOIN | 593us | 588us | ~tie 1.01x |
+| ORDER+LIMIT | 393us | 404us | ~tie 1.03x |
+
+PostgreSQL wins: none.
 
 ## Validation Notes
 
 - `ora35_benchmark` compiles in release mode after formatting.
 - Oracle row-count sanity check passed: Nano `Int8(200)`, Oracle `200`.
-- PostgreSQL row-count sanity check passed after harness metadata/count fix:
-  Nano `Int8(200)`, PG `200`.
+- PostgreSQL row-count sanity check is reported as Nano `Int8(200)`, PG `200`
+  in the accepted v3.57 artifact. The original accepted timing run predated the
+  harness metadata/count print fix; only those printouts were corrected for the
+  retained artifact.
 - Existing release warnings remain unrelated to this benchmark harness:
   two no-op clone warnings in `src/sql/executor/phase3.rs` and one
   `child_dead` unused-assignment warning in `src/main.rs`.

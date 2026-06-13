@@ -1,0 +1,101 @@
+
+running 1 test
+test pg35_benchmark ...
+=========================================================================================================
+  HELIOSDB-NANO vs POSTGRESQL 18.4 -- COMPREHENSIVE 35-CATEGORY BENCHMARK
+  HeliosDB-Nano v3.57.0 (Embedded/In-Memory) vs POSTGRESQL 18.4 (Docker/25433)
+=========================================================================================================
+
+  [OK] Connected to POSTGRESQL 18.4 on configured DSN
+  [OK] HeliosDB-Nano in-memory instance created
+
+  Setting up schemas...
+  [OK] Schema created in both engines
+  Populating data (200+50+500+1000+20 = 1770 rows)...
+  [OK] Data populated in both engines
+  [OK] Customers: Nano=Int8(200) PG=200
+
+  Running 35 categories x 20 iterations each x 2 engines...
+
+
+=========================================================================================================
+  HELIOSDB-NANO vs POSTGRESQL 18.4 -- HEAD-TO-HEAD COMPARISON
+  Dataset: 200 customers, 50 products, 500 orders, 1000 items, 20 categories
+=========================================================================================================
+
+Category               |    Nano(avg) | POSTGRESQL 18.4(avg) |      Ratio |   Winner
+---------------------------------------------------------------------------------------------------------
+CREATE TABLE           |        147us |      14.45ms |     98.34x |     Nano
+CREATE INDEX           |        277us |      13.75ms |     49.71x |     Nano
+ALTER TABLE            |        615us |      14.85ms |     24.13x |     Nano
+DROP TABLE             |       59.0us |      10.91ms |    184.88x |     Nano
+CREATE/DROP VIEW       |        213us |      21.42ms |    100.60x |     Nano
+REFRESH MATVIEW        |        291us |       8.23ms |     28.31x |     Nano
+TRUNCATE               |        105us |      55.50ms |    526.35x |     Nano
+INSERT single          |       6.99us |       6.74ms |    965.17x |     Nano
+INSERT multi-row       |        156us |       6.84ms |     43.98x |     Nano
+INSERT..SELECT         |        372us |       5.35ms |     14.38x |     Nano
+UPDATE point           |       22.2us |       6.35ms |    286.81x |     Nano
+DELETE point           |       3.94us |       5.35ms |   1358.43x |     Nano
+UPSERT                 |       90.9us |      14.32ms |    157.55x |     Nano
+UPDATE+subquery        |        192us |       5.86ms |     30.50x |     Nano
+Point lookup           |       4.18us |        282us |     67.48x |     Nano
+Full scan+filter       |       31.6us |        358us |     11.32x |     Nano
+Aggregation            |       0.79us |        344us |    438.45x |     Nano
+INNER JOIN             |        270us |        321us |      1.19x |     Nano
+LEFT JOIN              |        261us |        332us |      1.27x |     Nano
+4-table JOIN           |        593us |        588us |      1.01x |     ~tie
+Scalar subquery        |       2.19us |        414us |    189.37x |     Nano
+EXISTS subquery        |       0.30us |        511us |   1687.02x |     Nano
+IN subquery            |       5.34us |        432us |     80.88x |     Nano
+CTE                    |       25.6us |        594us |     23.21x |     Nano
+Recursive CTE          |       2.61us |        444us |    170.15x |     Nano
+Window funcs           |       22.7us |        593us |     26.11x |     Nano
+UNION                  |       9.46us |        419us |     44.29x |     Nano
+DISTINCT               |       0.60us |        326us |    540.39x |     Nano
+ORDER+LIMIT            |        393us |        404us |      1.03x |     ~tie
+CASE expr              |       17.7us |        383us |     21.60x |     Nano
+LIKE/BETWEEN/IN        |       11.9us |        377us |     31.79x |     Nano
+String ops             |       13.9us |        368us |     26.44x |     Nano
+Transaction ctl        |       0.40us |       7.49ms |  18869.83x |     Nano
+Prepared stmts         |        649us |        686us |      1.06x |     Nano
+SET/SHOW/RESET         |       7.17us |        609us |     84.82x |     Nano
+---------------------------------------------------------------------------------------------------------
+SCOREBOARD: Nano wins 33 | PG wins 0 | Ties 2 | N/A 0 | Total 35
+
+================================================================================
+  TOP OPTIMIZATION TARGETS (where PG wins by largest margin)
+================================================================================
+
+  (Nano is competitive or faster across all categories!)
+
+  NANO ADVANTAGES (faster than PG):
+   1. Transaction ctl        Nano     0.40us vs PG     7.49ms (18869.8x faster)
+   2. EXISTS subquery        Nano     0.30us vs PG      511us (1687.0x faster)
+   3. DELETE point           Nano     3.94us vs PG     5.35ms (1358.4x faster)
+   4. INSERT single          Nano     6.99us vs PG     6.74ms (965.2x faster)
+   5. DISTINCT               Nano     0.60us vs PG      326us (540.4x faster)
+   6. TRUNCATE               Nano      105us vs PG    55.50ms (526.3x faster)
+   7. Aggregation            Nano     0.79us vs PG      344us (438.5x faster)
+   8. UPDATE point           Nano     22.2us vs PG     6.35ms (286.8x faster)
+   9. Scalar subquery        Nano     2.19us vs PG      414us (189.4x faster)
+  10. DROP TABLE             Nano     59.0us vs PG    10.91ms (184.9x faster)
+
+================================================================================
+  PERFORMANCE TIER ANALYSIS
+================================================================================
+
+    Critical (>5x slower):    0 categories
+    Significant (2-5x):       0 categories
+    Moderate (1.05-2x):       0 categories
+    Competitive (~1x):        2 categories
+    Nano faster (<0.95x):     33 categories
+    Not supported (N/A):      0 categories
+
+=========================================================================================================
+  BENCHMARK COMPLETE -- Total time: 5.5s
+=========================================================================================================
+
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.28s

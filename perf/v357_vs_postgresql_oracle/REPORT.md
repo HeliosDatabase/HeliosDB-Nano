@@ -15,7 +15,8 @@ The two comparisons were paired benchmark runs, not one simultaneous three-way
 run. For that reason, the table keeps both Nano paired measurements:
 
 - `Nano us (Oracle run)` is the Nano timing captured by `ora35_benchmark`.
-- `Nano us (PG run)` is the Nano timing captured by `pg35_benchmark`.
+- `Nano us (PG accepted run)` is the Nano timing captured by the accepted
+  `pg35_benchmark` r2 result.
 
 ## Inputs
 
@@ -29,56 +30,58 @@ run. For that reason, the table keeps both Nano paired measurements:
 ## Summary
 
 - Oracle comparison: Nano wins 34, Oracle wins 0, N/A 1, total 35.
-- PostgreSQL comparison: Nano wins 32, PostgreSQL wins 3, N/A 0, total 35.
-- PostgreSQL wins were limited to 4-table JOIN, ORDER+LIMIT, and Prepared stmts.
+- PostgreSQL comparison: Nano wins 33, PostgreSQL wins 0, ties 2, N/A 0,
+  total 35.
+- PostgreSQL wins: none. The two ties are 4-table JOIN and ORDER+LIMIT.
 - Oracle N/A is Prepared stmts because SQL-level `PREPARE` / `EXECUTE` /
   `DEALLOCATE` is PostgreSQL-specific; Oracle driver-side statement caching is
   not the same operation.
 
 ## Normalized Table
 
-| # | Category | Nano us (Oracle run) | Oracle 26ai us | Nano vs Oracle | Nano us (PG run) | PostgreSQL 18.4 us | Nano vs PG |
+| # | Category | Nano us (Oracle run) | Oracle 26ai us | Nano vs Oracle | Nano us (PG accepted run) | PostgreSQL 18.4 us | Nano vs PG |
 |---:|---|---:|---:|---:|---:|---:|---:|
-| 1 | CREATE TABLE | 144 | 202,170 | Nano 1405.86x | 156 | 20,180 | Nano 129.63x |
-| 2 | CREATE INDEX | 399 | 130,750 | Nano 327.69x | 280 | 22,720 | Nano 81.25x |
-| 3 | ALTER TABLE | 625 | 59,810 | Nano 95.68x | 659 | 20,030 | Nano 30.38x |
-| 4 | DROP TABLE | 58.3 | 91,880 | Nano 1576.40x | 61.4 | 7,650 | Nano 124.63x |
-| 5 | CREATE/DROP VIEW | 210 | 53,470 | Nano 254.45x | 243 | 17,440 | Nano 71.63x |
-| 6 | REFRESH MATVIEW | 295 | 50,610 | Nano 171.37x | 293 | 9,600 | Nano 32.80x |
-| 7 | TRUNCATE | 107 | 79,420 | Nano 741.11x | 104 | 53,700 | Nano 517.70x |
-| 8 | INSERT single | 7.70 | 15,850 | Nano 2058.98x | 8.56 | 6,240 | Nano 729.12x |
-| 9 | INSERT multi-row | 134 | 18,420 | Nano 137.67x | 137 | 11,630 | Nano 85.15x |
-| 10 | INSERT..SELECT | 405 | 28,100 | Nano 69.33x | 385 | 6,170 | Nano 16.04x |
-| 11 | UPDATE point | 25.5 | 16,650 | Nano 654.17x | 19.8 | 12,970 | Nano 655.55x |
-| 12 | DELETE point | 3.91 | 14,670 | Nano 3748.18x | 4.74 | 6,970 | Nano 1470.09x |
-| 13 | UPSERT | 95.4 | 16,560 | Nano 173.52x | 96.3 | 8,160 | Nano 84.76x |
-| 14 | UPDATE+subquery | 218 | 18,070 | Nano 82.88x | 215 | 8,560 | Nano 39.82x |
-| 15 | Point lookup | 4.25 | 1,240 | Nano 292.21x | 3.90 | 270 | Nano 69.38x |
-| 16 | Full scan+filter | 25.6 | 390 | Nano 15.24x | 25.2 | 345 | Nano 13.66x |
-| 17 | Aggregation | 0.64 | 330 | Nano 514.46x | 0.66 | 358 | Nano 541.53x |
-| 18 | INNER JOIN | 284 | 1,330 | Nano 4.66x | 249 | 326 | Nano 1.31x |
-| 19 | LEFT JOIN | 267 | 2,310 | Nano 8.67x | 239 | 409 | Nano 1.71x |
-| 20 | 4-table JOIN | 836 | 3,400 | Nano 4.06x | 693 | 603 | PG 1.15x |
-| 21 | Scalar subquery | 2.14 | 333 | Nano 155.47x | 2.50 | 421 | Nano 168.75x |
-| 22 | EXISTS subquery | 0.34 | 355 | Nano 1034.39x | 0.33 | 524 | Nano 1582.52x |
-| 23 | IN subquery | 5.90 | 585 | Nano 99.15x | 6.44 | 454 | Nano 70.53x |
-| 24 | CTE | 24.9 | 948 | Nano 38.12x | 26.5 | 635 | Nano 23.99x |
-| 25 | Recursive CTE | 2.67 | 338 | Nano 126.77x | 3.02 | 405 | Nano 133.86x |
-| 26 | Window funcs | 22.5 | 457 | Nano 20.31x | 25.0 | 562 | Nano 22.54x |
-| 27 | UNION | 8.69 | 320 | Nano 36.81x | 9.67 | 415 | Nano 42.96x |
-| 28 | DISTINCT | 0.59 | 281 | Nano 473.85x | 0.66 | 317 | Nano 478.90x |
-| 29 | ORDER+LIMIT | 379 | 1,940 | Nano 5.11x | 412 | 362 | PG 1.14x |
-| 30 | CASE expr | 17.0 | 328 | Nano 19.32x | 14.9 | 336 | Nano 22.58x |
-| 31 | LIKE/BETWEEN/IN | 12.1 | 323 | Nano 26.66x | 9.75 | 362 | Nano 37.08x |
-| 32 | String ops | 13.9 | 366 | Nano 26.40x | 10.7 | 350 | Nano 32.76x |
-| 33 | Transaction ctl | 0.41 | 13,320 | Nano 32340.04x | 0.39 | 15,970 | Nano 40640.94x |
-| 34 | Prepared stmts | 642 | N/A | N/A | 725 | 683 | PG 1.06x |
-| 35 | SET/SHOW/RESET | 5.89 | 658 | Nano 111.76x | 8.33 | 603 | Nano 72.35x |
+| 1 | CREATE TABLE | 144 | 202,170 | Nano 1405.86x | 147 | 14,450 | Nano 98.34x |
+| 2 | CREATE INDEX | 399 | 130,750 | Nano 327.69x | 277 | 13,750 | Nano 49.71x |
+| 3 | ALTER TABLE | 625 | 59,810 | Nano 95.68x | 615 | 14,850 | Nano 24.13x |
+| 4 | DROP TABLE | 58.3 | 91,880 | Nano 1576.40x | 59.0 | 10,910 | Nano 184.88x |
+| 5 | CREATE/DROP VIEW | 210 | 53,470 | Nano 254.45x | 213 | 21,420 | Nano 100.60x |
+| 6 | REFRESH MATVIEW | 295 | 50,610 | Nano 171.37x | 291 | 8,230 | Nano 28.31x |
+| 7 | TRUNCATE | 107 | 79,420 | Nano 741.11x | 105 | 55,500 | Nano 526.35x |
+| 8 | INSERT single | 7.70 | 15,850 | Nano 2058.98x | 6.99 | 6,740 | Nano 965.17x |
+| 9 | INSERT multi-row | 134 | 18,420 | Nano 137.67x | 156 | 6,840 | Nano 43.98x |
+| 10 | INSERT..SELECT | 405 | 28,100 | Nano 69.33x | 372 | 5,350 | Nano 14.38x |
+| 11 | UPDATE point | 25.5 | 16,650 | Nano 654.17x | 22.2 | 6,350 | Nano 286.81x |
+| 12 | DELETE point | 3.91 | 14,670 | Nano 3748.18x | 3.94 | 5,350 | Nano 1358.43x |
+| 13 | UPSERT | 95.4 | 16,560 | Nano 173.52x | 90.9 | 14,320 | Nano 157.55x |
+| 14 | UPDATE+subquery | 218 | 18,070 | Nano 82.88x | 192 | 5,860 | Nano 30.50x |
+| 15 | Point lookup | 4.25 | 1,240 | Nano 292.21x | 4.18 | 282 | Nano 67.48x |
+| 16 | Full scan+filter | 25.6 | 390 | Nano 15.24x | 31.6 | 358 | Nano 11.32x |
+| 17 | Aggregation | 0.64 | 330 | Nano 514.46x | 0.79 | 344 | Nano 438.45x |
+| 18 | INNER JOIN | 284 | 1,330 | Nano 4.66x | 270 | 321 | Nano 1.19x |
+| 19 | LEFT JOIN | 267 | 2,310 | Nano 8.67x | 261 | 332 | Nano 1.27x |
+| 20 | 4-table JOIN | 836 | 3,400 | Nano 4.06x | 593 | 588 | ~tie 1.01x |
+| 21 | Scalar subquery | 2.14 | 333 | Nano 155.47x | 2.19 | 414 | Nano 189.37x |
+| 22 | EXISTS subquery | 0.34 | 355 | Nano 1034.39x | 0.30 | 511 | Nano 1687.02x |
+| 23 | IN subquery | 5.90 | 585 | Nano 99.15x | 5.34 | 432 | Nano 80.88x |
+| 24 | CTE | 24.9 | 948 | Nano 38.12x | 25.6 | 594 | Nano 23.21x |
+| 25 | Recursive CTE | 2.67 | 338 | Nano 126.77x | 2.61 | 444 | Nano 170.15x |
+| 26 | Window funcs | 22.5 | 457 | Nano 20.31x | 22.7 | 593 | Nano 26.11x |
+| 27 | UNION | 8.69 | 320 | Nano 36.81x | 9.46 | 419 | Nano 44.29x |
+| 28 | DISTINCT | 0.59 | 281 | Nano 473.85x | 0.60 | 326 | Nano 540.39x |
+| 29 | ORDER+LIMIT | 379 | 1,940 | Nano 5.11x | 393 | 404 | ~tie 1.03x |
+| 30 | CASE expr | 17.0 | 328 | Nano 19.32x | 17.7 | 383 | Nano 21.60x |
+| 31 | LIKE/BETWEEN/IN | 12.1 | 323 | Nano 26.66x | 11.9 | 377 | Nano 31.79x |
+| 32 | String ops | 13.9 | 366 | Nano 26.40x | 13.9 | 368 | Nano 26.44x |
+| 33 | Transaction ctl | 0.41 | 13,320 | Nano 32340.04x | 0.40 | 7,490 | Nano 18869.83x |
+| 34 | Prepared stmts | 642 | N/A | N/A | 649 | 686 | Nano 1.06x |
+| 35 | SET/SHOW/RESET | 5.89 | 658 | Nano 111.76x | 7.17 | 609 | Nano 84.82x |
 
 ## Raw Logs
 
 - [Oracle 26ai full run](../v357_vs_oracle/ora35_full_iters20_20260613T120857Z.log)
-- [PostgreSQL 18.4 full run](../v357_vs_postgresql/pg35_full_iters20_fixed_20260613T121206Z.log)
+- [PostgreSQL 18.4 accepted run](../v357_vs_postgresql/pg35_18_4_opusfix_r2_accepted_v357.log)
+- [PostgreSQL 18.4 accepted report](../v357_vs_postgresql/REPORT.md)
 
 ## Test Harnesses
 
@@ -88,7 +91,7 @@ run. For that reason, the table keeps both Nano paired measurements:
 
 ## Reproduction
 
-From `/home/gpc/HDB/Nano-r01`:
+From `/home/gpc/HDB/Nano`:
 
 ```bash
 # Oracle 26ai Free

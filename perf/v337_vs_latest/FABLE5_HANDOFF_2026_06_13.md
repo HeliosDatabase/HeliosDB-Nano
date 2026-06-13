@@ -47,8 +47,8 @@ guards validated on 2026-06-13.
 
 - v3.37 comparison report: `perf/v337_vs_latest/REPORT.md`
 - v3.37 compact metrics: `perf/v337_vs_latest/opusfix_summary.tsv`
-- PostgreSQL comparison report: `perf/v351_vs_postgresql/REPORT.md`
-- PostgreSQL compact metrics: `perf/v351_vs_postgresql/opusfix_summary.tsv`
+- PostgreSQL comparison report: `perf/v357_vs_postgresql/REPORT.md`
+- PostgreSQL accepted result log: `perf/v357_vs_postgresql/pg35_18_4_opusfix_r2_accepted_v357.log`
 
 Raw benchmark dumps (`*.txt`, `*.log`) are ignored to avoid bloating the
 release commit. They remain on disk in this worktree for local inspection.
