@@ -45,7 +45,8 @@ fn read_your_writes_in_session_transaction() {
     let db = setup();
     let a = db.create_wire_session("a").unwrap();
     db.execute_for_session(a, "BEGIN").unwrap();
-    db.execute_for_session(a, "INSERT INTO t (id, v) VALUES (1, 'mine')").unwrap();
+    db.execute_for_session(a, "INSERT INTO t (id, v) VALUES (1, 'mine')")
+        .unwrap();
     let (rows, _) = db
         .query_with_columns_for_session(a, "SELECT * FROM t WHERE id = 1")
         .unwrap();
@@ -77,7 +78,8 @@ fn rollback_cleans_art_index() {
     // unrelated global-slot rollback (undo-log isolation between the two).
     let b = db.create_wire_session("b").unwrap();
     db.execute_for_session(b, "BEGIN").unwrap();
-    db.execute_for_session(b, "INSERT INTO t (id, v) VALUES (7, 'kept')").unwrap();
+    db.execute_for_session(b, "INSERT INTO t (id, v) VALUES (7, 'kept')")
+        .unwrap();
     db.execute_for_session(b, "COMMIT").unwrap();
     db.destroy_session(b).unwrap();
 
@@ -145,7 +147,8 @@ fn destroy_session_rolls_back_open_transaction() {
     let db = setup();
     let a = db.create_wire_session("a").unwrap();
     db.execute_for_session(a, "BEGIN").unwrap();
-    db.execute_for_session(a, "INSERT INTO t (id, v) VALUES (1, 'orphan')").unwrap();
+    db.execute_for_session(a, "INSERT INTO t (id, v) VALUES (1, 'orphan')")
+        .unwrap();
     db.destroy_session(a).unwrap(); // connection dropped mid-transaction
     let rows = db.query("SELECT * FROM t", &[]).unwrap();
     assert_eq!(rows.len(), 0, "orphaned transaction must be rolled back");
@@ -166,7 +169,8 @@ fn snapshot_isolation_vs_autocommit_fast_insert() {
     let (rows, _) = db.query_with_columns_for_session(a, "SELECT * FROM t").unwrap();
     assert_eq!(rows.len(), 1);
     // Concurrent autocommit insert — takes the fast path under the new gate.
-    db.execute("INSERT INTO t (id, v) VALUES (2, 'after-snapshot')").unwrap();
+    db.execute("INSERT INTO t (id, v) VALUES (2, 'after-snapshot')")
+        .unwrap();
     let (rows, _) = db.query_with_columns_for_session(a, "SELECT * FROM t").unwrap();
     assert_eq!(
         rows.len(),
@@ -217,9 +221,11 @@ fn synchronous_commit_off_is_session_scoped() {
 
     // A's transactional + autocommit writes still commit and are visible.
     db.execute_for_session(a, "BEGIN").unwrap();
-    db.execute_for_session(a, "INSERT INTO t (id, v) VALUES (1, 'async')").unwrap();
+    db.execute_for_session(a, "INSERT INTO t (id, v) VALUES (1, 'async')")
+        .unwrap();
     db.execute_for_session(a, "COMMIT").unwrap();
-    db.execute_for_session(a, "INSERT INTO t (id, v) VALUES (2, 'auto')").unwrap();
+    db.execute_for_session(a, "INSERT INTO t (id, v) VALUES (2, 'auto')")
+        .unwrap();
     let (rows, _) = db.query_with_columns_for_session(b, "SELECT * FROM t").unwrap();
     assert_eq!(rows.len(), 2, "async-commit rows must be visible immediately");
 
@@ -243,14 +249,17 @@ fn synchronous_commit_on_overrides_non_durable_default() {
     db.execute_for_session(a, "SET synchronous_commit TO on").unwrap();
     assert_eq!(db.session_synchronous_commit(a).unwrap(), Some(true));
     assert!(db.session_synchronous_commit_effective(a).unwrap());
-    db.execute_for_session(a, "SET synchronous_commit = remote_write").unwrap();
+    db.execute_for_session(a, "SET synchronous_commit = remote_write")
+        .unwrap();
     assert_eq!(db.session_synchronous_commit(a).unwrap(), Some(true));
 
     // Durable-by-override commits work (group fsync on a non-durable engine).
     db.execute_for_session(a, "BEGIN").unwrap();
-    db.execute_for_session(a, "INSERT INTO t (id, v) VALUES (1, 'sync')").unwrap();
+    db.execute_for_session(a, "INSERT INTO t (id, v) VALUES (1, 'sync')")
+        .unwrap();
     db.execute_for_session(a, "COMMIT").unwrap();
-    db.execute_for_session(a, "INSERT INTO t (id, v) VALUES (2, 'auto-sync')").unwrap();
+    db.execute_for_session(a, "INSERT INTO t (id, v) VALUES (2, 'auto-sync')")
+        .unwrap();
     let rows = db.query("SELECT * FROM t", &[]).unwrap();
     assert_eq!(rows.len(), 2);
 
@@ -266,7 +275,8 @@ fn synchronous_commit_set_inside_open_transaction_applies() {
     let (db, tmp) = durable_disk_db("mid_txn", true);
     let a = db.create_wire_session("a").unwrap();
     db.execute_for_session(a, "BEGIN").unwrap();
-    db.execute_for_session(a, "INSERT INTO t (id, v) VALUES (1, 'x')").unwrap();
+    db.execute_for_session(a, "INSERT INTO t (id, v) VALUES (1, 'x')")
+        .unwrap();
     db.execute_for_session(a, "SET LOCAL synchronous_commit = off").unwrap();
     db.execute_for_session(a, "COMMIT").unwrap();
     let rows = db.query("SELECT * FROM t", &[]).unwrap();
@@ -300,10 +310,12 @@ fn synchronous_commit_embedded_session_api() {
     let s = db.create_session("emb", IsolationLevel::ReadCommitted).unwrap();
     db.execute_in_session(s, "SET synchronous_commit = off").unwrap();
     assert_eq!(db.session_synchronous_commit(s).unwrap(), Some(false));
-    db.execute_in_session(s, "INSERT INTO t (id, v) VALUES (1, 'emb')").unwrap();
+    db.execute_in_session(s, "INSERT INTO t (id, v) VALUES (1, 'emb')")
+        .unwrap();
     db.execute_in_session(s, "RESET synchronous_commit").unwrap();
     assert_eq!(db.session_synchronous_commit(s).unwrap(), None);
-    db.execute_in_session(s, "INSERT INTO t (id, v) VALUES (2, 'emb2')").unwrap();
+    db.execute_in_session(s, "INSERT INTO t (id, v) VALUES (2, 'emb2')")
+        .unwrap();
     let rows = db.query("SELECT * FROM t", &[]).unwrap();
     assert_eq!(rows.len(), 2);
     db.destroy_session(s).unwrap();

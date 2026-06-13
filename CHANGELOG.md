@@ -5,10 +5,11 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [3.51.0] - 2026-06-12
+## [3.57.0] - 2026-06-13
 
 Minor release: typed batches, commit-pipeline hardening, MVCC version GC,
-durable ART/HNSW index snapshots, and ordered index range scans.
+durable ART/HNSW index snapshots, ordered index range scans, COUNT/point-lookup
+fast paths, and indexed nested-loop join correctness guards.
 
 ### Added - R3.4 typed batches
 
@@ -37,11 +38,27 @@ durable ART/HNSW index snapshots, and ordered index range scans.
 - Ordered ART range scans support multi-selectivity index probes and top-k
   planning paths.
 
+### Changed - query fast paths
+
+- COUNT and point-lookup fast paths avoid unnecessary cache fills and keep the
+  hot read path allocation-light while preserving transaction and materialized
+  view fallback semantics.
+- Indexed nested-loop joins are enabled for selective indexed equi-joins, with
+  correctness guards for branch visibility, transaction-staged writes, and
+  type-equivalent join keys. Cross-type joins fall back to the existing
+  coercing hash/nested-loop path instead of probing incompatible ART key bytes.
+- INLJ materialized output now stamps aliased right-side schemas the same way
+  normal scans do, preserving alias-qualified predicates such as
+  `LEFT JOIN ... WHERE p.id IS NULL`.
+
 ### Validation
 
 - Post-merge gate battery passed: targeted conflict/session/transaction/CRUD
   suites, `cargo test --lib` at 1896/1896, and two contended conflict runs with
   `lost_updates=0`.
+- Final release validation passed with lib 1896/0, cross-type INLJ smoke
+  matching default-INLJ and `HELIOS_INLJ_OFF=1` row counts, v3.37 A/B accepted
+  by the user, and PG35 showing zero PostgreSQL wins across two rounds.
 
 ## [3.50.0] - 2026-06-11
 

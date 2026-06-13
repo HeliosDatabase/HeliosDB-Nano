@@ -412,6 +412,13 @@ pub struct EmbeddedDatabase {
     session_transactions: std::sync::Arc<dashmap::DashMap<crate::session::SessionId, SessionTxnSlot>>,
     /// Prepared statements storage (name -> plan)
     prepared_statements: std::sync::Arc<parking_lot::RwLock<std::collections::HashMap<String, sql::LogicalPlan>>>,
+    /// Original SQL for embedded prepared statements when available.
+    prepared_statement_sql: std::sync::Arc<parking_lot::RwLock<std::collections::HashMap<String, String>>>,
+    /// Fast embedded PREPARE metadata for simple PK lookups.
+    prepared_fast_selects:
+        std::sync::Arc<parking_lot::RwLock<std::collections::HashMap<String, PreparedFastSelectSpec>>>,
+    /// Database-level settings for embedded SQL entry points.
+    session_settings: sql::SessionSettings,
     /// Active savepoints stack (name -> transaction state)
     savepoints: std::sync::Arc<parking_lot::RwLock<Vec<SavepointState>>>,
     /// Plan cache: SQL string → `Arc<LogicalPlan>` (sharded LRU, skips parse+plan for repeated queries)
@@ -423,6 +430,9 @@ pub struct EmbeddedDatabase {
     /// Fast DML invalidation gate; avoids taking the result-cache mutex when
     /// no query has populated it since the last invalidation.
     result_cache_nonempty: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Last result-cache entry served. Hot repeated SELECTs avoid touching the
+    /// sharded LRU on every call; cleared by the same invalidation gate.
+    hot_result_cache_entry: std::sync::Arc<parking_lot::RwLock<Option<(String, std::sync::Arc<Vec<Tuple>>)>>>,
     /// Fingerprint of the most recent literal fast PK lookup. Used to avoid
     /// filling the result cache with one-off point lookups while still caching
     /// repeated hot-key queries after the second consecutive hit.
@@ -457,7 +467,7 @@ pub struct EmbeddedDatabase {
     /// (table, pk) spec on every statement; a read-mostly slot in front of the
     /// sharded LRU keeps that lookup off any mutex (mirrors
     /// `hot_fast_param_update_spec`). Cleared with the plan cache on DDL.
-    hot_fast_select_spec: std::sync::Arc<parking_lot::RwLock<Option<(String, std::sync::Arc<FastSelectSpec>)>>>,
+    hot_fast_select_spec: std::sync::Arc<parking_lot::RwLock<Option<std::sync::Arc<FastSelectSpec>>>>,
     /// Lightweight SQL-visible query profiler, disabled by default.
     query_profiler: std::sync::Arc<query_trace::QueryProfiler>,
     /// ART index undo log for transaction rollback: (table, row_id, col_values)
@@ -506,11 +516,12 @@ impl Drop for EmbeddedDatabase {
 
         // Clear session transactions
         self.session_transactions.clear();
-        self.session_txn_count
-            .store(0, std::sync::atomic::Ordering::Release);
+        self.session_txn_count.store(0, std::sync::atomic::Ordering::Release);
 
         // Clear prepared statements
         self.prepared_statements.write().clear();
+        self.prepared_statement_sql.write().clear();
+        self.prepared_fast_selects.write().clear();
 
         // Clear plan cache
         self.plan_cache.clear();
@@ -627,8 +638,15 @@ struct FastLiteralDeleteSpec {
 
 struct FastSelectSpec {
     table_name: String,
+    pk_col: String,
     schema: std::sync::Arc<Schema>,
     pk_data_type: DataType,
+}
+
+#[derive(Clone)]
+struct PreparedFastSelectSpec {
+    select: std::sync::Arc<FastSelectSpec>,
+    param_index: usize,
 }
 
 struct FastDeleteTarget {
@@ -811,6 +829,12 @@ impl<'a> Drop for CodeGraphBranchGuard<'a> {
     }
 }
 
+enum DbSettingStatement {
+    Set { name: String, value: String },
+    Show { name: String },
+    Reset { name: String },
+}
+
 impl EmbeddedDatabase {
     #[allow(clippy::expect_used)] // Safety: cache size is a non-zero compile-time constant.
     fn new_spec_cache<V: Clone>() -> std::sync::Arc<sharded_lru::ShardedLruCache<String, V>> {
@@ -876,6 +900,427 @@ impl EmbeddedDatabase {
         )
     }
 
+    fn is_prepared_statement_sql(sql: &str) -> bool {
+        let trimmed = sql.trim_start();
+        starts_with_icase(trimmed, "PREPARE ")
+            || starts_with_icase(trimmed, "EXECUTE ")
+            || starts_with_icase(trimmed, "DEALLOCATE ")
+    }
+
+    fn normalize_setting_name(raw: &str) -> String {
+        raw.split('.')
+            .map(|part| part.trim().trim_matches('"').to_ascii_lowercase())
+            .collect::<Vec<_>>()
+            .join(".")
+    }
+
+    fn parse_db_setting_statement(sql: &str) -> Option<DbSettingStatement> {
+        let trimmed = sql.trim().trim_end_matches(';').trim();
+
+        if let Some(rest) = strip_prefix_icase(trimmed, "SET ") {
+            let rest = strip_prefix_icase(rest.trim_start(), "LOCAL ")
+                .or_else(|| strip_prefix_icase(rest.trim_start(), "SESSION "))
+                .unwrap_or_else(|| rest.trim_start())
+                .trim_start();
+            let (raw_name, raw_value) = if let Some(pos) = rest.find('=') {
+                (&rest[..pos], &rest[pos + 1..])
+            } else {
+                let upper = rest.to_uppercase();
+                let pos = upper.find(" TO ")?;
+                (&rest[..pos], &rest[pos + " TO ".len()..])
+            };
+            let name = Self::normalize_setting_name(raw_name);
+            let value = raw_value.trim().trim_matches('\'').trim_matches('"').to_string();
+            if name.is_empty() || value.is_empty() {
+                return None;
+            }
+            return Some(DbSettingStatement::Set { name, value });
+        }
+
+        if let Some(rest) = strip_prefix_icase(trimmed, "SHOW ") {
+            let name = Self::normalize_setting_name(rest);
+            if !name.is_empty() {
+                return Some(DbSettingStatement::Show { name });
+            }
+        }
+
+        if let Some(rest) = strip_prefix_icase(trimmed, "RESET ") {
+            let name = Self::normalize_setting_name(rest);
+            if !name.is_empty() {
+                return Some(DbSettingStatement::Reset { name });
+            }
+        }
+
+        None
+    }
+
+    fn try_handle_db_setting_statement_with_columns(&self, sql: &str) -> Result<Option<(Vec<Tuple>, Vec<String>)>> {
+        let Some(statement) = Self::parse_db_setting_statement(sql) else {
+            return Ok(None);
+        };
+
+        match statement {
+            DbSettingStatement::Set { name, value } => {
+                if self.session_settings.get(&name).is_none() {
+                    return Ok(None);
+                }
+                self.session_settings.set(&name, sql::parse_setting_value(&value))?;
+                Ok(Some((Vec::new(), Vec::new())))
+            }
+            DbSettingStatement::Show { name } => {
+                let Some(value) = self.session_settings.get(&name) else {
+                    return Ok(None);
+                };
+                Ok(Some((
+                    vec![Tuple {
+                        values: vec![Value::String(value.as_string())],
+                        row_id: None,
+                        branch_id: None,
+                    }],
+                    vec![name],
+                )))
+            }
+            DbSettingStatement::Reset { name } => {
+                if self.session_settings.get(&name).is_none() {
+                    return Ok(None);
+                }
+                self.session_settings.reset(&name)?;
+                Ok(Some((Vec::new(), Vec::new())))
+            }
+        }
+    }
+
+    fn try_handle_prepared_query_plan_with_columns(
+        &self,
+        plan: &sql::LogicalPlan,
+    ) -> Result<Option<(Vec<Tuple>, Vec<String>)>> {
+        match plan {
+            sql::LogicalPlan::Prepare { name, statement, .. } => {
+                self.prepared_statements
+                    .write()
+                    .insert(name.clone(), *statement.clone());
+                self.prepared_statement_sql.write().remove(name);
+                self.prepared_fast_selects.write().remove(name);
+                Ok(Some((Vec::new(), Vec::new())))
+            }
+            sql::LogicalPlan::Execute { name, parameters } => {
+                let stored_plan = self.prepared_plan_or_lazy_fast_plan(name)?;
+
+                let empty_tuple = Tuple::new(vec![]);
+                let empty_schema = std::sync::Arc::new(Schema { columns: vec![] });
+                let evaluator = sql::Evaluator::new(empty_schema);
+                let param_values: Result<Vec<Value>> = parameters
+                    .iter()
+                    .map(|expr| evaluator.evaluate(expr, &empty_tuple))
+                    .collect();
+                let param_values = param_values?;
+
+                let columns = stored_plan
+                    .schema()
+                    .columns
+                    .iter()
+                    .map(|column| column.name.clone())
+                    .collect::<Vec<_>>();
+                if let Some(rows) = self.try_prepared_fast_select_rows(name, &param_values) {
+                    return Ok(Some((rows?, columns)));
+                }
+                let rows = if matches!(
+                    &stored_plan,
+                    sql::LogicalPlan::Insert { .. }
+                        | sql::LogicalPlan::InsertSelect { .. }
+                        | sql::LogicalPlan::Update { .. }
+                        | sql::LogicalPlan::Delete { .. }
+                ) {
+                    self.execute_plan_with_params(&stored_plan, &param_values, None)?.1
+                } else {
+                    self.query_plan_with_params(&stored_plan, &param_values, None)?
+                };
+                Ok(Some((rows, columns)))
+            }
+            sql::LogicalPlan::Deallocate { name } => {
+                if let Some(stmt_name) = name {
+                    if !self.remove_prepared_statement_state(stmt_name) {
+                        return Err(Error::query_execution(format!(
+                            "Prepared statement '{}' does not exist",
+                            stmt_name
+                        )));
+                    }
+                } else {
+                    self.prepared_statements.write().clear();
+                    self.prepared_statement_sql.write().clear();
+                    self.prepared_fast_selects.write().clear();
+                }
+                Ok(Some((Vec::new(), Vec::new())))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn try_handle_prepared_statement_sql_fast_with_columns(
+        &self,
+        sql: &str,
+    ) -> Result<Option<(Vec<Tuple>, Vec<String>)>> {
+        let trimmed = sql.trim().trim_end_matches(';').trim();
+
+        if let Some(rest) = strip_prefix_icase(trimmed, "PREPARE ") {
+            let Some((name, statement_sql)) = Self::split_fast_prepare(rest) else {
+                return Ok(None);
+            };
+            if let Some(spec) = self.fast_prepared_select_spec(statement_sql) {
+                let spec = spec?;
+                self.prepared_fast_selects.write().insert(name.clone(), spec);
+                self.prepared_statement_sql
+                    .write()
+                    .insert(name, statement_sql.to_string());
+                return Ok(Some((Vec::new(), Vec::new())));
+            }
+            let plan = (*self.parameterized_plan_cached(statement_sql)?).clone();
+            self.prepared_statements.write().insert(name.clone(), plan);
+            self.prepared_statement_sql
+                .write()
+                .insert(name, statement_sql.to_string());
+            return Ok(Some((Vec::new(), Vec::new())));
+        }
+
+        if let Some(rest) = strip_prefix_icase(trimmed, "EXECUTE ") {
+            let Some((name, params)) = Self::split_fast_execute(rest) else {
+                return Ok(None);
+            };
+            if let Some(result) = self.try_fast_prepared_select_with_columns(&name, &params) {
+                return Ok(Some(result?));
+            }
+            let stored_plan = self.prepared_plan_or_lazy_fast_plan(&name)?;
+
+            let columns = stored_plan
+                .schema()
+                .columns
+                .iter()
+                .map(|column| column.name.clone())
+                .collect::<Vec<_>>();
+            if let Some(rows) = self.try_prepared_fast_select_rows(&name, &params) {
+                return Ok(Some((rows?, columns)));
+            }
+            let rows = if matches!(
+                &stored_plan,
+                sql::LogicalPlan::Insert { .. }
+                    | sql::LogicalPlan::InsertSelect { .. }
+                    | sql::LogicalPlan::Update { .. }
+                    | sql::LogicalPlan::Delete { .. }
+            ) {
+                self.execute_plan_with_params(&stored_plan, &params, None)?.1
+            } else {
+                self.query_plan_with_params(&stored_plan, &params, None)?
+            };
+            return Ok(Some((rows, columns)));
+        }
+
+        if let Some(rest) = strip_prefix_icase(trimmed, "DEALLOCATE ") {
+            let name = rest.trim();
+            if name.eq_ignore_ascii_case("ALL") {
+                self.prepared_statements.write().clear();
+                self.prepared_statement_sql.write().clear();
+                self.prepared_fast_selects.write().clear();
+                return Ok(Some((Vec::new(), Vec::new())));
+            }
+            if name.is_empty() {
+                return Ok(None);
+            }
+            if !self.remove_prepared_statement_state(name) {
+                return Err(Error::query_execution(format!(
+                    "Prepared statement '{}' does not exist",
+                    name
+                )));
+            }
+            return Ok(Some((Vec::new(), Vec::new())));
+        }
+
+        Ok(None)
+    }
+
+    fn prepared_plan_or_lazy_fast_plan(&self, name: &str) -> Result<sql::LogicalPlan> {
+        if let Some(plan) = self.prepared_statements.read().get(name).cloned() {
+            return Ok(plan);
+        }
+
+        let source_sql = if self.prepared_fast_selects.read().contains_key(name) {
+            self.prepared_statement_sql.read().get(name).cloned()
+        } else {
+            None
+        };
+
+        let Some(source_sql) = source_sql else {
+            return Err(Error::query_execution(format!(
+                "Prepared statement '{}' does not exist",
+                name
+            )));
+        };
+
+        let plan = (*self.parameterized_plan_cached(&source_sql)?).clone();
+        self.prepared_statements.write().insert(name.to_string(), plan.clone());
+        Ok(plan)
+    }
+
+    fn remove_prepared_statement_state(&self, name: &str) -> bool {
+        let removed_plan = self.prepared_statements.write().remove(name).is_some();
+        let removed_sql = self.prepared_statement_sql.write().remove(name).is_some();
+        let removed_fast = self.prepared_fast_selects.write().remove(name).is_some();
+        removed_plan || removed_sql || removed_fast
+    }
+
+    fn try_prepared_fast_select_rows(&self, name: &str, params: &[Value]) -> Option<Result<Vec<Tuple>>> {
+        let source_sql = self.prepared_statement_sql.read().get(name).cloned()?;
+        self.try_fast_select_params(&source_sql, params)
+    }
+
+    fn fast_prepared_select_spec(&self, sql: &str) -> Option<Result<PreparedFastSelectSpec>> {
+        if self.in_transaction() {
+            return None;
+        }
+
+        let trimmed = sql.trim().trim_end_matches(';').trim();
+        if trimmed.len() < 20 || !trimmed.as_bytes().get(..6)?.eq_ignore_ascii_case(b"SELECT") {
+            return None;
+        }
+
+        let after_select = trimmed.get(6..)?.trim_start();
+        if !after_select.starts_with('*') {
+            return None;
+        }
+        let after_star = after_select.get(1..)?.trim_start();
+        if after_star.len() < 4 || !after_star.as_bytes().get(..4)?.eq_ignore_ascii_case(b"FROM") {
+            return None;
+        }
+
+        let after_from = after_star.get(4..)?.trim_start();
+        let table_end = after_from.find(|c: char| c.is_whitespace())?;
+        let table_name = after_from.get(..table_end)?.trim().trim_matches('"');
+        if table_name.is_empty() {
+            return None;
+        }
+
+        let rest = after_from.get(table_end..)?.trim_start();
+        if rest.len() < 5 || !rest.as_bytes().get(..5)?.eq_ignore_ascii_case(b"WHERE") {
+            return None;
+        }
+        let where_clause = rest.get(5..)?.trim_start();
+        if Self::contains_sql_keyword(where_clause, b"AND")
+            || Self::contains_sql_keyword(where_clause, b"OR")
+            || Self::contains_sql_keyword(where_clause, b"JOIN")
+            || Self::contains_sql_keyword(where_clause, b"ORDER")
+            || Self::contains_sql_keyword(where_clause, b"GROUP")
+            || Self::contains_sql_keyword(where_clause, b"LIMIT")
+        {
+            return None;
+        }
+
+        let where_clause = where_clause.strip_suffix(';').unwrap_or(where_clause).trim();
+        let eq_pos = where_clause.find('=')?;
+        let pk_col = where_clause.get(..eq_pos)?.trim().trim_matches('"');
+        let pk_val_str = where_clause.get(eq_pos + 1..)?.trim();
+        let param_index = pk_val_str.strip_prefix('$')?.parse::<usize>().ok()?;
+        if pk_col.is_empty() || param_index == 0 {
+            return None;
+        }
+
+        let select = match self.fast_select_spec(table_name, pk_col)? {
+            Ok(spec) => spec,
+            Err(e) => return Some(Err(e)),
+        };
+        Some(Ok(PreparedFastSelectSpec { select, param_index }))
+    }
+
+    fn try_fast_prepared_select_with_columns(
+        &self,
+        name: &str,
+        params: &[Value],
+    ) -> Option<Result<(Vec<Tuple>, Vec<String>)>> {
+        if self.in_transaction() {
+            return None;
+        }
+        let spec = self.prepared_fast_selects.read().get(name).cloned()?;
+        let mut value = match params.get(spec.param_index - 1) {
+            Some(value) => value.clone(),
+            None => {
+                return Some(Err(Error::query_execution(format!(
+                    "Parameter ${} not provided. Expected {} parameters, got {}",
+                    spec.param_index,
+                    spec.param_index,
+                    params.len()
+                ))))
+            }
+        };
+        if Self::insert_value_needs_cast(&value, &spec.select.pk_data_type) {
+            value = match Self::fast_cast_value(value, &spec.select.pk_data_type) {
+                Ok(value) => value,
+                Err(e) => return Some(Err(e)),
+            };
+        }
+        let columns = spec
+            .select
+            .schema
+            .columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect();
+        Some(self.fast_select_rows(&spec.select, &value).map(|rows| (rows, columns)))
+    }
+
+    fn split_fast_prepare(rest: &str) -> Option<(String, &str)> {
+        let upper = rest.to_uppercase();
+        let as_pos = upper.find(" AS ")?;
+        let header = rest[..as_pos].trim();
+        let statement_sql = rest[as_pos + " AS ".len()..].trim();
+        if header.is_empty() || statement_sql.is_empty() {
+            return None;
+        }
+        let name_end = header
+            .find(|c: char| c.is_whitespace() || c == '(')
+            .unwrap_or(header.len());
+        let name = header[..name_end].trim();
+        if name.is_empty() {
+            return None;
+        }
+        Some((name.to_string(), statement_sql))
+    }
+
+    fn split_fast_execute(rest: &str) -> Option<(String, Vec<Value>)> {
+        let rest = rest.trim();
+        if rest.is_empty() {
+            return None;
+        }
+        let name_end = rest.find(|c: char| c.is_whitespace() || c == '(').unwrap_or(rest.len());
+        let name = rest[..name_end].trim();
+        if name.is_empty() {
+            return None;
+        }
+        let args = rest[name_end..].trim();
+        if args.is_empty() {
+            return Some((name.to_string(), Vec::new()));
+        }
+        let args = args.strip_prefix('(')?.strip_suffix(')')?.trim();
+        if args.is_empty() {
+            return Some((name.to_string(), Vec::new()));
+        }
+        let mut params = Vec::new();
+        for raw in args.split(',') {
+            params.push(Self::parse_fast_prepared_literal(raw.trim())?);
+        }
+        Some((name.to_string(), params))
+    }
+
+    fn parse_fast_prepared_literal(raw: &str) -> Option<Value> {
+        if raw.eq_ignore_ascii_case("NULL") {
+            return Some(Value::Null);
+        }
+        if raw.starts_with('\'') && raw.ends_with('\'') && raw.len() >= 2 {
+            return Some(Value::String(raw[1..raw.len() - 1].replace("''", "'")));
+        }
+        if let Ok(value) = raw.parse::<i64>() {
+            return Some(Value::Int8(value));
+        }
+        None
+    }
+
     fn serialize_default_expr(default: &Option<sql::LogicalExpr>) -> Option<String> {
         default
             .as_ref()
@@ -906,9 +1351,32 @@ impl EmbeddedDatabase {
             return;
         }
 
-        self.result_cache.put(sql.to_string(), std::sync::Arc::new(results.to_vec()));
+        self.cache_query_result(sql, results);
+    }
+
+    fn cache_query_result(&self, sql: &str, results: &[Tuple]) {
+        let cached = std::sync::Arc::new(results.to_vec());
+        self.result_cache.put(sql.to_string(), std::sync::Arc::clone(&cached));
+        *self.hot_result_cache_entry.write() = Some((sql.to_string(), cached));
         self.result_cache_nonempty
             .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn cached_query_result(&self, sql: &str) -> Option<std::sync::Arc<Vec<Tuple>>> {
+        if let Some(cached) = self.hot_cached_query_result(sql) {
+            return Some(cached);
+        }
+
+        let cached = self.result_cache.get(sql)?;
+        *self.hot_result_cache_entry.write() = Some((sql.to_string(), std::sync::Arc::clone(&cached)));
+        Some(cached)
+    }
+
+    fn hot_cached_query_result(&self, sql: &str) -> Option<std::sync::Arc<Vec<Tuple>>> {
+        self.hot_result_cache_entry
+            .read()
+            .as_ref()
+            .and_then(|(hot_sql, rows)| (hot_sql == sql).then(|| std::sync::Arc::clone(rows)))
     }
 
     fn query_is_non_deterministic(sql: &str) -> bool {
@@ -1029,9 +1497,7 @@ impl EmbeddedDatabase {
         let normalized = value.trim_matches('\'').trim_matches('"').to_ascii_lowercase();
         match normalized.as_str() {
             "off" | "false" | "0" | "no" => Ok(Some(Some(false))),
-            "on" | "true" | "1" | "yes" | "local" | "remote_write" | "remote_apply" => {
-                Ok(Some(Some(true)))
-            }
+            "on" | "true" | "1" | "yes" | "local" | "remote_write" | "remote_apply" => Ok(Some(Some(true))),
             _ => Err(Error::query_execution(format!(
                 "invalid value for parameter \"synchronous_commit\": \"{}\"",
                 value
@@ -1266,8 +1732,7 @@ impl EmbeddedDatabase {
         *txn_ref = Some(txn);
         // Updated under the mutex: readers that skip the lock on a `false`
         // load behave exactly as if they had locked before this BEGIN.
-        self.global_txn_active
-            .store(true, std::sync::atomic::Ordering::Release);
+        self.global_txn_active.store(true, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 
@@ -1291,7 +1756,11 @@ impl EmbeddedDatabase {
             // transaction that overlapped other commits.
             // R1.3-p2: commit itself runs the row-cache fence when the cache
             // is wired; only unwired transactions need the caller-side sweep.
-            let written = if txn.has_row_cache() { Vec::new() } else { txn.written_data_keys() };
+            let written = if txn.has_row_cache() {
+                Vec::new()
+            } else {
+                txn.written_data_keys()
+            };
             let commit_ts = self.storage.next_commit_timestamp(txn.has_tracked_writes());
             txn.commit_with_timestamp(commit_ts)?;
             if !written.is_empty() {
@@ -1433,8 +1902,7 @@ impl EmbeddedDatabase {
     /// writing the main branch — the HNSW index is process-wide and serves
     /// main-branch kNN, so branch-isolated overlay writes must not mutate it.
     fn vector_dml_gate(&self, table_name: &str) -> bool {
-        self.storage.vector_indexes().table_has_indexes(table_name)
-            && self.storage.get_current_branch().is_none()
+        self.storage.vector_indexes().table_has_indexes(table_name) && self.storage.get_current_branch().is_none()
     }
 
     /// Try to parse HA switchover commands (ha-tier1 feature only)
@@ -1595,6 +2063,22 @@ impl EmbeddedDatabase {
         } else if sql::Parser::is_show_branches(sql) {
             // Parse SHOW BRANCHES statement
             sql::LogicalPlan::ShowBranches
+        } else if sql::Parser::is_create_materialized_view(sql)
+            && sql
+                .trim()
+                .get("CREATE MATERIALIZED VIEW".len()..)
+                .map(|rest| rest.trim_start())
+                .is_some_and(|rest| starts_with_icase(rest, "IF NOT EXISTS"))
+        {
+            // sqlparser does not currently accept `CREATE MATERIALIZED VIEW
+            // IF NOT EXISTS`; keep the existing MV/DMV execution path and
+            // only pre-parse the outer DDL wrapper here.
+            let (view_name, query_sql, if_not_exists) = sql::Parser::parse_create_materialized_view_sql(sql)?;
+            let (statement, _) = self.parse_cached(&query_sql)?;
+            let catalog = self.storage.catalog();
+            let planner = sql::Planner::with_catalog(&catalog).with_sql(query_sql);
+            let query_plan = planner.statement_to_plan(statement)?;
+            sql::phase3::MaterializedViewParser::parse_create_mv(view_name, query_plan, None, if_not_exists)?
         } else if sql::Parser::is_refresh_materialized_view(sql) {
             // Parse REFRESH MATERIALIZED VIEW statement
             let (view_name, concurrent, incremental) = sql::Parser::parse_refresh_materialized_view_sql(sql)?;
@@ -1913,606 +2397,623 @@ impl EmbeddedDatabase {
                 let mut pending_columnar: Vec<(u64, Tuple)> = Vec::new();
 
                 let loop_result: Result<u64> = (|| {
-                let mut count = 0;
-                for value_row in values {
-                    // Initialize tuple values for ALL columns (use None as placeholder)
-                    let mut tuple_values: Vec<Option<Value>> = vec![None; schema.columns.len()];
+                    let mut count = 0;
+                    for value_row in values {
+                        // Initialize tuple values for ALL columns (use None as placeholder)
+                        let mut tuple_values: Vec<Option<Value>> = vec![None; schema.columns.len()];
 
-                    // Fill in provided values
-                    for (val_idx, expr) in value_row.iter().enumerate() {
-                        let target_col_idx = if let Some(ref indices) = column_indices {
-                            if val_idx >= indices.len() {
-                                return Err(Error::query_execution("More values than columns specified"));
-                            }
-                            *indices
-                                .get(val_idx)
-                                .ok_or_else(|| Error::internal("column index out of bounds"))?
-                        } else {
-                            val_idx
-                        };
-
-                        // `DEFAULT` marker: leave the slot as None so
-                        // the default-fill pass below runs the column's
-                        // declared DEFAULT expression. Skips the NOT
-                        // NULL check for explicit NULL too — that's
-                        // only for literal NULL, not for DEFAULT.
-                        if matches!(expr, sql::LogicalExpr::DefaultValue) {
-                            continue;
-                        }
-
-                        let target_col = schema.get_column_at(target_col_idx).ok_or_else(|| {
-                            Error::query_execution(format!(
-                                "Too many values for INSERT: table has {} columns",
-                                schema.columns.len()
-                            ))
-                        })?;
-
-                        let target_type = &target_col.data_type;
-                        let mut value = evaluator.evaluate(expr, &empty_tuple)?;
-
-                        let needs_cast = match (&value, target_type) {
-                            (Value::Null, _) => false,
-                            (Value::Vector(_), DataType::Vector(_)) => true,
-                            (Value::String(_), DataType::Vector(_)) => true,
-                            (Value::String(_), DataType::Json | DataType::Jsonb) => true,
-                            (Value::Int4(_), DataType::Int4) => false,
-                            (Value::Int8(_), DataType::Int8) => false,
-                            (Value::Float4(_), DataType::Float4) => false,
-                            (Value::Float8(_), DataType::Float8) => false,
-                            (Value::String(_), DataType::Text | DataType::Varchar(_)) => false,
-                            (Value::Boolean(_), DataType::Boolean) => false,
-                            (Value::Json(_), DataType::Json | DataType::Jsonb) => false,
-                            _ => true,
-                        };
-
-                        if needs_cast {
-                            value = evaluator.cast_value(value, target_type)?;
-                        }
-
-                        // Enforce NOT NULL constraint for explicitly provided values
-                        if let Some(target_col_ref) = schema.get_column_at(target_col_idx) {
-                            if matches!(value, Value::Null) && !target_col_ref.nullable {
-                                return Err(Error::constraint_violation(format!(
-                                    "NOT NULL constraint violated: cannot insert NULL into column '{}'",
-                                    target_col_ref.name
-                                )));
-                            }
-                        }
-
-                        let tv = tuple_values
-                            .get_mut(target_col_idx)
-                            .ok_or_else(|| Error::internal("column index out of bounds"))?;
-                        *tv = Some(value);
-                    }
-
-                    // Fill in missing columns with defaults or NULL
-                    let final_values: Result<Vec<Value>> = tuple_values
-                        .into_iter()
-                        .enumerate()
-                        .map(|(idx, opt_val)| {
-                            if let Some(val) = opt_val {
-                                Ok(val)
+                        // Fill in provided values
+                        for (val_idx, expr) in value_row.iter().enumerate() {
+                            let target_col_idx = if let Some(ref indices) = column_indices {
+                                if val_idx >= indices.len() {
+                                    return Err(Error::query_execution("More values than columns specified"));
+                                }
+                                *indices
+                                    .get(val_idx)
+                                    .ok_or_else(|| Error::internal("column index out of bounds"))?
                             } else {
-                                // Column not provided, use default or NULL
-                                let col = schema
-                                    .get_column_at(idx)
-                                    .ok_or_else(|| Error::internal("column index out of bounds"))?;
-                                if let Some(ref default_expr) = default_exprs.get(idx).and_then(|d| d.as_ref()) {
-                                    // Evaluate default expression
-                                    let mut value = evaluator.evaluate(default_expr, &empty_tuple)?;
-                                    // Cast if needed
-                                    if value.data_type() != col.data_type {
-                                        value = evaluator.cast_value(value, &col.data_type)?;
-                                    }
-                                    Ok(value)
-                                } else if col.primary_key {
-                                    // PK column omitted from INSERT — fill with NULL so
-                                    // the SERIAL auto-fill logic replaces it with row_id.
-                                    Ok(Value::Null)
-                                } else if col.nullable {
-                                    Ok(Value::Null)
-                                } else {
-                                    Err(Error::query_execution(format!(
-                                        "Column '{}' does not have a default value and is not nullable",
-                                        col.name
-                                    )))
+                                val_idx
+                            };
+
+                            // `DEFAULT` marker: leave the slot as None so
+                            // the default-fill pass below runs the column's
+                            // declared DEFAULT expression. Skips the NOT
+                            // NULL check for explicit NULL too — that's
+                            // only for literal NULL, not for DEFAULT.
+                            if matches!(expr, sql::LogicalExpr::DefaultValue) {
+                                continue;
+                            }
+
+                            let target_col = schema.get_column_at(target_col_idx).ok_or_else(|| {
+                                Error::query_execution(format!(
+                                    "Too many values for INSERT: table has {} columns",
+                                    schema.columns.len()
+                                ))
+                            })?;
+
+                            let target_type = &target_col.data_type;
+                            let mut value = evaluator.evaluate(expr, &empty_tuple)?;
+
+                            let needs_cast = match (&value, target_type) {
+                                (Value::Null, _) => false,
+                                (Value::Vector(_), DataType::Vector(_)) => true,
+                                (Value::String(_), DataType::Vector(_)) => true,
+                                (Value::String(_), DataType::Json | DataType::Jsonb) => true,
+                                (Value::Int4(_), DataType::Int4) => false,
+                                (Value::Int8(_), DataType::Int8) => false,
+                                (Value::Float4(_), DataType::Float4) => false,
+                                (Value::Float8(_), DataType::Float8) => false,
+                                (Value::String(_), DataType::Text | DataType::Varchar(_)) => false,
+                                (Value::Boolean(_), DataType::Boolean) => false,
+                                (Value::Json(_), DataType::Json | DataType::Jsonb) => false,
+                                _ => true,
+                            };
+
+                            if needs_cast {
+                                value = evaluator.cast_value(value, target_type)?;
+                            }
+
+                            // Enforce NOT NULL constraint for explicitly provided values
+                            if let Some(target_col_ref) = schema.get_column_at(target_col_idx) {
+                                if matches!(value, Value::Null) && !target_col_ref.nullable {
+                                    return Err(Error::constraint_violation(format!(
+                                        "NOT NULL constraint violated: cannot insert NULL into column '{}'",
+                                        target_col_ref.name
+                                    )));
                                 }
                             }
-                        })
-                        .collect();
 
-                    let final_values_vec = final_values?;
+                            let tv = tuple_values
+                                .get_mut(target_col_idx)
+                                .ok_or_else(|| Error::internal("column index out of bounds"))?;
+                            *tv = Some(value);
+                        }
 
-                    // Enforce NOT NULL on columns the user passed
-                    // `NULL` for explicitly. Omitted columns were
-                    // already handled above (default-expr or error).
-                    // PK columns are left for SERIAL/IDENTITY auto-fill
-                    // to populate in the storage layer.
-                    for (idx, col) in schema.columns.iter().enumerate() {
-                        if !col.nullable && !col.primary_key {
-                            if matches!(final_values_vec.get(idx), Some(Value::Null)) {
+                        // Fill in missing columns with defaults or NULL
+                        let final_values: Result<Vec<Value>> = tuple_values
+                            .into_iter()
+                            .enumerate()
+                            .map(|(idx, opt_val)| {
+                                if let Some(val) = opt_val {
+                                    Ok(val)
+                                } else {
+                                    // Column not provided, use default or NULL
+                                    let col = schema
+                                        .get_column_at(idx)
+                                        .ok_or_else(|| Error::internal("column index out of bounds"))?;
+                                    if let Some(ref default_expr) = default_exprs.get(idx).and_then(|d| d.as_ref()) {
+                                        // Evaluate default expression
+                                        let mut value = evaluator.evaluate(default_expr, &empty_tuple)?;
+                                        // Cast if needed
+                                        if value.data_type() != col.data_type {
+                                            value = evaluator.cast_value(value, &col.data_type)?;
+                                        }
+                                        Ok(value)
+                                    } else if col.primary_key {
+                                        // PK column omitted from INSERT — fill with NULL so
+                                        // the SERIAL auto-fill logic replaces it with row_id.
+                                        Ok(Value::Null)
+                                    } else if col.nullable {
+                                        Ok(Value::Null)
+                                    } else {
+                                        Err(Error::query_execution(format!(
+                                            "Column '{}' does not have a default value and is not nullable",
+                                            col.name
+                                        )))
+                                    }
+                                }
+                            })
+                            .collect();
+
+                        let final_values_vec = final_values?;
+
+                        // Enforce NOT NULL on columns the user passed
+                        // `NULL` for explicitly. Omitted columns were
+                        // already handled above (default-expr or error).
+                        // PK columns are left for SERIAL/IDENTITY auto-fill
+                        // to populate in the storage layer.
+                        for (idx, col) in schema.columns.iter().enumerate() {
+                            if !col.nullable && !col.primary_key {
+                                if matches!(final_values_vec.get(idx), Some(Value::Null)) {
+                                    return Err(Error::constraint_violation(format!(
+                                        "NOT NULL constraint violated: cannot insert NULL into column '{}'",
+                                        col.name
+                                    )));
+                                }
+                            }
+                        }
+
+                        let mut tuple = Tuple::new(final_values_vec.clone());
+
+                        // Validate CHECK constraints
+                        let table_constraints = catalog.load_table_constraints(table_name)?;
+                        for check in &table_constraints.check_constraints {
+                            // Parse and evaluate the CHECK expression
+                            let check_result =
+                                self.evaluate_check_constraint(&check.expression, &schema, &final_values_vec)?;
+
+                            if !check_result {
                                 return Err(Error::constraint_violation(format!(
-                                    "NOT NULL constraint violated: cannot insert NULL into column '{}'",
-                                    col.name
+                                    "CHECK constraint '{}' violated: expression '{}' evaluated to false",
+                                    check.name, check.expression
                                 )));
                             }
                         }
-                    }
 
-                    let mut tuple = Tuple::new(final_values_vec.clone());
-
-                    // Validate CHECK constraints
-                    let table_constraints = catalog.load_table_constraints(table_name)?;
-                    for check in &table_constraints.check_constraints {
-                        // Parse and evaluate the CHECK expression
-                        let check_result =
-                            self.evaluate_check_constraint(&check.expression, &schema, &final_values_vec)?;
-
-                        if !check_result {
-                            return Err(Error::constraint_violation(format!(
-                                "CHECK constraint '{}' violated: expression '{}' evaluated to false",
-                                check.name, check.expression
-                            )));
-                        }
-                    }
-
-                    // Validate UNIQUE constraints via ART index (O(1) lookup instead of O(N) table scan)
-                    // When ON CONFLICT is specified, intercept constraint violations for upsert/skip
-                    {
-                        let mut col_values_map = std::collections::HashMap::new();
-                        for (i, col) in schema.columns.iter().enumerate() {
-                            if let Some(v) = final_values_vec.get(i) {
-                                col_values_map.insert(col.name.clone(), v.clone());
-                            }
-                        }
-                        if let Err(e) = self
-                            .storage
-                            .art_indexes()
-                            .check_unique_constraints(table_name, &col_values_map)
+                        // Validate UNIQUE constraints via ART index (O(1) lookup instead of O(N) table scan)
+                        // When ON CONFLICT is specified, intercept constraint violations for upsert/skip
                         {
-                            match on_conflict {
-                                Some(sql::logical_plan::OnConflictAction::DoNothing) => {
-                                    // Skip this row silently
-                                    continue;
+                            let mut col_values_map = std::collections::HashMap::new();
+                            for (i, col) in schema.columns.iter().enumerate() {
+                                if let Some(v) = final_values_vec.get(i) {
+                                    col_values_map.insert(col.name.clone(), v.clone());
                                 }
-                                Some(sql::logical_plan::OnConflictAction::DoUpdate { assignments, selection }) => {
-                                    // Upsert: find existing row by the conflicting constraint and update it.
-                                    // The conflict might be on PK or a UNIQUE key — extract which from the error.
-                                    let err_msg = e.to_string();
-
-                                    // Build a map of insert column name -> proposed value for EXCLUDED resolution
-                                    let mut excluded_map = std::collections::HashMap::new();
-                                    for (i, col) in schema.columns.iter().enumerate() {
-                                        if let Some(v) = final_values_vec.get(i) {
-                                            excluded_map.insert(col.name.to_lowercase(), v.clone());
-                                        }
+                            }
+                            if let Err(e) = self
+                                .storage
+                                .art_indexes()
+                                .check_unique_constraints(table_name, &col_values_map)
+                            {
+                                match on_conflict {
+                                    Some(sql::logical_plan::OnConflictAction::DoNothing) => {
+                                        // Skip this row silently
+                                        continue;
                                     }
+                                    Some(sql::logical_plan::OnConflictAction::DoUpdate { assignments, selection }) => {
+                                        // Upsert: find existing row by the conflicting constraint and update it.
+                                        // The conflict might be on PK or a UNIQUE key — extract which from the error.
+                                        let err_msg = e.to_string();
 
-                                    // Determine which column caused the conflict:
-                                    // 1. Try UNIQUE column mentioned in error message
-                                    // 2. Fall back to scanning UNIQUE columns for matching values
-                                    // 3. Last resort: try PK
-                                    let existing_row_id = {
-                                        let mut found_row_id: Option<u64> = None;
-
-                                        // Strategy 1: Try each UNIQUE column that has a non-null value in the INSERT
+                                        // Build a map of insert column name -> proposed value for EXCLUDED resolution
+                                        let mut excluded_map = std::collections::HashMap::new();
                                         for (i, col) in schema.columns.iter().enumerate() {
-                                            if (col.unique || col.primary_key) && !col.primary_key {
-                                                // UNIQUE (non-PK) column — check if it caused the conflict
-                                                if let Some(val) = final_values_vec.get(i) {
-                                                    if !matches!(val, Value::Null) {
-                                                        // Scan table for existing row with this UNIQUE value
-                                                        let scan_sql = format!(
-                                                            "SELECT {} FROM {} WHERE {} = '{}'",
-                                                            schema
-                                                                .columns
-                                                                .iter()
-                                                                .find(|c| c.primary_key)
-                                                                .map(|c| c.name.as_str())
-                                                                .unwrap_or("rowid"),
-                                                            table_name,
-                                                            col.name,
-                                                            val.to_string().trim_matches('\'')
-                                                        );
-                                                        if let Ok(rows) = self.query(&scan_sql, &[]) {
-                                                            if let Some(row) = rows.first() {
-                                                                if let Some(pk_val) = row.values.first() {
-                                                                    match pk_val {
-                                                                        Value::Int8(id) => {
-                                                                            found_row_id = Some(*id as u64);
+                                            if let Some(v) = final_values_vec.get(i) {
+                                                excluded_map.insert(col.name.to_lowercase(), v.clone());
+                                            }
+                                        }
+
+                                        // Determine which column caused the conflict:
+                                        // 1. Try UNIQUE column mentioned in error message
+                                        // 2. Fall back to scanning UNIQUE columns for matching values
+                                        // 3. Last resort: try PK
+                                        let existing_row_id = {
+                                            let mut found_row_id: Option<u64> = None;
+
+                                            // Strategy 1: Try each UNIQUE column that has a non-null value in the INSERT
+                                            for (i, col) in schema.columns.iter().enumerate() {
+                                                if (col.unique || col.primary_key) && !col.primary_key {
+                                                    // UNIQUE (non-PK) column — check if it caused the conflict
+                                                    if let Some(val) = final_values_vec.get(i) {
+                                                        if !matches!(val, Value::Null) {
+                                                            // Scan table for existing row with this UNIQUE value
+                                                            let scan_sql = format!(
+                                                                "SELECT {} FROM {} WHERE {} = '{}'",
+                                                                schema
+                                                                    .columns
+                                                                    .iter()
+                                                                    .find(|c| c.primary_key)
+                                                                    .map(|c| c.name.as_str())
+                                                                    .unwrap_or("rowid"),
+                                                                table_name,
+                                                                col.name,
+                                                                val.to_string().trim_matches('\'')
+                                                            );
+                                                            if let Ok(rows) = self.query(&scan_sql, &[]) {
+                                                                if let Some(row) = rows.first() {
+                                                                    if let Some(pk_val) = row.values.first() {
+                                                                        match pk_val {
+                                                                            Value::Int8(id) => {
+                                                                                found_row_id = Some(*id as u64);
+                                                                            }
+                                                                            Value::Int4(id) => {
+                                                                                found_row_id = Some(*id as u64);
+                                                                            }
+                                                                            _ => {}
                                                                         }
-                                                                        Value::Int4(id) => {
-                                                                            found_row_id = Some(*id as u64);
-                                                                        }
-                                                                        _ => {}
                                                                     }
                                                                 }
                                                             }
-                                                        }
-                                                        if found_row_id.is_some() {
-                                                            break;
+                                                            if found_row_id.is_some() {
+                                                                break;
+                                                            }
                                                         }
                                                     }
                                                 }
                                             }
-                                        }
 
-                                        // Strategy 2: Try PK lookup (for PK conflicts)
-                                        if found_row_id.is_none() {
-                                            let pk_cols: Vec<(usize, &crate::Column)> = schema
-                                                .columns
-                                                .iter()
-                                                .enumerate()
-                                                .filter(|(_, c)| c.primary_key)
-                                                .collect();
-                                            let pk_values: Vec<Value> = pk_cols
-                                                .iter()
-                                                .filter_map(|(idx, _)| final_values_vec.get(*idx).cloned())
-                                                .collect();
-                                            if !pk_values.is_empty()
-                                                && !pk_values.iter().any(|v| matches!(v, Value::Null))
-                                            {
-                                                let pk_key = crate::storage::ArtIndexManager::encode_key(&pk_values);
-                                                found_row_id =
-                                                    self.storage.art_indexes().pk_index_lookup(table_name, &pk_key);
+                                            // Strategy 2: Try PK lookup (for PK conflicts)
+                                            if found_row_id.is_none() {
+                                                let pk_cols: Vec<(usize, &crate::Column)> = schema
+                                                    .columns
+                                                    .iter()
+                                                    .enumerate()
+                                                    .filter(|(_, c)| c.primary_key)
+                                                    .collect();
+                                                let pk_values: Vec<Value> = pk_cols
+                                                    .iter()
+                                                    .filter_map(|(idx, _)| final_values_vec.get(*idx).cloned())
+                                                    .collect();
+                                                if !pk_values.is_empty()
+                                                    && !pk_values.iter().any(|v| matches!(v, Value::Null))
+                                                {
+                                                    let pk_key =
+                                                        crate::storage::ArtIndexManager::encode_key(&pk_values);
+                                                    found_row_id =
+                                                        self.storage.art_indexes().pk_index_lookup(table_name, &pk_key);
+                                                }
                                             }
-                                        }
 
-                                        found_row_id.ok_or_else(|| {
-                                            Error::query_execution(format!(
-                                                "ON CONFLICT DO UPDATE: could not find existing row ({})",
-                                                err_msg
-                                            ))
-                                        })?
-                                    };
+                                            found_row_id.ok_or_else(|| {
+                                                Error::query_execution(format!(
+                                                    "ON CONFLICT DO UPDATE: could not find existing row ({})",
+                                                    err_msg
+                                                ))
+                                            })?
+                                        };
 
-                                    // Read existing row through the transaction so that rows
-                                    // inserted earlier in the SAME transaction (still in the
-                                    // write set, not yet flushed to storage) are visible.
-                                    // Falls back to direct storage read for rows committed
-                                    // before this transaction started.
-                                    let existing_key = self.storage.branch_aware_data_key(table_name, existing_row_id);
-                                    let existing_raw = match txn.get(&existing_key)? {
-                                        Some(raw) => raw,
-                                        None => self.storage.get(&existing_key)?.ok_or_else(|| {
-                                            Error::query_execution(
-                                                "ON CONFLICT DO UPDATE: existing row not found in storage",
-                                            )
-                                        })?,
-                                    };
-                                    let mut existing_tuple: Tuple =
-                                        bincode::deserialize(&existing_raw).map_err(|err| {
-                                            Error::storage(format!("Failed to deserialize tuple: {}", err))
-                                        })?;
-                                    existing_tuple.row_id = Some(existing_row_id);
+                                        // Read existing row through the transaction so that rows
+                                        // inserted earlier in the SAME transaction (still in the
+                                        // write set, not yet flushed to storage) are visible.
+                                        // Falls back to direct storage read for rows committed
+                                        // before this transaction started.
+                                        let existing_key =
+                                            self.storage.branch_aware_data_key(table_name, existing_row_id);
+                                        let existing_raw = match txn.get(&existing_key)? {
+                                            Some(raw) => raw,
+                                            None => self.storage.get(&existing_key)?.ok_or_else(|| {
+                                                Error::query_execution(
+                                                    "ON CONFLICT DO UPDATE: existing row not found in storage",
+                                                )
+                                            })?,
+                                        };
+                                        let mut existing_tuple: Tuple =
+                                            bincode::deserialize(&existing_raw).map_err(|err| {
+                                                Error::storage(format!("Failed to deserialize tuple: {}", err))
+                                            })?;
+                                        existing_tuple.row_id = Some(existing_row_id);
 
-                                    // R5.V1: snapshot the pre-update row for HNSW vector
-                                    // maintenance (vector-indexed tables only).
-                                    let vector_pre_update_tuple = if self.vector_dml_gate(table_name) {
-                                        Some(existing_tuple.clone())
-                                    } else {
-                                        None
-                                    };
+                                        // R5.V1: snapshot the pre-update row for HNSW vector
+                                        // maintenance (vector-indexed tables only).
+                                        let vector_pre_update_tuple = if self.vector_dml_gate(table_name) {
+                                            Some(existing_tuple.clone())
+                                        } else {
+                                            None
+                                        };
 
-                                    // Apply assignments, resolving EXCLUDED references
-                                    let update_evaluator = sql::Evaluator::new(std::sync::Arc::new(
-                                        schema.clone().with_source_table_name(table_name),
-                                    ));
-                                    if let Some(predicate) = selection {
-                                        let resolved_predicate = Self::resolve_excluded_refs(predicate, &excluded_map);
-                                        match update_evaluator.evaluate(&resolved_predicate, &existing_tuple)? {
-                                            Value::Boolean(true) => {}
-                                            Value::Boolean(false) | Value::Null => {
-                                                continue;
-                                            }
-                                            other => {
-                                                return Err(Error::query_execution(format!(
+                                        // Apply assignments, resolving EXCLUDED references
+                                        let update_evaluator = sql::Evaluator::new(std::sync::Arc::new(
+                                            schema.clone().with_source_table_name(table_name),
+                                        ));
+                                        if let Some(predicate) = selection {
+                                            let resolved_predicate =
+                                                Self::resolve_excluded_refs(predicate, &excluded_map);
+                                            match update_evaluator.evaluate(&resolved_predicate, &existing_tuple)? {
+                                                Value::Boolean(true) => {}
+                                                Value::Boolean(false) | Value::Null => {
+                                                    continue;
+                                                }
+                                                other => {
+                                                    return Err(Error::query_execution(format!(
                                                     "ON CONFLICT DO UPDATE WHERE expression evaluated to non-boolean value: {:?}",
                                                     other
                                                 )));
+                                                }
                                             }
                                         }
-                                    }
-                                    for (col_name, expr) in assignments {
-                                        let target_idx = schema
-                                            .columns
-                                            .iter()
-                                            .position(|c| c.name.eq_ignore_ascii_case(col_name))
-                                            .ok_or_else(|| {
-                                                Error::query_execution(format!(
-                                                    "ON CONFLICT DO UPDATE: column '{}' not found",
-                                                    col_name
-                                                ))
-                                            })?;
+                                        for (col_name, expr) in assignments {
+                                            let target_idx = schema
+                                                .columns
+                                                .iter()
+                                                .position(|c| c.name.eq_ignore_ascii_case(col_name))
+                                                .ok_or_else(|| {
+                                                    Error::query_execution(format!(
+                                                        "ON CONFLICT DO UPDATE: column '{}' not found",
+                                                        col_name
+                                                    ))
+                                                })?;
 
-                                        // Resolve EXCLUDED references in the expression
-                                        let resolved_expr = Self::resolve_excluded_refs(expr, &excluded_map);
-                                        let mut new_val = update_evaluator.evaluate(&resolved_expr, &existing_tuple)?;
-                                        // Cast if needed
-                                        let target_type = &schema
-                                            .columns
-                                            .get(target_idx)
-                                            .ok_or_else(|| Error::internal("column index out of bounds"))?
-                                            .data_type;
-                                        if new_val.data_type() != *target_type && !matches!(new_val, Value::Null) {
-                                            new_val = update_evaluator.cast_value(new_val, target_type)?;
-                                        }
-                                        if target_idx < existing_tuple.values.len() {
-                                            #[allow(clippy::indexing_slicing)]
-                                            {
-                                                existing_tuple.values[target_idx] = new_val;
+                                            // Resolve EXCLUDED references in the expression
+                                            let resolved_expr = Self::resolve_excluded_refs(expr, &excluded_map);
+                                            let mut new_val =
+                                                update_evaluator.evaluate(&resolved_expr, &existing_tuple)?;
+                                            // Cast if needed
+                                            let target_type = &schema
+                                                .columns
+                                                .get(target_idx)
+                                                .ok_or_else(|| Error::internal("column index out of bounds"))?
+                                                .data_type;
+                                            if new_val.data_type() != *target_type && !matches!(new_val, Value::Null) {
+                                                new_val = update_evaluator.cast_value(new_val, target_type)?;
+                                            }
+                                            if target_idx < existing_tuple.values.len() {
+                                                #[allow(clippy::indexing_slicing)]
+                                                {
+                                                    existing_tuple.values[target_idx] = new_val;
+                                                }
                                             }
                                         }
-                                    }
 
-                                    // Write updated tuple back; columnar side-data is staged
-                                    // grouped after the row loop (R3.3). Keep the row bytes
-                                    // logical in the write set so read-your-own-writes returns
-                                    // values, not storage references.
-                                    if stage_columnar_grouped {
-                                        pending_columnar.push((existing_row_id, existing_tuple.clone()));
-                                    }
-                                    let updated_val = bincode::serialize(&existing_tuple)
-                                        .map_err(|err| Error::storage(err.to_string()))?;
-                                    txn.put(existing_key.clone(), updated_val.clone())?;
-
-                                    // Update ART index
-                                    {
-                                        let mut updated_col_values = std::collections::HashMap::new();
-                                        for (i, col) in schema.columns.iter().enumerate() {
-                                            if let Some(v) = existing_tuple.values.get(i) {
-                                                updated_col_values.insert(col.name.clone(), v.clone());
-                                            }
+                                        // Write updated tuple back; columnar side-data is staged
+                                        // grouped after the row loop (R3.3). Keep the row bytes
+                                        // logical in the write set so read-your-own-writes returns
+                                        // values, not storage references.
+                                        if stage_columnar_grouped {
+                                            pending_columnar.push((existing_row_id, existing_tuple.clone()));
                                         }
-                                        // Remove old entry and insert new one
-                                        let _ = self.storage.art_indexes().on_delete(
-                                            table_name,
-                                            existing_row_id,
-                                            &col_values_map,
-                                        );
-                                        let _ = self.storage.art_indexes().on_insert(
-                                            table_name,
-                                            existing_row_id,
-                                            &updated_col_values,
-                                        );
-                                    }
+                                        let updated_val = bincode::serialize(&existing_tuple)
+                                            .map_err(|err| Error::storage(err.to_string()))?;
+                                        txn.put(existing_key.clone(), updated_val.clone())?;
 
-                                    // R5.V1: re-index the row's vector if the DO UPDATE
-                                    // changed it (undo on rollback).
-                                    if let Some(old_tuple) = &vector_pre_update_tuple {
-                                        let vops = self.storage.vector_indexes().on_row_update(
-                                            table_name,
-                                            existing_row_id,
-                                            &schema,
-                                            Some(old_tuple),
-                                            &existing_tuple,
-                                        );
-                                        self.push_vector_undo(txn, vops);
-                                    }
-
-                                    // Log to WAL for replication
-                                    if !skip_fast_paths && self.storage.is_wal_enabled() {
-                                        if self.storage.fast_dml_requires_logical_wal() {
-                                            self.storage.log_data_insert(table_name, &existing_key, &updated_val)?;
-                                        } else {
-                                            self.storage
-                                                .log_data_insert_nosync(table_name, &existing_key, &updated_val)?;
-                                        }
-                                    }
-
-                                    // Invalidate result cache on update
-                                    self.invalidate_result_cache();
-
-                                    count += 1;
-
-                                    // Collect for RETURNING if needed
-                                    if has_returning {
-                                        if let Some(projected) =
-                                            Self::project_returning_columns(&existing_tuple, &schema, returning)
+                                        // Update ART index
                                         {
-                                            returned_tuples.push(projected);
+                                            let mut updated_col_values = std::collections::HashMap::new();
+                                            for (i, col) in schema.columns.iter().enumerate() {
+                                                if let Some(v) = existing_tuple.values.get(i) {
+                                                    updated_col_values.insert(col.name.clone(), v.clone());
+                                                }
+                                            }
+                                            // Remove old entry and insert new one
+                                            let _ = self.storage.art_indexes().on_delete(
+                                                table_name,
+                                                existing_row_id,
+                                                &col_values_map,
+                                            );
+                                            let _ = self.storage.art_indexes().on_insert(
+                                                table_name,
+                                                existing_row_id,
+                                                &updated_col_values,
+                                            );
                                         }
+
+                                        // R5.V1: re-index the row's vector if the DO UPDATE
+                                        // changed it (undo on rollback).
+                                        if let Some(old_tuple) = &vector_pre_update_tuple {
+                                            let vops = self.storage.vector_indexes().on_row_update(
+                                                table_name,
+                                                existing_row_id,
+                                                &schema,
+                                                Some(old_tuple),
+                                                &existing_tuple,
+                                            );
+                                            self.push_vector_undo(txn, vops);
+                                        }
+
+                                        // Log to WAL for replication
+                                        if !skip_fast_paths && self.storage.is_wal_enabled() {
+                                            if self.storage.fast_dml_requires_logical_wal() {
+                                                self.storage.log_data_insert(
+                                                    table_name,
+                                                    &existing_key,
+                                                    &updated_val,
+                                                )?;
+                                            } else {
+                                                self.storage.log_data_insert_nosync(
+                                                    table_name,
+                                                    &existing_key,
+                                                    &updated_val,
+                                                )?;
+                                            }
+                                        }
+
+                                        // Invalidate result cache on update
+                                        self.invalidate_result_cache();
+
+                                        count += 1;
+
+                                        // Collect for RETURNING if needed
+                                        if has_returning {
+                                            if let Some(projected) =
+                                                Self::project_returning_columns(&existing_tuple, &schema, returning)
+                                            {
+                                                returned_tuples.push(projected);
+                                            }
+                                        }
+                                        continue;
                                     }
+                                    None => {
+                                        return Err(Error::constraint_violation(e.to_string()));
+                                    }
+                                }
+                            }
+                        }
+
+                        // Execute BEFORE INSERT triggers (skip if no triggers for this table)
+                        if has_triggers {
+                            let row_context = sql::triggers::TriggerRowContext::for_insert(tuple.clone());
+                            let db_ref = self.clone_for_trigger();
+                            let mut executor_fn =
+                                |stmt: &sql::LogicalPlan, _ctx: &sql::triggers::TriggerRowContext| -> Result<()> {
+                                    db_ref.execute_plan_internal(stmt)?;
+                                    Ok(())
+                                };
+
+                            let action = self.trigger_registry.execute_triggers(
+                                table_name,
+                                &trigger_event,
+                                &sql::logical_plan::TriggerTiming::Before,
+                                &row_context,
+                                &mut trigger_context,
+                                Some(std::sync::Arc::new(schema.clone())),
+                                &mut executor_fn,
+                            )?;
+
+                            // Handle trigger action
+                            match action {
+                                sql::triggers::TriggerAction::Abort(msg) => {
+                                    return Err(Error::query_execution(format!("INSERT aborted by trigger: {}", msg)));
+                                }
+                                sql::triggers::TriggerAction::Skip => {
+                                    // INSTEAD OF trigger - skip the insert
                                     continue;
                                 }
-                                None => {
-                                    return Err(Error::constraint_violation(e.to_string()));
+                                sql::triggers::TriggerAction::Continue => {
+                                    // Continue with insert
                                 }
                             }
                         }
-                    }
 
-                    // Execute BEFORE INSERT triggers (skip if no triggers for this table)
-                    if has_triggers {
-                        let row_context = sql::triggers::TriggerRowContext::for_insert(tuple.clone());
-                        let db_ref = self.clone_for_trigger();
-                        let mut executor_fn =
-                            |stmt: &sql::LogicalPlan, _ctx: &sql::triggers::TriggerRowContext| -> Result<()> {
-                                db_ref.execute_plan_internal(stmt)?;
-                                Ok(())
-                            };
+                        // Transactional insert (branch-aware).
+                        // R1.1: volatile row id + counter staged in the txn —
+                        // the durable next_row_id() paid a synced WAL append per
+                        // row on the plan arm (INSERT ... RETURNING et al).
+                        let row_id = self.storage.next_row_id_volatile(table_name);
+                        self.storage.stage_row_counter_in_transaction(table_name, row_id, txn)?;
+                        let key = self.storage.branch_aware_data_key(table_name, row_id);
 
-                        let action = self.trigger_registry.execute_triggers(
-                            table_name,
-                            &trigger_event,
-                            &sql::logical_plan::TriggerTiming::Before,
-                            &row_context,
-                            &mut trigger_context,
-                            Some(std::sync::Arc::new(schema.clone())),
-                            &mut executor_fn,
-                        )?;
-
-                        // Handle trigger action
-                        match action {
-                            sql::triggers::TriggerAction::Abort(msg) => {
-                                return Err(Error::query_execution(format!("INSERT aborted by trigger: {}", msg)));
-                            }
-                            sql::triggers::TriggerAction::Skip => {
-                                // INSTEAD OF trigger - skip the insert
-                                continue;
-                            }
-                            sql::triggers::TriggerAction::Continue => {
-                                // Continue with insert
-                            }
-                        }
-                    }
-
-                    // Transactional insert (branch-aware).
-                    // R1.1: volatile row id + counter staged in the txn —
-                    // the durable next_row_id() paid a synced WAL append per
-                    // row on the plan arm (INSERT ... RETURNING et al).
-                    let row_id = self.storage.next_row_id_volatile(table_name);
-                    self.storage.stage_row_counter_in_transaction(table_name, row_id, txn)?;
-                    let key = self.storage.branch_aware_data_key(table_name, row_id);
-
-                    // Fill NULL values in SERIAL/BIGSERIAL PK columns with the auto-generated row_id.
-                    // This makes LAST_INSERT_ID() and MAX(pk) return the correct value.
-                    for (i, col) in schema.columns.iter().enumerate() {
-                        if col.primary_key {
-                            if let Some(v) = tuple.values.get(i) {
-                                if matches!(v, Value::Null) {
-                                    if i < tuple.values.len() {
-                                        #[allow(clippy::indexing_slicing)]
-                                        match col.data_type {
-                                            DataType::Int2 => {
-                                                tuple.values[i] = Value::Int2(row_id as i16);
-                                            }
-                                            DataType::Int4 => {
-                                                tuple.values[i] = Value::Int4(row_id as i32);
-                                            }
-                                            _ => {
-                                                tuple.values[i] = Value::Int8(row_id as i64);
+                        // Fill NULL values in SERIAL/BIGSERIAL PK columns with the auto-generated row_id.
+                        // This makes LAST_INSERT_ID() and MAX(pk) return the correct value.
+                        for (i, col) in schema.columns.iter().enumerate() {
+                            if col.primary_key {
+                                if let Some(v) = tuple.values.get(i) {
+                                    if matches!(v, Value::Null) {
+                                        if i < tuple.values.len() {
+                                            #[allow(clippy::indexing_slicing)]
+                                            match col.data_type {
+                                                DataType::Int2 => {
+                                                    tuple.values[i] = Value::Int2(row_id as i16);
+                                                }
+                                                DataType::Int4 => {
+                                                    tuple.values[i] = Value::Int4(row_id as i32);
+                                                }
+                                                _ => {
+                                                    tuple.values[i] = Value::Int8(row_id as i64);
+                                                }
                                             }
                                         }
                                     }
                                 }
                             }
                         }
-                    }
 
-                    // Build column-name → Value map up front; reused for
-                    // FK validation and ART updates below.
-                    let mut col_values = std::collections::HashMap::new();
-                    for (i, col) in schema.columns.iter().enumerate() {
-                        if let Some(v) = tuple.values.get(i) {
-                            col_values.insert(col.name.clone(), v.clone());
-                        }
-                    }
-
-                    // FK validation on INSERT (Kanttban bug #6 fix).
-                    // Pass the active txn so the parent-existence check
-                    // sees in-flight inserts to the parent table within
-                    // the same transaction (read-your-own-writes).
-                    self.check_fk_constraints_on_write(table_name, &col_values, Some(txn))?;
-
-                    // Columnar side-data is staged grouped after the row loop
-                    // (R3.3); the row value stays logical for
-                    // read-your-own-writes.
-                    if stage_columnar_grouped {
-                        pending_columnar.push((row_id, tuple.clone()));
-                    }
-                    let val = bincode::serialize(&tuple).map_err(|e| Error::storage(e.to_string()))?;
-                    txn.put(key.clone(), val.clone())?;
-
-                    // Log to WAL for replication (skip in explicit transactions —
-                    // WAL entries should only reflect committed changes).
-                    // R1.1: nosync append by default (P0#2 contract).
-                    if !skip_fast_paths && self.storage.is_wal_enabled() {
-                        if self.storage.fast_dml_requires_logical_wal() {
-                            self.storage.log_data_insert(table_name, &key, &val)?;
-                        } else {
-                            self.storage.log_data_insert_nosync(table_name, &key, &val)?;
-                        }
-                    }
-
-                    // Update ART index for PK/unique constraint lookups
-                    {
-                        if let Err(e) = self.storage.art_indexes().on_insert(table_name, row_id, &col_values) {
-                            tracing::debug!("ART index insert for '{}': {}", table_name, e);
-                        }
-                        self.push_art_undo(txn, ArtUndoOp::RemoveInserted {
-                            table_name: table_name.clone(),
-                            row_id,
-                            col_values,
-                        });
-                    }
-
-                    // R5.V1: eagerly maintain HNSW vector indexes (undo on rollback)
-                    if self.vector_dml_gate(table_name) {
-                        let vops = self
-                            .storage
-                            .vector_indexes()
-                            .on_row_insert(table_name, row_id, &schema, &tuple);
-                        self.push_vector_undo(txn, vops);
-                    }
-
-                    count += 1;
-
-                    // Collect tuple for RETURNING clause
-                    if has_returning {
-                        // Create tuple with row_id populated for reference
-                        let mut returned_tuple = tuple.clone();
-                        returned_tuple.row_id = Some(row_id);
-                        if let Some(projected) = Self::project_returning_columns(&returned_tuple, &schema, returning) {
-                            returned_tuples.push(projected);
-                        }
-                    }
-
-                    // Update storage quota tracking
-                    if let Some(context) = self.tenant_manager.get_current_context() {
-                        // Use already-serialized val length (avoid double serialization)
-                        let tuple_size = val.len() as u64;
-
-                        // Get current storage and add new tuple size
-                        if let Some(current_quota) = self.tenant_manager.get_quota_tracking(context.tenant_id) {
-                            let new_storage = current_quota.storage_bytes_used + tuple_size;
-                            if let Err(e) = self.tenant_manager.update_storage_usage(context.tenant_id, new_storage) {
-                                // Storage quota exceeded - rollback will happen automatically
-                                return Err(Error::query_execution(format!("Storage quota exceeded: {}", e)));
+                        // Build column-name → Value map up front; reused for
+                        // FK validation and ART updates below.
+                        let mut col_values = std::collections::HashMap::new();
+                        for (i, col) in schema.columns.iter().enumerate() {
+                            if let Some(v) = tuple.values.get(i) {
+                                col_values.insert(col.name.clone(), v.clone());
                             }
                         }
 
-                        // Record CDC event for INSERT
-                        let new_values = serde_json::to_string(&tuple.values).unwrap_or_else(|_| "[]".to_string());
+                        // FK validation on INSERT (Kanttban bug #6 fix).
+                        // Pass the active txn so the parent-existence check
+                        // sees in-flight inserts to the parent table within
+                        // the same transaction (read-your-own-writes).
+                        self.check_fk_constraints_on_write(table_name, &col_values, Some(txn))?;
 
-                        self.tenant_manager.record_change_event(
-                            crate::tenant::ChangeType::Insert,
-                            table_name.to_string(),
-                            row_id.to_string(),
-                            None, // no old values for INSERT
-                            Some(new_values),
-                            context.tenant_id,
-                            None, // transaction_id could be added if tracked
-                        );
-                    }
+                        // Columnar side-data is staged grouped after the row loop
+                        // (R3.3); the row value stays logical for
+                        // read-your-own-writes.
+                        if stage_columnar_grouped {
+                            pending_columnar.push((row_id, tuple.clone()));
+                        }
+                        let val = bincode::serialize(&tuple).map_err(|e| Error::storage(e.to_string()))?;
+                        txn.put(key.clone(), val.clone())?;
 
-                    // Execute AFTER INSERT triggers (skip if no triggers)
-                    if has_triggers {
-                        let row_context = sql::triggers::TriggerRowContext::for_insert(tuple.clone());
-                        let db_ref = self.clone_for_trigger();
-                        let mut executor_fn =
-                            |stmt: &sql::LogicalPlan, _ctx: &sql::triggers::TriggerRowContext| -> Result<()> {
-                                db_ref.execute_plan_internal(stmt)?;
-                                Ok(())
-                            };
-                        let action = self.trigger_registry.execute_triggers(
-                            table_name,
-                            &trigger_event,
-                            &sql::logical_plan::TriggerTiming::After,
-                            &row_context,
-                            &mut trigger_context,
-                            Some(std::sync::Arc::new(schema.clone())),
-                            &mut executor_fn,
-                        )?;
-                        if let sql::triggers::TriggerAction::Abort(msg) = action {
-                            return Err(Error::query_execution(format!(
-                                "INSERT aborted by AFTER trigger: {}",
-                                msg
-                            )));
+                        // Log to WAL for replication (skip in explicit transactions —
+                        // WAL entries should only reflect committed changes).
+                        // R1.1: nosync append by default (P0#2 contract).
+                        if !skip_fast_paths && self.storage.is_wal_enabled() {
+                            if self.storage.fast_dml_requires_logical_wal() {
+                                self.storage.log_data_insert(table_name, &key, &val)?;
+                            } else {
+                                self.storage.log_data_insert_nosync(table_name, &key, &val)?;
+                            }
+                        }
+
+                        // Update ART index for PK/unique constraint lookups
+                        {
+                            if let Err(e) = self.storage.art_indexes().on_insert(table_name, row_id, &col_values) {
+                                tracing::debug!("ART index insert for '{}': {}", table_name, e);
+                            }
+                            self.push_art_undo(
+                                txn,
+                                ArtUndoOp::RemoveInserted {
+                                    table_name: table_name.clone(),
+                                    row_id,
+                                    col_values,
+                                },
+                            );
+                        }
+
+                        // R5.V1: eagerly maintain HNSW vector indexes (undo on rollback)
+                        if self.vector_dml_gate(table_name) {
+                            let vops = self
+                                .storage
+                                .vector_indexes()
+                                .on_row_insert(table_name, row_id, &schema, &tuple);
+                            self.push_vector_undo(txn, vops);
+                        }
+
+                        count += 1;
+
+                        // Collect tuple for RETURNING clause
+                        if has_returning {
+                            // Create tuple with row_id populated for reference
+                            let mut returned_tuple = tuple.clone();
+                            returned_tuple.row_id = Some(row_id);
+                            if let Some(projected) =
+                                Self::project_returning_columns(&returned_tuple, &schema, returning)
+                            {
+                                returned_tuples.push(projected);
+                            }
+                        }
+
+                        // Update storage quota tracking
+                        if let Some(context) = self.tenant_manager.get_current_context() {
+                            // Use already-serialized val length (avoid double serialization)
+                            let tuple_size = val.len() as u64;
+
+                            // Get current storage and add new tuple size
+                            if let Some(current_quota) = self.tenant_manager.get_quota_tracking(context.tenant_id) {
+                                let new_storage = current_quota.storage_bytes_used + tuple_size;
+                                if let Err(e) = self.tenant_manager.update_storage_usage(context.tenant_id, new_storage)
+                                {
+                                    // Storage quota exceeded - rollback will happen automatically
+                                    return Err(Error::query_execution(format!("Storage quota exceeded: {}", e)));
+                                }
+                            }
+
+                            // Record CDC event for INSERT
+                            let new_values = serde_json::to_string(&tuple.values).unwrap_or_else(|_| "[]".to_string());
+
+                            self.tenant_manager.record_change_event(
+                                crate::tenant::ChangeType::Insert,
+                                table_name.to_string(),
+                                row_id.to_string(),
+                                None, // no old values for INSERT
+                                Some(new_values),
+                                context.tenant_id,
+                                None, // transaction_id could be added if tracked
+                            );
+                        }
+
+                        // Execute AFTER INSERT triggers (skip if no triggers)
+                        if has_triggers {
+                            let row_context = sql::triggers::TriggerRowContext::for_insert(tuple.clone());
+                            let db_ref = self.clone_for_trigger();
+                            let mut executor_fn =
+                                |stmt: &sql::LogicalPlan, _ctx: &sql::triggers::TriggerRowContext| -> Result<()> {
+                                    db_ref.execute_plan_internal(stmt)?;
+                                    Ok(())
+                                };
+                            let action = self.trigger_registry.execute_triggers(
+                                table_name,
+                                &trigger_event,
+                                &sql::logical_plan::TriggerTiming::After,
+                                &row_context,
+                                &mut trigger_context,
+                                Some(std::sync::Arc::new(schema.clone())),
+                                &mut executor_fn,
+                            )?;
+                            if let sql::triggers::TriggerAction::Abort(msg) = action {
+                                return Err(Error::query_execution(format!(
+                                    "INSERT aborted by AFTER trigger: {}",
+                                    msg
+                                )));
+                            }
                         }
                     }
-                }
-                Ok(count)
+                    Ok(count)
                 })();
 
                 // R3.3: stage the grouped columnar writes (values + presence
@@ -2521,8 +3022,10 @@ impl EmbeddedDatabase {
                 // the transaction keep their columnar side-data consistent
                 // (matching the old per-row staging order of effects).
                 if !pending_columnar.is_empty() {
-                    let row_refs: Vec<(u64, &Tuple)> =
-                        pending_columnar.iter().map(|(row_id, tuple)| (*row_id, tuple)).collect();
+                    let row_refs: Vec<(u64, &Tuple)> = pending_columnar
+                        .iter()
+                        .map(|(row_id, tuple)| (*row_id, tuple))
+                        .collect();
                     self.storage
                         .stage_columnar_rows_grouped_in_transaction(table_name, &row_refs, &schema, txn, true)?;
                 }
@@ -3184,10 +3687,8 @@ impl EmbeddedDatabase {
                         .art_indexes()
                         .tuple_update_affects_indexes(table_name, &schema, old_tuple, tuple)
                     {
-                        let mut old_col_values =
-                            std::collections::HashMap::with_capacity(schema.columns.len());
-                        let mut new_col_values =
-                            std::collections::HashMap::with_capacity(schema.columns.len());
+                        let mut old_col_values = std::collections::HashMap::with_capacity(schema.columns.len());
+                        let mut new_col_values = std::collections::HashMap::with_capacity(schema.columns.len());
                         for (i, col) in schema.columns.iter().enumerate() {
                             if let Some(v) = old_tuple.values.get(i) {
                                 old_col_values.insert(col.name.clone(), v.clone());
@@ -3210,12 +3711,15 @@ impl EmbeddedDatabase {
                         {
                             tracing::debug!("ART index update/insert-new for '{}': {}", table_name, e);
                         }
-                        self.push_art_undo(txn, ArtUndoOp::RestoreUpdated {
-                            table_name: table_name.clone(),
-                            row_id: *row_id,
-                            old_col_values,
-                            new_col_values,
-                        });
+                        self.push_art_undo(
+                            txn,
+                            ArtUndoOp::RestoreUpdated {
+                                table_name: table_name.clone(),
+                                row_id: *row_id,
+                                old_col_values,
+                                new_col_values,
+                            },
+                        );
                     }
 
                     // R5.V1: eagerly maintain HNSW vector indexes (undo on rollback)
@@ -3577,11 +4081,14 @@ impl EmbeddedDatabase {
                     if let Err(e) = self.storage.art_indexes().on_delete(table_name, *row_id, &col_values) {
                         tracing::debug!("ART index delete for table '{}': {}", table_name, e);
                     }
-                    self.push_art_undo(txn, ArtUndoOp::RestoreDeleted {
-                        table_name: table_name.clone(),
-                        row_id: *row_id,
-                        col_values,
-                    });
+                    self.push_art_undo(
+                        txn,
+                        ArtUndoOp::RestoreDeleted {
+                            table_name: table_name.clone(),
+                            row_id: *row_id,
+                            col_values,
+                        },
+                    );
 
                     // R5.V1: eagerly drop the row from HNSW vector indexes
                     // (undo on rollback)
@@ -4261,6 +4768,9 @@ impl EmbeddedDatabase {
             dirty_tracker,
             session_transactions: std::sync::Arc::new(dashmap::DashMap::new()),
             prepared_statements: std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
+            prepared_statement_sql: std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
+            prepared_fast_selects: std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
+            session_settings: sql::SessionSettings::new(),
             savepoints: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
             plan_cache: std::sync::Arc::new(sharded_lru::ShardedLruCache::new(
                 std::num::NonZeroUsize::new(256).expect("256 is non-zero"),
@@ -4272,6 +4782,7 @@ impl EmbeddedDatabase {
                 std::num::NonZeroUsize::new(128).expect("128 is non-zero"),
             )),
             result_cache_nonempty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            hot_result_cache_entry: std::sync::Arc::new(parking_lot::RwLock::new(None)),
             last_fast_select_fingerprint: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             fast_param_insert_cache: Self::new_fast_param_insert_cache(),
             fast_literal_insert_cache: Self::new_fast_literal_insert_cache(),
@@ -4341,6 +4852,9 @@ impl EmbeddedDatabase {
             dirty_tracker,
             session_transactions: std::sync::Arc::new(dashmap::DashMap::new()),
             prepared_statements: std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
+            prepared_statement_sql: std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
+            prepared_fast_selects: std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
+            session_settings: sql::SessionSettings::new(),
             savepoints: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
             plan_cache: std::sync::Arc::new(sharded_lru::ShardedLruCache::new(
                 std::num::NonZeroUsize::new(256).expect("256 is non-zero"),
@@ -4352,6 +4866,7 @@ impl EmbeddedDatabase {
                 std::num::NonZeroUsize::new(128).expect("128 is non-zero"),
             )),
             result_cache_nonempty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            hot_result_cache_entry: std::sync::Arc::new(parking_lot::RwLock::new(None)),
             last_fast_select_fingerprint: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             fast_param_insert_cache: Self::new_fast_param_insert_cache(),
             fast_literal_insert_cache: Self::new_fast_literal_insert_cache(),
@@ -4444,6 +4959,9 @@ impl EmbeddedDatabase {
             dirty_tracker,
             session_transactions: std::sync::Arc::new(dashmap::DashMap::new()),
             prepared_statements: std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
+            prepared_statement_sql: std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
+            prepared_fast_selects: std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
+            session_settings: sql::SessionSettings::new(),
             savepoints: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
             plan_cache: std::sync::Arc::new(sharded_lru::ShardedLruCache::new(
                 std::num::NonZeroUsize::new(256).expect("256 is non-zero"),
@@ -4455,6 +4973,7 @@ impl EmbeddedDatabase {
                 std::num::NonZeroUsize::new(128).expect("128 is non-zero"),
             )),
             result_cache_nonempty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            hot_result_cache_entry: std::sync::Arc::new(parking_lot::RwLock::new(None)),
             last_fast_select_fingerprint: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             fast_param_insert_cache: Self::new_fast_param_insert_cache(),
             fast_literal_insert_cache: Self::new_fast_literal_insert_cache(),
@@ -5187,6 +5706,10 @@ impl EmbeddedDatabase {
             return Ok(count);
         }
 
+        if let Some((_rows, _columns)) = self.try_handle_db_setting_statement_with_columns(sql)? {
+            return Ok(0);
+        }
+
         if let Some(count) = self.try_handle_fk_setting(sql)? {
             return Ok(count);
         }
@@ -5598,7 +6121,8 @@ impl EmbeddedDatabase {
             target_types,
             all_columns_explicit_no_default: provided_columns.iter().all(|provided| *provided),
         });
-        self.fast_literal_insert_cache.put(cache_key, std::sync::Arc::clone(&spec));
+        self.fast_literal_insert_cache
+            .put(cache_key, std::sync::Arc::clone(&spec));
         Some(Ok(spec))
     }
 
@@ -5673,7 +6197,8 @@ impl EmbeddedDatabase {
             Ok(spec) => std::sync::Arc::new(spec),
             Err(e) => return Some(Err(e)),
         };
-        self.fast_param_insert_cache.put(cache_key, std::sync::Arc::clone(&spec));
+        self.fast_param_insert_cache
+            .put(cache_key, std::sync::Arc::clone(&spec));
         Some(Ok(spec))
     }
 
@@ -6008,16 +6533,24 @@ impl EmbeddedDatabase {
                 };
                 let mut total = 0_u64;
                 for params in rows {
-                    match self.try_execute_fast_delete_param_spec(&spec, params) {
+                    match self.try_execute_fast_delete_param_spec_inner(&spec, params, false) {
                         Some(Ok(count)) => total += count,
                         Some(Err(e)) => {
                             if total > 0 {
+                                if let Err(barrier) = self.storage.durable_autocommit_barrier() {
+                                    return Some(Err(barrier));
+                                }
+                                self.storage.increment_lsn();
                                 self.invalidate_result_cache();
                             }
                             return Some(Err(e));
                         }
                         None => {
                             if total > 0 {
+                                if let Err(barrier) = self.storage.durable_autocommit_barrier() {
+                                    return Some(Err(barrier));
+                                }
+                                self.storage.increment_lsn();
                                 self.invalidate_result_cache();
                             }
                             return Some(Err(Error::internal(
@@ -6026,6 +6559,10 @@ impl EmbeddedDatabase {
                         }
                     }
                 }
+                if let Err(e) = self.storage.durable_autocommit_barrier() {
+                    return Some(Err(e));
+                }
+                self.storage.increment_lsn();
                 Some(Ok(total))
             }
             _ => None,
@@ -6113,20 +6650,20 @@ impl EmbeddedDatabase {
     }
 
     fn try_execute_fast_update_param_spec(&self, spec: &FastParamUpdateSpec, params: &[Value]) -> Option<Result<u64>> {
-        let pk_value = match Self::fast_pk_value_from_expr(&spec.pk_expr, &spec.pk_data_type, params) {
+        let pk_value = match Self::fast_pk_value_from_expr_cow(&spec.pk_expr, &spec.pk_data_type, params) {
             Some(Ok(value)) => value,
             Some(Err(e)) => return Some(Err(e)),
             None => return None,
         };
+        let pk_value = pk_value.as_ref();
 
-        let existing_row =
-            match self
-                .storage
-                .get_row_by_typed_pk_for_write_with_schema(&spec.table_name, &pk_value, &spec.schema)
-            {
-                Ok(Some(row)) => row,
-                Ok(None) => return Some(Ok(0)),
-                Err(e) => return Some(Err(e)),
+        let existing_row = match self
+            .storage
+            .get_row_by_typed_pk_for_write_with_schema(&spec.table_name, pk_value, &spec.schema)
+        {
+            Ok(Some(row)) => row,
+            Ok(None) => return Some(Ok(0)),
+            Err(e) => return Some(Err(e)),
             };
         let row_id = existing_row.row_id.unwrap_or(0);
         if row_id == 0 {
@@ -6279,13 +6816,23 @@ impl EmbeddedDatabase {
     }
 
     fn try_execute_fast_delete_param_spec(&self, spec: &FastParamDeleteSpec, params: &[Value]) -> Option<Result<u64>> {
-        let pk_value = match Self::fast_pk_value_from_expr(&spec.pk_expr, &spec.pk_data_type, params) {
+        self.try_execute_fast_delete_param_spec_inner(spec, params, true)
+    }
+
+    fn try_execute_fast_delete_param_spec_inner(
+        &self,
+        spec: &FastParamDeleteSpec,
+        params: &[Value],
+        finalize_statement: bool,
+    ) -> Option<Result<u64>> {
+        let pk_value = match Self::fast_pk_value_from_expr_cow(&spec.pk_expr, &spec.pk_data_type, params) {
             Some(Ok(value)) => value,
             Some(Err(e)) => return Some(Err(e)),
             None => return None,
         };
+        let pk_value = pk_value.as_ref();
 
-        let pk_key = crate::storage::art_manager::ArtIndexManager::encode_key(std::slice::from_ref(&pk_value));
+        let pk_key = crate::storage::art_manager::ArtIndexManager::encode_key(std::slice::from_ref(pk_value));
         let (row_id, existing_row) = if spec.pk_only_delete {
             match self.storage.art_indexes().pk_index_lookup(&spec.table_name, &pk_key) {
                 Some(row_id) => (row_id, None),
@@ -6295,7 +6842,7 @@ impl EmbeddedDatabase {
             let existing_row =
                 match self
                     .storage
-                    .get_row_by_typed_pk_for_write_with_schema(&spec.table_name, &pk_value, &spec.schema)
+                    .get_row_by_typed_pk_for_write_with_schema(&spec.table_name, pk_value, &spec.schema)
                 {
                     Ok(Some(row)) => row,
                     Ok(None) => return Some(Ok(0)),
@@ -6319,7 +6866,7 @@ impl EmbeddedDatabase {
             }
             if spec.pk_only_delete {
                 self.storage
-                    .delete_tuple_fast_pk_only(&spec.table_name, row_id, &pk_key, &pk_value)
+                    .delete_tuple_fast_pk_only(&spec.table_name, row_id, &pk_key, pk_value)
             } else {
                 let existing_row = existing_row
                     .as_ref()
@@ -6328,7 +6875,7 @@ impl EmbeddedDatabase {
                     .delete_tuple_fast(&spec.table_name, row_id, existing_row, &spec.schema)
             }
         })();
-        if result.is_ok() {
+        if result.is_ok() && finalize_statement {
             if let Err(e) = self.storage.durable_autocommit_barrier() {
                 return Some(Err(e));
             }
@@ -6361,7 +6908,8 @@ impl EmbeddedDatabase {
             Ok(spec) => std::sync::Arc::new(spec),
             Err(e) => return Some(Err(e)),
         };
-        self.fast_param_update_cache.put(sql.to_string(), std::sync::Arc::clone(&spec));
+        self.fast_param_update_cache
+            .put(sql.to_string(), std::sync::Arc::clone(&spec));
         *self.hot_fast_param_update_spec.write() = Some((sql.to_string(), std::sync::Arc::clone(&spec)));
         Some(Ok(spec))
     }
@@ -6457,7 +7005,8 @@ impl EmbeddedDatabase {
             Ok(spec) => std::sync::Arc::new(spec),
             Err(e) => return Some(Err(e)),
         };
-        self.fast_param_delete_cache.put(cache_key.clone(), std::sync::Arc::clone(&spec));
+        self.fast_param_delete_cache
+            .put(cache_key.clone(), std::sync::Arc::clone(&spec));
         *self.hot_fast_param_delete_spec.write() = Some((cache_key, std::sync::Arc::clone(&spec)));
         Some(Ok(spec))
     }
@@ -6558,6 +7107,33 @@ impl EmbeddedDatabase {
             };
         }
         Some(Ok(value))
+    }
+
+    fn fast_pk_value_from_expr_cow<'a>(
+        expr: &sql::LogicalExpr,
+        data_type: &DataType,
+        params: &'a [Value],
+    ) -> Option<Result<std::borrow::Cow<'a, Value>>> {
+        if let sql::LogicalExpr::Parameter { index } = expr {
+            if *index == 0 {
+                return Some(Err(Error::query_execution(
+                    "Parameter indices must be 1-based (e.g., $1, $2)",
+                )));
+            }
+            let Some(value) = params.get(index - 1) else {
+                return Some(Err(Error::query_execution(format!(
+                    "Parameter ${} not provided. Expected {} parameters, got {}",
+                    index,
+                    index,
+                    params.len()
+                ))));
+            };
+            if !Self::insert_value_needs_cast(value, data_type) {
+                return Some(Ok(std::borrow::Cow::Borrowed(value)));
+            }
+        }
+
+        Self::fast_pk_value_from_expr(expr, data_type, params).map(|result| result.map(std::borrow::Cow::Owned))
     }
 
     fn fast_eval_self_arithmetic_expr(
@@ -6825,6 +7401,7 @@ impl EmbeddedDatabase {
 
     /// Invalidate all cached query results (called on any DML operation)
     fn invalidate_result_cache(&self) {
+        *self.hot_result_cache_entry.write() = None;
         if !self
             .result_cache_nonempty
             .swap(false, std::sync::atomic::Ordering::AcqRel)
@@ -7403,7 +7980,8 @@ impl EmbeddedDatabase {
             .pk_index_len(table_name)
             .map_or(true, |len| len != 0);
 
-        let mut seen = std::collections::HashSet::new();
+        let duplicate_key_slots = prepared.len().saturating_mul(unique_specs.len()).max(1);
+        let mut seen = std::collections::HashSet::with_capacity(duplicate_key_slots);
         for (_, tuple) in prepared {
             if check_existing_unique_indexes {
                 if let Err(e) = self
@@ -7593,11 +8171,14 @@ impl EmbeddedDatabase {
             let _ = self.storage.art_indexes().on_delete(table_name, row_id, &col_values);
             return Err(e);
         }
-        self.push_art_undo(txn, ArtUndoOp::RemoveInserted {
-            table_name: table_name.to_string(),
-            row_id,
-            col_values,
-        });
+        self.push_art_undo(
+            txn,
+            ArtUndoOp::RemoveInserted {
+                table_name: table_name.to_string(),
+                row_id,
+                col_values,
+            },
+        );
 
         // R5.V1: eagerly maintain HNSW vector indexes (undo on rollback)
         if self.vector_dml_gate(table_name) {
@@ -7678,7 +8259,8 @@ impl EmbeddedDatabase {
             set_nullable,
             assignment_affects_indexes,
         });
-        self.fast_literal_update_cache.put(cache_key, std::sync::Arc::clone(&spec));
+        self.fast_literal_update_cache
+            .put(cache_key, std::sync::Arc::clone(&spec));
         Some(Ok(spec))
     }
 
@@ -7742,7 +8324,8 @@ impl EmbeddedDatabase {
             schema,
             pk_data_type,
         });
-        self.fast_literal_delete_cache.put(cache_key, std::sync::Arc::clone(&spec));
+        self.fast_literal_delete_cache
+            .put(cache_key, std::sync::Arc::clone(&spec));
         Some(Ok(spec))
     }
 
@@ -8131,11 +8714,14 @@ impl EmbeddedDatabase {
                     col_values.insert(col.name.clone(), v.clone());
                 }
             }
-            self.push_art_undo(txn, ArtUndoOp::RestoreDeleted {
-                table_name: target.table_name.clone(),
-                row_id: target.row_id,
-                col_values,
-            });
+            self.push_art_undo(
+                txn,
+                ArtUndoOp::RestoreDeleted {
+                    table_name: target.table_name.clone(),
+                    row_id: target.row_id,
+                    col_values,
+                },
+            );
 
             // R5.V1: eagerly drop the row from HNSW vector indexes (undo on rollback)
             if self.vector_dml_gate(&target.table_name) {
@@ -8201,22 +8787,21 @@ impl EmbeddedDatabase {
             return None;
         }
 
-        let cache_key = Self::fast_select_cache_key(table_name, pk_col);
         // R2.1: hot single-slot front. Point-lookup workloads resolve the
         // same (table, pk) spec on every statement; a shared-read slot keeps
         // the per-statement path off any mutex (an LRU `get` always needs
         // exclusive access for recency bookkeeping, so even a sharded cache
-        // serializes on one hot key).
-        if let Some(spec) = self
-            .hot_fast_select_spec
-            .read()
-            .as_ref()
-            .and_then(|(hot_key, spec)| (hot_key == &cache_key).then(|| std::sync::Arc::clone(spec)))
-        {
+        // serializes on one hot key). Check this slot before building the LRU
+        // key so the 1T point-lookup path avoids one allocation per query.
+        if let Some(spec) = self.hot_fast_select_spec.read().as_ref().and_then(|spec| {
+            (spec.table_name == table_name && spec.pk_col == pk_col).then(|| std::sync::Arc::clone(spec))
+        }) {
             return Some(Ok(spec));
         }
+
+        let cache_key = Self::fast_select_cache_key(table_name, pk_col);
         if let Some(spec) = self.fast_select_cache.get(&cache_key) {
-            *self.hot_fast_select_spec.write() = Some((cache_key, std::sync::Arc::clone(&spec)));
+            *self.hot_fast_select_spec.write() = Some(std::sync::Arc::clone(&spec));
             return Some(Ok(spec));
         }
 
@@ -8235,11 +8820,13 @@ impl EmbeddedDatabase {
 
         let spec = std::sync::Arc::new(FastSelectSpec {
             table_name: table_name.to_string(),
+            pk_col: pk_col.to_string(),
             schema,
             pk_data_type,
         });
-        self.fast_select_cache.put(cache_key.clone(), std::sync::Arc::clone(&spec));
-        *self.hot_fast_select_spec.write() = Some((cache_key, std::sync::Arc::clone(&spec)));
+        self.fast_select_cache
+            .put(cache_key.clone(), std::sync::Arc::clone(&spec));
+        *self.hot_fast_select_spec.write() = Some(std::sync::Arc::clone(&spec));
         Some(Ok(spec))
     }
 
@@ -8304,6 +8891,23 @@ impl EmbeddedDatabase {
         }
         let where_clause = rest.get(5..)?.trim_start();
 
+        let simple_where_clause = where_clause.strip_suffix(';').unwrap_or(where_clause).trim();
+        if let Some(eq_pos) = simple_where_clause.find('=') {
+            let pk_col = simple_where_clause.get(..eq_pos)?.trim().trim_matches('"');
+            let pk_val_str = simple_where_clause.get(eq_pos + 1..)?.trim();
+            if !pk_col.is_empty() && !pk_val_str.is_empty() {
+                let spec = match self.fast_select_spec(table_name, pk_col)? {
+                    Ok(spec) => spec,
+                    Err(e) => return Some(Err(e)),
+                };
+                if let Some((pk_value, pk_rest)) = Self::fast_parse_one_value(pk_val_str, &spec.pk_data_type) {
+                    if pk_rest.trim().is_empty() {
+                        return Some(Ok((spec, pk_value)));
+                    }
+                }
+            }
+        }
+
         // Bail on complex WHERE. Word-boundary + literal-aware (R1.2):
         // `WHERE order_id = 3` (contains "or"/"order") no longer bails;
         // real AND/OR/JOIN/ORDER/GROUP/LIMIT keywords still do.
@@ -8342,14 +8946,358 @@ impl EmbeddedDatabase {
     }
 
     fn fast_select_rows(&self, spec: &FastSelectSpec, pk_value: &Value) -> Result<Vec<Tuple>> {
-        match self
-            .storage
-            .get_row_by_typed_pk_with_schema(&spec.table_name, pk_value, &spec.schema)
-        {
+        let result = if self.config.storage.memory_only {
+            // In-memory hot-set workloads deliberately pre-warm the row cache.
+            // Disk-backed random point lookups keep no-cache-fill admission to
+            // avoid paying cache insert cost for one-off reads.
+            self.storage
+                .get_row_by_typed_pk_with_schema(&spec.table_name, pk_value, &spec.schema)
+        } else {
+            self.storage
+                .get_row_by_typed_pk_with_schema_no_cache_fill(&spec.table_name, pk_value, &spec.schema)
+        };
+        match result {
             Ok(Some(row)) => Ok(vec![row]),
             Ok(None) => Ok(vec![]),
             Err(e) => Err(e),
         }
+    }
+
+    fn try_fast_count_pk_query(&self, sql: &str) -> Option<Result<Vec<Tuple>>> {
+        if self.in_transaction()
+            || self.storage.is_branch_active()
+            || self.tenant_manager.get_current_context().is_some()
+        {
+            return None;
+        }
+
+        let trimmed = sql.trim();
+        if trimmed.len() < 20 || !trimmed.as_bytes().get(..6)?.eq_ignore_ascii_case(b"SELECT") {
+            return None;
+        }
+
+        let after_select = trimmed.get(6..)?.trim_start();
+        if after_select.len() < 5 || !after_select.as_bytes().get(..5)?.eq_ignore_ascii_case(b"COUNT") {
+            return None;
+        }
+        let after_count = after_select.get(5..)?.trim_start();
+        let count_inner = after_count.strip_prefix('(')?;
+        let close_idx = Self::find_closing_paren(count_inner)?;
+        let count_arg = count_inner.get(..close_idx)?.trim().trim_matches('"');
+        if count_arg.is_empty() || count_arg.bytes().any(|b| b == b',' || b == b'(' || b == b')') {
+            return None;
+        }
+        let mut rest = count_inner.get(close_idx + 1..)?.trim_start();
+        rest = strip_prefix_icase(rest, "FROM")?.trim_start();
+
+        let (table_name, after_table) = Self::fast_split_table_name(rest)?;
+        if self.tenant_manager.should_apply_rls(table_name, "SELECT") {
+            return None;
+        }
+        match self.storage.mv_catalog().view_exists(table_name) {
+            Ok(true) | Err(_) => return None,
+            Ok(false) => {}
+        }
+
+        let pk_col = if count_arg == "*" {
+            None
+        } else {
+            Some(count_arg)
+        };
+        let spec = match self.fast_count_pk_spec(table_name, pk_col)? {
+            Ok(spec) => spec,
+            Err(e) => return Some(Err(e)),
+        };
+
+        let where_clause = after_table.strip_suffix(';').unwrap_or(after_table).trim();
+        let count = if where_clause.is_empty() {
+            match self.storage.count_table_rows(&spec.table_name) {
+                Ok(count) => count,
+                Err(e) => return Some(Err(e)),
+            }
+        } else {
+            let predicate = strip_prefix_icase(where_clause, "WHERE")?.trim();
+            match self.fast_count_pk_predicate(&spec, predicate) {
+                Some(Ok(count)) => count,
+                Some(Err(e)) => return Some(Err(e)),
+                None => return None,
+            }
+        };
+
+        Some(Ok(vec![Tuple {
+            values: vec![Value::Int8(count as i64)],
+            row_id: None,
+            branch_id: None,
+        }]))
+    }
+
+    fn fast_count_pk_spec(
+        &self,
+        table_name: &str,
+        count_pk_col: Option<&str>,
+    ) -> Option<Result<std::sync::Arc<FastSelectSpec>>> {
+        let catalog = self.storage.catalog();
+        let schema = match catalog.get_table_schema(table_name) {
+            Ok(schema) => schema,
+            Err(_) => return None,
+        };
+        let mut pk_cols = schema.columns.iter().filter(|col| col.primary_key);
+        let pk_col = match (pk_cols.next(), pk_cols.next()) {
+            (Some(col), None) => col,
+            _ => return None,
+        };
+        if count_pk_col.is_some_and(|col| !col.eq_ignore_ascii_case(&pk_col.name)) {
+            return None;
+        }
+        if !matches!(pk_col.data_type, DataType::Int2 | DataType::Int4 | DataType::Int8) {
+            return None;
+        }
+        self.fast_select_spec(table_name, &pk_col.name)
+    }
+
+    fn fast_count_pk_predicate(&self, spec: &FastSelectSpec, predicate: &str) -> Option<Result<usize>> {
+        let predicate = predicate.strip_suffix(';').unwrap_or(predicate).trim();
+        if predicate.is_empty()
+            || Self::contains_sql_keyword(predicate, b"OR")
+            || Self::contains_sql_keyword(predicate, b"JOIN")
+            || Self::contains_sql_keyword(predicate, b"LIKE")
+            || Self::contains_sql_keyword(predicate, b"BETWEEN")
+            || Self::contains_sql_keyword(predicate, b"ORDER")
+            || Self::contains_sql_keyword(predicate, b"GROUP")
+            || Self::contains_sql_keyword(predicate, b"LIMIT")
+        {
+            return None;
+        }
+
+        if let Some(open_idx) = Self::find_sql_keyword(predicate, b"IN") {
+            return self.fast_count_pk_in_predicate(spec, predicate, open_idx);
+        }
+
+        let mut lower = None;
+        let mut upper = None;
+        for part in Self::fast_split_and_terms(predicate)? {
+            let (term_lower, term_upper) = self.fast_pk_bound_term(spec, part)?;
+            lower = Self::merge_fast_lower_bound(lower, term_lower)?;
+            upper = Self::merge_fast_upper_bound(upper, term_upper)?;
+        }
+
+        match self
+            .storage
+            .count_table_pk_int_range_with_schema(&spec.table_name, &spec.schema, lower, upper)
+        {
+            Ok(Some(count)) => Some(Ok(count)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        }
+    }
+
+    fn fast_count_pk_in_predicate(
+        &self,
+        spec: &FastSelectSpec,
+        predicate: &str,
+        in_idx: usize,
+    ) -> Option<Result<usize>> {
+        let left = predicate.get(..in_idx)?.trim().trim_matches('"');
+        if !left.eq_ignore_ascii_case(&spec.pk_col) {
+            return None;
+        }
+        let after_in = predicate.get(in_idx + 2..)?.trim_start();
+        let inner = after_in.strip_prefix('(')?;
+        let close_idx = Self::find_closing_paren(inner)?;
+        let values = inner.get(..close_idx)?;
+        if !inner.get(close_idx + 1..)?.trim().is_empty() {
+            return None;
+        }
+
+        // NOTE (Opus 2026-06-13): the per-key dedupe + per-key pk_index_contains
+        // probe below is the EMPIRICALLY-CHOSEN path. A batched-helper variant
+        // (HashSet dedupe + pk_index_count_keys single-lock probe) was tried by
+        // Fable 5 and REGRESSED small `count_pk(id IN)` probes (~-3.9%, see
+        // perf/v337_vs_latest/focused_scan_art_batch_*), so it was reverted.
+        // Left as-is intentionally; do not "optimize" without an A/B.
+        let mut seen_keys: Vec<Vec<u8>> = Vec::new();
+        for raw in Self::fast_split_comma_terms(values)? {
+            let value = match Self::fast_literal_for_type(raw, &spec.pk_data_type) {
+                Some(value) if !matches!(value, Value::Null) => value,
+                Some(_) => continue,
+                None => return None,
+            };
+            let key = storage::ArtIndexManager::encode_key(std::slice::from_ref(&value));
+            if seen_keys.iter().any(|seen| seen == &key) {
+                continue;
+            }
+            seen_keys.push(key);
+        }
+
+        let mut count = 0usize;
+        for key in &seen_keys {
+            match self.storage.art_indexes().pk_index_contains(&spec.table_name, key) {
+                Some(true) => count += 1,
+                Some(false) => {}
+                None => return None,
+            }
+        }
+        Some(Ok(count))
+    }
+
+    fn fast_pk_bound_term(
+        &self,
+        spec: &FastSelectSpec,
+        term: &str,
+    ) -> Option<(Option<(i64, bool)>, Option<(i64, bool)>)> {
+        for op in ["<=", ">=", "=", "<", ">"] {
+            let Some(op_idx) = term.find(op) else {
+                continue;
+            };
+            let left = term.get(..op_idx)?.trim().trim_matches('"');
+            let right = term.get(op_idx + op.len()..)?.trim();
+            if !left.eq_ignore_ascii_case(&spec.pk_col) {
+                return None;
+            }
+            let value = Self::fast_i64_literal_for_type(right, &spec.pk_data_type)?;
+            return match op {
+                "=" => Some((Some((value, true)), Some((value, true)))),
+                ">=" => Some((Some((value, true)), None)),
+                ">" => Some((Some((value, false)), None)),
+                "<=" => Some((None, Some((value, true)))),
+                "<" => Some((None, Some((value, false)))),
+                _ => None,
+            };
+        }
+        None
+    }
+
+    fn fast_literal_for_type(token: &str, target_type: &DataType) -> Option<Value> {
+        let token = Self::strip_fast_postgres_type_cast(token.trim());
+        let (value, rest) = Self::fast_parse_one_value(token, target_type)?;
+        rest.trim().is_empty().then_some(value)
+    }
+
+    fn fast_i64_literal_for_type(token: &str, target_type: &DataType) -> Option<i64> {
+        match Self::fast_literal_for_type(token, target_type)? {
+            Value::Int2(v) => Some(i64::from(v)),
+            Value::Int4(v) => Some(i64::from(v)),
+            Value::Int8(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    fn merge_fast_lower_bound(
+        existing: Option<(i64, bool)>,
+        incoming: Option<(i64, bool)>,
+    ) -> Option<Option<(i64, bool)>> {
+        Some(match (existing, incoming) {
+            (None, bound) | (bound, None) => bound,
+            (Some((a, ai)), Some((b, bi))) => {
+                if b > a {
+                    Some((b, bi))
+                } else if a > b {
+                    Some((a, ai))
+                } else {
+                    Some((a, ai && bi))
+                }
+            }
+        })
+    }
+
+    fn merge_fast_upper_bound(
+        existing: Option<(i64, bool)>,
+        incoming: Option<(i64, bool)>,
+    ) -> Option<Option<(i64, bool)>> {
+        Some(match (existing, incoming) {
+            (None, bound) | (bound, None) => bound,
+            (Some((a, ai)), Some((b, bi))) => {
+                if b < a {
+                    Some((b, bi))
+                } else if a < b {
+                    Some((a, ai))
+                } else {
+                    Some((a, ai && bi))
+                }
+            }
+        })
+    }
+
+    fn fast_split_table_name(s: &str) -> Option<(&str, &str)> {
+        let s = s.trim_start();
+        if s.is_empty() {
+            return None;
+        }
+        if let Some(rest) = s.strip_prefix('"') {
+            let end = rest.find('"')?;
+            let table = rest.get(..end)?;
+            let after = rest.get(end + 1..)?.trim_start();
+            return Some((table, after));
+        }
+        let end = s.find(|c: char| c.is_whitespace() || c == ';').unwrap_or(s.len());
+        let table = s.get(..end)?;
+        if table.is_empty() {
+            return None;
+        }
+        Some((table, s.get(end..)?.trim_start()))
+    }
+
+    fn fast_split_and_terms(mut s: &str) -> Option<Vec<&str>> {
+        let mut terms = Vec::new();
+        loop {
+            let Some(and_idx) = Self::find_sql_keyword(s, b"AND") else {
+                let term = s.trim();
+                if term.is_empty() {
+                    return None;
+                }
+                terms.push(term);
+                return Some(terms);
+            };
+            let term = s.get(..and_idx)?.trim();
+            if term.is_empty() {
+                return None;
+            }
+            terms.push(term);
+            s = s.get(and_idx + 3..)?.trim_start();
+        }
+    }
+
+    fn fast_split_comma_terms(mut s: &str) -> Option<Vec<&str>> {
+        let mut terms = Vec::new();
+        loop {
+            let idx = Self::find_top_level_comma(s);
+            let (term, rest) = match idx {
+                Some(idx) => (s.get(..idx)?.trim(), Some(s.get(idx + 1..)?)),
+                None => (s.trim(), None),
+            };
+            if term.is_empty() {
+                return None;
+            }
+            terms.push(term);
+            match rest {
+                Some(rest) => s = rest,
+                None => return Some(terms),
+            }
+        }
+    }
+
+    fn find_top_level_comma(s: &str) -> Option<usize> {
+        let bytes = s.as_bytes();
+        let mut in_string = false;
+        let mut i = 0;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if in_string {
+                if b == b'\'' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                        i += 2;
+                        continue;
+                    }
+                    in_string = false;
+                }
+            } else if b == b'\'' {
+                in_string = true;
+            } else if b == b',' {
+                return Some(i);
+            }
+            i += 1;
+        }
+        None
     }
 
     fn try_direct_projected_filtered_scan(&self, plan: &sql::LogicalPlan) -> Option<Result<Vec<Tuple>>> {
@@ -8454,6 +9402,30 @@ impl EmbeddedDatabase {
             return None;
         }
         let where_clause = rest.get(5..)?.trim_start();
+        let simple_where_clause = where_clause.strip_suffix(';').unwrap_or(where_clause).trim();
+        if let Some(eq_pos) = simple_where_clause.find('=') {
+            let pk_col = simple_where_clause.get(..eq_pos)?.trim().trim_matches('"');
+            let pk_val_str = simple_where_clause.get(eq_pos + 1..)?.trim();
+            if !pk_col.is_empty() && !pk_val_str.is_empty() {
+                let spec = match self.fast_select_spec(table_name, pk_col)? {
+                    Ok(spec) => spec,
+                    Err(e) => return Some(Err(e)),
+                };
+                let pk_value = match Self::fast_param_or_literal_value(pk_val_str, params, &spec.pk_data_type) {
+                    Some(Ok(value)) => value,
+                    Some(Err(e)) => return Some(Err(e)),
+                    None => return None,
+                };
+                return match self
+                    .storage
+                    .get_row_by_typed_pk_with_schema(&spec.table_name, &pk_value, &spec.schema)
+                {
+                    Ok(Some(row)) => Some(Ok(vec![row])),
+                    Ok(None) => Some(Ok(vec![])),
+                    Err(e) => Some(Err(e)),
+                };
+            }
+        }
         // Word-boundary + literal-aware (R1.2); see fast_select_lookup.
         if Self::contains_sql_keyword(where_clause, b"AND")
             || Self::contains_sql_keyword(where_clause, b"OR")
@@ -10720,19 +11692,23 @@ impl EmbeddedDatabase {
                                     )?;
                                 }
                                 let key = self.storage.branch_aware_data_key(table_name, row_id);
-                                let val =
-                                    bincode::serialize(&staged).map_err(|e| Error::storage(e.to_string()))?;
+                                let val = bincode::serialize(&staged).map_err(|e| Error::storage(e.to_string()))?;
                                 txn.put(key, val)?;
                                 if let Err(e) =
-                                    self.storage.art_indexes().on_insert(table_name, row_id, &staged_col_values)
+                                    self.storage
+                                        .art_indexes()
+                                        .on_insert(table_name, row_id, &staged_col_values)
                                 {
                                     tracing::debug!("ART index insert for '{}': {}", table_name, e);
                                 }
-                                self.push_art_undo(txn, ArtUndoOp::RemoveInserted {
-                                    table_name: table_name.clone(),
-                                    row_id,
-                                    col_values: staged_col_values,
-                                });
+                                self.push_art_undo(
+                                    txn,
+                                    ArtUndoOp::RemoveInserted {
+                                        table_name: table_name.clone(),
+                                        row_id,
+                                        col_values: staged_col_values,
+                                    },
+                                );
                                 row_id
                             } else {
                                 self.storage.insert_tuple_branch_aware_with_schema(
@@ -11163,10 +12139,8 @@ impl EmbeddedDatabase {
                             .art_indexes()
                             .tuple_update_affects_indexes(table_name, &schema, old_tuple, tuple)
                         {
-                            let mut old_col_values =
-                                std::collections::HashMap::with_capacity(schema.columns.len());
-                            let mut new_col_values =
-                                std::collections::HashMap::with_capacity(schema.columns.len());
+                            let mut old_col_values = std::collections::HashMap::with_capacity(schema.columns.len());
+                            let mut new_col_values = std::collections::HashMap::with_capacity(schema.columns.len());
                             for (i, col) in schema.columns.iter().enumerate() {
                                 if let Some(v) = old_tuple.values.get(i) {
                                     old_col_values.insert(col.name.clone(), v.clone());
@@ -11189,12 +12163,15 @@ impl EmbeddedDatabase {
                             {
                                 tracing::debug!("ART index update/insert-new for '{}': {}", table_name, e);
                             }
-                            self.push_art_undo(txn, ArtUndoOp::RestoreUpdated {
-                                table_name: table_name.clone(),
-                                row_id: *row_id,
-                                old_col_values,
-                                new_col_values,
-                            });
+                            self.push_art_undo(
+                                txn,
+                                ArtUndoOp::RestoreUpdated {
+                                    table_name: table_name.clone(),
+                                    row_id: *row_id,
+                                    old_col_values,
+                                    new_col_values,
+                                },
+                            );
                         }
                         // R5.V1: eagerly maintain HNSW vector indexes (undo
                         // on rollback). Runs outside the ART gate above —
@@ -11298,11 +12275,14 @@ impl EmbeddedDatabase {
                         tracing::debug!("ART index delete for table '{}': {}", table_name, e);
                     }
                     if let Some(txn) = active_txn {
-                        self.push_art_undo(txn, ArtUndoOp::RestoreDeleted {
-                            table_name: table_name.clone(),
-                            row_id: *row_id,
-                            col_values,
-                        });
+                        self.push_art_undo(
+                            txn,
+                            ArtUndoOp::RestoreDeleted {
+                                table_name: table_name.clone(),
+                                row_id: *row_id,
+                                col_values,
+                            },
+                        );
 
                         // R5.V1: eagerly drop the row from HNSW vector indexes
                         // (undo on rollback). Autocommit deletes go through
@@ -11423,37 +12403,25 @@ impl EmbeddedDatabase {
                 self.prepared_statements
                     .write()
                     .insert(name.clone(), *statement.clone());
+                self.prepared_statement_sql.write().remove(name);
+                self.prepared_fast_selects.write().remove(name);
                 Ok((0, Vec::new()))
             }
             sql::LogicalPlan::Execute { name, parameters } => {
-                // Look up the prepared statement
-                let stmt = {
-                    let stmts = self.prepared_statements.read();
-                    stmts.get(name).cloned()
-                };
-                if let Some(plan) = stmt {
-                    // Evaluate parameters
-                    let empty_tuple = Tuple::new(vec![]);
-                    let empty_schema = std::sync::Arc::new(Schema { columns: vec![] });
-                    let evaluator = sql::Evaluator::new(empty_schema);
-                    let param_values: Result<Vec<Value>> = parameters
-                        .iter()
-                        .map(|expr| evaluator.evaluate(expr, &empty_tuple))
-                        .collect();
-                    // Execute the prepared statement with parameters
-                    self.execute_plan_with_params(&plan, &param_values?, session_txn)
-                } else {
-                    Err(Error::query_execution(format!(
-                        "Prepared statement '{}' does not exist",
-                        name
-                    )))
-                }
+                let plan = self.prepared_plan_or_lazy_fast_plan(name)?;
+                let empty_tuple = Tuple::new(vec![]);
+                let empty_schema = std::sync::Arc::new(Schema { columns: vec![] });
+                let evaluator = sql::Evaluator::new(empty_schema);
+                let param_values: Result<Vec<Value>> = parameters
+                    .iter()
+                    .map(|expr| evaluator.evaluate(expr, &empty_tuple))
+                    .collect();
+                self.execute_plan_with_params(&plan, &param_values?, session_txn)
             }
             sql::LogicalPlan::Deallocate { name } => {
                 if let Some(ref stmt_name) = name {
                     // Remove specific prepared statement
-                    let removed = self.prepared_statements.write().remove(stmt_name);
-                    if removed.is_none() {
+                    if !self.remove_prepared_statement_state(stmt_name) {
                         return Err(Error::query_execution(format!(
                             "Prepared statement '{}' does not exist",
                             stmt_name
@@ -11462,6 +12430,8 @@ impl EmbeddedDatabase {
                 } else {
                     // DEALLOCATE ALL - remove all prepared statements
                     self.prepared_statements.write().clear();
+                    self.prepared_statement_sql.write().clear();
+                    self.prepared_fast_selects.write().clear();
                 }
                 Ok((0, Vec::new()))
             }
@@ -11530,6 +12500,10 @@ impl EmbeddedDatabase {
             return Ok(rows);
         }
 
+        if let Some((rows, _columns)) = self.try_handle_db_setting_statement_with_columns(sql)? {
+            return Ok(rows);
+        }
+
         // R4.3: VACUUM VERSIONS — manual MVCC version-history collection;
         // returns a single row with the reclaimed version count.
         if sql::Parser::is_vacuum_versions(sql) {
@@ -11560,6 +12534,21 @@ impl EmbeddedDatabase {
                 self.invalidate_result_cache();
                 self.log_slow_query(sql, start.elapsed(), tuples.len() as u64);
                 return Ok(tuples);
+            }
+        }
+
+        if Self::is_prepared_statement_sql(sql) {
+            if let Some((rows, _columns)) = self.try_handle_prepared_statement_sql_fast_with_columns(sql)? {
+                self.log_slow_query(sql, start.elapsed(), rows.len() as u64);
+                return Ok(rows);
+            }
+            let (statement, _) = self.parse_cached(sql)?;
+            let catalog = self.storage.catalog();
+            let planner = sql::Planner::with_catalog(&catalog).with_sql(sql.to_string());
+            let plan = planner.statement_to_plan(statement)?;
+            if let Some((rows, _columns)) = self.try_handle_prepared_query_plan_with_columns(&plan)? {
+                self.log_slow_query(sql, start.elapsed(), rows.len() as u64);
+                return Ok(rows);
             }
         }
 
@@ -11596,6 +12585,25 @@ impl EmbeddedDatabase {
 
         let result_cache_nonempty = self.result_cache_nonempty.load(std::sync::atomic::Ordering::Acquire);
 
+        // Preserve the v3.37 hot-result-cache behavior for repeated embedded
+        // COUNT(*) probes. The COUNT fast path below is still the cold path,
+        // but repeated deterministic COUNTs should not bypass an already-hot
+        // single-entry result cache.
+        if result_cache_nonempty {
+            if let Some(cached_results) = self.hot_cached_query_result(sql) {
+                tracing::debug!(phase = "result_cache", "Hot result cache hit");
+                self.log_slow_query(sql, start.elapsed(), cached_results.len() as u64);
+                return Ok((*cached_results).clone());
+            }
+        }
+
+        if let Some(result) = self.try_fast_count_pk_query(sql) {
+            let results = result?;
+            self.log_slow_query(sql, start.elapsed(), results.len() as u64);
+            self.cache_query_result(sql, &results);
+            return Ok(results);
+        }
+
         // Fast path: SELECT * FROM table WHERE pk = literal (skips full SQL
         // parsing). When the result cache is empty, run it before the
         // nondeterministic-function scan; this narrow grammar cannot contain
@@ -11617,9 +12625,22 @@ impl EmbeddedDatabase {
         // state, and gen_random_uuid / random / now / clock_timestamp
         // must return a fresh value every time. Caching any of these
         // would serve stale rows to the caller.
+        if result_cache_nonempty {
+            if let Some(cached_results) = self.hot_cached_query_result(sql) {
+                tracing::debug!(phase = "result_cache", "Hot result cache hit");
+                self.log_slow_query(sql, start.elapsed(), cached_results.len() as u64);
+                return Ok((*cached_results).clone());
+            }
+            if let Some(result) = self.try_fast_select(sql) {
+                let results = result?;
+                self.log_slow_query(sql, start.elapsed(), results.len() as u64);
+                self.maybe_cache_repeated_fast_select(sql, &results);
+                return Ok(results);
+            }
+        }
         let is_non_deterministic = Self::query_is_non_deterministic(sql);
         if !is_non_deterministic && result_cache_nonempty {
-            if let Some(cached_results) = self.result_cache.get(sql) {
+            if let Some(cached_results) = self.cached_query_result(sql) {
                 tracing::debug!(phase = "result_cache", "Result cache hit");
                 self.log_slow_query(sql, start.elapsed(), cached_results.len() as u64);
                 return Ok((*cached_results).clone());
@@ -11653,9 +12674,7 @@ impl EmbeddedDatabase {
                     );
                     self.log_slow_query(sql, start.elapsed(), results.len() as u64);
                     if !is_non_deterministic {
-                        self.result_cache.put(sql.to_string(), std::sync::Arc::new(results.clone()));
-                        self.result_cache_nonempty
-                            .store(true, std::sync::atomic::Ordering::Release);
+                        self.cache_query_result(sql, &results);
                     }
                     return Ok(results);
                 }
@@ -11675,9 +12694,7 @@ impl EmbeddedDatabase {
                 // queries already bypass lookup above and should not pay to
                 // clone rows into a cache they can never read from.
                 if !is_non_deterministic {
-                    self.result_cache.put(sql.to_string(), std::sync::Arc::new(results.clone()));
-                    self.result_cache_nonempty
-                        .store(true, std::sync::atomic::Ordering::Release);
+                    self.cache_query_result(sql, &results);
                 }
                 return Ok(results);
             }
@@ -11764,9 +12781,7 @@ impl EmbeddedDatabase {
         // already bypass lookup above, so caching them only adds clone/lock
         // overhead and risks serving stale rows if the lookup gate changes.
         if !is_non_deterministic {
-            self.result_cache.put(sql.to_string(), std::sync::Arc::new(results.clone()));
-            self.result_cache_nonempty
-                .store(true, std::sync::atomic::Ordering::Release);
+            self.cache_query_result(sql, &results);
         }
 
         Ok(results)
@@ -11785,7 +12800,7 @@ impl EmbeddedDatabase {
             return None;
         }
 
-        let cached_results = self.result_cache.get(sql)?;
+        let cached_results = self.cached_query_result(sql)?;
         let arc_plan = self.plan_cache.get(sql)?;
         let columns = arc_plan
             .schema()
@@ -11800,6 +12815,16 @@ impl EmbeddedDatabase {
     pub fn query_with_columns(&self, sql: &str) -> Result<(Vec<Tuple>, Vec<String>)> {
         if let Some(result) = self.try_fast_select_with_columns(sql) {
             return result;
+        }
+
+        if let Some(result) = self.try_handle_db_setting_statement_with_columns(sql)? {
+            return Ok(result);
+        }
+
+        if Self::is_prepared_statement_sql(sql) {
+            if let Some(result) = self.try_handle_prepared_statement_sql_fast_with_columns(sql)? {
+                return Ok(result);
+            }
         }
 
         // R4.3: VACUUM VERSIONS over the result-set surface (REPL/wire
@@ -11826,13 +12851,14 @@ impl EmbeddedDatabase {
         let plan = if sql::Parser::is_show_branches(sql) {
             sql::LogicalPlan::ShowBranches
         } else if let Some(arc_plan) = self.plan_cache.get(sql) {
+            if let Some(result) = self.try_handle_prepared_query_plan_with_columns(&arc_plan)? {
+                return Ok(result);
+            }
             let mut executor =
                 sql::Executor::with_storage(&self.storage).with_timeout(self.config.storage.query_timeout_ms);
             let result = executor.execute_with_columns(&arc_plan)?;
             if cacheable {
-                self.result_cache.put(sql.to_string(), std::sync::Arc::new(result.0.clone()));
-                self.result_cache_nonempty
-                    .store(true, std::sync::atomic::Ordering::Release);
+                self.cache_query_result(sql, &result.0);
             }
             return Ok(result);
         } else {
@@ -11841,6 +12867,10 @@ impl EmbeddedDatabase {
             let planner = sql::Planner::with_catalog(&catalog).with_sql(sql.to_string());
             planner.statement_to_plan(statement)?
         };
+
+        if let Some(result) = self.try_handle_prepared_query_plan_with_columns(&plan)? {
+            return Ok(result);
+        }
 
         let plan = {
             let stats = optimizer::cost::StatsCatalog::new();
@@ -11862,9 +12892,7 @@ impl EmbeddedDatabase {
             sql::Executor::with_storage(&self.storage).with_timeout(self.config.storage.query_timeout_ms);
         let result = executor.execute_with_columns(&plan)?;
         if cacheable && !matches!(plan, sql::LogicalPlan::ShowBranches) {
-            self.result_cache.put(sql.to_string(), std::sync::Arc::new(result.0.clone()));
-            self.result_cache_nonempty
-                .store(true, std::sync::atomic::Ordering::Release);
+            self.cache_query_result(sql, &result.0);
         }
         Ok(result)
     }
@@ -12089,8 +13117,7 @@ impl EmbeddedDatabase {
         // slot's write lock waits out any statement still borrowing the
         // transaction before rolling it back.
         if let Some((_, slot)) = self.session_transactions.remove(&session_id) {
-            self.session_txn_count
-                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            self.session_txn_count.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
             if let Some(txn) = slot.write().take() {
                 let _ = txn.rollback();
             }
@@ -12162,8 +13189,7 @@ impl EmbeddedDatabase {
         // Store transaction in map
         self.session_transactions
             .insert(session_id, std::sync::Arc::new(parking_lot::RwLock::new(Some(txn))));
-        self.session_txn_count
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.session_txn_count.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
 
         Ok(())
     }
@@ -12202,8 +13228,7 @@ impl EmbeddedDatabase {
         // transaction; the DashMap shard guard itself is released by the
         // time `remove` returns (deadlock fix — see [`SessionTxnSlot`]).
         if let Some((_, slot)) = self.session_transactions.remove(&session_id) {
-            self.session_txn_count
-                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            self.session_txn_count.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
             let Some(txn) = slot.write().take() else {
                 // Slot already drained (concurrent commit/rollback race) —
                 // treat like the missing-entry case below.
@@ -12215,7 +13240,11 @@ impl EmbeddedDatabase {
             };
             // R1.3-p2: commit itself runs the row-cache fence when the cache
             // is wired; only unwired transactions need the caller-side sweep.
-            let written = if txn.has_row_cache() { Vec::new() } else { txn.written_data_keys() };
+            let written = if txn.has_row_cache() {
+                Vec::new()
+            } else {
+                txn.written_data_keys()
+            };
             let commit_ts = self.storage.next_commit_timestamp(txn.has_tracked_writes());
             if let Err(e) = txn.commit_with_timestamp(commit_ts) {
                 // Failed commit (e.g. R0.2 serialization failure) behaves
@@ -12266,8 +13295,7 @@ impl EmbeddedDatabase {
 
         // Retrieve and rollback transaction (slot semantics as in commit).
         if let Some((_, slot)) = self.session_transactions.remove(&session_id) {
-            self.session_txn_count
-                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            self.session_txn_count.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
             if let Some(txn) = slot.write().take() {
                 txn.rollback()?;
             }
@@ -12370,7 +13398,11 @@ impl EmbeddedDatabase {
                 Ok(count) => {
                     // R1.3-p2: commit runs the row-cache fence itself when
                     // the cache is wired (it always is on this path).
-                    let written = if txn.has_row_cache() { Vec::new() } else { txn.written_data_keys() };
+                    let written = if txn.has_row_cache() {
+                        Vec::new()
+                    } else {
+                        txn.written_data_keys()
+                    };
                     let commit_ts = self.storage.next_commit_timestamp(txn.has_tracked_writes());
                     txn.commit_with_timestamp(commit_ts)?;
                     if !written.is_empty() {
@@ -12512,10 +13544,7 @@ impl EmbeddedDatabase {
 
     /// R1.3-p2: the session's raw `synchronous_commit` override
     /// (`None` = inherit `storage.durable_commit`).
-    pub fn session_synchronous_commit(
-        &self,
-        session_id: crate::session::SessionId,
-    ) -> Result<Option<bool>> {
+    pub fn session_synchronous_commit(&self, session_id: crate::session::SessionId) -> Result<Option<bool>> {
         let session_lock = self.session_manager.get_session(session_id)?;
         let value = session_lock.read().synchronous_commit;
         Ok(value)
@@ -12523,10 +13552,7 @@ impl EmbeddedDatabase {
 
     /// R1.3-p2: the session's EFFECTIVE `synchronous_commit` (override or
     /// the `storage.durable_commit` default; always false in memory mode).
-    pub fn session_synchronous_commit_effective(
-        &self,
-        session_id: crate::session::SessionId,
-    ) -> Result<bool> {
+    pub fn session_synchronous_commit_effective(&self, session_id: crate::session::SessionId) -> Result<bool> {
         let storage_cfg = &self.storage.config().storage;
         Ok(self
             .session_synchronous_commit(session_id)?
@@ -14188,11 +15214,15 @@ impl EmbeddedDatabase {
             dirty_tracker: self.dirty_tracker.clone(),
             session_transactions: self.session_transactions.clone(),
             prepared_statements: self.prepared_statements.clone(),
+            prepared_statement_sql: self.prepared_statement_sql.clone(),
+            prepared_fast_selects: self.prepared_fast_selects.clone(),
+            session_settings: self.session_settings.clone(),
             savepoints: self.savepoints.clone(),
             plan_cache: self.plan_cache.clone(),
             parse_cache: self.parse_cache.clone(),
             result_cache: self.result_cache.clone(),
             result_cache_nonempty: self.result_cache_nonempty.clone(),
+            hot_result_cache_entry: self.hot_result_cache_entry.clone(),
             last_fast_select_fingerprint: self.last_fast_select_fingerprint.clone(),
             fast_param_insert_cache: self.fast_param_insert_cache.clone(),
             fast_literal_insert_cache: self.fast_literal_insert_cache.clone(),
@@ -15614,7 +16644,11 @@ impl Transaction<'_> {
     pub fn commit(self) -> Result<()> {
         // R0.2: fresh commit timestamp (see commit_internal).
         // R1.3-p2: commit runs the row-cache fence itself when wired.
-        let written = if self.tx.has_row_cache() { Vec::new() } else { self.tx.written_data_keys() };
+        let written = if self.tx.has_row_cache() {
+            Vec::new()
+        } else {
+            self.tx.written_data_keys()
+        };
         let commit_ts = self.db.storage.next_commit_timestamp(self.tx.has_tracked_writes());
         self.tx.commit_with_timestamp(commit_ts)?;
         if !written.is_empty() {
@@ -15765,7 +16799,7 @@ mod tests {
         assert_eq!(p("SET synchronous_commit_extra = off").unwrap(), None);
         assert_eq!(p("INSERT INTO t VALUES (1)").unwrap(), None);
         assert_eq!(p("SET synchronous_commit off").unwrap(), None); // missing = / TO
-        // Ours but invalid value.
+                                                                    // Ours but invalid value.
         assert!(p("SET synchronous_commit = sideways").is_err());
         assert!(p("SET synchronous_commit = ").is_err());
     }
@@ -15840,10 +16874,14 @@ mod tests {
     #[test]
     fn test_r12_fast_path_eligibility_claims_and_bails() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE scores (points INT PRIMARY KEY, val TEXT)").unwrap();
-        db.execute("CREATE TABLE orders (order_id INT PRIMARY KEY, status TEXT)").unwrap();
-        db.execute("CREATE TABLE default_settings (id INT PRIMARY KEY, name TEXT)").unwrap();
-        db.execute("CREATE TABLE jobs (finalized INT PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("CREATE TABLE scores (points INT PRIMARY KEY, val TEXT)")
+            .unwrap();
+        db.execute("CREATE TABLE orders (order_id INT PRIMARY KEY, status TEXT)")
+            .unwrap();
+        db.execute("CREATE TABLE default_settings (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
+        db.execute("CREATE TABLE jobs (finalized INT PRIMARY KEY, name TEXT)")
+            .unwrap();
 
         // --- INSERT ---
         assert!(
@@ -15874,9 +16912,11 @@ mod tests {
 
         // --- UPDATE ---
         db.execute("INSERT INTO scores (points, val) VALUES (5, 'a')").unwrap();
-        db.execute("INSERT INTO orders (order_id, status) VALUES (3, 'open')").unwrap();
+        db.execute("INSERT INTO orders (order_id, status) VALUES (3, 'open')")
+            .unwrap();
         assert!(
-            db.try_fast_update("UPDATE scores SET val = 'z' WHERE points = 5").is_some(),
+            db.try_fast_update("UPDATE scores SET val = 'z' WHERE points = 5")
+                .is_some(),
             "WHERE points = 5 (contains 'in') must stay fast-path eligible"
         );
         assert!(
@@ -15890,7 +16930,8 @@ mod tests {
             "AND conjunction must still bail"
         );
         assert!(
-            db.try_fast_update("UPDATE scores SET val = 'q' WHERE points IN (5)").is_none(),
+            db.try_fast_update("UPDATE scores SET val = 'q' WHERE points IN (5)")
+                .is_none(),
             "IN list must still bail"
         );
         assert!(
@@ -15900,10 +16941,13 @@ mod tests {
         );
 
         // --- DELETE ---
-        db.execute("INSERT INTO jobs (finalized, name) VALUES (1, 'a')").unwrap();
-        db.execute("INSERT INTO jobs (finalized, name) VALUES (2, 'b')").unwrap();
+        db.execute("INSERT INTO jobs (finalized, name) VALUES (1, 'a')")
+            .unwrap();
+        db.execute("INSERT INTO jobs (finalized, name) VALUES (2, 'b')")
+            .unwrap();
         assert!(
-            db.try_fast_delete_autocommit("DELETE FROM jobs WHERE finalized = 1").is_some(),
+            db.try_fast_delete_autocommit("DELETE FROM jobs WHERE finalized = 1")
+                .is_some(),
             "WHERE finalized = 1 (contains 'in') must stay fast-path eligible"
         );
         assert!(
@@ -15927,7 +16971,8 @@ mod tests {
             "ORDER BY must still bail"
         );
         assert!(
-            db.try_fast_select("SELECT * FROM scores WHERE points = 5 LIMIT 1").is_none(),
+            db.try_fast_select("SELECT * FROM scores WHERE points = 5 LIMIT 1")
+                .is_none(),
             "LIMIT must still bail"
         );
         assert!(
@@ -15943,7 +16988,10 @@ mod tests {
             EmbeddedDatabase::find_sql_keyword("msg = 'x where y' WHERE id = 1", b"WHERE"),
             Some(18)
         );
-        assert_eq!(EmbeddedDatabase::find_sql_keyword("wherex = 1 WHERE id = 2", b"WHERE"), Some(11));
+        assert_eq!(
+            EmbeddedDatabase::find_sql_keyword("wherex = 1 WHERE id = 2", b"WHERE"),
+            Some(11)
+        );
         assert_eq!(EmbeddedDatabase::find_sql_keyword("a = 1", b"WHERE"), None);
         assert_eq!(EmbeddedDatabase::find_sql_keyword("anything", b""), None);
     }
@@ -16245,10 +17293,7 @@ mod tests {
         );
 
         db.execute("DROP TABLE fast_select_meta").unwrap();
-        assert!(
-            db.fast_select_cache.is_empty(),
-            "DDL must clear fast SELECT metadata"
-        );
+        assert!(db.fast_select_cache.is_empty(), "DDL must clear fast SELECT metadata");
 
         db.execute("CREATE TABLE fast_select_meta (id TEXT PRIMARY KEY, val TEXT)")
             .unwrap();

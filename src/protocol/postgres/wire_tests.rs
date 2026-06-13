@@ -165,7 +165,8 @@ async fn extended_select_with_many_params() {
 #[tokio::test]
 async fn extended_select_null_handling() {
     let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
-    db.execute("CREATE TABLE n (id INT PRIMARY KEY, v TEXT)").expect("create");
+    db.execute("CREATE TABLE n (id INT PRIMARY KEY, v TEXT)")
+        .expect("create");
     db.execute("INSERT INTO n VALUES (1, NULL), (2, 'x')").expect("insert");
 
     let (mut handler, mut client) = test_handler(db);
@@ -272,7 +273,10 @@ async fn ddl_between_executes_invalidates_pinned_plan() {
         .handle_bind_extended("evp1".into(), "ev".into(), vec![], vec![], vec![])
         .await
         .expect("bind");
-    handler.handle_execute_extended("evp1".into(), 0).await.expect("execute");
+    handler
+        .handle_execute_extended("evp1".into(), 0)
+        .await
+        .expect("execute");
     let rows = data_rows(&drain(&mut client).await);
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].len(), 1, "one column before DDL");
@@ -284,7 +288,10 @@ async fn ddl_between_executes_invalidates_pinned_plan() {
         .handle_bind_extended("evp2".into(), "ev".into(), vec![], vec![], vec![])
         .await
         .expect("bind");
-    handler.handle_execute_extended("evp2".into(), 0).await.expect("execute");
+    handler
+        .handle_execute_extended("evp2".into(), 0)
+        .await
+        .expect("execute");
     let rows = data_rows(&drain(&mut client).await);
     assert_eq!(rows.len(), 1);
     assert_eq!(
@@ -309,7 +316,10 @@ async fn catalog_query_still_served_after_parse_decision() {
         .handle_bind_extended("catp".into(), "cat".into(), vec![], vec![], vec![])
         .await
         .expect("bind");
-    handler.handle_execute_extended("catp".into(), 0).await.expect("execute");
+    handler
+        .handle_execute_extended("catp".into(), 0)
+        .await
+        .expect("execute");
 
     let rows = data_rows(&drain(&mut client).await);
     assert_eq!(rows.len(), 1);

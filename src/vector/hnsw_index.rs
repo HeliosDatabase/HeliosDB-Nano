@@ -375,8 +375,7 @@ fn reload_graph<D>(dir: &std::path::Path, basename: &str) -> Result<Hnsw<'static
 where
     D: Distance<f32> + Default + Send + Sync,
 {
-    let io: &'static mut hnsw_rs::hnswio::HnswIo =
-        Box::leak(Box::new(hnsw_rs::hnswio::HnswIo::new(dir, basename)));
+    let io: &'static mut hnsw_rs::hnswio::HnswIo = Box::leak(Box::new(hnsw_rs::hnswio::HnswIo::new(dir, basename)));
     io.load_hnsw::<f32, D>()
         .map_err(|e| Error::storage(format!("HNSW graph reload failed: {e}")))
 }

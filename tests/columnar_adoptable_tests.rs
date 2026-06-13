@@ -197,8 +197,7 @@ mod columnar_adoptable {
 
         for t in ["upd_c", "upd_r"] {
             // Point update of a columnar value.
-            db.execute(&format!("UPDATE {t} SET v = 999999 WHERE id = 42"))
-                .unwrap();
+            db.execute(&format!("UPDATE {t} SET v = 999999 WHERE id = 42")).unwrap();
             // Range update touching several batches.
             db.execute(&format!("UPDATE {t} SET w = NULL WHERE v >= 500 AND v < 700"))
                 .unwrap();
@@ -388,7 +387,8 @@ mod columnar_adoptable {
         db.execute("DELETE FROM mig WHERE id % 4 = 0").unwrap();
 
         // Row -> columnar migration, then queries must still be correct.
-        db.execute("ALTER TABLE mig ALTER COLUMN v SET STORAGE COLUMNAR").unwrap();
+        db.execute("ALTER TABLE mig ALTER COLUMN v SET STORAGE COLUMNAR")
+            .unwrap();
         let sum = run_normalized(&db, "SELECT COUNT(*), SUM(v) FROM mig");
         // 150 rows remain: ids with id % 4 != 0. Sum of 0..200 = 19900,
         // minus sum of multiples of 4 below 200 (0+4+...+196 = 4900).
@@ -400,7 +400,8 @@ mod columnar_adoptable {
         assert_eq!(sum, vec![vec!["150".to_string(), "15499".to_string()]]);
 
         // Columnar -> row migration must also stay correct.
-        db.execute("ALTER TABLE mig ALTER COLUMN v SET STORAGE DEFAULT").unwrap();
+        db.execute("ALTER TABLE mig ALTER COLUMN v SET STORAGE DEFAULT")
+            .unwrap();
         let sum = run_normalized(&db, "SELECT COUNT(*), SUM(v) FROM mig");
         assert_eq!(sum, vec![vec!["150".to_string(), "15499".to_string()]]);
     }
@@ -413,8 +414,11 @@ mod columnar_adoptable {
         for t in ["cnt_c", "cnt_r"] {
             db.execute(&format!("DELETE FROM {t} WHERE id >= 1024 AND id < 2048"))
                 .unwrap();
-            db.execute(&format!("INSERT INTO {t} (id, v, w, grp) VALUES {}", values_clause(3000, 3010)))
-                .unwrap();
+            db.execute(&format!(
+                "INSERT INTO {t} (id, v, w, grp) VALUES {}",
+                values_clause(3000, 3010)
+            ))
+            .unwrap();
         }
         let col = run_normalized(&db, "SELECT COUNT(*) FROM cnt_c");
         let row = run_normalized(&db, "SELECT COUNT(*) FROM cnt_r");

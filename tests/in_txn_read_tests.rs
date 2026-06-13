@@ -151,7 +151,8 @@ fn rc_txn_with_writes_keeps_read_your_writes() {
     assert_eq!(rows[0].get(1).unwrap(), &Value::String("mine".into()));
 
     // Staged UPDATE must be visible.
-    db.execute_for_session(a, "UPDATE t SET v = 'updated' WHERE id = 5").unwrap();
+    db.execute_for_session(a, "UPDATE t SET v = 'updated' WHERE id = 5")
+        .unwrap();
     let (rows, _) = db
         .query_with_columns_for_session(a, "SELECT v FROM t WHERE id = 5")
         .unwrap();
@@ -168,7 +169,11 @@ fn rc_txn_with_writes_keeps_read_your_writes() {
     let (rows, _) = db
         .query_with_columns_for_session(a, "SELECT COUNT(*) FROM t WHERE id > 1000")
         .unwrap();
-    assert_eq!(rows[0].get(0).unwrap(), &Value::Int8(1), "aggregate must include staged row");
+    assert_eq!(
+        rows[0].get(0).unwrap(),
+        &Value::Int8(1),
+        "aggregate must include staged row"
+    );
 
     // ROLLBACK undoes everything; autocommit view is unchanged.
     db.execute_for_session(a, "ROLLBACK").unwrap();
@@ -203,14 +208,19 @@ fn rr_txn_does_not_see_later_commits() {
     assert_eq!(rows.len(), 0);
 
     // Concurrent autocommit writes AFTER the snapshot.
-    db.execute("INSERT INTO t (id, v) VALUES (999, 'post-snapshot')").unwrap();
+    db.execute("INSERT INTO t (id, v) VALUES (999, 'post-snapshot')")
+        .unwrap();
     db.execute("UPDATE t SET v = 'changed' WHERE id = 1").unwrap();
 
     // The RR transaction must not see any of it — point lookup…
     let (rows, _) = db
         .query_with_columns_for_session(s, "SELECT * FROM t WHERE id = 999")
         .unwrap();
-    assert_eq!(rows.len(), 0, "RR txn saw a post-snapshot INSERT via a relaxed index probe");
+    assert_eq!(
+        rows.len(),
+        0,
+        "RR txn saw a post-snapshot INSERT via a relaxed index probe"
+    );
 
     // …updated row…
     let (rows, _) = db
@@ -341,13 +351,21 @@ fn knn_inside_rc_txn_no_writes_serves_index_path_results() -> Result<()> {
 
     // No writes to vecs: the HNSW index path answers, identical to autocommit.
     let (rows, _) = db.query_with_columns_for_session(a, knn)?;
-    assert_eq!(sorted_debug(&rows), sorted_debug(&autocommit), "in-txn kNN != autocommit kNN");
+    assert_eq!(
+        sorted_debug(&rows),
+        sorted_debug(&autocommit),
+        "in-txn kNN != autocommit kNN"
+    );
 
     // RC freshness: a concurrent committed insert that is nearer must be
     // visible to the next statement.
     db.execute("INSERT INTO vecs VALUES (99, '[0.1, 0.0, 0.0]')")?;
     let (rows, _) = db.query_with_columns_for_session(a, knn)?;
-    assert_eq!(rows[0].get(0).unwrap(), &Value::Int4(99), "RC kNN must see the fresh commit");
+    assert_eq!(
+        rows[0].get(0).unwrap(),
+        &Value::Int4(99),
+        "RC kNN must see the fresh commit"
+    );
 
     // Once the txn writes the vector table, reads take the slow path and must
     // see the staged (even nearer) row — read-your-writes.
@@ -383,10 +401,15 @@ fn rc_txn_topk_matches_committed_view_and_respects_writes() {
     let a = db.create_wire_session("a").unwrap();
     db.execute_for_session(a, "BEGIN").unwrap();
     let (rows, _) = db.query_with_columns_for_session(a, topk).unwrap();
-    assert_eq!(sorted_debug(&rows), sorted_debug(&autocommit), "in-txn top-k != autocommit top-k");
+    assert_eq!(
+        sorted_debug(&rows),
+        sorted_debug(&autocommit),
+        "in-txn top-k != autocommit top-k"
+    );
 
     // Stage a row beyond the current max: the slow path must surface it.
-    db.execute_for_session(a, "INSERT INTO t (id, v) VALUES (5000, 'top')").unwrap();
+    db.execute_for_session(a, "INSERT INTO t (id, v) VALUES (5000, 'top')")
+        .unwrap();
     let (rows, _) = db.query_with_columns_for_session(a, topk).unwrap();
     assert_eq!(
         rows[0].get(0).unwrap(),
@@ -463,8 +486,14 @@ fn run_in_txn_read_ab() {
     let per = |d: std::time::Duration| d.as_micros() as f64 / LOOKUPS as f64;
     println!("R2.3 A/B: point lookup on {ROWS}-row table, {LOOKUPS} lookups each");
     println!("  autocommit (reference fast path) : {:>10.1} us/lookup", per(auto));
-    println!("  RC txn, no table writes (R2.3)   : {:>10.1} us/lookup", per(no_writes));
-    println!("  RC txn, staged write (pre-R2.3)  : {:>10.1} us/lookup", per(with_write));
+    println!(
+        "  RC txn, no table writes (R2.3)   : {:>10.1} us/lookup",
+        per(no_writes)
+    );
+    println!(
+        "  RC txn, staged write (pre-R2.3)  : {:>10.1} us/lookup",
+        per(with_write)
+    );
     println!(
         "  speedup (slow path / R2.3 path)  : {:>10.1}x",
         per(with_write) / per(no_writes)

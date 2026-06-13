@@ -342,6 +342,80 @@ impl Parser {
         upper.starts_with("REFRESH MATERIALIZED VIEW")
     }
 
+    /// Check if SQL is a CREATE MATERIALIZED VIEW statement.
+    pub fn is_create_materialized_view(sql: &str) -> bool {
+        let upper = sql.trim().to_uppercase();
+        upper.starts_with("CREATE MATERIALIZED VIEW")
+    }
+
+    /// Parse CREATE MATERIALIZED VIEW for the PostgreSQL-compatible shape
+    /// that sqlparser does not currently accept: `IF NOT EXISTS`.
+    ///
+    /// The caller still plans the inner query through the normal planner so
+    /// the existing MV/DMV execution path stays authoritative.
+    pub fn parse_create_materialized_view_sql(sql: &str) -> Result<(String, String, bool)> {
+        let cleaned = sql.trim().trim_end_matches(';').trim();
+        let after_create = cleaned
+            .get("CREATE MATERIALIZED VIEW".len()..)
+            .ok_or_else(|| Error::query_execution("CREATE MATERIALIZED VIEW requires a view name"))?
+            .trim_start();
+
+        let upper_after = after_create.to_uppercase();
+        let if_not_exists = upper_after.starts_with("IF NOT EXISTS");
+        let remaining = if if_not_exists {
+            after_create["IF NOT EXISTS".len()..].trim_start()
+        } else {
+            after_create
+        };
+
+        let as_pos = Self::find_as_keyword(remaining)
+            .ok_or_else(|| Error::query_execution("CREATE MATERIALIZED VIEW requires AS <query>"))?;
+        let raw_name = remaining[..as_pos].trim();
+        let query = remaining[as_pos + "AS".len()..].trim();
+
+        if raw_name.is_empty() {
+            return Err(Error::query_execution("CREATE MATERIALIZED VIEW requires a view name"));
+        }
+        if query.is_empty() {
+            return Err(Error::query_execution("CREATE MATERIALIZED VIEW requires AS <query>"));
+        }
+
+        Ok((
+            Self::normalize_simple_object_name(raw_name),
+            query.to_string(),
+            if_not_exists,
+        ))
+    }
+
+    fn find_as_keyword(sql: &str) -> Option<usize> {
+        let upper = sql.to_uppercase();
+        for (idx, _) in upper.match_indices("AS") {
+            let before_ok = idx == 0 || upper[..idx].chars().next_back().is_some_and(|c| c.is_whitespace());
+            let after_idx = idx + "AS".len();
+            let after_ok =
+                after_idx >= upper.len() || upper[after_idx..].chars().next().is_some_and(|c| c.is_whitespace());
+            if before_ok && after_ok {
+                return Some(idx);
+            }
+        }
+        None
+    }
+
+    fn normalize_simple_object_name(raw_name: &str) -> String {
+        let joined = raw_name
+            .split('.')
+            .map(|part| part.trim().trim_matches('"').to_ascii_lowercase())
+            .collect::<Vec<_>>()
+            .join(".");
+        if let Some(rest) = joined.strip_prefix("public.") {
+            return rest.to_string();
+        }
+        if let Some(rest) = joined.strip_prefix("pg_catalog.") {
+            return rest.to_string();
+        }
+        joined
+    }
+
     /// Parse REFRESH MATERIALIZED VIEW statement
     ///
     /// Syntax:

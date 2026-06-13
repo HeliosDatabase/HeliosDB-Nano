@@ -39,14 +39,14 @@ pub mod lockfree;
 
 // Per-column storage optimization modules
 pub mod columnar;
-pub mod conflict;
 pub mod compression;
+pub mod conflict;
 pub mod content_addr;
 pub mod dictionary;
 // R3.4 typed columnar batch format v2 + vectorized kernels
+pub mod group_commit;
 pub mod typed_batch;
 pub mod typed_kernels;
-pub mod group_commit;
 
 // Row-level caching
 pub mod row_cache;
@@ -73,7 +73,6 @@ pub use branch::{
 };
 pub use catalog::Catalog;
 pub use dirty_tracker::{Change, ChangeType, DirtyTracker, DirtyTrackerError};
-pub use index_snapshot::{IndexOpenReport, IndexSnapshotPersistReport};
 pub use dump::{
     CompressionType as DumpCompressionType, DumpManager, DumpMetadata, DumpMode, DumpOptions, DumpOutputFormat,
     DumpReport, DumpType, RestoreOptions, RestoreReport,
@@ -81,6 +80,7 @@ pub use dump::{
 pub(crate) use engine::{ColumnarAggregateOp, ColumnarAggregateSpec};
 pub use engine::{DirectBulkLoadResult, StorageEngine, StorageStats, SynchronousCommitOverrideGuard};
 pub use gin_index::{GinIndex, GinIndexStats};
+pub use index_snapshot::{IndexOpenReport, IndexSnapshotPersistReport};
 pub use lock_manager::{LockGuard, LockManager, LockState, LockType};
 pub use materialized_view::{MaterializedViewCatalog, MaterializedViewMetadata};
 pub use mv_auto_refresh::{AutoRefreshConfig, AutoRefreshWorker};
@@ -99,11 +99,11 @@ pub use statistics::{ColumnStatistics, StatisticsAnalyzer, StatisticsCache, Tabl
 pub use stats::{DatabaseStats, GlobalStatsCollector, ReplicationRole, StatsSnapshot};
 pub use time_travel::{GcConfig, Scn, SnapshotManager, SnapshotMetadata, TransactionId};
 pub use transaction::{Transaction, TransactionSavepointSnapshot};
-pub use version_gc::{VersionGcConfig, VersionGcCycleStats, VersionStorageStats};
 pub use vector_index::{
     StoredVectorRecord, StoredVectorSearchResult, VectorIndexManager, VectorIndexMetadata, VectorIndexStats,
     VectorIndexType, VectorIndexUndoOp,
 };
+pub use version_gc::{VersionGcConfig, VersionGcCycleStats, VersionStorageStats};
 pub use view_catalog::{ViewCatalog, ViewMetadata};
 pub use wal::{
     CleanupStats, ReplayStats, WalEntry, WalIntegrityReport, WalMetrics, WalOperation, WalSyncMode, WriteAheadLog,

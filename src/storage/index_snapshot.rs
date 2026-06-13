@@ -120,8 +120,7 @@ impl SnapshotMarker {
     }
 
     pub fn matches_current(&self) -> bool {
-        self.format_version == INDEX_SNAPSHOT_FORMAT_VERSION
-            && self.key_encoding_version == ART_KEY_ENCODING_VERSION
+        self.format_version == INDEX_SNAPSHOT_FORMAT_VERSION && self.key_encoding_version == ART_KEY_ENCODING_VERSION
     }
 }
 

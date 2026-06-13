@@ -188,7 +188,12 @@ impl MySqlTestClient {
 
     async fn write_packet(&mut self, seq: u8, payload: &[u8]) {
         let len = payload.len();
-        let hdr = [(len & 0xFF) as u8, ((len >> 8) & 0xFF) as u8, ((len >> 16) & 0xFF) as u8, seq];
+        let hdr = [
+            (len & 0xFF) as u8,
+            ((len >> 8) & 0xFF) as u8,
+            ((len >> 16) & 0xFF) as u8,
+            seq,
+        ];
         self.stream.write_all(&hdr).await.unwrap();
         self.stream.write_all(payload).await.unwrap();
         self.stream.flush().await.unwrap();
@@ -212,7 +217,12 @@ impl MySqlTestClient {
         self.write_packet(0, &p).await;
 
         let (_seq, ok) = self.read_packet().await;
-        assert_eq!(ok[0], 0x00, "COM_STMT_PREPARE failed: {:?}", String::from_utf8_lossy(&ok));
+        assert_eq!(
+            ok[0],
+            0x00,
+            "COM_STMT_PREPARE failed: {:?}",
+            String::from_utf8_lossy(&ok)
+        );
         let stmt_id = u32::from_le_bytes([ok[1], ok[2], ok[3], ok[4]]);
         let _num_columns = u16::from_le_bytes([ok[5], ok[6]]);
         let num_params = u16::from_le_bytes([ok[7], ok[8]]);
@@ -415,9 +425,7 @@ async fn prepare_reports_quote_aware_param_count() {
     let mut client = MySqlTestClient::connect(db).await;
 
     // '?' inside the string literal must NOT count as a parameter
-    let (_id, n) = client
-        .prepare("INSERT INTO q (id, name) VALUES (?, 'what?')")
-        .await;
+    let (_id, n) = client.prepare("INSERT INTO q (id, name) VALUES (?, 'what?')").await;
     assert_eq!(n, 1, "placeholder inside string literal was counted");
 
     let (_id, n) = client.prepare("SELECT * FROM q WHERE id = ? AND name = ?").await;
@@ -497,9 +505,7 @@ async fn all_numeric_widths_decode() {
     .unwrap();
     let mut client = MySqlTestClient::connect(Arc::clone(&db)).await;
 
-    let (stmt, n) = client
-        .prepare("INSERT INTO nums VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
-        .await;
+    let (stmt, n) = client.prepare("INSERT INTO nums VALUES (?, ?, ?, ?, ?, ?, ?, ?)").await;
     assert_eq!(n, 8);
 
     let affected = client
@@ -607,7 +613,8 @@ async fn repeated_execute_reuses_cached_param_types() {
 async fn update_and_delete_with_params() {
     let db = test_db();
     db.execute("CREATE TABLE ud (id INT PRIMARY KEY, v TEXT)").unwrap();
-    db.execute("INSERT INTO ud VALUES (1, 'a'), (2, 'b'), (3, 'c')").unwrap();
+    db.execute("INSERT INTO ud VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .unwrap();
     let mut client = MySqlTestClient::connect(Arc::clone(&db)).await;
 
     let (upd, _) = client.prepare("UPDATE ud SET v = ? WHERE id = ?").await;

@@ -196,7 +196,9 @@ impl ColumnBatch {
         self.values(); // force materialization before dropping `typed`
         self.typed = None;
         // The cell was just initialized above.
-        self.values.get_mut().unwrap_or_else(|| unreachable!("values cell initialized above"))
+        self.values
+            .get_mut()
+            .unwrap_or_else(|| unreachable!("values cell initialized above"))
     }
 
     /// Number of slots covered by this batch.
@@ -548,7 +550,12 @@ impl ColumnarStore {
 
     /// Load one batch's presence record from the transaction overlay, then the
     /// database, then default to all-absent.
-    fn load_presence_for_write(db: &DB, txn: Option<&Transaction>, table: &str, batch_id: u64) -> Result<BatchPresence> {
+    fn load_presence_for_write(
+        db: &DB,
+        txn: Option<&Transaction>,
+        table: &str,
+        batch_id: u64,
+    ) -> Result<BatchPresence> {
         let key = Self::presence_key(table, batch_id);
         let raw = match txn {
             Some(txn) => match txn.get(&key)? {
@@ -944,7 +951,14 @@ impl ColumnarStore {
     /// only when the committed bytes still equal the image we decoded (a
     /// concurrent writer otherwise wins). Failures are logged and ignored —
     /// the batch simply stays v1 until the next scan.
-    fn maybe_migrate_v1_batch(db: &DB, table: &str, column: &str, batch_id: u64, original_raw: &[u8], batch: &ColumnBatch) {
+    fn maybe_migrate_v1_batch(
+        db: &DB,
+        table: &str,
+        column: &str,
+        batch_id: u64,
+        original_raw: &[u8],
+        batch: &ColumnBatch,
+    ) {
         use super::typed_batch as tb;
         if batch.typed.is_some() || !tb::batch_v2_migrate_enabled() || !tb::batch_v2_write_enabled() {
             return;

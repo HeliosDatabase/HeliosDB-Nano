@@ -121,14 +121,10 @@ fn mutual_fk_inserts_across_tables_do_not_deadlock() {
         .unwrap();
     db.execute("CREATE TABLE fk_side_b (id INT PRIMARY KEY, a_ref INT)")
         .unwrap();
-    db.execute(
-        "ALTER TABLE fk_side_a ADD CONSTRAINT fk_a_to_b FOREIGN KEY (b_ref) REFERENCES fk_side_b(id)",
-    )
-    .unwrap();
-    db.execute(
-        "ALTER TABLE fk_side_b ADD CONSTRAINT fk_b_to_a FOREIGN KEY (a_ref) REFERENCES fk_side_a(id)",
-    )
-    .unwrap();
+    db.execute("ALTER TABLE fk_side_a ADD CONSTRAINT fk_a_to_b FOREIGN KEY (b_ref) REFERENCES fk_side_b(id)")
+        .unwrap();
+    db.execute("ALTER TABLE fk_side_b ADD CONSTRAINT fk_b_to_a FOREIGN KEY (a_ref) REFERENCES fk_side_a(id)")
+        .unwrap();
 
     // Seed both sides with referenceable rows (NULL FK values are allowed).
     const SEED: i64 = 100;
@@ -203,8 +199,11 @@ fn concurrent_index_create_drop_during_reads() {
 
     const ROWS: i64 = 100;
     for i in 0..ROWS {
-        db.execute(&format!("INSERT INTO ddl_target VALUES ({}, 'user{}@example.com')", i, i))
-            .unwrap();
+        db.execute(&format!(
+            "INSERT INTO ddl_target VALUES ({}, 'user{}@example.com')",
+            i, i
+        ))
+        .unwrap();
         db.execute(&format!("INSERT INTO steady_reads VALUES ({}, 'val_{}')", i, i))
             .unwrap();
     }
@@ -269,8 +268,11 @@ fn concurrent_index_create_drop_during_reads() {
         handles.push(std::thread::spawn(move || {
             for i in 0..EXTRA_WRITES {
                 let id = 1000 + i;
-                db.execute(&format!("INSERT INTO ddl_target VALUES ({}, 'user{}@example.com')", id, id))
-                    .unwrap();
+                db.execute(&format!(
+                    "INSERT INTO ddl_target VALUES ({}, 'user{}@example.com')",
+                    id, id
+                ))
+                .unwrap();
             }
         }));
     }

@@ -675,7 +675,11 @@ where
             self.send_ready_for_query().await?;
             return Ok(());
         } else if starts_with_icase(trimmed, "RESET ")
-            && trimmed[6..].trim().trim_end_matches(';').trim().eq_ignore_ascii_case("synchronous_commit")
+            && trimmed[6..]
+                .trim()
+                .trim_end_matches(';')
+                .trim()
+                .eq_ignore_ascii_case("synchronous_commit")
         {
             // R1.3-p2: back to the storage.durable_commit default.
             if let Err(e) = self.database.set_session_synchronous_commit(self.session_id, None) {
@@ -1605,7 +1609,6 @@ where
         self.flush().await
     }
 
-
     /// SQLite-shaped `PRAGMA table_info(t)` rows.
     ///
     /// One row per column with `(cid, name, type, notnull, dflt_value, pk)` —
@@ -2411,7 +2414,7 @@ pub(crate) fn sqlstate_for_error(error: &Error) -> &'static str {
                 sqlstate::INTEGRITY_CONSTRAINT_VIOLATION // 23000
             }
         }
-        Error::SqlParse(_) => sqlstate::SYNTAX_ERROR, // 42601
+        Error::SqlParse(_) => sqlstate::SYNTAX_ERROR,            // 42601
         Error::TypeConversion(_) => sqlstate::DATATYPE_MISMATCH, // 42804
         Error::Transaction(message) => {
             let lower = message.to_ascii_lowercase();
@@ -2446,8 +2449,7 @@ fn sqlstate_for_query_execution_message(message: &str) -> &'static str {
     use crate::network::protocol::sqlstate;
 
     let lower = message.to_ascii_lowercase();
-    let not_found =
-        lower.contains("not found") || lower.contains("does not exist") || lower.contains("doesn't exist");
+    let not_found = lower.contains("not found") || lower.contains("does not exist") || lower.contains("doesn't exist");
 
     if lower.contains("function") && (not_found || lower.contains("unknown")) {
         sqlstate::UNDEFINED_FUNCTION // 42883
@@ -2559,7 +2561,9 @@ mod failed_transaction_state_tests {
         (
             PgConnectionHandler {
                 stream,
-                session_id: db.create_wire_session("pg_wire_test").expect("wire session creation is infallible"),
+                session_id: db
+                    .create_wire_session("pg_wire_test")
+                    .expect("wire session creation is infallible"),
                 database: db.clone(),
                 auth_manager: Arc::new(AuthManager::new(AuthMethod::Trust)),
                 catalog: PgCatalog::with_database(db),
@@ -2647,7 +2651,9 @@ mod show_branches_wire_tests {
         (
             PgConnectionHandler {
                 stream,
-                session_id: db.create_wire_session("pg_wire_test").expect("wire session creation is infallible"),
+                session_id: db
+                    .create_wire_session("pg_wire_test")
+                    .expect("wire session creation is infallible"),
                 database: db.clone(),
                 auth_manager: Arc::new(AuthManager::new(AuthMethod::Trust)),
                 catalog: PgCatalog::with_database(db),
@@ -2868,24 +2874,32 @@ mod sqlstate_mapping_unit_tests {
         // Real first-committer-wins conflict via two REPEATABLE READ
         // sessions (R0.2).
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE t40001 (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+        db.execute("CREATE TABLE t40001 (id INTEGER PRIMARY KEY, v INTEGER)")
+            .unwrap();
         db.execute("INSERT INTO t40001 VALUES (1, 100)").unwrap();
 
         let a = db.create_session("a", IsolationLevel::RepeatableRead).unwrap();
         let b = db.create_session("b", IsolationLevel::RepeatableRead).unwrap();
         db.begin_transaction_for_session(a).unwrap();
         db.begin_transaction_for_session(b).unwrap();
-        db.execute_in_session(a, "UPDATE t40001 SET v = 101 WHERE id = 1").unwrap();
+        db.execute_in_session(a, "UPDATE t40001 SET v = 101 WHERE id = 1")
+            .unwrap();
         db.commit_transaction_for_session(a).unwrap();
-        db.execute_in_session(b, "UPDATE t40001 SET v = 150 WHERE id = 1").unwrap();
-        let err = db.commit_transaction_for_session(b).expect_err("conflicting commit must fail");
+        db.execute_in_session(b, "UPDATE t40001 SET v = 150 WHERE id = 1")
+            .unwrap();
+        let err = db
+            .commit_transaction_for_session(b)
+            .expect_err("conflicting commit must fail");
 
         let code = sqlstate_for_error(&err);
         assert_eq!(code, "40001", "got error: {err}");
         let (detail, hint) = detail_hint_for_error(code, &err);
         assert!(detail.is_some());
         assert!(
-            hint.as_deref().unwrap_or_default().to_ascii_lowercase().contains("retry"),
+            hint.as_deref()
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .contains("retry"),
             "hint must suggest retrying; got {hint:?}"
         );
 
@@ -2902,7 +2916,11 @@ mod sqlstate_mapping_unit_tests {
         let code = sqlstate_for_error(&err);
         assert_eq!(code, "40P01");
         let (_, hint) = detail_hint_for_error(code, &err);
-        assert!(hint.as_deref().unwrap_or_default().to_ascii_lowercase().contains("retry"));
+        assert!(hint
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .contains("retry"));
     }
 
     #[test]

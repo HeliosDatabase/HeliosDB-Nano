@@ -546,10 +546,20 @@ pub(super) fn indexed_range_lookup(
 
         let mut parts = Vec::new();
         if let Some((_, inclusive, text)) = &lower {
-            parts.push(format!("{} {} {}", column.name, if *inclusive { ">=" } else { ">" }, text));
+            parts.push(format!(
+                "{} {} {}",
+                column.name,
+                if *inclusive { ">=" } else { ">" },
+                text
+            ));
         }
         if let Some((_, inclusive, text)) = &upper {
-            parts.push(format!("{} {} {}", column.name, if *inclusive { "<=" } else { "<" }, text));
+            parts.push(format!(
+                "{} {} {}",
+                column.name,
+                if *inclusive { "<=" } else { "<" },
+                text
+            ));
         }
         let display = parts.join(" AND ");
 

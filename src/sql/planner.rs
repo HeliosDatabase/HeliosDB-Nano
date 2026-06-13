@@ -954,6 +954,14 @@ impl<'a> Planner<'a> {
         })
     }
 
+    fn infer_recursive_cte_anchor_schema(&self, query: &Query) -> Result<Option<Arc<Schema>>> {
+        let SetExpr::SetOperation { left, .. } = query.body.as_ref() else {
+            return Ok(None);
+        };
+        let anchor_plan = self.set_expr_to_plan((**left).clone())?;
+        Ok(Some(anchor_plan.schema()))
+    }
+
     /// Convert a Query to a logical plan
     fn query_to_plan(&self, query: Query) -> Result<LogicalPlan> {
         // Handle WITH clause (CTEs)
@@ -977,6 +985,10 @@ impl<'a> Planner<'a> {
                             .collect(),
                     ));
                     self.add_cte(cte_name.clone(), schema);
+                } else if is_recursive {
+                    if let Some(schema) = self.infer_recursive_cte_anchor_schema(&cte.query)? {
+                        self.add_cte(cte_name.clone(), schema);
+                    }
                 }
 
                 // Convert CTE query to logical plan
@@ -2035,12 +2047,7 @@ impl<'a> Planner<'a> {
     /// is actually performed.
     fn runtime_stamped_schema(plan: &LogicalPlan) -> Arc<Schema> {
         match plan {
-            LogicalPlan::Scan {
-                table_name, alias, ..
-            }
-            | LogicalPlan::FilteredScan {
-                table_name, alias, ..
-            } => {
+            LogicalPlan::Scan { table_name, alias, .. } | LogicalPlan::FilteredScan { table_name, alias, .. } => {
                 // `plan.schema()` already applies any scan projection.
                 let mut schema = (*plan.schema()).clone();
                 let source_name = alias.as_ref().unwrap_or(table_name);

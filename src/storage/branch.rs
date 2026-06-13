@@ -751,6 +751,15 @@ impl BranchManager {
         Ok(branches)
     }
 
+    /// Return true when any registered branch other than main exists.
+    pub fn has_user_branches_registered(&self) -> bool {
+        let registry = self.registry.read();
+        registry
+            .branches
+            .iter()
+            .any(|(branch_id, name)| *branch_id != registry.main_branch && name != "main")
+    }
+
     /// Get branch name by ID
     pub fn get_branch_name(&self, branch_id: BranchId) -> Option<String> {
         let registry = self.registry.read();

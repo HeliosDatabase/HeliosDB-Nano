@@ -71,7 +71,10 @@ pub(crate) fn expand_bitmap_to_mask(bits: &[u8], mask: &mut [u8]) {
 /// once per query.
 enum ConstRepr<'a> {
     Int(i64),
-    Float { v: f64, is_f32: bool },
+    Float {
+        v: f64,
+        is_f32: bool,
+    },
     Bool(bool),
     Str(&'a str),
     /// NULL / list / unsupported constant: cross-family uniform results for
@@ -155,7 +158,15 @@ impl<'a> CompiledPredicate<'a> {
                 }
                 (TypedValues::Float { width, data }, ConstRepr::Float { v, is_f32 }) if cmp6 => {
                     let f32_math = *is_f32 && *width == FloatWidth::F4;
-                    mask_float_cmp(data, &typed.validity, self.pred.op, *v, f32_math, self.null_result, mask);
+                    mask_float_cmp(
+                        data,
+                        &typed.validity,
+                        self.pred.op,
+                        *v,
+                        f32_math,
+                        self.null_result,
+                        mask,
+                    );
                     return;
                 }
                 (TypedValues::Bool { data }, ConstRepr::Bool(c)) if cmp6 => {
@@ -262,7 +273,15 @@ fn mask_int_cmp(data: &[i64], validity: &[u8], op: FilterOp, c: i64, null_result
 /// (Float4 column, Float4 constant) scalar arm; all promoted values are
 /// exactly representable so the downcasts are lossless. LtEq/GtEq are
 /// `lt || eps_eq`, mirroring `evaluate`.
-fn mask_float_cmp(data: &[f64], validity: &[u8], op: FilterOp, c: f64, f32_math: bool, null_result: u8, mask: &mut [u8]) {
+fn mask_float_cmp(
+    data: &[f64],
+    validity: &[u8],
+    op: FilterOp,
+    c: f64,
+    f32_math: bool,
+    null_result: u8,
+    mask: &mut [u8],
+) {
     let eq = move |v: f64| -> bool {
         if f32_math {
             (v as f32 - c as f32).abs() < f32::EPSILON
@@ -544,7 +563,9 @@ pub(crate) fn group_count_sum_by_small_int(
             continue;
         }
         let idx = match (gdata.get(i), gvalid.get(i)) {
-            (Some(&v), Some(&ok)) if ok != 0 => usize::try_from(v.wrapping_sub(base)).map_or(null_slot, |d| d.min(null_slot)),
+            (Some(&v), Some(&ok)) if ok != 0 => {
+                usize::try_from(v.wrapping_sub(base)).map_or(null_slot, |d| d.min(null_slot))
+            }
             _ => null_slot,
         };
         if let Some(c) = counts.get_mut(idx) {
@@ -566,8 +587,8 @@ pub(crate) fn group_count_sum_by_small_int(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::typed_batch::{decode_column_batch, encode_column_batch};
     use crate::storage::columnar::BatchStats;
+    use crate::storage::typed_batch::{decode_column_batch, encode_column_batch};
 
     /// Build a decoded-from-v2 batch (typed populated) from values.
     fn typed_batch(values: Vec<Value>) -> ColumnBatch {

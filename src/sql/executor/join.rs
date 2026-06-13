@@ -1796,18 +1796,38 @@ pub(super) fn handle_join(
         )?));
     }
 
-    // Note: Index-Nested-Loop Join is available via try_index_nested_loop_join()
-    // but is currently disabled as hash join + predicate pushdown is faster for
-    // small-to-medium tables (individual RocksDB lookups are slower than batch scans).
-    // Enable with cardinality-based cost estimation in the future.
-
     let left_rows = estimate_hash_join_rows(executor, left);
     let right_rows = estimate_hash_join_rows(executor, right);
-    // Diagnostic kill switch for A/B perf runs; default is to build the
-    // smaller known side for inner equi-joins.
+    // Diagnostic kill switch for A/B perf runs. Build left only when it is
+    // much smaller; otherwise keep the left side as the probe stream, which is
+    // faster for common filtered one-to-many joins.
     let build_left_for_inner = matches!(join_type, crate::sql::JoinType::Inner)
         && std::env::var("HELIOS_HASHJOIN_BUILD_RIGHT").is_err()
-        && matches!((left_rows, right_rows), (Some(l), Some(r)) if l < r);
+        && should_build_left_for_inner(left_rows, right_rows);
+
+    if let Some(condition) = on {
+        let (equi_part, residual_part) = split_join_condition(condition);
+        let inlj_left_rows = if matches!(join_type, crate::sql::JoinType::Inner) {
+            estimate_index_nested_loop_probe_rows(executor, left).or(left_rows)
+        } else {
+            left_rows
+        };
+        if residual_part.is_none()
+            && matches!(join_type, crate::sql::JoinType::Inner | crate::sql::JoinType::Left)
+            && should_try_index_nested_loop_join(inlj_left_rows, right_rows)
+            && is_plain_scan_like(right)
+        {
+            if let Some(join_op) = try_index_nested_loop_join(
+                executor,
+                left,
+                right,
+                join_type,
+                equi_part.as_ref().unwrap_or(condition),
+            )? {
+                return Ok(join_op);
+            }
+        }
+    }
 
     let left_op = executor.plan_to_operator(left)?;
     let right_op = executor.plan_to_operator(right)?;
@@ -1915,8 +1935,33 @@ pub(super) fn handle_projected_join(
 
     let left_rows = estimate_hash_join_rows(executor, left);
     let right_rows = estimate_hash_join_rows(executor, right);
-    let build_left_for_inner = std::env::var("HELIOS_HASHJOIN_BUILD_RIGHT").is_err()
-        && matches!((left_rows, right_rows), (Some(l), Some(r)) if l < r);
+    let build_left_for_inner =
+        std::env::var("HELIOS_HASHJOIN_BUILD_RIGHT").is_err() && should_build_left_for_inner(left_rows, right_rows);
+
+    let inlj_left_rows = estimate_index_nested_loop_probe_rows(executor, left).or(left_rows);
+    if post_join_predicate.is_none()
+        && should_try_index_nested_loop_join(inlj_left_rows, right_rows)
+        && is_plain_scan_like(right)
+    {
+        if let Some(join_op) = try_index_nested_loop_join(
+            executor,
+            left,
+            right,
+            join_type,
+            equi_part.as_ref().expect("checked above"),
+        )? {
+            let timeout_ctx = executor.timeout_ctx();
+            let project_op = super::project::ProjectOperator::new(
+                join_op,
+                exprs.to_vec(),
+                aliases.to_vec(),
+                false,
+                executor.parameters().to_vec(),
+            )
+            .with_timeout(timeout_ctx);
+            return Ok(Some(Box::new(project_op)));
+        }
+    }
 
     let compact_plans = equi_part
         .as_ref()
@@ -2036,6 +2081,133 @@ fn estimate_hash_join_rows(executor: &Executor<'_>, plan: &crate::sql::LogicalPl
     }
 }
 
+fn estimate_index_nested_loop_probe_rows(executor: &Executor<'_>, plan: &crate::sql::LogicalPlan) -> Option<usize> {
+    match plan {
+        crate::sql::LogicalPlan::FilteredScan {
+            table_name,
+            alias,
+            schema,
+            predicate: Some(predicate),
+            ..
+        } => indexed_equality_predicate_is_selective(executor, table_name, alias.as_deref(), schema, predicate)
+            .then_some(1),
+        crate::sql::LogicalPlan::Filter { input, .. } => {
+            estimate_index_nested_loop_probe_rows(executor, input).map(estimate_filtered_rows)
+        }
+        crate::sql::LogicalPlan::Project { input, .. } | crate::sql::LogicalPlan::Sort { input, .. } => {
+            estimate_index_nested_loop_probe_rows(executor, input)
+        }
+        crate::sql::LogicalPlan::Limit { input, limit, .. } => {
+            estimate_index_nested_loop_probe_rows(executor, input).map(|rows| rows.min(*limit))
+        }
+        crate::sql::LogicalPlan::Join {
+            left,
+            right,
+            join_type,
+            on: Some(condition),
+            lateral: false,
+        } if matches!(join_type, crate::sql::JoinType::Inner) => {
+            let left_rows = estimate_index_nested_loop_probe_rows(executor, left)?;
+            if left_rows > 128 || !is_plain_scan_like(right) || !right_join_key_has_index(executor, right, condition) {
+                return None;
+            }
+            Some(left_rows.saturating_mul(8).min(128))
+        }
+        _ => None,
+    }
+}
+
+fn indexed_equality_predicate_is_selective(
+    executor: &Executor<'_>,
+    table_name: &str,
+    alias: Option<&str>,
+    schema: &Schema,
+    predicate: &crate::sql::LogicalExpr,
+) -> bool {
+    use crate::sql::{BinaryOperator, LogicalExpr};
+    let LogicalExpr::BinaryExpr {
+        left,
+        op: BinaryOperator::Eq,
+        right,
+    } = predicate
+    else {
+        return false;
+    };
+    let column = match (left.as_ref(), right.as_ref()) {
+        (LogicalExpr::Column { table, name }, LogicalExpr::Literal(_) | LogicalExpr::Parameter { .. })
+        | (LogicalExpr::Literal(_) | LogicalExpr::Parameter { .. }, LogicalExpr::Column { table, name }) => {
+            if table.as_deref().is_some_and(|qualifier| {
+                !qualifier.eq_ignore_ascii_case(table_name)
+                    && !alias.is_some_and(|alias| qualifier.eq_ignore_ascii_case(alias))
+            }) {
+                return false;
+            }
+            name
+        }
+        _ => return false,
+    };
+    if !schema.columns.iter().any(|col| col.name.eq_ignore_ascii_case(column)) {
+        return false;
+    }
+    executor
+        .storage()
+        .and_then(|storage| storage.art_indexes().find_column_index(table_name, column))
+        .is_some()
+}
+
+fn right_join_key_has_index(
+    executor: &Executor<'_>,
+    right: &crate::sql::LogicalPlan,
+    condition: &crate::sql::LogicalExpr,
+) -> bool {
+    let Some(storage) = executor.storage() else {
+        return false;
+    };
+    let Some((right_table, right_alias, _right_schema)) = extract_scan_info(right) else {
+        return false;
+    };
+    let Some((left_col, right_col)) = extract_equi_columns(condition) else {
+        return false;
+    };
+    let right_join_col = if column_matches_table(&right_col, &right_table, right_alias.as_deref()) {
+        &right_col.1
+    } else if column_matches_table(&left_col, &right_table, right_alias.as_deref()) {
+        &left_col.1
+    } else {
+        return false;
+    };
+    storage
+        .art_indexes()
+        .find_column_index(&right_table, right_join_col)
+        .is_some()
+}
+
+fn should_build_left_for_inner(left_rows: Option<usize>, right_rows: Option<usize>) -> bool {
+    match (left_rows, right_rows) {
+        (Some(l), Some(r)) => l.saturating_mul(4) < r,
+        _ => false,
+    }
+}
+
+fn should_try_index_nested_loop_join(left_rows: Option<usize>, right_rows: Option<usize>) -> bool {
+    if std::env::var("HELIOS_INLJ_OFF").is_ok() {
+        return false;
+    }
+    match (left_rows, right_rows) {
+        (Some(l), Some(r)) => l <= 128 || l.saturating_mul(8) <= r,
+        (Some(l), None) => l <= 128,
+        _ => false,
+    }
+}
+
+fn is_plain_scan_like(plan: &crate::sql::LogicalPlan) -> bool {
+    match plan {
+        crate::sql::LogicalPlan::Scan { .. } => true,
+        crate::sql::LogicalPlan::Project { input, .. } => is_plain_scan_like(input),
+        _ => false,
+    }
+}
+
 fn estimate_filtered_rows(rows: usize) -> usize {
     rows.saturating_mul(33).saturating_add(99).saturating_div(100).max(1)
 }
@@ -2053,17 +2225,33 @@ fn try_index_nested_loop_join(
     use crate::storage::art_manager::ArtIndexManager;
 
     // Phase 1: Check eligibility (immutable borrow of executor/storage)
-    let (right_table, right_schema, index_name, left_join_col) = {
+    let (right_table, right_schema, right_output_schema, index_name, left_join_col, right_join_col_type) = {
         let storage = match executor.storage() {
             Some(s) => s,
             None => return Ok(None),
         };
 
-        // Extract the right table name and schema from a Scan or Filter(Scan) node
+        // Visibility guard (correctness): INLJ probes committed ART/storage
+        // directly and bypasses branch routing. When a branch is active, fall
+        // back to the branch-correct hash/NLJ path rather than returning
+        // main-branch rows.
+        if storage.is_branch_active() {
+            return Ok(None);
+        }
+
+        // Extract the right table name and schema from a plain right scan.
+        // Callers exclude filtered right inputs because this helper probes
+        // ART row IDs directly and would otherwise bypass the right predicate.
         let (right_table, right_alias, right_schema) = match extract_scan_info(right) {
             Some(info) => info,
             None => return Ok(None),
         };
+        let right_source_name = right_alias.as_deref().unwrap_or(right_table.as_str());
+        let right_output_schema = Arc::new(super::scan::schema_with_source(
+            right_schema.as_ref(),
+            right_source_name,
+            &right_table,
+        ));
 
         // Extract equi-join column pair from condition (simple case: single equality)
         let (left_col, right_col) = match extract_equi_columns(condition) {
@@ -2086,6 +2274,15 @@ fn try_index_nested_loop_join(
             None => return Ok(None),
         };
 
+        // Capture the right join column's declared type so Phase 2 can require
+        // the left key to encode to the SAME byte layout (encode_key is
+        // type-width sensitive). None here -> Phase 2 bails conservatively.
+        let right_join_col_type = right_schema
+            .columns
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(&right_join_col))
+            .map(|c| c.data_type.clone());
+
         // Determine which column is the left key
         let left_join_col = if column_matches_table(&right_col, &right_table, right_alias.as_deref()) {
             left_col.clone()
@@ -2093,8 +2290,23 @@ fn try_index_nested_loop_join(
             right_col.clone()
         };
 
-        (right_table, right_schema, index_name, left_join_col)
+        (
+            right_table,
+            right_schema,
+            right_output_schema,
+            index_name,
+            left_join_col,
+            right_join_col_type,
+        )
     }; // Immutable borrow of executor dropped here
+
+    // Visibility guard (correctness): bail when the active transaction has a
+    // stale snapshot or staged writes for the right table. INLJ bypasses the
+    // write-set overlay, so without this it would return stale committed-only
+    // rows / miss read-your-own-writes — diverging from the hash/NLJ path.
+    if executor.txn_forces_slow_reads_for_table(&right_table) {
+        return Ok(None);
+    }
 
     // Phase 2: Build left operator (mutable borrow of executor)
     let mut left_op = executor.plan_to_operator(left)?;
@@ -2106,9 +2318,24 @@ fn try_index_nested_loop_join(
         None => return Ok(None),
     };
 
+    // Type-equivalence guard (correctness): INLJ encodes the LEFT key value and
+    // probes the RIGHT column's index. encode_key is type-width sensitive
+    // (Int2=2B, Int4=4B, Int8=8B, etc.), so a cross-type equi-join such as
+    // `int4_fk = int8_pk` or `text = int` would build a key with a different
+    // byte layout than the index entries and silently drop every match. Only
+    // proceed when the left key column and right index column share a type;
+    // otherwise fall back to the type-coercing hash/NLJ path.
+    match (
+        left_schema.columns.get(left_key_idx).map(|c| &c.data_type),
+        right_join_col_type.as_ref(),
+    ) {
+        (Some(lt), Some(rt)) if lt == rt => {}
+        _ => return Ok(None),
+    }
+
     // Build output schema (left + right)
     let mut output_columns = left_schema.columns.clone();
-    output_columns.extend(right_schema.columns.clone());
+    output_columns.extend(right_output_schema.columns.clone());
     let output_schema = Arc::new(Schema {
         columns: output_columns,
     });

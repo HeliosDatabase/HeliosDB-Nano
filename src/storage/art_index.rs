@@ -1085,7 +1085,8 @@ impl AdaptiveRadixTree {
     /// R4.4: now a tree-guided bounded scan (subtree pruning) instead of a
     /// full-tree iteration + filter — O(log n + k) instead of O(n).
     pub fn range(&self, start: &[u8], end: &[u8]) -> impl Iterator<Item = (Vec<u8>, RowId)> {
-        self.range_scan(Some((start, true)), Some((end, false)), None).into_iter()
+        self.range_scan(Some((start, true)), Some((end, false)), None)
+            .into_iter()
     }
 
     /// Prefix scan - find all keys with the given prefix

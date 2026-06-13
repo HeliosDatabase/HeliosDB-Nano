@@ -19,10 +19,8 @@ fn gated() -> bool {
 
 /// Wide-ish table so the per-row linear schema scan has something to chew on.
 fn setup_rows(db: &EmbeddedDatabase, n: usize) {
-    db.execute(
-        "CREATE TABLE probe (a INTEGER, b INTEGER, c INTEGER, d TEXT, e TEXT, f TEXT, g INTEGER, h INTEGER)",
-    )
-    .unwrap();
+    db.execute("CREATE TABLE probe (a INTEGER, b INTEGER, c INTEGER, d TEXT, e TEXT, f TEXT, g INTEGER, h INTEGER)")
+        .unwrap();
     db.execute("BEGIN").unwrap();
     for i in 0..n {
         db.execute(&format!(
@@ -111,7 +109,12 @@ fn probe_item2_sort_keys() {
         "SELECT a FROM probe ORDER BY (b * 100 - c) + h",
         3,
     );
-    time_query(&db, "ORDER BY two columns, full sort", "SELECT a FROM probe ORDER BY b, c DESC", 3);
+    time_query(
+        &db,
+        "ORDER BY two columns, full sort",
+        "SELECT a FROM probe ORDER BY b, c DESC",
+        3,
+    );
     println!();
 }
 

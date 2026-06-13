@@ -192,7 +192,10 @@ mod tests {
             h.join().unwrap();
         }
         let n = flushes.load(Ordering::SeqCst);
-        assert!(n >= 1 && n < threads, "expected grouped flushes, got {n} for {threads} committers");
+        assert!(
+            n >= 1 && n < threads,
+            "expected grouped flushes, got {n} for {threads} committers"
+        );
     }
 
     #[test]
