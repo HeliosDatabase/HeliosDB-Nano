@@ -241,14 +241,17 @@ fn test_branch_created_at_snapshot_inherits_parent_state() {
     let engine = StorageEngine::open_in_memory(&config).unwrap();
 
     // Insert data in main at different times
-    engine.put(b"key1", b"value1_v1").unwrap();
+    // engine.put(b"key1", b"value1_v1").unwrap();
+    let key1 = b"key1".to_vec();
+    engine.put(&key1, b"value1_v1").unwrap();
 
     // Register snapshot after first insert
     let snapshot_mgr = engine.snapshot_manager();
     snapshot_mgr.register_snapshot(100).unwrap();
 
     // Update data
-    engine.put(b"key1", b"value1_v2").unwrap();
+    // engine.put(b"key1", b"value1_v2").unwrap();
+    engine.put(&key1, b"value1_v2").unwrap();
 
     // Register another snapshot
     snapshot_mgr.register_snapshot(200).unwrap();

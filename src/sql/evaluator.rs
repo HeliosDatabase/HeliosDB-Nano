@@ -129,7 +129,10 @@ pub fn bind_expr_columns(expr: LogicalExpr, schema: &Schema) -> LogicalExpr {
             op,
             right: bind_box(right),
         },
-        LogicalExpr::UnaryExpr { op, expr } => LogicalExpr::UnaryExpr { op, expr: bind_box(expr) },
+        LogicalExpr::UnaryExpr { op, expr } => LogicalExpr::UnaryExpr {
+            op,
+            expr: bind_box(expr),
+        },
         LogicalExpr::IsNull { expr, is_null } => LogicalExpr::IsNull {
             expr: bind_box(expr),
             is_null,

@@ -355,11 +355,15 @@ impl SnapshotManager {
     /// Resolve timestamp string to snapshot timestamp
     fn resolve_timestamp(&self, ts_str: &str) -> Result<u64> {
         // Parse timestamp string
-        let dt = NaiveDateTime::parse_from_str(ts_str, "%Y-%m-%d %H:%M:%S")
-            .or_else(|_| NaiveDateTime::parse_from_str(ts_str, "%Y-%m-%dT%H:%M:%S"))
-            .map_err(|e| Error::query_execution(format!("Invalid timestamp format: {}", e)))?;
+        let target_time = if let Ok(dt) = DateTime::parse_from_rfc3339(ts_str) {
+            dt.timestamp() as u64
+        } else {
+            let dt = NaiveDateTime::parse_from_str(ts_str, "%Y-%m-%d %H:%M:%S")
+                .or_else(|_| NaiveDateTime::parse_from_str(ts_str, "%Y-%m-%dT%H:%M:%S"))
+                .map_err(|e| Error::query_execution(format!("Invalid timestamp format: {}", e)))?;
 
-        let target_time = dt.and_utc().timestamp() as u64;
+            dt.and_utc().timestamp() as u64
+        };
 
         // Find the closest snapshot <= target time
         let snapshots = self.snapshots.read();
@@ -418,11 +422,15 @@ impl SnapshotManager {
             }
             AsOfClause::Timestamp(ts_str) => {
                 // Parse the target timestamp
-                let dt = NaiveDateTime::parse_from_str(ts_str, "%Y-%m-%d %H:%M:%S")
-                    .or_else(|_| NaiveDateTime::parse_from_str(ts_str, "%Y-%m-%dT%H:%M:%S"))
-                    .map_err(|e| Error::query_execution(format!("Invalid timestamp format: {}", e)))?;
+                let target_time = if let Ok(dt) = DateTime::parse_from_rfc3339(ts_str) {
+                    dt.timestamp() as u64
+                } else {
+                    let dt = NaiveDateTime::parse_from_str(ts_str, "%Y-%m-%d %H:%M:%S")
+                        .or_else(|_| NaiveDateTime::parse_from_str(ts_str, "%Y-%m-%dT%H:%M:%S"))
+                        .map_err(|e| Error::query_execution(format!("Invalid timestamp format: {}", e)))?;
 
-                let target_time = dt.and_utc().timestamp() as u64;
+                    dt.and_utc().timestamp() as u64
+                };
 
                 // Search through snapshots to find matching LSN
                 let snapshots = self.snapshots.read();

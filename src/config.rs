@@ -197,11 +197,9 @@ impl Config {
             // Re-parse as a raw TOML document to learn which [storage] keys
             // the file set explicitly — after serde deserialization a default
             // is indistinguishable from an explicit value.
-            let raw: toml::Value = toml::from_str(content)
-                .map_err(|e| crate::Error::config(format!("Failed to parse config: {}", e)))?;
-            config.apply_profile_defaults(profile, |key| {
-                raw.get("storage").and_then(|s| s.get(key)).is_some()
-            });
+            let raw: toml::Value =
+                toml::from_str(content).map_err(|e| crate::Error::config(format!("Failed to parse config: {}", e)))?;
+            config.apply_profile_defaults(profile, |key| raw.get("storage").and_then(|s| s.get(key)).is_some());
         }
         Ok(config)
     }
@@ -418,9 +416,9 @@ pub fn parse_retention_duration_secs(raw: &str) -> crate::Result<u64> {
             raw
         ))
     })?;
-    value.checked_mul(multiplier).ok_or_else(|| {
-        crate::Error::config(format!("storage.version_retention '{}' overflows u64 seconds", raw))
-    })
+    value
+        .checked_mul(multiplier)
+        .ok_or_else(|| crate::Error::config(format!("storage.version_retention '{}' overflows u64 seconds", raw)))
 }
 
 fn default_idle_timeout_secs() -> u64 {
@@ -443,7 +441,7 @@ impl Default for StorageConfig {
             slow_query_threshold_ms: Some(1000), // 1 second default
             logical_wal_per_statement: false, // rely on RocksDB WAL at commit (see field docs)
             durable_commit: false,
-            version_retention: None, // infinite retention: version GC disabled (R4.3)
+            version_retention: None,        // infinite retention: version GC disabled (R4.3)
             version_gc_interval_secs: None, // auto: off without retention, 300s with it
             version_gc_max_per_cycle: default_version_gc_max_per_cycle(),
             group_commit_window_us: 200,
@@ -1445,7 +1443,10 @@ mod tests {
     fn test_profile_round_trips_through_serialization() {
         let config = Config::with_profile(ProfileConfig::Balanced);
         let toml_str = toml::to_string(&config).expect("serialize");
-        assert!(toml_str.starts_with("profile = \"balanced\""), "profile must be first: {toml_str}");
+        assert!(
+            toml_str.starts_with("profile = \"balanced\""),
+            "profile must be first: {toml_str}"
+        );
         let back = Config::from_toml_str(&toml_str).expect("reparse");
         assert_eq!(back.profile, Some(ProfileConfig::Balanced));
         assert_eq!(back.storage.wal_sync_mode, WalSyncModeConfig::GroupCommit);

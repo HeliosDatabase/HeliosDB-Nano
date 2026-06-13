@@ -127,10 +127,8 @@ fn annotate_index_range_scans(executor: &Executor, plan: &LogicalPlan, node: &mu
             "Index Range Scan using {} on {} ({})",
             spec.index_name, table_name, spec.display
         );
-        node.details
-            .insert("index".to_string(), spec.index_name.clone());
-        node.details
-            .insert("range".to_string(), spec.display.clone());
+        node.details.insert("index".to_string(), spec.index_name.clone());
+        node.details.insert("range".to_string(), spec.display.clone());
     }
 
     let range_spec = |table_name: &str, schema: &crate::Schema, predicate: &crate::sql::LogicalExpr| {
@@ -208,9 +206,7 @@ fn annotate_index_range_scans(executor: &Executor, plan: &LogicalPlan, node: &mu
                 annotate_index_range_scans(executor, input, child);
             }
         }
-        LogicalPlan::Project { input, .. }
-        | LogicalPlan::Aggregate { input, .. }
-        | LogicalPlan::Sort { input, .. } => {
+        LogicalPlan::Project { input, .. } | LogicalPlan::Aggregate { input, .. } | LogicalPlan::Sort { input, .. } => {
             if let Some(child) = node.children.first_mut() {
                 annotate_index_range_scans(executor, input, child);
             }
@@ -236,7 +232,9 @@ fn find_node_mut<'n>(
     if node.node_type == node_type {
         return Some(node);
     }
-    node.children.iter_mut().find_map(|child| find_node_mut(child, node_type))
+    node.children
+        .iter_mut()
+        .find_map(|child| find_node_mut(child, node_type))
 }
 
 /// Execute the query for EXPLAIN ANALYZE

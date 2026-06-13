@@ -9,7 +9,8 @@ use heliosdb_nano::{EmbeddedDatabase, Value};
 
 fn setup() -> EmbeddedDatabase {
     let db = EmbeddedDatabase::new_in_memory().unwrap();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
     db.execute("INSERT INTO t (id, v) VALUES (1, 100)").unwrap();
     db.execute("INSERT INTO t (id, v) VALUES (2, 200)").unwrap();
     db
@@ -103,8 +104,10 @@ fn disjoint_keys_never_conflict() {
     for round in 0..50 {
         db.begin_transaction_for_session(a).unwrap();
         db.begin_transaction_for_session(b).unwrap();
-        db.execute_in_session(a, &format!("UPDATE t SET v = {round} WHERE id = 1")).unwrap();
-        db.execute_in_session(b, &format!("UPDATE t SET v = {round} WHERE id = 2")).unwrap();
+        db.execute_in_session(a, &format!("UPDATE t SET v = {round} WHERE id = 1"))
+            .unwrap();
+        db.execute_in_session(b, &format!("UPDATE t SET v = {round} WHERE id = 2"))
+            .unwrap();
         db.commit_transaction_for_session(a).unwrap();
         db.commit_transaction_for_session(b).unwrap();
     }

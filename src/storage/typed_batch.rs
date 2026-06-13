@@ -567,11 +567,11 @@ mod tests {
     #[test]
     fn mixed_or_unsupported_batches_stay_v1() {
         for values in [
-            vec![Value::Int4(1), Value::Int8(2)],                 // mixed widths
-            vec![Value::Int4(1), Value::String("x".into())],      // mixed families
-            vec![Value::Null, Value::Null],                       // no type evidence
-            vec![Value::Numeric("1.5".into())],                   // unsupported type
-            Vec::new(),                                           // empty
+            vec![Value::Int4(1), Value::Int8(2)],            // mixed widths
+            vec![Value::Int4(1), Value::String("x".into())], // mixed families
+            vec![Value::Null, Value::Null],                  // no type evidence
+            vec![Value::Numeric("1.5".into())],              // unsupported type
+            Vec::new(),                                      // empty
         ] {
             let batch = batch_of(values.clone());
             let stats = BatchStats::from_batch(&batch);

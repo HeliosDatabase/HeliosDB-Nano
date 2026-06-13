@@ -272,7 +272,9 @@ impl VersionGc {
     /// (wallclock), from snapshot metadata + in-memory + persisted anchors.
     /// Also prunes persisted anchors strictly behind the chosen one.
     fn retention_horizon(&self, cutoff_secs: i64) -> Result<Option<u64>> {
-        let mut best = self.snapshot_manager.max_snapshot_ts_at_or_before_wallclock(cutoff_secs);
+        let mut best = self
+            .snapshot_manager
+            .max_snapshot_ts_at_or_before_wallclock(cutoff_secs);
 
         {
             let anchors = self.memory_anchors.lock();
@@ -379,16 +381,15 @@ impl VersionGc {
         let mut next_cursor: Option<Vec<u8>> = None;
         let mut finished_pass = true;
 
-        let flush =
-            |batch: &mut WriteBatch, batch_keys: &mut usize, db: &DB| -> Result<()> {
-                if *batch_keys > 0 {
-                    let owned = std::mem::take(batch);
-                    db.write(owned)
-                        .map_err(|e| Error::storage(format!("version-gc delete batch: {}", e)))?;
-                    *batch_keys = 0;
-                }
-                Ok(())
-            };
+        let flush = |batch: &mut WriteBatch, batch_keys: &mut usize, db: &DB| -> Result<()> {
+            if *batch_keys > 0 {
+                let owned = std::mem::take(batch);
+                db.write(owned)
+                    .map_err(|e| Error::storage(format!("version-gc delete batch: {}", e)))?;
+                *batch_keys = 0;
+            }
+            Ok(())
+        };
 
         let index_key_for = |prefix: &[u8], ts: u64| -> Vec<u8> {
             // v_idx:{table}:{row}:{(MAX-ts):020}
@@ -400,10 +401,10 @@ impl VersionGc {
         };
 
         let process_group_fn = |prefix: &[u8],
-                                 versions: &mut Vec<u64>,
-                                 batch: &mut WriteBatch,
-                                 batch_keys: &mut usize,
-                                 stats: &mut VersionGcCycleStats|
+                                versions: &mut Vec<u64>,
+                                batch: &mut WriteBatch,
+                                batch_keys: &mut usize,
+                                stats: &mut VersionGcCycleStats|
          -> Result<()> {
             if versions.len() > 1 {
                 if let Some(keep) = versions.iter().copied().filter(|ts| *ts <= horizon).max() {
@@ -422,8 +423,11 @@ impl VersionGc {
                         .map_err(|e| Error::storage(format!("version-gc index probe: {}", e)))?
                         .is_some();
                     if !keep_has_index {
-                        let mut candidates: Vec<u64> =
-                            versions.iter().copied().filter(|ts| *ts <= horizon && *ts != keep).collect();
+                        let mut candidates: Vec<u64> = versions
+                            .iter()
+                            .copied()
+                            .filter(|ts| *ts <= horizon && *ts != keep)
+                            .collect();
                         candidates.sort_unstable_by(|a, b| b.cmp(a)); // newest first
                         for ts in candidates {
                             let indexed = self
@@ -468,7 +472,9 @@ impl VersionGc {
             }
 
             // Split `v:{table}:{row_id}:{ts}` at the LAST ':'.
-            let Some(last_colon) = key.iter().rposition(|b| *b == b':') else { continue };
+            let Some(last_colon) = key.iter().rposition(|b| *b == b':') else {
+                continue;
+            };
             let prefix = &key[..=last_colon];
             let Some(ts) = std::str::from_utf8(&key[last_colon + 1..])
                 .ok()
@@ -478,7 +484,13 @@ impl VersionGc {
             };
 
             if prefix != group_prefix.as_slice() {
-                process_group_fn(&group_prefix, &mut group_versions, &mut batch, &mut batch_keys, &mut stats)?;
+                process_group_fn(
+                    &group_prefix,
+                    &mut group_versions,
+                    &mut batch,
+                    &mut batch_keys,
+                    &mut stats,
+                )?;
                 // Bound checks happen at group boundaries so a row's chain
                 // is always evaluated as a whole.
                 if stats.versions_deleted >= max_deletes as u64 || stats.keys_scanned >= scan_budget as u64 {
@@ -493,7 +505,13 @@ impl VersionGc {
         }
 
         if finished_pass {
-            process_group_fn(&group_prefix, &mut group_versions, &mut batch, &mut batch_keys, &mut stats)?;
+            process_group_fn(
+                &group_prefix,
+                &mut group_versions,
+                &mut batch,
+                &mut batch_keys,
+                &mut stats,
+            )?;
         }
         flush(&mut batch, &mut batch_keys, &self.db)?;
 

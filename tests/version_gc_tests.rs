@@ -133,7 +133,10 @@ fn time_travel_inside_horizon_exact_beyond_horizon_errors() {
 
     // Beyond the horizon: a clear error, never wrong data.
     let err = db
-        .query(&format!("SELECT val FROM tt AS OF TIMESTAMP '{}'", ts_after_insert), &[])
+        .query(
+            &format!("SELECT val FROM tt AS OF TIMESTAMP '{}'", ts_after_insert),
+            &[],
+        )
         .unwrap_err();
     let msg = err.to_string();
     assert!(
@@ -432,8 +435,7 @@ fn gc_preserves_indexed_reads_over_unindexed_autocommit_versions() {
         stats
     );
     assert_eq!(
-        stats.version_index_keys,
-        ROWS as u64,
+        stats.version_index_keys, ROWS as u64,
         "expected exactly the keep_indexed index entry per row, stats: {:?}",
         stats
     );

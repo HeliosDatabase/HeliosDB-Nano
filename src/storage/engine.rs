@@ -138,7 +138,10 @@ fn group_columnar_row_values(
             let Some(value) = tuple.values.get(idx) else {
                 continue;
             };
-            grouped.entry((idx, batch_id)).or_default().push((*row_id, value.clone()));
+            grouped
+                .entry((idx, batch_id))
+                .or_default()
+                .push((*row_id, value.clone()));
         }
     }
     grouped
@@ -314,7 +317,10 @@ fn compute_zone_pruned_batches(
             }
         };
         for (batch_id, stats) in &stats_map {
-            if column_predicates.iter().any(|predicate| !batch_can_match(stats, predicate)) {
+            if column_predicates
+                .iter()
+                .any(|predicate| !batch_can_match(stats, predicate))
+            {
                 pruned.insert(*batch_id);
             }
         }
@@ -476,6 +482,42 @@ fn integer_filter_candidate(schema: &crate::Schema, predicates: &[FilterPredicat
     })
 }
 
+fn integer_filter_candidates(
+    schema: &crate::Schema,
+    predicates: &[FilterPredicate],
+) -> Option<Vec<IntegerFilterCandidate>> {
+    if predicates.is_empty() {
+        return None;
+    }
+
+    let mut candidates = Vec::with_capacity(predicates.len());
+    for predicate in predicates {
+        if !matches!(
+            predicate.op,
+            FilterOp::Eq | FilterOp::Lt | FilterOp::LtEq | FilterOp::Gt | FilterOp::GtEq
+        ) {
+            return None;
+        }
+        let column = schema.columns.get(predicate.column_index)?;
+        if !primitive_integer_data_type(&column.data_type) {
+            return None;
+        }
+        let value = match predicate.value {
+            Value::Int2(value) => i64::from(value),
+            Value::Int4(value) => i64::from(value),
+            Value::Int8(value) => value,
+            _ => return None,
+        };
+        candidates.push(IntegerFilterCandidate {
+            column_index: predicate.column_index,
+            op: predicate.op,
+            value,
+        });
+    }
+
+    Some(candidates)
+}
+
 fn string_eq_filter_candidate<'a>(
     schema: &crate::Schema,
     predicates: &'a [FilterPredicate],
@@ -631,6 +673,25 @@ fn agg_parallel_rows_met(row_count: usize) -> bool {
     agg_parallel_threshold().is_some_and(|threshold| row_count >= threshold)
 }
 
+/// Row-store aggregate pushdown decodes compact row values rather than
+/// columnar batches, and the fixed parallel overhead pays back earlier on the
+/// 50k-row row-control shapes used by the columnar A/B bench. Keep
+/// HELIOS_AGG_SERIAL as the global kill switch, and let either the row-specific
+/// threshold or the existing aggregate threshold override the default.
+fn row_agg_parallel_rows_met(row_count: usize) -> bool {
+    if agg_parallel_threshold().is_none() {
+        return false;
+    }
+    static ROW_AGG_THRESHOLD: once_cell::sync::Lazy<usize> = once_cell::sync::Lazy::new(|| {
+        std::env::var("HELIOS_ROW_AGG_PARALLEL_THRESHOLD")
+            .or_else(|_| std::env::var("HELIOS_AGG_PARALLEL_THRESHOLD"))
+            .ok()
+            .and_then(|raw| raw.trim().parse().ok())
+            .unwrap_or(32_768)
+    });
+    row_count >= *ROW_AGG_THRESHOLD
+}
+
 /// R3.2: merge a chunk's partial aggregate states into the running states.
 /// Both sides come from the same aggregate spec list, so they zip positionally.
 fn merge_columnar_aggregate_states(
@@ -735,10 +796,7 @@ fn build_columnar_group_key(
 ) -> Vec<Value> {
     group_by_columns
         .iter()
-        .map(|&idx| {
-            columnar_batch_value(column_batches, idx, batch_id, offset)
-                .unwrap_or(Value::Null)
-        })
+        .map(|&idx| columnar_batch_value(column_batches, idx, batch_id, offset).unwrap_or(Value::Null))
         .collect()
 }
 
@@ -779,7 +837,9 @@ fn apply_compiled_predicates(
     mask: &mut [u8],
 ) {
     for cp in compiled {
-        let batch = column_batches.get(&cp.pred.column_index).and_then(|by| by.get(batch_id));
+        let batch = column_batches
+            .get(&cp.pred.column_index)
+            .and_then(|by| by.get(batch_id));
         cp.apply_to_mask(batch, mask);
     }
 }
@@ -820,8 +880,7 @@ fn kernel_update_aggregate(
                 .is_some_and(|(mn, mx)| mn >= -tk::SUM_I64_SAFE_BOUND && mx <= tk::SUM_I64_SAFE_BOUND);
             let (sum, contributing) = tk::sum_int_selected(data, &typed.validity, mask, small);
             if contributing > 0 {
-                let sum =
-                    i64::try_from(sum).map_err(|_| Error::query_execution("integer overflow: BIGINT SUM"))?;
+                let sum = i64::try_from(sum).map_err(|_| Error::query_execution("integer overflow: BIGINT SUM"))?;
                 state.merge(ColumnarAggregateState::Sum(ColumnarSumState::Int(sum)))?;
             }
             Ok(true)
@@ -1990,7 +2049,9 @@ impl StorageEngine {
         // already exist in `v:` version keys and snapshot metadata, which
         // breaks AS OF resolution ("AS OF NOW" resolves to the prior run's
         // max) and would make any watermark-based version GC unsound.
-        let timestamp = Arc::new(RwLock::new(snapshot_manager.max_snapshot_timestamp().unwrap_or(1).max(1)));
+        let timestamp = Arc::new(RwLock::new(
+            snapshot_manager.max_snapshot_timestamp().unwrap_or(1).max(1),
+        ));
 
         // Initialize branch manager
         debug!("Initializing BranchManager");
@@ -3244,8 +3305,7 @@ impl StorageEngine {
     /// session-scoped `SET synchronous_commit` override is installed for the
     /// current thread (R1.3 phase 2). Never durable in memory-only mode.
     fn statement_durability_required(&self) -> bool {
-        !self.config.storage.memory_only
-            && Self::synchronous_commit_override().unwrap_or(self.durable_commit_enabled)
+        !self.config.storage.memory_only && Self::synchronous_commit_override().unwrap_or(self.durable_commit_enabled)
     }
 
     /// R1.3 phase 2: engine-wide leader/follower group committer (shared by
@@ -3603,6 +3663,14 @@ impl StorageEngine {
             }
         }
 
+        if let Some(candidates) = integer_filter_candidates(schema, &filter_predicates) {
+            if let Some(tuples) =
+                self.scan_table_with_schema_columns_integer_filtered(table_name, schema, &requested, &candidates)?
+            {
+                return Ok(Some(tuples));
+            }
+        }
+
         let prefix = format!("data:{}:", table_name);
         let prefix_bytes = prefix.as_bytes();
         let mut read_opts = ReadOptions::default();
@@ -3622,6 +3690,69 @@ impl StorageEngine {
             if !row_tuple_matches_filters(&tuple, &filter_predicates) {
                 continue;
             }
+            if let Some(row_id) = Self::parse_row_id_after_prefix(&key, prefix_bytes.len()) {
+                tuple.row_id = Some(row_id);
+            }
+            tuples.push(tuple);
+        }
+
+        Ok(Some(tuples))
+    }
+
+    fn scan_table_with_schema_columns_integer_filtered(
+        &self,
+        table_name: &str,
+        schema: &crate::Schema,
+        requested: &[usize],
+        filters: &[IntegerFilterCandidate],
+    ) -> Result<Option<Vec<Tuple>>> {
+        if filters.is_empty() {
+            return Ok(None);
+        }
+
+        let prefix = format!("data:{}:", table_name);
+        let prefix_bytes = prefix.as_bytes();
+        let mut read_opts = ReadOptions::default();
+        read_opts.set_total_order_seek(true);
+        let iter = self
+            .db
+            .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read_opts);
+
+        let mut tuples = Vec::new();
+        for item in iter {
+            let (key, raw_value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+            if !key.starts_with(prefix_bytes) {
+                break;
+            }
+
+            let decrypted;
+            let row_bytes = if let Some(km) = &self.key_manager {
+                decrypted = crypto::decrypt(km.key(), raw_value.as_ref())?;
+                decrypted.as_slice()
+            } else {
+                raw_value.as_ref()
+            };
+
+            let mut matched = true;
+            for filter in filters {
+                let Some(decoded) =
+                    crate::storage::prefix_decode::decode_tuple_numeric_column_value(row_bytes, filter.column_index)
+                else {
+                    return Ok(None);
+                };
+                let Some(filter_matches) = decoded_integer_matches_filter(decoded, *filter) else {
+                    return Ok(None);
+                };
+                if !filter_matches {
+                    matched = false;
+                    break;
+                }
+            }
+            if !matched {
+                continue;
+            }
+
+            let mut tuple = self.decode_rowstore_columns(row_bytes, requested, schema.columns.len())?;
             if let Some(row_id) = Self::parse_row_id_after_prefix(&key, prefix_bytes.len()) {
                 tuple.row_id = Some(row_id);
             }
@@ -3685,6 +3816,15 @@ impl StorageEngine {
             );
         }
 
+        if filter_predicates.len() > 1 {
+            if let Some(candidates) = integer_filter_candidates(schema, &filter_predicates) {
+                if let Some(tuples) =
+                    self.scan_table_with_schema_projected_integer_filters(table_name, schema, projection, &candidates)?
+                {
+                    return Ok(Some(tuples));
+                }
+            }
+        }
         if let Some(candidate) = integer_filter_candidate(schema, &filter_predicates) {
             if let Some(tuples) =
                 self.scan_table_with_schema_projected_integer_filtered(table_name, schema, projection, candidate)?
@@ -4022,10 +4162,8 @@ impl StorageEngine {
                         projected_values.push(default_values.get(*pos).cloned().unwrap_or(Value::Null));
                     }
                     MixedProjectionSource::Columnar(idx) => {
-                        projected_values.push(
-                            columnar_batch_value(&column_batches, *idx, batch_id, offset)
-                                .unwrap_or(Value::Null),
-                        );
+                        projected_values
+                            .push(columnar_batch_value(&column_batches, *idx, batch_id, offset).unwrap_or(Value::Null));
                     }
                 }
             }
@@ -4092,6 +4230,99 @@ impl StorageEngine {
                 return Ok(None);
             };
             if !matches {
+                continue;
+            }
+
+            crate::storage::prefix_decode::decode_tuple_column_values_into(
+                row_bytes,
+                &output_requested,
+                schema.columns.len(),
+                &mut values,
+            )
+            .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
+
+            let mut projected_values = Vec::with_capacity(projection_positions.len());
+            for &pos in &projection_positions {
+                if let Some(value) = values.get_mut(pos) {
+                    projected_values.push(std::mem::replace(value, Value::Null));
+                } else {
+                    projected_values.push(Value::Null);
+                }
+            }
+            tuples.push(Tuple::new(projected_values));
+        }
+
+        Ok(Some(tuples))
+    }
+
+    fn scan_table_with_schema_projected_integer_filters(
+        &self,
+        table_name: &str,
+        schema: &crate::Schema,
+        projection: &[usize],
+        filters: &[IntegerFilterCandidate],
+    ) -> Result<Option<Vec<Tuple>>> {
+        if filters.is_empty() {
+            return Ok(None);
+        }
+
+        let mut output_requested: Vec<usize> = projection.to_vec();
+        output_requested.sort_unstable();
+        output_requested.dedup();
+
+        let output_pos = |column_index: usize| -> Result<usize> {
+            output_requested.binary_search(&column_index).map_err(|_| {
+                Error::storage(format!(
+                    "Column index {} missing from projected integer filtered scan decode set for {}",
+                    column_index, table_name
+                ))
+            })
+        };
+        let projection_positions: Vec<usize> = projection
+            .iter()
+            .map(|&idx| output_pos(idx))
+            .collect::<Result<Vec<_>>>()?;
+
+        let prefix = format!("data:{}:", table_name);
+        let prefix_bytes = prefix.as_bytes();
+        let mut read_opts = ReadOptions::default();
+        read_opts.set_total_order_seek(true);
+        let iter = self
+            .db
+            .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read_opts);
+
+        let mut values = Vec::with_capacity(output_requested.len());
+        let mut tuples = Vec::new();
+        for item in iter {
+            let (key, raw_value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+            if !key.starts_with(prefix_bytes) {
+                break;
+            }
+
+            let decrypted;
+            let row_bytes = if let Some(km) = &self.key_manager {
+                decrypted = crypto::decrypt(km.key(), raw_value.as_ref())?;
+                decrypted.as_slice()
+            } else {
+                raw_value.as_ref()
+            };
+
+            let mut matched = true;
+            for filter in filters {
+                let Some(decoded) =
+                    crate::storage::prefix_decode::decode_tuple_numeric_column_value(row_bytes, filter.column_index)
+                else {
+                    return Ok(None);
+                };
+                let Some(filter_matches) = decoded_integer_matches_filter(decoded, *filter) else {
+                    return Ok(None);
+                };
+                if !filter_matches {
+                    matched = false;
+                    break;
+                }
+            }
+            if !matched {
                 continue;
             }
 
@@ -4432,10 +4663,7 @@ impl StorageEngine {
         let mut consider_row = |batch_id: u64, offset: usize| {
             values.clear();
             for &idx in &requested {
-                values.push(
-                    columnar_batch_value(&column_batches, idx, batch_id, offset)
-                        .unwrap_or(Value::Null),
-                );
+                values.push(columnar_batch_value(&column_batches, idx, batch_id, offset).unwrap_or(Value::Null));
             }
 
             let replace = if heap.len() < k {
@@ -4613,19 +4841,15 @@ impl StorageEngine {
         }
 
         let mut tuples = Vec::new();
-        let emit_projected =
-            |tuples: &mut Vec<Tuple>, batch_id: u64, offset: usize| {
-                let mut values = Vec::with_capacity(projection.len());
-                for &idx in projection {
-                    values.push(
-                        columnar_batch_value(&column_batches, idx, batch_id, offset)
-                            .unwrap_or(Value::Null),
-                    );
-                }
-                let mut tuple = Tuple::new(values);
-                tuple.row_id = Some(batch_id * BATCH_SIZE as u64 + offset as u64);
-                tuples.push(tuple);
-            };
+        let emit_projected = |tuples: &mut Vec<Tuple>, batch_id: u64, offset: usize| {
+            let mut values = Vec::with_capacity(projection.len());
+            for &idx in projection {
+                values.push(columnar_batch_value(&column_batches, idx, batch_id, offset).unwrap_or(Value::Null));
+            }
+            let mut tuple = Tuple::new(values);
+            tuple.row_id = Some(batch_id * BATCH_SIZE as u64 + offset as u64);
+            tuples.push(tuple);
+        };
 
         // R3.3: liveness from the presence sidecar; row-keyspace walk fallback.
         if let Some(presence) = self.columnar_live_presence(table_name) {
@@ -5008,23 +5232,24 @@ impl StorageEngine {
                 // routing for single text group columns); the pre-R3.4
                 // small-group linear scan is subsumed by the per-batch group
                 // accumulation (output is sorted below either way).
-                let fold_chunk = |chunk: &[(u64, &ColumnBatch)]| -> Result<HashMap<Vec<Value>, Vec<ColumnarAggregateState>>> {
-                    let mut groups: HashMap<Vec<Value>, Vec<ColumnarAggregateState>> = HashMap::new();
-                    let mut mask = vec![0u8; BATCH_SIZE];
-                    for &(batch_id, _) in chunk {
-                        mask.fill(1);
-                        apply_compiled_predicates(&compiled, &column_batches, batch_id, &mut mask);
-                        update_groups_for_batch_kernel(
-                            &mut groups,
-                            aggregates,
-                            group_by_columns,
-                            &column_batches,
-                            batch_id,
-                            &mask,
-                        )?;
-                    }
-                    Ok(groups)
-                };
+                let fold_chunk =
+                    |chunk: &[(u64, &ColumnBatch)]| -> Result<HashMap<Vec<Value>, Vec<ColumnarAggregateState>>> {
+                        let mut groups: HashMap<Vec<Value>, Vec<ColumnarAggregateState>> = HashMap::new();
+                        let mut mask = vec![0u8; BATCH_SIZE];
+                        for &(batch_id, _) in chunk {
+                            mask.fill(1);
+                            apply_compiled_predicates(&compiled, &column_batches, batch_id, &mut mask);
+                            update_groups_for_batch_kernel(
+                                &mut groups,
+                                aggregates,
+                                group_by_columns,
+                                &column_batches,
+                                batch_id,
+                                &mask,
+                            )?;
+                        }
+                        Ok(groups)
+                    };
 
                 let hash_groups: HashMap<Vec<Value>, Vec<ColumnarAggregateState>> = if parallel {
                     use rayon::prelude::*;
@@ -5218,23 +5443,24 @@ impl StorageEngine {
             // R3.4: prune → presence mask → predicate kernels → grouped
             // kernel (dictionary-code routing for single text group columns).
             let compiled = tk::compile_predicates(&filter_predicates);
-            let fold_chunk = |chunk: &[(u64, &BatchPresence)]| -> Result<HashMap<Vec<Value>, Vec<ColumnarAggregateState>>> {
-                let mut groups: HashMap<Vec<Value>, Vec<ColumnarAggregateState>> = HashMap::new();
-                let mut mask = vec![0u8; BATCH_SIZE];
-                for (batch_id, batch_presence) in chunk {
-                    tk::expand_bitmap_to_mask(&batch_presence.bits, &mut mask);
-                    apply_compiled_predicates(&compiled, &column_batches, *batch_id, &mut mask);
-                    update_groups_for_batch_kernel(
-                        &mut groups,
-                        aggregates,
-                        group_by_columns,
-                        &column_batches,
-                        *batch_id,
-                        &mask,
-                    )?;
-                }
-                Ok(groups)
-            };
+            let fold_chunk =
+                |chunk: &[(u64, &BatchPresence)]| -> Result<HashMap<Vec<Value>, Vec<ColumnarAggregateState>>> {
+                    let mut groups: HashMap<Vec<Value>, Vec<ColumnarAggregateState>> = HashMap::new();
+                    let mut mask = vec![0u8; BATCH_SIZE];
+                    for (batch_id, batch_presence) in chunk {
+                        tk::expand_bitmap_to_mask(&batch_presence.bits, &mut mask);
+                        apply_compiled_predicates(&compiled, &column_batches, *batch_id, &mut mask);
+                        update_groups_for_batch_kernel(
+                            &mut groups,
+                            aggregates,
+                            group_by_columns,
+                            &column_batches,
+                            *batch_id,
+                            &mask,
+                        )?;
+                    }
+                    Ok(groups)
+                };
             if parallel {
                 use rayon::prelude::*;
                 let partials: Vec<HashMap<Vec<Value>, Vec<ColumnarAggregateState>>> = live
@@ -5415,8 +5641,7 @@ impl StorageEngine {
                 let state = groups.entry(key_of(idx)).or_insert_with(CountSumIntState::new);
                 state.count += count;
                 if sum_seen != 0 {
-                    let sum =
-                        i64::try_from(sum).map_err(|_| Error::query_execution("integer overflow: BIGINT SUM"))?;
+                    let sum = i64::try_from(sum).map_err(|_| Error::query_execution("integer overflow: BIGINT SUM"))?;
                     state.update_sum_int(Some(sum))?;
                 }
             }
@@ -5508,8 +5733,8 @@ impl StorageEngine {
                         continue;
                     }
                     let sum_value = columnar_batch_value(column_batches, sum_column, *batch_id, offset);
-                    let group_key = columnar_batch_value(column_batches, group_column, *batch_id, offset)
-                        .unwrap_or(Value::Null);
+                    let group_key =
+                        columnar_batch_value(column_batches, group_column, *batch_id, offset).unwrap_or(Value::Null);
                     let state = groups.entry(group_key).or_insert_with(CountSumIntState::new);
                     state.update_count();
                     state.update_sum(sum_value.as_ref())?;
@@ -5578,7 +5803,9 @@ impl StorageEngine {
                 let batches_per_chunk = (AGG_PARALLEL_CHUNK / BATCH_SIZE).max(1);
                 let partials: Vec<HashMap<Value, CountSumIntState>> = live
                     .par_chunks(batches_per_chunk)
-                    .map(|chunk| Self::count_sum_kernel_chunk(chunk, &compiled, column_batches, group_column, sum_column))
+                    .map(|chunk| {
+                        Self::count_sum_kernel_chunk(chunk, &compiled, column_batches, group_column, sum_column)
+                    })
                     .collect::<Result<Vec<_>>>()?;
                 let mut merged: HashMap<Value, CountSumIntState> = HashMap::new();
                 for partial in partials {
@@ -5612,8 +5839,8 @@ impl StorageEngine {
                         continue;
                     }
                     let sum_value = columnar_batch_value(column_batches, sum_column, batch_id, offset);
-                    let group_key = columnar_batch_value(column_batches, group_column, batch_id, offset)
-                        .unwrap_or(Value::Null);
+                    let group_key =
+                        columnar_batch_value(column_batches, group_column, batch_id, offset).unwrap_or(Value::Null);
                     let state = groups.entry(group_key).or_insert_with(CountSumIntState::new);
                     state.update_count();
                     state.update_sum(sum_value.as_ref())?;
@@ -5652,8 +5879,8 @@ impl StorageEngine {
 
                 let sum_value = columnar_batch_value(column_batches, sum_column, batch_id, offset);
                 if let Some(groups) = hash_groups.as_mut() {
-                    let group_key = columnar_batch_value(column_batches, group_column, batch_id, offset)
-                        .unwrap_or(Value::Null);
+                    let group_key =
+                        columnar_batch_value(column_batches, group_column, batch_id, offset).unwrap_or(Value::Null);
                     let state = groups.entry(group_key).or_insert_with(CountSumIntState::new);
                     state.update_count();
                     state.update_sum(sum_value.as_ref())?;
@@ -5665,8 +5892,8 @@ impl StorageEngine {
                     state.update_count();
                     state.update_sum(sum_value.as_ref())?;
                 } else {
-                    let group_key = columnar_batch_value(column_batches, group_column, batch_id, offset)
-                        .unwrap_or(Value::Null);
+                    let group_key =
+                        columnar_batch_value(column_batches, group_column, batch_id, offset).unwrap_or(Value::Null);
                     let mut state = CountSumIntState::new();
                     state.update_count();
                     state.update_sum(sum_value.as_ref())?;
@@ -5747,8 +5974,8 @@ impl StorageEngine {
         // unaffected: both paths sort the merged groups below.
         let row_count_hint = self.art_index_manager.pk_index_len(table_name);
         if row_count_hint.is_some_and(agg_parallel_rows_met) {
-            let partials: Vec<Option<HashMap<Option<String>, CountSumIntState>>> = self
-                .par_prefix_shard_results(&prefix, |iter| {
+            let partials: Vec<Option<HashMap<Option<String>, CountSumIntState>>> =
+                self.par_prefix_shard_results(&prefix, |iter| {
                     let mut shard_small: Vec<(Option<String>, CountSumIntState)> = Vec::new();
                     let mut shard_hash: Option<HashMap<Option<String>, CountSumIntState>> = None;
                     for item in iter {
@@ -6077,57 +6304,56 @@ impl StorageEngine {
         // merge the partials.
         let row_count_hint = self.art_index_manager.pk_index_len(table_name);
         if row_count_hint.is_some_and(agg_parallel_rows_met) {
-            let partials: Vec<Option<(i64, i64, bool, f64, u64)>> =
-                self.par_prefix_shard_results(&prefix, |iter| {
-                    let mut count = 0_i64;
-                    let mut sum = 0_i64;
-                    let mut sum_seen = false;
-                    let mut avg_sum = 0.0_f64;
-                    let mut avg_count = 0_u64;
-                    let mut values = Vec::with_capacity(requested.len());
-                    for item in iter {
-                        let (_, raw_value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
-                        let decoded = if let Some(km) = &self.key_manager {
-                            let decrypted = crypto::decrypt(km.key(), &raw_value)?;
-                            crate::storage::prefix_decode::decode_tuple_numeric_column_values_into(
-                                &decrypted,
-                                requested,
-                                &mut values,
-                            )
-                        } else {
-                            crate::storage::prefix_decode::decode_tuple_numeric_column_values_into(
-                                &raw_value,
-                                requested,
-                                &mut values,
-                            )
-                        };
-                        if decoded.is_none() {
-                            return Ok(None);
-                        }
-
-                        count += 1;
-                        if let Some(crate::storage::prefix_decode::DecodedNumericValue::Int(value)) =
-                            values.get(sum_position)
-                        {
-                            sum = sum
-                                .checked_add(*value)
-                                .ok_or_else(|| Error::query_execution("integer overflow: BIGINT SUM"))?;
-                            sum_seen = true;
-                        }
-                        match values.get(avg_position) {
-                            Some(crate::storage::prefix_decode::DecodedNumericValue::Int(value)) => {
-                                avg_sum += *value as f64;
-                                avg_count += 1;
-                            }
-                            Some(crate::storage::prefix_decode::DecodedNumericValue::Float(value)) => {
-                                avg_sum += *value;
-                                avg_count += 1;
-                            }
-                            _ => {}
-                        }
+            let partials: Vec<Option<(i64, i64, bool, f64, u64)>> = self.par_prefix_shard_results(&prefix, |iter| {
+                let mut count = 0_i64;
+                let mut sum = 0_i64;
+                let mut sum_seen = false;
+                let mut avg_sum = 0.0_f64;
+                let mut avg_count = 0_u64;
+                let mut values = Vec::with_capacity(requested.len());
+                for item in iter {
+                    let (_, raw_value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+                    let decoded = if let Some(km) = &self.key_manager {
+                        let decrypted = crypto::decrypt(km.key(), &raw_value)?;
+                        crate::storage::prefix_decode::decode_tuple_numeric_column_values_into(
+                            &decrypted,
+                            requested,
+                            &mut values,
+                        )
+                    } else {
+                        crate::storage::prefix_decode::decode_tuple_numeric_column_values_into(
+                            &raw_value,
+                            requested,
+                            &mut values,
+                        )
+                    };
+                    if decoded.is_none() {
+                        return Ok(None);
                     }
-                    Ok(Some((count, sum, sum_seen, avg_sum, avg_count)))
-                })?;
+
+                    count += 1;
+                    if let Some(crate::storage::prefix_decode::DecodedNumericValue::Int(value)) =
+                        values.get(sum_position)
+                    {
+                        sum = sum
+                            .checked_add(*value)
+                            .ok_or_else(|| Error::query_execution("integer overflow: BIGINT SUM"))?;
+                        sum_seen = true;
+                    }
+                    match values.get(avg_position) {
+                        Some(crate::storage::prefix_decode::DecodedNumericValue::Int(value)) => {
+                            avg_sum += *value as f64;
+                            avg_count += 1;
+                        }
+                        Some(crate::storage::prefix_decode::DecodedNumericValue::Float(value)) => {
+                            avg_sum += *value;
+                            avg_count += 1;
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(Some((count, sum, sum_seen, avg_sum, avg_count)))
+            })?;
 
             for partial in partials {
                 let Some((chunk_count, chunk_sum, chunk_sum_seen, chunk_avg_sum, chunk_avg_count)) = partial else {
@@ -6306,13 +6532,13 @@ impl StorageEngine {
         // R3.2 gate: parallel partial aggregation over per-shard RocksDB
         // iterators for large tables. DISTINCT aggregates stay serial
         // (set-union partials are not worth it today); HELIOS_AGG_SERIAL /
-        // HELIOS_AGG_PARALLEL_THRESHOLD control the gate via
-        // agg_parallel_rows_met.
+        // HELIOS_AGG_PARALLEL_THRESHOLD control the columnar gate; row-store
+        // pushdown uses a lower default gate through row_agg_parallel_rows_met.
         let has_distinct = aggregates
             .iter()
             .any(|aggregate| matches!(aggregate.op, ColumnarAggregateOp::CountDistinct));
         let row_count_hint = self.art_index_manager.pk_index_len(table_name);
-        let parallel = !has_distinct && row_count_hint.is_some_and(agg_parallel_rows_met);
+        let parallel = !has_distinct && row_count_hint.is_some_and(row_agg_parallel_rows_met);
 
         if group_by_columns.is_empty() {
             let mut states: Vec<ColumnarAggregateState> = aggregates
@@ -6410,12 +6636,14 @@ impl StorageEngine {
                         if !row_values_match_filters(&values, &filter_predicates, &filter_positions) {
                             continue;
                         }
-                        let states = groups.entry(build_group_key(&values, &group_positions)).or_insert_with(|| {
-                            aggregates
-                                .iter()
-                                .map(|aggregate| ColumnarAggregateState::new(aggregate.op))
-                                .collect()
-                        });
+                        let states = groups
+                            .entry(build_group_key(&values, &group_positions))
+                            .or_insert_with(|| {
+                                aggregates
+                                    .iter()
+                                    .map(|aggregate| ColumnarAggregateState::new(aggregate.op))
+                                    .collect()
+                            });
                         for ((state, aggregate), position) in
                             states.iter_mut().zip(aggregates).zip(&aggregate_positions)
                         {
@@ -6719,8 +6947,10 @@ impl StorageEngine {
             .as_deref()
             .map_or(true, |name| name == "main");
         let has_user_branches = self
-            .list_branches()
-            .map(|branches| branches.iter().any(|branch| branch.name != "main"))
+            .branch_manager
+            .read()
+            .as_ref()
+            .map(|manager| manager.has_user_branches_registered())
             .unwrap_or(true);
         if on_main_branch && !has_user_branches {
             if let Some(count) = self.art_index_manager.pk_index_len(table_name) {
@@ -7049,6 +7279,19 @@ impl StorageEngine {
         self.get_row_by_pk_inner(table_name, pk_value, Some(schema), true, false)
     }
 
+    /// Typed PK lookup for SQL fast SELECTs. It still consumes existing row-cache
+    /// hits, but does not fill the row cache on miss: the fast SELECT result
+    /// cache already admits repeated identical SQL, while random one-off point
+    /// lookups otherwise pay cache insertion cost with no reuse.
+    pub fn get_row_by_typed_pk_with_schema_no_cache_fill(
+        &self,
+        table_name: &str,
+        pk_value: &crate::Value,
+        schema: &crate::Schema,
+    ) -> Result<Option<Tuple>> {
+        self.get_row_by_pk_inner(table_name, pk_value, Some(schema), false, false)
+    }
+
     /// PK point lookup for write paths. Cache hits are used, but cache misses
     /// are not inserted because UPDATE/DELETE immediately invalidate the row.
     pub fn get_row_by_pk_for_write_with_schema(
@@ -7142,7 +7385,8 @@ impl StorageEngine {
         populate_cache_on_miss: bool,
         coerce_pk_value: bool,
     ) -> Result<Option<Tuple>> {
-        let lookup_start = std::time::Instant::now();
+        let trace_lookup = tracing::enabled!(tracing::Level::DEBUG);
+        let lookup_start = trace_lookup.then(std::time::Instant::now);
 
         // Coerce the PK value to match the actual PK column type so that the ART
         // key encoding is identical to the one produced at INSERT time.  Without
@@ -7170,25 +7414,29 @@ impl StorageEngine {
         let row_id = match self.art_index_manager.pk_index_lookup(table_name, &key) {
             Some(rid) => rid,
             None => {
-                tracing::debug!(
-                    phase = "index_lookup",
-                    table = table_name,
-                    duration_us = lookup_start.elapsed().as_micros() as u64,
-                    "PK index lookup: no match"
-                );
+                if trace_lookup {
+                    tracing::debug!(
+                        phase = "index_lookup",
+                        table = table_name,
+                        duration_us = lookup_start.as_ref().map(|s| s.elapsed().as_micros() as u64).unwrap_or(0),
+                        "PK index lookup: no match"
+                    );
+                }
                 return Ok(None);
             }
         };
 
         // Check row cache before going to storage
         if let Some(cached) = self.row_cache.get(table_name, row_id) {
-            tracing::debug!(
-                phase = "index_lookup",
-                table = table_name,
-                duration_us = lookup_start.elapsed().as_micros() as u64,
-                cache = "hit",
-                "PK point lookup: row cache hit"
-            );
+            if trace_lookup {
+                tracing::debug!(
+                    phase = "index_lookup",
+                    table = table_name,
+                    duration_us = lookup_start.as_ref().map(|s| s.elapsed().as_micros() as u64).unwrap_or(0),
+                    cache = "hit",
+                    "PK point lookup: row cache hit"
+                );
+            }
             return Ok(Some(cached));
         }
 
@@ -7249,13 +7497,15 @@ impl StorageEngine {
             self.row_cache.put(table_name, row_id, tuple.clone());
         }
 
-        tracing::debug!(
-            phase = "index_lookup",
-            table = table_name,
-            duration_us = lookup_start.elapsed().as_micros() as u64,
-            cache = "miss",
-            "PK point lookup: fetched from storage, cached"
-        );
+        if trace_lookup {
+            tracing::debug!(
+                phase = "index_lookup",
+                table = table_name,
+                duration_us = lookup_start.as_ref().map(|s| s.elapsed().as_micros() as u64).unwrap_or(0),
+                cache = "miss",
+                "PK point lookup: fetched from storage, cached"
+            );
+        }
 
         Ok(Some(tuple))
     }
@@ -8112,8 +8362,7 @@ impl StorageEngine {
 
         let catalog = super::Catalog::new(self);
         let marker = snap::SnapshotMarker::current();
-        let marker_bytes =
-            bincode::serialize(&marker).map_err(|e| Error::storage(format!("marker serialize: {e}")))?;
+        let marker_bytes = bincode::serialize(&marker).map_err(|e| Error::storage(format!("marker serialize: {e}")))?;
 
         for table_name in catalog.list_tables()? {
             if table_name.starts_with("helios_") {
@@ -8153,15 +8402,18 @@ impl StorageEngine {
             }
             match self.vector_indexes.dump_standard_index(&meta.name, &dump_dir) {
                 Ok(Some(sidecar)) => {
-                    let blob = bincode::serialize(&sidecar)
-                        .map_err(|e| Error::storage(format!("sidecar serialize: {e}")))?;
+                    let blob =
+                        bincode::serialize(&sidecar).map_err(|e| Error::storage(format!("sidecar serialize: {e}")))?;
                     self.put(&snap::vec_snapshot_key(&meta.name), &blob)?;
                     self.put(&snap::vec_snapshot_marker_key(&meta.name), &marker_bytes)?;
                     report.vector_graphs += 1;
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    warn!("HNSW snapshot dump for '{}' failed: {} — it will rebuild on open", meta.name, e);
+                    warn!(
+                        "HNSW snapshot dump for '{}' failed: {} — it will rebuild on open",
+                        meta.name, e
+                    );
                     report.vector_dump_failures += 1;
                 }
             }
@@ -8206,7 +8458,10 @@ impl StorageEngine {
                 continue;
             };
             let Ok(table_snap) = bincode::deserialize::<snap::ArtTableSnapshot>(&blob) else {
-                warn!("ART snapshot for '{}' is unreadable — falling back to scan rebuild", table);
+                warn!(
+                    "ART snapshot for '{}' is unreadable — falling back to scan rebuild",
+                    table
+                );
                 continue;
             };
             if table_snap.format_version != snap::INDEX_SNAPSHOT_FORMAT_VERSION
@@ -10013,11 +10268,12 @@ impl StorageEngine {
                 "fast batch insert requires Transaction path when logical WAL is active",
             ));
         }
-        if schema
-            .columns
-            .iter()
-            .any(|column| matches!(column.storage_mode, ColumnStorageMode::Dictionary | ColumnStorageMode::ContentAddressed))
-        {
+        if schema.columns.iter().any(|column| {
+            matches!(
+                column.storage_mode,
+                ColumnStorageMode::Dictionary | ColumnStorageMode::ContentAddressed
+            )
+        }) {
             return Err(Error::internal(
                 "fast batch insert direct WriteBatch requires default or columnar row storage",
             ));
@@ -12052,9 +12308,13 @@ impl StorageEngine {
             // vector index is process-wide and serves main-branch kNN, so
             // branch-isolated overlay writes must not mutate it).
             if branch_id.is_none() {
-                let _ = self
-                    .vector_indexes
-                    .on_row_update(table_name, row_id, &schema, old_tuple_for_delta.as_ref(), &tuple);
+                let _ = self.vector_indexes.on_row_update(
+                    table_name,
+                    row_id,
+                    &schema,
+                    old_tuple_for_delta.as_ref(),
+                    &tuple,
+                );
             }
 
             // Update speculative filters (track new values)

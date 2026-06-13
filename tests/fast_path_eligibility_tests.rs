@@ -55,7 +55,7 @@ fn insert_literals_containing_keywords_round_trip() -> Result<()> {
         // (id, SQL literal spelling, expected stored string)
         (1, "'please select me'", "please select me"),
         (2, "'the default value'", "the default value"),
-        (3, "'it''s an order'", "it's an order"),       // '' escape + ORDER/OR
+        (3, "'it''s an order'", "it's an order"), // '' escape + ORDER/OR
         (4, "'to be or not, and in between'", "to be or not, and in between"),
         (5, "'on conflict do nothing'", "on conflict do nothing"),
         (6, "'returning soon'", "returning soon"),
@@ -237,7 +237,11 @@ fn insert_default_keyword_in_values_still_routed_to_planner() -> Result<()> {
     assert_eq!(n, 1);
     let rows = db.query("SELECT * FROM cfg WHERE id = 1", &[])?;
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].get(1).unwrap(), &Value::Int4(42), "DEFAULT must materialize to 42");
+    assert_eq!(
+        rows[0].get(1).unwrap(),
+        &Value::Int4(42),
+        "DEFAULT must materialize to 42"
+    );
     Ok(())
 }
 
@@ -336,10 +340,8 @@ fn mixed_workload_end_state_equivalence() -> Result<()> {
 
     // Equivalent end state on `reference`, built with statements that are
     // unambiguously planner-routed (multi-predicate WHERE / IN lists).
-    reference
-        .execute("INSERT INTO inventory (order_id, points, note) VALUES (1, 5, 'select default')")?;
-    reference
-        .execute("INSERT INTO inventory (order_id, points, note) VALUES (2, 6, 'it''s in order')")?;
+    reference.execute("INSERT INTO inventory (order_id, points, note) VALUES (1, 5, 'select default')")?;
+    reference.execute("INSERT INTO inventory (order_id, points, note) VALUES (2, 6, 'it''s in order')")?;
     reference.execute("INSERT INTO inventory (order_id, points, note) VALUES (3, 7, 'plain')")?;
     reference.execute("UPDATE inventory SET note = 'or and in between' WHERE order_id = 1 AND points = 5")?;
     reference.execute("UPDATE inventory SET points = 99 WHERE order_id IN (2)")?;

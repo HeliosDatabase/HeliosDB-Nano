@@ -51,8 +51,7 @@ impl<K: Hash + Eq, V: Clone> ShardedLruCache<K, V> {
     /// Create a cache with `total_capacity` entries divided evenly across
     /// the shards (minimum one entry per shard).
     pub(crate) fn new(total_capacity: NonZeroUsize) -> Self {
-        let per_shard =
-            NonZeroUsize::new((total_capacity.get() / SHARD_COUNT).max(1)).unwrap_or(NonZeroUsize::MIN);
+        let per_shard = NonZeroUsize::new((total_capacity.get() / SHARD_COUNT).max(1)).unwrap_or(NonZeroUsize::MIN);
         let shards: Vec<Mutex<lru::LruCache<K, V>>> = (0..SHARD_COUNT)
             .map(|_| Mutex::new(lru::LruCache::new(per_shard)))
             .collect();
@@ -73,9 +72,7 @@ impl<K: Hash + Eq, V: Clone> ShardedLruCache<K, V> {
         self.shards.get(idx).expect("masked shard index in range")
     }
 
-    fn lock_shard<'a>(
-        shard: &'a Mutex<lru::LruCache<K, V>>,
-    ) -> std::sync::MutexGuard<'a, lru::LruCache<K, V>> {
+    fn lock_shard<'a>(shard: &'a Mutex<lru::LruCache<K, V>>) -> std::sync::MutexGuard<'a, lru::LruCache<K, V>> {
         match shard.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -173,9 +170,7 @@ mod tests {
             c.put(format!("key-{i}"), i);
         }
         // At most one entry per shard survives.
-        let live: usize = (0..1000u64)
-            .filter(|i| c.contains(&format!("key-{i}")))
-            .count();
+        let live: usize = (0..1000u64).filter(|i| c.contains(&format!("key-{i}"))).count();
         assert!(live <= 16, "live={live} exceeds shard capacity");
         assert!(live >= 1);
     }

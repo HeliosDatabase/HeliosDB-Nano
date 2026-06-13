@@ -1,0 +1,68 @@
+metric	unit	v337_median	v351_median	delta_pct	higher_is_better	status
+cache:1 threads	lookups/s	1045178.500000	1093250.500000	4.5994	True	green
+cache:16 threads	lookups/s	924396.500000	2159519.000000	133.6139	True	green
+cache:4 threads	lookups/s	914978.500000	1279033.000000	39.7883	True	green
+colscan:agg_no_filter columnar	us/query	4224.000000	1158.600000	264.5779	False	green
+colscan:agg_no_filter row	us/query	16185.850000	2037.000000	694.5925	False	green
+colscan:agg_sum_avg columnar	us/query	10595.200000	1229.900000	761.4684	False	green
+colscan:agg_sum_avg row	us/query	16663.000000	2657.400000	527.0415	False	green
+colscan:count_distinct_a columnar	us/query	6672.050000	3388.500000	96.9028	False	green
+colscan:count_distinct_a row	us/query	16233.700000	16107.900000	0.7810	False	green
+colscan:count_star_filter columnar	us/query	2697.200000	524.450000	414.2912	False	green
+colscan:count_star_filter row	us/query	13584.100000	1689.600000	703.9832	False	green
+colscan:filter_eq_e columnar	us/query	19620.750000	4721.100000	315.5970	False	green
+colscan:filter_eq_e row	us/query	20417.150000	17487.100000	16.7555	False	green
+colscan:filter_scan columnar	us/query	35070.150000	17685.100000	98.3034	False	green
+colscan:filter_scan row	us/query	38224.450000	32674.150000	16.9868	False	green
+colscan:group_by_e columnar	us/query	23844.100000	1341.700000	1677.1558	False	green
+colscan:group_by_e row	us/query	17442.250000	2405.100000	625.2193	False	green
+disk:agg_count_sum_avg	ops/s	85.000000	90.500000	6.4706	True	green
+disk:autocommit_insert	ops/s	41934.000000	47654.500000	13.6417	True	green
+disk:bulk_insert_users(txn)	ops/s	132457.000000	163582.000000	23.4982	True	green
+disk:delete_by_pk	ops/s	92985.500000	138447.500000	48.8915	True	green
+disk:filter_scan(age>50)	ops/s	32.500000	30.500000	-6.1538	True	green
+disk:group_by_status	ops/s	52.000000	490.500000	843.2692	True	green
+disk:join_users_orders	ops/s	14.000000	15.000000	7.1429	True	green
+disk:order_by_limit10	ops/s	32.000000	91.500000	185.9375	True	green
+disk:point_lookup_hot	ops/s	1416514.500000	2828470.500000	99.6782	True	green
+disk:point_lookup_pk	ops/s	225874.500000	233718.500000	3.4727	True	green
+disk:update_by_pk	ops/s	56737.000000	71324.000000	25.7099	True	green
+mem:agg_count_sum_avg	ops/s	85.000000	95.000000	11.7647	True	green
+mem:autocommit_insert	ops/s	96199.000000	112971.500000	17.4352	True	green
+mem:bulk_insert_users(txn)	ops/s	135757.500000	161911.500000	19.2652	True	green
+mem:delete_by_pk	ops/s	142223.000000	247482.500000	74.0102	True	green
+mem:filter_scan(age>50)	ops/s	32.500000	37.000000	13.8462	True	green
+mem:group_by_status	ops/s	49.000000	465.000000	848.9796	True	green
+mem:join_users_orders	ops/s	15.000000	15.500000	3.3333	True	green
+mem:order_by_limit10	ops/s	32.000000	92.000000	187.5000	True	green
+mem:point_lookup_hot	ops/s	1430138.000000	2842720.500000	98.7725	True	green
+mem:point_lookup_pk	ops/s	279107.500000	291062.000000	4.2831	True	green
+mem:update_by_pk	ops/s	108400.000000	168991.500000	55.8962	True	green
+oltp:Batch INSERT (1000 rows)	ops/s	162982.000000	213795.500000	31.1774	True	green
+oltp:COUNT(*) (median of 5)	ops/s	1189733.500000	2293880.000000	92.8062	True	green
+oltp:INNER JOIN mean	ms	0.011550	0.012150	-4.9383	False	green
+oltp:INNER JOIN p50	ms	0.011300	0.011850	-4.6414	False	green
+oltp:INNER JOIN p99	ms	0.014600	0.017550	-16.8091	False	accepted/noise
+oltp:INSERT single + commit (median)	ops/s	69108.500000	107097.000000	54.9694	True	green
+oltp:PK lookup (hot, median of 100)	ops/s	1199005.000000	2557545.000000	113.3056	True	green
+oltp:Repeated query x100 (cached)	ops/s	1414067.000000	2781405.000000	96.6954	True	green
+param:param_autocommit_insert	ops/s	98529.500000	151593.500000	53.8560	True	green
+param:param_bulk_insert(txn)	ops/s	153664.000000	200360.500000	30.3887	True	green
+param:param_delete_by_pk	ops/s	234910.500000	408997.500000	74.1078	True	green
+param:param_execute_many_delete	ops/s	441787.000000	466635.000000	5.6244	True	green
+param:param_execute_many_insert	ops/s	227875.000000	224455.000000	-1.5008	True	green
+param:param_execute_many_update	ops/s	243760.500000	216694.000000	-11.1037	True	accepted/noise
+param:param_point_lookup_pk	ops/s	351551.500000	368257.500000	4.7521	True	green
+param:param_update_by_pk	ops/s	168860.500000	216235.500000	28.0557	True	green
+scan:agg_sum_avg	us/query	78056.750000	8830.550000	783.9398	False	green
+scan:count_distinct_expr(range)	us/query	128640.300000	179.500000	71565.9053	False	green
+scan:count_distinct_pk(range)	us/query	190.200000	142.450000	33.5205	False	green
+scan:count_pk(id IN)	us/query	146.300000	5.600000	2512.5000	False	green
+scan:count_star(all)	us/query	222.650000	14.800000	1404.3919	False	green
+scan:count_star(id IN)	us/query	153.000000	87.700000	74.4584	False	green
+scan:count_star(id range)	us/query	149.250000	4.550000	3180.2198	False	green
+scan:count_star(id=r)	us/query	139.200000	4.550000	2959.3407	False	green
+scan:count_star(id>=r)	us/query	133.400000	5.400000	2370.3704	False	green
+scan:filter_scan(d>50000)	us/query	148936.350000	145431.000000	2.4103	False	green
+scan:full_scan(SELECT *)	us/query	329483.650000	305200.450000	7.9565	False	green
+scan:group_by_e	us/query	84603.050000	8924.800000	847.9546	False	green

@@ -9,12 +9,15 @@
 //! Run with:
 //!   cargo test --release --test pg35_benchmark -- --nocapture --ignored
 
-use heliosdb_nano::{EmbeddedDatabase, Value};
+// Legacy import included Value even though the benchmark does not use it:
+// use heliosdb_nano::{EmbeddedDatabase, Value};
+use heliosdb_nano::EmbeddedDatabase;
 use std::time::{Duration, Instant};
 
 // --- Result types ---
 
 struct CategoryResult {
+    #[allow(dead_code)]
     name: String,
     #[allow(dead_code)]
     iterations: usize,
@@ -152,9 +155,35 @@ fn format_us(us: f64) -> String {
         format!("{:.1}s", us / 1_000_000.0)
     } else if us >= 1_000.0 {
         format!("{:.2}ms", us / 1_000.0)
-    } else {
+    // Legacy output floored all sub-millisecond values to whole microseconds:
+    // } else {
+    //     format!("{:.0}us", us)
+    } else if us >= 100.0 {
         format!("{:.0}us", us)
+    } else if us >= 10.0 {
+        format!("{:.1}us", us)
+    } else {
+        format!("{:.2}us", us)
     }
+}
+
+fn pg35_label() -> String {
+    std::env::var("PG35_PG_LABEL").unwrap_or_else(|_| "POSTGRESQL 18.4".to_string())
+}
+
+fn pg35_connstr() -> String {
+    std::env::var("PG35_CONNSTR").unwrap_or_else(|_| {
+        // Legacy hard-coded DSN:
+        // "host=127.0.0.1 port=25433 user=bench password=benchpass dbname=benchdb"
+        "host=127.0.0.1 port=25433 user=bench password=benchpass dbname=benchdb".to_string()
+    })
+}
+
+fn pg35_iters() -> usize {
+    std::env::var("PG35_ITERS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(20)
 }
 
 // --- Schema setup ---
@@ -1145,8 +1174,11 @@ fn run_all_categories(db: &EmbeddedDatabase, pg: &PgClient, iters: usize) -> Vec
 }
 
 fn compare_result(name: &str, h: &CategoryResult, p: &CategoryResult) -> ComparisonRow {
-    let h_us = h.avg_per_iter.as_micros() as f64;
-    let p_us = p.avg_per_iter.as_micros() as f64;
+    // Legacy microsecond-floor precision:
+    // let h_us = h.avg_per_iter.as_micros() as f64;
+    // let p_us = p.avg_per_iter.as_micros() as f64;
+    let h_us = h.avg_per_iter.as_nanos() as f64 / 1_000.0;
+    let p_us = p.avg_per_iter.as_nanos() as f64 / 1_000.0;
     let ratio = if p_us > 0.0 { h_us / p_us } else { 0.0 };
     let winner = if ratio <= 1.0 {
         "Helios".to_string()
@@ -1167,7 +1199,9 @@ fn compare_safe(name: &str, h: Option<&CategoryResult>, p: &CategoryResult) -> C
     match h {
         Some(h) => compare_result(name, h, p),
         None => {
-            let p_us = p.avg_per_iter.as_micros() as f64;
+            // Legacy microsecond-floor precision:
+            // let p_us = p.avg_per_iter.as_micros() as f64;
+            let p_us = p.avg_per_iter.as_nanos() as f64 / 1_000.0;
             ComparisonRow {
                 name: name.to_string(),
                 helios_avg_us: 0.0,
@@ -1182,15 +1216,26 @@ fn compare_safe(name: &str, h: Option<&CategoryResult>, p: &CategoryResult) -> C
 
 // --- Output formatting ---
 
-fn print_comparison_table(results: &[ComparisonRow]) {
+// Legacy fixed-label signature:
+// fn print_comparison_table(results: &[ComparisonRow]) {
+fn print_comparison_table(results: &[ComparisonRow], pg_label: &str) {
     println!("\n{}", "=".repeat(105));
-    println!("  HELIOSDB-NANO vs POSTGRESQL 16 -- HEAD-TO-HEAD COMPARISON");
+    // Legacy fixed label:
+    // println!("  HELIOSDB-NANO vs POSTGRESQL 16 -- HEAD-TO-HEAD COMPARISON");
+    println!("  HELIOSDB-NANO vs {} -- HEAD-TO-HEAD COMPARISON", pg_label);
     println!("  Dataset: 200 customers, 50 products, 500 orders, 1000 items, 20 categories");
     println!("{}\n", "=".repeat(105));
 
+    let pg_col = format!("{}(avg)", pg_label);
     println!(
         "{:<22} | {:>12} | {:>12} | {:>10} | {:>8}",
-        "Category", "Nano(avg)", "PG 16(avg)", "Ratio", "Winner"
+        // Legacy fixed column label:
+        // "Category", "Nano(avg)", "PG 16(avg)", "Ratio", "Winner"
+        "Category",
+        "Nano(avg)",
+        pg_col,
+        "Ratio",
+        "Winner"
     );
     println!("{}", "-".repeat(105));
 
@@ -1334,20 +1379,35 @@ fn print_analysis(results: &[ComparisonRow]) {
 #[test]
 #[ignore] // Requires Docker PostgreSQL on port 25433
 fn pg35_benchmark() {
+    let pg_label = pg35_label();
+    let pg_connstr = pg35_connstr();
+
     println!("\n{}", "=".repeat(105));
-    println!("  HELIOSDB-NANO vs POSTGRESQL 16 -- COMPREHENSIVE 35-CATEGORY BENCHMARK");
-    println!("  HeliosDB-Nano v3.7.0 (Embedded/In-Memory) vs PostgreSQL 16 (Docker/25433)");
+    // Legacy fixed label:
+    // println!("  HELIOSDB-NANO vs POSTGRESQL 16 -- COMPREHENSIVE 35-CATEGORY BENCHMARK");
+    // println!("  HeliosDB-Nano v3.7.0 (Embedded/In-Memory) vs PostgreSQL 16 (Docker/25433)");
+    println!("  HELIOSDB-NANO vs {} -- COMPREHENSIVE 35-CATEGORY BENCHMARK", pg_label);
+    println!(
+        "  HeliosDB-Nano v3.51.0 (Embedded/In-Memory) vs {} (Docker/25433)",
+        pg_label
+    );
     println!("{}\n", "=".repeat(105));
 
     // Connect to PostgreSQL
-    let pg = match PgClient::connect("host=127.0.0.1 port=25433 user=bench password=benchpass dbname=benchdb") {
+    // Legacy hard-coded connection:
+    // let pg = match PgClient::connect("host=127.0.0.1 port=25433 user=bench password=benchpass dbname=benchdb") {
+    let pg = match PgClient::connect(&pg_connstr) {
         Ok(pg) => {
-            println!("  [OK] Connected to PostgreSQL 16 on port 25433");
+            // Legacy fixed label:
+            // println!("  [OK] Connected to PostgreSQL 16 on port 25433");
+            println!("  [OK] Connected to {} on configured DSN", pg_label);
             pg
         }
         Err(e) => {
             println!("  [SKIP] Cannot connect to PostgreSQL: {}", e);
-            println!("  Start with: docker run -d --name pg_bench_nano -e POSTGRES_USER=bench -e POSTGRES_PASSWORD=benchpass -e POSTGRES_DB=benchdb -p 25433:5432 postgres:16-alpine");
+            // Legacy start command:
+            // println!("  Start with: docker run -d --name pg_bench_nano -e POSTGRES_USER=bench -e POSTGRES_PASSWORD=benchpass -e POSTGRES_DB=benchdb -p 25433:5432 postgres:16-alpine");
+            println!("  Start with: docker run -d --name pg_bench_nano -e POSTGRES_USER=bench -e POSTGRES_PASSWORD=benchpass -e POSTGRES_DB=benchdb -p 25433:5432 postgres:18.4-bookworm");
             return;
         }
     };
@@ -1382,7 +1442,9 @@ fn pg35_benchmark() {
     println!("  [OK] Customers: Nano={} PG={}", h_count, p_count);
 
     // Run benchmarks
-    let iters = 20;
+    // Legacy fixed iteration count:
+    // let iters = 20;
+    let iters = pg35_iters();
     println!("\n  Running 35 categories x {} iterations each x 2 engines...\n", iters);
 
     let start = Instant::now();
@@ -1390,7 +1452,9 @@ fn pg35_benchmark() {
     let total_time = start.elapsed();
 
     // Output
-    print_comparison_table(&results);
+    // Legacy fixed-label call:
+    // print_comparison_table(&results);
+    print_comparison_table(&results, &pg_label);
     print_trace_breakdown(&results);
     print_analysis(&results);
 

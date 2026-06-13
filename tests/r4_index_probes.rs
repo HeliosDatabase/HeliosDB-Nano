@@ -126,7 +126,8 @@ fn probe_open_time_snapshot_vs_rebuild() {
         fill_vectors(&db, "p_vecs", vectors, dim);
         println!("load: {} vectors in {:.1}s", vectors, started.elapsed().as_secs_f64());
         let started = Instant::now();
-        db.execute("CREATE INDEX idx_p_vecs_emb ON p_vecs USING hnsw (emb)").unwrap();
+        db.execute("CREATE INDEX idx_p_vecs_emb ON p_vecs USING hnsw (emb)")
+            .unwrap();
         println!("hnsw build: {:.1}s", started.elapsed().as_secs_f64());
 
         // Simulate crash → next open must rebuild everything (the "before").
@@ -184,12 +185,17 @@ fn probe_range_scan_selectivity() {
     db.execute("CREATE INDEX idx_p_range_score ON p_range(score)").unwrap();
 
     // score is uniform over [0, 1000): a span of S values ≈ S/1000 selectivity.
-    let cases = [("0.1%", "score >= 100 AND score < 101"),
-                 ("1%",   "score >= 100 AND score < 110"),
-                 ("10%",  "score >= 100 AND score < 200")];
+    let cases = [
+        ("0.1%", "score >= 100 AND score < 101"),
+        ("1%", "score >= 100 AND score < 110"),
+        ("10%", "score >= 100 AND score < 200"),
+    ];
 
     println!("\nrange scan @ {} rows (ms, best of 5):", rows);
-    println!("{:<6} {:>12} {:>12} {:>9} {:>10}", "sel", "indexed", "full-scan", "speedup", "rows");
+    println!(
+        "{:<6} {:>12} {:>12} {:>9} {:>10}",
+        "sel", "indexed", "full-scan", "speedup", "rows"
+    );
     for (label, predicate) in cases {
         let sql = format!("SELECT id FROM p_range WHERE {predicate}");
         let (indexed_ms, n1) = time_query(&db, &sql, 5);
@@ -252,8 +258,13 @@ fn probe_cold_range_cost_and_compaction() {
     fill_rows(&db, "p_cold", rows);
     db.execute("CREATE INDEX idx_p_cold_score ON p_cold(score)").unwrap();
 
-    let slice_sql =
-        |r: usize| format!("SELECT id FROM p_cold WHERE score >= {} AND score < {}", 10 * r, 10 * r + 10);
+    let slice_sql = |r: usize| {
+        format!(
+            "SELECT id FROM p_cold WHERE score >= {} AND score < {}",
+            10 * r,
+            10 * r + 10
+        )
+    };
     let run_one = |sql: &str| -> (f64, usize) {
         let stmt = uncached(sql);
         let started = Instant::now();
@@ -320,7 +331,12 @@ fn probe_point_lookup_and_dml_parity() {
             .unwrap();
     }
     let s = started.elapsed().as_secs_f64();
-    println!("UPDATE (index column): {} ops in {:.2}s = {:.0} ops/s", updates, s, updates as f64 / s);
+    println!(
+        "UPDATE (index column): {} ops in {:.2}s = {:.0} ops/s",
+        updates,
+        s,
+        updates as f64 / s
+    );
 
     let started = Instant::now();
     let deletes = 10_000.min(rows);
@@ -328,5 +344,10 @@ fn probe_point_lookup_and_dml_parity() {
         db.execute(&format!("DELETE FROM p_dml WHERE id = {i}")).unwrap();
     }
     let s = started.elapsed().as_secs_f64();
-    println!("DELETE by PK: {} ops in {:.2}s = {:.0} ops/s", deletes, s, deletes as f64 / s);
+    println!(
+        "DELETE by PK: {} ops in {:.2}s = {:.0} ops/s",
+        deletes,
+        s,
+        deletes as f64 / s
+    );
 }

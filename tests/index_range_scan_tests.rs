@@ -10,13 +10,7 @@ use heliosdb_nano::{EmbeddedDatabase, Tuple, Value};
 fn rows_sorted(rows: &[Tuple]) -> Vec<String> {
     let mut out: Vec<String> = rows
         .iter()
-        .map(|t| {
-            t.values
-                .iter()
-                .map(|v| format!("{v:?}"))
-                .collect::<Vec<_>>()
-                .join("|")
-        })
+        .map(|t| t.values.iter().map(|v| format!("{v:?}")).collect::<Vec<_>>().join("|"))
         .collect();
     out.sort();
     out
@@ -25,13 +19,7 @@ fn rows_sorted(rows: &[Tuple]) -> Vec<String> {
 /// Render a result set order-SENSITIVELY (for ORDER BY checks).
 fn rows_exact(rows: &[Tuple]) -> Vec<String> {
     rows.iter()
-        .map(|t| {
-            t.values
-                .iter()
-                .map(|v| format!("{v:?}"))
-                .collect::<Vec<_>>()
-                .join("|")
-        })
+        .map(|t| t.values.iter().map(|v| format!("{v:?}")).collect::<Vec<_>>().join("|"))
         .collect()
 }
 
@@ -55,7 +43,11 @@ fn build_pair(db: &EmbeddedDatabase) {
             } else {
                 format!("{}", f64::from(score) / 7.0)
             };
-            let score_sql = if score % 13 == 0 { "NULL".to_string() } else { score.to_string() };
+            let score_sql = if score % 13 == 0 {
+                "NULL".to_string()
+            } else {
+                score.to_string()
+            };
             db.execute(&format!(
                 "INSERT INTO {table} VALUES ({i}, {score_sql}, {name}, {ratio})"
             ))
@@ -70,7 +62,10 @@ fn build_pair(db: &EmbeddedDatabase) {
 
 fn assert_twin_match(db: &EmbeddedDatabase, predicate: &str) {
     let indexed = db
-        .query(&format!("SELECT id, score, name FROM rt_indexed WHERE {predicate}"), &[])
+        .query(
+            &format!("SELECT id, score, name FROM rt_indexed WHERE {predicate}"),
+            &[],
+        )
         .unwrap();
     let twin = db
         .query(&format!("SELECT id, score, name FROM rt_twin WHERE {predicate}"), &[])
@@ -131,7 +126,10 @@ fn range_scan_excludes_nulls_like_full_scan() {
     for predicate in ["score < 1000", "score > -1000", "name < 'zzz'", "ratio > -1000.0"] {
         assert_twin_match(&db, predicate);
         let rows = db
-            .query(&format!("SELECT score, name, ratio FROM rt_indexed WHERE {predicate}"), &[])
+            .query(
+                &format!("SELECT score, name, ratio FROM rt_indexed WHERE {predicate}"),
+                &[],
+            )
             .unwrap();
         // No NULL may satisfy a range predicate.
         let col = if predicate.starts_with("score") {
@@ -154,7 +152,8 @@ fn range_scan_tracks_dml() {
     build_pair(&db);
 
     for table in ["rt_indexed", "rt_twin"] {
-        db.execute(&format!("UPDATE {table} SET score = 500 WHERE id = 10")).unwrap();
+        db.execute(&format!("UPDATE {table} SET score = 500 WHERE id = 10"))
+            .unwrap();
         db.execute(&format!("DELETE FROM {table} WHERE id = 11")).unwrap();
         db.execute(&format!("INSERT INTO {table} VALUES (9001, 501, 'late', 1.0)"))
             .unwrap();
@@ -185,11 +184,18 @@ fn order_by_indexed_column_limit_matches_twin() {
         let twin = db.query(&query.replace("{T}", "rt_twin"), &[]).unwrap();
         // Sort keys can tie (duplicate scores / NULLs); compare the sort-key
         // sequence exactly and the full row sets order-insensitively.
-        let key_seq = |rows: &[Tuple]| -> Vec<String> {
-            rows.iter().map(|t| format!("{:?}", t.values.get(1))).collect()
-        };
-        assert_eq!(key_seq(&indexed), key_seq(&twin), "sort-key order diverged for: {query}");
-        assert_eq!(rows_sorted(&indexed), rows_sorted(&twin), "row set diverged for: {query}");
+        let key_seq =
+            |rows: &[Tuple]| -> Vec<String> { rows.iter().map(|t| format!("{:?}", t.values.get(1))).collect() };
+        assert_eq!(
+            key_seq(&indexed),
+            key_seq(&twin),
+            "sort-key order diverged for: {query}"
+        );
+        assert_eq!(
+            rows_sorted(&indexed),
+            rows_sorted(&twin),
+            "row set diverged for: {query}"
+        );
     }
 }
 
@@ -206,9 +212,7 @@ fn order_by_desc_still_correct() {
     let twin = db
         .query("SELECT id, score FROM rt_twin ORDER BY score DESC LIMIT 10", &[])
         .unwrap();
-    let key_seq = |rows: &[Tuple]| -> Vec<String> {
-        rows.iter().map(|t| format!("{:?}", t.values.get(1))).collect()
-    };
+    let key_seq = |rows: &[Tuple]| -> Vec<String> { rows.iter().map(|t| format!("{:?}", t.values.get(1))).collect() };
     assert_eq!(key_seq(&indexed), key_seq(&twin));
 }
 
@@ -233,7 +237,8 @@ fn order_by_limit_nulls_beyond_first_batch_still_sort_first() {
             id += 1;
         }
         for _ in 0..10 {
-            db.execute(&format!("INSERT INTO {table} VALUES ({id}, 'zzz')")).unwrap();
+            db.execute(&format!("INSERT INTO {table} VALUES ({id}, 'zzz')"))
+                .unwrap();
             id += 1;
         }
     }
@@ -246,9 +251,8 @@ fn order_by_limit_nulls_beyond_first_batch_still_sort_first() {
     ] {
         let indexed = db.query(&sql.replace("{T}", "nb_indexed"), &[]).unwrap();
         let twin = db.query(&sql.replace("{T}", "nb_twin"), &[]).unwrap();
-        let key_seq = |rows: &[Tuple]| -> Vec<String> {
-            rows.iter().map(|t| format!("{:?}", t.values.get(1))).collect()
-        };
+        let key_seq =
+            |rows: &[Tuple]| -> Vec<String> { rows.iter().map(|t| format!("{:?}", t.values.get(1))).collect() };
         assert_eq!(key_seq(&indexed), key_seq(&twin), "sort-key order diverged for: {sql}");
     }
     // With 12 NULLs present, LIMIT 10 must be entirely NULL-keyed rows.
@@ -311,14 +315,20 @@ fn explain_shows_index_range_scan() {
     build_pair(&db);
 
     let plan = db
-        .query("EXPLAIN SELECT id FROM rt_indexed WHERE score > 120 AND score < 135", &[])
+        .query(
+            "EXPLAIN SELECT id FROM rt_indexed WHERE score > 120 AND score < 135",
+            &[],
+        )
         .unwrap();
     let text = rows_exact(&plan).join("\n");
     assert!(
         text.contains("Index Range Scan using idx_rt_score"),
         "EXPLAIN must surface the index range scan, got:\n{text}"
     );
-    assert!(text.contains("score > 120"), "EXPLAIN must show the bounds, got:\n{text}");
+    assert!(
+        text.contains("score > 120"),
+        "EXPLAIN must show the bounds, got:\n{text}"
+    );
 
     // The twin (no index) must NOT claim a range scan.
     let plan = db
@@ -361,7 +371,10 @@ fn explain_shows_ordered_index_topk() {
 
     // DESC is not served by the fast path — EXPLAIN must keep the Sort.
     let plan = db
-        .query("EXPLAIN SELECT id, score FROM rt_indexed ORDER BY score DESC LIMIT 5", &[])
+        .query(
+            "EXPLAIN SELECT id, score FROM rt_indexed ORDER BY score DESC LIMIT 5",
+            &[],
+        )
         .unwrap();
     let text = rows_exact(&plan).join("\n");
     assert!(

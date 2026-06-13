@@ -196,9 +196,7 @@ fn complex_predicates_fall_back_and_stay_correct() -> Result<()> {
     let db = EmbeddedDatabase::new_in_memory()?;
     seed(&db, N_ROWS)?;
 
-    let q = format!(
-        "SELECT id FROM items WHERE val < 5 OR val >= 1198 ORDER BY embedding <-> {QUERY} LIMIT 10"
-    );
+    let q = format!("SELECT id FROM items WHERE val < 5 OR val >= 1198 ORDER BY embedding <-> {QUERY} LIMIT 10");
     let (fast, brute) = fast_vs_brute(&db, &q, &[])?;
     assert_eq!(fast, brute, "OR-filtered kNN != brute force");
     assert_eq!(fast, vec![0, 1, 2, 3, 4, 1198, 1199]);

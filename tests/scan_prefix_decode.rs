@@ -146,6 +146,11 @@ fn count_distinct_pk_uses_index_cardinality() {
         .unwrap();
     assert_eq!(int(&rows[0].values[0]), 8);
 
+    let rows = db
+        .query("SELECT COUNT(DISTINCT id + 0) FROM n WHERE id >= -3 AND id < 5", &[])
+        .unwrap();
+    assert_eq!(int(&rows[0].values[0]), 8);
+
     db.execute("DELETE FROM n WHERE id = 0").unwrap();
     let rows = db.query("SELECT COUNT(DISTINCT id) FROM n", &[]).unwrap();
     assert_eq!(int(&rows[0].values[0]), 20);
@@ -188,6 +193,76 @@ fn count_pk_and_count_star_pk_in_list_use_index_cardinality() {
         .query("SELECT COUNT(bucket) FROM n WHERE id IN (1, 2, 3)", &[])
         .unwrap();
     assert_eq!(int(&rows[0].values[0]), 3);
+}
+
+#[test]
+fn query_fast_count_pk_shapes_preserve_sql_results() {
+    let db = EmbeddedDatabase::new_in_memory().unwrap();
+    db.execute("CREATE TABLE n (id INTEGER PRIMARY KEY, bucket INT)")
+        .unwrap();
+    for id in -2i32..=4 {
+        db.execute(&format!("INSERT INTO n VALUES ({id}, {})", id.rem_euclid(3)))
+            .unwrap();
+    }
+
+    let rows = db.query("SELECT COUNT(*) FROM n", &[]).unwrap();
+    assert_eq!(int(&rows[0].values[0]), 7);
+
+    let rows = db.query("SELECT COUNT(id) FROM n", &[]).unwrap();
+    assert_eq!(int(&rows[0].values[0]), 7);
+
+    let rows = db
+        .query("SELECT COUNT(*) FROM n WHERE id IN (-2, -2, 0, NULL, 99)", &[])
+        .unwrap();
+    assert_eq!(int(&rows[0].values[0]), 2);
+
+    let rows = db
+        .query("SELECT COUNT(id) FROM n WHERE id >= -1 AND id <= 2", &[])
+        .unwrap();
+    assert_eq!(int(&rows[0].values[0]), 4);
+
+    let rows = db
+        .query("SELECT COUNT(*) FROM n WHERE id > 2 AND id < 2", &[])
+        .unwrap();
+    assert_eq!(int(&rows[0].values[0]), 0);
+
+    // Non-PK COUNT must fall back to the planner and keep ordinary COUNT(col)
+    // null semantics.
+    db.execute("INSERT INTO n VALUES (10, NULL)").unwrap();
+    let rows = db.query("SELECT COUNT(bucket) FROM n WHERE id IN (0, 1, 10)", &[]).unwrap();
+    assert_eq!(int(&rows[0].values[0]), 2);
+
+    // Non-integer PKs are deliberately outside the COUNT shortcut and must
+    // still execute correctly through the normal planner path.
+    db.execute("CREATE TABLE kv (name TEXT PRIMARY KEY, v INT)").unwrap();
+    db.execute("INSERT INTO kv VALUES ('a', 1)").unwrap();
+    db.execute("INSERT INTO kv VALUES ('b', 2)").unwrap();
+    let rows = db.query("SELECT COUNT(*) FROM kv WHERE name IN ('a', 'missing')", &[]).unwrap();
+    assert_eq!(int(&rows[0].values[0]), 1);
+}
+
+#[test]
+fn query_fast_count_pk_falls_back_for_transaction_and_materialized_view() {
+    let db = EmbeddedDatabase::new_in_memory().unwrap();
+    db.execute("CREATE TABLE n (id INTEGER PRIMARY KEY, bucket INT)")
+        .unwrap();
+    db.execute("INSERT INTO n VALUES (1, 10)").unwrap();
+    db.execute("INSERT INTO n VALUES (2, 20)").unwrap();
+
+    db.execute("BEGIN").unwrap();
+    db.execute("INSERT INTO n VALUES (3, 30)").unwrap();
+    let rows = db.query("SELECT COUNT(*) FROM n", &[]).unwrap();
+    assert_eq!(int(&rows[0].values[0]), 3);
+    db.execute("ROLLBACK").unwrap();
+
+    let rows = db.query("SELECT COUNT(*) FROM n", &[]).unwrap();
+    assert_eq!(int(&rows[0].values[0]), 2);
+
+    db.execute("CREATE MATERIALIZED VIEW n_mv AS SELECT * FROM n")
+        .unwrap();
+    db.execute("REFRESH MATERIALIZED VIEW n_mv").unwrap();
+    let rows = db.query("SELECT COUNT(*) FROM n_mv", &[]).unwrap();
+    assert_eq!(int(&rows[0].values[0]), 2);
 }
 
 #[test]

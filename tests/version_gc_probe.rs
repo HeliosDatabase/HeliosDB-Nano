@@ -93,12 +93,19 @@ fn probe_reclaim_and_scan_throughput() {
 
     let scan_before = scan_rows_per_sec(&db, "SELECT * FROM bench", ROWS, 3);
     let asof_before = scan_rows_per_sec(&db, &as_of_sql, ROWS, 3);
-    println!("scan before GC: {:.0} rows/s plain, {:.0} rows/s AS OF", scan_before, asof_before);
+    println!(
+        "scan before GC: {:.0} rows/s plain, {:.0} rows/s AS OF",
+        scan_before, asof_before
+    );
 
     std::thread::sleep(std::time::Duration::from_secs(2));
     let t = Instant::now();
     let collected = db.vacuum_versions().unwrap();
-    println!("VACUUM VERSIONS: {} collected in {:.1}s", collected, t.elapsed().as_secs_f64());
+    println!(
+        "VACUUM VERSIONS: {} collected in {:.1}s",
+        collected,
+        t.elapsed().as_secs_f64()
+    );
 
     let after = db.version_storage_stats().unwrap();
     println!(
@@ -110,7 +117,10 @@ fn probe_reclaim_and_scan_throughput() {
 
     let scan_after = scan_rows_per_sec(&db, "SELECT * FROM bench", ROWS, 3);
     let asof_after = scan_rows_per_sec(&db, &as_of_sql, ROWS, 3);
-    println!("scan after GC: {:.0} rows/s plain, {:.0} rows/s AS OF", scan_after, asof_after);
+    println!(
+        "scan after GC: {:.0} rows/s plain, {:.0} rows/s AS OF",
+        scan_after, asof_after
+    );
 
     // Compaction clears the delete tombstones the GC left behind.
     let t = Instant::now();

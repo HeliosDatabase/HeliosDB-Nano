@@ -569,19 +569,15 @@ impl<'a> Executor<'a> {
         let Some(storage) = self.storage else {
             return Ok(None);
         };
-        let LogicalPlan::Sort {
-            input: sort_input,
-            exprs: sort_exprs,
-            asc,
-        } = input
-        else {
+        let Some((sort_exprs, asc, sort_input, project_wrap)) = Self::extract_sort_for_topk(input) else {
             return Ok(None);
         };
         if sort_exprs.is_empty() || sort_exprs.len() != asc.len() {
             return Ok(None);
         }
 
-        if let Some(spec) = self.direct_topk_project_spec(sort_input, sort_exprs)? {
+        let spec_input = if project_wrap.is_some() { input } else { sort_input };
+        if let Some(spec) = self.direct_topk_project_spec(spec_input, &sort_exprs)? {
             if self.txn_forces_slow_reads_for_table(&spec.table_name) {
                 return Ok(None);
             }
@@ -590,7 +586,7 @@ impl<'a> Executor<'a> {
                 &spec.scan_schema,
                 &spec.output_columns,
                 &spec.sort_columns,
-                asc,
+                &asc,
                 limit.saturating_add(offset),
             )? {
                 tuples
@@ -599,7 +595,7 @@ impl<'a> Executor<'a> {
                 &spec.scan_schema,
                 &spec.output_columns,
                 &spec.sort_columns,
-                asc,
+                &asc,
                 limit.saturating_add(offset),
             )? {
                 tuples
@@ -896,8 +892,7 @@ impl<'a> Executor<'a> {
             // the output) are still unfetched beyond `fetch_k`.
             if exhausted
                 || fetch_k >= total
-                || (null_head.len() + non_null.len() >= k_target
-                    && (nulls_complete || null_head.len() >= k_target))
+                || (null_head.len() + non_null.len() >= k_target && (nulls_complete || null_head.len() >= k_target))
             {
                 break;
             }
@@ -1308,7 +1303,11 @@ impl<'a> Executor<'a> {
                 distinct: false,
                 distinct_on: None,
             } => {
-                let Some((table_name, scan_schema)) = self.direct_topk_scan_schema(input)? else {
+                let scan_input = match input.as_ref() {
+                    LogicalPlan::Sort { input, .. } => input.as_ref(),
+                    other => other,
+                };
+                let Some((table_name, scan_schema)) = self.direct_topk_scan_schema(scan_input)? else {
                     return Ok(None);
                 };
                 let mut output_columns = Vec::with_capacity(exprs.len());
@@ -1525,9 +1524,7 @@ impl<'a> Executor<'a> {
                 | BinaryOperator::Lt
                 | BinaryOperator::LtEq
                 | BinaryOperator::Gt
-                | BinaryOperator::GtEq => {
-                    (is_column(left) && is_const(right)) || (is_const(left) && is_column(right))
-                }
+                | BinaryOperator::GtEq => (is_column(left) && is_const(right)) || (is_const(left) && is_column(right)),
                 _ => false,
             },
             _ => false,
@@ -2142,7 +2139,7 @@ impl<'a> Executor<'a> {
             return Ok(None);
         }
 
-        let Some(arg_idx) = Self::column_expr_index(arg, schema) else {
+        let Some(arg_idx) = Self::identity_pk_count_distinct_index(arg, schema) else {
             return Ok(None);
         };
         let Some(pk_col) = schema.columns.get(arg_idx).filter(|col| col.primary_key) else {
@@ -2174,6 +2171,41 @@ impl<'a> Executor<'a> {
         )))
     }
 
+    fn try_count_star_pk_cardinality(&mut self, input: &LogicalPlan) -> Result<Option<Box<dyn PhysicalOperator>>> {
+        let storage = match self.storage {
+            Some(storage) => storage,
+            None => return Ok(None),
+        };
+        if self.txn_forces_slow_reads() || storage.is_branch_active() {
+            return Ok(None);
+        }
+
+        let Some((table_name, schema, predicate, as_of)) = Self::columnar_aggregate_input(input) else {
+            return Ok(None);
+        };
+        let Some(predicate) = predicate else {
+            return Ok(None);
+        };
+        if as_of.is_some() || self.get_cte(table_name).is_some() || self.txn_forces_slow_reads_for_table(table_name) {
+            return Ok(None);
+        }
+
+        let mut pk_cols = schema.columns.iter().filter(|col| col.primary_key);
+        let pk_col = match (pk_cols.next(), pk_cols.next()) {
+            (Some(col), None) => col,
+            _ => return Ok(None),
+        };
+        let count_table_name = self.fast_path_storage_table_name(table_name)?;
+        if self.txn_forces_slow_reads_for_table(&count_table_name) {
+            return Ok(None);
+        }
+        let Some(count) = self.count_single_pk_predicate(&count_table_name, schema, pk_col, predicate)? else {
+            return Ok(None);
+        };
+
+        Ok(Some(Self::count_star_schema_operator(count as i64)))
+    }
+
     fn count_single_pk_predicate(
         &mut self,
         table_name: &str,
@@ -2193,6 +2225,39 @@ impl<'a> Executor<'a> {
             return storage.count_table_pk_int_range_with_schema(table_name, schema, lower, upper);
         }
         self.count_single_pk_in_list(table_name, pk_col, &predicate)
+    }
+
+    fn identity_pk_count_distinct_index(expr: &crate::sql::LogicalExpr, schema: &Schema) -> Option<usize> {
+        use crate::sql::{BinaryOperator, LogicalExpr};
+        use crate::{DataType, Value};
+
+        fn is_integer_zero(expr: &LogicalExpr) -> bool {
+            matches!(
+                expr,
+                LogicalExpr::Literal(Value::Int2(0) | Value::Int4(0) | Value::Int8(0))
+            )
+        }
+
+        let idx = match expr {
+            LogicalExpr::Column { .. } => Self::column_expr_index(expr, schema)?,
+            LogicalExpr::BinaryExpr {
+                left,
+                op: BinaryOperator::Plus,
+                right,
+            } if is_integer_zero(right) => Self::column_expr_index(left, schema)?,
+            LogicalExpr::BinaryExpr {
+                left,
+                op: BinaryOperator::Plus,
+                right,
+            } if is_integer_zero(left) => Self::column_expr_index(right, schema)?,
+            _ => return None,
+        };
+        let column = schema.columns.get(idx)?;
+        if column.primary_key && matches!(column.data_type, DataType::Int2 | DataType::Int4 | DataType::Int8) {
+            Some(idx)
+        } else {
+            None
+        }
     }
 
     fn count_single_pk_in_list(
@@ -2219,8 +2284,11 @@ impl<'a> Executor<'a> {
             None => return Ok(None),
         };
 
-        let mut seen = std::collections::HashSet::new();
-        let mut count = 0usize;
+        // Tiny literal IN lists are common in the scan/count microbenchmarks.
+        // Avoid building a HashSet and cloning encoded ART keys; a short
+        // linear duplicate check is cheaper and preserves SQL IN de-dup
+        // semantics.
+        let mut seen_keys: Vec<Vec<u8>> = Vec::with_capacity(list.len().min(8));
         for item in list {
             let Some(value) = self.pk_in_list_value(item, &pk_col.data_type) else {
                 return Ok(None);
@@ -2229,15 +2297,20 @@ impl<'a> Executor<'a> {
                 continue;
             }
             let key = crate::storage::ArtIndexManager::encode_key(std::slice::from_ref(&value));
-            if seen.insert(key.clone()) {
-                match storage.art_indexes().pk_index_contains(table_name, &key) {
-                    Some(true) => count += 1,
-                    Some(false) => {}
-                    None => return Ok(None),
-                }
+            if seen_keys.iter().any(|seen| seen == &key) {
+                continue;
             }
+            seen_keys.push(key);
         }
 
+        let mut count = 0usize;
+        for key in &seen_keys {
+            match storage.art_indexes().pk_index_contains(table_name, key) {
+                Some(true) => count += 1,
+                Some(false) => {}
+                None => return Ok(None),
+            }
+        }
         Ok(Some(count))
     }
 
@@ -3216,6 +3289,17 @@ impl<'a> Executor<'a> {
                 let k = limit.saturating_add(*offset);
                 let real_bound = *limit != usize::MAX;
                 if real_bound {
+                    if let Some((sort_exprs, sort_asc, _, _)) = Self::extract_sort_for_topk(input) {
+                        if sort_exprs.len() == 1
+                            && sort_asc.len() == 1
+                            && !sort_asc[0]
+                            && matches!(sort_exprs[0], crate::sql::LogicalExpr::Column { .. })
+                        {
+                            if let Some(topk) = self.try_storage_direct_topk(input, *limit, *offset)? {
+                                return Ok(topk);
+                            }
+                        }
+                    }
                     // Vector kNN fast path: `ORDER BY col <=>/<->/<#> $const`
                     // backed by an HNSW index. Tried first because it's the
                     // most specific shape; falls through (returns None) for
@@ -3310,6 +3394,10 @@ impl<'a> Executor<'a> {
                             .first()
                             .is_some_and(|a| matches!(a, crate::sql::LogicalExpr::Wildcard));
                         if is_count_star {
+                            if let Some(op) = self.try_count_star_pk_cardinality(input.as_ref())? {
+                                return Ok(op);
+                            }
+
                             let scan_table = match input.as_ref() {
                                 LogicalPlan::Scan { table_name, .. } => Some(table_name.as_str()),
                                 LogicalPlan::Project { input: inner, .. } => {
@@ -3825,9 +3913,8 @@ impl<'a> Executor<'a> {
     /// come from the write set / insert_log — index and base storage only
     /// reflect them at commit).
     pub(crate) fn txn_forces_slow_reads_for_table(&self, table: &str) -> bool {
-        self.transaction.is_some_and(|txn| {
-            !Self::txn_snapshot_is_statement_fresh(txn) || txn.has_writes_for_table(table)
-        })
+        self.transaction
+            .is_some_and(|txn| !Self::txn_snapshot_is_statement_fresh(txn) || txn.has_writes_for_table(table))
     }
 }
 

@@ -745,7 +745,11 @@ fn decode_binary_param(payload: &mut Bytes, mysql_type: u8, unsigned: bool) -> R
                 return Ok(Value::Date(date));
             }
             let (hour, min, sec) = if len >= 7 {
-                (payload.get_u8() as u32, payload.get_u8() as u32, payload.get_u8() as u32)
+                (
+                    payload.get_u8() as u32,
+                    payload.get_u8() as u32,
+                    payload.get_u8() as u32,
+                )
             } else {
                 (0, 0, 0)
             };
@@ -780,15 +784,13 @@ fn decode_binary_param(payload: &mut Bytes, mysql_type: u8, unsigned: bool) -> R
             let sec = payload.get_u8() as i64;
             let micros = if len >= 12 { payload.get_u32_le() as i64 } else { 0 };
             if !negative && days == 0 {
-                let time =
-                    chrono::NaiveTime::from_hms_micro_opt(hour as u32, min as u32, sec as u32, micros as u32)
-                        .ok_or_else(|| MySqlError::Protocol("Invalid binary TIME value".into()))?;
+                let time = chrono::NaiveTime::from_hms_micro_opt(hour as u32, min as u32, sec as u32, micros as u32)
+                    .ok_or_else(|| MySqlError::Protocol("Invalid binary TIME value".into()))?;
                 Ok(Value::Time(time))
             } else {
                 // MySQL TIME spans -838h..838h — beyond a time-of-day.
                 // Represent day-spanning / negative values as an interval.
-                let total =
-                    (((days * 24 + hour) * 60 + min) * 60 + sec) * 1_000_000 + micros;
+                let total = (((days * 24 + hour) * 60 + min) * 60 + sec) * 1_000_000 + micros;
                 Ok(Value::Interval(if negative { -total } else { total }))
             }
         }

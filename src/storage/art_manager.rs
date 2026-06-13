@@ -246,9 +246,8 @@ fn decode_int_key(key: &[u8], width: usize) -> Option<i64> {
             (u32::from_be_bytes([key[0], key[1], key[2], key[3]]) ^ 0x8000_0000) as i32,
         )),
         8 if key.len() == 8 => Some(
-            (u64::from_be_bytes([
-                key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7],
-            ]) ^ 0x8000_0000_0000_0000) as i64,
+            (u64::from_be_bytes([key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7]])
+                ^ 0x8000_0000_0000_0000) as i64,
         ),
         _ => None,
     }
@@ -911,6 +910,20 @@ impl ArtIndexManager {
         })
     }
 
+    /// Count how many encoded keys exist in a table's PK index while holding
+    /// the index read lock once. Callers are responsible for SQL-level
+    /// duplicate handling before passing keys.
+    pub fn pk_index_count_keys(&self, table: &str, keys: &[Vec<u8>]) -> Option<usize> {
+        let pk_name = {
+            let pk_indexes = self.pk_indexes.read().unwrap_or_else(|e| e.into_inner());
+            pk_indexes.get(table).cloned()
+        }?;
+        let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
+        let entry = indexes.get(&pk_name)?;
+        let tree = entry.tree.read().unwrap_or_else(|e| e.into_inner());
+        Some(keys.iter().filter(|key| tree.contains(key)).count())
+    }
+
     /// Return the number of live entries in a table's primary-key index.
     ///
     /// For a PK index this is the table row count. This avoids cloning the ART
@@ -1082,7 +1095,11 @@ impl ArtIndexManager {
             // negative floats are bitwise inverted.
             Value::Float4(v) => {
                 let bits = v.to_bits();
-                let ordered = if bits & 0x8000_0000 == 0 { bits ^ 0x8000_0000 } else { !bits };
+                let ordered = if bits & 0x8000_0000 == 0 {
+                    bits ^ 0x8000_0000
+                } else {
+                    !bits
+                };
                 key.extend_from_slice(&ordered.to_be_bytes());
             }
             Value::Float8(v) => {

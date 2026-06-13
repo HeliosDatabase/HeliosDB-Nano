@@ -353,9 +353,6 @@ fn large_index_overfetch_skips_tombstones() -> Result<()> {
     )?;
     let got = ids(&rows);
     assert_eq!(got.len(), 10, "LIMIT must be satisfied despite 30 tombstones in front");
-    assert!(
-        got.iter().all(|id| *id > 30),
-        "no deleted row may be served: {got:?}"
-    );
+    assert!(got.iter().all(|id| *id > 30), "no deleted row may be served: {got:?}");
     Ok(())
 }

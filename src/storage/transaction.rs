@@ -651,12 +651,9 @@ impl Transaction {
         // never-reused engine row ids and skip the registry by design.
         let inflight = self.has_tracked_writes();
         if let Some(registry) = &self.conflict_registry {
-            if let Err((key, committed_ts)) = registry.validate_and_record(
-                &self.write_set,
-                self.conflict_validation,
-                self.snapshot_ts,
-                commit_ts,
-            ) {
+            if let Err((key, committed_ts)) =
+                registry.validate_and_record(&self.write_set, self.conflict_validation, self.snapshot_ts, commit_ts)
+            {
                 if inflight {
                     registry.end_commit(commit_ts);
                 }
@@ -735,8 +732,7 @@ impl Transaction {
             // live-row presence (`colp:`) sidecars alongside the batch.
             // Applying them under the zone-stats write lock (below) keeps
             // lazy stats/presence backfill from racing this commit.
-            if !touches_columnar
-                && (key.starts_with(b"col:") || key.starts_with(b"colz:") || key.starts_with(b"colp:"))
+            if !touches_columnar && (key.starts_with(b"col:") || key.starts_with(b"colz:") || key.starts_with(b"colp:"))
             {
                 touches_columnar = true;
             }

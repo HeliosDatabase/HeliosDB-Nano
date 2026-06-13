@@ -889,10 +889,7 @@ impl VectorIndexManager {
                 continue; // NULL / missing vector: nothing to index
             };
             match self.insert_vector(&index_name, row_id, vector) {
-                Ok(()) => undo.push(VectorIndexUndoOp::RemoveInserted {
-                    index_name,
-                    row_id,
-                }),
+                Ok(()) => undo.push(VectorIndexUndoOp::RemoveInserted { index_name, row_id }),
                 Err(e) => {
                     tracing::debug!(
                         "vector index insert for '{}' row {} into '{}': {}",

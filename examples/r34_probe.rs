@@ -72,10 +72,7 @@ fn time_query(db: &EmbeddedDatabase, sql: &str) -> (f64, String) {
 }
 
 fn main() {
-    let rows: i64 = std::env::args()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(500_000);
+    let rows: i64 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(500_000);
 
     let mut config = Config::default();
     config.storage.memory_only = true;
@@ -94,7 +91,10 @@ fn main() {
         ("A filtered-agg ", "SELECT SUM(v), COUNT(*) FROM {t} WHERE v < 25000"),
         ("B text-group-by", "SELECT grp, COUNT(*), SUM(v) FROM {t} GROUP BY grp"),
         ("C unfiltered-sum", "SELECT SUM(v) FROM {t}"),
-        ("D filter-scan  ", "SELECT v, grp FROM {t} WHERE v >= 42000 AND v < 43000"),
+        (
+            "D filter-scan  ",
+            "SELECT v, grp FROM {t} WHERE v >= 42000 AND v < 43000",
+        ),
     ];
 
     for (name, template) in shapes {

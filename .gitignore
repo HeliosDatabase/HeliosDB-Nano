@@ -49,6 +49,18 @@ heliosdb.pid
 .fastembed_cache/
 bench-data-predicate-pushdown/
 
+# Raw benchmark dumps generated during release validation. Keep compact
+# Markdown/TSV summaries under perf/ tracked instead.
+perf/v337_vs_latest/*.txt
+perf/v337_vs_latest/*.log
+perf/v337_vs_latest/**/*.txt
+perf/v337_vs_latest/**/*.log
+perf/v337_vs_latest/focused_*/
+perf/v337_vs_latest/fresh_*summary.tsv
+perf/v351_vs_postgresql/*.log
+perf/v351_vs_postgresql/**/*.log
+perf/v351_vs_postgresql/pg35_18_4_fresh_*summary.tsv
+
 # Agent instructions (local only, not tracked in the repo)
 AGENTS.md
 

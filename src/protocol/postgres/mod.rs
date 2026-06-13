@@ -63,13 +63,13 @@ pub mod catalog;
 pub mod certs;
 pub mod handler;
 mod handler_extended;
-#[cfg(test)]
-mod wire_tests;
 pub mod messages;
 pub mod password_store;
 pub mod prepared;
 pub mod server;
 pub mod ssl;
+#[cfg(test)]
+mod wire_tests;
 
 // Re-exports
 pub use auth::{AuthManager, AuthMethod, ScramAuthState};

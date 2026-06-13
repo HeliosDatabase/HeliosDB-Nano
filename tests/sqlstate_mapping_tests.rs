@@ -56,7 +56,9 @@ async fn expect_db_error(client: &Client, sql: &str) -> tokio_postgres::error::D
         .await
         .expect("query timeout")
         .expect_err("statement must fail");
-    err.as_db_error().cloned().unwrap_or_else(|| panic!("expected DbError, got: {err:?}"))
+    err.as_db_error()
+        .cloned()
+        .unwrap_or_else(|| panic!("expected DbError, got: {err:?}"))
 }
 
 #[tokio::test]
@@ -160,13 +162,21 @@ async fn serialization_failure_reports_40001_with_retry_hint_on_the_wire() {
     .await
     .expect("seed");
 
-    a.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ").await.expect("begin a");
-    b.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ").await.expect("begin b");
+    a.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        .await
+        .expect("begin a");
+    b.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        .await
+        .expect("begin b");
 
-    a.batch_execute("UPDATE sqlstate_ser SET v = 101 WHERE id = 1").await.expect("update a");
+    a.batch_execute("UPDATE sqlstate_ser SET v = 101 WHERE id = 1")
+        .await
+        .expect("update a");
     a.batch_execute("COMMIT").await.expect("commit a");
 
-    b.batch_execute("UPDATE sqlstate_ser SET v = 150 WHERE id = 1").await.expect("update b");
+    b.batch_execute("UPDATE sqlstate_ser SET v = 150 WHERE id = 1")
+        .await
+        .expect("update b");
     let db_err = expect_db_error(&b, "COMMIT").await;
 
     assert_eq!(*db_err.code(), SqlState::T_R_SERIALIZATION_FAILURE, "got: {db_err:?}");

@@ -41,7 +41,8 @@ fn clean_restart_loads_art_snapshot_without_row_scan() {
             .unwrap();
         }
         db.execute("CREATE INDEX idx_d_users_email ON d_users(email)").unwrap();
-        db.execute("CREATE INDEX idx_d_users_bucket ON d_users(bucket)").unwrap();
+        db.execute("CREATE INDEX idx_d_users_bucket ON d_users(bucket)")
+            .unwrap();
         // Clean drop → checkpoint written.
     }
 
@@ -54,7 +55,10 @@ fn clean_restart_loads_art_snapshot_without_row_scan() {
         report.tables_from_snapshot, 1,
         "the only user table must load from the snapshot, report: {report:?}"
     );
-    assert_eq!(report.tables_scanned, 0, "no table may be scan-rebuilt, report: {report:?}");
+    assert_eq!(
+        report.tables_scanned, 0,
+        "no table may be scan-rebuilt, report: {report:?}"
+    );
     assert_eq!(report.rows_scanned, 0, "snapshot load must not replay rows");
     assert!(report.entries_loaded >= 900, "PK + 2 secondary indexes x 300 rows");
 
@@ -69,7 +73,9 @@ fn clean_restart_loads_art_snapshot_without_row_scan() {
         6
     );
     // PK constraint state survived: duplicate insert must fail.
-    assert!(db.execute("INSERT INTO d_users VALUES (5, 'dup@example.com', 0)").is_err());
+    assert!(db
+        .execute("INSERT INTO d_users VALUES (5, 'dup@example.com', 0)")
+        .is_err());
     // And the indexes keep tracking new mutations.
     db.execute("INSERT INTO d_users VALUES (1000, 'user7@example.com', 1)")
         .unwrap();
@@ -85,10 +91,12 @@ fn crash_after_checkpoint_with_later_mutations_rebuilds_from_rows() {
 
     {
         let db = EmbeddedDatabase::new(temp.path()).unwrap();
-        db.execute("CREATE TABLE d_events (id INT PRIMARY KEY, kind TEXT)").unwrap();
+        db.execute("CREATE TABLE d_events (id INT PRIMARY KEY, kind TEXT)")
+            .unwrap();
         db.execute("CREATE INDEX idx_d_events_kind ON d_events(kind)").unwrap();
         for i in 0..50 {
-            db.execute(&format!("INSERT INTO d_events VALUES ({i}, 'pre')")).unwrap();
+            db.execute(&format!("INSERT INTO d_events VALUES ({i}, 'pre')"))
+                .unwrap();
         }
 
         // Explicit mid-run checkpoint.
@@ -98,7 +106,8 @@ fn crash_after_checkpoint_with_later_mutations_rebuilds_from_rows() {
         // Mutations AFTER the checkpoint: the first one must durably
         // invalidate the markers.
         for i in 50..80 {
-            db.execute(&format!("INSERT INTO d_events VALUES ({i}, 'post')")).unwrap();
+            db.execute(&format!("INSERT INTO d_events VALUES ({i}, 'post')"))
+                .unwrap();
         }
         db.execute("DELETE FROM d_events WHERE id = 0").unwrap();
 
@@ -115,8 +124,14 @@ fn crash_after_checkpoint_with_later_mutations_rebuilds_from_rows() {
     assert_eq!(report.tables_scanned, 1, "table must be rebuilt from rows");
 
     // Replay correctness: post-checkpoint mutations are all visible.
-    assert_eq!(index_row_count(&db, "idx_d_events_kind", Value::String("post".into())), 30);
-    assert_eq!(index_row_count(&db, "idx_d_events_kind", Value::String("pre".into())), 49);
+    assert_eq!(
+        index_row_count(&db, "idx_d_events_kind", Value::String("post".into())),
+        30
+    );
+    assert_eq!(
+        index_row_count(&db, "idx_d_events_kind", Value::String("pre".into())),
+        49
+    );
     assert_eq!(count_rows(&db, "SELECT COUNT(*) FROM d_events"), 79);
 }
 
@@ -126,7 +141,8 @@ fn crash_without_mutations_after_open_is_safe_either_way() {
 
     {
         let db = EmbeddedDatabase::new(temp.path()).unwrap();
-        db.execute("CREATE TABLE d_static (id INT PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("CREATE TABLE d_static (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
         db.execute("CREATE INDEX idx_d_static_name ON d_static(name)").unwrap();
         db.execute("INSERT INTO d_static VALUES (1, 'a'), (2, 'b'), (3, 'a')")
             .unwrap();
@@ -154,7 +170,8 @@ fn hnsw_graph_reloads_from_dump_and_stays_mutable() {
 
     {
         let db = EmbeddedDatabase::new(temp.path()).unwrap();
-        db.execute("CREATE TABLE d_docs (id INT PRIMARY KEY, emb VECTOR(4))").unwrap();
+        db.execute("CREATE TABLE d_docs (id INT PRIMARY KEY, emb VECTOR(4))")
+            .unwrap();
         // Distinct vectors: duplicate-heavy data (the original `i % 20` gave
         // 20 groups of identical points) degrades HNSW graph connectivity —
         // neighbor lists fill with zero-distance duplicates and a fresh
@@ -173,7 +190,8 @@ fn hnsw_graph_reloads_from_dump_and_stays_mutable() {
             ))
             .unwrap();
         }
-        db.execute("CREATE INDEX idx_d_docs_emb ON d_docs USING hnsw (emb)").unwrap();
+        db.execute("CREATE INDEX idx_d_docs_emb ON d_docs USING hnsw (emb)")
+            .unwrap();
         db.execute("DELETE FROM d_docs WHERE id = 399").unwrap(); // leave a tombstone
     }
 
@@ -238,8 +256,10 @@ fn hnsw_crash_path_rebuilds_with_correct_results() {
 
     {
         let db = EmbeddedDatabase::new(temp.path()).unwrap();
-        db.execute("CREATE TABLE d_vecs (id INT PRIMARY KEY, emb VECTOR(3))").unwrap();
-        db.execute("CREATE INDEX idx_d_vecs_emb ON d_vecs USING hnsw (emb)").unwrap();
+        db.execute("CREATE TABLE d_vecs (id INT PRIMARY KEY, emb VECTOR(3))")
+            .unwrap();
+        db.execute("CREATE INDEX idx_d_vecs_emb ON d_vecs USING hnsw (emb)")
+            .unwrap();
         db.execute("INSERT INTO d_vecs VALUES (1, '[1,0,0]'), (2, '[0,1,0]'), (3, '[0,0,1]')")
             .unwrap();
         db.storage.set_index_snapshots_on_close(false); // crash
@@ -248,7 +268,10 @@ fn hnsw_crash_path_rebuilds_with_correct_results() {
     let db = EmbeddedDatabase::new(temp.path()).unwrap();
     let report = db.storage.last_index_open_report().unwrap();
     assert_eq!(report.vector_reloaded, 0);
-    assert_eq!(report.vector_rebuilt, 1, "crash path must rebuild from rows, report: {report:?}");
+    assert_eq!(
+        report.vector_rebuilt, 1,
+        "crash path must rebuild from rows, report: {report:?}"
+    );
     let rows = db
         .query("SELECT id FROM d_vecs ORDER BY emb <-> '[0.9,0.1,0]' LIMIT 1", &[])
         .unwrap();
@@ -277,7 +300,10 @@ fn open_transaction_at_drop_skips_checkpoint() {
         report.tables_from_snapshot, 0,
         "no snapshot may exist after a drop with an open transaction, report: {report:?}"
     );
-    assert_eq!(index_row_count(&db, "idx_d_txn_v", Value::String("committed".into())), 1);
+    assert_eq!(
+        index_row_count(&db, "idx_d_txn_v", Value::String("committed".into())),
+        1
+    );
     assert_eq!(
         index_row_count(&db, "idx_d_txn_v", Value::String("uncommitted".into())),
         0,
@@ -305,4 +331,3 @@ fn checkpoint_then_clean_close_refreshes_snapshot() {
     assert_eq!(report.tables_from_snapshot, 1, "clean close must rewrite the snapshot");
     assert_eq!(index_row_count(&db, "idx_d_fresh_v", Value::Int4(10)), 2);
 }
-

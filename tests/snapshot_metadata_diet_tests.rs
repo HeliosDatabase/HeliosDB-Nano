@@ -20,7 +20,8 @@ fn as_of_survives_restart_without_mapping_keys() {
     let ts_between;
     {
         let db = open();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+            .unwrap();
         db.execute("INSERT INTO t (id, v) VALUES (1, 10)").unwrap();
         // A wall-clock anchor between the two states.
         std::thread::sleep(std::time::Duration::from_millis(1100));

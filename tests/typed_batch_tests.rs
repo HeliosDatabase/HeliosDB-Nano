@@ -193,9 +193,7 @@ mod typed_batches {
             "SELECT SUM(v) FROM {t} WHERE v BETWEEN 1000 AND 2000",
         ];
         for template in battery {
-            let mut results = tables
-                .iter()
-                .map(|t| run_normalized(db, &template.replace("{t}", t)));
+            let mut results = tables.iter().map(|t| run_normalized(db, &template.replace("{t}", t)));
             let first = results.next().unwrap();
             for (table, rows) in tables.iter().skip(1).zip(results) {
                 assert_eq!(
@@ -241,7 +239,8 @@ mod typed_batches {
             db.execute(&format!("DELETE FROM {t} WHERE id % 5 = 0")).unwrap();
             db.execute(&format!("UPDATE {t} SET v = v + 1, grp = 'bumped' WHERE id % 7 = 0"))
                 .unwrap();
-            db.execute(&format!("UPDATE {t} SET w = NULL WHERE id % 11 = 0")).unwrap();
+            db.execute(&format!("UPDATE {t} SET w = NULL WHERE id % 11 = 0"))
+                .unwrap();
         }
         assert_tables_equal(&db, &["eq_r", "eq_c2", "eq_c1"], "after deletes + updates");
 
@@ -268,7 +267,10 @@ mod typed_batches {
         ColumnarStore::store(&raw, "mix_t", "c", 1, Value::String("x".into())).unwrap();
         let bytes = raw_batch(&db, "mix_t", "c", 0).expect("batch must exist");
         assert!(!is_v2(&bytes), "mixed-family batch must be v1");
-        assert_eq!(ColumnarStore::get(&raw, "mix_t", "c", 0).unwrap(), Some(Value::Int8(42)));
+        assert_eq!(
+            ColumnarStore::get(&raw, "mix_t", "c", 0).unwrap(),
+            Some(Value::Int8(42))
+        );
         assert_eq!(
             ColumnarStore::get(&raw, "mix_t", "c", 1).unwrap(),
             Some(Value::String("x".into()))
@@ -312,7 +314,10 @@ mod typed_batches {
         ColumnarStore::store(&raw, "rmw_t", "c", 5, Value::Int8(55)).unwrap();
         let bytes = raw_batch(&db, "rmw_t", "c", 0).expect("batch must exist");
         assert_eq!(is_v2(&bytes), v2_writes_on());
-        assert_eq!(ColumnarStore::get(&raw, "rmw_t", "c", 5).unwrap(), Some(Value::Int8(55)));
+        assert_eq!(
+            ColumnarStore::get(&raw, "rmw_t", "c", 5).unwrap(),
+            Some(Value::Int8(55))
+        );
     }
 
     /// Dictionary text GROUP BY: NULL groups, >64 groups (hash path), and a
@@ -342,8 +347,10 @@ mod typed_batches {
         }
         for chunk in parts.chunks(512) {
             let values = chunk.join(", ");
-            db.execute(&format!("INSERT INTO hc_c (id, g, v) VALUES {values}")).unwrap();
-            db.execute(&format!("INSERT INTO hc_r (id, g, v) VALUES {values}")).unwrap();
+            db.execute(&format!("INSERT INTO hc_c (id, g, v) VALUES {values}"))
+                .unwrap();
+            db.execute(&format!("INSERT INTO hc_r (id, g, v) VALUES {values}"))
+                .unwrap();
         }
 
         for template in [
@@ -392,7 +399,10 @@ mod typed_batches {
 
         let migrated = count_batches(&db, "mig_c", true);
         if migrate_on() && v2_writes_on() {
-            assert!(migrated > 0, "HELIOS_BATCH_V2_MIGRATE=1 must rewrite scanned v1 batches");
+            assert!(
+                migrated > 0,
+                "HELIOS_BATCH_V2_MIGRATE=1 must rewrite scanned v1 batches"
+            );
         } else {
             assert_eq!(migrated, 0, "migration must stay off by default");
         }
@@ -409,10 +419,8 @@ mod typed_batches {
     #[test]
     fn test_float4_and_bool_columns() {
         let db = test_db();
-        db.execute(
-            "CREATE TABLE fb_c (id INT8 PRIMARY KEY, r FLOAT4 STORAGE COLUMNAR, b BOOLEAN STORAGE COLUMNAR)",
-        )
-        .unwrap();
+        db.execute("CREATE TABLE fb_c (id INT8 PRIMARY KEY, r FLOAT4 STORAGE COLUMNAR, b BOOLEAN STORAGE COLUMNAR)")
+            .unwrap();
         db.execute("CREATE TABLE fb_r (id INT8 PRIMARY KEY, r FLOAT4, b BOOLEAN)")
             .unwrap();
         let mut parts = Vec::new();
@@ -431,8 +439,10 @@ mod typed_batches {
         }
         for chunk in parts.chunks(500) {
             let values = chunk.join(", ");
-            db.execute(&format!("INSERT INTO fb_c (id, r, b) VALUES {values}")).unwrap();
-            db.execute(&format!("INSERT INTO fb_r (id, r, b) VALUES {values}")).unwrap();
+            db.execute(&format!("INSERT INTO fb_c (id, r, b) VALUES {values}"))
+                .unwrap();
+            db.execute(&format!("INSERT INTO fb_r (id, r, b) VALUES {values}"))
+                .unwrap();
         }
         for template in [
             "SELECT COUNT(r), COUNT(b) FROM {t}",

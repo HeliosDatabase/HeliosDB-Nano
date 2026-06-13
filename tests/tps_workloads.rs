@@ -513,8 +513,7 @@ fn apply_tps_overrides(config: &mut Config, embedded_profile: TpsEmbeddedProfile
     // HELIOS_TPS_DURABLE=1 enables fsync-per-commit WriteBatch durability
     // (storage.durable_commit, v3.44.0+) — the power-loss-durable tier.
     // Only meaningful for the disk modes; harmless no-op for mem.
-    config.storage.durable_commit =
-        env_bool_enabled("HELIOS_TPS_DURABLE", config.storage.durable_commit);
+    config.storage.durable_commit = env_bool_enabled("HELIOS_TPS_DURABLE", config.storage.durable_commit);
     embedded_profile.apply_config(config);
 }
 
@@ -1182,7 +1181,8 @@ fn run_session_txn_bench() {
         .unwrap_or(2000);
 
     let db = EmbeddedDatabase::new_in_memory().unwrap();
-    db.execute("CREATE TABLE st (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+    db.execute("CREATE TABLE st (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
 
     println!("\n=== session transaction bench (cycles per measurement: {cycles}) ===");
 
@@ -1291,7 +1291,8 @@ fn run_conflict_bench() {
         .unwrap_or(500);
 
     let db = EmbeddedDatabase::new_in_memory().unwrap();
-    db.execute("CREATE TABLE cf (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+    db.execute("CREATE TABLE cf (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
     for i in 0..64 {
         db.execute(&format!("INSERT INTO cf (id, v) VALUES ({i}, 0)")).unwrap();
     }
@@ -1331,7 +1332,10 @@ fn run_conflict_bench() {
                 Value::Int8(x) => x,
                 _ => -1,
             };
-            assert!(v >= cycles as i64, "disjoint update lost rows: id={t} v={v} expected>={cycles}");
+            assert!(
+                v >= cycles as i64,
+                "disjoint update lost rows: id={t} v={v} expected>={cycles}"
+            );
         }
     }
 
@@ -1499,10 +1503,7 @@ fn run_durable_commit_bench() {
     configs.extend(windows.iter().map(|&w| (true, w)));
 
     for (durable, window_us) in configs {
-        let tmp = std::env::temp_dir().join(format!(
-            "helios_dur_{}_{durable}_{window_us}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("helios_dur_{}_{durable}_{window_us}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let mut c = Config::default();
         c.storage.path = Some(tmp.clone());
@@ -1511,7 +1512,8 @@ fn run_durable_commit_bench() {
         c.storage.durable_commit = durable;
         c.storage.group_commit_window_us = window_us;
         let db = EmbeddedDatabase::with_config(c).unwrap();
-        db.execute("CREATE TABLE d (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+        db.execute("CREATE TABLE d (id INTEGER PRIMARY KEY, v INTEGER)")
+            .unwrap();
         let label = if durable {
             format!("durable=true  w={window_us:<4}")
         } else {
@@ -1524,7 +1526,8 @@ fn run_durable_commit_bench() {
             let start = Instant::now();
             let n = 50usize;
             for i in 0..n {
-                db.execute(&format!("INSERT INTO d (id, v) VALUES ({}, 9)", 90_000_000 + i)).unwrap();
+                db.execute(&format!("INSERT INTO d (id, v) VALUES ({}, 9)", 90_000_000 + i))
+                    .unwrap();
             }
             println!(
                 "{label} autocommit   {:>10.0} ops/s  ({n} inserts)",
@@ -1538,7 +1541,9 @@ fn run_durable_commit_bench() {
                 for t in 0..threads {
                     let dbr = &db;
                     let lat = &commit_lat_us;
-                    let base = 1_000_000 * (threads) + t * cycles + if durable { 50_000_000 } else { 0 }
+                    let base = 1_000_000 * (threads)
+                        + t * cycles
+                        + if durable { 50_000_000 } else { 0 }
                         + window_us as usize * 3_000_000;
                     s.spawn(move || {
                         let sid = dbr

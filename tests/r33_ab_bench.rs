@@ -28,7 +28,11 @@ mod r33_ab {
                         Value::Int8(i),
                         Value::Int8((i * 7) % 100_000),
                         Value::Int8(i % 10),
-                        if i % 17 == 0 { Value::Null } else { Value::Int8(i % 4000) },
+                        if i % 17 == 0 {
+                            Value::Null
+                        } else {
+                            Value::Int8(i % 4000)
+                        },
                     ]
                 })
                 .collect();
@@ -58,10 +62,8 @@ mod r33_ab {
     #[ignore]
     fn ab_bulk_insert_200k_columnar() {
         let db = test_db();
-        db.execute(
-            "CREATE TABLE m (id INT8 PRIMARY KEY, v INT8 STORAGE COLUMNAR, g INT8 STORAGE COLUMNAR, w INT8)",
-        )
-        .unwrap();
+        db.execute("CREATE TABLE m (id INT8 PRIMARY KEY, v INT8 STORAGE COLUMNAR, g INT8 STORAGE COLUMNAR, w INT8)")
+            .unwrap();
         let secs = bulk_insert(&db, "m", 200_000, 1_000);
         let count = db.query("SELECT COUNT(*) FROM m", &[]).unwrap();
         println!(
@@ -96,7 +98,10 @@ mod r33_ab {
         println!("AB aggregate seed: 500000 rows in {:.3}s", seed_secs);
 
         for (name, sql) in [
-            ("grouped count/sum (walk->presence)", "SELECT g, COUNT(*), SUM(v) FROM a GROUP BY g"),
+            (
+                "grouped count/sum (walk->presence)",
+                "SELECT g, COUNT(*), SUM(v) FROM a GROUP BY g",
+            ),
             (
                 "filtered grouped, NULL-accepting (walk->presence)",
                 "SELECT g, COUNT(*), SUM(v) FROM a WHERE w IS NULL GROUP BY g",
@@ -105,7 +110,10 @@ mod r33_ab {
                 "filtered scalar, NULL-accepting (walk->presence)",
                 "SELECT COUNT(*), SUM(v) FROM a WHERE w IS NULL",
             ),
-            ("unfiltered scalar (batch-direct)", "SELECT SUM(v), MIN(v), MAX(v) FROM a"),
+            (
+                "unfiltered scalar (batch-direct)",
+                "SELECT SUM(v), MIN(v), MAX(v) FROM a",
+            ),
             ("zone-prunable range", "SELECT COUNT(*), SUM(v) FROM a WHERE v < 1000"),
         ] {
             let (best, rows) = time_query(&db, sql, 5);
