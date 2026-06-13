@@ -1,0 +1,164 @@
+warning: call to `.clone()` on a reference in this situation does nothing
+    --> src/sql/executor/phase3.rs:354:73
+     |
+ 354 |           .ok_or_else(|| Error::execution("No storage engine available"))?
+     |  _________________________________________________________________________^
+ 355 | |         .clone();
+     | |________________^
+     |
+     = note: the type `StorageEngine` does not implement `Clone`, so calling `clone` on `&StorageEngine` copies the reference, which does not do anything and can be removed
+     = note: `#[warn(noop_method_call)]` on by default
+help: remove this redundant call
+     |
+ 354 -         .ok_or_else(|| Error::execution("No storage engine available"))?
+ 355 -         .clone();
+ 354 +         .ok_or_else(|| Error::execution("No storage engine available"))?;
+     |
+help: if you meant to clone `StorageEngine`, implement `Clone` for it
+    -->  src/storage/engine.rs:1708:1
+     |
+1708 + #[derive(Clone)]
+1709 | pub struct StorageEngine {
+     |
+
+warning: call to `.clone()` on a reference in this situation does nothing
+    --> src/sql/executor/phase3.rs:604:73
+     |
+ 604 |           .ok_or_else(|| Error::execution("No storage engine available"))?
+     |  _________________________________________________________________________^
+ 605 | |         .clone();
+     | |________________^
+     |
+     = note: the type `StorageEngine` does not implement `Clone`, so calling `clone` on `&StorageEngine` copies the reference, which does not do anything and can be removed
+help: remove this redundant call
+     |
+ 604 -         .ok_or_else(|| Error::execution("No storage engine available"))?
+ 605 -         .clone();
+ 604 +         .ok_or_else(|| Error::execution("No storage engine available"))?;
+     |
+help: if you meant to clone `StorageEngine`, implement `Clone` for it
+    -->  src/storage/engine.rs:1708:1
+     |
+1708 + #[derive(Clone)]
+1709 | pub struct StorageEngine {
+     |
+
+warning: `heliosdb-nano` (lib) generated 2 warnings (run `cargo fix --lib -p heliosdb-nano` to apply 2 suggestions)
+warning: value assigned to `child_dead` is never read
+    --> src/main.rs:1289:21
+     |
+1289 |                     child_dead = true;
+     |                     ^^^^^^^^^^^^^^^^^
+     |
+     = help: maybe it is overwritten before being read?
+     = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: `heliosdb-nano` (bin "heliosdb-nano") generated 1 warning
+    Finished `release` profile [optimized] target(s) in 0.28s
+     Running tests/ora35_benchmark.rs (target/release/deps/ora35_benchmark-93678f152766064c)
+
+running 1 test
+
+=========================================================================================================
+  HELIOSDB-NANO vs ORACLE 26ai -- COMPREHENSIVE 35-CATEGORY BENCHMARK
+  HeliosDB-Nano v3.57.0 (Embedded/In-Memory) vs ORACLE 26ai (Docker/21521)
+=========================================================================================================
+
+  [OK] Connected to ORACLE 26ai on configured DSN
+  [OK] HeliosDB-Nano in-memory instance created
+
+  Setting up schemas...
+  [OK] Schema created in both engines
+  Populating data (200+50+500+1000+20 = 1770 rows)...
+  [OK] Data populated in both engines
+  [OK] Customers: Nano=Int8(200) Oracle=200
+
+  Running 35 categories x 20 iterations each x 2 engines...
+
+  [ORA N/A] Prepared stmts -- SQL PREPARE/EXECUTE/DEALLOCATE is PostgreSQL-specific; python-oracledb uses driver-side statement caching
+
+=========================================================================================================
+  HELIOSDB-NANO vs ORACLE 26ai -- HEAD-TO-HEAD COMPARISON
+  Dataset: 200 customers, 50 products, 500 orders, 1000 items, 20 categories
+=========================================================================================================
+
+Category               |    Nano(avg) | ORACLE 26ai(avg) |      Ratio |   Winner
+---------------------------------------------------------------------------------------------------------
+CREATE TABLE           |        144us |     202.17ms |   1405.86x |     Nano
+CREATE INDEX           |        399us |     130.75ms |    327.69x |     Nano
+ALTER TABLE            |        625us |      59.81ms |     95.68x |     Nano
+DROP TABLE             |       58.3us |      91.88ms |   1576.40x |     Nano
+CREATE/DROP VIEW       |        210us |      53.47ms |    254.45x |     Nano
+REFRESH MATVIEW        |        295us |      50.61ms |    171.37x |     Nano
+TRUNCATE               |        107us |      79.42ms |    741.11x |     Nano
+INSERT single          |       7.70us |      15.85ms |   2058.98x |     Nano
+INSERT multi-row       |        134us |      18.42ms |    137.67x |     Nano
+INSERT..SELECT         |        405us |      28.10ms |     69.33x |     Nano
+UPDATE point           |       25.5us |      16.65ms |    654.17x |     Nano
+DELETE point           |       3.91us |      14.67ms |   3748.18x |     Nano
+UPSERT                 |       95.4us |      16.56ms |    173.52x |     Nano
+UPDATE+subquery        |        218us |      18.07ms |     82.88x |     Nano
+Point lookup           |       4.25us |       1.24ms |    292.21x |     Nano
+Full scan+filter       |       25.6us |        390us |     15.24x |     Nano
+Aggregation            |       0.64us |        330us |    514.46x |     Nano
+INNER JOIN             |        284us |       1.33ms |      4.66x |     Nano
+LEFT JOIN              |        267us |       2.31ms |      8.67x |     Nano
+4-table JOIN           |        836us |       3.40ms |      4.06x |     Nano
+Scalar subquery        |       2.14us |        333us |    155.47x |     Nano
+EXISTS subquery        |       0.34us |        355us |   1034.39x |     Nano
+IN subquery            |       5.90us |        585us |     99.15x |     Nano
+CTE                    |       24.9us |        948us |     38.12x |     Nano
+Recursive CTE          |       2.67us |        338us |    126.77x |     Nano
+Window funcs           |       22.5us |        457us |     20.31x |     Nano
+UNION                  |       8.69us |        320us |     36.81x |     Nano
+DISTINCT               |       0.59us |        281us |    473.85x |     Nano
+ORDER+LIMIT            |        379us |       1.94ms |      5.11x |     Nano
+CASE expr              |       17.0us |        328us |     19.32x |     Nano
+LIKE/BETWEEN/IN        |       12.1us |        323us |     26.66x |     Nano
+String ops             |       13.9us |        366us |     26.40x |     Nano
+Transaction ctl        |       0.41us |      13.32ms |  32340.04x |     Nano
+Prepared stmts         |        642us |          N/A |         -- |      N/A
+SET/SHOW/RESET         |       5.89us |        658us |    111.76x |     Nano
+---------------------------------------------------------------------------------------------------------
+SCOREBOARD: Nano wins 34 | Oracle wins 0 | Ties 0 | N/A 1 | Total 35
+
+================================================================================
+  TOP OPTIMIZATION TARGETS (where Oracle wins by largest margin)
+================================================================================
+
+  (Nano is competitive or faster across all categories!)
+
+  NANO ADVANTAGES (faster than Oracle):
+   1. Transaction ctl        Nano     0.41us vs Oracle    13.32ms (32340.0x faster)
+   2. DELETE point           Nano     3.91us vs Oracle    14.67ms (3748.2x faster)
+   3. INSERT single          Nano     7.70us vs Oracle    15.85ms (2059.0x faster)
+   4. DROP TABLE             Nano     58.3us vs Oracle    91.88ms (1576.4x faster)
+   5. CREATE TABLE           Nano      144us vs Oracle   202.17ms (1405.9x faster)
+   6. EXISTS subquery        Nano     0.34us vs Oracle      355us (1034.4x faster)
+   7. TRUNCATE               Nano      107us vs Oracle    79.42ms (741.1x faster)
+   8. UPDATE point           Nano     25.5us vs Oracle    16.65ms (654.2x faster)
+   9. Aggregation            Nano     0.64us vs Oracle      330us (514.5x faster)
+  10. DISTINCT               Nano     0.59us vs Oracle      281us (473.8x faster)
+
+================================================================================
+  PERFORMANCE TIER ANALYSIS
+================================================================================
+
+    Critical (>5x slower):    0 categories
+    Significant (2-5x):       0 categories
+    Moderate (1.05-2x):       0 categories
+    Competitive (~1x):        0 categories
+    Nano faster (<0.95x):     34 categories
+    Not supported (N/A):      1 categories
+
+  N/A CATEGORIES (not supported in one or both engines):
+    - Prepared stmts (Nano: ok, Oracle: N/A)
+
+=========================================================================================================
+  BENCHMARK COMPLETE -- Total time: 22.5s
+=========================================================================================================
+
+test ora35_benchmark ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 27.31s
+
