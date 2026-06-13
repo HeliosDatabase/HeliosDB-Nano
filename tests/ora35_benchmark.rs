@@ -1,17 +1,22 @@
-//! HeliosDB-Nano vs PostgreSQL 16 — Head-to-Head Performance Comparison
+//! HeliosDB-Nano vs Oracle AI Database 26ai — Head-to-Head Performance Comparison
 //!
 //! Runs 35 SQL categories against both engines with identical schema/data.
 //!
 //! Prerequisites:
-//!   docker run -d --name pg_bench_nano -e POSTGRES_USER=bench -e POSTGRES_PASSWORD=benchpass \
-//!     -e POSTGRES_DB=benchdb -p 25433:5432 postgres:16-alpine
+//!   docker run -d --name ora26ai_bench_nano -e ORACLE_PWD=oracle \
+//!     -p 21521:1521 container-registry.oracle.com/database/free:latest
 //!
 //! Run with:
-//!   cargo test --release --test pg35_benchmark -- --nocapture --ignored
+//!   cargo test --release --test ora35_benchmark -- --nocapture --ignored
 
 // Legacy import included Value even though the benchmark does not use it:
 // use heliosdb_nano::{EmbeddedDatabase, Value};
 use heliosdb_nano::EmbeddedDatabase;
+use serde::Deserialize;
+use serde_json::json;
+use std::io::{BufRead, BufReader, Write};
+use std::path::PathBuf;
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::time::{Duration, Instant};
 
 // --- Result types ---
@@ -29,44 +34,113 @@ struct CategoryResult {
 struct ComparisonRow {
     name: String,
     helios_avg_us: f64,
-    pg_avg_us: f64,
+    ora_avg_us: f64,
     ratio: f64,
     #[allow(dead_code)]
     winner: String,
     helios_na: bool,
+    ora_na: bool,
 }
 
-// --- PostgreSQL client (synchronous wrapper around tokio-postgres) ---
+// --- Oracle client (persistent python-oracledb thin helper) ---
 
-struct PgClient {
-    rt: tokio::runtime::Runtime,
-    client: tokio_postgres::Client,
-    _handle: tokio::task::JoinHandle<()>,
+#[derive(Deserialize)]
+struct OracleResponse {
+    ok: bool,
+    #[serde(default)]
+    rows: usize,
+    #[serde(default)]
+    error: String,
 }
 
-impl PgClient {
-    fn connect(connstr: &str) -> std::result::Result<Self, Box<dyn std::error::Error>> {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-        let (client, connection) = rt.block_on(tokio_postgres::connect(connstr, tokio_postgres::NoTls))?;
-        let handle = rt.spawn(async move {
-            if let Err(e) = connection.await {
-                eprintln!("PG connection error: {}", e);
+struct OracleClient {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<std::process::ChildStdout>,
+}
+
+impl OracleClient {
+    fn connect() -> std::result::Result<Self, Box<dyn std::error::Error>> {
+        let python = std::env::var("ORA35_PYTHON").unwrap_or_else(|_| {
+            let vendored = PathBuf::from("tests/protocol_tests/venv/bin/python");
+            if vendored.exists() {
+                vendored.display().to_string()
+            } else {
+                "python3".to_string()
             }
         });
-        Ok(PgClient {
-            rt,
-            client,
-            _handle: handle,
-        })
+        let helper = std::env::var("ORA35_HELPER").unwrap_or_else(|_| "tests/support/ora35_client.py".to_string());
+        let mut child = Command::new(python)
+            .arg(helper)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()?;
+        let stdin = child.stdin.take().ok_or("oracle helper stdin unavailable")?;
+        let stdout = child.stdout.take().ok_or("oracle helper stdout unavailable")?;
+        let mut client = OracleClient {
+            child,
+            stdin,
+            stdout: BufReader::new(stdout),
+        };
+        let first = client.read_response()?;
+        if !first.ok {
+            return Err(first.error.into());
+        }
+        Ok(client)
     }
 
-    fn execute(&self, sql: &str) -> std::result::Result<u64, Box<dyn std::error::Error>> {
-        Ok(self.rt.block_on(self.client.execute(sql, &[]))?)
+    fn read_response(&mut self) -> std::result::Result<OracleResponse, Box<dyn std::error::Error>> {
+        let mut line = String::new();
+        let n = self.stdout.read_line(&mut line)?;
+        if n == 0 {
+            return Err("oracle helper exited".into());
+        }
+        Ok(serde_json::from_str(&line)?)
     }
 
-    fn query_count(&self, sql: &str) -> std::result::Result<usize, Box<dyn std::error::Error>> {
-        let rows = self.rt.block_on(self.client.query(sql, &[]))?;
-        Ok(rows.len())
+    fn request(
+        &mut self,
+        request: serde_json::Value,
+    ) -> std::result::Result<OracleResponse, Box<dyn std::error::Error>> {
+        writeln!(self.stdin, "{}", request)?;
+        self.stdin.flush()?;
+        let response = self.read_response()?;
+        if response.ok {
+            Ok(response)
+        } else {
+            Err(response.error.into())
+        }
+    }
+
+    fn execute(&mut self, sql: &str) -> std::result::Result<u64, Box<dyn std::error::Error>> {
+        let resp = self.request(json!({ "op": "execute", "sql": sql, "commit": true }))?;
+        Ok(resp.rows as u64)
+    }
+
+    fn execute_no_commit(&mut self, sql: &str) -> std::result::Result<u64, Box<dyn std::error::Error>> {
+        let resp = self.request(json!({ "op": "execute", "sql": sql, "commit": false }))?;
+        Ok(resp.rows as u64)
+    }
+
+    fn execute_ignore(&mut self, sql: &str) {
+        let _ = self.request(json!({ "op": "execute", "sql": sql, "commit": true }));
+    }
+
+    fn query_count(&mut self, sql: &str) -> std::result::Result<usize, Box<dyn std::error::Error>> {
+        let resp = self.request(json!({ "op": "query_count", "sql": sql }))?;
+        Ok(resp.rows)
+    }
+
+    fn commit(&mut self) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        self.request(json!({ "op": "commit" })).map(|_| ())
+    }
+}
+
+impl Drop for OracleClient {
+    fn drop(&mut self) {
+        let _ = self.request(json!({ "op": "close" }));
+        let _ = self.child.wait();
     }
 }
 
@@ -127,18 +201,18 @@ where
     })
 }
 
-fn bench_pg<F>(pg: &PgClient, name: &str, iters: usize, f: F) -> CategoryResult
+fn bench_ora<F>(ora: &mut OracleClient, name: &str, iters: usize, mut f: F) -> CategoryResult
 where
-    F: Fn(&PgClient, usize),
+    F: FnMut(&mut OracleClient, usize),
 {
     // Warmup
     for i in 0..2 {
-        f(pg, i);
+        f(ora, i);
     }
 
     let wall_start = Instant::now();
     for i in 0..iters {
-        f(pg, i);
+        f(ora, i);
     }
     let wall_time = wall_start.elapsed();
 
@@ -148,6 +222,36 @@ where
         wall_time,
         avg_per_iter: wall_time / iters as u32,
     }
+}
+
+fn bench_ora_safe<F>(ora: &mut OracleClient, name: &str, iters: usize, mut f: F) -> Option<CategoryResult>
+where
+    F: FnMut(&mut OracleClient, usize) -> std::result::Result<(), String>,
+{
+    match f(ora, 99999) {
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("  [ORA N/A] {} -- {}", name, e);
+            return None;
+        }
+    }
+
+    for i in 0..2 {
+        let _ = f(ora, i);
+    }
+
+    let wall_start = Instant::now();
+    for i in 0..iters {
+        let _ = f(ora, i);
+    }
+    let wall_time = wall_start.elapsed();
+
+    Some(CategoryResult {
+        name: name.to_string(),
+        iterations: iters,
+        wall_time,
+        avg_per_iter: wall_time / iters as u32,
+    })
 }
 
 fn format_us(us: f64) -> String {
@@ -167,20 +271,12 @@ fn format_us(us: f64) -> String {
     }
 }
 
-fn pg35_label() -> String {
-    std::env::var("PG35_PG_LABEL").unwrap_or_else(|_| "POSTGRESQL 18.4".to_string())
+fn ora35_label() -> String {
+    std::env::var("ORA35_LABEL").unwrap_or_else(|_| "ORACLE 26ai".to_string())
 }
 
-fn pg35_connstr() -> String {
-    std::env::var("PG35_CONNSTR").unwrap_or_else(|_| {
-        // Legacy hard-coded DSN:
-        // "host=127.0.0.1 port=25433 user=bench password=benchpass dbname=benchdb"
-        "host=127.0.0.1 port=25433 user=bench password=benchpass dbname=benchdb".to_string()
-    })
-}
-
-fn pg35_iters() -> usize {
-    std::env::var("PG35_ITERS")
+fn ora35_iters() -> usize {
+    std::env::var("ORA35_ITERS")
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(20)
@@ -201,13 +297,13 @@ fn schema_ddl() -> Vec<String> {
     ]
 }
 
-fn schema_ddl_pg() -> Vec<String> {
+fn schema_ddl_ora() -> Vec<String> {
     vec![
-        "CREATE TABLE customers (id INT PRIMARY KEY, name TEXT, email TEXT, age INT, region TEXT, metadata TEXT, bio TEXT)".into(),
-        "CREATE TABLE products (product_id INT PRIMARY KEY, name TEXT, category TEXT, price INT, description TEXT)".into(),
-        "CREATE TABLE orders (order_id INT PRIMARY KEY, customer_id INT REFERENCES customers(id), order_date TEXT, status TEXT, total INT)".into(),
+        "CREATE TABLE customers (id INT PRIMARY KEY, name VARCHAR2(200), email VARCHAR2(200), age INT, region VARCHAR2(80), metadata VARCHAR2(4000), bio VARCHAR2(4000))".into(),
+        "CREATE TABLE products (product_id INT PRIMARY KEY, name VARCHAR2(200), category VARCHAR2(80), price INT, description VARCHAR2(4000))".into(),
+        "CREATE TABLE orders (order_id INT PRIMARY KEY, customer_id INT REFERENCES customers(id), order_date VARCHAR2(20), status VARCHAR2(40), total INT)".into(),
         "CREATE TABLE order_items (item_id INT PRIMARY KEY, order_id INT REFERENCES orders(order_id), product_id INT REFERENCES products(product_id), quantity INT, unit_price INT)".into(),
-        "CREATE TABLE categories (cat_id INT PRIMARY KEY, name TEXT, parent_id INT)".into(),
+        "CREATE TABLE categories (cat_id INT PRIMARY KEY, name VARCHAR2(200), parent_id INT)".into(),
         "CREATE INDEX idx_cust_age ON customers(age)".into(),
         "CREATE INDEX idx_ord_cust ON orders(customer_id)".into(),
         "CREATE INDEX idx_oi_ord ON order_items(order_id)".into(),
@@ -222,21 +318,34 @@ fn setup_helios_schema(db: &EmbeddedDatabase) {
     }
 }
 
-fn setup_pg_schema(pg: &PgClient) {
+fn ora_insert_all(table: &str, rows: &[String]) -> String {
+    let mut sql = String::from("INSERT ALL ");
+    for row in rows {
+        sql.push_str("INTO ");
+        sql.push_str(table);
+        sql.push_str(" VALUES ");
+        sql.push_str(row);
+        sql.push(' ');
+    }
+    sql.push_str("SELECT 1 FROM dual");
+    sql
+}
+
+fn setup_ora_schema(ora: &mut OracleClient) {
     let drops = [
-        "DROP TABLE IF EXISTS order_items CASCADE",
-        "DROP TABLE IF EXISTS orders CASCADE",
-        "DROP TABLE IF EXISTS products CASCADE",
-        "DROP TABLE IF EXISTS customers CASCADE",
-        "DROP TABLE IF EXISTS categories CASCADE",
+        "DROP TABLE order_items CASCADE CONSTRAINTS PURGE",
+        "DROP TABLE orders CASCADE CONSTRAINTS PURGE",
+        "DROP TABLE products CASCADE CONSTRAINTS PURGE",
+        "DROP TABLE customers CASCADE CONSTRAINTS PURGE",
+        "DROP TABLE categories CASCADE CONSTRAINTS PURGE",
     ];
     for sql in &drops {
-        let _ = pg.execute(sql);
+        ora.execute_ignore(sql);
     }
-    let stmts = schema_ddl_pg();
+    let stmts = schema_ddl_ora();
     for sql in &stmts {
-        pg.execute(sql)
-            .unwrap_or_else(|e| panic!("PG DDL failed: {} -- {}", sql, e));
+        ora.execute(sql)
+            .unwrap_or_else(|e| panic!("Oracle DDL failed: {} -- {}", sql, e));
     }
 }
 
@@ -336,7 +445,7 @@ fn populate_helios(db: &EmbeddedDatabase) {
     }
 }
 
-fn populate_pg(pg: &PgClient) {
+fn populate_ora(ora: &mut OracleClient) {
     let regions = ["East", "West", "North", "South", "Central"];
     let statuses = ["pending", "shipped", "delivered", "cancelled"];
 
@@ -352,7 +461,7 @@ fn populate_pg(pg: &PgClient) {
                 i, i, i, age, region, tier, i
             ));
         }
-        let _ = pg.execute(&format!("INSERT INTO customers VALUES {}", values.join(",")));
+        let _ = ora.execute(&ora_insert_all("customers", &values));
     }
 
     let cats = ["Electronics", "Books", "Clothing", "Food", "Sports"];
@@ -369,7 +478,7 @@ fn populate_pg(pg: &PgClient) {
                 i
             ));
         }
-        let _ = pg.execute(&format!("INSERT INTO products VALUES {}", values.join(",")));
+        let _ = ora.execute(&ora_insert_all("products", &values));
     }
 
     for batch in 0..5 {
@@ -388,7 +497,7 @@ fn populate_pg(pg: &PgClient) {
                 50 + (i % 950)
             ));
         }
-        let _ = pg.execute(&format!("INSERT INTO orders VALUES {}", values.join(",")));
+        let _ = ora.execute(&ora_insert_all("orders", &values));
     }
 
     for batch in 0..2 {
@@ -406,7 +515,7 @@ fn populate_pg(pg: &PgClient) {
                 5 + (i % 100)
             ));
         }
-        let _ = pg.execute(&format!("INSERT INTO order_items VALUES {}", values.join(",")));
+        let _ = ora.execute(&ora_insert_all("order_items", &values));
     }
 
     let cat_names = [
@@ -438,23 +547,24 @@ fn populate_pg(pg: &PgClient) {
         } else {
             format!("{}", (i % 5) + 1)
         };
-        let _ = pg.execute(&format!(
+        let _ = ora.execute(&format!(
             "INSERT INTO categories VALUES ({}, '{}', {})",
             cat_id, name, parent
         ));
     }
 
-    let _ = pg.execute("ANALYZE");
+    let _ = ora.execute("BEGIN DBMS_STATS.GATHER_SCHEMA_STATS(USER); END;");
 }
 
 // --- 35 benchmark categories ---
 
-fn run_all_categories(db: &EmbeddedDatabase, pg: &PgClient, iters: usize) -> Vec<ComparisonRow> {
+fn run_all_categories(db: &EmbeddedDatabase, ora: &mut OracleClient, iters: usize) -> Vec<ComparisonRow> {
     let mut results = Vec::new();
 
     // Helper tables for DDL benchmarks
     let _ = db.execute("CREATE TABLE IF NOT EXISTS bench_alt (id INT PRIMARY KEY, base TEXT)");
-    let _ = pg.execute("CREATE TABLE IF NOT EXISTS bench_alt (id INT PRIMARY KEY, base TEXT)");
+    ora.execute_ignore("DROP TABLE bench_alt CASCADE CONSTRAINTS PURGE");
+    let _ = ora.execute("CREATE TABLE bench_alt (id INT PRIMARY KEY, base VARCHAR2(200))");
 
     // ============ DDL ============
 
@@ -471,12 +581,12 @@ fn run_all_categories(db: &EmbeddedDatabase, pg: &PgClient, iters: usize) -> Vec
                 .map(|_| ())
                 .map_err(|e| e.to_string())
         });
-        let p = bench_pg(pg, "CREATE TABLE", iters, |pg, i| {
-            let _ = pg.execute(&format!(
-                "CREATE TABLE IF NOT EXISTS bench_ct_{} (id INT PRIMARY KEY, val TEXT)",
+        let p = bench_ora(ora, "CREATE TABLE", iters, |ora, i| {
+            let _ = ora.execute(&format!(
+                "CREATE TABLE bench_ct_{} (id INT PRIMARY KEY, val VARCHAR2(200))",
                 i
             ));
-            let _ = pg.execute(&format!("DROP TABLE IF EXISTS bench_ct_{}", i));
+            ora.execute_ignore(&format!("DROP TABLE bench_ct_{} PURGE", i));
         });
         results.push(compare_safe("CREATE TABLE", h.as_ref(), &p));
     }
@@ -494,12 +604,9 @@ fn run_all_categories(db: &EmbeddedDatabase, pg: &PgClient, iters: usize) -> Vec
                 .map(|_| ())
                 .map_err(|e| e.to_string())
         });
-        let p = bench_pg(pg, "CREATE INDEX", iters, |pg, i| {
-            let _ = pg.execute(&format!(
-                "CREATE INDEX IF NOT EXISTS bench_idx_{} ON customers(name)",
-                i
-            ));
-            let _ = pg.execute(&format!("DROP INDEX IF EXISTS bench_idx_{}", i));
+        let p = bench_ora(ora, "CREATE INDEX", iters, |ora, i| {
+            let _ = ora.execute(&format!("CREATE INDEX bench_idx_{} ON customers(name)", i));
+            ora.execute_ignore(&format!("DROP INDEX bench_idx_{}", i));
         });
         results.push(compare_safe("CREATE INDEX", h.as_ref(), &p));
     }
@@ -514,9 +621,9 @@ fn run_all_categories(db: &EmbeddedDatabase, pg: &PgClient, iters: usize) -> Vec
                 .map(|_| ())
                 .map_err(|e| e.to_string())
         });
-        let p = bench_pg(pg, "ALTER TABLE", iters, |pg, i| {
-            let _ = pg.execute(&format!("ALTER TABLE bench_alt ADD COLUMN col_{} TEXT", i));
-            let _ = pg.execute(&format!("ALTER TABLE bench_alt DROP COLUMN col_{}", i));
+        let p = bench_ora(ora, "ALTER TABLE", iters, |ora, i| {
+            let _ = ora.execute(&format!("ALTER TABLE bench_alt ADD col_{} VARCHAR2(200)", i));
+            let _ = ora.execute(&format!("ALTER TABLE bench_alt DROP COLUMN col_{}", i));
         });
         results.push(compare_safe("ALTER TABLE", h.as_ref(), &p));
     }
@@ -525,15 +632,16 @@ fn run_all_categories(db: &EmbeddedDatabase, pg: &PgClient, iters: usize) -> Vec
     {
         for i in 0..(iters + 2) {
             let _ = db.execute(&format!("CREATE TABLE IF NOT EXISTS bench_drop_{} (id INT)", i));
-            let _ = pg.execute(&format!("CREATE TABLE IF NOT EXISTS bench_drop_{} (id INT)", i));
+            ora.execute_ignore(&format!("DROP TABLE bench_drop_{} PURGE", i));
+            let _ = ora.execute(&format!("CREATE TABLE bench_drop_{} (id INT)", i));
         }
         let h = bench_helios_safe(db, "DROP TABLE", iters, |db, i| {
             db.execute(&format!("DROP TABLE IF EXISTS bench_drop_{}", i))
                 .map(|_| ())
                 .map_err(|e| e.to_string())
         });
-        let p = bench_pg(pg, "DROP TABLE", iters, |pg, i| {
-            let _ = pg.execute(&format!("DROP TABLE IF EXISTS bench_drop_{}", i));
+        let p = bench_ora(ora, "DROP TABLE", iters, |ora, i| {
+            ora.execute_ignore(&format!("DROP TABLE bench_drop_{} PURGE", i));
         });
         results.push(compare_safe("DROP TABLE", h.as_ref(), &p));
     }
@@ -551,12 +659,12 @@ fn run_all_categories(db: &EmbeddedDatabase, pg: &PgClient, iters: usize) -> Vec
                 .map(|_| ())
                 .map_err(|e| e.to_string())
         });
-        let p = bench_pg(pg, "CREATE/DROP VIEW", iters, |pg, i| {
-            let _ = pg.execute(&format!(
+        let p = bench_ora(ora, "CREATE/DROP VIEW", iters, |ora, i| {
+            let _ = ora.execute(&format!(
                 "CREATE VIEW bench_v_{} AS SELECT id, name FROM customers WHERE age > 30",
                 i
             ));
-            let _ = pg.execute(&format!("DROP VIEW IF EXISTS bench_v_{}", i));
+            ora.execute_ignore(&format!("DROP VIEW bench_v_{}", i));
         });
         results.push(compare_safe("CREATE/DROP VIEW", h.as_ref(), &p));
     }
@@ -566,8 +674,8 @@ fn run_all_categories(db: &EmbeddedDatabase, pg: &PgClient, iters: usize) -> Vec
         let mv_ok = db
             .execute("CREATE MATERIALIZED VIEW IF NOT EXISTS bench_mv AS SELECT region, COUNT(*) as cnt FROM customers GROUP BY region")
             .is_ok();
-        let _ = pg.execute("DROP MATERIALIZED VIEW IF EXISTS bench_mv");
-        let _ = pg.execute(
+        ora.execute_ignore("DROP MATERIALIZED VIEW bench_mv");
+        let _ = ora.execute(
             "CREATE MATERIALIZED VIEW bench_mv AS SELECT region, COUNT(*) as cnt FROM customers GROUP BY region",
         );
 
@@ -580,16 +688,19 @@ fn run_all_categories(db: &EmbeddedDatabase, pg: &PgClient, iters: usize) -> Vec
         } else {
             None
         };
-        let p = bench_pg(pg, "REFRESH MATVIEW", iters, |pg, _| {
-            let _ = pg.execute("REFRESH MATERIALIZED VIEW bench_mv");
+        let p = bench_ora_safe(ora, "REFRESH MATVIEW", iters, |ora, _| {
+            ora.execute("BEGIN DBMS_MVIEW.REFRESH('BENCH_MV'); END;")
+                .map(|_| ())
+                .map_err(|e| e.to_string())
         });
-        results.push(compare_safe("REFRESH MATVIEW", h.as_ref(), &p));
+        results.push(compare_safe_both("REFRESH MATVIEW", h.as_ref(), p.as_ref()));
     }
 
     // 7. TRUNCATE
     {
         let _ = db.execute("CREATE TABLE IF NOT EXISTS bench_trunc (id INT, val TEXT)");
-        let _ = pg.execute("CREATE TABLE IF NOT EXISTS bench_trunc (id INT, val TEXT)");
+        ora.execute_ignore("DROP TABLE bench_trunc PURGE");
+        let _ = ora.execute("CREATE TABLE bench_trunc (id INT, val VARCHAR2(200))");
 
         let h = bench_helios_safe(db, "TRUNCATE", iters, |db, _| {
             for j in 0..5 {
@@ -600,11 +711,11 @@ fn run_all_categories(db: &EmbeddedDatabase, pg: &PgClient, iters: usize) -> Vec
                 .map(|_| ())
                 .map_err(|e| e.to_string())
         });
-        let p = bench_pg(pg, "TRUNCATE", iters, |pg, _| {
+        let p = bench_ora(ora, "TRUNCATE", iters, |ora, _| {
             for j in 0..5 {
-                let _ = pg.execute(&format!("INSERT INTO bench_trunc VALUES ({}, 'x')", j));
+                let _ = ora.execute(&format!("INSERT INTO bench_trunc VALUES ({}, 'x')", j));
             }
-            let _ = pg.execute("TRUNCATE bench_trunc");
+            let _ = ora.execute("TRUNCATE bench_trunc");
         });
         results.push(compare_safe("TRUNCATE", h.as_ref(), &p));
     }
@@ -614,14 +725,14 @@ fn run_all_categories(db: &EmbeddedDatabase, pg: &PgClient, iters: usize) -> Vec
     // 8. INSERT single row
     {
         let _ = db.execute("CREATE TABLE IF NOT EXISTS bench_ins (id INT PRIMARY KEY, val TEXT)");
-        let _ = pg.execute("DROP TABLE IF EXISTS bench_ins");
-        let _ = pg.execute("CREATE TABLE bench_ins (id INT PRIMARY KEY, val TEXT)");
+        ora.execute_ignore("DROP TABLE bench_ins PURGE");
+        let _ = ora.execute("CREATE TABLE bench_ins (id INT PRIMARY KEY, val VARCHAR2(200))");
 
         let h = bench_helios(db, "INSERT single", iters, |db, i| {
             let _ = db.execute(&format!("INSERT INTO bench_ins VALUES ({}, 'v{}')", 10000 + i, i));
         });
-        let p = bench_pg(pg, "INSERT single", iters, |pg, i| {
-            let _ = pg.execute(&format!("INSERT INTO bench_ins VALUES ({}, 'v{}')", 10000 + i, i));
+        let p = bench_ora(ora, "INSERT single", iters, |ora, i| {
+            let _ = ora.execute(&format!("INSERT INTO bench_ins VALUES ({}, 'v{}')", 10000 + i, i));
         });
         results.push(compare_result("INSERT single", &h, &p));
     }
@@ -629,18 +740,18 @@ fn run_all_categories(db: &EmbeddedDatabase, pg: &PgClient, iters: usize) -> Vec
     // 9. INSERT multi-row
     {
         let _ = db.execute("CREATE TABLE IF NOT EXISTS bench_ins_m (id INT PRIMARY KEY, val TEXT)");
-        let _ = pg.execute("DROP TABLE IF EXISTS bench_ins_m");
-        let _ = pg.execute("CREATE TABLE bench_ins_m (id INT PRIMARY KEY, val TEXT)");
+        ora.execute_ignore("DROP TABLE bench_ins_m PURGE");
+        let _ = ora.execute("CREATE TABLE bench_ins_m (id INT PRIMARY KEY, val VARCHAR2(200))");
 
         let h = bench_helios(db, "INSERT multi-row", iters, |db, i| {
             let base = 20000 + i * 10;
             let vals: Vec<String> = (0..10).map(|j| format!("({}, 'b{}')", base + j, j)).collect();
             let _ = db.execute(&format!("INSERT INTO bench_ins_m VALUES {}", vals.join(",")));
         });
-        let p = bench_pg(pg, "INSERT multi-row", iters, |pg, i| {
+        let p = bench_ora(ora, "INSERT multi-row", iters, |ora, i| {
             let base = 20000 + i * 10;
             let vals: Vec<String> = (0..10).map(|j| format!("({}, 'b{}')", base + j, j)).collect();
-            let _ = pg.execute(&format!("INSERT INTO bench_ins_m VALUES {}", vals.join(",")));
+            let _ = ora.execute(&ora_insert_all("bench_ins_m", &vals));
         });
         results.push(compare_result("INSERT multi-row", &h, &p));
     }
@@ -648,8 +759,8 @@ fn run_all_categories(db: &EmbeddedDatabase, pg: &PgClient, iters: usize) -> Vec
     // 10. INSERT...SELECT
     {
         let _ = db.execute("CREATE TABLE IF NOT EXISTS bench_ins_s (id INT PRIMARY KEY, name TEXT)");
-        let _ = pg.execute("DROP TABLE IF EXISTS bench_ins_s");
-        let _ = pg.execute("CREATE TABLE bench_ins_s (id INT PRIMARY KEY, name TEXT)");
+        ora.execute_ignore("DROP TABLE bench_ins_s PURGE");
+        let _ = ora.execute("CREATE TABLE bench_ins_s (id INT PRIMARY KEY, name VARCHAR2(200))");
 
         let h = bench_helios_safe(db, "INSERT..SELECT", iters, |db, i| {
             let off = 30000 + i * 10;
@@ -660,9 +771,9 @@ fn run_all_categories(db: &EmbeddedDatabase, pg: &PgClient, iters: usize) -> Vec
             .map(|_| ())
             .map_err(|e| e.to_string())
         });
-        let p = bench_pg(pg, "INSERT..SELECT", iters, |pg, i| {
+        let p = bench_ora(ora, "INSERT..SELECT", iters, |ora, i| {
             let off = 30000 + i * 10;
-            let _ = pg.execute(&format!(
+            let _ = ora.execute(&format!(
                 "INSERT INTO bench_ins_s SELECT id + {}, name FROM customers WHERE id <= 10",
                 off
             ));
@@ -676,9 +787,9 @@ fn run_all_categories(db: &EmbeddedDatabase, pg: &PgClient, iters: usize) -> Vec
             let id = (i % 200) + 1;
             let _ = db.execute(&format!("UPDATE customers SET age = age + 0 WHERE id = {}", id));
         });
-        let p = bench_pg(pg, "UPDATE point", iters, |pg, i| {
+        let p = bench_ora(ora, "UPDATE point", iters, |ora, i| {
             let id = (i % 200) + 1;
-            let _ = pg.execute(&format!("UPDATE customers SET age = age + 0 WHERE id = {}", id));
+            let _ = ora.execute(&format!("UPDATE customers SET age = age + 0 WHERE id = {}", id));
         });
         results.push(compare_result("UPDATE point", &h, &p));
     }
@@ -686,18 +797,18 @@ fn run_all_categories(db: &EmbeddedDatabase, pg: &PgClient, iters: usize) -> Vec
     // 12. DELETE point
     {
         let _ = db.execute("CREATE TABLE IF NOT EXISTS bench_del (id INT PRIMARY KEY, val TEXT)");
-        let _ = pg.execute("DROP TABLE IF EXISTS bench_del");
-        let _ = pg.execute("CREATE TABLE bench_del (id INT PRIMARY KEY, val TEXT)");
+        ora.execute_ignore("DROP TABLE bench_del PURGE");
+        let _ = ora.execute("CREATE TABLE bench_del (id INT PRIMARY KEY, val VARCHAR2(200))");
         for i in 0..(iters + 2) {
             let _ = db.execute(&format!("INSERT INTO bench_del VALUES ({}, 'd{}')", i, i));
-            let _ = pg.execute(&format!("INSERT INTO bench_del VALUES ({}, 'd{}')", i, i));
+            let _ = ora.execute(&format!("INSERT INTO bench_del VALUES ({}, 'd{}')", i, i));
         }
 
         let h = bench_helios(db, "DELETE point", iters, |db, i| {
             let _ = db.execute(&format!("DELETE FROM bench_del WHERE id = {}", i));
         });
-        let p = bench_pg(pg, "DELETE point", iters, |pg, i| {
-            let _ = pg.execute(&format!("DELETE FROM bench_del WHERE id = {}", i));
+        let p = bench_ora(ora, "DELETE point", iters, |ora, i| {
+            let _ = ora.execute(&format!("DELETE FROM bench_del WHERE id = {}", i));
         });
         results.push(compare_result("DELETE point", &h, &p));
     }
@@ -705,11 +816,11 @@ fn run_all_categories(db: &EmbeddedDatabase, pg: &PgClient, iters: usize) -> Vec
     // 13. UPSERT
     {
         let _ = db.execute("CREATE TABLE IF NOT EXISTS bench_ups (id INT PRIMARY KEY, val TEXT, counter INT)");
-        let _ = pg.execute("DROP TABLE IF EXISTS bench_ups");
-        let _ = pg.execute("CREATE TABLE bench_ups (id INT PRIMARY KEY, val TEXT, counter INT)");
+        ora.execute_ignore("DROP TABLE bench_ups PURGE");
+        let _ = ora.execute("CREATE TABLE bench_ups (id INT PRIMARY KEY, val VARCHAR2(200), counter INT)");
         for i in 0..30 {
             let _ = db.execute(&format!("INSERT INTO bench_ups VALUES ({}, 'orig', 0)", i));
-            let _ = pg.execute(&format!("INSERT INTO bench_ups VALUES ({}, 'orig', 0)", i));
+            let _ = ora.execute(&format!("INSERT INTO bench_ups VALUES ({}, 'orig', 0)", i));
         }
 
         let h = bench_helios_safe(db, "UPSERT", iters, |db, i| {
@@ -721,10 +832,14 @@ fn run_all_categories(db: &EmbeddedDatabase, pg: &PgClient, iters: usize) -> Vec
             .map(|_| ())
             .map_err(|e| e.to_string())
         });
-        let p = bench_pg(pg, "UPSERT", iters, |pg, i| {
+        let p = bench_ora(ora, "UPSERT", iters, |ora, i| {
             let id = i % 30;
-            let _ = pg.execute(&format!(
-                "INSERT INTO bench_ups VALUES ({}, 'new', 1) ON CONFLICT (id) DO UPDATE SET counter = bench_ups.counter + 1",
+            let _ = ora.execute(&format!(
+                "MERGE INTO bench_ups dst \
+                 USING (SELECT {} AS id, 'new' AS val, 1 AS counter FROM dual) src \
+                 ON (dst.id = src.id) \
+                 WHEN MATCHED THEN UPDATE SET dst.counter = dst.counter + 1 \
+                 WHEN NOT MATCHED THEN INSERT (id, val, counter) VALUES (src.id, src.val, src.counter)",
                 id
             ));
         });
@@ -742,9 +857,9 @@ fn run_all_categories(db: &EmbeddedDatabase, pg: &PgClient, iters: usize) -> Vec
             .map(|_| ())
             .map_err(|e| e.to_string())
         });
-        let p = bench_pg(pg, "UPDATE+subquery", iters, |pg, i| {
+        let p = bench_ora(ora, "UPDATE+subquery", iters, |ora, i| {
             let id = (i % 500) + 1;
-            let _ = pg.execute(&format!(
+            let _ = ora.execute(&format!(
                 "UPDATE orders SET total = (SELECT COUNT(*) FROM order_items WHERE order_id = {}) WHERE order_id = {}",
                 id, id
             ));
@@ -760,9 +875,9 @@ fn run_all_categories(db: &EmbeddedDatabase, pg: &PgClient, iters: usize) -> Vec
             let id = (i % 200) + 1;
             let _ = db.query(&format!("SELECT * FROM customers WHERE id = {}", id), &[]);
         });
-        let p = bench_pg(pg, "Point lookup", iters, |pg, i| {
+        let p = bench_ora(ora, "Point lookup", iters, |ora, i| {
             let id = (i % 200) + 1;
-            let _ = pg.query_count(&format!("SELECT * FROM customers WHERE id = {}", id));
+            let _ = ora.query_count(&format!("SELECT * FROM customers WHERE id = {}", id));
         });
         results.push(compare_result("Point lookup", &h, &p));
     }
@@ -772,8 +887,8 @@ fn run_all_categories(db: &EmbeddedDatabase, pg: &PgClient, iters: usize) -> Vec
         let h = bench_helios(db, "Full scan+filter", iters, |db, _| {
             let _ = db.query("SELECT * FROM customers WHERE age > 50", &[]);
         });
-        let p = bench_pg(pg, "Full scan+filter", iters, |pg, _| {
-            let _ = pg.query_count("SELECT * FROM customers WHERE age > 50");
+        let p = bench_ora(ora, "Full scan+filter", iters, |ora, _| {
+            let _ = ora.query_count("SELECT * FROM customers WHERE age > 50");
         });
         results.push(compare_result("Full scan+filter", &h, &p));
     }
@@ -786,8 +901,8 @@ fn run_all_categories(db: &EmbeddedDatabase, pg: &PgClient, iters: usize) -> Vec
                 &[],
             );
         });
-        let p = bench_pg(pg, "Aggregation", iters, |pg, _| {
-            let _ = pg.query_count(
+        let p = bench_ora(ora, "Aggregation", iters, |ora, _| {
+            let _ = ora.query_count(
                 "SELECT region, COUNT(*), SUM(age), AVG(age) FROM customers GROUP BY region HAVING COUNT(*) > 10",
             );
         });
@@ -806,9 +921,9 @@ fn run_all_categories(db: &EmbeddedDatabase, pg: &PgClient, iters: usize) -> Vec
                 &[],
             );
         });
-        let p = bench_pg(pg, "INNER JOIN", iters, |pg, i| {
+        let p = bench_ora(ora, "INNER JOIN", iters, |ora, i| {
             let id = (i % 200) + 1;
-            let _ = pg.query_count(&format!(
+            let _ = ora.query_count(&format!(
                 "SELECT c.name, o.order_id, o.total FROM customers c INNER JOIN orders o ON c.id = o.customer_id WHERE c.id = {}",
                 id
             ));
@@ -828,9 +943,9 @@ fn run_all_categories(db: &EmbeddedDatabase, pg: &PgClient, iters: usize) -> Vec
                 &[],
             );
         });
-        let p = bench_pg(pg, "LEFT JOIN", iters, |pg, i| {
+        let p = bench_ora(ora, "LEFT JOIN", iters, |ora, i| {
             let id = (i % 200) + 1;
-            let _ = pg.query_count(&format!(
+            let _ = ora.query_count(&format!(
                 "SELECT c.name, o.order_id FROM customers c LEFT JOIN orders o ON c.id = o.customer_id WHERE c.id = {}",
                 id
             ));
@@ -855,9 +970,9 @@ fn run_all_categories(db: &EmbeddedDatabase, pg: &PgClient, iters: usize) -> Vec
                 &[],
             );
         });
-        let p = bench_pg(pg, "4-table JOIN", iters, |pg, i| {
+        let p = bench_ora(ora, "4-table JOIN", iters, |ora, i| {
             let id = (i % 200) + 1;
-            let _ = pg.query_count(&format!(
+            let _ = ora.query_count(&format!(
                 "SELECT c.name, o.order_id, oi.quantity, p.name \
                  FROM customers c \
                  INNER JOIN orders o ON c.id = o.customer_id \
@@ -880,8 +995,8 @@ fn run_all_categories(db: &EmbeddedDatabase, pg: &PgClient, iters: usize) -> Vec
             .map(|_| ())
             .map_err(|e| e.to_string())
         });
-        let p = bench_pg(pg, "Scalar subquery", iters, |pg, _| {
-            let _ = pg.query_count(
+        let p = bench_ora(ora, "Scalar subquery", iters, |ora, _| {
+            let _ = ora.query_count(
                 "SELECT name, (SELECT COUNT(*) FROM orders WHERE customer_id = customers.id) AS order_count FROM customers WHERE id <= 20",
             );
         });
@@ -898,8 +1013,8 @@ fn run_all_categories(db: &EmbeddedDatabase, pg: &PgClient, iters: usize) -> Vec
             .map(|_| ())
             .map_err(|e| e.to_string())
         });
-        let p = bench_pg(pg, "EXISTS subquery", iters, |pg, _| {
-            let _ = pg.query_count(
+        let p = bench_ora(ora, "EXISTS subquery", iters, |ora, _| {
+            let _ = ora.query_count(
                 "SELECT name FROM customers WHERE EXISTS (SELECT 1 FROM orders WHERE customer_id = customers.id) AND id <= 50",
             );
         });
@@ -916,8 +1031,8 @@ fn run_all_categories(db: &EmbeddedDatabase, pg: &PgClient, iters: usize) -> Vec
             .map(|_| ())
             .map_err(|e| e.to_string())
         });
-        let p = bench_pg(pg, "IN subquery", iters, |pg, _| {
-            let _ = pg.query_count(
+        let p = bench_ora(ora, "IN subquery", iters, |ora, _| {
+            let _ = ora.query_count(
                 "SELECT name FROM customers WHERE id IN (SELECT customer_id FROM orders WHERE total > 500) AND id <= 100",
             );
         });
@@ -935,8 +1050,8 @@ fn run_all_categories(db: &EmbeddedDatabase, pg: &PgClient, iters: usize) -> Vec
             .map(|_| ())
             .map_err(|e| e.to_string())
         });
-        let p = bench_pg(pg, "CTE", iters, |pg, _| {
-            let _ = pg.query_count(
+        let p = bench_ora(ora, "CTE", iters, |ora, _| {
+            let _ = ora.query_count(
                 "WITH high_value AS (SELECT customer_id, SUM(total) as total_spent FROM orders GROUP BY customer_id HAVING SUM(total) > 500) \
                  SELECT c.name, hv.total_spent FROM customers c JOIN high_value hv ON c.id = hv.customer_id",
             );
@@ -958,13 +1073,12 @@ fn run_all_categories(db: &EmbeddedDatabase, pg: &PgClient, iters: usize) -> Vec
             .map(|_| ())
             .map_err(|e| e.to_string())
         });
-        let p = bench_pg(pg, "Recursive CTE", iters, |pg, _| {
-            let _ = pg.query_count(
-                "WITH RECURSIVE cat_tree AS (\
-                    SELECT cat_id, name, parent_id, 0 AS depth FROM categories WHERE parent_id IS NULL \
-                    UNION ALL \
-                    SELECT c.cat_id, c.name, c.parent_id, ct.depth + 1 FROM categories c JOIN cat_tree ct ON c.parent_id = ct.cat_id\
-                 ) SELECT * FROM cat_tree",
+        let p = bench_ora(ora, "Recursive CTE", iters, |ora, _| {
+            let _ = ora.query_count(
+                "SELECT cat_id, name, parent_id, LEVEL - 1 AS depth \
+                 FROM categories \
+                 START WITH parent_id IS NULL \
+                 CONNECT BY PRIOR cat_id = parent_id",
             );
         });
         results.push(compare_safe("Recursive CTE", h.as_ref(), &p));
@@ -984,8 +1098,8 @@ fn run_all_categories(db: &EmbeddedDatabase, pg: &PgClient, iters: usize) -> Vec
             .map(|_| ())
             .map_err(|e| e.to_string())
         });
-        let p = bench_pg(pg, "Window funcs", iters, |pg, _| {
-            let _ = pg.query_count(
+        let p = bench_ora(ora, "Window funcs", iters, |ora, _| {
+            let _ = ora.query_count(
                 "SELECT name, age, region, \
                     ROW_NUMBER() OVER (PARTITION BY region ORDER BY age DESC) as rn, \
                     RANK() OVER (PARTITION BY region ORDER BY age DESC) as rnk, \
@@ -1006,8 +1120,8 @@ fn run_all_categories(db: &EmbeddedDatabase, pg: &PgClient, iters: usize) -> Vec
             .map(|_| ())
             .map_err(|e| e.to_string())
         });
-        let p = bench_pg(pg, "UNION", iters, |pg, _| {
-            let _ = pg.query_count(
+        let p = bench_ora(ora, "UNION", iters, |ora, _| {
+            let _ = ora.query_count(
                 "SELECT name FROM customers WHERE age < 30 UNION SELECT name FROM customers WHERE region = 'East'",
             );
         });
@@ -1019,8 +1133,8 @@ fn run_all_categories(db: &EmbeddedDatabase, pg: &PgClient, iters: usize) -> Vec
         let h = bench_helios(db, "DISTINCT", iters, |db, _| {
             let _ = db.query("SELECT DISTINCT region FROM customers", &[]);
         });
-        let p = bench_pg(pg, "DISTINCT", iters, |pg, _| {
-            let _ = pg.query_count("SELECT DISTINCT region FROM customers");
+        let p = bench_ora(ora, "DISTINCT", iters, |ora, _| {
+            let _ = ora.query_count("SELECT DISTINCT region FROM customers");
         });
         results.push(compare_result("DISTINCT", &h, &p));
     }
@@ -1037,10 +1151,10 @@ fn run_all_categories(db: &EmbeddedDatabase, pg: &PgClient, iters: usize) -> Vec
                 &[],
             );
         });
-        let p = bench_pg(pg, "ORDER+LIMIT", iters, |pg, i| {
+        let p = bench_ora(ora, "ORDER+LIMIT", iters, |ora, i| {
             let off = (i % 50) * 10;
-            let _ = pg.query_count(&format!(
-                "SELECT * FROM customers ORDER BY age DESC, name ASC LIMIT 20 OFFSET {}",
+            let _ = ora.query_count(&format!(
+                "SELECT * FROM customers ORDER BY age DESC, name ASC OFFSET {} ROWS FETCH NEXT 20 ROWS ONLY",
                 off
             ));
         });
@@ -1057,8 +1171,8 @@ fn run_all_categories(db: &EmbeddedDatabase, pg: &PgClient, iters: usize) -> Vec
                 &[],
             );
         });
-        let p = bench_pg(pg, "CASE expr", iters, |pg, _| {
-            let _ = pg.query_count(
+        let p = bench_ora(ora, "CASE expr", iters, |ora, _| {
+            let _ = ora.query_count(
                 "SELECT name, \
                     CASE WHEN age < 25 THEN 'young' WHEN age < 50 THEN 'middle' ELSE 'senior' END AS age_group \
                  FROM customers WHERE id <= 100",
@@ -1075,8 +1189,8 @@ fn run_all_categories(db: &EmbeddedDatabase, pg: &PgClient, iters: usize) -> Vec
                 &[],
             );
         });
-        let p = bench_pg(pg, "LIKE/BETWEEN/IN", iters, |pg, _| {
-            let _ = pg.query_count(
+        let p = bench_ora(ora, "LIKE/BETWEEN/IN", iters, |ora, _| {
+            let _ = ora.query_count(
                 "SELECT * FROM customers WHERE name LIKE 'Customer_1%' AND age BETWEEN 20 AND 50 AND region IN ('East', 'West', 'North')",
             );
         });
@@ -1091,8 +1205,8 @@ fn run_all_categories(db: &EmbeddedDatabase, pg: &PgClient, iters: usize) -> Vec
                 &[],
             );
         });
-        let p = bench_pg(pg, "String ops", iters, |pg, _| {
-            let _ = pg.query_count(
+        let p = bench_ora(ora, "String ops", iters, |ora, _| {
+            let _ = ora.query_count(
                 "SELECT id, name, LENGTH(bio) as bio_len FROM customers WHERE bio IS NOT NULL AND id <= 100",
             );
         });
@@ -1114,14 +1228,19 @@ fn run_all_categories(db: &EmbeddedDatabase, pg: &PgClient, iters: usize) -> Vec
                 .map_err(|e| e.to_string())?;
             db.execute("COMMIT").map(|_| ()).map_err(|e| e.to_string())
         });
-        let p = bench_pg(pg, "Transaction ctl", iters, |pg, _| {
-            let _ = pg.execute("BEGIN");
-            let _ = pg.execute("SAVEPOINT sp1");
-            let _ = pg.execute("INSERT INTO bench_ins VALUES (99999, 'txn')");
-            let _ = pg.execute("ROLLBACK TO SAVEPOINT sp1");
-            let _ = pg.execute("COMMIT");
+        let p = bench_ora_safe(ora, "Transaction ctl", iters, |ora, _| {
+            ora.execute_no_commit("SAVEPOINT sp1")
+                .map(|_| ())
+                .map_err(|e| e.to_string())?;
+            ora.execute_no_commit("INSERT INTO bench_ins VALUES (99999, 'txn')")
+                .map(|_| ())
+                .map_err(|e| e.to_string())?;
+            ora.execute_no_commit("ROLLBACK TO SAVEPOINT sp1")
+                .map(|_| ())
+                .map_err(|e| e.to_string())?;
+            ora.commit().map_err(|e| e.to_string())
         });
-        results.push(compare_safe("Transaction ctl", h.as_ref(), &p));
+        results.push(compare_safe_both("Transaction ctl", h.as_ref(), p.as_ref()));
     }
 
     // 34. PREPARE / EXECUTE / DEALLOCATE
@@ -1141,16 +1260,10 @@ fn run_all_categories(db: &EmbeddedDatabase, pg: &PgClient, iters: usize) -> Vec
                 .map(|_| ())
                 .map_err(|e| e.to_string())
         });
-        let p = bench_pg(pg, "Prepared stmts", iters, |pg, i| {
-            let name = format!("bench_s_{}", i);
-            let _ = pg.execute(&format!(
-                "PREPARE {} (int) AS SELECT * FROM customers WHERE id = $1",
-                name
-            ));
-            let _ = pg.execute(&format!("EXECUTE {} (42)", name));
-            let _ = pg.execute(&format!("DEALLOCATE {}", name));
+        let p = bench_ora_safe(ora, "Prepared stmts", iters, |_ora, _| {
+            Err("SQL PREPARE/EXECUTE/DEALLOCATE is PostgreSQL-specific; python-oracledb uses driver-side statement caching".to_string())
         });
-        results.push(compare_safe("Prepared stmts", h.as_ref(), &p));
+        results.push(compare_safe_both("Prepared stmts", h.as_ref(), p.as_ref()));
     }
 
     // 35. SET/SHOW/RESET
@@ -1162,10 +1275,10 @@ fn run_all_categories(db: &EmbeddedDatabase, pg: &PgClient, iters: usize) -> Vec
             db.query("SHOW work_mem", &[]).map(|_| ()).map_err(|e| e.to_string())?;
             db.query("RESET work_mem", &[]).map(|_| ()).map_err(|e| e.to_string())
         });
-        let p = bench_pg(pg, "SET/SHOW/RESET", iters, |pg, _| {
-            let _ = pg.execute("SET work_mem = '8MB'");
-            let _ = pg.execute("SHOW work_mem");
-            let _ = pg.execute("RESET work_mem");
+        let p = bench_ora(ora, "SET/SHOW/RESET", iters, |ora, _| {
+            let _ = ora.execute("ALTER SESSION SET optimizer_mode = ALL_ROWS");
+            let _ = ora.query_count("SELECT SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') FROM dual");
+            let _ = ora.execute("ALTER SESSION SET optimizer_mode = CHOOSE");
         });
         results.push(compare_safe("SET/SHOW/RESET", h.as_ref(), &p));
     }
@@ -1183,15 +1296,16 @@ fn compare_result(name: &str, h: &CategoryResult, p: &CategoryResult) -> Compari
     let winner = if ratio <= 1.0 {
         "Helios".to_string()
     } else {
-        "PG".to_string()
+        "Oracle".to_string()
     };
     ComparisonRow {
         name: name.to_string(),
         helios_avg_us: h_us,
-        pg_avg_us: p_us,
+        ora_avg_us: p_us,
         ratio,
         winner,
         helios_na: false,
+        ora_na: false,
     }
 }
 
@@ -1205,12 +1319,52 @@ fn compare_safe(name: &str, h: Option<&CategoryResult>, p: &CategoryResult) -> C
             ComparisonRow {
                 name: name.to_string(),
                 helios_avg_us: 0.0,
-                pg_avg_us: p_us,
+                ora_avg_us: p_us,
                 ratio: 0.0,
                 winner: "N/A".to_string(),
                 helios_na: true,
+                ora_na: false,
             }
         }
+    }
+}
+
+fn compare_safe_both(name: &str, h: Option<&CategoryResult>, o: Option<&CategoryResult>) -> ComparisonRow {
+    match (h, o) {
+        (Some(h), Some(o)) => compare_result(name, h, o),
+        (None, Some(o)) => {
+            let o_us = o.avg_per_iter.as_nanos() as f64 / 1_000.0;
+            ComparisonRow {
+                name: name.to_string(),
+                helios_avg_us: 0.0,
+                ora_avg_us: o_us,
+                ratio: 0.0,
+                winner: "N/A".to_string(),
+                helios_na: true,
+                ora_na: false,
+            }
+        }
+        (Some(h), None) => {
+            let h_us = h.avg_per_iter.as_nanos() as f64 / 1_000.0;
+            ComparisonRow {
+                name: name.to_string(),
+                helios_avg_us: h_us,
+                ora_avg_us: 0.0,
+                ratio: 0.0,
+                winner: "N/A".to_string(),
+                helios_na: false,
+                ora_na: true,
+            }
+        }
+        (None, None) => ComparisonRow {
+            name: name.to_string(),
+            helios_avg_us: 0.0,
+            ora_avg_us: 0.0,
+            ratio: 0.0,
+            winner: "N/A".to_string(),
+            helios_na: true,
+            ora_na: true,
+        },
     }
 }
 
@@ -1218,40 +1372,48 @@ fn compare_safe(name: &str, h: Option<&CategoryResult>, p: &CategoryResult) -> C
 
 // Legacy fixed-label signature:
 // fn print_comparison_table(results: &[ComparisonRow]) {
-fn print_comparison_table(results: &[ComparisonRow], pg_label: &str) {
+fn print_comparison_table(results: &[ComparisonRow], ora_label: &str) {
     println!("\n{}", "=".repeat(105));
     // Legacy fixed label:
     // println!("  HELIOSDB-NANO vs POSTGRESQL 16 -- HEAD-TO-HEAD COMPARISON");
-    println!("  HELIOSDB-NANO vs {} -- HEAD-TO-HEAD COMPARISON", pg_label);
+    println!("  HELIOSDB-NANO vs {} -- HEAD-TO-HEAD COMPARISON", ora_label);
     println!("  Dataset: 200 customers, 50 products, 500 orders, 1000 items, 20 categories");
     println!("{}\n", "=".repeat(105));
 
-    let pg_col = format!("{}(avg)", pg_label);
+    let ora_col = format!("{}(avg)", ora_label);
     println!(
         "{:<22} | {:>12} | {:>12} | {:>10} | {:>8}",
         // Legacy fixed column label:
-        // "Category", "Nano(avg)", "PG 16(avg)", "Ratio", "Winner"
+        // "Category", "Nano(avg)", "Oracle 16(avg)", "Ratio", "Winner"
         "Category",
         "Nano(avg)",
-        pg_col,
+        ora_col,
         "Ratio",
         "Winner"
     );
     println!("{}", "-".repeat(105));
 
     let mut helios_wins = 0;
-    let mut pg_wins = 0;
+    let mut ora_wins = 0;
     let mut ties = 0;
     let mut na_count = 0;
 
     for r in results {
-        if r.helios_na {
+        if r.helios_na || r.ora_na {
             na_count += 1;
             println!(
                 "{:<22} | {:>12} | {:>12} | {:>10} | {:>8}",
                 r.name,
-                "N/A",
-                format_us(r.pg_avg_us),
+                if r.helios_na {
+                    "N/A".to_string()
+                } else {
+                    format_us(r.helios_avg_us)
+                },
+                if r.ora_na {
+                    "N/A".to_string()
+                } else {
+                    format_us(r.ora_avg_us)
+                },
                 "--",
                 "N/A"
             );
@@ -1272,8 +1434,8 @@ fn print_comparison_table(results: &[ComparisonRow], pg_label: &str) {
             helios_wins += 1;
             "Nano"
         } else if r.ratio >= 1.05 {
-            pg_wins += 1;
-            "PG"
+            ora_wins += 1;
+            "Oracle"
         } else {
             ties += 1;
             "~tie"
@@ -1283,7 +1445,7 @@ fn print_comparison_table(results: &[ComparisonRow], pg_label: &str) {
             "{:<22} | {:>12} | {:>12} | {:>10} | {:>8}",
             r.name,
             format_us(r.helios_avg_us),
-            format_us(r.pg_avg_us),
+            format_us(r.ora_avg_us),
             ratio_str,
             winner_display,
         );
@@ -1291,9 +1453,9 @@ fn print_comparison_table(results: &[ComparisonRow], pg_label: &str) {
 
     println!("{}", "-".repeat(105));
     println!(
-        "SCOREBOARD: Nano wins {} | PG wins {} | Ties {} | N/A {} | Total {}",
+        "SCOREBOARD: Nano wins {} | Oracle wins {} | Ties {} | N/A {} | Total {}",
         helios_wins,
-        pg_wins,
+        ora_wins,
         ties,
         na_count,
         results.len()
@@ -1302,19 +1464,22 @@ fn print_comparison_table(results: &[ComparisonRow], pg_label: &str) {
 
 fn print_trace_breakdown(results: &[ComparisonRow]) {
     println!("\n{}", "=".repeat(80));
-    println!("  TOP OPTIMIZATION TARGETS (where PG wins by largest margin)");
+    println!("  TOP OPTIMIZATION TARGETS (where Oracle wins by largest margin)");
     println!("{}\n", "=".repeat(80));
 
-    let mut sorted: Vec<&ComparisonRow> = results.iter().filter(|r| !r.helios_na && r.ratio > 1.05).collect();
+    let mut sorted: Vec<&ComparisonRow> = results
+        .iter()
+        .filter(|r| !r.helios_na && !r.ora_na && r.ratio > 1.05)
+        .collect();
     sorted.sort_by(|a, b| b.ratio.partial_cmp(&a.ratio).unwrap_or(std::cmp::Ordering::Equal));
 
     for (i, r) in sorted.iter().take(10).enumerate() {
         println!(
-            "  {:>2}. {:<22} Nano {:>10} vs PG {:>10} ({:.1}x slower)",
+            "  {:>2}. {:<22} Nano {:>10} vs Oracle {:>10} ({:.1}x slower)",
             i + 1,
             r.name,
             format_us(r.helios_avg_us),
-            format_us(r.pg_avg_us),
+            format_us(r.ora_avg_us),
             r.ratio,
         );
     }
@@ -1326,19 +1491,19 @@ fn print_trace_breakdown(results: &[ComparisonRow]) {
     // Nano advantages
     let mut helios_better: Vec<&ComparisonRow> = results
         .iter()
-        .filter(|r| !r.helios_na && r.ratio < 0.95 && r.ratio > 0.0)
+        .filter(|r| !r.helios_na && !r.ora_na && r.ratio < 0.95 && r.ratio > 0.0)
         .collect();
     helios_better.sort_by(|a, b| a.ratio.partial_cmp(&b.ratio).unwrap_or(std::cmp::Ordering::Equal));
 
     if !helios_better.is_empty() {
-        println!("\n  NANO ADVANTAGES (faster than PG):");
+        println!("\n  NANO ADVANTAGES (faster than Oracle):");
         for (i, r) in helios_better.iter().take(10).enumerate() {
             println!(
-                "  {:>2}. {:<22} Nano {:>10} vs PG {:>10} ({:.1}x faster)",
+                "  {:>2}. {:<22} Nano {:>10} vs Oracle {:>10} ({:.1}x faster)",
                 i + 1,
                 r.name,
                 format_us(r.helios_avg_us),
-                format_us(r.pg_avg_us),
+                format_us(r.ora_avg_us),
                 1.0 / r.ratio,
             );
         }
@@ -1350,14 +1515,14 @@ fn print_analysis(results: &[ComparisonRow]) {
     println!("  PERFORMANCE TIER ANALYSIS");
     println!("{}\n", "=".repeat(80));
 
-    let active: Vec<&ComparisonRow> = results.iter().filter(|r| !r.helios_na).collect();
+    let active: Vec<&ComparisonRow> = results.iter().filter(|r| !r.helios_na && !r.ora_na).collect();
 
     let critical: Vec<&&ComparisonRow> = active.iter().filter(|r| r.ratio > 5.0).collect();
     let significant: Vec<&&ComparisonRow> = active.iter().filter(|r| r.ratio > 2.0 && r.ratio <= 5.0).collect();
     let moderate: Vec<&&ComparisonRow> = active.iter().filter(|r| r.ratio > 1.05 && r.ratio <= 2.0).collect();
     let competitive: Vec<&&ComparisonRow> = active.iter().filter(|r| r.ratio >= 0.95 && r.ratio <= 1.05).collect();
     let helios_faster: Vec<&&ComparisonRow> = active.iter().filter(|r| r.ratio > 0.0 && r.ratio < 0.95).collect();
-    let na_list: Vec<&ComparisonRow> = results.iter().filter(|r| r.helios_na).collect();
+    let na_list: Vec<&ComparisonRow> = results.iter().filter(|r| r.helios_na || r.ora_na).collect();
 
     println!("    Critical (>5x slower):    {} categories", critical.len());
     println!("    Significant (2-5x):       {} categories", significant.len());
@@ -1367,9 +1532,14 @@ fn print_analysis(results: &[ComparisonRow]) {
     println!("    Not supported (N/A):      {} categories", na_list.len());
 
     if !na_list.is_empty() {
-        println!("\n  N/A CATEGORIES (not supported in Nano):");
+        println!("\n  N/A CATEGORIES (not supported in one or both engines):");
         for r in &na_list {
-            println!("    - {}", r.name);
+            println!(
+                "    - {} (Nano: {}, Oracle: {})",
+                r.name,
+                if r.helios_na { "N/A" } else { "ok" },
+                if r.ora_na { "N/A" } else { "ok" }
+            );
         }
     }
 }
@@ -1377,37 +1547,42 @@ fn print_analysis(results: &[ComparisonRow]) {
 // --- Main test ---
 
 #[test]
-#[ignore] // Requires Docker PostgreSQL on port 25433
-fn pg35_benchmark() {
-    let pg_label = pg35_label();
-    let pg_connstr = pg35_connstr();
+#[ignore] // Requires Docker Oracle on port 21521
+fn ora35_benchmark() {
+    let ora_label = ora35_label();
 
     println!("\n{}", "=".repeat(105));
     // Legacy fixed label:
     // println!("  HELIOSDB-NANO vs POSTGRESQL 16 -- COMPREHENSIVE 35-CATEGORY BENCHMARK");
-    // println!("  HeliosDB-Nano v3.7.0 (Embedded/In-Memory) vs PostgreSQL 16 (Docker/25433)");
-    println!("  HELIOSDB-NANO vs {} -- COMPREHENSIVE 35-CATEGORY BENCHMARK", pg_label);
+    // println!("  HeliosDB-Nano v3.7.0 (Embedded/In-Memory) vs Oracle 16 (Docker/25433)");
     println!(
-        "  HeliosDB-Nano v3.57.0 (Embedded/In-Memory) vs {} (Docker/25433)",
-        pg_label
+        "  HELIOSDB-NANO vs {} -- COMPREHENSIVE 35-CATEGORY BENCHMARK",
+        ora_label
+    );
+    println!(
+        "  HeliosDB-Nano v3.57.0 (Embedded/In-Memory) vs {} (Docker/21521)",
+        ora_label
     );
     println!("{}\n", "=".repeat(105));
 
-    // Connect to PostgreSQL
+    // Connect to Oracle
     // Legacy hard-coded connection:
-    // let pg = match PgClient::connect("host=127.0.0.1 port=25433 user=bench password=benchpass dbname=benchdb") {
-    let pg = match PgClient::connect(&pg_connstr) {
-        Ok(pg) => {
+    // let ora = match OracleClient::connect("host=127.0.0.1 port=25433 user=bench password=benchpass dbname=benchdb") {
+    let mut ora = match OracleClient::connect() {
+        Ok(ora) => {
             // Legacy fixed label:
-            // println!("  [OK] Connected to PostgreSQL 16 on port 25433");
-            println!("  [OK] Connected to {} on configured DSN", pg_label);
-            pg
+            // println!("  [OK] Connected to Oracle 16 on port 25433");
+            println!("  [OK] Connected to {} on configured DSN", ora_label);
+            ora
         }
         Err(e) => {
-            println!("  [SKIP] Cannot connect to PostgreSQL: {}", e);
+            println!("  [SKIP] Cannot connect to Oracle: {}", e);
             // Legacy start command:
             // println!("  Start with: docker run -d --name pg_bench_nano -e POSTGRES_USER=bench -e POSTGRES_PASSWORD=benchpass -e POSTGRES_DB=benchdb -p 25433:5432 postgres:16-alpine");
-            println!("  Start with: docker run -d --name pg_bench_nano -e POSTGRES_USER=bench -e POSTGRES_PASSWORD=benchpass -e POSTGRES_DB=benchdb -p 25433:5432 postgres:18.4-bookworm");
+            println!("  Start with: docker run -d --name ora26ai_bench_nano -e ORACLE_PWD=oracle -p 21521:1521 container-registry.oracle.com/database/free:latest");
+            println!(
+                "  Expected env defaults: ORA35_USER=system ORA35_PASSWORD=oracle ORA35_DSN=127.0.0.1:21521/FREEPDB1"
+            );
             return;
         }
     };
@@ -1419,12 +1594,12 @@ fn pg35_benchmark() {
     // Schema + Data
     println!("\n  Setting up schemas...");
     setup_helios_schema(&db);
-    setup_pg_schema(&pg);
+    setup_ora_schema(&mut ora);
     println!("  [OK] Schema created in both engines");
 
     println!("  Populating data (200+50+500+1000+20 = 1770 rows)...");
     populate_helios(&db);
-    populate_pg(&pg);
+    populate_ora(&mut ora);
     println!("  [OK] Data populated in both engines");
 
     // Verify row counts
@@ -1438,25 +1613,23 @@ fn pg35_benchmark() {
             }
         })
         .unwrap_or_else(|_| "err".to_string());
-    // Legacy sanity check counted the single aggregate row instead of table rows:
-    // let p_count = pg.query_count("SELECT COUNT(*) FROM customers").unwrap_or(0);
-    let p_count = pg.query_count("SELECT * FROM customers").unwrap_or(0);
-    println!("  [OK] Customers: Nano={} PG={}", h_count, p_count);
+    let p_count = ora.query_count("SELECT * FROM customers").unwrap_or(0);
+    println!("  [OK] Customers: Nano={} Oracle={}", h_count, p_count);
 
     // Run benchmarks
     // Legacy fixed iteration count:
     // let iters = 20;
-    let iters = pg35_iters();
+    let iters = ora35_iters();
     println!("\n  Running 35 categories x {} iterations each x 2 engines...\n", iters);
 
     let start = Instant::now();
-    let results = run_all_categories(&db, &pg, iters);
+    let results = run_all_categories(&db, &mut ora, iters);
     let total_time = start.elapsed();
 
     // Output
     // Legacy fixed-label call:
     // print_comparison_table(&results);
-    print_comparison_table(&results, &pg_label);
+    print_comparison_table(&results, &ora_label);
     print_trace_breakdown(&results);
     print_analysis(&results);
 

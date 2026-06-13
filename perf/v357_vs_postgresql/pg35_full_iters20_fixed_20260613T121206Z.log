@@ -1,0 +1,163 @@
+warning: call to `.clone()` on a reference in this situation does nothing
+    --> src/sql/executor/phase3.rs:354:73
+     |
+ 354 |           .ok_or_else(|| Error::execution("No storage engine available"))?
+     |  _________________________________________________________________________^
+ 355 | |         .clone();
+     | |________________^
+     |
+     = note: the type `StorageEngine` does not implement `Clone`, so calling `clone` on `&StorageEngine` copies the reference, which does not do anything and can be removed
+     = note: `#[warn(noop_method_call)]` on by default
+help: remove this redundant call
+     |
+ 354 -         .ok_or_else(|| Error::execution("No storage engine available"))?
+ 355 -         .clone();
+ 354 +         .ok_or_else(|| Error::execution("No storage engine available"))?;
+     |
+help: if you meant to clone `StorageEngine`, implement `Clone` for it
+    -->  src/storage/engine.rs:1708:1
+     |
+1708 + #[derive(Clone)]
+1709 | pub struct StorageEngine {
+     |
+
+warning: call to `.clone()` on a reference in this situation does nothing
+    --> src/sql/executor/phase3.rs:604:73
+     |
+ 604 |           .ok_or_else(|| Error::execution("No storage engine available"))?
+     |  _________________________________________________________________________^
+ 605 | |         .clone();
+     | |________________^
+     |
+     = note: the type `StorageEngine` does not implement `Clone`, so calling `clone` on `&StorageEngine` copies the reference, which does not do anything and can be removed
+help: remove this redundant call
+     |
+ 604 -         .ok_or_else(|| Error::execution("No storage engine available"))?
+ 605 -         .clone();
+ 604 +         .ok_or_else(|| Error::execution("No storage engine available"))?;
+     |
+help: if you meant to clone `StorageEngine`, implement `Clone` for it
+    -->  src/storage/engine.rs:1708:1
+     |
+1708 + #[derive(Clone)]
+1709 | pub struct StorageEngine {
+     |
+
+warning: `heliosdb-nano` (lib) generated 2 warnings (run `cargo fix --lib -p heliosdb-nano` to apply 2 suggestions)
+warning: value assigned to `child_dead` is never read
+    --> src/main.rs:1289:21
+     |
+1289 |                     child_dead = true;
+     |                     ^^^^^^^^^^^^^^^^^
+     |
+     = help: maybe it is overwritten before being read?
+     = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+   Compiling heliosdb-nano v3.57.0 (/home/gpc/HDB/Nano-r01)
+warning: `heliosdb-nano` (bin "heliosdb-nano") generated 1 warning
+    Finished `release` profile [optimized] target(s) in 1m 52s
+     Running tests/pg35_benchmark.rs (target/release/deps/pg35_benchmark-74f47e41dccd3a74)
+
+running 1 test
+
+=========================================================================================================
+  HELIOSDB-NANO vs POSTGRESQL 18.4 -- COMPREHENSIVE 35-CATEGORY BENCHMARK
+  HeliosDB-Nano v3.57.0 (Embedded/In-Memory) vs POSTGRESQL 18.4 (Docker/25433)
+=========================================================================================================
+
+  [OK] Connected to POSTGRESQL 18.4 on configured DSN
+  [OK] HeliosDB-Nano in-memory instance created
+
+  Setting up schemas...
+  [OK] Schema created in both engines
+  Populating data (200+50+500+1000+20 = 1770 rows)...
+  [OK] Data populated in both engines
+  [OK] Customers: Nano=Int8(200) PG=200
+
+  Running 35 categories x 20 iterations each x 2 engines...
+
+
+=========================================================================================================
+  HELIOSDB-NANO vs POSTGRESQL 18.4 -- HEAD-TO-HEAD COMPARISON
+  Dataset: 200 customers, 50 products, 500 orders, 1000 items, 20 categories
+=========================================================================================================
+
+Category               |    Nano(avg) | POSTGRESQL 18.4(avg) |      Ratio |   Winner
+---------------------------------------------------------------------------------------------------------
+CREATE TABLE           |        156us |      20.18ms |    129.63x |     Nano
+CREATE INDEX           |        280us |      22.72ms |     81.25x |     Nano
+ALTER TABLE            |        659us |      20.03ms |     30.38x |     Nano
+DROP TABLE             |       61.4us |       7.65ms |    124.63x |     Nano
+CREATE/DROP VIEW       |        243us |      17.44ms |     71.63x |     Nano
+REFRESH MATVIEW        |        293us |       9.60ms |     32.80x |     Nano
+TRUNCATE               |        104us |      53.70ms |    517.70x |     Nano
+INSERT single          |       8.56us |       6.24ms |    729.12x |     Nano
+INSERT multi-row       |        137us |      11.63ms |     85.15x |     Nano
+INSERT..SELECT         |        385us |       6.17ms |     16.04x |     Nano
+UPDATE point           |       19.8us |      12.97ms |    655.55x |     Nano
+DELETE point           |       4.74us |       6.97ms |   1470.09x |     Nano
+UPSERT                 |       96.3us |       8.16ms |     84.76x |     Nano
+UPDATE+subquery        |        215us |       8.56ms |     39.82x |     Nano
+Point lookup           |       3.90us |        270us |     69.38x |     Nano
+Full scan+filter       |       25.2us |        345us |     13.66x |     Nano
+Aggregation            |       0.66us |        358us |    541.53x |     Nano
+INNER JOIN             |        249us |        326us |      1.31x |     Nano
+LEFT JOIN              |        239us |        409us |      1.71x |     Nano
+4-table JOIN           |        693us |        603us |      1.15x |       PG
+Scalar subquery        |       2.50us |        421us |    168.75x |     Nano
+EXISTS subquery        |       0.33us |        524us |   1582.52x |     Nano
+IN subquery            |       6.44us |        454us |     70.53x |     Nano
+CTE                    |       26.5us |        635us |     23.99x |     Nano
+Recursive CTE          |       3.02us |        405us |    133.86x |     Nano
+Window funcs           |       25.0us |        562us |     22.54x |     Nano
+UNION                  |       9.67us |        415us |     42.96x |     Nano
+DISTINCT               |       0.66us |        317us |    478.90x |     Nano
+ORDER+LIMIT            |        412us |        362us |      1.14x |       PG
+CASE expr              |       14.9us |        336us |     22.58x |     Nano
+LIKE/BETWEEN/IN        |       9.75us |        362us |     37.08x |     Nano
+String ops             |       10.7us |        350us |     32.76x |     Nano
+Transaction ctl        |       0.39us |      15.97ms |  40640.94x |     Nano
+Prepared stmts         |        725us |        683us |      1.06x |       PG
+SET/SHOW/RESET         |       8.33us |        603us |     72.35x |     Nano
+---------------------------------------------------------------------------------------------------------
+SCOREBOARD: Nano wins 32 | PG wins 3 | Ties 0 | N/A 0 | Total 35
+
+================================================================================
+  TOP OPTIMIZATION TARGETS (where PG wins by largest margin)
+================================================================================
+
+   1. 4-table JOIN           Nano      693us vs PG      603us (1.1x slower)
+   2. ORDER+LIMIT            Nano      412us vs PG      362us (1.1x slower)
+   3. Prepared stmts         Nano      725us vs PG      683us (1.1x slower)
+
+  NANO ADVANTAGES (faster than PG):
+   1. Transaction ctl        Nano     0.39us vs PG    15.97ms (40640.9x faster)
+   2. EXISTS subquery        Nano     0.33us vs PG      524us (1582.5x faster)
+   3. DELETE point           Nano     4.74us vs PG     6.97ms (1470.1x faster)
+   4. INSERT single          Nano     8.56us vs PG     6.24ms (729.1x faster)
+   5. UPDATE point           Nano     19.8us vs PG    12.97ms (655.6x faster)
+   6. Aggregation            Nano     0.66us vs PG      358us (541.5x faster)
+   7. TRUNCATE               Nano      104us vs PG    53.70ms (517.7x faster)
+   8. DISTINCT               Nano     0.66us vs PG      317us (478.9x faster)
+   9. Scalar subquery        Nano     2.50us vs PG      421us (168.7x faster)
+  10. Recursive CTE          Nano     3.02us vs PG      405us (133.9x faster)
+
+================================================================================
+  PERFORMANCE TIER ANALYSIS
+================================================================================
+
+    Critical (>5x slower):    0 categories
+    Significant (2-5x):       0 categories
+    Moderate (1.05-2x):       3 categories
+    Competitive (~1x):        0 categories
+    Nano faster (<0.95x):     32 categories
+    Not supported (N/A):      0 categories
+
+=========================================================================================================
+  BENCHMARK COMPLETE -- Total time: 6.0s
+=========================================================================================================
+
+test pg35_benchmark ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.11s
+
