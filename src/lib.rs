@@ -14408,11 +14408,24 @@ impl EmbeddedDatabase {
         let catalog = self.storage.catalog();
         let schema = catalog.get_table_schema(table_name)?;
 
+        // Candidate (c) fix: under bulk_load_mode, allocate row ids from the
+        // in-memory VOLATILE counter (no per-row RocksDB counter PUT + WAL
+        // UpdateCounter append) and persist the final value once after the
+        // batch via flush_row_counter — the fast-INSERT path's pattern. Removes
+        // ~one counter PUT + one WAL append per row on a bulk load. Non-bulk
+        // callers keep the per-row persisting next_row_id() so default crash
+        // semantics — and pg35 — are byte-unchanged.
+        let bulk = self.storage.is_bulk_load_mode();
+
         let mut row_ids: Vec<u64> = Vec::with_capacity(tuples.len());
         let mut art_updates: Vec<(u64, std::collections::HashMap<String, Value>)> = Vec::with_capacity(tuples.len());
 
         for mut tuple in tuples {
-            let row_id = catalog.next_row_id(table_name)?;
+            let row_id = if bulk {
+                self.storage.next_row_id_volatile(table_name)
+            } else {
+                catalog.next_row_id(table_name)?
+            };
 
             // Fill BIGSERIAL / SERIAL PK columns with the auto-allocated
             // row_id when the caller left them NULL.
@@ -14498,6 +14511,13 @@ impl EmbeddedDatabase {
         // prior clear, so default behavior — and pg35 — is byte-unchanged.
         if !self.storage.is_bulk_load_mode() {
             self.plan_cache.clear();
+        }
+
+        // Candidate (c): persist the row-id counter ONCE after the bulk batch
+        // (it was bumped in-memory only above under bulk_load_mode). Outside
+        // bulk_load_mode the per-row next_row_id() already persisted it.
+        if bulk {
+            self.storage.flush_row_counter(table_name)?;
         }
 
         Ok(row_ids)
