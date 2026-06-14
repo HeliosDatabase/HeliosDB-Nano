@@ -229,6 +229,16 @@ impl Config {
                 self.storage.durable_commit = durable_commit;
             }
         }
+        if let Some(compression) = bundle.compression {
+            if !explicitly_set("compression") {
+                self.storage.compression = compression;
+            }
+        }
+        if let Some(cache_size) = bundle.cache_size {
+            if !explicitly_set("cache_size") {
+                self.storage.cache_size = cache_size;
+            }
+        }
     }
 
     /// Save configuration to file
@@ -477,6 +487,16 @@ pub enum ProfileConfig {
     /// `Balanced`; the named profile exists so agent deployments opt into
     /// the documented bundle rather than individual knobs.
     Agent,
+    /// Regenerable bulk-ingest bundle (v3.58): `wal_sync_mode = "async"`,
+    /// `time_travel_enabled = false`, `durable_commit = false`,
+    /// `compression = "lz4"`, larger `cache_size`, plus code-index overrides
+    /// (skip refs / cross-file-resolve, bounded `chunk_size`). For throwaway /
+    /// rebuildable indexes (e.g. a code-KB) where `AS OF` history, a fully
+    /// resolved ref graph, and power-loss durability are not needed during the
+    /// build. Opt-in only — never selected by default, so OLTP/`pg35` paths are
+    /// untouched.
+    #[serde(rename = "fast_ingest")]
+    FastIngest,
 }
 
 /// Bundled storage values a profile applies (None = leave field untouched).
@@ -484,6 +504,21 @@ pub(crate) struct ProfileStorageBundle {
     pub wal_sync_mode: WalSyncModeConfig,
     pub time_travel_enabled: bool,
     pub durable_commit: Option<bool>,
+    /// SST compression (None = leave the configured/default value).
+    pub compression: Option<CompressionType>,
+    /// RocksDB cache budget in bytes (None = leave the configured/default value).
+    pub cache_size: Option<usize>,
+}
+
+/// Code-index overrides a profile recommends for the ingest path. Lives in
+/// `config.rs` (always compiled, no `code-graph` dependency) so an external
+/// indexer plugin can read the engine's recommended values instead of
+/// re-hardcoding them, then map them onto its `CodeIndexOptions`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CodeIndexProfileDefaults {
+    pub skip_symbol_refs: bool,
+    pub skip_cross_file_resolve: bool,
+    pub chunk_size: Option<usize>,
 }
 
 impl ProfileConfig {
@@ -494,6 +529,22 @@ impl ProfileConfig {
             ProfileConfig::Balanced => "balanced",
             ProfileConfig::Fast => "fast",
             ProfileConfig::Agent => "agent",
+            ProfileConfig::FastIngest => "fast_ingest",
+        }
+    }
+
+    /// Code-index overrides recommended when ingesting under this profile.
+    /// `None` for non-ingest profiles (no change to indexing behavior). An
+    /// external indexer reads this and applies it to its `CodeIndexOptions`,
+    /// keeping the values single-sourced in the engine.
+    pub fn code_index_overrides(&self) -> Option<CodeIndexProfileDefaults> {
+        match self {
+            ProfileConfig::FastIngest => Some(CodeIndexProfileDefaults {
+                skip_symbol_refs: true,
+                skip_cross_file_resolve: true,
+                chunk_size: Some(2000),
+            }),
+            _ => None,
         }
     }
 
@@ -506,16 +557,34 @@ impl ProfileConfig {
                 wal_sync_mode: WalSyncModeConfig::Sync,
                 time_travel_enabled: true,
                 durable_commit: None,
+                compression: None,
+                cache_size: None,
             },
             ProfileConfig::Balanced => ProfileStorageBundle {
                 wal_sync_mode: WalSyncModeConfig::GroupCommit,
                 time_travel_enabled: true,
                 durable_commit: None,
+                compression: None,
+                cache_size: None,
             },
             ProfileConfig::Fast => ProfileStorageBundle {
                 wal_sync_mode: WalSyncModeConfig::GroupCommit,
                 time_travel_enabled: false,
                 durable_commit: Some(false),
+                compression: None,
+                cache_size: None,
+            },
+            // Regenerable bulk-ingest: async WAL, no version snapshots, no
+            // power-loss durability, cheap Lz4 SST compression, and a larger
+            // cache budget (the 25% write-buffer slice cuts L0 flushes during
+            // the bulk write). Opt-in; all other profiles set the new fields to
+            // None so their behavior — and pg35 — is unchanged.
+            ProfileConfig::FastIngest => ProfileStorageBundle {
+                wal_sync_mode: WalSyncModeConfig::Async,
+                time_travel_enabled: false,
+                durable_commit: Some(false),
+                compression: Some(CompressionType::Lz4),
+                cache_size: Some(2 * 1024 * 1024 * 1024),
             },
             // Agent: time-travel must stay on (AS OF reads + AS OF branch
             // anchors are part of the agent bundle), writes use group
@@ -526,6 +595,8 @@ impl ProfileConfig {
                 wal_sync_mode: WalSyncModeConfig::GroupCommit,
                 time_travel_enabled: true,
                 durable_commit: None,
+                compression: None,
+                cache_size: None,
             },
         }
     }
