@@ -38,9 +38,15 @@ Nothing changes Nano defaults or the simple-Query OLTP path pg35 measures.
   preserved). **GATE NOW.** Feature: `code-embed`. Targeted A/B: code_index embed
   wall-time, single-call vs batched (expect 2–5× on code_index). pg35 neutrality:
   embed is not on the pg35 path → confirm pg35 unchanged + default-feature build clean.
-- [ ] Item 1b — `bulk_load_mode` actually suspends inline vector-DML/secondary-index
-  maintenance on `bulk_insert_tuples` (lib.rs:14465-14473). Also the 3.57 write-path
-  regression suspect → bisect.
+- [x] Item 1b — **3.57.0 write-path regression FIXED** (3d15e9c). Root cause (CodeKB
+  candidate b): `bulk_insert_tuples` called `self.plan_cache.clear()` on every call
+  (lib.rs:14490) — a full ShardedLruCache clear per chunk, defeating the plan cache
+  for all interleaved DELETE/UPDATE. Plans aren't data-stale, so it was pure waste.
+  Fix: skip it under `bulk_load_mode`; `result_cache` still invalidated. Candidate
+  (a) inline vector_dml_gate ruled out (off for code-graph tables, no vector index at
+  ingest). pg35-neutral (bulk_load_mode off on OLTP path). Gate: lib 1906/0, crud/txn/
+  fast-path pass, pg35 33-34 wins / no envelope erosion. CodeKB re-running --fast-ingest
+  (target < 6782.6s); if residual remains, candidate (c) engine.rs growth is next.
 - [~] Item 2 — COPY wire sub-protocol. **FROM STDIN (text) DONE + gated**:
   2a wire frames (e357eb5), 2b parser (833846d), 2c handler state machine
   (68b443b). pg35 34-0-1/32-0-3, zero PG wins, no envelope erosion. Proxy
