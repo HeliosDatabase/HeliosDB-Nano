@@ -45,8 +45,14 @@ Nothing changes Nano defaults or the simple-Query OLTP path pg35 measures.
   Fix: skip it under `bulk_load_mode`; `result_cache` still invalidated. Candidate
   (a) inline vector_dml_gate ruled out (off for code-graph tables, no vector index at
   ingest). pg35-neutral (bulk_load_mode off on OLTP path). Gate: lib 1906/0, crud/txn/
-  fast-path pass, pg35 33-34 wins / no envelope erosion. CodeKB re-running --fast-ingest
-  (target < 6782.6s); if residual remains, candidate (c) engine.rs growth is next.
+  fast-path pass, pg35 33-34 wins / no envelope erosion.
+  **RE-VALIDATION STATUS (2026-06-14): IN PROGRESS, RISK FLAG.** CodeKB's --fast-ingest
+  re-run has **crossed the old 6782.6s window without the final code-graph number landing
+  yet** — early signal that item-1b alone may NOT fully close the regression. If the final
+  number lands ABOVE 6782.6s, **candidate (c) (engine.rs 9838->12607 growth — net-new
+  per-statement work on the execute/commit path) is the next bisect**, and v3.58 is NOT yet
+  a perf win for code-graph. Awaiting CodeKB's final number before concluding. **v3.58
+  release is GATED on this number.**
 - [~] Item 2 — COPY wire sub-protocol. **FROM STDIN (text) DONE + gated**:
   2a wire frames (e357eb5), 2b parser (833846d), 2c handler state machine
   (68b443b). pg35 34-0-1/32-0-3, zero PG wins, no envelope erosion. Proxy
@@ -140,8 +146,14 @@ Nothing changes Nano defaults or the simple-Query OLTP path pg35 measures.
 - [ ] Regression bisect 3.36.1→3.57.0 bulk write (CodeKB §4.2).
 
 ### 3.59
-- [!] Item 3 — plan cache: **INVESTIGATION FINDING — already implemented; building it
-  would be REDUNDANT.** Nano already has BOTH text-keyed caches and the extended path
+- [x] Item 3 — plan cache: **RESOLVED — no Nano change. Proxy empirically confirmed
+  (2026-06-14) the extended/prepared gap is PROTOCOL OVERHEAD, not re-planning (Nano
+  already text-caches plans), and fixed it PROXY-SIDE: unnamed-Parse promotion (Proxy
+  commit 275c202) — repeated unnamed Parses collapse to one cached statement, 98%
+  redundant Parses eliminated (50 extended txns -> 1 backend Parse with promotion ON vs
+  50 OFF). Validation PG 9/9, Nano 7/7, ON/OFF correctness 8/8, lib 1344/0. The Nano
+  investigation (below) was vindicated — a Nano plan-cache feature would have been pure
+  redundancy.** ORIGINAL FINDING: Nano already has BOTH text-keyed caches and the extended path
   uses them: `parse_cache` (SQL→AST, `parse_cached` lib.rs:9977) and `plan_cache`
   (SQL→LogicalPlan, `parameterized_plan_cached` lib.rs:9991, key `"\0params\0{sql}"`).
   Extended Execute → `pinned_plan_for` (handler_extended.rs:417) →
