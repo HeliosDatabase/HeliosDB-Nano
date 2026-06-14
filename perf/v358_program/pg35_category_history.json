@@ -1,0 +1,285 @@
+{
+ "envelope": {
+  "Recursive CTE": {
+   "ratio_min": 0.0052,
+   "ratio_median": 0.0059,
+   "ratio_max": 0.0077,
+   "nano_us_median": 2.61,
+   "pg_us_median": 405.0,
+   "n": 11
+  },
+  "Point lookup": {
+   "ratio_min": 0.0115,
+   "ratio_median": 0.0144,
+   "ratio_max": 0.0164,
+   "nano_us_median": 3.82,
+   "pg_us_median": 270.0,
+   "n": 11
+  },
+  "CTE": {
+   "ratio_min": 0.0305,
+   "ratio_median": 0.0395,
+   "ratio_max": 0.0511,
+   "nano_us_median": 25.5,
+   "pg_us_median": 645.0,
+   "n": 11
+  },
+  "4-table JOIN": {
+   "ratio_min": 0.7248,
+   "ratio_median": 0.8816,
+   "ratio_max": 1.1493,
+   "nano_us_median": 528.0,
+   "pg_us_median": 623.0,
+   "n": 11
+  },
+  "LEFT JOIN": {
+   "ratio_min": 0.5844,
+   "ratio_median": 0.7286,
+   "ratio_max": 0.7861,
+   "nano_us_median": 236.0,
+   "pg_us_median": 328.0,
+   "n": 11
+  },
+  "UPSERT": {
+   "ratio_min": 0.0061,
+   "ratio_median": 0.0112,
+   "ratio_max": 0.0151,
+   "nano_us_median": 90.9,
+   "pg_us_median": 8400.0,
+   "n": 11
+  },
+  "ORDER+LIMIT": {
+   "ratio_min": 0.8534,
+   "ratio_median": 0.9728,
+   "ratio_max": 1.1381,
+   "nano_us_median": 374.0,
+   "pg_us_median": 375.0,
+   "n": 11
+  },
+  "DROP TABLE": {
+   "ratio_min": 0.0054,
+   "ratio_median": 0.007,
+   "ratio_max": 0.0101,
+   "nano_us_median": 58.9,
+   "pg_us_median": 8580.0,
+   "n": 11
+  },
+  "CREATE/DROP VIEW": {
+   "ratio_min": 0.0075,
+   "ratio_median": 0.011,
+   "ratio_max": 0.0163,
+   "nano_us_median": 213.0,
+   "pg_us_median": 20690.0,
+   "n": 11
+  },
+  "ALTER TABLE": {
+   "ratio_min": 0.0329,
+   "ratio_median": 0.0372,
+   "ratio_max": 0.0491,
+   "nano_us_median": 618.0,
+   "pg_us_median": 16780.0,
+   "n": 11
+  },
+  "IN subquery": {
+   "ratio_min": 0.0078,
+   "ratio_median": 0.01,
+   "ratio_max": 0.0142,
+   "nano_us_median": 4.62,
+   "pg_us_median": 472.0,
+   "n": 11
+  },
+  "REFRESH MATVIEW": {
+   "ratio_min": 0.0167,
+   "ratio_median": 0.0301,
+   "ratio_max": 0.0354,
+   "nano_us_median": 294.0,
+   "pg_us_median": 9730.0,
+   "n": 11
+  },
+  "UPDATE+subquery": {
+   "ratio_min": 0.0129,
+   "ratio_median": 0.021,
+   "ratio_max": 0.0328,
+   "nano_us_median": 172.0,
+   "pg_us_median": 8150.0,
+   "n": 11
+  },
+  "LIKE/BETWEEN/IN": {
+   "ratio_min": 0.0259,
+   "ratio_median": 0.0277,
+   "ratio_max": 0.0337,
+   "nano_us_median": 10.2,
+   "pg_us_median": 365.0,
+   "n": 11
+  },
+  "Aggregation": {
+   "ratio_min": 0.0017,
+   "ratio_median": 0.0019,
+   "ratio_max": 0.0023,
+   "nano_us_median": 0.66,
+   "pg_us_median": 344.0,
+   "n": 11
+  },
+  "Window funcs": {
+   "ratio_min": 0.0325,
+   "ratio_median": 0.0383,
+   "ratio_max": 0.0445,
+   "nano_us_median": 22.7,
+   "pg_us_median": 559.0,
+   "n": 11
+  },
+  "UPDATE point": {
+   "ratio_min": 0.0013,
+   "ratio_median": 0.0026,
+   "ratio_max": 0.0035,
+   "nano_us_median": 20.8,
+   "pg_us_median": 8420.0,
+   "n": 11
+  },
+  "CASE expr": {
+   "ratio_min": 0.0367,
+   "ratio_median": 0.045,
+   "ratio_max": 0.0556,
+   "nano_us_median": 14.9,
+   "pg_us_median": 346.0,
+   "n": 11
+  },
+  "String ops": {
+   "ratio_min": 0.029,
+   "ratio_median": 0.0325,
+   "ratio_max": 0.0421,
+   "nano_us_median": 11.0,
+   "pg_us_median": 354.0,
+   "n": 11
+  },
+  "CREATE INDEX": {
+   "ratio_min": 0.0095,
+   "ratio_median": 0.0144,
+   "ratio_max": 0.0204,
+   "nano_us_median": 279.0,
+   "pg_us_median": 19990.0,
+   "n": 11
+  },
+  "DISTINCT": {
+   "ratio_min": 0.0015,
+   "ratio_median": 0.0018,
+   "ratio_max": 0.0021,
+   "nano_us_median": 0.54,
+   "pg_us_median": 304.0,
+   "n": 11
+  },
+  "Scalar subquery": {
+   "ratio_min": 0.004,
+   "ratio_median": 0.0051,
+   "ratio_max": 0.0059,
+   "nano_us_median": 2.19,
+   "pg_us_median": 421.0,
+   "n": 11
+  },
+  "CREATE TABLE": {
+   "ratio_min": 0.0042,
+   "ratio_median": 0.008,
+   "ratio_max": 0.0102,
+   "nano_us_median": 143.0,
+   "pg_us_median": 17780.0,
+   "n": 11
+  },
+  "Transaction ctl": {
+   "ratio_min": 0.0,
+   "ratio_median": 0.0,
+   "ratio_max": 0.0001,
+   "nano_us_median": 0.38,
+   "pg_us_median": 9550.0,
+   "n": 11
+  },
+  "INSERT..SELECT": {
+   "ratio_min": 0.0263,
+   "ratio_median": 0.0525,
+   "ratio_max": 0.0695,
+   "nano_us_median": 372.0,
+   "pg_us_median": 7150.0,
+   "n": 11
+  },
+  "EXISTS subquery": {
+   "ratio_min": 0.0004,
+   "ratio_median": 0.0005,
+   "ratio_max": 0.0006,
+   "nano_us_median": 0.3,
+   "pg_us_median": 552.0,
+   "n": 11
+  },
+  "TRUNCATE": {
+   "ratio_min": 0.0013,
+   "ratio_median": 0.0018,
+   "ratio_max": 0.0029,
+   "nano_us_median": 102.0,
+   "pg_us_median": 55670.0,
+   "n": 11
+  },
+  "SET/SHOW/RESET": {
+   "ratio_min": 0.0095,
+   "ratio_median": 0.011,
+   "ratio_max": 0.0138,
+   "nano_us_median": 6.66,
+   "pg_us_median": 603.0,
+   "n": 11
+  },
+  "UNION": {
+   "ratio_min": 0.0168,
+   "ratio_median": 0.0201,
+   "ratio_max": 0.0237,
+   "nano_us_median": 8.54,
+   "pg_us_median": 415.0,
+   "n": 11
+  },
+  "INSERT multi-row": {
+   "ratio_min": 0.0118,
+   "ratio_median": 0.0188,
+   "ratio_max": 0.0254,
+   "nano_us_median": 133.0,
+   "pg_us_median": 7980.0,
+   "n": 11
+  },
+  "INSERT single": {
+   "ratio_min": 0.0008,
+   "ratio_median": 0.001,
+   "ratio_max": 0.0017,
+   "nano_us_median": 7.49,
+   "pg_us_median": 6940.0,
+   "n": 11
+  },
+  "Full scan+filter": {
+   "ratio_min": 0.0693,
+   "ratio_median": 0.0797,
+   "ratio_max": 0.0913,
+   "nano_us_median": 25.2,
+   "pg_us_median": 344.0,
+   "n": 11
+  },
+  "DELETE point": {
+   "ratio_min": 0.0003,
+   "ratio_median": 0.0005,
+   "ratio_max": 0.0007,
+   "nano_us_median": 3.91,
+   "pg_us_median": 7890.0,
+   "n": 11
+  },
+  "INNER JOIN": {
+   "ratio_min": 0.7284,
+   "ratio_median": 0.8105,
+   "ratio_max": 0.9213,
+   "nano_us_median": 249.0,
+   "pg_us_median": 321.0,
+   "n": 11
+  },
+  "Prepared stmts": {
+   "ratio_min": 0.8633,
+   "ratio_median": 1.0243,
+   "ratio_max": 1.101,
+   "nano_us_median": 676.0,
+   "pg_us_median": 683.0,
+   "n": 11
+  }
+ },
+ "snapshots": []
+}
