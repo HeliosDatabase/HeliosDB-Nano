@@ -56,6 +56,37 @@ Nothing changes Nano defaults or the simple-Query OLTP path pg35 measures.
   CopyOutResponse + stream rows as CopyData); (iii) CSV + binary formats
   (PGCOPY\n\377\r\n\0 signature). 2c currently returns a clear 0A000 error for
   TO STDOUT / non-text.
+  COPY STATUS: FROM STDIN + TO STDOUT both support **text (2c/2e) + CSV (2f)**,
+  all gated green, flush-fix in (c32aacf). Remaining = **binary (2g)**.
+
+  ### Item 2g — COPY binary format — SCOPE (decision pending, NOT implemented)
+  **Framing (clear):** header = 11-byte signature `PGCOPY\n\377\r\n\0` + int32
+  flags(0) + int32 header-ext-len(0); each row = int16 field-count, then per
+  field int32 length (`-1`=NULL) + value bytes; trailer = int16 `-1`.
+  **Per-type byte layout (the type table):**
+  | type | binary layout | clarity |
+  |---|---|---|
+  | bool | 1 byte 0/1 | CLEAR |
+  | int2/int4/int8 | 2/4/8 bytes big-endian | CLEAR |
+  | float4/float8 | IEEE-754 bits, big-endian | CLEAR |
+  | text/varchar/bytea | raw bytes | CLEAR |
+  | uuid | 16 bytes | CLEAR |
+  | date | int32 days since 2000-01-01 | CLEAR |
+  | timestamp/timestamptz | int64 µs since 2000-01-01 00:00:00 UTC | CLEAR |
+  | time | int64 µs since midnight | CLEAR |
+  | interval | int64 µs + int32 days + int32 months | mostly clear |
+  | **numeric** | int16 ndigits, int16 weight, int16 sign, int16 dscale, then ndigits × int16 base-10000 digits | **NOT trivial — fiddly, easy to get wrong** |
+  | json / jsonb | json=text; jsonb = 1 version byte (0x01) + text | moderate |
+  **FROM STDIN binary** additionally needs the **table column types** (schema
+  lookup) to decode each field's bytes back to a value (text/CSV don't — they're
+  self-describing); decode must be the exact inverse of the encode table.
+  **Test-vector path (available):** the PG18.4 container can emit reference bytes
+  via `COPY t TO STDOUT WITH (FORMAT binary)` (and accept `FROM STDIN ... BINARY`);
+  diff Nano's output byte-for-byte against PG's, per type, as the correctness gate.
+  **Risk:** a byte-exact codec is where a single wrong layout = SILENT data
+  corruption in the migration mirror — the exact failure mode to avoid. numeric
+  is the unclear cell; common types are clear.
+
   PROTOCOL LAYER MAPPED (ready to implement in increments, each build+gate):
   - **2a messages.rs:** FrontendMessageType += `CopyData=b'd'`, `CopyDone=b'c'`,
     `CopyFail=b'f'`; BackendMessageType += `CopyInResponse=b'G'`,
