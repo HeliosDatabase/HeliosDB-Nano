@@ -281,5 +281,46 @@
    "n": 11
   }
  },
- "snapshots": []
+ "snapshots": [
+  {
+   "label": "items1+4+8+lz4embedfix",
+   "ratios": {
+    "CREATE TABLE": 0.00686,
+    "CREATE INDEX": 0.01237,
+    "ALTER TABLE": 0.0382,
+    "DROP TABLE": 0.00955,
+    "CREATE/DROP VIEW": 0.01454,
+    "REFRESH MATVIEW": 0.02232,
+    "TRUNCATE": 0.00188,
+    "INSERT single": 0.00187,
+    "INSERT multi-row": 0.02158,
+    "INSERT..SELECT": 0.06313,
+    "UPDATE point": 0.00359,
+    "DELETE point": 0.00068,
+    "UPSERT": 0.00873,
+    "UPDATE+subquery": 0.02744,
+    "Point lookup": 0.01569,
+    "Full scan+filter": 0.08693,
+    "Aggregation": 0.00211,
+    "INNER JOIN": 0.7998,
+    "LEFT JOIN": 0.71554,
+    "4-table JOIN": 0.87314,
+    "Scalar subquery": 0.00401,
+    "EXISTS subquery": 0.00052,
+    "IN subquery": 0.00989,
+    "CTE": 0.03546,
+    "Recursive CTE": 0.00588,
+    "Window funcs": 0.03521,
+    "UNION": 0.01928,
+    "DISTINCT": 0.00168,
+    "ORDER+LIMIT": 0.85282,
+    "CASE expr": 0.04477,
+    "LIKE/BETWEEN/IN": 0.02862,
+    "String ops": 0.03761,
+    "Transaction ctl": 5e-05,
+    "Prepared stmts": 0.88503,
+    "SET/SHOW/RESET": 0.01189
+   }
+  }
+ ]
 }
