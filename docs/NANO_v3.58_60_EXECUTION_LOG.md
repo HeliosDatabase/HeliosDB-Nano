@@ -103,4 +103,15 @@ knobs, makes cache_size effective) → 1b (bulk_load_mode suspend) → 2 (COPY, 
 - 2026-06-14: **Item 1 (embed_batch) GATE GREEN** — default build clean (code_graph is
   feature-gated OUT of default → pg35-neutral by compilation), code-embed build clean
   (embed_batch compiles), code_graph tests 56/0. CodeKB to validate embed wall-time on its
-  corpus. Committed on integrate/v3.58.0. Proxy + CodeKB coordinated (above).
+  corpus. Committed integrate/v3.58.0 f71cdcb. Proxy + CodeKB coordinated (above).
+- 2026-06-14: **Item 4 (FastIngest profile) GATE GREEN** — default/pg35 build clean,
+  config tests 39/0, profile tests 11/0. pg35-neutral by construction (apply_profile_defaults
+  only runs when a profile is selected; pg35 selects none; existing profiles set new fields
+  None). Committed 455de90.
+
+**pg35 strategy (efficiency):** items neutral-BY-CONSTRUCTION (feature-gated out, or
+opt-in-profile/SET default-off) are gated by clean build + targeted tests + the inertness
+argument; a SINGLE consolidated pg35 A/B is run on the full integrate/v3.58.0 branch at the
+release boundary to confirm the whole batch is neutral (avoids N×40min redundant runs).
+Items that DO touch the live OLTP code path (e.g. 1b bulk_load_mode, plan-cache lookup on
+the hot path) get a per-item pg35 A/B before commit.
