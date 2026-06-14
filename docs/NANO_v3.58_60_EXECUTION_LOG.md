@@ -8,11 +8,16 @@ Workspace: `/home/gpc/HDB/Nano` (the ISSUE-08 WIP is stashed; do not pop it).
 1. **Builds clean**: `cargo build --release` (default features) AND with the
    item's feature(s) enabled. No new errors (pre-existing phase3.rs/main.rs
    warnings OK).
-2. **pg35 NEUTRALITY (the hard gate)**: rebuild `pg35_benchmark`, run ≥2 rounds
-   vs the 3.57.0 baseline with the new code present but the feature **OFF/default**.
-   The 35-category scoreboard and OLTP medians must be **unchanged** vs 3.57.0
-   (noise band only). If any OLTP row regresses, the item is NOT done — gate it
-   harder (default-off, separate code path) until neutral.
+2. **pg35 NEUTRALITY (the hard gate) + PER-CATEGORY EROSION TRACKING**: rebuild
+   `pg35_benchmark`, run ≥2 rounds vs PG18.4 capturing the **full per-category
+   table** (not just the SCOREBOARD) to `/tmp/<item>_pg35_full.log`, then run
+   `python3 /tmp/pg35_track.py <full-log> "<item-label>"`. The tracker appends a
+   snapshot to `perf/v358_program/pg35_category_history.json` and flags ANY
+   category whose Nano/PG ratio rose >0.05 vs baseline (margin eroding) or whose
+   winner flipped toward PG. Goal: catch GRADUAL loss of Nano's advantage that a
+   32-vs-33 scoreboard hides. A flagged category that isn't pure noise
+   (ratio in the 0.95–1.05 ~tie band oscillating) blocks the item until fixed.
+   The whole 35-category set must stay at-or-above its historical Nano margin.
 3. **Targeted ON A/B**: prove the claimed downstream win with the feature ON
    (e.g. embed wall-time, COPY ingest rate, extended-protocol tps).
 4. **Correctness**: relevant suite(s) green; for wire features add conformance
