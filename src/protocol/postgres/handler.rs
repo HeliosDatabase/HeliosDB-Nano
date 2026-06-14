@@ -589,6 +589,13 @@ where
             return Ok(());
         }
 
+        // COPY ... FROM STDIN / TO STDOUT is a wire sub-protocol — handle it
+        // here, before the normal parse/plan path (item 2c). parse_copy returns
+        // None for any non-STDIN/STDOUT SQL, so everything else falls through.
+        if let Some(copy_stmt) = super::copy::parse_copy(query) {
+            return self.handle_copy(copy_stmt).await;
+        }
+
         // Handle transaction commands (case-insensitive without allocation)
         let trimmed = query.trim();
         if trimmed.eq_ignore_ascii_case("BEGIN")
@@ -1245,6 +1252,88 @@ where
 
     /// Send a backend message (write only, no flush).
     /// Caller is responsible for flushing at the end of a response cycle.
+    /// COPY ... FROM STDIN wire sub-protocol (v3.58 item 2c). Sends
+    /// CopyInResponse, drains CopyData frames until CopyDone/CopyFail, parses
+    /// the text rows, and bulk-inserts them in batches. TO STDOUT and non-text
+    /// formats return a clear error for now (added in a 2c follow-up). Row
+    /// decoding + injection-safe INSERT construction live in the unit-tested
+    /// `copy` module.
+    async fn handle_copy(&mut self, copy: super::copy::CopyStatement) -> Result<()> {
+        use super::copy::CopyFormat;
+        if copy.to_stdout {
+            return self
+                .send_error("ERROR", "0A000", "COPY TO STDOUT is not yet supported", None, None)
+                .await;
+        }
+        if copy.format != CopyFormat::Text {
+            return self
+                .send_error(
+                    "ERROR",
+                    "0A000",
+                    "only COPY ... FROM STDIN (text format) is supported",
+                    None,
+                    None,
+                )
+                .await;
+        }
+
+        // Ready to receive: text format (overall_format = 0).
+        let ncols = copy.columns.len();
+        self.send_message(BackendMessage::CopyInResponse {
+            overall_format: 0,
+            column_formats: vec![0i16; ncols],
+        })
+        .await?;
+
+        // Drain CopyData frames until CopyDone / CopyFail.
+        let mut data: Vec<u8> = Vec::new();
+        let mut client_fail: Option<String> = None;
+        loop {
+            match self.read_message().await? {
+                Some(FrontendMessage::CopyData(chunk)) => data.extend_from_slice(&chunk),
+                Some(FrontendMessage::CopyDone) => break,
+                Some(FrontendMessage::CopyFail(msg)) => {
+                    client_fail = Some(msg);
+                    break;
+                }
+                // Connection ending mid-copy: abort without inserting.
+                None | Some(FrontendMessage::Terminate) => return Ok(()),
+                Some(_) => {
+                    return self
+                        .send_error(
+                            "ERROR",
+                            "08P01",
+                            "unexpected message during COPY FROM STDIN",
+                            None,
+                            None,
+                        )
+                        .await;
+                }
+            }
+        }
+        if let Some(msg) = client_fail {
+            return self
+                .send_error("ERROR", "57014", &format!("COPY from stdin failed: {msg}"), None, None)
+                .await;
+        }
+
+        // Parse text rows and bulk-insert in batches.
+        let rows = super::copy::parse_text_rows(&data);
+        let total = rows.len();
+        const BATCH: usize = 500;
+        for chunk in rows.chunks(BATCH) {
+            if let Some(sql) = super::copy::build_insert_sql(&copy.table, &copy.columns, chunk) {
+                if let Err(e) = self.database.execute(&sql) {
+                    return self
+                        .send_error("ERROR", "XX000", &format!("COPY insert failed: {e}"), None, None)
+                        .await;
+                }
+            }
+        }
+        self.send_command_complete(&format!("COPY {total}")).await?;
+        self.send_ready_for_query().await
+    }
+
     pub(super) async fn send_message(&mut self, msg: BackendMessage) -> Result<()> {
         self.write_buf.clear();
         msg.encode(&mut self.write_buf);
