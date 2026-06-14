@@ -321,6 +321,46 @@
     "Prepared stmts": 0.88503,
     "SET/SHOW/RESET": 0.01189
    }
+  },
+  {
+   "label": "item2c_copy_from_stdin",
+   "ratios": {
+    "CREATE TABLE": 0.0068,
+    "CREATE INDEX": 0.02092,
+    "ALTER TABLE": 0.03839,
+    "DROP TABLE": 0.00978,
+    "CREATE/DROP VIEW": 0.01459,
+    "REFRESH MATVIEW": 0.03077,
+    "TRUNCATE": 0.0019,
+    "INSERT single": 0.0015,
+    "INSERT multi-row": 0.01962,
+    "INSERT..SELECT": 0.06857,
+    "UPDATE point": 0.00347,
+    "DELETE point": 0.00065,
+    "UPSERT": 0.01726,
+    "UPDATE+subquery": 0.01216,
+    "Point lookup": 0.01787,
+    "Full scan+filter": 0.08044,
+    "Aggregation": 0.00219,
+    "INNER JOIN": 0.82157,
+    "LEFT JOIN": 0.75961,
+    "4-table JOIN": 0.95409,
+    "Scalar subquery": 0.00498,
+    "EXISTS subquery": 0.00058,
+    "IN subquery": 0.01175,
+    "CTE": 0.04282,
+    "Recursive CTE": 0.00662,
+    "Window funcs": 0.03819,
+    "UNION": 0.02559,
+    "DISTINCT": 0.00189,
+    "ORDER+LIMIT": 1.02726,
+    "CASE expr": 0.05036,
+    "LIKE/BETWEEN/IN": 0.03271,
+    "String ops": 0.03328,
+    "Transaction ctl": 4e-05,
+    "Prepared stmts": 0.93823,
+    "SET/SHOW/RESET": 0.01279
+   }
   }
  ]
 }
