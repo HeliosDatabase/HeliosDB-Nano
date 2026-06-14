@@ -1284,6 +1284,12 @@ where
             column_formats: vec![0i16; ncols],
         })
         .await?;
+        // The client must SEE CopyInResponse before it will send any CopyData,
+        // but send_message only writes into the BufWriter. Flush now — exactly
+        // like the auth-challenge path ("Client must read challenge before
+        // responding") — or both sides deadlock: client waits for 'G', server
+        // waits for CopyData. (Found by Proxy live validation of 2c.)
+        self.flush().await?;
 
         // Drain CopyData frames until CopyDone / CopyFail.
         let mut data: Vec<u8> = Vec::new();
