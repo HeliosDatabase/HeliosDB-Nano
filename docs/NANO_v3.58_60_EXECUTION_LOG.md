@@ -54,7 +54,16 @@ Nothing changes Nano defaults or the simple-Query OLTP path pg35 measures.
   a perf win for code-graph. Awaiting CodeKB's final number before concluding. **v3.58
   release is GATED on this number.**
 
-  ### Candidate (c) PRE-SCOPE (read-only, 2026-06-14) — strong concrete suspect found
+  ### Candidate (c) — FIX IMPLEMENTED + GATED (16287b5), awaiting CodeKB re-measure
+  Pre-emptive fix landed: `bulk_insert_tuples` under `bulk_load_mode` now uses
+  `next_row_id_volatile()` per row + one `flush_row_counter()` at batch end (was the
+  per-row persisting `next_row_id()` = counter PUT + WAL append each). Gate green: lib
+  1911/0, crud/txn/fast-path/wal-crash-recovery all pass, pg35 33-0-2/34-1-0 no envelope
+  erosion (bulk_load_mode off → default/pg35 byte-unchanged). CodeKB pinged to re-run
+  --fast-ingest on item-1b + candidate-c build; **v3.58 release still GATED on that
+  number < 6782.6s**. If still above, instrument per-row engine ops (next op).
+
+  ### Candidate (c) ORIGINAL PRE-SCOPE (read-only, 2026-06-14) — strong concrete suspect found
   **PRIME SUSPECT: `bulk_insert_tuples` allocates row ids with the PERSISTING
   `next_row_id()` per row.** engine.rs:11075 `next_row_id` does, per call: atomic
   increment (cheap) + **`put_internal("counter:{table}", next)` — a RocksDB PUT** +
