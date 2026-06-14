@@ -398,6 +398,9 @@ All PostgreSQL types plus MySQL type aliases (automatically translated):
 
 - **Full SQL**: JOINs, CTEs, window functions, subqueries, set operations, aggregates, CASE
 - **PL/pgSQL**: Stored procedures and functions
+- **Materialized views**: `CREATE` / `REFRESH MATERIALIZED VIEW`, staleness tracking (`\dmv`, `pg_mv_staleness()`)
+- **MVCC transactions**: snapshot isolation; `READ COMMITTED` / `REPEATABLE READ` / `SERIALIZABLE`; first-committer-wins write-write conflict detection (SQLSTATE `40001`)
+- **COPY (PostgreSQL wire)**: `COPY … FROM STDIN` / `TO STDOUT` in text and CSV — works with `psql \copy` and high-throughput PG→Nano bulk migration
 - **JSONB**: `->`, `->>`, `@>`, `?` operators
 - **Full-text search**: `tsvector`, `tsquery`, `@@`, `ts_rank_cd`, `CREATE INDEX ... USING gin` (see [FTS scope](docs/compatibility/fts.md))
 - **Keyset pagination**: row-constructor comparison `WHERE (col, id) < ($1, $2)`; top-K sort; constant-time deep OFFSET
