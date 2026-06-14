@@ -14483,11 +14483,22 @@ impl EmbeddedDatabase {
         }
 
         // Bulk path bypasses the SQL execute pipeline, so the
-        // engine-managed result + plan caches don't see this DML.
-        // Subsequent SELECT/DELETE/UPDATE statements on this table
-        // would otherwise plan against stale state.
+        // engine-managed result cache doesn't see this DML. Result rows ARE
+        // stale after an insert, so always invalidate them (cheap — gated by
+        // result_cache_nonempty).
         self.invalidate_result_cache();
-        self.plan_cache.clear();
+        // Item 1b (3.57.0 write-path regression): a LogicalPlan is query
+        // STRUCTURE and is NOT invalidated by data inserts (only schema
+        // changes invalidate plans). Clearing the entire plan cache on every
+        // bulk_insert_tuples call was therefore unnecessary for correctness and
+        // was the dominant ingest write-path regression — one full
+        // ShardedLruCache clear per chunk, which also forced every interleaved
+        // DELETE/UPDATE in a bulk load to re-parse + re-plan from cold. Skip it
+        // under bulk_load_mode (the opt-in bulk path). Non-bulk callers keep the
+        // prior clear, so default behavior — and pg35 — is byte-unchanged.
+        if !self.storage.is_bulk_load_mode() {
+            self.plan_cache.clear();
+        }
 
         Ok(row_ids)
     }
