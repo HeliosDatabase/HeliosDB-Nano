@@ -231,6 +231,38 @@ pub(crate) fn build_insert_sql(
     ))
 }
 
+/// Encode one field for COPY-text OUTPUT (inverse of `decode_text_field`):
+/// None -> the `\N` NULL sentinel; otherwise the value with backslash, tab,
+/// newline and carriage-return escaped per the COPY text format.
+pub(crate) fn encode_text_field(v: Option<&[u8]>) -> String {
+    match v {
+        None => "\\N".to_string(),
+        Some(bytes) => {
+            let s = String::from_utf8_lossy(bytes);
+            let mut out = String::with_capacity(s.len() + 2);
+            for c in s.chars() {
+                match c {
+                    '\\' => out.push_str("\\\\"),
+                    '\t' => out.push_str("\\t"),
+                    '\n' => out.push_str("\\n"),
+                    '\r' => out.push_str("\\r"),
+                    other => out.push(other),
+                }
+            }
+            out
+        }
+    }
+}
+
+/// Encode a row of already-rendered field bytes as a COPY-text line
+/// (tab-joined, newline-terminated).
+pub(crate) fn encode_text_row(fields: &[Option<Vec<u8>>]) -> Vec<u8> {
+    let parts: Vec<String> = fields.iter().map(|f| encode_text_field(f.as_deref())).collect();
+    let mut line = parts.join("\t");
+    line.push('\n');
+    line.into_bytes()
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -306,5 +338,29 @@ mod tests {
         assert!(s2.contains("VALUES (NULL, 'a')"));
         // identifier with a quote is escaped
         assert_eq!(super::quote_ident("we\"ird"), "\"we\"\"ird\"");
+    }
+
+    #[test]
+    fn encode_field_null_and_escapes() {
+        assert_eq!(encode_text_field(None), "\\N");
+        assert_eq!(encode_text_field(Some(b"plain")), "plain");
+        assert_eq!(encode_text_field(Some(b"a\tb\nc")), "a\\tb\\nc");
+        assert_eq!(encode_text_field(Some(b"a\\b")), "a\\\\b");
+        assert_eq!(encode_text_field(Some(b"")), ""); // empty string, not NULL
+    }
+
+    #[test]
+    fn encode_decode_roundtrip() {
+        // a row encodes to a line that decodes back to the same fields
+        let fields: Vec<Option<Vec<u8>>> =
+            vec![Some(b"1".to_vec()), None, Some(b"has\ttab\nand nl".to_vec())];
+        let line = encode_text_row(&fields);
+        assert_eq!(line.last(), Some(&b'\n'));
+        let rows = parse_text_rows(&line);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0],
+            vec![Some("1".to_string()), None, Some("has\ttab\nand nl".to_string())]
+        );
     }
 }

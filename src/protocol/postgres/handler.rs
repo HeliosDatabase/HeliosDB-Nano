@@ -1260,21 +1260,19 @@ where
     /// `copy` module.
     async fn handle_copy(&mut self, copy: super::copy::CopyStatement) -> Result<()> {
         use super::copy::CopyFormat;
-        if copy.to_stdout {
-            return self
-                .send_error("ERROR", "0A000", "COPY TO STDOUT is not yet supported", None, None)
-                .await;
-        }
         if copy.format != CopyFormat::Text {
             return self
                 .send_error(
                     "ERROR",
                     "0A000",
-                    "only COPY ... FROM STDIN (text format) is supported",
+                    "COPY currently supports only the text format (CSV/binary coming soon)",
                     None,
                     None,
                 )
                 .await;
+        }
+        if copy.to_stdout {
+            return self.handle_copy_to_stdout(&copy).await;
         }
 
         // Ready to receive: text format (overall_format = 0).
@@ -1336,6 +1334,49 @@ where
                 }
             }
         }
+        self.send_command_complete(&format!("COPY {total}")).await?;
+        self.send_ready_for_query().await
+    }
+
+    /// COPY ... TO STDOUT (text format) — SELECT the rows and stream each as a
+    /// CopyData frame. The server only sends here (never waits on the client
+    /// mid-stream), so no intermediate flush is needed; the trailing
+    /// ReadyForQuery flushes the whole sequence.
+    async fn handle_copy_to_stdout(&mut self, copy: &super::copy::CopyStatement) -> Result<()> {
+        let cols_sql = if copy.columns.is_empty() {
+            "*".to_string()
+        } else {
+            copy.columns
+                .iter()
+                .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let sql = format!("SELECT {} FROM \"{}\"", cols_sql, copy.table.replace('"', "\"\""));
+        let (rows, columns) = match self
+            .database
+            .query_with_columns_for_session(self.session_id, &sql)
+        {
+            Ok(r) => r,
+            Err(e) => {
+                return self
+                    .send_error("ERROR", "XX000", &format!("COPY TO STDOUT failed: {e}"), None, None)
+                    .await;
+            }
+        };
+        let ncols = columns.len();
+        self.send_message(BackendMessage::CopyOutResponse {
+            overall_format: 0,
+            column_formats: vec![0i16; ncols],
+        })
+        .await?;
+        let total = rows.len();
+        for row in &rows {
+            let fields = tuple_to_pg_values(row);
+            self.send_message(BackendMessage::CopyData(super::copy::encode_text_row(&fields)))
+                .await?;
+        }
+        self.send_message(BackendMessage::CopyDone).await?;
         self.send_command_complete(&format!("COPY {total}")).await?;
         self.send_ready_for_query().await
     }
