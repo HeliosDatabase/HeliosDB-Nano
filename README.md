@@ -4,7 +4,7 @@
 [![Documentation](https://docs.rs/heliosdb-nano/badge.svg)](https://docs.rs/heliosdb-nano)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-**An embedded database with native PostgreSQL and MySQL wire-protocol compatibility, plus one-shot SQLite file import.** Single 47 MB binary. HNSW vector search, git-like branching, time-travel queries, AES-256-GCM encryption, built-in BaaS layer (Auth, REST API, Realtime).
+**An embedded database with native PostgreSQL and MySQL wire-protocol compatibility, plus one-shot SQLite file import.** Single self-contained binary (~32 MB; ~12 MB compressed download). HNSW vector search, git-like branching, time-travel queries, AES-256-GCM encryption, built-in BaaS layer (Auth, REST API, Realtime).
 
 Use your existing clients (`psql`, `mysql`), RESTful HTTP, drivers (`psycopg2`, `mysql-connector`, `node-postgres`, JDBC), and ORMs (SQLAlchemy, Prisma, Drizzle, Hibernate, GORM) — zero migration required. Existing `.sqlite` files import via a bundled converter.
 
@@ -68,44 +68,31 @@ cargo build --release --locked
 ./target/release/heliosdb-nano --version
 ```
 
-### Channels Not Yet Active
+### Prebuilt Binaries
 
-`npx`, Homebrew, Docker, and direct binary downloads are not active Nano release
-channels yet. Use Cargo for a verified install today.
-
-If those channels are announced in a future release, you can prepare your
-machine with the matching tool first. Installing these tools only makes your
-machine ready; it does not install Nano until the corresponding Nano package,
-formula, image, or binary asset has been published.
-
-For `npx`, install Node.js LTS from [nodejs.org](https://nodejs.org/) or with
-`nvm`, then verify:
+Grab a self-contained binary from the [**GitHub Releases**](https://github.com/HeliosDatabase/HeliosDB-Nano/releases/latest)
+page — Linux (`x86_64` / `aarch64`), macOS (`aarch64`), and Windows (`x86_64`),
+each with `SHA256SUMS`. No Rust toolchain required: download the archive for your
+platform, verify it against `SHA256SUMS`, extract, and run the `heliosdb-nano`
+binary.
 
 ```bash
-node --version
-npx --version
-```
-
-For Homebrew, install `brew` from [brew.sh](https://brew.sh/), then verify:
-
-```bash
-brew --version
-```
-
-For Docker, install Docker Desktop, Docker Engine, or Podman, start the daemon,
-then verify:
-
-```bash
-docker --version
-```
-
-For direct binary downloads, use only archives and checksums attached to an
-official [GitHub Release](https://github.com/HeliosDatabase/HeliosDB-Nano/releases),
-then verify the extracted binary:
-
-```bash
+# Example: Linux x86_64 (see Releases for macOS arm64 / Linux aarch64 / Windows)
+VER=v3.57.0
+curl -sSfL -O "https://github.com/HeliosDatabase/HeliosDB-Nano/releases/download/$VER/heliosdb-nano-$VER-x86_64-unknown-linux-gnu.tar.gz"
+tar xzf "heliosdb-nano-$VER-x86_64-unknown-linux-gnu.tar.gz"
 ./heliosdb-nano --version
 ```
+
+### Channels Not Yet Active
+
+`npx`, Homebrew, and Docker images are not active Nano release channels yet — use
+a prebuilt binary (above) or Cargo for a verified install today. If those channels
+are announced later, installing the matching tool only readies your machine; it
+does not install Nano until the corresponding package, formula, or image is
+published. Tooling: Node.js LTS from [nodejs.org](https://nodejs.org/) (`npx`),
+`brew` from [brew.sh](https://brew.sh/) (Homebrew), or Docker Desktop / Engine /
+Podman (Docker).
 
 ## Start the Server
 
@@ -161,7 +148,7 @@ heliosdb> SELECT * FROM products WHERE price < 15;
 
 ```bash
 $ psql -h 127.0.0.1 -p 5432 -U postgres
-psql (16.0, server HeliosDB Nano 3.30.1)
+psql (16.0, server HeliosDB Nano 3.57.0)
 postgres=# INSERT INTO products (name, price) VALUES ('Gizmo', 29.99);
 INSERT 0 1
 postgres=# SELECT COUNT(*) FROM products;
@@ -271,9 +258,10 @@ Scope and honest limitations: see [docs/compatibility/fts.md](docs/compatibility
 
 ## Pagination — Constant-Time at Depth
 
-Deep `LIMIT … OFFSET` runs in ~30 µs regardless of offset, up to **334× faster
-than PostgreSQL 13** for 100k-row tables. Top-K over Sort, storage-level
-`OFFSET` skip, and keyset (`WHERE (col, id) < ($1, $2)`) are all native.
+Deep `LIMIT … OFFSET` runs in **~30 µs regardless of offset** — constant-time,
+where a stock row-store re-scans every skipped row (linear in the offset).
+Top-K over Sort, storage-level `OFFSET` skip, and keyset
+(`WHERE (col, id) < ($1, $2)`) are all native.
 
 ```sql
 -- Traditional LIMIT / OFFSET — constant-time at any depth via storage-level skip
