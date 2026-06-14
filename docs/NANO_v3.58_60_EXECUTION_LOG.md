@@ -57,7 +57,10 @@ Nothing changes Nano defaults or the simple-Query OLTP path pg35 measures.
   (PGCOPY\n\377\r\n\0 signature). 2c currently returns a clear 0A000 error for
   TO STDOUT / non-text.
   COPY STATUS: FROM STDIN + TO STDOUT both support **text (2c/2e) + CSV (2f)**,
-  all gated green, flush-fix in (c32aacf). Remaining = **binary (2g)**.
+  all gated green, flush-fix in (c32aacf). **Binary (2g) DEFERRED by user decision
+  2026-06-14** — text+CSV unblock the migration mirror; binary is a focused
+  follow-up (needs a PG reference-vector harness + the numeric layout). FORMAT
+  binary returns a clear 0A000 error meanwhile. **COPY = DONE for v3.58.**
 
   ### Item 2g — COPY binary format — SCOPE (decision pending, NOT implemented)
   **Framing (clear):** header = 11-byte signature `PGCOPY\n\377\r\n\0` + int32
