@@ -54,6 +54,16 @@ Nothing changes Nano defaults or the simple-Query OLTP path pg35 measures.
   a perf win for code-graph. Awaiting CodeKB's final number before concluding. **v3.58
   release is GATED on this number.**
 
+  ### CodeKB re-validation results
+  **STAGE 1 (item-1b only, 2026-06-14):** code-graph 11,334.0 s vs target 6,782.6 s —
+  essentially unchanged from pre-fix 11,144.8 s (+1.7% = noise). **Confirms item-1b's
+  plan-cache-clear fix is real-but-minor for ingest** (172 chunk-clears vs 344k per-row
+  counter writes), and that **candidate (c) is the DOMINANT residual** — exactly the
+  pre-scope prediction. item-1b stays (valid, gated, pg35-neutral; helps interleaved
+  DELETE/UPDATE re-planning) but was never the headline cost.
+  **STAGE 2 (item-1b + candidate-c @ 9ceeb05): PENDING — the definitive number.** v3.58
+  release gated on it < 6,782.6 s.
+
   ### Candidate (c) — FIX IMPLEMENTED + GATED (16287b5), awaiting CodeKB re-measure
   Pre-emptive fix landed: `bulk_insert_tuples` under `bulk_load_mode` now uses
   `next_row_id_volatile()` per row + one `flush_row_counter()` at batch end (was the
