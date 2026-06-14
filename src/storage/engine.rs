@@ -1991,8 +1991,17 @@ impl StorageEngine {
         // - Block cache: 75% of cache_size for read-heavy workloads (decompressed block caching)
         // - Write buffer: 25% of cache_size for write batching
         let cache_size = config.storage.cache_size;
-        let block_cache_size = (cache_size as f64 * 0.75) as usize;
-        let write_buffer_size = cache_size - block_cache_size;
+        // Item 8: an explicit rocksdb_write_buffer_size sets the memtable
+        // directly and gives the FULL cache_size to the block cache (so a
+        // write-only ingest gets a big memtable without over-allocating read
+        // cache). None = legacy 75/25 split — byte-identical to pre-3.58.
+        let (block_cache_size, write_buffer_size) = match config.storage.rocksdb_write_buffer_size {
+            Some(wb) => (cache_size, wb),
+            None => {
+                let bc = (cache_size as f64 * 0.75) as usize;
+                (bc, cache_size - bc)
+            }
+        };
 
         // Create LRU block cache for optimized read performance
         let block_cache = Cache::new_lru_cache(block_cache_size);
@@ -2015,12 +2024,14 @@ impl StorageEngine {
         opts.set_block_based_table_factory(&block_opts);
 
         opts.set_write_buffer_size(write_buffer_size);
-        // Write path performance tuning
-        opts.set_max_write_buffer_number(4); // Allow more concurrent memtables
-        opts.set_min_write_buffer_number_to_merge(2); // Merge memtables before flush (reduces write amp)
-        opts.set_level_zero_file_num_compaction_trigger(4);
-        opts.set_max_background_jobs(4); // Concurrent compaction/flush threads
-        opts.set_bytes_per_sync(1048576); // Sync every 1MB to reduce fsync overhead
+        // Write path performance tuning (item 8: config-overridable; None = the
+        // literal shown, so default/pg35 behavior is unchanged).
+        let sc = &config.storage;
+        opts.set_max_write_buffer_number(sc.rocksdb_max_write_buffer_number.unwrap_or(4)); // concurrent memtables
+        opts.set_min_write_buffer_number_to_merge(sc.rocksdb_min_write_buffer_number_to_merge.unwrap_or(2)); // merge before flush
+        opts.set_level_zero_file_num_compaction_trigger(sc.rocksdb_level0_file_num_compaction_trigger.unwrap_or(4));
+        opts.set_max_background_jobs(sc.rocksdb_max_background_jobs.unwrap_or(4)); // compaction/flush threads
+        opts.set_bytes_per_sync(sc.rocksdb_bytes_per_sync.unwrap_or(1048576)); // sync every 1MB
         opts.set_enable_pipelined_write(true); // Pipeline WAL + memtable writes
 
         let db = DB::open(&opts, path).map_err(|e| Error::storage(format!("Failed to open RocksDB: {}", e)))?;
