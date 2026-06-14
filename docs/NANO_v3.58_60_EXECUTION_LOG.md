@@ -140,7 +140,22 @@ Nothing changes Nano defaults or the simple-Query OLTP path pg35 measures.
 - [ ] Regression bisect 3.36.1→3.57.0 bulk write (CodeKB §4.2).
 
 ### 3.59
-- [ ] Item 3 — plan cache for unnamed/text-keyed extended stmts (`SET helios.plan_cache=on`).
+- [!] Item 3 — plan cache: **INVESTIGATION FINDING — already implemented; building it
+  would be REDUNDANT.** Nano already has BOTH text-keyed caches and the extended path
+  uses them: `parse_cache` (SQL→AST, `parse_cached` lib.rs:9977) and `plan_cache`
+  (SQL→LogicalPlan, `parameterized_plan_cached` lib.rs:9991, key `"\0params\0{sql}"`).
+  Extended Execute → `pinned_plan_for` (handler_extended.rs:417) →
+  `wire_parameterized_plan` → `parameterized_plan_cached` (cached, epoch-invalidated on
+  DDL). So unnamed statements with repeated SQL text get a plan-cache HIT, not a re-plan.
+  Proxy's measured extended(69.7k) < prepared(84.9k) gap is therefore NOT re-planning — it
+  is the per-Parse PROTOCOL overhead (create PreparedStatement + ParameterDescription +
+  ParseComplete each cycle) that unnamed pays per-exec and named pays once, plus the extra
+  frames. A `SET helios.plan_cache=on` GUC would be a no-op (caching is always on).
+  → That residual gap is **item 6 (pipelining — fewer round-trips)** + per-Parse allocation,
+  not a plan cache. RECOMMEND: close item 3 as already-satisfied; verify cache-hit with
+  Proxy; redirect effort to item 6. (Exception: the `pinned_plan_for` FALLBACK shapes —
+  DML index-probe / code-graph / SHOW BRANCHES — re-plan per exec, but those aren't the
+  proxy's benchmarked SELECT path.)
 - [ ] Item 6 — pipelined extended exec (N Bind/Execute before one Sync).
 - [ ] Item 5 — cheap session reset (DISCARD ALL / helios.reset_session()).
 - [ ] Item 10 — connection-setup + `ParameterStatus` capability advertising.
