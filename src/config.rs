@@ -370,6 +370,32 @@ pub struct StorageConfig {
     /// `durable_commit = true` (or sessions running
     /// `SET synchronous_commit = on`). Default: 200.
     pub group_commit_window_us: u64,
+    /// Item 8 (v3.58): direct RocksDB write-path tunables for bulk ingest.
+    /// Every field is `None` by default = the built-in literal shown, so
+    /// existing configs and the OLTP/`pg35` path are byte-unchanged. Override
+    /// only to tune a bulk-load (e.g. the `fast_ingest` profile / a code-KB).
+    ///
+    /// `None` derives the memtable as 25% of `cache_size` (legacy split);
+    /// `Some(n)` sets the write buffer directly AND gives the full `cache_size`
+    /// to the block cache — so a write-only ingest gets a large memtable
+    /// without over-allocating read cache.
+    #[serde(default)]
+    pub rocksdb_write_buffer_size: Option<usize>,
+    /// `None` = 4.
+    #[serde(default)]
+    pub rocksdb_max_write_buffer_number: Option<i32>,
+    /// `None` = 2.
+    #[serde(default)]
+    pub rocksdb_min_write_buffer_number_to_merge: Option<i32>,
+    /// `None` = 4.
+    #[serde(default)]
+    pub rocksdb_level0_file_num_compaction_trigger: Option<i32>,
+    /// `None` = 4.
+    #[serde(default)]
+    pub rocksdb_max_background_jobs: Option<i32>,
+    /// `None` = 1 MiB (1048576).
+    #[serde(default)]
+    pub rocksdb_bytes_per_sync: Option<u64>,
 }
 
 fn default_slow_query_threshold() -> Option<u64> {
@@ -455,6 +481,13 @@ impl Default for StorageConfig {
             version_gc_interval_secs: None, // auto: off without retention, 300s with it
             version_gc_max_per_cycle: default_version_gc_max_per_cycle(),
             group_commit_window_us: 200,
+            // Item 8: None = built-in RocksDB literals (no behavior change).
+            rocksdb_write_buffer_size: None,
+            rocksdb_max_write_buffer_number: None,
+            rocksdb_min_write_buffer_number_to_merge: None,
+            rocksdb_level0_file_num_compaction_trigger: None,
+            rocksdb_max_background_jobs: None,
+            rocksdb_bytes_per_sync: None,
         }
     }
 }
