@@ -41,7 +41,15 @@ Nothing changes Nano defaults or the simple-Query OLTP path pg35 measures.
 - [ ] Item 1b — `bulk_load_mode` actually suspends inline vector-DML/secondary-index
   maintenance on `bulk_insert_tuples` (lib.rs:14465-14473). Also the 3.57 write-path
   regression suspect → bisect.
-- [ ] Item 2 — COPY wire sub-protocol (CopyIn/CopyData/CopyDone/CopyOut).
+- [~] Item 2 — COPY wire sub-protocol. **FROM STDIN (text) DONE + gated**:
+  2a wire frames (e357eb5), 2b parser (833846d), 2c handler state machine
+  (68b443b). pg35 34-0-1/32-0-3, zero PG wins, no envelope erosion. Proxy
+  notified to validate against the migration-mirror harness (Batch G2 unblock).
+  REMAINING COPY follow-ups: (i) 2d wire round-trip conformance test (or accept
+  Proxy's live validation as the e2e proof); (ii) COPY TO STDOUT (export path —
+  CopyOutResponse + stream rows as CopyData); (iii) CSV + binary formats
+  (PGCOPY\n\377\r\n\0 signature). 2c currently returns a clear 0A000 error for
+  TO STDOUT / non-text.
   PROTOCOL LAYER MAPPED (ready to implement in increments, each build+gate):
   - **2a messages.rs:** FrontendMessageType += `CopyData=b'd'`, `CopyDone=b'c'`,
     `CopyFail=b'f'`; BackendMessageType += `CopyInResponse=b'G'`,
