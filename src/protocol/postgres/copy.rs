@@ -263,6 +263,104 @@ pub(crate) fn encode_text_row(fields: &[Option<Vec<u8>>]) -> Vec<u8> {
     line.into_bytes()
 }
 
+// ── CSV format (item 2f) ────────────────────────────────────────────────────
+
+fn finish_csv_field(field: &str, was_quoted: bool) -> Option<String> {
+    // PG CSV default: an UNQUOTED empty field is NULL; a quoted "" is the empty
+    // string.
+    if !was_quoted && field.is_empty() {
+        None
+    } else {
+        Some(field.to_string())
+    }
+}
+
+/// Parse COPY CSV bytes into rows of optional fields. A proper stateful parser:
+/// quoted fields may contain the comma delimiter, embedded newlines, and `""`
+/// (escaped quote). Comma delimiter, newline (LF or CRLF) row separator.
+pub(crate) fn parse_csv_rows(data: &[u8]) -> Vec<Vec<Option<String>>> {
+    let text = String::from_utf8_lossy(data);
+    let mut rows: Vec<Vec<Option<String>>> = Vec::new();
+    let mut row: Vec<Option<String>> = Vec::new();
+    let mut field = String::new();
+    let mut in_quotes = false;
+    let mut was_quoted = false;
+    let mut field_started = false;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_quotes {
+            if c == '"' {
+                if chars.peek() == Some(&'"') {
+                    chars.next();
+                    field.push('"');
+                } else {
+                    in_quotes = false;
+                }
+            } else {
+                field.push(c);
+            }
+            continue;
+        }
+        match c {
+            '"' if !field_started => {
+                in_quotes = true;
+                was_quoted = true;
+                field_started = true;
+            }
+            ',' => {
+                row.push(finish_csv_field(&field, was_quoted));
+                field.clear();
+                was_quoted = false;
+                field_started = false;
+            }
+            '\r' => {} // tolerate CRLF
+            '\n' => {
+                row.push(finish_csv_field(&field, was_quoted));
+                rows.push(std::mem::take(&mut row));
+                field.clear();
+                was_quoted = false;
+                field_started = false;
+            }
+            other => {
+                field.push(other);
+                field_started = true;
+            }
+        }
+    }
+    // trailing field/row when the data does not end with a newline
+    if field_started || was_quoted || !row.is_empty() {
+        row.push(finish_csv_field(&field, was_quoted));
+        rows.push(row);
+    }
+    rows
+}
+
+/// Encode one field for COPY CSV output. None -> empty (the default CSV NULL).
+/// Quotes the field (and doubles internal quotes) when it contains the comma
+/// delimiter, a quote, or a newline.
+pub(crate) fn encode_csv_field(v: Option<&[u8]>) -> String {
+    match v {
+        None => String::new(),
+        Some(bytes) => {
+            let s = String::from_utf8_lossy(bytes);
+            if s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r') {
+                format!("\"{}\"", s.replace('"', "\"\""))
+            } else {
+                s.into_owned()
+            }
+        }
+    }
+}
+
+/// Encode a row of rendered field bytes as a COPY CSV line (comma-joined,
+/// newline-terminated).
+pub(crate) fn encode_csv_row(fields: &[Option<Vec<u8>>]) -> Vec<u8> {
+    let parts: Vec<String> = fields.iter().map(|f| encode_csv_field(f.as_deref())).collect();
+    let mut line = parts.join(",");
+    line.push('\n');
+    line.into_bytes()
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -361,6 +459,43 @@ mod tests {
         assert_eq!(
             rows[0],
             vec![Some("1".to_string()), None, Some("has\ttab\nand nl".to_string())]
+        );
+    }
+
+    #[test]
+    fn csv_parse_quoting_and_null() {
+        // unquoted empty = NULL; quoted "" = empty string; quoted field with a
+        // comma, an escaped quote, and an embedded newline.
+        let data = b"1,,\"\"\n2,\"a,b\",\"she said \"\"hi\"\"\"\n3,\"line1\nline2\",x\n";
+        let rows = parse_csv_rows(data);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0], vec![Some("1".into()), None, Some("".into())]);
+        assert_eq!(
+            rows[1],
+            vec![Some("2".into()), Some("a,b".into()), Some("she said \"hi\"".into())]
+        );
+        assert_eq!(rows[2], vec![Some("3".into()), Some("line1\nline2".into()), Some("x".into())]);
+    }
+
+    #[test]
+    fn csv_encode_quotes_when_needed() {
+        assert_eq!(encode_csv_field(None), ""); // NULL
+        assert_eq!(encode_csv_field(Some(b"plain")), "plain");
+        assert_eq!(encode_csv_field(Some(b"a,b")), "\"a,b\"");
+        assert_eq!(encode_csv_field(Some(b"she \"q\"")), "\"she \"\"q\"\"\"");
+        assert_eq!(encode_csv_field(Some(b"l1\nl2")), "\"l1\nl2\"");
+    }
+
+    #[test]
+    fn csv_encode_decode_roundtrip() {
+        let fields: Vec<Option<Vec<u8>>> =
+            vec![Some(b"1".to_vec()), None, Some(b"a,b\"c\nd".to_vec())];
+        let line = encode_csv_row(&fields);
+        let rows = parse_csv_rows(&line);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0],
+            vec![Some("1".to_string()), None, Some("a,b\"c\nd".to_string())]
         );
     }
 }

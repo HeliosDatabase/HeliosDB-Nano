@@ -1260,15 +1260,9 @@ where
     /// `copy` module.
     async fn handle_copy(&mut self, copy: super::copy::CopyStatement) -> Result<()> {
         use super::copy::CopyFormat;
-        if copy.format != CopyFormat::Text {
+        if copy.format == CopyFormat::Binary {
             return self
-                .send_error(
-                    "ERROR",
-                    "0A000",
-                    "COPY currently supports only the text format (CSV/binary coming soon)",
-                    None,
-                    None,
-                )
+                .send_error("ERROR", "0A000", "COPY binary format is not yet supported", None, None)
                 .await;
         }
         if copy.to_stdout {
@@ -1321,8 +1315,12 @@ where
                 .await;
         }
 
-        // Parse text rows and bulk-insert in batches.
-        let rows = super::copy::parse_text_rows(&data);
+        // Parse rows (text or CSV) and bulk-insert in batches.
+        let rows = if copy.format == CopyFormat::Csv {
+            super::copy::parse_csv_rows(&data)
+        } else {
+            super::copy::parse_text_rows(&data)
+        };
         let total = rows.len();
         const BATCH: usize = 500;
         for chunk in rows.chunks(BATCH) {
@@ -1373,8 +1371,12 @@ where
         let total = rows.len();
         for row in &rows {
             let fields = tuple_to_pg_values(row);
-            self.send_message(BackendMessage::CopyData(super::copy::encode_text_row(&fields)))
-                .await?;
+            let line = if copy.format == super::copy::CopyFormat::Csv {
+                super::copy::encode_csv_row(&fields)
+            } else {
+                super::copy::encode_text_row(&fields)
+            };
+            self.send_message(BackendMessage::CopyData(line)).await?;
         }
         self.send_message(BackendMessage::CopyDone).await?;
         self.send_command_complete(&format!("COPY {total}")).await?;
