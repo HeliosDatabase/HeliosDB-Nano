@@ -42,6 +42,33 @@ Nothing changes Nano defaults or the simple-Query OLTP path pg35 measures.
   maintenance on `bulk_insert_tuples` (lib.rs:14465-14473). Also the 3.57 write-path
   regression suspect → bisect.
 - [ ] Item 2 — COPY wire sub-protocol (CopyIn/CopyData/CopyDone/CopyOut).
+  PROTOCOL LAYER MAPPED (ready to implement in increments, each build+gate):
+  - **2a messages.rs:** FrontendMessageType += `CopyData=b'd'`, `CopyDone=b'c'`,
+    `CopyFail=b'f'`; BackendMessageType += `CopyInResponse=b'G'`,
+    `CopyOutResponse=b'H'`, `CopyData=b'd'`, `CopyDone=b'c'`. FrontendMessage enum
+    += `CopyData(Vec<u8>)`/`CopyDone`/`CopyFail(String)` + parse arms (dispatch in
+    parse fn ~256). BackendMessage enum += `CopyInResponse{overall_format:u8,
+    column_formats:Vec<i16>}`/`CopyOutResponse{..}`/`CopyData(Vec<u8>)`/`CopyDone`
+    + encode arms (encoder writes `put_u8(tag)` + len-prefixed payload like the
+    existing CommandComplete b'C' ~599). CopyInResponse payload: format byte +
+    int16 col count + int16 per-col formats.
+  - **2b parser:** `COPY tbl [(cols)] FROM STDIN | TO STDOUT [WITH (FORMAT
+    text|csv|binary[, DELIMITER ..., HEADER ...])]` -> a Copy AST node (new
+    LogicalPlan/Statement variant). Default format text.
+  - **2c handler (handler.rs, the sub-protocol state machine):** on a COPY FROM
+    STDIN statement -> send CopyInResponse(format, per-col), then enter copy-in
+    loop reading FrontendMessage::CopyData frames, parse rows per format
+    (text: tab-delimited, \N=NULL, \. terminator; csv; binary signature
+    PGCOPY\n...), bulk-INSERT via the existing bulk path, on CopyDone send
+    CommandComplete "COPY n". COPY TO STDOUT -> CopyOutResponse + stream rows as
+    CopyData + CopyDone + CommandComplete. Honor Proxy contract: Sync-scoped RFQ,
+    overall+per-col format bytes, text/csv/binary, COPY FROM STDIN + TO STDOUT.
+  - **2d gate:** build + new wire-conformance tests (round-trip a COPY FROM STDIN
+    then COPY TO STDOUT, text+binary) + pg35 erosion check (COPY is a new code
+    path entered only on the COPY statement -> pg35-neutral by construction).
+  Proxy already relays CopyData/CopyDone and yields on CopyInResponse (Batch B),
+  so it validates the moment 2c lands. NOTE: ~400 LOC total; implement 2a->2d in
+  order, committing each compilable increment green.
 - [ ] Item 4 — Fast-ingest `ProfileConfig` bundle (extends existing profile system).
 - [ ] Item 8 — expose hard-coded RocksDB knobs (engine.rs:2019-2024) as StorageConfig.
 - [ ] Regression bisect 3.36.1→3.57.0 bulk write (CodeKB §4.2).
