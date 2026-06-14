@@ -61,6 +61,7 @@
 pub mod auth;
 pub mod catalog;
 pub mod certs;
+pub(crate) mod copy;
 pub mod handler;
 mod handler_extended;
 pub mod messages;
