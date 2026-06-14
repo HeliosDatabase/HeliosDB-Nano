@@ -686,17 +686,31 @@ fn bulk_insert_symbols_batched(
 ) -> Result<Vec<i64>> {
     debug_assert_eq!(file_id_per_symbol.len(), symbols.len());
 
-    let mut vectors: Vec<Option<Vec<f32>>> = Vec::with_capacity(symbols.len());
-    for sym in symbols {
-        let v = if !sym.signature.is_empty() {
-            embedder.embed(&sym.signature)?
-        } else {
-            None
-        };
-        if v.is_some() {
-            stats.embed_calls += 1;
+    // Batch the embed calls: collect every non-empty signature, embed them all
+    // in ONE `embed_batch` call, then scatter results back to their original
+    // indices (empty signatures stay None). This replaces the per-symbol serial
+    // embed — the dominant ingest cost (one Mutex-guarded single-text ORT call
+    // per symbol) — with a single batched inference. Semantics are preserved:
+    // empty → None, `embed_calls` counts produced vectors, NoopEmbedder/Http
+    // keep their per-text behavior via the trait's default `embed_batch`.
+    let mut vectors: Vec<Option<Vec<f32>>> = vec![None; symbols.len()];
+    let mut batch_texts: Vec<&str> = Vec::with_capacity(symbols.len());
+    let mut batch_idx: Vec<usize> = Vec::with_capacity(symbols.len());
+    for (i, sym) in symbols.iter().enumerate() {
+        if !sym.signature.is_empty() {
+            batch_texts.push(sym.signature.as_str());
+            batch_idx.push(i);
         }
-        vectors.push(v);
+    }
+    if !batch_texts.is_empty() {
+        let embedded = embedder.embed_batch(&batch_texts)?;
+        debug_assert_eq!(embedded.len(), batch_idx.len());
+        for (slot, v) in batch_idx.iter().zip(embedded.into_iter()) {
+            if v.is_some() {
+                stats.embed_calls += 1;
+            }
+            vectors[*slot] = v;
+        }
     }
 
     let any_vec = vectors.iter().any(Option::is_some);

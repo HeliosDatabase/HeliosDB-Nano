@@ -13,6 +13,19 @@ use crate::{Error, Result};
 /// long as the vector is stable across calls.
 pub trait Embedder: Send + Sync {
     fn embed(&self, text: &str) -> Result<Option<Vec<f32>>>;
+
+    /// Embed many texts in one call. Result is 1:1 with `texts` by index.
+    ///
+    /// Default impl loops `embed` so `NoopEmbedder`/`HttpEmbedder` work
+    /// unchanged. Implementations backed by a batching runtime
+    /// (`FastEmbedder` → fastembed/ORT) override this to amortize the
+    /// per-call lock + inference overhead — the ingest path embeds hundreds
+    /// of thousands of symbols, and a per-symbol single-element call under one
+    /// `Mutex` is the dominant ingest cost. Opt-in / additive: nothing on the
+    /// OLTP path embeds, so this cannot affect `pg35_benchmark`.
+    fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Option<Vec<f32>>>> {
+        texts.iter().map(|t| self.embed(t)).collect()
+    }
 }
 
 /// Default. Never emits a vector — `body_vec` stays `NULL`.
@@ -155,6 +168,29 @@ mod fastembed_impl {
                 .embed(vec![text.to_string()], None)
                 .map_err(|e| Error::query_execution(format!("fastembed embed: {e}")))?;
             Ok(out.pop())
+        }
+
+        /// One ORT inference for the whole slice instead of one per text.
+        /// fastembed fans tokenization over rayon (`par_chunks`) and runs ORT
+        /// with `with_intra_threads(all_cpus)` internally, so a single batched
+        /// call collapses the serial per-symbol embed tail. `Some(256)` bounds
+        /// peak memory (BGESmallENV15 is static-precision → batching is safe).
+        /// Returns one `Some(vec)` per input text, in input order.
+        fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Option<Vec<f32>>>> {
+            if texts.is_empty() {
+                return Ok(Vec::new());
+            }
+            let guard = self
+                .inner
+                .lock()
+                .map_err(|e| Error::query_execution(format!("fastembed lock: {e}")))?;
+            let owned: Vec<String> = texts.iter().map(|t| t.to_string()).collect();
+            let out = guard
+                .embed(owned, Some(256))
+                .map_err(|e| Error::query_execution(format!("fastembed embed_batch: {e}")))?;
+            // fastembed returns one embedding per input, in order.
+            debug_assert_eq!(out.len(), texts.len());
+            Ok(out.into_iter().map(Some).collect())
         }
     }
 }
