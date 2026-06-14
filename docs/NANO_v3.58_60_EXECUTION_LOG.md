@@ -53,6 +53,30 @@ Nothing changes Nano defaults or the simple-Query OLTP path pg35 measures.
   per-statement work on the execute/commit path) is the next bisect**, and v3.58 is NOT yet
   a perf win for code-graph. Awaiting CodeKB's final number before concluding. **v3.58
   release is GATED on this number.**
+
+  ### Candidate (c) PRE-SCOPE (read-only, 2026-06-14) — strong concrete suspect found
+  **PRIME SUSPECT: `bulk_insert_tuples` allocates row ids with the PERSISTING
+  `next_row_id()` per row.** engine.rs:11075 `next_row_id` does, per call: atomic
+  increment (cheap) + **`put_internal("counter:{table}", next)` — a RocksDB PUT** +
+  **`wal.append(UpdateCounter)` — a WAL append**. Called once per row in
+  `bulk_insert_tuples` (`catalog.next_row_id`) → for a ~344k-row FastIngest that is
+  ~344k redundant counter PUTs + ~344k WAL appends, pure per-row overhead that scales
+  with row count (≈ the ~12 ms/row magnitude the gap implies). The engine ALREADY has
+  the cure: `next_row_id_volatile()` (engine.rs:11114, in-memory only) +
+  `flush_row_counter()` once after the batch — *"Used by the fast INSERT path."* The
+  bulk path just doesn't use it.
+  **FIX (gateable, pg35-neutral):** in `bulk_insert_tuples`, under `bulk_load_mode`, use
+  `next_row_id_volatile()` per row + one `flush_row_counter(table)` at batch end; non-bulk
+  callers keep the persisting path → default crash-semantics + pg35 unchanged. Mirrors
+  the item-1b pattern.
+  **SECONDARY (lower confidence):** ART `on_insert` per row (art_manager.rs:1449); the
+  autocommit commit path (R0.2 conflict registry + R1.3-p2 watermark barrier) for
+  code_index's DELETE/UPDATE traffic — but too few commits to explain the gap at µs each.
+  **VALIDATION:** apply the volatile-counter fix (isolated dispatch change), have CodeKB
+  re-run `--fast-ingest`; if the gap closes, confirmed; else instrument per-row engine ops
+  (next_row_id/put/on_insert) with coarse timing on a focused ingest microbench.
+  **VERIFY FIRST:** confirm `flush_row_counter` exists + signature, and that
+  `bulk_insert_tuples` is the path FastIngest actually drives for the 344k symbol rows.
 - [~] Item 2 — COPY wire sub-protocol. **FROM STDIN (text) DONE + gated**:
   2a wire frames (e357eb5), 2b parser (833846d), 2c handler state machine
   (68b443b). pg35 34-0-1/32-0-3, zero PG wins, no envelope erosion. Proxy
