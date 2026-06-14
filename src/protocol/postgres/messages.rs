@@ -51,6 +51,10 @@ pub enum BackendMessageType {
     ParseComplete = b'1',
     ReadyForQuery = b'Z',
     RowDescription = b'T',
+    CopyInResponse = b'G',
+    CopyOutResponse = b'H',
+    CopyData = b'd',
+    CopyDone = b'c',
 }
 
 /// Frontend message (client to server)
@@ -111,6 +115,13 @@ pub enum FrontendMessage {
 
     /// SASL response (continue)
     SaslResponse { data: Vec<u8> },
+
+    /// COPY ... FROM STDIN data frame (one or more rows of raw payload bytes).
+    CopyData(Vec<u8>),
+    /// COPY ... FROM STDIN completed normally by the client.
+    CopyDone,
+    /// COPY ... FROM STDIN aborted by the client (carries the error message).
+    CopyFail(String),
 }
 
 /// Describe target (statement or portal)
@@ -178,6 +189,22 @@ pub enum BackendMessage {
 
     /// Row description (result set metadata)
     RowDescription { fields: Vec<FieldDescription> },
+
+    /// COPY FROM STDIN: server is ready to receive CopyData frames.
+    /// `overall_format` 0=text, 1=binary; `column_formats` per-column codes.
+    CopyInResponse {
+        overall_format: u8,
+        column_formats: Vec<i16>,
+    },
+    /// COPY TO STDOUT: server is about to stream CopyData rows.
+    CopyOutResponse {
+        overall_format: u8,
+        column_formats: Vec<i16>,
+    },
+    /// A COPY data frame (raw payload bytes).
+    CopyData(Vec<u8>),
+    /// COPY stream complete (server -> client).
+    CopyDone,
 }
 
 /// Authentication message types
@@ -269,6 +296,23 @@ impl FrontendMessage {
                 FrontendMessage::Terminate
             }
             b'p' => Self::parse_password(buf, len)?,
+            b'd' => {
+                // CopyData: the payload is (len - 4) raw bytes.
+                buf.advance(4);
+                let data = buf.copy_to_bytes(len - 4).to_vec();
+                FrontendMessage::CopyData(data)
+            }
+            b'c' => {
+                // CopyDone: no payload beyond the length header.
+                buf.advance(len);
+                FrontendMessage::CopyDone
+            }
+            b'f' => {
+                // CopyFail: a null-terminated error message.
+                buf.advance(4);
+                let msg = read_cstring(buf)?;
+                FrontendMessage::CopyFail(msg)
+            }
             _ => {
                 return Err(Error::protocol(format!(
                     "Unknown message type: {} (0x{:02x})",
@@ -616,6 +660,41 @@ impl BackendMessage {
 
                 buf.put_u8(0); // Terminator
             }
+            BackendMessage::CopyInResponse {
+                overall_format,
+                column_formats,
+            } => {
+                buf.put_u8(BackendMessageType::CopyInResponse as u8);
+                let len = 4 + 1 + 2 + column_formats.len() * 2;
+                buf.put_i32(len as i32);
+                buf.put_u8(*overall_format);
+                buf.put_i16(column_formats.len() as i16);
+                for f in column_formats {
+                    buf.put_i16(*f);
+                }
+            }
+            BackendMessage::CopyOutResponse {
+                overall_format,
+                column_formats,
+            } => {
+                buf.put_u8(BackendMessageType::CopyOutResponse as u8);
+                let len = 4 + 1 + 2 + column_formats.len() * 2;
+                buf.put_i32(len as i32);
+                buf.put_u8(*overall_format);
+                buf.put_i16(column_formats.len() as i16);
+                for f in column_formats {
+                    buf.put_i16(*f);
+                }
+            }
+            BackendMessage::CopyData(data) => {
+                buf.put_u8(BackendMessageType::CopyData as u8);
+                buf.put_i32((4 + data.len()) as i32);
+                buf.put_slice(data);
+            }
+            BackendMessage::CopyDone => {
+                buf.put_u8(BackendMessageType::CopyDone as u8);
+                buf.put_i32(4);
+            }
             _ => {
                 // Other message types not yet implemented
             }
@@ -713,5 +792,68 @@ mod tests {
         assert_eq!(buf[0], b'C');
         let len = i32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]);
         assert!(len > 4);
+    }
+
+    #[test]
+    fn test_copy_in_response_encode() {
+        let mut buf = BytesMut::new();
+        BackendMessage::CopyInResponse {
+            overall_format: 0,
+            column_formats: vec![0, 0, 0],
+        }
+        .encode(&mut buf);
+        assert_eq!(buf[0], b'G');
+        // len = 4 + 1(format) + 2(count) + 3*2(per-col) = 13
+        assert_eq!(i32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]), 13);
+        assert_eq!(buf[5], 0); // overall format = text
+        assert_eq!(i16::from_be_bytes([buf[6], buf[7]]), 3); // column count
+    }
+
+    #[test]
+    fn test_copy_data_done_encode() {
+        let mut buf = BytesMut::new();
+        BackendMessage::CopyData(vec![1, 2, 3, 4]).encode(&mut buf);
+        assert_eq!(buf[0], b'd');
+        assert_eq!(i32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]), 8); // 4 + 4
+        assert_eq!(&buf[5..9], &[1, 2, 3, 4]);
+
+        let mut buf2 = BytesMut::new();
+        BackendMessage::CopyDone.encode(&mut buf2);
+        assert_eq!(buf2[0], b'c');
+        assert_eq!(i32::from_be_bytes([buf2[1], buf2[2], buf2[3], buf2[4]]), 4);
+    }
+
+    #[test]
+    fn test_copy_frontend_parse_roundtrip() {
+        // CopyData: 'd' | len | raw payload
+        let payload = b"1\thello\n";
+        let mut buf = BytesMut::new();
+        buf.put_u8(b'd');
+        buf.put_i32((4 + payload.len()) as i32);
+        buf.put_slice(payload);
+        match FrontendMessage::parse(&mut buf).unwrap().unwrap() {
+            FrontendMessage::CopyData(d) => assert_eq!(d, payload),
+            other => panic!("expected CopyData, got {:?}", other),
+        }
+
+        // CopyDone: 'c' | len(4)
+        let mut buf = BytesMut::new();
+        buf.put_u8(b'c');
+        buf.put_i32(4);
+        assert!(matches!(
+            FrontendMessage::parse(&mut buf).unwrap().unwrap(),
+            FrontendMessage::CopyDone
+        ));
+
+        // CopyFail: 'f' | len | cstring
+        let mut buf = BytesMut::new();
+        let m = b"oops\0";
+        buf.put_u8(b'f');
+        buf.put_i32((4 + m.len()) as i32);
+        buf.put_slice(m);
+        match FrontendMessage::parse(&mut buf).unwrap().unwrap() {
+            FrontendMessage::CopyFail(s) => assert_eq!(s, "oops"),
+            other => panic!("expected CopyFail, got {:?}", other),
+        }
     }
 }
