@@ -55,14 +55,32 @@ Nothing changes Nano defaults or the simple-Query OLTP path pg35 measures.
   - **2b parser:** `COPY tbl [(cols)] FROM STDIN | TO STDOUT [WITH (FORMAT
     text|csv|binary[, DELIMITER ..., HEADER ...])]` -> a Copy AST node (new
     LogicalPlan/Statement variant). Default format text.
-  - **2c handler (handler.rs, the sub-protocol state machine):** on a COPY FROM
-    STDIN statement -> send CopyInResponse(format, per-col), then enter copy-in
-    loop reading FrontendMessage::CopyData frames, parse rows per format
-    (text: tab-delimited, \N=NULL, \. terminator; csv; binary signature
-    PGCOPY\n...), bulk-INSERT via the existing bulk path, on CopyDone send
-    CommandComplete "COPY n". COPY TO STDOUT -> CopyOutResponse + stream rows as
-    CopyData + CopyDone + CommandComplete. Honor Proxy contract: Sync-scoped RFQ,
-    overall+per-col format bytes, text/csv/binary, COPY FROM STDIN + TO STDOUT.
+  - **2c handler (handler.rs, the sub-protocol state machine) — FULLY SCOPED, APIs found:**
+    - Hook: in `handle_single_query` (handler.rs:561), after the empty-query check,
+      `if let Some(c) = super::copy::parse_copy(query) { return self.handle_copy(c).await; }`
+      (intercepts BEFORE the normal parse/plan path).
+    - Receive loop API: `self.read_message().await? -> Option<FrontendMessage>`
+      (handler.rs:430). Insert API: `self.database.execute(sql)` (used at :668).
+      Send: `self.send_message(BackendMessage)` (:1248), `send_command_complete(tag)`
+      (:1522), `send_ready_for_query()` (:1508).
+    - FROM STDIN flow: determine column count (copy.columns.len() or table schema
+      via catalog) -> send CopyInResponse{overall_format:0, column_formats:vec![0;ncols]}
+      -> loop read_message: CopyData(d)=>accumulate; CopyDone=>finish; CopyFail=>abort
+      (discard, send ErrorResponse). Parse accumulated bytes as TEXT rows: split on
+      '\n'; a lone "\\." line = end marker; each row split on '\t'; decode escapes
+      (\t \n \r \\ ; "\\N" => NULL). **INJECTION-SAFE**: build INSERT via the
+      parameterized path or strict single-quote escaping (double every '\''),
+      NULL for \N. Batch inserts. -> send_command_complete("COPY <n>") ->
+      send_ready_for_query().
+    - TO STDOUT flow: send CopyOutResponse{0,vec![0;ncols]} -> SELECT [cols] FROM
+      table -> per row, TEXT-encode (tab-join, NULL=>"\\N", escape \t\n\r\\) + '\n'
+      -> send as CopyData -> CopyDone -> CommandComplete("COPY <n>") -> RFQ.
+    - Proxy contract: ONE ReadyForQuery at the end (Sync-scoped), overall+per-col
+      format bytes. Increment: TEXT format first (migration-mirror ingest path),
+      then CSV + BINARY (PGCOPY\n\377\r\n\0 signature) as a 2c-followup.
+    - WIRE TEST: round-trip COPY FROM STDIN then COPY TO STDOUT over a DuplexStream
+      (like wire_tests.rs), assert row data integrity incl. NULLs + tab/newline
+      escapes. Plus error cases: CopyFail aborts cleanly, malformed row -> error.
   - **2d gate:** build + new wire-conformance tests (round-trip a COPY FROM STDIN
     then COPY TO STDOUT, text+binary) + pg35 erosion check (COPY is a new code
     path entered only on the COPY statement -> pg35-neutral by construction).
