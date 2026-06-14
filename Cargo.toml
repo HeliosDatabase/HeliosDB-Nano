@@ -57,7 +57,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Storage (Direct RocksDB, no wrapper)
-rocksdb = { version = "0.22", default-features = false, features = ["snappy", "zstd"] }
+rocksdb = { version = "0.22", default-features = false, features = ["snappy", "zstd", "lz4"] }
 
 # SQL Parsing
 sqlparser = { version = "0.53", features = ["visitor"] }

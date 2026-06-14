@@ -180,17 +180,29 @@ mod fastembed_impl {
             if texts.is_empty() {
                 return Ok(Vec::new());
             }
+            // Bound peak memory by processing the input in sub-batches, even
+            // when the caller passes a very large slice. CodeIndexOptions
+            // chunk_size=None batches the whole corpus, which on a >=10k-file
+            // repo materializes ~344k strings + 384-dim vectors at once (tens of
+            // GB RSS, measured 40.8 GB on a large corpus). MAX_BATCH caps peak
+            // memory regardless of caller chunking; fastembed still batches the
+            // ORT inference internally (Some(256)) within each sub-batch.
+            const MAX_BATCH: usize = 2048;
             let guard = self
                 .inner
                 .lock()
                 .map_err(|e| Error::query_execution(format!("fastembed lock: {e}")))?;
-            let owned: Vec<String> = texts.iter().map(|t| t.to_string()).collect();
-            let out = guard
-                .embed(owned, Some(256))
-                .map_err(|e| Error::query_execution(format!("fastembed embed_batch: {e}")))?;
-            // fastembed returns one embedding per input, in order.
-            debug_assert_eq!(out.len(), texts.len());
-            Ok(out.into_iter().map(Some).collect())
+            let mut result: Vec<Option<Vec<f32>>> = Vec::with_capacity(texts.len());
+            for chunk in texts.chunks(MAX_BATCH) {
+                let owned: Vec<String> = chunk.iter().map(|t| t.to_string()).collect();
+                let out = guard
+                    .embed(owned, Some(256))
+                    .map_err(|e| Error::query_execution(format!("fastembed embed_batch: {e}")))?;
+                // fastembed returns one embedding per input, in order.
+                debug_assert_eq!(out.len(), chunk.len());
+                result.extend(out.into_iter().map(Some));
+            }
+            Ok(result)
         }
     }
 }
