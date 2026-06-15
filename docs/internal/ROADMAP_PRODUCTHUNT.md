@@ -1,4 +1,4 @@
-# HeliosDB-Nano — Roadmap vs ProductHunt launch (2026-06-17)
+# HeliosDB-Nano — ProductHunt Launch Roadmap
 
 **Today:** 2026-06-14 · **Launch:** 2026-06-17 (3 days) · **Branch:** `integrate/v3.58.0`
 (28 commits over main `fb8943b`; clean; ISSUE-08 stashed; **nothing pushed/released yet**).
@@ -10,12 +10,29 @@ traffic actually judges on first contact.
 
 ---
 
+## STRATEGIC PIVOT (2026-06-15): focus = Nano's own GENERAL DB performance
+CodeKB has pinned to 3.36.1 for now, so Nano **stops optimizing for the code-graph
+ingest workload** and focuses on its general-purpose DB performance. **This is good
+for the launch:** the 3.57 "write-path regression" was a code-graph-ingest-SCALE case
+(bulk-loading 142k rows into a 3-secondary-index table) — **NOT general OLTP.** Nano's
+GENERAL performance is healthy and unregressed: **pg35 vs PostgreSQL 18.4 = 32–34 of 35
+categories won, zero PG wins, no per-category erosion below the historical envelope.**
+- The CodeKB-driven items (embed_batch, FastIngest profile, RocksDB knobs, item-1b,
+  candidate-c) are all **opt-in / gated / pg35-neutral** → keep them (valid bulk-load
+  features), but they're no longer launch-critical.
+- **Candidate-(d)** (ART secondary-index deferral under bulk_load_mode) → DE-PRIORITIZED;
+  build only if general bulk-load demand appears. Not a launch item.
+- **General-perf focus going forward:** maintain the pg35 lead (erosion tracker guards it)
+  + the deferred general polish (engine.rs `Arc<Tuple>` cache, integer-filter scan dedup,
+  INLJ streaming) for further OLTP/HTAP gains.
+
 ## TL;DR recommendation
 - **You already have a shippable public release (v3.57.0).** The launch is NOT
-  blocked on engineering — worst case you launch on v3.57.0 and ship v3.58.0 after.
-- **Aim to ship v3.58.0 before the 17th IF CodeKB stage-2 confirms the ingest perf
-  win.** The release chain fits in 3 days; stage-2 is the long pole (a multi-hour
-  ingest run, already in flight).
+  blocked on engineering.
+- **The launch perf story is GENERAL: Nano beats PostgreSQL 18.4 on 32–34/35 pg35
+  categories** (honest, quiet-host run to confirm the published number). NOT code-graph
+  ingest. v3.58's shippable adds are features (COPY text+CSV, MVCC, RocksDB knobs), not a
+  perf headline.
 - **The real pre-launch risk is NOT code — it's the front door.** Honesty of the
   README/benchmarks/claims and a working 5-minute install are what convert PH
   visitors. Treat the "Launch readiness" section below as P0.
@@ -26,10 +43,26 @@ traffic actually judges on first contact.
 
 ## P0 — MUST resolve before 2026-06-17
 
-### A. Release-gating (the only hard engineering blocker)
+### A. Release-gating — CodeKB stage-2 RESULT (2026-06-15): v3.58 is NOT an ingest perf win
 | # | Item | Status | Note |
 |---|---|---|---|
-| 1 | **CodeKB stage-2 wall-time** (`--fast-ingest` on item-1b+candidate-c `9ceeb05`) | RUNNING | < 6,782.6 s ⇒ v3.58 is a perf win. ≥ ⇒ instrument next per-row engine op. **Gates whether v3.58 ships AND whether the perf claim is true.** |
+| 1 | **CodeKB stage-2, corrected apples-to-apples** | **DONE — NEGATIVE** | Earlier "beats 1.74×" was an artifact of FastIngest **skipping refs**. Same flags (full refs): 3.58 no-embed ref-write **347 s vs 3.36.1 18.6 s = 18.6× slower**; with-embed **489 s vs 241 s = 2×**. Candidate-c fixed the SYMBOL path (1.4 s); a **2nd write-path regression remains on the 142k REF rows.** |
+
+> **⇒ DO NOT claim an ingest perf win for v3.58** — it is a regression vs 3.36.1 on
+> ref-heavy ingest. v3.58 still ships real features (COPY text+CSV, FastIngest profile,
+> RocksDB knobs, MVCC, erosion tracker) — just not "faster ingest." Launch on v3.57.0,
+> or v3.58 *without* the perf headline.
+
+**NEW critical-path item — candidate (d) (the 2nd write-path regression):**
+`_hdb_code_symbol_refs` has 3 ART secondary indexes vs symbols' 1, and **ART
+secondary-index maintenance is NOT gated by `bulk_load_mode`** (unlike SMFI +
+candidate-c) → 142k refs × 3 indexes maintained per row (347 s). **Fix (CodeKB-proposed,
+same opt-in shape):** under `bulk_load_mode`, defer ART secondary-index maintenance on the
+bulk path + rebuild once at batch end → pg35-neutral. **Caveat:** needs engine
+instrumentation to confirm per-row-regression vs 3.36.1-deferred-build. **Non-trivial
+(deferral+rebuild) → likely POST-launch** (2 days out).
+**ALSO open (separate):** super-linear embed-at-scale (full-corpus 11,144 s vs ~2,150 s
+extrapolated, ~5×) — likely embed memory pressure (14.5 GB RSS). Distinct from candidate-d.
 
 ### B. v3.58.0 release mechanics (only if (1) green AND you authorize)
 | # | Item | Effort |

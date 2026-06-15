@@ -1,6 +1,6 @@
 # PL/pgSQL compatibility
 
-HeliosDB Nano accepts `DO $$ … $$` / `DO LANGUAGE plpgsql $tag$ … $tag$` blocks and executes **plain SQL** statement bodies. Full PL/pgSQL control flow (variables, `FOR … IN SELECT … LOOP`, `IF`/`ELSE`, `RAISE`, `EXCEPTION`) is **not** interpreted as of v3.14.0.
+HeliosDB Nano accepts `DO $$ … $$` / `DO LANGUAGE plpgsql $tag$ … $tag$` blocks and executes **plain SQL** statement bodies. Full PL/pgSQL control flow (variables, `FOR … IN SELECT … LOOP`, `IF`/`ELSE`, `RAISE`, `EXCEPTION`) is **not** interpreted.
 
 When a DO block contains PL/pgSQL syntax, the server returns a clear error — it does **not** silently no-op, which would corrupt migrations that rely on the block running.
 
@@ -92,10 +92,6 @@ INSERT INTO tenants (id, name) VALUES ('default', 'Default Tenant')
 ON CONFLICT (id) DO NOTHING;
 ```
 
-## Roadmap
+## Follow-up
 
 A minimal PL/pgSQL interpreter is tracked as a follow-up. Priority depends on customer demand — if you hit a real migration that doesn't fit the patterns above, open an issue with the block and we'll either adjust the rewrite recipes or fast-track the interpreter.
-
----
-
-*Added in v3.14.1 (2026-04-20).*

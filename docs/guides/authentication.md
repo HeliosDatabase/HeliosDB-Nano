@@ -3,7 +3,7 @@
 HeliosDB Nano exposes four authentication modes on the PG-wire and
 MySQL-wire listeners: `trust` (default for same-host development),
 `password` (cleartext, suitable only with TLS), `md5` (PG legacy), and
-`scram-sha-256` (PG 10+ default, **standards-compliant since v3.26.0**).
+`scram-sha-256` (PG 10+ default, standards-compliant).
 
 ```bash
 # Production default — SCRAM-SHA-256 over TLS
@@ -16,16 +16,15 @@ heliosdb-nano start --data-dir ./mydata --mysql \
 
 | Mode | When to use | Wire shape | Notes |
 |------|-------------|-----------|-------|
-| `trust` | Local dev, same-host embedded | No challenge | Same-host-only since v3.26.0 (see below) |
+| `trust` | Local dev, same-host embedded | No challenge | Same-host-only; see below |
 | `password` | Behind TLS only | Cleartext over the socket | TLS strongly recommended |
 | `md5` | Legacy PG clients only | MD5(password+salt) | Use SCRAM unless your client is < PG 9.5 |
-| `scram-sha-256` | **Default for production** | RFC 5802 + PG SCRAM profile | Re-enabled for libpq / asyncpg / pgx / JDBC clients at v3.26.0 |
+| `scram-sha-256` | **Default for production** | RFC 5802 + PG SCRAM profile | Compatible with libpq / asyncpg / pgx / JDBC clients |
 
 ## SCRAM-SHA-256
 
-Since **v3.26.0** the SCRAM parser correctly handles the GS2 header
-that every conformant libpq-family driver sends. The client-first
-message format is:
+The SCRAM parser handles the GS2 header that every conformant
+libpq-family driver sends. The client-first message format is:
 
 ```
 n,,n=,r=<24-char-nonce>
@@ -38,20 +37,17 @@ n,,n=,r=<24-char-nonce>
                                 r=  → 24-char base64 nonce
 ```
 
-Older Nano releases (< 3.26.0) misparsed the leading `n,,` header and
-indexed the channel-binding flag as the username — every libpq /
-asyncpg / pgx / node-postgres / JDBC client failed handshake with
-`Invalid SCRAM client-first-message: missing GS2 authzid slot`. The
-v3.26.0 fix is **server-side only**; drivers do not need to be
-upgraded.
+The real username comes from the StartupMessage `user` parameter, not
+the empty SCRAM `n=` slot. Drivers do not need special handling for
+Nano.
 
-## Same-host-only `trust` (v3.26.0)
+## Same-host-only `trust`
 
 The `trust` mode disables password verification entirely and is
-intended for local development. Since v3.26.0 the engine **rejects
-trust-mode connections from non-loopback addresses** — a connection
-from `127.0.0.1` (or `::1`, or the Unix socket) is accepted, anything
-else gets the standard authentication error path.
+intended for local development. The engine rejects trust-mode
+connections from non-loopback addresses — a connection from `127.0.0.1`
+(or `::1`, or the Unix socket) is accepted, anything else gets the
+standard authentication error path.
 
 ```bash
 # Loopback only — accepted
@@ -68,14 +64,13 @@ in an embedded container with the listener bound to a Unix socket only
 (see "Embedded mode" in [README.md](../../README.md#start-the-server)),
 or move to `scram-sha-256` for any network-exposed listener.
 
-## StartupMessage `database` validation (v3.25.0)
+## StartupMessage `database` validation
 
 When a PG-wire client connects, the StartupMessage carries a
 `database` parameter (set by `psql -d <name>` or the driver's `dbname`
-option). Since v3.25.0 the engine validates that name against the
-catalog and rejects unknown databases at handshake time. Previously a
-typo silently fell back to the default database, which masked
-configuration drift in multi-database setups.
+option). The engine validates that name against the catalog and rejects
+unknown databases at handshake time, which prevents typos from silently
+falling back to the default database.
 
 See [`database_management.md`](database_management.md) for the
 `CREATE DATABASE` / `DROP DATABASE` SQL surface that backs this.

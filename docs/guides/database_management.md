@@ -1,10 +1,8 @@
 # Database Management (`CREATE DATABASE` / `DROP DATABASE`)
 
-> **Available since v3.25.0.** Before v3.25.0, the engine ran a single
-> implicit database and rejected `CREATE DATABASE` at parse time. Tools
-> that expect to provision multiple databases on connect (Gitea, Drizzle,
-> SQLAlchemy multi-tenant patterns, Diesel's `setup` command) now work
-> against Nano with no engine flags.
+> Nano supports explicit database creation and removal for tools that
+> provision multiple databases on connect, including Gitea, Drizzle,
+> SQLAlchemy multi-tenant patterns, and Diesel setup flows.
 
 ## SQL surface
 
@@ -36,10 +34,9 @@ migration scripts and Docker entrypoints.
   FROM users` in database `myapp` and `SELECT * FROM users` in database
   `myapp_test` are different tables.
 - A connection's active database is set by the PG-wire StartupMessage
-  `database` parameter (`psql -d myapp …`). Since **v3.25.0** the
-  startup handshake validates the requested database against the
-  catalog and rejects unknown names with a clear error — previously a
-  typo silently fell back to the default database.
+  `database` parameter (`psql -d myapp …`). The startup handshake
+  validates the requested database against the catalog and rejects
+  unknown names with a clear error.
 - `DROP DATABASE` is transactional w.r.t. its own catalog write but
   is **not** safe to run while other connections hold the same
   database open. The driver will see "database does not exist" on the

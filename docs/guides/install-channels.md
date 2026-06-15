@@ -4,8 +4,8 @@ HeliosDB-Nano ships through several channels. Prebuilt binaries get you from
 zero to first query in under a minute; building from source takes 20–40
 minutes of compile time.
 
-Prebuilt targets (attached to every [GitHub Release](https://github.com/HeliosDatabase/HeliosDB-Nano/releases)
-starting after v3.38.0):
+Prebuilt targets are attached to
+[GitHub Releases](https://github.com/HeliosDatabase/HeliosDB-Nano/releases):
 
 | Target | Archive |
 |---|---|
@@ -35,7 +35,7 @@ Detects OS/arch, downloads the latest release archive, verifies it against
 root). Options:
 
 ```sh
-sh install.sh v3.39.0                          # pin a version
+sh install.sh <release-tag>                    # pin a release tag
 HELIOSDB_INSTALL_DIR=/opt/bin sh install.sh    # custom install dir
 ```
 
@@ -55,7 +55,7 @@ prebuilt archive.
 ## 3. Manual download + verification
 
 ```sh
-VERSION=v3.39.0
+VERSION=<release-tag>
 TARGET=x86_64-unknown-linux-gnu
 BASE=https://github.com/HeliosDatabase/HeliosDB-Nano/releases/download/$VERSION
 
@@ -73,7 +73,7 @@ release CI:
 
 ```sh
 docker run -p 5432:5432 -v heliosdb_data:/data \
-  ghcr.io/heliosdatabase/heliosdb-nano:latest        # or :vX.Y.Z
+  ghcr.io/heliosdatabase/heliosdb-nano:latest
 ```
 
 To build locally from source instead (e.g. for custom feature flags):
