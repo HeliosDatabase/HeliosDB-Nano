@@ -22,6 +22,8 @@ Nano is one of four products in the HeliosDB family. SDKs and integrations are c
 
 **Catalogue:** [heliosdb.com/sdks.html](https://www.heliosdb.com/sdks.html) · **Build with AI agents:** [heliosdb.com/build-with-agents.html](https://www.heliosdb.com/build-with-agents.html) · **LLM-discoverable index:** [heliosdb.com/llms.txt](https://www.heliosdb.com/llms.txt)
 
+**Performance:** [what's fast, and where we're still improving](docs/PERFORMANCE.md) — honest strengths + transparent limits.
+
 ## Install
 
 ### Supported now: Cargo / crates.io
@@ -78,21 +80,17 @@ binary.
 
 ```bash
 # Example: Linux x86_64 (see Releases for macOS arm64 / Linux aarch64 / Windows)
-VER=v3.57.0
+VER=<release-tag>
 curl -sSfL -O "https://github.com/HeliosDatabase/HeliosDB-Nano/releases/download/$VER/heliosdb-nano-$VER-x86_64-unknown-linux-gnu.tar.gz"
 tar xzf "heliosdb-nano-$VER-x86_64-unknown-linux-gnu.tar.gz"
 ./heliosdb-nano --version
 ```
 
-### Channels Not Yet Active
+### Install Channels
 
-`npx`, Homebrew, and Docker images are not active Nano release channels yet — use
-a prebuilt binary (above) or Cargo for a verified install today. If those channels
-are announced later, installing the matching tool only readies your machine; it
-does not install Nano until the corresponding package, formula, or image is
-published. Tooling: Node.js LTS from [nodejs.org](https://nodejs.org/) (`npx`),
-`brew` from [brew.sh](https://brew.sh/) (Homebrew), or Docker Desktop / Engine /
-Podman (Docker).
+Use Cargo or the GitHub release binaries for a verified install. Package-manager
+channels such as npm, Homebrew, and container images should be treated as
+available only when they are listed on the official releases page.
 
 ## Start the Server
 
@@ -148,7 +146,7 @@ heliosdb> SELECT * FROM products WHERE price < 15;
 
 ```bash
 $ psql -h 127.0.0.1 -p 5432 -U postgres
-psql (16.0, server HeliosDB Nano 3.57.0)
+psql (server HeliosDB Nano)
 postgres=# INSERT INTO products (name, price) VALUES ('Gizmo', 29.99);
 INSERT 0 1
 postgres=# SELECT COUNT(*) FROM products;
@@ -161,7 +159,7 @@ postgres=# SELECT COUNT(*) FROM products;
 
 ```bash
 $ mysql -h 127.0.0.1 -P 3306 -u root
-Server version: 8.0.35-HeliosDB-Nano
+Server version: HeliosDB-Nano
 mysql> SELECT * FROM products WHERE name LIKE 'G%';
 +----+--------+-------+
 | id | name   | price |
@@ -270,14 +268,14 @@ SELECT id, created_at, subject
  ORDER BY created_at DESC, id DESC
  LIMIT 20 OFFSET 100000;
 
--- Keyset (row-constructor tuple, v3.12.0+) — preferred for high-volume lists
+-- Keyset (row-constructor tuple) — preferred for high-volume lists
 SELECT id, created_at, subject
   FROM leads
  WHERE (created_at, id) < ($1, $2)
  ORDER BY created_at DESC, id DESC
  LIMIT 20;
 
--- JOIN + pagination composes cleanly (v3.23.0+: JoinPredicatePushdownRule)
+-- JOIN + pagination composes cleanly
 SELECT l.id, l.subject, c.name AS company
   FROM leads l
   LEFT OUTER JOIN companies c ON l.company_id = c.id
