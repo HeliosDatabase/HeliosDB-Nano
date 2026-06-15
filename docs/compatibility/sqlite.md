@@ -25,8 +25,8 @@ isn't covered.
 | `INTEGER` type affinity | ✅ | parser type mapping | Maps to `INT4` (or `BIGSERIAL` when paired with `PRIMARY KEY AUTOINCREMENT`). |
 | `BLOB` / `BOOLEAN` / `REAL` / `TEXT` types | ✅ | parser type mapping | Map to `BYTEA` / `BOOL` / `FLOAT4` / `TEXT` respectively. |
 | `\|\|` string concat, `IFNULL`, `COALESCE`, `LENGTH`, `IFNULL`, `LIKE` | ✅ | evaluator | Same semantics as PostgreSQL. |
-| `cursor.lastrowid` | ✅ (v3.21+) | SDK auto-rewrite | Cursor.execute() detects INSERT statements, appends `RETURNING <pk>` (PK column cached per table via `PRAGMA table_info`), captures the returned value. Tables with TEXT PKs return `None`, matching sqlite3 semantics. |
-| `STRFTIME(fmt, …)` / `JULIANDAY(d)` | ❌ engine; ⚠️ SDK rewrite optional | — | Not added to the engine — SQLite-specific names would be drift. Use the PG surface: `TO_CHAR(d, fmt)`, `EXTRACT(EPOCH FROM d) / 86400`, `DATE_TRUNC`, `DATE_PART`, `AGE`, `MAKE_DATE`, `MAKE_TIMESTAMP`. All shipped in v3.21. |
+| `cursor.lastrowid` | ✅ | SDK auto-rewrite | Cursor.execute() detects INSERT statements, appends `RETURNING <pk>` (PK column cached per table via `PRAGMA table_info`), captures the returned value. Tables with TEXT PKs return `None`, matching sqlite3 semantics. |
+| `STRFTIME(fmt, …)` / `JULIANDAY(d)` | ❌ engine; ⚠️ SDK rewrite optional | — | Not added to the engine — SQLite-specific names would be drift. Use the PG surface: `TO_CHAR(d, fmt)`, `EXTRACT(EPOCH FROM d) / 86400`, `DATE_TRUNC`, `DATE_PART`, `AGE`, `MAKE_DATE`, `MAKE_TIMESTAMP`. |
 | User-defined Python functions, `register_adapter`/`register_converter` | ❌ | SDK raises `NotSupportedError` | Embedded mode runs in a separate process; in-process callbacks are not bridged. |
 | Custom collations, loadable extensions | ❌ | SDK raises `NotSupportedError` | — |
 
@@ -46,16 +46,16 @@ PRAGMA results with the SQLite-shaped schema directly.
 |---|---|---|
 | How it runs | One `heliosdb-nano repl` subprocess per `Connection` | Many `psycopg2` connections to one running `heliosdb-nano start` |
 | Per-query latency | ~10–50 ms (subprocess RPC) | Sub-millisecond (PG wire) |
-| Cross-connection consistency | ✅ as of v3.21 — every new process re-registers PK / UNIQUE / FK indexes and replays existing rows through `on_insert` on open. Cross-connection upserts and uniqueness checks behave correctly. | Single shared process — full consistency. |
+| Cross-connection consistency | ✅ — every new process re-registers PK / UNIQUE / FK indexes and replays existing rows through `on_insert` on open. Cross-connection upserts and uniqueness checks behave correctly. | Single shared process — full consistency. |
 | Setup | Zero — only the binary on `PATH` (or `HELIOSDB_BIN=`) | Run `heliosdb-nano start --port … --auth=trust` (or with passwords) |
 | Recommended for | Dev, CI, single-process scripts | Production, multi-user, long-lived dashboards |
 
 ## Honest gaps
 
-- **Persistent ART pages** — the v3.21 fix rebuilds indexes from data on
-  open (O(rows + indexes) one-time cost). For multi-million-row data
-  directories, that startup cost can be material. v3.22+ tracks moving
-  to a RocksDB column family per index so opens are O(small).
+- **Persistent ART pages** — indexes are rebuilt from data on open
+  (O(rows + indexes) one-time cost). For multi-million-row data
+  directories, that startup cost can be material. A storage-level index
+  column family would make opens O(small).
 - **`STRFTIME` / `JULIANDAY` engine functions** — intentionally not
   added. The PostgreSQL surface (`TO_CHAR`, `EXTRACT`, `DATE_TRUNC`,
   `DATE_PART`, `AGE`, `MAKE_DATE`, `MAKE_TIMESTAMP`, etc.) is the

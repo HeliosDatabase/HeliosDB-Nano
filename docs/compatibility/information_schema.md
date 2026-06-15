@@ -1,12 +1,10 @@
 # `information_schema` Compatibility
 
-> **Available since v3.24.0.** Earlier versions exposed only the
-> introspection views that the `psql \d`-family commands required;
-> SQL-standard `information_schema` queries against the long-tail
-> views (`character_sets`, `routines`, `parameters`, …) returned
-> empty result sets or undefined columns. v3.24.0 completes the surface
-> and v3.24.0+ raises a loud error on `information_schema.<unknown>`
-> rather than silently returning rows from the wrong view.
+> Nano exposes the long-tail SQL-standard `information_schema` views
+> that ORMs, migration tools, and dashboard builders commonly probe,
+> including `character_sets`, `routines`, `parameters`, and view-usage
+> metadata. Unknown `information_schema` views raise a loud error rather
+> than silently returning rows from the wrong view.
 
 Nano implements the PostgreSQL flavour of the SQL-standard
 `information_schema`. All views are read-only and reflect the catalog
@@ -32,23 +30,23 @@ state at query time (no caching, no staleness).
 |------|--------|-------|
 | `information_schema.schemata` | Complete | One row per registered schema |
 | `information_schema.catalog_name` | Complete | Single-row view; returns the current database name |
-| `information_schema.character_sets` | Complete (v3.24.0) | Single-row UTF-8 entry |
-| `information_schema.collations` | Complete (v3.24.0) | UTF-8 collation + the `C` POSIX collation |
+| `information_schema.character_sets` | Complete | Single-row UTF-8 entry |
+| `information_schema.collations` | Complete | UTF-8 collation + the `C` POSIX collation |
 
 ### Routines and parameters
 
 | View | Status | Notes |
 |------|--------|-------|
-| `information_schema.routines` | Complete (v3.24.0) | PL/pgSQL functions registered via `CREATE FUNCTION` |
-| `information_schema.parameters` | Complete (v3.24.0) | Per-routine parameter rows (ordinal, mode, data type) |
+| `information_schema.routines` | Complete | PL/pgSQL functions registered via `CREATE FUNCTION` |
+| `information_schema.parameters` | Complete | Per-routine parameter rows (ordinal, mode, data type) |
 
 ### Views and views-on-views
 
 | View | Status | Notes |
 |------|--------|-------|
 | `information_schema.views` | Complete | `view_definition` is the raw `CREATE VIEW` body |
-| `information_schema.view_table_usage` | Complete (v3.24.0) | Edges from views to the base tables they reference |
-| `information_schema.view_column_usage` | Complete (v3.24.0) | Edges from views to the base columns they reference |
+| `information_schema.view_table_usage` | Complete | Edges from views to the base tables they reference |
+| `information_schema.view_column_usage` | Complete | Edges from views to the base columns they reference |
 
 ### Privileges (RLS / multi-tenancy)
 
@@ -56,10 +54,10 @@ state at query time (no caching, no staleness).
 |------|--------|-------|
 | `information_schema.table_privileges` | Complete | Resolved against the active `current_tenant()` |
 | `information_schema.column_privileges` | Complete | Same |
-| `information_schema.role_table_grants` | Complete (v3.24.0) | Pre-resolved grants per role |
-| `information_schema.role_column_grants` | Complete (v3.24.0) | Same |
+| `information_schema.role_table_grants` | Complete | Pre-resolved grants per role |
+| `information_schema.role_column_grants` | Complete | Same |
 
-## Strict-unknown-view behaviour (v3.24.0+)
+## Strict-unknown-view behaviour
 
 A reference to `information_schema.<unknown>` raises an error at parse
 time:

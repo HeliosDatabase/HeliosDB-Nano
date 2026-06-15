@@ -170,8 +170,8 @@ week in production before removing.
 ## Limits
 
 - **Embedded mode** spawns a fresh `heliosdb-nano repl` subprocess per
-  `Connection`. As of **v3.21** every fresh process rebuilds PK /
-  UNIQUE / FK indexes from the on-disk rows on open, so
+  `Connection`. Every fresh process rebuilds PK / UNIQUE / FK indexes
+  from the on-disk rows on open, so
   cross-connection upserts and uniqueness checks behave correctly.
   Cost is O(rows + indexes) at startup; for very large data dirs,
   switching to **daemon mode** (one long-running server, many

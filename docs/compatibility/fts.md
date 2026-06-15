@@ -1,6 +1,6 @@
 # PostgreSQL full-text search compatibility
 
-HeliosDB Nano v3.13.0 ships Postgres-compatible full-text search at the
+HeliosDB Nano ships Postgres-compatible full-text search at the
 SQL surface: the `tsvector` and `tsquery` column types, the `@@` match
 operator, and the `to_tsvector` / `to_tsquery` / `ts_rank` /
 `ts_rank_cd` scalar functions. All are backed by the same BM25 engine
@@ -178,7 +178,3 @@ LIMIT 10;
 - `USING gin` DDL: `src/sql/executor/ddl.rs` (look for `idx_type ==
   "gin"`).
 - Tests: `tests/fts_tests.rs` — 8 regression cases.
-
----
-
-*Added in v3.13.0 (2026-04-19).*

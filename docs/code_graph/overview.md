@@ -1,14 +1,13 @@
-# Code-graph track (phase 1, v3.15.0)
+# Code Graph
 
 HeliosDB-Nano can act as an embedded code-graph for AI coding agents:
 an AST index, LSP-shaped queries, and every row pushed through the
 same storage layer as any other Nano table.
 
-**Status.** Phase 1 ships an embedded Rust API plus auto-created
-`_hdb_code_*` tables. Rust and Python grammars are bundled. Wire-level
-DDL (`CREATE EXTENSION hdb_code`, `CREATE AST INDEX`) and temporal
-queries (`AS OF COMMIT`) land in phase 2. See
-`FEATURE_REQUEST_code_graph_overview.md` for the full track.
+The feature ships an embedded Rust API plus auto-created `_hdb_code_*`
+tables. Rust and Python grammars are bundled. Wire-level DDL (`CREATE
+EXTENSION hdb_code`, `CREATE AST INDEX`) and temporal queries (`AS OF
+COMMIT`) are planned extensions to the current embedded API.
 
 ## Enabling the feature
 
@@ -86,28 +85,26 @@ impl EmbeddedDatabase {
 }
 ```
 
-## Supported languages (phase 1)
+## Supported languages
 
 - Rust (`tree-sitter-rust`)
 - Python (`tree-sitter-python`)
 
-TypeScript, Go, SQL, and Markdown extractors arrive in phase 2.
+TypeScript, Go, SQL, and Markdown extractors are planned.
 
 ## Embeddings
 
-Phase 1 does **not** populate a vector column by default. `body_vec`
-is absent from the schema; it returns in phase 2 behind a size-
-parameterised `VECTOR(n)` column whose `n` is negotiated with the
-user's embedding endpoint at index time.
+The embedded code graph does **not** populate a vector column by default.
+`body_vec` is absent from the schema; semantic retrieval can be layered
+on by pairing the index output with an external embedding endpoint.
 
 If you want semantic retrieval today:
 
-1. Keep phase-1 BM25-ready data as-is (works fine for name / qualified
+1. Keep BM25-ready data as-is (works fine for name / qualified
    / signature text).
-2. Wait for phase 2 if you need `body_vec` populated via an HTTP
-   endpoint. The wire shape `{"input": "..."} → {"embedding": [...]}`
-   is already defined in `src/code_graph/embed.rs` so the endpoint can
-   be tested standalone.
+2. Use an external embedding endpoint if you need vector retrieval. The
+   wire shape `{"input": "..."} → {"embedding": [...]}` is defined in
+   `src/code_graph/embed.rs` so the endpoint can be tested standalone.
 
 Nano ships no in-process inference runtime — by design. Tree-sitter
 is bundled; model inference is always external.

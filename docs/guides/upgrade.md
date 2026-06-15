@@ -1,21 +1,18 @@
 # Upgrading HeliosDB Nano
 
-This guide covers in-place upgrades between Nano versions. The on-disk
-RocksDB layout has been **forward-compatible since v3.6.0** — a binary
-upgrade from any 3.x point release to the latest 3.x is a drop-in swap
-in the common case. Read the version-specific notes below before
-upgrading across a wire-protocol or schema boundary.
+This guide covers in-place Nano binary upgrades. The current on-disk
+RocksDB layout is forward-compatible across supported releases in the
+common case. Read the notes below before upgrading across a
+wire-protocol or schema boundary.
 
 ## Upgrade matrix at a glance
 
-| From | To | Strategy | Data migration |
-|------|----|----------|---------------|
-| 3.6.0 → 3.11.x | 3.30.x | Drop-in binary swap | None |
-| 3.11.x → 3.19.1+ | 3.30.x | Drop-in binary swap | None — but see "Wire-protocol notes" below |
-| 3.19.1 → 3.30.x | 3.30.x | Drop-in binary swap | None |
-| Pre-3.6.0 | 3.30.x | Dump-and-restore via `heliosdb-nano dump` | Required (storage layout changed in 3.6.0) |
+| Source data directory | Strategy | Data migration |
+|------|----------|---------------|
+| Supported current layout | Drop-in binary swap | None |
+| Older incompatible layout | Dump-and-restore via `heliosdb-nano dump` | Required |
 
-There is **no required step-wise migration** for any 3.x → 3.x upgrade.
+There is **no required step-wise migration** across supported releases.
 Stop the server, replace the binary, and start it again — recovery is
 automatic via WAL replay.
 
@@ -34,54 +31,52 @@ heliosdb-nano start --data-dir ./mydata
 # → WAL replay runs once, no manual reindex
 ```
 
-## Wire-protocol notes for 3.11.x clients
+## Wire-protocol notes
 
-If your application is pinned at 3.11.x and you are upgrading to
-3.19.1 or later (the keyset row-constructor cutoff), a few SQL-side
-features become available that the 3.11.x client may not yet use:
+After upgrading, a few SQL-side features may become available that older
+clients did not yet use:
 
-| Added in | Feature | Client impact |
-|---|---|---|
-| v3.12.0 | Row-constructor keyset (`WHERE (col, id) < ($1, $2)`) | Optional — the equivalent `OR`-expanded form continues to work |
-| v3.12.0 | Top-K optimisation over `ORDER BY ... LIMIT` | Transparent (planner picks it automatically) |
-| v3.23.0 | `JoinPredicatePushdownRule` (JOIN + WHERE composes correctly) | Transparent — fixes a planner bug, no client change needed |
-| v3.24.0 | `information_schema` completion | Transparent — DDL-aware tools work that previously errored |
-| v3.25.0 | `CREATE DATABASE` / `DROP DATABASE` SQL | New SQL surface; existing apps not affected |
-| v3.26.0 | SCRAM-SHA-256 GS2 header parsing (Bug 2) | Re-enables libpq / asyncpg / node-postgres / JDBC SCRAM clients that previously failed handshake |
+| Feature | Client impact |
+|---|---|
+| Row-constructor keyset (`WHERE (col, id) < ($1, $2)`) | Optional — the equivalent `OR`-expanded form continues to work |
+| Top-K optimisation over `ORDER BY ... LIMIT` | Transparent (planner picks it automatically) |
+| `JoinPredicatePushdownRule` (JOIN + WHERE composes correctly) | Transparent — no client change needed |
+| `information_schema` completion | Transparent — DDL-aware tools work with richer introspection |
+| `CREATE DATABASE` / `DROP DATABASE` SQL | SQL surface for tools that provision databases |
+| SCRAM-SHA-256 GS2 header parsing | Supports libpq / asyncpg / node-postgres / JDBC SCRAM clients |
 
 The drivers themselves do not need to be bumped — these are server-side
 changes that improve compatibility with already-conformant clients.
 
-## Pre-3.6.0 storage layout
+## Older incompatible storage layout
 
-If you have a data directory written by HeliosDB Nano < 3.6.0, the
-storage layout is incompatible with current builds. Dump the data on
-the old binary and restore it on the new one:
+If you have a data directory written by an incompatible old storage
+layout, dump the data on the old binary and restore it on the new one:
 
 ```bash
 # On the old binary
-heliosdb-nano-3.5.x dump --data-dir ./old --output ./snapshot.json.zst
+heliosdb-nano-old dump --data-dir ./old --output ./snapshot.json.zst
 
 # Install the new binary, then restore
 heliosdb-nano restore --data-dir ./mydata --input ./snapshot.json.zst
 ```
 
-Pre-3.6.0 has not been seen in the wild for some time. If you are not
-sure which version wrote your data-dir, run
-`heliosdb-nano start --data-dir ./mydata` — modern binaries refuse to
-open an incompatible directory and print the writer's version. No data
-is mutated when the open fails.
+If you are not sure which binary wrote your data-dir, run
+`heliosdb-nano start --data-dir ./mydata` — current binaries refuse to
+open an incompatible directory and print the writer metadata. No data is
+mutated when the open fails.
 
 ## SQLite-import compatibility
 
-The bundled `.sqlite` importer is independent of the on-disk version
-and works across all 3.x releases. If a `.sqlite` file imports cleanly
-on 3.11.0 it will import cleanly on 3.30.x.
+The bundled `.sqlite` importer is independent of the on-disk layout for
+supported releases. If a `.sqlite` file imports cleanly on a supported
+binary, it should import cleanly after the upgrade.
 
 ## Rolling-back
 
 The forward-compatible storage layout is **not symmetric** — a
-data-dir written by 3.30.x may use record types unknown to 3.11.x.
+data-dir written by a newer binary may use record types unknown to an
+older binary.
 Take a `heliosdb-nano dump` of the data-dir *before* upgrading if you
 need a clean rollback path. Branches (`docs/code_graph/overview.md` →
 "Git-Like Branching") are also a low-cost way to rehearse an upgrade:

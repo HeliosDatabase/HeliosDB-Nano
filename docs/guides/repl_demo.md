@@ -7,7 +7,7 @@ This document demonstrates an interactive REPL session with HeliosDB Nano.
 ```bash
 $ heliosdb-nano repl --memory
 
-HeliosDB Nano v3.7.0
+HeliosDB Nano
 PostgreSQL-compatible embedded database
 
 Type \h for help, \q to quit
@@ -269,7 +269,7 @@ $ mkdir mydb
 # Start REPL with persistent storage
 $ heliosdb-nano repl -d mydb
 
-HeliosDB Nano v3.7.0
+HeliosDB Nano
 PostgreSQL-compatible embedded database
 
 Type \h for help, \q to quit
