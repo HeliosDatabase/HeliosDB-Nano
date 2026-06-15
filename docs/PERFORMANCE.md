@@ -4,10 +4,9 @@ We'd rather you trust our numbers than be dazzled by them. HeliosDB-Nano is fast
 and production-useful for general OLTP/HTAP today — and there are areas we're
 openly still improving. This page is the honest version of both.
 
-The PostgreSQL comparison is reproducible from `tests/pg35_benchmark.rs`; SQLite
-comparisons are published in the project's benchmark docs. **Numbers vary with
-hardware, dataset, and config** — run them on your box; don't take a single figure
-as gospel.
+The PostgreSQL comparison is reproducible from `tests/pg35_benchmark.rs`.
+**Numbers vary with hardware, dataset, and config** — run them on your box; don't
+take a single figure as gospel.
 
 ## Where Nano is genuinely strong
 
@@ -22,10 +21,6 @@ a wide margin, not a hair:
   of offset), where a stock row-store re-scans every skipped row.
 - **Triple wire compatibility** (PostgreSQL + MySQL + REST) on one process, same
   data — no proxy, no second service.
-
-vs **SQLite**: Nano flips the large-analytics comparison (group-by / aggregate at
-200k rows) in its favor while staying competitive on the OLTP shapes SQLite is
-built for.
 
 ## Where we're competitive, not dominant (actively improving)
 
@@ -68,8 +63,6 @@ Our internal goal is to turn "wins most categories" into "wins them all."
 # vs PostgreSQL (point a local PG at PG35_CONNSTR)
 cargo test --release --test pg35_benchmark -- --ignored --nocapture
 ```
-
-SQLite comparisons are published in the project's benchmark docs.
 
 Found a case where Nano is slower than you expected? **Open an issue with the
 repro** — the categories above are exactly the ones we want sharpened, and a
