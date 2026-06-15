@@ -5,6 +5,50 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.58.0] - 2026-06-15
+
+Minor release: PostgreSQL-wire `COPY`, an opt-in `fast_ingest` profile, exposed
+RocksDB write-path tunables, and a batched code-graph embedding path. Everything
+here is additive or opt-in — the default OLTP path and the PostgreSQL-comparison
+benchmark suite are byte-unchanged. This is a feature release, not an ingest
+performance release; see `docs/PERFORMANCE.md` for honest strengths and limits.
+
+### Added
+
+- **`COPY` over the PostgreSQL wire**: `COPY … FROM STDIN` and `COPY … TO STDOUT`
+  in both text and CSV formats — compatible with `psql \copy` and PG→Nano bulk
+  migration. Binary format (`WITH (FORMAT binary)`) is not yet supported and
+  returns a clear `0A000` error.
+- **`fast_ingest` profile** (`ProfileConfig::FastIngest`): an opt-in bundle of
+  regenerable bulk-load settings (async WAL, time-travel off, Lz4 compression,
+  larger block cache) plus a code-index override bridge
+  (`ProfileConfig::code_index_overrides()`).
+- **RocksDB write-path tunables** surfaced as `StorageConfig` fields
+  (`rocksdb_write_buffer_size`, `rocksdb_max_write_buffer_number`,
+  `rocksdb_max_background_jobs`, `rocksdb_bytes_per_sync`, and related); each
+  defaults to the previous built-in value, so existing configs are unaffected.
+- **`Embedder::embed_batch`**: a batched in-process embedding path for the
+  code-graph `code-embed` flow, replacing the per-symbol serial loop with
+  internally chunked batches that bound peak memory.
+
+### Changed
+
+- **Opt-in bulk-load fast paths** (active only under `SET bulk_load_mode = true`):
+  the bulk-insert path skips the per-bulk plan-cache clear and uses an in-memory
+  row-id counter persisted once at batch end. Default behavior and the standard
+  OLTP path are unchanged.
+
+### Fixed
+
+- The `rocksdb` dependency now links `lz4`, so the `fast_ingest` profile's
+  `compression = Lz4` opens disk-backed databases cleanly (previously failed at
+  runtime with "Compression type LZ4 is not linked with the binary").
+- `embed_batch` bounds peak memory via internal 2048-item chunking instead of
+  materializing an entire corpus of embeddings at once.
+- Indexed nested-loop join correctness: added type-equivalence and
+  branch/transaction guards so the fast INLJ path is not taken when the join
+  key types differ or when an active branch/transaction requires slow-path reads.
+
 ## [3.57.0] - 2026-06-13
 
 Minor release: typed batches, commit-pipeline hardening, MVCC version GC,
