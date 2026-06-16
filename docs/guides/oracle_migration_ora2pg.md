@@ -190,16 +190,27 @@ psql -h 127.0.0.1 -p 5432 -U postgres -c "CREATE DATABASE appdb;"
 psql -h 127.0.0.1 -p 5432 -U postgres -d appdb -c "SELECT 1;"
 ```
 
+In HeliosDB Nano, `CREATE DATABASE` registers a **tenant** rather than a
+separate PostgreSQL catalog. For a single-application migration you can skip it
+and load directly into the default database that `heliosdb-nano start
+--data-dir` already opens; create a tenant only when you need multi-tenant
+isolation.
+
 For production, use SCRAM-SHA-256 and TLS instead of `trust`:
 
 ```bash
 heliosdb-nano start \
   --data-dir /var/lib/heliosdb/appdb \
   --auth scram-sha-256 \
-  --password-file /etc/heliosdb/users.toml \
+  --password "$HELIOSDB_PWD" \
   --tls-cert /etc/heliosdb/tls.crt \
   --tls-key /etc/heliosdb/tls.key
 ```
+
+Provide the password through `--password` (there is no `--password-file` flag);
+source it from an environment variable or secrets manager — e.g.
+`export HELIOSDB_PWD=...` — rather than hard-coding it in scripts or shell
+history.
 
 ## Export and review schema
 
@@ -236,9 +247,10 @@ Common edits:
   `INSERT ... SELECT`.
 - Move trigger/function/package code into an application-service backlog if it
   cannot be represented as plain SQL.
-- Recheck multi-column indexes. HeliosDB Nano accepts common B-tree index DDL,
-  but only the leading column is indexed by the current SQLite-compat note; use
-  targeted query tests for critical composite-index workloads.
+- Recheck multi-column indexes. HeliosDB Nano supports true multi-column
+  (composite) B-tree/ART indexes — every key column participates, not just the
+  leading one. Still run targeted query tests for critical composite-index
+  workloads to confirm the planner picks the index you expect.
 
 Load reviewed schema:
 
@@ -256,10 +268,13 @@ file has been reviewed and tested.
 
 ## Export and load data
 
-Ora2Pg can export data as `COPY` or `INSERT`. Use `INSERT` for the first
-HeliosDB migration rehearsal because it exercises the normal SQL path and is
-easiest to debug. After a small smoke test confirms that your target build
-accepts the exact Ora2Pg `COPY` format, switch to `COPY` for speed.
+Ora2Pg can export data as `COPY` or `INSERT`. As of HeliosDB Nano **v3.58**,
+the PostgreSQL-wire `COPY ... FROM STDIN` sub-protocol is supported in text and
+CSV formats — the same text format Ora2Pg's default `-t COPY` export emits — so
+`COPY` is a first-class fast path. Binary `COPY` (`WITH (FORMAT binary)`) is not
+yet supported, and on v3.57 or earlier `COPY FROM STDIN` is unavailable. Use
+`INSERT` for the first rehearsal regardless, because it is the easiest path to
+debug; switch to `COPY` for speed once a small smoke test passes.
 
 Conservative first pass:
 
@@ -289,16 +304,17 @@ these patterns:
   switch them to `ENFORCED`.
 - Split parent and child table loads manually.
 
-For a `COPY` smoke test, create a tiny table and load a small Ora2Pg-generated
-file into a throwaway HeliosDB database before using `COPY` for the full load:
+For a `COPY` smoke test, load a small Ora2Pg-generated `COPY` file into a
+throwaway HeliosDB database to confirm the text format round-trips on your
+build:
 
 ```bash
 ora2pg -c config/ora2pg.conf -t COPY -a SMALL_TABLE -o data/small_copy.sql
 $PSQL -f data/small_copy.sql
 ```
 
-Only use `COPY` for the full migration after the generated format succeeds
-against your HeliosDB build.
+On v3.58+ this loads through the native `COPY FROM STDIN` path; on older builds
+without it, fall back to `-t INSERT`.
 
 ## Direct Ora2Pg import
 
