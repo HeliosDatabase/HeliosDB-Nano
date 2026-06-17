@@ -133,9 +133,9 @@ Per-agent global discovery dirs (same `SKILL.md`, just different roots):
 |-------|-------|------------|
 | Claude Code | `~/.claude/skills/` | Auto-discovered next session start. |
 | OpenCode | `~/.claude/skills/`, `~/.agents/skills/`, `~/.config/opencode/skills/` | On-demand via the `skill` tool (allow it if policy is `ask`/`deny`). |
-| OpenAI Codex | `~/.agents/skills/` (personal), `.agents/skills/` (repo), `/etc/codex/skills/` (admin) | Implicit by `description`, or `/skills` / `$heliosdb-nano-…`; restart to pick up new skills. |
+| OpenAI Codex | `~/.agents/skills/` (personal), `.agents/skills/` (repo), `/etc/codex/skills/` (admin); the CLI also scans `~/.codex/skills/` | Implicit by `description`, or `/skills` / `$heliosdb-nano-…`; restart to pick up new skills. |
 
-Deploying to both `~/.claude/skills/` and `~/.agents/skills/` covers all three (`.agents` is the cross-tool standard Codex + OpenCode share; Codex does **not** read `~/.claude/skills/`). The cache only exists after cargo extracts the crate — if GC'd, run `cargo fetch heliosdb-nano` or reinstall. Each `SKILL.md` carries the required `name` + `description` frontmatter, so all three accept them unchanged.
+Deploying to both `~/.claude/skills/` and `~/.agents/skills/` covers all three (`.agents` is the cross-tool standard Codex + OpenCode share; Codex does **not** read `~/.claude/skills/`, though the Codex CLI additionally scans `~/.codex/skills/`). The cache only exists after cargo extracts the crate — if GC'd, run `cargo fetch heliosdb-nano` or reinstall. Each `SKILL.md` carries the required `name` + `description` frontmatter, so all three accept them unchanged. (Discovery verified on Codex 0.139 via `codex debug prompt-input` and OpenCode 1.17 via `opencode debug skill`.)
 
 ## See also
 - `heliosdb-nano-connect` — open a connection to a running or in-memory database.
