@@ -23,6 +23,8 @@ allowed-tools: Bash(cargo *), Bash(heliosdb-nano *), Bash(rustc *), Read
 | version | CLI | `heliosdb-nano --version` |
 | help | CLI | `heliosdb-nano --help`, `heliosdb-nano <subcmd> --help` |
 | list features (live) | cargo | `cargo info heliosdb-nano --features` |
+| deploy skills (cargo install) | shell | copy `…/registry/src/*/heliosdb-nano-*/.claude/skills/` → `~/.claude/skills/` + `~/.agents/skills/` |
+| deploy skills (git checkout) | shell | `bash scripts/install-agent-skills.sh [--symlink]` |
 
 ## Cargo feature catalogue
 
@@ -106,6 +108,34 @@ heliosdb-nano code-graph --help 2>/dev/null \
 - **First `code-embed` run is slow**. The fastembed model (~80–500 MB depending on model) downloads to `./.fastembed_cache/`. Cache the directory in CI.
 - **`heliosdb-nano init` is optional**. `start` and `repl` create the data dir on demand if missing. `init` is for scripted bootstrap and pre-flight validation.
 - **`heliosdb-nano` (binary) vs `heliosdb_nano` (library crate)**. The binary is hyphenated; the Rust library imported as `use heliosdb_nano::{…}` is underscored. Both come from the same crate.
+
+## Deploy the agent-skill catalogue (Claude Code / OpenCode / Codex)
+
+The 19 `heliosdb-nano-*` skills are plain [Anthropic `SKILL.md`](https://agentskills.io) files. There is **no `heliosdb-nano skills` subcommand** — the binary cannot deploy them. Two deployment paths:
+
+**A — git checkout (official):** `bash scripts/install-agent-skills.sh [--symlink]` copies/symlinks into `~/.claude/skills/` with timestamped backups. Requires a checkout; the script is **excluded from the published crate** (`scripts/` is in Cargo.toml `exclude`).
+
+**B — `cargo install` only (no checkout):** the skill files *do* ship inside the crate (`.claude/skills/` is not excluded), so they sit in cargo's registry cache. Copy them out:
+
+```bash
+# Newest cached crate's skills (or pin: …/heliosdb-nano-<version>/.claude/skills)
+SRC=$(ls -d ~/.cargo/registry/src/*/heliosdb-nano-*/.claude/skills 2>/dev/null | sort -V | tail -1)
+for DEST in ~/.claude/skills ~/.agents/skills; do
+  mkdir -p "$DEST"
+  cp -r "$SRC"/heliosdb-nano-* "$DEST"/
+  cp -r "$SRC"/_index "$DEST"/heliosdb-nano-_index   # reference docs, not a skill
+done
+```
+
+Per-agent global discovery dirs (same `SKILL.md`, just different roots):
+
+| Agent | Reads | Invocation |
+|-------|-------|------------|
+| Claude Code | `~/.claude/skills/` | Auto-discovered next session start. |
+| OpenCode | `~/.claude/skills/`, `~/.agents/skills/`, `~/.config/opencode/skills/` | On-demand via the `skill` tool (allow it if policy is `ask`/`deny`). |
+| OpenAI Codex | `~/.agents/skills/` (personal), `.agents/skills/` (repo), `/etc/codex/skills/` (admin) | Implicit by `description`, or `/skills` / `$heliosdb-nano-…`; restart to pick up new skills. |
+
+Deploying to both `~/.claude/skills/` and `~/.agents/skills/` covers all three (`.agents` is the cross-tool standard Codex + OpenCode share; Codex does **not** read `~/.claude/skills/`). The cache only exists after cargo extracts the crate — if GC'd, run `cargo fetch heliosdb-nano` or reinstall. Each `SKILL.md` carries the required `name` + `description` frontmatter, so all three accept them unchanged.
 
 ## See also
 - `heliosdb-nano-connect` — open a connection to a running or in-memory database.

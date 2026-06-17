@@ -576,6 +576,29 @@ bash scripts/install-agent-skills.sh --symlink      # symlink (live updates)
 
 Existing `~/.claude/skills/heliosdb-nano-*` directories are backed up to `*.bak.<unix-ts>` before being overwritten in either mode.
 
+**Installed via `cargo install` (no git checkout)?** The skill files ship *inside* the published crate, so they are already on disk in cargo's registry cache — but `scripts/install-agent-skills.sh` is **not** packaged. Deploy them straight from the cache. The catalogue is plain [Anthropic `SKILL.md`](https://agentskills.io), so the same files also work in **OpenCode** and **OpenAI Codex**, which scan their own global skill dirs:
+
+```bash
+# Skills bundled inside the crate you installed (newest cached version):
+SRC=$(ls -d ~/.cargo/registry/src/*/heliosdb-nano-*/.claude/skills 2>/dev/null | sort -V | tail -1)
+echo "Deploying skills from: $SRC"
+
+# Claude Code + OpenCode read ~/.claude/skills/ ; Codex + OpenCode read ~/.agents/skills/
+for DEST in ~/.claude/skills ~/.agents/skills; do
+  mkdir -p "$DEST"
+  cp -r "$SRC"/heliosdb-nano-* "$DEST"/
+  cp -r "$SRC"/_index "$DEST"/heliosdb-nano-_index   # verb-map + feature-matrix (reference docs, not a skill)
+done
+```
+
+| Agent | Global skill dir(s) it scans | Notes |
+|-------|------------------------------|-------|
+| **Claude Code** | `~/.claude/skills/` | Auto-discovered at next session start. |
+| **OpenCode** | `~/.claude/skills/`, `~/.agents/skills/`, `~/.config/opencode/skills/` | Loaded on demand via the native `skill` tool; if your permission policy is `ask`/`deny`, allow that tool. |
+| **OpenAI Codex** | `~/.agents/skills/` (personal), `.agents/skills/` (per-repo, team), `/etc/codex/skills/` (admin) | Auto-selected by `description`, or invoke `/skills` / `$heliosdb-nano-…`. Restart Codex if new skills don't appear. |
+
+The cache path exists once cargo has extracted the crate (`cargo install` does this). If cargo GC'd it, run `cargo fetch heliosdb-nano` or reinstall. To pin a specific version instead of newest-cached, replace the `SRC=` glob with `…/heliosdb-nano-<version>/.claude/skills`. The `_index` folder has no `SKILL.md`, so OpenCode/Codex ignore it as a skill (it stays available as reference docs).
+
 | Skill | What it covers |
 |-------|---------------|
 | `heliosdb-nano-overview` | Top-level navigation; routes to the domain skills |
