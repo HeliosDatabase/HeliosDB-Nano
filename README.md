@@ -595,7 +595,7 @@ done
 |-------|------------------------------|-------|
 | **Claude Code** | `~/.claude/skills/` | Auto-discovered at next session start. |
 | **OpenCode** | `~/.claude/skills/`, `~/.agents/skills/`, `~/.config/opencode/skills/` | Loaded on demand via the native `skill` tool; if your permission policy is `ask`/`deny`, allow that tool. |
-| **OpenAI Codex** | `~/.agents/skills/` (personal), `.agents/skills/` (per-repo, team), `/etc/codex/skills/` (admin) | Auto-selected by `description`, or invoke `/skills` / `$heliosdb-nano-…`. Restart Codex if new skills don't appear. |
+| **OpenAI Codex** | `~/.agents/skills/` (personal), `.agents/skills/` (per-repo, team), `/etc/codex/skills/` (admin). The Codex CLI also scans `~/.codex/skills/`. | Auto-selected by `description`, or invoke `/skills` / `$heliosdb-nano-…`. Restart Codex if new skills don't appear. |
 
 The cache path exists once cargo has extracted the crate (`cargo install` does this). If cargo GC'd it, run `cargo fetch heliosdb-nano` or reinstall. To pin a specific version instead of newest-cached, replace the `SRC=` glob with `…/heliosdb-nano-<version>/.claude/skills`. The `_index` folder has no `SKILL.md`, so OpenCode/Codex ignore it as a skill (it stays available as reference docs).
 
