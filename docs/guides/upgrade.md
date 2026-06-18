@@ -20,9 +20,12 @@ automatic via WAL replay.
 # Stop the running server (graceful)
 heliosdb-nano stop --data-dir ./mydata
 
-# Swap the binary. Cargo / crates.io is the only active release channel
-# today (Homebrew, Docker, npx, and prebuilt binaries are not published yet):
+# Swap the binary. crates.io (cargo), the prebuilt per-release GitHub binaries,
+# and the ghcr.io Docker image are the active channels today (Homebrew and npx
+# are not published yet):
 cargo install heliosdb-nano --locked --force
+# or download the prebuilt archive for your platform from the GitHub release,
+# or pull the container image from ghcr.io,
 # or, from a source checkout:
 #   cargo build --release --locked
 
@@ -30,6 +33,24 @@ cargo install heliosdb-nano --locked --force
 heliosdb-nano start --data-dir ./mydata
 # → WAL replay runs once, no manual reindex
 ```
+
+## What's new in 3.58.1
+
+3.58.1 is a drop-in patch over 3.58.0 — no storage-format change and no data
+migration: stop, swap the binary, start. It lands PostgreSQL-compatibility
+fixes, so several statements that errored against 3.58.0 now work after the
+upgrade (server-side changes; no client or driver bump needed):
+
+| Statement | 3.58.0 | 3.58.1 |
+|---|---|---|
+| `DROP TABLE a, b CASCADE` (multi-object) | error "Multiple drops not supported" | drops every named object |
+| `CREATE SEQUENCE s START 100 INCREMENT 10` (clauses in any order) | parse error | parses; `nextval` honors `START` / `INCREMENT` |
+| `WITH t (a, b) AS (VALUES (1,'x'),(2,'y')) …` | "Unsupported set expression" | plans correctly |
+| `CREATE FUNCTION … RETURNS TRIGGER` + `BEFORE INSERT … FOR EACH ROW EXECUTE FUNCTION f()` | function rejected ("Data type not yet supported: Trigger") | runs `NEW.<col> = <expr>; RETURN NEW\|NULL` before the row is written |
+| CHECK-constraint violation message | dumped the internal serialized expression | PG-style `new row violates CHECK constraint '<name>' on table '<table>'` |
+
+Nothing here changes existing behavior — they are additive compatibility fixes.
+See the `CHANGELOG.md` `[3.58.1]` entry for the full list.
 
 ## Wire-protocol notes
 
