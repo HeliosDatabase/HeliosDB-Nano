@@ -263,6 +263,10 @@ impl Parser {
             None
         };
 
+        // Reorder CREATE SEQUENCE option clauses (PostgreSQL allows any order;
+        // sqlparser requires INCREMENT before START, etc.).
+        processed_sql = Self::preprocess_create_sequence_clause_order(&processed_sql);
+
         let mut statements = SqlParser::parse_sql(&self.dialect, &processed_sql)
             .map_err(|e| Error::sql_parse(format!("Failed to parse SQL: {}", e)))?;
 
@@ -839,6 +843,91 @@ impl Parser {
     ///
     /// Quote-aware paren matching so identifiers like `"my(table)"`
     /// don't fool the scan.
+    /// Reorder `CREATE SEQUENCE` option clauses into the fixed order
+    /// sqlparser 0.53 requires (INCREMENT, MINVALUE, MAXVALUE, START, CACHE,
+    /// CYCLE). PostgreSQL accepts these clauses in any order; sqlparser does
+    /// not, so `CREATE SEQUENCE s START 100 INCREMENT 10` fails to parse even
+    /// though `INCREMENT BY 10 START WITH 100` succeeds. Only the option tail
+    /// of each CREATE SEQUENCE statement is rewritten; on any clause we don't
+    /// recognise we leave the statement untouched (never corrupt valid DDL).
+    pub fn preprocess_create_sequence_clause_order(sql: &str) -> String {
+        use regex::Regex;
+        use std::sync::OnceLock;
+
+        // Cheap bail-out: only touch input that creates a sequence.
+        let upper = sql.to_ascii_uppercase();
+        if !upper.contains("SEQUENCE") || !upper.contains("CREATE") {
+            return sql.to_string();
+        }
+
+        static STMT_RE: OnceLock<Regex> = OnceLock::new();
+        // (1) header up to and including the sequence name,
+        // (2) the option tail (non-greedy, up to the terminator),
+        // (3) the terminator (`;` or end of string).
+        let stmt_re = STMT_RE.get_or_init(|| {
+            Regex::new(
+                r#"(?is)(CREATE\s+(?:TEMP\s+|TEMPORARY\s+)?SEQUENCE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:"[^"]+"|[A-Za-z_][\w$]*)(?:\.(?:"[^"]+"|[A-Za-z_][\w$]*))?)(\s+[^;]*?)?(\s*(?:;|$))"#,
+            )
+            .expect("static CREATE SEQUENCE regex is valid")
+        });
+
+        stmt_re
+            .replace_all(sql, |caps: &regex::Captures<'_>| {
+                let header = &caps[1];
+                let tail = caps.get(2).map_or("", |m| m.as_str());
+                let term = &caps[3];
+                if tail.trim().is_empty() {
+                    return format!("{header}{term}");
+                }
+                match Self::reorder_sequence_option_tail(tail.trim()) {
+                    Some(reordered) => format!("{header} {reordered}{term}"),
+                    // Unknown clause present — leave the statement verbatim.
+                    None => format!("{header}{tail}{term}"),
+                }
+            })
+            .into_owned()
+    }
+
+    /// Extract the recognised sequence-option clauses from `tail` (in any
+    /// order) and re-emit them in sqlparser's canonical order. Returns `None`
+    /// if anything other than whitespace is left over (i.e. an option we don't
+    /// model, such as `AS bigint` or `OWNED BY`), so the caller can leave the
+    /// original statement untouched.
+    fn reorder_sequence_option_tail(tail: &str) -> Option<String> {
+        use regex::Regex;
+        use std::sync::OnceLock;
+
+        // (canonical rank, clause matcher). Each matches a whole clause.
+        static CLAUSES: OnceLock<Vec<(usize, Regex)>> = OnceLock::new();
+        let clauses = CLAUSES.get_or_init(|| {
+            vec![
+                (0usize, Regex::new(r"(?i)\bINCREMENT(?:\s+BY)?\s+[+-]?\d+").unwrap()),
+                (1, Regex::new(r"(?i)\b(?:NO\s+MINVALUE|MINVALUE\s+[+-]?\d+)").unwrap()),
+                (2, Regex::new(r"(?i)\b(?:NO\s+MAXVALUE|MAXVALUE\s+[+-]?\d+)").unwrap()),
+                (3, Regex::new(r"(?i)\bSTART(?:\s+WITH)?\s+[+-]?\d+").unwrap()),
+                (4, Regex::new(r"(?i)\bCACHE\s+[+-]?\d+").unwrap()),
+                (5, Regex::new(r"(?i)\b(?:NO\s+CYCLE|CYCLE)\b").unwrap()),
+            ]
+        });
+
+        let mut remaining = tail.to_string();
+        let mut found: Vec<(usize, String)> = Vec::new();
+        for (rank, re) in clauses {
+            if let Some(m) = re.find(&remaining) {
+                let clause = m.as_str().trim().to_string();
+                let (a, b) = (m.start(), m.end());
+                remaining.replace_range(a..b, " ");
+                found.push((*rank, clause));
+            }
+        }
+        // Leftover non-whitespace ⇒ an option we don't understand: bail.
+        if !remaining.trim().is_empty() || found.is_empty() {
+            return None;
+        }
+        found.sort_by_key(|(rank, _)| *rank);
+        Some(found.into_iter().map(|(_, c)| c).collect::<Vec<_>>().join(" "))
+    }
+
     pub fn preprocess_strip_identity_options(sql: &str) -> String {
         let upper = sql.to_uppercase();
         let bytes = sql.as_bytes();

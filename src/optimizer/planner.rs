@@ -341,6 +341,7 @@ impl Planner {
             | LogicalPlan::Delete { .. }
             | LogicalPlan::CreateTable { .. }
             | LogicalPlan::DropTable { .. }
+            | LogicalPlan::DropMulti { .. }
             | LogicalPlan::CreateIndex { .. }
             | LogicalPlan::CreateSequence { .. }
             | LogicalPlan::CreateEnumType { .. }
