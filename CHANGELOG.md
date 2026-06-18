@@ -5,6 +5,34 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.58.1] - 2026-06-18
+
+Patch release: PostgreSQL-compatibility fixes from a 13-item compatibility
+report against 3.58.0. All changes are additive or correctness fixes; the
+default OLTP path and the PostgreSQL-comparison benchmark suite are unchanged
+(Nano still wins 32–33/35 with no envelope erosion).
+
+### Fixed
+
+- **Multi-object `DROP`**: `DROP TABLE a, b CASCADE` (and the view/type forms)
+  now drop every named object instead of erroring "Multiple drops not
+  supported".
+- **`CREATE SEQUENCE` option order**: clauses are accepted in any order
+  (`START 100 INCREMENT 10` previously failed because the parser required
+  `INCREMENT` before `START`), and `START WITH` / `INCREMENT BY` are now honored
+  by `nextval` (defaults remain 1, 2, 3 …).
+- **CTE / top-level `VALUES`**: `WITH t (a, b) AS (VALUES (1,'x'),(2,'y')) …`
+  now plans (previously "Unsupported set expression"). Bare top-level `VALUES`
+  used as a statement is still best addressed via a wrapping `SELECT`.
+- **Trigger functions**: `CREATE FUNCTION … RETURNS TRIGGER` is accepted, and
+  `BEFORE INSERT … FOR EACH ROW EXECUTE FUNCTION f()` now runs the common
+  `NEW.<col> = <expr>; RETURN NEW|NULL` pattern — including expressions that
+  reference `NEW.`/`OLD.` columns — to rewrite or skip the row before it is
+  written.
+- **CHECK-violation message**: now PG-style
+  (`new row violates CHECK constraint '<name>' on table '<table>'`) instead of
+  dumping the constraint's internal serialized expression.
+
 ## [3.58.0] - 2026-06-15
 
 Minor release: PostgreSQL-wire `COPY`, an opt-in `fast_ingest` profile, exposed
