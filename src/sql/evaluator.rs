@@ -218,6 +218,39 @@ impl Evaluator {
             }
 
             LogicalExpr::Column { table, name } => {
+                // Inside a trigger, `NEW.col` / `OLD.col` qualifiers resolve
+                // against the row context rather than the operator tuple. Gated
+                // on a live trigger context, so normal queries are unaffected.
+                if let Some((ctx, row_schema)) = &self.trigger_row_context {
+                    if let Some(t) = table {
+                        let qualifier = t.to_ascii_lowercase();
+                        if qualifier == "new" || qualifier == "old" {
+                            let is_new = qualifier == "new";
+                            let row = if is_new { ctx.new_tuple.as_ref() } else { ctx.old_tuple.as_ref() }
+                                .ok_or_else(|| {
+                                    Error::query_execution(format!(
+                                        "{} is not available in this trigger",
+                                        qualifier.to_uppercase()
+                                    ))
+                                })?;
+                            let idx = row_schema.get_column_index(name).ok_or_else(|| {
+                                Error::query_execution(format!(
+                                    "Column '{}' not found in {} row",
+                                    name,
+                                    qualifier.to_uppercase()
+                                ))
+                            })?;
+                            return row.get(idx).cloned().ok_or_else(|| {
+                                Error::query_execution(format!(
+                                    "Column index {} out of bounds in {} row",
+                                    idx,
+                                    qualifier.to_uppercase()
+                                ))
+                            });
+                        }
+                    }
+                }
+
                 // Find column index in schema, using table qualifier for disambiguation if provided
                 let index = self
                     .schema

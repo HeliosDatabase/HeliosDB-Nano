@@ -2534,8 +2534,8 @@ impl EmbeddedDatabase {
 
                             if !check_result {
                                 return Err(Error::constraint_violation(format!(
-                                    "CHECK constraint '{}' violated: expression '{}' evaluated to false",
-                                    check.name, check.expression
+                                    "new row violates CHECK constraint '{}' on table '{}'",
+                                    check.name, check.table_name
                                 )));
                             }
                         }
@@ -2849,6 +2849,18 @@ impl EmbeddedDatabase {
                                 sql::triggers::TriggerAction::Continue => {
                                     // Continue with insert
                                 }
+                            }
+
+                            // Apply BEFORE-row trigger-function NEW mutations
+                            // (`NEW.col = expr`) to the row before it is written.
+                            if !self.trigger_registry.apply_before_row_mutations(
+                                table_name,
+                                &trigger_event,
+                                &mut tuple,
+                                std::sync::Arc::new(schema.clone()),
+                            )? {
+                                // Trigger body did `RETURN NULL` — skip this row.
+                                continue;
                             }
                         }
 
@@ -3229,8 +3241,8 @@ impl EmbeddedDatabase {
 
                         if !check_result {
                             return Err(Error::constraint_violation(format!(
-                                "CHECK constraint '{}' violated: expression '{}' evaluated to false",
-                                check.name, check.expression
+                                "new row violates CHECK constraint '{}' on table '{}'",
+                                check.name, check.table_name
                             )));
                         }
                     }
@@ -3501,8 +3513,8 @@ impl EmbeddedDatabase {
                                 self.evaluate_check_constraint(&check.expression, &schema, &new_tuple.values)?;
                             if !check_result {
                                 return Err(Error::constraint_violation(format!(
-                                    "CHECK constraint '{}' violated: expression '{}' evaluated to false",
-                                    check.name, check.expression
+                                    "new row violates CHECK constraint '{}' on table '{}'",
+                                    check.name, check.table_name
                                 )));
                             }
                         }
@@ -4200,6 +4212,7 @@ impl EmbeddedDatabase {
                 characteristics,
                 trigger_type,
                 from_constraint,
+                function_name,
             } => {
                 // Check if trigger already exists
                 if let Ok(Some(_)) = self.trigger_registry.get_trigger(table_name, name) {
@@ -4236,6 +4249,20 @@ impl EmbeddedDatabase {
                 // Register trigger
                 self.trigger_registry.register_trigger(definition.clone())?;
 
+                // Resolve the invoked function body into a BEFORE-row NEW
+                // mutation recipe (`NEW.col = expr; RETURN NEW|NULL`). Best
+                // effort: an unsupported body simply registers no mutation, so
+                // the trigger is accepted but performs no row rewrite.
+                if matches!(timing, sql::logical_plan::TriggerTiming::Before)
+                    && matches!(for_each, sql::logical_plan::TriggerFor::Row)
+                {
+                    if let Some(fname) = function_name {
+                        if let Some(mutation) = self.build_trigger_row_mutation(fname, events) {
+                            self.trigger_registry.register_row_mutation(table_name, name, mutation);
+                        }
+                    }
+                }
+
                 // Log to WAL for replication
                 if let Ok(serialized) = bincode::serialize(&definition) {
                     if let Err(e) = self.storage.log_create_trigger(name, table_name, &serialized) {
@@ -4256,6 +4283,7 @@ impl EmbeddedDatabase {
                 })?;
 
                 let dropped = self.trigger_registry.drop_trigger(tbl, name)?;
+                self.trigger_registry.drop_row_mutation(tbl, name);
 
                 if !dropped && !*if_exists {
                     return Err(Error::query_execution(format!(
@@ -9986,6 +10014,109 @@ impl EmbeddedDatabase {
         Ok((statement, false))
     }
 
+    /// Resolve a trigger function's body into a BEFORE-row NEW-mutation recipe
+    /// for the `NEW.<col> = <expr>; … RETURN NEW|NULL` pattern. Returns `None`
+    /// when the function is unknown or its body has no recognised effect.
+    fn build_trigger_row_mutation(
+        &self,
+        function_name: &str,
+        events: &[sql::logical_plan::TriggerEvent],
+    ) -> Option<sql::triggers::TriggerRowMutation> {
+        let func = self.function_registry.get_function(function_name)?;
+        let (assigns, returns_null) = Self::parse_trigger_assignments(&func.body);
+        if assigns.is_empty() && !returns_null {
+            return None;
+        }
+        let mut assignments = Vec::new();
+        for (col, rhs) in &assigns {
+            // Convert each RHS independently so one unsupported expression
+            // doesn't drop the others. Conversion goes straight through
+            // `expr_to_logical` (not full SELECT planning) so `NEW.col` /
+            // `OLD.col` references survive — they're resolved against the row
+            // context when the trigger fires.
+            if let Ok(expr) = self.rhs_to_logical_expr(rhs) {
+                assignments.push((col.clone(), expr));
+            }
+        }
+        if assignments.is_empty() && !returns_null {
+            return None;
+        }
+        Some(sql::triggers::TriggerRowMutation {
+            events: events.to_vec(),
+            assignments,
+            returns_null,
+        })
+    }
+
+    /// Parse a PL/pgSQL trigger body for `NEW.<col> = <expr>` assignments and a
+    /// `RETURN NULL` (skip-row) marker. Best effort: statements it doesn't
+    /// recognise are ignored.
+    fn parse_trigger_assignments(body: &str) -> (Vec<(String, String)>, bool) {
+        // Narrow to the BEGIN … END block when present.
+        let inner = {
+            let upper = body.to_ascii_uppercase();
+            let start = upper.find("BEGIN").map(|i| i + "BEGIN".len()).unwrap_or(0);
+            let end = upper.rfind("END").unwrap_or(body.len());
+            if start <= end && end <= body.len() {
+                &body[start..end]
+            } else {
+                body
+            }
+        };
+
+        let mut assignments = Vec::new();
+        let mut returns_null = false;
+        for raw in inner.split(';') {
+            let stmt = raw.trim();
+            if stmt.is_empty() {
+                continue;
+            }
+            let upper = stmt.to_ascii_uppercase();
+            if upper.starts_with("RETURN") {
+                if upper.contains("NULL") {
+                    returns_null = true;
+                }
+                continue;
+            }
+            // NEW.<col> [:]= <rhs>
+            if upper.starts_with("NEW.") {
+                let after = &stmt[4..]; // after "NEW."
+                if let Some(eq) = after.find('=') {
+                    let col = after[..eq].trim();
+                    // tolerate ':=' assignment
+                    let col = col.strip_suffix(':').unwrap_or(col).trim();
+                    let rhs = after[eq + 1..].trim();
+                    if !col.is_empty() && !rhs.is_empty() {
+                        assignments.push((col.to_string(), rhs.to_string()));
+                    }
+                }
+            }
+        }
+        (assignments, returns_null)
+    }
+
+    /// Convert a single scalar RHS expression (e.g. `NOW()`, `NEW.a + 1`) to a
+    /// logical expression via `expr_to_logical`, deferring column resolution so
+    /// `NEW.`/`OLD.` references are kept for the trigger evaluator.
+    fn rhs_to_logical_expr(&self, rhs: &str) -> Result<sql::logical_plan::LogicalExpr> {
+        let parser = sql::Parser::new();
+        let statement = parser.parse_one(&format!("SELECT {rhs}"))?;
+        let expr = match statement {
+            sqlparser::ast::Statement::Query(query) => match *query.body {
+                sqlparser::ast::SetExpr::Select(select) => match select.projection.into_iter().next() {
+                    Some(sqlparser::ast::SelectItem::UnnamedExpr(e)) => e,
+                    Some(sqlparser::ast::SelectItem::ExprWithAlias { expr, .. }) => expr,
+                    _ => return Err(Error::query_execution("unsupported trigger RHS".to_string())),
+                },
+                _ => return Err(Error::query_execution("unsupported trigger RHS".to_string())),
+            },
+            _ => return Err(Error::query_execution("unsupported trigger RHS".to_string())),
+        };
+        let catalog = self.storage.catalog();
+        let planner = sql::Planner::with_catalog(&catalog);
+        planner.expr_to_logical(&expr)
+    }
+
     /// Parse and plan a parameterized statement with a cache key that cannot
     /// collide with the non-parameterized `query()` plan cache entries.
     fn parameterized_plan_cached(&self, sql: &str) -> Result<std::sync::Arc<sql::LogicalPlan>> {
@@ -15517,8 +15648,8 @@ impl EmbeddedDatabase {
             let check_result = self.evaluate_check_constraint(&check.expression, schema, values)?;
             if !check_result {
                 return Err(Error::constraint_violation(format!(
-                    "CHECK constraint '{}' violated: expression '{}' evaluated to false",
-                    check.name, check.expression
+                    "new row violates CHECK constraint '{}' on table '{}'",
+                    check.name, check.table_name
                 )));
             }
         }
@@ -17042,6 +17173,7 @@ mod tests {
             characteristics: sql::logical_plan::TriggerCharacteristics::default(),
             trigger_type: sql::logical_plan::TriggerType::default(),
             from_constraint: None,
+            function_name: None,
         };
         assert!(EmbeddedDatabase::plan_invalidates_sql_caches(&create_trigger));
 

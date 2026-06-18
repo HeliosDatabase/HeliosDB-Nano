@@ -322,10 +322,28 @@ impl Default for TriggerContext {
     }
 }
 
+/// A BEFORE-row trigger-function effect for the common
+/// `NEW.<col> = <expr>; … RETURN NEW|NULL;` pattern. Resolved from the
+/// invoked function's body at CREATE TRIGGER time and applied to the NEW
+/// tuple before the row is written. Held in memory (session-scoped); not
+/// part of the persisted `TriggerDefinition`.
+#[derive(Debug, Clone)]
+pub struct TriggerRowMutation {
+    /// Events the owning trigger fires on (INSERT / UPDATE).
+    pub events: Vec<TriggerEvent>,
+    /// `NEW.<col> = <expr>` assignments, applied in order.
+    pub assignments: Vec<(String, LogicalExpr)>,
+    /// Body contains `RETURN NULL` ⇒ skip the row entirely.
+    pub returns_null: bool,
+}
+
 /// Trigger registry for managing trigger definitions
 pub struct TriggerRegistry {
     /// In-memory trigger storage keyed by (table_name, trigger_name)
     triggers: Arc<RwLock<HashMap<(String, String), TriggerDefinition>>>,
+    /// BEFORE-row NEW-mutation recipes keyed by (table_name, trigger_name).
+    /// Session-scoped; rebuilt on CREATE TRIGGER.
+    row_mutations: Arc<RwLock<HashMap<(String, String), TriggerRowMutation>>>,
     /// Storage key prefix for triggers
     storage_prefix: &'static str,
 }
@@ -335,8 +353,90 @@ impl TriggerRegistry {
     pub fn new() -> Self {
         Self {
             triggers: Arc::new(RwLock::new(HashMap::new())),
+            row_mutations: Arc::new(RwLock::new(HashMap::new())),
             storage_prefix: "trigger:",
         }
+    }
+
+    /// Register a BEFORE-row NEW-mutation recipe for a trigger.
+    pub fn register_row_mutation(&self, table_name: &str, trigger_name: &str, mutation: TriggerRowMutation) {
+        if let Ok(mut guard) = self.row_mutations.write() {
+            guard.insert((table_name.to_string(), trigger_name.to_string()), mutation);
+        }
+    }
+
+    /// Forget a trigger's NEW-mutation recipe (on DROP TRIGGER).
+    pub fn drop_row_mutation(&self, table_name: &str, trigger_name: &str) {
+        if let Ok(mut guard) = self.row_mutations.write() {
+            guard.remove(&(table_name.to_string(), trigger_name.to_string()));
+        }
+    }
+
+    /// Whether any BEFORE-row mutation recipe is registered for `table_name`.
+    pub fn has_row_mutations(&self, table_name: &str) -> bool {
+        self.row_mutations
+            .read()
+            .map(|g| g.keys().any(|(tbl, _)| tbl == table_name))
+            .unwrap_or(false)
+    }
+
+    /// Apply BEFORE-row trigger-function mutations (`NEW.col = expr`) to
+    /// `new_tuple` in place for `event`. Returns `Ok(false)` if a trigger body
+    /// did `RETURN NULL` (the row should be skipped). Unknown target columns
+    /// and non-evaluable expressions are skipped rather than erroring, so an
+    /// unsupported body never breaks the DML.
+    pub fn apply_before_row_mutations(
+        &self,
+        table_name: &str,
+        event: &TriggerEvent,
+        new_tuple: &mut Tuple,
+        schema: Arc<Schema>,
+    ) -> Result<bool> {
+        let applicable: Vec<TriggerRowMutation> = match self.row_mutations.read() {
+            Ok(guard) => guard
+                .iter()
+                // Match by event kind, ignoring `Update`'s column-list payload
+                // (`Update(None)` at CREATE time vs `Update(Some(cols))` at fire time).
+                .filter(|((tbl, _), m)| {
+                    tbl == table_name
+                        && m.events
+                            .iter()
+                            .any(|e| std::mem::discriminant(e) == std::mem::discriminant(event))
+                })
+                .map(|(_, m)| m.clone())
+                .collect(),
+            Err(_) => return Ok(true),
+        };
+
+        for m in &applicable {
+            if m.returns_null {
+                return Ok(false);
+            }
+            for (col, expr) in &m.assignments {
+                let Some(idx) = schema
+                    .columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(col))
+                else {
+                    continue; // unknown column — ignore
+                };
+                // Evaluate the RHS against the current NEW row (so later
+                // assignments can see earlier ones).
+                let ctx = TriggerRowContext::for_insert(new_tuple.clone());
+                let evaluator =
+                    Evaluator::with_trigger_row_context(schema.clone(), Vec::new(), ctx, schema.clone());
+                let empty = Tuple::new(Vec::new());
+                match evaluator.evaluate(expr, &empty) {
+                    Ok(value) => {
+                        if idx < new_tuple.values.len() {
+                            new_tuple.values[idx] = value;
+                        }
+                    }
+                    Err(_) => continue, // non-evaluable RHS — leave column unchanged
+                }
+            }
+        }
+        Ok(true)
     }
 
     /// Register a new trigger

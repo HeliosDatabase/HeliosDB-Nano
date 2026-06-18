@@ -3556,10 +3556,15 @@ impl<'a> Executor<'a> {
                 Ok(Box::new(ExceptOperator::new(left_op, right_op, *all)?))
             }
             LogicalPlan::CreateIndex { .. } => ddl::handle_create_index(self, plan),
-            LogicalPlan::CreateSequence { name, if_not_exists } => {
+            LogicalPlan::CreateSequence {
+                name,
+                if_not_exists,
+                start_value,
+                increment_by,
+            } => {
                 // In-memory sequence registration. Returns empty result
                 // set (DDL semantics).
-                crate::sql::sequences::create_sequence(name, *if_not_exists);
+                crate::sql::sequences::create_sequence(name, *if_not_exists, *start_value, *increment_by);
                 Ok(Box::new(
                     ScanOperator::new(
                         String::new(),
@@ -3667,6 +3672,24 @@ impl<'a> Executor<'a> {
                 ))
             }
             LogicalPlan::DropTable { name, if_exists } => ddl::handle_drop_table(self, name, *if_exists),
+            LogicalPlan::DropMulti { drops } => {
+                // Execute each drop in sequence. DDL side effects happen during
+                // physical planning (as for the other Drop nodes here), so this
+                // recursion performs every drop; the operators are discarded.
+                for drop in drops {
+                    let _ = self.plan_to_operator(drop)?;
+                }
+                Ok(Box::new(
+                    ScanOperator::new(
+                        String::new(),
+                        Arc::new(crate::Schema { columns: vec![] }),
+                        None,
+                        vec![],
+                        vec![],
+                    )
+                    .with_timeout(self.timeout_ctx()),
+                ))
+            }
             LogicalPlan::Truncate { table_name } => ddl::handle_truncate(self, table_name),
             LogicalPlan::CreateBranch { .. }
             | LogicalPlan::DropBranch { .. }

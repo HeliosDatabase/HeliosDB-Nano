@@ -273,6 +273,41 @@ impl<'a> Planner<'a> {
     /// use this instead of `ObjectName::to_string()` so that
     /// `CREATE TABLE Users` and `SELECT FROM users` resolve to the
     /// same name.
+    /// Pull `START WITH` / `INCREMENT BY` out of the parsed `CREATE
+    /// SEQUENCE` options. MIN/MAX/CACHE/CYCLE are accepted and ignored for
+    /// now; non-literal expressions are skipped (fall back to defaults).
+    fn extract_sequence_options(opts: &[sqlparser::ast::SequenceOptions]) -> (Option<i64>, Option<i64>) {
+        use sqlparser::ast::SequenceOptions;
+        let mut start = None;
+        let mut increment = None;
+        for opt in opts {
+            match opt {
+                SequenceOptions::StartWith(expr, _) => start = Self::literal_i64(expr),
+                SequenceOptions::IncrementBy(expr, _) => increment = Self::literal_i64(expr),
+                _ => {}
+            }
+        }
+        (start, increment)
+    }
+
+    /// Best-effort evaluation of a literal integer expression, tolerating a
+    /// leading unary `+`/`-` (sequence bounds may be negative).
+    fn literal_i64(expr: &sqlparser::ast::Expr) -> Option<i64> {
+        use sqlparser::ast::{Expr, UnaryOperator, Value};
+        match expr {
+            Expr::Value(Value::Number(s, _)) => s.parse::<i64>().ok(),
+            Expr::UnaryOp {
+                op: UnaryOperator::Minus,
+                expr,
+            } => Self::literal_i64(expr).map(|n| -n),
+            Expr::UnaryOp {
+                op: UnaryOperator::Plus,
+                expr,
+            } => Self::literal_i64(expr),
+            _ => None,
+        }
+    }
+
     pub(crate) fn normalize_object_name(name: &sqlparser::ast::ObjectName) -> String {
         let joined = name.0.iter().map(Self::normalize_ident).collect::<Vec<_>>().join(".");
         // Schema-namespacing alias: `_hdb_code.<table>` → `_hdb_code_<table>`,
@@ -375,47 +410,33 @@ impl<'a> Planner<'a> {
                 object_type,
                 ..
             } => {
-                if names.len() != 1 {
-                    return Err(Error::query_execution("Multiple drops not supported"));
+                if names.is_empty() {
+                    return Err(Error::query_execution("DROP requires a name"));
                 }
-                // SAFETY: We've verified names.len() == 1 above
-                let name = Self::normalize_object_name(
-                    names
-                        .first()
-                        .ok_or_else(|| Error::query_execution("DROP requires a name"))?,
-                );
+                // Build one drop plan per object. `DROP TABLE a, b` (PostgreSQL's
+                // comma list) yields a DropMulti executed sequentially. DROP TYPE
+                // notes: removes the enum registration from the catalog; tables
+                // that referenced the type keep their synthesized CHECK constraint
+                // (we don't track back-pointers), which mirrors PG closely enough
+                // for an embedded DB.
+                let to_plan = |name: &sqlparser::ast::ObjectName| -> LogicalPlan {
+                    let name = Self::normalize_object_name(name);
+                    match object_type {
+                        sqlparser::ast::ObjectType::View => LogicalPlan::DropView { name, if_exists },
+                        sqlparser::ast::ObjectType::Table => LogicalPlan::DropTable { name, if_exists },
+                        sqlparser::ast::ObjectType::Database => LogicalPlan::DropDatabase { name, if_exists },
+                        sqlparser::ast::ObjectType::Type => LogicalPlan::DropEnumType { name, if_exists },
+                        // Default to DROP TABLE for backwards compatibility.
+                        _ => LogicalPlan::DropTable { name, if_exists },
+                    }
+                };
 
-                match object_type {
-                    sqlparser::ast::ObjectType::View => {
-                        // DROP VIEW
-                        Ok(LogicalPlan::DropView { name, if_exists })
-                    }
-                    sqlparser::ast::ObjectType::Table => {
-                        // DROP TABLE
-                        Ok(LogicalPlan::DropTable { name, if_exists })
-                    }
-                    sqlparser::ast::ObjectType::Database => {
-                        // DROP DATABASE — Bug 1 mirror; wraps the
-                        // tenant-API.
-                        Ok(LogicalPlan::DropDatabase { name, if_exists })
-                    }
-                    sqlparser::ast::ObjectType::Type => {
-                        // KanttBan #20 (v3.31.0): DROP TYPE removes
-                        // the enum registration from the catalog. Any
-                        // tables that referenced the type retain
-                        // their CHECK constraint — we don't track
-                        // back-pointers. Behaviour mirrors stock PG
-                        // semantically (PG would refuse with
-                        // "depends on…" without CASCADE; for an
-                        // embedded DB the laxer behaviour is more
-                        // useful and the CHECK still enforces the
-                        // allowed labels).
-                        Ok(LogicalPlan::DropEnumType { name, if_exists })
-                    }
-                    _ => {
-                        // Default to DROP TABLE for backwards compatibility
-                        Ok(LogicalPlan::DropTable { name, if_exists })
-                    }
+                if names.len() == 1 {
+                    Ok(to_plan(&names[0]))
+                } else {
+                    Ok(LogicalPlan::DropMulti {
+                        drops: names.iter().map(&to_plan).collect(),
+                    })
                 }
             }
             Statement::Truncate { table_names, .. } => {
@@ -803,12 +824,18 @@ impl<'a> Planner<'a> {
             // ownership relationship to columns yet — this is scoped to
             // unblock Prisma / Drizzle migrations that emit sequence DDL.
             Statement::CreateSequence {
-                name, if_not_exists, ..
+                name,
+                if_not_exists,
+                sequence_options,
+                ..
             } => {
                 let seq_name = Self::normalize_object_name(&name);
+                let (start_value, increment_by) = Self::extract_sequence_options(&sequence_options);
                 Ok(LogicalPlan::CreateSequence {
                     name: seq_name,
                     if_not_exists,
+                    start_value,
+                    increment_by,
                 })
             }
             // `CREATE DATABASE name [IF NOT EXISTS]` — Bug 1 from the
@@ -912,11 +939,14 @@ impl<'a> Planner<'a> {
             })
             .collect();
 
-        let return_type = cf
-            .return_type
-            .as_ref()
-            .map(|rt| self.sql_data_type_to_data_type(rt))
-            .transpose()?;
+        let return_type = match cf.return_type.as_ref() {
+            // `RETURNS TRIGGER` is a pseudo-type for trigger functions — it is
+            // not a real value type, so record None rather than failing type
+            // mapping. The trigger machinery interprets the body separately.
+            Some(sqlparser::ast::DataType::Trigger) => None,
+            Some(rt) => Some(self.sql_data_type_to_data_type(rt)?),
+            None => None,
+        };
 
         let body = match cf.function_body {
             Some(sqlparser::ast::CreateFunctionBody::AsBeforeOptions(expr)) => match expr {
@@ -1181,8 +1211,53 @@ impl<'a> Planner<'a> {
                 }
             }
             SetExpr::Query(query) => self.query_to_plan(*query),
+            SetExpr::Values(values) => self.values_to_plan(&values),
             _ => Err(Error::query_execution("Unsupported set expression")),
         }
+    }
+
+    /// Plan a `VALUES (…), (…)` relation — top-level (`VALUES (1),(2)`) or as
+    /// a CTE body (`WITH t(a,b) AS (VALUES …)`). Desugars into a UNION ALL of
+    /// single-row projections over DualScan, reusing the existing projection /
+    /// union operators. Columns are named `column1`, `column2`, … (PostgreSQL's
+    /// convention for a bare VALUES); a CTE column-alias list renames them
+    /// downstream via the normal CTE aliasing path.
+    fn values_to_plan(&self, values: &sqlparser::ast::Values) -> Result<LogicalPlan> {
+        let first = values
+            .rows
+            .first()
+            .ok_or_else(|| Error::query_execution("VALUES requires at least one row"))?;
+        let ncols = first.len();
+        let aliases: Vec<String> = (1..=ncols).map(|i| format!("column{i}")).collect();
+
+        let mut combined: Option<LogicalPlan> = None;
+        for row in &values.rows {
+            if row.len() != ncols {
+                return Err(Error::query_execution(
+                    "VALUES lists must all be the same length",
+                ));
+            }
+            let exprs = row
+                .iter()
+                .map(|e| self.expr_to_logical(e))
+                .collect::<Result<Vec<_>>>()?;
+            let project = LogicalPlan::Project {
+                input: Box::new(LogicalPlan::DualScan),
+                exprs,
+                aliases: aliases.clone(),
+                distinct: false,
+                distinct_on: None,
+            };
+            combined = Some(match combined {
+                None => project,
+                Some(prev) => LogicalPlan::Union {
+                    left: Box::new(prev),
+                    right: Box::new(project),
+                    all: true,
+                },
+            });
+        }
+        combined.ok_or_else(|| Error::query_execution("VALUES requires at least one row"))
     }
 
     /// Convert a SELECT to a logical plan
@@ -2883,7 +2958,7 @@ impl<'a> Planner<'a> {
         }
     }
 
-    fn expr_to_logical(&self, expr: &Expr) -> Result<LogicalExpr> {
+    pub(crate) fn expr_to_logical(&self, expr: &Expr) -> Result<LogicalExpr> {
         match expr {
             Expr::Identifier(ident) => Ok(LogicalExpr::Column {
                 table: None,
@@ -4836,6 +4911,10 @@ impl<'a> Planner<'a> {
         // that will be called when the trigger fires. For now, we're just parsing
         // the structure, not implementing execution.
 
+        // Capture the invoked function name (`EXECUTE FUNCTION f()`) so the
+        // executor can resolve its body for BEFORE-row NEW mutation.
+        let function_name = Some(Self::normalize_object_name(&exec_body.func_desc.name));
+
         Ok(LogicalPlan::CreateTrigger {
             name: trigger_name,
             table_name: table_name_str,
@@ -4849,6 +4928,7 @@ impl<'a> Planner<'a> {
             characteristics: trigger_characteristics,
             trigger_type,
             from_constraint,
+            function_name,
         })
     }
 

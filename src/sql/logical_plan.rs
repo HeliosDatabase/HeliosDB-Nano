@@ -347,6 +347,14 @@ pub enum LogicalPlan {
         if_exists: bool,
     },
 
+    /// Multiple DROP operations in a single statement (`DROP TABLE a, b`).
+    /// Each sub-plan is a single-object Drop (DropTable/DropView/…) executed
+    /// in sequence.
+    DropMulti {
+        /// The individual drop plans to execute in order.
+        drops: Vec<LogicalPlan>,
+    },
+
     /// Truncate table (remove all rows)
     Truncate {
         /// Table name
@@ -403,6 +411,10 @@ pub enum LogicalPlan {
         name: String,
         /// Silently succeed if the sequence already exists
         if_not_exists: bool,
+        /// `START WITH` value (None ⇒ default 1)
+        start_value: Option<i64>,
+        /// `INCREMENT BY` step (None ⇒ default 1)
+        increment_by: Option<i64>,
     },
 
     /// `CREATE TYPE <name> AS ENUM (label1, label2, …)` — KanttBan
@@ -752,6 +764,10 @@ pub enum LogicalPlan {
         trigger_type: TriggerType,
         /// Referenced constraint name (for CONSTRAINT triggers with FROM clause)
         from_constraint: Option<String>,
+        /// Name of the function invoked via `EXECUTE FUNCTION/PROCEDURE f()`.
+        /// Used to resolve the trigger-function body for BEFORE-row NEW
+        /// mutation (the `NEW.col = expr; RETURN NEW` pattern).
+        function_name: Option<String>,
     },
 
     /// Drop a trigger
@@ -1706,6 +1722,7 @@ impl LogicalPlan {
             }
             LogicalPlan::CreateTable { .. } => Arc::new(Schema { columns: vec![] }),
             LogicalPlan::DropTable { .. } => Arc::new(Schema { columns: vec![] }),
+            LogicalPlan::DropMulti { .. } => Arc::new(Schema { columns: vec![] }),
             LogicalPlan::Truncate { .. } => {
                 // Truncate doesn't have output schema
                 Arc::new(Schema { columns: vec![] })
