@@ -3644,6 +3644,16 @@ impl<'a> Planner<'a> {
                 }
             }
             sqlparser::ast::Value::SingleQuotedString(s) => Ok(Value::String(Self::repair_sqlparser_string(s))),
+            // C-style escaped string `E'...'` and unicode string `U&'...'`.
+            // sqlparser has already processed their escape sequences, so the
+            // stored content is the final text — lift it straight to a String
+            // (no `repair_sqlparser_string`, which is for doubled `''` quotes).
+            // Needed because psycopg renders bytea parameters as escaped
+            // literals (e.g. `E'\\x89504e470001'`), which the CDC replicat's
+            // INSERT ... ON CONFLICT upsert emits — previously rejected with
+            // "Value type not yet supported: EscapedStringLiteral".
+            sqlparser::ast::Value::EscapedStringLiteral(s)
+            | sqlparser::ast::Value::UnicodeStringLiteral(s) => Ok(Value::String(s.clone())),
             // Dollar-quoted strings: `$$hello$$` or `$tag$hello$tag$`. The
             // content is already safely delimited by the parser, so we
             // just lift it to a plain String value — the tag is
@@ -4252,6 +4262,39 @@ impl<'a> Planner<'a> {
                 });
                 Ok(DataType::Varchar(len))
             }
+            // Fixed-length CHAR / CHARACTER. Per the SQL standard an
+            // unspecified length means CHAR(1). Needed for e.g. Pagila's
+            // `language.name CHARACTER(20)` — previously rejected at CREATE
+            // TABLE with "Data type not yet supported: Char(..)".
+            SqlDataType::Char(char_len) | SqlDataType::Character(char_len) => {
+                let len = char_len
+                    .as_ref()
+                    .and_then(|cl| match cl {
+                        sqlparser::ast::CharacterLength::IntegerLength { length, .. } => {
+                            Some(*length as usize)
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or(1);
+                Ok(DataType::Char(len))
+            }
+            // Variable-length national/var character types behave as VARCHAR(n).
+            SqlDataType::CharacterVarying(char_len)
+            | SqlDataType::CharVarying(char_len)
+            | SqlDataType::Nvarchar(char_len) => {
+                let len = char_len.as_ref().and_then(|cl| {
+                    if let sqlparser::ast::CharacterLength::IntegerLength { length, .. } = cl {
+                        Some(*length as usize)
+                    } else {
+                        None
+                    }
+                });
+                Ok(DataType::Varchar(len))
+            }
+            // Character large objects map to unbounded TEXT.
+            SqlDataType::Clob(_)
+            | SqlDataType::CharacterLargeObject(_)
+            | SqlDataType::CharLargeObject(_) => Ok(DataType::Text),
             SqlDataType::Text => Ok(DataType::Text),
             SqlDataType::Bytea => Ok(DataType::Bytea),
             SqlDataType::Date => Ok(DataType::Date),

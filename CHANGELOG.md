@@ -5,6 +5,38 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.58.3] - 2026-06-23
+
+Patch release: PostgreSQL / heterogeneous-migration compatibility fixes surfaced
+by validating Oracle, MySQL, and PostgreSQL (Pagila) → Nano migrations and a CDC
+extract→replicat round-trip through Any2HeliosDB, plus a disposable-app
+(sakila) hardening pass. All changes are additive or correctness fixes; the
+default OLTP path and the PostgreSQL-comparison benchmark suite are unchanged.
+
+### Fixed
+
+- **`NUMERIC` / `DECIMAL` wire type OID**: result columns now advertise the real
+  `numeric` OID (1700) instead of 705 (`unknown`). Clients (psycopg, JDBC, …)
+  were receiving every numeric column as an untyped string and skipping decimal
+  parsing, which broke value-fidelity checks in migration/validation tooling
+  (e.g. `NUMBER(10,2)` 98000.0 comparing unequal to a normalized source value).
+  `char`/`timestamptz`/`interval` were also mapped off 705 to their canonical
+  OIDs.
+- **`CHAR(n)` / `CHARACTER(n)` columns**: accepted in `CREATE TABLE` (previously
+  "Data type not yet supported: Char(..)"), and values now coerce into them —
+  loading into a `CHAR(n)` column failed with "CAST to Char(n) not yet
+  implemented". Values are blank-padded to the declared length per PostgreSQL
+  `bpchar` semantics. `CHARACTER VARYING(n)` / `NVARCHAR(n)` map to `VARCHAR`,
+  and the CLOB forms to `TEXT`. (Pagila `language.name CHARACTER(20)`.)
+- **C-style escaped string literals `E'…'`** (and unicode `U&'…'`) are now
+  accepted as values (previously "Value type not yet supported:
+  EscapedStringLiteral"). psycopg renders `bytea` parameters as escaped
+  literals, so CDC replicat's `INSERT … ON CONFLICT … DO UPDATE` upsert of a
+  binary column was blocked.
+- **`setval(seq, value, is_called)`**: the three-argument form is honored — with
+  `is_called = false` the next `nextval` returns exactly `value` (it previously
+  ignored the flag and returned `value + increment`). pg_dump emits this form.
+
 ## [3.58.2] - 2026-06-23
 
 Patch release: a single PostgreSQL-compatibility fix for quoted identifiers in

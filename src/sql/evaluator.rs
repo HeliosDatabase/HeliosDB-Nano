@@ -886,7 +886,16 @@ impl Evaluator {
                     Some(Value::Int2(n)) => *n as i64,
                     _ => return Err(Error::query_execution("setval() second argument must be an integer")),
                 };
-                Ok(Value::Int8(crate::sql::sequences::setval(&name, value)))
+                // Optional third argument `is_called` (PostgreSQL). When false
+                // the next nextval returns exactly `value`; when true or
+                // omitted it returns `value + increment`. pg_dump emits the
+                // three-arg form, so honour it for round-trip fidelity.
+                let is_called = match arg_values.get(2) {
+                    None | Some(Value::Null) => true,
+                    Some(Value::Boolean(b)) => *b,
+                    _ => return Err(Error::query_execution("setval() third argument must be a boolean")),
+                };
+                Ok(Value::Int8(crate::sql::sequences::setval(&name, value, is_called)))
             }
             // Self-introspection: summarise what HeliosDB Nano supports
             // vs. stock PostgreSQL. Useful for drivers / migration tools
@@ -5243,6 +5252,30 @@ impl Evaluator {
                     other => Ok(Value::String(other.to_string())),
                 }
             }
+            // Fixed-length CHAR(n): coerce to text, then blank-pad to the
+            // declared length per PostgreSQL `bpchar` semantics. Without this
+            // arm, inserting/loading into a CHAR(n) column failed with
+            // "CAST to Char(n) not yet implemented" (e.g. Pagila language.name
+            // CHARACTER(20)). Over-length values are left intact rather than
+            // erroring, matching Nano's lenient migration philosophy.
+            DataType::Char(n) => {
+                let s = match value {
+                    Value::Null => return Ok(Value::Null),
+                    Value::String(s) => s,
+                    Value::Uuid(u) => u.to_string(),
+                    other => other.to_string(),
+                };
+                let want = *n;
+                let have = s.chars().count();
+                let padded = if have < want {
+                    let mut p = s;
+                    p.extend(std::iter::repeat(' ').take(want - have));
+                    p
+                } else {
+                    s
+                };
+                Ok(Value::String(padded))
+            }
 
             DataType::Vector(dimension) => match value {
                 Value::Vector(v) => {
@@ -7326,6 +7359,36 @@ mod tests {
             .evaluate(&expr, &tuple)
             .expect("Failed to evaluate literal expression");
         assert_eq!(result, Value::Int4(42));
+    }
+
+    #[test]
+    fn cast_to_char_pads_to_declared_length() {
+        // Regression: inserting/loading into a CHAR(n) column previously failed
+        // with "CAST to Char(n) not yet implemented" (Pagila language.name
+        // CHARACTER(20)). The value coerces to text and blank-pads to n.
+        let evaluator = Evaluator::new(test_schema());
+        let v = evaluator
+            .cast_value(Value::String("English".to_string()), &crate::DataType::Char(20))
+            .expect("cast to Char(20) should succeed");
+        match v {
+            Value::String(s) => {
+                assert_eq!(s.chars().count(), 20, "CHAR(20) must blank-pad to 20");
+                assert_eq!(s, format!("English{}", " ".repeat(13)));
+            }
+            other => panic!("expected Value::String, got {:?}", other),
+        }
+        // Already-padded (source bpchar) values are preserved unchanged.
+        assert_eq!(
+            evaluator
+                .cast_value(Value::String("x".repeat(20)), &crate::DataType::Char(20))
+                .unwrap(),
+            Value::String("x".repeat(20))
+        );
+        // NULL stays NULL.
+        assert_eq!(
+            evaluator.cast_value(Value::Null, &crate::DataType::Char(20)).unwrap(),
+            Value::Null
+        );
     }
 
     #[test]

@@ -1972,12 +1972,20 @@ pub(super) fn datatype_to_oid(dt: &crate::DataType) -> i32 {
         crate::DataType::Int8 => 20,
         crate::DataType::Float4 => 700,
         crate::DataType::Float8 => 701,
+        // Arbitrary-precision numeric. Must advertise the real `numeric` OID
+        // (1700), not 705/unknown — otherwise clients (psycopg, JDBC, …)
+        // receive numeric columns as untyped strings and skip decimal parsing,
+        // breaking value fidelity for migration/validation tools.
+        crate::DataType::Numeric => 1700,
         crate::DataType::Text => 25,
         crate::DataType::Varchar(_) => 1043,
+        crate::DataType::Char(_) => 1042, // bpchar
         crate::DataType::Bytea => 17,
         crate::DataType::Json => 114,
         crate::DataType::Jsonb => 3802,
         crate::DataType::Timestamp => 1114,
+        crate::DataType::Timestamptz => 1184,
+        crate::DataType::Interval => 1186,
         crate::DataType::Date => 1082,
         crate::DataType::Time => 1083,
         crate::DataType::Uuid => 2950,
@@ -2523,6 +2531,36 @@ mod plpgsql_detection_tests {
         assert_eq!(pg_detect_plpgsql("LOOP exit; END LOOP;"), Some("LOOP"));
         assert_eq!(pg_detect_plpgsql("RAISE NOTICE 'hi';"), Some("RAISE"));
         assert_eq!(pg_detect_plpgsql("DECLARE v integer;"), Some("DECLARE"));
+    }
+}
+
+#[cfg(test)]
+mod datatype_oid_tests {
+    use super::datatype_to_oid;
+    use crate::DataType;
+
+    /// Numeric/decimal columns MUST advertise the real `numeric` OID (1700),
+    /// not 705/unknown. Regression for the Any2HeliosDB Oracle→Nano data-fidelity
+    /// gap: with OID 705, psycopg returns numeric columns as untyped strings, so
+    /// `NUMBER(10,2)` values like 98000.0 fail checksum comparison against the
+    /// source (which normalizes the decimal). See a2h test-data EMPLOYEES.
+    #[test]
+    fn numeric_advertises_numeric_oid_not_unknown() {
+        assert_eq!(datatype_to_oid(&DataType::Numeric), 1700);
+        assert_ne!(datatype_to_oid(&DataType::Numeric), 705);
+    }
+
+    /// Other scalar types that previously fell through to 705/unknown.
+    #[test]
+    fn scalar_types_map_to_canonical_oids() {
+        assert_eq!(datatype_to_oid(&DataType::Char(10)), 1042); // bpchar
+        assert_eq!(datatype_to_oid(&DataType::Timestamptz), 1184);
+        assert_eq!(datatype_to_oid(&DataType::Interval), 1186);
+        // Spot-check the already-correct ones didn't regress.
+        assert_eq!(datatype_to_oid(&DataType::Int4), 23);
+        assert_eq!(datatype_to_oid(&DataType::Int8), 20);
+        assert_eq!(datatype_to_oid(&DataType::Float8), 701);
+        assert_eq!(datatype_to_oid(&DataType::Timestamp), 1114);
     }
 }
 
