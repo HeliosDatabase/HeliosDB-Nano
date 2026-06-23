@@ -197,3 +197,33 @@ fn a11_parameterized_excluded_where_stress() -> Result<()> {
     );
     Ok(())
 }
+
+/// Regression for Any2HeliosDB gap #34 (2026-06-23): double-quoted identifiers
+/// in the `DO UPDATE SET` target and the `EXCLUDED` ref must resolve. psycopg's
+/// `sql.Identifier(...)` emits `"col"`, which previously left the quote
+/// characters in the SET target and failed the column lookup
+/// (`column '"dept_name"' not found`), blocking a2h's CDC idempotent upsert.
+#[test]
+fn a11_quoted_identifiers_in_set_and_excluded() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute("CREATE TABLE a11_quoted (id INT4 PRIMARY KEY, val TEXT, qty INT4, note TEXT)")?;
+    db.execute("INSERT INTO a11_quoted VALUES (1, 'old', 10, 'kept')")?;
+
+    // Mirrors the psycopg-rendered upsert: quoted table, column list,
+    // ON CONFLICT target, and `"col" = EXCLUDED."col"` assignments.
+    let affected = db.execute(
+        "INSERT INTO \"a11_quoted\" (\"id\", \"val\", \"qty\", \"note\") VALUES (1, 'new', 4, 'incoming') \
+         ON CONFLICT (\"id\") DO UPDATE SET \"val\" = EXCLUDED.\"val\", \"qty\" = EXCLUDED.\"qty\", \"note\" = EXCLUDED.\"note\"",
+    )?;
+
+    assert_eq!(affected, 1);
+    assert_eq!(
+        select_values(&db, "a11_quoted")?,
+        vec![
+            Value::String("new".to_string()),
+            Value::Int4(4),
+            Value::String("incoming".to_string()),
+        ]
+    );
+    Ok(())
+}
