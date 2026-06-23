@@ -5,6 +5,21 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.58.2] - 2026-06-23
+
+Patch release: a single PostgreSQL-compatibility fix for quoted identifiers in
+`ON CONFLICT … DO UPDATE`.
+
+### Fixed
+
+- **`ON CONFLICT … DO UPDATE SET "col" = EXCLUDED."col"`** now resolves when the
+  SET target is a double-quoted identifier. The target column name was taken via
+  `to_string()`, which re-emitted the quote characters, so the schema lookup
+  failed with `column '"col"' not found`. Clients that always quote identifiers
+  (e.g. psycopg's `sql.Identifier`) — and therefore idempotent-upsert / CDC
+  workloads built on them — were blocked. Fixed for both `ON CONFLICT DO UPDATE`
+  and MySQL `ON DUPLICATE KEY UPDATE`.
+
 ## [3.58.1] - 2026-06-18
 
 Patch release: PostgreSQL-compatibility fixes from a 13-item compatibility
