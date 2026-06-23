@@ -4661,6 +4661,26 @@ impl<'a> Planner<'a> {
     }
 
     /// Convert ON CONFLICT clause from sqlparser AST to our internal representation
+    /// Extract the column name from an `ON CONFLICT … DO UPDATE SET <target>`
+    /// (or MySQL `ON DUPLICATE KEY UPDATE`) assignment target. Uses each
+    /// ident's unquoted `value` exactly like the regular UPDATE path —
+    /// `target.to_string()` would re-emit the quote characters (`"col"`),
+    /// which then fail the executor's schema lookup (the EXCLUDED quoted-
+    /// identifier upsert bug).
+    fn assignment_target_name(target: &sqlparser::ast::AssignmentTarget) -> Result<String> {
+        match target {
+            sqlparser::ast::AssignmentTarget::ColumnName(object_name) => Ok(object_name
+                .0
+                .iter()
+                .map(|ident| ident.value.clone())
+                .collect::<Vec<_>>()
+                .join(".")),
+            _ => Err(Error::query_execution(
+                "Complex assignment targets not supported in ON CONFLICT DO UPDATE",
+            )),
+        }
+    }
+
     fn convert_on_conflict(&self, on_insert: &Option<sqlparser::ast::OnInsert>) -> Result<Option<OnConflictAction>> {
         let on = match on_insert {
             Some(on) => on,
@@ -4674,7 +4694,7 @@ impl<'a> Planner<'a> {
                         .assignments
                         .iter()
                         .map(|a| {
-                            let col_name = a.target.to_string();
+                            let col_name = Self::assignment_target_name(&a.target)?;
                             let expr = self.expr_to_logical(&a.value)?;
                             Ok((col_name, expr))
                         })
@@ -4692,7 +4712,7 @@ impl<'a> Planner<'a> {
                 let assign_pairs = assignments
                     .iter()
                     .map(|a| {
-                        let col_name = a.target.to_string();
+                        let col_name = Self::assignment_target_name(&a.target)?;
                         let expr = self.expr_to_logical(&a.value)?;
                         Ok((col_name, expr))
                     })
