@@ -83,13 +83,26 @@ pub fn currval(name: &str) -> i64 {
     store().lock().get(name).map_or(0, |m| m.current)
 }
 
-/// `setval(name, value)` — set the counter to `value`, preserving the
-/// sequence's increment. Subsequent `nextval` calls return
-/// `value + increment`, `value + 2*increment`, ….
-pub fn setval(name: &str, value: i64) -> i64 {
+/// `setval(name, value [, is_called])` — set the sequence counter, matching
+/// PostgreSQL's two- and three-argument forms.
+///
+/// * `is_called = true` (the default, and the two-argument form): `value` is
+///   treated as *already produced*, so the next `nextval` returns
+///   `value + increment`, `value + 2*increment`, ….
+/// * `is_called = false`: `value` has *not* been produced yet, so the next
+///   `nextval` returns exactly `value`.
+///
+/// Always returns `value`, like PostgreSQL.
+pub fn setval(name: &str, value: i64, is_called: bool) -> i64 {
     let mut guard = store().lock();
     let entry = guard.entry(name.to_string()).or_default();
-    entry.current = value;
+    entry.current = if is_called {
+        value
+    } else {
+        // Back the counter off by one increment so the next nextval lands on
+        // `value` exactly. saturating_sub guards the i64::MIN edge.
+        value.saturating_sub(entry.increment)
+    };
     value
 }
 
@@ -117,8 +130,20 @@ mod tests {
     fn setval_preserves_increment() {
         create_sequence("seq_sv", false, Some(1), Some(5));
         assert_eq!(nextval("seq_sv"), 1);
-        setval("seq_sv", 50);
+        // Two-arg form == is_called=true: next nextval is value + increment.
+        setval("seq_sv", 50, true);
         assert_eq!(nextval("seq_sv"), 55);
+    }
+
+    #[test]
+    fn setval_is_called_false_makes_next_nextval_equal_value() {
+        create_sequence("seq_sv_false", false, Some(1), Some(5));
+        assert_eq!(nextval("seq_sv_false"), 1);
+        // is_called=false: the next nextval returns exactly `value`.
+        setval("seq_sv_false", 300, false);
+        assert_eq!(nextval("seq_sv_false"), 300);
+        // and then resumes stepping by the increment.
+        assert_eq!(nextval("seq_sv_false"), 305);
     }
 
     #[test]
