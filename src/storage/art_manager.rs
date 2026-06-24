@@ -610,6 +610,47 @@ impl ArtIndexManager {
         Ok(inserted)
     }
 
+    /// Backfill a foreign-key index from existing rows. Mirrors
+    /// `backfill_manual_index` but for `ForeignKey` indexes. Needed when a
+    /// foreign key is added to a table that already holds data: `create_fk_index`
+    /// registers an empty tree, and the planner may answer `WHERE fk_col = …`
+    /// (and FK-column joins) from it — so without this backfill the pre-existing
+    /// rows are invisible and such lookups silently return zero matches.
+    pub fn backfill_fk_index(&self, name: &str, schema: &Schema, tuples: &[Tuple]) -> ArtResult<usize> {
+        self.note_mutation();
+        let entry = {
+            let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
+            indexes
+                .get(name)
+                .cloned()
+                .ok_or_else(|| ArtIndexError::IndexNotFound(name.to_string()))?
+        };
+        if entry.index_type != ArtIndexType::ForeignKey {
+            return Err(ArtIndexError::Internal(format!(
+                "Index '{}' is not a foreign-key index",
+                name
+            )));
+        }
+
+        let mut index = entry.tree.write().unwrap_or_else(|e| e.into_inner());
+        let mut inserted = 0usize;
+        for tuple in tuples {
+            let Some(row_id) = tuple.row_id else {
+                return Err(ArtIndexError::Internal(format!(
+                    "Cannot backfill index '{}' from tuple without row_id",
+                    name
+                )));
+            };
+            if let Some(values) = Self::index_value_refs_from_tuple(&entry.columns, schema, tuple) {
+                let key = Self::encode_key_from_values(values.iter().copied());
+                index.insert(&key, row_id)?;
+                inserted += 1;
+            }
+        }
+
+        Ok(inserted)
+    }
+
     // =========================================================================
     // INDEX REMOVAL
     // =========================================================================
