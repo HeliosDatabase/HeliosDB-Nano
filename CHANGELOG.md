@@ -5,6 +5,24 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.58.5] - 2026-06-24
+
+Patch release: a correctness fix for foreign keys added to already-populated
+tables (the bulk-migration order), found via the Any2HeliosDB Pagila run.
+
+### Fixed
+
+- **`ALTER TABLE … ADD FOREIGN KEY` on a table that already holds rows** now
+  backfills the foreign key's lookup index from the existing rows. The FK
+  auto-creates an ART index on the FK column(s), but it was registered empty
+  and never populated, so the planner answered `WHERE fk_col = …` (and
+  FK-column joins) from an empty index and **silently returned zero rows** even
+  though the data was present. Most visible on composite-PK tables whose FK
+  references a non-leading PK column (Pagila `film_category` / `film_actor`),
+  where multi-table views (`film_list`) came back empty. A full scan
+  (`WHERE fk_col + 0 = …`) or rebuilding the index already returned the correct
+  rows; now the index itself is correct from the moment the FK is added.
+
 ## [3.58.4] - 2026-06-24
 
 Patch release: two more heterogeneous-migration compatibility fixes from the

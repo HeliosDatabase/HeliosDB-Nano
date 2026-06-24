@@ -1399,22 +1399,58 @@ impl<'a> Catalog<'a> {
         constraints.add_foreign_key(fk.clone());
         self.save_table_constraints(&fk.table_name, &constraints)?;
 
-        // Auto-create ART index for FK lookups
+        // Auto-create ART index for FK lookups.
         let art_manager = self.storage.art_indexes();
-        if let Err(e) = art_manager.create_fk_index(
+        match art_manager.create_fk_index(
             &fk.table_name,
             &fk.columns,
             &fk.references_table,
             &fk.references_columns,
             Some(&fk.name),
         ) {
-            tracing::warn!("Failed to create FK ART index for constraint '{}': {}", fk.name, e);
-        } else {
-            tracing::debug!(
-                "Created FK ART index for constraint '{}' on table '{}'",
-                fk.name,
-                fk.table_name
-            );
+            Ok(index_name) => {
+                // Backfill from rows already in the table. An FK added after the
+                // data is loaded (the common bulk-migration order) would
+                // otherwise leave an empty index, and equality lookups /
+                // FK-column joins that the planner answers from it silently
+                // return zero matches. CREATE INDEX backfills the same way.
+                match self.get_table_schema(&fk.table_name) {
+                    Ok(schema) => match self.storage.scan_table_with_schema(&fk.table_name, &schema) {
+                        Ok(tuples) => {
+                            if !tuples.is_empty() {
+                                if let Err(e) = art_manager.backfill_fk_index(&index_name, &schema, &tuples) {
+                                    tracing::warn!(
+                                        "Failed to backfill FK ART index '{}' on '{}': {}",
+                                        index_name,
+                                        fk.table_name,
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => tracing::warn!(
+                            "Failed to scan '{}' to backfill FK index '{}': {}",
+                            fk.table_name,
+                            index_name,
+                            e
+                        ),
+                    },
+                    Err(e) => tracing::warn!(
+                        "Failed to load schema of '{}' to backfill FK index '{}': {}",
+                        fk.table_name,
+                        index_name,
+                        e
+                    ),
+                }
+                tracing::debug!(
+                    "Created FK ART index for constraint '{}' on table '{}'",
+                    fk.name,
+                    fk.table_name
+                );
+            }
+            Err(e) => {
+                tracing::warn!("Failed to create FK ART index for constraint '{}': {}", fk.name, e);
+            }
         }
 
         Ok(())
