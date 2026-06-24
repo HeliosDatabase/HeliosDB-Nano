@@ -1799,6 +1799,24 @@ impl<'a> Planner<'a> {
                     alias: table_alias,
                 })
             }
+            TableFactor::NestedJoin {
+                table_with_joins,
+                alias,
+            } => {
+                // Parenthesized join group, e.g. `(a JOIN b ON …) JOIN c ON …`.
+                // a2h's view-body translation emits left-deep nested joins like
+                // this for multi-table views (Pagila / sakila `*_list`). Recurse
+                // to build the inner join sub-plan; the inner table aliases are
+                // preserved so the ON clauses resolve. An explicit alias on the
+                // whole group would re-qualify its columns, which we don't
+                // rewrite yet — reject it rather than silently mis-resolve.
+                if alias.is_some() {
+                    return Err(Error::query_execution(
+                        "Aliased parenthesized join `(… JOIN …) AS alias` is not yet supported",
+                    ));
+                }
+                self.table_with_joins_to_plan(table_with_joins)
+            }
             other => Err(Error::query_execution(format!(
                 "Unsupported table expression: {:?}",
                 other
@@ -2694,19 +2712,26 @@ impl<'a> Planner<'a> {
             _ => return Err(Error::query_execution("STRING_AGG requires arguments")),
         };
 
-        if args.len() != 2 {
-            return Err(Error::query_execution(
-                "STRING_AGG requires exactly 2 arguments: value and delimiter",
-            ));
-        }
-
-        // Extract delimiter from second argument (must be a literal string)
-        let delimiter_arg = args
-            .get(1)
-            .ok_or_else(|| Error::query_execution("STRING_AGG requires a delimiter argument"))?;
-        let delimiter = match delimiter_arg {
-            LogicalExpr::Literal(crate::Value::String(s)) => s.clone(),
-            _ => return Err(Error::query_execution("STRING_AGG delimiter must be a string literal")),
+        // GROUP_CONCAT(x) — the MySQL form, and Pagila's custom aggregate of the
+        // same name — defaults the separator to ',' when called with a single
+        // argument. STRING_AGG always requires an explicit delimiter, matching
+        // PostgreSQL. A two-argument call uses the given literal delimiter.
+        let is_group_concat = func.name.to_string().eq_ignore_ascii_case("group_concat");
+        let delimiter = match args.len() {
+            2 => match args.get(1) {
+                Some(LogicalExpr::Literal(crate::Value::String(s))) => s.clone(),
+                _ => {
+                    return Err(Error::query_execution(
+                        "STRING_AGG delimiter must be a string literal",
+                    ))
+                }
+            },
+            1 if is_group_concat => ",".to_string(),
+            _ => {
+                return Err(Error::query_execution(
+                    "STRING_AGG requires (value, delimiter); GROUP_CONCAT requires (value) or (value, delimiter)",
+                ))
+            }
         };
 
         let distinct = match &func.args {
@@ -4169,6 +4194,18 @@ impl<'a> Planner<'a> {
                     deferrable,
                     initially_deferred,
                     enforcement,
+                })
+            }
+            // ALTER TABLE … DROP CONSTRAINT [IF EXISTS] name [CASCADE].
+            // Migration tools (a2h's chunked loader) drop FKs before a
+            // range-delete + reload pass and re-add them after. CASCADE is
+            // accepted but not propagated (Nano drops the named constraint
+            // only; dependent objects are handled by their own DDL).
+            AlterTableOperation::DropConstraint { name, if_exists, .. } => {
+                Ok(LogicalPlan::AlterTableDropConstraint {
+                    table_name,
+                    constraint_name: name.value,
+                    if_exists,
                 })
             }
             _ => Err(Error::query_execution(format!(

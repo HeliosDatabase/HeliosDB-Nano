@@ -890,6 +890,7 @@ impl EmbeddedDatabase {
                 | sql::LogicalPlan::AlterTableAlterColumnNullability { .. }
                 | sql::LogicalPlan::AlterTableAddForeignKey { .. }
                 | sql::LogicalPlan::AlterTableAlterConstraintEnforcement { .. }
+                | sql::LogicalPlan::AlterTableDropConstraint { .. }
                 | sql::LogicalPlan::AlterTableMulti { .. }
                 | sql::LogicalPlan::CreateIndex { .. }
                 | sql::LogicalPlan::CreateTrigger { .. }
@@ -4622,6 +4623,47 @@ impl EmbeddedDatabase {
                 if !found {
                     return Err(Error::query_execution(format!(
                         "Foreign key constraint '{}' not found on table '{}'",
+                        constraint_name, table_name
+                    )));
+                }
+                catalog.save_table_constraints(table_name, &constraints)?;
+                Ok(0)
+            }
+            sql::LogicalPlan::AlterTableDropConstraint {
+                table_name,
+                constraint_name,
+                if_exists,
+            } => {
+                let catalog = self.storage.catalog();
+                // Surface a clear error if the table itself is missing.
+                catalog.get_table_schema(table_name)?;
+                let mut constraints = catalog.load_table_constraints(table_name)?;
+                let before = constraints.foreign_keys.len()
+                    + constraints.check_constraints.len()
+                    + constraints.unique_constraints.len();
+                // DROP CONSTRAINT names a single object; match it across FK,
+                // UNIQUE/PK, and CHECK by name (case-insensitive, PG-style).
+                constraints
+                    .foreign_keys
+                    .retain(|c| !c.name.eq_ignore_ascii_case(constraint_name));
+                constraints
+                    .check_constraints
+                    .retain(|c| !c.name.eq_ignore_ascii_case(constraint_name));
+                constraints
+                    .unique_constraints
+                    .retain(|c| !c.name.eq_ignore_ascii_case(constraint_name));
+                let after = constraints.foreign_keys.len()
+                    + constraints.check_constraints.len()
+                    + constraints.unique_constraints.len();
+                if before == after {
+                    // Nothing matched. IF EXISTS makes this a no-op (the shape
+                    // a2h emits before a fresh load, where no FK exists yet);
+                    // otherwise it is an error like PostgreSQL.
+                    if *if_exists {
+                        return Ok(0);
+                    }
+                    return Err(Error::query_execution(format!(
+                        "constraint \"{}\" of relation \"{}\" does not exist",
                         constraint_name, table_name
                     )));
                 }

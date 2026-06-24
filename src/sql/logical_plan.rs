@@ -596,6 +596,16 @@ pub enum LogicalPlan {
         enforcement: ConstraintEnforcement,
     },
 
+    /// ALTER TABLE … DROP CONSTRAINT [IF EXISTS] name [CASCADE]
+    AlterTableDropConstraint {
+        /// Table name owning the constraint
+        table_name: String,
+        /// Constraint name to drop (FK / UNIQUE / CHECK)
+        constraint_name: String,
+        /// IF EXISTS — a missing constraint is a no-op rather than an error
+        if_exists: bool,
+    },
+
     /// Multiple ALTER TABLE operations in a single statement
     AlterTableMulti {
         /// The individual ALTER TABLE operations to execute sequentially
@@ -1643,6 +1653,7 @@ impl LogicalPlan {
             Self::SystemView { .. } => "SystemView",
             Self::TableFunction { .. } => "TableFunction",
             Self::AlterTableMulti { .. } => "AlterTableMulti",
+            Self::AlterTableDropConstraint { .. } => "AlterTableDropConstraint",
             _ => "Other",
         }
     }
@@ -1768,7 +1779,9 @@ impl LogicalPlan {
                 // ALTER TABLE RENAME doesn't have output schema
                 Arc::new(Schema { columns: vec![] })
             }
-            LogicalPlan::AlterTableAddForeignKey { .. } | LogicalPlan::AlterTableAlterConstraintEnforcement { .. } => {
+            LogicalPlan::AlterTableAddForeignKey { .. }
+            | LogicalPlan::AlterTableAlterConstraintEnforcement { .. }
+            | LogicalPlan::AlterTableDropConstraint { .. } => {
                 Arc::new(Schema { columns: vec![] })
             }
             LogicalPlan::AlterTableMulti { .. } => {

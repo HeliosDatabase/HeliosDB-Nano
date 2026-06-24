@@ -5,6 +5,30 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.58.4] - 2026-06-24
+
+Patch release: two more heterogeneous-migration compatibility fixes from the
+Any2HeliosDB validation pass (PostgreSQL/Pagila views and the chunked loader's
+FK handling).
+
+### Fixed
+
+- **Parenthesized / nested joins** in `SELECT` and `CREATE VIEW` —
+  `… FROM ((a JOIN b ON …) JOIN c ON …)` now plans instead of erroring
+  "Unsupported table expression: NestedJoin". Migration tools emit left-deep
+  nested joins for multi-table views (e.g. Pagila's `customer_list` /
+  `staff_list`), so those views now migrate.
+- **`ALTER TABLE … DROP CONSTRAINT [IF EXISTS] name [CASCADE]`** is implemented
+  (it previously errored "Unsupported ALTER TABLE operation: DropConstraint").
+  Drops the named `FOREIGN KEY` / `UNIQUE` / `CHECK` constraint; `IF EXISTS`
+  makes a missing constraint a no-op. The resumable loader drops FKs before its
+  range-delete + reload pass, so this removes a spurious per-table warning.
+- **`GROUP_CONCAT(value)`** (single argument) now defaults the separator to `,`,
+  matching MySQL and Pagila's custom `group_concat` aggregate. It previously
+  required two arguments (the `STRING_AGG` rule), so views aggregating with the
+  1-arg form (Pagila's `film_list` / `nicer_but_slower_film_list`) failed to
+  create. `STRING_AGG` still requires an explicit delimiter (PostgreSQL).
+
 ## [3.58.3] - 2026-06-23
 
 Patch release: PostgreSQL / heterogeneous-migration compatibility fixes surfaced
