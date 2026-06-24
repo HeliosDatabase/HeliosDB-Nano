@@ -359,6 +359,7 @@ impl Planner {
             | LogicalPlan::AlterTableRename { .. }
             | LogicalPlan::AlterTableAddForeignKey { .. }
             | LogicalPlan::AlterTableAlterConstraintEnforcement { .. }
+            | LogicalPlan::AlterTableDropConstraint { .. }
             | LogicalPlan::Truncate { .. }
             | LogicalPlan::CreateBranch { .. }
             | LogicalPlan::DropBranch { .. }
