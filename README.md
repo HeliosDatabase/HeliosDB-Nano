@@ -25,7 +25,7 @@ Nano is one of four products in the HeliosDB family. SDKs and integrations are c
 
 **Performance:** [what's fast, and where we're still improving](docs/PERFORMANCE.md) — honest strengths + transparent limits.
 
-**Benchmark:** [HeliosDB-Nano vs PostgreSQL 18.4 — the `pg35` benchmark, its history & evolution](docs/benchmarks/PG35_BENCHMARK.md) — 35 SQL categories head-to-head; Nano wins 34/35 (30 by 10×–35,000×), with the one classified loss (Prepared stmts) shown honestly to be a measurement artifact, not a code deficit.
+**Benchmark:** [HeliosDB-Nano vs PostgreSQL 18.4 — the `pg35` benchmark, its history & evolution](docs/benchmarks/PG35_BENCHMARK.md) — 35 SQL categories head-to-head; Nano wins all 35/35 at 300 iterations (30 by 10×–35,000×, the joins by 1.1×–2×). The one category that ever classified against Nano (Prepared stmts) turned out to expose a real `ROLLBACK TO SAVEPOINT` bug — fixed in v3.60.3, and now a ~157× Nano win.
 
 ## Install
 
