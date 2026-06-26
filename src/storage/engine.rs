@@ -3312,6 +3312,36 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Persist a sequence high-water record and force it power-loss durable
+    /// REGARDLESS of the per-statement autocommit-durability GUC.
+    ///
+    /// The sequence no-duplicate invariant requires this fsync to ALWAYS
+    /// happen: a value V is served only after a durable high-water H >= V has
+    /// hit disk. Routing through `durable_autocommit_barrier()` /
+    /// `statement_durability_required()` would silently skip the fsync when
+    /// `durable_commit` is off or a session `synchronous_commit=off` override
+    /// is active — which would let a crash re-serve already-handed-out values.
+    /// So this batches via the same group committer (keeping the cohort-fsync
+    /// win) but is NOT gated by that predicate.
+    ///
+    /// The only skip is `memory_only` mode: there is no WAL and no crash
+    /// recovery, so sequences are documented-volatile and the fsync is moot.
+    /// Goes through `save_sequence_state` -> `StorageEngine::put`, so the
+    /// record inherits the same at-rest encryption as enum/identity records.
+    pub fn flush_sequence_state(
+        &self,
+        name: &str,
+        st: crate::storage::catalog::PersistedSeqState,
+    ) -> Result<()> {
+        self.catalog().save_sequence_state(name, &st)?;
+        if !self.config.storage.memory_only {
+            self.group_committer
+                .wait_durable(|| self.db.flush_wal(true).map_err(|e| e.to_string()))
+                .map_err(|e| Error::storage(format!("sequence WAL fsync failed: {}", e)))?;
+        }
+        Ok(())
+    }
+
     /// Effective per-statement durability: `storage.durable_commit` unless a
     /// session-scoped `SET synchronous_commit` override is installed for the
     /// current thread (R1.3 phase 2). Never durable in memory-only mode.
@@ -3837,9 +3867,15 @@ impl StorageEngine {
             }
         }
         if let Some(candidate) = integer_filter_candidate(schema, &filter_predicates) {
-            if let Some(tuples) =
-                self.scan_table_with_schema_projected_integer_filtered(table_name, schema, projection, candidate)?
-            {
+            // The single-filter case is the 1-element specialization of the
+            // multi-filter scan; route through it (slice::from_ref, no alloc)
+            // rather than maintaining a near-identical second copy.
+            if let Some(tuples) = self.scan_table_with_schema_projected_integer_filters(
+                table_name,
+                schema,
+                projection,
+                std::slice::from_ref(&candidate),
+            )? {
                 return Ok(Some(tuples));
             }
         }
@@ -4176,88 +4212,6 @@ impl StorageEngine {
                         projected_values
                             .push(columnar_batch_value(&column_batches, *idx, batch_id, offset).unwrap_or(Value::Null));
                     }
-                }
-            }
-            tuples.push(Tuple::new(projected_values));
-        }
-
-        Ok(Some(tuples))
-    }
-
-    fn scan_table_with_schema_projected_integer_filtered(
-        &self,
-        table_name: &str,
-        schema: &crate::Schema,
-        projection: &[usize],
-        filter: IntegerFilterCandidate,
-    ) -> Result<Option<Vec<Tuple>>> {
-        let mut output_requested: Vec<usize> = projection.to_vec();
-        output_requested.sort_unstable();
-        output_requested.dedup();
-
-        let output_pos = |column_index: usize| -> Result<usize> {
-            output_requested.binary_search(&column_index).map_err(|_| {
-                Error::storage(format!(
-                    "Column index {} missing from projected integer filtered scan decode set for {}",
-                    column_index, table_name
-                ))
-            })
-        };
-        let projection_positions: Vec<usize> = projection
-            .iter()
-            .map(|&idx| output_pos(idx))
-            .collect::<Result<Vec<_>>>()?;
-
-        let prefix = format!("data:{}:", table_name);
-        let prefix_bytes = prefix.as_bytes();
-        let mut read_opts = ReadOptions::default();
-        read_opts.set_total_order_seek(true);
-        let iter = self
-            .db
-            .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read_opts);
-
-        let mut values = Vec::with_capacity(output_requested.len());
-        let mut tuples = Vec::new();
-        for item in iter {
-            let (key, raw_value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
-            if !key.starts_with(prefix_bytes) {
-                break;
-            }
-
-            let decrypted;
-            let row_bytes = if let Some(km) = &self.key_manager {
-                decrypted = crypto::decrypt(km.key(), raw_value.as_ref())?;
-                decrypted.as_slice()
-            } else {
-                raw_value.as_ref()
-            };
-
-            let Some(decoded) =
-                crate::storage::prefix_decode::decode_tuple_numeric_column_value(row_bytes, filter.column_index)
-            else {
-                return Ok(None);
-            };
-            let Some(matches) = decoded_integer_matches_filter(decoded, filter) else {
-                return Ok(None);
-            };
-            if !matches {
-                continue;
-            }
-
-            crate::storage::prefix_decode::decode_tuple_column_values_into(
-                row_bytes,
-                &output_requested,
-                schema.columns.len(),
-                &mut values,
-            )
-            .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
-
-            let mut projected_values = Vec::with_capacity(projection_positions.len());
-            for &pos in &projection_positions {
-                if let Some(value) = values.get_mut(pos) {
-                    projected_values.push(std::mem::replace(value, Value::Null));
-                } else {
-                    projected_values.push(Value::Null);
                 }
             }
             tuples.push(Tuple::new(projected_values));
@@ -7325,10 +7279,25 @@ impl StorageEngine {
         self.get_row_by_pk_inner(table_name, pk_value, Some(schema), false, false)
     }
 
-    /// Fetch a row directly by its row_id (for index-nested-loop join)
+    /// Fetch a row directly by its row_id as an owned `Tuple`.
     pub fn get_row_by_id(&self, table_name: &str, row_id: u64, schema: &crate::Schema) -> Result<Option<Tuple>> {
+        Ok(self
+            .get_row_by_id_arc(table_name, row_id, schema)?
+            .map(|t| (*t).clone()))
+    }
+
+    /// Fetch a row directly by its row_id as a shared `Arc<Tuple>` (for the
+    /// index-nested-loop join, which only borrows the right row to build the
+    /// combined output tuple — so a cache hit is a refcount bump, not a deep
+    /// `Vec<Value>` copy, and a cache fill stores the same `Arc` it returns).
+    pub fn get_row_by_id_arc(
+        &self,
+        table_name: &str,
+        row_id: u64,
+        schema: &crate::Schema,
+    ) -> Result<Option<std::sync::Arc<Tuple>>> {
         // Check row cache first
-        if let Some(cached) = self.row_cache.get(table_name, row_id) {
+        if let Some(cached) = self.row_cache.get_arc(table_name, row_id) {
             return Ok(Some(cached));
         }
 
@@ -7382,8 +7351,9 @@ impl StorageEngine {
             }
         }
 
-        // Populate row cache
-        self.row_cache.put(table_name, row_id, tuple.clone());
+        // Populate the row cache and return the shared handle (no deep copy).
+        let tuple = std::sync::Arc::new(tuple);
+        self.row_cache.put_arc(table_name, row_id, std::sync::Arc::clone(&tuple));
 
         Ok(Some(tuple))
     }

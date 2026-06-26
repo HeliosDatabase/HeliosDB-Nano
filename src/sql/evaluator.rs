@@ -860,7 +860,13 @@ impl Evaluator {
                         ))
                     }
                 };
-                Ok(Value::Int8(crate::sql::sequences::nextval(&name)))
+                // SEQ-5: propagate the real error (NO-CYCLE overflow /
+                // out-of-range) with the PostgreSQL message instead of clamping
+                // to the boundary. The durable cached-block reservation lives in
+                // `try_nextval`; the process-global persistence handle lets this
+                // storage-less evaluator reach storage without any per-statement
+                // hot-path cost.
+                Ok(Value::Int8(crate::sql::sequences::try_nextval(&name)?))
             }
             "currval" | "pg_catalog.currval" => {
                 let name = match arg_values.first() {
@@ -895,7 +901,11 @@ impl Evaluator {
                     Some(Value::Boolean(b)) => *b,
                     _ => return Err(Error::query_execution("setval() third argument must be a boolean")),
                 };
-                Ok(Value::Int8(crate::sql::sequences::setval(&name, value, is_called)))
+                // SEQ-5: propagate an out-of-bounds `setval` as a PostgreSQL
+                // error rather than swallowing it. `try_setval` also fsyncs the
+                // new high-water before returning, so a pg_dump-emitted
+                // `setval(seq, max(col))` survives a restart.
+                Ok(Value::Int8(crate::sql::sequences::try_setval(&name, value, is_called)?))
             }
             // Self-introspection: summarise what HeliosDB Nano supports
             // vs. stock PostgreSQL. Useful for drivers / migration tools
@@ -1014,19 +1024,65 @@ impl Evaluator {
             //   calls don't error.
             //
             // pg_get_serial_sequence(table, column) — returns the
-            //   regclass name of the sequence backing a SERIAL column,
-            //   or NULL if there is none. Nano doesn't model
-            //   sequences as separate objects (synthetic counters
-            //   on the row), so NULL is the truthful answer. drizzle
-            //   uses this to detect SERIAL columns; NULL falls
-            //   through to format_type.
+            //   regclass name ('public.<seq>') of the sequence backing
+            //   a column, or NULL if there is none. Resolves via the
+            //   process-global durable persistence handle (the evaluator
+            //   is itself storage-less): a real CREATE SEQUENCE … OWNED
+            //   BY t.c wins; otherwise a SERIAL/IDENTITY column maps to
+            //   the synthetic '<table>_<col>_seq'. NULL when storage is
+            //   absent or the column owns no sequence.
             //
             // format_type(oid, typmod) — render a type OID as the
             //   textual form (e.g. 23 → "integer"). Mirrors
             //   `PgCatalog::pg_format_type` but at the SQL layer so
             //   `SELECT format_type(a.atttypid, a.atttypmod)` works.
             "pg_get_expr" => Ok(Value::Null),
-            "pg_get_serial_sequence" => Ok(Value::Null),
+            "pg_get_serial_sequence" => {
+                let as_text = |v: &Value| match v {
+                    Value::String(s) => Some(s.clone()),
+                    _ => None,
+                };
+                let table_arg = arg_values.first().and_then(as_text);
+                let col = arg_values.get(1).and_then(as_text);
+                let (table, col) = match (table_arg, col) {
+                    (Some(t), Some(c)) => (t, c),
+                    _ => return Ok(Value::Null),
+                };
+                // Strip an optional schema qualifier (and surrounding quotes)
+                // from the table argument: 'public.t' / '"public"."t"' -> 't'.
+                let table = table
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or(&table)
+                    .trim_matches('"')
+                    .to_string();
+                let col = col.trim_matches('"').to_string();
+
+                match crate::sql::sequences::persist_handle() {
+                    None => Ok(Value::Null), // storage-absent (pure in-mem eval)
+                    Some(s) => {
+                        let catalog = s.catalog();
+                        // (1) Real sequence explicitly OWNED BY this column.
+                        let owned = catalog.list_sequences()?.into_iter().find(|def| {
+                            def.owned_by_table
+                                .as_deref()
+                                .is_some_and(|t| t.eq_ignore_ascii_case(&table))
+                                && def
+                                    .owned_by_column
+                                    .as_deref()
+                                    .is_some_and(|c| c.eq_ignore_ascii_case(&col))
+                        });
+                        if let Some(def) = owned {
+                            return Ok(Value::String(format!("public.{}", def.name)));
+                        }
+                        // (2) SERIAL/IDENTITY column -> synthetic owned sequence.
+                        if catalog.is_identity_column(&table, &col)? {
+                            return Ok(Value::String(format!("public.{table}_{col}_seq")));
+                        }
+                        Ok(Value::Null)
+                    }
+                }
+            }
             "format_type" => {
                 // KanttBan #23 phase 2.4: accept both OID and text
                 // input. drizzle calls `format_type('int4'::regtype, NULL)`

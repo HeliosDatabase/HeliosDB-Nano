@@ -2387,9 +2387,11 @@ fn try_index_nested_loop_join(
             continue;
         }
 
-        // Fetch each matching right row and combine
+        // Fetch each matching right row and combine. Use the Arc variant: we
+        // only borrow the right row here to copy its values into the combined
+        // tuple, so a cache hit/fill avoids deep-copying the whole row.
         for row_id in matching_row_ids {
-            if let Some(right_tuple) = storage.get_row_by_id(&right_table, row_id, &right_schema)? {
+            if let Some(right_tuple) = storage.get_row_by_id_arc(&right_table, row_id, &right_schema)? {
                 let mut combined_values = Vec::with_capacity(left_tuple.values.len() + right_tuple.values.len());
                 combined_values.extend_from_slice(&left_tuple.values);
                 combined_values.extend_from_slice(&right_tuple.values);

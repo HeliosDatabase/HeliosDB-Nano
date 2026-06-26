@@ -344,6 +344,8 @@ impl Planner {
             | LogicalPlan::DropMulti { .. }
             | LogicalPlan::CreateIndex { .. }
             | LogicalPlan::CreateSequence { .. }
+            | LogicalPlan::AlterSequence(_)
+            | LogicalPlan::DropSequence { .. }
             | LogicalPlan::CreateEnumType { .. }
             | LogicalPlan::DropEnumType { .. }
             | LogicalPlan::CreateSchema { .. }

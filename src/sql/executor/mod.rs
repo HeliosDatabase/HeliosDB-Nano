@@ -3559,12 +3559,250 @@ impl<'a> Executor<'a> {
             LogicalPlan::CreateSequence {
                 name,
                 if_not_exists,
+                data_type,
                 start_value,
                 increment_by,
+                min_value,
+                no_minvalue,
+                max_value,
+                no_maxvalue,
+                cache,
+                cycle,
+                owned_by,
             } => {
-                // In-memory sequence registration. Returns empty result
-                // set (DDL semantics).
-                crate::sql::sequences::create_sequence(name, *if_not_exists, *start_value, *increment_by);
+                // Build and durably persist the FULL sequence definition so it
+                // is discoverable (pg_sequences / information_schema) and
+                // survives restart. Returns an empty result set (DDL).
+                let storage = self
+                    .storage
+                    .ok_or_else(|| Error::query_execution("CREATE SEQUENCE requires storage context".to_string()))?;
+
+                // IF NOT EXISTS: honour as a no-op when a def already exists
+                // (do NOT overwrite/reset). Without it, re-create resets —
+                // matching the lenient idempotent-migration behaviour.
+                if *if_not_exists && storage.catalog().sequence_exists(name)? {
+                    return Ok(Box::new(
+                        ScanOperator::new(
+                            String::new(),
+                            Arc::new(crate::Schema { columns: vec![] }),
+                            None,
+                            vec![],
+                            vec![],
+                        )
+                        .with_timeout(self.timeout_ctx()),
+                    ));
+                }
+
+                let def = Self::build_sequence_def(
+                    name,
+                    data_type.as_deref(),
+                    *start_value,
+                    *increment_by,
+                    *min_value,
+                    *no_minvalue,
+                    *max_value,
+                    *no_maxvalue,
+                    *cache,
+                    *cycle,
+                    owned_by.clone(),
+                )?;
+
+                // A CREATE without IF NOT EXISTS on a name that ALREADY exists is
+                // lenient (idempotent re-migration, spec D8): we overwrite the
+                // DEFINITION but must NOT reset the durable high-water downward —
+                // doing so would re-issue already-served values (a duplicate-PK
+                // hazard for `DEFAULT nextval(...)` columns when an ORM re-runs a
+                // migration). So we seed fresh state ONLY when the sequence is
+                // genuinely new; an existing high-water is preserved.
+                let already_exists = storage.catalog().sequence_exists(name)?;
+                storage.catalog().save_sequence(&def)?;
+                if !already_exists {
+                    storage.catalog().save_sequence_state(
+                        name,
+                        &crate::storage::PersistedSeqState {
+                            last_reserved: def.start_value,
+                            is_called: false,
+                        },
+                    )?;
+                }
+                // Evict any cached runtime so the next nextval lazy-loads the
+                // new durable def (and, on re-create, the PRESERVED durable
+                // state). The post-statement durability barrier fsyncs the def +
+                // seed-state puts.
+                crate::sql::sequences::invalidate_cache(name);
+
+                Ok(Box::new(
+                    ScanOperator::new(
+                        String::new(),
+                        Arc::new(crate::Schema { columns: vec![] }),
+                        None,
+                        vec![],
+                        vec![],
+                    )
+                    .with_timeout(self.timeout_ctx()),
+                ))
+            }
+            LogicalPlan::AlterSequence(action) => {
+                let storage = self
+                    .storage
+                    .ok_or_else(|| Error::query_execution("ALTER SEQUENCE requires storage context".to_string()))?;
+                let catalog = storage.catalog();
+
+                let mut def = match catalog.get_sequence(&action.name)? {
+                    Some(d) => d,
+                    None if action.if_exists => {
+                        return Ok(Box::new(
+                            ScanOperator::new(
+                                String::new(),
+                                Arc::new(crate::Schema { columns: vec![] }),
+                                None,
+                                vec![],
+                                vec![],
+                            )
+                            .with_timeout(self.timeout_ctx()),
+                        ));
+                    }
+                    None => {
+                        return Err(Error::query_execution(format!(
+                            "relation \"{}\" does not exist",
+                            action.name
+                        )));
+                    }
+                };
+
+                // Whether this ALTER explicitly set MIN/MAXVALUE (so an AS-type
+                // change does NOT clobber an explicitly-set bound this stmt).
+                let min_set = action.min_value.is_some();
+                let max_set = action.max_value.is_some();
+
+                // AS <type>: re-derive bounds from the new type for any bound
+                // not explicitly set in this ALTER.
+                if let Some(new_type) = &action.data_type {
+                    def.data_type = new_type.clone();
+                    let incr_sign = action.increment.unwrap_or(def.increment_by);
+                    let (tmin, tmax) = crate::storage::PersistedSequence::type_bounds(new_type);
+                    if !min_set {
+                        def.min_value = if incr_sign >= 0 { 1 } else { tmin };
+                    }
+                    if !max_set {
+                        def.max_value = if incr_sign >= 0 { tmax } else { -1 };
+                    }
+                }
+
+                if let Some(incr) = action.increment {
+                    if incr == 0 {
+                        return Err(Error::query_execution(
+                            "ALTER SEQUENCE INCREMENT must not be zero".to_string(),
+                        ));
+                    }
+                    def.increment_by = incr;
+                }
+                if let Some(c) = action.cache {
+                    def.cache = c.max(1);
+                }
+                if let Some(cyc) = action.cycle {
+                    def.cycle = cyc;
+                }
+                if let Some(s) = action.start_value {
+                    def.start_value = s;
+                }
+                match &action.min_value {
+                    Some(Some(n)) => def.min_value = *n,
+                    Some(None) => {
+                        // NO MINVALUE -> type/sign default.
+                        let (tmin, _) = crate::storage::PersistedSequence::type_bounds(&def.data_type);
+                        def.min_value = if def.increment_by >= 0 { 1 } else { tmin };
+                    }
+                    None => {}
+                }
+                match &action.max_value {
+                    Some(Some(n)) => def.max_value = *n,
+                    Some(None) => {
+                        let (_, tmax) = crate::storage::PersistedSequence::type_bounds(&def.data_type);
+                        def.max_value = if def.increment_by >= 0 { tmax } else { -1 };
+                    }
+                    None => {}
+                }
+                match &action.owned_by {
+                    Some(Some((t, c))) => {
+                        def.owned_by_table = Some(t.clone());
+                        def.owned_by_column = Some(c.clone());
+                    }
+                    Some(None) => {
+                        def.owned_by_table = None;
+                        def.owned_by_column = None;
+                    }
+                    None => {}
+                }
+
+                if def.min_value > def.max_value {
+                    return Err(Error::query_execution(format!(
+                        "ALTER SEQUENCE \"{}\": MINVALUE ({}) must be <= MAXVALUE ({})",
+                        action.name, def.min_value, def.max_value
+                    )));
+                }
+                if def.start_value < def.min_value || def.start_value > def.max_value {
+                    return Err(Error::query_execution(format!(
+                        "ALTER SEQUENCE \"{}\": START value ({}) out of bounds [{}, {}]",
+                        action.name, def.start_value, def.min_value, def.max_value
+                    )));
+                }
+
+                catalog.save_sequence(&def)?;
+
+                // RESTART rewrites the durable high-water (acts like
+                // setval(., false) to the restart point): the next nextval
+                // returns exactly that value. Some(None) -> start; Some(n) -> n.
+                if let Some(restart) = action.restart {
+                    let target = restart.unwrap_or(def.start_value);
+                    // BOUND-SAFETY invariant: the not-called refill branch serves
+                    // the RESTART target directly (no clamp on `first`), so an
+                    // out-of-range target would make nextval return a value
+                    // outside [min,max]. Validate here (CREATE validates START and
+                    // setval validates its value the same way).
+                    if target < def.min_value || target > def.max_value {
+                        return Err(Error::query_execution(format!(
+                            "ALTER SEQUENCE \"{}\": RESTART value ({}) out of bounds [{}, {}]",
+                            action.name, target, def.min_value, def.max_value
+                        )));
+                    }
+                    catalog.save_sequence_state(
+                        &action.name,
+                        &crate::storage::PersistedSeqState {
+                            last_reserved: target,
+                            is_called: false,
+                        },
+                    )?;
+                }
+
+                // Evict the cached runtime so the lock-free counter discards any
+                // in-flight cached block (RESTART correctness) and the next
+                // nextval rebuilds from the freshly written def + state.
+                crate::sql::sequences::invalidate_cache(&action.name);
+
+                Ok(Box::new(
+                    ScanOperator::new(
+                        String::new(),
+                        Arc::new(crate::Schema { columns: vec![] }),
+                        None,
+                        vec![],
+                        vec![],
+                    )
+                    .with_timeout(self.timeout_ctx()),
+                ))
+            }
+            LogicalPlan::DropSequence { name, if_exists } => {
+                let storage = self
+                    .storage
+                    .ok_or_else(|| Error::query_execution("DROP SEQUENCE requires storage context".to_string()))?;
+                let catalog = storage.catalog();
+                if !*if_exists && !catalog.sequence_exists(name)? {
+                    return Err(Error::query_execution(format!(
+                        "sequence \"{name}\" does not exist"
+                    )));
+                }
+                catalog.drop_sequence(name)?;
+                crate::sql::sequences::invalidate_cache(name);
                 Ok(Box::new(
                     ScanOperator::new(
                         String::new(),
@@ -3880,6 +4118,101 @@ impl<'a> Executor<'a> {
     /// Get storage engine reference (for submodules)
     pub(crate) fn storage(&self) -> Option<&StorageEngine> {
         self.storage
+    }
+
+    /// Build a fully-defaulted [`crate::storage::PersistedSequence`] from the
+    /// `CREATE SEQUENCE` plan fields, resolving the PostgreSQL default rules:
+    ///
+    /// * `data_type` defaults to `bigint`; INCREMENT 0 is coerced to 1.
+    /// * For an omitted MINVALUE/MAXVALUE: ascending defaults are
+    ///   `min = 1`, `max = type-max`; descending are `min = type-min`,
+    ///   `max = -1`. An explicit `NO MINVALUE`/`NO MAXVALUE` forces the same
+    ///   type/sign default.
+    /// * `START` defaults to `min` (ascending) / `max` (descending). If an
+    ///   explicit START sits below an ascending default `min = 1`, the min is
+    ///   widened to START (so START is in range), mirroring PG leniency.
+    /// * `cache` is clamped to `>= 1`.
+    ///
+    /// Validates `min <= max` and `start` in `[min, max]`, erroring otherwise.
+    #[allow(clippy::too_many_arguments)]
+    fn build_sequence_def(
+        name: &str,
+        data_type: Option<&str>,
+        start_value: Option<i64>,
+        increment_by: Option<i64>,
+        min_value: Option<i64>,
+        no_minvalue: bool,
+        max_value: Option<i64>,
+        no_maxvalue: bool,
+        cache: Option<i64>,
+        cycle: bool,
+        owned_by: Option<(String, String)>,
+    ) -> Result<crate::storage::PersistedSequence> {
+        let data_type = data_type.unwrap_or("bigint").to_string();
+        let increment = match increment_by.unwrap_or(1) {
+            0 => 1,
+            n => n,
+        };
+        let (type_min, type_max) = crate::storage::PersistedSequence::type_bounds(&data_type);
+
+        // Sign-aware type defaults for an omitted (or NO MIN/MAXVALUE) bound.
+        let default_min = if increment >= 0 { 1 } else { type_min };
+        let default_max = if increment >= 0 { type_max } else { -1 };
+
+        let mut min = match (min_value, no_minvalue) {
+            (Some(n), _) => n,
+            _ => default_min, // omitted or NO MINVALUE
+        };
+        let max = match (max_value, no_maxvalue) {
+            (Some(n), _) => n,
+            _ => default_max,
+        };
+
+        let start = match start_value {
+            Some(s) => s,
+            None => {
+                if increment >= 0 {
+                    min
+                } else {
+                    max
+                }
+            }
+        };
+
+        // PG leniency: an explicit ascending START below the default min=1
+        // widens min to START (only when min was not explicitly given).
+        if increment >= 0 && min_value.is_none() && !no_minvalue && start < min {
+            min = start;
+        }
+
+        if min > max {
+            return Err(Error::query_execution(format!(
+                "CREATE SEQUENCE \"{name}\": MINVALUE ({min}) must be <= MAXVALUE ({max})"
+            )));
+        }
+        if start < min || start > max {
+            return Err(Error::query_execution(format!(
+                "CREATE SEQUENCE \"{name}\": START value ({start}) out of bounds [{min}, {max}]"
+            )));
+        }
+
+        let (owned_by_table, owned_by_column) = match owned_by {
+            Some((t, c)) => (Some(t), Some(c)),
+            None => (None, None),
+        };
+
+        Ok(crate::storage::PersistedSequence {
+            name: name.to_string(),
+            data_type,
+            start_value: start,
+            increment_by: increment,
+            min_value: min,
+            max_value: max,
+            cache: cache.unwrap_or(1).max(1),
+            cycle,
+            owned_by_table,
+            owned_by_column,
+        })
     }
 
     /// Get timeout context (for submodules)

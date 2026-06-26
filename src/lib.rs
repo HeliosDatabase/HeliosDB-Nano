@@ -882,6 +882,9 @@ impl EmbeddedDatabase {
             plan,
             sql::LogicalPlan::CreateTable { .. }
                 | sql::LogicalPlan::DropTable { .. }
+                | sql::LogicalPlan::CreateSequence { .. }
+                | sql::LogicalPlan::AlterSequence(_)
+                | sql::LogicalPlan::DropSequence { .. }
                 | sql::LogicalPlan::AlterColumnStorage { .. }
                 | sql::LogicalPlan::AlterTableAddColumn { .. }
                 | sql::LogicalPlan::AlterTableDropColumn { .. }
@@ -1506,6 +1509,56 @@ impl EmbeddedDatabase {
         }
     }
 
+    /// Item 9: parse `SET/RESET helios.fast_autocommit`. Returns:
+    /// - `Ok(Some(true|false))` — a valid SET (or `RESET` → `false`, the default)
+    /// - `Ok(None)` — the statement is not about this GUC
+    /// - `Err(_)` — it IS this GUC but the value is invalid
+    ///
+    /// Mirrors [`Self::parse_synchronous_commit_statement`] (same SET/LOCAL/
+    /// SESSION/`=`/`TO` grammar and boolean value set).
+    pub(crate) fn parse_helios_fast_autocommit_statement(sql: &str) -> Result<Option<bool>> {
+        let trimmed = sql.trim().trim_end_matches(';').trim();
+        if let Some(rest) = strip_prefix_icase(trimmed, "RESET ") {
+            if rest.trim().eq_ignore_ascii_case("helios.fast_autocommit") {
+                return Ok(Some(false));
+            }
+            return Ok(None);
+        }
+        let Some(mut body) = strip_prefix_icase(trimmed, "SET ") else {
+            return Ok(None);
+        };
+        body = body.trim();
+        if let Some(rest) = strip_prefix_icase(body, "LOCAL ") {
+            body = rest.trim();
+        } else if let Some(rest) = strip_prefix_icase(body, "SESSION ") {
+            body = rest.trim();
+        }
+        let (name, value) = if let Some(eq_pos) = body.find('=') {
+            (body[..eq_pos].trim(), body[eq_pos + 1..].trim())
+        } else {
+            let mut parts = body.splitn(3, char::is_whitespace);
+            let name = parts.next().unwrap_or("");
+            let to = parts.next().unwrap_or("");
+            let value = parts.next().unwrap_or("").trim();
+            if !to.eq_ignore_ascii_case("TO") {
+                return Ok(None);
+            }
+            (name, value)
+        };
+        if !name.eq_ignore_ascii_case("helios.fast_autocommit") {
+            return Ok(None);
+        }
+        let normalized = value.trim_matches('\'').trim_matches('"').to_ascii_lowercase();
+        match normalized.as_str() {
+            "off" | "false" | "0" | "no" => Ok(Some(false)),
+            "on" | "true" | "1" | "yes" => Ok(Some(true)),
+            _ => Err(Error::query_execution(format!(
+                "invalid value for parameter \"helios.fast_autocommit\": \"{}\"",
+                value
+            ))),
+        }
+    }
+
     pub(crate) fn is_fk_setting_statement(sql: &str) -> bool {
         let trimmed = sql.trim().trim_end_matches(';').trim();
         let upper = trimmed.to_ascii_uppercase();
@@ -2102,6 +2155,10 @@ impl EmbeddedDatabase {
                 name: view_name,
                 options,
             }
+        } else if sql::Parser::is_alter_sequence(sql) {
+            // Parse ALTER SEQUENCE [IF EXISTS] <name> <actions...> via the
+            // custom pre-parse path (sqlparser 0.53 has no AlterSequence node).
+            sql::LogicalPlan::AlterSequence(sql::Parser::parse_alter_sequence(sql)?)
         } else if sql::Parser::is_alter_column_storage(sql) {
             // Parse ALTER TABLE ALTER COLUMN SET STORAGE statement
             let (table_name, column_name, storage_mode) = sql::Parser::parse_alter_column_storage(sql)?;
@@ -4822,6 +4879,13 @@ impl EmbeddedDatabase {
             tracing::warn!("ART rebuild on open failed: {} — falling back to scan paths", e);
         }
 
+        // v3.60.0: install the process-global sequence persistence handle once,
+        // here at DB-open (a `Weak<StorageEngine>` downgrade — does not affect
+        // the move of `storage` into `Self` below). nextval/setval upgrade the
+        // Weak only when a sequence function actually runs, so NOTHING is added
+        // to the per-statement hot path.
+        crate::sql::sequences::install_persistence(&storage);
+
         Ok(Self {
             storage,
             config,
@@ -4905,6 +4969,13 @@ impl EmbeddedDatabase {
         let session_manager = std::sync::Arc::new(crate::session::SessionManager::new());
         let lock_manager = std::sync::Arc::new(storage::LockManager::with_default_timeout());
         let dirty_tracker = std::sync::Arc::new(storage::DirtyTracker::new());
+
+        // Install the durable sequence persistence handle (mirrors `new` /
+        // `open_with_config`). For an in-memory DB `flush_sequence_state` skips
+        // the fsync (no WAL / no crash recovery), but the handle still lets
+        // `nextval` lazy-load the real persisted CREATE SEQUENCE definition
+        // (its increment/min/max/cycle) instead of a volatile default.
+        crate::sql::sequences::install_persistence(&storage);
 
         Ok(Self {
             storage,
@@ -5012,6 +5083,12 @@ impl EmbeddedDatabase {
                 tracing::warn!("ART rebuild on open failed: {} — falling back to scan paths", e);
             }
         }
+
+        // v3.60.0: install the process-global sequence persistence handle once
+        // (UNCONDITIONALLY — for memory-only the handle still installs but
+        // flush_sequence_state skips the fsync, keeping :memory: nextval
+        // volatile-but-working). Weak downgrade, zero per-statement cost.
+        crate::sql::sequences::install_persistence(&storage);
 
         Ok(Self {
             storage,
@@ -13509,6 +13586,9 @@ impl EmbeddedDatabase {
         if let Some(handled) = self.try_handle_session_synchronous_commit(session_id, sql)? {
             return Ok(handled);
         }
+        if let Some(handled) = self.try_handle_session_fast_autocommit(session_id, sql)? {
+            return Ok(handled);
+        }
         let session_lock = self.session_manager.get_session(session_id)?;
         let mut session = session_lock.write();
         session.touch();
@@ -13750,6 +13830,43 @@ impl EmbeddedDatabase {
         }
     }
 
+    /// Item 9: set the session's `helios.fast_autocommit` opt-in. When `true`,
+    /// single-statement autocommit on this session commits non-blocking (see
+    /// the field doc on [`crate::session::Session`]).
+    pub fn set_session_fast_autocommit(
+        &self,
+        session_id: crate::session::SessionId,
+        value: bool,
+    ) -> Result<()> {
+        let session_lock = self.session_manager.get_session(session_id)?;
+        session_lock.write().fast_autocommit = value;
+        Ok(())
+    }
+
+    /// Item 9: read the session's `helios.fast_autocommit` flag (default false).
+    pub fn session_fast_autocommit(&self, session_id: crate::session::SessionId) -> Result<bool> {
+        let session_lock = self.session_manager.get_session(session_id)?;
+        let value = session_lock.read().fast_autocommit;
+        Ok(value)
+    }
+
+    /// Item 9: intercept `SET/RESET helios.fast_autocommit` for a session
+    /// (the extended-protocol / RESET path; the simple-query handler
+    /// intercepts the SET form itself). Returns `Some(0)` when handled.
+    fn try_handle_session_fast_autocommit(
+        &self,
+        session_id: crate::session::SessionId,
+        sql: &str,
+    ) -> Result<Option<u64>> {
+        match Self::parse_helios_fast_autocommit_statement(sql)? {
+            Some(value) => {
+                self.set_session_fast_autocommit(session_id, value)?;
+                Ok(Some(0))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Touch session stats and, for READ COMMITTED, refresh the open
     /// transaction's snapshot so the next statement sees the latest commits.
     fn touch_session_for_statement(&self, session_id: crate::session::SessionId) -> Result<()> {
@@ -13807,8 +13924,21 @@ impl EmbeddedDatabase {
         session_id: crate::session::SessionId,
     ) -> Option<storage::SynchronousCommitOverrideGuard> {
         let session_lock = self.session_manager.get_session(session_id).ok()?;
-        let value = session_lock.read().synchronous_commit?;
-        Some(storage::StorageEngine::synchronous_commit_override_guard(Some(value)))
+        let (sync, fast) = {
+            let s = session_lock.read();
+            (s.synchronous_commit, s.fast_autocommit)
+        };
+        // An explicit `synchronous_commit` override always wins. Otherwise
+        // `helios.fast_autocommit = on` (item 9) selects non-blocking autocommit
+        // for this session. With neither set — the default, and exactly what the
+        // pg35 benchmark runs — there is no override and no guard is installed,
+        // byte-identical to before (still one session read).
+        let effective = match sync {
+            Some(v) => v,
+            None if fast => false,
+            None => return None,
+        };
+        Some(storage::StorageEngine::synchronous_commit_override_guard(Some(effective)))
     }
 
     /// Execute a statement on behalf of a wire-protocol session.
@@ -13820,6 +13950,9 @@ impl EmbeddedDatabase {
         // simple-query handler intercepts SET itself; RESET and the
         // extended protocol land here).
         if let Some(handled) = self.try_handle_session_synchronous_commit(session_id, sql)? {
+            return Ok(handled);
+        }
+        if let Some(handled) = self.try_handle_session_fast_autocommit(session_id, sql)? {
             return Ok(handled);
         }
         if !self.session_transactions.contains_key(&session_id) {
@@ -13954,6 +14087,9 @@ impl EmbeddedDatabase {
             return self.handle_transaction_control_for_session(session_id, sql);
         }
         if let Some(handled) = self.try_handle_session_synchronous_commit(session_id, sql)? {
+            return Ok(handled);
+        }
+        if let Some(handled) = self.try_handle_session_fast_autocommit(session_id, sql)? {
             return Ok(handled);
         }
         if !self.session_transactions.contains_key(&session_id) {
