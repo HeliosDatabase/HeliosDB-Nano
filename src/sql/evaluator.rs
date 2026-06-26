@@ -1036,7 +1036,13 @@ impl Evaluator {
             //   textual form (e.g. 23 → "integer"). Mirrors
             //   `PgCatalog::pg_format_type` but at the SQL layer so
             //   `SELECT format_type(a.atttypid, a.atttypmod)` works.
-            "pg_get_expr" => Ok(Value::Null),
+            // pg_get_expr(node_tree, oid[, prettify]): `pg_attrdef` now stores
+            // the already-rendered default SQL in `adbin`, so return that first
+            // argument verbatim (NULL when there is no node-tree text).
+            "pg_get_expr" => Ok(match arg_values.first() {
+                Some(Value::String(s)) if !s.is_empty() => Value::String(s.clone()),
+                _ => Value::Null,
+            }),
             "pg_get_serial_sequence" => {
                 let as_text = |v: &Value| match v {
                     Value::String(s) => Some(s.clone()),
