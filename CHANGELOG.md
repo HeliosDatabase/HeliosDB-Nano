@@ -5,6 +5,32 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.60.4] - 2026-06-26
+
+Patch release: fixes a dropped `WHERE` filter on `information_schema.columns`
+over the wire, found by the Any2HeliosDB v1.0.0 re-validation on v3.60.3.
+
+### Fixed
+
+- **`information_schema.columns` `WHERE table_name=…`/`column_name=…` filters
+  written without spaces around `=` are now honored.** The wire catalog handler
+  extracted the filter with a hard-coded spaced pattern (`"table_name = '"`), so
+  the no-space form `table_name='x'` that psycopg / ORMs actually emit matched
+  nothing — the filter was silently dropped and the handler returned *every*
+  table's columns. A client running
+  `SELECT column_default FROM information_schema.columns WHERE table_name='t' AND
+  column_name='id'` then `fetchone()` read back the first table's first defaulted
+  column — e.g. a different table's `nextval('…_seq')` default (the a2h v3.60.3
+  report: `harden_t.id` read back `actor`'s sequence). The extractor is now
+  whitespace-tolerant (`col='x'`, `col = 'x'`, `col= 'x'`, `c.table_name='x'`)
+  with an identifier-boundary guard, and the handler now also applies a
+  `column_name='…'` equality filter so such a query returns exactly the requested
+  column. **The stored defaults were always correct** — this was a
+  catalog-readback filter bug only (functional `DEFAULT nextval(...)` was
+  unaffected). Regression tests in
+  [`src/protocol/postgres/catalog.rs`](src/protocol/postgres/catalog.rs)
+  (`test_extract_eq_filter`, `test_information_schema_columns_filter_distinguishes_tables`).
+
 ## [3.60.3] - 2026-06-26
 
 Patch release: a **`ROLLBACK TO SAVEPOINT` correctness fix**. A row written
