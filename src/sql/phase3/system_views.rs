@@ -3296,11 +3296,20 @@ impl SystemViewRegistry {
             if let Ok(schema) = catalog.get_table_schema(table_name) {
                 let identity_cols = catalog.list_identity_columns(table_name)?;
                 for (col_idx, col) in schema.columns.iter().enumerate() {
-                    if !identity_cols.iter().any(|c| c.eq_ignore_ascii_case(&col.name)) {
+                    // Emit a row for every column that HAS a default: an IDENTITY
+                    // column (synthetic owned sequence) OR a column with an
+                    // explicit `DEFAULT` expression (e.g. `DEFAULT nextval('seq')`,
+                    // which is NOT an identity column). Previously only identity
+                    // columns appeared, so pg_get_expr over an explicit-default
+                    // column returned nothing.
+                    let is_identity = identity_cols.iter().any(|c| c.eq_ignore_ascii_case(&col.name));
+                    let adsrc = if is_identity {
+                        format!("nextval('{table_name}_{}_seq'::regclass)", col.name)
+                    } else if let Some(def) = &col.default_expr {
+                        crate::sql::logical_plan::default_expr_json_to_sql(def).unwrap_or_else(|| def.clone())
+                    } else {
                         continue;
-                    }
-                    let seq_name = format!("{table_name}_{}_seq", col.name);
-                    let adsrc = format!("nextval('{seq_name}'::regclass)");
+                    };
                     rows.push(Tuple::new(vec![
                         Value::Int4(oid_counter),          // oid
                         Value::Int4(adrelid),              // adrelid
@@ -3897,7 +3906,12 @@ impl SystemViewRegistry {
                             column
                                 .default_expr
                                 .as_ref()
-                                .map(|s| Value::String(s.clone()))
+                                .map(|s| {
+                                    Value::String(
+                                        crate::sql::logical_plan::default_expr_json_to_sql(s)
+                                            .unwrap_or_else(|| s.clone()),
+                                    )
+                                })
                                 .unwrap_or(Value::Null)
                         };
 

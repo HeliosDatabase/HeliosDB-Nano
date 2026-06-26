@@ -5,6 +5,30 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.60.1] - 2026-06-26
+
+Patch release: catalog readback of column `DEFAULT` expressions, found by the
+Any2HeliosDB Pagila PostgreSQL→Nano migration (the v3.60.0 sequences otherwise
+passed end-to-end: tables + data + FKs + indexes + sequences + views).
+
+### Fixed
+
+- **Column `DEFAULT` expressions now read back as SQL text.** Defaults are
+  stored as a serialized `LogicalExpr` (for evaluation); introspection now
+  renders them back to SQL for pg_dump / ORM round-trips:
+  - `information_schema.columns.column_default` returns the real default
+    (e.g. `nextval('actor_actor_id_seq')`, `5`, `'hi'`). The PostgreSQL-wire
+    `information_schema.columns` view was also missing the `column_default`
+    column entirely (so the projection mis-resolved to the table name) — it is
+    now present.
+  - `pg_attrdef` emits a row for every column with a default — both `IDENTITY`
+    columns and explicit `DEFAULT` columns (previously only `IDENTITY`), so
+    `pg_get_expr(adbin, adrelid)` returns the rendered expression instead of
+    `NULL`.
+
+  The default's *evaluation* was always correct (an INSERT auto-increments); only
+  the introspected text was wrong. Functional migration was never blocked.
+
 ## [3.60.0] - 2026-06-26
 
 Minor release: durable + scalable **sequences** (introspection catalogs, ALTER

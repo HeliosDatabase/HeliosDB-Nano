@@ -531,6 +531,8 @@ impl PgCatalog {
             Column::new("is_nullable", DataType::Text),
             Column::new("ordinal_position", DataType::Int4),
             Column::new("is_pk", DataType::Boolean),
+            // column_default rendered back to SQL text (pg_dump / ORM readback).
+            Column::new("column_default", DataType::Text),
         ]);
 
         let db = match &self.database {
@@ -570,6 +572,15 @@ impl PgCatalog {
                         }),
                         Value::Int4((i + 1) as i32),
                         Value::Boolean(col.primary_key),
+                        col.default_expr
+                            .as_ref()
+                            .map(|d| {
+                                Value::String(
+                                    crate::sql::logical_plan::default_expr_json_to_sql(d)
+                                        .unwrap_or_else(|| d.clone()),
+                                )
+                            })
+                            .unwrap_or(Value::Null),
                     ]));
                 }
             }

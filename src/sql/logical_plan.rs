@@ -1239,6 +1239,73 @@ pub enum LogicalExpr {
     },
 }
 
+impl LogicalExpr {
+    /// Best-effort render of a column `DEFAULT` expression back to PostgreSQL
+    /// SQL text, for catalog *readback* — `information_schema.columns
+    /// .column_default`, `pg_attrdef.adsrc`, and `pg_get_expr`. Column defaults
+    /// are stored as serialized `LogicalExpr` (for evaluation); this reverses
+    /// that for introspection (pg_dump / ORM round-trips). It covers the shapes
+    /// real defaults use — literals, `nextval('seq')` / `now()` / function
+    /// calls, casts, negation — and is deliberately NOT a general SQL
+    /// serializer; unusual shapes fall back to a debug rendering.
+    pub fn to_default_sql(&self) -> String {
+        match self {
+            LogicalExpr::Literal(v) => render_default_literal(v),
+            LogicalExpr::ScalarFunction { fun, args } => {
+                let rendered: Vec<String> = args.iter().map(|a| a.to_default_sql()).collect();
+                format!("{}({})", fun, rendered.join(", "))
+            }
+            LogicalExpr::Cast { expr, data_type } => {
+                format!("{}::{}", expr.to_default_sql(), data_type)
+            }
+            LogicalExpr::Column { table: Some(t), name } => format!("{t}.{name}"),
+            LogicalExpr::Column { table: None, name } => name.clone(),
+            LogicalExpr::UnaryExpr { op, expr } => {
+                let op_str = match op {
+                    UnaryOperator::Not => "NOT ",
+                    UnaryOperator::Minus => "-",
+                    UnaryOperator::Plus => "+",
+                };
+                format!("{}{}", op_str, expr.to_default_sql())
+            }
+            other => format!("{other:?}"),
+        }
+    }
+}
+
+/// Render a literal `Value` as a PostgreSQL SQL literal for default readback.
+fn render_default_literal(v: &Value) -> String {
+    match v {
+        Value::Null => "NULL".to_string(),
+        Value::Boolean(b) => {
+            if *b {
+                "true".to_string()
+            } else {
+                "false".to_string()
+            }
+        }
+        Value::Int2(n) => n.to_string(),
+        Value::Int4(n) => n.to_string(),
+        Value::Int8(n) => n.to_string(),
+        Value::Float4(n) => n.to_string(),
+        Value::Float8(n) => n.to_string(),
+        Value::Numeric(s) => s.clone(),
+        Value::String(s) => format!("'{}'", s.replace('\'', "''")),
+        Value::Uuid(u) => format!("'{u}'"),
+        Value::Json(s) => format!("'{}'", s.replace('\'', "''")),
+        other => format!("'{}'", format!("{other:?}").replace('\'', "''")),
+    }
+}
+
+/// Deserialize a stored (serde_json) column default and render it to SQL text.
+/// Returns `None` only if the string is neither valid `LogicalExpr` JSON — in
+/// which case the caller should fall back to the raw stored string.
+pub fn default_expr_json_to_sql(stored: &str) -> Option<String> {
+    serde_json::from_str::<LogicalExpr>(stored)
+        .ok()
+        .map(|expr| expr.to_default_sql())
+}
+
 /// Window function type
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WindowFunctionType {
