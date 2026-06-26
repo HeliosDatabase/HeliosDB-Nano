@@ -5,6 +5,46 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.60.3] - 2026-06-26
+
+Patch release: a **`ROLLBACK TO SAVEPOINT` correctness fix**. A row written
+after a savepoint left a ghost secondary/PK-index entry that `ROLLBACK TO
+SAVEPOINT` failed to remove, so it survived a subsequent `COMMIT`. Found while
+root-causing the one category the `pg35` benchmark classified as a PostgreSQL
+win (*Prepared stmts*) — the cause turned out to be this real bug, not a
+measurement artifact.
+
+### Fixed
+
+- **`ROLLBACK TO SAVEPOINT` now reverts eager index maintenance.** Secondary-
+  and primary-key index updates are applied eagerly at statement time and undone
+  via a per-transaction undo log that *full* `ROLLBACK` replays. `ROLLBACK TO
+  SAVEPOINT` reverted the staged write set (row data) but **not** that undo log,
+  so an `INSERT`/`UPDATE`/`DELETE` made after a savepoint left the in-memory
+  indexes inconsistent with the rolled-back data: a post-savepoint `INSERT`
+  persisted a ghost PK-index entry after `ROLLBACK TO SAVEPOINT` + `COMMIT`, and
+  the next insert of that key then failed with a spurious duplicate-key error.
+  Savepoints now snapshot the undo-log position and replay exactly the index ops
+  staged after the savepoint. Covers all three undo kinds (insert/update/delete),
+  nested savepoints, and per-session transactions. Regression tests:
+  [`tests/savepoint_rollback_regression_tests.rs`](tests/savepoint_rollback_regression_tests.rs).
+
+### Benchmarks
+
+- **`pg35` *Prepared stmts* flips from a classified PostgreSQL win to a decisive
+  Nano win** (~2.7µs vs PostgreSQL's ~670µs, **≈250× faster**). The benchmark's
+  *Transaction ctl* category exercises `BEGIN / SAVEPOINT / INSERT / ROLLBACK TO
+  SAVEPOINT / COMMIT`; under the bug the post-savepoint insert's ghost index
+  entry made every later iteration's insert fail, which left the embedded
+  connection wedged inside an open transaction for the remainder of the run. An
+  open transaction disables the ART point-lookup fast path, so *every* later read
+  — including the *Prepared stmts* `EXECUTE` — fell back to a slow scan
+  (~650µs/query instead of <1µs). With the savepoint fix the connection is never
+  wedged and the prepared path measures at its true cost. The only remaining
+  non-Nano categories are the near-parity joins (INNER / 4-table), which hover at
+  ~1.0× and remain shared-host-noise-dominated. See
+  [`docs/benchmarks/PG35_BENCHMARK.md`](docs/benchmarks/PG35_BENCHMARK.md).
+
 ## [3.60.2] - 2026-06-26
 
 Patch release: low-risk, plan-identical allocation and planning-cost reductions
