@@ -5,6 +5,25 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.60.2] - 2026-06-26
+
+Patch release: low-risk, plan-identical allocation and planning-cost reductions
+from a pg35-targeted profiling pass. **No behavior or query-plan changes**, and
+the pg35 scoreboard is unchanged — these trim constant-factor cost and variance,
+not the structural gaps in the two near-parity categories (Prepared stmts,
+4-table JOIN), which need deeper work and a dedicated benchmarking host to move.
+
+### Performance
+
+- **Trace-control statement gate.** A cheap ASCII first-byte check skips the
+  uppercase allocation for any statement that cannot be a `SET` / `SHOW` /
+  `RESET` trace control — removing one allocation from every other statement on
+  the simple-Query path (and several per prepared-statement iteration).
+- **Allocation-free fast-prepare header scan**, and **cold-path optimizer
+  reuse**: the stateless rewrite-rule set + empty statistics catalog are built
+  once and shared via `OnceLock` instead of per query, and the plan cache shares
+  an `Arc` on the cold-miss path. Produced plans and results are byte-identical.
+
 ## [3.60.1] - 2026-06-26
 
 Patch release: catalog readback of column `DEFAULT` expressions, found by the

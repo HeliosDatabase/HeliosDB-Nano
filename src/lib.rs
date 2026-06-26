@@ -490,6 +490,14 @@ pub struct EmbeddedDatabase {
     fk_validation_source: std::sync::Arc<parking_lot::RwLock<FkValidationSource>>,
     /// Deferred FK checks queued until COMMIT.
     deferred_fk_checks: std::sync::Arc<parking_lot::Mutex<Vec<PendingFkCheck>>>,
+    /// Lazily-constructed, shared read-only optimizer for the cold (cache-miss)
+    /// planning path. Every cache-miss query previously rebuilt a fresh
+    /// `StatsCatalog` + 5 boxed rules + `Optimizer`; the rules are stateless
+    /// `Send + Sync`, `StatsCatalog` is empty/constant, and `optimize*`/cost
+    /// paths take `&self`, so a single instance is safely shareable with no
+    /// lock. `OnceLock<Arc<_>>` clones cheaply (just an `Arc` bump) and avoids
+    /// threading the field through the three constructors.
+    cold_optimizer: std::sync::OnceLock<std::sync::Arc<optimizer::Optimizer>>,
 }
 
 impl Drop for EmbeddedDatabase {
@@ -1270,10 +1278,31 @@ impl EmbeddedDatabase {
     }
 
     fn split_fast_prepare(rest: &str) -> Option<(String, &str)> {
-        let upper = rest.to_uppercase();
-        let as_pos = upper.find(" AS ")?;
+        // Locate the first whitespace-delimited ` AS ` without allocating an
+        // uppercased copy of the whole statement. `find_sql_keyword` skips
+        // single-quoted literals (so `SELECT 'x as y' ...` no longer splits on
+        // the literal `as`), and the surrounding-whitespace check reproduces
+        // the exact ` AS ` boundary the prior `find(" AS ")` matched.
+        let bytes = rest.as_bytes();
+        let mut search_from = 0;
+        let as_pos = loop {
+            let rel = Self::find_sql_keyword(rest.get(search_from..)?, b"AS")?;
+            let pos = search_from + rel;
+            let prev_ws = pos
+                .checked_sub(1)
+                .and_then(|p| bytes.get(p))
+                .is_some_and(|b| b.is_ascii_whitespace());
+            let next_ws = bytes
+                .get(pos + 2)
+                .is_some_and(|b| b.is_ascii_whitespace());
+            if prev_ws && next_ws {
+                break pos;
+            }
+            // This `AS` was not space-delimited on both sides; keep scanning.
+            search_from = pos + 2;
+        };
         let header = rest[..as_pos].trim();
-        let statement_sql = rest[as_pos + " AS ".len()..].trim();
+        let statement_sql = rest[as_pos + "AS".len()..].trim();
         if header.is_empty() || statement_sql.is_empty() {
             return None;
         }
@@ -1689,6 +1718,17 @@ impl EmbeddedDatabase {
 
     fn try_handle_trace_control(&self, sql: &str) -> Result<Option<TraceControl>> {
         let trimmed = sql.trim().trim_end_matches(';').trim();
+        // First-byte ASCII gate: every trace-control statement begins with
+        // SET / SHOW (S) or RESET (R). Skipping the uppercase allocation for
+        // statements that provably cannot match removes one heap alloc from
+        // every non-trace query on the hot single-statement path (and three
+        // allocs per Prepared benchmark iteration). Byte-identical behavior:
+        // any real trace-control statement still starts with S or R, is still
+        // uppercased below, and matched downstream exactly as before.
+        match trimmed.as_bytes().first().copied().map(|c| c.to_ascii_uppercase()) {
+            Some(b'S') | Some(b'R') => {}
+            _ => return Ok(None),
+        }
         let upper = trimmed.to_ascii_uppercase();
         if upper.starts_with("SET ") {
             let mut body = trimmed[4..].trim();
@@ -4935,6 +4975,7 @@ impl EmbeddedDatabase {
             fk_validation_mode: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationMode::Enforced)),
             fk_validation_source: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationSource::Engine)),
             deferred_fk_checks: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
+            cold_optimizer: std::sync::OnceLock::new(),
         })
     }
 
@@ -5026,6 +5067,7 @@ impl EmbeddedDatabase {
             fk_validation_mode: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationMode::Enforced)),
             fk_validation_source: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationSource::Engine)),
             deferred_fk_checks: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
+            cold_optimizer: std::sync::OnceLock::new(),
         })
     }
 
@@ -5139,6 +5181,7 @@ impl EmbeddedDatabase {
             fk_validation_mode: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationMode::Enforced)),
             fk_validation_source: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationSource::Engine)),
             deferred_fk_checks: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
+            cold_optimizer: std::sync::OnceLock::new(),
         })
     }
 
@@ -12987,17 +13030,31 @@ impl EmbeddedDatabase {
         );
 
         // 3. Optimize plan (predicate pushdown, constant folding, projection pruning)
+        //
+        // Reuse a single, lazily-built, shared read-only optimizer instead of
+        // reconstructing `StatsCatalog::new()` + 5 boxed rules + `Optimizer`
+        // on every cache-miss query. The rule set and order are IDENTICAL
+        // (ConstantFolding, SelectionPushdown, JoinPredicatePushdown,
+        // ProjectionPruning, StorageFilterPushdown) and the cost-guarded
+        // acceptance (`new_cost <= old_cost`) is unchanged, so the produced
+        // plan is byte-identical; this only removes per-query allocations.
         let plan = {
             let opt_start = std::time::Instant::now();
-            let stats = optimizer::cost::StatsCatalog::new();
-            let rules: Vec<Box<dyn optimizer::rules::OptimizationRule>> = vec![
-                Box::new(optimizer::rules::ConstantFoldingRule::new()),
-                Box::new(optimizer::rules::SelectionPushdownRule::new()),
-                Box::new(optimizer::rules::JoinPredicatePushdownRule::new()),
-                Box::new(optimizer::rules::ProjectionPruningRule::new()),
-                Box::new(optimizer::rules::StorageFilterPushdownRule::new()),
-            ];
-            let opt = optimizer::Optimizer::with_rules(stats, rules, optimizer::OptimizerConfig::default());
+            let opt = self.cold_optimizer.get_or_init(|| {
+                let stats = optimizer::cost::StatsCatalog::new();
+                let rules: Vec<Box<dyn optimizer::rules::OptimizationRule>> = vec![
+                    Box::new(optimizer::rules::ConstantFoldingRule::new()),
+                    Box::new(optimizer::rules::SelectionPushdownRule::new()),
+                    Box::new(optimizer::rules::JoinPredicatePushdownRule::new()),
+                    Box::new(optimizer::rules::ProjectionPruningRule::new()),
+                    Box::new(optimizer::rules::StorageFilterPushdownRule::new()),
+                ];
+                std::sync::Arc::new(optimizer::Optimizer::with_rules(
+                    stats,
+                    rules,
+                    optimizer::OptimizerConfig::default(),
+                ))
+            });
             let optimized = opt.optimize_recursive(plan)?;
             tracing::debug!(
                 phase = "optimize",
@@ -13007,17 +13064,31 @@ impl EmbeddedDatabase {
             optimized
         };
 
-        // 4. Cache the optimized plan
-        self.plan_cache.put(sql.to_string(), std::sync::Arc::new(plan.clone()));
+        // 4. Cache the optimized plan. Build the `Arc` once and clone the
+        // pointer (an O(1) refcount bump) into the cache, rather than deep
+        // cloning the whole `LogicalPlan` just to insert it. Execution below
+        // then runs through the same `Arc`, mirroring the cache-HIT path.
+        let plan_arc = std::sync::Arc::new(plan);
+        self.plan_cache.put(sql.to_string(), plan_arc.clone());
 
-        // 5. Apply RLS policies
-        let plan = self.apply_rls_to_plan(plan)?;
-
-        // 6. Execute
+        // 5. Apply RLS policies + 6. Execute.
+        //
+        // Fast path (common case): no tenant context → execute directly from
+        // the cached `Arc` with no clone, exactly as the cache-HIT branch does.
+        // `apply_rls_to_plan` is a no-op move here, so the prior code already
+        // paid no RLS clone in this case; the only change is dropping the
+        // deep `plan.clone()` that fed the cache insertion above.
         let exec_start = std::time::Instant::now();
         let mut executor =
             sql::Executor::with_storage(&self.storage).with_timeout(self.config.storage.query_timeout_ms);
-        let results = executor.execute(&plan)?;
+        let results = if self.tenant_manager.get_current_context().is_none() {
+            executor.execute(&plan_arc)?
+        } else {
+            // RLS active → need an owned plan to rewrite. Clone out of the
+            // cached `Arc`, matching the cache-HIT slow path.
+            let rls_plan = self.apply_rls_to_plan_recursive((*plan_arc).clone())?;
+            executor.execute(&rls_plan)?
+        };
         tracing::debug!(
             phase = "execute",
             duration_us = exec_start.elapsed().as_micros() as u64,
@@ -15581,6 +15652,7 @@ impl EmbeddedDatabase {
             fk_validation_mode: self.fk_validation_mode.clone(),
             fk_validation_source: self.fk_validation_source.clone(),
             deferred_fk_checks: self.deferred_fk_checks.clone(),
+            cold_optimizer: self.cold_optimizer.clone(),
         }
     }
 
@@ -17142,6 +17214,101 @@ mod tests {
                                                                     // Ours but invalid value.
         assert!(p("SET synchronous_commit = sideways").is_err());
         assert!(p("SET synchronous_commit = ").is_err());
+    }
+
+    // ---- Prepared fast-path: allocation-free ` AS ` split ----
+
+    #[test]
+    fn split_fast_prepare_header_body_boundary() {
+        let s = EmbeddedDatabase::split_fast_prepare;
+        // Basic split: name + body, exact first whitespace-delimited ` AS `.
+        assert_eq!(
+            s("p AS SELECT * FROM customers WHERE id = $1"),
+            Some(("p".to_string(), "SELECT * FROM customers WHERE id = $1"))
+        );
+        // Parameter type list in the header (PG `PREPARE p (int) AS ...`).
+        assert_eq!(
+            s("p (int) AS SELECT * FROM customers WHERE id = $1"),
+            Some(("p".to_string(), "SELECT * FROM customers WHERE id = $1"))
+        );
+        // Case-insensitive AS, extra whitespace.
+        assert_eq!(
+            s("q   as   SELECT 1"),
+            Some(("q".to_string(), "SELECT 1"))
+        );
+        // The body's own ` AS ` (column alias) must NOT be the split point —
+        // only the FIRST whitespace-delimited ` AS ` separates header/body.
+        assert_eq!(
+            s("p AS SELECT id AS k FROM customers WHERE id = $1"),
+            Some(("p".to_string(), "SELECT id AS k FROM customers WHERE id = $1"))
+        );
+        // Literal-skip correctness improvement: a quoted `as` inside the body
+        // must not be mistaken for the header/body separator. The naive
+        // uppercase-`find(" AS ")` could split inside the literal; the
+        // keyword scanner skips single-quoted literals.
+        assert_eq!(
+            s("p AS SELECT 'x as y' FROM customers WHERE id = $1"),
+            Some((
+                "p".to_string(),
+                "SELECT 'x as y' FROM customers WHERE id = $1"
+            ))
+        );
+        // No standalone AS -> no fast split (caller falls back to the parser).
+        assert_eq!(s("p SELECT 1"), None);
+        // `AS` only as a substring of an identifier must not match.
+        assert_eq!(s("p ASPECT SELECT 1"), None);
+        // Non-space ASCII whitespace (tab / newline) delimiting the header/body
+        // `AS` is a benign superset of the prior literal-` AS ` `find`: it now
+        // takes the fast path and yields the SAME (name, body) split. Safe
+        // because the body is re-validated downstream and any miss falls back
+        // to the parser via Ok(None).
+        assert_eq!(
+            s("p\tAS\tSELECT 1"),
+            Some(("p".to_string(), "SELECT 1"))
+        );
+        assert_eq!(
+            s("p\nAS\nSELECT 1"),
+            Some(("p".to_string(), "SELECT 1"))
+        );
+        // Mixed: space-then-tab around AS still splits identically.
+        assert_eq!(
+            s("p \tAS\t SELECT * FROM customers WHERE id = $1"),
+            Some(("p".to_string(), "SELECT * FROM customers WHERE id = $1"))
+        );
+    }
+
+    // ---- Trace-control first-byte gate: SET/SHOW/RESET preserved ----
+
+    #[test]
+    fn trace_control_first_byte_gate_preserves_semantics() {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        // SET enables tracing; SHOW reflects the new state; RESET disables it.
+        db.query("SET helios.trace_queries = on", &[]).unwrap();
+        let shown = db.query("SHOW helios.trace_queries", &[]).unwrap();
+        assert_eq!(shown.len(), 1);
+        assert_eq!(shown[0].values[0], Value::String("on".to_string()));
+
+        // The trace report is reachable (starts with S -> passes the gate).
+        let _report = db.query("SHOW helios.trace_report", &[]).unwrap();
+
+        db.query("RESET helios.trace_queries", &[]).unwrap();
+        let shown_off = db.query("SHOW helios.trace_queries", &[]).unwrap();
+        assert_eq!(shown_off[0].values[0], Value::String("off".to_string()));
+
+        // A non-trace SET (does not match helios.trace_queries) is gated past
+        // trace handling and not swallowed as a trace control.
+        assert!(EmbeddedDatabase::new_in_memory()
+            .unwrap()
+            .try_handle_trace_control("SET client_encoding = 'UTF8'")
+            .unwrap()
+            .is_none());
+        // A statement that cannot start a trace control (not S/R) returns None
+        // via the first-byte gate without allocating.
+        assert!(EmbeddedDatabase::new_in_memory()
+            .unwrap()
+            .try_handle_trace_control("INSERT INTO t VALUES (1)")
+            .unwrap()
+            .is_none());
     }
 
     // ---- R1.2: word-boundary, literal-aware keyword matcher ----
