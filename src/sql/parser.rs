@@ -733,6 +733,241 @@ impl Parser {
         Ok((table_name, column_name, storage_mode))
     }
 
+    /// Does this SQL start an `ALTER SEQUENCE` statement?
+    ///
+    /// sqlparser 0.53 has no `AlterSequence` variant — `parse_alter` only
+    /// accepts VIEW/TABLE/INDEX/ROLE/POLICY and otherwise errors — so this is
+    /// routed through a custom pre-parse path (mirroring
+    /// `is_alter_column_storage`).
+    pub fn is_alter_sequence(sql: &str) -> bool {
+        let upper = sql.trim_start().to_uppercase();
+        upper.starts_with("ALTER SEQUENCE")
+    }
+
+    /// Parse `ALTER SEQUENCE [IF EXISTS] <name> <actions...>` into an
+    /// [`AlterSequenceAction`]. Actions may appear in any order:
+    /// `RESTART [[WITH] n]`, `INCREMENT [BY] n`, `MINVALUE n | NO MINVALUE`,
+    /// `MAXVALUE n | NO MAXVALUE`, `CACHE n`, `CYCLE | NO CYCLE`,
+    /// `START [WITH] n`, `AS <type>`, `OWNED BY <table>.<col> | OWNED BY NONE`.
+    ///
+    /// Strip-and-scan style (mirrors `parse_alter_column_storage`): peel the
+    /// `ALTER SEQUENCE [IF EXISTS]` header, read the sequence name up to the
+    /// first action keyword, then extract each recognised clause with a regex,
+    /// blanking it out. Any non-whitespace left over is an unsupported clause →
+    /// a clear error (so we never silently accept a malformed ALTER).
+    pub fn parse_alter_sequence(sql: &str) -> Result<AlterSequenceAction> {
+        use regex::Regex;
+        use std::sync::OnceLock;
+
+        let trimmed = sql.trim().trim_end_matches(';').trim();
+
+        // Strip "ALTER SEQUENCE".
+        let upper = trimmed.to_uppercase();
+        if !upper.starts_with("ALTER SEQUENCE") {
+            return Err(Error::query_execution("Expected ALTER SEQUENCE"));
+        }
+        let mut rest = trimmed["ALTER SEQUENCE".len()..].trim_start();
+
+        // Optional IF EXISTS.
+        let mut if_exists = false;
+        if rest.len() >= 9 && rest[..9].eq_ignore_ascii_case("IF EXISTS") {
+            if_exists = true;
+            rest = rest[9..].trim_start();
+        }
+
+        // Read the (possibly quoted, possibly schema-qualified) sequence name,
+        // which ends at the first whitespace OUTSIDE a quoted segment. The
+        // surrounding clause keywords are all alphabetic, so the first space
+        // after the name terminates it.
+        let (raw_name, after_name) = Self::read_sequence_name(rest)?;
+        if raw_name.is_empty() {
+            return Err(Error::query_execution("ALTER SEQUENCE requires a sequence name"));
+        }
+        let name = crate::sql::Planner::normalize_dotted_name(&raw_name);
+
+        // Scan the action tail. Each entry: (kind, whole-clause matcher).
+        // RESTART/START/AS/OWNED BY/CACHE/INCREMENT/MIN/MAX/CYCLE.
+        static CLAUSES: OnceLock<Vec<(SeqClauseKind, Regex)>> = OnceLock::new();
+        let clauses = CLAUSES.get_or_init(|| {
+            use SeqClauseKind::*;
+            vec![
+                // RESTART must be tried before START so "RESTART" isn't seen as
+                // a bare token; the `RESTART\b` alternative (no value) is last
+                // in the alternation so `RESTART WITH n` wins greedily.
+                (
+                    Restart,
+                    Regex::new(r"(?i)\bRESTART(?:\s+WITH)?\s+[+-]?\d+|\bRESTART\b").unwrap(),
+                ),
+                (Increment, Regex::new(r"(?i)\bINCREMENT(?:\s+BY)?\s+[+-]?\d+").unwrap()),
+                (MinValue, Regex::new(r"(?i)\bNO\s+MINVALUE|\bMINVALUE\s+[+-]?\d+").unwrap()),
+                (MaxValue, Regex::new(r"(?i)\bNO\s+MAXVALUE|\bMAXVALUE\s+[+-]?\d+").unwrap()),
+                (Cache, Regex::new(r"(?i)\bCACHE\s+[+-]?\d+").unwrap()),
+                (Cycle, Regex::new(r"(?i)\bNO\s+CYCLE|\bCYCLE\b").unwrap()),
+                (Start, Regex::new(r"(?i)\bSTART(?:\s+WITH)?\s+[+-]?\d+").unwrap()),
+                (
+                    As,
+                    Regex::new(r"(?i)\bAS\s+(?:SMALLINT|INTEGER|INT|BIGINT|INT2|INT4|INT8)\b").unwrap(),
+                ),
+                (
+                    OwnedBy,
+                    Regex::new(
+                        r#"(?i)\bOWNED\s+BY\s+(?:NONE|(?:"[^"]+"|[A-Za-z_][\w$]*)(?:\.(?:"[^"]+"|[A-Za-z_][\w$]*))*)"#,
+                    )
+                    .unwrap(),
+                ),
+            ]
+        });
+
+        let mut remaining = after_name.to_string();
+        let mut action = AlterSequenceAction {
+            name,
+            if_exists,
+            ..Default::default()
+        };
+
+        for (kind, re) in clauses {
+            // A clause may legitimately appear at most once; loop in case the
+            // statement repeats it (last write wins, like PG tolerates).
+            while let Some(m) = re.find(&remaining) {
+                let clause = m.as_str().trim().to_string();
+                let (a, b) = (m.start(), m.end());
+                Self::apply_alter_seq_clause(*kind, &clause, &mut action)?;
+                remaining.replace_range(a..b, " ");
+            }
+        }
+
+        // PostgreSQL/Oracle ALTER SEQUENCE has no SET keyword — the clauses are
+        // bare (INCREMENT BY n, MINVALUE m, …). But a2h-style migration tooling
+        // (and the request that drove this) may emit `SET <option>`; tolerate a
+        // stray standalone SET token as noise rather than erroring.
+        let leftover: Vec<&str> = remaining
+            .split_whitespace()
+            .filter(|t| !t.eq_ignore_ascii_case("SET"))
+            .collect();
+        if !leftover.is_empty() {
+            return Err(Error::query_execution(format!(
+                "Unsupported or malformed ALTER SEQUENCE clause: '{}'",
+                leftover.join(" ")
+            )));
+        }
+
+        Ok(action)
+    }
+
+    /// Read a (quoted / schema-qualified) sequence name from the front of
+    /// `s`, returning `(name, rest)`. Handles `"Quoted Name"`, `schema.name`,
+    /// and bare identifiers; the name ends at the first whitespace that is not
+    /// inside a double-quoted segment.
+    fn read_sequence_name(s: &str) -> Result<(String, &str)> {
+        let bytes = s.as_bytes();
+        let mut i = 0;
+        let mut in_quote = false;
+        while i < bytes.len() {
+            let c = bytes[i] as char;
+            if c == '"' {
+                in_quote = !in_quote;
+            } else if c.is_whitespace() && !in_quote {
+                break;
+            }
+            i += 1;
+        }
+        if in_quote {
+            return Err(Error::query_execution("Unterminated quoted identifier in ALTER SEQUENCE"));
+        }
+        let name = s[..i].trim().to_string();
+        Ok((name, s[i..].trim_start()))
+    }
+
+    /// Apply one parsed ALTER SEQUENCE clause to the accumulating action.
+    fn apply_alter_seq_clause(kind: SeqClauseKind, clause: &str, action: &mut AlterSequenceAction) -> Result<()> {
+        let upper = clause.to_uppercase();
+        // Pull a trailing signed integer out of a clause (the last token).
+        let trailing_i64 = |c: &str| -> Option<i64> { c.split_whitespace().last().and_then(|t| t.parse::<i64>().ok()) };
+        match kind {
+            SeqClauseKind::Restart => {
+                // `RESTART` (no value) → Some(None); `RESTART [WITH] n` → Some(Some(n)).
+                if upper == "RESTART" {
+                    action.restart = Some(None);
+                } else {
+                    let n = trailing_i64(clause)
+                        .ok_or_else(|| Error::query_execution("ALTER SEQUENCE RESTART requires an integer"))?;
+                    action.restart = Some(Some(n));
+                }
+            }
+            SeqClauseKind::Increment => {
+                let n = trailing_i64(clause)
+                    .ok_or_else(|| Error::query_execution("ALTER SEQUENCE INCREMENT requires an integer"))?;
+                action.increment = Some(n);
+            }
+            SeqClauseKind::MinValue => {
+                if upper.starts_with("NO") {
+                    action.min_value = Some(None);
+                } else {
+                    let n = trailing_i64(clause)
+                        .ok_or_else(|| Error::query_execution("ALTER SEQUENCE MINVALUE requires an integer"))?;
+                    action.min_value = Some(Some(n));
+                }
+            }
+            SeqClauseKind::MaxValue => {
+                if upper.starts_with("NO") {
+                    action.max_value = Some(None);
+                } else {
+                    let n = trailing_i64(clause)
+                        .ok_or_else(|| Error::query_execution("ALTER SEQUENCE MAXVALUE requires an integer"))?;
+                    action.max_value = Some(Some(n));
+                }
+            }
+            SeqClauseKind::Cache => {
+                let n = trailing_i64(clause)
+                    .ok_or_else(|| Error::query_execution("ALTER SEQUENCE CACHE requires an integer"))?;
+                action.cache = Some(n);
+            }
+            SeqClauseKind::Cycle => {
+                action.cycle = Some(!upper.starts_with("NO"));
+            }
+            SeqClauseKind::Start => {
+                let n = trailing_i64(clause)
+                    .ok_or_else(|| Error::query_execution("ALTER SEQUENCE START requires an integer"))?;
+                action.start_value = Some(n);
+            }
+            SeqClauseKind::As => {
+                // `AS <type>` — last token is the type keyword.
+                let ty = upper.split_whitespace().last().unwrap_or("BIGINT");
+                let canonical = match ty {
+                    "SMALLINT" | "INT2" => "smallint",
+                    "INT" | "INTEGER" | "INT4" => "integer",
+                    _ => "bigint",
+                };
+                action.data_type = Some(canonical.to_string());
+            }
+            SeqClauseKind::OwnedBy => {
+                // `OWNED BY NONE` → Some(None); `OWNED BY t.c` → Some(Some((t, c))).
+                // Strip the two leading keywords (OWNED, BY) by token, keeping
+                // the original-cased reference intact.
+                let after_owned = clause[clause.char_indices().nth(5).map(|(i, _)| i).unwrap_or(clause.len())..].trim_start();
+                let ref_part = if after_owned.len() >= 2 && after_owned[..2].eq_ignore_ascii_case("BY") {
+                    after_owned[2..].trim()
+                } else {
+                    after_owned
+                };
+                if ref_part.eq_ignore_ascii_case("NONE") {
+                    action.owned_by = Some(None);
+                } else {
+                    let normalized = crate::sql::Planner::normalize_dotted_name(ref_part);
+                    let parts: Vec<&str> = normalized.split('.').collect();
+                    if parts.len() >= 2 {
+                        let table = parts[parts.len() - 2].to_string();
+                        let col = parts[parts.len() - 1].to_string();
+                        action.owned_by = Some(Some((table, col)));
+                    } else {
+                        action.owned_by = Some(None);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Extract column storage modes from CREATE TABLE SQL
     ///
     /// Parses STORAGE DICTIONARY, STORAGE CONTENT_ADDRESSED, and STORAGE COLUMNAR
@@ -898,15 +1133,32 @@ impl Parser {
         use std::sync::OnceLock;
 
         // (canonical rank, clause matcher). Each matches a whole clause.
+        // Ranks mirror sqlparser 0.53's canonical Display order for a CREATE
+        // SEQUENCE: `AS <type>` (immediately after the name) → the option
+        // clauses (strict-ordered) → `OWNED BY <ref>` last. Matching AS/OWNED
+        // BY here (instead of bailing) lets the preprocess reorder the FULL
+        // statement so sqlparser both accepts it AND fills the data_type /
+        // owned_by AST fields.
         static CLAUSES: OnceLock<Vec<(usize, Regex)>> = OnceLock::new();
         let clauses = CLAUSES.get_or_init(|| {
             vec![
-                (0usize, Regex::new(r"(?i)\bINCREMENT(?:\s+BY)?\s+[+-]?\d+").unwrap()),
-                (1, Regex::new(r"(?i)\b(?:NO\s+MINVALUE|MINVALUE\s+[+-]?\d+)").unwrap()),
-                (2, Regex::new(r"(?i)\b(?:NO\s+MAXVALUE|MAXVALUE\s+[+-]?\d+)").unwrap()),
-                (3, Regex::new(r"(?i)\bSTART(?:\s+WITH)?\s+[+-]?\d+").unwrap()),
-                (4, Regex::new(r"(?i)\bCACHE\s+[+-]?\d+").unwrap()),
-                (5, Regex::new(r"(?i)\b(?:NO\s+CYCLE|CYCLE)\b").unwrap()),
+                (
+                    0usize,
+                    Regex::new(r"(?i)\bAS\s+(?:SMALLINT|INTEGER|INT|BIGINT|INT2|INT4|INT8)\b").unwrap(),
+                ),
+                (1, Regex::new(r"(?i)\bINCREMENT(?:\s+BY)?\s+[+-]?\d+").unwrap()),
+                (2, Regex::new(r"(?i)\b(?:NO\s+MINVALUE|MINVALUE\s+[+-]?\d+)").unwrap()),
+                (3, Regex::new(r"(?i)\b(?:NO\s+MAXVALUE|MAXVALUE\s+[+-]?\d+)").unwrap()),
+                (4, Regex::new(r"(?i)\bSTART(?:\s+WITH)?\s+[+-]?\d+").unwrap()),
+                (5, Regex::new(r"(?i)\bCACHE\s+[+-]?\d+").unwrap()),
+                (6, Regex::new(r"(?i)\b(?:NO\s+CYCLE|CYCLE)\b").unwrap()),
+                (
+                    7,
+                    Regex::new(
+                        r#"(?i)\bOWNED\s+BY\s+(?:NONE|(?:"[^"]+"|[A-Za-z_][\w$]*)(?:\.(?:"[^"]+"|[A-Za-z_][\w$]*))*)"#,
+                    )
+                    .unwrap(),
+                ),
             ]
         });
 
@@ -1954,6 +2206,47 @@ impl Parser {
     }
 }
 
+/// Which ALTER SEQUENCE clause a regex match represents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeqClauseKind {
+    Restart,
+    Increment,
+    MinValue,
+    MaxValue,
+    Cache,
+    Cycle,
+    Start,
+    As,
+    OwnedBy,
+}
+
+/// Parsed `ALTER SEQUENCE [IF EXISTS] <name> <actions...>`.
+///
+/// Each `Option` is `None` when the corresponding clause was absent. The
+/// doubly-wrapped fields encode a tri-state:
+/// * `restart`: `None` = no RESTART; `Some(None)` = `RESTART` (to start);
+///   `Some(Some(n))` = `RESTART WITH n`.
+/// * `min_value`/`max_value`: `Some(Some(n))` = explicit value; `Some(None)`
+///   = `NO MINVALUE`/`NO MAXVALUE` (reset to the type/sign default).
+/// * `owned_by`: `Some(Some((t, c)))` = `OWNED BY t.c`; `Some(None)` =
+///   `OWNED BY NONE`.
+///
+/// The executor applies only the present actions to the persisted definition.
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+pub struct AlterSequenceAction {
+    pub name: String,
+    pub if_exists: bool,
+    pub restart: Option<Option<i64>>,
+    pub increment: Option<i64>,
+    pub min_value: Option<Option<i64>>,
+    pub max_value: Option<Option<i64>>,
+    pub cache: Option<i64>,
+    pub cycle: Option<bool>,
+    pub start_value: Option<i64>,
+    pub owned_by: Option<Option<(String, String)>>,
+    pub data_type: Option<String>,
+}
+
 impl Default for Parser {
     fn default() -> Self {
         Self::new()
@@ -2050,6 +2343,119 @@ mod tests {
             let result = Parser::parse_switchover_check_sql("SWITCHOVER CHECK my_standby");
             assert!(result.is_ok());
             assert_eq!(result.unwrap(), "my_standby");
+        }
+    }
+
+    // ---- SEQ-3: ALTER SEQUENCE custom pre-parse path ---------------------
+    mod alter_sequence {
+        use super::*;
+
+        #[test]
+        fn detects_alter_sequence() {
+            assert!(Parser::is_alter_sequence("ALTER SEQUENCE s RESTART"));
+            assert!(Parser::is_alter_sequence("  alter sequence s INCREMENT BY 2"));
+            assert!(!Parser::is_alter_sequence("ALTER TABLE t ADD COLUMN c INT"));
+            assert!(!Parser::is_alter_sequence("CREATE SEQUENCE s"));
+        }
+
+        #[test]
+        fn restart_bare_and_with_value() {
+            let a = Parser::parse_alter_sequence("ALTER SEQUENCE s RESTART").unwrap();
+            assert_eq!(a.name, "s");
+            assert_eq!(a.restart, Some(None));
+
+            let b = Parser::parse_alter_sequence("ALTER SEQUENCE s RESTART WITH 100").unwrap();
+            assert_eq!(b.restart, Some(Some(100)));
+
+            let c = Parser::parse_alter_sequence("ALTER SEQUENCE s RESTART 250").unwrap();
+            assert_eq!(c.restart, Some(Some(250)));
+        }
+
+        #[test]
+        fn if_exists_and_set_options_any_order() {
+            // Options in an arbitrary order all parse (mirrors the
+            // sqlparser-strictness the CREATE preprocess works around).
+            let a = Parser::parse_alter_sequence(
+                "ALTER SEQUENCE IF EXISTS s CYCLE CACHE 50 MAXVALUE 999 INCREMENT BY 7 MINVALUE 3 START WITH 3",
+            )
+            .unwrap();
+            assert_eq!(a.name, "s");
+            assert!(a.if_exists);
+            assert_eq!(a.increment, Some(7));
+            assert_eq!(a.min_value, Some(Some(3)));
+            assert_eq!(a.max_value, Some(Some(999)));
+            assert_eq!(a.cache, Some(50));
+            assert_eq!(a.cycle, Some(true));
+            assert_eq!(a.start_value, Some(3));
+        }
+
+        #[test]
+        fn no_minvalue_no_maxvalue_no_cycle() {
+            let a = Parser::parse_alter_sequence("ALTER SEQUENCE s NO MINVALUE NO MAXVALUE NO CYCLE").unwrap();
+            assert_eq!(a.min_value, Some(None));
+            assert_eq!(a.max_value, Some(None));
+            assert_eq!(a.cycle, Some(false));
+        }
+
+        #[test]
+        fn negative_values_and_increment_by_omitted_keyword() {
+            let a = Parser::parse_alter_sequence("ALTER SEQUENCE s INCREMENT -1 MINVALUE -100 MAXVALUE -1").unwrap();
+            assert_eq!(a.increment, Some(-1));
+            assert_eq!(a.min_value, Some(Some(-100)));
+            assert_eq!(a.max_value, Some(Some(-1)));
+        }
+
+        #[test]
+        fn owned_by_table_col_and_none() {
+            let a = Parser::parse_alter_sequence("ALTER SEQUENCE s OWNED BY orders.id").unwrap();
+            assert_eq!(a.owned_by, Some(Some(("orders".to_string(), "id".to_string()))));
+
+            let b = Parser::parse_alter_sequence("ALTER SEQUENCE s OWNED BY NONE").unwrap();
+            assert_eq!(b.owned_by, Some(None));
+
+            // Schema-qualified owner collapses public. and keeps the last two parts.
+            let c = Parser::parse_alter_sequence("ALTER SEQUENCE s OWNED BY public.orders.id").unwrap();
+            assert_eq!(c.owned_by, Some(Some(("orders".to_string(), "id".to_string()))));
+        }
+
+        #[test]
+        fn as_type_clause() {
+            let a = Parser::parse_alter_sequence("ALTER SEQUENCE s AS bigint").unwrap();
+            assert_eq!(a.data_type, Some("bigint".to_string()));
+            let b = Parser::parse_alter_sequence("ALTER SEQUENCE s AS smallint").unwrap();
+            assert_eq!(b.data_type, Some("smallint".to_string()));
+        }
+
+        #[test]
+        fn quoted_sequence_name() {
+            let a = Parser::parse_alter_sequence(r#"ALTER SEQUENCE "MySeq" RESTART WITH 5"#).unwrap();
+            // Quoted name keeps its case (matches normalize_ident).
+            assert_eq!(a.name, "MySeq");
+            assert_eq!(a.restart, Some(Some(5)));
+        }
+
+        #[test]
+        fn trailing_semicolon_ok() {
+            let a = Parser::parse_alter_sequence("ALTER SEQUENCE s RESTART WITH 9;").unwrap();
+            assert_eq!(a.restart, Some(Some(9)));
+        }
+
+        #[test]
+        fn unsupported_clause_errors() {
+            // A clause we do not model must produce a clear error, never a
+            // silently-accepted no-op.
+            let err = Parser::parse_alter_sequence("ALTER SEQUENCE s FROBNICATE 3").unwrap_err();
+            assert!(
+                err.to_string().to_lowercase().contains("unsupported")
+                    || err.to_string().to_lowercase().contains("malformed"),
+                "{err}"
+            );
+        }
+
+        #[test]
+        fn missing_name_errors() {
+            assert!(Parser::parse_alter_sequence("ALTER SEQUENCE").is_err());
+            assert!(Parser::parse_alter_sequence("ALTER SEQUENCE IF EXISTS").is_err());
         }
     }
 }

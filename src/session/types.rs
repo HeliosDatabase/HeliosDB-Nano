@@ -209,6 +209,13 @@ pub struct Session {
     /// `Some(true)` waits on the group fsync even when the storage default
     /// is non-durable.
     pub synchronous_commit: Option<bool>,
+    /// Item 9: per-session `helios.fast_autocommit` opt-in (default `false`).
+    /// When `true`, single-statement autocommit on this session commits
+    /// non-blocking (visible immediately, durable at the next group flush),
+    /// the same semantics as `synchronous_commit = off` but exposed as an
+    /// independent capability a connection pool can flip. An explicit
+    /// `synchronous_commit` override always wins over this flag.
+    pub fast_autocommit: bool,
     /// Active transaction ID (None if no transaction in progress)
     pub active_txn: Option<u64>,
     /// Session creation timestamp (Unix epoch seconds)
@@ -232,6 +239,7 @@ impl Session {
             user_id,
             isolation_level,
             synchronous_commit: None,
+            fast_autocommit: false,
             active_txn: None,
             created_at: now,
             last_activity: now,

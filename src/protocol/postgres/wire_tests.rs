@@ -430,3 +430,177 @@ async fn probe_w1_extended_select_10k_wide_rows() {
         bytes as f64 / (1024.0 * 1024.0)
     );
 }
+
+// ---------------------------------------------------------------------------
+// Item 6 — pipelining contract: one ReadyForQuery per Sync, never per Execute.
+// ---------------------------------------------------------------------------
+
+/// A pipelined `Parse, Bind, Execute, Bind, Execute, Sync` must emit results
+/// per Execute but EXACTLY ONE ReadyForQuery, as the LAST message. A
+/// per-Execute RFQ would terminate the HeliosProxy batch relay early. This
+/// drives the same `handle_message` dispatch the main loop uses.
+#[tokio::test]
+async fn pipelined_executes_emit_exactly_one_ready_for_query() {
+    use super::messages::FrontendMessage;
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY)").unwrap();
+    db.execute("INSERT INTO t VALUES (1),(2),(3)").unwrap();
+
+    let (mut handler, mut client) = test_handler(db);
+
+    let pipeline = vec![
+        FrontendMessage::Parse {
+            statement_name: "s1".into(),
+            query: "SELECT id FROM t ORDER BY id".into(),
+            param_types: vec![],
+        },
+        FrontendMessage::Bind {
+            portal_name: "p1".into(),
+            statement_name: "s1".into(),
+            param_formats: vec![],
+            params: vec![],
+            result_formats: vec![],
+        },
+        FrontendMessage::Execute { portal_name: "p1".into(), max_rows: 0 },
+        FrontendMessage::Bind {
+            portal_name: "p2".into(),
+            statement_name: "s1".into(),
+            param_formats: vec![],
+            params: vec![],
+            result_formats: vec![],
+        },
+        FrontendMessage::Execute { portal_name: "p2".into(), max_rows: 0 },
+        FrontendMessage::Sync,
+    ];
+    for msg in pipeline {
+        handler.handle_message(msg).await.expect("dispatch");
+    }
+
+    let out = drain(&mut client).await;
+    let types: Vec<u8> = parse_messages(&out).iter().map(|(t, _)| *t).collect();
+    let render: String = types.iter().map(|&t| t as char).collect();
+
+    assert_eq!(
+        types.iter().filter(|&&t| t == b'Z').count(),
+        1,
+        "exactly one ReadyForQuery for the whole pipeline: {render}"
+    );
+    assert_eq!(*types.last().unwrap(), b'Z', "ReadyForQuery must be last: {render}");
+    assert_eq!(types.iter().filter(|&&t| t == b'1').count(), 1, "one ParseComplete: {render}");
+    assert_eq!(types.iter().filter(|&&t| t == b'2').count(), 2, "two BindComplete: {render}");
+    assert_eq!(types.iter().filter(|&&t| t == b'C').count(), 2, "two CommandComplete: {render}");
+    assert_eq!(
+        types.iter().filter(|&&t| t == b'D').count(),
+        6,
+        "six DataRows (3 per Execute): {render}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Items 5 / 9 / 10 — session GUCs and DISCARD over the wire.
+// ---------------------------------------------------------------------------
+
+fn command_tags(bytes: &[u8]) -> Vec<String> {
+    parse_messages(bytes)
+        .into_iter()
+        .filter(|(t, _)| *t == b'C')
+        .map(|(_, p)| String::from_utf8_lossy(p.split(|&b| b == 0).next().unwrap_or(&[])).to_string())
+        .collect()
+}
+
+fn param_status(bytes: &[u8]) -> Vec<(String, String)> {
+    parse_messages(bytes)
+        .into_iter()
+        .filter(|(t, _)| *t == b'S')
+        .map(|(_, p)| {
+            let mut it = p.split(|&b| b == 0);
+            let name = String::from_utf8_lossy(it.next().unwrap_or(&[])).to_string();
+            let val = String::from_utf8_lossy(it.next().unwrap_or(&[])).to_string();
+            (name, val)
+        })
+        .collect()
+}
+
+fn first_data_row_text(bytes: &[u8]) -> Option<String> {
+    data_rows(bytes)
+        .into_iter()
+        .next()
+        .and_then(|r| r.into_iter().next().flatten())
+        .map(|b| String::from_utf8_lossy(&b).to_string())
+}
+
+/// Item 9 + item 10: `SET helios.fast_autocommit = on` echoes a GUC_REPORT
+/// `ParameterStatus` (so a capability-probing pool sees the change) and a
+/// `SET` CommandComplete; `SHOW` reflects it; an invalid value errors cleanly.
+#[tokio::test]
+async fn helios_fast_autocommit_set_show_roundtrip() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+
+    handler
+        .handle_single_query("SET helios.fast_autocommit = on")
+        .await
+        .unwrap();
+    let out = drain(&mut client).await;
+    assert!(
+        param_status(&out)
+            .iter()
+            .any(|(n, v)| n == "helios.fast_autocommit" && v == "on"),
+        "expected GUC_REPORT helios.fast_autocommit=on, got {:?}",
+        param_status(&out)
+    );
+    assert!(command_tags(&out).iter().any(|t| t == "SET"), "expected SET tag");
+
+    handler
+        .handle_single_query("SHOW helios.fast_autocommit")
+        .await
+        .unwrap();
+    assert_eq!(
+        first_data_row_text(&drain(&mut client).await).as_deref(),
+        Some("on"),
+        "SHOW must reflect the SET"
+    );
+
+    // Invalid value must error cleanly (handler sends ErrorResponse, returns Ok).
+    handler
+        .handle_single_query("SET helios.fast_autocommit = banana")
+        .await
+        .unwrap();
+    let out = drain(&mut client).await;
+    assert!(
+        parse_messages(&out).iter().any(|(t, _)| *t == b'E'),
+        "invalid value must produce an ErrorResponse"
+    );
+}
+
+/// Item 5: `DISCARD ALL` acks with the `DISCARD ALL` tag and resets the
+/// session's `helios.fast_autocommit` GUC back to its default.
+#[tokio::test]
+async fn discard_all_resets_session_guc() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+
+    handler
+        .handle_single_query("SET helios.fast_autocommit = on")
+        .await
+        .unwrap();
+    let _ = drain(&mut client).await;
+
+    handler.handle_single_query("DISCARD ALL").await.unwrap();
+    let out = drain(&mut client).await;
+    assert!(
+        command_tags(&out).iter().any(|t| t == "DISCARD ALL"),
+        "expected DISCARD ALL tag, got {:?}",
+        command_tags(&out)
+    );
+
+    handler
+        .handle_single_query("SHOW helios.fast_autocommit")
+        .await
+        .unwrap();
+    assert_eq!(
+        first_data_row_text(&drain(&mut client).await).as_deref(),
+        Some("off"),
+        "DISCARD ALL must reset helios.fast_autocommit to off"
+    );
+}

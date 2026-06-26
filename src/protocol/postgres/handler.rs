@@ -408,6 +408,19 @@ where
             self.send_parameter_status("TimeZone", "UTC").await?;
             self.send_parameter_status("integer_datetimes", "on").await?;
 
+            // Item 10: advertise the helios.* opt-in capabilities so a
+            // capability-probing client (HeliosProxy) auto-enables only what
+            // this server actually supports. libpq tolerates unknown
+            // ParameterStatus names, and non-helios clients ignore them, so
+            // this is safe to always send (paid once per connection, off the
+            // per-query path pg35 measures).
+            self.send_parameter_status("helios.copy", "on").await?;
+            self.send_parameter_status("helios.pipeline", "on").await?;
+            self.send_parameter_status("helios.plan_cache", "on").await?;
+            self.send_parameter_status("helios.binary_results", "on").await?;
+            self.send_parameter_status("helios.reset_session", "on").await?;
+            self.send_parameter_status("helios.fast_autocommit", "off").await?;
+
             // Send backend key data
             self.send_message(BackendMessage::BackendKeyData {
                 process_id: std::process::id() as i32,
@@ -465,8 +478,12 @@ where
         }
     }
 
-    /// Handle a frontend message
-    async fn handle_message(&mut self, msg: FrontendMessage) -> Result<()> {
+    /// Handle a frontend message.
+    ///
+    /// `pub(super)` so the wire conformance tests can drive an exact
+    /// Parse/Bind/Execute/Sync pipeline through the same dispatch the main
+    /// loop uses (the loop is just `read_message` → `handle_message`).
+    pub(super) async fn handle_message(&mut self, msg: FrontendMessage) -> Result<()> {
         if !self.authenticated && !matches!(msg, FrontendMessage::PasswordMessage { .. }) {
             return Err(Error::authentication("Not authenticated"));
         }
@@ -671,6 +688,28 @@ where
                 }
                 Ok(None) => {}
             }
+            // Item 9: SET helios.fast_autocommit = on|off — intercept before the
+            // generic ack below (which would silently drop an unknown SET).
+            match EmbeddedDatabase::parse_helios_fast_autocommit_statement(trimmed) {
+                Ok(Some(value)) => {
+                    if let Err(e) = self.database.set_session_fast_autocommit(self.session_id, value) {
+                        self.send_error("ERROR", "22023", &e.to_string(), None, None).await?;
+                        return Ok(());
+                    }
+                    // Item 10: GUC_REPORT — echo the new value so a capability-
+                    // probing pool observes the change.
+                    self.send_parameter_status("helios.fast_autocommit", if value { "on" } else { "off" })
+                        .await?;
+                    self.send_command_complete("SET").await?;
+                    self.send_ready_for_query().await?;
+                    return Ok(());
+                }
+                Err(e) => {
+                    self.send_error("ERROR", "22023", &e.to_string(), None, None).await?;
+                    return Ok(());
+                }
+                Ok(None) => {}
+            }
             if EmbeddedDatabase::is_fk_setting_statement(trimmed) {
                 if let Err(e) = self.database.execute(trimmed) {
                     self.send_error("ERROR", "22023", &e.to_string(), None, None).await?;
@@ -696,6 +735,19 @@ where
             self.send_command_complete("RESET").await?;
             self.send_ready_for_query().await?;
             return Ok(());
+        } else if starts_with_icase(trimmed, "RESET ")
+            && trimmed[6..]
+                .trim()
+                .trim_end_matches(';')
+                .trim()
+                .eq_ignore_ascii_case("helios.fast_autocommit")
+        {
+            // Item 9: RESET helios.fast_autocommit -> default (off).
+            let _ = self.database.set_session_fast_autocommit(self.session_id, false);
+            self.send_parameter_status("helios.fast_autocommit", "off").await?; // item 10 GUC_REPORT
+            self.send_command_complete("RESET").await?;
+            self.send_ready_for_query().await?;
+            return Ok(());
         } else if starts_with_icase(trimmed, "SHOW ") && !crate::sql::Parser::is_show_branches(trimmed) {
             // Handle SHOW commands for client compatibility
             let param = trimmed[5..].trim().trim_end_matches(';').trim();
@@ -708,6 +760,16 @@ where
                 (
                     "synchronous_commit".to_string(),
                     if effective { "on".to_string() } else { "off".to_string() },
+                )
+            } else if param.eq_ignore_ascii_case("helios.fast_autocommit") {
+                // Item 9: SHOW helios.fast_autocommit.
+                let on = self
+                    .database
+                    .session_fast_autocommit(self.session_id)
+                    .unwrap_or(false);
+                (
+                    "helios.fast_autocommit".to_string(),
+                    if on { "on".to_string() } else { "off".to_string() },
                 )
             } else {
                 Self::resolve_show_parameter(param)
@@ -800,6 +862,42 @@ where
             }
             self.transaction_status = TransactionStatus::Idle;
             self.send_command_complete("ROLLBACK").await?;
+            self.send_ready_for_query().await?;
+            return Ok(());
+        } else if let Some(target) = Self::parse_discard_target(trimmed) {
+            // Item 5: DISCARD resets session state without a reconnect, so a
+            // connection pool can hand this physical connection to a different
+            // client. DISCARD ALL is the pool's reset; the narrower forms are
+            // accepted for compatibility.
+            match target {
+                "ALL" => {
+                    if matches!(
+                        self.transaction_status,
+                        TransactionStatus::InTransaction | TransactionStatus::Failed
+                    ) && self.database.session_in_transaction(self.session_id)
+                    {
+                        self.database.rollback_transaction_for_session(self.session_id)?;
+                    }
+                    self.transaction_status = TransactionStatus::Idle;
+                    self.prepared_statements.clear_all()?;
+                    // Reset session GUCs to their defaults.
+                    let _ = self.database.set_session_synchronous_commit(self.session_id, None);
+                    let _ = self.database.set_session_fast_autocommit(self.session_id, false);
+                    let _ = self.database.set_session_isolation(
+                        self.session_id,
+                        crate::session::IsolationLevel::ReadCommitted,
+                    );
+                    // Item 10: GUC_REPORT the reset helios.* GUC.
+                    self.send_parameter_status("helios.fast_autocommit", "off").await?;
+                }
+                "PLANS" => {
+                    self.prepared_statements.clear_all()?;
+                }
+                // Nano has no session-scoped temp tables or sequence caches to
+                // drop; accept and ack for client compatibility.
+                _ => {}
+            }
+            self.send_command_complete(&format!("DISCARD {target}")).await?;
             self.send_ready_for_query().await?;
             return Ok(());
         }
@@ -1856,6 +1954,28 @@ where
             _ => String::new(),
         };
         (col, val)
+    }
+
+    /// Item 5: classify a `DISCARD …` statement, returning the canonical
+    /// target (`"ALL" | "PLANS" | "SEQUENCES" | "TEMP"`) or `None` when this is
+    /// not a recognized DISCARD form (so it falls through to normal parsing).
+    fn parse_discard_target(trimmed: &str) -> Option<&'static str> {
+        let rest = trimmed.trim_end_matches(';').trim();
+        if !starts_with_icase(rest, "DISCARD ") {
+            return None;
+        }
+        let arg = rest[8..].trim(); // "DISCARD ".len() == 8 (ASCII)
+        if arg.eq_ignore_ascii_case("ALL") {
+            Some("ALL")
+        } else if arg.eq_ignore_ascii_case("PLANS") {
+            Some("PLANS")
+        } else if arg.eq_ignore_ascii_case("SEQUENCES") {
+            Some("SEQUENCES")
+        } else if arg.eq_ignore_ascii_case("TEMP") || arg.eq_ignore_ascii_case("TEMPORARY") {
+            Some("TEMP")
+        } else {
+            None
+        }
     }
 
     fn parse_isolation_level(query: &str) -> Option<String> {

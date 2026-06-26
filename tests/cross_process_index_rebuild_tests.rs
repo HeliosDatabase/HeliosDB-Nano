@@ -223,4 +223,82 @@ mod cross_process_rebuild {
         drop(db);
         let _ = EmbeddedDatabase::new(&dir).unwrap();
     }
+
+    /// Count registered in-memory ART indexes. `pg_index` (the raw catalog,
+    /// which the embedded planner supports — unlike the `pg_indexes` view,
+    /// which is wire-protocol only) emits one row per ART index, reading the
+    /// same in-memory managers `pg_indexes` does. So a stable count across a
+    /// reopen proves the indexes were actually re-registered on open.
+    fn art_index_count(db: &EmbeddedDatabase) -> usize {
+        db.query("SELECT indisprimary FROM pg_index", &[]).unwrap().len()
+    }
+
+    /// Regression for the upgrade bug: a user `CREATE INDEX` secondary index,
+    /// built *after* the table holds rows, must survive a reopen on the same
+    /// data directory — staying registered AND usable for lookups. The original
+    /// failure left only `*_pkey` registered; every secondary index vanished
+    /// (the ART index count would collapse from 3 to 1) and queries silently
+    /// fell back to full scans.
+    #[test]
+    fn secondary_indexes_survive_reopen() {
+        let dir = scratch_dir();
+        let before;
+
+        // Session 1 — populate, then build two secondary indexes on non-PK
+        // columns after the data is already present.
+        {
+            let db = EmbeddedDatabase::new(&dir).unwrap();
+            db.execute("CREATE TABLE docs (id INT PRIMARY KEY, status TEXT, owner TEXT)")
+                .unwrap();
+            for i in 0..50 {
+                let status = if i % 2 == 0 { "open" } else { "closed" };
+                db.execute(&format!(
+                    "INSERT INTO docs (id, status, owner) VALUES ({i}, '{status}', 'u{}')",
+                    i % 5
+                ))
+                .unwrap();
+            }
+            db.execute("CREATE INDEX docs_status_idx ON docs (status)").unwrap();
+            db.execute("CREATE INDEX docs_owner_idx ON docs (owner)").unwrap();
+
+            before = art_index_count(&db);
+            assert!(
+                before >= 3,
+                "expected at least PK + 2 secondary ART indexes pre-reopen, got {before}"
+            );
+        }
+
+        // Session 2 — fresh open on the same data-dir (simulates a binary
+        // upgrade). Both secondary indexes must be re-registered, not just PK.
+        {
+            let db = EmbeddedDatabase::new(&dir).unwrap();
+            let after = art_index_count(&db);
+            assert_eq!(
+                after, before,
+                "ART index count changed across reopen ({before} -> {after}) — secondary \
+                 indexes were not re-registered (the upgrade-bug failure mode)"
+            );
+
+            // ...and the indexes are still functional after rebuild.
+            let rows = db
+                .query("SELECT id FROM docs WHERE status = 'open'", &[])
+                .unwrap();
+            assert_eq!(
+                rows.len(),
+                25,
+                "WHERE status='open' returned {} rows after reopen",
+                rows.len()
+            );
+
+            let rows = db
+                .query("SELECT id FROM docs WHERE owner = 'u3'", &[])
+                .unwrap();
+            assert_eq!(
+                rows.len(),
+                10,
+                "WHERE owner='u3' returned {} rows after reopen",
+                rows.len()
+            );
+        }
+    }
 }

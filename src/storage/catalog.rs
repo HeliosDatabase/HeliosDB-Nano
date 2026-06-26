@@ -23,6 +23,96 @@ pub struct PersistedIndexDefinition {
     pub options: Vec<crate::sql::logical_plan::IndexOption>,
 }
 
+/// On-disk format tag for a persisted index definition: a 4-byte magic plus a
+/// single version byte, written ahead of the bincode body. The tag lets a
+/// future format change be *detected* (and skipped/migrated) rather than
+/// silently aborting the whole index rebuild — which is the failure mode behind
+/// the upgrade bug where every secondary index vanished. Records written before
+/// the tag existed (raw bincode, or the older WAL-replay tuple) are still read
+/// via the legacy fallbacks in `decode_persisted_index_definition`.
+const INDEX_DEF_MAGIC: &[u8; 4] = b"HIDX";
+const INDEX_DEF_FORMAT_VERSION: u8 = 1;
+
+/// Persisted `CREATE SEQUENCE` definition (the immutable-ish config half).
+///
+/// Split from the high-water counter (`PersistedSeqState`) on purpose, mirroring
+/// the engine's own definition-vs-counter split (index definition vs row
+/// counter): the definition is written on CREATE/ALTER and rides the normal
+/// post-statement durability barrier, while the *state* record is the tiny,
+/// hot, explicitly-fsynced record that backs the no-duplicate invariant.
+///
+/// `name` follows the index/object-name convention (NOT lowercased) so that
+/// quoted, case-sensitive sequence names round-trip.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PersistedSequence {
+    pub name: String,
+    /// "smallint" | "integer" | "bigint" (default "bigint").
+    pub data_type: String,
+    pub start_value: i64,
+    /// Non-zero. CREATE coerces 0 -> 1; ALTER rejects 0.
+    pub increment_by: i64,
+    pub min_value: i64,
+    pub max_value: i64,
+    /// >= 1. The number of values reserved per durable high-water fsync.
+    pub cache: i64,
+    pub cycle: bool,
+    pub owned_by_table: Option<String>,
+    pub owned_by_column: Option<String>,
+}
+
+impl PersistedSequence {
+    /// Inclusive bigint floor (`i64::MIN + 1`) — avoids the negation-UB hazard
+    /// of `-i64::MIN` when a descending sequence mirrors the range.
+    pub const BIGINT_MIN: i64 = i64::MIN + 1;
+    pub const BIGINT_MAX: i64 = i64::MAX;
+
+    /// Type-driven `[min, max]` bounds for a missing MINVALUE/MAXVALUE.
+    pub fn type_bounds(data_type: &str) -> (i64, i64) {
+        match data_type {
+            "smallint" => (i16::MIN as i64, i16::MAX as i64),
+            "integer" => (i32::MIN as i64, i32::MAX as i64),
+            _ => (Self::BIGINT_MIN, Self::BIGINT_MAX),
+        }
+    }
+
+    /// A lenient default sequence (bigint, ascending from 1) used by the
+    /// auto-vivify path when `nextval` names an unknown sequence.
+    pub fn default_named(name: &str) -> Self {
+        let (_tmin, tmax) = Self::type_bounds("bigint");
+        Self {
+            name: name.to_string(),
+            data_type: "bigint".to_string(),
+            start_value: 1,
+            increment_by: 1,
+            min_value: 1,
+            max_value: tmax,
+            cache: 1,
+            cycle: false,
+            owned_by_table: None,
+            owned_by_column: None,
+        }
+    }
+}
+
+/// Durable high-water mark for a sequence.
+///
+/// `last_reserved` is the highest value any block grant has reserved; on
+/// restart the runtime resumes strictly PAST this value, so a value is never
+/// served twice across a crash. `is_called=false` (after CREATE / `setval(.,
+/// false)`) means the next `nextval` returns the start value itself.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct PersistedSeqState {
+    pub last_reserved: i64,
+    pub is_called: bool,
+}
+
+/// On-disk tags for the two sequence records (frame == index-def: magic +
+/// version byte + bincode body), so a future format bump is detectable.
+const SEQ_DEF_MAGIC: &[u8; 4] = b"HSEQ";
+const SEQ_DEF_FORMAT_VERSION: u8 = 1;
+const SEQ_STATE_MAGIC: &[u8; 4] = b"HSQS";
+const SEQ_STATE_FORMAT_VERSION: u8 = 1;
+
 fn vector_distance_metric(options: &[crate::sql::logical_plan::IndexOption]) -> crate::vector::DistanceMetric {
     use crate::sql::logical_plan::IndexOption;
     use crate::vector::DistanceMetric;
@@ -372,9 +462,84 @@ impl<'a> Catalog<'a> {
     /// Persist a user-created index definition in the catalog.
     pub fn save_index_definition(&self, index_name: &str, definition: &PersistedIndexDefinition) -> Result<()> {
         let key = Self::index_metadata_key(index_name);
-        let value = bincode::serialize(definition)
+        let body = bincode::serialize(definition)
             .map_err(|e| Error::storage(format!("Failed to serialize index definition: {}", e)))?;
+        let mut value = Vec::with_capacity(INDEX_DEF_MAGIC.len() + 1 + body.len());
+        value.extend_from_slice(INDEX_DEF_MAGIC);
+        value.push(INDEX_DEF_FORMAT_VERSION);
+        value.extend_from_slice(&body);
         self.storage.put(&key, &value)
+    }
+
+    /// Decode one persisted index record, tolerating every on-disk format we
+    /// have ever written. Returns `None` (after a `warn!`) for an undecodable
+    /// or unknown-version record instead of erroring, so a single bad record
+    /// degrades to a scan for *that* index rather than aborting the rebuild of
+    /// every other index in the database.
+    fn decode_persisted_index_definition(
+        index_name: &str,
+        value: &[u8],
+    ) -> Option<PersistedIndexDefinition> {
+        // Current tagged format: magic + version byte + bincode(definition).
+        if value.len() > INDEX_DEF_MAGIC.len() && value.starts_with(INDEX_DEF_MAGIC) {
+            let version = value[INDEX_DEF_MAGIC.len()];
+            let body = &value[INDEX_DEF_MAGIC.len() + 1..];
+            if version == INDEX_DEF_FORMAT_VERSION {
+                match bincode::deserialize::<PersistedIndexDefinition>(body) {
+                    Ok(definition) => return Some(definition),
+                    Err(e) => {
+                        tracing::warn!(
+                            "Index rebuild: skipping index '{}' — v{} record failed to decode \
+                             ({}); it will fall back to a scan until rebuilt with CREATE INDEX",
+                            index_name,
+                            version,
+                            e
+                        );
+                        return None;
+                    }
+                }
+            }
+            tracing::warn!(
+                "Index rebuild: skipping index '{}' — on-disk format version {} is newer than \
+                 this binary supports (v{}); REINDEX after upgrading",
+                index_name,
+                version,
+                INDEX_DEF_FORMAT_VERSION
+            );
+            return None;
+        }
+
+        // Legacy untagged format A: raw bincode(PersistedIndexDefinition),
+        // written by v3.37.2 .. the introduction of the tag.
+        if let Ok(definition) = bincode::deserialize::<PersistedIndexDefinition>(value) {
+            return Some(definition);
+        }
+
+        // Legacy untagged format B: the old WAL-replay tuple
+        // (table, column, index_type, options_bytes).
+        if let Ok((table_name, column_name, index_type, options_bytes)) =
+            bincode::deserialize::<(String, String, Option<String>, Vec<u8>)>(value)
+        {
+            let options = if options_bytes.is_empty() {
+                Vec::new()
+            } else {
+                bincode::deserialize(&options_bytes).unwrap_or_default()
+            };
+            return Some(PersistedIndexDefinition {
+                table_name,
+                column_name,
+                index_type,
+                options,
+            });
+        }
+
+        tracing::warn!(
+            "Index rebuild: skipping index '{}' — record ({} bytes) is not decodable in any known \
+             format; it will fall back to a scan until rebuilt with CREATE INDEX",
+            index_name,
+            value.len()
+        );
+        None
     }
 
     /// Drop a persisted user-created index definition.
@@ -401,38 +566,12 @@ impl<'a> Catalog<'a> {
             }
             let index_name = String::from_utf8_lossy(key.get(prefix.len()..).unwrap_or_default()).to_string();
 
-            let definition = match bincode::deserialize::<PersistedIndexDefinition>(&value) {
-                Ok(definition) => definition,
-                Err(_) => {
-                    // Backward-compatible decode for older WAL replay records
-                    // that stored `(table, column, index_type, options_bytes)`.
-                    let (table_name, column_name, index_type, options_bytes): (
-                        String,
-                        String,
-                        Option<String>,
-                        Vec<u8>,
-                    ) = bincode::deserialize(&value).map_err(|e| {
-                        Error::storage(format!(
-                            "Failed to deserialize index definition '{}': {}",
-                            index_name, e
-                        ))
-                    })?;
-                    let options = if options_bytes.is_empty() {
-                        Vec::new()
-                    } else {
-                        bincode::deserialize(&options_bytes).map_err(|e| {
-                            Error::storage(format!("Failed to deserialize index options '{}': {}", index_name, e))
-                        })?
-                    };
-                    PersistedIndexDefinition {
-                        table_name,
-                        column_name,
-                        index_type,
-                        options,
-                    }
-                }
-            };
-            indexes.push((index_name, definition));
+            // Per-record resilience: a single undecodable record must NOT abort
+            // the whole rebuild (that would silently un-index every *other*
+            // index on the database — the failure mode behind the upgrade bug).
+            if let Some(definition) = Self::decode_persisted_index_definition(&index_name, &value) {
+                indexes.push((index_name, definition));
+            }
         }
 
         indexes.sort_by(|a, b| a.0.cmp(&b.0));
@@ -546,7 +685,23 @@ impl<'a> Catalog<'a> {
                 if matches!(definition.index_type.as_deref(), None | Some("art" | "btree" | "hash")) {
                     let columns = vec![definition.column_name.clone()];
                     if let Err(e) = art_manager.create_manual_index(index_name, &table_name, &columns) {
-                        tracing::debug!("Index rebuild: manual index {} already registered: {}", index_name, e);
+                        // IndexAlreadyExists is expected when CREATE INDEX ran
+                        // earlier in this same process. Anything else is a real
+                        // degradation — the index stays unregistered and queries
+                        // silently full-scan — so it must be surfaced, not
+                        // swallowed at debug level.
+                        if matches!(e, super::art_index::ArtIndexError::IndexAlreadyExists(_)) {
+                            tracing::debug!("Index rebuild: manual index {} already registered", index_name);
+                        } else {
+                            tracing::warn!(
+                                "Index rebuild: manual index '{}' on {}.{} FAILED to register ({}); \
+                                 queries will full-scan until it is rebuilt with CREATE INDEX",
+                                index_name,
+                                table_name,
+                                definition.column_name,
+                                e
+                            );
+                        }
                     }
                 }
             }
@@ -1138,6 +1293,188 @@ impl<'a> Catalog<'a> {
     pub fn drop_identity_columns(&self, table_name: &str) -> Result<()> {
         let key = Self::identity_key(table_name);
         self.storage.delete(&key)
+    }
+
+    // -------------------------------------------------------------------
+    // v3.60.0 — durable + scalable SEQUENCES.
+    //
+    // Two records per sequence so the hot, explicitly-fsynced record stays
+    // tiny (mirroring the engine's definition-vs-counter split):
+    //   meta:sequence:<name>  -> PersistedSequence  (config; rides the
+    //                            normal post-statement barrier)
+    //   meta:seqstate:<name>  -> PersistedSeqState  (high-water; fsynced
+    //                            explicitly by flush_sequence_state before
+    //                            any value in a block is served)
+    // The two prefixes are disjoint (they diverge at byte 7, 'u' vs 't'),
+    // and the list scan breaks on the first key outside its exact prefix,
+    // so `meta:seqstate:` never bleeds into the `meta:sequence:` scan.
+    // -------------------------------------------------------------------
+
+    fn sequence_def_key(name: &str) -> Vec<u8> {
+        format!("meta:sequence:{}", name).into_bytes()
+    }
+
+    fn sequence_state_key(name: &str) -> Vec<u8> {
+        format!("meta:seqstate:{}", name).into_bytes()
+    }
+
+    /// Persist a `CREATE SEQUENCE` definition. Overwrites any existing entry —
+    /// callers wanting IF NOT EXISTS semantics must check `sequence_exists`
+    /// first. Definition durability rides the normal post-statement barrier
+    /// (like enum/identity); a lost CREATE means the sequence is *absent* on
+    /// restart, never a duplicate value.
+    pub fn save_sequence(&self, def: &PersistedSequence) -> Result<()> {
+        let key = Self::sequence_def_key(&def.name);
+        let body = bincode::serialize(def)
+            .map_err(|e| Error::storage(format!("Failed to serialize sequence definition: {}", e)))?;
+        let mut value = Vec::with_capacity(SEQ_DEF_MAGIC.len() + 1 + body.len());
+        value.extend_from_slice(SEQ_DEF_MAGIC);
+        value.push(SEQ_DEF_FORMAT_VERSION);
+        value.extend_from_slice(&body);
+        self.storage.put(&key, &value)
+    }
+
+    /// Decode one persisted sequence-definition record, tolerating a future
+    /// format bump or a raw (untagged) bincode body. Returns `None` (after a
+    /// `warn!`) for an undecodable / unknown-version record instead of
+    /// erroring, so one bad record degrades to "that sequence is missing"
+    /// rather than aborting the load of every other sequence — the same
+    /// per-record resilience the index rebuild relies on.
+    fn decode_persisted_sequence(name: &str, value: &[u8]) -> Option<PersistedSequence> {
+        if value.len() > SEQ_DEF_MAGIC.len() && value.starts_with(SEQ_DEF_MAGIC) {
+            let version = value[SEQ_DEF_MAGIC.len()];
+            let body = &value[SEQ_DEF_MAGIC.len() + 1..];
+            if version == SEQ_DEF_FORMAT_VERSION {
+                match bincode::deserialize::<PersistedSequence>(body) {
+                    Ok(def) => return Some(def),
+                    Err(e) => {
+                        tracing::warn!(
+                            "Sequence load: skipping sequence '{}' — v{} record failed to decode ({})",
+                            name,
+                            version,
+                            e
+                        );
+                        return None;
+                    }
+                }
+            }
+            tracing::warn!(
+                "Sequence load: skipping sequence '{}' — on-disk format version {} is newer than \
+                 this binary supports (v{})",
+                name,
+                version,
+                SEQ_DEF_FORMAT_VERSION
+            );
+            return None;
+        }
+
+        // Legacy untagged fallback: raw bincode(PersistedSequence).
+        if let Ok(def) = bincode::deserialize::<PersistedSequence>(value) {
+            return Some(def);
+        }
+
+        tracing::warn!(
+            "Sequence load: skipping sequence '{}' — record ({} bytes) is not decodable in any known format",
+            name,
+            value.len()
+        );
+        None
+    }
+
+    /// Look up a single persisted sequence definition by name.
+    pub fn get_sequence(&self, name: &str) -> Result<Option<PersistedSequence>> {
+        let key = Self::sequence_def_key(name);
+        match self.storage.get(&key)? {
+            Some(bytes) => Ok(Self::decode_persisted_sequence(name, &bytes)),
+            None => Ok(None),
+        }
+    }
+
+    /// True if a sequence definition with this name exists.
+    pub fn sequence_exists(&self, name: &str) -> Result<bool> {
+        let key = Self::sequence_def_key(name);
+        Ok(self.storage.get(&key)?.is_some())
+    }
+
+    /// List every persisted sequence definition. Per-record resilient: a
+    /// single undecodable record is skipped (with a `warn!`), never aborting
+    /// the whole load. Used by startup warm-load and by the pg_sequences /
+    /// information_schema.sequences / pg_class introspection views.
+    pub fn list_sequences(&self) -> Result<Vec<PersistedSequence>> {
+        let prefix = b"meta:sequence:";
+        let mut sequences = Vec::new();
+        let mut read_opts = rocksdb::ReadOptions::default();
+        read_opts.set_total_order_seek(true);
+        let iter = self.storage.db.iterator_opt(
+            rocksdb::IteratorMode::From(prefix, rocksdb::Direction::Forward),
+            read_opts,
+        );
+
+        for item in iter {
+            let (key, value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+            // `meta:seqstate:` is NOT a prefix of `meta:sequence:` (they
+            // diverge at byte 7), so breaking on the first non-matching key
+            // keeps the state records out of this scan.
+            if !key.starts_with(prefix) {
+                break;
+            }
+            let name = String::from_utf8_lossy(key.get(prefix.len()..).unwrap_or_default()).to_string();
+            if let Some(def) = Self::decode_persisted_sequence(&name, &value) {
+                sequences.push(def);
+            }
+        }
+
+        sequences.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(sequences)
+    }
+
+    /// Drop a sequence: deletes BOTH the definition and the high-water state
+    /// records. No-op for whichever key is already absent.
+    pub fn drop_sequence(&self, name: &str) -> Result<()> {
+        self.storage.delete(&Self::sequence_def_key(name))?;
+        self.storage.delete(&Self::sequence_state_key(name))?;
+        Ok(())
+    }
+
+    /// Read the durable high-water state for a sequence (the resume point).
+    pub fn get_sequence_state(&self, name: &str) -> Result<Option<PersistedSeqState>> {
+        let key = Self::sequence_state_key(name);
+        match self.storage.get(&key)? {
+            Some(bytes) => {
+                // Tagged frame: magic + version + bincode.
+                if bytes.len() > SEQ_STATE_MAGIC.len() && bytes.starts_with(SEQ_STATE_MAGIC) {
+                    let version = bytes[SEQ_STATE_MAGIC.len()];
+                    let body = &bytes[SEQ_STATE_MAGIC.len() + 1..];
+                    if version == SEQ_STATE_FORMAT_VERSION {
+                        return Ok(bincode::deserialize::<PersistedSeqState>(body).ok());
+                    }
+                    tracing::warn!(
+                        "Sequence load: state for '{}' has unsupported version {} (this binary v{})",
+                        name,
+                        version,
+                        SEQ_STATE_FORMAT_VERSION
+                    );
+                    return Ok(None);
+                }
+                // Legacy untagged fallback.
+                Ok(bincode::deserialize::<PersistedSeqState>(&bytes).ok())
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Persist the high-water state record. This performs the `put` only — it
+    /// does NOT fsync. The no-duplicate invariant's fsync is forced by
+    /// `StorageEngine::flush_sequence_state`, which wraps this call.
+    pub fn save_sequence_state(&self, name: &str, st: &PersistedSeqState) -> Result<()> {
+        let key = Self::sequence_state_key(name);
+        let body = bincode::serialize(st)
+            .map_err(|e| Error::storage(format!("Failed to serialize sequence state: {}", e)))?;
+        let mut value = Vec::with_capacity(SEQ_STATE_MAGIC.len() + 1 + body.len());
+        value.extend_from_slice(SEQ_STATE_MAGIC);
+        value.push(SEQ_STATE_FORMAT_VERSION);
+        value.extend_from_slice(&body);
+        self.storage.put(&key, &value)
     }
 
     /// Build counter key for table row IDs
@@ -1775,6 +2112,50 @@ mod tests {
             0,
             "Should have no orphaned data rows, found: {:?}",
             orphaned_keys
+        );
+    }
+
+    #[test]
+    fn list_index_definitions_is_resilient_to_bad_records() {
+        let config = Config::in_memory();
+        let storage = StorageEngine::open_in_memory(&config).expect("open in-memory");
+        let catalog = Catalog::new(&storage);
+
+        // A valid definition written through the normal (tagged) path.
+        let good = PersistedIndexDefinition {
+            table_name: "t".to_string(),
+            column_name: "c".to_string(),
+            index_type: Some("art".to_string()),
+            options: Vec::new(),
+        };
+        catalog.save_index_definition("good_idx", &good).expect("save good");
+
+        // A legacy untagged record (raw bincode, the pre-tag on-disk format)
+        // must still load for back-compat across the upgrade boundary.
+        let legacy = PersistedIndexDefinition {
+            table_name: "t2".to_string(),
+            column_name: "c2".to_string(),
+            index_type: None,
+            options: Vec::new(),
+        };
+        storage
+            .put(&b"meta:index:legacy_idx".to_vec(), &bincode::serialize(&legacy).unwrap())
+            .expect("put legacy");
+
+        // A corrupt record — the kind a torn write or a future format change
+        // could leave behind. It must be SKIPPED, not abort the whole listing
+        // (the failure mode that silently un-indexed the database on upgrade).
+        storage
+            .put(&b"meta:index:corrupt_idx".to_vec(), &[0xde, 0xad, 0xbe, 0xef, 0x01])
+            .expect("put corrupt");
+
+        let defs = catalog.list_index_definitions().expect("list must not error");
+        let names: Vec<&str> = defs.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"good_idx"), "tagged index dropped: {names:?}");
+        assert!(names.contains(&"legacy_idx"), "legacy index dropped: {names:?}");
+        assert!(
+            !names.contains(&"corrupt_idx"),
+            "corrupt record should be skipped, not surfaced: {names:?}"
         );
     }
 }

@@ -12,6 +12,8 @@
 //! - Automatic invalidation on INSERT/UPDATE/DELETE
 
 use crate::Tuple;
+use std::sync::Arc;
+
 use lru::LruCache;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -42,8 +44,11 @@ impl RowCacheKey {
 /// Cached row entry with metadata
 #[derive(Debug, Clone)]
 struct CachedRow {
-    /// The cached tuple
-    tuple: Tuple,
+    /// The cached tuple, shared via `Arc` so a cache hit can hand out a cheap
+    /// refcount bump (`get_arc`) instead of deep-copying the whole
+    /// `Vec<Value>` — the win for index-nested-loop joins, where the right row
+    /// is only borrowed to build the combined output tuple.
+    tuple: Arc<Tuple>,
     /// When this entry was cached
     cached_at: Instant,
     /// Time-to-live for this entry
@@ -55,6 +60,11 @@ struct CachedRow {
 impl CachedRow {
     /// Create a new cached row
     fn new(tuple: Tuple, ttl: Duration) -> Self {
+        Self::from_arc(Arc::new(tuple), ttl)
+    }
+
+    /// Create a cached row from an already-shared tuple (no deep copy).
+    fn from_arc(tuple: Arc<Tuple>, ttl: Duration) -> Self {
         Self {
             tuple,
             cached_at: Instant::now(),
@@ -68,10 +78,10 @@ impl CachedRow {
         self.cached_at.elapsed() > self.ttl
     }
 
-    /// Record an access and return the tuple
-    fn access(&mut self) -> Tuple {
+    /// Record an access and return a shared handle to the tuple.
+    fn access(&mut self) -> Arc<Tuple> {
         self.access_count += 1;
-        self.tuple.clone()
+        Arc::clone(&self.tuple)
     }
 }
 
@@ -193,10 +203,20 @@ impl RowCache {
         })
     }
 
-    /// Get a cached row by key
+    /// Get a cached row by key as an owned `Tuple` (deep-copies the values on
+    /// hit). Most callers want this; the index-nested-loop join uses
+    /// [`Self::get_arc`] to avoid the copy when it only borrows the row.
     ///
     /// Returns `Some(Tuple)` if found and not expired, `None` otherwise.
     pub fn get(&self, table: &str, row_id: u64) -> Option<Tuple> {
+        self.get_arc(table, row_id).map(|t| (*t).clone())
+    }
+
+    /// Get a shared `Arc` handle to a cached row by key (cheap refcount bump on
+    /// hit, no `Vec<Value>` copy).
+    ///
+    /// Returns `Some(Arc<Tuple>)` if found and not expired, `None` otherwise.
+    pub fn get_arc(&self, table: &str, row_id: u64) -> Option<Arc<Tuple>> {
         if !self.config.enabled {
             return None;
         }
@@ -267,8 +287,14 @@ impl RowCache {
         None
     }
 
-    /// Insert a row into the cache
+    /// Insert a row into the cache.
     pub fn put(&self, table: &str, row_id: u64, tuple: Tuple) {
+        self.put_arc(table, row_id, Arc::new(tuple));
+    }
+
+    /// Insert an already-shared row into the cache without a deep copy (used by
+    /// the `Arc`-returning point/INLJ fetch path).
+    pub fn put_arc(&self, table: &str, row_id: u64, tuple: Arc<Tuple>) {
         if !self.config.enabled {
             return;
         }
@@ -283,7 +309,7 @@ impl RowCache {
         // Check if we're at capacity (LRU will handle eviction)
         let was_full = cache.len() >= self.config.max_entries;
 
-        cache.put(key, CachedRow::new(tuple, ttl));
+        cache.put(key, CachedRow::from_arc(tuple, ttl));
 
         let mut stats = self.stats.write();
         stats.inserts += 1;

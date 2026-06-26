@@ -55,6 +55,20 @@ struct AggregateInfo {
     group_by_aliases: Vec<String>,
 }
 
+/// Parsed `CREATE SEQUENCE` option clauses (each `Option` = "clause present?").
+/// For MIN/MAXVALUE the inner `Option<i64>` distinguishes an explicit value
+/// (`Some(Some(n))`) from `NO MINVALUE`/`NO MAXVALUE` (`Some(None)`); a literal
+/// that failed to parse degrades to `Some(None)` (treated as the type default).
+#[derive(Debug, Default, Clone)]
+struct ParsedSeqOpts {
+    start: Option<i64>,
+    increment: Option<i64>,
+    min: Option<Option<i64>>,
+    max: Option<Option<i64>>,
+    cache: Option<i64>,
+    cycle: bool,
+}
+
 /// Query planner
 pub struct Planner<'a> {
     catalog: Option<&'a Catalog<'a>>,
@@ -273,21 +287,62 @@ impl<'a> Planner<'a> {
     /// use this instead of `ObjectName::to_string()` so that
     /// `CREATE TABLE Users` and `SELECT FROM users` resolve to the
     /// same name.
-    /// Pull `START WITH` / `INCREMENT BY` out of the parsed `CREATE
-    /// SEQUENCE` options. MIN/MAX/CACHE/CYCLE are accepted and ignored for
-    /// now; non-literal expressions are skipped (fall back to defaults).
-    fn extract_sequence_options(opts: &[sqlparser::ast::SequenceOptions]) -> (Option<i64>, Option<i64>) {
+    /// Pull every recognised clause out of the parsed `CREATE SEQUENCE`
+    /// options. Each `Option` distinguishes "clause omitted" from "clause
+    /// present". For MIN/MAXVALUE the inner `Option<i64>` distinguishes
+    /// `MINVALUE n` (`Some(Some(n))`) from `NO MINVALUE` (`Some(None)`).
+    /// Non-literal expressions are skipped (fall back to defaults).
+    fn extract_sequence_options(opts: &[sqlparser::ast::SequenceOptions]) -> ParsedSeqOpts {
         use sqlparser::ast::SequenceOptions;
-        let mut start = None;
-        let mut increment = None;
+        let mut out = ParsedSeqOpts::default();
         for opt in opts {
             match opt {
-                SequenceOptions::StartWith(expr, _) => start = Self::literal_i64(expr),
-                SequenceOptions::IncrementBy(expr, _) => increment = Self::literal_i64(expr),
-                _ => {}
+                SequenceOptions::StartWith(expr, _) => out.start = Self::literal_i64(expr),
+                SequenceOptions::IncrementBy(expr, _) => out.increment = Self::literal_i64(expr),
+                // `MINVALUE n` → Some(Some(n)); `NO MINVALUE` → Some(None).
+                SequenceOptions::MinValue(Some(expr)) => out.min = Some(Self::literal_i64(expr)),
+                SequenceOptions::MinValue(None) => out.min = Some(None),
+                SequenceOptions::MaxValue(Some(expr)) => out.max = Some(Self::literal_i64(expr)),
+                SequenceOptions::MaxValue(None) => out.max = Some(None),
+                SequenceOptions::Cache(expr) => out.cache = Self::literal_i64(expr),
+                // sqlparser 0.53 has an INVERTED CYCLE flag: it parses `CYCLE`
+                // as `Cycle(false)` and `NO CYCLE` as `Cycle(true)` (see
+                // sqlparser parser/mod.rs `parse_create_sequence_options`). We
+                // invert it back so `CYCLE` => cycle=true.
+                SequenceOptions::Cycle(b) => out.cycle = !*b,
             }
         }
-        (start, increment)
+        out
+    }
+
+    /// Map a parsed `AS <type>` clause to the canonical sequence type string
+    /// (`"smallint"` | `"integer"` | `"bigint"`). Unknown / unsupported types
+    /// fall back to `bigint` (PG's default sequence type).
+    fn sequence_type_name(dt: &sqlparser::ast::DataType) -> String {
+        use sqlparser::ast::DataType as Dt;
+        match dt {
+            Dt::SmallInt(_) | Dt::Int2(_) => "smallint".to_string(),
+            Dt::Int(_) | Dt::Integer(_) | Dt::Int4(_) => "integer".to_string(),
+            _ => "bigint".to_string(),
+        }
+    }
+
+    /// Map a parsed `OWNED BY <ref>` `ObjectName` to `Some((table, col))`.
+    /// `OWNED BY NONE` parses as a single ident "NONE" (case-insensitively),
+    /// which maps to `None`. A multi-part name yields its last two idents as
+    /// (table, col); anything shorter than two parts is treated as unowned.
+    fn sequence_owned_by(name: &sqlparser::ast::ObjectName) -> Option<(String, String)> {
+        let parts = &name.0;
+        if parts.len() == 1 && parts[0].value.eq_ignore_ascii_case("NONE") {
+            return None;
+        }
+        if parts.len() >= 2 {
+            let table = Self::normalize_ident(&parts[parts.len() - 2]);
+            let col = Self::normalize_ident(&parts[parts.len() - 1]);
+            Some((table, col))
+        } else {
+            None
+        }
     }
 
     /// Best-effort evaluation of a literal integer expression, tolerating a
@@ -331,6 +386,59 @@ impl<'a> Planner<'a> {
             return rest.to_string();
         }
         joined
+    }
+
+    /// Normalise a raw (possibly quoted / schema-qualified) dotted name string
+    /// the SAME way [`Self::normalize_object_name`] normalises a parsed
+    /// `ObjectName`, so names that arrive via a custom string pre-parse path
+    /// (e.g. ALTER SEQUENCE) resolve identically to ones parsed by sqlparser.
+    /// Splits on `.` outside double quotes; each unquoted part is lowercased,
+    /// each quoted part keeps its case; then the `_hdb_*` dealias and
+    /// `public.`/`pg_catalog.` collapse are applied.
+    pub(crate) fn normalize_dotted_name(raw: &str) -> String {
+        // Split on unquoted dots.
+        let mut parts: Vec<String> = Vec::new();
+        let mut cur = String::new();
+        let mut in_quote = false;
+        let mut quoted_part = false;
+        for ch in raw.trim().chars() {
+            match ch {
+                '"' => {
+                    in_quote = !in_quote;
+                    quoted_part = true;
+                }
+                '.' if !in_quote => {
+                    parts.push(Self::normalize_name_part(&cur, quoted_part));
+                    cur.clear();
+                    quoted_part = false;
+                }
+                _ => cur.push(ch),
+            }
+        }
+        parts.push(Self::normalize_name_part(&cur, quoted_part));
+        let joined = parts.join(".");
+
+        if let Some(dealiased) = Self::dealias_schema(&joined) {
+            return dealiased;
+        }
+        if let Some(rest) = joined.strip_prefix("public.") {
+            return rest.to_string();
+        }
+        if let Some(rest) = joined.strip_prefix("pg_catalog.") {
+            return rest.to_string();
+        }
+        joined
+    }
+
+    /// One component of a dotted name: quoted parts keep case (quotes already
+    /// stripped by the splitter), unquoted parts are lowercased — matching
+    /// [`Self::normalize_ident`].
+    fn normalize_name_part(part: &str, was_quoted: bool) -> String {
+        if was_quoted {
+            part.to_string()
+        } else {
+            part.to_lowercase()
+        }
     }
 
     /// Map dotted names of the form `_hdb_code.<table>` or
@@ -426,6 +534,7 @@ impl<'a> Planner<'a> {
                         sqlparser::ast::ObjectType::Table => LogicalPlan::DropTable { name, if_exists },
                         sqlparser::ast::ObjectType::Database => LogicalPlan::DropDatabase { name, if_exists },
                         sqlparser::ast::ObjectType::Type => LogicalPlan::DropEnumType { name, if_exists },
+                        sqlparser::ast::ObjectType::Sequence => LogicalPlan::DropSequence { name, if_exists },
                         // Default to DROP TABLE for backwards compatibility.
                         _ => LogicalPlan::DropTable { name, if_exists },
                     }
@@ -826,16 +935,39 @@ impl<'a> Planner<'a> {
             Statement::CreateSequence {
                 name,
                 if_not_exists,
+                data_type,
                 sequence_options,
-                ..
+                owned_by,
+                temporary: _,
             } => {
                 let seq_name = Self::normalize_object_name(&name);
-                let (start_value, increment_by) = Self::extract_sequence_options(&sequence_options);
+                let opts = Self::extract_sequence_options(&sequence_options);
+                let data_type = data_type.as_ref().map(Self::sequence_type_name);
+                // MINVALUE: Some(Some(n)) = explicit n; Some(None) = NO MINVALUE.
+                let (min_value, no_minvalue) = match opts.min {
+                    Some(Some(n)) => (Some(n), false),
+                    Some(None) => (None, true),
+                    None => (None, false),
+                };
+                let (max_value, no_maxvalue) = match opts.max {
+                    Some(Some(n)) => (Some(n), false),
+                    Some(None) => (None, true),
+                    None => (None, false),
+                };
+                let owned_by = owned_by.as_ref().and_then(Self::sequence_owned_by);
                 Ok(LogicalPlan::CreateSequence {
                     name: seq_name,
                     if_not_exists,
-                    start_value,
-                    increment_by,
+                    data_type,
+                    start_value: opts.start,
+                    increment_by: opts.increment,
+                    min_value,
+                    no_minvalue,
+                    max_value,
+                    no_maxvalue,
+                    cache: opts.cache,
+                    cycle: opts.cycle,
+                    owned_by,
                 })
             }
             // `CREATE DATABASE name [IF NOT EXISTS]` — Bug 1 from the

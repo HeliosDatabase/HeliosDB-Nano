@@ -2240,7 +2240,32 @@ impl SystemViewRegistry {
                     sv_col("last_value", DataType::Int8),
                 ],
             },
-            description: "PG-compat sequences view (empty — Nano uses synthetic counters)".to_string(),
+            description: "PG-compat sequences view (real CREATE SEQUENCE defs + SERIAL/IDENTITY synthetics)".to_string(),
+        });
+
+        // information_schema.sequences — SQL-standard 12-col shape. Lists REAL
+        // CREATE SEQUENCE definitions only (PG excludes SERIAL/IDENTITY-owned
+        // sequences from this view). a2h / ORMs / pg_dump discover sequences
+        // through this surface; the prior count=0 break is fixed.
+        self.register_view(SystemViewSchema {
+            name: "information_schema.sequences".to_string(),
+            schema: Schema {
+                columns: vec![
+                    sv_col("sequence_catalog", DataType::Text),
+                    sv_col("sequence_schema", DataType::Text),
+                    sv_col("sequence_name", DataType::Text),
+                    sv_col("data_type", DataType::Text),
+                    sv_col("numeric_precision", DataType::Int4),
+                    sv_col("numeric_precision_radix", DataType::Int4),
+                    sv_col("numeric_scale", DataType::Int4),
+                    sv_col("start_value", DataType::Text),
+                    sv_col("minimum_value", DataType::Text),
+                    sv_col("maximum_value", DataType::Text),
+                    sv_col("increment", DataType::Text),
+                    sv_col("cycle_option", DataType::Text),
+                ],
+            },
+            description: "SQL-standard sequences catalogue, sourced from storage::catalog::list_sequences".to_string(),
         });
 
         self.register_view(SystemViewSchema {
@@ -2502,6 +2527,9 @@ fn sv_col(name: &str, data_type: DataType) -> Column {
 const PG_TABLE_OID_BASE: i32 = 1000;
 const PG_INDEX_OID_BASE: i32 = 5000;
 const PG_CONSTRAINT_OID_BASE: i32 = 4000;
+/// Distinct OID base for sequence relations (pg_class relkind='S'). Kept clear
+/// of the table (1000) and index (5000) bases so sequence OIDs never collide.
+const PG_SEQ_OID_BASE: i32 = 6000;
 const PG_PUBLIC_NAMESPACE_OID: i32 = 2200;
 
 fn pg_table_oid(table_idx: usize) -> i32 {
@@ -2531,6 +2559,21 @@ fn pg_index_oid_by_name(indexes: &[(String, String, ArtIndexType, Vec<String>)],
         .position(|(name, _, _, _)| name.eq_ignore_ascii_case(index_name))
         .map(pg_index_oid)
         .unwrap_or(0)
+}
+
+fn pg_sequence_oid(seq_idx: usize) -> i32 {
+    PG_SEQ_OID_BASE + seq_idx as i32
+}
+
+/// Map a SERIAL/IDENTITY column's integer type to its synthetic
+/// owned-sequence `(data_type, max_value)`. Non-integer columns (shouldn't
+/// happen for an identity column) fall back to bigint.
+fn serial_type_bounds(dt: &DataType) -> (&'static str, i64) {
+    match dt {
+        DataType::Int2 => ("smallint", i16::MAX as i64),
+        DataType::Int4 => ("integer", i32::MAX as i64),
+        _ => ("bigint", i64::MAX),
+    }
 }
 
 fn pg_attnums(schema: &Schema, columns: &[String]) -> Vec<i32> {
@@ -2676,6 +2719,7 @@ impl SystemViewRegistry {
             "pg_user" => Self::execute_pg_user(),
             "pg_roles" => Self::execute_pg_roles(),
             "information_schema.tables" => Self::execute_information_schema_tables(storage),
+            "information_schema.sequences" => Self::execute_information_schema_sequences(storage),
             "information_schema.table_constraints" => Self::execute_information_schema_table_constraints(storage),
             "information_schema.key_column_usage" => Self::execute_information_schema_key_column_usage(storage),
             "information_schema.constraint_column_usage" => {
@@ -2949,6 +2993,48 @@ impl SystemViewRegistry {
             ]));
         }
 
+        // Sequences (relkind='S'): real CREATE SEQUENCE defs first, then
+        // SERIAL/IDENTITY synthetic owned-sequence names, deduped by name so
+        // pg_class never reports a sequence twice. A monotonic `seq_idx` keeps
+        // OIDs stable for a given catalog ordering.
+        let mut seq_idx = 0usize;
+        let mut seen_seq: HashSet<String> = HashSet::new();
+        for def in catalog.list_sequences()? {
+            if !seen_seq.insert(def.name.to_lowercase()) {
+                continue;
+            }
+            let oid = pg_sequence_oid(seq_idx);
+            seq_idx += 1;
+            results.push(Tuple::new(vec![
+                Value::Int4(oid),                     // oid
+                Value::String(def.name.clone()),      // relname
+                Value::Int4(PG_PUBLIC_NAMESPACE_OID), // relnamespace
+                Value::Int4(oid),                     // reltype
+                Value::String("S".to_string()),       // relkind (S = sequence)
+                Value::Int4(oid),                     // relfilenode
+                Value::Boolean(false),                // relrowsecurity
+            ]));
+        }
+        for table_name in &tables {
+            for col_name in catalog.list_identity_columns(table_name)? {
+                let seq_name = format!("{table_name}_{col_name}_seq");
+                if !seen_seq.insert(seq_name.to_lowercase()) {
+                    continue;
+                }
+                let oid = pg_sequence_oid(seq_idx);
+                seq_idx += 1;
+                results.push(Tuple::new(vec![
+                    Value::Int4(oid),
+                    Value::String(seq_name),
+                    Value::Int4(PG_PUBLIC_NAMESPACE_OID),
+                    Value::Int4(oid),
+                    Value::String("S".to_string()),
+                    Value::Int4(oid),
+                    Value::Boolean(false),
+                ]));
+            }
+        }
+
         Ok(results)
     }
 
@@ -3091,22 +3177,106 @@ impl SystemViewRegistry {
     fn execute_pg_sequences(storage: &StorageEngine) -> Result<Vec<Tuple>> {
         let catalog = storage.catalog();
         let mut rows = Vec::new();
+        // Track the names we've already emitted so a real CREATE SEQUENCE and a
+        // SERIAL/IDENTITY synthetic row never both surface the same name —
+        // pg_dump would otherwise see doubles.
+        let mut seen: HashSet<String> = HashSet::new();
+
+        // (1) REAL sequences from the durable catalog: full fidelity from each
+        // PersistedSequence + its high-water state.
+        for def in catalog.list_sequences()? {
+            // PostgreSQL's `last_value` is the value last OBTAINED, not the
+            // reserved CACHE-block end. The durable state stores the block end
+            // (`last_reserved`), which would overstate by up to `cache - 1` and,
+            // worse, move BACKWARD after a CYCLE wrap. So prefer the exact
+            // value this session actually served (tracked in the live runtime);
+            // fall back to the durable high-water only when this session has not
+            // advanced the sequence (e.g. just after a reopen) — the documented
+            // cached-sequence gap. NULL until the first nextval (is_called).
+            let last_value = match crate::sql::sequences::peek_last_served(&def.name) {
+                Some(v) => Value::Int8(v),
+                None => match catalog.get_sequence_state(&def.name)? {
+                    Some(st) if st.is_called => Value::Int8(st.last_reserved),
+                    _ => Value::Null, // never advanced yet (is_called == false)
+                },
+            };
+            seen.insert(def.name.to_lowercase());
+            rows.push(Tuple::new(vec![
+                Value::String("public".into()),       // schemaname
+                Value::String(def.name.clone()),      // sequencename
+                Value::String("postgres".into()),     // sequenceowner
+                Value::String(def.data_type.clone()), // data_type
+                Value::Int8(def.start_value),         // start_value
+                Value::Int8(def.min_value),           // min_value
+                Value::Int8(def.max_value),           // max_value
+                Value::Int8(def.increment_by),        // increment_by
+                Value::Boolean(def.cycle),            // cycle
+                Value::Int8(def.cache),               // cache_size
+                last_value,                           // last_value
+            ]));
+        }
+
+        // (2) SYNTHETIC owned sequences for SERIAL / IDENTITY columns, named
+        // `<table>_<col>_seq`. Type/start/max reflect the column's real integer
+        // type (next_row_id-backed, so last_value is NULL). Skip any name a real
+        // sequence already owns.
         for table_name in catalog.list_tables()? {
+            let schema = catalog.get_table_schema(&table_name).ok();
             for col_name in catalog.list_identity_columns(&table_name)? {
+                let seq_name = format!("{table_name}_{col_name}_seq");
+                if !seen.insert(seq_name.to_lowercase()) {
+                    continue;
+                }
+                let (data_type, max_value) = schema
+                    .as_ref()
+                    .and_then(|s| s.columns.iter().find(|c| c.name.eq_ignore_ascii_case(&col_name)))
+                    .map(|c| serial_type_bounds(&c.data_type))
+                    .unwrap_or(("bigint", i64::MAX));
                 rows.push(Tuple::new(vec![
-                    Value::String("public".into()),                        // schemaname
-                    Value::String(format!("{table_name}_{col_name}_seq")), // sequencename
-                    Value::String("postgres".into()),                      // sequenceowner
-                    Value::String("bigint".into()),                        // data_type
-                    Value::Int8(1),                                        // start_value
-                    Value::Int8(1),                                        // min_value
-                    Value::Int8(i64::MAX),                                 // max_value
-                    Value::Int8(1),                                        // increment_by
-                    Value::Boolean(false),                                 // cycle
-                    Value::Int8(1),                                        // cache_size
-                    Value::Null,                                           // last_value (unknown — synthetic counter)
+                    Value::String("public".into()),     // schemaname
+                    Value::String(seq_name),            // sequencename
+                    Value::String("postgres".into()),   // sequenceowner
+                    Value::String(data_type.into()),    // data_type
+                    Value::Int8(1),                     // start_value
+                    Value::Int8(1),                     // min_value
+                    Value::Int8(max_value),             // max_value
+                    Value::Int8(1),                     // increment_by
+                    Value::Boolean(false),              // cycle
+                    Value::Int8(1),                     // cache_size
+                    Value::Null,                        // last_value (synthetic counter)
                 ]));
             }
+        }
+        Ok(rows)
+    }
+
+    /// information_schema.sequences (SQL-standard, 12 cols). PG excludes
+    /// SERIAL/IDENTITY-owned sequences here, so this lists REAL CREATE SEQUENCE
+    /// definitions only. Numeric metadata + the value columns are decimal
+    /// STRINGS per the standard.
+    fn execute_information_schema_sequences(storage: &StorageEngine) -> Result<Vec<Tuple>> {
+        let catalog = storage.catalog();
+        let mut rows = Vec::new();
+        for def in catalog.list_sequences()? {
+            let precision = match def.data_type.as_str() {
+                "smallint" => 16,
+                "integer" => 32,
+                _ => 64, // bigint (default)
+            };
+            rows.push(Tuple::new(vec![
+                Value::String("heliosdb".into()),              // sequence_catalog
+                Value::String("public".into()),               // sequence_schema
+                Value::String(def.name.clone()),              // sequence_name
+                Value::String(def.data_type.clone()),         // data_type
+                Value::Int4(precision),                       // numeric_precision
+                Value::Int4(2),                               // numeric_precision_radix
+                Value::Int4(0),                               // numeric_scale
+                Value::String(def.start_value.to_string()),   // start_value
+                Value::String(def.min_value.to_string()),     // minimum_value
+                Value::String(def.max_value.to_string()),     // maximum_value
+                Value::String(def.increment_by.to_string()),  // increment
+                Value::String(if def.cycle { "YES" } else { "NO" }.into()), // cycle_option
+            ]));
         }
         Ok(rows)
     }

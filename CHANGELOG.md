@@ -5,6 +5,95 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.60.0] - 2026-06-26
+
+Minor release: durable + scalable **sequences** (introspection catalogs, ALTER
+SEQUENCE, owned SERIAL/IDENTITY, cached-block `nextval`), connection-pool /
+proxy wire capabilities, an index-durability hardening pass, and join/scan
+performance polish. All changes are additive, opt-in, or correctness fixes; the
+default single-statement OLTP path and the PostgreSQL-comparison benchmark suite
+are unchanged.
+
+### Added
+
+**Durable + scalable sequences.** `CREATE SEQUENCE` / `nextval` / `currval` /
+`setval` are now backed by a persistent catalog instead of a process-global
+in-memory counter, and the full option set is honored:
+
+- **Durability.** A sequence's definition and counter survive a restart. A
+  cached-block `nextval` reserves `CACHE` values per single durable fsync and
+  serves the rest lock-free; only the block high-water mark is persisted, so a
+  crash leaks the unused tail as a gap (exactly like PostgreSQL/Oracle — SQL
+  sequences are explicitly not gapless). The high-water is fsynced **before**
+  any value in the block is served, so a crash never re-issues a value — no
+  duplicates, for any cache size, ascending or descending.
+- **Full semantics.** `START` / `INCREMENT` / `MINVALUE` / `MAXVALUE` / `CACHE`
+  / `CYCLE` are all enforced on an `int8` domain (previously `MINVALUE` /
+  `MAXVALUE` / `CACHE` / `CYCLE` parsed but were dropped). `CYCLE` wraps at the
+  bound; `NO CYCLE` raises PostgreSQL's "reached maximum/minimum value" error on
+  overflow (via `checked_add`, never a panic).
+- **`ALTER SEQUENCE`** is implemented (previously a parse error): `RESTART
+  [WITH n]`, `INCREMENT BY`, `MINVALUE` / `MAXVALUE`, `CACHE`, `[NO] CYCLE`,
+  `AS <int type>`, and `OWNED BY t.c | NONE`, in any clause order, with
+  `IF EXISTS`. A leading `SET` before a clause is tolerated for migration
+  tooling.
+- **Introspection.** `pg_sequences` and `information_schema.sequences` now list
+  real `CREATE SEQUENCE` objects with their live metadata (they were empty,
+  which broke sequence discovery for migration tools and ORMs); `pg_class`
+  reports `relkind = 'S'` for sequences; and `pg_get_serial_sequence(table,col)`
+  resolves a `SERIAL` / `IDENTITY` column's sequence name. `DEFAULT
+  nextval('seq'::regclass)` column defaults read and evaluate correctly.
+- **`SERIAL` / `IDENTITY`** columns are discoverable as owned sequences while
+  still incrementing via the durable per-table row-id counter (the INSERT hot
+  path is unchanged).
+
+- **`DISCARD ALL`** (and `DISCARD PLANS | SEQUENCES | TEMP`) resets session state
+  — open transaction, prepared statements + portals, and session GUCs — without
+  a reconnect, so a connection pool can safely hand a physical connection to a
+  different client. Committed data is untouched.
+- **`SET helios.fast_autocommit = on|off`** (default `off`): a per-session GUC
+  selecting non-blocking autocommit (commits visible immediately, durable at the
+  next group flush). An explicit `synchronous_commit` override still wins.
+  `SHOW` / `RESET` and the extended-protocol SET path are supported.
+- **`helios.*` capability advertising**: the server emits a `ParameterStatus`
+  for each opt-in capability (`helios.copy`, `helios.pipeline`,
+  `helios.plan_cache`, `helios.binary_results`, `helios.reset_session`,
+  `helios.fast_autocommit`) at startup, and re-emits one (GUC_REPORT) when a
+  `helios.*` GUC changes — so a capability-probing client (HeliosProxy) enables
+  each feature only when the connected server advertises it.
+
+### Fixed
+
+- **Index-definition persistence is resilient to a single bad record.** The
+  startup index rebuild no longer aborts wholesale when one persisted index
+  record is undecodable — it skips that record (with a warning) and rebuilds the
+  rest, instead of silently leaving the whole database un-indexed. Persisted
+  records now carry a format-version tag so a future format change is detected
+  and skipped/migrated rather than failing every index. A secondary index that
+  fails to re-register on open is surfaced at `warn` level instead of being
+  swallowed at `debug`. (Hardens the cross-version-upgrade path reported from
+  ada-core live ops.)
+
+### Performance
+
+- **Index-nested-loop join** no longer deep-copies each right row it fetches: the
+  inner fetch now hands out a shared (`Arc`) row, removing one `Vec<Value>` copy
+  per matched row on the join hot path. The point-lookup path is byte-identical
+  (it still returns an owned tuple), so the change is confined to the join inner
+  loop.
+- Removed a near-duplicate integer-filter scan method; the single-predicate path
+  now routes through the multi-predicate one (maintainability; functionally
+  identical).
+
+### Verified (no code change required)
+
+- **Pipelined extended-protocol execution** (N `Bind`/`Execute` before one
+  `Sync`) already emits exactly one `ReadyForQuery` per `Sync` — never
+  per-`Execute`; a wire conformance test now locks that contract.
+- The **columnar analytical scan path** (columnar scan operator, zone-map
+  predicate pushdown, kernelized aggregates, `O(batches)` `COUNT(*)`) is exercised
+  by the columnar-vs-row differential suite.
+
 ## [3.58.5] - 2026-06-24
 
 Patch release: a correctness fix for foreign keys added to already-populated

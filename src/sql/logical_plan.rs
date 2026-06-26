@@ -411,10 +411,43 @@ pub enum LogicalPlan {
         name: String,
         /// Silently succeed if the sequence already exists
         if_not_exists: bool,
-        /// `START WITH` value (None ⇒ default 1)
+        /// `AS <type>` — "smallint" | "integer" | "bigint" (None ⇒ bigint).
+        data_type: Option<String>,
+        /// `START WITH` value (None ⇒ type/sign default)
         start_value: Option<i64>,
         /// `INCREMENT BY` step (None ⇒ default 1)
         increment_by: Option<i64>,
+        /// Explicit `MINVALUE n` (None ⇒ NO MINVALUE / type-or-sign default).
+        min_value: Option<i64>,
+        /// `NO MINVALUE` was written explicitly (forces the type/sign default
+        /// even if a non-default could otherwise be inferred).
+        no_minvalue: bool,
+        /// Explicit `MAXVALUE n` (None ⇒ NO MAXVALUE / type-or-sign default).
+        max_value: Option<i64>,
+        /// `NO MAXVALUE` was written explicitly.
+        no_maxvalue: bool,
+        /// `CACHE n` (None ⇒ 1).
+        cache: Option<i64>,
+        /// `CYCLE` (true) / `NO CYCLE` (false, the default).
+        cycle: bool,
+        /// `OWNED BY <table>.<col>` (None ⇒ unowned / OWNED BY NONE).
+        owned_by: Option<(String, String)>,
+    },
+
+    /// `ALTER SEQUENCE [IF EXISTS] <name> <actions...>` — parsed by a custom
+    /// pre-sqlparser path (sqlparser 0.53 has no `AlterSequence` variant). The
+    /// executor applies each present action to the persisted definition and,
+    /// for RESTART, rewrites the durable high-water state.
+    AlterSequence(crate::sql::parser::AlterSequenceAction),
+
+    /// `DROP SEQUENCE [IF EXISTS] <name>` — removes both the definition and the
+    /// high-water state record. (Previously `DROP SEQUENCE` fell through to
+    /// `DROP TABLE`; the planner now routes `ObjectType::Sequence` here.)
+    DropSequence {
+        /// Sequence name (already normalised).
+        name: String,
+        /// Silently succeed if the sequence does not exist.
+        if_exists: bool,
     },
 
     /// `CREATE TYPE <name> AS ENUM (label1, label2, …)` — KanttBan
@@ -1638,6 +1671,8 @@ impl LogicalPlan {
             Self::DropTable { .. } => "DropTable",
             Self::CreateIndex { .. } => "CreateIndex",
             Self::CreateSequence { .. } => "CreateSequence",
+            Self::AlterSequence(_) => "AlterSequence",
+            Self::DropSequence { .. } => "DropSequence",
             Self::CreateExtension { .. } => "CreateExtension",
             Self::CreateDatabase { .. } => "CreateDatabase",
             Self::DropDatabase { .. } => "DropDatabase",
@@ -1750,8 +1785,10 @@ impl LogicalPlan {
                 // CreateIndex doesn't have output schema
                 Arc::new(Schema { columns: vec![] })
             }
-            LogicalPlan::CreateSequence { .. } => {
-                // CREATE SEQUENCE is DDL — no output schema.
+            LogicalPlan::CreateSequence { .. }
+            | LogicalPlan::AlterSequence(_)
+            | LogicalPlan::DropSequence { .. } => {
+                // CREATE / ALTER / DROP SEQUENCE are DDL — no output schema.
                 Arc::new(Schema { columns: vec![] })
             }
             LogicalPlan::CreateExtension { .. }

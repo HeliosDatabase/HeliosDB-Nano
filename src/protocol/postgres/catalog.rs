@@ -103,6 +103,12 @@ impl PgCatalog {
             {
                 // JOIN / aggregate across registry-backed views: defer to the planner.
                 return Ok(None);
+            } else if query_lower.contains("information_schema.sequences") {
+                // The real sequence catalog is served by the planner-backed
+                // SystemViewRegistry (execute_information_schema_sequences).
+                // Defer so it returns live rows instead of the empty placeholder
+                // stub — sequence discovery is a migration-tooling requirement.
+                return Ok(None);
             } else if query_lower.contains("information_schema.columns") {
                 Some(self.query_information_schema_columns(&query_lower)?)
             } else if query_lower.contains("information_schema.tables") {
