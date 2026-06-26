@@ -542,6 +542,11 @@ impl PgCatalog {
 
         // Extract table_name filter (e.g., "WHERE table_name = 'my_table'")
         let table_filter = Self::extract_eq_filter(query_lower, "table_name");
+        // Also honor a column_name equality filter so a query like
+        // `WHERE table_name='t' AND column_name='id'` returns exactly that
+        // column, not every column of the table (avoids a client `fetchone()`
+        // reading an unrelated column's default).
+        let column_filter = Self::extract_eq_filter(query_lower, "column_name");
 
         let catalog = db.storage.catalog();
 
@@ -561,6 +566,11 @@ impl PgCatalog {
         for table_name in &tables_to_query {
             if let Ok(table_schema) = catalog.get_table_schema(table_name) {
                 for (i, col) in table_schema.columns.iter().enumerate() {
+                    if let Some(ref want) = column_filter {
+                        if !col.name.eq_ignore_ascii_case(want) {
+                            continue;
+                        }
+                    }
                     rows.push(Tuple::new(vec![
                         Value::String(table_name.clone()),
                         Value::String(col.name.clone()),
@@ -605,9 +615,34 @@ impl PgCatalog {
     /// Extract an equality filter value from a query
     /// E.g., "table_name = 'my_table'" -> Some("my_table")
     fn extract_eq_filter(query: &str, column: &str) -> Option<String> {
-        let pattern = format!("{} = '", column);
-        if let Some(start) = query.find(&pattern) {
-            let after = &query[start + pattern.len()..];
+        // Match `<column> = 'value'` tolerant of optional whitespace around `=`
+        // (`col='x'`, `col = 'x'`, `col ='x'`, `col= 'x'`) and a table-qualified
+        // reference (`c.table_name = 'x'`). Real clients (psycopg, ORMs) emit the
+        // no-space form, so the old `"{col} = '"` literal silently matched nothing
+        // and the filter was dropped — returning every table's columns instead of
+        // the requested one (a2h v3.60.3 report: information_schema.columns
+        // readback returned a different table's default).
+        let bytes = query.as_bytes();
+        let mut from = 0;
+        while let Some(rel) = query[from..].find(column) {
+            let start = from + rel;
+            from = start + column.len();
+            // Token boundary before `column`: the previous char must not be part
+            // of an identifier, so searching for `table_name` does not match the
+            // tail of `referenced_table_name`.
+            if start > 0 {
+                let prev = bytes[start - 1];
+                if prev.is_ascii_alphanumeric() || prev == b'_' {
+                    continue;
+                }
+            }
+            // After the column: optional ws, `=`, optional ws, then `'value'`.
+            let Some(after) = query[from..].trim_start().strip_prefix('=') else {
+                continue;
+            };
+            let Some(after) = after.trim_start().strip_prefix('\'') else {
+                continue;
+            };
             if let Some(end) = after.find('\'') {
                 return Some(after[..end].to_string());
             }
@@ -2464,6 +2499,79 @@ mod tests {
             PgCatalog::extract_eq_filter(query, "table_name"),
             Some("my_table".to_string())
         );
+        // No-space form, as emitted by psycopg / ORMs (the a2h v3.60.3 bug).
+        assert_eq!(
+            PgCatalog::extract_eq_filter("... where table_name='harden_t' and column_name='id'", "table_name"),
+            Some("harden_t".to_string())
+        );
+        assert_eq!(
+            PgCatalog::extract_eq_filter("... where table_name='harden_t' and column_name='id'", "column_name"),
+            Some("id".to_string())
+        );
+        // Asymmetric spacing.
+        assert_eq!(
+            PgCatalog::extract_eq_filter("where table_name ='t'", "table_name"),
+            Some("t".to_string())
+        );
+        assert_eq!(
+            PgCatalog::extract_eq_filter("where table_name= 't'", "table_name"),
+            Some("t".to_string())
+        );
+        // Table-qualified reference.
+        assert_eq!(
+            PgCatalog::extract_eq_filter("where c.table_name='t'", "table_name"),
+            Some("t".to_string())
+        );
+        // Token boundary: must NOT match the tail of a longer identifier, and
+        // must skip a SELECT-list mention to find the WHERE predicate.
+        assert_eq!(
+            PgCatalog::extract_eq_filter("where referenced_table_name='other'", "table_name"),
+            None
+        );
+        assert_eq!(
+            PgCatalog::extract_eq_filter("select column_name from t where column_name='id'", "column_name"),
+            Some("id".to_string())
+        );
+    }
+
+    #[test]
+    fn test_information_schema_columns_filter_distinguishes_tables() {
+        // Regression for the a2h v3.60.3 report. With multiple tables each having
+        // a `nextval` default, `information_schema.columns` read back the WRONG
+        // table's default: the `table_name='t'`/`column_name='c'` filter (no
+        // spaces around `=`, as psycopg emits) was dropped, the handler returned
+        // every table's columns, and a client `fetchone()` got the first table's
+        // first defaulted column. The stored defaults were always correct.
+        use std::sync::Arc;
+        let db = crate::EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE SEQUENCE actor_actor_id_seq").unwrap();
+        db.execute("CREATE TABLE actor (actor_id INT DEFAULT nextval('actor_actor_id_seq'), first_name TEXT)")
+            .unwrap();
+        db.execute("CREATE SEQUENCE harden_seq").unwrap();
+        db.execute("CREATE TABLE harden_t (id INT DEFAULT nextval('harden_seq'), v TEXT)")
+            .unwrap();
+        let catalog = PgCatalog::with_database(Arc::new(db));
+
+        let default_of = |sql: &str| -> String {
+            let (_, rows) = catalog.handle_query(sql).unwrap().unwrap();
+            assert_eq!(rows.len(), 1, "expected exactly one row for `{sql}`, got {}", rows.len());
+            match rows[0].values.first() {
+                Some(Value::String(s)) => s.clone(),
+                other => panic!("expected a string column_default, got {other:?}"),
+            }
+        };
+
+        // a2h's exact no-space query must return each table's OWN sequence default.
+        let h = default_of(
+            "select column_default from information_schema.columns where table_name='harden_t' and column_name='id'",
+        );
+        assert!(h.contains("harden_seq"), "harden_t.id default should be harden_seq, got {h}");
+        assert!(!h.contains("actor"), "harden_t.id default must NOT leak actor's sequence, got {h}");
+
+        let a = default_of(
+            "select column_default from information_schema.columns where table_name='actor' and column_name='actor_id'",
+        );
+        assert!(a.contains("actor_actor_id_seq"), "actor.actor_id default should be actor_actor_id_seq, got {a}");
     }
 
     // -------------------------------------------------------------------
