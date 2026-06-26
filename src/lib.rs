@@ -552,6 +552,14 @@ struct SavepointState {
     /// Snapshot of transaction staged writes at savepoint creation time.
     /// Used by ROLLBACK TO SAVEPOINT to undo data changes made after the savepoint.
     write_set_snapshot: storage::TransactionSavepointSnapshot,
+    /// Length of the transaction's ART/vector-index undo log at savepoint
+    /// creation time. Eager index maintenance (INSERT/UPDATE/DELETE) appends
+    /// undo ops to this log; ROLLBACK TO SAVEPOINT replays and drops exactly
+    /// the ops staged after the savepoint so the in-memory indexes match the
+    /// rolled-back write set (without it, a post-savepoint INSERT leaves a
+    /// ghost index entry that survives COMMIT — see the savepoint regression
+    /// tests).
+    art_undo_len: usize,
 }
 
 #[derive(Clone)]
@@ -1918,6 +1926,43 @@ impl EmbeddedDatabase {
     fn rollback_art_undo_log(&self) {
         let undo_entries: Vec<_> = self.art_undo_log.write().drain(..).collect();
         self.replay_art_undo(undo_entries);
+    }
+
+    /// Current length of the ART/vector-index undo log that `txn`'s eager index
+    /// ops append to — the per-session log for session transactions, else the
+    /// global-slot log. Captured at SAVEPOINT creation so ROLLBACK TO SAVEPOINT
+    /// can revert exactly the index ops staged after the savepoint.
+    fn art_undo_len_for(&self, txn: &storage::Transaction) -> usize {
+        match txn.session_id() {
+            Some(sid) => self
+                .session_art_undo
+                .get(&sid)
+                .map(|e| e.value().len())
+                .unwrap_or(0),
+            None => self.art_undo_log.read().len(),
+        }
+    }
+
+    /// ROLLBACK TO SAVEPOINT counterpart to `rollback_art_undo_log`: replay and
+    /// drop only the ART/vector undo entries appended to `txn`'s log after
+    /// `target_len`, reverting the eager index changes made since the savepoint
+    /// while leaving earlier entries intact for a later COMMIT/ROLLBACK.
+    fn rollback_art_undo_to(&self, txn: &storage::Transaction, target_len: usize) {
+        let drained: Vec<ArtUndoOp> = match txn.session_id() {
+            Some(sid) => match self.session_art_undo.get_mut(&sid) {
+                Some(mut entry) if entry.len() > target_len => entry.split_off(target_len),
+                _ => Vec::new(),
+            },
+            None => {
+                let mut log = self.art_undo_log.write();
+                if log.len() > target_len {
+                    log.split_off(target_len)
+                } else {
+                    Vec::new()
+                }
+            }
+        };
+        self.replay_art_undo(drained);
     }
 
     /// Drop a session's ART undo log, replaying it first on rollback
@@ -4776,9 +4821,11 @@ impl EmbeddedDatabase {
             }
             sql::LogicalPlan::Savepoint { ref name } => {
                 let write_set_snapshot = txn.savepoint_snapshot();
+                let art_undo_len = self.art_undo_len_for(txn);
                 let savepoint = SavepointState {
                     name: name.clone(),
                     write_set_snapshot,
+                    art_undo_len,
                 };
                 self.savepoints.write().push(savepoint);
                 Ok(0)
@@ -4795,10 +4842,13 @@ impl EmbeddedDatabase {
             sql::LogicalPlan::RollbackToSavepoint { ref name } => {
                 let savepoints = self.savepoints.read();
                 if let Some(pos) = savepoints.iter().rposition(|s| &s.name == name) {
-                    let snapshot = savepoints.get(pos).map(|s| s.write_set_snapshot.clone());
+                    let restore = savepoints
+                        .get(pos)
+                        .map(|s| (s.write_set_snapshot.clone(), s.art_undo_len));
                     drop(savepoints);
-                    if let Some(snapshot) = snapshot {
+                    if let Some((snapshot, art_undo_len)) = restore {
                         txn.rollback_to_savepoint(&snapshot);
+                        self.rollback_art_undo_to(txn, art_undo_len);
                     }
                     let mut savepoints = self.savepoints.write();
                     savepoints.truncate(pos + 1);
@@ -11228,8 +11278,8 @@ impl EmbeddedDatabase {
                     .current_transaction
                     .lock()
                     .map_err(|_| Error::query_execution("Failed to lock transaction"))?;
-                let write_set_snapshot = match txn.as_ref() {
-                    Some(t) => t.savepoint_snapshot(),
+                let (write_set_snapshot, art_undo_len) = match txn.as_ref() {
+                    Some(t) => (t.savepoint_snapshot(), self.art_undo_len_for(t)),
                     None => {
                         return Err(Error::query_execution(
                             "SAVEPOINT can only be used within a transaction",
@@ -11240,6 +11290,7 @@ impl EmbeddedDatabase {
                 let savepoint = SavepointState {
                     name: name.clone(),
                     write_set_snapshot,
+                    art_undo_len,
                 };
                 self.savepoints.write().push(savepoint);
                 Ok(0)
@@ -11256,16 +11307,19 @@ impl EmbeddedDatabase {
             sql::LogicalPlan::RollbackToSavepoint { ref name } => {
                 let savepoints = self.savepoints.read();
                 if let Some(pos) = savepoints.iter().rposition(|s| &s.name == name) {
-                    let snapshot = savepoints.get(pos).map(|s| s.write_set_snapshot.clone());
+                    let restore = savepoints
+                        .get(pos)
+                        .map(|s| (s.write_set_snapshot.clone(), s.art_undo_len));
                     drop(savepoints);
 
-                    if let Some(snapshot) = snapshot {
+                    if let Some((snapshot, art_undo_len)) = restore {
                         let txn = self
                             .current_transaction
                             .lock()
                             .map_err(|_| Error::query_execution("Failed to lock transaction"))?;
                         if let Some(t) = txn.as_ref() {
                             t.rollback_to_savepoint(&snapshot);
+                            self.rollback_art_undo_to(t, art_undo_len);
                         }
                         drop(txn);
                     }
@@ -12636,8 +12690,8 @@ impl EmbeddedDatabase {
                     .current_transaction
                     .lock()
                     .map_err(|_| Error::query_execution("Failed to lock transaction"))?;
-                let write_set_snapshot = match txn.as_ref() {
-                    Some(t) => t.savepoint_snapshot(),
+                let (write_set_snapshot, art_undo_len) = match txn.as_ref() {
+                    Some(t) => (t.savepoint_snapshot(), self.art_undo_len_for(t)),
                     None => {
                         return Err(Error::query_execution(
                             "SAVEPOINT can only be used within a transaction",
@@ -12649,6 +12703,7 @@ impl EmbeddedDatabase {
                 let savepoint = SavepointState {
                     name: name.clone(),
                     write_set_snapshot,
+                    art_undo_len,
                 };
                 self.savepoints.write().push(savepoint);
                 Ok((0, Vec::new()))
@@ -12667,17 +12722,20 @@ impl EmbeddedDatabase {
                 let savepoints = self.savepoints.read();
                 // Find the savepoint
                 if let Some(pos) = savepoints.iter().rposition(|s| &s.name == name) {
-                    let snapshot = savepoints.get(pos).map(|s| s.write_set_snapshot.clone());
+                    let restore = savepoints
+                        .get(pos)
+                        .map(|s| (s.write_set_snapshot.clone(), s.art_undo_len));
                     drop(savepoints);
 
                     // Rollback the transaction write set to the savepoint state
-                    if let Some(snapshot) = snapshot {
+                    if let Some((snapshot, art_undo_len)) = restore {
                         let txn = self
                             .current_transaction
                             .lock()
                             .map_err(|_| Error::query_execution("Failed to lock transaction"))?;
                         if let Some(t) = txn.as_ref() {
                             t.rollback_to_savepoint(&snapshot);
+                            self.rollback_art_undo_to(t, art_undo_len);
                         }
                         drop(txn);
                     }

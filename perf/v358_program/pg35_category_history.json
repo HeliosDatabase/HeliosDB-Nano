@@ -601,6 +601,46 @@
         "Prepared stmts": 4.3593,
         "SET/SHOW/RESET": 0.01068
       }
+    },
+    {
+      "label": "v3.60.3-2026-06-26-300iter-savepoint-fix",
+      "ratios": {
+        "CREATE TABLE": 0.00617,
+        "CREATE INDEX": 0.0205,
+        "ALTER TABLE": 0.04965,
+        "DROP TABLE": 0.00389,
+        "CREATE/DROP VIEW": 0.01068,
+        "REFRESH MATVIEW": 0.04929,
+        "TRUNCATE": 0.003,
+        "INSERT single": 0.0009,
+        "INSERT multi-row": 0.01658,
+        "INSERT..SELECT": 0.03975,
+        "UPDATE point": 0.01531,
+        "DELETE point": 0.00042,
+        "UPSERT": 0.0054,
+        "UPDATE+subquery": 0.01094,
+        "Point lookup": 0.00937,
+        "Full scan+filter": 0.07305,
+        "Aggregation": 0.00205,
+        "INNER JOIN": 0.63291,
+        "LEFT JOIN": 0.51282,
+        "4-table JOIN": 0.88496,
+        "Scalar subquery": 0.0043,
+        "EXISTS subquery": 0.00049,
+        "IN subquery": 0.01097,
+        "CTE": 0.01163,
+        "Recursive CTE": 0.0071,
+        "Window funcs": 0.03636,
+        "UNION": 0.021,
+        "DISTINCT": 0.00206,
+        "ORDER+LIMIT": 0.20877,
+        "CASE expr": 0.04386,
+        "LIKE/BETWEEN/IN": 0.02936,
+        "String ops": 0.03521,
+        "Transaction ctl": 0.00347,
+        "Prepared stmts": 0.00636,
+        "SET/SHOW/RESET": 0.01272
+      }
     }
   ]
 }
