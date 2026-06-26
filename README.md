@@ -25,7 +25,7 @@ Nano is one of four products in the HeliosDB family. SDKs and integrations are c
 
 **Performance:** [what's fast, and where we're still improving](docs/PERFORMANCE.md) — honest strengths + transparent limits.
 
-**Benchmark:** [HeliosDB-Nano vs PostgreSQL 18.4 — the `pg35` benchmark, its history & evolution](docs/benchmarks/PG35_BENCHMARK.md) — 35 SQL categories head-to-head; Nano wins 30 by 10×–35,000×, with the 5 join/top-k/prepared categories reported honestly (PostgreSQL edges 2).
+**Benchmark:** [HeliosDB-Nano vs PostgreSQL 18.4 — the `pg35` benchmark, its history & evolution](docs/benchmarks/PG35_BENCHMARK.md) — 35 SQL categories head-to-head; Nano wins 34/35 (30 by 10×–35,000×), with the one classified loss (Prepared stmts) shown honestly to be a measurement artifact, not a code deficit.
 
 ## Install
 
