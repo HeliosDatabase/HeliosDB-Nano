@@ -407,6 +407,18 @@ where
             self.send_parameter_status("DateStyle", "ISO, MDY").await?;
             self.send_parameter_status("TimeZone", "UTC").await?;
             self.send_parameter_status("integer_datetimes", "on").await?;
+            // Advertise standard_conforming_strings=on (the PostgreSQL default
+            // since 9.1, and what Nano's lexer actually implements: backslashes
+            // in regular '...' literals are ordinary characters). Drivers such
+            // as psycopg2 read this at connect time; when it is ABSENT they
+            // assume the legacy off behaviour and DOUBLE every backslash in
+            // bytea/text literals (`'\x00..'::bytea` -> `'\\x00..'::bytea`),
+            // which the (correctly conforming) lexer then decodes via bytea
+            // escape format into the wrong bytes — silently corrupting BLOB/RAW
+            // round-trips. Sending it makes those drivers emit single-backslash
+            // literals that Nano decodes correctly.
+            self.send_parameter_status("standard_conforming_strings", "on")
+                .await?;
 
             // Item 10: advertise the helios.* opt-in capabilities so a
             // capability-probing client (HeliosProxy) auto-enables only what
@@ -1546,8 +1558,13 @@ where
                     self.write_buf.put_slice(s.as_bytes());
                 }
                 Value::Bytes(b) => {
-                    self.write_buf.put_i32(b.len() as i32);
-                    self.write_buf.put_slice(b);
+                    // bytea text format is `\x<hex>` (PostgreSQL bytea_output=hex).
+                    // Raw bytes here make libpq/psycopg2 un-escape the field and
+                    // drop any 0x5C (backslash) byte — see tuple_to_pg_values.
+                    let hex = hex::encode(b);
+                    self.write_buf.put_i32((2 + hex.len()) as i32);
+                    self.write_buf.put_slice(b"\\x");
+                    self.write_buf.put_slice(hex.as_bytes());
                 }
                 Value::Json(j) => {
                     let s = j.to_string();
@@ -2146,7 +2163,16 @@ pub(super) fn tuple_to_pg_values(tuple: &Tuple) -> Vec<Option<Vec<u8>>> {
                 Value::Float4(f) => Some(ryu::Buffer::new().format(*f).as_bytes().to_vec()),
                 Value::Float8(f) => Some(ryu::Buffer::new().format(*f).as_bytes().to_vec()),
                 Value::String(s) => Some(s.as_bytes().to_vec()),
-                Value::Bytes(b) => Some(b.clone()),
+                // bytea text format is `\x<hex>` (PostgreSQL bytea_output=hex).
+                // Emitting the raw bytes makes libpq/psycopg2 apply
+                // escape-format un-escaping on the field, which silently drops
+                // any 0x5C (backslash) byte — corrupting BLOB/RAW round-trips.
+                Value::Bytes(b) => {
+                    let mut out = Vec::with_capacity(2 + b.len() * 2);
+                    out.extend_from_slice(b"\\x");
+                    out.extend_from_slice(hex::encode(b).as_bytes());
+                    Some(out)
+                }
                 Value::Json(j) => Some(j.to_string().into_bytes()),
                 Value::Numeric(n) => Some(n.as_bytes().to_vec()),
                 Value::Uuid(u) => Some(u.to_string().into_bytes()),

@@ -367,6 +367,23 @@ fn decode_text_parameter(data: &[u8], type_oid: i32) -> Result<Value> {
             // Value::Json stores the JSON as a String for bincode compatibility
             Ok(Value::Json(text.to_string()))
         }
+        17 => {
+            // Bytea. PostgreSQL's text format is hex (`\x..`) or the legacy
+            // escape form. A text-format bytea Bind param must be decoded to raw
+            // bytes, not stored as the literal `\x..` string (which would then
+            // round-trip back the ASCII text, corrupting the value). Mirrors
+            // Evaluator::cast_value's DataType::Bytea arm. Embedded NULs are
+            // preserved (the data already arrived length-prefixed, and hex
+            // decode is NUL-agnostic).
+            let trimmed = text.trim();
+            if let Some(hex_str) = trimmed.strip_prefix("\\x").or_else(|| trimmed.strip_prefix("0x")) {
+                hex::decode(hex_str)
+                    .map(Value::Bytes)
+                    .map_err(|e| Error::protocol(format!("Invalid bytea hex parameter: {}", e)))
+            } else {
+                Ok(Value::Bytes(text.as_bytes().to_vec()))
+            }
+        }
         _ => {
             // Unknown type - treat as text
             Ok(Value::String(text.to_string()))
@@ -541,6 +558,21 @@ fn value_to_sql_literal(value: &Value) -> String {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_text_bytea_param_preserves_embedded_nul() {
+        // OID 17 = bytea. A text-format bytea Bind param in hex form (`\x..`)
+        // must decode to raw bytes with embedded NULs preserved. Regression:
+        // previously bytea fell through to `Value::String`, so the literal
+        // `\x..` text round-tripped back as ASCII, corrupting BLOB/RAW values.
+        let v = decode_parameter(b"\\x00010203", 0, 17).unwrap();
+        assert_eq!(v, Value::Bytes(vec![0x00, 0x01, 0x02, 0x03]));
+        let v2 = decode_parameter(b"\\xDEADBE00EF", 0, 17).unwrap();
+        assert_eq!(v2, Value::Bytes(vec![0xDE, 0xAD, 0xBE, 0x00, 0xEF]));
+        // Binary-format (1) bytea already passed through raw — also NUL-safe.
+        let v3 = decode_parameter(&[0xDE, 0xAD, 0xBE, 0x00, 0xEF], 1, 17).unwrap();
+        assert_eq!(v3, Value::Bytes(vec![0xDE, 0xAD, 0xBE, 0x00, 0xEF]));
+    }
 
     #[test]
     fn test_statement_manager() {
