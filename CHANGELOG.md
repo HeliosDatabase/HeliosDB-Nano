@@ -5,6 +5,38 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.60.7] - 2026-06-28
+
+Patch release: two concurrency/availability fixes found by the Any2HeliosDB
+Pagila→Nano work. See `docs/NANO_CONCURRENCY_LOCKING.md`.
+
+### Fixed
+
+- **A single same-row write conflict no longer stalls the whole server for 60s**
+  (BUG A). The pessimistic row-lock acquire is a synchronous spin that was
+  bounded by a hard-coded 60-second timeout; while a second writer waited on a
+  contended row, unrelated statements and even new-connection startup stalled,
+  and — because the lock holder's own COMMIT cannot make progress until the
+  waiter gives up — the wait could only ever end in a timeout (waiting is futile
+  for a write-write conflict). `LockManager::with_default_timeout()` now honors
+  `NANO_LOCK_TIMEOUT_MS` and defaults to **1000 ms** (was 60 000), so a conflict
+  fails fast with a retriable serialization/lock-timeout error. Non-conflicting
+  concurrent writes (different rows) were never affected. This is a mitigation;
+  the redundant pessimistic lock should be dropped in favor of the existing
+  optimistic first-committer-wins registry (documented as Option 2).
+
+- **`DROP TABLE` of a populated table was O(rows) `fdatasync` calls** (BUG B).
+  `catalog.drop_table` deleted data rows one at a time, and each delete appended
+  a WAL entry with a synchronous `fdatasync` — so a 200-row table took ~8s and a
+  Pagila-sized table appeared to hang and monopolized the WAL writer (stalling
+  other sessions, which read as "DROP wedges the whole server"). The drop is
+  already WAL-logged as a single DDL op (replayed on recovery/replication), so
+  the per-row WAL entries were redundant. Data rows are now removed in one
+  batched RocksDB write — O(1) fsyncs. Regression: `tests/b_drop_table_batched.rs`.
+  (Note: Nano still permits dropping an FK-referenced parent table — a
+  deliberate divergence from PostgreSQL that Any2HeliosDB's `drop_existing`
+  relies on; see the doc.)
+
 ## [3.60.6] - 2026-06-28
 
 Patch release: two silent data-correctness fixes found by the Any2HeliosDB

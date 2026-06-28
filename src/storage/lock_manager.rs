@@ -166,9 +166,30 @@ impl LockManager {
         }
     }
 
-    /// Create a new LockManager with default timeout (60 seconds)
+    /// Create a `LockManager` with the configured default acquisition timeout.
+    ///
+    /// Honors `NANO_LOCK_TIMEOUT_MS`; defaults to a short, bounded wait.
+    ///
+    /// The previous 60-second default was harmful: the lock-acquire wait is a
+    /// synchronous spin, and a single same-row write conflict wedged the *whole
+    /// server* for up to 60s — new connections could not complete startup and
+    /// unrelated statements stalled. Worse, the lock holder's own COMMIT cannot
+    /// make progress until the waiter gives up, so for a write-write conflict
+    /// *waiting is futile*: the wait can only ever end in a timeout, never in
+    /// the lock being granted. A short bound turns that 60s server-wide stall
+    /// into a fast, retriable serialization/lock-timeout error.
+    ///
+    /// The proper fix (NANO_v3.58 HTAP spec, Option 2) is to drop this
+    /// redundant pessimistic write lock entirely and rely on the optimistic
+    /// first-committer-wins registry (`WriteConflictRegistry::validate_and_record`),
+    /// which already reports write-write conflicts at COMMIT with no spin.
     pub fn with_default_timeout() -> Self {
-        Self::new(60_000)
+        let timeout_ms = std::env::var("NANO_LOCK_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|ms| *ms > 0)
+            .unwrap_or(1_000);
+        Self::new(timeout_ms)
     }
 
     /// Acquire a lock on a resource

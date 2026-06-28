@@ -362,27 +362,36 @@ impl<'a> Catalog<'a> {
         let data_prefix = format!("data:{}:", table_name);
         let prefix_bytes = data_prefix.as_bytes();
 
-        // Collect all keys to delete using prefix seek (O(rows_in_table), not O(all_keys))
-        let mut keys_to_delete = Vec::new();
+        // Batch-delete all data rows in a SINGLE RocksDB write (prefix seek,
+        // O(rows_in_table) keys, not O(all_keys)).
+        //
+        // The previous implementation deleted rows one at a time via
+        // `self.storage.delete()`, which appends a WAL `Delete` entry per row —
+        // and the WAL append issues a synchronous `fdatasync`. So DROP TABLE
+        // cost one fsync PER ROW: a 200-row table took ~8s and a Pagila-sized
+        // table appeared to hang and monopolized the WAL writer, stalling other
+        // sessions. The drop is already WAL-logged as a single DDL op above
+        // (`log_drop_table`, replayed on recovery/replication), so the per-row
+        // WAL entries were redundant. One batched write is correct and turns
+        // O(rows) fsyncs into O(1) — matching the metadata batch just above.
+        let mut data_batch = rocksdb::WriteBatch::default();
         let mut read_opts = rocksdb::ReadOptions::default();
         read_opts.set_total_order_seek(false); // Enable prefix-based seek
         let iter = self.storage.db.iterator_opt(
             rocksdb::IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward),
             read_opts,
         );
-
         for item in iter {
             let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
             if !key.starts_with(prefix_bytes) {
                 break; // Past the prefix range
             }
-            keys_to_delete.push(key.to_vec());
+            data_batch.delete(key);
         }
-
-        // Delete all collected data row keys
-        for key in keys_to_delete {
-            self.storage.delete(&key)?;
-        }
+        self.storage
+            .db
+            .write(data_batch)
+            .map_err(|e| Error::storage(format!("Batch delete of table data failed: {}", e)))?;
 
         // R3.3: purge columnar sidecars (col:/colz:/colzm:/colp:/colpm:) so a
         // re-created table with the same name never reads stale batches, zone
