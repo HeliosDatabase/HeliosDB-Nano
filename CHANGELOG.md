@@ -5,6 +5,45 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.60.6] - 2026-06-28
+
+Patch release: two silent data-correctness fixes found by the Any2HeliosDB
+Oracle/PostgreSQL→Nano CDC build.
+
+### Fixed
+
+- **DELETE/UPDATE by a `DECIMAL`/`NUMERIC` primary key silently matched 0 rows**
+  (BUG D). `DELETE FROM t WHERE dec_pk = 6` (and the equivalent `UPDATE`) removed
+  nothing while the identical `SELECT` returned the row; integer PKs were
+  unaffected. The fast-DML PK path (`fast_parse_one_value`) parsed a numeric
+  literal for a `NUMERIC` column as `Int8`/`Float8`, whose ART-index key
+  encoding (sign-flipped 8-byte int) never matched the stored `Numeric("6")` key
+  (the bytes of the decimal string), so the point lookup missed every time and
+  the statement reported 0 affected rows. The parser now yields `Value::Numeric`
+  for `NUMERIC` columns; the slow `get_row_by_pk` path additionally coerces an
+  integer literal to the column's numeric type (`coerce_pk_value`). Impact:
+  Oracle `NUMBER(p,0)` PKs map to `DECIMAL(p,0)`, so CDC delete-reconcile (and
+  any keyed DELETE/UPDATE) silently no-oped on those tables — a data-drift bug.
+  Regression: `tests/d_decimal_pk_dml.rs`, `coerce_pk_value_int_to_numeric`.
+
+- **`BYTEA` corruption via Python/psycopg2 drivers** (BUG E). Nano did not
+  advertise `standard_conforming_strings` in its startup `ParameterStatus`, so
+  psycopg2 (and other drivers) saw it as unset, assumed the legacy off behaviour,
+  and **doubled every backslash** in bytea/text literals (`'\x00..'::bytea` →
+  `'\\x00..'::bytea`). Nano's (correctly conforming) lexer then decoded the
+  doubled form via bytea *escape* format into the wrong bytes — silently
+  corrupting `BLOB`/`RAW` round-trips (Oracle blobs with embedded NULs were the
+  visible symptom). Nano now advertises `standard_conforming_strings=on` at
+  connect, so drivers emit single-backslash literals that decode correctly
+  (verified end-to-end with `psycopg2.Binary`). Additionally, a text-format
+  `bytea` bind parameter (OID 17) is now hex-decoded to raw bytes instead of
+  falling through to a string. **The bytea result-row encoder also now emits
+  the `\x<hex>` text format instead of the raw bytes** — raw bytes made
+  libpq/psycopg2 un-escape the field and drop any `0x5C` (backslash) byte, so a
+  blob containing a backslash lost it on read-back (storage was always intact).
+  Regressions: `decode_text_bytea_param_preserves_embedded_nul`,
+  `bytea_text_output_is_hex_not_raw_bytes`.
+
 ## [3.60.5] - 2026-06-28
 
 Patch release: a `timestamptz`→`TIMESTAMP` cast-leniency fix, found by the

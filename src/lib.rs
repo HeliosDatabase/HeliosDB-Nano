@@ -10167,11 +10167,17 @@ impl EmbeddedDatabase {
                     Value::Float8(f)
                 }
                 DataType::Numeric => {
-                    // Try integer first, then float
-                    if let Ok(n) = num_str.parse::<i64>() {
-                        Value::Int8(n)
-                    } else if let Ok(f) = num_str.parse::<f64>() {
-                        Value::Float8(f)
+                    // NUMERIC/DECIMAL values are stored and ART-key-encoded as
+                    // their string form (ArtIndexManager::encode_value_into ->
+                    // Value::Numeric uses the raw bytes of the decimal string).
+                    // Parsing the literal as Int8/Float8 here produced a key
+                    // (8-byte sign-flipped int / IEEE float) that never matched
+                    // the stored Numeric("6") key (the bytes of "6"), so the PK
+                    // fast-path for DELETE/UPDATE/SELECT silently matched 0 rows
+                    // on a DECIMAL PK while the full-scan path matched 1. Keep
+                    // the canonical string form, after validating it is numeric.
+                    if num_str.parse::<i64>().is_ok() || num_str.parse::<f64>().is_ok() {
+                        Value::Numeric(num_str.to_string())
                     } else {
                         return None;
                     }

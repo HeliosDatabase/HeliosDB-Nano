@@ -7512,6 +7512,15 @@ impl StorageEngine {
             (Value::String(s), DataType::Int8) => s.parse::<i64>().map(Value::Int8).unwrap_or_else(|_| value.clone()),
             (Value::String(s), DataType::Int4) => s.parse::<i32>().map(Value::Int4).unwrap_or_else(|_| value.clone()),
             (Value::String(s), DataType::Int2) => s.parse::<i16>().map(Value::Int2).unwrap_or_else(|_| value.clone()),
+            // Integer literal against a NUMERIC/DECIMAL PK column. The SQL parser
+            // yields Int4(6) for the literal `6`, but an INSERT cast the same
+            // value to Numeric("6") (see Evaluator::cast_value), so the stored
+            // ART key is the UTF-8 string "6", not the 4-byte int encoding.
+            // Without this, UPDATE/DELETE by a DECIMAL PK silently match 0 rows
+            // while SELECT (which type-coerces during predicate eval) matches 1.
+            (Value::Int2(v), DataType::Numeric) => Value::Numeric(format!("{}", v)),
+            (Value::Int4(v), DataType::Numeric) => Value::Numeric(format!("{}", v)),
+            (Value::Int8(v), DataType::Numeric) => Value::Numeric(format!("{}", v)),
             // Already correct type — return as-is
             _ => value.clone(),
         }
@@ -11134,6 +11143,31 @@ impl StorageEngine {
 mod tests {
     use super::*;
     use crate::{Column, DataType, Schema, Value};
+
+    #[test]
+    fn coerce_pk_value_int_to_numeric() {
+        // An integer literal compared against a NUMERIC/DECIMAL PK column must
+        // coerce to Numeric("6") so the ART key matches what INSERT stored
+        // (INSERT casts 6 -> Numeric("6")). Without this, UPDATE/DELETE by a
+        // DECIMAL PK silently match 0 rows while SELECT matches 1 (BUG D).
+        assert_eq!(
+            StorageEngine::coerce_pk_value(&Value::Int4(6), &DataType::Numeric),
+            Value::Numeric("6".to_string())
+        );
+        assert_eq!(
+            StorageEngine::coerce_pk_value(&Value::Int8(6), &DataType::Numeric),
+            Value::Numeric("6".to_string())
+        );
+        assert_eq!(
+            StorageEngine::coerce_pk_value(&Value::Int2(6), &DataType::Numeric),
+            Value::Numeric("6".to_string())
+        );
+        // Existing integer-widening coercion is unaffected.
+        assert_eq!(
+            StorageEngine::coerce_pk_value(&Value::Int4(6), &DataType::Int8),
+            Value::Int8(6)
+        );
+    }
 
     #[test]
     fn test_parse_row_id_after_prefix() {

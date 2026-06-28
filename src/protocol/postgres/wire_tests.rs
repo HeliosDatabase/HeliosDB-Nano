@@ -604,3 +604,28 @@ async fn discard_all_resets_session_guc() {
         "DISCARD ALL must reset helios.fast_autocommit to off"
     );
 }
+
+/// BUG E: bytea must be sent to the client as `\x<hex>` (PostgreSQL
+/// bytea_output=hex), NOT as raw bytes. Raw bytes make libpq/psycopg2 apply
+/// escape-format un-escaping to the field, silently dropping any 0x5C
+/// (backslash) byte — corrupting Any2HeliosDB BLOB/RAW round-trips. The literal
+/// below contains 0x5c (`5a5b5c5d5e`), the byte that was being lost.
+#[tokio::test]
+async fn bytea_text_output_is_hex_not_raw_bytes() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+    handler.handle_single_query("CREATE TABLE wbt (b bytea)").await.unwrap();
+    let _ = drain(&mut client).await;
+    handler
+        .handle_single_query("INSERT INTO wbt VALUES ('\\x5a5b5c5d5e')")
+        .await
+        .unwrap();
+    let _ = drain(&mut client).await;
+    handler.handle_single_query("SELECT b FROM wbt").await.unwrap();
+    let out = drain(&mut client).await;
+    assert_eq!(
+        first_data_row_text(&out).as_deref(),
+        Some("\\x5a5b5c5d5e"),
+        "bytea text output must be `\\x`-hex encoded, not raw bytes"
+    );
+}
