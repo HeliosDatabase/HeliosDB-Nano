@@ -5,6 +5,30 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.60.5] - 2026-06-28
+
+Patch release: a `timestamptz`→`TIMESTAMP` cast-leniency fix, found by the
+Any2HeliosDB PostgreSQL→Nano CDC work.
+
+### Fixed
+
+- **String→`TIMESTAMP` cast now accepts a trailing timezone offset.** Nano
+  downgrades `TIMESTAMP WITH TIME ZONE` to a plain `TIMESTAMP`, but the two write
+  paths disagreed: bulk `COPY` of a Postgres `timestamptz` literal like
+  `2026-06-28 05:52:42.692688+00` was tolerated while the same value via
+  `INSERT`/`INSERT … ON CONFLICT` (and `::timestamp` / `::timestamptz`) failed
+  with `Cannot cast '…+00' to TIMESTAMP: trailing input`. So a row could load via
+  `migrate` (COPY) yet the identical value fail via CDC apply (literal upsert).
+  The cast now parses Postgres' space-separated offset form (`%#z`, with or
+  without fractional seconds) in addition to RFC3339, **accepts the zone and
+  drops it, keeping the written wall-clock** (matching Postgres `::timestamp`).
+  All offset-bearing forms now drop the zone *uniformly* — previously the RFC3339
+  branch UTC-converted, so `+05:30` shifted while `-08` did not. Offset-less
+  values are unaffected. Regression test:
+  [`test_timestamptz_offset_cast_drops_zone`](src/sql/evaluator.rs). Found by the
+  Any2HeliosDB CDC build (a2h has a source-side workaround; this fixes the
+  COPY-vs-cast inconsistency itself).
+
 ## [3.60.4] - 2026-06-26
 
 Patch release: fixes a dropped `WHERE` filter on `information_schema.columns`
