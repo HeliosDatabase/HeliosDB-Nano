@@ -5454,9 +5454,25 @@ impl Evaluator {
                     )))
                 }
                 Value::String(s) => {
-                    // Try RFC3339 format first, then common formats
+                    // Parse timestamp text, accepting a trailing timezone offset
+                    // (RFC3339 `T`-separated, or Postgres' space-separated form
+                    // `2026-06-28 05:52:42.692688+00`). `timestamptz` downgrades
+                    // to TIMESTAMP: the offset is ACCEPTED and the zone DROPPED,
+                    // keeping the written wall-clock — matching Postgres
+                    // `::timestamp` and the bulk-COPY path, so the literal/cast
+                    // path agrees with COPY (without this, COPY tolerated the
+                    // offset while the cast rejected the identical value with
+                    // "trailing input" — a2h BUG C). All offset-bearing forms
+                    // drop the zone uniformly (rfc3339 must NOT UTC-convert, or
+                    // `+05:30` would shift while `-08` would not). Offset-less
+                    // forms parse as-is below.
                     chrono::DateTime::parse_from_rfc3339(&s)
-                        .map(|ts| Value::Timestamp(ts.with_timezone(&Utc)))
+                        .or_else(|_| chrono::DateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S%.f%#z"))
+                        .or_else(|_| chrono::DateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S%#z"))
+                        .map(|dt| {
+                            // Drop the zone, keep the written wall-clock.
+                            Value::Timestamp(chrono::DateTime::from_naive_utc_and_offset(dt.naive_local(), Utc))
+                        })
                         .or_else(|_| {
                             chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S")
                                 .map(|ndt| Value::Timestamp(chrono::DateTime::from_naive_utc_and_offset(ndt, Utc)))
@@ -7639,5 +7655,40 @@ mod tests {
         // Invalid UUID string
         let result3 = evaluator.cast_value(Value::String("not-a-uuid".to_string()), &DataType::Uuid);
         assert!(result3.is_err());
+    }
+
+    #[test]
+    fn test_timestamptz_offset_cast_drops_zone() {
+        // a2h BUG C: Postgres `timestamptz` text (space separator + trailing
+        // offset) must cast to TIMESTAMP by accepting the offset and dropping
+        // the zone (keeping the written wall-clock), so the literal/cast path
+        // agrees with bulk COPY. These previously failed with "trailing input".
+        let evaluator = Evaluator::new(test_schema());
+        for s in [
+            "2026-06-28 05:52:42.692688+00",
+            "2026-06-28 05:52:42+00",
+            "2026-06-28 05:52:42.692688+05:30",
+            "2026-06-28 05:52:42-08",
+        ] {
+            let v = evaluator
+                .cast_value(Value::String(s.to_string()), &DataType::Timestamp)
+                .unwrap_or_else(|e| panic!("cast of `{s}` should succeed: {e}"));
+            assert!(matches!(v, Value::Timestamp(_)), "`{s}` -> {v:?}");
+        }
+
+        // Zone is DROPPED (wall-clock kept), not converted to UTC: an
+        // offset-bearing value equals the same wall-clock with no offset.
+        let with_off = evaluator
+            .cast_value(Value::String("2026-06-28 05:52:42.692688+05:30".to_string()), &DataType::Timestamp)
+            .unwrap();
+        let no_off = evaluator
+            .cast_value(Value::String("2026-06-28 05:52:42.692688".to_string()), &DataType::Timestamp)
+            .unwrap();
+        assert_eq!(with_off, no_off, "offset must be dropped, wall-clock kept (not UTC-converted)");
+
+        // Offset-less forms still parse (no regression).
+        assert!(evaluator
+            .cast_value(Value::String("2026-06-28 05:52:42".to_string()), &DataType::Timestamp)
+            .is_ok());
     }
 }
