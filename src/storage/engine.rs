@@ -1799,7 +1799,11 @@ pub struct StorageEngine {
     /// accumulation window (`storage.group_commit_window_us`).
     group_committer: Arc<super::group_commit::GroupCommitter>,
     /// In-memory schema cache (avoids repeated RocksDB get + bincode deserialize)
-    schema_cache: Arc<parking_lot::Mutex<std::collections::HashMap<String, crate::Schema>>>,
+    // Sharded concurrent map (not a single Mutex): get_table_schema() is on the
+    // hot path of EVERY table-touching query, and a global Mutex here serialized
+    // all concurrent reads, capping point-read scaling (~48k tps @ c=32). DashMap
+    // shards the lock so concurrent schema lookups don't contend.
+    schema_cache: Arc<dashmap::DashMap<String, crate::Schema>>,
     /// In-memory table-constraints cache (avoids repeated metadata gets on DML)
     constraints_cache: Arc<parking_lot::Mutex<std::collections::HashMap<String, crate::sql::TableConstraints>>>,
     /// In-memory reverse-FK cache (referenced table -> constraints that point at it)
@@ -2216,7 +2220,7 @@ impl StorageEngine {
             group_committer: Arc::new(super::group_commit::GroupCommitter::new(
                 std::time::Duration::from_micros(config.storage.group_commit_window_us),
             )),
-            schema_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+            schema_cache: Arc::new(dashmap::DashMap::new()),
             constraints_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             referencing_fk_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             index_snapshots_on_close: Arc::new(AtomicBool::new(true)),
@@ -2440,7 +2444,7 @@ impl StorageEngine {
             group_committer: Arc::new(super::group_commit::GroupCommitter::new(
                 std::time::Duration::from_micros(config.storage.group_commit_window_us),
             )),
-            schema_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+            schema_cache: Arc::new(dashmap::DashMap::new()),
             constraints_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             referencing_fk_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             index_snapshots_on_close: Arc::new(AtomicBool::new(true)),
@@ -2455,22 +2459,22 @@ impl StorageEngine {
 
     /// Get a cached schema, or look it up and cache it
     pub fn get_cached_schema(&self, table_name: &str) -> Option<crate::Schema> {
-        self.schema_cache.lock().get(table_name).cloned()
+        self.schema_cache.get(table_name).map(|e| e.value().clone())
     }
 
     /// Cache a schema for a table
     pub fn cache_schema(&self, table_name: &str, schema: crate::Schema) {
-        self.schema_cache.lock().insert(table_name.to_string(), schema);
+        self.schema_cache.insert(table_name.to_string(), schema);
     }
 
     /// Invalidate a cached schema (call on DDL changes)
     pub fn invalidate_schema_cache(&self, table_name: &str) {
-        self.schema_cache.lock().remove(table_name);
+        self.schema_cache.remove(table_name);
     }
 
     /// Clear all cached schemas (call on bulk DDL operations)
     pub fn clear_schema_cache(&self) {
-        self.schema_cache.lock().clear();
+        self.schema_cache.clear();
     }
 
     /// Get cached constraints for a table

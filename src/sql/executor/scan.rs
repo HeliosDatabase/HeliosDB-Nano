@@ -1890,7 +1890,7 @@ pub(super) fn handle_scan(executor: &Executor, plan: &LogicalPlan) -> Result<Box
         // the rows from the Phase 3 registry here so Project / Filter /
         // Join compose on top exactly like a user table.
         use crate::sql::phase3::SystemViewRegistry;
-        let registry = SystemViewRegistry::new();
+        let registry = SystemViewRegistry::shared();
         if registry.is_system_view(table_name) {
             let storage = executor
                 .storage()
@@ -2182,7 +2182,7 @@ pub(super) fn handle_filtered_scan(executor: &Executor, plan: &LogicalPlan) -> R
         }
 
         use crate::sql::phase3::SystemViewRegistry;
-        let registry = SystemViewRegistry::new();
+        let registry = SystemViewRegistry::shared();
         if registry.is_system_view(table_name) {
             let storage = executor
                 .storage()

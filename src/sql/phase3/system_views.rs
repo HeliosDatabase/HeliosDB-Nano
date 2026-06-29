@@ -33,6 +33,23 @@ impl SystemViewRegistry {
         registry
     }
 
+    /// Borrow the process-global registry, built exactly once.
+    ///
+    /// The Phase-3 system-view set is static — `register_phase3_views` consumes
+    /// no runtime/storage state, it only allocates string/enum literals — so a
+    /// fresh `new()` produces a byte-identical 46-view, hundreds-of-`Column`
+    /// HashMap every time. Table resolution (`Planner::table_factor_to_plan`
+    /// and the executor scan twins) rebuilt it per query just to answer one
+    /// `is_system_view()` membership test, which the profile showed hotter than
+    /// the actual index lookup. Sharing one immutable `&'static` removes that
+    /// per-query rebuild at no behavioral cost (only `&self` accessors are used
+    /// after construction).
+    pub fn shared() -> &'static Self {
+        static SHARED: std::sync::LazyLock<SystemViewRegistry> =
+            std::sync::LazyLock::new(SystemViewRegistry::new);
+        &SHARED
+    }
+
     /// Register all Phase 3 system views
     fn register_phase3_views(&mut self) {
         // pg_database_branches()

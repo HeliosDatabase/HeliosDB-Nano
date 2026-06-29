@@ -1779,7 +1779,7 @@ impl<'a> Planner<'a> {
                 // work" because the same operators handle them as for
                 // user tables.
                 use crate::sql::phase3::SystemViewRegistry;
-                let registry = SystemViewRegistry::new();
+                let registry = SystemViewRegistry::shared();
 
                 if registry.is_system_view(&table_name) {
                     let schema = Arc::new(
