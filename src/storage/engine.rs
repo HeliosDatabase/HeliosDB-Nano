@@ -1982,9 +1982,24 @@ impl StorageEngine {
 
     /// Open a storage engine
     pub fn open(path: impl AsRef<Path>, config: &Config) -> Result<Self> {
+        Self::open_with_mode(path, config, false)
+    }
+
+    /// Open an EXISTING database read-only (RocksDB open-for-read-only). A
+    /// second process can read while a primary holds the dir open for writing
+    /// (RocksDB read-only opens take no DB lock). The read-only handle sees the
+    /// on-disk state as of open; reopen to observe a writer's later commits.
+    /// No WAL, no background GC / consolidation workers, never creates the dir.
+    /// (Used by `EmbeddedDatabase::open_read_only` for a2h's concurrent manifest
+    /// reader: one writer + one or more read-only readers, same file.)
+    pub fn open_read_only(path: impl AsRef<Path>, config: &Config) -> Result<Self> {
+        Self::open_with_mode(path, config, true)
+    }
+
+    fn open_with_mode(path: impl AsRef<Path>, config: &Config, read_only: bool) -> Result<Self> {
         let db_path = path.as_ref().to_path_buf();
         let mut opts = Options::default();
-        opts.create_if_missing(true);
+        opts.create_if_missing(!read_only);
         opts.set_compression_type(match config.storage.compression {
             crate::config::CompressionType::None => rocksdb::DBCompressionType::None,
             crate::config::CompressionType::Zstd => rocksdb::DBCompressionType::Zstd,
@@ -2038,7 +2053,14 @@ impl StorageEngine {
         opts.set_bytes_per_sync(sc.rocksdb_bytes_per_sync.unwrap_or(1048576)); // sync every 1MB
         opts.set_enable_pipelined_write(true); // Pipeline WAL + memtable writes
 
-        let db = DB::open(&opts, path).map_err(|e| Error::storage(format!("Failed to open RocksDB: {}", e)))?;
+        let db = if read_only {
+            // No DB lock taken — a second process can open read-only while a
+            // primary writes. `false` = tolerate an existing WAL/log file.
+            DB::open_for_read_only(&opts, path, false)
+                .map_err(|e| Error::storage(format!("Failed to open RocksDB read-only: {}", e)))?
+        } else {
+            DB::open(&opts, path).map_err(|e| Error::storage(format!("Failed to open RocksDB: {}", e)))?
+        };
 
         let db = Arc::new(db);
 
@@ -2084,8 +2106,9 @@ impl StorageEngine {
             }
         };
 
-        // Initialize WAL if enabled
-        let wal = if config.storage.wal_enabled {
+        // Initialize WAL if enabled (never for a read-only handle — it must not
+        // write, and `wal = None` also skips the WAL replay+truncate below).
+        let wal = if !read_only && config.storage.wal_enabled {
             // Convert config sync mode to WAL sync mode
             let sync_mode = match config.storage.wal_sync_mode {
                 crate::config::WalSyncModeConfig::Sync => WalSyncMode::Sync,
@@ -2131,8 +2154,11 @@ impl StorageEngine {
         let speculative_filter_manager = Arc::new(SpeculativeFilterManager::new(SpeculativeConfig::default()));
         let parallel_filter_engine = Arc::new(ParallelFilterEngine::new(ParallelFilterConfig::default()));
 
-        // Initialize consolidation worker
-        let consolidation_worker = {
+        // Initialize consolidation worker (skipped for a read-only handle — it
+        // mutates the filter index in the background).
+        let consolidation_worker = if read_only {
+            None
+        } else {
             let worker = FilterConsolidationWorker::new(
                 ConsolidationConfig::default(),
                 Arc::clone(&filter_delta_tracker),
@@ -2174,6 +2200,7 @@ impl StorageEngine {
             Arc::clone(&conflict_registry),
             Arc::clone(&branch_manager),
             Arc::clone(&timestamp),
+            read_only,
         )?;
 
         let engine = Self {
@@ -2397,6 +2424,7 @@ impl StorageEngine {
             Arc::clone(&conflict_registry),
             Arc::clone(&branch_manager),
             Arc::clone(&timestamp),
+            false,
         )?;
 
         Ok(Self {
@@ -3388,6 +3416,7 @@ impl StorageEngine {
         conflict_registry: Arc<super::conflict::WriteConflictRegistry>,
         branch_manager: Arc<RwLock<Option<Arc<BranchManager>>>>,
         timestamp: Arc<RwLock<u64>>,
+        read_only: bool,
     ) -> Result<(
         Arc<super::version_gc::VersionGc>,
         Option<super::version_gc::VersionGcWorker>,
@@ -3407,7 +3436,9 @@ impl StorageEngine {
             timestamp,
             gc_config,
         ));
-        let worker = if interval_secs > 0 {
+        // Never start the background collector for a read-only handle — it
+        // deletes superseded versions (a write).
+        let worker = if interval_secs > 0 && !read_only {
             info!(
                 interval_secs,
                 retention_secs = retention_secs.unwrap_or(0),
