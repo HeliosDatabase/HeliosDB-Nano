@@ -1,0 +1,105 @@
+name: Publish embedded Python wheel (PyPI)
+
+# Builds the abi3 manylinux wheel for the IN-PROCESS embedded binding
+# (bindings/python — `import heliosdb_nano`) and publishes it to PyPI as
+# `heliosdb-nano-embedded`. Distinct from the crates.io release (release.yml,
+# `v*` tags): the wheel has its own `py-v*` tag lifecycle so engine and wheel
+# can ship independently.
+#
+# ── ONE-TIME SETUP before the first real publish (a maintainer, on PyPI) ──────
+# Recommended — PyPI Trusted Publishing (no API token in GitHub secrets):
+#   https://pypi.org/manage/account/publishing/  → add a pending publisher:
+#     PyPI Project Name : heliosdb-nano-embedded
+#     Owner             : HeliosDatabase
+#     Repository name   : HeliosDB-Nano
+#     Workflow name     : python-wheel.yml
+#     Environment       : (leave blank, or set `pypi` and add `environment: pypi`
+#                          to the publish job below for a protected deploy)
+#   (Alternative: store a `PYPI_API_TOKEN` secret and swap the publish step's
+#    auth to `with: { password: ${{ secrets.PYPI_API_TOKEN }} }`.)
+#
+# ── TO RELEASE ────────────────────────────────────────────────────────────────
+#   1. bump `version` in bindings/python/Cargo.toml
+#   2. git tag py-vX.Y.Z && git push origin py-vX.Y.Z        → builds + publishes to PyPI
+# Or run manually (Actions → this workflow → Run workflow) — defaults to a
+# TestPyPI dry run; choose `pypi` to publish for real.
+#
+# NOTE: the binding pulls heavy C/C++/asm deps (RocksDB, ring, the crypto
+# stack). They compile from source inside the manylinux container, so the build
+# installs cmake/clang/perl there. If the first CI run trips on a missing build
+# tool, add it to `before-script-linux` (iterate via the Actions log).
+
+on:
+  push:
+    tags:
+      - 'py-v*'
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Publish target'
+        type: choice
+        options: [testpypi, pypi]
+        default: testpypi
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build abi3 manylinux wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Verify py-tag matches binding version
+        if: startsWith(github.ref, 'refs/tags/py-v')
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF#refs/tags/py-v}"
+          ver=$(grep -m1 '^version' bindings/python/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          echo "tag=$tag binding-version=$ver"
+          [ "$tag" = "$ver" ] || { echo "::error::tag py-v$tag != bindings/python/Cargo.toml version $ver"; exit 1; }
+
+      - name: Build wheel (manylinux_2_28, abi3)
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: bindings/python
+          command: build
+          args: --release --out dist
+          manylinux: '2_28'
+          before-script-linux: |
+            if command -v dnf >/dev/null 2>&1; then PM=dnf; else PM=yum; fi
+            $PM install -y cmake clang perl perl-IPC-Cmd make gcc gcc-c++ || true
+
+      - name: Inspect wheel
+        run: |
+          ls -la bindings/python/dist/
+          python3 -m pip install --quiet abi3audit || true
+          python3 -m abi3audit bindings/python/dist/*.whl || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel
+          path: bindings/python/dist/*.whl
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # PyPI Trusted Publishing (OIDC) — no token stored in secrets
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheel
+          path: dist
+
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          # Tag push → real PyPI. Manual dispatch → the chosen target (default TestPyPI).
+          repository-url: >-
+            ${{ (github.event_name == 'push' || github.event.inputs.target == 'pypi')
+                && 'https://upload.pypi.org/legacy/'
+                || 'https://test.pypi.org/legacy/' }}
