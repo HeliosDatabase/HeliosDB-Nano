@@ -3,7 +3,11 @@ requires = ["maturin>=1.5,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "heliosdb-nano"
+# PyPI distribution name (`pip install heliosdb-nano-embedded`). The importable
+# module stays `heliosdb_nano` (see [tool.maturin] module-name). Distinct from
+# the engine/server crate so the embedded-only binding is unambiguous — this is
+# the name Any2HeliosDB's optional extra (`any2heliosdb[nano-manifest]`) targets.
+name = "heliosdb-nano-embedded"
 dynamic = ["version"]                       # taken from Cargo.toml by maturin
 description = "In-process Python binding for HeliosDB-Nano (embedded mode) — no subprocess, no wire protocol"
 requires-python = ">=3.8"
