@@ -5,6 +5,43 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.60.9] - 2026-06-30
+
+Patch release: three Any2HeliosDB (a2h) Oracle→HeliosDB export-compatibility
+fixes — Nano now tolerates three more migrated-DDL/SQL shapes.
+
+### Fixed
+
+- **A trailing comma before the closing `)` of a CREATE TABLE column/constraint
+  list is now tolerated** (a2h export #1). Oracle-style exports emit
+  `CREATE TABLE t ( …, PRIMARY KEY (id), )`; sqlparser 0.53 (like PostgreSQL)
+  rejects the dangling comma. A CREATE-TABLE-scoped, quote-aware pre-parser
+  rewrite strips a comma immediately before `)`. Scoped to CREATE TABLE, so
+  `INSERT … VALUES (..),(..)`, `NUMERIC(p,0)` scale specs and string literals
+  are unaffected.
+- **`INTERVAL 'N' YEAR` / `INTERVAL 'N' MONTH` (and the `'N years'` /
+  `'N months'` string forms) now lower** instead of erroring "Unsupported
+  interval field" (a2h export #2). Nano stores intervals as a single i64
+  microsecond count with no calendar component, so YEAR and MONTH are
+  **approximated** to 365 and 30 days respectively. Imprecise across leap years
+  and variable-length months (`DATE '2020-01-01' + INTERVAL '2' YEAR` lands on
+  2021-12-31) but unblocks migrated date arithmetic; DAY/HOUR/MINUTE/… stay
+  exact.
+- **An Oracle-style self-referencing CTE without the `RECURSIVE` keyword now
+  resolves** (a2h export #4). Oracle infers recursion and omits `RECURSIVE`;
+  Postgres/sqlparser require it, so `WITH t (…) AS (… FROM t …)` failed with
+  "Table 't' does not exist". The planner now detects a CTE that references its
+  own name as a table in its body and treats the whole WITH as recursive
+  (registering the CTE name into scope before planning its body) — both as a
+  bare query and wrapped in CREATE VIEW.
+
+### Note
+
+a2h export deficiency #3 (view dependency ordering) is an export-side concern,
+not a Nano fix: PostgreSQL and HeliosDB both require a view's referenced
+relations to exist at CREATE time, so the export must emit views in topological
+(dependency) order.
+
 ## [3.60.8] - 2026-06-30
 
 Patch release: three embedded-engine correctness fixes surfaced by Any2HeliosDB

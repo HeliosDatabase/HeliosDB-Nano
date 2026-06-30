@@ -1129,6 +1129,50 @@ impl<'a> Planner<'a> {
         })
     }
 
+    /// Detect whether a CTE body references its own name as a table — the
+    /// signal that an Oracle-style WITH (no RECURSIVE keyword) is in fact
+    /// recursive. Walks table references only (not arbitrary identifiers) to
+    /// avoid false positives from columns or string literals.
+    fn cte_body_references(query: &Query, target: &str) -> bool {
+        Self::set_expr_references_table(query.body.as_ref(), target)
+    }
+
+    fn set_expr_references_table(set_expr: &SetExpr, target: &str) -> bool {
+        match set_expr {
+            SetExpr::SetOperation { left, right, .. } => {
+                Self::set_expr_references_table(left, target)
+                    || Self::set_expr_references_table(right, target)
+            }
+            SetExpr::Query(q) => Self::set_expr_references_table(q.body.as_ref(), target),
+            SetExpr::Select(select) => select
+                .from
+                .iter()
+                .any(|twj| Self::table_with_joins_references(twj, target)),
+            _ => false,
+        }
+    }
+
+    fn table_with_joins_references(twj: &TableWithJoins, target: &str) -> bool {
+        if Self::table_factor_references(&twj.relation, target) {
+            return true;
+        }
+        twj.joins
+            .iter()
+            .any(|j| Self::table_factor_references(&j.relation, target))
+    }
+
+    fn table_factor_references(tf: &TableFactor, target: &str) -> bool {
+        match tf {
+            TableFactor::Table { name, .. } => {
+                Self::normalize_object_name(name).eq_ignore_ascii_case(target)
+            }
+            TableFactor::Derived { subquery, .. } => {
+                Self::set_expr_references_table(subquery.body.as_ref(), target)
+            }
+            _ => false,
+        }
+    }
+
     fn infer_recursive_cte_anchor_schema(&self, query: &Query) -> Result<Option<Arc<Schema>>> {
         let SetExpr::SetOperation { left, .. } = query.body.as_ref() else {
             return Ok(None);
@@ -1141,7 +1185,17 @@ impl<'a> Planner<'a> {
     fn query_to_plan(&self, query: Query) -> Result<LogicalPlan> {
         // Handle WITH clause (CTEs)
         let (cte_plans, is_recursive) = if let Some(with_clause) = query.with {
-            let is_recursive = with_clause.recursive;
+            // Oracle infers recursion and omits the RECURSIVE keyword; Postgres/
+            // sqlparser require it. If any CTE references its own name as a table
+            // in its body, treat the whole WITH as recursive so the CTE name is
+            // pre-registered into scope before its body is planned and the
+            // executor uses the fixpoint loop — making a non-RECURSIVE
+            // self-referencing CTE behave like WITH RECURSIVE (migration-friendly).
+            let is_recursive = with_clause.recursive
+                || with_clause
+                    .cte_tables
+                    .iter()
+                    .any(|cte| Self::cte_body_references(&cte.query, &cte.alias.name.to_string()));
             let mut ctes = Vec::new();
             for cte in with_clause.cte_tables {
                 let cte_name = cte.alias.name.to_string();
@@ -3755,6 +3809,16 @@ impl<'a> Planner<'a> {
     fn interval_unit_to_micros(amount: f64, field: &sqlparser::ast::DateTimeField) -> Result<i64> {
         use sqlparser::ast::DateTimeField;
         let micros = match field {
+            // Calendar fields have no fixed microsecond width. Nano stores
+            // intervals as a single i64 microsecond count (no months/years
+            // component), so we APPROXIMATE: YEAR -> 365 days, MONTH -> 30 days.
+            // Imprecise across leap years / variable months (e.g.
+            // `DATE '2020-01-01' + INTERVAL '2' YEAR` lands on 2021-12-31), but
+            // it unblocks Oracle/PostgreSQL migrations using `<date> + INTERVAL
+            // 'N' YEAR/MONTH`. A precise calendar interval would require a months
+            // field threaded through Value::Interval.
+            DateTimeField::Year => amount * 365.0 * 86_400_000_000.0,
+            DateTimeField::Month => amount * 30.0 * 86_400_000_000.0,
             DateTimeField::Week(_) => amount * 7.0 * 86_400_000_000.0,
             DateTimeField::Day => amount * 86_400_000_000.0,
             DateTimeField::Hour => amount * 3_600_000_000.0,
@@ -3786,6 +3850,11 @@ impl<'a> Planner<'a> {
             "h" | "hr" | "hour" => amount * 3_600_000_000.0,
             "d" | "day" => amount * 86_400_000_000.0,
             "w" | "week" => amount * 7.0 * 86_400_000_000.0,
+            // Calendar approximations, matching interval_unit_to_micros:
+            // MONTH -> 30 days, YEAR -> 365 days (imprecise; Nano has no months
+            // component in Value::Interval).
+            "month" | "mon" => amount * 30.0 * 86_400_000_000.0,
+            "year" | "yr" => amount * 365.0 * 86_400_000_000.0,
             _ => {
                 return Err(Error::query_execution(format!(
                     "Unsupported interval unit '{unit}'. Nano intervals are stored as microseconds"
