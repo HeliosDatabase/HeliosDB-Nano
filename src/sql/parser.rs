@@ -245,6 +245,13 @@ impl Parser {
         // fails to parse before the planner is ever reached.
         processed_sql = Self::preprocess_is_json(&processed_sql);
 
+        // Preprocess: strip a trailing comma sitting immediately before the
+        // closing `)` of a CREATE TABLE column/constraint list. a2h's
+        // Oracle->HeliosDB export emits `... , PRIMARY KEY (id), )`; sqlparser
+        // 0.53 (like PostgreSQL) rejects the dangling comma. Scoped to CREATE
+        // TABLE and quote-aware so string literals / multi-row VALUES are safe.
+        processed_sql = Self::preprocess_strip_trailing_commas(&processed_sql);
+
         // Preprocess to remove SECURITY DEFINER/INVOKER (not supported by sqlparser)
         processed_sql = Self::preprocess_remove_security_clause(&processed_sql);
 
@@ -1765,6 +1772,81 @@ impl Parser {
         // are ASCII, so byte indices land on char boundaries.
         let bytes = sql.as_bytes();
         let mut out = String::with_capacity(sql.len() + 16);
+        let mut seg_start = 0usize;
+        let mut i = 0usize;
+        while i < bytes.len() {
+            let c = bytes[i];
+            if c == b'\'' || c == b'"' {
+                rewrite_unquoted(&sql[seg_start..i], &mut out);
+                let quote = c;
+                let qstart = i;
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == quote {
+                        i += 1;
+                        // A doubled quote ('' or "") is an escape: stay in the literal.
+                        if i < bytes.len() && bytes[i] == quote {
+                            i += 1;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+                out.push_str(&sql[qstart..i]);
+                seg_start = i;
+                continue;
+            }
+            i += 1;
+        }
+        rewrite_unquoted(&sql[seg_start..], &mut out);
+        out
+    }
+
+    /// Strip a trailing comma that sits immediately before the closing `)` of a
+    /// CREATE TABLE column/constraint list.
+    ///
+    /// a2h's Oracle->HeliosDB export emits `CREATE TABLE t ( ... , PRIMARY KEY
+    /// (id), )` — a dangling comma after the last item. sqlparser 0.53 (like
+    /// PostgreSQL) rejects it: "Expected: column name or constraint definition,
+    /// found: )". Nano positions as migration-friendly, so this defensive
+    /// rewrite removes only the offending comma.
+    ///
+    /// Safety:
+    /// - Scoped to CREATE TABLE statements only (early return otherwise), so
+    ///   INSERT ... VALUES, multi-row `(..),(..)`, ARRAY / row constructors and
+    ///   function-call defaults in other statements are never touched.
+    /// - Quote-aware (mirrors `preprocess_is_json`): single-quoted string
+    ///   literals and double-quoted identifiers are copied verbatim, so a
+    ///   literal such as `DEFAULT ',)'` is preserved.
+    /// - Only the comma is removed, never the paren; a legitimate `),`
+    ///   (comma followed by the next column/constraint) does not match because
+    ///   the comma is not immediately followed by `)`.
+    pub fn preprocess_strip_trailing_commas(sql: &str) -> String {
+        // Only CREATE TABLE statements can carry this artifact.
+        if !sql.trim_start().to_ascii_uppercase().starts_with("CREATE TABLE") {
+            return sql.to_string();
+        }
+        // Fast path: no `,` means nothing to strip.
+        if !sql.contains(',') {
+            return sql.to_string();
+        }
+        use regex::Regex;
+        use std::sync::OnceLock;
+        // A comma, then only whitespace, then a closing paren.
+        static RE: OnceLock<Regex> = OnceLock::new();
+        let re = RE.get_or_init(|| Regex::new(r",\s*\)").expect("static trailing-comma regex is valid"));
+
+        let rewrite_unquoted = |span: &str, out: &mut String| {
+            let replaced = re.replace_all(span, ")");
+            out.push_str(&replaced);
+        };
+
+        // Quote-aware walk: copy single-quoted string literals and double-quoted
+        // identifiers verbatim; only rewrite the unquoted spans between them.
+        // Quote bytes are ASCII, so byte indices land on char boundaries.
+        let bytes = sql.as_bytes();
+        let mut out = String::with_capacity(sql.len());
         let mut seg_start = 0usize;
         let mut i = 0usize;
         while i < bytes.len() {
