@@ -373,17 +373,22 @@ impl<'a> Planner<'a> {
         if let Some(dealiased) = Self::dealias_schema(&joined) {
             return dealiased;
         }
-        // Schema-qualified `public.<table>` and `pg_catalog.<table>`
-        // collapse to bare `<table>` — Nano stores everything in the
-        // implicit `public` schema, and most ORM-emitted DDL prefixes
-        // table names with `"public"."tbl"` (KanttBan #13 against
-        // v3.28.0). pg_catalog references are also normalized so
-        // `pg_catalog.pg_type` and `pg_type` resolve identically.
-        if let Some(rest) = joined.strip_prefix("public.") {
-            return rest.to_string();
-        }
-        if let Some(rest) = joined.strip_prefix("pg_catalog.") {
-            return rest.to_string();
+        // Nano stores every table in the implicit `public` schema, so ANY
+        // schema qualifier collapses to the bare table name (the last
+        // dot-separated component): `public.`/`pg_catalog.` (most ORM-emitted
+        // DDL prefixes `"public"."tbl"` — KanttBan #13), AND any user schema.
+        // `CREATE SCHEMA` / `SET search_path` do not create a real separate
+        // namespace, so a table created unqualified (or under a non-default
+        // search_path that Nano resolves to `public`) must resolve identically
+        // whether later referenced bare OR schema-qualified — otherwise
+        // `CREATE TABLE t; DROP TABLE myschema.t` fails with "table does not
+        // exist" (reported as a search_path scoping error). A single quoted
+        // identifier that itself contains a dot (e.g. `"my.table"`) parses as
+        // ONE part and is correctly left intact. The one exception is
+        // `information_schema.*`, whose system views are registered/resolved
+        // under their qualified name — those keep the prefix.
+        if name.0.len() >= 2 && Self::normalize_ident(&name.0[0]) != "information_schema" {
+            return Self::normalize_ident(&name.0[name.0.len() - 1]);
         }
         joined
     }
@@ -421,6 +426,14 @@ impl<'a> Planner<'a> {
         if let Some(dealiased) = Self::dealias_schema(&joined) {
             return dealiased;
         }
+        // NB: only `public.`/`pg_catalog.` collapse here — NOT every schema
+        // qualifier. Unlike `normalize_object_name` (table/object names), this
+        // string pre-parse path is ALSO used for `OWNED BY table.col`
+        // references, where the dotted `table.col` structure is meaningful and
+        // the caller splits it back into (table, col). Collapsing to the last
+        // component would corrupt that (regression: alter_sequence
+        // owned_by_table_col_and_none). The reported DROP/CREATE schema-scoping
+        // bug only flows through `normalize_object_name`, which is fixed there.
         if let Some(rest) = joined.strip_prefix("public.") {
             return rest.to_string();
         }
@@ -5327,6 +5340,40 @@ fn regtype_label_to_oid(label: &str) -> i32 {
 mod tests {
     use super::*;
     use crate::sql::Parser;
+
+    #[test]
+    fn schema_qualified_names_collapse_to_bare_table() {
+        use sqlparser::ast::{Ident, ObjectName};
+        let on = |parts: &[&str]| ObjectName(parts.iter().map(|p| Ident::new(*p)).collect());
+        // Nano is public-only: ANY schema qualifier -> the bare table name, so a
+        // table created bare resolves whether later referenced bare or
+        // schema-qualified. (Regression: `CREATE TABLE t; DROP TABLE sch.t`
+        // previously failed with "table does not exist".)
+        assert_eq!(Planner::normalize_object_name(&on(&["public", "t"])), "t");
+        assert_eq!(Planner::normalize_object_name(&on(&["pg_catalog", "pg_type"])), "pg_type");
+        assert_eq!(Planner::normalize_object_name(&on(&["smoke", "____smoketest"])), "____smoketest");
+        assert_eq!(Planner::normalize_object_name(&on(&["myschema", "qualtest"])), "qualtest");
+        // bare name unchanged
+        assert_eq!(Planner::normalize_object_name(&on(&["____smoketest"])), "____smoketest");
+        // a single (quoted) identifier that contains a dot is ONE part -> intact
+        assert_eq!(Planner::normalize_object_name(&on(&["my.table"])), "my.table");
+        // information_schema.* system views KEEP their qualifier (registered/
+        // resolved under the qualified name — must not collapse to bare).
+        assert_eq!(
+            Planner::normalize_object_name(&on(&["information_schema", "tables"])),
+            "information_schema.tables"
+        );
+        // The string pre-parse path (ALTER SEQUENCE / OWNED BY) collapses ONLY
+        // public./pg_catalog. — it must PRESERVE `table.col` (and other custom
+        // dotted names) so OWNED BY can split them back into (table, col).
+        assert_eq!(Planner::normalize_dotted_name("public.t"), "t");
+        assert_eq!(Planner::normalize_dotted_name("mytable.mycol"), "mytable.mycol");
+        assert_eq!(Planner::normalize_dotted_name("\"my.table\""), "my.table");
+        assert_eq!(
+            Planner::normalize_dotted_name("information_schema.columns"),
+            "information_schema.columns"
+        );
+    }
 
     #[test]
     fn test_select_to_plan() {
