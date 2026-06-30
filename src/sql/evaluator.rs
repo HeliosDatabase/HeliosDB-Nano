@@ -649,6 +649,10 @@ impl Evaluator {
             // JSONB type check
             "jsonb_typeof" => self.jsonb_typeof(&arg_values),
 
+            // JSON validity predicate — the lowering target for `<expr> IS
+            // [NOT] JSON` (BUG H), also directly callable.
+            "json_valid" | "jsonb_valid" => self.func_json_valid(&arg_values),
+
             // JSONB path query (basic support)
             "jsonb_path_query" => self.jsonb_path_query(&arg_values),
             "jsonb_path_query_array" => self.jsonb_path_query_array(&arg_values),
@@ -6218,6 +6222,29 @@ impl Evaluator {
     // ========== String Functions ==========
 
     /// UPPER(string) - convert to uppercase
+    /// `json_valid(text) -> bool` — true iff the argument parses as well-formed
+    /// JSON. NULL-propagating (NULL in -> NULL out): this is the lowering target
+    /// for the SQL:2016 / Oracle `<expr> IS [NOT] JSON` predicate (BUG H), and a
+    /// CHECK constraint treats a NULL result as satisfied, so a NULL value is
+    /// neither accepted nor rejected on its own — matching `IS JSON` semantics
+    /// and never spuriously failing a NULL row during a migrate.
+    fn func_json_valid(&self, args: &[Value]) -> Result<Value> {
+        let [arg] = args else {
+            return Err(Error::query_execution(
+                "json_valid requires exactly one argument",
+            ));
+        };
+        let valid = match arg {
+            Value::Null => return Ok(Value::Null),
+            Value::Json(s) | Value::String(s) => {
+                serde_json::from_str::<serde_json::Value>(s).is_ok()
+            }
+            // Any other concrete (non-text) value is not JSON text.
+            _ => false,
+        };
+        Ok(Value::Boolean(valid))
+    }
+
     fn func_upper(&self, args: &[Value]) -> Result<Value> {
         let [arg] = args else {
             return Err(Error::query_execution("UPPER requires exactly one argument"));

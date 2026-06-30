@@ -5,6 +5,44 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.60.8] - 2026-06-30
+
+Patch release: three embedded-engine correctness fixes surfaced by Any2HeliosDB
+(a2h) dogfooding Nano as a manifest store and running an Oracle→HeliosDB migrate.
+
+### Fixed
+
+- **UPDATE / DELETE / SELECT on a COMPOSITE PRIMARY KEY no longer silently match
+  0 rows when the WHERE constrains only a leading prefix of the key** (BUG F). A
+  table with `PRIMARY KEY(a, b)` marks *both* columns `primary_key = true`; the
+  single-value PK-index fast paths *and* the executor's `get_row_by_pk` point-
+  lookup optimization (`try_extract_pk_value`) treated the first PK column as the
+  complete key and probed the grouped composite index with a one-value key, which
+  can never match. `DELETE FROM t WHERE a = ?` and `UPDATE t SET … WHERE a = ?`
+  reported 0 rows while the rows remained, and a cold fast `SELECT … WHERE a = ?`
+  could return `[]`. Five spec/optimization sites now decline a composite PK and
+  fall through to the planner's scan + filter, which evaluates the predicate per
+  row and matches every prefix row. Single-column-PK fast paths (the hot OLTP
+  shape and point-lookup benchmarks) are unaffected. a2h's `reset_run`
+  (`DELETE FROM chunks WHERE run_id = ?`) now works.
+- **`execute_many` (and multi-row `VALUES` INSERT / COPY) no longer falsely
+  rejects composite-DISTINCT keys as a UNIQUE violation** (BUG G). The intra-
+  batch duplicate check derived its key specs from per-column `primary_key` /
+  `unique` flags, fragmenting a composite `PRIMARY KEY(a, b)` into two single-
+  column specs and rejecting e.g. `(r1,c0),(r1,c1),(r2,c0)` because rows share a
+  column value. It now sources the specs from the grouped PK/UNIQUE ART indexes
+  (the same authoritative source the single-row check uses), so distinct
+  composite keys all insert and a genuine duplicate composite key is still
+  rejected without leaving partial rows.
+- **`<col> IS [NOT] JSON` (SQL:2016 / Oracle predicate) now parses** (BUG H).
+  sqlparser 0.53 has no `IS JSON` support, so an Oracle→HeliosDB migrate emitting
+  `CHECK (mfa IS JSON)` failed at parse time. A quote-aware pre-parser rewrite
+  lowers `<col> IS JSON` → `json_valid(col)` and `<col> IS NOT JSON` →
+  `(NOT json_valid(col))`. The new NULL-propagating `json_valid()` function
+  returns NULL for a NULL input, so inside a CHECK (enforced per-row) a NULL value
+  is treated as satisfied — exactly as real `IS JSON` behaves — and a migrate
+  never spuriously rejects a NULL row.
+
 ## [3.60.7] - 2026-06-28
 
 Patch release: two concurrency/availability fixes found by the Any2HeliosDB

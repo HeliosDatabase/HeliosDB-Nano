@@ -239,6 +239,12 @@ impl Parser {
         // Preprocess DECIMAL to NUMERIC for sqlparser compatibility
         processed_sql = Self::preprocess_decimal_to_numeric(&processed_sql);
 
+        // Preprocess `<col> IS [NOT] JSON` (SQL:2016 / Oracle predicate) into a
+        // `json_valid(col)` call. sqlparser 0.53 has no IS JSON support, so an
+        // Oracle->HeliosDB migrate emitting `CHECK (mfa IS JSON)` otherwise
+        // fails to parse before the planner is ever reached.
+        processed_sql = Self::preprocess_is_json(&processed_sql);
+
         // Preprocess to remove SECURITY DEFINER/INVOKER (not supported by sqlparser)
         processed_sql = Self::preprocess_remove_security_clause(&processed_sql);
 
@@ -1697,6 +1703,97 @@ impl Parser {
         }
 
         format!("{trimmed} WITH (metric = '{metric}')")
+    }
+
+    /// Rewrite the SQL:2016 / Oracle `<column> IS [NOT] JSON [STRICT|LAX]
+    /// [WITH|WITHOUT [UNIQUE] KEYS]` predicate into a `json_valid(<column>)`
+    /// call that sqlparser 0.53 accepts.
+    ///
+    /// sqlparser only understands `IS [NOT] NULL`, `IS TRUE|FALSE|UNKNOWN` and
+    /// `IS [NOT] DISTINCT FROM` after `IS`; the bare `JSON` keyword otherwise
+    /// errors during parsing — before the planner is ever reached — and blocks
+    /// an Oracle→HeliosDB migrate that emits e.g. `CHECK (mfa IS JSON)`.
+    ///
+    /// The lowering is operand-faithful and NULL-safe:
+    ///   `<col> IS JSON`      → `json_valid(<col>)`
+    ///   `<col> IS NOT JSON`  → `(NOT json_valid(<col>))`
+    /// `json_valid` returns NULL for a NULL input, so inside a CHECK (enforced
+    /// per-row) a NULL value is treated as satisfied — exactly as real `IS JSON`
+    /// behaves — and a migrate never spuriously rejects a NULL row. Because the
+    /// result is a function call it is also precedence-safe inside compound
+    /// `AND`/`OR` predicates (unlike rewriting to `IS NOT NULL OR TRUE`).
+    ///
+    /// Conservative by design: only a simple (optionally schema-qualified)
+    /// column-reference operand is matched, and never inside a single-quoted
+    /// string literal or a double-quoted identifier. A non-trivial operand
+    /// (function call, concatenation, parenthesised sub-expression) is left
+    /// untouched and will still fail to parse — acceptable, as migrated `IS
+    /// JSON` predicates are applied to bare columns. The optional Oracle
+    /// modifier tail (STRICT/LAX, WITH/WITHOUT [UNIQUE] KEYS) is consumed.
+    pub fn preprocess_is_json(sql: &str) -> String {
+        // Fast path: nothing to do without the JSON keyword.
+        if !sql.to_ascii_uppercase().contains("JSON") {
+            return sql.to_string();
+        }
+        use regex::Regex;
+        use std::sync::OnceLock;
+        // Operand = simple (optionally `schema.col`) identifier, then
+        // `IS [NOT] JSON`, then the optional Oracle modifier tail.
+        static RE: OnceLock<Regex> = OnceLock::new();
+        let re = RE.get_or_init(|| {
+            Regex::new(
+                r"(?i)\b([A-Za-z_][A-Za-z0-9_$]*(?:\.[A-Za-z_][A-Za-z0-9_$]*)?)\s+IS\s+(NOT\s+)?JSON\b(?:\s+(?:STRICT|LAX))?(?:\s+(?:WITH|WITHOUT)(?:\s+UNIQUE)?(?:\s+KEYS)?)?",
+            )
+            .expect("static IS JSON regex is valid")
+        });
+
+        let rewrite_unquoted = |span: &str, out: &mut String| {
+            let replaced = re.replace_all(span, |caps: &regex::Captures<'_>| {
+                let operand = &caps[1];
+                if caps.get(2).is_some() {
+                    format!("(NOT json_valid({operand}))")
+                } else {
+                    format!("json_valid({operand})")
+                }
+            });
+            out.push_str(&replaced);
+        };
+
+        // Quote-aware: copy single-quoted string literals and double-quoted
+        // identifiers verbatim; only rewrite the unquoted spans between them, so
+        // a literal like `'this is json text'` is never corrupted. Quote bytes
+        // are ASCII, so byte indices land on char boundaries.
+        let bytes = sql.as_bytes();
+        let mut out = String::with_capacity(sql.len() + 16);
+        let mut seg_start = 0usize;
+        let mut i = 0usize;
+        while i < bytes.len() {
+            let c = bytes[i];
+            if c == b'\'' || c == b'"' {
+                rewrite_unquoted(&sql[seg_start..i], &mut out);
+                let quote = c;
+                let qstart = i;
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == quote {
+                        i += 1;
+                        // A doubled quote ('' or "") is an escape: stay in the literal.
+                        if i < bytes.len() && bytes[i] == quote {
+                            i += 1;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+                out.push_str(&sql[qstart..i]);
+                seg_start = i;
+                continue;
+            }
+            i += 1;
+        }
+        rewrite_unquoted(&sql[seg_start..], &mut out);
+        out
     }
 
     /// Convert DECIMAL type to NUMERIC for sqlparser compatibility
