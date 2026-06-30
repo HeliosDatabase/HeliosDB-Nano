@@ -4942,8 +4942,27 @@ impl EmbeddedDatabase {
     /// ```
     #[allow(clippy::expect_used)] // Safety: cache sizes are non-zero compile-time constants
     pub fn new(path: impl AsRef<std::path::Path>) -> Result<Self> {
+        Self::open_db(path, false)
+    }
+
+    /// Open an EXISTING database READ-ONLY, in-process (RocksDB
+    /// open-for-read-only). A second process can read while another process
+    /// holds the same directory open for writing — e.g. a status/monitor
+    /// reader alongside a writer (RocksDB read-only opens take no DB lock). No
+    /// WAL, no background GC/consolidation workers. Writes through this handle
+    /// error. The handle sees on-disk state as of open; reopen to observe a
+    /// writer's later commits.
+    pub fn open_read_only(path: impl AsRef<std::path::Path>) -> Result<Self> {
+        Self::open_db(path, true)
+    }
+
+    fn open_db(path: impl AsRef<std::path::Path>, read_only: bool) -> Result<Self> {
         let config = Config::default();
-        let storage = std::sync::Arc::new(storage::StorageEngine::open(path.as_ref(), &config)?);
+        let storage = std::sync::Arc::new(if read_only {
+            storage::StorageEngine::open_read_only(path.as_ref(), &config)?
+        } else {
+            storage::StorageEngine::open(path.as_ref(), &config)?
+        });
         let mv_scheduler = std::sync::Arc::new(storage::MVScheduler::new(
             storage::SchedulerConfig::default(),
             std::sync::Arc::clone(&storage),

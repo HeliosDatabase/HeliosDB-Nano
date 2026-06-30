@@ -145,6 +145,18 @@ impl PyDatabase {
         })
     }
 
+    /// Open an EXISTING database READ-ONLY. A separate process can read while
+    /// another process holds the same directory open for writing (RocksDB
+    /// read-only opens take no lock) — e.g. a status/monitor reader alongside a
+    /// writer. Writes through this handle raise. The handle sees the on-disk
+    /// state as of open; reopen to observe a writer's later commits.
+    #[staticmethod]
+    fn open_read_only(path: String) -> PyResult<Self> {
+        Ok(Self {
+            inner: EmbeddedDatabase::open_read_only(path).map_err(rt_err)?,
+        })
+    }
+
     /// Run a query and return rows as `list[dict]`. Optional positional `params`
     /// bind to `$1..$n`.
     #[pyo3(signature = (sql, params = None))]
