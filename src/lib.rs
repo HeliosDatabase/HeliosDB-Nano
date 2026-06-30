@@ -7338,6 +7338,14 @@ impl EmbeddedDatabase {
         {
             return None;
         }
+        // BUG F: a composite PRIMARY KEY marks every member column
+        // `primary_key = true`. The parameterized ($1) UPDATE/DELETE fast paths
+        // resolve the target row via a single-value PK index probe, which can
+        // never match the grouped composite key. Only a sole PK column qualifies;
+        // otherwise fall through to the planner, which scans + filters.
+        if !schema.has_single_column_pk() {
+            return None;
+        }
         Some((value_expr.clone(), column.data_type.clone()))
     }
 
@@ -8198,36 +8206,42 @@ impl EmbeddedDatabase {
             }
         }
 
-        let mut unique_specs: Vec<Vec<usize>> = schema
-            .columns
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, col)| {
-                if col.primary_key || col.unique {
-                    Some(vec![idx])
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        if let Ok(tc) = self.storage.catalog().load_table_constraints(table_name) {
-            for unique in tc.unique_constraints {
-                let mut indexes = Vec::with_capacity(unique.columns.len());
-                for col_name in &unique.columns {
-                    match schema.get_column_index(col_name) {
-                        Some(idx) => indexes.push(idx),
-                        None => {
-                            return Err(Error::constraint_violation(format!(
-                                "UNIQUE constraint '{}' references unknown column '{}'",
-                                unique.name, col_name
-                            )))
-                        }
+        // BUG G: derive the intra-batch uniqueness specs from the actual
+        // PK/UNIQUE ART indexes, which group composite-key columns together —
+        // the same authoritative source the correct single-row
+        // `check_unique_constraints_tuple` path trusts. Re-deriving them from
+        // per-column `primary_key`/`unique` schema flags fragments a composite
+        // `PRIMARY KEY(a, b)` into two bogus single-column specs `[a]` and `[b]`
+        // (every member column carries `primary_key = true`), which then keys
+        // the intra-batch dedup on each column individually and falsely rejects
+        // two *distinct* composite keys that merely share one column value.
+        // This shared validator is also reached by multi-row `VALUES` INSERT and
+        // COPY, so the fix covers those batch paths too (sweep finding #2).
+        let mut unique_specs: Vec<Vec<usize>> = Vec::new();
+        for (_name, index_type, columns) in self.storage.art_indexes().list_table_indexes(table_name)
+        {
+            if !matches!(
+                index_type,
+                crate::storage::art_index::ArtIndexType::PrimaryKey
+                    | crate::storage::art_index::ArtIndexType::Unique
+            ) {
+                continue;
+            }
+            let mut indexes = Vec::with_capacity(columns.len());
+            let mut resolved = true;
+            for col_name in &columns {
+                match schema.get_column_index(col_name) {
+                    Some(idx) => indexes.push(idx),
+                    None => {
+                        // Index columns are engine-maintained and always present
+                        // in the schema; skip defensively rather than erroring.
+                        resolved = false;
+                        break;
                     }
                 }
-                if !indexes.is_empty() {
-                    unique_specs.push(indexes);
-                }
+            }
+            if resolved && !indexes.is_empty() {
+                unique_specs.push(indexes);
             }
         }
         unique_specs.sort();
@@ -8483,6 +8497,12 @@ impl EmbeddedDatabase {
         if !pk_column.primary_key {
             return None;
         }
+        // BUG F: composite PRIMARY KEY — a single prefix-column equality is not
+        // resolvable by the single-value PK index probe; only a sole primary-key
+        // column is fast-path eligible. Bail to the planner otherwise.
+        if !schema.has_single_column_pk() {
+            return None;
+        }
         let pk_data_type = pk_column.data_type.clone();
 
         let set_col_idx = schema.get_column_index(set_col)?;
@@ -8560,6 +8580,12 @@ impl EmbeddedDatabase {
         let pk_col_idx = schema.get_column_index(pk_col)?;
         let pk_column = schema.get_column_at(pk_col_idx)?;
         if !pk_column.primary_key {
+            return None;
+        }
+        // BUG F: composite PRIMARY KEY — a single prefix-column equality is not
+        // resolvable by the single-value PK index probe; only a sole primary-key
+        // column is fast-path eligible. Bail to the planner otherwise.
+        if !schema.has_single_column_pk() {
             return None;
         }
         let pk_data_type = pk_column.data_type.clone();
@@ -9073,6 +9099,14 @@ impl EmbeddedDatabase {
         let pk_col_idx = schema.get_column_index(pk_col)?;
         let pk_column = schema.get_column_at(pk_col_idx)?;
         if !pk_column.primary_key {
+            return None;
+        }
+        // BUG F (read path / sweep finding #1): a composite PRIMARY KEY marks
+        // every member column `primary_key = true`. A fast point SELECT on a
+        // prefix column would build a single-value key that can never match the
+        // grouped composite index entry, silently returning zero rows. Only a
+        // sole PK column is fast-path eligible; otherwise the planner scans.
+        if !schema.has_single_column_pk() {
             return None;
         }
         let pk_data_type = pk_column.data_type.clone();
@@ -16823,6 +16857,17 @@ impl EmbeddedDatabase {
     /// Returns None if the predicate is not a simple PK equality or no PK column exists.
     fn try_extract_pk_value(selection: Option<&sql::LogicalExpr>, schema: &Schema) -> Option<Value> {
         let predicate = selection?;
+        // BUG F: this single-value `get_row_by_pk` optimization (used by the
+        // UPDATE and DELETE executor arms) is only valid for a SOLE primary-key
+        // column. A composite PRIMARY KEY marks every member `primary_key =
+        // true`; matching a prefix predicate against the first one and probing
+        // the grouped composite index with a single value never matches,
+        // silently affecting 0 rows. Decline for composite PKs so the caller
+        // falls back to a full scan + filter (which evaluates the predicate
+        // per row and correctly matches every prefix row).
+        if !schema.has_single_column_pk() {
+            return None;
+        }
         let pk_col = schema.columns.iter().find(|c| c.primary_key)?;
 
         if let sql::LogicalExpr::BinaryExpr {

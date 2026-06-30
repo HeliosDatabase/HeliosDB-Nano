@@ -663,6 +663,20 @@ impl Schema {
         self.columns.is_empty()
     }
 
+    /// True iff the table has exactly one PRIMARY KEY column.
+    ///
+    /// A composite PRIMARY KEY marks *every* member column `primary_key = true`,
+    /// so a bare `col.primary_key` check cannot tell a sole-PK column from one
+    /// member of a composite key. The single-value PK-index fast paths (point
+    /// SELECT / UPDATE / DELETE) build a one-value key and probe the PK index;
+    /// for a composite PK that key can never match the grouped composite index
+    /// entry, so those fast paths must decline (return `None`) and let the
+    /// planner scan + filter instead (BUG F). Mirrors the single-column-PK
+    /// guard already used by `fast_count_pk_spec` and the executor's count path.
+    pub fn has_single_column_pk(&self) -> bool {
+        self.columns.iter().filter(|c| c.primary_key).count() == 1
+    }
+
     /// Merge two schemas (for JOIN operations)
     ///
     /// Combines columns from left and right schemas, handling name conflicts
