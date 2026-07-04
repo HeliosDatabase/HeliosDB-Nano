@@ -185,7 +185,7 @@ pub use lockfree::{
 
 // Per-column storage optimization exports
 pub use catalog::PersistedIndexDefinition;
-pub use catalog::{PersistedSeqState, PersistedSequence};
+pub use catalog::{PersistedSeqState, PersistedSequence, DEFAULT_SEQUENCE_CACHE};
 pub use columnar::{BatchPresence, ColumnBatch, ColumnarStats, ColumnarStore, BATCH_SIZE};
 pub use compression::{
     ColumnCompressionMetadata, CompressionCodec, CompressionConfig, CompressionManager, CompressionStats,

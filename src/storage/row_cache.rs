@@ -151,18 +151,41 @@ impl Default for RowCacheConfig {
     }
 }
 
-/// High-performance row cache with LRU eviction and TTL
-pub struct RowCache {
-    /// LRU cache storage
+/// Number of independent LRU shards (R-D3). Power of two so the shard index is
+/// a mask. Sharding removes the single global cache lock that every committer
+/// took per written row at commit time (the row-cache invalidation fence),
+/// which convoyed concurrent writers to different rows.
+const ROW_CACHE_SHARDS: usize = 16;
+
+/// One independently-locked LRU partition of the row cache.
+struct CacheShard {
     cache: RwLock<LruCache<RowCacheKey, CachedRow>>,
+}
+
+/// High-performance row cache with LRU eviction and TTL.
+///
+/// R-D3: storage is sharded across [`ROW_CACHE_SHARDS`] independently-locked
+/// LRU partitions keyed by a hash of `(table, row_id)`, and the write-path
+/// counters (inserts/evictions/invalidations/peak) are lock-free atomics — so
+/// neither a point-read nor a commit-time invalidation of a written row takes a
+/// process-global lock. Read-path counters were already atomics (P0#4).
+pub struct RowCache {
+    /// LRU storage, partitioned by key hash.
+    shards: Box<[CacheShard]>,
+    /// `shards.len() - 1`, used to mask a key hash to a shard index.
+    shard_mask: usize,
     /// Tables with active invalidation (recently written)
     hot_tables: RwLock<HashSet<String>>,
     /// Last time hot_tables was reset (auto-resets every 60s)
     hot_tables_last_reset: RwLock<Instant>,
     /// Configuration
     config: RowCacheConfig,
-    /// Statistics (cold counters: inserts/evictions/invalidations/peak)
-    stats: RwLock<RowCacheStats>,
+    /// Write-path counters — atomics (R-D3) so `put`/`invalidate` take no global
+    /// stats lock. Merged into `stats()` on demand alongside the read counters.
+    stat_inserts: AtomicU64,
+    stat_evictions: AtomicU64,
+    stat_invalidations: AtomicU64,
+    stat_peak_entries: AtomicU64,
     /// Hot per-lookup counters — atomics so the read path needs no stats lock
     /// (P0#4). Merged into `stats()` on demand.
     hot_lookups: AtomicU64,
@@ -179,19 +202,72 @@ impl RowCache {
 
     /// Create a row cache with custom configuration
     pub fn with_config(config: RowCacheConfig) -> Self {
-        // SAFETY: 1 is always non-zero
-        let cache_size = NonZeroUsize::new(config.max_entries.max(1)).unwrap_or(NonZeroUsize::MIN);
+        // Shard only when the capacity is large enough that each shard still
+        // holds a meaningful slice; a tiny cache stays a single exact LRU (so
+        // small configured capacities keep precise total-capacity eviction).
+        // Both branches are powers of two, so the shard index is a mask.
+        let num_shards = if config.max_entries >= ROW_CACHE_SHARDS {
+            ROW_CACHE_SHARDS
+        } else {
+            1
+        };
+        let per_shard = (config.max_entries / num_shards).max(1);
+        let per_shard = NonZeroUsize::new(per_shard).unwrap_or(NonZeroUsize::MIN);
+        let shards = (0..num_shards)
+            .map(|_| CacheShard {
+                cache: RwLock::new(LruCache::new(per_shard)),
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
 
         Self {
-            cache: RwLock::new(LruCache::new(cache_size)),
+            shards,
+            shard_mask: num_shards - 1,
             hot_tables: RwLock::new(HashSet::new()),
             hot_tables_last_reset: RwLock::new(Instant::now()),
             config,
-            stats: RwLock::new(RowCacheStats::default()),
+            stat_inserts: AtomicU64::new(0),
+            stat_evictions: AtomicU64::new(0),
+            stat_invalidations: AtomicU64::new(0),
+            stat_peak_entries: AtomicU64::new(0),
             hot_lookups: AtomicU64::new(0),
             hot_hits: AtomicU64::new(0),
             hot_misses: AtomicU64::new(0),
             hot_expirations: AtomicU64::new(0),
+        }
+    }
+
+    /// Route a key to its shard by an FNV-1a hash of `(table, row_id)`.
+    fn shard_for(&self, key: &RowCacheKey) -> &RwLock<LruCache<RowCacheKey, CachedRow>> {
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        for b in key.table.as_bytes() {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h ^= key.row_id;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        &self.shards[(h as usize) & self.shard_mask].cache
+    }
+
+    /// Current live entry count across all shards.
+    fn total_len(&self) -> u64 {
+        self.shards.iter().map(|s| s.cache.read().len() as u64).sum()
+    }
+
+    /// Bump the peak-entries high-water atomically.
+    fn record_peak(&self) {
+        let cur = self.total_len();
+        let mut peak = self.stat_peak_entries.load(Ordering::Relaxed);
+        while cur > peak {
+            match self.stat_peak_entries.compare_exchange_weak(
+                peak,
+                cur,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => peak = observed,
+            }
         }
     }
 
@@ -236,8 +312,9 @@ impl RowCache {
         // required). Read once.
         static LEGACY: once_cell::sync::Lazy<bool> =
             once_cell::sync::Lazy::new(|| std::env::var("HELIOS_ROWCACHE_LEGACY").is_ok());
+        let shard = self.shard_for(&key);
         if *LEGACY {
-            let mut cache = self.cache.write();
+            let mut cache = shard.write();
             if let Some(entry) = cache.get_mut(&key) {
                 if entry.is_expired() {
                     cache.pop(&key);
@@ -253,7 +330,7 @@ impl RowCache {
         }
 
         {
-            let cache = self.cache.read();
+            let cache = shard.read();
             match cache.peek(&key) {
                 Some(entry) if !entry.is_expired() => {
                     let tuple = entry.tuple.clone();
@@ -271,7 +348,7 @@ impl RowCache {
         // (so `expirations` is counted once — not once per read — and the slot is
         // reclaimed rather than occupying capacity until the next put). The hot,
         // non-expired path above stays fully shared + lock-free.
-        let mut cache = self.cache.write();
+        let mut cache = shard.write();
         if let Some(entry) = cache.peek(&key) {
             if entry.is_expired() {
                 cache.pop(&key);
@@ -304,22 +381,20 @@ impl RowCache {
         // Determine TTL based on table hotness
         let ttl = self.get_ttl_for_table(table);
 
-        let mut cache = self.cache.write();
+        let per_shard_cap = (self.config.max_entries / ROW_CACHE_SHARDS).max(1);
+        let shard = self.shard_for(&key);
+        let was_full = {
+            let mut cache = shard.write();
+            let full = cache.len() >= per_shard_cap;
+            cache.put(key, CachedRow::from_arc(tuple, ttl));
+            full
+        };
 
-        // Check if we're at capacity (LRU will handle eviction)
-        let was_full = cache.len() >= self.config.max_entries;
-
-        cache.put(key, CachedRow::from_arc(tuple, ttl));
-
-        let mut stats = self.stats.write();
-        stats.inserts += 1;
-        stats.current_entries = cache.len() as u64;
-        if stats.current_entries > stats.peak_entries {
-            stats.peak_entries = stats.current_entries;
-        }
+        self.stat_inserts.fetch_add(1, Ordering::Relaxed);
         if was_full {
-            stats.evictions += 1;
+            self.stat_evictions.fetch_add(1, Ordering::Relaxed);
         }
+        self.record_peak();
     }
 
     /// Invalidate a specific row
@@ -330,14 +405,10 @@ impl RowCache {
 
         let key = RowCacheKey::new(table, row_id);
 
-        let mut cache = self.cache.write();
-        let removed = cache.pop(&key).is_some();
+        let removed = self.shard_for(&key).write().pop(&key).is_some();
         if removed {
-            let mut stats = self.stats.write();
-            stats.invalidations += 1;
-            stats.current_entries = cache.len() as u64;
+            self.stat_invalidations.fetch_add(1, Ordering::Relaxed);
         }
-        drop(cache);
 
         // Mark the table hot only when this invalidation actually removed a
         // cached row. UPDATE/DELETE fast paths often invalidate rows that were
@@ -354,61 +425,60 @@ impl RowCache {
             return;
         }
 
-        let mut cache = self.cache.write();
-        let mut stats = self.stats.write();
-
-        // Collect keys to remove (can't modify while iterating)
-        let keys_to_remove: Vec<RowCacheKey> = cache
-            .iter()
-            .filter(|(k, _)| k.table == table)
-            .map(|(k, _)| k.clone())
-            .collect();
-
-        let removed_count = keys_to_remove.len();
-        for key in keys_to_remove {
-            cache.pop(&key);
+        // A table's rows may live in any shard — sweep them all.
+        let mut removed_count = 0u64;
+        for shard in self.shards.iter() {
+            let mut cache = shard.cache.write();
+            let keys_to_remove: Vec<RowCacheKey> = cache
+                .iter()
+                .filter(|(k, _)| k.table == table)
+                .map(|(k, _)| k.clone())
+                .collect();
+            removed_count += keys_to_remove.len() as u64;
+            for key in keys_to_remove {
+                cache.pop(&key);
+            }
         }
 
-        stats.invalidations += removed_count as u64;
-        stats.current_entries = cache.len() as u64;
-
-        // Mark table as hot
-        drop(cache);
-        drop(stats);
+        self.stat_invalidations.fetch_add(removed_count, Ordering::Relaxed);
         self.mark_table_hot(table);
     }
 
     /// Clear all cached entries
     pub fn clear(&self) {
-        let mut cache = self.cache.write();
-        let count = cache.len();
-        cache.clear();
-
-        let mut stats = self.stats.write();
-        stats.invalidations += count as u64;
-        stats.current_entries = 0;
+        let mut count = 0u64;
+        for shard in self.shards.iter() {
+            let mut cache = shard.cache.write();
+            count += cache.len() as u64;
+            cache.clear();
+        }
+        self.stat_invalidations.fetch_add(count, Ordering::Relaxed);
     }
 
     /// Get cache statistics
     pub fn stats(&self) -> RowCacheStats {
-        let mut s = self.stats.read().clone();
-        // Merge the lock-free hot counters (P0#4).
-        s.lookups += self.hot_lookups.load(Ordering::Relaxed);
-        s.hits += self.hot_hits.load(Ordering::Relaxed);
-        s.misses += self.hot_misses.load(Ordering::Relaxed);
-        s.expirations += self.hot_expirations.load(Ordering::Relaxed);
-        s
+        RowCacheStats {
+            // Read-path counters (P0#4).
+            lookups: self.hot_lookups.load(Ordering::Relaxed),
+            hits: self.hot_hits.load(Ordering::Relaxed),
+            misses: self.hot_misses.load(Ordering::Relaxed),
+            expirations: self.hot_expirations.load(Ordering::Relaxed),
+            // Write-path counters (R-D3).
+            evictions: self.stat_evictions.load(Ordering::Relaxed),
+            inserts: self.stat_inserts.load(Ordering::Relaxed),
+            invalidations: self.stat_invalidations.load(Ordering::Relaxed),
+            current_entries: self.total_len(),
+            peak_entries: self.stat_peak_entries.load(Ordering::Relaxed),
+        }
     }
 
     /// Reset statistics
     pub fn reset_stats(&self) {
-        let current_entries = self.cache.read().len() as u64;
-        let mut stats = self.stats.write();
-        *stats = RowCacheStats {
-            current_entries,
-            peak_entries: current_entries,
-            ..Default::default()
-        };
+        let current_entries = self.total_len();
+        self.stat_inserts.store(0, Ordering::Relaxed);
+        self.stat_evictions.store(0, Ordering::Relaxed);
+        self.stat_invalidations.store(0, Ordering::Relaxed);
+        self.stat_peak_entries.store(current_entries, Ordering::Relaxed);
         self.hot_lookups.store(0, Ordering::Relaxed);
         self.hot_hits.store(0, Ordering::Relaxed);
         self.hot_misses.store(0, Ordering::Relaxed);
@@ -430,12 +500,12 @@ impl RowCache {
 
     /// Get current entry count
     pub fn len(&self) -> usize {
-        self.cache.read().len()
+        self.total_len() as usize
     }
 
     /// Check if cache is empty
     pub fn is_empty(&self) -> bool {
-        self.cache.read().is_empty()
+        self.shards.iter().all(|s| s.cache.read().is_empty())
     }
 
     /// Mark a table as "hot" (recently written to).

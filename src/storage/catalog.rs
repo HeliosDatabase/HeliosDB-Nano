@@ -43,6 +43,21 @@ const INDEX_DEF_FORMAT_VERSION: u8 = 1;
 ///
 /// `name` follows the index/object-name convention (NOT lowercased) so that
 /// quoted, case-sensitive sequence names round-trip.
+/// Default `CACHE` for a sequence created without an explicit `CACHE` clause
+/// (and for auto-vivified sequences). R-D1: each cached block costs exactly one
+/// durable high-water fsync, and the no-duplicate-on-crash invariant fsyncs
+/// unconditionally (even when `durable_commit=false`), so `CACHE 1` made every
+/// `nextval` a serialized fsync — a hard ceiling near one value per
+/// fsync-latency (~90/s on a ~11ms-fsync disk) that no group commit could
+/// coalesce. Reserving 32 per block cuts that to ~one fsync per 32 values
+/// (~32×). This matches PostgreSQL's own durability granularity: PG WAL-logs
+/// sequence advances in batches of 32 (`SEQ_LOG_VALS`), so a PG sequence can
+/// already gap by up to 32 on a crash regardless of its `CACHE` parameter.
+/// Explicit `CREATE SEQUENCE … CACHE n` / `ALTER SEQUENCE … CACHE n` are
+/// unaffected. SERIAL columns do not use this path (they fill from the
+/// lock-free row counter).
+pub const DEFAULT_SEQUENCE_CACHE: i64 = 32;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PersistedSequence {
     pub name: String,
@@ -86,7 +101,7 @@ impl PersistedSequence {
             increment_by: 1,
             min_value: 1,
             max_value: tmax,
-            cache: 1,
+            cache: DEFAULT_SEQUENCE_CACHE,
             cycle: false,
             owned_by_table: None,
             owned_by_column: None,
