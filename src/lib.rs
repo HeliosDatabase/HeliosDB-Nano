@@ -6338,6 +6338,145 @@ impl EmbeddedDatabase {
         Some(Ok(inserted))
     }
 
+    /// R-B1: bulk-apply a decoded `COPY … FROM STDIN` batch through the fast
+    /// insert-batch machinery, bypassing the old per-chunk
+    /// render-to-SQL → sqlparser → generic-plan-arm path (which cost a ~25KB
+    /// INSERT string, a full parse, an AST deep-clone into the parse cache, and
+    /// the generic per-row Insert arm — the ~23µs/row COPY was dominated by it).
+    ///
+    /// The whole COPY is validated and applied as ONE atomic unit (single
+    /// WriteBatch when the schema allows a direct write, else one autocommit
+    /// transaction), matching PostgreSQL's all-or-nothing COPY semantics: a
+    /// constraint failure on any row rejects the entire COPY and a crash
+    /// mid-COPY exposes zero rows. This is a deliberate behavior change from the
+    /// old per-500-row-chunk commit (which left earlier chunks visible on a
+    /// later failure).
+    ///
+    /// Returns `None` to signal the caller to fall back to the generic SQL path
+    /// — used for every shape this fast path does not cover, so semantics are
+    /// preserved exactly: an open transaction (handled separately), triggers,
+    /// RLS/tenant context, an active branch, FK/CHECK constraints (via
+    /// `fast_literal_insert_spec`), dictionary/CAS column storage, or an HA/
+    /// logical-WAL requirement.
+    pub(crate) fn copy_bulk_insert(
+        &self,
+        table_name: &str,
+        columns: &[String],
+        rows: &[Vec<Option<String>>],
+    ) -> Option<Result<u64>> {
+        if rows.is_empty() {
+            return Some(Ok(0));
+        }
+        // Fall back for every shape the fast batch path does not preserve.
+        if self.in_transaction()
+            || self.any_session_txns()
+            || !self.savepoints.read().is_empty()
+            || self.tenant_manager.get_current_context().is_some()
+            || self.storage.get_current_branch_id().is_some()
+            || self.trigger_registry.has_triggers_for_table(table_name)
+            || self.storage.fast_dml_requires_logical_wal()
+        {
+            return None;
+        }
+
+        let explicit_columns: Option<Vec<&str>> =
+            (!columns.is_empty()).then(|| columns.iter().map(String::as_str).collect());
+        // `fast_literal_insert_spec` resolves the schema + column indices and
+        // itself bails (→ None) on FK/CHECK constraints or an unknown table/
+        // column — exactly the cases the generic path must handle.
+        let spec = match self.fast_literal_insert_spec(table_name, explicit_columns.as_deref(), None)? {
+            Ok(spec) => spec,
+            Err(e) => return Some(Err(e)),
+        };
+        // Dictionary/CAS column storage needs the per-row transform; let the
+        // generic path handle those tables.
+        if !Self::fast_insert_batch_can_use_direct_write(&spec.schema) {
+            return None;
+        }
+
+        // Decode every row up front. Any malformed row or failed cast rejects
+        // the whole COPY before a single write (atomicity).
+        let mut tuples = Vec::with_capacity(rows.len());
+        for row in rows {
+            match Self::materialize_copy_tuple(&spec, row) {
+                Ok(tuple) => tuples.push(tuple),
+                Err(e) => return Some(Err(e)),
+            }
+        }
+
+        // Suspend SMFI delta tracking for the whole load (one rebuild after,
+        // not one per row), matching the other bulk-insert entry points.
+        let _smfi_guard = self
+            .storage
+            .suspend_smfi_for_bulk_load(table_name, storage::filter_index_delta::BulkLoadReason::CopyFrom);
+
+        let prepared = match self.prepare_fast_insert_batch(table_name, tuples, &spec.schema) {
+            Ok(prepared) => prepared,
+            Err(e) => return Some(Err(e)),
+        };
+        if let Err(e) = self.validate_fast_insert_batch(table_name, &spec.schema, &prepared) {
+            return Some(Err(e));
+        }
+        let inserted = match self
+            .storage
+            .insert_prepared_tuples_fast_batch(table_name, prepared, &spec.schema)
+        {
+            Ok(inserted) => inserted,
+            Err(e) => return Some(Err(e)),
+        };
+        if let Err(e) = self.storage.durable_autocommit_barrier() {
+            return Some(Err(e));
+        }
+        self.storage.increment_lsn();
+        self.invalidate_result_cache();
+        Some(Ok(inserted))
+    }
+
+    /// Materialize one decoded COPY row (`Vec<Option<String>>`, `None` = the
+    /// NULL sentinel) into a full-width tuple. Mirrors the old
+    /// render-to-SQL-then-parse path's typing: each non-NULL field was rendered
+    /// as a quoted string literal and cast to the column type, so here each
+    /// `Some(text)` becomes `Value::String(text)` cast via `fast_cast_value` —
+    /// the same result, without the SQL round-trip.
+    fn materialize_copy_tuple(spec: &FastLiteralInsertSpec, row: &[Option<String>]) -> Result<Tuple> {
+        if row.len() != spec.col_indices.len() {
+            return Err(Error::query_execution(format!(
+                "COPY row has {} fields but {} target columns",
+                row.len(),
+                spec.col_indices.len()
+            )));
+        }
+
+        let mut tuple_values = vec![Value::Null; spec.schema.columns.len()];
+        let mut user_provided = if spec.all_columns_explicit_no_default {
+            Vec::new()
+        } else {
+            vec![false; spec.schema.columns.len()]
+        };
+
+        for (i, (&col_idx, target_type)) in spec.col_indices.iter().zip(&spec.target_types).enumerate() {
+            let value = match &row[i] {
+                None => Value::Null,
+                Some(text) => Self::fast_cast_value(Value::String(text.clone()), target_type)?,
+            };
+            if let Some(slot) = tuple_values.get_mut(col_idx) {
+                *slot = value;
+            }
+            if !spec.all_columns_explicit_no_default {
+                if let Some(flag) = user_provided.get_mut(col_idx) {
+                    *flag = true;
+                }
+            }
+        }
+
+        if spec.all_columns_explicit_no_default {
+            Self::check_not_null_for_materialized_insert(&tuple_values, &spec.schema)?;
+        } else {
+            Self::apply_defaults_and_check_not_null(&mut tuple_values, &spec.schema, &user_provided)?;
+        }
+        Ok(Tuple::new(tuple_values))
+    }
+
     fn fast_insert_batch_can_use_direct_write(schema: &Schema) -> bool {
         // R3.3: STORAGE COLUMNAR schemas take the direct WriteBatch path too
         // (grouped batch writes ride the same WriteBatch as the rows);
@@ -28046,5 +28185,115 @@ mod tests {
         let rows = db.query("SELECT name FROM t_oc10 WHERE id = 1", &[]).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values[0], Value::String("replaced".to_string()));
+    }
+
+    // ---- R-B1 COPY typed bulk path ----
+
+    fn copy_rows(specs: &[&[Option<&str>]]) -> Vec<Vec<Option<String>>> {
+        specs
+            .iter()
+            .map(|r| r.iter().map(|f| f.map(str::to_string)).collect())
+            .collect()
+    }
+
+    #[test]
+    fn copy_bulk_insert_types_and_counts() {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE cbi (id INT PRIMARY KEY, name TEXT, score FLOAT8)")
+            .unwrap();
+        let rows = copy_rows(&[
+            &[Some("1"), Some("alice"), Some("1.5")],
+            &[Some("2"), Some("bob"), None],
+            &[Some("3"), Some("o'brien"), Some("-2.25")],
+        ]);
+        let n = db.copy_bulk_insert("cbi", &[], &rows).expect("fast path taken").unwrap();
+        assert_eq!(n, 3);
+
+        let got = db.query("SELECT id, name, score FROM cbi ORDER BY id", &[]).unwrap();
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0].values[0], Value::Int4(1));
+        assert_eq!(got[0].values[2], Value::Float8(1.5));
+        assert_eq!(got[1].values[2], Value::Null);
+        assert_eq!(got[2].values[1], Value::String("o'brien".to_string())); // quote preserved, no SQL round-trip
+        assert_eq!(got[2].values[2], Value::Float8(-2.25));
+    }
+
+    #[test]
+    fn copy_bulk_insert_is_atomic_on_bad_row() {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE cbi_atom (id INT PRIMARY KEY, n INT)").unwrap();
+        // Second row has a non-integer field → whole COPY must reject, 0 rows.
+        let rows = copy_rows(&[&[Some("1"), Some("10")], &[Some("2"), Some("notanint")]]);
+        let result = db.copy_bulk_insert("cbi_atom", &[], &rows).expect("fast path taken");
+        assert!(result.is_err(), "bad cast must reject the whole COPY");
+        let got = db.query("SELECT count(*) FROM cbi_atom", &[]).unwrap();
+        assert_eq!(got[0].values[0], Value::Int8(0), "no partial rows may survive");
+    }
+
+    #[test]
+    fn copy_bulk_insert_duplicate_pk_rejects_whole_batch() {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE cbi_pk (id INT PRIMARY KEY, n INT)").unwrap();
+        db.execute("INSERT INTO cbi_pk VALUES (1, 100)").unwrap();
+        let rows = copy_rows(&[&[Some("2"), Some("20")], &[Some("1"), Some("99")]]);
+        let result = db.copy_bulk_insert("cbi_pk", &[], &rows).expect("fast path taken");
+        assert!(result.is_err(), "duplicate PK must reject the whole COPY");
+        let got = db.query("SELECT count(*) FROM cbi_pk", &[]).unwrap();
+        assert_eq!(got[0].values[0], Value::Int8(1), "only the pre-existing row remains");
+    }
+
+    #[test]
+    fn copy_bulk_insert_partial_columns_and_defaults() {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE cbi_def (id INT PRIMARY KEY, n INT DEFAULT 7, note TEXT)")
+            .unwrap();
+        // Only id + note provided; n must take its default.
+        let cols = vec!["id".to_string(), "note".to_string()];
+        let rows = copy_rows(&[&[Some("1"), Some("x")], &[Some("2"), None]]);
+        let n = db.copy_bulk_insert("cbi_def", &cols, &rows).expect("fast path taken").unwrap();
+        assert_eq!(n, 2);
+        let got = db.query("SELECT id, n, note FROM cbi_def ORDER BY id", &[]).unwrap();
+        assert_eq!(got[0].values[1], Value::Int4(7));
+        assert_eq!(got[1].values[1], Value::Int4(7));
+        assert_eq!(got[1].values[2], Value::Null);
+    }
+
+    #[test]
+    fn copy_bulk_insert_not_null_violation_rejects() {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE cbi_nn (id INT PRIMARY KEY, n INT NOT NULL)").unwrap();
+        let rows = copy_rows(&[&[Some("1"), Some("5")], &[Some("2"), None]]);
+        let result = db.copy_bulk_insert("cbi_nn", &[], &rows).expect("fast path taken");
+        assert!(result.is_err(), "NULL into NOT NULL must reject the whole COPY");
+        let got = db.query("SELECT count(*) FROM cbi_nn", &[]).unwrap();
+        assert_eq!(got[0].values[0], Value::Int8(0));
+    }
+
+    #[test]
+    fn copy_bulk_insert_falls_back_on_fk_and_check() {
+        // FK/CHECK tables must take the generic path (None) so their
+        // constraints still fire; copy_bulk_insert only claims tables it can
+        // fully validate through the fast batch.
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE cbi_parent (id INT PRIMARY KEY)").unwrap();
+        db.execute("CREATE TABLE cbi_child (id INT PRIMARY KEY, pid INT REFERENCES cbi_parent(id))")
+            .unwrap();
+        db.execute("CREATE TABLE cbi_chk (id INT PRIMARY KEY, n INT CHECK (n > 0))").unwrap();
+        let rows = copy_rows(&[&[Some("1"), Some("1")]]);
+        assert!(
+            db.copy_bulk_insert("cbi_child", &[], &rows).is_none(),
+            "FK table must fall back to the generic path"
+        );
+        assert!(
+            db.copy_bulk_insert("cbi_chk", &[], &rows).is_none(),
+            "CHECK table must fall back to the generic path"
+        );
+    }
+
+    #[test]
+    fn copy_bulk_insert_empty_is_noop() {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE cbi_empty (id INT PRIMARY KEY)").unwrap();
+        assert_eq!(db.copy_bulk_insert("cbi_empty", &[], &[]).unwrap().unwrap(), 0);
     }
 }
