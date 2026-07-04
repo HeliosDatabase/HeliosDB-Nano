@@ -198,6 +198,19 @@ impl HnswIndex {
             })
             .collect();
 
+        // Recall guard: hnsw_rs 0.3.3 can leave an early-inserted, high-level
+        // point with an empty layer-0 neighbour list (the rank-1 point gets no
+        // forward links, and back-links land at the later point's own level).
+        // A search that descends onto such a pivot under-returns even though
+        // the vectors exist. When the graph returns fewer than the achievable
+        // k on a small index, recover exactness by brute force. Capped so a
+        // tombstone-heavy large index degrades as before instead of paying an
+        // O(N) scan per query.
+        let live = reverse_mapping.len();
+        if mapped_results.len() < k.min(live) && live <= BRUTE_FORCE_RESCUE_MAX {
+            return Ok(brute_force_rescue(&index, query, k, &id_mapping, &reverse_mapping));
+        }
+
         Ok(mapped_results)
     }
 
@@ -365,6 +378,49 @@ fn export_mappings_impl(
 
 fn reverse_pairs_to_map(pairs: &[(u64, u64)]) -> std::collections::HashMap<u64, usize> {
     pairs.iter().map(|(row, hnsw)| (*row, *hnsw as usize)).collect()
+}
+
+/// Upper bound on live entries for the under-return brute-force rescue in the
+/// search paths. The layer-0-isolation pathology (see `brute_force_rescue`) is
+/// a small-index phenomenon; beyond this size an under-full result is almost
+/// always tombstone filtering, which brute force would turn into a per-query
+/// O(N) scan.
+const BRUTE_FORCE_RESCUE_MAX: usize = 10_000;
+
+/// Exact k-NN over every live point — the recall rescue for hnsw_rs 0.3.3's
+/// layer-0 isolation defect: an early-inserted point that drew a high level
+/// can end up with an empty layer-0 neighbour list (the rank-1 point gets no
+/// forward links; back-links land at the later point's own level), making it
+/// unreachable from a search that descends onto it, which then under-returns
+/// even though the vectors exist. Uses the same distance functor as the graph
+/// search so scores are directly comparable. Caller must already hold the
+/// index/mapping read locks (guards are passed in, not re-taken — parking_lot
+/// locks are not reentrant under a queued writer).
+fn brute_force_rescue<D>(
+    index: &Hnsw<'static, f32, D>,
+    query: &Vector,
+    k: usize,
+    id_mapping: &[u64],
+    reverse_mapping: &std::collections::HashMap<u64, usize>,
+) -> Vec<(u64, f32)>
+where
+    D: Distance<f32> + Default + Send + Sync,
+{
+    let dist = D::default();
+    let mut all: Vec<(u64, f32)> = index
+        .get_point_indexation()
+        .into_iter()
+        .filter_map(|point| {
+            let hnsw_id = point.get_origin_id();
+            let row_id = *id_mapping.get(hnsw_id)?;
+            // Same tombstone rule as the graph-result filter.
+            (reverse_mapping.get(&row_id) == Some(&hnsw_id))
+                .then(|| (row_id, dist.eval(query.as_slice(), point.get_v())))
+        })
+        .collect();
+    all.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    all.truncate(k);
+    all
 }
 
 /// Reload a dumped graph. The `HnswIo` loader owns buffers the reloaded
@@ -626,6 +682,12 @@ impl CosineHnswIndex {
             })
             .collect();
 
+        // Recall guard — see `brute_force_rescue`.
+        let live = reverse_mapping.len();
+        if mapped_results.len() < k.min(live) && live <= BRUTE_FORCE_RESCUE_MAX {
+            return Ok(brute_force_rescue(&index, query, k, &id_mapping, &reverse_mapping));
+        }
+
         Ok(mapped_results)
     }
 
@@ -796,6 +858,12 @@ impl InnerProductHnswIndex {
             })
             .collect();
 
+        // Recall guard — see `brute_force_rescue`.
+        let live = reverse_mapping.len();
+        if mapped_results.len() < k.min(live) && live <= BRUTE_FORCE_RESCUE_MAX {
+            return Ok(brute_force_rescue(&index, query, k, &id_mapping, &reverse_mapping));
+        }
+
         Ok(mapped_results)
     }
 
@@ -880,10 +948,14 @@ mod tests {
 
         let index = HnswIndex::new(config).unwrap();
 
-        // Insert vectors
-        index.insert(1, &vec![1.0, 0.0, 0.0]).unwrap();
+        // Insert vectors. The query's nearest neighbor (id 1) goes LAST:
+        // hnsw_rs 0.3.3 gives the first-inserted point no forward links, and
+        // when its (OS-entropy-seeded) level draw puts it above the later
+        // points it can end up layer-0-isolated — search then returns 1 of 2
+        // results (~1/800 runs). A non-first insert always gets layer-0 links.
         index.insert(2, &vec![0.0, 1.0, 0.0]).unwrap();
         index.insert(3, &vec![0.0, 0.0, 1.0]).unwrap();
+        index.insert(1, &vec![1.0, 0.0, 0.0]).unwrap();
 
         // Search
         let query = vec![1.0, 0.1, 0.0];
@@ -891,6 +963,52 @@ mod tests {
 
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].0, 1); // Closest to [1,0,0]
+    }
+
+    #[test]
+    fn test_first_insert_isolation_rescued() {
+        // Historical flake shape: nearest vector inserted FIRST. In ~1/800
+        // seeds hnsw_rs leaves it layer-0-isolated and the graph search
+        // under-returns; the brute-force rescue must make k=2 exact every
+        // time. Loop enough that a regression reappears at a visible rate.
+        for _ in 0..800 {
+            let config = HnswConfig {
+                dimension: 3,
+                max_connections: 16,
+                ef_construction: 200,
+                distance_metric: DistanceMetric::L2,
+                ef_search_base: 200,
+                dynamic_ef_search: true,
+                ef_search_min: 50,
+                ef_search_max: 500,
+            };
+            let index = HnswIndex::new(config).unwrap();
+            index.insert(1, &vec![1.0, 0.0, 0.0]).unwrap();
+            index.insert(2, &vec![0.0, 1.0, 0.0]).unwrap();
+            index.insert(3, &vec![0.0, 0.0, 1.0]).unwrap();
+
+            let results = index.search(&vec![1.0, 0.1, 0.0], 2).unwrap();
+            assert_eq!(results.len(), 2, "under-returned despite rescue");
+            assert_eq!(results[0].0, 1);
+        }
+    }
+
+    #[test]
+    fn test_rescue_respects_tombstones() {
+        let config = HnswConfig {
+            dimension: 3,
+            ..Default::default()
+        };
+        let index = HnswIndex::new(config).unwrap();
+        index.insert(1, &vec![1.0, 0.0, 0.0]).unwrap();
+        index.insert(2, &vec![0.0, 1.0, 0.0]).unwrap();
+        index.delete(1).unwrap();
+
+        // k=2 but only 1 live vector: must return exactly the live one —
+        // the rescue must not resurrect the tombstoned row.
+        let results = index.search(&vec![1.0, 0.0, 0.0], 2).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, 2);
     }
 
     #[test]

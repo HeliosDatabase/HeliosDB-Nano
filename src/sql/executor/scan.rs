@@ -747,7 +747,7 @@ pub(super) fn guarded_range_pairs(
     Some(pairs)
 }
 
-fn indexed_equality_lookup(
+pub(super) fn indexed_equality_lookup(
     storage: &crate::storage::StorageEngine,
     table_name: &str,
     schema: &Schema,
@@ -835,6 +835,10 @@ fn coerce_index_lookup_value(value: Value, data_type: &DataType) -> Option<Value
         DataType::Uuid => match value {
             Value::Uuid(_) => Some(value),
             Value::String(s) => uuid::Uuid::parse_str(&s).ok().map(Value::Uuid),
+            // Binary-format wire parameter with no declared OID arrives as raw
+            // bytes; a 16-byte payload is the UUID itself. Without this arm the
+            // probe is skipped and the query silently degrades to a full scan.
+            Value::Bytes(b) => uuid::Uuid::from_slice(&b).ok().map(Value::Uuid),
             _ => None,
         },
         DataType::Date => match value {

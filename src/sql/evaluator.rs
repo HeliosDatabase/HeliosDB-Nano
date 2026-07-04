@@ -1730,7 +1730,12 @@ impl Evaluator {
         };
         let f = match fmt {
             Value::String(s) => s.clone(),
-            _ => unreachable!(),
+            other => {
+                return Err(Error::query_execution(format!(
+                    "TO_DATE format must be a string, got {:?}",
+                    other
+                )))
+            }
         };
         let chrono_fmt = Self::pg_format_to_chrono(&f);
         let parsed = chrono::NaiveDate::parse_from_str(&s, &chrono_fmt)
@@ -1785,7 +1790,12 @@ impl Evaluator {
                 };
                 let f = match fmt {
                     Value::String(s) => s.clone(),
-                    _ => unreachable!(),
+                    other => {
+                        return Err(Error::query_execution(format!(
+                            "TO_TIMESTAMP format must be a string, got {:?}",
+                            other
+                        )))
+                    }
                 };
                 let chrono_fmt = Self::pg_format_to_chrono(&f);
                 let parsed = chrono::NaiveDateTime::parse_from_str(&s, &chrono_fmt)
@@ -3664,6 +3674,29 @@ impl Evaluator {
                     return Err(Error::query_execution(format!(
                         "Cannot compare invalid UUID string '{}' with UUID",
                         a
+                    )))
+                }
+            },
+            // Bytes-to-UUID coercion: a binary-format wire parameter bound
+            // with no declared OID arrives as raw bytes; 16 bytes are the
+            // UUID itself (matches the index-probe coercion in
+            // executor/scan.rs — without this the probe finds the row and
+            // the re-filter then rejects it).
+            (Value::Uuid(a), Value::Bytes(b)) => match uuid::Uuid::from_slice(b) {
+                Ok(b_uuid) => a.cmp(&b_uuid),
+                Err(_) => {
+                    return Err(Error::query_execution(format!(
+                        "Cannot compare UUID with {}-byte binary value",
+                        b.len()
+                    )))
+                }
+            },
+            (Value::Bytes(a), Value::Uuid(b)) => match uuid::Uuid::from_slice(a) {
+                Ok(a_uuid) => a_uuid.cmp(b),
+                Err(_) => {
+                    return Err(Error::query_execution(format!(
+                        "Cannot compare {}-byte binary value with UUID",
+                        a.len()
                     )))
                 }
             },

@@ -316,6 +316,17 @@ where
 
         let len = i32::from_be_bytes(len_buf) as usize;
 
+        // Validate before allocating: this runs pre-authentication, so an
+        // unchecked length here is a remote 2 GiB allocation (or, negative
+        // reinterpreted, effectively unbounded). Mirrors parse_startup().
+        if !(8..=super::messages::MAX_STARTUP_MESSAGE_LEN).contains(&len) {
+            return Err(Error::protocol(format!(
+                "Invalid startup message length {} (max {})",
+                len as i64,
+                super::messages::MAX_STARTUP_MESSAGE_LEN
+            )));
+        }
+
         // Calculate how many bytes we still need to read
         let bytes_in_buffer = self.buffer.len();
         let bytes_needed = len.saturating_sub(bytes_in_buffer);

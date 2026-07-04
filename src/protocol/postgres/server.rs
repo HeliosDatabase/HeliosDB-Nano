@@ -216,6 +216,10 @@ impl PgServer {
                 }
                 Err(e) => {
                     tracing::error!("Failed to accept connection: {}", e);
+                    // Accept errors (e.g. EMFILE at fd exhaustion) return
+                    // immediately — without a pause this loop busy-spins at
+                    // 100% CPU exactly when the process is resource-starved.
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
             }
         }
