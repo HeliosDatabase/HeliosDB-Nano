@@ -3877,24 +3877,34 @@ impl<'a> Planner<'a> {
     }
 
     /// Convert SQL value to internal Value
+    /// Type a numeric literal exactly as `sql_value_to_value` does: try i32,
+    /// then i64, then f64, then f32. Shared with the query-normalizer (A2) so a
+    /// normalized `$n` parameter and the inline literal it replaced can never
+    /// diverge in type.
+    pub(crate) fn number_literal_to_value(text: &str) -> Result<Value> {
+        if let Ok(i) = text.parse::<i32>() {
+            Ok(Value::Int4(i))
+        } else if let Ok(i) = text.parse::<i64>() {
+            Ok(Value::Int8(i))
+        } else if let Ok(f) = text.parse::<f64>() {
+            Ok(Value::Float8(f))
+        } else if let Ok(f) = text.parse::<f32>() {
+            Ok(Value::Float4(f))
+        } else {
+            Err(Error::query_execution(format!("Invalid number: {}", text)))
+        }
+    }
+
+    /// Wrap already-unquoted single-quoted-string content into a `Value`,
+    /// exactly as `sql_value_to_value` does. Shared with the query-normalizer.
+    pub(crate) fn single_quoted_content_to_value(content: &str) -> Value {
+        Value::String(Self::repair_sqlparser_string(content))
+    }
+
     fn sql_value_to_value(&self, value: &sqlparser::ast::Value) -> Result<Value> {
         match value {
-            sqlparser::ast::Value::Number(n, _) => {
-                // Try integer types first (more common and exact)
-                if let Ok(i) = n.parse::<i32>() {
-                    Ok(Value::Int4(i))
-                } else if let Ok(i) = n.parse::<i64>() {
-                    Ok(Value::Int8(i))
-                } else if let Ok(f) = n.parse::<f64>() {
-                    // If it has a decimal point or is too large for i64, treat as float
-                    Ok(Value::Float8(f))
-                } else if let Ok(f) = n.parse::<f32>() {
-                    Ok(Value::Float4(f))
-                } else {
-                    Err(Error::query_execution(format!("Invalid number: {}", n)))
-                }
-            }
-            sqlparser::ast::Value::SingleQuotedString(s) => Ok(Value::String(Self::repair_sqlparser_string(s))),
+            sqlparser::ast::Value::Number(n, _) => Self::number_literal_to_value(n),
+            sqlparser::ast::Value::SingleQuotedString(s) => Ok(Self::single_quoted_content_to_value(s)),
             // C-style escaped string `E'...'` and unicode string `U&'...'`.
             // sqlparser has already processed their escape sequences, so the
             // stored content is the final text — lift it straight to a String
