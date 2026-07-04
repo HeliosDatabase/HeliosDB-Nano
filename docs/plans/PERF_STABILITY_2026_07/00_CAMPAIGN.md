@@ -55,6 +55,12 @@ Run on a **quiet machine** (no concurrent builds/agents). Offloaded to a Sonnet 
 
 - 2026-07-04: campaign started; 4 analysis agents launched; baseline binary building.
 - 2026-07-04: all 4 analysis reports in; plan docs A-D written; milestones M1-M5 fixed.
+- 2026-07-04: **M1 MERGED** (PR #6, f67af88). Regression gate: lib 1963/0, HNSW loop
+  300/300, integration 146/0, smoke 12/12; protocol failures proven pre-existing
+  (C17 filed). Scalability gate: zero cells below baseline beyond ±5%; RENAME
+  verified end-to-end (baseline: 2/2 hangs + torn split-table on kill; M1: 1.3s,
+  atomic, replay-correct). Bonus findings fixed in M1: RENAME torn-table hazard,
+  RENAME WAL-replay resurrection, HNSW production recall bug.
 - 2026-07-04: M1 (C-I) implemented on `fix/stability-wire-hardening`: C1-C10 complete
   (wire caps, checked parsers, TO_DATE panic, parking_lot txn mutex, MySQL conn cap +
   stmt cap, accept backoff, HNSW flake reorder + brute-force recall rescue ×3 metrics,
