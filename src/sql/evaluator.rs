@@ -1730,7 +1730,12 @@ impl Evaluator {
         };
         let f = match fmt {
             Value::String(s) => s.clone(),
-            _ => unreachable!(),
+            other => {
+                return Err(Error::query_execution(format!(
+                    "TO_DATE format must be a string, got {:?}",
+                    other
+                )))
+            }
         };
         let chrono_fmt = Self::pg_format_to_chrono(&f);
         let parsed = chrono::NaiveDate::parse_from_str(&s, &chrono_fmt)
@@ -1785,7 +1790,12 @@ impl Evaluator {
                 };
                 let f = match fmt {
                     Value::String(s) => s.clone(),
-                    _ => unreachable!(),
+                    other => {
+                        return Err(Error::query_execution(format!(
+                            "TO_TIMESTAMP format must be a string, got {:?}",
+                            other
+                        )))
+                    }
                 };
                 let chrono_fmt = Self::pg_format_to_chrono(&f);
                 let parsed = chrono::NaiveDateTime::parse_from_str(&s, &chrono_fmt)

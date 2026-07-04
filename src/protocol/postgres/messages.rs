@@ -253,6 +253,18 @@ pub struct FieldDescription {
     pub format_code: i16,
 }
 
+/// Maximum accepted length (bytes, including the 4-byte length field itself) of
+/// a single frontend wire message. A peer claiming more is rejected with a
+/// protocol error instead of buffered — otherwise an (even unauthenticated)
+/// client could make the server buffer up to 2 GiB per connection, and a
+/// negative length would stall the read loop forever.
+pub(crate) const MAX_MESSAGE_LEN: usize = 64 * 1024 * 1024;
+
+/// Startup packets only carry the protocol version and a small parameter map;
+/// cap them much tighter than regular messages. This bounds the pre-auth
+/// allocation in the startup path.
+pub(crate) const MAX_STARTUP_MESSAGE_LEN: usize = 1024 * 1024;
+
 impl FrontendMessage {
     /// Parse a frontend message from bytes
     // SAFETY: Buffer offsets are validated (buf.len() >= 5) before indexing buf[0..4].
@@ -265,6 +277,17 @@ impl FrontendMessage {
 
         let msg_type = buf[0];
         let len = i32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+
+        // Reject impossible or oversized claims before waiting for more bytes:
+        // the protocol length includes its own 4 bytes, so anything below 4 is
+        // malformed (a `len < 4` CopyData would otherwise underflow below), and
+        // an i32 read as usize can also be a reinterpreted negative value.
+        if !(4..=MAX_MESSAGE_LEN).contains(&len) {
+            return Err(Error::protocol(format!(
+                "Invalid frontend message length {} for type 0x{:02x} (max {})",
+                len as i64, msg_type, MAX_MESSAGE_LEN
+            )));
+        }
 
         // Check if we have the full message
         if buf.len() < 1 + len {
@@ -334,6 +357,15 @@ impl FrontendMessage {
 
         let len = i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
 
+        // Startup length includes the 4 length bytes + 4 protocol-version
+        // bytes; cap it tightly — this is reachable before authentication.
+        if !(8..=MAX_STARTUP_MESSAGE_LEN).contains(&len) {
+            return Err(Error::protocol(format!(
+                "Invalid startup message length {} (max {})",
+                len as i64, MAX_STARTUP_MESSAGE_LEN
+            )));
+        }
+
         if buf.len() < len {
             return Ok(None);
         }
@@ -372,10 +404,10 @@ impl FrontendMessage {
         buf.advance(4); // Skip length
         let statement_name = read_cstring(buf)?;
         let query = read_cstring(buf)?;
-        let num_params = buf.get_i16() as usize;
+        let num_params = get_count_checked(buf, 4, "Parse parameter-type")?;
         let mut param_types = Vec::with_capacity(num_params);
         for _ in 0..num_params {
-            param_types.push(buf.get_i32());
+            param_types.push(get_i32_checked(buf, "Parse parameter type")?);
         }
         Ok(FrontendMessage::Parse {
             statement_name,
@@ -390,31 +422,45 @@ impl FrontendMessage {
         let statement_name = read_cstring(buf)?;
 
         // Parameter formats
-        let num_formats = buf.get_i16() as usize;
+        let num_formats = get_count_checked(buf, 2, "Bind parameter-format")?;
         let mut param_formats = Vec::with_capacity(num_formats);
         for _ in 0..num_formats {
-            param_formats.push(buf.get_i16());
+            param_formats.push(get_i16_checked(buf, "Bind parameter format")?);
         }
 
         // Parameters
-        let num_params = buf.get_i16() as usize;
+        let num_params = get_count_checked(buf, 4, "Bind parameter")?;
         let mut params = Vec::with_capacity(num_params);
         for _ in 0..num_params {
-            let param_len = buf.get_i32();
+            let param_len = get_i32_checked(buf, "Bind parameter length")?;
             if param_len == -1 {
                 params.push(None);
             } else {
-                let mut param_data = vec![0u8; param_len as usize];
+                if param_len < 0 {
+                    return Err(Error::protocol(format!(
+                        "Invalid Bind parameter length: {}",
+                        param_len
+                    )));
+                }
+                let param_len = param_len as usize;
+                if param_len > buf.remaining() {
+                    return Err(Error::protocol(format!(
+                        "Bind parameter length {} exceeds message body ({} bytes remaining)",
+                        param_len,
+                        buf.remaining()
+                    )));
+                }
+                let mut param_data = vec![0u8; param_len];
                 buf.copy_to_slice(&mut param_data);
                 params.push(Some(param_data));
             }
         }
 
         // Result formats
-        let num_result_formats = buf.get_i16() as usize;
+        let num_result_formats = get_count_checked(buf, 2, "Bind result-format")?;
         let mut result_formats = Vec::with_capacity(num_result_formats);
         for _ in 0..num_result_formats {
-            result_formats.push(buf.get_i16());
+            result_formats.push(get_i16_checked(buf, "Bind result format")?);
         }
 
         Ok(FrontendMessage::Bind {
@@ -429,13 +475,13 @@ impl FrontendMessage {
     fn parse_execute(buf: &mut BytesMut, len: usize) -> Result<Self> {
         buf.advance(4); // Skip length
         let portal_name = read_cstring(buf)?;
-        let max_rows = buf.get_i32();
+        let max_rows = get_i32_checked(buf, "Execute max-rows")?;
         Ok(FrontendMessage::Execute { portal_name, max_rows })
     }
 
     fn parse_describe(buf: &mut BytesMut, len: usize) -> Result<Self> {
         buf.advance(4); // Skip length
-        let target_byte = buf.get_u8();
+        let target_byte = get_u8_checked(buf, "Describe target")?;
         let target = match target_byte {
             b'S' => DescribeTarget::Statement,
             b'P' => DescribeTarget::Portal,
@@ -494,7 +540,7 @@ impl FrontendMessage {
 
     fn parse_close(buf: &mut BytesMut, len: usize) -> Result<Self> {
         buf.advance(4); // Skip length
-        let target_byte = buf.get_u8();
+        let target_byte = get_u8_checked(buf, "Close target")?;
         let target = match target_byte {
             b'S' => DescribeTarget::Statement,
             b'P' => DescribeTarget::Portal,
@@ -742,6 +788,52 @@ impl BackendMessage {
 }
 
 /// Read a null-terminated C string from buffer
+/// Bounds-checked primitive reads for frontend-message bodies. The outer
+/// `parse()` guarantees the *declared* message is fully buffered, but a
+/// malformed body can still declare counts/lengths that walk past its own
+/// end (into pipelined bytes or off the buffer entirely) — `bytes` panics on
+/// overread, so every body-field read must go through these.
+fn get_u8_checked(buf: &mut BytesMut, what: &str) -> Result<u8> {
+    if buf.remaining() < 1 {
+        return Err(Error::protocol(format!("Truncated message: missing {}", what)));
+    }
+    Ok(buf.get_u8())
+}
+
+fn get_i16_checked(buf: &mut BytesMut, what: &str) -> Result<i16> {
+    if buf.remaining() < 2 {
+        return Err(Error::protocol(format!("Truncated message: missing {}", what)));
+    }
+    Ok(buf.get_i16())
+}
+
+fn get_i32_checked(buf: &mut BytesMut, what: &str) -> Result<i32> {
+    if buf.remaining() < 4 {
+        return Err(Error::protocol(format!("Truncated message: missing {}", what)));
+    }
+    Ok(buf.get_i32())
+}
+
+/// Read an i16 element count and validate it against the bytes actually
+/// available (`min_elem_size` = smallest possible wire size per element), so a
+/// hostile count can neither go negative nor force a huge upfront reservation.
+fn get_count_checked(buf: &mut BytesMut, min_elem_size: usize, what: &str) -> Result<usize> {
+    let n = get_i16_checked(buf, what)?;
+    if n < 0 {
+        return Err(Error::protocol(format!("Negative {} count: {}", what, n)));
+    }
+    let n = n as usize;
+    if n * min_elem_size > buf.remaining() {
+        return Err(Error::protocol(format!(
+            "{} count {} exceeds message body ({} bytes remaining)",
+            what,
+            n,
+            buf.remaining()
+        )));
+    }
+    Ok(n)
+}
+
 fn read_cstring(buf: &mut BytesMut) -> Result<String> {
     let mut bytes = Vec::new();
     loop {
@@ -854,6 +946,145 @@ mod tests {
         match FrontendMessage::parse(&mut buf).unwrap().unwrap() {
             FrontendMessage::CopyFail(s) => assert_eq!(s, "oops"),
             other => panic!("expected CopyFail, got {:?}", other),
+        }
+    }
+
+    // ---- malformed-frame hardening (S1/S7): every case below must return a
+    // clean protocol Err — never panic, never allocate from the wire claim,
+    // and never wait for more bytes that will not come. ----
+
+    fn frame(msg_type: u8, len: i32, body: &[u8]) -> BytesMut {
+        let mut buf = BytesMut::new();
+        buf.put_u8(msg_type);
+        buf.put_i32(len);
+        buf.put_slice(body);
+        buf
+    }
+
+    #[test]
+    fn copydata_len_below_4_is_error_not_panic() {
+        // 5-byte packet `64 00 00 00 02`: len=2 used to underflow
+        // `copy_to_bytes(len - 4)` to usize::MAX and panic — pre-auth.
+        let mut buf = frame(b'd', 2, &[]);
+        assert!(FrontendMessage::parse(&mut buf).is_err());
+    }
+
+    #[test]
+    fn oversized_length_claim_is_error_not_buffered() {
+        // Rejected immediately from the 5 header bytes — must NOT return
+        // Ok(None) (which would keep the connection buffering toward 2 GiB).
+        let mut buf = frame(b'Q', i32::MAX, &[]);
+        assert!(FrontendMessage::parse(&mut buf).is_err());
+    }
+
+    #[test]
+    fn negative_length_claim_is_error() {
+        let mut buf = frame(b'Q', -1, &[]);
+        assert!(FrontendMessage::parse(&mut buf).is_err());
+    }
+
+    #[test]
+    fn bind_negative_format_count_is_error() {
+        // 'B' | len=8 | portal "" | stmt "" | num_formats = -1
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0, 0]); // two empty cstrings
+        body.extend_from_slice(&(-1i16).to_be_bytes());
+        let mut buf = frame(b'B', (4 + body.len()) as i32, &body);
+        assert!(FrontendMessage::parse(&mut buf).is_err());
+    }
+
+    #[test]
+    fn bind_param_count_beyond_body_is_error_not_panic() {
+        // Declares 1000 parameters with an empty remainder: used to run
+        // `get_i32()` off the end of the buffer and panic.
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0, 0]); // portal "", stmt ""
+        body.extend_from_slice(&0i16.to_be_bytes()); // num_formats = 0
+        body.extend_from_slice(&1000i16.to_be_bytes()); // num_params = 1000
+        let mut buf = frame(b'B', (4 + body.len()) as i32, &body);
+        assert!(FrontendMessage::parse(&mut buf).is_err());
+    }
+
+    #[test]
+    fn bind_param_len_beyond_body_is_error_not_giant_alloc() {
+        // One parameter claiming ~2 GiB: used to do `vec![0u8; param_len]`
+        // before noticing the body is empty.
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0, 0]);
+        body.extend_from_slice(&0i16.to_be_bytes()); // num_formats
+        body.extend_from_slice(&1i16.to_be_bytes()); // num_params = 1
+        body.extend_from_slice(&0x7FFF_0000i32.to_be_bytes()); // param_len
+        let mut buf = frame(b'B', (4 + body.len()) as i32, &body);
+        assert!(FrontendMessage::parse(&mut buf).is_err());
+    }
+
+    #[test]
+    fn parse_param_type_count_beyond_body_is_error_not_panic() {
+        // 'P' | stmt "" | query "SELECT 1" | num_params=500 | (no type bytes)
+        let mut body = Vec::new();
+        body.push(0); // statement_name ""
+        body.extend_from_slice(b"SELECT 1\0");
+        body.extend_from_slice(&500i16.to_be_bytes());
+        let mut buf = frame(b'P', (4 + body.len()) as i32, &body);
+        assert!(FrontendMessage::parse(&mut buf).is_err());
+    }
+
+    #[test]
+    fn execute_truncated_max_rows_is_error_not_panic() {
+        // 'E' | portal "" | (no max_rows i32)
+        let mut buf = frame(b'E', 5, &[0]);
+        assert!(FrontendMessage::parse(&mut buf).is_err());
+    }
+
+    #[test]
+    fn describe_empty_body_is_error_not_panic() {
+        let mut buf = frame(b'D', 4, &[]);
+        assert!(FrontendMessage::parse(&mut buf).is_err());
+    }
+
+    #[test]
+    fn startup_length_bounds_are_enforced() {
+        // Undersized (< 8: length + protocol version).
+        let mut buf = BytesMut::new();
+        buf.put_i32(4);
+        assert!(FrontendMessage::parse_startup(&mut buf).is_err());
+
+        // Oversized claim must error immediately, not buffer toward it —
+        // this is the pre-auth 2 GiB allocation vector.
+        let mut buf = BytesMut::new();
+        buf.put_i32(i32::MAX);
+        assert!(FrontendMessage::parse_startup(&mut buf).is_err());
+    }
+
+    #[test]
+    fn valid_bind_still_parses_after_hardening() {
+        // 'B' | portal "" | stmt "s" | 1 format (binary) | 1 param (4 bytes) |
+        // 1 result format (text) — the happy path must be unaffected.
+        let mut body = Vec::new();
+        body.push(0); // portal ""
+        body.extend_from_slice(b"s\0");
+        body.extend_from_slice(&1i16.to_be_bytes());
+        body.extend_from_slice(&1i16.to_be_bytes()); // format = binary
+        body.extend_from_slice(&1i16.to_be_bytes()); // num_params
+        body.extend_from_slice(&4i32.to_be_bytes());
+        body.extend_from_slice(&42i32.to_be_bytes());
+        body.extend_from_slice(&1i16.to_be_bytes()); // num_result_formats
+        body.extend_from_slice(&0i16.to_be_bytes());
+        let mut buf = frame(b'B', (4 + body.len()) as i32, &body);
+        match FrontendMessage::parse(&mut buf).unwrap().unwrap() {
+            FrontendMessage::Bind {
+                statement_name,
+                param_formats,
+                params,
+                result_formats,
+                ..
+            } => {
+                assert_eq!(statement_name, "s");
+                assert_eq!(param_formats, vec![1]);
+                assert_eq!(params, vec![Some(42i32.to_be_bytes().to_vec())]);
+                assert_eq!(result_formats, vec![0]);
+            }
+            other => panic!("expected Bind, got {:?}", other),
         }
     }
 }

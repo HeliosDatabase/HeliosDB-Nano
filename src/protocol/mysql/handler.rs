@@ -2603,6 +2603,25 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
     // ------------------------------------------------------------------
 
     async fn handle_stmt_prepare(&mut self, payload: Bytes) -> Result<()> {
+        // A client that prepares without closing (or a hostile one) must not
+        // grow this map unboundedly. Erroring mirrors MySQL's
+        // max_prepared_stmt_count (ER_MAX_PREPARED_STMT_COUNT_REACHED) and is
+        // honest where silent LRU eviction would invalidate a statement id the
+        // client still holds.
+        const MAX_PREPARED_STATEMENTS_PER_CONN: usize = 1024;
+        if self.prepared_statements.len() >= MAX_PREPARED_STATEMENTS_PER_CONN {
+            return self
+                .send_error(
+                    1461,
+                    "42000",
+                    &format!(
+                        "Can't create more than {} prepared statements on one connection (close statements with COM_STMT_CLOSE)",
+                        MAX_PREPARED_STATEMENTS_PER_CONN
+                    ),
+                )
+                .await;
+        }
+
         let raw_sql = String::from_utf8_lossy(&payload).to_string();
         debug!("COM_STMT_PREPARE: {}", raw_sql);
         let sql = super::translator::translate(&raw_sql);
