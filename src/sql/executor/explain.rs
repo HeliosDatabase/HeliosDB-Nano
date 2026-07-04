@@ -131,9 +131,15 @@ fn annotate_index_range_scans(executor: &Executor, plan: &LogicalPlan, node: &mu
         node.details.insert("range".to_string(), spec.display.clone());
     }
 
-    let range_spec = |table_name: &str, schema: &crate::Schema, predicate: &crate::sql::LogicalExpr| {
+    fn annotate_point(node: &mut PlanNode, table_name: &str, index_name: &str) {
+        node.node_type = "IndexPointLookup".to_string();
+        node.operation = format!("Index Point Lookup using {} on {}", index_name, table_name);
+        node.details.insert("index".to_string(), index_name.to_string());
+    }
+
+    let common_gates_pass = |table_name: &str| -> Option<&crate::storage::StorageEngine> {
         let storage = executor.storage()?;
-        if storage.is_branch_active() || super::scan::index_range_fast_path_disabled() {
+        if storage.is_branch_active() {
             return None;
         }
         // Mirror the executor's gates (transaction snapshot, CTE shadowing,
@@ -146,6 +152,23 @@ fn annotate_index_range_scans(executor: &Executor, plan: &LogicalPlan, node: &mu
         {
             return None;
         }
+        Some(storage)
+    };
+
+    // Mirrors `try_index_point_lookup_for_scan` (minus subquery
+    // materialization — EXPLAIN must not execute subqueries, so `col = (…)`
+    // predicates conservatively render unannotated).
+    let point_spec = |table_name: &str, schema: &crate::Schema, predicate: &crate::sql::LogicalExpr| {
+        let storage = common_gates_pass(table_name)?;
+        super::scan::indexed_equality_lookup(storage, table_name, schema, predicate, executor.parameters())
+            .map(|(index_name, _)| index_name)
+    };
+
+    let range_spec = |table_name: &str, schema: &crate::Schema, predicate: &crate::sql::LogicalExpr| {
+        if super::scan::index_range_fast_path_disabled() {
+            return None;
+        }
+        let storage = common_gates_pass(table_name)?;
         let spec = super::scan::indexed_range_lookup(storage, table_name, schema, predicate, executor.parameters())?;
         // Selectivity guard: ranges the executor would hand back to the
         // sequential scan must not be advertised as index range scans.
@@ -162,6 +185,12 @@ fn annotate_index_range_scans(executor: &Executor, plan: &LogicalPlan, node: &mu
                 ..
             } = input.as_ref()
             {
+                // Same priority as the executor: the equality probe runs
+                // before the range fast path.
+                if let Some(index_name) = point_spec(table_name, schema, predicate) {
+                    annotate_point(node, table_name, &index_name);
+                    return;
+                }
                 if let Some(spec) = range_spec(table_name, schema, predicate) {
                     annotate(node, table_name, &spec);
                     return;
@@ -178,7 +207,9 @@ fn annotate_index_range_scans(executor: &Executor, plan: &LogicalPlan, node: &mu
             as_of: None,
             ..
         } => {
-            if let Some(spec) = range_spec(table_name, schema, predicate) {
+            if let Some(index_name) = point_spec(table_name, schema, predicate) {
+                annotate_point(node, table_name, &index_name);
+            } else if let Some(spec) = range_spec(table_name, schema, predicate) {
                 annotate(node, table_name, &spec);
             }
         }

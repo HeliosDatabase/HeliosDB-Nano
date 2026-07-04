@@ -803,6 +803,9 @@ async fn start_server(
         let mysql_db = Arc::clone(&db);
         info!("MySQL protocol listening on {}", mysql_addr);
         let conn_counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1));
+        // Same per-listener cap the PostgreSQL server enforces — without it the
+        // MySQL side accepts unbounded connections/tasks/fds.
+        let conn_limiter = std::sync::Arc::new(tokio::sync::Semaphore::new(max_connections));
         Some(tokio::spawn(async move {
             let listener = match tokio::net::TcpListener::bind(mysql_addr).await {
                 Ok(l) => l,
@@ -815,9 +818,22 @@ async fn start_server(
                 match listener.accept().await {
                     Ok((stream, addr)) => {
                         tracing::debug!("MySQL connection from {}", addr);
+                        let permit = match Arc::clone(&conn_limiter).try_acquire_owned() {
+                            Ok(permit) => permit,
+                            Err(_) => {
+                                tracing::warn!(
+                                    "MySQL connection limit reached ({}), rejecting {}",
+                                    max_connections,
+                                    addr
+                                );
+                                drop(stream);
+                                continue;
+                            }
+                        };
                         let db_clone = Arc::clone(&mysql_db);
                         let conn_id = conn_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         tokio::spawn(async move {
+                            let _permit = permit;
                             if let Err(e) =
                                 heliosdb_nano::protocol::mysql::handle_mysql_connection(db_clone, stream, conn_id).await
                             {
@@ -827,6 +843,10 @@ async fn start_server(
                     }
                     Err(e) => {
                         tracing::error!("MySQL accept error: {}", e);
+                        // Accept errors (e.g. EMFILE at fd exhaustion) return
+                        // immediately — without a pause this loop busy-spins at
+                        // 100% CPU exactly when the process is resource-starved.
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     }
                 }
             }
@@ -845,6 +865,7 @@ async fn start_server(
         let _ = std::fs::remove_file(&path);
         let mysql_db = Arc::clone(&db);
         let conn_counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1_000_000));
+        let conn_limiter = std::sync::Arc::new(tokio::sync::Semaphore::new(max_connections));
         info!("MySQL Unix socket listening on {}", path.display());
         println!("    mysql (UDS): mysql --socket={}", path.display());
         Some(tokio::spawn(async move {
@@ -860,9 +881,21 @@ async fn start_server(
             loop {
                 match listener.accept().await {
                     Ok((stream, _)) => {
+                        let permit = match Arc::clone(&conn_limiter).try_acquire_owned() {
+                            Ok(permit) => permit,
+                            Err(_) => {
+                                tracing::warn!(
+                                    "MySQL UDS connection limit reached ({}), rejecting",
+                                    max_connections
+                                );
+                                drop(stream);
+                                continue;
+                            }
+                        };
                         let db_clone = Arc::clone(&mysql_db);
                         let conn_id = conn_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         tokio::spawn(async move {
+                            let _permit = permit;
                             if let Err(e) = heliosdb_nano::protocol::mysql::handler::handle_mysql_connection_unix(
                                 db_clone, stream, conn_id,
                             )
@@ -874,6 +907,7 @@ async fn start_server(
                     }
                     Err(e) => {
                         tracing::error!("MySQL UDS accept error: {}", e);
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     }
                 }
             }
