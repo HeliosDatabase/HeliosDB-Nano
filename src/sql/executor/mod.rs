@@ -3981,8 +3981,22 @@ impl<'a> Executor<'a> {
                         // 3. Stop when no new rows are produced
 
                         const MAX_RECURSION_DEPTH: usize = 1000;
+                        // C12: cumulative materialized-row ceiling. The depth cap
+                        // alone doesn't bound memory — a wide fan-out (each level
+                        // multiplies rows) OOMs long before 1000 iterations. This
+                        // aborts such a runaway with a clear error instead.
+                        const MAX_RECURSION_ROWS: usize = 5_000_000;
+
                         let mut all_tuples: Vec<Tuple> = Vec::new();
+                        // C12: O(1) fixpoint dedup. The old `all_tuples.contains`
+                        // was O(n) per probe → O(n²) over the whole recursion; a
+                        // set keyed on the serialized row makes it O(1). The key
+                        // is the bincode encoding of the tuple (values + row_id),
+                        // which matches the previous `PartialEq`-based dedup.
+                        let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
                         let mut iteration = 0;
+
+                        let row_key = |t: &Tuple| -> Vec<u8> { bincode::serialize(t).unwrap_or_default() };
 
                         // First iteration: register empty CTE, then execute to get base results
                         self.add_cte(CteData {
@@ -3994,6 +4008,7 @@ impl<'a> Executor<'a> {
                         let mut cte_operator = self.plan_to_operator(cte_plan)?;
                         let mut new_tuples = Vec::new();
                         while let Some(tuple) = cte_operator.next()? {
+                            seen.insert(row_key(&tuple));
                             new_tuples.push(tuple);
                         }
 
@@ -4015,13 +4030,19 @@ impl<'a> Executor<'a> {
                             let mut cte_operator = self.plan_to_operator(cte_plan)?;
                             new_tuples.clear();
                             while let Some(tuple) = cte_operator.next()? {
-                                // Only add tuples not already in all_tuples to avoid infinite loops
-                                if !all_tuples.contains(&tuple) {
+                                // Only keep rows not seen in any prior level (fixpoint).
+                                if seen.insert(row_key(&tuple)) {
                                     new_tuples.push(tuple);
                                 }
                             }
 
                             all_tuples.extend(new_tuples.clone());
+                            if all_tuples.len() > MAX_RECURSION_ROWS {
+                                return Err(Error::query_execution(format!(
+                                    "Recursive CTE '{}' exceeded the {}-row materialization limit (possible runaway recursion)",
+                                    cte_name, MAX_RECURSION_ROWS
+                                )));
+                            }
                         }
 
                         if iteration >= MAX_RECURSION_DEPTH {

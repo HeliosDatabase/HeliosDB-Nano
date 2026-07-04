@@ -32,6 +32,17 @@ Small, low-risk, and de-flakes the release gate for every subsequent PR.
 | **C15** (Issue A remainder) | Index-def cross-version migration: self-describing encoding (serde_json) for the tiny cold `meta:index:` defs + real version migration path (older-migratable vs newer-unsupported — today ANY version mismatch → index silently dropped, message even mislabels older as "newer"); REINDEX-from-decodable on mismatch | `storage/catalog.rs:474,488-552` |
 | **C16** (S14 Low) | Explicit shutdown persist for index snapshots instead of IO-in-Drop | `lib.rs:503-518` |
 | **C17** (M1 gate finding) | `helios_sessions` system table: schema defined (`sql/system_tables.rs::helios_sessions_schema`) but never provisioned at startup — protocol suite step 7 fails on every version; wire it up or drop the dead schema + test | `src/sql/system_tables.rs` |
+
+## M5 status (2026-07-04)
+C11/C12/C13 SHIPPED (branch `fix/resource-governance`). C11 enforces configured
+`statement_timeout_ms`/`query_timeout_ms` server-wide (all paths incl. wire) +
+embedded `SET statement_timeout`. Deferred as follow-ups:
+- **C11-wire**: wire per-connection `SET statement_timeout` is still accepted-and-
+  dropped by the generic-SET compat branch (`handler.rs` ~line 742); needs
+  per-session timeout storage threaded through `query_*_for_session`. Config-level
+  timeout IS enforced over the wire, so runaway queries are cappable server-wide.
+- **C17** (helios_sessions), **C14** (portal streaming), **C15** (index-def version
+  migration), **D4** (UPDATE versioning unify), **D6** (pessimistic-lock removal).
 | **D4** (from Group D) | Fast/branch UPDATE versioning unification (stale `AS OF` reads today) | `engine.rs:10797-10888,12242-12335` → `time_travel.rs:780-805` |
 | **D6** (from Group D) | Drop pessimistic row lock for session-txn writes (1s worker-pinning futile waits → immediate retriable conflict error; doc'd Option 2) | `transaction.rs:448-454`, `docs/NANO_CONCURRENCY_LOCKING.md:55-81` |
 

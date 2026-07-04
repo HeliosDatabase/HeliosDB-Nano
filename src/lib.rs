@@ -1401,6 +1401,23 @@ impl EmbeddedDatabase {
         }
     }
 
+    /// C11: effective per-statement timeout in milliseconds (`None` =
+    /// unlimited). A session-level `SET statement_timeout` takes precedence;
+    /// otherwise the configured `statement_timeout_ms`, else the legacy
+    /// `query_timeout_ms`. Operators poll their `TimeoutContext` between rows,
+    /// so a runaway query that keeps producing rows is cancelled cooperatively
+    /// instead of pinning its worker indefinitely. Previously `SET
+    /// statement_timeout` was accepted but never consulted here (dead code).
+    fn effective_statement_timeout_ms(&self) -> Option<u64> {
+        if let Some(d) = self.session_settings.statement_timeout() {
+            return Some(d.as_millis() as u64);
+        }
+        self.config
+            .storage
+            .statement_timeout_ms
+            .or(self.config.storage.query_timeout_ms)
+    }
+
     /// R-A1: admission gate for the parse/plan/result caches on the cold query
     /// path. A pgbench-style point-read arrives with a fresh literal every
     /// statement, so its raw-SQL cache key can never hit — but the old code
@@ -3254,7 +3271,7 @@ impl EmbeddedDatabase {
             } => {
                 // Execute the source SELECT plan to get rows
                 let mut executor =
-                    sql::Executor::with_storage(&self.storage).with_timeout(self.config.storage.query_timeout_ms);
+                    sql::Executor::with_storage(&self.storage).with_timeout(self.effective_statement_timeout_ms());
                 let source_rows = executor.execute(source)?;
 
                 let catalog = self.storage.catalog();
@@ -4959,7 +4976,7 @@ impl EmbeddedDatabase {
                 // For other operations (CREATE INDEX, SELECT, etc.), use executor
                 // with transaction context so reads see uncommitted writes
                 let mut executor = sql::Executor::with_storage(&self.storage)
-                    .with_timeout(self.config.storage.query_timeout_ms)
+                    .with_timeout(self.effective_statement_timeout_ms())
                     .with_transaction(txn);
                 let results = executor.execute(&plan)?;
                 // Return results as tuples for SELECT queries, empty for DDL
@@ -10829,7 +10846,7 @@ impl EmbeddedDatabase {
             } => {
                 // Execute source SELECT plan to get rows
                 let mut executor =
-                    sql::Executor::with_storage(&self.storage).with_timeout(self.config.storage.query_timeout_ms);
+                    sql::Executor::with_storage(&self.storage).with_timeout(self.effective_statement_timeout_ms());
                 let source_rows = executor.execute(source)?;
 
                 // Check for RLS enforcement
@@ -11600,7 +11617,7 @@ impl EmbeddedDatabase {
             _ => {
                 // For query plans, use executor
                 let mut executor =
-                    sql::Executor::with_storage(&self.storage).with_timeout(self.config.storage.query_timeout_ms);
+                    sql::Executor::with_storage(&self.storage).with_timeout(self.effective_statement_timeout_ms());
                 let results = executor.execute(&plan)?;
                 Ok(results.len() as u64)
             }
@@ -12517,7 +12534,7 @@ impl EmbeddedDatabase {
             } => {
                 // Execute source SELECT plan
                 let mut executor =
-                    sql::Executor::with_storage(&self.storage).with_timeout(self.config.storage.query_timeout_ms);
+                    sql::Executor::with_storage(&self.storage).with_timeout(self.effective_statement_timeout_ms());
                 let source_rows = executor.execute(source)?;
 
                 let catalog = self.storage.catalog();
@@ -13042,7 +13059,7 @@ impl EmbeddedDatabase {
             _ => {
                 // For query plans and other operations, use executor with parameters
                 let mut executor = sql::Executor::with_storage(&self.storage)
-                    .with_timeout(self.config.storage.query_timeout_ms)
+                    .with_timeout(self.effective_statement_timeout_ms())
                     .with_parameters(params.to_vec());
                 let results = executor.execute(plan)?;
                 Ok((results.len() as u64, Vec::new()))
@@ -13177,7 +13194,7 @@ impl EmbeddedDatabase {
                 let planner = sql::Planner::with_catalog(&catalog).with_sql(sql.to_string());
                 let plan = planner.statement_to_plan(statement)?;
                 let mut executor = sql::Executor::with_storage(&self.storage)
-                    .with_timeout(self.config.storage.query_timeout_ms)
+                    .with_timeout(self.effective_statement_timeout_ms())
                     .with_transaction(txn_ref);
                 let results = executor.execute(&plan)?;
                 self.log_slow_query(sql, start.elapsed(), results.len() as u64);
@@ -13283,7 +13300,7 @@ impl EmbeddedDatabase {
 
                 let exec_start = std::time::Instant::now();
                 let mut executor =
-                    sql::Executor::with_storage(&self.storage).with_timeout(self.config.storage.query_timeout_ms);
+                    sql::Executor::with_storage(&self.storage).with_timeout(self.effective_statement_timeout_ms());
                 let results = executor.execute(&arc_plan)?;
                 tracing::debug!(
                     phase = "execute",
@@ -13305,7 +13322,7 @@ impl EmbeddedDatabase {
             let plan = self.apply_rls_to_plan((*arc_plan).clone())?;
             let exec_start = std::time::Instant::now();
             let mut executor =
-                sql::Executor::with_storage(&self.storage).with_timeout(self.config.storage.query_timeout_ms);
+                sql::Executor::with_storage(&self.storage).with_timeout(self.effective_statement_timeout_ms());
             let results = executor.execute(&plan)?;
             tracing::debug!(
                 phase = "execute",
@@ -13382,7 +13399,7 @@ impl EmbeddedDatabase {
         // deep `plan.clone()` that fed the cache insertion above.
         let exec_start = std::time::Instant::now();
         let mut executor =
-            sql::Executor::with_storage(&self.storage).with_timeout(self.config.storage.query_timeout_ms);
+            sql::Executor::with_storage(&self.storage).with_timeout(self.effective_statement_timeout_ms());
         let results = if self.tenant_manager.get_current_context().is_none() {
             executor.execute(&plan_arc)?
         } else {
@@ -13484,7 +13501,7 @@ impl EmbeddedDatabase {
                 return Ok(result);
             }
             let mut executor =
-                sql::Executor::with_storage(&self.storage).with_timeout(self.config.storage.query_timeout_ms);
+                sql::Executor::with_storage(&self.storage).with_timeout(self.effective_statement_timeout_ms());
             let result = executor.execute_with_columns(&arc_plan)?;
             if admit {
                 self.cache_query_result(sql, &result.0);
@@ -13513,7 +13530,7 @@ impl EmbeddedDatabase {
         }
 
         let mut executor =
-            sql::Executor::with_storage(&self.storage).with_timeout(self.config.storage.query_timeout_ms);
+            sql::Executor::with_storage(&self.storage).with_timeout(self.effective_statement_timeout_ms());
         let result = executor.execute_with_columns(&plan_arc)?;
         if admit && !is_show_branches {
             self.cache_query_result(sql, &result.0);
@@ -14099,7 +14116,7 @@ impl EmbeddedDatabase {
 
             // Execute plan with transaction context
             let mut executor = sql::Executor::with_storage(&self.storage)
-                .with_timeout(self.config.storage.query_timeout_ms)
+                .with_timeout(self.effective_statement_timeout_ms())
                 .with_transaction(&txn);
 
             executor.execute(&plan)
@@ -14383,7 +14400,7 @@ impl EmbeddedDatabase {
         let plan = planner.statement_to_plan(statement)?;
 
         let mut executor = sql::Executor::with_storage(&self.storage)
-            .with_timeout(self.config.storage.query_timeout_ms)
+            .with_timeout(self.effective_statement_timeout_ms())
             .with_transaction(&txn);
         let result = executor.execute_with_columns(&plan);
         if let Ok((rows, _)) = &result {
@@ -14613,7 +14630,7 @@ impl EmbeddedDatabase {
         }
 
         let mut executor = sql::Executor::with_storage(&self.storage)
-            .with_timeout(self.config.storage.query_timeout_ms)
+            .with_timeout(self.effective_statement_timeout_ms())
             .with_parameters(params.to_vec())
             .with_transaction(&txn);
         executor.execute_with_columns(&plan)
@@ -14828,7 +14845,7 @@ impl EmbeddedDatabase {
         };
 
         let mut executor = sql::Executor::with_storage(&self.storage)
-            .with_timeout(self.config.storage.query_timeout_ms)
+            .with_timeout(self.effective_statement_timeout_ms())
             .with_parameters(params.to_vec());
         if let Some(txn_ref) = active_txn {
             executor = executor.with_transaction(txn_ref);
@@ -14927,7 +14944,7 @@ impl EmbeddedDatabase {
             .current_transaction
             .lock();
         let mut executor = sql::Executor::with_storage(&self.storage)
-            .with_timeout(self.config.storage.query_timeout_ms)
+            .with_timeout(self.effective_statement_timeout_ms())
             .with_parameters(params.to_vec());
         if let Some(txn_ref) = txn_lock.as_ref() {
             executor = executor.with_transaction(txn_ref);
@@ -16829,7 +16846,7 @@ impl EmbeddedDatabase {
                 let bound_plan = Self::bind_outer_refs_in_plan(subquery.as_ref(), outer_row, outer_schema, outer_table);
                 // Execute the (now-uncorrelated) plan.
                 let mut executor =
-                    sql::Executor::with_storage(&self.storage).with_timeout(self.config.storage.query_timeout_ms);
+                    sql::Executor::with_storage(&self.storage).with_timeout(self.effective_statement_timeout_ms());
                 let rows = executor.execute(&bound_plan)?;
                 let value = rows
                     .first()

@@ -636,7 +636,8 @@ impl WriteAheadLog {
         let mut entries = Vec::new();
         let prefix = b"wal:entries:";
 
-        // Iterate over all WAL entries
+        // Iterate over all WAL entries. Keys are `wal:entries:{lsn:020}`, so
+        // the prefix iterator yields them in ascending-LSN order.
         let iter = self.db.prefix_iterator(prefix);
         for item in iter {
             let (key, value) = item.map_err(|e| Error::storage(format!("WAL replay iterator error: {}", e)))?;
@@ -646,10 +647,28 @@ impl WriteAheadLog {
                 break;
             }
 
-            // Deserialize entry
-            let entry = WalEntry::deserialize(&value)?;
-            debug!("Replaying WAL entry with LSN {}", entry.lsn);
-            entries.push(entry);
+            // C13: a record that fails to decode is a torn/corrupt TAIL — the
+            // last append at crash time may be partial. Because entries are in
+            // ascending-LSN order, everything BEFORE it is a valid, complete
+            // prefix and is safe to replay; a record after a gap can never have
+            // been acknowledged (LSN is issued in order), so we stop here and
+            // keep the good prefix instead of aborting the entire recovery
+            // (which the old `?` did, discarding every recovered entry over one
+            // bad tail record).
+            match WalEntry::deserialize(&value) {
+                Ok(entry) => {
+                    debug!("Replaying WAL entry with LSN {}", entry.lsn);
+                    entries.push(entry);
+                }
+                Err(e) => {
+                    warn!(
+                        "WAL replay stopping at first undecodable record ({}): keeping {} valid entries recovered before it (torn tail)",
+                        e,
+                        entries.len()
+                    );
+                    break;
+                }
+            }
         }
 
         info!("WAL replay complete, {} entries recovered", entries.len());
@@ -1242,6 +1261,39 @@ mod tests {
         // Replay
         let entries = wal.replay().unwrap();
         assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].lsn, 1);
+        assert_eq!(entries[1].lsn, 2);
+    }
+
+    #[test]
+    fn test_wal_replay_tolerates_torn_tail() {
+        // C13: a corrupt/partial record at the tail (LSN 3) must NOT abort the
+        // whole replay — the valid prefix (LSN 1, 2) is kept and replay stops
+        // at the first undecodable record.
+        let (_temp, db) = create_test_db();
+        let wal = WriteAheadLog::open(Arc::clone(&db), WalSyncMode::Sync).unwrap();
+
+        wal.append(WalOperation::CreateTable {
+            table: "t".to_string(),
+            schema: vec![1],
+        })
+        .unwrap();
+        wal.append(WalOperation::Insert {
+            table: "t".to_string(),
+            key: b"data:t:1".to_vec(),
+            tuple: vec![9],
+        })
+        .unwrap();
+
+        // Inject a torn record at the next LSN key: valid key, garbage value.
+        let torn_key = format!("wal:entries:{:020}", 3);
+        db.put(torn_key.as_bytes(), b"\xff\xff not a valid WalEntry \x00\x01")
+            .unwrap();
+
+        // Old behavior: `?` on the failed decode discarded everything and
+        // returned Err. New behavior: keep the good prefix, stop at the tear.
+        let entries = wal.replay().expect("replay must not error on a torn tail");
+        assert_eq!(entries.len(), 2, "valid prefix must survive the torn tail");
         assert_eq!(entries[0].lsn, 1);
         assert_eq!(entries[1].lsn, 2);
     }

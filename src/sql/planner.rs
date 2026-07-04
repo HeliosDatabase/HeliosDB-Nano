@@ -1191,11 +1191,23 @@ impl<'a> Planner<'a> {
             // pre-registered into scope before its body is planned and the
             // executor uses the fixpoint loop — making a non-RECURSIVE
             // self-referencing CTE behave like WITH RECURSIVE (migration-friendly).
+            //
+            // C12: but ONLY when the self-reference cannot resolve to a real
+            // table. A non-RECURSIVE `WITH x AS (SELECT … FROM x)` where a table
+            // `x` also exists is a table-SHADOW under PostgreSQL semantics — the
+            // inner `x` is the table, not the CTE — and must NOT be hijacked into
+            // an (empty-then-fixpoint) recursion, which returned 0 rows. A genuine
+            // recursive CTE has no same-named table (or is written WITH RECURSIVE,
+            // which sets `recursive` directly).
             let is_recursive = with_clause.recursive
-                || with_clause
-                    .cte_tables
-                    .iter()
-                    .any(|cte| Self::cte_body_references(&cte.query, &cte.alias.name.to_string()));
+                || with_clause.cte_tables.iter().any(|cte| {
+                    let name = cte.alias.name.to_string();
+                    Self::cte_body_references(&cte.query, &name)
+                        && !self
+                            .catalog
+                            .map(|c| c.table_exists(&name).unwrap_or(false))
+                            .unwrap_or(false)
+                });
             let mut ctes = Vec::new();
             for cte in with_clause.cte_tables {
                 let cte_name = cte.alias.name.to_string();
