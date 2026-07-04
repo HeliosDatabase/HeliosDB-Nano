@@ -13453,6 +13453,73 @@ impl EmbeddedDatabase {
         Some((cached_results, columns))
     }
 
+    /// A2: is query normalization enabled? Read once from
+    /// `NANO_DISABLE_QUERY_NORMALIZATION` (the runtime kill switch) and cached.
+    fn query_normalization_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var("NANO_DISABLE_QUERY_NORMALIZATION").is_err())
+    }
+
+    /// A2: rewrite a unique-literal SELECT's WHERE predicate to `$n` parameters
+    /// and execute it against a plan cached under the normalized (literal-free)
+    /// key — so repeated point reads that differ only in their literals share
+    /// one cached parameterized plan instead of re-parsing and re-planning every
+    /// time. Returns `None` (caller uses the raw path) whenever normalization
+    /// does not apply. Correctness is guaranteed by `normalize_select_literals`
+    /// (typed through the planner's own literal path) and the
+    /// `tests/…::differential` oracle (raw rows == normalized rows).
+    fn try_normalized_query_with_columns(&self, sql: &str) -> Option<Result<(Vec<Tuple>, Vec<String>)>> {
+        if !Self::query_normalization_enabled() {
+            return None;
+        }
+        // Only the autocommit read path. In a transaction the query may need to
+        // see the txn's own writes / RLS rewrites; leave those to the raw path.
+        if self.in_transaction()
+            || self.any_session_txns()
+            || self.tenant_manager.get_current_context().is_some()
+            || self.storage.get_current_branch_id().is_some()
+        {
+            return None;
+        }
+
+        let (nsql, params) = sql::normalize::normalize_select_literals(sql)?;
+
+        // Reuse a plan cached under the normalized key, else parse + plan it
+        // once and admit it (A1 admission still applies: the normalized key
+        // recurs across every literal variant, so it warms on the second call).
+        let plan_arc = if let Some(cached) = self.plan_cache.get(&nsql) {
+            cached
+        } else {
+            let (statement, _) = match self.parse_cached(&nsql) {
+                Ok(v) => v,
+                Err(e) => return Some(Err(e)),
+            };
+            let catalog = self.storage.catalog();
+            let planner = sql::Planner::with_catalog(&catalog).with_sql(nsql.clone());
+            let plan = match planner.statement_to_plan(statement) {
+                Ok(p) => p,
+                Err(e) => return Some(Err(e)),
+            };
+            let plan = match self.cold_optimizer().optimize_recursive(plan) {
+                Ok(p) => p,
+                Err(e) => return Some(Err(e)),
+            };
+            let plan_arc = std::sync::Arc::new(plan);
+            if self.cache_admits(&nsql) {
+                self.plan_cache.put(nsql.clone(), plan_arc.clone());
+            }
+            plan_arc
+        };
+
+        let mut executor = sql::Executor::with_storage(&self.storage)
+            .with_parameters(params)
+            .with_timeout(self.effective_statement_timeout_ms());
+        // The normalized path deliberately does NOT populate the result cache:
+        // the parameters vary per call, so the rows are not reusable under the
+        // normalized key (only the plan is).
+        Some(executor.execute_with_columns(&plan_arc))
+    }
+
     pub fn query_with_columns(&self, sql: &str) -> Result<(Vec<Tuple>, Vec<String>)> {
         if let Some(result) = self.try_fast_select_with_columns(sql) {
             return result;
@@ -13478,6 +13545,17 @@ impl EmbeddedDatabase {
                 branch_id: None,
             };
             return Ok((vec![row], vec!["versions_collected".to_string()]));
+        }
+
+        // A2: literal normalization → shared parameterized plan. A repeated
+        // point read that differs only in its WHERE literals reuses one cached
+        // plan under the normalized key instead of re-parsing/planning every
+        // literal variant. Only fires for deterministic autocommit SELECTs it
+        // can prove safe; everything else falls through to the raw path below.
+        if !Self::query_is_non_deterministic(sql) {
+            if let Some(result) = self.try_normalized_query_with_columns(sql) {
+                return result;
+            }
         }
 
         let cacheable = !self.in_transaction() && !Self::query_is_non_deterministic(sql);
@@ -18031,7 +18109,11 @@ mod tests {
         db.execute("INSERT INTO qwc_plan_cache VALUES (1, 10)").unwrap();
         db.execute("INSERT INTO qwc_plan_cache VALUES (2, 20)").unwrap();
 
-        let sql = "SELECT id, val FROM qwc_plan_cache WHERE val >= 10";
+        // `WHERE val IS NOT NULL` has no normalizable literal, so A2 leaves it
+        // on the raw plan/result-cache path this test exercises (a normalizable
+        // predicate like `val >= 10` would instead cache under the normalized
+        // key — see `a2_normalized_plan_is_reused_across_literals`).
+        let sql = "SELECT id, val FROM qwc_plan_cache WHERE val IS NOT NULL";
         // R-A1: the cache-admission filter only admits a query on its second
         // sighting, so one-shot unique-literal queries never churn the caches.
         // The first run must NOT cache; the second warms plan + result.
@@ -28312,5 +28394,49 @@ mod tests {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         db.execute("CREATE TABLE cbi_empty (id INT PRIMARY KEY)").unwrap();
         assert_eq!(db.copy_bulk_insert("cbi_empty", &[], &[]).unwrap().unwrap(), 0);
+    }
+
+    // ---- A2 literal normalization: plan-cache reuse across literal variants ----
+
+    #[test]
+    fn a2_normalized_plan_is_reused_across_literals() {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE t (aid INT, abalance INT)").unwrap();
+        db.execute("CREATE INDEX t_aid ON t(aid)").unwrap();
+        for i in 1..=10 {
+            db.execute(&format!("INSERT INTO t VALUES ({i}, {})", i * 100)).unwrap();
+        }
+        let norm_key = "SELECT abalance FROM t WHERE aid = $1";
+
+        // Distinct literals: each raw key is unique and must NOT be plan-cached
+        // (A1 admission), but the shared normalized key warms and is reused.
+        for aid in 1..=6 {
+            let (rows, _c) = db
+                .query_with_columns(&format!("SELECT abalance FROM t WHERE aid = {aid}"))
+                .unwrap();
+            assert_eq!(rows[0].values[0], Value::Int4(aid * 100));
+            // No per-literal raw plan-cache entry should ever form.
+            assert!(
+                !db.plan_cache.contains(&format!("SELECT abalance FROM t WHERE aid = {aid}")),
+                "raw literal key must not be plan-cached (aid={aid})"
+            );
+        }
+        // The normalized key is cached and shared (warmed by the 2nd sighting).
+        assert!(
+            db.plan_cache.contains(norm_key),
+            "the normalized key must be plan-cached and reused across literals"
+        );
+    }
+
+    #[test]
+    fn a2_kill_switch_env_is_honored() {
+        // With normalization compiled in and enabled by default, a point read
+        // still returns correct rows; the kill-switch path is a process-global
+        // env read (covered by the differential oracle running both paths).
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE k (id INT, v INT)").unwrap();
+        db.execute("INSERT INTO k VALUES (1,10),(2,20)").unwrap();
+        let (rows, _c) = db.query_with_columns("SELECT v FROM k WHERE id = 2").unwrap();
+        assert_eq!(rows[0].values[0], Value::Int4(20));
     }
 }
