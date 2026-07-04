@@ -132,6 +132,13 @@ pub enum WalOperation {
     /// Update a sequence counter (for HA replication)
     /// Ensures auto-increment values are preserved across failover
     UpdateCounter { table_name: String, new_value: u64 },
+
+    /// Rename a table (ALTER TABLE … RENAME TO). Belongs with the Table-DDL
+    /// section above, but bincode encodes the variant *index*, so new
+    /// variants must be appended at the END to keep existing on-disk WALs
+    /// decodable. Without this entry, replay re-applies CreateTable+Inserts
+    /// for the old name and resurrects the renamed-away table.
+    RenameTable { old_table: String, new_table: String },
 }
 
 /// WAL entry with metadata

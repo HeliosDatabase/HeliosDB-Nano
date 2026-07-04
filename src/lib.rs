@@ -1825,7 +1825,6 @@ impl EmbeddedDatabase {
 
     /// Internal method to begin a transaction
     fn begin_transaction_internal(&self) -> Result<()> {
-        use crate::error::LockResultExt;
         let mut txn_ref = self
             .current_transaction
             .lock();
@@ -1842,7 +1841,6 @@ impl EmbeddedDatabase {
 
     /// Internal method to commit the current transaction
     fn commit_internal(&self) -> Result<()> {
-        use crate::error::LockResultExt;
         let mut txn_ref = self
             .current_transaction
             .lock();
@@ -1883,7 +1881,6 @@ impl EmbeddedDatabase {
 
     /// Internal method to rollback the current transaction
     fn rollback_internal(&self) -> Result<()> {
-        use crate::error::LockResultExt;
         let mut txn_ref = self
             .current_transaction
             .lock();
@@ -5925,7 +5922,6 @@ impl EmbeddedDatabase {
     }
 
     pub fn execute(&self, sql: &str) -> Result<u64> {
-        use crate::error::LockResultExt;
 
         // SQLite-compat: PRAGMA without a result-set (assignments / no-op
         // tunables) — `execute()` callers don't expect rows back.
@@ -12959,7 +12955,6 @@ impl EmbeddedDatabase {
         // fall through to the autocommit path — same outcome as locking
         // after that commit/rollback.
         if self.global_txn_active.load(std::sync::atomic::Ordering::Acquire) {
-            use crate::error::LockResultExt;
             let txn_lock = self
                 .current_transaction
                 .lock();
