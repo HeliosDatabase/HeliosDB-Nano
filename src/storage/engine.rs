@@ -9015,6 +9015,26 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Log a table rename to the logical WAL. Without this entry, replay
+    /// re-applies the old name's CreateTable+Inserts and resurrects the
+    /// renamed-away table (and an HA standby never learns of the rename).
+    pub fn log_rename_table(&self, old_name: &str, new_name: &str) -> Result<()> {
+        // Skip if replaying (recovery) or not primary
+        if self.is_replaying.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(());
+        }
+
+        if let Some(wal) = &self.wal {
+            let wal = wal.read();
+            // Use nosync for DDL — metadata is already crash-safe in RocksDB
+            wal.append_nosync(WalOperation::RenameTable {
+                old_table: old_name.to_string(),
+                new_table: new_name.to_string(),
+            })?;
+        }
+        Ok(())
+    }
+
     /// Log a Truncate operation to WAL
     pub fn log_truncate(&self, table_name: &str) -> Result<()> {
         if self.is_replaying.load(std::sync::atomic::Ordering::Acquire) {
@@ -9505,6 +9525,21 @@ impl StorageEngine {
                 Ok(())
             }
 
+            WalOperation::RenameTable { old_table, new_table } => {
+                let catalog = Catalog::new(self);
+                // Earlier replayed entries (CreateTable + Inserts) resurrect
+                // the old name; re-applying the rename moves them onto the
+                // (byte-identical) checkpointed target. If the old name is
+                // absent the rename already holds — skip.
+                if catalog.get_table_schema(&old_table).is_err() {
+                    debug!("Table {} doesn't exist, skipping rename (already applied)", old_table);
+                    return Ok(());
+                }
+                catalog.rename_table_replay(&old_table, &new_table)?;
+                debug!("Replayed rename table: {} -> {}", old_table, new_table);
+                Ok(())
+            }
+
             WalOperation::Truncate { table } => {
                 let catalog = Catalog::new(self);
 
@@ -9864,6 +9899,19 @@ impl StorageEngine {
 
                 catalog.drop_table(table)?;
                 debug!("Replayed drop table: {}", table);
+                Ok(false) // Don't count as batch operation
+            }
+
+            WalOperation::RenameTable { old_table, new_table } => {
+                // Can't batch schema operations, apply immediately (see the
+                // apply_wal_operation arm for the skip semantics).
+                let catalog = Catalog::new(self);
+                if catalog.get_table_schema(old_table).is_err() {
+                    debug!("Table {} doesn't exist, skipping rename (already applied)", old_table);
+                    return Ok(false);
+                }
+                catalog.rename_table_replay(old_table, new_table)?;
+                debug!("Replayed rename table: {} -> {}", old_table, new_table);
                 Ok(false) // Don't count as batch operation
             }
 

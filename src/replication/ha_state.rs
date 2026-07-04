@@ -542,6 +542,7 @@ impl HAStateRegistry {
             // Table DDL
             WalOperation::CreateTable { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
             WalOperation::DropTable { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
+            WalOperation::RenameTable { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
             WalOperation::AlterColumnStorage { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
 
             // Index operations
