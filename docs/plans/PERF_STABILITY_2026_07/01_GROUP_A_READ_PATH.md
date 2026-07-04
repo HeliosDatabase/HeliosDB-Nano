@@ -29,6 +29,23 @@ pgbench ratios match). pstack at c=32: top waits = glibc **malloc arena locks** 
 clone/evict churn; ART/RocksDB are NOT the cap. The v3.33 "4-Mutex convoy" is REFUTED at
 HEAD (fixed by R2.1 sharded LRUs + `global_txn_active` fast-out).
 
+## Execution split (decided during implementation)
+
+Group A ships in **two milestones** matching the plan's own "ship first" / "headline"
+structure, so the low-risk churn-stop isn't gated against the beat-PG target it can't
+reach alone, and the high-risk normalization gets its own focused gate:
+
+- **M2a (`perf/read-path-normalization`, A1 + A5 + parse guard)** — DONE, gating.
+  Cache-admission filter, shared cold optimizer, Arc-once plan insert, parse-cache size
+  guard. Gate criterion: **no regression anywhere (incl. pg35, SELECT 1, COPY, DROP) +
+  measurable c≥16 indexed-read improvement** (A1's actual goal is removing malloc-arena
+  churn at concurrency, not the c=1 straight-line cost — that needs A2).
+- **M2b (next milestone, A2 + A3 + A4)** — the headline: token-level literal
+  normalization → parameterized plan cache (design below), row-cache capacity/stats/keys,
+  ART registry map. Gate criterion: the full group-A target (c=1 ≥+50% & >PG; c=32
+  ≥+75% & >PG). A2 is the risky piece (touches every wire SELECT) — own branch, full
+  bail-out matrix, pg35 + psycopg regression.
+
 ## Changes (agent's ranked list, implementation order)
 
 ### A1 — Stop guaranteed-miss cache churn + handler preamble trims (S, ship first)
