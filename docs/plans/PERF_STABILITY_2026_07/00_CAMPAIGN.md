@@ -61,9 +61,9 @@ Run on a **quiet machine** (no concurrent builds/agents). Offloaded to a Sonnet 
 | M3 COPY typed bulk path | #8 | COPY 100k 2.47s→458ms (**5.4×**), atomic; +B4 session-txn COPY |
 | M4 write-path | #9 | nextval inserts **32.3×** (D1); durable +11-63% @16-32T (D2); sharded row cache (D3) |
 | M5 resource governance | #10 | statement timeout enforced (C11); CTE caps + shadow fix (C12); WAL torn-tail (C13) |
+| M2b A2 literal normalization | #11 | **indexed point-read +104% @c=1 (2.14× PG), +157% @c=32 (2.26× PG)** — reverses the pre-campaign vs-PG deficit at every concurrency; differential oracle + pg35 35-0-0 |
 
-Deferred (documented, ready to pick up): **M2b** A2 literal normalization (headline read-path
-win, high-risk — appendix `01a`, differential-oracle mandated), C11-wire per-connection SET,
+Deferred (documented, ready to pick up): C11-wire per-connection SET,
 C14 portal streaming, C15 index-def version migration, D4 UPDATE versioning unify, D6
 pessimistic-lock removal. Two product DECISION items unchanged: `durable_commit=false` default,
 `version_retention: None` default (§Group C/D DECISION).
