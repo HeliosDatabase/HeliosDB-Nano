@@ -19,7 +19,8 @@ Groups are finalized after the 4-agent analysis fan-out (read-path, COPY, stabil
 | M | Group / branch | Content | Headline expectation |
 |---|---|---|---|
 | M1 | C-I `fix/stability-wire-hardening` | Wire-message caps, malformed-msg panic fixes, TO_DATE panic, MySQL conn cap + stmt LRU, accept backoff, poisonable mutex, HNSW flake fix A + recall guard, UUID-probe regression tests (03_GROUP_C §C-I) | Perf-neutral; de-flakes release gate; kills pre-auth OOM/panic vectors |
-| M2 | A `perf/read-path-normalization` | Cache-churn stop + preamble trims (A1), token-level literal normalization → param plan cache (A2), row-cache cap/stats (A3), ART registry map (A4), probe de-warting (A5) (01_GROUP_A) | Indexed read c=1 5.3k→≥8k, c=32 48k→≥85k (beat PG both) |
+| M2a ✅MERGED | A `perf/read-path-normalization` (PR #7) | Cache-admission churn stop (A1) + shared cold optimizer (A5) + parse guard | Indexed-read +9-35% @ c≥8/16 (2 trials); no erosion; pg35 35-0-0 |
+| M2b | A2+A3+A4 (own branch) | Token-level literal normalization → param plan cache (A2, see 01a), row-cache cap/stats (A3), ART registry map (A4) | Indexed read c=1 ≥+50% & >PG, c=32 ≥+75% & >PG |
 | M3 | B `perf/copy-bulk-load` | COPY → typed fast-batch path (B1), implicit-txn multi-row literal fast path (B2) (02_GROUP_B) | COPY 100k 2.3s→≤0.5s + PG-atomic semantics |
 | M4 | D `perf/write-path-2026-07` | Sequence refill fsync-outside-mutex + CACHE default (D1), group-commit window 1000µs (D2), row-cache sharding + batched invalidation (D3) (04_GROUP_D) | nextval inserts ~90/s→≥1.5k/s; durable TPS +10-25% @ 32T |
 | M5 | C-II `fix/stability-resource-governance` | Statement timeout (C11), CTE caps (C12), WAL prefix replay (C13), portal double-copy (C14), index-def version migration (C15), UPDATE versioning unify (D4), pessimistic-lock removal (D6), session-txn COPY (B4) | Bounded resources; no silent stale AS OF; no 1s conflict stalls |
@@ -61,6 +62,12 @@ Run on a **quiet machine** (no concurrent builds/agents). Offloaded to a Sonnet 
   verified end-to-end (baseline: 2/2 hangs + torn split-table on kill; M1: 1.3s,
   atomic, replay-correct). Bonus findings fixed in M1: RENAME torn-table hazard,
   RENAME WAL-replay resurrection, HNSW production recall bug.
+- 2026-07-04: **M2a MERGED** (PR #7, eef73d7). Read-path churn stop. Regression lib
+  1963/0; scalability PASS — indexed-read (target) +35% @c=16 trial 1, +9-18% @c≥8
+  paired retest; all apparent SELECT1/COPY/DROP regressions reversed on order-swapped
+  retest (host noise; `cache_admits` unreachable on cache hits, confirmed at source);
+  pg35 35-0-0. GATE LESSON: one `bench-engines.sh` run is noise-unreliable on this
+  host — paired/order-swapped retest required before calling any cell eroded.
 - 2026-07-04: M1 (C-I) implemented on `fix/stability-wire-hardening`: C1-C10 complete
   (wire caps, checked parsers, TO_DATE panic, parking_lot txn mutex, MySQL conn cap +
   stmt cap, accept backoff, HNSW flake reorder + brute-force recall rescue ×3 metrics,
