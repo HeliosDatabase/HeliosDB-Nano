@@ -1436,17 +1436,45 @@ where
                 .await;
         }
 
-        // Parse rows (text or CSV) and bulk-insert in batches.
+        // Parse rows (text or CSV) and bulk-insert.
         let rows = if copy.format == CopyFormat::Csv {
             super::copy::parse_csv_rows(&data)
         } else {
             super::copy::parse_text_rows(&data)
         };
         let total = rows.len();
+
+        // R-B1: typed fast path — apply the whole COPY as one atomic batch
+        // through the fast insert-batch machinery, skipping the per-chunk
+        // render-to-SQL → parse → generic-plan-arm round-trip. Only for
+        // autocommit COPY (no open session transaction); returns None for
+        // shapes it does not cover (triggers, FK/CHECK, RLS, …), in which case
+        // we fall through to the generic SQL path below with identical
+        // semantics.
+        if !self.database.session_in_transaction(self.session_id) {
+            match self.database.copy_bulk_insert(&copy.table, &copy.columns, &rows) {
+                Some(Ok(_)) => {
+                    self.send_command_complete(&format!("COPY {total}")).await?;
+                    return self.send_ready_for_query().await;
+                }
+                Some(Err(e)) => {
+                    return self
+                        .send_error("ERROR", "XX000", &format!("COPY insert failed: {e}"), None, None)
+                        .await;
+                }
+                None => {} // fall back to the generic SQL path
+            }
+        }
+
+        // R-B4: route the generic fallback through the SESSION so that COPY
+        // inside `BEGIN … ROLLBACK` participates in the transaction (previously
+        // it used the session-unaware `execute()` and leaked rows on rollback).
+        // Outside a transaction `execute_for_session` autocommits per chunk,
+        // matching the prior behavior.
         const BATCH: usize = 500;
         for chunk in rows.chunks(BATCH) {
             if let Some(sql) = super::copy::build_insert_sql(&copy.table, &copy.columns, chunk) {
-                if let Err(e) = self.database.execute(&sql) {
+                if let Err(e) = self.database.execute_for_session(self.session_id, &sql) {
                     return self
                         .send_error("ERROR", "XX000", &format!("COPY insert failed: {e}"), None, None)
                         .await;
