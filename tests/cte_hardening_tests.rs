@@ -527,4 +527,68 @@ mod cte_hardening {
             Err(e) => eprintln!("CTE with EXISTS not supported: {e}"),
         }
     }
+
+    // ---- C12: recursive-CTE resource governance (HashSet dedup + row cap) ----
+
+    #[test]
+    fn recursive_cte_still_reaches_fixpoint_with_hashset_dedup() {
+        // The O(1) HashSet fixpoint dedup must give byte-identical results to
+        // the old O(n²) Vec::contains dedup: a linear counter terminates at its
+        // WHERE bound with exactly the expected dense series.
+        let db = setup_db();
+        let rows = try_q(
+            &db,
+            "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 200) SELECT n FROM c ORDER BY n",
+        )
+        .expect("recursive counter should terminate");
+        assert_eq!(rows.len(), 200);
+        assert_eq!(rows[0].values[0], Value::Int4(1));
+        assert_eq!(rows[199].values[0], Value::Int4(200));
+    }
+
+    #[test]
+    fn non_recursive_cte_shadowing_a_table_reads_the_table() {
+        // C12/planner: `WITH t AS (SELECT … FROM t)` without RECURSIVE, where a
+        // table `t` exists, must resolve the inner `t` to the TABLE (PG
+        // table-shadow semantics) — NOT auto-recurse into an empty CTE (which
+        // returned 0 rows). A same-named table is the tell that it is a shadow,
+        // not recursion; genuine recursion has no same-named table or uses
+        // WITH RECURSIVE.
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE shadow_t (id INT, category TEXT)").unwrap();
+        db.execute("INSERT INTO shadow_t VALUES (1,'A'),(2,'A'),(3,'B')").unwrap();
+        let rows = try_q(
+            &db,
+            "WITH shadow_t AS (SELECT id FROM shadow_t WHERE category = 'A') SELECT id FROM shadow_t ORDER BY id",
+        )
+        .expect("table-shadowing CTE should read the table");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values[0], Value::Int4(1));
+        assert_eq!(rows[1].values[0], Value::Int4(2));
+    }
+
+    #[test]
+    fn recursive_cte_duplicate_rows_are_deduped_to_fixpoint() {
+        // A graph with a cycle: without dedup this never terminates. The
+        // fixpoint set must collapse repeated rows so the traversal ends.
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE edges (src INT, dst INT)").unwrap();
+        // 1->2, 2->3, 3->1 (a cycle) + 3->4.
+        db.execute("INSERT INTO edges VALUES (1,2),(2,3),(3,1),(3,4)").unwrap();
+        let rows = try_q(
+            &db,
+            "WITH RECURSIVE reach(node) AS (SELECT 1 UNION SELECT e.dst FROM edges e JOIN reach r ON e.src = r.node) SELECT node FROM reach ORDER BY node",
+        )
+        .expect("cyclic reachability must terminate via dedup");
+        // Reachable from 1: {1,2,3,4}.
+        let got: Vec<i64> = rows
+            .iter()
+            .map(|r| match &r.values[0] {
+                Value::Int4(n) => i64::from(*n),
+                Value::Int8(n) => *n,
+                v => panic!("unexpected {v:?}"),
+            })
+            .collect();
+        assert_eq!(got, vec![1, 2, 3, 4]);
+    }
 }
