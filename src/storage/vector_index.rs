@@ -1479,10 +1479,13 @@ mod tests {
             )
             .unwrap();
 
-        // Insert vectors
-        manager.insert_vector("test_idx", 1, &vec![1.0, 0.0, 0.0]).unwrap();
+        // Insert vectors. The query's nearest neighbor (id 1) goes LAST — the
+        // first-inserted point can be layer-0-isolated by hnsw_rs's unseeded
+        // level draw and drop out of the k=2 result (~4/2000 runs); see
+        // test_hnsw_basic in vector::hnsw_index for the full mechanism.
         manager.insert_vector("test_idx", 2, &vec![0.0, 1.0, 0.0]).unwrap();
         manager.insert_vector("test_idx", 3, &vec![0.0, 0.0, 1.0]).unwrap();
+        manager.insert_vector("test_idx", 1, &vec![1.0, 0.0, 0.0]).unwrap();
 
         // Search
         let query = vec![1.0, 0.1, 0.0];

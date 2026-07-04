@@ -1067,15 +1067,31 @@ impl<'a> Catalog<'a> {
     /// This operation renames a table by updating its metadata and moving all data rows
     /// to use the new table name. This is used for concurrent materialized view refresh.
     pub fn rename_table(&self, old_name: &str, new_name: &str) -> Result<()> {
+        // Check that new table name is not already in use
+        if self.table_exists(new_name)? {
+            return Err(Error::query_execution(format!("Table '{}' already exists", new_name)));
+        }
+        self.rename_table_inner(old_name, new_name)
+    }
+
+    /// Replay-path rename: WAL replay re-applies operations onto a state
+    /// where earlier entries have already resurrected the old name AND the
+    /// checkpointed data already contains the new name — so the
+    /// target-must-not-exist validation must not apply (the re-moved keys are
+    /// byte-identical). Runtime callers go through `rename_table`.
+    pub(crate) fn rename_table_replay(&self, old_name: &str, new_name: &str) -> Result<()> {
+        self.rename_table_inner(old_name, new_name)
+    }
+
+    fn rename_table_inner(&self, old_name: &str, new_name: &str) -> Result<()> {
         // Check that old table exists
         if !self.table_exists(old_name)? {
             return Err(Error::query_execution(format!("Table '{}' does not exist", old_name)));
         }
 
-        // Check that new table name is not already in use
-        if self.table_exists(new_name)? {
-            return Err(Error::query_execution(format!("Table '{}' already exists", new_name)));
-        }
+        // Log the rename to the logical WAL before touching data (mirrors
+        // log_drop_table ordering) — no-op during replay or on standbys.
+        self.storage.log_rename_table(old_name, new_name)?;
 
         // Get the schema from old table
         let schema = self.get_table_schema(old_name)?;
@@ -1096,16 +1112,6 @@ impl<'a> Catalog<'a> {
         // Get compression stats if they exist
         let compression_stats = self.get_compression_stats(old_name)?;
 
-        // Create new table metadata with the same schema
-        let new_metadata_key = Self::table_metadata_key(new_name);
-        let schema_bytes =
-            bincode::serialize(&schema).map_err(|e| Error::storage(format!("Failed to serialize schema: {}", e)))?;
-        self.storage.put(&new_metadata_key, &schema_bytes)?;
-
-        // Create new counter
-        let new_counter_key = Self::table_counter_key(new_name);
-        self.storage.put(&new_counter_key, &counter_value)?;
-
         // Copy compression config to new table
         if let Some(config) = compression_config {
             self.set_compression_config(new_name, &config)?;
@@ -1116,14 +1122,42 @@ impl<'a> Catalog<'a> {
             self.set_compression_stats(new_name, &stats)?;
         }
 
-        // Move all data rows from old table to new table
+        // The entire rename — new metadata + counter, every data row moved,
+        // all old keys removed — lands in ONE atomic RocksDB write.
+        //
+        // The previous implementation moved rows via per-row
+        // `storage.put()` + `storage.delete()`, which had two bugs (the same
+        // family as the c478286 DROP-TABLE stall):
+        //   1. every `delete()` appends a logical-WAL entry with a synchronous
+        //      fdatasync — a 50k-row RENAME was ~50k fsyncs: 15+ minutes,
+        //      non-cancellable (the statement runs on after client disconnect),
+        //      and it monopolized the WAL writer ("server wedged").
+        //   2. `put()` re-encrypts the value bytes, but the iterator yields the
+        //      *stored* (already-encrypted) form — with encryption enabled every
+        //      moved row was double-encrypted and unreadable after the rename.
+        // Raw batched writes fix both, and make a crash mid-rename atomic
+        // instead of leaving two half-tables.
+        //
+        // NOTE: rename is not logged to the logical WAL as a DDL op (no
+        // WalOperation::RenameTable exists) — true before this change too; the
+        // per-row Delete entries a standby used to receive only deleted the old
+        // rows there without creating the new ones. Proper rename DDL logging
+        // is tracked in docs/plans/PERF_STABILITY_2026_07 (C-II).
+        let new_metadata_key = Self::table_metadata_key(new_name);
+        let schema_bytes =
+            bincode::serialize(&schema).map_err(|e| Error::storage(format!("Failed to serialize schema: {}", e)))?;
+        let new_counter_key = Self::table_counter_key(new_name);
+
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.put(&new_metadata_key, &schema_bytes);
+        batch.put(&new_counter_key, &counter_value);
+
         let old_data_prefix = format!("data:{}:", old_name);
         let old_prefix_bytes = old_data_prefix.as_bytes();
         let new_data_prefix = format!("data:{}:", new_name);
 
-        // Collect all old keys and their values. Seek to the table's data
-        // prefix instead of scanning from the start of the keyspace.
-        let mut rows_to_move = Vec::new();
+        // Seek to the table's data prefix instead of scanning from the start
+        // of the keyspace; stage each move (raw bytes, verbatim) in the batch.
         let mut read_opts = rocksdb::ReadOptions::default();
         read_opts.set_total_order_seek(true);
         let iter = self.storage.db.iterator_opt(
@@ -1139,20 +1173,24 @@ impl<'a> Catalog<'a> {
             // Extract row_id from old key: data:{old_name}:{row_id}
             let key_str = String::from_utf8_lossy(&key);
             if let Some(row_id_str) = key_str.strip_prefix(&old_data_prefix) {
-                rows_to_move.push((row_id_str.to_string(), value.to_vec()));
+                let new_key = format!("{}{}", new_data_prefix, row_id_str).into_bytes();
+                batch.put(&new_key, &value);
+                batch.delete(&key);
             }
         }
 
-        // Write new rows and delete old rows
-        for (row_id, value) in rows_to_move {
-            // Write to new location
-            let new_key = format!("{}{}", new_data_prefix, row_id).into_bytes();
-            self.storage.put(&new_key, &value)?;
+        // Old-name cleanup rides the same atomic batch (these keys are not
+        // `meta:`-exempt in storage.delete(), so they each cost a WAL fsync
+        // on the old path).
+        batch.delete(Self::table_metadata_key(old_name));
+        batch.delete(&old_counter_key);
+        batch.delete(Self::compression_config_key(old_name));
+        batch.delete(Self::compression_stats_key(old_name));
 
-            // Delete from old location
-            let old_key = format!("{}{}", old_data_prefix, row_id).into_bytes();
-            self.storage.delete(&old_key)?;
-        }
+        self.storage
+            .db
+            .write(batch)
+            .map_err(|e| Error::storage(format!("Rename batch write failed: {}", e)))?;
 
         // Rename compression manager resources (no-op - compression handled by RocksDB LZ4)
         super::CompressionManager::new().rename_table(old_name, new_name)?;
@@ -1167,20 +1205,6 @@ impl<'a> Catalog<'a> {
                 e
             );
         }
-
-        // Delete old table metadata
-        let old_metadata_key = Self::table_metadata_key(old_name);
-        self.storage.delete(&old_metadata_key)?;
-
-        // Delete old counter
-        self.storage.delete(&old_counter_key)?;
-
-        // Delete old compression config and stats
-        let old_compression_config_key = Self::compression_config_key(old_name);
-        self.storage.delete(&old_compression_config_key)?;
-
-        let old_compression_stats_key = Self::compression_stats_key(old_name);
-        self.storage.delete(&old_compression_stats_key)?;
 
         // Update schema cache: remove old, add new
         self.storage.invalidate_schema_cache(old_name);

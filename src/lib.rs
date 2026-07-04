@@ -380,8 +380,11 @@ pub struct EmbeddedDatabase {
     /// Storage engine (public for REPL access)
     pub storage: std::sync::Arc<storage::StorageEngine>,
     config: Config,
-    /// Current active transaction (if any)
-    current_transaction: std::sync::Arc<std::sync::Mutex<Option<storage::Transaction>>>,
+    /// Current active transaction (if any). parking_lot: non-poisonable — a
+    /// panic mid-statement (e.g. from a COPY row routed through the global
+    /// execute() path) must not wedge every later statement on this handle
+    /// with a PoisonError.
+    current_transaction: std::sync::Arc<parking_lot::Mutex<Option<storage::Transaction>>>,
     /// "Global transaction open" fast-out (R2.1). Mirrors
     /// `current_transaction.is_some()` and is updated *only* while holding
     /// the `current_transaction` mutex (begin/commit/rollback internals are
@@ -1822,11 +1825,9 @@ impl EmbeddedDatabase {
 
     /// Internal method to begin a transaction
     fn begin_transaction_internal(&self) -> Result<()> {
-        use crate::error::LockResultExt;
         let mut txn_ref = self
             .current_transaction
-            .lock()
-            .map_lock_err("Failed to acquire transaction lock for begin")?;
+            .lock();
         if txn_ref.is_some() {
             return Err(Error::transaction("Transaction already active"));
         }
@@ -1840,11 +1841,9 @@ impl EmbeddedDatabase {
 
     /// Internal method to commit the current transaction
     fn commit_internal(&self) -> Result<()> {
-        use crate::error::LockResultExt;
         let mut txn_ref = self
             .current_transaction
-            .lock()
-            .map_lock_err("Failed to acquire transaction lock for commit")?;
+            .lock();
         if let Some(txn) = txn_ref.as_ref() {
             self.validate_deferred_fk_checks(Some(txn))?;
         }
@@ -1882,11 +1881,9 @@ impl EmbeddedDatabase {
 
     /// Internal method to rollback the current transaction
     fn rollback_internal(&self) -> Result<()> {
-        use crate::error::LockResultExt;
         let mut txn_ref = self
             .current_transaction
-            .lock()
-            .map_lock_err("Failed to acquire transaction lock for rollback")?;
+            .lock();
         if let Some(txn) = txn_ref.take() {
             // Slot emptied (the transaction is consumed even if rollback
             // errors) — clear the fast-out immediately.
@@ -4998,7 +4995,7 @@ impl EmbeddedDatabase {
         Ok(Self {
             storage,
             config,
-            current_transaction: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            current_transaction: std::sync::Arc::new(parking_lot::Mutex::new(None)),
             global_txn_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tenant_manager: std::sync::Arc::new(crate::tenant::TenantManager::new()),
             trigger_registry: std::sync::Arc::new(sql::TriggerRegistry::new()),
@@ -5090,7 +5087,7 @@ impl EmbeddedDatabase {
         Ok(Self {
             storage,
             config,
-            current_transaction: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            current_transaction: std::sync::Arc::new(parking_lot::Mutex::new(None)),
             global_txn_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tenant_manager: std::sync::Arc::new(crate::tenant::TenantManager::new()),
             trigger_registry: std::sync::Arc::new(sql::TriggerRegistry::new()),
@@ -5204,7 +5201,7 @@ impl EmbeddedDatabase {
         Ok(Self {
             storage,
             config,
-            current_transaction: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            current_transaction: std::sync::Arc::new(parking_lot::Mutex::new(None)),
             global_txn_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tenant_manager: std::sync::Arc::new(crate::tenant::TenantManager::new()),
             trigger_registry: std::sync::Arc::new(sql::TriggerRegistry::new()),
@@ -5925,7 +5922,6 @@ impl EmbeddedDatabase {
     }
 
     pub fn execute(&self, sql: &str) -> Result<u64> {
-        use crate::error::LockResultExt;
 
         // SQLite-compat: PRAGMA without a result-set (assignments / no-op
         // tunables) — `execute()` callers don't expect rows back.
@@ -5991,8 +5987,7 @@ impl EmbeddedDatabase {
             let txn_lock = if self.global_txn_active.load(std::sync::atomic::Ordering::Acquire) {
                 Some(
                     self.current_transaction
-                        .lock()
-                        .map_lock_err("Failed to acquire transaction lock for execute")?,
+                        .lock(),
                 )
             } else {
                 None
@@ -6166,10 +6161,7 @@ impl EmbeddedDatabase {
             Err(e) => return Some(Err(e)),
         };
 
-        let txn_guard = match self.current_transaction.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let txn_guard = self.current_transaction.lock();
         let txn = txn_guard.as_ref()?;
         Some(self.insert_validated_tuple_in_transaction(&spec.table_name, tuple, &spec.schema, txn))
     }
@@ -6204,10 +6196,7 @@ impl EmbeddedDatabase {
             }
         }
 
-        let txn_guard = match self.current_transaction.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let txn_guard = self.current_transaction.lock();
         if let Some(txn) = txn_guard.as_ref() {
             return Some(self.insert_validated_tuples_in_transaction(&spec.table_name, tuples, &spec.schema, txn));
         }
@@ -11335,8 +11324,7 @@ impl EmbeddedDatabase {
             sql::LogicalPlan::Savepoint { ref name } => {
                 let txn = self
                     .current_transaction
-                    .lock()
-                    .map_err(|_| Error::query_execution("Failed to lock transaction"))?;
+                    .lock();
                 let (write_set_snapshot, art_undo_len) = match txn.as_ref() {
                     Some(t) => (t.savepoint_snapshot(), self.art_undo_len_for(t)),
                     None => {
@@ -11374,8 +11362,7 @@ impl EmbeddedDatabase {
                     if let Some((snapshot, art_undo_len)) = restore {
                         let txn = self
                             .current_transaction
-                            .lock()
-                            .map_err(|_| Error::query_execution("Failed to lock transaction"))?;
+                            .lock();
                         if let Some(t) = txn.as_ref() {
                             t.rollback_to_savepoint(&snapshot);
                             self.rollback_art_undo_to(t, art_undo_len);
@@ -11933,8 +11920,7 @@ impl EmbeddedDatabase {
                     None => {
                         _txn_guard = Some(
                             self.current_transaction
-                                .lock()
-                                .map_err(|_| Error::query_execution("Failed to lock transaction"))?,
+                                .lock(),
                         );
                         _txn_guard.as_ref().and_then(|guard| guard.as_ref())
                     }
@@ -12415,8 +12401,7 @@ impl EmbeddedDatabase {
                     None => {
                         _txn_guard = Some(
                             self.current_transaction
-                                .lock()
-                                .map_err(|_| Error::query_execution("Failed to lock transaction"))?,
+                                .lock(),
                         );
                         _txn_guard.as_ref().and_then(|guard| guard.as_ref())
                     }
@@ -12622,8 +12607,7 @@ impl EmbeddedDatabase {
                     None => {
                         _txn_guard = Some(
                             self.current_transaction
-                                .lock()
-                                .map_err(|_| Error::query_execution("Failed to lock transaction"))?,
+                                .lock(),
                         );
                         _txn_guard.as_ref().and_then(|guard| guard.as_ref())
                     }
@@ -12747,8 +12731,7 @@ impl EmbeddedDatabase {
                 // Check if we're in a transaction and snapshot the write set
                 let txn = self
                     .current_transaction
-                    .lock()
-                    .map_err(|_| Error::query_execution("Failed to lock transaction"))?;
+                    .lock();
                 let (write_set_snapshot, art_undo_len) = match txn.as_ref() {
                     Some(t) => (t.savepoint_snapshot(), self.art_undo_len_for(t)),
                     None => {
@@ -12790,8 +12773,7 @@ impl EmbeddedDatabase {
                     if let Some((snapshot, art_undo_len)) = restore {
                         let txn = self
                             .current_transaction
-                            .lock()
-                            .map_err(|_| Error::query_execution("Failed to lock transaction"))?;
+                            .lock();
                         if let Some(t) = txn.as_ref() {
                             t.rollback_to_savepoint(&snapshot);
                             self.rollback_art_undo_to(t, art_undo_len);
@@ -12973,11 +12955,9 @@ impl EmbeddedDatabase {
         // fall through to the autocommit path — same outcome as locking
         // after that commit/rollback.
         if self.global_txn_active.load(std::sync::atomic::Ordering::Acquire) {
-            use crate::error::LockResultExt;
             let txn_lock = self
                 .current_transaction
-                .lock()
-                .map_lock_err("Failed to acquire transaction lock for query")?;
+                .lock();
             if let Some(txn_ref) = txn_lock.as_ref() {
                 // Parse and execute through transaction-aware executor
                 let (statement, _) = self.parse_cached(sql)?;
@@ -14635,8 +14615,7 @@ impl EmbeddedDatabase {
             None => {
                 _txn_guard = Some(
                     self.current_transaction
-                        .lock()
-                        .map_err(|_| Error::query_execution("Failed to lock transaction"))?,
+                        .lock(),
                 );
                 _txn_guard.as_ref().and_then(|guard| guard.as_ref())
             }
@@ -14740,8 +14719,7 @@ impl EmbeddedDatabase {
 
         let txn_lock = self
             .current_transaction
-            .lock()
-            .map_err(|_| Error::query_execution("Failed to lock transaction"))?;
+            .lock();
         let mut executor = sql::Executor::with_storage(&self.storage)
             .with_timeout(self.config.storage.query_timeout_ms)
             .with_parameters(params.to_vec());
