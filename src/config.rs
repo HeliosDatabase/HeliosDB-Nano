@@ -368,7 +368,10 @@ pub struct StorageConfig {
     /// the whole cohort. `0` disables the accumulation wait (commits still
     /// group behind any in-flight fsync). Only meaningful with
     /// `durable_commit = true` (or sessions running
-    /// `SET synchronous_commit = on`). Default: 200.
+    /// `SET synchronous_commit = on`). Default: 1000 — measured 984-1718
+    /// txn/s vs 890-1393 at w=200 on 24-32T durable workloads
+    /// (perf/r1_3_p2_runs); at saturation the window hides behind the
+    /// in-flight fsync, so the added latency only shows on idle-WAL commits.
     pub group_commit_window_us: u64,
     /// Item 8 (v3.58): direct RocksDB write-path tunables for bulk ingest.
     /// Every field is `None` by default = the built-in literal shown, so
@@ -480,7 +483,7 @@ impl Default for StorageConfig {
             version_retention: None,        // infinite retention: version GC disabled (R4.3)
             version_gc_interval_secs: None, // auto: off without retention, 300s with it
             version_gc_max_per_cycle: default_version_gc_max_per_cycle(),
-            group_commit_window_us: 200,
+            group_commit_window_us: 1000,
             // Item 8: None = built-in RocksDB literals (no behavior change).
             rocksdb_write_buffer_size: None,
             rocksdb_max_write_buffer_number: None,
