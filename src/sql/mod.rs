@@ -9,6 +9,7 @@ pub mod evaluator;
 pub mod executor;
 pub mod functions;
 pub mod logical_plan;
+pub(crate) mod normalize;
 pub mod parser;
 pub mod planner;
 pub mod procedural;
