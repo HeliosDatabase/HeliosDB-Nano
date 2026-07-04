@@ -52,6 +52,22 @@ Run on a **quiet machine** (no concurrent builds/agents). Offloaded to a Sonnet 
 
 **Merge**: branch `perf/<group>` or `fix/<group>` → PR with gate results in the body → merge to main (repo uses merge commits, no branch protection). CI perf-gate + release-gate flakes (HNSW/vector tests, dep downloads) are known — rerun failed jobs once before treating as real.
 
+## Campaign complete (2026-07-04) — all 5 milestones merged
+
+| M | PR | Result |
+|---|---|---|
+| M1 stability wire hardening | #6 | pre-auth OOM/panic vectors closed; HNSW flake→recall fix; RENAME wedge+torn-table+WAL-resurrection fix |
+| M2a read-path churn stop | #7 | indexed-read +9-35% @ c≥8/16; no erosion; pg35 35-0-0 |
+| M3 COPY typed bulk path | #8 | COPY 100k 2.47s→458ms (**5.4×**), atomic; +B4 session-txn COPY |
+| M4 write-path | #9 | nextval inserts **32.3×** (D1); durable +11-63% @16-32T (D2); sharded row cache (D3) |
+| M5 resource governance | #10 | statement timeout enforced (C11); CTE caps + shadow fix (C12); WAL torn-tail (C13) |
+
+Deferred (documented, ready to pick up): **M2b** A2 literal normalization (headline read-path
+win, high-risk — appendix `01a`, differential-oracle mandated), C11-wire per-connection SET,
+C14 portal streaming, C15 index-def version migration, D4 UPDATE versioning unify, D6
+pessimistic-lock removal. Two product DECISION items unchanged: `durable_commit=false` default,
+`version_retention: None` default (§Group C/D DECISION).
+
 ## Status log
 
 - 2026-07-04: campaign started; 4 analysis agents launched; baseline binary building.
