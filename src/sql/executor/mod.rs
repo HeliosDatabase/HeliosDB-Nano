@@ -4208,7 +4208,7 @@ impl<'a> Executor<'a> {
             increment_by: increment,
             min_value: min,
             max_value: max,
-            cache: cache.unwrap_or(1).max(1),
+            cache: cache.unwrap_or(crate::storage::DEFAULT_SEQUENCE_CACHE).max(1),
             cycle,
             owned_by_table,
             owned_by_column,
