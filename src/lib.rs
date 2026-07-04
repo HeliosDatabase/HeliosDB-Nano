@@ -376,6 +376,17 @@ fn convert_logical_referential_action(
 /// through the slot's RwLock, which only same-session work ever contends.
 type SessionTxnSlot = std::sync::Arc<parking_lot::RwLock<Option<storage::Transaction>>>;
 
+/// Number of slots in the R-A1 cache-admission filter (`cache_admits`). Power
+/// of two so the slot index is a mask, not a modulo. 1024 slots track enough
+/// distinct hot query shapes that a real working set admits promptly while a
+/// stream of unique-literal one-shots keeps overwriting a bounded footprint.
+const CACHE_ADMISSION_SLOTS: usize = 1024;
+
+/// Build a zeroed R-A1 admission slot table behind an `Arc`.
+fn new_cache_admission() -> std::sync::Arc<[std::sync::atomic::AtomicU64; CACHE_ADMISSION_SLOTS]> {
+    std::sync::Arc::new(std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)))
+}
+
 pub struct EmbeddedDatabase {
     /// Storage engine (public for REPL access)
     pub storage: std::sync::Arc<storage::StorageEngine>,
@@ -440,6 +451,10 @@ pub struct EmbeddedDatabase {
     /// filling the result cache with one-off point lookups while still caching
     /// repeated hot-key queries after the second consecutive hit.
     last_fast_select_fingerprint: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// R-A1 cache-admission slot table (see `cache_admits`): fixed array of
+    /// last-seen SQL fingerprints; a query is admitted to the cold-path caches
+    /// only on a repeat sighting, so unique-literal queries stop churning them.
+    cache_admission: std::sync::Arc<[std::sync::atomic::AtomicU64; CACHE_ADMISSION_SLOTS]>,
     /// Repeated parameterized INSERT metadata cache. Invalidated with the plan cache on DDL.
     fast_param_insert_cache: std::sync::Arc<sharded_lru::ShardedLruCache<String, std::sync::Arc<FastParamInsertSpec>>>,
     /// Repeated literal INSERT shape cache. Literal values differ per statement,
@@ -1384,6 +1399,52 @@ impl EmbeddedDatabase {
         } else {
             hash
         }
+    }
+
+    /// R-A1: admission gate for the parse/plan/result caches on the cold query
+    /// path. A pgbench-style point-read arrives with a fresh literal every
+    /// statement, so its raw-SQL cache key can never hit — but the old code
+    /// still inserted (deep-cloning the AST + plan + result and taking the
+    /// global `hot_result_cache_entry` write lock) on every statement, which
+    /// stack sampling showed as the dominant malloc-arena contention at c≥16.
+    ///
+    /// This is a "seen twice" filter: a query is only admitted to the caches
+    /// on its *second* sighting mapping to the same slot, so single-shot
+    /// unique-literal queries never pollute the cache. It is a lock-free,
+    /// intentionally racy heuristic over a fixed slot table — a hash collision
+    /// or a torn read only ever changes *whether* a given SQL is cached (a
+    /// perf heuristic), never correctness. Genuinely repeated queries (fixed
+    /// literal, prepared shapes normalized by R-A2) admit on the second run.
+    fn cache_admits(&self, sql: &str) -> bool {
+        let fp = Self::fast_select_fingerprint(sql);
+        let slot = (fp as usize) & (CACHE_ADMISSION_SLOTS - 1);
+        // Relaxed is fine: this is a statistical filter, not a synchronization
+        // point — no other state is published through it.
+        let prev = self.cache_admission[slot].swap(fp, std::sync::atomic::Ordering::Relaxed);
+        prev == fp
+    }
+
+    /// Shared cold-path optimizer (R-A5): the five rewrite rules are stateless,
+    /// so build them once and reuse the `Arc` instead of allocating five boxed
+    /// trait objects + a `StatsCatalog` on every cold query. `query()` already
+    /// did this via `cold_optimizer`; this exposes it so `query_with_columns`
+    /// (the wire hot path) can stop rebuilding them per statement.
+    fn cold_optimizer(&self) -> &std::sync::Arc<optimizer::Optimizer> {
+        self.cold_optimizer.get_or_init(|| {
+            let stats = optimizer::cost::StatsCatalog::new();
+            let rules: Vec<Box<dyn optimizer::rules::OptimizationRule>> = vec![
+                Box::new(optimizer::rules::ConstantFoldingRule::new()),
+                Box::new(optimizer::rules::SelectionPushdownRule::new()),
+                Box::new(optimizer::rules::JoinPredicatePushdownRule::new()),
+                Box::new(optimizer::rules::ProjectionPruningRule::new()),
+                Box::new(optimizer::rules::StorageFilterPushdownRule::new()),
+            ];
+            std::sync::Arc::new(optimizer::Optimizer::with_rules(
+                stats,
+                rules,
+                optimizer::OptimizerConfig::default(),
+            ))
+        })
     }
 
     fn maybe_cache_repeated_fast_select(&self, sql: &str, results: &[Tuple]) {
@@ -5024,6 +5085,7 @@ impl EmbeddedDatabase {
             result_cache_nonempty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             hot_result_cache_entry: std::sync::Arc::new(parking_lot::RwLock::new(None)),
             last_fast_select_fingerprint: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            cache_admission: new_cache_admission(),
             fast_param_insert_cache: Self::new_fast_param_insert_cache(),
             fast_literal_insert_cache: Self::new_fast_literal_insert_cache(),
             fast_param_update_cache: Self::new_fast_param_update_cache(),
@@ -5116,6 +5178,7 @@ impl EmbeddedDatabase {
             result_cache_nonempty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             hot_result_cache_entry: std::sync::Arc::new(parking_lot::RwLock::new(None)),
             last_fast_select_fingerprint: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            cache_admission: new_cache_admission(),
             fast_param_insert_cache: Self::new_fast_param_insert_cache(),
             fast_literal_insert_cache: Self::new_fast_literal_insert_cache(),
             fast_param_update_cache: Self::new_fast_param_update_cache(),
@@ -5230,6 +5293,7 @@ impl EmbeddedDatabase {
             result_cache_nonempty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             hot_result_cache_entry: std::sync::Arc::new(parking_lot::RwLock::new(None)),
             last_fast_select_fingerprint: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            cache_admission: new_cache_admission(),
             fast_param_insert_cache: Self::new_fast_param_insert_cache(),
             fast_literal_insert_cache: Self::new_fast_literal_insert_cache(),
             fast_param_update_cache: Self::new_fast_param_update_cache(),
@@ -10261,16 +10325,25 @@ impl EmbeddedDatabase {
         }
     }
 
+    /// Largest SQL text (bytes) the parse cache will key on. COPY renders each
+    /// chunk into a ~25KB multi-row `INSERT … VALUES (…),(…)…` string with a
+    /// unique key that can never hit; caching it deep-clones a 500-row AST and
+    /// evicts genuinely hot entries. Real reusable statements are far smaller.
+    const PARSE_CACHE_MAX_SQL_LEN: usize = 4096;
+
     /// Parse SQL with caching. Returns (statement, was_cached).
     pub(crate) fn parse_cached(&self, sql: &str) -> Result<(sqlparser::ast::Statement, bool)> {
         // Check parse cache first
         if let Some(stmt) = self.parse_cache.get(sql) {
             return Ok((stmt, true));
         }
-        // Cache miss — parse and cache
+        // Cache miss — parse, and cache unless the text is too large to be a
+        // reusable statement (B3: stops COPY/bulk-INSERT parse-cache pollution).
         let parser = sql::Parser::new();
         let statement = parser.parse_one(sql)?;
-        self.parse_cache.put(sql.to_string(), statement.clone());
+        if sql.len() <= Self::PARSE_CACHE_MAX_SQL_LEN {
+            self.parse_cache.put(sql.to_string(), statement.clone());
+        }
         Ok((statement, false))
     }
 
@@ -13137,22 +13210,7 @@ impl EmbeddedDatabase {
         // plan is byte-identical; this only removes per-query allocations.
         let plan = {
             let opt_start = std::time::Instant::now();
-            let opt = self.cold_optimizer.get_or_init(|| {
-                let stats = optimizer::cost::StatsCatalog::new();
-                let rules: Vec<Box<dyn optimizer::rules::OptimizationRule>> = vec![
-                    Box::new(optimizer::rules::ConstantFoldingRule::new()),
-                    Box::new(optimizer::rules::SelectionPushdownRule::new()),
-                    Box::new(optimizer::rules::JoinPredicatePushdownRule::new()),
-                    Box::new(optimizer::rules::ProjectionPruningRule::new()),
-                    Box::new(optimizer::rules::StorageFilterPushdownRule::new()),
-                ];
-                std::sync::Arc::new(optimizer::Optimizer::with_rules(
-                    stats,
-                    rules,
-                    optimizer::OptimizerConfig::default(),
-                ))
-            });
-            let optimized = opt.optimize_recursive(plan)?;
+            let optimized = self.cold_optimizer().optimize_recursive(plan)?;
             tracing::debug!(
                 phase = "optimize",
                 duration_us = opt_start.elapsed().as_micros() as u64,
@@ -13165,8 +13223,16 @@ impl EmbeddedDatabase {
         // pointer (an O(1) refcount bump) into the cache, rather than deep
         // cloning the whole `LogicalPlan` just to insert it. Execution below
         // then runs through the same `Arc`, mirroring the cache-HIT path.
+        //
+        // R-A1: only admit on a repeat sighting (one decision, shared with the
+        // result-cache insert below) so unique-literal one-shots stop churning
+        // the plan/result caches. A genuinely repeated query warms on its
+        // second run; a plan-cache hit thereafter takes the branch above.
+        let admit = !is_non_deterministic && self.cache_admits(sql);
         let plan_arc = std::sync::Arc::new(plan);
-        self.plan_cache.put(sql.to_string(), plan_arc.clone());
+        if admit {
+            self.plan_cache.put(sql.to_string(), plan_arc.clone());
+        }
 
         // 5. Apply RLS policies + 6. Execute.
         //
@@ -13195,10 +13261,11 @@ impl EmbeddedDatabase {
 
         self.log_slow_query(sql, start.elapsed(), results.len() as u64);
 
-        // Cache only deterministic query results. Non-deterministic queries
-        // already bypass lookup above, so caching them only adds clone/lock
-        // overhead and risks serving stale rows if the lookup gate changes.
-        if !is_non_deterministic {
+        // Cache only deterministic query results, and only once admitted
+        // (R-A1) — shares the `admit` decision with the plan-cache insert so a
+        // later hit finds both. Non-deterministic queries already bypass
+        // lookup above, so caching them only adds clone/lock overhead.
+        if admit {
             self.cache_query_result(sql, &results);
         }
 
@@ -13261,6 +13328,11 @@ impl EmbeddedDatabase {
         if let Some((cached_results, columns)) = self.try_cached_query_with_columns(sql) {
             return Ok(((*cached_results).clone(), columns));
         }
+        // R-A1: on a cold miss, only admit to the caches on a repeat sighting,
+        // so unique-literal one-shots stop deep-cloning the plan/result and
+        // taking the global hot-result lock. One decision per cold entry keeps
+        // the plan and result caches consistent (a later hit needs both).
+        let admit = cacheable && self.cache_admits(sql);
 
         // Phase 3 branching commands (`SHOW BRANCHES`, `USE BRANCH`)
         // aren't recognised by sqlparser; mirror the pre-detect that
@@ -13275,7 +13347,7 @@ impl EmbeddedDatabase {
             let mut executor =
                 sql::Executor::with_storage(&self.storage).with_timeout(self.config.storage.query_timeout_ms);
             let result = executor.execute_with_columns(&arc_plan)?;
-            if cacheable {
+            if admit {
                 self.cache_query_result(sql, &result.0);
             }
             return Ok(result);
@@ -13290,26 +13362,21 @@ impl EmbeddedDatabase {
             return Ok(result);
         }
 
-        let plan = {
-            let stats = optimizer::cost::StatsCatalog::new();
-            let rules: Vec<Box<dyn optimizer::rules::OptimizationRule>> = vec![
-                Box::new(optimizer::rules::ConstantFoldingRule::new()),
-                Box::new(optimizer::rules::SelectionPushdownRule::new()),
-                Box::new(optimizer::rules::JoinPredicatePushdownRule::new()),
-                Box::new(optimizer::rules::ProjectionPruningRule::new()),
-                Box::new(optimizer::rules::StorageFilterPushdownRule::new()),
-            ];
-            let opt = optimizer::Optimizer::with_rules(stats, rules, optimizer::OptimizerConfig::default());
-            opt.optimize_recursive(plan)?
-        };
-        if !matches!(plan, sql::LogicalPlan::ShowBranches) {
-            self.plan_cache.put(sql.to_string(), std::sync::Arc::new(plan.clone()));
+        // R-A5: reuse the process-shared stateless optimizer instead of
+        // allocating five boxed rules + a StatsCatalog per cold query.
+        let plan = self.cold_optimizer().optimize_recursive(plan)?;
+        let is_show_branches = matches!(plan, sql::LogicalPlan::ShowBranches);
+        // Build the plan Arc once; clone the pointer into the cache (O(1)
+        // refcount bump) rather than deep-cloning the whole LogicalPlan.
+        let plan_arc = std::sync::Arc::new(plan);
+        if admit && !is_show_branches {
+            self.plan_cache.put(sql.to_string(), std::sync::Arc::clone(&plan_arc));
         }
 
         let mut executor =
             sql::Executor::with_storage(&self.storage).with_timeout(self.config.storage.query_timeout_ms);
-        let result = executor.execute_with_columns(&plan)?;
-        if cacheable && !matches!(plan, sql::LogicalPlan::ShowBranches) {
+        let result = executor.execute_with_columns(&plan_arc)?;
+        if admit && !is_show_branches {
             self.cache_query_result(sql, &result.0);
         }
         Ok(result)
@@ -15730,6 +15797,7 @@ impl EmbeddedDatabase {
             result_cache_nonempty: self.result_cache_nonempty.clone(),
             hot_result_cache_entry: self.hot_result_cache_entry.clone(),
             last_fast_select_fingerprint: self.last_fast_select_fingerprint.clone(),
+            cache_admission: self.cache_admission.clone(),
             fast_param_insert_cache: self.fast_param_insert_cache.clone(),
             fast_literal_insert_cache: self.fast_literal_insert_cache.clone(),
             fast_param_update_cache: self.fast_param_update_cache.clone(),
@@ -17808,12 +17876,23 @@ mod tests {
         db.execute("INSERT INTO qwc_plan_cache VALUES (2, 20)").unwrap();
 
         let sql = "SELECT id, val FROM qwc_plan_cache WHERE val >= 10";
+        // R-A1: the cache-admission filter only admits a query on its second
+        // sighting, so one-shot unique-literal queries never churn the caches.
+        // The first run must NOT cache; the second warms plan + result.
+        let (rows, columns) = db.query_with_columns(sql).unwrap();
+        assert_eq!(columns, vec!["id".to_string(), "val".to_string()]);
+        assert_eq!(rows.len(), 2);
+        assert!(
+            !db.plan_cache.contains(sql),
+            "R-A1: first sighting must not be admitted to the plan cache"
+        );
+
         let (rows, columns) = db.query_with_columns(sql).unwrap();
         assert_eq!(columns, vec!["id".to_string(), "val".to_string()]);
         assert_eq!(rows.len(), 2);
         assert!(
             db.plan_cache.contains(sql),
-            "query_with_columns should cache optimized non-fast SELECT plans"
+            "query_with_columns should cache optimized non-fast SELECT plans on the second sighting"
         );
         assert!(
             db.result_cache.contains(sql),
