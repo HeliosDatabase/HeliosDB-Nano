@@ -1,61 +1,219 @@
-# HeliosDB-Nano — Next Perf Batch Roadmap (post-v4.0.0)
+# HeliosDB-Nano — Next Perf Batch Roadmap (post-v4.0.0) — v2, refined designs
 
-_Produced 2026-07-05 by a 7-way parallel subsystem analysis (Fable 5) + adversarial synthesis. All file:line anchors re-verified at HEAD._
+_v1 (2026-07-05): 7-way parallel subsystem analysis + adversarial synthesis (git history @85c978f)._
+_v2 (2026-07-05): per-topic design refinement — each item re-examined for a strictly better
+mechanism, staging, or risk profile. What changed vs v1 is called out per item._
 
-All seven findings' load-bearing anchors verified at HEAD. Final roadmap follows.
+Ranking is unchanged except where noted (#5 becomes promotable — its blocker is resolved by
+design rather than by product decision).
 
-# HeliosDB-Nano post-v4.0.0 — Ranked Next-Batch Perf Roadmap
+---
 
-All file:line anchors below re-verified at HEAD this session (not just trusted from the findings).
+## NEXT MILESTONE
 
-## NEXT MILESTONE (do now, in this order)
+### 1. Normalizer widening — IN/BETWEEN/casts **with arity padding** (S / low)
 
-### 1. DO FIRST — IN/BETWEEN/cast widening of the literal normalizer (Read path)
-- **Lever**: Remove `"in"`/`"between"` from `is_predicate_bail_kw` (src/sql/normalize.rs:333-338) and pass `::type` through as `$n::type` instead of bailing (normalize.rs:166-169). Cache key = normalized SQL, so IN-arity is naturally keyed.
-- **Mechanism**: The lexer already parameterizes any WHERE-region literal regardless of paren depth; only the keyword bail blocks IN/BETWEEN and only the `::` bail blocks casts. Zero executor work needed — verified `pk_in_list_value` already resolves `LogicalExpr::Parameter` (src/sql/executor/mod.rs:2317-2324) and range bounds likewise. `IN (SELECT …)` still bails on the retained `"select"` keyword. ORM IN-list preloads (the most common unique-literal shape v1 misses) stop re-parsing/re-planning per statement.
-- **Expected win**: Extends the v4.0.0 flagship read win (1.7-2.3x PG) to IN-list/range/cast point reads; ~30-100% on those shapes on the wire simple-query + embedded autocommit paths.
-- **Effort/Risk**: S / low. Correctness is machine-checked by the existing differential oracle (normalize.rs:511+, tests/normalization_differential.rs) and the env kill switch is already wired.
-- **First step**: Delete the two bail keywords + add cast passthrough; extend the oracle corpus with IN (incl. NULL-in-list, NOT IN), BETWEEN, `::uuid`/`::int` casts, and `POSITION('x' IN s)`; **add an arity cap (bail above ~32 elements)** so ORM 500-element IN lists don't pollute the plan cache — the finding omitted this.
-- **Flag**: Impact honest per-shape but suite-level effect is smaller than the headline reads suggest (published benches are equality-dominated). Ship it anyway — it's days of work at near-zero risk.
+**v1 proposal:** remove `in`/`between` from `is_predicate_bail_kw`, pass `::type` through as
+`$n::type`, bail above ~32 IN elements.
 
-### 2. COPY at PG parity — per-batch version-range marker replacing per-row MVCC writes
-- **Lever**: In `insert_prepared_tuples_fast_batch`, replace the N× (`v:` full-value duplicate + `v_idx:` padded key) puts (verified triple-put loop, src/storage/engine.rs:10404-10448) with ONE `vrange:{table}:{first}:{last}:{ts}` record — valid because the whole batch shares one `commit_ts` (engine.rs:10374-10378) and contiguous row ids. AS-OF treats "covered by marker, no newer v_idx:" as "insert version = current `data:` value"; UPDATE/DELETE lazily backfill a real `v:` from the old row (both paths already read it for ART maintenance).
-- **Expected win**: 423ms → ~140-170ms on the 100k-row COPY bench = **parity with PostgreSQL (115-133ms) at default settings**, closing the last headline write-path loss. The finding's live A/B (time-travel on: 368-425ms; off: 102-156ms) is the strongest evidence in the whole set — it isolates the version writes as effectively the *entire* remaining gap.
-- **Effort/Risk**: L / medium. Risk is time-travel/branch-anchor correctness and scope creep: the lazy backfill puts a marker-check on every future UPDATE/DELETE of bulk-loaded tables (needs an in-memory per-table interval map loaded at open — the finding understates this permanent cost, though it's O(log ranges)).
-- **First step**: Scope v1 to the COPY fast path only, behind `HELIOS_COPY_VRANGE` kill switch; gate on the full time-travel + branch + AS-OF suites per the merge-validation methodology. Fallback increment if backfill risk bites: drop only the `v:` full-value duplicate (derive insert version from `data:` when no newer version exists), keep `v_idx:` — roughly half the win, much smaller blast radius.
+**Refined design:**
+- **Power-of-two IN-arity padding** instead of a hard cap: normalize `IN ($1,$2,$3)` by
+  padding to the next power of two, repeating the last parameter (`IN ($1,$2,$3,$3)`).
+  IN has set semantics, so duplicate elements are provably result-neutral (holds for
+  `NOT IN` and NULL elements too). Distinct plan-cache shapes collapse from one-per-arity
+  to log₂(arity) — an ORM sweeping arities 1..200 produces ~8 cached plans, not 200.
+  Keep a bail above 128 elements (padding cost + plan quality both degrade).
+- **Cast whitelist, not blanket passthrough:** only rewrite `literal::T` → `$n::T` for
+  `T ∈ {uuid, int2/4/8, bigint, text, varchar, date, timestamp, timestamptz, numeric,
+  float4/8, boolean}` — the types whose `Cast{expr: Parameter}` unwrap is already verified
+  in the index-probe path (`scan.rs::lookup_bound_value` handles Cast-over-Parameter).
+  Unknown cast targets bail as today.
+- **Oracle upgrade to match the wider shape space:** add a property-based corpus
+  (randomized tables + predicates, raw vs normalized row-parity) alongside the fixed
+  corpus, and specifically: `IN` with NULL element, `NOT IN`, duplicate elements,
+  1/2/3/33/128-arity, `BETWEEN` inclusive bounds and reversed bounds, each whitelisted
+  cast, and `POSITION('x' IN s)` (the non-predicate `IN` false-positive).
+- Keep `query()` un-normalized (it remains the oracle's independent raw reference).
 
-### 3. Analytics/OLAP — activate the already-shipped columnar engine via side copies (STAGED, gated)
-- **Lever**: The P1#5 "real fix" **already exists and is unreachable** — verified: `perf/P1_5_columnar_scan.md` says "NOT IMPLEMENTED" but commits 884ae83/ae00fd0/da60a5d/d602b17 shipped typed batches v2, batch-direct aggregation, and rayon partial aggregation; the only blockers are two planner gates requiring `storage_mode == Columnar` (src/sql/executor/scan.rs:135-141; src/sql/executor/mod.rs:2440-2448), which zero real tables set. Build columnar SIDE COPIES for default tables (row blobs stay inline — point reads untouched) and relax the gates to "side data present + fresh".
-- **Expected win**: The 6.2-26.8x SQLite deficits (1M-row suite) compress toward 1-3x — the single biggest remaining gap in the product.
-- **Effort/Risk**: L / medium, **but only under the staged plan below**.
-- **Adversarial take (this is the item that demands it)**: (a) The "1-3x of SQLite" number is **unmeasured** — P1_5's estimates were design-phase. (b) Side-copy *freshness under DML* is the hard 20%: tests/columnar_adoptable_tests.rs validates true-columnar DML parity, NOT side-copy coherence. (c) Naive default-flip is correctly ruled out — verified `ColumnarRef` sentinel (engine.rs:10387-10402) + uncached full-batch point-get (columnar.rs:932-946) would regress the just-won OLTP lead. (d) **Cross-item tension the finding missed**: inline populate during COPY adds typed-batch writes to the exact path item #2 is driving to PG parity — populate must be async/background, not inline.
-- **First step — increment 0 (half a day, no new code)**: with the existing release binary, load the P1_5 1M-row suite into an explicit `STORAGE COLUMNAR` twin table and measure vs the row twin and vs SQLite. **If the shipped kernels don't deliver ≥5x, stop — the whole lever's premise fails cheaply.** If they do: v1 = bulk-load/background-backfill population + any-DML-marks-stale invalidation (stale → row path; background re-backfill), behind a flag. Load-then-analyze coverage matches both the benchmark shape and real OLAP usage; coherent dual-write is explicitly out of scope for v1.
+**Why better than v1:** the hard cap silently gives up on the most common ORM shape
+(large preload lists); padding keeps them cached with bounded shape count and zero
+semantic risk. The cast whitelist turns "medium blast radius" into "verified-path only."
 
-### 4. Aggregate-over-Join column pruning
-- **Lever**: The Aggregate arm builds its join input unpruned (verified: src/sql/executor/mod.rs:3521 `plan_to_operator(input)` raw) while Project-over-Join already prunes via `compact_projected_join_inputs` (join.rs:1035) — extend the same shipped machinery (collector at join.rs:827 already handles aggregate nodes) to GROUP BY/HAVING-over-join.
-- **Expected win**: 2-4x on aggregate-over-join with TEXT-bearing schemas (pg35: 12 values/~6 Strings cloned per joined row to consume 2-3); attacks the join-shaped slice of the OLAP gap.
-- **Effort/Risk**: M / low — reuses validated machinery, wildcard cases already bail to the old path.
-- **Why in-milestone**: It hedges item #3 — if columnar increment 0 disappoints, join-shaped analytics still improve; and it's independent code (executor only, no storage). Flag: 2-4x assumes TEXT-heavy rows; expect less on narrow int tables.
-- **First step**: In the Aggregate arm, collect required columns from group_by + aggr args + HAVING, call `compact_projected_join_inputs`, bail-to-old-path on any unresolved/wildcard column; gate with pg35 + join-suite parity.
+**First step:** padding helper + keyword removal + whitelist, then extend the oracle
+before wiring — the oracle must fail closed on any shape the lexer mis-handles.
 
-**Sequencing constraints**: #1 is independent, land immediately. #2 before #3 (both touch `insert_prepared_tuples_fast_batch`, engine.rs:10374-10516; the columnar populate hook at 10471 must be rebased on the vrange change). #4 fully parallel with everything.
+---
 
-## LATER (ranked)
+### 2. COPY → PG parity — **transient batch marker + background materialization** (L / medium)
 
-5. **LockManager Option 2 — drop pessimistic row locks for session-txn DML** (M/medium). Verified: repo's own doc recommends it with gdb-proven whole-server 1s stalls (docs/NANO_CONCURRENCY_LOCKING.md:26-81), redundant lock at transaction.rs:448-453, optimistic registry already wired. Order-of-magnitude win on contended multi-writer. **Held out of the milestone for one reason the finding under-flags**: at ReadCommitted, PostgreSQL blocks-then-proceeds and never returns serialization errors for a plain same-row UPDATE — Option 2 makes RC fail-fast with retriable errors, a client-visible PG-compat divergence (ORMs without retry loops). Needs a product decision first: ship for RR/Serializable only (keep bounded pessimistic wait at RC), or ship for all with documented semantics. Promote to the milestone immediately if contended multi-writer workloads are hurting users today — the stall is production-severity, not just a benchmark number.
-6. **Filtered vector kNN via traversal-time predicates** (M/medium). Fully verified: escalation loop with brute-force O(N) bailouts (mod.rs:1127-1207), `hnsw_rs` 0.3.3/0.3.4 both ship unused `search_filter` (registry hnsw.rs:1475), in-house `PersistentVectorIndex::search_filtered` tested but unreachable (persistent.rs:955), `search_with_filters` is an O(N) scan (vector_index.rs:701). 10-100x on selective filtered kNN — the dominant RAG shape. Strategically important (agentic-DB positioning) but absent from the PG/SQLite headline tables, hence "later". Keep the brute-force fallback as the correctness net.
-7. **Lock-free ART point probe** (M/medium). Verified: 2 process-global RwLock acquisitions + String clone + per-tree lock per probe (art_manager.rs:925-937). Extends an already-won lead rather than closing a gap; the +25-60% is extrapolated from analogues, not measured — do it when the point-read saturation number matters for marketing again. The FastSelectSpec-caching step is the right design; the tree-Arc-swap audit (recovery/TRUNCATE/branch) is the real work.
-8. **mimalloc global allocator** (S/low). Cross-cutting percent-level win cited by two findings' evidence (glibc arena contention); cheap A/B, slot it into any milestone with spare capacity.
+**v1 proposal:** permanent `vrange:{table}:{first}:{last}:{ts}` markers replacing per-row
+`v:`/`v_idx:` writes; lazy backfill on UPDATE/DELETE; permanent in-memory interval map.
 
-**Dropped/demoted from findings**: row-cache enlargement (both findings that examined it independently concluded the disk fast-select path skips cache fill — consistent, so correctly demoted to runner-up status); new vectorized operator work (would duplicate the verified-existing R3.x engine).
+**Refined design:** same critical-path win, but the marker is **transient**:
+1. COPY's fast batch writes `data:` rows + ONE durable `vmeta:{table}:{first}:{last}:{ts}`
+   record in the same WriteBatch (atomic). No per-row `v:`/`v_idx:` on the COPY path —
+   the full measured win (~230–270 ms of the 423 ms @100k) stays.
+2. A **background materializer** (same worker pattern as SMFI rebuilds) walks live markers
+   at low priority, writes the standard per-row `v:`/`v_idx:` records batch-by-batch, then
+   deletes the marker. The system **converges to today's on-disk format** — no permanent
+   new MVCC concept for AS-OF, branches, GC, or backup/restore to understand forever.
+3. While a marker is live (transient window): an in-memory per-table interval set (loaded
+   from the `vmeta:` prefix at open — crash-safe resume) is consulted by AS-OF reads and
+   UPDATE/DELETE. The consult is guarded by one process-wide atomic "any live markers"
+   fast-out, so the **permanent tax on the hot paths is a single atomic load** once
+   materialization drains. UPDATE/DELETE of a covered row synchronously materializes just
+   that row first (the update path already reads the old row value; the marker carries the
+   insert ts it needs for the `v:{t}:{row}:{revts}` key).
+4. AS-OF semantics during the window: `T < ts` → row excluded (marker says so);
+   `T ≥ ts`, no newer version → serve `data:` (insert version == current value).
 
-## Why #1 is first
-The normalize widening is the only S-effort/low-risk item in the set, its safety harness (differential oracle + kill switch) already exists, its executor prerequisites are verified in-tree, and it compounds the campaign's flagship win on the workload shape (ORM IN-list reads) users hit most. It ships in days while #2/#3 — the two items that actually move headline gaps (COPY parity vs PG, OLAP vs SQLite) — run their longer validation gates.
+**Fallback increment (lower risk, likely 60–75% of the win):** keep per-row `v_idx:`
+(20-byte keys — cheap) and elide only the `v:` full-value duplicate; AS-OF derives the
+insert version from `data:` when the `v_idx:` seek shows no newer version (that seek
+already happens on every AS-OF read, so reads pay nothing extra); UPDATE/DELETE backfills
+the old `v:` using the ts recovered from the row's existing `v_idx:` entry
+(`v_idx:{t}:{row}:{rev_ts} → actual_ts`, verified `time_travel.rs:653-664`). No interval
+map at all.
 
-## Evidence-quality notes (over/understatements found during verification)
-- **Strongest**: COPY finding (live A/B isolating the entire remaining gap). **Weakest impact claim**: columnar "1-3x of SQLite" (unmeasured — hence mandatory increment 0).
-- Columnar finding understates side-copy freshness risk and misses the COPY-parity tension (fixed via async backfill above).
-- COPY finding understates the permanent marker-check cost on future UPDATE/DELETE of bulk-loaded tables.
-- LockManager finding's "medium risk" hides a PG RC-semantics divergence (block-and-wait → fail-fast) that is a product decision, not an engineering one.
-- Normalize finding omits the IN-arity cache-explosion cap; ART finding's +25-60% is analogy-based, not measured.
-- All file:line anchors from all seven findings that I spot-checked were accurate — no fabricated evidence detected.
+**Why better than v1:** v1's permanent interval map grows with every COPY forever and puts
+a check on every future UPDATE/DELETE of every table. The transient design bounds the
+novel semantics to a drain window, self-cleans, converges to the standard format, and
+collapses the permanent cost to one atomic load. The fallback increment needs no marker
+machinery at all.
+
+**First step:** ship the fallback increment behind `HELIOS_COPY_ELIDE_V=1`, gated on
+time-travel + branch + crash suites; then the transient-marker design as increment 2.
+Before choosing, run one measurement with only the `v:` put removed to learn the
+WAL-bytes vs memtable-entry split of the 230–270 ms — it decides whether increment 1
+alone reaches parity.
+
+---
+
+### 3. OLAP — activate the shipped columnar engine via a **derived cache with watermark + delta overlay** (L / medium)
+
+**v1 proposal:** columnar side copies; relax the two planner gates; any-DML-marks-stale →
+background full re-backfill; increment 0 = measure the existing kernels first.
+
+**Refined design (increment 0 unchanged — measure before building):**
+- Side data is explicitly a **derived cache**, keyed by a per-table **watermark**
+  (max row-id/LSN covered) in the catalog: scans serve rows ≤ watermark from typed
+  columnar batches and the tail (> watermark) via the row path, merged. A trickle of
+  INSERTs just lags the watermark — **analytics never fall off a cliff**, unlike v1's
+  whole-table staleness where one INSERT reverts the table to the row path until a full
+  O(table) re-backfill completes.
+- UPDATE/DELETE of covered rows: clear the row's presence bit in its batch (presence
+  bitmaps shipped in b866669) and append the row-id to a small in-memory **delta list**;
+  scans overlay delta rows via the row path. A background compactor folds deltas and
+  advances the watermark when lag exceeds a threshold. v1's "any DML → stale" becomes
+  "DML → O(1) bitmap clear + delta append."
+- Population is **always background** (bulk-load hook enqueues, never inline) — resolving
+  the cross-item tension with #2's COPY-parity path that the v1 synthesis flagged.
+- Recovery for free: side data is derivable, so the v1 delta list can be memory-only —
+  on crash, rebuild from a watermark re-scan (or re-run backfill). No new durability
+  obligations.
+- Gates: planner keys on catalog "columnar cache ready(watermark)" instead of
+  `storage_mode == Columnar`; session kill switch `SET helios.columnar_scan = off`;
+  adoption explicit at first (`ALTER TABLE … SET COLUMNAR CACHE ON`), auto-threshold
+  behind a flag later.
+
+**Why better than v1:** v1's invalidation model made the feature self-defeating on any
+table that receives writes — exactly the HTAP case. Watermark + delta overlay is the
+standard main-store/delta-store split, reuses the shipped presence bitmaps and grouped
+batch writer, and keeps the OLTP write path at one bitmap-clear + list-append.
+
+**Increment 0 (unchanged, mandatory):** half a day — load the 1M-row P1_5 suite into a
+`STORAGE COLUMNAR` twin and measure vs row twin + SQLite. **< 5× → stop.**
+
+---
+
+### 4. Aggregate-over-Join pruning — **as an optimizer rule, not an executor special case** (M / low)
+
+**v1 proposal:** in the executor's Aggregate arm, collect required columns and call
+`compact_projected_join_inputs` (the machinery Project-over-Join already uses).
+
+**Refined design:** implement the same column-requirement propagation as a **plan-time
+projection-pushdown-through-join rule** (extend the existing `ProjectionPruningRule`):
+insert pruned `Project` nodes under join inputs based on the union of columns required by
+*any* ancestor — Aggregate (group-by keys + aggregate args + HAVING), Sort, Project,
+Filter. The executor's existing Project-under-Join handling consumes it unchanged.
+- **Why plan-time is better:** it composes with the (now A2-normalized) plan cache — the
+  pruned plan is cached once and reused across literal variants; it benefits every
+  consumer shape instead of one executor arm; and the cost-guarded rule acceptance
+  (`new_cost <= old_cost`) plus wildcard bail keep it safe.
+- Prioritize **hash-join build-side** pruning: build rows are materialized in the hash
+  table, so pruning there cuts memory + build time, not just per-row clones.
+- Keep v1's executor-arm version as the fallback if the rule's interaction surface with
+  correlated subqueries proves noisy — both reuse the same
+  `compact_projected_join_inputs` core, so the work is shared.
+
+**First step:** the rule + pg35 join categories and the join/window/subquery hardening
+suites as the parity gate; measure on a TEXT-heavy aggregate-over-join microbench (v1's
+2–4× claim assumes wide TEXT rows — validate that assumption explicitly).
+
+---
+
+## LATER (ranked) — with upgraded designs
+
+### 5. Same-row conflicts — Option 2 **+ engine-internal statement retry (PG-equivalent RC)** (M / medium) — now PROMOTABLE
+**v1 blocker:** dropping pessimistic locks makes ReadCommitted fail-fast with retriable
+errors — a client-visible PG divergence needing a product decision.
+**Refined design that dissolves the blocker:** PostgreSQL's own RC conflict behavior is
+block-then-**re-evaluate** (EvalPlanQual): the loser waits, then re-checks its predicate
+against the winner's committed row and proceeds. Replicate that at the engine level: on a
+first-committer-wins conflict at RC, **retry the losing statement internally** against a
+fresh snapshot (bounded, e.g. 3 attempts, then surface a serialization error). A plain
+same-row UPDATE/DELETE then behaves exactly like PG — no client-visible error, no ORM
+retry loops needed — while the 1 s worker-pinning futile spin and the DFS-deadlock/
+timeout machinery go away. Keep the bounded pessimistic path only for `SELECT FOR
+UPDATE`; RR/Serializable keep fail-fast (PG also errors there).
+**Why better:** turns a product-semantics decision into an engineering task with
+PG-matching behavior for the common case. Promote into the milestone if contended
+multi-writer pain is current — the underlying stall is production-severity.
+
+### 6. Filtered vector kNN — **selectivity-adaptive 3-way strategy** (M / medium)
+**v1:** switch the over-fetch escalation loop to traversal-time `search_filter`.
+**Refined:** build the filter as a roaring bitmap over hnsw ids (via `reverse_mapping`),
+read selectivity off the bitmap cardinality (free once built), then pick:
+**high selectivity** (matching set ≲ 5–10k) → exact distance scan over just the matching
+ids (often beats any graph traversal; the brute-force rescue machinery already exists);
+**medium** → traversal-time filtered search (`hnsw_rs::search_filter`, shipped-but-unused,
+or the in-house tested `PersistentVectorIndex::search_filtered`); **low** → plain kNN +
+post-filter (today's fast case). This pgvector/Qdrant-style adaptive planner strictly
+dominates any single strategy across the selectivity range. Keep brute force as the
+correctness net.
+
+### 7. ART point probe — **resolved-index handles pinned in cached plans** (S-M / low)
+**v1:** DashMap registry + FastSelectSpec caching + tree-Arc-swap audit.
+**Refined:** attach the resolved `SharedArtIndex` Arc (plus a DDL epoch stamp) to the
+**cached normalized plan** — the A2 plan cache gives these plans long lives, and
+`invalidate_plan_cache()` (verified `lib.rs:7860`) already clears them wholesale on DDL,
+so invalidation is free. A probe becomes: epoch check (one atomic) → direct per-tree
+access. The two process-global registry RwLock acquisitions + linear scan + String clone
+vanish from the hot path without touching tree internals or an Arc-swap audit. Swap the
+per-tree `std::sync::RwLock` (verified `art_manager.rs:21-27`) for `parking_lot` as a
+free rider. v1's lock-free tree redesign is deferred until this cheap version is measured.
+
+### 8. mimalloc — **binary-only, feature-gated, RSS-measured** (S / low)
+**v1:** 5-line global allocator swap + A/B.
+**Refined:** gate as `--features mimalloc`, default-on for the **server binary only** —
+not the lib/cdylib/Python wheel (embedders and PyO3 own their allocator policy). A/B with
+the paired order-swapped harness on the indexed-read + COPY cells, and track **RSS**
+alongside TPS (mimalloc trades memory for speed; edge deployments care). Try snmalloc as
+a second candidate in the same harness before committing.
+
+---
+
+## Cross-cutting addition (new in v2)
+Add the batch's target metrics to the perf gate so the wins can't silently erode: an
+IN-list normalization cell, the COPY 100k cell, and (post-#3) a columnar aggregate cell
+in `ci_perf_smoke.sh` / `bench-engines.sh` baselines. S effort, protects everything above.
+
+## Sequencing
+#1 first (days, near-zero risk, harness exists) → #2 fallback increment → #2 full →
+#3 increment 0 (half a day, can run any time) → #3 v1 → #4 in parallel with #2/#3
+(different files) → #5 when promoted. #7 naturally follows #1 (it piggybacks on the
+normalized plan cache). #8 slots into any idle machine window.
+
+## Dropped (unchanged from v1)
+Row-cache enlargement (disk fast-select path skips cache fill — confirmed by two
+independent findings); new vectorized operator work (the R3.x engine already exists).
