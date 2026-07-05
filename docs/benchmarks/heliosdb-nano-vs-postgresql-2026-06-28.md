@@ -1,5 +1,10 @@
 # HeliosDB-Nano vs PostgreSQL — Scalability & Performance
 
+> **⚠️ Superseded by [`heliosdb-nano-vs-postgresql-2026-07-05.md`](heliosdb-nano-vs-postgresql-2026-07-05.md) (v4.0.0).**
+> The indexed-read result below (PostgreSQL winning) was **reversed** by the
+> 2026-07 campaign: v4.0.0 now leads PostgreSQL 1.7×–2.3× on indexed reads, and
+> COPY is ~6× faster than the 3.60.x numbers here. Kept for historical reference.
+
 **Date:** 2026-06-28
 **Engines:** PostgreSQL 18.4 vs HeliosDB-Nano `3.31.0-dev, 3.58.1, 3.60.4, 3.60.5, 3.60.6, 3.60.7`
 **Client:** `pgbench` (from the PostgreSQL 18.4 image), concurrency sweep c ∈ {1, 8, 16, 32, 64}, 8 s per cell.
