@@ -4,6 +4,11 @@ _v1 (2026-07-05): 7-way parallel subsystem analysis + adversarial synthesis (git
 _v2 (2026-07-05): per-topic design refinement — each item re-examined for a strictly better
 mechanism, staging, or risk profile. What changed vs v1 is called out per item._
 
+> **To execute:** read [`NEXT_PERF_BATCH_EXECUTOR_HANDBOOK.md`](NEXT_PERF_BATCH_EXECUTOR_HANDBOOK.md)
+> first — it has the verified code anchors (symbol + grep), the campaign's non-negotiable
+> invariants, the exact gate/bench/release commands, and the per-item traps this roadmap
+> assumes you know.
+
 Ranking is unchanged except where noted (#5 becomes promotable — its blocker is resolved by
 design rather than by product decision).
 
