@@ -212,7 +212,7 @@ flakes** on dep-download or a vector-index test → `gh run rerun --failed <id>`
   add side-copy coherence tests (INSERT lag, UPDATE/DELETE overlay, crash rebuild). pg35.
 
 ### Item 4 — Aggregate-over-Join column pruning (optimizer rule) · M/low
-- **Files:** `src/sql/optimizer/rules.rs` (`ProjectionPruningRule`), `src/sql/executor/join.rs`
+- **Files:** `src/optimizer/rules.rs` (`ProjectionPruningRule`, :494 — note: NOT under src/sql/), `src/sql/executor/join.rs`
   (`compact_projected_join_inputs` ~join.rs:1035, collector ~join.rs:827), `src/sql/executor/mod.rs`
   (the Aggregate arm `plan_to_operator(input)` ~mod.rs:3521, currently unpruned).
 - **Design (refined):** implement as a plan-time projection-pushdown-through-join RULE (extend
