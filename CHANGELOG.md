@@ -5,6 +5,89 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.0.0] - 2026-07-05
+
+Major release: the **2026-07 performance & stability campaign**. Six milestones,
+each shipped through independent regression + scalability gates. The headline is
+a reversal of the one workload PostgreSQL used to win — indexed point-reads now
+run **1.7×–2.3× faster than PostgreSQL 18.4** at every concurrency (they were
+*losing* ~2× before). See
+[`docs/benchmarks/heliosdb-nano-vs-postgresql-2026-07-05.md`](docs/benchmarks/heliosdb-nano-vs-postgresql-2026-07-05.md).
+
+Major version because several defaults and behaviors change (see **Changed** /
+**Behavior changes**).
+
+### Performance
+
+- **Indexed point-read: reversed to 1.7×–2.3× PostgreSQL** (was PostgreSQL-won
+  ~2×; Nano saturated ~48k TPS, now scales to ~172k). Two levers: a
+  cache-admission filter that stops unique-literal queries from churning the
+  plan/result caches, and **token-level literal normalization** — repeated point
+  reads that differ only in their WHERE literals now share ONE cached
+  parameterized plan instead of re-parsing and re-planning every statement. A
+  differential oracle (raw-SQL execution == normalized+parameterized execution,
+  row-for-row) and the pg35 benchmark-of-record (35 categories, 35–0–0 vs
+  PostgreSQL) prove correctness. Kill switch: `NANO_DISABLE_QUERY_NORMALIZATION`.
+- **COPY bulk-load: 5.4× faster** (100k rows ~2.3 s → ~423 ms), closing the gap
+  to PostgreSQL from ~20× to ~3×. COPY now applies the whole load as one atomic
+  batch through the fast insert-batch machinery.
+- **`nextval`-bound INSERT: ~32×** (~60 → ~2,000 TPS). Default sequences reserve
+  a block of 32 per durable fsync (was one fsync per value), matching
+  PostgreSQL's `SEQ_LOG_VALS=32` durability granularity.
+- **Durable-write throughput +11–63% at 16–32 threads** (group-commit
+  accumulation window 200 µs → 1000 µs), with lower p50 commit latency.
+- Sharded row cache (16 partitions, lock-free write-stats) removes the
+  single-global-lock convoy at the commit-time invalidation fence.
+
+### Fixed
+
+- **`ALTER TABLE … RENAME` server-wedge:** renaming a populated table hung 15+
+  minutes (non-cancellable, ~2 WAL-fsyncs/row) and left a torn split-table on
+  kill; it was also never WAL-logged, so recovery resurrected renamed-away
+  tables. Now one atomic WriteBatch (~1.3 s for 50k rows) with proper WAL
+  logging; also fixed a latent double-encryption of moved rows.
+- **Pre-auth remote-OOM vector:** a client claiming a ~2 GiB message length
+  forced an unbounded/2 GiB allocation before authentication. Frontend messages
+  are now capped (64 MiB) and startup packets (1 MiB), validated before
+  buffering; malformed Parse/Bind/Execute/CopyData frames return protocol errors
+  instead of panicking.
+- **HNSW recall bug:** an early-inserted, high-level vector could be
+  layer-0-isolated and silently dropped from k-NN results (also the source of a
+  release-gate test flake). A brute-force rescue guarantees correct recall on
+  small indexes.
+- **Recursive-CTE table shadow:** `WITH x AS (SELECT … FROM x)` where a table `x`
+  exists now correctly reads the table (PostgreSQL semantics) instead of
+  auto-recursing to 0 rows.
+- **UUID equality** binary parameters (untyped OID) now use the index probe
+  instead of a full scan.
+- **WAL replay** now tolerates a torn tail (keeps the valid prefix) instead of
+  discarding all recovered entries on one bad record.
+- **`SET statement_timeout`** / configured `statement_timeout_ms` is now enforced
+  (was accepted but ignored — a runaway query could pin a worker).
+- **Recursive CTEs** gained a cumulative-row cap and O(1) fixpoint dedup (was
+  O(n²), unbounded memory).
+- MySQL listeners now enforce `max_connections` and a per-connection
+  prepared-statement cap; accept loops back off on fd exhaustion.
+
+### Changed / Behavior changes
+
+- **COPY is now atomic** (all-or-nothing) rather than committing per 500-row
+  chunk, and participates in an enclosing transaction (`BEGIN; COPY; ROLLBACK`
+  no longer leaks rows).
+- **Default sequences reserve blocks of 32** — a crash/restart may skip forward
+  by up to 31 (never backward, never reuse). Use `CACHE 1` for the old
+  gapless-per-value behavior.
+- A deterministic SELECT warms its plan/result caches on its **second** execution
+  (cache-admission filter), not its first.
+- `group_commit_window_us` default 200 → 1000 (affects `durable_commit=true`).
+
+### Deferred (documented follow-ups)
+
+`durable_commit` and `version_retention` defaults are unchanged and flagged for a
+product decision; per-connection wire `SET statement_timeout`, portal streaming,
+and index-def cross-version migration are tracked in
+`docs/plans/PERF_STABILITY_2026_07/`.
+
 ## [3.60.9] - 2026-06-30
 
 Patch release: three Any2HeliosDB (a2h) Oracle→HeliosDB export-compatibility

@@ -65,3 +65,9 @@ perf/v351_vs_postgresql/pg35_18_4_fresh_*summary.tsv
 AGENTS.md
 
 .claude/settings.local.json
+
+# Campaign scratch (2026-07): baseline comparison binary + profiling dumps
+perf/baseline_runs/bins/
+/stacks.txt
+/stacks_b.txt
+/dist/
