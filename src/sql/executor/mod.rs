@@ -2410,7 +2410,7 @@ impl<'a> Executor<'a> {
         }
         let analyzed_predicates = predicate
             .as_ref()
-            .map(|predicate| storage.predicate_pushdown().analyze_predicate(predicate, schema))
+            .map(|predicate| storage.predicate_pushdown().analyze_predicate(predicate, schema, &self.parameters))
             .unwrap_or_default();
         if predicate.is_some() && analyzed_predicates.is_empty() {
             return Ok(None);
@@ -2504,7 +2504,7 @@ impl<'a> Executor<'a> {
         }
         let analyzed_predicates = predicate
             .as_ref()
-            .map(|predicate| storage.predicate_pushdown().analyze_predicate(predicate, schema))
+            .map(|predicate| storage.predicate_pushdown().analyze_predicate(predicate, schema, &self.parameters))
             .unwrap_or_default();
         if predicate.is_some() && analyzed_predicates.is_empty() {
             return Ok(None);
@@ -2961,6 +2961,10 @@ impl<'a> Executor<'a> {
                 if let Some(result) = scan::try_index_point_lookup_for_scan(self, &scan_plan, predicate)? {
                     return Ok(result);
                 }
+                // `col IN (…)` on an indexed column → N index probes unioned.
+                if let Some(result) = scan::try_index_in_list_for_scan(self, &scan_plan, predicate)? {
+                    return Ok(result);
+                }
                 // R4.4: range predicates on an indexed column become an
                 // ordered bounded index scan instead of scan + filter.
                 if let Some(result) = scan::try_index_range_scan_for_scan(self, &scan_plan, predicate)? {
@@ -2973,6 +2977,10 @@ impl<'a> Executor<'a> {
             LogicalPlan::Filter { input, predicate } => {
                 // Try ART index-based point lookup for Filter(Scan) equality predicates.
                 if let Some(result) = scan::try_index_point_lookup_for_scan(self, input, predicate)? {
+                    return Ok(result);
+                }
+                // `col IN (…)` on an indexed column → N index probes unioned.
+                if let Some(result) = scan::try_index_in_list_for_scan(self, input, predicate)? {
                     return Ok(result);
                 }
                 // R4.4: index range scan for Filter(Scan) range predicates.
