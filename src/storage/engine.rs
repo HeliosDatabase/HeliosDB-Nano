@@ -112,6 +112,18 @@ fn columnar_presence_enabled() -> bool {
     !*COLP_OFF
 }
 
+/// Item #2 kill switch for COPY version-write elision. When enabled (default),
+/// the time-travel COPY fast batch writes one durable `vmeta:` range marker
+/// instead of a per-row `v:`/`v_idx:` pair (see `copy_marker`). `HELIOS_COPY_VRANGE_OFF`
+/// restores the pre-item-#2 per-row version writes for every COPY batch — an
+/// escape hatch if a marker interaction is ever suspected. Existing markers on
+/// disk stay correct either way (the read/backfill paths always consult them).
+fn copy_vrange_enabled() -> bool {
+    static VRANGE_OFF: once_cell::sync::Lazy<bool> =
+        once_cell::sync::Lazy::new(|| std::env::var("HELIOS_COPY_VRANGE_OFF").is_ok());
+    !*VRANGE_OFF
+}
+
 /// Does the schema have at least one `STORAGE COLUMNAR` column? (Narrower
 /// than `schema_uses_column_storage`, which also covers dictionary/CAS.)
 fn schema_has_columnar_columns(schema: &crate::Schema) -> bool {
@@ -10401,7 +10413,47 @@ impl StorageEngine {
             }
         };
 
-        if let (Some(ts), Some(reverse_ts)) = (commit_ts, reverse_ts) {
+        // Item #2: on a time-travel COPY of a non-columnar table, elide the
+        // per-row `v:`/`v_idx:` writes (measured ~2/3 of COPY cost on narrow
+        // rows) and record one durable `vmeta:` range marker instead. AS-OF
+        // reads + the first UPDATE/DELETE of a covered row consult/materialize
+        // via the marker (see `copy_marker` + `read_at_snapshot_uncached`).
+        // Columnar tables keep the per-row path (item #3 territory).
+        let use_vrange = commit_ts.is_some() && !uses_columnar && copy_vrange_enabled();
+        let mut vrange: Option<(u64, u64)> = None;
+
+        if use_vrange {
+            let ts = commit_ts.unwrap_or(0);
+            let mut vfirst = u64::MAX;
+            let mut vlast = 0_u64;
+            for (row_id, tuple) in prepared {
+                if row_id < vfirst {
+                    vfirst = row_id;
+                }
+                if row_id > vlast {
+                    vlast = row_id;
+                }
+                let value = serialize_stored(&tuple)?;
+                let row_id_str = row_id_buf.format(row_id);
+
+                key_buf.clear();
+                key_buf.extend_from_slice(data_prefix.as_bytes());
+                key_buf.extend_from_slice(row_id_str.as_bytes());
+                batch.put(&key_buf, &value);
+
+                final_row_id = row_id;
+                indexed_rows.push((row_id, tuple));
+            }
+            if !indexed_rows.is_empty() {
+                // One marker over the batch's contiguous row-id range, in the
+                // SAME WriteBatch as the data rows (atomic with the insert).
+                let marker_key = crate::storage::copy_marker::CopyMarkers::marker_key(
+                    table_name, vfirst, vlast,
+                );
+                batch.put(marker_key.as_bytes(), ts.to_be_bytes());
+                vrange = Some((vfirst, vlast));
+            }
+        } else if let (Some(ts), Some(reverse_ts)) = (commit_ts, reverse_ts) {
             let version_prefix = format!("v:{}:", table_name);
             let version_suffix = format!(":{}", ts);
             let version_index_prefix = format!("v_idx:{}:", table_name);
@@ -10499,6 +10551,13 @@ impl StorageEngine {
 
         if let Some(ts) = commit_ts {
             let _ = self.snapshot_manager.register_snapshot(ts);
+            // Item #2: publish the just-committed COPY marker into the in-memory
+            // interval index so AS-OF reads + UPDATE/DELETE materialization see
+            // it immediately (the durable `vmeta:` key is already in the batch).
+            if let Some((first, last)) = vrange {
+                self.snapshot_manager
+                    .record_copy_marker(table_name, first, last, ts);
+            }
         }
 
         for (row_id, tuple) in &indexed_rows {
@@ -10851,6 +10910,11 @@ impl StorageEngine {
         schema: &crate::Schema,
         index_update_needed: Option<bool>,
     ) -> Result<u64> {
+        // Item #2: preserve a COPY marker-covered row's insert version before
+        // this version-skipping fast UPDATE overwrites `data:` (no-op — one
+        // atomic load — when no COPY markers are live).
+        self.snapshot_manager
+            .materialize_copy_marker_row_durable(table_name, row_id)?;
         // Serialize the storage-format tuple; logical WAL is emitted by callers
         // before this fast storage write. Default row-store tables can serialize
         // directly and avoid a full tuple clone in the hot UPDATE path.
@@ -10924,6 +10988,10 @@ impl StorageEngine {
         schema: &crate::Schema,
         vector_old_tuple: Option<&Tuple>,
     ) -> Result<u64> {
+        // Item #2: preserve a COPY marker-covered row's insert version before
+        // this version-skipping fast UPDATE overwrites `data:`.
+        self.snapshot_manager
+            .materialize_copy_marker_row_durable(table_name, row_id)?;
         let value = if schema_uses_column_storage(schema) {
             let stored_tuple = self.transform_tuple_for_column_storage(table_name, row_id, &new_tuple, schema)?;
             bincode::serialize(&stored_tuple)
@@ -10958,6 +11026,10 @@ impl StorageEngine {
         old_tuple: &Tuple,
         schema: &crate::Schema,
     ) -> Result<u64> {
+        // Item #2: preserve a COPY marker-covered row's insert version before
+        // this version-skipping fast DELETE removes `data:`.
+        self.snapshot_manager
+            .materialize_copy_marker_row_durable(table_name, row_id)?;
         let key = Self::build_data_key(table_name, row_id);
         if let Some(opts) = &self.memory_write_options {
             self.db
@@ -10999,6 +11071,10 @@ impl StorageEngine {
         pk_key: &[u8],
         pk_value: &crate::Value,
     ) -> Result<u64> {
+        // Item #2: preserve a COPY marker-covered row's insert version before
+        // this version-skipping fast DELETE removes `data:`.
+        self.snapshot_manager
+            .materialize_copy_marker_row_durable(table_name, row_id)?;
         let key = Self::build_data_key(table_name, row_id);
         if let Some(opts) = &self.memory_write_options {
             self.db
@@ -11036,6 +11112,38 @@ impl StorageEngine {
     /// Get snapshot manager (Arc)
     pub fn snapshot_manager_arc(&self) -> Arc<crate::storage::time_travel::SnapshotManager> {
         Arc::clone(&self.snapshot_manager)
+    }
+
+    /// Item #2: materialize every live COPY marker-covered row in `table_name`
+    /// (write its insert `v:`/`v_idx:` from `data:`) BEFORE a bulk `data:`
+    /// removal such as TRUNCATE. Without this, AS-OF reads predating the
+    /// TRUNCATE would find neither a version nor a `data:` row for a covered,
+    /// never-mutated row and wrongly treat it as never-existing — a regression
+    /// from the per-row baseline, which leaves its `v:` intact across TRUNCATE.
+    /// No-op (one atomic + one map probe) when the table has no markers.
+    pub(crate) fn materialize_copy_markers_for_table(&self, table_name: &str) -> Result<()> {
+        if !self.snapshot_manager.table_has_copy_markers(table_name) {
+            return Ok(());
+        }
+        let prefix = format!("data:{}:", table_name);
+        let prefix_bytes = prefix.as_bytes();
+        let mut read_opts = ReadOptions::default();
+        read_opts.set_total_order_seek(true);
+        let iter = self.db.iterator_opt(
+            IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward),
+            read_opts,
+        );
+        for item in iter {
+            let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+            if !key.starts_with(prefix_bytes) {
+                break;
+            }
+            if let Some(row_id) = Self::parse_row_id_after_prefix(&key, prefix_bytes.len()) {
+                self.snapshot_manager
+                    .materialize_copy_marker_row_durable(table_name, row_id)?;
+            }
+        }
+        Ok(())
     }
 
     /// Scan table at a specific snapshot (for time-travel queries)
@@ -12319,6 +12427,16 @@ impl StorageEngine {
             // Get current timestamp for versioning
             let timestamp = self.next_timestamp();
 
+            // Item #2: on the main branch, preserve a COPY marker-covered row's
+            // insert version (at the COPY ts) before this path rewrites `data:`
+            // and records the old value at `timestamp-1`. Without it the copy
+            // slice `[copy_ts, timestamp-1)` would have no version and AS-OF
+            // there would wrongly treat the row as not-yet-existing.
+            if branch_id.is_none() {
+                self.snapshot_manager
+                    .materialize_copy_marker_row_durable(table_name, row_id)?;
+            }
+
             // Determine the key based on whether we're in a branch
             let current_key = if let Some(bid) = branch_id {
                 // Branch update: read from and write to branch-specific key
@@ -12476,6 +12594,11 @@ impl StorageEngine {
             // Main branch delete: preserve old value for time-travel before deleting
             let mut delete_count = 0u64;
             for row_id in &row_ids {
+                // Item #2: preserve a COPY marker-covered row's insert version
+                // (at the COPY ts) before removing `data:`, so AS-OF reads in
+                // [copy_ts, delete_ts) still resolve the copied value.
+                self.snapshot_manager
+                    .materialize_copy_marker_row_durable(table_name, *row_id)?;
                 let key = format!("data:{}:{}", table_name, row_id).into_bytes();
 
                 // PRESERVE DELETED VERSION FOR TIME-TRAVEL

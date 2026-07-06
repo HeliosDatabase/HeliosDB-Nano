@@ -76,6 +76,22 @@ before wiring — the oracle must fail closed on any shape the lexer mis-handles
 
 ### 2. COPY → PG parity — **transient batch marker + background materialization** (L / medium)
 
+> **✅ SHIPPED (2026-07-06, branch `perf/copy-version-elide`).** COPY 100k **~397 ms → ~160 ms
+> (2.5×, order-swap-robust), landing near PostgreSQL parity (~115–133 ms).** Implemented the
+> durable `vmeta:{table}:{first:020}:{last:020}` range marker per batch (elides per-row
+> `v:`/`v_idx:`), an in-memory interval index rebuilt from `vmeta:` at open (crash-safe) with a
+> one-atomic fast-out, AS-OF read gating (`read_at_snapshot_uncached`), and insert-version
+> materialization on **every** main-branch `data:` mutation path — fast `update_tuple_fast*` /
+> `delete_tuple_fast*`, general `*_tuples_branch_aware`, the transaction commit-apply
+> (`commit_with_timestamp` — the path autocommit-wrapped general UPDATE/DELETE actually take),
+> and both TRUNCATE arms. Kill switch `HELIOS_COPY_VRANGE_OFF=1`. 13 correctness tests +
+> full regression (lib 2021/0, time-travel/branch/crash/GC 55/0, ci_perf_smoke 12/12).
+> **Deviation from the design below:** the *background materializer* was NOT built — markers
+> are per-COPY-batch (few, not per-row), so the interval index stays tiny; they persist and are
+> consulted/backfilled indefinitely, which is correct and cheap. Background drain (to converge
+> markers to the standard on-disk `v:`/`v_idx:` format and bound index growth under extreme
+> COPY volume) remains a documented follow-up.
+
 **v1 proposal:** permanent `vrange:{table}:{first}:{last}:{ts}` markers replacing per-row
 `v:`/`v_idx:` writes; lazy backfill on UPDATE/DELETE; permanent in-memory interval map.
 

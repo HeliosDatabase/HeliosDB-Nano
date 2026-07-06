@@ -6,6 +6,7 @@
 
 mod branch;
 mod catalog;
+mod copy_marker;
 mod dirty_tracker;
 pub mod dump;
 mod engine;

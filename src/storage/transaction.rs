@@ -701,6 +701,10 @@ impl Transaction {
         // Apply write set atomically using RocksDB batch
         let mut batch = rocksdb::WriteBatch::default();
         let write_set_has_entries = !self.write_set.is_empty();
+        // Item #2: hoist the "any COPY markers live?" check out of the per-entry
+        // loop so a no-COPY commit pays one atomic load, not a `data:`-key parse
+        // per write. Only when markers exist do we parse keys + materialize.
+        let check_copy_markers = self.versioning_enabled && self.snapshot_manager.has_any_copy_markers();
         let mut version_key_buf = Vec::with_capacity(128);
         let mut version_index_key_buf = Vec::with_capacity(128);
 
@@ -735,6 +739,30 @@ impl Transaction {
             if !touches_columnar && (key.starts_with(b"col:") || key.starts_with(b"colz:") || key.starts_with(b"colp:"))
             {
                 touches_columnar = true;
+            }
+            // Item #2: this commit is about to write the mutation's own version
+            // at `commit_ts` for a `data:` row. If that row is still covered by
+            // a COPY marker (its per-row `v:`/`v_idx:` were elided at COPY),
+            // stage the copy insert version FROM the pre-commit `data:` value
+            // into the SAME batch first — otherwise AS-OF reads in
+            // [copy_ts, commit_ts) would find only the new version and treat the
+            // row as not-yet-existing. Gated on `check_copy_markers` (hoisted
+            // above) so no-COPY commits skip the key parse entirely.
+            if check_copy_markers {
+                if let Some(rest) = key.strip_prefix(b"data:".as_slice()) {
+                    if let Ok(text) = std::str::from_utf8(rest) {
+                        if let Some(pos) = text.rfind(':') {
+                            if let Ok(row_id) = text[pos + 1..].parse::<u64>() {
+                                self.snapshot_manager.materialize_copy_marker_row(
+                                    &mut batch,
+                                    &text[..pos],
+                                    row_id,
+                                    commit_ts,
+                                )?;
+                            }
+                        }
+                    }
+                }
             }
             match value {
                 Some(val) => {
