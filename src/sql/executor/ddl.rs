@@ -557,6 +557,12 @@ pub(super) fn handle_truncate(executor: &Executor, table_name: &str) -> Result<B
             return Err(Error::query_execution(format!("Table '{}' does not exist", table_name)));
         }
 
+        // Item #2: preserve AS-OF history for COPY marker-covered rows before
+        // their `data:` is removed below — TRUNCATE leaves `v:`/`v_idx:` intact
+        // (so the per-row baseline stays queryable AS-OF), and markers must
+        // match that by materializing their insert versions first.
+        storage.materialize_copy_markers_for_table(table_name)?;
+
         // Delete all rows from the table
         let prefix = format!("data:{}:", table_name);
         let prefix_bytes = prefix.as_bytes();
