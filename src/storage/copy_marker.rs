@@ -6,7 +6,9 @@
 //! traffic was ~2/3 of the COPY cost (measured 393 ms → 173 ms @100k when
 //! elided). Instead, the batch writes ONE durable marker
 //!
-//!     `vmeta:{table}:{first_row_id:020}:{last_row_id:020}` → {commit_ts: be u64}
+//! ```text
+//! vmeta:{table}:{first_row_id:020}:{last_row_id:020} → {commit_ts: be u64}
+//! ```
 //!
 //! over its contiguous row-id range, and this in-memory interval set answers
 //! the only two questions the version records were needed for:

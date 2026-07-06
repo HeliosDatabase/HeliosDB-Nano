@@ -5,6 +5,33 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.1.0] - 2026-07-06
+
+Next performance batch (all gated through regression + scalability suites):
+
+- **COPY → PostgreSQL parity** — the time-travel COPY fast batch now writes one
+  durable `vmeta:` range marker per batch instead of a per-row `v:`/`v_idx:`
+  version pair. **COPY 100k: ~397 ms → ~160 ms (2.5×), near PostgreSQL parity
+  (~115–133 ms).** AS-OF visibility and insert-version materialization are wired
+  at every mutation path (fast update/delete, general branch-aware, the txn
+  commit-apply, and both TRUNCATE arms); an in-memory interval index is rebuilt
+  from `vmeta:` at open (crash-safe) behind a one-atomic fast-out. Kill switch
+  `HELIOS_COPY_VRANGE_OFF=1`. (PR #13)
+- **Normalizer widening** — `IN` / `BETWEEN` / cast literals now parameterize for
+  shared cached plans, with IN-list power-of-two arity padding; `IN` on an
+  indexed column gained an index multi-probe path (was a full filter-scan),
+  measured **100–161× on the wire**. (PR #12)
+- **Fix (embedded):** `$n` placeholders inside a scalar subquery in
+  `UPDATE … SET n = (SELECT … WHERE a=$1) …` now bind (previously
+  "Parameter $1 not provided"). Wire path was never affected. Reported by a2h. (PR #14)
+
+Also investigated and **stopped with evidence** (no code shipped): columnar OLAP
+activation (#3 — shipped kernels measured best 3.5× / median 1.0× vs the
+already-fast row store) and aggregate-over-join column pruning (#4 — pruning is
+correct but the row-store scan full-decodes the blob, so it's a no-op; the real
+lever is projected fast-skip decode in the join-input scan, deferred). See
+`docs/plans/NEXT_PERF_BATCH_2026_07.md`.
+
 ## [4.0.0] - 2026-07-05
 
 Major release: the **2026-07 performance & stability campaign**. Six milestones,
