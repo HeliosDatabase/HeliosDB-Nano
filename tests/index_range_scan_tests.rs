@@ -430,3 +430,51 @@ fn sign_flip_encoding_orders_negative_integers() {
     let order: Vec<i64> = keys.into_iter().map(|(v, _)| v).collect();
     assert_eq!(order, vec![i64::MIN, -100, -1, 0, 1, 100, i64::MAX]);
 }
+
+// ── IN-list index multi-probe (next-batch item 1) ──────────────────────────
+// `col IN (…)` on an indexed column probes the index per value (unioned) rather
+// than seq-scanning. Correctness vs an unindexed row twin; EXPLAIN must show the
+// probe (matching what actually executes); literal and parameterized forms agree.
+
+#[test]
+fn in_list_index_probe_matches_twin_and_explains() {
+    let db = EmbeddedDatabase::new_in_memory().unwrap();
+    for t in ["ii_indexed", "ii_twin"] {
+        db.execute(&format!("CREATE TABLE {t} (aid INT, v INT)")).unwrap();
+    }
+    db.execute("CREATE INDEX ii_idx ON ii_indexed(aid)").unwrap();
+    for t in ["ii_indexed", "ii_twin"] {
+        let vals: String = (1..=500).map(|i| format!("({i},{})", (i * 7) % 1000)).collect::<Vec<_>>().join(",");
+        db.execute(&format!("INSERT INTO {t} VALUES {vals}")).unwrap();
+    }
+
+    for q in [
+        "SELECT aid, v FROM {T} WHERE aid IN (3, 7, 11)",
+        "SELECT aid FROM {T} WHERE aid IN (7, 3, 7, 11, 3)", // dups
+        "SELECT aid FROM {T} WHERE aid IN (99998, 99999)",   // no match
+        "SELECT aid FROM {T} WHERE aid IN (3, 7, 11) AND v > 0", // IN + other
+        "SELECT aid FROM {T} WHERE aid IN (3, 7, 11) OR aid = 400", // OR (falls back, still correct)
+    ] {
+        let indexed = db.query(&q.replace("{T}", "ii_indexed"), &[]).unwrap();
+        let twin = db.query(&q.replace("{T}", "ii_twin"), &[]).unwrap();
+        assert_eq!(rows_sorted(&indexed), rows_sorted(&twin), "divergence for: {q}");
+    }
+
+    // EXPLAIN surfaces the probe (displayed plan == executed plan).
+    let plan = db.query("EXPLAIN SELECT v FROM ii_indexed WHERE aid IN (3, 7, 11)", &[]).unwrap();
+    let text = rows_exact(&plan).join("\n");
+    assert!(text.contains("Index IN Probe"), "EXPLAIN must show the IN probe, got:\n{text}");
+    // Unindexed twin must NOT claim a probe.
+    let plan = db.query("EXPLAIN SELECT v FROM ii_twin WHERE aid IN (3, 7, 11)", &[]).unwrap();
+    assert!(!rows_exact(&plan).join("\n").contains("Index IN Probe"));
+
+    // Parameterized IN (A2-normalized shape) agrees with literal.
+    let lit = db.query("SELECT aid FROM ii_indexed WHERE aid IN (3,7,11) ORDER BY aid", &[]).unwrap();
+    let par = db
+        .query_params(
+            "SELECT aid FROM ii_indexed WHERE aid IN ($1,$2,$3,$3) ORDER BY aid",
+            &[Value::Int4(3), Value::Int4(7), Value::Int4(11)],
+        )
+        .unwrap();
+    assert_eq!(rows_exact(&lit), rows_exact(&par));
+}
