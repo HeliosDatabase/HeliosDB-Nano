@@ -168,6 +168,27 @@ alone reaches parity.
 
 ### 3. OLAP — activate the shipped columnar engine via a **derived cache with watermark + delta overlay** (L / medium)
 
+> **⛔ STOPPED at increment-0 (2026-07-06) — premise failed, no impl code invested.**
+> The mandatory go/no-go (`tests/columnar_increment0_bench.rs`, 1M rows, columnar table
+> vs row-store twin) measured the shipped vectorized kernels at **best 3.5×, median 1.0×**
+> vs the row store — far below the ≥5× bar, and *slower* on filtered queries:
+>
+> | query | columnar | row-store | speedup |
+> |---|---:|---:|---:|
+> | unfiltered SUM/MIN/MAX | 22.6 ms | 26.9 ms | 1.2× |
+> | WHERE v<1000 COUNT/SUM | 69.1 ms | 20.3 ms | **0.3×** |
+> | GROUP BY g SUM | 31.2 ms | 30.9 ms | 1.0× |
+> | COUNT(DISTINCT s) | 87.9 ms | 311.4 ms | 3.5× |
+> | WHERE w IS NULL GROUP BY g | 41.5 ms | 23.9 ms | 0.6× |
+>
+> **Why:** the columnar proposal's cited 6–89× gap was vs a *pre-campaign* row store (725–902 ms
+> on these queries). The M1–M5 + batch-#1 row-store work already closed it — Nano's row store now
+> **beats the documented SQLite** on filter (20 vs 76 ms) and GROUP BY (31 vs 145 ms); only
+> COUNT(DISTINCT) lags (311 vs 27 ms), and columnar's 3.5× (88 ms) still trails SQLite. Activating
+> columnar would add watermark/delta/coherence machinery to *regress* filtered scans for a win on
+> one query shape. Not worth it. Revisit only if a real workload is COUNT(DISTINCT)-bound.
+> The bench stays as an ignored regression guard for any future columnar attempt.
+
 **v1 proposal:** columnar side copies; relax the two planner gates; any-DML-marks-stale →
 background full re-backfill; increment 0 = measure the existing kernels first.
 
