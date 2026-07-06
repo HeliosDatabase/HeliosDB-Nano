@@ -2410,7 +2410,7 @@ impl<'a> Executor<'a> {
         }
         let analyzed_predicates = predicate
             .as_ref()
-            .map(|predicate| storage.predicate_pushdown().analyze_predicate(predicate, schema))
+            .map(|predicate| storage.predicate_pushdown().analyze_predicate(predicate, schema, &self.parameters))
             .unwrap_or_default();
         if predicate.is_some() && analyzed_predicates.is_empty() {
             return Ok(None);
@@ -2504,7 +2504,7 @@ impl<'a> Executor<'a> {
         }
         let analyzed_predicates = predicate
             .as_ref()
-            .map(|predicate| storage.predicate_pushdown().analyze_predicate(predicate, schema))
+            .map(|predicate| storage.predicate_pushdown().analyze_predicate(predicate, schema, &self.parameters))
             .unwrap_or_default();
         if predicate.is_some() && analyzed_predicates.is_empty() {
             return Ok(None);
