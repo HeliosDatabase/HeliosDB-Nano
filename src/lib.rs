@@ -9837,7 +9837,7 @@ impl EmbeddedDatabase {
             Ok(false) => {}
         }
 
-        let analyzed_predicates = self.storage.predicate_pushdown().analyze_predicate(predicate, &schema);
+        let analyzed_predicates = self.storage.predicate_pushdown().analyze_predicate(predicate, &schema, &[]);
         if analyzed_predicates.len() != 1
             || !crate::sql::executor::scan::storage_predicates_are_sql_safe(&schema, &analyzed_predicates)
         {

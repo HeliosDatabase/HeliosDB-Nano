@@ -334,6 +334,140 @@ pub(super) fn try_index_point_lookup_for_scan(
     )))
 }
 
+/// Locate a `col IN (v1, v2, …)` on an ART-indexed single column anywhere in an
+/// AND-tree, resolving each element (Literal / Parameter / Cast) to a coerced
+/// lookup value. `NOT IN` and any non-resolvable element (column, NULL,
+/// expression, subquery) → `None` (fall back to the filtered scan). Mirrors
+/// `indexed_equality_lookup` for the multi-value case.
+pub(super) fn indexed_in_list_lookup(
+    storage: &crate::storage::StorageEngine,
+    table_name: &str,
+    schema: &Schema,
+    predicate: &LogicalExpr,
+    parameters: &[Value],
+) -> Option<(String, Vec<Value>)> {
+    use crate::sql::BinaryOperator;
+    match predicate {
+        LogicalExpr::BinaryExpr {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => indexed_in_list_lookup(storage, table_name, schema, left, parameters)
+            .or_else(|| indexed_in_list_lookup(storage, table_name, schema, right, parameters)),
+        LogicalExpr::InList {
+            expr,
+            list,
+            negated: false,
+        } => {
+            let LogicalExpr::Column { table, name } = expr.as_ref() else {
+                return None;
+            };
+            if list.is_empty() {
+                return None;
+            }
+            let column_idx = schema
+                .get_qualified_column_index(table.as_deref(), name)
+                .or_else(|| schema.get_column_index(name))?;
+            let column = schema.columns.get(column_idx)?;
+            let index_name = storage.art_indexes().find_column_index(table_name, &column.name)?;
+            let mut values = Vec::with_capacity(list.len());
+            for item in list {
+                // Every element must resolve to a concrete indexed value, else
+                // the probe set is incomplete and would drop matching rows.
+                let raw = lookup_bound_value(item, parameters)?;
+                values.push(coerce_index_lookup_value(raw, &column.data_type)?);
+            }
+            Some((index_name, values))
+        }
+        _ => None,
+    }
+}
+
+/// `col IN (v1, v2, …)` on an ART-indexed column becomes N index probes (one
+/// per distinct value) unioned, instead of a full scan + per-row membership
+/// filter. Works identically for literal and parameterized (A2-normalized) IN
+/// lists — value resolution goes through `lookup_bound_value`, so a cached
+/// `IN ($1,$2,$3,$3)` plan is as fast as a fresh literal one. Duplicate values
+/// (arity padding or a user's `IN (5,5)`) collapse via row-id dedup.
+pub(super) fn try_index_in_list_for_scan(
+    executor: &Executor,
+    input: &LogicalPlan,
+    predicate: &LogicalExpr,
+) -> Result<Option<Box<dyn PhysicalOperator>>> {
+    let storage = match executor.storage() {
+        Some(storage) => storage,
+        None => return Ok(None),
+    };
+    if storage.is_branch_active() {
+        return Ok(None);
+    }
+    let LogicalPlan::Scan {
+        table_name,
+        alias,
+        schema,
+        projection,
+        as_of,
+    } = input
+    else {
+        return Ok(None);
+    };
+    if executor.txn_forces_slow_reads_for_table(table_name) {
+        return Ok(None);
+    }
+    if as_of.is_some()
+        || executor.get_cte(table_name).is_some()
+        || storage.mv_catalog().view_exists(table_name)?
+        || !storage.catalog().table_exists(table_name)?
+    {
+        return Ok(None);
+    }
+
+    let materialized_predicate = executor.materialize_subqueries(predicate)?;
+    let Some((index_name, lookup_values)) =
+        indexed_in_list_lookup(storage, table_name, schema.as_ref(), &materialized_predicate, executor.parameters())
+    else {
+        return Ok(None);
+    };
+
+    // Probe once per value; union the row ids (dedup handles duplicate values
+    // and the arity-padding repeat), preserving first-seen order.
+    let mut seen = std::collections::HashSet::new();
+    let mut row_ids = Vec::new();
+    for value in &lookup_values {
+        let key = crate::storage::ArtIndexManager::encode_key_from_values(std::iter::once(value));
+        for row_id in storage.art_indexes().index_get_all(&index_name, &key) {
+            if seen.insert(row_id) {
+                row_ids.push(row_id);
+            }
+        }
+    }
+
+    let mut tuples = Vec::with_capacity(row_ids.len());
+    for row_id in row_ids {
+        if let Some(tuple) = storage.get_row_by_id(table_name, row_id, schema.as_ref())? {
+            tuples.push(tuple);
+        }
+    }
+
+    let source_name = alias.as_ref().unwrap_or(table_name);
+    let actual_schema = Arc::new(schema_with_source(schema.as_ref(), source_name, table_name));
+    // Re-filter with the full predicate: an `IN (…) AND other` keeps `other`,
+    // and this is the correctness backstop for the index probe.
+    let tuples =
+        filter_tuples_with_evaluator(tuples, actual_schema.clone(), &materialized_predicate, executor.parameters())?;
+
+    Ok(Some(Box::new(
+        ScanOperator::new(
+            table_name.clone(),
+            actual_schema,
+            projection.clone(),
+            tuples,
+            executor.parameters().to_vec(),
+        )
+        .with_timeout(executor.timeout_ctx()),
+    )))
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // R4.4: index range scans — `col > / >= / < / <= / BETWEEN bound` predicates
 // on a single-column ART-indexed column become an ordered, bounded index
@@ -2248,7 +2382,7 @@ pub(super) fn handle_filtered_scan(executor: &Executor, plan: &LogicalPlan) -> R
 
             // Analyze the predicate for storage-level pushdown
             let analyzed_predicates = if let Some(ref pred) = materialized_predicate {
-                storage.predicate_pushdown().analyze_predicate(pred, &schema)
+                storage.predicate_pushdown().analyze_predicate(pred, &schema, executor.parameters())
             } else {
                 Vec::new()
             };
