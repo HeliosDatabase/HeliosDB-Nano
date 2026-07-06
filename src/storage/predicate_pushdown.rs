@@ -264,21 +264,47 @@ impl PredicatePushdownManager {
         }
     }
 
-    /// Analyze a logical expression to extract pushable predicates
-    pub fn analyze_predicate(&self, expr: &LogicalExpr, schema: &Schema) -> Vec<AnalyzedPredicate> {
+    /// Resolve a predicate operand to a concrete bound value for pushdown
+    /// analysis. Mirrors `scan.rs::lookup_bound_value`: a `Literal` is itself,
+    /// a `Parameter { index }` binds from `parameters`, and a `Cast` unwraps to
+    /// its inner value (column-type coercion happens in
+    /// `coerce_literal_for_column` at the call site). Without this, a cached
+    /// parameterized plan (from the A2 literal normalizer) carries `Parameter`
+    /// nodes, extraction returns nothing, and the whole bloom/zone-map storage
+    /// pushdown silently disables — permanently, since the plan is cached. That
+    /// regressed IN-list / range point reads once those shapes were normalized.
+    fn resolve_pushdown_value(expr: &LogicalExpr, parameters: &[Value]) -> Option<Value> {
+        match expr {
+            LogicalExpr::Literal(value) => Some(value.clone()),
+            LogicalExpr::Parameter { index } if *index > 0 => parameters.get(index - 1).cloned(),
+            LogicalExpr::Cast { expr, .. } => Self::resolve_pushdown_value(expr, parameters),
+            _ => None,
+        }
+    }
+
+    /// Analyze a logical expression to extract pushable predicates. `parameters`
+    /// binds `$n` placeholders in a cached parameterized plan (empty slice for
+    /// literal-only plans).
+    pub fn analyze_predicate(&self, expr: &LogicalExpr, schema: &Schema, parameters: &[Value]) -> Vec<AnalyzedPredicate> {
         let mut predicates = Vec::new();
-        self.extract_predicates(expr, schema, &mut predicates);
+        self.extract_predicates(expr, schema, parameters, &mut predicates);
         predicates
     }
 
-    fn extract_predicates(&self, expr: &LogicalExpr, schema: &Schema, predicates: &mut Vec<AnalyzedPredicate>) {
+    fn extract_predicates(
+        &self,
+        expr: &LogicalExpr,
+        schema: &Schema,
+        parameters: &[Value],
+        predicates: &mut Vec<AnalyzedPredicate>,
+    ) {
         match expr {
             LogicalExpr::BinaryExpr { left, op, right } => {
                 match op {
                     BinaryOperator::And => {
                         // Recurse into AND branches
-                        self.extract_predicates(left, schema, predicates);
-                        self.extract_predicates(right, schema, predicates);
+                        self.extract_predicates(left, schema, parameters, predicates);
+                        self.extract_predicates(right, schema, parameters, predicates);
                     }
                     BinaryOperator::Or => {
                         // OR predicates are harder to push down
@@ -291,9 +317,9 @@ impl PredicatePushdownManager {
                     | BinaryOperator::Gt
                     | BinaryOperator::GtEq => {
                         // Try to extract column = value predicates
-                        if let Some(pred) = self.extract_comparison(left, right, op, schema) {
+                        if let Some(pred) = self.extract_comparison(left, right, op, schema, parameters) {
                             predicates.push(pred);
-                        } else if let Some(pred) = self.extract_comparison(right, left, op, schema) {
+                        } else if let Some(pred) = self.extract_comparison(right, left, op, schema, parameters) {
                             predicates.push(pred);
                         }
                     }
@@ -333,15 +359,16 @@ impl PredicatePushdownManager {
                 negated,
             } => {
                 if let LogicalExpr::Column { name, .. } = expr.as_ref() {
-                    if let (LogicalExpr::Literal(low_val), LogicalExpr::Literal(high_val)) =
-                        (low.as_ref(), high.as_ref())
-                    {
+                    if let (Some(low_val), Some(high_val)) = (
+                        Self::resolve_pushdown_value(low, parameters),
+                        Self::resolve_pushdown_value(high, parameters),
+                    ) {
                         if let Some(col_idx) = schema.get_column_index(name) {
                             let Some(column) = schema.columns.get(col_idx) else {
                                 return;
                             };
-                            let low_value = coerce_literal_for_column(low_val.clone(), &column.data_type);
-                            let high_value = coerce_literal_for_column(high_val.clone(), &column.data_type);
+                            let low_value = coerce_literal_for_column(low_val, &column.data_type);
+                            let high_value = coerce_literal_for_column(high_val, &column.data_type);
                             predicates.push(AnalyzedPredicate {
                                 column_name: name.clone(),
                                 column_index: col_idx,
@@ -367,16 +394,24 @@ impl PredicatePushdownManager {
                         let Some(column) = schema.columns.get(col_idx) else {
                             return;
                         };
-                        let values: Vec<Value> = list
-                            .iter()
-                            .filter_map(|e| {
-                                if let LogicalExpr::Literal(v) = e {
-                                    Some(coerce_literal_for_column(v.clone(), &column.data_type))
-                                } else {
-                                    None
+                        // Every element must resolve to a bound value, else the
+                        // pushed value_list would be incomplete and prune rows
+                        // that actually match. A mixed list (column members,
+                        // NULL) yields None and skips pushdown for this InList.
+                        let mut values: Vec<Value> = Vec::with_capacity(list.len());
+                        let mut all_resolved = true;
+                        for e in list {
+                            match Self::resolve_pushdown_value(e, parameters) {
+                                Some(v) => values.push(coerce_literal_for_column(v, &column.data_type)),
+                                None => {
+                                    all_resolved = false;
+                                    break;
                                 }
-                            })
-                            .collect();
+                            }
+                        }
+                        if !all_resolved {
+                            return;
+                        }
 
                         if !values.is_empty() {
                             predicates.push(AnalyzedPredicate {
@@ -404,6 +439,7 @@ impl PredicatePushdownManager {
         right: &LogicalExpr,
         op: &BinaryOperator,
         schema: &Schema,
+        parameters: &[Value],
     ) -> Option<AnalyzedPredicate> {
         let (column_name, column_index, column_type) = match left {
             LogicalExpr::Column { name, .. } => {
@@ -414,9 +450,9 @@ impl PredicatePushdownManager {
             _ => return None,
         };
 
-        let value = match right {
-            LogicalExpr::Literal(v) => coerce_literal_for_column(v.clone(), &column_type),
-            _ => return None,
+        let value = match Self::resolve_pushdown_value(right, parameters) {
+            Some(v) => coerce_literal_for_column(v, &column_type),
+            None => return None,
         };
 
         let pred_op = match op {
@@ -704,7 +740,7 @@ pub struct PushdownAnalysis {
 /// Analyze a filter expression for pushdown opportunities
 pub fn analyze_for_pushdown(expr: &LogicalExpr, schema: &Schema) -> PushdownAnalysis {
     let manager = PredicatePushdownManager::with_defaults();
-    let predicates = manager.analyze_predicate(expr, schema);
+    let predicates = manager.analyze_predicate(expr, schema, &[]);
 
     let estimated_selectivity = predicates.iter().map(|p| p.selectivity).product::<f64>().max(0.001); // Minimum selectivity
 
@@ -745,11 +781,78 @@ mod tests {
             right: Box::new(LogicalExpr::Literal(Value::Int8(42))),
         };
 
-        let predicates = manager.analyze_predicate(&expr, &schema);
+        let predicates = manager.analyze_predicate(&expr, &schema, &[]);
         assert_eq!(predicates.len(), 1);
         assert_eq!(predicates[0].column_name, "id");
         assert_eq!(predicates[0].op, PredicateOp::Eq);
         assert!(predicates[0].can_use_bloom);
+    }
+
+    fn col(name: &str) -> LogicalExpr {
+        LogicalExpr::Column {
+            table: None,
+            name: name.to_string(),
+        }
+    }
+
+    /// The bound-value resolver must extract from `$n` parameters and casts, not
+    /// just literals — else a cached parameterized plan (A2 normalizer output)
+    /// silently loses all storage pushdown. This locks in the regression fix.
+    #[test]
+    fn parameterized_predicates_extract_via_bound_values() {
+        let schema = create_test_schema();
+        let m = PredicatePushdownManager::with_defaults();
+        let params = vec![Value::Int8(42), Value::Int4(10), Value::Int4(20)];
+
+        // `id = $1`
+        let eq = LogicalExpr::BinaryExpr {
+            left: Box::new(col("id")),
+            op: BinaryOperator::Eq,
+            right: Box::new(LogicalExpr::Parameter { index: 1 }),
+        };
+        let p = m.analyze_predicate(&eq, &schema, &params);
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].op, PredicateOp::Eq);
+        assert_eq!(p[0].value, Value::Int8(42));
+
+        // `age BETWEEN $2 AND $3`
+        let between = LogicalExpr::Between {
+            expr: Box::new(col("age")),
+            low: Box::new(LogicalExpr::Parameter { index: 2 }),
+            high: Box::new(LogicalExpr::Parameter { index: 3 }),
+            negated: false,
+        };
+        let p = m.analyze_predicate(&between, &schema, &params);
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].op, PredicateOp::Between);
+        assert_eq!(p[0].value, Value::Int4(10));
+        assert_eq!(p[0].value2, Some(Value::Int4(20)));
+
+        // `age IN ($2, $3, $3)` — padded shape; full value list resolves.
+        let in_list = LogicalExpr::InList {
+            expr: Box::new(col("age")),
+            list: vec![
+                LogicalExpr::Parameter { index: 2 },
+                LogicalExpr::Parameter { index: 3 },
+                LogicalExpr::Parameter { index: 3 },
+            ],
+            negated: false,
+        };
+        let p = m.analyze_predicate(&in_list, &schema, &params);
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].op, PredicateOp::In);
+        assert_eq!(p[0].value_list, vec![Value::Int4(10), Value::Int4(20), Value::Int4(20)]);
+
+        // Empty params → no resolution → no pushdown (safe, not a panic).
+        assert!(m.analyze_predicate(&eq, &schema, &[]).is_empty());
+
+        // Mixed list (a column member) → skip pushdown entirely (correctness).
+        let mixed = LogicalExpr::InList {
+            expr: Box::new(col("age")),
+            list: vec![LogicalExpr::Parameter { index: 2 }, col("id")],
+            negated: false,
+        };
+        assert!(m.analyze_predicate(&mixed, &schema, &params).is_empty());
     }
 
     #[test]
@@ -777,7 +880,7 @@ mod tests {
             }),
         };
 
-        let predicates = manager.analyze_predicate(&expr, &schema);
+        let predicates = manager.analyze_predicate(&expr, &schema, &[]);
         assert_eq!(predicates.len(), 2);
     }
 

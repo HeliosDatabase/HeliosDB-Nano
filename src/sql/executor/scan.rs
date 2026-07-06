@@ -2248,7 +2248,7 @@ pub(super) fn handle_filtered_scan(executor: &Executor, plan: &LogicalPlan) -> R
 
             // Analyze the predicate for storage-level pushdown
             let analyzed_predicates = if let Some(ref pred) = materialized_predicate {
-                storage.predicate_pushdown().analyze_predicate(pred, &schema)
+                storage.predicate_pushdown().analyze_predicate(pred, &schema, executor.parameters())
             } else {
                 Vec::new()
             };
