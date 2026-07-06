@@ -137,6 +137,12 @@ fn annotate_index_range_scans(executor: &Executor, plan: &LogicalPlan, node: &mu
         node.details.insert("index".to_string(), index_name.to_string());
     }
 
+    fn annotate_in_list(node: &mut PlanNode, table_name: &str, index_name: &str, n: usize) {
+        node.node_type = "IndexInListProbe".to_string();
+        node.operation = format!("Index IN Probe ({n} values) using {index_name} on {table_name}");
+        node.details.insert("index".to_string(), index_name.to_string());
+    }
+
     let common_gates_pass = |table_name: &str| -> Option<&crate::storage::StorageEngine> {
         let storage = executor.storage()?;
         if storage.is_branch_active() {
@@ -164,6 +170,12 @@ fn annotate_index_range_scans(executor: &Executor, plan: &LogicalPlan, node: &mu
             .map(|(index_name, _)| index_name)
     };
 
+    let in_list_spec = |table_name: &str, schema: &crate::Schema, predicate: &crate::sql::LogicalExpr| {
+        let storage = common_gates_pass(table_name)?;
+        super::scan::indexed_in_list_lookup(storage, table_name, schema, predicate, executor.parameters())
+            .map(|(index_name, values)| (index_name, values.len()))
+    };
+
     let range_spec = |table_name: &str, schema: &crate::Schema, predicate: &crate::sql::LogicalExpr| {
         if super::scan::index_range_fast_path_disabled() {
             return None;
@@ -185,10 +197,13 @@ fn annotate_index_range_scans(executor: &Executor, plan: &LogicalPlan, node: &mu
                 ..
             } = input.as_ref()
             {
-                // Same priority as the executor: the equality probe runs
-                // before the range fast path.
+                // Same priority as the executor: point → IN-list → range.
                 if let Some(index_name) = point_spec(table_name, schema, predicate) {
                     annotate_point(node, table_name, &index_name);
+                    return;
+                }
+                if let Some((index_name, n)) = in_list_spec(table_name, schema, predicate) {
+                    annotate_in_list(node, table_name, &index_name, n);
                     return;
                 }
                 if let Some(spec) = range_spec(table_name, schema, predicate) {
@@ -209,6 +224,8 @@ fn annotate_index_range_scans(executor: &Executor, plan: &LogicalPlan, node: &mu
         } => {
             if let Some(index_name) = point_spec(table_name, schema, predicate) {
                 annotate_point(node, table_name, &index_name);
+            } else if let Some((index_name, n)) = in_list_spec(table_name, schema, predicate) {
+                annotate_in_list(node, table_name, &index_name, n);
             } else if let Some(spec) = range_spec(table_name, schema, predicate) {
                 annotate(node, table_name, &spec);
             }
