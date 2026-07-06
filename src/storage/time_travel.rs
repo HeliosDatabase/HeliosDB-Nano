@@ -108,6 +108,12 @@ pub struct SnapshotManager {
     /// timestamp fail with a clear error instead of reconstructing state
     /// from a partially collected version chain. `0` = GC never ran.
     gc_low_watermark: AtomicU64,
+    /// Transient COPY batch version markers (next-batch item #2). A COPY fast
+    /// batch elides per-row `v:`/`v_idx:` in favor of one durable `vmeta:`
+    /// range marker; this in-memory interval index answers AS-OF visibility
+    /// and drives materialization on the first UPDATE/DELETE of a covered row.
+    /// Guarded by an internal atomic fast-out (one relaxed load when empty).
+    copy_markers: crate::storage::copy_marker::CopyMarkers,
 }
 
 /// Snapshot cache configuration
@@ -169,6 +175,7 @@ impl SnapshotManager {
             non_durable_writes: false,
             gc_low_watermark: AtomicU64::new(0),
             persist_metadata: true,
+            copy_markers: crate::storage::copy_marker::CopyMarkers::new(),
         }
     }
 
@@ -199,6 +206,7 @@ impl SnapshotManager {
             non_durable_writes: false,
             gc_low_watermark: AtomicU64::new(0),
             persist_metadata: true,
+            copy_markers: crate::storage::copy_marker::CopyMarkers::new(),
         }
     }
 
@@ -220,6 +228,7 @@ impl SnapshotManager {
             non_durable_writes: false,
             gc_low_watermark: AtomicU64::new(0),
             persist_metadata: true,
+            copy_markers: crate::storage::copy_marker::CopyMarkers::new(),
         }
     }
 
@@ -702,8 +711,24 @@ impl SnapshotManager {
             .any(|(k, _)| k.starts_with(any_prefix.as_bytes()));
 
         if !has_any_versions {
-            // No MVCC versions at all — row was written via non-versioned path.
-            // Read from the data key directly (pre-MVCC data visible to all snapshots).
+            // Item #2: a COPY fast-batch row carries no per-row `v:`/`v_idx:` —
+            // its insert timestamp lives in a `vmeta:` range marker instead. If
+            // a live marker covers this row, it is visible ONLY from that ts
+            // onward; an AS-OF read that predates the COPY must not see it.
+            // (Fast-out: `covering_ts` is one relaxed atomic load when no
+            // markers exist, so the common non-COPY case pays nothing here.)
+            if let Some(marker_ts) = self.copy_markers.covering_ts(table_name, row_id) {
+                if snapshot_ts < marker_ts {
+                    // Row did not exist yet at this snapshot.
+                    return Ok(None);
+                }
+                // snapshot_ts >= marker_ts: the row is visible and (having no
+                // versions) has never been updated, so `data:` is its value —
+                // fall through to the direct read below.
+            }
+            // No MVCC versions at all — row was written via non-versioned path
+            // (marker-covered & visible, or a genuine pre-MVCC fast insert).
+            // Read from the data key directly.
             let data_key = format!("data:{}:{}", table_name, row_id);
             return self
                 .db
@@ -820,6 +845,138 @@ impl SnapshotManager {
         (metadata, txn_id, scn)
     }
 
+    /// Item #2: record a durable COPY range marker's presence in the in-memory
+    /// interval index after its batch has committed. Called by the storage
+    /// engine's fast batch path; the `vmeta:` key itself is written inside that
+    /// same `WriteBatch` for atomicity.
+    pub(crate) fn record_copy_marker(&self, table_name: &str, first: u64, last: u64, ts: u64) {
+        self.copy_markers.insert(table_name, first, last, ts);
+    }
+
+    /// Test/inspection hook (item #2): number of live COPY range markers in the
+    /// in-memory index. A single COPY batch registers exactly one marker, so a
+    /// non-zero count proves the version-elision path was taken (not the
+    /// per-row `v:`/`v_idx:` fallback).
+    #[doc(hidden)]
+    pub fn debug_copy_marker_len(&self) -> usize {
+        self.copy_markers.len()
+    }
+
+    /// Test/inspection hook (item #2): the COPY insert ts covering `(table,
+    /// row_id)`, or `None` if no live marker covers it.
+    #[doc(hidden)]
+    pub fn debug_copy_marker_ts(&self, table_name: &str, row_id: u64) -> Option<u64> {
+        self.copy_markers.covering_ts(table_name, row_id)
+    }
+
+    /// Whether ANY `v_idx:` entry exists for `(table, row_id)` — i.e. the row
+    /// has at least one materialized version. Used to decide if a marker-covered
+    /// row still needs its insert version backfilled.
+    fn has_any_version_index(&self, table_name: &str, row_id: u64) -> Result<bool> {
+        let prefix = format!("v_idx:{}:{}:", table_name, row_id);
+        let mut iter = self.db.iterator(rocksdb::IteratorMode::From(
+            prefix.as_bytes(),
+            rocksdb::Direction::Forward,
+        ));
+        Ok(match iter.next() {
+            Some(Ok((k, _))) => k.starts_with(prefix.as_bytes()),
+            _ => false,
+        })
+    }
+
+    /// Item #2: whether `table` currently has any live COPY markers — a cheap
+    /// gate for TRUNCATE, which must materialize covered rows before removing
+    /// `data:` (else AS-OF reads predating the TRUNCATE lose the copied value).
+    pub(crate) fn table_has_copy_markers(&self, table_name: &str) -> bool {
+        self.copy_markers.table_has_markers(table_name)
+    }
+
+    /// Item #2: whether ANY live COPY marker exists (one relaxed atomic load).
+    /// The transaction commit-apply loop uses this to skip per-`data:`-key
+    /// marker probing entirely on the common no-COPY path.
+    pub(crate) fn has_any_copy_markers(&self) -> bool {
+        !self.copy_markers.is_empty()
+    }
+
+    /// Item #2: durably materialize a marker-covered row's insert version NOW,
+    /// in its own write, BEFORE a version-SKIPPING fast UPDATE/DELETE
+    /// (`update_tuple_fast*` / `delete_tuple_fast*`) overwrites or removes
+    /// `data:`. Without this, the per-row `v:`/`v_idx:` that the pre-item-#2
+    /// COPY wrote eagerly (and which survived a later fast mutation) would be
+    /// gone, and an AS-OF read in `[copy_ts, mutation_ts)` would wrongly resolve
+    /// to the post-mutation `data:` (or find the row deleted). No-op — one
+    /// relaxed atomic load — when no markers exist, so the hot fast-DML path is
+    /// untaxed on non-COPY workloads. Idempotent: a row that already has a
+    /// `v_idx:` is treated as materialized and skipped.
+    pub(crate) fn materialize_copy_marker_row_durable(
+        &self,
+        table_name: &str,
+        row_id: u64,
+    ) -> Result<()> {
+        if self.copy_markers.is_empty() {
+            return Ok(());
+        }
+        let marker_ts = match self.copy_markers.covering_ts(table_name, row_id) {
+            Some(ts) => ts,
+            None => return Ok(()),
+        };
+        if self.has_any_version_index(table_name, row_id)? {
+            return Ok(());
+        }
+        let data_key = format!("data:{}:{}", table_name, row_id);
+        let old_value = self
+            .db
+            .get(data_key.as_bytes())
+            .map_err(|e| Error::storage(format!("marker materialize data read failed: {}", e)))?;
+        if let Some(old_value) = old_value {
+            let mut batch = WriteBatch::default();
+            let version_key = format!("v:{}:{}:{}", table_name, row_id, marker_ts);
+            batch.put(version_key.as_bytes(), &old_value);
+            let reverse_ts = u64::MAX - marker_ts;
+            let index_key = format!("v_idx:{}:{}:{:020}", table_name, row_id, reverse_ts);
+            batch.put(index_key.as_bytes(), marker_ts.to_be_bytes());
+            self.write_batch(batch, "copy marker materialize")?;
+        }
+        Ok(())
+    }
+
+    /// Item #2: if `(table, row_id)` is covered by a live COPY marker and has no
+    /// materialized version yet, stage its insert version (`v:`/`v_idx:` at the
+    /// marker's ts, value = current `data:`) into `batch`. Idempotent: once a
+    /// `v_idx:` exists the row is considered materialized and this is a no-op.
+    /// The `data:` read returns the pre-update value because `batch` (which
+    /// carries the new `data:`) has not been committed yet.
+    pub(crate) fn materialize_copy_marker_row(
+        &self,
+        batch: &mut WriteBatch,
+        table_name: &str,
+        row_id: u64,
+        new_timestamp: u64,
+    ) -> Result<()> {
+        let marker_ts = match self.copy_markers.covering_ts(table_name, row_id) {
+            Some(ts) => ts,
+            None => return Ok(()),
+        };
+        // A mutation landing at the exact marker ts needs no separate insert
+        // version, and an already-materialized row must not be double-written.
+        if marker_ts >= new_timestamp || self.has_any_version_index(table_name, row_id)? {
+            return Ok(());
+        }
+        let data_key = format!("data:{}:{}", table_name, row_id);
+        let old_value = self
+            .db
+            .get(data_key.as_bytes())
+            .map_err(|e| Error::storage(format!("marker backfill data read failed: {}", e)))?;
+        if let Some(old_value) = old_value {
+            let version_key = format!("v:{}:{}:{}", table_name, row_id, marker_ts);
+            batch.put(version_key.as_bytes(), &old_value);
+            let reverse_ts = u64::MAX - marker_ts;
+            let index_key = format!("v_idx:{}:{}:{:020}", table_name, row_id, reverse_ts);
+            batch.put(index_key.as_bytes(), marker_ts.to_be_bytes());
+        }
+        Ok(())
+    }
+
     fn append_version_snapshot_to_batch(
         &self,
         batch: &mut WriteBatch,
@@ -829,6 +986,15 @@ impl SnapshotManager {
         value: &[u8],
         metadata: &SnapshotMetadata,
     ) -> Result<()> {
+        // Item #2: if this row is still covered by a live COPY marker (inserted
+        // via the version-eliding fast batch) and has not yet been materialized,
+        // write its insert version FROM the current on-disk `data:` value before
+        // recording the new version — so AS-OF reads in [copy_ts, this_ts)
+        // resolve to the pre-update value instead of finding no version and
+        // treating the row as not-yet-existing. Cheap common path: `covering_ts`
+        // is a single relaxed atomic load when no markers exist.
+        self.materialize_copy_marker_row(batch, table_name, row_id, timestamp)?;
+
         let version_key = format!("v:{}:{}:{}", table_name, row_id, timestamp);
         batch.put(version_key.as_bytes(), value);
 
@@ -1057,6 +1223,14 @@ impl SnapshotManager {
 
         for item in iter {
             let (key, value) = item.map_err(|e| Error::storage(format!("Iterator error during recovery: {}", e)))?;
+
+            // Item #2: rebuild the in-memory COPY marker index from the durable
+            // `vmeta:` records in the same scan (crash-safe resume — a marker
+            // outlives the process, so AS-OF visibility survives restart).
+            if key.starts_with(crate::storage::copy_marker::VMETA_PREFIX.as_bytes()) {
+                self.copy_markers.load_record(&key, &value);
+                continue;
+            }
 
             if let Ok(key_str) = std::str::from_utf8(&key) {
                 if key_str.starts_with("snapshot:") {
