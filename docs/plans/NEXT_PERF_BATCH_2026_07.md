@@ -248,6 +248,32 @@ batch writer, and keeps the OLTP write path at one bitmap-clear + list-append.
 
 ### 4. Aggregate-over-Join pruning — **as an optimizer rule, not an executor special case** (M / low)
 
+> **⛔ STOPPED (2026-07-06) — pruning is correct but the row-store scan makes it a no-op;
+> the REAL lever found underneath (deferred).** Implemented the executor-arm pruning
+> (Aggregate arm → `compact_projected_join_inputs`, wildcard-skipping column collector so
+> `COUNT(*)` doesn't bail); it PASSES a full differential-correctness suite (pruned == unpruned
+> over 8 aggregate-over-join shapes + safe bails on LEFT/unqualified) and the 250-test
+> join/aggregate/subquery/window battery. **But it delivers no measured speedup** — a debug
+> trace confirmed pruning fires (`compact returned SOME`) and sets each join-side scan's
+> projection, yet the wide-TEXT fact query stayed ~820 ms (vs 811 ms unpruned; narrow-twin
+> ceiling 388 ms).
+>
+> **Root cause (the valuable finding):** the general join-input scan reads `data:{table}:{row}`
+> and `bincode::deserialize`s the WHOLE row blob via `get_row_by_id`/`get_row_by_id_arc`
+> (engine.rs) — the `Scan.projection` only selects columns AFTER decode, so the TEXT-decode
+> cost (the dominant cost the pruning targets) is unavoidable. **The existing Project-over-Join
+> pushdown has the SAME dead-for-decode limitation.** Nano DOES have fast-skip partial decode
+> (`row_blob_fast_skip_supported`, which supports TEXT via length-prefix seek) — but it is wired
+> ONLY into the TopK and primitive-scalar-aggregate fast paths, NOT the general join-input scan.
+>
+> **The real lever (deferred, bigger than #4):** wire projected fast-skip decode into the
+> join-input scan path (`get_row_by_id*` gains an optional projection that decodes only
+> `0..=max_requested`, seeking past skippable columns). That makes BOTH #4 AND the existing
+> projection-over-join pushdown effective — measured ~2x ceiling on wide-TEXT aggregate-over-join.
+> It's a hot-path storage change with real correctness surface, so it belongs in its own gated
+> milestone, not bolted onto #4. Opportunity bench kept: `tests/aggjoin_prune_opportunity_bench.rs`.
+> The #4 pruning code was reverted (correct but no measured win → don't ship the surface).
+
 **v1 proposal:** in the executor's Aggregate arm, collect required columns and call
 `compact_projected_join_inputs` (the machinery Project-over-Join already uses).
 
