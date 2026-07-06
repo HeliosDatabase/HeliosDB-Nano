@@ -11296,6 +11296,12 @@ impl EmbeddedDatabase {
                     keys_to_delete.push(key.to_vec());
                 }
 
+                // Item #2: materialize COPY marker-covered rows' insert versions
+                // before removing their `data:`, so AS-OF reads predating this
+                // TRUNCATE still resolve them (matches the per-row baseline,
+                // which leaves `v:` intact across TRUNCATE). No-op without markers.
+                self.storage.materialize_copy_markers_for_table(table_name)?;
+
                 // Delete all collected keys
                 for key in &keys_to_delete {
                     self.storage.delete(key)?;
@@ -28394,6 +28400,309 @@ mod tests {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         db.execute("CREATE TABLE cbi_empty (id INT PRIMARY KEY)").unwrap();
         assert_eq!(db.copy_bulk_insert("cbi_empty", &[], &[]).unwrap().unwrap(), 0);
+    }
+
+    // ---- Item #2: COPY version-write elision via transient vmeta: markers ----
+    // The COPY fast batch writes one durable range marker instead of per-row
+    // v:/v_idx:. These tests pin the correctness envelope: AS-OF visibility
+    // gating, UPDATE/DELETE insert-version backfill, and durability across
+    // reopen. (The kill-switch / per-row fallback path is the pre-item-#2
+    // behavior already covered by the wider time-travel suite, and is exercised
+    // with HELIOS_COPY_VRANGE_OFF in the scalability A/B gate.)
+
+    #[test]
+    fn copy_marker_gates_as_of_before_copy() {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE cvm (id INT PRIMARY KEY, v INT)").unwrap();
+
+        let ts_before = db.storage.current_timestamp();
+        let n = db
+            .copy_bulk_insert("cvm", &[], &copy_rows(&[&[Some("1"), Some("10")], &[Some("2"), Some("20")]]))
+            .expect("fast path taken")
+            .unwrap();
+        assert_eq!(n, 2);
+        let ts_after = db.storage.current_timestamp();
+
+        let sm = db.storage.snapshot_manager();
+        // Elision path ran: exactly one marker covering both rows.
+        assert_eq!(sm.debug_copy_marker_len(), 1, "one marker per COPY batch");
+        assert!(sm.debug_copy_marker_ts("cvm", 1).is_some());
+        assert!(sm.debug_copy_marker_ts("cvm", 2).is_some());
+
+        // AS-OF before the COPY: rows did not exist yet -> invisible.
+        assert!(sm.read_at_snapshot("cvm", 1, ts_before).unwrap().is_none());
+        assert!(sm.read_at_snapshot("cvm", 2, ts_before).unwrap().is_none());
+        // AS-OF at/after the COPY: visible.
+        assert!(sm.read_at_snapshot("cvm", 1, ts_after).unwrap().is_some());
+
+        // Current-time read unaffected.
+        let got = db.query("SELECT id, v FROM cvm ORDER BY id", &[]).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].values[0], Value::Int4(1));
+        assert_eq!(got[1].values[1], Value::Int4(20));
+    }
+
+    #[test]
+    fn copy_marker_update_backfills_insert_version() {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE cvm2 (id INT PRIMARY KEY, v INT)").unwrap();
+
+        let ts_before = db.storage.current_timestamp();
+        db.copy_bulk_insert("cvm2", &[], &copy_rows(&[&[Some("1"), Some("10")]]))
+            .expect("fast path taken")
+            .unwrap();
+        let ts_after_copy = db.storage.current_timestamp();
+
+        db.execute("UPDATE cvm2 SET v = 99 WHERE id = 1").unwrap();
+        let ts_after_update = db.storage.current_timestamp();
+
+        let _ = ts_after_update;
+        let sm = db.storage.snapshot_manager();
+        // Pre-COPY: still gated even after a later update.
+        assert!(sm.read_at_snapshot("cvm2", 1, ts_before).unwrap().is_none());
+        // [copy_ts, update_ts): the backfilled insert version (v=10) — THIS is
+        // the item-#2 regression guard. Without the fast-path materialization
+        // the marker-covered row's `data:` would already read 99 here.
+        let mid = sm.read_at_snapshot("cvm2", 1, ts_after_copy).unwrap();
+        assert!(mid.is_some(), "copied value must be visible between COPY and UPDATE");
+        let tup: Tuple = bincode::deserialize(&mid.unwrap()).unwrap();
+        assert_eq!(tup.values[1], Value::Int4(10), "AS-OF pre-update must see copied 10");
+        // Current read reflects the update.
+        let got = db.query("SELECT v FROM cvm2 WHERE id = 1", &[]).unwrap();
+        assert_eq!(got[0].values[0], Value::Int4(99));
+        // NOTE: an AS-OF read AT the update ts returns 10, not 99 — the
+        // AUTOCOMMIT UPDATE takes the version-skipping fast path
+        // (`update_tuple_fast`, the pre-existing D4 gap) and writes no version
+        // for its own change. Baseline (per-row COPY versions) behaves
+        // identically; markers neither introduce nor fix that gap. The
+        // transactional path below versions properly and is asserted there.
+    }
+
+    #[test]
+    fn copy_marker_txn_update_preserves_history() {
+        // A multi-statement transaction's UPDATE routes through the general
+        // `update_tuples_branch_aware` path (not the autocommit fast path),
+        // exercising that path's marker materialization: the copy version must
+        // survive so AS-OF between COPY and the txn UPDATE still resolves it.
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE cvm6 (id INT PRIMARY KEY, v INT)").unwrap();
+
+        let ts_before = db.storage.current_timestamp();
+        db.copy_bulk_insert("cvm6", &[], &copy_rows(&[&[Some("1"), Some("10")]]))
+            .expect("fast path taken")
+            .unwrap();
+        let ts_after_copy = db.storage.current_timestamp();
+
+        db.execute("BEGIN").unwrap();
+        db.execute("UPDATE cvm6 SET v = 42 WHERE id = 1").unwrap();
+        db.execute("COMMIT").unwrap();
+
+        let sm = db.storage.snapshot_manager();
+        assert!(sm.read_at_snapshot("cvm6", 1, ts_before).unwrap().is_none());
+        // Between COPY and the txn UPDATE: the preserved copy version (10) — the
+        // item-#2 regression guard for the transactional mutation path.
+        let mid = sm.read_at_snapshot("cvm6", 1, ts_after_copy).unwrap();
+        assert!(mid.is_some(), "txn-path mutation must preserve the copied row for AS-OF");
+        let tup: Tuple = bincode::deserialize(&mid.unwrap()).unwrap();
+        assert_eq!(tup.values[1], Value::Int4(10), "AS-OF pre-update must see copied 10");
+        // Current read reflects the update.
+        let got = db.query("SELECT v FROM cvm6 WHERE id = 1", &[]).unwrap();
+        assert_eq!(got[0].values[0], Value::Int4(42));
+    }
+
+    #[test]
+    fn copy_marker_general_delete_preserves_history() {
+        // A non-PK predicate routes through the general LogicalPlan::Delete arm
+        // -> `delete_tuples_branch_aware` (not the fast PK short-circuit),
+        // exercising that path's marker materialization.
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE cvm7 (id INT PRIMARY KEY, v INT)").unwrap();
+
+        let ts_before = db.storage.current_timestamp();
+        db.copy_bulk_insert(
+            "cvm7",
+            &[],
+            &copy_rows(&[&[Some("1"), Some("10")], &[Some("2"), Some("20")], &[Some("3"), Some("30")]]),
+        )
+        .expect("fast path taken")
+        .unwrap();
+        let ts_after_copy = db.storage.current_timestamp();
+
+        db.execute("DELETE FROM cvm7 WHERE v = 20").unwrap(); // non-PK -> general path
+
+        let sm = db.storage.snapshot_manager();
+        assert!(sm.read_at_snapshot("cvm7", 2, ts_before).unwrap().is_none());
+        let mid = sm.read_at_snapshot("cvm7", 2, ts_after_copy).unwrap();
+        assert!(mid.is_some(), "general-path delete must preserve the copied row for AS-OF");
+        let tup: Tuple = bincode::deserialize(&mid.unwrap()).unwrap();
+        assert_eq!(tup.values[1], Value::Int4(20));
+        let got = db.query("SELECT id FROM cvm7 ORDER BY id", &[]).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].values[0], Value::Int4(1));
+        assert_eq!(got[1].values[0], Value::Int4(3));
+    }
+
+    #[test]
+    fn copy_marker_general_update_preserves_history() {
+        // Non-PK predicate -> general LogicalPlan::Update arm ->
+        // `update_tuples_branch_aware` (main branch), exercising that path's
+        // marker materialization.
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE cvm8 (id INT PRIMARY KEY, v INT)").unwrap();
+
+        let ts_before = db.storage.current_timestamp();
+        db.copy_bulk_insert("cvm8", &[], &copy_rows(&[&[Some("1"), Some("10")], &[Some("2"), Some("20")]]))
+            .expect("fast path taken")
+            .unwrap();
+        let ts_after_copy = db.storage.current_timestamp();
+
+        db.execute("UPDATE cvm8 SET v = 200 WHERE v = 20").unwrap(); // non-PK -> general path
+
+        let sm = db.storage.snapshot_manager();
+        assert!(sm.read_at_snapshot("cvm8", 2, ts_before).unwrap().is_none());
+        // Between COPY and the general-path UPDATE: the preserved copied value 20.
+        let mid = sm.read_at_snapshot("cvm8", 2, ts_after_copy).unwrap();
+        assert!(mid.is_some(), "general-path update must preserve the copied row for AS-OF");
+        let tup: Tuple = bincode::deserialize(&mid.unwrap()).unwrap();
+        assert_eq!(tup.values[1], Value::Int4(20), "AS-OF pre-update must see copied 20");
+        // Current read reflects the update.
+        let got = db.query("SELECT v FROM cvm8 WHERE id = 2", &[]).unwrap();
+        assert_eq!(got[0].values[0], Value::Int4(200));
+    }
+
+    #[test]
+    fn copy_marker_truncate_preserves_history() {
+        // TRUNCATE removes `data:` but (like the per-row baseline) leaves
+        // version history queryable AS-OF. For marker-covered rows the insert
+        // version must be materialized before the wipe, else AS-OF predating
+        // the TRUNCATE would find nothing.
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE cvm9 (id INT PRIMARY KEY, v INT)").unwrap();
+
+        let ts_before = db.storage.current_timestamp();
+        db.copy_bulk_insert("cvm9", &[], &copy_rows(&[&[Some("1"), Some("10")], &[Some("2"), Some("20")]]))
+            .expect("fast path taken")
+            .unwrap();
+        let ts_after_copy = db.storage.current_timestamp();
+
+        db.execute("TRUNCATE TABLE cvm9").unwrap();
+
+        let sm = db.storage.snapshot_manager();
+        // Pre-COPY: never existed.
+        assert!(sm.read_at_snapshot("cvm9", 1, ts_before).unwrap().is_none());
+        // Between COPY and TRUNCATE: the copied values survive AS-OF.
+        let r1 = sm.read_at_snapshot("cvm9", 1, ts_after_copy).unwrap();
+        assert!(r1.is_some(), "TRUNCATE must materialize marker rows so AS-OF still resolves them");
+        let t1: Tuple = bincode::deserialize(&r1.unwrap()).unwrap();
+        assert_eq!(t1.values[1], Value::Int4(10));
+        let r2 = sm.read_at_snapshot("cvm9", 2, ts_after_copy).unwrap().unwrap();
+        let t2: Tuple = bincode::deserialize(&r2).unwrap();
+        assert_eq!(t2.values[1], Value::Int4(20));
+        // Current: table is empty.
+        let got = db.query("SELECT count(*) FROM cvm9", &[]).unwrap();
+        assert_eq!(got[0].values[0], Value::Int8(0));
+    }
+
+    #[test]
+    fn copy_marker_delete_preserves_history() {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE cvm3 (id INT PRIMARY KEY, v INT)").unwrap();
+
+        let ts_before = db.storage.current_timestamp();
+        db.copy_bulk_insert("cvm3", &[], &copy_rows(&[&[Some("1"), Some("10")], &[Some("2"), Some("20")]]))
+            .expect("fast path taken")
+            .unwrap();
+        let ts_after_copy = db.storage.current_timestamp();
+
+        db.execute("DELETE FROM cvm3 WHERE id = 1").unwrap();
+
+        let sm = db.storage.snapshot_manager();
+        assert!(sm.read_at_snapshot("cvm3", 1, ts_before).unwrap().is_none());
+        let mid = sm.read_at_snapshot("cvm3", 1, ts_after_copy).unwrap();
+        assert!(mid.is_some(), "AS-OF between COPY and DELETE must still see the row");
+        let tup: Tuple = bincode::deserialize(&mid.unwrap()).unwrap();
+        assert_eq!(tup.values[1], Value::Int4(10));
+        // Current: row 1 gone, row 2 remains.
+        let got = db.query("SELECT id FROM cvm3 ORDER BY id", &[]).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].values[0], Value::Int4(2));
+    }
+
+    #[test]
+    fn copy_marker_survives_reopen() {
+        let dir = std::env::temp_dir().join(format!("helios_cvm_reopen_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let ts_before;
+        {
+            let mut c = Config::default();
+            c.storage.path = Some(dir.clone());
+            c.storage.memory_only = false;
+            c.storage.time_travel_enabled = true;
+            let db = EmbeddedDatabase::with_config(c).unwrap();
+            db.execute("CREATE TABLE cvm4 (id INT PRIMARY KEY, v INT)").unwrap();
+            ts_before = db.storage.current_timestamp();
+            db.copy_bulk_insert("cvm4", &[], &copy_rows(&[&[Some("1"), Some("10")], &[Some("2"), Some("20")]]))
+                .expect("fast path taken")
+                .unwrap();
+            assert_eq!(db.storage.snapshot_manager().debug_copy_marker_len(), 1);
+        }
+        {
+            let mut c = Config::default();
+            c.storage.path = Some(dir.clone());
+            c.storage.memory_only = false;
+            c.storage.time_travel_enabled = true;
+            let db = EmbeddedDatabase::with_config(c).unwrap();
+            let sm = db.storage.snapshot_manager();
+            assert_eq!(sm.debug_copy_marker_len(), 1, "marker rebuilt from durable vmeta: on open");
+            assert!(
+                sm.read_at_snapshot("cvm4", 1, ts_before).unwrap().is_none(),
+                "AS-OF gating must survive reopen"
+            );
+            let got = db.query("SELECT id, v FROM cvm4 ORDER BY id", &[]).unwrap();
+            assert_eq!(got.len(), 2);
+            assert_eq!(got[1].values[1], Value::Int4(20));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn copy_marker_backfills_after_reopen() {
+        let dir = std::env::temp_dir().join(format!("helios_cvm_reopen_upd_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let ts_before;
+        let ts_after_copy;
+        {
+            let mut c = Config::default();
+            c.storage.path = Some(dir.clone());
+            c.storage.memory_only = false;
+            c.storage.time_travel_enabled = true;
+            let db = EmbeddedDatabase::with_config(c).unwrap();
+            db.execute("CREATE TABLE cvm5 (id INT PRIMARY KEY, v INT)").unwrap();
+            ts_before = db.storage.current_timestamp();
+            db.copy_bulk_insert("cvm5", &[], &copy_rows(&[&[Some("1"), Some("10")]]))
+                .expect("fast path taken")
+                .unwrap();
+            ts_after_copy = db.storage.current_timestamp();
+        }
+        {
+            let mut c = Config::default();
+            c.storage.path = Some(dir.clone());
+            c.storage.memory_only = false;
+            c.storage.time_travel_enabled = true;
+            let db = EmbeddedDatabase::with_config(c).unwrap();
+            db.execute("UPDATE cvm5 SET v = 77 WHERE id = 1").unwrap();
+            let sm = db.storage.snapshot_manager();
+            assert!(sm.read_at_snapshot("cvm5", 1, ts_before).unwrap().is_none());
+            let mid = sm.read_at_snapshot("cvm5", 1, ts_after_copy).unwrap();
+            assert!(mid.is_some(), "backfill after reopen must preserve the copied value");
+            let tup: Tuple = bincode::deserialize(&mid.unwrap()).unwrap();
+            assert_eq!(tup.values[1], Value::Int4(10));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ---- A2 literal normalization: plan-cache reuse across literal variants ----
