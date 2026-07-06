@@ -3644,7 +3644,7 @@ impl EmbeddedDatabase {
                             // plan once per row. No-op for expressions
                             // without subqueries.
                             let bound = self
-                                .materialize_scalar_subqueries_for_row(value_expr, &old_tuple, &schema, table_name)?;
+                                .materialize_scalar_subqueries_for_row(value_expr, &old_tuple, &schema, table_name, &[])?;
                             let mut new_value = evaluator.evaluate(&bound, &old_tuple)?;
                             let col_index = evaluator
                                 .schema()
@@ -11043,7 +11043,7 @@ impl EmbeddedDatabase {
                         // row-scoped evaluator.
                         for (col_name, value_expr) in assignments {
                             let bound =
-                                self.materialize_scalar_subqueries_for_row(value_expr, &tuple, &schema, table_name)?;
+                                self.materialize_scalar_subqueries_for_row(value_expr, &tuple, &schema, table_name, &[])?;
                             let mut new_value = evaluator.evaluate(&bound, &tuple)?;
                             // Find column index
                             let col_index = evaluator
@@ -12669,7 +12669,7 @@ impl EmbeddedDatabase {
                         let mut tuple = tuple;
                         for (col_name, value_expr) in assignments {
                             let bound =
-                                self.materialize_scalar_subqueries_for_row(value_expr, &tuple, &schema, table_name)?;
+                                self.materialize_scalar_subqueries_for_row(value_expr, &tuple, &schema, table_name, params)?;
                             let mut new_value = evaluator.evaluate(&bound, &tuple)?;
                             let col_index = evaluator
                                 .schema()
@@ -16922,15 +16922,21 @@ impl EmbeddedDatabase {
         outer_row: &Tuple,
         outer_schema: &Schema,
         outer_table: &str,
+        params: &[Value],
     ) -> Result<sql::LogicalExpr> {
         use sql::LogicalExpr;
         match expr {
             LogicalExpr::ScalarSubquery { subquery } => {
                 // Substitute any outer-table column refs with literals.
                 let bound_plan = Self::bind_outer_refs_in_plan(subquery.as_ref(), outer_row, outer_schema, outer_table);
-                // Execute the (now-uncorrelated) plan.
-                let mut executor =
-                    sql::Executor::with_storage(&self.storage).with_timeout(self.effective_statement_timeout_ms());
+                // Execute the (now-uncorrelated) plan. Thread the outer
+                // statement's bound parameters so `$n` placeholders INSIDE the
+                // subquery (e.g. `SET n = (SELECT count(*) FROM t WHERE a=$1)`)
+                // resolve — without this the sub-executor sees zero params and
+                // fails with "Parameter $N not provided" (a2h embedded report).
+                let mut executor = sql::Executor::with_storage(&self.storage)
+                    .with_timeout(self.effective_statement_timeout_ms())
+                    .with_parameters(params.to_vec());
                 let rows = executor.execute(&bound_plan)?;
                 let value = rows
                     .first()
@@ -16944,6 +16950,7 @@ impl EmbeddedDatabase {
                     outer_row,
                     outer_schema,
                     outer_table,
+                    params,
                 )?),
                 op: *op,
                 right: Box::new(self.materialize_scalar_subqueries_for_row(
@@ -16951,6 +16958,7 @@ impl EmbeddedDatabase {
                     outer_row,
                     outer_schema,
                     outer_table,
+                    params,
                 )?),
             }),
             LogicalExpr::UnaryExpr { op, expr: inner } => Ok(LogicalExpr::UnaryExpr {
@@ -16960,6 +16968,7 @@ impl EmbeddedDatabase {
                     outer_row,
                     outer_schema,
                     outer_table,
+                    params,
                 )?),
             }),
             LogicalExpr::Cast { expr: inner, data_type } => Ok(LogicalExpr::Cast {
@@ -16968,6 +16977,7 @@ impl EmbeddedDatabase {
                     outer_row,
                     outer_schema,
                     outer_table,
+                    params,
                 )?),
                 data_type: data_type.clone(),
             }),
@@ -28601,6 +28611,42 @@ mod tests {
         // Current: table is empty.
         let got = db.query("SELECT count(*) FROM cvm9", &[]).unwrap();
         assert_eq!(got[0].values[0], Value::Int8(0));
+    }
+
+    #[test]
+    fn update_set_scalar_subquery_binds_params() {
+        // a2h embedded report: a `$n` placeholder INSIDE a scalar subquery in
+        // `UPDATE ... SET` was not bound (the SET-subquery sub-executor got no
+        // params) → "Parameter $1 not provided". The outer WHERE binds fine.
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE t (a TEXT, b TEXT, n INT, PRIMARY KEY(a,b))").unwrap();
+        db.execute("INSERT INTO t (a,b,n) VALUES ('x','1',0),('x','2',0),('y','1',0)").unwrap();
+
+        // DISTINCT values so the test detects an off-by-one: the subquery
+        // counts a=$1='y' (=1 row), NOT a=$2='x' (=2 rows). Outer targets the
+        // ('x','2') row via a=$2 AND b=$3.
+        let count = db
+            .execute_params(
+                "UPDATE t SET n = (SELECT count(*) FROM t WHERE a=$1) WHERE a=$2 AND b=$3",
+                &[
+                    Value::String("y".to_string()),
+                    Value::String("x".to_string()),
+                    Value::String("2".to_string()),
+                ],
+            )
+            .expect("SET-subquery $1 must bind (was: 'Parameter $1 not provided')");
+        assert_eq!(count, 1);
+
+        // n('x','2') = count(a='y') = 1 — proves $1 bound to 'y', not 'x'.
+        let got = db.query("SELECT n FROM t WHERE a='x' AND b='2'", &[]).unwrap();
+        assert!(
+            matches!(got[0].values[0], Value::Int4(1) | Value::Int8(1)),
+            "SET subquery $1='y' should yield count=1 (off-by-one would give 2), got {:?}",
+            got[0].values[0]
+        );
+        // Sibling ('x','1') untouched.
+        let untouched = db.query("SELECT n FROM t WHERE a='x' AND b='1'", &[]).unwrap();
+        assert!(matches!(untouched[0].values[0], Value::Int4(0) | Value::Int8(0)));
     }
 
     #[test]
