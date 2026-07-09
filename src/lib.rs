@@ -1022,7 +1022,27 @@ impl EmbeddedDatabase {
                 if self.session_settings.get(&name).is_none() {
                     return Ok(None);
                 }
-                self.session_settings.set(&name, sql::parse_setting_value(&value))?;
+                let parsed = sql::parse_setting_value(&value);
+                // `bulk_load_mode` is registered as a session setting, but its
+                // real effect lives in the storage engine's atomic flag. This
+                // passive handler intercepts the bare `SET bulk_load_mode = …`
+                // form on every embedded execute()/query() path (it runs before
+                // try_handle_fk_setting), so without this propagation the
+                // documented perf knob would be a silent no-op — the shadow
+                // value would update but the engine's bulk-insert fast path
+                // would never turn on. (The `helios.bulk_load_mode` form is not
+                // a registered session setting and is handled by
+                // try_handle_fk_setting; the PG wire path routes it via
+                // is_fk_setting_statement.)
+                let bulk_flag = if name == "bulk_load_mode" {
+                    parsed.as_bool()
+                } else {
+                    None
+                };
+                self.session_settings.set(&name, parsed)?;
+                if let Some(enabled) = bulk_flag {
+                    self.storage.set_bulk_load_mode(enabled);
+                }
                 Ok(Some((Vec::new(), Vec::new())))
             }
             DbSettingStatement::Show { name } => {
@@ -1043,6 +1063,12 @@ impl EmbeddedDatabase {
                     return Ok(None);
                 }
                 self.session_settings.reset(&name)?;
+                // Keep the storage-engine flag in sync when the bulk-load
+                // session setting is reset to its default (off); see the Set
+                // arm above for why this propagation is required.
+                if name == "bulk_load_mode" {
+                    self.storage.set_bulk_load_mode(false);
+                }
                 Ok(Some((Vec::new(), Vec::new())))
             }
         }
