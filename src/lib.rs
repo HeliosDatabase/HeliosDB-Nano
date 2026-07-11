@@ -13357,23 +13357,30 @@ impl EmbeddedDatabase {
 
         // A2: normalized-plan path. `query_with_columns` (the wire path) runs
         // this FIRST; here it runs AFTER every raw-cache check above so the
-        // FAST-PATH caches that self-populate independently of the cold path —
-        // the hot-result cache, `try_fast_count_pk_query`, and `try_fast_select`
-        // — still serve repeated-identical fast-shaped reads in ~µs (running
-        // normalization first would replace those hits with a full normalized
-        // execution). Note the cold-path `cached_query_result` does NOT protect
-        // normalizable text: intercepting here means a normalizable query never
-        // reaches the cold-path result-cache admit below, so it re-executes via
-        // the shared plan rather than serving cached rows. That is the accepted
-        // trade — it matches the wire path's long-shipping behavior, and the
-        // workload this exists for is exactly the "rotating literal" shape
-        // (varying LIMIT/OFFSET / WHERE literals) that never populates any raw
-        // result cache anyway: reaching this point means `sql` missed every raw
-        // cache, so we share ONE cached parameterized plan across every literal
-        // variant instead of paying a full parse+plan per variant.
+        // fast-path caches (hot-result, `try_fast_count_pk_query`,
+        // `try_fast_select`) still serve repeated-identical fast-shaped reads in
+        // ~µs. Reaching this point means `sql` missed every raw cache — the
+        // "rotating literal" shape (varying LIMIT/OFFSET / WHERE literals) this
+        // exists for — so we execute against ONE shared parameterized plan
+        // instead of paying a full parse+plan per literal variant.
+        //
+        // Then cache the rows under the RAW key, gated by the SAME seen-twice
+        // admission as the cold path. Without this, a repeated-IDENTICAL or
+        // low-cardinality normalizable query — which the result cache used to
+        // serve in µs — would re-execute on every call, because normalization
+        // intercepts before the cold-path result-cache admit below (a large
+        // regression, e.g. a stable `… LIKE 'x%' AND … BETWEEN …` scan). Caching
+        // here restores those hits: a stable text hits `cached_query_result`
+        // above on its next call, while a genuinely rotating text (unique raw
+        // key) never re-hits and is harmless. Deterministic-only, and
+        // write-invalidated exactly like every other result-cache entry, so it
+        // can never serve stale rows.
         if !is_non_deterministic {
             if let Some(result) = self.try_normalized_query_with_columns(sql) {
                 let (rows, _columns) = result?;
+                if self.cache_admits(sql) {
+                    self.cache_query_result(sql, &rows);
+                }
                 self.log_slow_query(sql, start.elapsed(), rows.len() as u64);
                 return Ok(rows);
             }
