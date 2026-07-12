@@ -13,16 +13,21 @@
 //!      (`Planner::number_literal_to_value` / `single_quoted_content_to_value`),
 //!      so a `$n` and the literal it replaced can never diverge in type.
 //!   2. The lexer BAILS (returns `None` → the caller uses the raw path) on
-//!      anything it is not certain is safe. It only ever normalizes number and
-//!      single-quoted-string literals that sit in the top-level WHERE predicate;
-//!      literals in the SELECT list / GROUP / ORDER / LIMIT / OFFSET (which can
-//!      change the output shape or row count) are left untouched, and a large
-//!      set of constructs (comments, casts, IN/BETWEEN/subquery lists, escaped/
-//!      dollar-quoted strings, existing placeholders) force a full bail.
+//!      anything it is not certain is safe. It normalizes number and
+//!      single-quoted-string literals in the top-level WHERE predicate, plus
+//!      (next-batch item) a bare integer literal directly after a top-level
+//!      LIMIT or OFFSET keyword — never one nested inside a parenthesized
+//!      subquery, and never `LIMIT ALL` or an expression. Literals in the
+//!      SELECT list / GROUP / ORDER (which can change the output shape) are
+//!      left untouched, and a large set of constructs (comments, casts,
+//!      IN/BETWEEN/subquery lists, escaped/dollar-quoted strings, existing
+//!      placeholders) force a full bail.
 //!
-//! The `tests/normalization_differential.rs` oracle asserts, over a large
-//! corpus, that executing the raw SQL and executing the normalized+parameterized
-//! SQL return identical rows — the real proof that this is sound.
+//! This file's own `mod differential` oracle asserts, over a large corpus,
+//! that executing the raw SQL (via `EmbeddedDatabase::query_raw_unnormalized`,
+//! which bypasses this normalizer) and executing the normalized+parameterized
+//! SQL return identical rows — the real proof that this is sound. The wired
+//! end-to-end path is covered by `tests/query_normalization.rs`.
 
 use crate::sql::Planner;
 use crate::Value;
@@ -47,9 +52,12 @@ pub(crate) fn normalize_select_literals(sql: &str) -> Option<(String, Vec<Value>
     let mut depth: i32 = 0;
     // Are we inside the top-level (depth-0) WHERE predicate right now?
     let mut in_where = false;
-    // Did we see a top-level WHERE at all? (Only queries with a WHERE are worth
-    // normalizing; a WHERE-less query has no predicate literals to extract.)
-    let mut saw_where = false;
+    // Are we inside a top-level (depth-0) LIMIT / OFFSET clause right now?
+    // Only ever set while `depth == 0` (see the clause-keyword handling
+    // below), so a LIMIT/OFFSET belonging to a parenthesized subquery never
+    // sets these — it is read at `depth > 0` and left untouched.
+    let mut in_limit = false;
+    let mut in_offset = false;
 
     while i < n {
         let b = bytes[i];
@@ -107,13 +115,28 @@ pub(crate) fn normalize_select_literals(sql: &str) -> Option<(String, Vec<Value>
                 // Top-level clause keywords delimit the WHERE region.
                 if word.eq_ignore_ascii_case("where") {
                     in_where = true;
-                    saw_where = true;
+                    in_limit = false;
+                    in_offset = false;
                     out.push_str(word);
                     i = word_end;
                     continue;
                 }
                 if is_where_terminator_kw(word) {
                     in_where = false;
+                    // LIMIT/OFFSET open their own literal-normalizable
+                    // region; any OTHER top-level clause keyword (GROUP,
+                    // ORDER, HAVING, WINDOW, FETCH, FOR, UNION, INTERSECT,
+                    // EXCEPT) closes it.
+                    if word.eq_ignore_ascii_case("limit") {
+                        in_limit = true;
+                        in_offset = false;
+                    } else if word.eq_ignore_ascii_case("offset") {
+                        in_offset = true;
+                        in_limit = false;
+                    } else {
+                        in_limit = false;
+                        in_offset = false;
+                    }
                 }
             }
 
@@ -186,12 +209,40 @@ pub(crate) fn normalize_select_literals(sql: &str) -> Option<(String, Vec<Value>
         // --- number literal (starts with an ASCII digit) ---
         if b.is_ascii_digit() {
             let end = read_number(bytes, i)?;
+            // LIMIT/OFFSET only ever normalize a literal sitting directly at
+            // depth 0 (i.e. immediately after the clause keyword, not inside
+            // some parenthesized expression under it) — `in_where` is
+            // deliberately depth-agnostic (a parenthesized boolean group like
+            // `(a = 1)` is still the same predicate), but LIMIT/OFFSET are
+            // conservative: any paren nesting after the keyword falls back to
+            // copying the literal through unchanged.
             if in_where {
                 let text = &sql[i..end];
                 let value = Planner::number_literal_to_value(text).ok()?;
                 params.push(value);
                 out.push('$');
                 out.push_str(&params.len().to_string());
+            } else if depth == 0
+                && (in_limit || in_offset)
+                && bytes[i..end].iter().all(u8::is_ascii_digit)
+            {
+                // A LIMIT/OFFSET bound: exactly ONE bare non-negative integer
+                // per clause keyword. Parameterizing it is result-preserving —
+                // the plan is identical for every bound value (the executor
+                // applies the count at runtime), so all `LIMIT n OFFSET m`
+                // variants collapse onto one cached parameterized plan. The
+                // all-digits guard keeps the param typed as Int4/Int8 (the only
+                // shapes the LIMIT resolver accepts) and, together with clearing
+                // the flag below, leaves a two-operand or expression bound
+                // (`LIMIT 10+5`, MySQL `LIMIT 5,10`, `LIMIT 5.5`) inline so it
+                // errors identically on the raw and normalized sides.
+                let text = &sql[i..end];
+                let value = Planner::number_literal_to_value(text).ok()?;
+                params.push(value);
+                out.push('$');
+                out.push_str(&params.len().to_string());
+                in_limit = false;
+                in_offset = false;
             } else {
                 out.push_str(&sql[i..end]);
             }
@@ -202,7 +253,11 @@ pub(crate) fn normalize_select_literals(sql: &str) -> Option<(String, Vec<Value>
         // A bare `.` immediately before a digit would be a leading-dot decimal
         // (`.5`) that read_number (digit-led) would mis-split into `.` + `5`.
         // Rare in predicates; bail rather than risk it.
-        if b == b'.' && i + 1 < n && bytes[i + 1].is_ascii_digit() && in_where {
+        if b == b'.'
+            && i + 1 < n
+            && bytes[i + 1].is_ascii_digit()
+            && (in_where || in_limit || in_offset)
+        {
             return None;
         }
 
@@ -254,9 +309,10 @@ pub(crate) fn normalize_select_literals(sql: &str) -> Option<(String, Vec<Value>
         i += 1;
     }
 
-    // Only worth returning a rewrite that actually parameterized something in a
-    // real WHERE predicate.
-    if saw_where && !params.is_empty() {
+    // Only worth returning a rewrite that actually parameterized something —
+    // either a WHERE predicate literal or a top-level LIMIT/OFFSET literal. A
+    // query with neither (e.g. `SELECT x FROM t`) has nothing to extract.
+    if !params.is_empty() {
         Some((out, params))
     } else {
         None
@@ -538,10 +594,90 @@ mod tests {
     }
 
     #[test]
-    fn limit_offset_not_touched() {
+    fn limit_offset_parameterized() {
+        // LIMIT/OFFSET literals are now parameterized too, so a rotating
+        // LIMIT/OFFSET workload shares ONE cached plan instead of one per
+        // distinct (limit, offset) pair.
         let (s, p) = norm("SELECT x FROM t WHERE a = 5 LIMIT 10 OFFSET 3").unwrap();
-        assert_eq!(s, "SELECT x FROM t WHERE a = $1 LIMIT 10 OFFSET 3");
+        assert_eq!(s, "SELECT x FROM t WHERE a = $1 LIMIT $2 OFFSET $3");
+        assert_eq!(p, vec![Value::Int4(5), Value::Int4(10), Value::Int4(3)]);
+    }
+
+    #[test]
+    fn limit_offset_only_no_where() {
+        // No WHERE at all — LIMIT/OFFSET literals alone are still worth
+        // parameterizing (the `saw_where` gate was dropped for exactly this).
+        let (s, p) = norm("SELECT x FROM t LIMIT 20 OFFSET 40").unwrap();
+        assert_eq!(s, "SELECT x FROM t LIMIT $1 OFFSET $2");
+        assert_eq!(p, vec![Value::Int4(20), Value::Int4(40)]);
+    }
+
+    #[test]
+    fn offset_before_limit_parameterized() {
+        // Postgres also accepts OFFSET before LIMIT.
+        let (s, p) = norm("SELECT x FROM t OFFSET 40 LIMIT 20").unwrap();
+        assert_eq!(s, "SELECT x FROM t OFFSET $1 LIMIT $2");
+        assert_eq!(p, vec![Value::Int4(40), Value::Int4(20)]);
+    }
+
+    #[test]
+    fn offset_only_no_limit_parameterized() {
+        // OFFSET with no LIMIT: limit_param stays None, offset_param is set.
+        let (s, p) = norm("SELECT x FROM t OFFSET 5").unwrap();
+        assert_eq!(s, "SELECT x FROM t OFFSET $1");
         assert_eq!(p, vec![Value::Int4(5)]);
+    }
+
+    #[test]
+    fn limit_expression_takes_only_first_bare_integer() {
+        // A two-operand / expression bound is left as an expression: only the
+        // FIRST bare integer after the keyword is taken (the flag clears after
+        // it), so the second operand stays inline. `$1 + 5` is then rejected by
+        // the planner's LIMIT bound check identically to raw `10 + 5` — no
+        // divergence. (The point of the guard: never parameterize BOTH operands
+        // of a MySQL `LIMIT a,b` or an arithmetic bound.)
+        let (s, p) = norm("SELECT x FROM t LIMIT 10+5").unwrap();
+        assert_eq!(s, "SELECT x FROM t LIMIT $1+5");
+        assert_eq!(p, vec![Value::Int4(10)]);
+        // MySQL `LIMIT a,b`: first taken, comma+second left inline.
+        let (s2, p2) = norm("SELECT x FROM t LIMIT 5,10").unwrap();
+        assert_eq!(s2, "SELECT x FROM t LIMIT $1,10");
+        assert_eq!(p2, vec![Value::Int4(5)]);
+    }
+
+    #[test]
+    fn limit_non_integer_left_inline() {
+        // A non-integer LIMIT bound (invalid SQL) is copied through verbatim,
+        // not parameterized — so it errors identically on both sides.
+        let (s, p) = norm("SELECT x FROM t WHERE a = 1 LIMIT 5.5").unwrap();
+        assert_eq!(s, "SELECT x FROM t WHERE a = $1 LIMIT 5.5");
+        assert_eq!(p, vec![Value::Int4(1)]);
+    }
+
+    #[test]
+    fn limit_all_untouched() {
+        // `LIMIT ALL` has no literal to extract; only the WHERE literal
+        // parameterizes.
+        let (s, p) = norm("SELECT x FROM t WHERE a = 5 LIMIT ALL").unwrap();
+        assert_eq!(s, "SELECT x FROM t WHERE a = $1 LIMIT ALL");
+        assert_eq!(p, vec![Value::Int4(5)]);
+    }
+
+    #[test]
+    fn limit_inside_subquery_not_touched() {
+        // A LIMIT belonging to a FROM-clause subquery is at paren depth > 0
+        // when the keyword is seen, so `in_limit` never activates for it —
+        // only the outer WHERE literal parameterizes.
+        let (s, p) = norm("SELECT * FROM (SELECT y FROM z LIMIT 5) t WHERE a = 1").unwrap();
+        assert_eq!(s, "SELECT * FROM (SELECT y FROM z LIMIT 5) t WHERE a = $1");
+        assert_eq!(p, vec![Value::Int4(1)]);
+    }
+
+    #[test]
+    fn existing_limit_placeholder_still_bails() {
+        // `$n` anywhere forces a full bail (the global `$` guard), including
+        // an already-parameterized LIMIT.
+        assert!(norm("SELECT x FROM t WHERE a = 5 LIMIT $1").is_none());
     }
 
     #[test]
@@ -838,11 +974,23 @@ mod differential {
             "SELECT id FROM d WHERE r BETWEEN -3.0 AND 1.6",
             "SELECT id FROM d WHERE big = 7000000000::int8",
             "SELECT id FROM d WHERE n = 10 AND name IN ('alice','carol') OR r BETWEEN 40.0 AND 43.0",
+            // ---- LIMIT/OFFSET parameterization ----
+            "SELECT id FROM d WHERE n = 20 ORDER BY id LIMIT 1 OFFSET 1",
+            "SELECT id FROM d WHERE flag = true ORDER BY id LIMIT 2 OFFSET 1",
+            "SELECT id FROM d ORDER BY id LIMIT 3 OFFSET 2",
+            "SELECT id FROM d ORDER BY id DESC LIMIT 100 OFFSET 0",
+            "SELECT id FROM d ORDER BY id LIMIT 0",
+            "SELECT id FROM d ORDER BY id LIMIT 2 OFFSET 999",
+            "SELECT id FROM d WHERE n = 10 LIMIT ALL",
+            "SELECT id FROM d WHERE id IN (SELECT id FROM d LIMIT 3)",
         ];
 
         let mut normalized_count = 0;
         for raw in corpus {
-            let raw_rows = repr(&db.query(raw, &[]).unwrap_or_else(|e| panic!("raw failed for {raw}: {e}")));
+            let raw_rows = repr(
+                &db.query_raw_unnormalized(raw)
+                    .unwrap_or_else(|e| panic!("raw failed for {raw}: {e}")),
+            );
             if let Some((nsql, params)) = normalize_select_literals(raw) {
                 normalized_count += 1;
                 let norm_rows = db
@@ -857,7 +1005,10 @@ mod differential {
         }
         // Guard against the corpus silently all-bailing (which would make the
         // oracle vacuous).
-        assert!(normalized_count >= 30, "expected most of the corpus to normalize, got {normalized_count}");
+        assert!(
+            normalized_count >= 45,
+            "expected most of the corpus to normalize, got {normalized_count}"
+        );
     }
 
     /// Deterministic property fuzz: generate a few hundred random predicates
@@ -919,7 +1070,10 @@ mod differential {
                 pred = format!("{pred} {joiner} {}", term(&mut next));
             }
             let raw = format!("SELECT id FROM d WHERE {pred}");
-            let raw_rows = repr(&db.query(&raw, &[]).unwrap_or_else(|e| panic!("raw failed for {raw}: {e}")));
+            let raw_rows = repr(
+                &db.query_raw_unnormalized(&raw)
+                    .unwrap_or_else(|e| panic!("raw failed for {raw}: {e}")),
+            );
             if let Some((nsql, params)) = normalize_select_literals(&raw) {
                 normalized_count += 1;
                 let norm_rows = db

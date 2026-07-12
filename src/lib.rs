@@ -382,9 +382,17 @@ type SessionTxnSlot = std::sync::Arc<parking_lot::RwLock<Option<storage::Transac
 /// stream of unique-literal one-shots keeps overwriting a bounded footprint.
 const CACHE_ADMISSION_SLOTS: usize = 1024;
 
+/// Ways per admission slot. Two fingerprints that collide onto the same slot
+/// (birthday-paradox-likely at 1024 slots once the working set grows) used to
+/// permanently ping-pong each other out of "seen twice" — slot holds A, B
+/// arrives (miss, overwrites with B), A arrives (miss, overwrites with A),
+/// forever, so NEITHER ever admits. Two ways let both live in the same slot.
+const CACHE_ADMISSION_WAYS: usize = 2;
+
 /// Build a zeroed R-A1 admission slot table behind an `Arc`.
-fn new_cache_admission() -> std::sync::Arc<[std::sync::atomic::AtomicU64; CACHE_ADMISSION_SLOTS]> {
-    std::sync::Arc::new(std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)))
+fn new_cache_admission() -> std::sync::Arc<[[std::sync::atomic::AtomicU64; CACHE_ADMISSION_WAYS]; CACHE_ADMISSION_SLOTS]>
+{
+    std::sync::Arc::new(std::array::from_fn(|_| std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0))))
 }
 
 pub struct EmbeddedDatabase {
@@ -452,9 +460,10 @@ pub struct EmbeddedDatabase {
     /// repeated hot-key queries after the second consecutive hit.
     last_fast_select_fingerprint: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// R-A1 cache-admission slot table (see `cache_admits`): fixed array of
-    /// last-seen SQL fingerprints; a query is admitted to the cold-path caches
+    /// last-seen SQL fingerprints (2-way set-associative — see
+    /// `CACHE_ADMISSION_WAYS`); a query is admitted to the cold-path caches
     /// only on a repeat sighting, so unique-literal queries stop churning them.
-    cache_admission: std::sync::Arc<[std::sync::atomic::AtomicU64; CACHE_ADMISSION_SLOTS]>,
+    cache_admission: std::sync::Arc<[[std::sync::atomic::AtomicU64; CACHE_ADMISSION_WAYS]; CACHE_ADMISSION_SLOTS]>,
     /// Repeated parameterized INSERT metadata cache. Invalidated with the plan cache on DDL.
     fast_param_insert_cache: std::sync::Arc<sharded_lru::ShardedLruCache<String, std::sync::Arc<FastParamInsertSpec>>>,
     /// Repeated literal INSERT shape cache. Literal values differ per statement,
@@ -1432,13 +1441,27 @@ impl EmbeddedDatabase {
     /// or a torn read only ever changes *whether* a given SQL is cached (a
     /// perf heuristic), never correctness. Genuinely repeated queries (fixed
     /// literal, prepared shapes normalized by R-A2) admit on the second run.
+    ///
+    /// 2-way set-associative (`CACHE_ADMISSION_WAYS`): two distinct hot
+    /// fingerprints that collide onto the same slot both get to establish
+    /// "seen once" state instead of overwriting each other's on every call
+    /// (which, with a single way, meant NEITHER ever reached "seen twice").
     fn cache_admits(&self, sql: &str) -> bool {
         let fp = Self::fast_select_fingerprint(sql);
         let slot = (fp as usize) & (CACHE_ADMISSION_SLOTS - 1);
-        // Relaxed is fine: this is a statistical filter, not a synchronization
-        // point — no other state is published through it.
-        let prev = self.cache_admission[slot].swap(fp, std::sync::atomic::Ordering::Relaxed);
-        prev == fp
+        let ways = &self.cache_admission[slot];
+        // Relaxed is fine throughout: this is a statistical filter, not a
+        // synchronization point — no other state is published through it.
+        // A hit in EITHER way admits without disturbing the slot.
+        if ways.iter().any(|w| w.load(std::sync::atomic::Ordering::Relaxed) == fp) {
+            return true;
+        }
+        // Miss: record this sighting. Shift way 0 into way 1 (so a fingerprint
+        // that was admitted-once doesn't get evicted by the very next distinct
+        // fingerprint) and install the new one in way 0.
+        let evicted = ways[0].swap(fp, std::sync::atomic::Ordering::Relaxed);
+        ways[1].store(evicted, std::sync::atomic::Ordering::Relaxed);
+        false
     }
 
     /// Shared cold-path optimizer (R-A5): the five rewrite rules are stateless,
@@ -13244,18 +13267,13 @@ impl EmbeddedDatabase {
             }
         }
 
-        // Check result cache first (returns cached query results for identical SQL).
-        // Skip queries that contain non-deterministic side-effecting
-        // scalar functions — nextval/currval/setval mutate server-side
-        // state, and gen_random_uuid / random / now / clock_timestamp
-        // must return a fresh value every time. Caching any of these
-        // would serve stale rows to the caller.
+        // Check result cache first (returns cached query results for identical
+        // SQL). The hot-result-cache check above already covers
+        // `hot_cached_query_result` under this same `result_cache_nonempty`
+        // condition (it is a duplicate to re-check it here — removed; see R-A1
+        // cleanup), so only the `try_fast_select` fast path is new at this
+        // point in the function.
         if result_cache_nonempty {
-            if let Some(cached_results) = self.hot_cached_query_result(sql) {
-                tracing::debug!(phase = "result_cache", "Hot result cache hit");
-                self.log_slow_query(sql, start.elapsed(), cached_results.len() as u64);
-                return Ok((*cached_results).clone());
-            }
             if let Some(result) = self.try_fast_select(sql) {
                 let results = result?;
                 self.log_slow_query(sql, start.elapsed(), results.len() as u64);
@@ -13263,21 +13281,18 @@ impl EmbeddedDatabase {
                 return Ok(results);
             }
         }
+
+        // Skip queries that contain non-deterministic side-effecting
+        // scalar functions — nextval/currval/setval mutate server-side
+        // state, and gen_random_uuid / random / now / clock_timestamp
+        // must return a fresh value every time. Caching any of these
+        // would serve stale rows to the caller.
         let is_non_deterministic = Self::query_is_non_deterministic(sql);
         if !is_non_deterministic && result_cache_nonempty {
             if let Some(cached_results) = self.cached_query_result(sql) {
                 tracing::debug!(phase = "result_cache", "Result cache hit");
                 self.log_slow_query(sql, start.elapsed(), cached_results.len() as u64);
                 return Ok((*cached_results).clone());
-            }
-        }
-
-        if result_cache_nonempty {
-            if let Some(result) = self.try_fast_select(sql) {
-                let results = result?;
-                self.log_slow_query(sql, start.elapsed(), results.len() as u64);
-                self.maybe_cache_repeated_fast_select(sql, &results);
-                return Ok(results);
             }
         }
 
@@ -13338,6 +13353,37 @@ impl EmbeddedDatabase {
             );
             self.log_slow_query(sql, start.elapsed(), results.len() as u64);
             return Ok(results);
+        }
+
+        // A2: normalized-plan path. `query_with_columns` (the wire path) runs
+        // this FIRST; here it runs AFTER every raw-cache check above so the
+        // fast-path caches (hot-result, `try_fast_count_pk_query`,
+        // `try_fast_select`) still serve repeated-identical fast-shaped reads in
+        // ~µs. Reaching this point means `sql` missed every raw cache — the
+        // "rotating literal" shape (varying LIMIT/OFFSET / WHERE literals) this
+        // exists for — so we execute against ONE shared parameterized plan
+        // instead of paying a full parse+plan per literal variant.
+        //
+        // Then cache the rows under the RAW key, gated by the SAME seen-twice
+        // admission as the cold path. Without this, a repeated-IDENTICAL or
+        // low-cardinality normalizable query — which the result cache used to
+        // serve in µs — would re-execute on every call, because normalization
+        // intercepts before the cold-path result-cache admit below (a large
+        // regression, e.g. a stable `… LIKE 'x%' AND … BETWEEN …` scan). Caching
+        // here restores those hits: a stable text hits `cached_query_result`
+        // above on its next call, while a genuinely rotating text (unique raw
+        // key) never re-hits and is harmless. Deterministic-only, and
+        // write-invalidated exactly like every other result-cache entry, so it
+        // can never serve stale rows.
+        if !is_non_deterministic {
+            if let Some(result) = self.try_normalized_query_with_columns(sql) {
+                let (rows, _columns) = result?;
+                if self.cache_admits(sql) {
+                    self.cache_query_result(sql, &rows);
+                }
+                self.log_slow_query(sql, start.elapsed(), rows.len() as u64);
+                return Ok(rows);
+            }
         }
 
         // Cache miss: parse, plan, optimize, cache, execute
@@ -13524,6 +13570,27 @@ impl EmbeddedDatabase {
         // the parameters vary per call, so the rows are not reusable under the
         // normalized key (only the plan is).
         Some(executor.execute_with_columns(&plan_arc))
+    }
+
+    /// Test-only oracle helper: execute `sql` via the cold parse → plan →
+    /// optimize → execute path, bypassing every fast path AND the A2
+    /// normalizer. Now that `query()` itself routes eligible SELECTs through
+    /// `try_normalized_query_with_columns` (see above), plain `query()` is no
+    /// longer a guaranteed-raw reference for the differential oracle — a
+    /// normalizable query passed to `query()` would silently execute the
+    /// *normalized* form on both sides of the comparison, making it vacuous.
+    /// This is the genuine raw reference the oracle in
+    /// `sql::normalize::differential` compares against instead.
+    #[cfg(test)]
+    pub(crate) fn query_raw_unnormalized(&self, sql: &str) -> Result<Vec<Tuple>> {
+        let (statement, _) = self.parse_cached(sql)?;
+        let catalog = self.storage.catalog();
+        let planner = sql::Planner::with_catalog(&catalog).with_sql(sql.to_string());
+        let plan = planner.statement_to_plan(statement)?;
+        let plan = self.cold_optimizer().optimize_recursive(plan)?;
+        let mut executor =
+            sql::Executor::with_storage(&self.storage).with_timeout(self.effective_statement_timeout_ms());
+        executor.execute(&plan)
     }
 
     pub fn query_with_columns(&self, sql: &str) -> Result<(Vec<Tuple>, Vec<String>)> {
@@ -28781,6 +28848,67 @@ mod tests {
             db.plan_cache.contains(norm_key),
             "the normalized key must be plan-cached and reused across literals"
         );
+    }
+
+    // ---- A2 LIMIT/OFFSET parameterization, wired into the embedded `query()`
+    // entry point (previously wire-path-only). ----
+
+    #[test]
+    fn a2_embedded_query_limit_offset_shares_one_normalized_plan() {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE p (id INT PRIMARY KEY, v INT)").unwrap();
+        for i in 1..=20 {
+            db.execute(&format!("INSERT INTO p VALUES ({i}, {})", i * 10)).unwrap();
+        }
+        let norm_key = "SELECT id, v FROM p ORDER BY id LIMIT $1 OFFSET $2";
+
+        // Distinct (limit, offset) pairs through the EMBEDDED `query()` entry
+        // point (not `query_with_columns`) — this is the path that previously
+        // had NO normalization wiring at all, so every rotating page used to
+        // pay a full cold parse+plan. Covers ordinary paging, LIMIT 0, OFFSET
+        // past the end of the table, and LIMIT larger than the table.
+        let cases: &[(i64, i64)] = &[(5, 0), (5, 5), (3, 17), (0, 2), (100, 0), (4, 200)];
+        for &(limit, offset) in cases {
+            let raw = format!("SELECT id, v FROM p ORDER BY id LIMIT {limit} OFFSET {offset}");
+            let got = db.query(&raw, &[]).unwrap();
+            let want = db.query_raw_unnormalized(&raw).unwrap();
+            assert_eq!(got, want, "limit={limit} offset={offset}");
+            // No per-literal raw plan-cache entry should ever form — the
+            // normalized-plan path returns before the raw cold path's
+            // `cache_admits`/`plan_cache.put` are ever reached.
+            assert!(
+                !db.plan_cache.contains(&raw),
+                "raw literal key must not be plan-cached (limit={limit}, offset={offset})"
+            );
+        }
+        // The normalized key is cached and shared across every distinct
+        // (limit, offset) pair above (warmed on the 2nd sighting) — the whole
+        // point: ONE parameterized plan instead of one cold parse per page.
+        assert!(
+            db.plan_cache.contains(norm_key),
+            "the LIMIT/OFFSET-normalized key must be plan-cached and reused"
+        );
+    }
+
+    #[test]
+    fn a2_embedded_query_where_limit_offset_desc_correct() {
+        // WHERE + ORDER BY DESC + LIMIT/OFFSET together, through `query()`.
+        // Row-for-row correctness against the genuine raw (non-normalized)
+        // execution is the load-bearing property here, not plan sharing.
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE q (id INT PRIMARY KEY, grp INT, v INT)").unwrap();
+        db.execute("CREATE INDEX q_grp ON q(grp)").unwrap();
+        for i in 1..=30 {
+            db.execute(&format!("INSERT INTO q VALUES ({i}, {}, {})", i % 3, i * 11)).unwrap();
+        }
+        let cases: &[(i64, i64, i64)] = &[(1, 4, 0), (1, 2, 3), (1, 0, 100), (1, 50, 0)];
+        for &(grp, limit, offset) in cases {
+            let raw =
+                format!("SELECT id FROM q WHERE grp = {grp} ORDER BY id DESC LIMIT {limit} OFFSET {offset}");
+            let got = db.query(&raw, &[]).unwrap();
+            let want = db.query_raw_unnormalized(&raw).unwrap();
+            assert_eq!(got, want, "grp={grp} limit={limit} offset={offset}");
+        }
     }
 
     #[test]
