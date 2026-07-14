@@ -1631,6 +1631,46 @@ impl EmbeddedDatabase {
         Ok(Some(self.storage.vacuum_versions()?))
     }
 
+    /// Priority #5 of the pgrust-corpus diagnosis: standard PostgreSQL
+    /// `VACUUM` -- bare, `ANALYZE`, `FULL`, with or without a table list --
+    /// never reaches the planner (sqlparser 0.53 has no VACUUM grammar at
+    /// all), so it is intercepted here exactly like `VACUUM VERSIONS`
+    /// above. `storage.vacuum()` / `vacuum_table()` are pre-existing,
+    /// already-working engine entry points (previously reachable only from
+    /// the REPL's `\vacuum` meta-command) -- this is purely a missing
+    /// SQL-surface wire-up, not new engine capability. FULL/FREEZE/
+    /// VERBOSE/ANALYZE options are accepted and ignored.
+    fn try_handle_vacuum_statement(&self, sql: &str) -> Result<Option<u64>> {
+        if !sql::Parser::is_vacuum_statement(sql) {
+            return Ok(None);
+        }
+        let tables = sql::Parser::parse_vacuum_tables(sql);
+        if tables.is_empty() {
+            self.storage.vacuum()?;
+        } else {
+            for table in &tables {
+                self.storage.vacuum_table(table)?;
+            }
+        }
+        Ok(Some(0))
+    }
+
+    /// Priority #7 of the pgrust-corpus diagnosis: `CREATE TABLESPACE` also
+    /// never reaches the planner (sqlparser 0.53 has no TABLESPACE grammar
+    /// at all), so it is intercepted here as an accept-and-ignore no-op --
+    /// the same "single flat namespace" precedent already used for CREATE
+    /// SCHEMA, just applied one layer earlier (pre-parse instead of
+    /// planner-level) because the statement can't be parsed into a
+    /// `Statement` value at all. Real multi-tablespace semantics (LOCATION
+    /// handling, DROP TABLESPACE, ALTER ... SET TABLESPACE) are explicitly
+    /// out of scope.
+    fn try_handle_create_tablespace_statement(&self, sql: &str) -> Result<Option<u64>> {
+        if !sql::Parser::is_create_tablespace_statement(sql) {
+            return Ok(None);
+        }
+        Ok(Some(0))
+    }
+
     /// R4.3: run a full MVCC version-GC pass (the library twin of the
     /// `VACUUM VERSIONS` SQL statement). Returns reclaimed version count.
     pub fn vacuum_versions(&self) -> Result<u64> {
@@ -6175,6 +6215,16 @@ impl EmbeddedDatabase {
 
         // R4.3: VACUUM VERSIONS — manual MVCC version-history collection.
         if let Some(count) = self.try_handle_vacuum_versions(sql)? {
+            return Ok(count);
+        }
+
+        // Priority #5: standard PostgreSQL VACUUM (bare/ANALYZE/FULL/...).
+        if let Some(count) = self.try_handle_vacuum_statement(sql)? {
+            return Ok(count);
+        }
+
+        // Priority #7: CREATE TABLESPACE accept-and-ignore no-op.
+        if let Some(count) = self.try_handle_create_tablespace_statement(sql)? {
             return Ok(count);
         }
 
@@ -13602,6 +13652,17 @@ impl EmbeddedDatabase {
             }]);
         }
 
+        // Priority #5: standard PostgreSQL VACUUM. Matches real Postgres'
+        // command-tag-only response — no rows.
+        if let Some(_count) = self.try_handle_vacuum_statement(sql)? {
+            return Ok(Vec::new());
+        }
+
+        // Priority #7: CREATE TABLESPACE accept-and-ignore no-op.
+        if let Some(_count) = self.try_handle_create_tablespace_statement(sql)? {
+            return Ok(Vec::new());
+        }
+
         // DML belongs on the write executor.  `query()` is commonly used
         // by client adapters as a generic SQL entry point; without this
         // guard, INSERT/UPDATE/DELETE without RETURNING fall into the
@@ -14053,6 +14114,17 @@ impl EmbeddedDatabase {
                 branch_id: None,
             };
             return Ok((vec![row], vec!["versions_collected".to_string()]));
+        }
+
+        // Priority #5: standard PostgreSQL VACUUM over the result-set
+        // surface (REPL/wire protocols) — command-tag-only, no rows.
+        if let Some(_count) = self.try_handle_vacuum_statement(sql)? {
+            return Ok((Vec::new(), Vec::new()));
+        }
+
+        // Priority #7: CREATE TABLESPACE accept-and-ignore no-op.
+        if let Some(_count) = self.try_handle_create_tablespace_statement(sql)? {
+            return Ok((Vec::new(), Vec::new()));
         }
 
         // A2: literal normalization → shared parameterized plan. A repeated
