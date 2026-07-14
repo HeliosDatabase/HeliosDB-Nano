@@ -2824,11 +2824,19 @@ impl PhysicalOperator for UnnestOperator {
 }
 
 /// Build a table function schema with source table information
-fn build_table_function_schema(col_name: &str, alias: &Option<String>) -> Arc<Schema> {
+///
+/// `column_alias` is the explicit output-column rename from
+/// `FROM generate_series(1, 10) g(i)` (the `i`). Priority #6 of the
+/// pgrust-corpus diagnosis: previously always dropped, so the schema's
+/// column stayed named after the function itself and a `SELECT i FROM
+/// ... g(i)` referencing the aliased name failed with "Column 'i' not
+/// found in schema".
+fn build_table_function_schema(col_name: &str, alias: &Option<String>, column_alias: &Option<String>) -> Arc<Schema> {
     let source_name = alias.as_deref().unwrap_or(col_name);
+    let output_col_name = column_alias.as_deref().unwrap_or(col_name);
     Arc::new(Schema {
         columns: vec![crate::Column {
-            name: col_name.to_string(),
+            name: output_col_name.to_string(),
             data_type: crate::DataType::Int8,
             nullable: false,
             primary_key: false,
@@ -2886,6 +2894,7 @@ pub(super) fn handle_table_function(executor: &Executor, plan: &LogicalPlan) -> 
         function_name,
         args,
         alias,
+        column_alias,
     } = plan
     {
         match function_name.as_str() {
@@ -2916,7 +2925,7 @@ pub(super) fn handle_table_function(executor: &Executor, plan: &LogicalPlan) -> 
                     1
                 };
 
-                let schema = build_table_function_schema("generate_series", alias);
+                let schema = build_table_function_schema("generate_series", alias, column_alias);
                 Ok(Box::new(GenerateSeriesOperator::new(start, stop, step, schema)))
             }
             "unnest" => {
@@ -2941,7 +2950,7 @@ pub(super) fn handle_table_function(executor: &Executor, plan: &LogicalPlan) -> 
                     }
                 }
 
-                let schema = build_table_function_schema("unnest", alias);
+                let schema = build_table_function_schema("unnest", alias, column_alias);
                 Ok(Box::new(UnnestOperator::new(values, schema)))
             }
             _ => Err(Error::query_execution(format!(
