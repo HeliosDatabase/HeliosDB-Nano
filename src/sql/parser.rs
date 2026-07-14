@@ -353,6 +353,119 @@ impl Parser {
         upper == "VACUUM VERSIONS"
     }
 
+    /// Priority #5 of the pgrust-corpus diagnosis: does this statement begin
+    /// with the standard PostgreSQL `VACUUM` keyword? sqlparser 0.53
+    /// implements NO form of the VACUUM grammar at all (confirmed: no
+    /// `Keyword::VACUUM` dispatch anywhere in its parser), so every VACUUM
+    /// form -- bare, `ANALYZE`, `FULL`, with/without a table list -- fails
+    /// at the parse stage with "Expected: an SQL statement, found: VACUUM"
+    /// before it ever reaches the planner. This is a pre-parse intercept in
+    /// the same spirit as `is_vacuum_versions` above, checked separately
+    /// (and excluding the Nano-specific `VACUUM VERSIONS` form, which is
+    /// handled by `is_vacuum_versions` earlier in the same dispatch chain).
+    ///
+    /// Runs on the shared pre-parse dispatch path for every statement
+    /// (alongside `is_transaction_control` / `is_vacuum_versions`), so this
+    /// is deliberately a single cheap prefix check via `starts_with_icase`
+    /// -- no full uppercasing, no allocation -- before any further string
+    /// work happens.
+    pub fn is_vacuum_statement(sql: &str) -> bool {
+        let trimmed = sql.trim();
+        crate::starts_with_icase(trimmed, "VACUUM") && !Self::is_vacuum_versions(trimmed)
+    }
+
+    /// Hand-parse the optional FULL/FREEZE/VERBOSE/ANALYZE flags (either the
+    /// modern `VACUUM (option [, ...])` parenthesized form or the older
+    /// bare-keyword form) and an optional comma-separated table list off a
+    /// statement already confirmed by `is_vacuum_statement`. Per-table
+    /// column lists (`VACUUM t (col1, col2)`) are accepted and ignored --
+    /// Nano's `vacuum_table` operates on the whole table.
+    ///
+    /// Returns the requested table names (already case-folded per the
+    /// unquoted-lowercase / quoted-preserved rule used elsewhere in the
+    /// planner). An empty vec means "no table list" (whole-database
+    /// VACUUM). Flags themselves are deliberately not returned: this pass
+    /// accepts-and-ignores FULL/FREEZE/VERBOSE/ANALYZE, matching Postgres's
+    /// own idempotent, safe-anytime VACUUM semantics -- a real
+    /// ANALYZE-driven stats refresh is a reasonable fast-follow, not a
+    /// blocker.
+    pub fn parse_vacuum_tables(sql: &str) -> Vec<String> {
+        let cleaned = sql.trim().trim_end_matches(';').trim();
+        // Strip the leading VACUUM keyword.
+        let after_vacuum = cleaned.get(6..).unwrap_or("").trim_start();
+
+        // Modern parenthesized option list: `VACUUM (FULL, ANALYZE) t1, t2`.
+        let after_options = if let Some(rest) = after_vacuum.strip_prefix('(') {
+            match rest.find(')') {
+                Some(close) => rest[close + 1..].trim_start(),
+                None => "", // Malformed options list; nothing usable follows.
+            }
+        } else {
+            // Older bare-keyword flags: `VACUUM FULL ANALYZE t1, t2`.
+            let mut rest = after_vacuum;
+            loop {
+                let word_end = rest.find(|c: char| c.is_whitespace() || c == ',').unwrap_or(rest.len());
+                let word = &rest[..word_end];
+                if word.eq_ignore_ascii_case("FULL")
+                    || word.eq_ignore_ascii_case("FREEZE")
+                    || word.eq_ignore_ascii_case("VERBOSE")
+                    || word.eq_ignore_ascii_case("ANALYZE")
+                    || word.eq_ignore_ascii_case("ANALYSE")
+                {
+                    rest = rest[word_end..].trim_start();
+                } else {
+                    break;
+                }
+            }
+            rest
+        };
+
+        if after_options.is_empty() {
+            return Vec::new();
+        }
+
+        // Comma-separated `table_and_columns` list. Each entry is a table
+        // name optionally followed by a parenthesized column list, which we
+        // accept and discard.
+        after_options
+            .split(',')
+            .filter_map(|entry| {
+                let name_part = entry.trim().split(|c: char| c.is_whitespace() || c == '(').next()?.trim();
+                if name_part.is_empty() {
+                    return None;
+                }
+                // Preserve double-quoted identifiers as written; fold
+                // unquoted identifiers to lowercase, matching
+                // `Planner::normalize_ident`'s PostgreSQL rule.
+                if name_part.starts_with('"') && name_part.ends_with('"') && name_part.len() >= 2 {
+                    Some(name_part[1..name_part.len() - 1].to_string())
+                } else {
+                    Some(name_part.to_lowercase())
+                }
+            })
+            .collect()
+    }
+
+    /// Priority #7 of the pgrust-corpus diagnosis: does this statement begin
+    /// with `CREATE TABLESPACE`? sqlparser 0.53 has no `CreateTablespace`
+    /// grammar at all (confirmed: no `TABLESPACE` keyword anywhere in its
+    /// parser), so this fails at the parse stage ("Expected: an object type
+    /// after CREATE, found: TABLESPACE"), not at the planner's generic
+    /// "Statement not yet supported" catch-all. A minimal no-op stub
+    /// therefore needs the same pre-parse-intercept treatment as VACUUM
+    /// above, rather than a `Statement::CreateTablespace` planner match arm
+    /// (there is no such variant to match).
+    ///
+    /// Real multi-tablespace functionality (LOCATION handling, DROP
+    /// TABLESPACE, ALTER ... SET TABLESPACE) is explicitly out of scope --
+    /// this only lets the statement parse-and-succeed as a no-op so fixture
+    /// loads that issue it (e.g. `CREATE TABLESPACE regress_tblspace
+    /// LOCATION '';`) don't fail outright.
+    pub fn is_create_tablespace_statement(sql: &str) -> bool {
+        let trimmed = sql.trim();
+        crate::starts_with_icase(trimmed, "CREATE TABLESPACE")
+    }
+
     /// Check if SQL is a REFRESH MATERIALIZED VIEW statement
     pub fn is_refresh_materialized_view(sql: &str) -> bool {
         let upper = sql.trim().to_uppercase();
