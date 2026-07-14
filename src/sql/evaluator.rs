@@ -5216,7 +5216,15 @@ impl Evaluator {
                             }
                         })
                 }
+                // `.trim()` before parsing: Postgres' pg_strtoint16
+                // explicitly skips leading/trailing whitespace, but Rust's
+                // FromStr for integers does not, so whitespace-padded
+                // literals (CSV imports, fixed-width exports) previously
+                // failed here with a spurious "Cannot cast" error. Same
+                // trim applied to the other five numeric String arms
+                // below (INT4/INT8/FLOAT4/FLOAT8/NUMERIC).
                 Value::String(s) => s
+                    .trim()
                     .parse::<i16>()
                     .map(Value::Int2)
                     .map_err(|e| Error::query_execution(format!("Cannot cast '{}' to INT2: {}", s, e))),
@@ -5247,6 +5255,7 @@ impl Evaluator {
                         })
                 }
                 Value::String(s) => s
+                    .trim()
                     .parse::<i32>()
                     .map(Value::Int4)
                     .map_err(|e| Error::query_execution(format!("Cannot cast '{}' to INT4: {}", s, e))),
@@ -5277,6 +5286,7 @@ impl Evaluator {
                         })
                 }
                 Value::String(s) => s
+                    .trim()
                     .parse::<i64>()
                     .map(Value::Int8)
                     .map_err(|e| Error::query_execution(format!("Cannot cast '{}' to INT8: {}", s, e))),
@@ -5300,6 +5310,7 @@ impl Evaluator {
                         })
                 }
                 Value::String(s) => s
+                    .trim()
                     .parse::<f32>()
                     .map(Value::Float4)
                     .map_err(|e| Error::query_execution(format!("Cannot cast '{}' to FLOAT4: {}", s, e))),
@@ -5323,6 +5334,7 @@ impl Evaluator {
                         })
                 }
                 Value::String(s) => s
+                    .trim()
                     .parse::<f64>()
                     .map(Value::Float8)
                     .map_err(|e| Error::query_execution(format!("Cannot cast '{}' to FLOAT8: {}", s, e))),
@@ -5452,8 +5464,13 @@ impl Evaluator {
                 Value::Float8(f) => Ok(Value::Numeric(format!("{}", f))),
                 // String to Numeric: parse and validate
                 Value::String(s) => {
-                    // Validate that the string is a valid numeric value
-                    s.parse::<Decimal>()
+                    // Validate that the string is a valid numeric value.
+                    // Trim leading/trailing whitespace first: Postgres'
+                    // numeric-in accepts it (pg_strtoint16/32/64 and the
+                    // numeric parser both skip surrounding whitespace),
+                    // but rust_decimal::Decimal::from_str does not.
+                    s.trim()
+                        .parse::<Decimal>()
                         .map(|dec| Value::Numeric(format!("{}", dec)))
                         .map_err(|e| Error::query_execution(format!("Cannot cast '{}' to NUMERIC: {}", s, e)))
                 }
