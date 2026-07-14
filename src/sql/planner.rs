@@ -4500,6 +4500,19 @@ impl<'a> Planner<'a> {
             }
             // Handle NUMERIC/DECIMAL types (PostgreSQL arbitrary precision decimal)
             SqlDataType::Numeric(_) | SqlDataType::Decimal(_) => Ok(DataType::Numeric),
+            // PostgreSQL fixed-length internal identifier type. Real
+            // Postgres stores this as a 64-byte blank-padded string used
+            // for catalog columns (pg_class.relname etc) and is exercised
+            // directly by fixture tables like onek/tenk1
+            // (`stringu1/stringu2/string4 name`). TEXT is the same
+            // simplification already applied to CLOB above: no 63-byte
+            // truncation enforcement in this first pass.
+            SqlDataType::Name(_) => Ok(DataType::Text),
+            // Bit / bit-varying. sqlparser exposes these as dedicated
+            // variants (not Custom). Stored as TEXT carrying the
+            // canonical '0'/'1' string form -- same simplification
+            // pattern used throughout this function (e.g. Clob -> Text).
+            SqlDataType::Bit(_) | SqlDataType::BitVarying(_) => Ok(DataType::Text),
             // Handle PostgreSQL SERIAL types
             SqlDataType::Custom(object_name, type_modifiers) => {
                 let type_name = object_name.to_string().to_uppercase();
@@ -4507,6 +4520,17 @@ impl<'a> Planner<'a> {
                     "SERIAL" => Ok(DataType::Int4),      // SERIAL is Int4 with auto-increment
                     "BIGSERIAL" => Ok(DataType::Int8),   // BIGSERIAL is Int8 with auto-increment
                     "SMALLSERIAL" => Ok(DataType::Int2), // SMALLSERIAL is Int2 with auto-increment
+                    // Geometric POINT type (and, by the same Stage-1
+                    // simplification, PATH used by fixtures like `road`).
+                    // Stage 1 (this fix): round-trip through Nano's
+                    // canonical `(x,y)` textual form as TEXT so CREATE
+                    // TABLE POINT_TBL/person/road succeed and unblock
+                    // the large set of downstream fixture-dependent
+                    // files. Stage 2 (fast-follow, not in this pass):
+                    // a real DataType::Point with (f64,f64) storage and
+                    // operator support (`<->` etc), mirroring how
+                    // DataType::Vector(usize) was added.
+                    "POINT" | "PATH" => Ok(DataType::Text),
                     "VECTOR" | "VECTOR_F16" | "VECTOR_I8" | "VECTOR_I16" | "HALFVEC" => {
                         // Parse dimension from type modifiers: VECTOR(1536).
                         // Multi-precision aliases are accepted as schema-level
