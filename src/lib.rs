@@ -1671,6 +1671,21 @@ impl EmbeddedDatabase {
         Ok(Some(0))
     }
 
+    /// Round-2 pgrust-corpus compat: standard PostgreSQL `RESET name` /
+    /// `RESET ALL` that no earlier SET/RESET handler claimed. sqlparser 0.53
+    /// cannot parse a top-level RESET at all, so these otherwise fail at the
+    /// parse stage; this accepts them as a no-op (the GUC is one Nano does
+    /// not model, so there is no session state to restore). Runs only after
+    /// `try_handle_db_setting_statement_with_columns` / `try_handle_fk_setting`
+    /// / `try_handle_trace_*`, so a `RESET` of a real session setting still
+    /// performs its actual reset before ever reaching here.
+    fn try_handle_reset_statement(&self, sql: &str) -> Result<Option<u64>> {
+        if !sql::Parser::is_reset_statement(sql) {
+            return Ok(None);
+        }
+        Ok(Some(0))
+    }
+
     /// R4.3: run a full MVCC version-GC pass (the library twin of the
     /// `VACUUM VERSIONS` SQL statement). Returns reclaimed version count.
     pub fn vacuum_versions(&self) -> Result<u64> {
@@ -6225,6 +6240,12 @@ impl EmbeddedDatabase {
 
         // Priority #7: CREATE TABLESPACE accept-and-ignore no-op.
         if let Some(count) = self.try_handle_create_tablespace_statement(sql)? {
+            return Ok(count);
+        }
+
+        // Round-2: standard PostgreSQL RESET name / RESET ALL no-op (after
+        // the specific SET/RESET handlers above have had first refusal).
+        if let Some(count) = self.try_handle_reset_statement(sql)? {
             return Ok(count);
         }
 
@@ -13663,6 +13684,11 @@ impl EmbeddedDatabase {
             return Ok(Vec::new());
         }
 
+        // Round-2: standard PostgreSQL RESET name / RESET ALL no-op.
+        if let Some(_count) = self.try_handle_reset_statement(sql)? {
+            return Ok(Vec::new());
+        }
+
         // DML belongs on the write executor.  `query()` is commonly used
         // by client adapters as a generic SQL entry point; without this
         // guard, INSERT/UPDATE/DELETE without RETURNING fall into the
@@ -14124,6 +14150,11 @@ impl EmbeddedDatabase {
 
         // Priority #7: CREATE TABLESPACE accept-and-ignore no-op.
         if let Some(_count) = self.try_handle_create_tablespace_statement(sql)? {
+            return Ok((Vec::new(), Vec::new()));
+        }
+
+        // Round-2: standard PostgreSQL RESET name / RESET ALL no-op.
+        if let Some(_count) = self.try_handle_reset_statement(sql)? {
             return Ok((Vec::new(), Vec::new()));
         }
 
