@@ -466,6 +466,32 @@ impl Parser {
         crate::starts_with_icase(trimmed, "CREATE TABLESPACE")
     }
 
+    /// Round-2 pgrust-corpus compat (~464 corpus statements): standard
+    /// PostgreSQL `RESET name` / `RESET ALL`. sqlparser 0.53 has no
+    /// top-level RESET grammar at all (the RESET keyword appears only inside
+    /// `ALTER … RESET` in its parser), so a `RESET <guc>` / `RESET ALL` that
+    /// is not one of Nano's already-modelled session settings fails at the
+    /// parse stage with "Expected: an SQL statement, found: RESET" before it
+    /// ever reaches the planner. This is a pre-parse intercept in the same
+    /// spirit as `is_create_tablespace_statement` above.
+    ///
+    /// It is deliberately checked only AFTER the specific SET/RESET handlers
+    /// (`try_handle_db_setting_statement_with_columns`,
+    /// `try_handle_fk_setting`, `try_handle_trace_*`), so a `RESET` of a
+    /// real session setting still performs its actual reset; only the
+    /// otherwise-unhandled GUCs (`RESET search_path`, `RESET
+    /// statement_timeout`, `RESET ALL`, …) fall through to here and are
+    /// accepted as a no-op — matching PostgreSQL's safe-anytime RESET
+    /// semantics (a GUC Nano does not model has no session state to
+    /// restore). A single cheap `starts_with_icase` prefix check, no
+    /// allocation, matching the cost profile of the checks it sits beside.
+    /// The trailing space excludes a bare `RESET` (not valid PostgreSQL)
+    /// and any identifier that merely begins with those letters.
+    pub fn is_reset_statement(sql: &str) -> bool {
+        let trimmed = sql.trim();
+        crate::starts_with_icase(trimmed, "RESET ")
+    }
+
     /// Check if SQL is a REFRESH MATERIALIZED VIEW statement
     pub fn is_refresh_materialized_view(sql: &str) -> bool {
         let upper = sql.trim().to_uppercase();
