@@ -1055,17 +1055,17 @@ where
                 let schema = Self::schema_from_query_columns(&columns, cached_results.as_slice());
                 self.send_query_result(schema, cached_results.as_slice()).await?;
             } else {
-                let (results, columns) = self.database.query_with_columns_for_session(self.session_id, query)?;
+                let (results, columns) = run_guarded(|| self.database.query_with_columns_for_session(self.session_id, query))?;
                 let schema = Self::schema_from_query_columns(&columns, &results);
                 self.send_query_result(schema, &results).await?;
             }
         } else if is_cte {
-            let (results, columns) = self.database.query_with_columns_for_session(self.session_id, query)?;
+            let (results, columns) = run_guarded(|| self.database.query_with_columns_for_session(self.session_id, query))?;
             let schema = Self::schema_from_query_columns(&columns, &results);
             self.send_query_result(schema, &results).await?;
         } else if is_dml_returning {
             // DML with RETURNING clause - returns rows like a query
-            let (affected, tuples) = self.database.execute_returning_for_session(self.session_id, query)?;
+            let (affected, tuples) = run_guarded(|| self.database.execute_returning_for_session(self.session_id, query))?;
             if tuples.is_empty() {
                 // No rows returned - send command complete with count
                 let tag = self.get_command_tag(query, affected);
@@ -1082,7 +1082,7 @@ where
                 self.send_query_result(schema, &tuples).await?;
             }
         } else {
-            let affected = self.database.execute_for_session(self.session_id, query)?;
+            let affected = run_guarded(|| self.database.execute_for_session(self.session_id, query))?;
             let tag = self.get_command_tag(query, affected);
             self.send_command_complete(&tag).await?;
         }
@@ -2772,6 +2772,31 @@ mod datatype_oid_tests {
 // ============================================================================
 // SQLSTATE mapping (D4 phase 1)
 // ============================================================================
+
+/// Run a synchronous, per-statement database call under `catch_unwind`.
+///
+/// A panic in the planner/evaluator — e.g. an integer-overflow panic under
+/// `overflow-checks = true`, or an allocation-size panic — would otherwise
+/// unwind the connection's Tokio task and drop the client (observed as
+/// CONN_LOST in the corpus). This guard converts such a panic into a
+/// recoverable `XX000` error that flows through the normal `?` /
+/// `send_error_for_query` path, so the connection survives and the
+/// transaction is marked failed exactly as for any other statement error.
+///
+/// Cost: `catch_unwind` installs a landing pad but fires **once per
+/// statement**, never per row, on a path already dominated by planning and
+/// I/O; in the non-panicking case it is a no-op guard, so throughput is
+/// unaffected. `parking_lot` locks (used throughout the engine) do not
+/// poison, so a caught panic releases its guards cleanly and cannot wedge or
+/// cascade into other connections.
+pub(crate) fn run_guarded<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(result) => result,
+        Err(_) => Err(Error::query_execution(
+            "internal error while executing statement",
+        )),
+    }
+}
 
 /// Map an [`Error`] to the SQLSTATE the wire reports (D4 phase 1).
 ///
