@@ -280,6 +280,14 @@ impl Parser {
         // sqlparser requires INCREMENT before START, etc.).
         processed_sql = Self::preprocess_create_sequence_clause_order(&processed_sql);
 
+        // Round-2 pgrust-corpus compat: strip the PostgreSQL
+        // `INHERITS (parent[, …])` table-option clause off CREATE TABLE
+        // (sqlparser 0.53 has no INHERITS grammar, so it fails at the parse
+        // stage). Faithful parent column/constraint merge is out of scope for
+        // this pass; stripping the clause lets the child table create with
+        // its own explicitly-listed columns, the pragmatic compatibility win.
+        processed_sql = Self::preprocess_strip_inherits(&processed_sql);
+
         let mut statements = SqlParser::parse_sql(&self.dialect, &processed_sql)
             .map_err(|e| Error::sql_parse(format!("Failed to parse SQL: {}", e)))?;
 
@@ -2072,6 +2080,144 @@ impl Parser {
         }
         rewrite_unquoted(&sql[seg_start..], &mut out);
         out
+    }
+
+    /// Round-2 pgrust-corpus compat (~207 corpus statements): strip the
+    /// PostgreSQL `INHERITS (parent[, …])` table-option clause from a
+    /// CREATE TABLE so the statement parses. sqlparser 0.53 has no INHERITS
+    /// grammar at all, so `CREATE TABLE child (…) INHERITS (parent)` fails
+    /// at the parse stage before the planner. Faithful column/constraint
+    /// merge from the parent(s) is intentionally out of scope for this
+    /// zero-regression pass -- stripping the clause lets the child table be
+    /// created with its own explicitly-listed columns, which is the
+    /// pragmatic compatibility win the round-2 diagnosis asked for.
+    ///
+    /// Quote-aware and keyword-boundary-aware, mirroring
+    /// `preprocess_strip_trailing_commas` above: an `INHERITS (` sequence
+    /// inside a single-quoted string literal or a double-quoted identifier
+    /// is copied through untouched, a column named `inherits` (not followed
+    /// by `(`) is left alone, and an identifier that merely embeds the
+    /// letters (`my_inherits`) never matches. Only the first INHERITS clause
+    /// is removed -- a CREATE TABLE carries at most one. Any options that
+    /// follow the clause (`WITH (…)`, `TABLESPACE …`, …) are preserved.
+    ///
+    /// Cheap early-outs keep this off the hot path: an allocation-free
+    /// `starts_with_icase("CREATE TABLE")` gate, then a single
+    /// case-insensitive substring probe for "INHERITS"; only a CREATE TABLE
+    /// statement that actually contains those letters does any byte-walk
+    /// work. This runs only at parse time (once per statement, alongside the
+    /// sibling preprocessors).
+    pub fn preprocess_strip_inherits(sql: &str) -> String {
+        // Gate strictly to `CREATE TABLE`, matching the sibling
+        // preprocess_strip_trailing_commas. This is where INHERITS lives and
+        // -- critically -- it excludes CREATE FUNCTION / PROCEDURE / TRIGGER,
+        // whose dollar-quoted bodies this ' / "-only quote walk does not
+        // track. UNLOGGED / TEMP table variants are not covered (the same
+        // deliberate tradeoff the sibling makes); the corpus INHERITS cases
+        // are all plain CREATE TABLE.
+        if !crate::starts_with_icase(sql.trim_start(), "CREATE TABLE") {
+            return sql.to_string();
+        }
+        // The keyword must be literally present before any byte walk.
+        if !sql.to_ascii_uppercase().contains("INHERITS") {
+            return sql.to_string();
+        }
+
+        let bytes = sql.as_bytes();
+        let n = bytes.len();
+        let mut i = 0usize;
+        while i < n {
+            let c = bytes[i];
+            // Copy single-quoted string literals / double-quoted identifiers
+            // verbatim (a doubled quote is an escape: stay in the literal).
+            if c == b'\'' || c == b'"' {
+                let quote = c;
+                i += 1;
+                while i < n {
+                    if bytes[i] == quote {
+                        i += 1;
+                        if i < n && bytes[i] == quote {
+                            i += 1;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+
+            // A standalone INHERITS keyword (case-insensitive) with a left
+            // word boundary, immediately followed (after optional whitespace)
+            // by '('.
+            if (c == b'I' || c == b'i')
+                && i + 8 <= n
+                && bytes[i..i + 8].eq_ignore_ascii_case(b"INHERITS")
+                && (i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_'))
+            {
+                let after = i + 8;
+                let right_boundary_ok =
+                    after >= n || !(bytes[after].is_ascii_alphanumeric() || bytes[after] == b'_');
+                if right_boundary_ok {
+                    let mut j = after;
+                    while j < n && bytes[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                    if j < n && bytes[j] == b'(' {
+                        // Balance to the matching ')', skipping quoted spans.
+                        // depth is 0 only before the opening paren is counted,
+                        // which is the first byte examined here, so the ')'
+                        // decrement can never underflow.
+                        let mut depth = 0usize;
+                        let mut k = j;
+                        let mut close = None;
+                        while k < n {
+                            let ck = bytes[k];
+                            if ck == b'\'' || ck == b'"' {
+                                let q = ck;
+                                k += 1;
+                                while k < n {
+                                    if bytes[k] == q {
+                                        k += 1;
+                                        if k < n && bytes[k] == q {
+                                            k += 1;
+                                            continue;
+                                        }
+                                        break;
+                                    }
+                                    k += 1;
+                                }
+                                continue;
+                            }
+                            if ck == b'(' {
+                                depth += 1;
+                            } else if ck == b')' {
+                                depth -= 1;
+                                if depth == 0 {
+                                    close = Some(k);
+                                    break;
+                                }
+                            }
+                            k += 1;
+                        }
+                        if let Some(close) = close {
+                            // Also drop the whitespace run immediately before
+                            // INHERITS so `) INHERITS (p)` collapses to `)`.
+                            let mut left = i;
+                            while left > 0 && bytes[left - 1].is_ascii_whitespace() {
+                                left -= 1;
+                            }
+                            let mut out = String::with_capacity(n);
+                            out.push_str(&sql[..left]);
+                            out.push_str(&sql[close + 1..]);
+                            return out;
+                        }
+                    }
+                }
+            }
+            i += 1;
+        }
+        sql.to_string()
     }
 
     /// Convert DECIMAL type to NUMERIC for sqlparser compatibility
