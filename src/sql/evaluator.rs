@@ -4023,7 +4023,14 @@ impl Evaluator {
                 Ok(Value::Date(new_date))
             }
             // Interval + Interval
-            (Value::Interval(a), Value::Interval(b)) => Ok(Value::Interval(a + b)),
+            // checked_add: interval micros are a single i64; summing two large
+            // intervals overflows and (with overflow-checks=true) panics, dropping
+            // the connection (corpus interval seq 383-386). PostgreSQL returns
+            // 'interval out of range'.
+            (Value::Interval(a), Value::Interval(b)) => a
+                .checked_add(*b)
+                .map(Value::Interval)
+                .ok_or_else(|| Error::query_execution("interval out of range")),
             _ => Err(Error::query_execution(format!("Cannot add {:?} and {:?}", left, right))),
         }
     }
@@ -4179,7 +4186,13 @@ impl Evaluator {
                 Ok(Value::Interval(micros))
             }
             // Interval - Interval
-            (Value::Interval(a), Value::Interval(b)) => Ok(Value::Interval(a - b)),
+            // checked_sub mirrors checked_add in arithmetic_add: an i64
+            // microsecond overflow panics under overflow-checks; PostgreSQL
+            // returns 'interval out of range' (corpus interval seq 383-386).
+            (Value::Interval(a), Value::Interval(b)) => a
+                .checked_sub(*b)
+                .map(Value::Interval)
+                .ok_or_else(|| Error::query_execution("interval out of range")),
             _ => Err(Error::query_execution(format!(
                 "Cannot subtract {:?} and {:?}",
                 left, right
