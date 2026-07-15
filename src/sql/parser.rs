@@ -492,6 +492,34 @@ impl Parser {
         crate::starts_with_icase(trimmed, "RESET ")
     }
 
+    /// Round-2 pgrust-corpus compat (~80 corpus statements): PostgreSQL
+    /// `REINDEX [ ( option … ) ] { INDEX | TABLE | SCHEMA | DATABASE |
+    /// SYSTEM } name`. sqlparser 0.53 has no REINDEX statement dispatch at
+    /// all (the word appears only in doc comments in its AST, never in the
+    /// parser), so every REINDEX form fails at the parse stage before the
+    /// planner. Accepted as a pre-parse no-op: Nano's LSM/index storage has
+    /// no external-fragmentation rebuild need that a user-issued REINDEX
+    /// must satisfy, and PostgreSQL REINDEX is itself an idempotent,
+    /// safe-anytime maintenance command, so a success-returning no-op is a
+    /// faithful-enough surface.
+    ///
+    /// Whole-keyword boundary check: the byte immediately after `REINDEX`
+    /// (if any) must not continue an identifier, so a hypothetical
+    /// `REINDEXED`-prefixed token never matches. Valid REINDEX forms
+    /// continue with whitespace (`REINDEX TABLE t`) or `(` (`REINDEX
+    /// (VERBOSE) TABLE t`), both of which pass the boundary.
+    pub fn is_reindex_statement(sql: &str) -> bool {
+        let trimmed = sql.trim();
+        if !crate::starts_with_icase(trimmed, "REINDEX") {
+            return false;
+        }
+        // "REINDEX" is 7 ASCII bytes; index 7 is the byte right after it.
+        match trimmed.as_bytes().get(7) {
+            None => true,
+            Some(&c) => !(c.is_ascii_alphanumeric() || c == b'_'),
+        }
+    }
+
     /// Check if SQL is a REFRESH MATERIALIZED VIEW statement
     pub fn is_refresh_materialized_view(sql: &str) -> bool {
         let upper = sql.trim().to_uppercase();
