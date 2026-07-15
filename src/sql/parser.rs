@@ -520,6 +520,35 @@ impl Parser {
         }
     }
 
+    /// Round-2 pgrust-corpus compat (~144 corpus statements): PostgreSQL
+    /// `CREATE DOMAIN name [AS] base_type [constraints]` and `DROP DOMAIN
+    /// [IF EXISTS] name`. sqlparser 0.53 has no DOMAIN object type at all
+    /// (no `parse_create_domain`, no `ObjectType::Domain`), so both fail at
+    /// the parse stage before the planner -- CREATE DOMAIN as "Expected: an
+    /// object type after CREATE, found: DOMAIN", DROP DOMAIN similarly.
+    ///
+    /// Accepted as a parse-and-accept no-op, the same "single flat
+    /// namespace" precedent used for CREATE SCHEMA / CREATE TABLESPACE:
+    /// the statement parse-and-succeeds so a fixture load that issues it no
+    /// longer aborts. Faithful domain semantics (registering the domain as
+    /// an alias of its base type so a later `CREATE TABLE t (c my_domain)`
+    /// resolves, plus its CHECK/NOT NULL/DEFAULT constraints) are a
+    /// deliberate non-goal for this zero-regression pass: that would touch
+    /// the type-resolution / column-binding path. A table that references
+    /// an undefined domain therefore still fails on the unknown custom type
+    /// exactly as it did before -- this change is strictly additive (a hard
+    /// parse error becomes a success for the DOMAIN statement itself) and
+    /// regresses nothing.
+    ///
+    /// The trailing space anchors the whole keyword and excludes an
+    /// identifier that merely begins with these letters. `DROP DOMAIN IF
+    /// EXISTS name` is covered because it still begins with `DROP DOMAIN `.
+    pub fn is_domain_ddl_statement(sql: &str) -> bool {
+        let trimmed = sql.trim();
+        crate::starts_with_icase(trimmed, "CREATE DOMAIN ")
+            || crate::starts_with_icase(trimmed, "DROP DOMAIN ")
+    }
+
     /// Check if SQL is a REFRESH MATERIALIZED VIEW statement
     pub fn is_refresh_materialized_view(sql: &str) -> bool {
         let upper = sql.trim().to_uppercase();

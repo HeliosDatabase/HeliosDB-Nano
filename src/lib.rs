@@ -1700,6 +1700,21 @@ impl EmbeddedDatabase {
         Ok(Some(0))
     }
 
+    /// Round-2 pgrust-corpus compat: PostgreSQL `CREATE DOMAIN` / `DROP
+    /// DOMAIN`. sqlparser 0.53 has no DOMAIN object type, so both fail at
+    /// the parse stage; this accepts them as a parse-and-accept no-op so
+    /// dependent fixture loads proceed. Faithful base-type aliasing (so a
+    /// table can reference the domain as a column type) is intentionally
+    /// out of scope for this zero-regression pass -- it would touch the
+    /// type-resolution path -- and a table referencing an undefined domain
+    /// still fails on the unknown custom type exactly as before.
+    fn try_handle_domain_ddl_statement(&self, sql: &str) -> Result<Option<u64>> {
+        if !sql::Parser::is_domain_ddl_statement(sql) {
+            return Ok(None);
+        }
+        Ok(Some(0))
+    }
+
     /// R4.3: run a full MVCC version-GC pass (the library twin of the
     /// `VACUUM VERSIONS` SQL statement). Returns reclaimed version count.
     pub fn vacuum_versions(&self) -> Result<u64> {
@@ -6265,6 +6280,11 @@ impl EmbeddedDatabase {
 
         // Round-2: PostgreSQL REINDEX … no-op.
         if let Some(count) = self.try_handle_reindex_statement(sql)? {
+            return Ok(count);
+        }
+
+        // Round-2: PostgreSQL CREATE DOMAIN / DROP DOMAIN no-op.
+        if let Some(count) = self.try_handle_domain_ddl_statement(sql)? {
             return Ok(count);
         }
 
@@ -13713,6 +13733,11 @@ impl EmbeddedDatabase {
             return Ok(Vec::new());
         }
 
+        // Round-2: PostgreSQL CREATE DOMAIN / DROP DOMAIN no-op.
+        if let Some(_count) = self.try_handle_domain_ddl_statement(sql)? {
+            return Ok(Vec::new());
+        }
+
         // DML belongs on the write executor.  `query()` is commonly used
         // by client adapters as a generic SQL entry point; without this
         // guard, INSERT/UPDATE/DELETE without RETURNING fall into the
@@ -14184,6 +14209,11 @@ impl EmbeddedDatabase {
 
         // Round-2: PostgreSQL REINDEX … no-op.
         if let Some(_count) = self.try_handle_reindex_statement(sql)? {
+            return Ok((Vec::new(), Vec::new()));
+        }
+
+        // Round-2: PostgreSQL CREATE DOMAIN / DROP DOMAIN no-op.
+        if let Some(_count) = self.try_handle_domain_ddl_statement(sql)? {
             return Ok((Vec::new(), Vec::new()));
         }
 
