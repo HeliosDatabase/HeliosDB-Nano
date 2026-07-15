@@ -12,6 +12,12 @@ use std::sync::Arc;
 
 const ANY_ARRAY_MARKER_FUNCTION: &str = "__hdb_any_array";
 
+/// Upper bound (1 GiB) on a string length that string-building functions
+/// (repeat/lpad/rpad) will attempt to allocate. Beyond this the allocation
+/// would panic on capacity overflow and drop the connection; PostgreSQL
+/// likewise rejects fields above ~1GB with "requested length too large".
+const MAX_STRING_LEN: usize = 1_073_741_824;
+
 /// Expression evaluator
 ///
 /// Evaluates expressions in the context of a tuple and schema.
@@ -6497,12 +6503,21 @@ impl Evaluator {
             Value::String(s) => s,
             _ => return Err(Error::query_execution("REPEAT first argument must be a string")),
         };
+        // Clamp negative length to 0 (PostgreSQL returns an empty string). A
+        // negative int cast `as usize` would become ~1.8e19 and str::repeat would
+        // panic on capacity overflow, dropping the client connection (corpus
+        // strings seq 475, CONN_LOST).
         let n = match b {
-            Value::Int2(n) => *n as usize,
-            Value::Int4(n) => *n as usize,
-            Value::Int8(n) => *n as usize,
+            Value::Int2(n) => usize::try_from(*n).unwrap_or(0),
+            Value::Int4(n) => usize::try_from(*n).unwrap_or(0),
+            Value::Int8(n) => usize::try_from(*n).unwrap_or(0),
             _ => return Err(Error::query_execution("REPEAT second argument must be an integer")),
         };
+        // Guard an absurd positive result size (str::repeat panics on capacity
+        // overflow); PostgreSQL rejects fields above ~1GB with this same error.
+        if s.len().checked_mul(n).is_none_or(|total| total > MAX_STRING_LEN) {
+            return Err(Error::query_execution("requested length too large"));
+        }
         Ok(Value::String(s.repeat(n)))
     }
 
@@ -6629,12 +6644,19 @@ impl Evaluator {
             Value::String(s) => s,
             _ => return Err(Error::query_execution("LPAD first argument must be a string")),
         };
+        // Clamp negative length to 0 (PostgreSQL returns an empty string). A
+        // negative int cast `as usize` would become ~1.8e19 and the subsequent
+        // String::with_capacity / extend would panic on capacity overflow,
+        // dropping the client connection (corpus strings seq 458, CONN_LOST).
         let length = match arg1 {
-            Value::Int2(n) => *n as usize,
-            Value::Int4(n) => *n as usize,
-            Value::Int8(n) => *n as usize,
+            Value::Int2(n) => usize::try_from(*n).unwrap_or(0),
+            Value::Int4(n) => usize::try_from(*n).unwrap_or(0),
+            Value::Int8(n) => usize::try_from(*n).unwrap_or(0),
             _ => return Err(Error::query_execution("LPAD second argument must be an integer")),
         };
+        if length > MAX_STRING_LEN {
+            return Err(Error::query_execution("requested length too large"));
+        }
         let fill = if let Some(arg2) = args.get(2) {
             match arg2 {
                 Value::String(f) => f.clone(),
@@ -6676,12 +6698,19 @@ impl Evaluator {
             Value::String(s) => s,
             _ => return Err(Error::query_execution("RPAD first argument must be a string")),
         };
+        // Clamp negative length to 0 (PostgreSQL returns an empty string). A
+        // negative int cast `as usize` would become ~1.8e19 and the subsequent
+        // extend would panic on capacity overflow, dropping the client
+        // connection (corpus strings seq 463, CONN_LOST).
         let length = match arg1 {
-            Value::Int2(n) => *n as usize,
-            Value::Int4(n) => *n as usize,
-            Value::Int8(n) => *n as usize,
+            Value::Int2(n) => usize::try_from(*n).unwrap_or(0),
+            Value::Int4(n) => usize::try_from(*n).unwrap_or(0),
+            Value::Int8(n) => usize::try_from(*n).unwrap_or(0),
             _ => return Err(Error::query_execution("RPAD second argument must be an integer")),
         };
+        if length > MAX_STRING_LEN {
+            return Err(Error::query_execution("requested length too large"));
+        }
         let fill = if let Some(arg2) = args.get(2) {
             match arg2 {
                 Value::String(f) => f.clone(),
