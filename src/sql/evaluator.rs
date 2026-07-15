@@ -6729,9 +6729,22 @@ impl Evaluator {
         };
         match arg {
             Value::Null => Ok(Value::Null),
-            Value::Int2(n) => Ok(Value::Int2(n.abs())),
-            Value::Int4(n) => Ok(Value::Int4(n.abs())),
-            Value::Int8(n) => Ok(Value::Int8(n.abs())),
+            // checked_abs: abs() of the type minimum (e.g. i64::MIN) overflows.
+            // With overflow-checks=true (forced by .cargo/config.toml) the plain
+            // `.abs()` panics and drops the client connection; PostgreSQL instead
+            // returns an out-of-range error. Return that error rather than panic.
+            Value::Int2(n) => n
+                .checked_abs()
+                .map(Value::Int2)
+                .ok_or_else(|| Error::query_execution("smallint out of range")),
+            Value::Int4(n) => n
+                .checked_abs()
+                .map(Value::Int4)
+                .ok_or_else(|| Error::query_execution("integer out of range")),
+            Value::Int8(n) => n
+                .checked_abs()
+                .map(Value::Int8)
+                .ok_or_else(|| Error::query_execution("bigint out of range")),
             Value::Float4(f) => Ok(Value::Float4(f.abs())),
             Value::Float8(f) => Ok(Value::Float8(f.abs())),
             Value::Numeric(s) => {
