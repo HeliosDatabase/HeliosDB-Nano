@@ -172,7 +172,6 @@ fn whitelist_views_return_empty_without_error() {
     for view in &[
         "triggers",
         "parameters",
-        "sequences",
         "domains",
         "character_sets",
         "collations",
@@ -188,6 +187,19 @@ fn whitelist_views_return_empty_without_error() {
             "{view}: should be recognised and intercepted"
         );
     }
+
+    // `sequences` left the placeholder whitelist in v3.60: the wire catalog
+    // DEFERS it (Ok(None)) so the planner-backed SystemViewRegistry serves
+    // LIVE rows (catalog.rs `information_schema.sequences` arm — sequence
+    // discovery is a migration-tooling requirement). Re-intercepting it with
+    // an empty stub would silently break migration tooling, so pin the
+    // deferral direction too.
+    let seq = cat.handle_query("SELECT * FROM information_schema.sequences");
+    assert!(seq.is_ok(), "sequences: should not error, got {seq:?}");
+    assert!(
+        seq.unwrap().is_none(),
+        "sequences: must DEFER to the SystemViewRegistry (live rows), not an empty stub"
+    );
 }
 
 #[test]
