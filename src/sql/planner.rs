@@ -42,17 +42,17 @@ use std::sync::Arc;
 const ANY_ARRAY_MARKER_FUNCTION: &str = "__hdb_any_array";
 
 /// Information about an aggregate plan needed to rewrite ORDER BY expressions.
-/// Contains the aggregate expressions and the corresponding output aliases from the
-/// wrapping Project layer, plus GROUP BY expressions and their aliases.
+/// The aggregate and GROUP BY expressions of a grouped plan, used to rewrite
+/// ORDER BY keys to the Aggregate operator's output columns (group_N / agg_N)
+/// via the same `rewrite_expr_replace_aggregates` the select list uses.
+/// (The former per-Project alias fields were removed: slicing Project aliases
+/// positionally as [group cols…, agg cols…] is wrong whenever the select list
+/// is not exactly the group list — see the ORDER BY rewrite site.)
 struct AggregateInfo {
     /// The aggregate expressions from the Aggregate plan (e.g., SUM(val), COUNT(*))
     aggr_exprs: Vec<LogicalExpr>,
-    /// The output aliases for each aggregate (from the Project layer)
-    aggr_aliases: Vec<String>,
     /// The GROUP BY expressions from the Aggregate plan
     group_by_exprs: Vec<LogicalExpr>,
-    /// The output aliases for each GROUP BY column (from the Project layer)
-    group_by_aliases: Vec<String>,
 }
 
 /// Parsed `CREATE SEQUENCE` option clauses (each `Option` = "clause present?").
@@ -1332,10 +1332,23 @@ impl<'a> Planner<'a> {
                     }
                     let logical_expr = self.expr_to_logical(&order_by_expr.expr)?;
 
-                    // If the ORDER BY expression contains aggregate functions and
-                    // we have an aggregate plan, rewrite them to column references
+                    // Grouped plans: rewrite the sort key with the SAME helper the
+                    // select list uses (`rewrite_expr_replace_aggregates`), so group
+                    // keys become `group_N` and aggregates `agg_N` — the Aggregate
+                    // operator's actual output names. `place_order_by` then resolves
+                    // the Sort BELOW the post-aggregate Project, where every group
+                    // key exists. This fixes two bugs in the old alias-position
+                    // rewrite (which sliced the Project aliases as [group cols…,
+                    // agg cols…] — only true when the select list IS the group
+                    // list): (1) `SELECT a FROM t GROUP BY a, b ORDER BY a, b`
+                    // errored "Column 'b' not found" (unprojected group key had no
+                    // alias, T8); (2) `SELECT b, a FROM t GROUP BY a, b ORDER BY a`
+                    // silently sorted by the WRONG column (positional alias slice).
+                    // Bare alias references (`ORDER BY total`) don't match any
+                    // group/aggregate expression, stay unrewritten, fail below-
+                    // resolution, and keep sorting above the Project as before.
                     let resolved = if let Some(ref info) = aggregate_info {
-                        Self::rewrite_order_by_aggregates(&logical_expr, info)
+                        Self::rewrite_expr_replace_aggregates(&logical_expr, &info.aggr_exprs, &info.group_by_exprs)
                     } else {
                         logical_expr
                     };
@@ -2265,36 +2278,20 @@ impl<'a> Planner<'a> {
     /// Extract aggregate info from the plan if it's a Project over an Aggregate.
     /// Returns None if the plan is not an aggregate query.
     fn extract_aggregate_info(plan: &LogicalPlan) -> Option<AggregateInfo> {
-        if let LogicalPlan::Project { input, aliases, .. } = plan {
+        if let LogicalPlan::Project { input, .. } = plan {
             if let LogicalPlan::Aggregate {
                 group_by, aggr_exprs, ..
             } = input.as_ref()
             {
-                let num_groups = group_by.len();
-                let num_aggs = aggr_exprs.len();
-
-                // The Project aliases are ordered: group columns first, then aggregate columns.
-                // aliases[0..num_groups] -> GROUP BY aliases
-                // aliases[num_groups..num_groups+num_aggs] -> aggregate aliases
-                let group_by_aliases: Vec<String> = aliases.iter().take(num_groups).cloned().collect();
-                let aggr_aliases: Vec<String> = aliases.iter().skip(num_groups).take(num_aggs).cloned().collect();
-
                 return Some(AggregateInfo {
                     aggr_exprs: aggr_exprs.clone(),
-                    aggr_aliases,
                     group_by_exprs: group_by.clone(),
-                    group_by_aliases,
                 });
             }
         }
         None
     }
 
-    /// Rewrite an ORDER BY expression by replacing aggregate function references
-    /// with column references to the corresponding output alias.
-    /// For example, `SUM(val)` becomes `Column { name: "total" }` if that aggregate
-    /// has alias "total" in the output schema.
-    /// Also handles GROUP BY column references that need remapping.
     /// Redirect an ORDER BY expression to a projected output column when it
     /// structurally matches a select-list expression. The Sort runs above the
     /// Project and can only see projected columns, so an ORDER BY expression
@@ -2463,91 +2460,6 @@ impl<'a> Planner<'a> {
                 .iter()
                 .all(|item| Self::expr_resolves_against_schema(item, schema)),
             _ => false,
-        }
-    }
-
-    fn rewrite_order_by_aggregates(expr: &LogicalExpr, info: &AggregateInfo) -> LogicalExpr {
-        // Whole-expression GROUP BY match first (R3.5 item 2): for
-        // `GROUP BY id % 2 ORDER BY id % 2` the sort key must redirect to the
-        // computed group output column. Recursing into the expression cannot
-        // discover this — `id` alone does not match the group expression, so
-        // the key previously reached the Sort unresolved, errored per row,
-        // and the error-skipping comparator silently left rows unsorted.
-        for (i, group_expr) in info.group_by_exprs.iter().enumerate() {
-            if group_expr == expr {
-                if let Some(alias) = info.group_by_aliases.get(i) {
-                    return LogicalExpr::Column {
-                        table: None,
-                        name: alias.clone(),
-                    };
-                }
-            }
-        }
-        match expr {
-            LogicalExpr::AggregateFunction { fun, args, distinct } => {
-                // Find this aggregate in the plan's aggregate expressions
-                for (i, aggr_expr) in info.aggr_exprs.iter().enumerate() {
-                    if let LogicalExpr::AggregateFunction {
-                        fun: aggr_fun,
-                        args: aggr_args,
-                        distinct: aggr_distinct,
-                    } = aggr_expr
-                    {
-                        if fun == aggr_fun && args == aggr_args && distinct == aggr_distinct {
-                            // Found a match - replace with column reference to the output alias
-                            if let Some(alias) = info.aggr_aliases.get(i) {
-                                return LogicalExpr::Column {
-                                    table: None,
-                                    name: alias.clone(),
-                                };
-                            }
-                        }
-                    }
-                }
-                // No match found - keep as-is (may fail at evaluation, but that's expected
-                // for aggregates not in SELECT list)
-                expr.clone()
-            }
-            LogicalExpr::BinaryExpr { left, op, right } => LogicalExpr::BinaryExpr {
-                left: Box::new(Self::rewrite_order_by_aggregates(left, info)),
-                op: *op,
-                right: Box::new(Self::rewrite_order_by_aggregates(right, info)),
-            },
-            LogicalExpr::UnaryExpr { op, expr: inner } => LogicalExpr::UnaryExpr {
-                op: *op,
-                expr: Box::new(Self::rewrite_order_by_aggregates(inner, info)),
-            },
-            LogicalExpr::Cast { expr: inner, data_type } => LogicalExpr::Cast {
-                expr: Box::new(Self::rewrite_order_by_aggregates(inner, info)),
-                data_type: data_type.clone(),
-            },
-            LogicalExpr::ScalarFunction { fun, args } => {
-                let rewritten_args: Vec<_> = args
-                    .iter()
-                    .map(|a| Self::rewrite_order_by_aggregates(a, info))
-                    .collect();
-                LogicalExpr::ScalarFunction {
-                    fun: fun.clone(),
-                    args: rewritten_args,
-                }
-            }
-            // For column references in an aggregate context, check if they match
-            // a GROUP BY expression and remap to the output alias
-            LogicalExpr::Column { table, name } => {
-                for (i, group_expr) in info.group_by_exprs.iter().enumerate() {
-                    if group_expr == expr {
-                        if let Some(alias) = info.group_by_aliases.get(i) {
-                            return LogicalExpr::Column {
-                                table: None,
-                                name: alias.clone(),
-                            };
-                        }
-                    }
-                }
-                expr.clone()
-            }
-            // All other expression types: return as-is
-            _ => expr.clone(),
         }
     }
 

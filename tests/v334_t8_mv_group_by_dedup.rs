@@ -156,3 +156,32 @@ fn t8_group_by_without_aggregates_stress_smoke() -> Result<()> {
     eprintln!("T8 stress: grouped 300 rows into 30 MV rows in {elapsed:?}");
     Ok(())
 }
+
+#[test]
+fn t8_order_by_group_key_with_reordered_projection_sorts_correctly() -> Result<()> {
+    // Latent-bug regression (fixed with the T8 ORDER-BY fix): the old ORDER BY
+    // rewrite sliced the post-aggregate Project aliases POSITIONALLY as
+    // [group cols…, agg cols…], which mis-maps whenever the select list is not
+    // exactly the group list. `SELECT b, a … GROUP BY a, b ORDER BY a` then
+    // silently redirected the sort to the alias at position 0 — column b —
+    // returning wrongly-ordered rows. The group_N rewrite sorts below the
+    // projection on the real group key.
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute("CREATE TABLE t8_reorder (id INT PRIMARY KEY, a INT, b INT)")?;
+    // (a, b) pairs chosen so ordering by a and ordering by b DISAGREE:
+    // by a: (1,30), (2,20), (3,10) — by b would reverse it.
+    db.execute("INSERT INTO t8_reorder VALUES (1, 2, 20), (2, 1, 30), (3, 3, 10)")?;
+
+    let rows = db.query(
+        "SELECT b, a FROM t8_reorder GROUP BY a, b ORDER BY a",
+        &[],
+    )?;
+    // Output columns are (b, a); ordered by a ascending → a = 1, 2, 3.
+    let a_values: Vec<i32> = rows.iter().map(|t| int_value(t, 1)).collect();
+    assert_eq!(
+        a_values,
+        vec![1, 2, 3],
+        "ORDER BY a must sort by column a even when the projection lists b first (old rewrite sorted by b)"
+    );
+    Ok(())
+}
