@@ -1716,6 +1716,21 @@ impl Drop for SynchronousCommitOverrideGuard {
     }
 }
 
+/// Catalog-existence classification for a table name, cached by the indexed-
+/// scan fast paths (see `StorageEngine::cached_table_kind`). Only `Table` is
+/// fast-path eligible; `MatView` and `Missing` fall back to the general scan
+/// path (materialized views resolve to their backing data table, missing names
+/// error downstream).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TableKind {
+    /// A regular table exists under this name.
+    Table,
+    /// A materialized view (not a regular table) exists under this name.
+    MatView,
+    /// Neither a regular table nor a materialized view exists under this name.
+    Missing,
+}
+
 /// Storage engine
 pub struct StorageEngine {
     /// RocksDB instance
@@ -1816,6 +1831,20 @@ pub struct StorageEngine {
     // all concurrent reads, capping point-read scaling (~48k tps @ c=32). DashMap
     // shards the lock so concurrent schema lookups don't contend.
     schema_cache: Arc<dashmap::DashMap<String, crate::Schema>>,
+    /// Generation-stamped catalog-existence cache (W1.3). Maps a table name to
+    /// its `TableKind`, letting the indexed-scan fast paths skip two RocksDB
+    /// metadata point-gets (`view_exists` + `table_exists`) per probe. Each
+    /// entry carries the `schema_generation` it was computed at and is trusted
+    /// only while that stamp matches the current generation; any
+    /// existence-changing DDL (CREATE/DROP/RENAME TABLE, CREATE/DROP
+    /// MATERIALIZED VIEW — including restore and WAL recovery, which funnel
+    /// through the same catalog methods) or branch switch bumps the generation,
+    /// lazily invalidating every entry in O(1). Bounded by distinct table names
+    /// (one entry per name, overwritten in place on a generation miss).
+    existence_cache: Arc<dashmap::DashMap<String, (u64, TableKind)>>,
+    /// Monotonic schema generation backing `existence_cache`; bumped by
+    /// `bump_schema_generation` on every catalog-existence change.
+    schema_generation: Arc<AtomicU64>,
     /// In-memory table-constraints cache (avoids repeated metadata gets on DML)
     constraints_cache: Arc<parking_lot::Mutex<std::collections::HashMap<String, crate::sql::TableConstraints>>>,
     /// In-memory reverse-FK cache (referenced table -> constraints that point at it)
@@ -2260,6 +2289,8 @@ impl StorageEngine {
                 std::time::Duration::from_micros(config.storage.group_commit_window_us),
             )),
             schema_cache: Arc::new(dashmap::DashMap::new()),
+            existence_cache: Arc::new(dashmap::DashMap::new()),
+            schema_generation: Arc::new(AtomicU64::new(0)),
             constraints_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             referencing_fk_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             index_snapshots_on_close: Arc::new(AtomicBool::new(true)),
@@ -2485,6 +2516,8 @@ impl StorageEngine {
                 std::time::Duration::from_micros(config.storage.group_commit_window_us),
             )),
             schema_cache: Arc::new(dashmap::DashMap::new()),
+            existence_cache: Arc::new(dashmap::DashMap::new()),
+            schema_generation: Arc::new(AtomicU64::new(0)),
             constraints_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             referencing_fk_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             index_snapshots_on_close: Arc::new(AtomicBool::new(true)),
@@ -2510,6 +2543,51 @@ impl StorageEngine {
     /// Invalidate a cached schema (call on DDL changes)
     pub fn invalidate_schema_cache(&self, table_name: &str) {
         self.schema_cache.remove(table_name);
+    }
+
+    /// Current schema generation (W1.3). Diagnostic/test surface for the
+    /// generation-stamped existence cache.
+    pub fn schema_generation(&self) -> u64 {
+        self.schema_generation.load(Ordering::Acquire)
+    }
+
+    /// Bump the schema generation (W1.3), lazily invalidating every
+    /// `existence_cache` entry in O(1). Call AFTER committing any
+    /// existence-changing catalog mutation (CREATE/DROP/RENAME TABLE,
+    /// CREATE/DROP MATERIALIZED VIEW) and on branch switch, so a subsequent
+    /// probe recomputes against the post-mutation catalog state.
+    pub fn bump_schema_generation(&self) {
+        self.schema_generation.fetch_add(1, Ordering::Release);
+    }
+
+    /// Classify `table_name` as a regular table / materialized view / missing
+    /// (W1.3), backed by the generation-stamped `existence_cache`. On a
+    /// generation hit the cached kind is returned without touching storage; on
+    /// a miss the two catalog probes run in the SAME order as the original
+    /// inline gate (`view_exists` first, then `table_exists`) and the result is
+    /// stored under the current generation. Used by the indexed-scan fast paths
+    /// to avoid two RocksDB metadata point-gets per probe.
+    pub fn cached_table_kind(&self, table_name: &str) -> Result<TableKind> {
+        let generation = self.schema_generation.load(Ordering::Acquire);
+        if let Some(entry) = self.existence_cache.get(table_name) {
+            let (entry_generation, kind) = *entry.value();
+            if entry_generation == generation {
+                return Ok(kind);
+            }
+        }
+        // Miss (cold or stale generation): recompute. Order matches the former
+        // inline `view_exists(t) || !table_exists(t)` short-circuit exactly — a
+        // name that is a materialized view is classified `MatView` without a
+        // `table_exists` probe, so semantics and get-count are unchanged.
+        let kind = if self.mv_catalog().view_exists(table_name)? {
+            TableKind::MatView
+        } else if self.catalog().table_exists(table_name)? {
+            TableKind::Table
+        } else {
+            TableKind::Missing
+        };
+        self.existence_cache.insert(table_name.to_string(), (generation, kind));
+        Ok(kind)
     }
 
     /// Clear all cached schemas (call on bulk DDL operations)
@@ -3372,11 +3450,7 @@ impl StorageEngine {
     /// recovery, so sequences are documented-volatile and the fsync is moot.
     /// Goes through `save_sequence_state` -> `StorageEngine::put`, so the
     /// record inherits the same at-rest encryption as enum/identity records.
-    pub fn flush_sequence_state(
-        &self,
-        name: &str,
-        st: crate::storage::catalog::PersistedSeqState,
-    ) -> Result<()> {
+    pub fn flush_sequence_state(&self, name: &str, st: crate::storage::catalog::PersistedSeqState) -> Result<()> {
         self.catalog().save_sequence_state(name, &st)?;
         if !self.config.storage.memory_only {
             self.group_committer
@@ -7400,7 +7474,8 @@ impl StorageEngine {
 
         // Populate the row cache and return the shared handle (no deep copy).
         let tuple = std::sync::Arc::new(tuple);
-        self.row_cache.put_arc(table_name, row_id, std::sync::Arc::clone(&tuple));
+        self.row_cache
+            .put_arc(table_name, row_id, std::sync::Arc::clone(&tuple));
 
         Ok(Some(tuple))
     }
@@ -7446,7 +7521,10 @@ impl StorageEngine {
                     tracing::debug!(
                         phase = "index_lookup",
                         table = table_name,
-                        duration_us = lookup_start.as_ref().map(|s| s.elapsed().as_micros() as u64).unwrap_or(0),
+                        duration_us = lookup_start
+                            .as_ref()
+                            .map(|s| s.elapsed().as_micros() as u64)
+                            .unwrap_or(0),
                         "PK index lookup: no match"
                     );
                 }
@@ -7460,7 +7538,10 @@ impl StorageEngine {
                 tracing::debug!(
                     phase = "index_lookup",
                     table = table_name,
-                    duration_us = lookup_start.as_ref().map(|s| s.elapsed().as_micros() as u64).unwrap_or(0),
+                    duration_us = lookup_start
+                        .as_ref()
+                        .map(|s| s.elapsed().as_micros() as u64)
+                        .unwrap_or(0),
                     cache = "hit",
                     "PK point lookup: row cache hit"
                 );
@@ -7529,7 +7610,10 @@ impl StorageEngine {
             tracing::debug!(
                 phase = "index_lookup",
                 table = table_name,
-                duration_us = lookup_start.as_ref().map(|s| s.elapsed().as_micros() as u64).unwrap_or(0),
+                duration_us = lookup_start
+                    .as_ref()
+                    .map(|s| s.elapsed().as_micros() as u64)
+                    .unwrap_or(0),
                 cache = "miss",
                 "PK point lookup: fetched from storage, cached"
             );
@@ -10447,9 +10531,7 @@ impl StorageEngine {
             if !indexed_rows.is_empty() {
                 // One marker over the batch's contiguous row-id range, in the
                 // SAME WriteBatch as the data rows (atomic with the insert).
-                let marker_key = crate::storage::copy_marker::CopyMarkers::marker_key(
-                    table_name, vfirst, vlast,
-                );
+                let marker_key = crate::storage::copy_marker::CopyMarkers::marker_key(table_name, vfirst, vlast);
                 batch.put(marker_key.as_bytes(), ts.to_be_bytes());
                 vrange = Some((vfirst, vlast));
             }
@@ -10555,8 +10637,7 @@ impl StorageEngine {
             // interval index so AS-OF reads + UPDATE/DELETE materialization see
             // it immediately (the durable `vmeta:` key is already in the batch).
             if let Some((first, last)) = vrange {
-                self.snapshot_manager
-                    .record_copy_marker(table_name, first, last, ts);
+                self.snapshot_manager.record_copy_marker(table_name, first, last, ts);
             }
         }
 
@@ -11129,10 +11210,9 @@ impl StorageEngine {
         let prefix_bytes = prefix.as_bytes();
         let mut read_opts = ReadOptions::default();
         read_opts.set_total_order_seek(true);
-        let iter = self.db.iterator_opt(
-            IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward),
-            read_opts,
-        );
+        let iter = self
+            .db
+            .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read_opts);
         for item in iter {
             let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
             if !key.starts_with(prefix_bytes) {
@@ -11389,6 +11469,110 @@ mod tests {
         let config = Config::in_memory();
         let engine = StorageEngine::open_in_memory(&config);
         assert!(engine.is_ok());
+    }
+
+    // W1.3: the generation-stamped existence cache must reclassify a name after
+    // every existence-changing catalog mutation. Each assertion below flips to
+    // the stale prior value if the corresponding `bump_schema_generation` call
+    // is removed (create/drop/rename/MV/branch), which is exactly the class of
+    // bug this cache could introduce.
+    #[test]
+    fn existence_cache_generation_stamping() {
+        let config = Config::in_memory();
+        let engine = StorageEngine::open_in_memory(&config).expect("open in-memory");
+
+        let int_pk = |name: &str| Schema {
+            columns: vec![Column {
+                name: name.to_string(),
+                data_type: DataType::Int4,
+                nullable: false,
+                primary_key: true,
+                source_table: None,
+                source_table_name: None,
+                default_expr: None,
+                unique: false,
+                storage_mode: crate::ColumnStorageMode::Default,
+            }],
+        };
+
+        // Cold probe of an absent name → Missing (and now cached).
+        assert_eq!(engine.cached_table_kind("t").unwrap(), TableKind::Missing);
+
+        // CREATE bumps the generation → the stale `Missing` is recomputed to
+        // `Table` (flip: without the create-path bump this stays Missing).
+        let g0 = engine.schema_generation();
+        engine.catalog().create_table("t", int_pk("id")).expect("create t");
+        assert!(engine.schema_generation() > g0, "create_table must bump generation");
+        assert_eq!(engine.cached_table_kind("t").unwrap(), TableKind::Table);
+
+        // DROP bumps again → the cached `Table` must NOT survive the drop
+        // (flip: without the drop-path bump this returns the stale `Table`).
+        let g1 = engine.schema_generation();
+        engine.catalog().drop_table("t").expect("drop t");
+        assert!(engine.schema_generation() > g1, "drop_table must bump generation");
+        assert_eq!(
+            engine.cached_table_kind("t").unwrap(),
+            TableKind::Missing,
+            "dropped table must reclassify to Missing, not serve a stale Table"
+        );
+
+        // RENAME changes existence for BOTH names in one mutation. The old
+        // name is the dangerous direction: a stale `Table` there would let a
+        // fast-path probe proceed against a nonexistent table (flips: without
+        // the rename-path bump, "t2" serves stale `Table` and "t3" stale
+        // `Missing`).
+        engine.catalog().create_table("t2", int_pk("id")).expect("create t2");
+        assert_eq!(engine.cached_table_kind("t2").unwrap(), TableKind::Table);
+        assert_eq!(engine.cached_table_kind("t3").unwrap(), TableKind::Missing);
+        let gr = engine.schema_generation();
+        engine.catalog().rename_table("t2", "t3").expect("rename t2 -> t3");
+        assert!(engine.schema_generation() > gr, "rename_table must bump generation");
+        assert_eq!(
+            engine.cached_table_kind("t2").unwrap(),
+            TableKind::Missing,
+            "old name must reclassify to Missing after rename, not serve a stale Table"
+        );
+        assert_eq!(engine.cached_table_kind("t3").unwrap(), TableKind::Table);
+
+        // A materialized view under a name → MatView (never `Table`, so the
+        // fast paths bail). create_view bumps the generation.
+        let g2 = engine.schema_generation();
+        let mv_meta = crate::storage::MaterializedViewMetadata::new(
+            "mv".to_string(),
+            "SELECT 1".to_string(),
+            Vec::new(),
+            Vec::new(),
+            int_pk("id"),
+        );
+        engine.mv_catalog().create_view(mv_meta).expect("create mv");
+        assert!(engine.schema_generation() > g2, "create_view must bump generation");
+        assert_eq!(engine.cached_table_kind("mv").unwrap(), TableKind::MatView);
+
+        // DROP VIEW must reclassify the name to Missing (flip: without the
+        // drop_view-path bump this serves the stale `MatView`).
+        let gv = engine.schema_generation();
+        engine.mv_catalog().drop_view("mv").expect("drop mv");
+        assert!(engine.schema_generation() > gv, "drop_view must bump generation");
+        assert_eq!(
+            engine.cached_table_kind("mv").unwrap(),
+            TableKind::Missing,
+            "dropped view must reclassify to Missing, not serve a stale MatView"
+        );
+
+        // A branch switch changes catalog visibility without table DDL and must
+        // also bump the generation (both switch-away and switch-back).
+        let g3 = engine.schema_generation();
+        engine.set_current_branch(Some("feature".to_string()));
+        assert!(
+            engine.schema_generation() > g3,
+            "set_current_branch must bump generation"
+        );
+        let g4 = engine.schema_generation();
+        engine.clear_current_branch();
+        assert!(
+            engine.schema_generation() > g4,
+            "clear_current_branch must bump generation"
+        );
     }
 
     #[test]
@@ -12006,11 +12190,27 @@ impl StorageEngine {
     /// All subsequent queries will execute on this branch instead of main
     pub fn set_current_branch(&self, branch_name: Option<String>) {
         *self.current_branch.lock() = branch_name.filter(|name| name != "main");
+        // W1.3: a branch switch changes catalog visibility WITHOUT table DDL;
+        // invalidate the existence cache so a probe never serves wrong-branch
+        // classification (the fast paths also bail on `is_branch_active`, but
+        // this keeps the cache correct across switch-back to main).
+        self.bump_schema_generation();
+        // The row cache is keyed by (table, row_id) with NO branch dimension,
+        // while fills read through `branch_aware_data_key` — so an entry
+        // filled on one branch (e.g. an indexed probe reading `bdata:…`) is
+        // wrong-branch data for every other branch. The branch context is
+        // engine-global and only changes here, so clearing at the switch makes
+        // every fill/hit within a branch epoch self-consistent.
+        self.row_cache.clear();
     }
 
     /// Clear the current branch context (revert to main)
     pub fn clear_current_branch(&self) {
         *self.current_branch.lock() = None;
+        // W1.3: see `set_current_branch` — invalidate on branch-context change
+        // (generation for the existence cache, row cache for wrong-branch rows).
+        self.bump_schema_generation();
+        self.row_cache.clear();
     }
 
     /// Check if a non-main branch is currently active

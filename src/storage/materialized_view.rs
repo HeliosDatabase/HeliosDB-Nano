@@ -163,6 +163,10 @@ impl<'a> MaterializedViewCatalog<'a> {
 
         self.storage.put(&key, &value)?;
 
+        // W1.3: this name now resolves as a materialized view; bump so the
+        // existence cache reclassifies it (fast paths must bail on it).
+        self.storage.bump_schema_generation();
+
         tracing::info!("Successfully created materialized view '{}'", metadata.view_name);
         Ok(())
     }
@@ -224,6 +228,10 @@ impl<'a> MaterializedViewCatalog<'a> {
         // Invalidate schema cache for the view name itself (may have been cached
         // by catalog.get_table_schema() which falls back to MV lookup)
         self.storage.invalidate_schema_cache(view_name);
+
+        // W1.3: the view no longer exists; bump so the existence cache
+        // recomputes this name to `Missing`.
+        self.storage.bump_schema_generation();
 
         tracing::info!("Successfully dropped materialized view '{}'", view_name);
         Ok(())

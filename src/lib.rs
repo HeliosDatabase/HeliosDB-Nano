@@ -392,7 +392,9 @@ const CACHE_ADMISSION_WAYS: usize = 2;
 /// Build a zeroed R-A1 admission slot table behind an `Arc`.
 fn new_cache_admission() -> std::sync::Arc<[[std::sync::atomic::AtomicU64; CACHE_ADMISSION_WAYS]; CACHE_ADMISSION_SLOTS]>
 {
-    std::sync::Arc::new(std::array::from_fn(|_| std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0))))
+    std::sync::Arc::new(std::array::from_fn(|_| {
+        std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0))
+    }))
 }
 
 pub struct EmbeddedDatabase {
@@ -944,6 +946,15 @@ impl EmbeddedDatabase {
                 | sql::LogicalPlan::Truncate { .. }
                 | sql::LogicalPlan::CreateMaterializedView { .. }
                 | sql::LogicalPlan::DropMaterializedView { .. }
+                // Branch operations change the session's visible data WITHOUT
+                // any DML-path invalidation: a result cached on branch A must
+                // never be served on branch B (W1.3 branch-switch test). The
+                // REPL's USE BRANCH pre-detect bypasses execute() and calls
+                // invalidate_plan_cache() itself (repl/shell.rs). CreateBranch
+                // is excluded: it snapshots without changing current visibility.
+                | sql::LogicalPlan::UseBranch { .. }
+                | sql::LogicalPlan::MergeBranch { .. }
+                | sql::LogicalPlan::DropBranch { .. }
         )
     }
 
@@ -1327,9 +1338,7 @@ impl EmbeddedDatabase {
                 .checked_sub(1)
                 .and_then(|p| bytes.get(p))
                 .is_some_and(|b| b.is_ascii_whitespace());
-            let next_ws = bytes
-                .get(pos + 2)
-                .is_some_and(|b| b.is_ascii_whitespace());
+            let next_ws = bytes.get(pos + 2).is_some_and(|b| b.is_ascii_whitespace());
             if prev_ws && next_ws {
                 break pos;
             }
@@ -1926,9 +1935,7 @@ impl EmbeddedDatabase {
 
     /// Internal method to begin a transaction
     fn begin_transaction_internal(&self) -> Result<()> {
-        let mut txn_ref = self
-            .current_transaction
-            .lock();
+        let mut txn_ref = self.current_transaction.lock();
         if txn_ref.is_some() {
             return Err(Error::transaction("Transaction already active"));
         }
@@ -1942,9 +1949,7 @@ impl EmbeddedDatabase {
 
     /// Internal method to commit the current transaction
     fn commit_internal(&self) -> Result<()> {
-        let mut txn_ref = self
-            .current_transaction
-            .lock();
+        let mut txn_ref = self.current_transaction.lock();
         if let Some(txn) = txn_ref.as_ref() {
             self.validate_deferred_fk_checks(Some(txn))?;
         }
@@ -1982,9 +1987,7 @@ impl EmbeddedDatabase {
 
     /// Internal method to rollback the current transaction
     fn rollback_internal(&self) -> Result<()> {
-        let mut txn_ref = self
-            .current_transaction
-            .lock();
+        let mut txn_ref = self.current_transaction.lock();
         if let Some(txn) = txn_ref.take() {
             // Slot emptied (the transaction is consumed even if rollback
             // errors) — clear the fast-out immediately.
@@ -2032,11 +2035,7 @@ impl EmbeddedDatabase {
     /// can revert exactly the index ops staged after the savepoint.
     fn art_undo_len_for(&self, txn: &storage::Transaction) -> usize {
         match txn.session_id() {
-            Some(sid) => self
-                .session_art_undo
-                .get(&sid)
-                .map(|e| e.value().len())
-                .unwrap_or(0),
+            Some(sid) => self.session_art_undo.get(&sid).map(|e| e.value().len()).unwrap_or(0),
             None => self.art_undo_log.read().len(),
         }
     }
@@ -3666,8 +3665,13 @@ impl EmbeddedDatabase {
                             // refs with literals and executes the
                             // plan once per row. No-op for expressions
                             // without subqueries.
-                            let bound = self
-                                .materialize_scalar_subqueries_for_row(value_expr, &old_tuple, &schema, table_name, &[])?;
+                            let bound = self.materialize_scalar_subqueries_for_row(
+                                value_expr,
+                                &old_tuple,
+                                &schema,
+                                table_name,
+                                &[],
+                            )?;
                             let mut new_value = evaluator.evaluate(&bound, &old_tuple)?;
                             let col_index = evaluator
                                 .schema()
@@ -6026,7 +6030,6 @@ impl EmbeddedDatabase {
     }
 
     pub fn execute(&self, sql: &str) -> Result<u64> {
-
         // SQLite-compat: PRAGMA without a result-set (assignments / no-op
         // tunables) — `execute()` callers don't expect rows back.
         if let Some((_, _)) = crate::sql::sqlite_compat::parse_pragma(sql) {
@@ -6089,10 +6092,7 @@ impl EmbeddedDatabase {
             // happen under that mutex, so a `false` load is exactly the
             // "locked and found None" outcome without the lock).
             let txn_lock = if self.global_txn_active.load(std::sync::atomic::Ordering::Acquire) {
-                Some(
-                    self.current_transaction
-                        .lock(),
-                )
+                Some(self.current_transaction.lock())
             } else {
                 None
             };
@@ -7130,6 +7130,7 @@ impl EmbeddedDatabase {
             || self.tenant_manager.should_apply_rls(table_name, "UPDATE")
             || self.trigger_registry.has_triggers_for_table(table_name)
         {
+            tracing::debug!(target: "helios::fastpath", reason = "param-update:returning-empty-rls-trigger", "fast-update bail");
             return None;
         }
 
@@ -7148,13 +7149,14 @@ impl EmbeddedDatabase {
         };
         let pk_value = pk_value.as_ref();
 
-        let existing_row = match self
-            .storage
-            .get_row_by_typed_pk_for_write_with_schema(&spec.table_name, pk_value, &spec.schema)
-        {
-            Ok(Some(row)) => row,
-            Ok(None) => return Some(Ok(0)),
-            Err(e) => return Some(Err(e)),
+        let existing_row =
+            match self
+                .storage
+                .get_row_by_typed_pk_for_write_with_schema(&spec.table_name, pk_value, &spec.schema)
+            {
+                Ok(Some(row)) => row,
+                Ok(None) => return Some(Ok(0)),
+                Err(e) => return Some(Err(e)),
             };
         let row_id = existing_row.row_id.unwrap_or(0);
         if row_id == 0 {
@@ -7427,6 +7429,7 @@ impl EmbeddedDatabase {
         };
         if let Ok(constraints) = catalog.load_table_constraints(table_name) {
             if !constraints.foreign_keys.is_empty() || !constraints.check_constraints.is_empty() {
+                tracing::debug!(target: "helios::fastpath", reason = "param-update-spec:fk-or-check-constraint", "fast-update bail");
                 return None;
             }
         }
@@ -7444,6 +7447,7 @@ impl EmbeddedDatabase {
                 None => return None,
             };
             if column.primary_key || column.unique || !Self::fast_update_expr_supported(expr) {
+                tracing::debug!(target: "helios::fastpath", reason = "param-update-spec:set-col-pk-unique-or-expr-unsupported", "fast-update bail");
                 return None;
             }
             assignment_columns.push(col_name.clone());
@@ -8450,12 +8454,10 @@ impl EmbeddedDatabase {
         // This shared validator is also reached by multi-row `VALUES` INSERT and
         // COPY, so the fix covers those batch paths too (sweep finding #2).
         let mut unique_specs: Vec<Vec<usize>> = Vec::new();
-        for (_name, index_type, columns) in self.storage.art_indexes().list_table_indexes(table_name)
-        {
+        for (_name, index_type, columns) in self.storage.art_indexes().list_table_indexes(table_name) {
             if !matches!(
                 index_type,
-                crate::storage::art_index::ArtIndexType::PrimaryKey
-                    | crate::storage::art_index::ArtIndexType::Unique
+                crate::storage::art_index::ArtIndexType::PrimaryKey | crate::storage::art_index::ArtIndexType::Unique
             ) {
                 continue;
             }
@@ -8710,6 +8712,7 @@ impl EmbeddedDatabase {
         if self.tenant_manager.should_apply_rls(table_name, "UPDATE")
             || self.trigger_registry.has_triggers_for_table(table_name)
         {
+            tracing::debug!(target: "helios::fastpath", reason = "lit-update-spec:rls-or-trigger", "fast-update bail");
             return None;
         }
 
@@ -8740,16 +8743,19 @@ impl EmbeddedDatabase {
         let set_col_idx = schema.get_column_index(set_col)?;
         let set_column = schema.get_column_at(set_col_idx)?;
         if set_column.primary_key || set_column.unique {
+            tracing::debug!(target: "helios::fastpath", reason = "lit-update-spec:set-col-pk-or-unique", "fast-update bail");
             return None;
         }
         let set_data_type = set_column.data_type.clone();
         let set_nullable = set_column.nullable;
 
         if self.storage.art_indexes().has_fk(table_name) {
+            tracing::debug!(target: "helios::fastpath", reason = "lit-update-spec:has-fk", "fast-update bail");
             return None;
         }
         if let Ok(constraints) = catalog.load_table_constraints(table_name) {
             if !constraints.foreign_keys.is_empty() || !constraints.check_constraints.is_empty() {
+                tracing::debug!(target: "helios::fastpath", reason = "lit-update-spec:fk-or-check-constraint", "fast-update bail");
                 return None;
             }
         }
@@ -8874,6 +8880,7 @@ impl EmbeddedDatabase {
             || Self::contains_sql_keyword(trimmed, b"CASE")
             || Self::contains_sql_keyword(trimmed, b"COALESCE")
         {
+            tracing::debug!(target: "helios::fastpath", reason = "lit-update:complex-keyword", "fast-update bail");
             return None;
         }
 
@@ -8907,6 +8914,7 @@ impl EmbeddedDatabase {
 
         // Parse SET clause: col = value (single assignment only for fast path)
         if set_clause.contains(',') {
+            tracing::debug!(target: "helios::fastpath", reason = "lit-update:multi-col-set", "fast-update bail");
             return None; // Multiple columns — fall through
         }
         let eq_pos = set_clause.find('=')?;
@@ -8927,6 +8935,7 @@ impl EmbeddedDatabase {
             || Self::contains_sql_keyword(where_clause, b"IN")
             || Self::contains_sql_keyword(where_clause, b"BETWEEN")
         {
+            tracing::debug!(target: "helios::fastpath", reason = "lit-update:complex-where", "fast-update bail");
             return None;
         }
         let weq_pos = where_clause.find('=')?;
@@ -8938,6 +8947,7 @@ impl EmbeddedDatabase {
 
         // Check branch — skip fast path on branches
         if self.storage.get_current_branch_id().is_some() {
+            tracing::debug!(target: "helios::fastpath", reason = "lit-update:branch", "fast-update bail");
             return None;
         }
 
@@ -8967,6 +8977,7 @@ impl EmbeddedDatabase {
 
         let row_id = existing_row.row_id.unwrap_or(0);
         if row_id == 0 {
+            tracing::debug!(target: "helios::fastpath", reason = "lit-update:no-row-id", "fast-update bail");
             return None; // No row_id — can't do fast update
         }
 
@@ -8982,6 +8993,7 @@ impl EmbeddedDatabase {
         {
             val
         } else {
+            tracing::debug!(target: "helios::fastpath", reason = "lit-update:set-expr-unsupported", "fast-update bail");
             return None; // Complex expression — fall through to normal path
         };
 
@@ -9524,11 +9536,7 @@ impl EmbeddedDatabase {
             Ok(false) => {}
         }
 
-        let pk_col = if count_arg == "*" {
-            None
-        } else {
-            Some(count_arg)
-        };
+        let pk_col = if count_arg == "*" { None } else { Some(count_arg) };
         let spec = match self.fast_count_pk_spec(table_name, pk_col)? {
             Ok(spec) => spec,
             Err(e) => return Some(Err(e)),
@@ -9860,7 +9868,10 @@ impl EmbeddedDatabase {
             Ok(false) => {}
         }
 
-        let analyzed_predicates = self.storage.predicate_pushdown().analyze_predicate(predicate, &schema, &[]);
+        let analyzed_predicates = self
+            .storage
+            .predicate_pushdown()
+            .analyze_predicate(predicate, &schema, &[]);
         if analyzed_predicates.len() != 1
             || !crate::sql::executor::scan::storage_predicates_are_sql_safe(&schema, &analyzed_predicates)
         {
@@ -11065,8 +11076,13 @@ impl EmbeddedDatabase {
                         // row before handing the expression to the
                         // row-scoped evaluator.
                         for (col_name, value_expr) in assignments {
-                            let bound =
-                                self.materialize_scalar_subqueries_for_row(value_expr, &tuple, &schema, table_name, &[])?;
+                            let bound = self.materialize_scalar_subqueries_for_row(
+                                value_expr,
+                                &tuple,
+                                &schema,
+                                table_name,
+                                &[],
+                            )?;
                             let mut new_value = evaluator.evaluate(&bound, &tuple)?;
                             // Find column index
                             let col_index = evaluator
@@ -11580,9 +11596,7 @@ impl EmbeddedDatabase {
                 Ok(total_rows)
             }
             sql::LogicalPlan::Savepoint { ref name } => {
-                let txn = self
-                    .current_transaction
-                    .lock();
+                let txn = self.current_transaction.lock();
                 let (write_set_snapshot, art_undo_len) = match txn.as_ref() {
                     Some(t) => (t.savepoint_snapshot(), self.art_undo_len_for(t)),
                     None => {
@@ -11618,9 +11632,7 @@ impl EmbeddedDatabase {
                     drop(savepoints);
 
                     if let Some((snapshot, art_undo_len)) = restore {
-                        let txn = self
-                            .current_transaction
-                            .lock();
+                        let txn = self.current_transaction.lock();
                         if let Some(t) = txn.as_ref() {
                             t.rollback_to_savepoint(&snapshot);
                             self.rollback_art_undo_to(t, art_undo_len);
@@ -12176,10 +12188,7 @@ impl EmbeddedDatabase {
                 let active_txn: Option<&storage::Transaction> = match session_txn {
                     Some(txn) => Some(txn),
                     None => {
-                        _txn_guard = Some(
-                            self.current_transaction
-                                .lock(),
-                        );
+                        _txn_guard = Some(self.current_transaction.lock());
                         _txn_guard.as_ref().and_then(|guard| guard.as_ref())
                     }
                 };
@@ -12657,10 +12666,7 @@ impl EmbeddedDatabase {
                 let active_txn: Option<&storage::Transaction> = match session_txn {
                     Some(txn) => Some(txn),
                     None => {
-                        _txn_guard = Some(
-                            self.current_transaction
-                                .lock(),
-                        );
+                        _txn_guard = Some(self.current_transaction.lock());
                         _txn_guard.as_ref().and_then(|guard| guard.as_ref())
                     }
                 };
@@ -12691,8 +12697,9 @@ impl EmbeddedDatabase {
                         let old_tuple = tuple.clone();
                         let mut tuple = tuple;
                         for (col_name, value_expr) in assignments {
-                            let bound =
-                                self.materialize_scalar_subqueries_for_row(value_expr, &tuple, &schema, table_name, params)?;
+                            let bound = self.materialize_scalar_subqueries_for_row(
+                                value_expr, &tuple, &schema, table_name, params,
+                            )?;
                             let mut new_value = evaluator.evaluate(&bound, &tuple)?;
                             let col_index = evaluator
                                 .schema()
@@ -12863,10 +12870,7 @@ impl EmbeddedDatabase {
                 let active_txn: Option<&storage::Transaction> = match session_txn {
                     Some(txn) => Some(txn),
                     None => {
-                        _txn_guard = Some(
-                            self.current_transaction
-                                .lock(),
-                        );
+                        _txn_guard = Some(self.current_transaction.lock());
                         _txn_guard.as_ref().and_then(|guard| guard.as_ref())
                     }
                 };
@@ -12987,9 +12991,7 @@ impl EmbeddedDatabase {
             // Savepoint support for nested transactions
             sql::LogicalPlan::Savepoint { name } => {
                 // Check if we're in a transaction and snapshot the write set
-                let txn = self
-                    .current_transaction
-                    .lock();
+                let txn = self.current_transaction.lock();
                 let (write_set_snapshot, art_undo_len) = match txn.as_ref() {
                     Some(t) => (t.savepoint_snapshot(), self.art_undo_len_for(t)),
                     None => {
@@ -13029,9 +13031,7 @@ impl EmbeddedDatabase {
 
                     // Rollback the transaction write set to the savepoint state
                     if let Some((snapshot, art_undo_len)) = restore {
-                        let txn = self
-                            .current_transaction
-                            .lock();
+                        let txn = self.current_transaction.lock();
                         if let Some(t) = txn.as_ref() {
                             t.rollback_to_savepoint(&snapshot);
                             self.rollback_art_undo_to(t, art_undo_len);
@@ -13213,9 +13213,7 @@ impl EmbeddedDatabase {
         // fall through to the autocommit path — same outcome as locking
         // after that commit/rollback.
         if self.global_txn_active.load(std::sync::atomic::Ordering::Acquire) {
-            let txn_lock = self
-                .current_transaction
-                .lock();
+            let txn_lock = self.current_transaction.lock();
             if let Some(txn_ref) = txn_lock.as_ref() {
                 // Parse and execute through transaction-aware executor
                 let (statement, _) = self.parse_cached(sql)?;
@@ -14375,11 +14373,7 @@ impl EmbeddedDatabase {
     /// Item 9: set the session's `helios.fast_autocommit` opt-in. When `true`,
     /// single-statement autocommit on this session commits non-blocking (see
     /// the field doc on [`crate::session::Session`]).
-    pub fn set_session_fast_autocommit(
-        &self,
-        session_id: crate::session::SessionId,
-        value: bool,
-    ) -> Result<()> {
+    pub fn set_session_fast_autocommit(&self, session_id: crate::session::SessionId, value: bool) -> Result<()> {
         let session_lock = self.session_manager.get_session(session_id)?;
         session_lock.write().fast_autocommit = value;
         Ok(())
@@ -14480,7 +14474,9 @@ impl EmbeddedDatabase {
             None if fast => false,
             None => return None,
         };
-        Some(storage::StorageEngine::synchronous_commit_override_guard(Some(effective)))
+        Some(storage::StorageEngine::synchronous_commit_override_guard(Some(
+            effective,
+        )))
     }
 
     /// Execute a statement on behalf of a wire-protocol session.
@@ -14936,9 +14932,16 @@ impl EmbeddedDatabase {
         }
 
         let plan_start = std::time::Instant::now();
-        let mut plan = match plan_override {
-            Some(p) => (**p).clone(),
-            None => (*self.parameterized_plan_cached(sql)?).clone(),
+        // W1.2: hold the cached plan by `Arc` and execute it directly when no
+        // tenant context is active, mirroring the raw `query()` precedent at
+        // lib.rs:13455. `apply_rls_to_plan` is a semantic no-op without a
+        // context (lib.rs:17283), so the deep `LogicalPlan` clone this used to
+        // pay on *every* parameterized statement (10–30 allocations for a
+        // point read) only bought an owned tree for the RLS rewrite — which the
+        // no-context path never performs. Clone lazily, on the RLS branch only.
+        let plan_arc: std::sync::Arc<sql::LogicalPlan> = match plan_override {
+            Some(p) => std::sync::Arc::clone(p),
+            None => self.parameterized_plan_cached(sql)?,
         };
         tracing::debug!(
             phase = "plan",
@@ -14946,23 +14949,33 @@ impl EmbeddedDatabase {
             "Parameterized logical plan ready"
         );
 
-        plan = self.apply_rls_to_plan(plan)?;
+        // `owned_plan` is declared before the borrow so it outlives `plan`; it
+        // is only initialized on the RLS branch, where it is also the only
+        // thing `plan` borrows. Same gating as the raw path: a tenant context
+        // is the sole trigger for the (owning) RLS rewrite.
+        let owned_plan;
+        let plan: &sql::LogicalPlan = if self.tenant_manager.get_current_context().is_none() {
+            &plan_arc
+        } else {
+            owned_plan = self.apply_rls_to_plan((*plan_arc).clone())?;
+            &owned_plan
+        };
 
         if matches!(
-            &plan,
+            plan,
             sql::LogicalPlan::Insert { .. }
                 | sql::LogicalPlan::InsertSelect { .. }
                 | sql::LogicalPlan::Update { .. }
                 | sql::LogicalPlan::Delete { .. }
         ) {
-            let (_count, returned) = self.execute_plan_with_params(&plan, params, None)?;
+            let (_count, returned) = self.execute_plan_with_params(plan, params, None)?;
             self.log_slow_query(sql, start.elapsed(), returned.len() as u64);
             return Ok(returned);
         }
 
         // 4. Execute plan with parameters and return results
         let exec_start = std::time::Instant::now();
-        let results = self.query_plan_with_params(&plan, params, None)?;
+        let results = self.query_plan_with_params(plan, params, None)?;
         tracing::debug!(
             phase = "execute",
             duration_us = exec_start.elapsed().as_micros() as u64,
@@ -14986,13 +14999,18 @@ impl EmbeddedDatabase {
         let mut _txn_guard = None;
         let active_txn: Option<&storage::Transaction> = match session_txn {
             Some(txn) => Some(txn),
-            None => {
-                _txn_guard = Some(
-                    self.current_transaction
-                        .lock(),
-                );
+            // W1.1: mirror the simple-path `global_txn_active` fast-out
+            // (lib.rs:13215) — only touch the `current_transaction` mutex when a
+            // global transaction is actually open. The flag transitions under
+            // that same mutex (begin/commit/rollback at :1939/:1954/:1991), so a
+            // `false` load is exactly the "locked, found None" autocommit outcome
+            // without serializing every parameterized/extended-protocol read on
+            // one global lock.
+            None if self.global_txn_active.load(std::sync::atomic::Ordering::Acquire) => {
+                _txn_guard = Some(self.current_transaction.lock());
                 _txn_guard.as_ref().and_then(|guard| guard.as_ref())
             }
+            None => None,
         };
 
         let mut executor = sql::Executor::with_storage(&self.storage)
@@ -15091,13 +15109,20 @@ impl EmbeddedDatabase {
             opt.optimize_recursive(plan)?
         };
 
-        let txn_lock = self
-            .current_transaction
-            .lock();
+        // W1.1: gate the `current_transaction` mutex on the `global_txn_active`
+        // fast-out (see query_plan_with_params) so autocommit parameterized reads
+        // — the extended/prepared protocol path every driver uses — don't
+        // serialize on one global lock. Flag transitions happen under this mutex,
+        // so a `false` load is the "locked, found None" outcome without locking.
+        let txn_lock = if self.global_txn_active.load(std::sync::atomic::Ordering::Acquire) {
+            Some(self.current_transaction.lock())
+        } else {
+            None
+        };
         let mut executor = sql::Executor::with_storage(&self.storage)
             .with_timeout(self.effective_statement_timeout_ms())
             .with_parameters(params.to_vec());
-        if let Some(txn_ref) = txn_lock.as_ref() {
+        if let Some(txn_ref) = txn_lock.as_ref().and_then(|guard| guard.as_ref()) {
             executor = executor.with_transaction(txn_ref);
         }
         executor.execute_with_columns(&plan)
@@ -17723,10 +17748,7 @@ mod tests {
             Some(("p".to_string(), "SELECT * FROM customers WHERE id = $1"))
         );
         // Case-insensitive AS, extra whitespace.
-        assert_eq!(
-            s("q   as   SELECT 1"),
-            Some(("q".to_string(), "SELECT 1"))
-        );
+        assert_eq!(s("q   as   SELECT 1"), Some(("q".to_string(), "SELECT 1")));
         // The body's own ` AS ` (column alias) must NOT be the split point —
         // only the FIRST whitespace-delimited ` AS ` separates header/body.
         assert_eq!(
@@ -17739,10 +17761,7 @@ mod tests {
         // keyword scanner skips single-quoted literals.
         assert_eq!(
             s("p AS SELECT 'x as y' FROM customers WHERE id = $1"),
-            Some((
-                "p".to_string(),
-                "SELECT 'x as y' FROM customers WHERE id = $1"
-            ))
+            Some(("p".to_string(), "SELECT 'x as y' FROM customers WHERE id = $1"))
         );
         // No standalone AS -> no fast split (caller falls back to the parser).
         assert_eq!(s("p SELECT 1"), None);
@@ -17753,14 +17772,8 @@ mod tests {
         // takes the fast path and yields the SAME (name, body) split. Safe
         // because the body is re-validated downstream and any miss falls back
         // to the parser via Ok(None).
-        assert_eq!(
-            s("p\tAS\tSELECT 1"),
-            Some(("p".to_string(), "SELECT 1"))
-        );
-        assert_eq!(
-            s("p\nAS\nSELECT 1"),
-            Some(("p".to_string(), "SELECT 1"))
-        );
+        assert_eq!(s("p\tAS\tSELECT 1"), Some(("p".to_string(), "SELECT 1")));
+        assert_eq!(s("p\nAS\nSELECT 1"), Some(("p".to_string(), "SELECT 1")));
         // Mixed: space-then-tab around AS still splits identically.
         assert_eq!(
             s("p \tAS\t SELECT * FROM customers WHERE id = $1"),
@@ -28388,7 +28401,10 @@ mod tests {
             &[Some("2"), Some("bob"), None],
             &[Some("3"), Some("o'brien"), Some("-2.25")],
         ]);
-        let n = db.copy_bulk_insert("cbi", &[], &rows).expect("fast path taken").unwrap();
+        let n = db
+            .copy_bulk_insert("cbi", &[], &rows)
+            .expect("fast path taken")
+            .unwrap();
         assert_eq!(n, 3);
 
         let got = db.query("SELECT id, name, score FROM cbi ORDER BY id", &[]).unwrap();
@@ -28432,7 +28448,10 @@ mod tests {
         // Only id + note provided; n must take its default.
         let cols = vec!["id".to_string(), "note".to_string()];
         let rows = copy_rows(&[&[Some("1"), Some("x")], &[Some("2"), None]]);
-        let n = db.copy_bulk_insert("cbi_def", &cols, &rows).expect("fast path taken").unwrap();
+        let n = db
+            .copy_bulk_insert("cbi_def", &cols, &rows)
+            .expect("fast path taken")
+            .unwrap();
         assert_eq!(n, 2);
         let got = db.query("SELECT id, n, note FROM cbi_def ORDER BY id", &[]).unwrap();
         assert_eq!(got[0].values[1], Value::Int4(7));
@@ -28443,7 +28462,8 @@ mod tests {
     #[test]
     fn copy_bulk_insert_not_null_violation_rejects() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE cbi_nn (id INT PRIMARY KEY, n INT NOT NULL)").unwrap();
+        db.execute("CREATE TABLE cbi_nn (id INT PRIMARY KEY, n INT NOT NULL)")
+            .unwrap();
         let rows = copy_rows(&[&[Some("1"), Some("5")], &[Some("2"), None]]);
         let result = db.copy_bulk_insert("cbi_nn", &[], &rows).expect("fast path taken");
         assert!(result.is_err(), "NULL into NOT NULL must reject the whole COPY");
@@ -28460,7 +28480,8 @@ mod tests {
         db.execute("CREATE TABLE cbi_parent (id INT PRIMARY KEY)").unwrap();
         db.execute("CREATE TABLE cbi_child (id INT PRIMARY KEY, pid INT REFERENCES cbi_parent(id))")
             .unwrap();
-        db.execute("CREATE TABLE cbi_chk (id INT PRIMARY KEY, n INT CHECK (n > 0))").unwrap();
+        db.execute("CREATE TABLE cbi_chk (id INT PRIMARY KEY, n INT CHECK (n > 0))")
+            .unwrap();
         let rows = copy_rows(&[&[Some("1"), Some("1")]]);
         assert!(
             db.copy_bulk_insert("cbi_child", &[], &rows).is_none(),
@@ -28494,7 +28515,11 @@ mod tests {
 
         let ts_before = db.storage.current_timestamp();
         let n = db
-            .copy_bulk_insert("cvm", &[], &copy_rows(&[&[Some("1"), Some("10")], &[Some("2"), Some("20")]]))
+            .copy_bulk_insert(
+                "cvm",
+                &[],
+                &copy_rows(&[&[Some("1"), Some("10")], &[Some("2"), Some("20")]]),
+            )
             .expect("fast path taken")
             .unwrap();
         assert_eq!(n, 2);
@@ -28579,7 +28604,10 @@ mod tests {
         // Between COPY and the txn UPDATE: the preserved copy version (10) — the
         // item-#2 regression guard for the transactional mutation path.
         let mid = sm.read_at_snapshot("cvm6", 1, ts_after_copy).unwrap();
-        assert!(mid.is_some(), "txn-path mutation must preserve the copied row for AS-OF");
+        assert!(
+            mid.is_some(),
+            "txn-path mutation must preserve the copied row for AS-OF"
+        );
         let tup: Tuple = bincode::deserialize(&mid.unwrap()).unwrap();
         assert_eq!(tup.values[1], Value::Int4(10), "AS-OF pre-update must see copied 10");
         // Current read reflects the update.
@@ -28599,7 +28627,11 @@ mod tests {
         db.copy_bulk_insert(
             "cvm7",
             &[],
-            &copy_rows(&[&[Some("1"), Some("10")], &[Some("2"), Some("20")], &[Some("3"), Some("30")]]),
+            &copy_rows(&[
+                &[Some("1"), Some("10")],
+                &[Some("2"), Some("20")],
+                &[Some("3"), Some("30")],
+            ]),
         )
         .expect("fast path taken")
         .unwrap();
@@ -28610,7 +28642,10 @@ mod tests {
         let sm = db.storage.snapshot_manager();
         assert!(sm.read_at_snapshot("cvm7", 2, ts_before).unwrap().is_none());
         let mid = sm.read_at_snapshot("cvm7", 2, ts_after_copy).unwrap();
-        assert!(mid.is_some(), "general-path delete must preserve the copied row for AS-OF");
+        assert!(
+            mid.is_some(),
+            "general-path delete must preserve the copied row for AS-OF"
+        );
         let tup: Tuple = bincode::deserialize(&mid.unwrap()).unwrap();
         assert_eq!(tup.values[1], Value::Int4(20));
         let got = db.query("SELECT id FROM cvm7 ORDER BY id", &[]).unwrap();
@@ -28628,9 +28663,13 @@ mod tests {
         db.execute("CREATE TABLE cvm8 (id INT PRIMARY KEY, v INT)").unwrap();
 
         let ts_before = db.storage.current_timestamp();
-        db.copy_bulk_insert("cvm8", &[], &copy_rows(&[&[Some("1"), Some("10")], &[Some("2"), Some("20")]]))
-            .expect("fast path taken")
-            .unwrap();
+        db.copy_bulk_insert(
+            "cvm8",
+            &[],
+            &copy_rows(&[&[Some("1"), Some("10")], &[Some("2"), Some("20")]]),
+        )
+        .expect("fast path taken")
+        .unwrap();
         let ts_after_copy = db.storage.current_timestamp();
 
         db.execute("UPDATE cvm8 SET v = 200 WHERE v = 20").unwrap(); // non-PK -> general path
@@ -28639,7 +28678,10 @@ mod tests {
         assert!(sm.read_at_snapshot("cvm8", 2, ts_before).unwrap().is_none());
         // Between COPY and the general-path UPDATE: the preserved copied value 20.
         let mid = sm.read_at_snapshot("cvm8", 2, ts_after_copy).unwrap();
-        assert!(mid.is_some(), "general-path update must preserve the copied row for AS-OF");
+        assert!(
+            mid.is_some(),
+            "general-path update must preserve the copied row for AS-OF"
+        );
         let tup: Tuple = bincode::deserialize(&mid.unwrap()).unwrap();
         assert_eq!(tup.values[1], Value::Int4(20), "AS-OF pre-update must see copied 20");
         // Current read reflects the update.
@@ -28657,9 +28699,13 @@ mod tests {
         db.execute("CREATE TABLE cvm9 (id INT PRIMARY KEY, v INT)").unwrap();
 
         let ts_before = db.storage.current_timestamp();
-        db.copy_bulk_insert("cvm9", &[], &copy_rows(&[&[Some("1"), Some("10")], &[Some("2"), Some("20")]]))
-            .expect("fast path taken")
-            .unwrap();
+        db.copy_bulk_insert(
+            "cvm9",
+            &[],
+            &copy_rows(&[&[Some("1"), Some("10")], &[Some("2"), Some("20")]]),
+        )
+        .expect("fast path taken")
+        .unwrap();
         let ts_after_copy = db.storage.current_timestamp();
 
         db.execute("TRUNCATE TABLE cvm9").unwrap();
@@ -28669,7 +28715,10 @@ mod tests {
         assert!(sm.read_at_snapshot("cvm9", 1, ts_before).unwrap().is_none());
         // Between COPY and TRUNCATE: the copied values survive AS-OF.
         let r1 = sm.read_at_snapshot("cvm9", 1, ts_after_copy).unwrap();
-        assert!(r1.is_some(), "TRUNCATE must materialize marker rows so AS-OF still resolves them");
+        assert!(
+            r1.is_some(),
+            "TRUNCATE must materialize marker rows so AS-OF still resolves them"
+        );
         let t1: Tuple = bincode::deserialize(&r1.unwrap()).unwrap();
         assert_eq!(t1.values[1], Value::Int4(10));
         let r2 = sm.read_at_snapshot("cvm9", 2, ts_after_copy).unwrap().unwrap();
@@ -28686,8 +28735,10 @@ mod tests {
         // `UPDATE ... SET` was not bound (the SET-subquery sub-executor got no
         // params) → "Parameter $1 not provided". The outer WHERE binds fine.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE t (a TEXT, b TEXT, n INT, PRIMARY KEY(a,b))").unwrap();
-        db.execute("INSERT INTO t (a,b,n) VALUES ('x','1',0),('x','2',0),('y','1',0)").unwrap();
+        db.execute("CREATE TABLE t (a TEXT, b TEXT, n INT, PRIMARY KEY(a,b))")
+            .unwrap();
+        db.execute("INSERT INTO t (a,b,n) VALUES ('x','1',0),('x','2',0),('y','1',0)")
+            .unwrap();
 
         // DISTINCT values so the test detects an off-by-one: the subquery
         // counts a=$1='y' (=1 row), NOT a=$2='x' (=2 rows). Outer targets the
@@ -28722,9 +28773,13 @@ mod tests {
         db.execute("CREATE TABLE cvm3 (id INT PRIMARY KEY, v INT)").unwrap();
 
         let ts_before = db.storage.current_timestamp();
-        db.copy_bulk_insert("cvm3", &[], &copy_rows(&[&[Some("1"), Some("10")], &[Some("2"), Some("20")]]))
-            .expect("fast path taken")
-            .unwrap();
+        db.copy_bulk_insert(
+            "cvm3",
+            &[],
+            &copy_rows(&[&[Some("1"), Some("10")], &[Some("2"), Some("20")]]),
+        )
+        .expect("fast path taken")
+        .unwrap();
         let ts_after_copy = db.storage.current_timestamp();
 
         db.execute("DELETE FROM cvm3 WHERE id = 1").unwrap();
@@ -28756,9 +28811,13 @@ mod tests {
             let db = EmbeddedDatabase::with_config(c).unwrap();
             db.execute("CREATE TABLE cvm4 (id INT PRIMARY KEY, v INT)").unwrap();
             ts_before = db.storage.current_timestamp();
-            db.copy_bulk_insert("cvm4", &[], &copy_rows(&[&[Some("1"), Some("10")], &[Some("2"), Some("20")]]))
-                .expect("fast path taken")
-                .unwrap();
+            db.copy_bulk_insert(
+                "cvm4",
+                &[],
+                &copy_rows(&[&[Some("1"), Some("10")], &[Some("2"), Some("20")]]),
+            )
+            .expect("fast path taken")
+            .unwrap();
             assert_eq!(db.storage.snapshot_manager().debug_copy_marker_len(), 1);
         }
         {
@@ -28768,7 +28827,11 @@ mod tests {
             c.storage.time_travel_enabled = true;
             let db = EmbeddedDatabase::with_config(c).unwrap();
             let sm = db.storage.snapshot_manager();
-            assert_eq!(sm.debug_copy_marker_len(), 1, "marker rebuilt from durable vmeta: on open");
+            assert_eq!(
+                sm.debug_copy_marker_len(),
+                1,
+                "marker rebuilt from durable vmeta: on open"
+            );
             assert!(
                 sm.read_at_snapshot("cvm4", 1, ts_before).unwrap().is_none(),
                 "AS-OF gating must survive reopen"
@@ -28839,7 +28902,8 @@ mod tests {
             assert_eq!(rows[0].values[0], Value::Int4(aid * 100));
             // No per-literal raw plan-cache entry should ever form.
             assert!(
-                !db.plan_cache.contains(&format!("SELECT abalance FROM t WHERE aid = {aid}")),
+                !db.plan_cache
+                    .contains(&format!("SELECT abalance FROM t WHERE aid = {aid}")),
                 "raw literal key must not be plan-cached (aid={aid})"
             );
         }
@@ -28896,15 +28960,16 @@ mod tests {
         // Row-for-row correctness against the genuine raw (non-normalized)
         // execution is the load-bearing property here, not plan sharing.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE q (id INT PRIMARY KEY, grp INT, v INT)").unwrap();
+        db.execute("CREATE TABLE q (id INT PRIMARY KEY, grp INT, v INT)")
+            .unwrap();
         db.execute("CREATE INDEX q_grp ON q(grp)").unwrap();
         for i in 1..=30 {
-            db.execute(&format!("INSERT INTO q VALUES ({i}, {}, {})", i % 3, i * 11)).unwrap();
+            db.execute(&format!("INSERT INTO q VALUES ({i}, {}, {})", i % 3, i * 11))
+                .unwrap();
         }
         let cases: &[(i64, i64, i64)] = &[(1, 4, 0), (1, 2, 3), (1, 0, 100), (1, 50, 0)];
         for &(grp, limit, offset) in cases {
-            let raw =
-                format!("SELECT id FROM q WHERE grp = {grp} ORDER BY id DESC LIMIT {limit} OFFSET {offset}");
+            let raw = format!("SELECT id FROM q WHERE grp = {grp} ORDER BY id DESC LIMIT {limit} OFFSET {offset}");
             let got = db.query(&raw, &[]).unwrap();
             let want = db.query_raw_unnormalized(&raw).unwrap();
             assert_eq!(got, want, "grp={grp} limit={limit} offset={offset}");

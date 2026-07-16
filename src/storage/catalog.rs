@@ -254,6 +254,11 @@ impl<'a> Catalog<'a> {
             }
         }
 
+        // W1.3: a new table flips a prior `Missing` classification; bump so the
+        // existence cache recomputes (covers wire/REPL/HTTP/embedded/restore/
+        // WAL-recovery, which all funnel through this method).
+        self.storage.bump_schema_generation();
+
         Ok(())
     }
 
@@ -371,6 +376,13 @@ impl<'a> Catalog<'a> {
                 .write(batch)
                 .map_err(|e| crate::Error::storage(format!("Batch delete failed: {}", e)))?;
         }
+
+        // W1.3: bump immediately after the metadata delete commits — that is
+        // the point where `table_exists` flips false. The remaining steps
+        // (data-row deletes, sidecar purge) don't change existence and each can
+        // early-return with `?`; bumping here means even those error paths
+        // leave no stale `Table` entry for the dropped table.
+        self.storage.bump_schema_generation();
 
         // Delete all data rows using prefix seek (jumps directly to table's key range)
         // Key format: data:{table_name}:{row_id}
@@ -500,10 +512,7 @@ impl<'a> Catalog<'a> {
     /// or unknown-version record instead of erroring, so a single bad record
     /// degrades to a scan for *that* index rather than aborting the rebuild of
     /// every other index in the database.
-    fn decode_persisted_index_definition(
-        index_name: &str,
-        value: &[u8],
-    ) -> Option<PersistedIndexDefinition> {
+    fn decode_persisted_index_definition(index_name: &str, value: &[u8]) -> Option<PersistedIndexDefinition> {
         // Current tagged format: magic + version byte + bincode(definition).
         if value.len() > INDEX_DEF_MAGIC.len() && value.starts_with(INDEX_DEF_MAGIC) {
             let version = value[INDEX_DEF_MAGIC.len()];
@@ -1225,6 +1234,10 @@ impl<'a> Catalog<'a> {
         self.storage.invalidate_schema_cache(old_name);
         self.storage.cache_schema(new_name, schema);
 
+        // W1.3: rename changes existence for BOTH names (old → Missing,
+        // new → Table); bump so the existence cache recomputes both.
+        self.storage.bump_schema_generation();
+
         Ok(())
     }
 
@@ -1516,8 +1529,8 @@ impl<'a> Catalog<'a> {
     /// `StorageEngine::flush_sequence_state`, which wraps this call.
     pub fn save_sequence_state(&self, name: &str, st: &PersistedSeqState) -> Result<()> {
         let key = Self::sequence_state_key(name);
-        let body = bincode::serialize(st)
-            .map_err(|e| Error::storage(format!("Failed to serialize sequence state: {}", e)))?;
+        let body =
+            bincode::serialize(st).map_err(|e| Error::storage(format!("Failed to serialize sequence state: {}", e)))?;
         let mut value = Vec::with_capacity(SEQ_STATE_MAGIC.len() + 1 + body.len());
         value.extend_from_slice(SEQ_STATE_MAGIC);
         value.push(SEQ_STATE_FORMAT_VERSION);
@@ -2187,7 +2200,10 @@ mod tests {
             options: Vec::new(),
         };
         storage
-            .put(&b"meta:index:legacy_idx".to_vec(), &bincode::serialize(&legacy).unwrap())
+            .put(
+                &b"meta:index:legacy_idx".to_vec(),
+                &bincode::serialize(&legacy).unwrap(),
+            )
             .expect("put legacy");
 
         // A corrupt record — the kind a torn write or a future format change
