@@ -1140,7 +1140,20 @@ impl StorageFilterPushdownRule {
                     | BinaryOperator::LtEq
                     | BinaryOperator::Gt
                     | BinaryOperator::GtEq => {
-                        // Check if it's column vs literal
+                        // Check if it's column vs literal.
+                        //
+                        // W1.4 HISTORY (reverted 2026-07-16): Parameter was
+                        // briefly accepted here so normalized `WHERE c.id = $1`
+                        // could reach FilteredScan/INLJ like its literal twin
+                        // (the pg35 4-table-JOIN parity item). It regressed
+                        // aggregate-less GROUP BY over a projected subset
+                        // (`SELECT a FROM t WHERE tenant = $1 GROUP BY a, b` →
+                        // "Column 'b' not found in schema": projection pruning
+                        // around the FilteredScan shape drops GROUP-BY-only
+                        // keys). Re-land only after FilteredScan+GROUP-BY key
+                        // retention is fixed and tested — see
+                        // docs/plans/PERF_STABILITY_2026_07 (W1.4) and
+                        // tests/v334_t8_mv_group_by_dedup.rs.
                         matches!(
                             (left.as_ref(), right.as_ref()),
                             (LogicalExpr::Column { .. }, LogicalExpr::Literal(v))
@@ -2180,4 +2193,5 @@ mod tests {
         assert!(!rule.is_applicable(&plan));
         assert!(rule.apply(plan, &estimator).unwrap().is_none());
     }
+
 }

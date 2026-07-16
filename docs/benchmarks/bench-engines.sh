@@ -29,6 +29,12 @@ PGHOST="${PGHOST:-127.0.0.1}"; PGPORT="${PGPORT:-25433}"; PGDB="${PGDB:-benchdb}
 PGUSER="${PGUSER:-bench}"; PGPASS="${PGPASS:-benchpass}"
 NANO_USER=bench; NANO_DB=heliosdb
 DUR="${DUR:-8}"; CLIENTS="${CLIENTS:-1 8 16 32 64}"; NANO_PORT0="${NANO_PORT0:-5460}"
+# W1.1 increment-0: pgbench query protocol(s) for the indexed point-read.
+# `simple` is the historical default (unchanged output). `extended`/`prepared`
+# drive the Parse/Bind/Execute path real drivers use — the path whose per-read
+# `current_transaction` mutex W1.1 removes. Measure the concurrency scaling gap
+# with:  PROTOCOLS="simple extended prepared" ./bench-engines.sh ...
+PROTOCOLS="${PROTOCOLS:-simple}"
 W="$(mktemp -d /tmp/bench-engines.XXXXXX)"; trap 'rm -rf "$W"' EXIT
 
 # --- fixtures -----------------------------------------------------------------
@@ -38,10 +44,10 @@ for n in 10000 50000 100000; do
   awk -v n=$n 'BEGIN{for(i=1;i<=n;i++)printf "%d,%d\n",i,(i*7)%100000}' > "$W/ba_$n.csv"
 done
 
-# pgbench TPS+latency for a script. args: host port db passenv script
-sweep(){ local h=$1 p=$2 d=$3 pe=$4 scr=$5 c j out
+# pgbench TPS+latency for a script. args: host port db passenv script [protocol]
+sweep(){ local h=$1 p=$2 d=$3 pe=$4 scr=$5 mode="${6:-simple}" c j out
   for c in $CLIENTS; do j=$(( c<8?c:8 ))
-    out=$(docker run --rm --network host $pe -v "$W":/w "$IMG" pgbench -h "$h" -p "$p" -U "$NANO_USER" -d "$d" -n -f "/w/$scr" -c "$c" -j "$j" -T "$DUR" 2>&1)
+    out=$(docker run --rm --network host $pe -v "$W":/w "$IMG" pgbench -h "$h" -p "$p" -U "$NANO_USER" -d "$d" -M "$mode" -n -f "/w/$scr" -c "$c" -j "$j" -T "$DUR" 2>&1)
     printf '  c=%-3s tps=%-12s lat=%sms\n' "$c" \
       "$(printf '%s' "$out"|grep -oE 'tps = [0-9.]+'|head -1|grep -oE '[0-9.]+')" \
       "$(printf '%s' "$out"|grep -oE 'latency average = [0-9.]+'|head -1|grep -oE '[0-9.]+')"
@@ -60,7 +66,10 @@ storage(){ local h=$1 p=$2 d=$3 pe=$4
     done
     $P -qc "DROP TABLE IF EXISTS t50; ALTER TABLE t50000 RENAME TO t50" >/dev/null 2>&1
     $P -qc "CREATE INDEX i50 ON t50(aid)" >/dev/null 2>&1'
-  echo "  indexed point-read (50k rows):"; sweep "$h" "$p" "$d" "$pe" s_read.sql
+  for proto in $PROTOCOLS; do
+    echo "  indexed point-read (50k rows) [proto=$proto]:"
+    sweep "$h" "$p" "$d" "$pe" s_read.sql "$proto"
+  done
   echo "  DROP TABLE (100k rows -> ms):"
   docker run --rm --network host $pe -v "$W":/w "$IMG" bash -c '
     P="psql -h '"$h"' -p '"$p"' -U '"$NANO_USER"' -d '"$d"'"

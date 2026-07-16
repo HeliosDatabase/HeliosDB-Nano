@@ -317,6 +317,10 @@ impl ReplShell {
                     self.current_branch = branch_name.clone();
                     // Sync branch context to storage layer
                     self.db.storage.set_current_branch(Some(branch_name.clone()));
+                    // This pre-detect bypasses execute(), so it must mirror the
+                    // UseBranch cache invalidation itself: results/plans cached
+                    // on the previous branch must not survive the switch.
+                    self.db.invalidate_plan_cache();
                     println!("{}", format!("Switched to branch: {}", branch_name).green());
 
                     // Show isolation status
