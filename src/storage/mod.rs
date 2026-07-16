@@ -79,7 +79,7 @@ pub use dump::{
     DumpReport, DumpType, RestoreOptions, RestoreReport,
 };
 pub(crate) use engine::{ColumnarAggregateOp, ColumnarAggregateSpec};
-pub use engine::{DirectBulkLoadResult, StorageEngine, StorageStats, SynchronousCommitOverrideGuard};
+pub use engine::{DirectBulkLoadResult, StorageEngine, StorageStats, SynchronousCommitOverrideGuard, TableKind};
 pub use gin_index::{GinIndex, GinIndexStats};
 pub use index_snapshot::{IndexOpenReport, IndexSnapshotPersistReport};
 pub use lock_manager::{LockGuard, LockManager, LockState, LockType};

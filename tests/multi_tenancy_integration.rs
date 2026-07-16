@@ -9,7 +9,7 @@
 //! - Cross-tenant data isolation
 
 use heliosdb_nano::tenant::{ChangeType, IsolationMode, RLSCommand, ResourceLimits, TenantContext};
-use heliosdb_nano::{EmbeddedDatabase, Result};
+use heliosdb_nano::{EmbeddedDatabase, Result, Value};
 
 // ============================================================================
 // Test Utilities
@@ -807,6 +807,138 @@ fn test_17_concurrent_context_switching() {
     }
 
     println!("✓ Successfully switched contexts {} times", tenants.len());
+}
+
+// ============================================================================
+// 7. W1.2 — PARAMETERIZED-PATH RLS GUARD (LogicalPlan Arc fast path)
+// ============================================================================
+
+/// W1.2 guard: `query_params` (the parameterized/extended-protocol path) must
+/// still apply RLS whenever a tenant context is active. W1.2 lets that path
+/// execute the cached plan straight from its `Arc` — skipping the deep clone
+/// and the RLS rewrite — ONLY when no tenant context is set. This test proves
+/// the RLS rewrite is NOT skipped when a context IS set (a naive fast path that
+/// always took the Arc branch would leak Tenant B's row and fail here).
+///
+/// Note: this is a behavior-preserving optimization, so the assertions pass on
+/// both the pre- and post-W1.2 code; they flip only against an *incorrect*
+/// widening of the fast path. The raw `query()` oracle below (which already
+/// Arc-executes + gates RLS on the same condition, lib.rs:13455) pins the
+/// parameterized result to the established-correct path.
+#[test]
+fn test_18_rls_applies_to_parameterized_select() {
+    println!("\n=== TEST 18: RLS on Parameterized SELECT (W1.2) ===");
+
+    let db = setup_test_db().unwrap();
+    create_test_table(&db).unwrap();
+
+    let tenant_a = db
+        .tenant_manager
+        .register_tenant("tenant-a".to_string(), IsolationMode::SharedSchema);
+    let tenant_b = db
+        .tenant_manager
+        .register_tenant("tenant-b".to_string(), IsolationMode::SharedSchema);
+
+    // Insert rows for both tenants with NO context set (unfiltered writes).
+    db.execute(&format!(
+        "INSERT INTO sales VALUES (1, '{}', 'Laptop', 1200)",
+        tenant_a.id
+    ))
+    .unwrap();
+    db.execute(&format!(
+        "INSERT INTO sales VALUES (2, '{}', 'Desktop', 1500)",
+        tenant_b.id
+    ))
+    .unwrap();
+
+    // RLS SELECT policy restricting visibility to Tenant A.
+    db.tenant_manager.create_rls_policy(
+        "sales".to_string(),
+        "tenant_a_select".to_string(),
+        "Tenant A isolation".to_string(),
+        RLSCommand::Select,
+        format!("tenant_id = '{}'", tenant_a.id),
+        None,
+    );
+
+    // Activate the Tenant A context.
+    db.tenant_manager.set_current_context(TenantContext {
+        tenant_id: tenant_a.id,
+        user_id: "user@acme.com".to_string(),
+        roles: vec!["admin".to_string()],
+        isolation_mode: IsolationMode::SharedSchema,
+    });
+
+    // Explicit column list (not `SELECT *`) so `try_fast_select_params` bails
+    // and execution reaches the `query_params_inner` plan+RLS path W1.2 edits.
+    let rows = db
+        .query_params("SELECT id, tenant_id, product, amount FROM sales ORDER BY id", &[])
+        .unwrap();
+
+    // Only Tenant A's row is visible; Tenant B's row is filtered out by RLS.
+    assert_eq!(rows.len(), 1, "RLS must restrict the parameterized SELECT to Tenant A");
+    assert_eq!(rows[0].get(1).unwrap(), &Value::String(tenant_a.id.to_string()));
+
+    // Oracle: the raw `query()` path agrees row-for-row, proving the
+    // parameterized fast path did not diverge from the reference RLS path.
+    let via_raw = db
+        .query("SELECT id, tenant_id, product, amount FROM sales ORDER BY id", &[])
+        .unwrap();
+    assert_eq!(
+        via_raw.len(),
+        rows.len(),
+        "raw and parameterized RLS results must agree"
+    );
+    assert_eq!(via_raw[0].values, rows[0].values);
+
+    db.tenant_manager.clear_current_context();
+    println!("✓ RLS correctly applied on the parameterized SELECT path");
+}
+
+/// W1.2: without a tenant context, `query_params` takes the no-clone `Arc` fast
+/// path. It must return the full, unfiltered result — identical to the raw
+/// `query()` path (differential equivalence of the two read paths).
+#[test]
+fn test_19_parameterized_select_without_context_returns_all() {
+    println!("\n=== TEST 19: Parameterized SELECT without context (W1.2) ===");
+
+    let db = setup_test_db().unwrap();
+    create_test_table(&db).unwrap();
+
+    let tenant_a = db
+        .tenant_manager
+        .register_tenant("tenant-a".to_string(), IsolationMode::SharedSchema);
+    let tenant_b = db
+        .tenant_manager
+        .register_tenant("tenant-b".to_string(), IsolationMode::SharedSchema);
+
+    db.execute(&format!(
+        "INSERT INTO sales VALUES (1, '{}', 'Laptop', 1200)",
+        tenant_a.id
+    ))
+    .unwrap();
+    db.execute(&format!(
+        "INSERT INTO sales VALUES (2, '{}', 'Desktop', 1500)",
+        tenant_b.id
+    ))
+    .unwrap();
+
+    // No context → the fast path must not clone and must not filter.
+    assert!(db.tenant_manager.get_current_context().is_none());
+
+    let via_params = db
+        .query_params("SELECT id, tenant_id, product, amount FROM sales ORDER BY id", &[])
+        .unwrap();
+    let via_raw = db
+        .query("SELECT id, tenant_id, product, amount FROM sales ORDER BY id", &[])
+        .unwrap();
+
+    assert_eq!(via_params.len(), 2, "no-context fast path must return all rows");
+    assert_eq!(via_params.len(), via_raw.len());
+    assert_eq!(via_params[0].values, via_raw[0].values);
+    assert_eq!(via_params[1].values, via_raw[1].values);
+
+    println!("✓ No-context parameterized SELECT returns the full result set");
 }
 
 // ============================================================================

@@ -1140,13 +1140,25 @@ impl StorageFilterPushdownRule {
                     | BinaryOperator::LtEq
                     | BinaryOperator::Gt
                     | BinaryOperator::GtEq => {
-                        // Check if it's column vs literal
-                        matches!(
-                            (left.as_ref(), right.as_ref()),
+                        // Column vs literal/parameter. A NULL *literal* is
+                        // excluded at plan time (`col = NULL` is UNKNOWN → zero
+                        // rows, no scan needed). A `Parameter` carries no
+                        // plan-time value, so accept it here and resolve
+                        // NULL-ness at runtime: the storage-safety gate
+                        // (`storage_predicates_are_sql_safe`) and the
+                        // index-probe helpers (`indexed_equality_lookup` /
+                        // `indexed_range_lookup` plus the evaluator re-filter)
+                        // treat a NULL-resolved bound as matching nothing. This
+                        // lets normalized `WHERE c.id = $1` reach FilteredScan so
+                        // multi-joins choose index-nested-loop exactly like their
+                        // literal twins (W1.4).
+                        match (left.as_ref(), right.as_ref()) {
                             (LogicalExpr::Column { .. }, LogicalExpr::Literal(v))
-                                | (LogicalExpr::Literal(v), LogicalExpr::Column { .. })
-                                if !matches!(v, crate::Value::Null)
-                        )
+                            | (LogicalExpr::Literal(v), LogicalExpr::Column { .. }) => !matches!(v, crate::Value::Null),
+                            (LogicalExpr::Column { .. }, LogicalExpr::Parameter { .. })
+                            | (LogicalExpr::Parameter { .. }, LogicalExpr::Column { .. }) => true,
+                            _ => false,
+                        }
                     }
                     // AND predicates can be pushed if all parts can be pushed
                     BinaryOperator::And => Self::can_push_predicate(left) && Self::can_push_predicate(right),
@@ -2179,5 +2191,46 @@ mod tests {
 
         assert!(!rule.is_applicable(&plan));
         assert!(rule.apply(plan, &estimator).unwrap().is_none());
+    }
+
+    /// W1.4: a normalized `WHERE col = $1` must reach FilteredScan so a
+    /// multi-join can pick index-nested-loop like its literal twin. Pre-change,
+    /// `can_push_predicate` matched only `(Column, Literal)`, so `is_applicable`
+    /// was false and `apply` returned `None` (the filter stayed above a plain
+    /// Scan and the join fell back to hash/nested-loop).
+    #[test]
+    fn storage_pushdown_accepts_parameter_equality() {
+        let rule = StorageFilterPushdownRule::new();
+        let estimator = CostEstimator::new(StatsCatalog::new());
+        let plan = LogicalPlan::Filter {
+            input: Box::new(make_scan("t")),
+            predicate: binary(col("t", "id"), BinaryOperator::Eq, LogicalExpr::Parameter { index: 1 }),
+        };
+
+        assert!(rule.is_applicable(&plan), "Column = $1 must be pushable (W1.4)");
+        assert!(
+            matches!(
+                rule.apply(plan, &estimator).unwrap(),
+                Some(LogicalPlan::FilteredScan { .. })
+            ),
+            "Column = $1 must become FilteredScan (was Filter{{Scan}} pre-W1.4)"
+        );
+    }
+
+    /// Mirror side (`$1 = col`) — the literal path accepts both orderings, so
+    /// the parameter path must too.
+    #[test]
+    fn storage_pushdown_accepts_parameter_equality_reversed() {
+        let rule = StorageFilterPushdownRule::new();
+        let estimator = CostEstimator::new(StatsCatalog::new());
+        let plan = LogicalPlan::Filter {
+            input: Box::new(make_scan("t")),
+            predicate: binary(LogicalExpr::Parameter { index: 1 }, BinaryOperator::Eq, col("t", "id")),
+        };
+
+        assert!(matches!(
+            rule.apply(plan, &estimator).unwrap(),
+            Some(LogicalPlan::FilteredScan { .. })
+        ));
     }
 }
