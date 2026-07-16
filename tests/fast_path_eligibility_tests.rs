@@ -18,7 +18,7 @@
 
 mod test_helpers;
 
-use heliosdb_nano::{Result, Value};
+use heliosdb_nano::{Config, EmbeddedDatabase, Result, Value};
 use test_helpers::create_test_db;
 
 // ============================================================================
@@ -360,5 +360,140 @@ fn mixed_workload_end_state_equivalence() -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+// ============================================================================
+// W1.3: generation-stamped catalog-existence cache. The indexed point/IN/range
+// fast paths now classify a table via `StorageEngine::cached_table_kind`
+// (generation-stamped) instead of two RocksDB metadata point-gets per probe.
+// These are end-to-end correctness guards: an existence-changing DDL or branch
+// switch must invalidate the cache so a probe never serves a stale
+// classification (which would fast-path a dropped/replaced table).
+// ============================================================================
+
+#[test]
+fn dropped_table_point_requery_is_clean_not_stale() -> Result<()> {
+    let db = create_test_db()?;
+    db.execute("CREATE TABLE cache_probe (id INT PRIMARY KEY, v TEXT)")?;
+    db.execute("INSERT INTO cache_probe (id, v) VALUES (1, 'a')")?;
+
+    // Prime the indexed point-read fast path (populates the existence cache
+    // entry for `cache_probe` as a regular Table).
+    let rows = db.query("SELECT * FROM cache_probe WHERE id = 1", &[])?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get(1).unwrap(), &Value::String("a".to_string()));
+
+    // DROP bumps the schema generation; the immediate re-query of the same
+    // indexed point-read shape must NOT serve a stale fast-path hit.
+    db.execute("DROP TABLE cache_probe")?;
+    let requery = db.query("SELECT * FROM cache_probe WHERE id = 1", &[]);
+    assert!(
+        requery.is_err(),
+        "querying a dropped table must error, not return a stale fast-path row"
+    );
+    Ok(())
+}
+
+#[test]
+fn dropped_table_range_requery_is_clean_not_stale() -> Result<()> {
+    // Exercises the third probe site (indexed range scan fast path).
+    let db = create_test_db()?;
+    db.execute("CREATE TABLE range_probe (id INT PRIMARY KEY, v TEXT)")?;
+    for id in 1..=5 {
+        db.execute(&format!("INSERT INTO range_probe (id, v) VALUES ({id}, 'r{id}')"))?;
+    }
+
+    // Prime the range fast path.
+    let rows = db.query("SELECT * FROM range_probe WHERE id >= 2 AND id <= 4", &[])?;
+    assert_eq!(rows.len(), 3);
+
+    db.execute("DROP TABLE range_probe")?;
+    let requery = db.query("SELECT * FROM range_probe WHERE id >= 2 AND id <= 4", &[]);
+    assert!(
+        requery.is_err(),
+        "range query on a dropped table must error, not return stale rows"
+    );
+    Ok(())
+}
+
+#[test]
+fn recreated_table_after_drop_reads_fresh_rows() -> Result<()> {
+    // DROP + CREATE the same name: the fast path must read the NEW table's
+    // rows, never a stale classification pointing at the old table.
+    let db = create_test_db()?;
+    db.execute("CREATE TABLE rc (id INT PRIMARY KEY, v INT)")?;
+    db.execute("INSERT INTO rc (id, v) VALUES (1, 100)")?;
+    assert_eq!(
+        db.query("SELECT * FROM rc WHERE id = 1", &[])?[0].get(1).unwrap(),
+        &Value::Int4(100)
+    );
+
+    db.execute("DROP TABLE rc")?;
+    db.execute("CREATE TABLE rc (id INT PRIMARY KEY, v INT)")?;
+    db.execute("INSERT INTO rc (id, v) VALUES (1, 200)")?;
+
+    let rows = db.query("SELECT * FROM rc WHERE id = 1", &[])?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].get(1).unwrap(),
+        &Value::Int4(200),
+        "re-created table must read fresh rows, not a stale cached probe"
+    );
+    Ok(())
+}
+
+#[test]
+fn matview_probe_after_create_honors_mv_semantics() -> Result<()> {
+    let db = create_test_db()?;
+    db.execute("CREATE TABLE base (id INT PRIMARY KEY, v INT)")?;
+    db.execute("INSERT INTO base (id, v) VALUES (1, 10)")?;
+    db.execute("INSERT INTO base (id, v) VALUES (2, 20)")?;
+
+    // CREATE MATERIALIZED VIEW bumps the generation; a subsequent probe of the
+    // view name must classify it as a materialized view (bail the plain-table
+    // fast path) and resolve via MV semantics.
+    db.execute("CREATE MATERIALIZED VIEW mv AS SELECT id, v FROM base")?;
+    let rows = db.query("SELECT * FROM mv WHERE id = 1", &[])?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get(1).unwrap(), &Value::Int4(10));
+    Ok(())
+}
+
+#[test]
+fn indexed_point_read_correct_across_branch_switch() -> Result<()> {
+    // A branch switch changes catalog/data visibility without table DDL. The
+    // existence cache must not leak wrong-branch classification: after a switch
+    // the point-read fast path must serve the active branch's rows.
+    let mut config = Config::default();
+    config.storage.memory_only = true;
+    config.storage.wal_enabled = false;
+    let db = EmbeddedDatabase::with_config(config).expect("create in-memory db");
+
+    db.execute("CREATE TABLE acct (id INT PRIMARY KEY, bal INT)")?;
+    db.execute("INSERT INTO acct (id, bal) VALUES (1, 100)")?;
+    // Prime the fast path + existence cache on main.
+    assert_eq!(
+        db.query("SELECT * FROM acct WHERE id = 1", &[])?[0].get(1).unwrap(),
+        &Value::Int4(100)
+    );
+
+    db.execute("CREATE BRANCH b1 AS OF NOW")?;
+    db.execute("USE BRANCH b1")?;
+    db.execute("UPDATE acct SET bal = 999 WHERE id = 1")?;
+    assert_eq!(
+        db.query("SELECT * FROM acct WHERE id = 1", &[])?[0].get(1).unwrap(),
+        &Value::Int4(999),
+        "branch must see its own update"
+    );
+
+    db.execute("USE BRANCH main")?;
+    let rows = db.query("SELECT * FROM acct WHERE id = 1", &[])?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].get(1).unwrap(),
+        &Value::Int4(100),
+        "main must read its own row after branch switch, not the branch's value"
+    );
     Ok(())
 }

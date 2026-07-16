@@ -175,7 +175,21 @@ pub(crate) fn storage_predicates_are_sql_safe(schema: &Schema, predicates: &[Ana
                 .value_list
                 .iter()
                 .all(|value| storage_filter_value_matches_type(&column.data_type, value)),
-            _ => storage_filter_value_matches_type(&column.data_type, &predicate.value),
+            // A comparison bound (Eq/NotEq/Lt/LtEq/Gt/GtEq) that resolved to
+            // NULL only reaches here via a parameterized predicate whose $n was
+            // NULL at runtime — literal NULLs are rejected at plan time in
+            // `can_push_predicate`. SQL three-valued logic makes `col <op> NULL`
+            // UNKNOWN → zero rows, but the SIMD/columnar kernels compare NULL
+            // structurally (`FilterPredicate::compare_eq(NULL, NULL) == true`),
+            // so they must not evaluate it. Marking it unsafe routes the whole
+            // predicate back to the executor's NULL-correct evaluator
+            // (`filter_tuples_with_evaluator`), which drops UNKNOWN rows exactly
+            // like the literal `= NULL` path. Mirrors the NULL rejection in
+            // `rowstore_aggregate_predicates_are_sql_safe`.
+            _ => {
+                !matches!(predicate.value, Value::Null)
+                    && storage_filter_value_matches_type(&column.data_type, &predicate.value)
+            }
         }
     })
 }
@@ -287,8 +301,7 @@ pub(super) fn try_index_point_lookup_for_scan(
     }
     if as_of.is_some()
         || executor.get_cte(table_name).is_some()
-        || storage.mv_catalog().view_exists(table_name)?
-        || !storage.catalog().table_exists(table_name)?
+        || storage.cached_table_kind(table_name)? != crate::storage::TableKind::Table
     {
         return Ok(None);
     }
@@ -416,16 +429,19 @@ pub(super) fn try_index_in_list_for_scan(
     }
     if as_of.is_some()
         || executor.get_cte(table_name).is_some()
-        || storage.mv_catalog().view_exists(table_name)?
-        || !storage.catalog().table_exists(table_name)?
+        || storage.cached_table_kind(table_name)? != crate::storage::TableKind::Table
     {
         return Ok(None);
     }
 
     let materialized_predicate = executor.materialize_subqueries(predicate)?;
-    let Some((index_name, lookup_values)) =
-        indexed_in_list_lookup(storage, table_name, schema.as_ref(), &materialized_predicate, executor.parameters())
-    else {
+    let Some((index_name, lookup_values)) = indexed_in_list_lookup(
+        storage,
+        table_name,
+        schema.as_ref(),
+        &materialized_predicate,
+        executor.parameters(),
+    ) else {
         return Ok(None);
     };
 
@@ -453,8 +469,12 @@ pub(super) fn try_index_in_list_for_scan(
     let actual_schema = Arc::new(schema_with_source(schema.as_ref(), source_name, table_name));
     // Re-filter with the full predicate: an `IN (…) AND other` keeps `other`,
     // and this is the correctness backstop for the index probe.
-    let tuples =
-        filter_tuples_with_evaluator(tuples, actual_schema.clone(), &materialized_predicate, executor.parameters())?;
+    let tuples = filter_tuples_with_evaluator(
+        tuples,
+        actual_schema.clone(),
+        &materialized_predicate,
+        executor.parameters(),
+    )?;
 
     Ok(Some(Box::new(
         ScanOperator::new(
@@ -772,8 +792,7 @@ pub(super) fn try_index_range_scan_for_scan(
         return Ok(None);
     }
     if executor.get_cte(table_name).is_some()
-        || storage.mv_catalog().view_exists(table_name)?
-        || !storage.catalog().table_exists(table_name)?
+        || storage.cached_table_kind(table_name)? != crate::storage::TableKind::Table
     {
         return Ok(None);
     }
@@ -2382,11 +2401,36 @@ pub(super) fn handle_filtered_scan(executor: &Executor, plan: &LogicalPlan) -> R
 
             // Analyze the predicate for storage-level pushdown
             let analyzed_predicates = if let Some(ref pred) = materialized_predicate {
-                storage.predicate_pushdown().analyze_predicate(pred, &schema, executor.parameters())
+                storage
+                    .predicate_pushdown()
+                    .analyze_predicate(pred, &schema, executor.parameters())
             } else {
                 Vec::new()
             };
-            let storage_predicates_safe = storage_predicates_are_sql_safe(&schema, &analyzed_predicates);
+            // W1.4 review: `can_push_predicate` now accepts `(Column, Parameter)`,
+            // so a conjunct can carry a `$n` whose index is out of range of the
+            // bound params (e.g. `WHERE note = $2` with one param). At runtime
+            // `resolve_pushdown_value` returns None, `extract_comparison` drops
+            // that conjunct, and `analyzed_predicates` ends up SHORTER than the
+            // predicate — a (possibly empty) set that `storage_predicates_are_sql_safe`
+            // calls vacuously safe, which would skip the evaluator re-filter below
+            // and return the dropped conjunct's rows unfiltered. Extraction yields
+            // at most one `AnalyzedPredicate` per And-flattened conjunct, so fewer
+            // analyzed than conjuncts means a conjunct was silently dropped: treat
+            // the pushdown as unsafe so the re-filter re-applies the FULL predicate
+            // (reproducing the pre-widening `Parameter $n not provided` error, and
+            // healing latent extract_* misses like a non-string LIKE pattern). A
+            // no-op for fully-resolvable plans, where every conjunct extracts.
+            let extraction_complete = match materialized_predicate {
+                Some(ref pred) => {
+                    let mut conjuncts = Vec::new();
+                    flatten_and(pred, &mut conjuncts);
+                    analyzed_predicates.len() == conjuncts.len()
+                }
+                None => true,
+            };
+            let storage_predicates_safe =
+                extraction_complete && storage_predicates_are_sql_safe(&schema, &analyzed_predicates);
             let pushed_predicates = if storage_predicates_safe {
                 analyzed_predicates.as_slice()
             } else {
