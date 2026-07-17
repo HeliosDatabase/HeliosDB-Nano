@@ -723,6 +723,13 @@ impl Transaction {
         // loop so a no-COPY commit pays one atomic load, not a `data:`-key parse
         // per write. Only when markers exist do we parse keys + materialize.
         let check_copy_markers = self.versioning_enabled && self.snapshot_manager.has_any_copy_markers();
+        // W3.2: `elide` decides whether NEW versions written this commit skip the
+        // `v:` copy (flagged `v_idx:` event). `check_elided` decides whether an
+        // OVERWRITE must first materialize a prior flagged event — armed whenever
+        // any flagged row might exist, including ones a prior session left when
+        // this session has elision off (`maybe_elided_rows` ⊇ `elide_latest_version`).
+        let elide = self.versioning_enabled && self.snapshot_manager.elide_latest_version();
+        let check_elided = self.versioning_enabled && self.snapshot_manager.maybe_elided_rows();
         let mut version_key_buf = Vec::with_capacity(128);
         let mut version_index_key_buf = Vec::with_capacity(128);
 
@@ -737,6 +744,7 @@ impl Transaction {
                     key,
                     val,
                     self.versioning_enabled,
+                    elide,
                     commit_ts_text.as_bytes(),
                     reverse_ts_text.as_bytes(),
                     &commit_ts_bytes,
@@ -758,25 +766,35 @@ impl Transaction {
             {
                 touches_columnar = true;
             }
-            // Item #2: this commit is about to write the mutation's own version
-            // at `commit_ts` for a `data:` row. If that row is still covered by
-            // a COPY marker (its per-row `v:`/`v_idx:` were elided at COPY),
-            // stage the copy insert version FROM the pre-commit `data:` value
-            // into the SAME batch first — otherwise AS-OF reads in
-            // [copy_ts, commit_ts) would find only the new version and treat the
-            // row as not-yet-existing. Gated on `check_copy_markers` (hoisted
-            // above) so no-COPY commits skip the key parse entirely.
-            if check_copy_markers {
+            // This commit is about to overwrite/delete this entry's `data:` row.
+            // BEFORE it does, stage the pre-image version(s) into the SAME batch
+            // (crash-atomic), so AS-OF reads predating this commit still resolve:
+            //   * Item #2 — a COPY marker-covered row (its per-row `v:`/`v_idx:`
+            //     were elided at COPY) gets its insert version from the pre-commit
+            //     `data:`; else [copy_ts, commit_ts) would find no version.
+            //   * W3.2 — a prior FLAGGED (elided) version of the row is
+            //     materialized to a real `v:` with the flag cleared.
+            // Both gates are hoisted above, so a plain commit parses no key.
+            if check_copy_markers || check_elided {
                 if let Some(rest) = key.strip_prefix(b"data:".as_slice()) {
                     if let Ok(text) = std::str::from_utf8(rest) {
                         if let Some(pos) = text.rfind(':') {
                             if let Ok(row_id) = text[pos + 1..].parse::<u64>() {
-                                self.snapshot_manager.materialize_copy_marker_row(
-                                    &mut batch,
-                                    &text[..pos],
-                                    row_id,
-                                    commit_ts,
-                                )?;
+                                if check_copy_markers {
+                                    self.snapshot_manager.materialize_copy_marker_row(
+                                        &mut batch,
+                                        &text[..pos],
+                                        row_id,
+                                        commit_ts,
+                                    )?;
+                                }
+                                if check_elided {
+                                    self.snapshot_manager.materialize_elided_latest_version(
+                                        &mut batch,
+                                        &text[..pos],
+                                        row_id,
+                                    )?;
+                                }
                             }
                         }
                     }
@@ -789,6 +807,7 @@ impl Transaction {
                         key,
                         val,
                         self.versioning_enabled,
+                        elide,
                         commit_ts_text.as_bytes(),
                         reverse_ts_text.as_bytes(),
                         &commit_ts_bytes,
@@ -972,6 +991,7 @@ impl Transaction {
         key: &[u8],
         val: &[u8],
         versioning_enabled: bool,
+        elide: bool,
         commit_ts_text: &[u8],
         reverse_ts_text: &[u8],
         commit_ts_bytes: &[u8; 8],
@@ -998,6 +1018,7 @@ impl Transaction {
                 batch,
                 key,
                 val,
+                elide,
                 commit_ts_text,
                 reverse_ts_text,
                 commit_ts_bytes,
@@ -1011,6 +1032,7 @@ impl Transaction {
         batch: &mut rocksdb::WriteBatch,
         key: &[u8],
         val: &[u8],
+        elide: bool,
         commit_ts_text: &[u8],
         reverse_ts_text: &[u8],
         commit_ts_bytes: &[u8; 8],
@@ -1029,14 +1051,21 @@ impl Transaction {
             return;
         }
 
-        version_key_buf.clear();
-        version_key_buf.extend_from_slice(b"v:");
-        version_key_buf.extend_from_slice(table_name);
-        version_key_buf.push(b':');
-        version_key_buf.extend_from_slice(row_id);
-        version_key_buf.push(b':');
-        version_key_buf.extend_from_slice(commit_ts_text);
-        batch.put(&version_key_buf, val);
+        // W3.2: when eliding, skip the `v:` copy entirely and flag the `v_idx:`
+        // event value's high bit; the value is served from `data:` (this commit's
+        // `data:` put, same batch) until the row's first later overwrite
+        // materializes the real `v:`. `elide` mirrors the value the row-store /
+        // `append_version_snapshot_to_batch` funnel writes for the fast path.
+        if !elide {
+            version_key_buf.clear();
+            version_key_buf.extend_from_slice(b"v:");
+            version_key_buf.extend_from_slice(table_name);
+            version_key_buf.push(b':');
+            version_key_buf.extend_from_slice(row_id);
+            version_key_buf.push(b':');
+            version_key_buf.extend_from_slice(commit_ts_text);
+            batch.put(&version_key_buf, val);
+        }
 
         version_index_key_buf.clear();
         version_index_key_buf.extend_from_slice(b"v_idx:");
@@ -1045,15 +1074,25 @@ impl Transaction {
         version_index_key_buf.extend_from_slice(row_id);
         version_index_key_buf.push(b':');
         version_index_key_buf.extend_from_slice(reverse_ts_text);
-        batch.put(&version_index_key_buf, commit_ts_bytes);
+        // Big-endian `commit_ts`, high bit = elided flag (see
+        // `time_travel::VERSION_VALUE_ELIDED_FLAG`). Byte 0 is the MSB.
+        let mut index_value = *commit_ts_bytes;
+        if elide {
+            if let Some(b0) = index_value.first_mut() {
+                *b0 |= 0x80;
+            }
+        }
+        batch.put(&version_index_key_buf, index_value);
 
-        // W3.2: version-chain bytes for the buffered commit path. `v:` value ==
-        // the row payload (`val`) — the byte-identical duplicate W3.2 quantifies.
+        // W3.2: version-chain bytes for the buffered commit path. With elision on
+        // the `v:` copy is gone, so this collapses to the `v_idx:` event size.
         if crate::write_volume::enabled() {
-            crate::write_volume::add(
-                crate::write_volume::Category::Version,
-                (version_key_buf.len() + val.len() + version_index_key_buf.len() + commit_ts_bytes.len()) as u64,
-            );
+            let version_bytes = if elide {
+                (version_index_key_buf.len() + index_value.len()) as u64
+            } else {
+                (version_key_buf.len() + val.len() + version_index_key_buf.len() + index_value.len()) as u64
+            };
+            crate::write_volume::add(crate::write_volume::Category::Version, version_bytes);
         }
     }
 

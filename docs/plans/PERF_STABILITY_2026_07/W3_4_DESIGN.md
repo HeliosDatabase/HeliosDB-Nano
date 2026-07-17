@@ -347,3 +347,52 @@ clear consistency + a per-`DataType` encode differential), then re-runs
 `heliosdb_copy_phase_stats` to confirm `art_maintain` share drops. §3.4 (batched tree
 locking) is pursued only if the counters attribute `art_maintain` to per-row lock/insert
 overhead after §3.2 removes the map scan.
+
+### 5.1 GO record — IMPLEMENTED 2026-07-17 (branch `perf/w3-impl-2026-07-17`)
+
+Verdict **GO** (§1.4: 15.8% unconstrained / 9.1% constrained, both ≥8%). Shipped:
+
+- **§3.2 per-table entry list.** New `ArtIndexManager::table_indexes:
+  RwLock<HashMap<String, Vec<String>>>` covering ALL index kinds incl. Manual.
+  Maintained (leaf lock, never held with `indexes` or a tree → no new lock rank) at
+  every register (`create_pk/fk/unique/manual_index`), single drop (`drop_index`) and
+  rename (`rename_table_indexes`) choke point; `clear_table_indexes` (TRUNCATE) leaves
+  it untouched by design. The DML mutation loops — `on_insert`, `on_insert_tuple`,
+  `on_insert_tuple_collect_index_values`, `on_delete`, `on_delete_tuple` (and
+  `on_update` via delete+insert) — now resolve a table's own indexes from it in
+  O(own indexes) instead of scanning the global map. Consistency test asserts
+  register/drop/rename/clear each leave `table_indexes` identical to a full `indexes`
+  filter (incl. the Manual index the partial maps omit).
+- **§3.3 encode-once.** Per-row per-column value encoding is hoisted into a row-scoped
+  `(column, escape) → fragment` cache (`encode_fragment` / `encode_key_cached`), reused
+  across a table's indexes; engaged only when a table has >1 index (single-index tables
+  keep the original direct encode, zero overhead). Output is BYTE-IDENTICAL to
+  `encode_key_from_values` — proven by a per-`DataType`, single- and multi-column
+  differential test (the cache keys on `escape` because single-column keys are never
+  escaped while multi-column keys are).
+- **§3.4 (batched tree locking): evaluated, NOT taken.** The cheap form (one tree lock
+  per index per batch) does not fall out naturally — it needs an index-outer/row-inner
+  loop, which conflicts with §3.3's row-outer/index-inner encode-once sharing, and
+  reconciling them by buffering all `(key,row_id)` pairs is O(N·k_own) memory, not
+  "cheap". What DID fall out: a batch entry point `on_insert_tuples` (wired into the COPY
+  funnel, `engine.rs`) resolves the table's index set + takes the registry read lock
+  ONCE per COPY batch (not per row) and reuses one fragment cache across rows; per-row
+  tree locks and post-commit ART maintenance are unchanged (durability untouched).
+- **CHECK batching (the 35% prize).** `copy_bulk_insert` now compiles the table's CHECK
+  expression(s) ONCE per statement (`compile_check_constraints`: parse/plan +
+  `Evaluator::bind` column resolution hoisted out of the per-row loop; one shared
+  `Evaluator`), then evaluates the bound form per row against the tuple directly (no
+  per-row `Tuple` clone). Semantics — incl. SQL three-valued logic where a NULL/UNKNOWN
+  CHECK PASSES — are identical by construction (reuses the same `evaluate()` and
+  result→bool mapping as `validate_check_constraints`); a both-paths differential test
+  (NULL operands, `NOT`, nested `AND`/`OR` with NULLs) asserts the compiled COPY path
+  and the generic per-row INSERT evaluator agree on accept/reject AND error text.
+  Multi-row `INSERT … VALUES` does NOT share this funnel (`build_fast_param_insert_spec`
+  bails to the generic path whenever a table has CHECK/FK constraints), so its per-row
+  CHECK evaluation is left as a follow-up.
+
+No new config knob (§4): all changes are structural with natural bounds; the batch is
+already bounded by `copy_max_buffered_rows`.
+
+**Coordinator gate (open):** re-run `heliosdb_copy_phase_stats` on the §1.3 workloads and
+confirm the `art_maintain` and `check_constraint` shares drop.

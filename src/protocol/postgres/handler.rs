@@ -1064,8 +1064,14 @@ where
             let schema = Self::schema_from_query_columns(&columns, &results);
             self.send_query_result(schema, &results).await?;
         } else if is_dml_returning {
-            // DML with RETURNING clause - returns rows like a query
-            let (affected, tuples) = run_guarded(|| self.database.execute_returning_for_session(self.session_id, query))?;
+            // DML with RETURNING clause - returns rows like a query. W3.3:
+            // same autocommit write-conflict retry as the plain-DML arm below.
+            let policy = self.database.statement_retry_policy();
+            let retriable = policy.is_enabled() && !self.database.session_in_transaction(self.session_id);
+            let db = &self.database;
+            let sid = self.session_id;
+            let (affected, tuples) =
+                run_with_retry(policy, retriable, || db.execute_returning_for_session(sid, query)).await?;
             if tuples.is_empty() {
                 // No rows returned - send command complete with count
                 let tag = self.get_command_tag(query, affected);
@@ -1082,7 +1088,16 @@ where
                 self.send_query_result(schema, &tuples).await?;
             }
         } else {
-            let affected = run_guarded(|| self.database.execute_for_session(self.session_id, query))?;
+            // W3.3: autocommit same-row write-conflict retry (default OFF). The
+            // gate is autocommit-only — an open explicit txn surfaces 40001
+            // untouched. `op` captures `&self.database` (not `&self`), so the
+            // future stays Send for the spawned connection task.
+            let policy = self.database.statement_retry_policy();
+            let retriable = policy.is_enabled() && !self.database.session_in_transaction(self.session_id);
+            let db = &self.database;
+            let sid = self.session_id;
+            let affected =
+                run_with_retry(policy, retriable, || db.execute_for_session(sid, query)).await?;
             let tag = self.get_command_tag(query, affected);
             self.send_command_complete(&tag).await?;
         }
@@ -1504,14 +1519,35 @@ where
         // Outside a transaction `execute_for_session` autocommits per chunk,
         // matching the prior behavior.
         const BATCH: usize = 500;
-        for chunk in rows.chunks(BATCH) {
-            if let Some(sql) = super::copy::build_insert_sql(&copy.table, &copy.columns, chunk) {
-                if let Err(e) = self.database.execute_for_session(self.session_id, &sql) {
-                    return self
-                        .send_error("ERROR", "XX000", &format!("COPY insert failed: {e}"), None, None)
-                        .await;
+        // W3.2: attribute this generic COPY fallback to the `copy` write-volume
+        // class. copy_bulk_insert declined the fast batch (constrained /
+        // columnar / trigger / session-transaction shape), so each chunk is
+        // re-issued as an `INSERT … VALUES` through the buffered generic arm —
+        // which, absent a scope, would land in `other` (or `insert_multi` with
+        // the arm's class upgrade), never in `copy`, so a routed-around COPY
+        // reads `rows = 0` in the census. The generic arm's upgrade is
+        // `if_other`, so this enclosing `Copy` scope wins. Hoisted once per COPY
+        // (per-statement, zero per-row cost). The loop is fully synchronous
+        // (`execute_for_session` does not await), so the guard is dropped before
+        // any `.await` below — no cross-thread thread-local hazard; the error is
+        // captured and reported after the guard drops.
+        let copy_fallback_err = {
+            let _wv = crate::write_volume::stmt_scope(crate::write_volume::StmtClass::Copy);
+            let mut err = None;
+            for chunk in rows.chunks(BATCH) {
+                if let Some(sql) = super::copy::build_insert_sql(&copy.table, &copy.columns, chunk) {
+                    if let Err(e) = self.database.execute_for_session(self.session_id, &sql) {
+                        err = Some(e);
+                        break;
+                    }
                 }
             }
+            err
+        };
+        if let Some(e) = copy_fallback_err {
+            return self
+                .send_error("ERROR", "XX000", &format!("COPY insert failed: {e}"), None, None)
+                .await;
         }
         self.send_command_complete(&format!("COPY {total}")).await?;
         self.send_ready_for_query().await
@@ -2810,6 +2846,57 @@ pub(crate) fn run_guarded<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
         Err(_) => Err(Error::query_execution(
             "internal error while executing statement",
         )),
+    }
+}
+
+/// W3.3: run one autocommit wire statement, retrying a same-row write conflict
+/// (`Error::WriteConflict` → SQLSTATE 40001) against a fresh snapshot with a
+/// scheduler-yielding backoff.
+///
+/// `retriable` is the caller's autocommit gate: it must be `false` whenever the
+/// session has an open explicit transaction, so a 40001 there surfaces
+/// untouched and the client owns the retry (the PostgreSQL contract, design
+/// §5.2). Each attempt re-invokes `op`, which rebuilds a fresh implicit
+/// transaction with a new snapshot (`next_timestamp`); a rolled-back failed
+/// attempt leaves no partial effect, so a retried INSERT may skip durable
+/// sequence values but never double-applies rows (design §5.1/§5.5).
+///
+/// The wait between attempts is `tokio::time::sleep(..).await`, NEVER
+/// `std::thread::sleep`: a synchronous sleep on a tokio worker re-pins it and
+/// reproduces the worker-starvation livelock the retry exists to break (design
+/// §5.4 sub-case 2a). Deadlocks (`Error::deadlock` → 40P01) and every other
+/// error are NOT retried — `StatementRetryPolicy::retry_after` keys only on
+/// `WriteConflict` — so a true deadlock cannot be spun into a livelock. A free
+/// function (not a `&self` method) so the returned future borrows no `&self`
+/// across the await and stays `Send` for the spawned connection task; each
+/// attempt is panic-guarded exactly as the un-retried call sites were.
+pub(crate) async fn run_with_retry<T>(
+    policy: crate::storage::StatementRetryPolicy,
+    retriable: bool,
+    mut op: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    // Fast path: retry disabled (the default) or inside an explicit txn — one
+    // guarded attempt, identical to the pre-W3.3 call sites.
+    if !retriable || !policy.is_enabled() {
+        return run_guarded(|| op());
+    }
+    let mut retries_done: u32 = 0;
+    loop {
+        let outcome = run_guarded(|| op());
+        // Extract the backoff (a Copy Duration) and drop `outcome` BEFORE the
+        // await so nothing non-trivial is held across the yield point.
+        let backoff = match &outcome {
+            Err(e) => policy.retry_after(retries_done, e),
+            Ok(_) => None,
+        };
+        match backoff {
+            Some(delay) => {
+                retries_done += 1;
+                drop(outcome);
+                tokio::time::sleep(delay).await;
+            }
+            None => return outcome,
+        }
     }
 }
 

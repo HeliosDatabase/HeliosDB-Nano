@@ -2136,6 +2136,11 @@ impl StorageEngine {
             warn!("Failed to recover snapshots: {}", e);
         }
 
+        // W3.2: wire the single-copy-latest-version knob (after recovery, so the
+        // durable elision sentinel is loaded and the materialize gate is armed
+        // for any rows a prior session left flagged).
+        snapshot_manager.configure_elision(config.storage.elide_latest_version);
+
         // R4.3: seed the logical MVCC timestamp counter from recovered
         // snapshot metadata so timestamps stay monotonic across reopens.
         // Restarting at 1 (the historical behavior) reuses timestamps that
@@ -2393,6 +2398,9 @@ impl StorageEngine {
 
         // Initialize snapshot manager
         let snapshot_manager = Arc::new(SnapshotManager::new_non_durable(Arc::clone(&db)));
+        // W3.2: wire the single-copy-latest-version knob (memory-only: no durable
+        // sentinel, but the in-process materialize gate is still armed).
+        snapshot_manager.configure_elision(config.storage.elide_latest_version);
 
         let timestamp = Arc::new(RwLock::new(1));
 
@@ -6954,6 +6962,54 @@ impl StorageEngine {
         .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))
     }
 
+    /// W3.5 Stage 1: shape a decoded BASE-TABLE tuple to the current catalog
+    /// width `width` at a scan decode boundary.
+    ///
+    /// A base row can decode to a DIFFERENT arity than the catalog now reports
+    /// when a version-resolved (`AS OF` / open-snapshot) or branch-forked read
+    /// surfaces a tuple written under an older schema. Both directions are
+    /// legitimate schema evolution, and both are shaped to `width` here:
+    ///
+    /// - `A < width` (the table GREW via `ADD COLUMN`): the added columns are
+    ///   padded with `Value::Null`, matching what the projected-decode paths
+    ///   (`prefix_decode`) already do — a pre-ALTER snapshot projects the new
+    ///   column as NULL rather than erroring, and never observes the
+    ///   post-snapshot DEFAULT backfill (isolation-preserving; design §3).
+    /// - `A > width` (the table SHRANK via `DROP COLUMN`): the trailing values
+    ///   are TRUNCATED to `width`. `drop_column_from_rows` rewrites `data:` in
+    ///   place with NO new snapshot-resolvable version, so a pre-DROP snapshot
+    ///   legitimately resolves a wider old version, and a `bdata:` fork made
+    ///   before a main DROP is left un-rewritten (still wide). This is NOT
+    ///   corruption — it is exactly what the pre-W3.5 projection did: the plan,
+    ///   built from the current catalog, only ever references indices `< width`
+    ///   (`Tuple::get(idx)` returns `Some` for `idx < len`), so the extra
+    ///   trailing values were already silently ignored. Truncating here
+    ///   preserves that Ok behavior instead of turning a legitimately-old/forked
+    ///   row into a hard error.
+    ///
+    /// A genuine executor/planner wrong-arity — a plan referencing a column
+    /// index that does not exist even in the current catalog — is caught by the
+    /// generic evaluator/aggregate/join guards on INTERMEDIATE tuples; those stay
+    /// hard errors and this base-scan shaper is never applied to them (§1.1).
+    ///
+    /// `Vec::resize` grows (padding with the fill value) or shrinks (truncating)
+    /// in one call and is a no-op when the arity already matches.
+    ///
+    /// This is ONLY invoked under `snapshot_schema_evolution = "null_pad"`;
+    /// under `"strict"` the tuple keeps its stored arity (pre-W3.5 behavior).
+    fn shape_base_tuple_to_width(tuple: &mut Tuple, width: usize) {
+        tuple.values.resize(width, crate::Value::Null);
+    }
+
+    /// W3.5: whether snapshot / branch base-scan decodes NULL-pad rows written
+    /// under an older schema (`snapshot_schema_evolution = "null_pad"`).
+    fn null_pad_snapshot_schema(&self) -> bool {
+        matches!(
+            self.config.storage.snapshot_schema_evolution,
+            crate::config::SnapshotSchemaEvolution::NullPad
+        )
+    }
+
     fn scan_table_with_schema_opt(
         &self,
         table_name: &str,
@@ -6963,6 +7019,16 @@ impl StorageEngine {
         let scan_start = std::time::Instant::now();
         let prefix = format!("data:{}:", table_name);
         let prefix_bytes = prefix.as_bytes();
+
+        // W3.5 Stage 1: shape a `Full`-decoded row (its stored arity IS its
+        // write-time column count) to the current catalog width. The Prefix /
+        // Columns hints already NULL-fill to `schema.columns.len()`, so the
+        // shaper is a no-op there — this only makes the `Full` bincode path
+        // consistent with them (design §3). The `Full`-hint predicate is
+        // loop-invariant, so fold it into the flag once here rather than
+        // re-testing it per row in the closure.
+        let pad_full = self.null_pad_snapshot_schema() && matches!(decode_hint, RowDecodeHint::Full);
+        let target_width = schema.columns.len();
 
         let decode = |key: &[u8], raw_value: &[u8]| -> Result<Tuple> {
             {
@@ -6995,6 +7061,16 @@ impl StorageEngine {
                     }
                 }
                 .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
+
+                // W3.5 Stage 1: shape a row written under an older schema to the
+                // current catalog width — NULL-pad an ADD-COLUMN-narrower row,
+                // truncate a DROP-COLUMN-wider one (see `shape_base_tuple_to_width`).
+                // Only the `Full` bincode path decodes at the stored arity — the
+                // Prefix / Columns hints already build a `schema.columns.len()`-
+                // wide tuple, so `pad_full` scopes the shaper to `Full` (design §3).
+                if pad_full {
+                    Self::shape_base_tuple_to_width(&mut tuple, target_width);
+                }
 
                 // Extract row_id from key (key format: "data:{table_name}:{row_id}")
                 let mut row_id = 0u64;
@@ -8007,6 +8083,19 @@ impl StorageEngine {
             }
         }
 
+        // W3.2: this in-place `data:` rewrite is an uncovered mutation funnel —
+        // like the fast UPDATE/DELETE paths it overwrites `data:` with NO new
+        // version, so it must FIRST materialize any elided (flagged) latest
+        // version (whose only copy lives in `data:`) and any COPY-marker-covered
+        // row before widening the row. Otherwise an AS-OF read predating this
+        // ALTER would resolve a flagged event to the widened post-ALTER `data:`,
+        // and W3.5's `null_pad` would pad the added column from that wrong
+        // pre-image instead of the insert-time value. Gate hoisted out of the row
+        // loop: one relaxed atomic load (+ one marker-map probe) when no
+        // elided/COPY rows can exist, matching `materialize_copy_markers_for_table`.
+        let needs_version_materialize =
+            self.snapshot_manager.table_has_copy_markers(table_name) || self.snapshot_manager.maybe_elided_rows();
+
         // Update each row by appending the new column value
         for key in keys_to_update {
             let raw_value = self
@@ -8036,6 +8125,18 @@ impl StorageEngine {
             } else {
                 new_value
             };
+
+            // W3.2: preserve this row's elided/COPY-marker insert version in its
+            // own durable write BEFORE the overwrite below (the materialize reads
+            // the pre-overwrite `data:` and stages `v:` first, same crash-atomic
+            // ordering as the fast UPDATE/DELETE funnels). No-op unless the row's
+            // newest event is flagged or a COPY marker covers it.
+            if needs_version_materialize {
+                if let Some(row_id) = Self::parse_row_id_after_prefix(&key, prefix_bytes.len()) {
+                    self.snapshot_manager
+                        .materialize_copy_marker_row_durable(table_name, row_id)?;
+                }
+            }
 
             self.db
                 .put(&key, &final_value)
@@ -8075,6 +8176,15 @@ impl StorageEngine {
         // fast-read gate was open on this table falls to the snapshot path (see
         // `invalidate_write_watermark`).
         self.invalidate_write_watermark(table_name);
+
+        // W3.2: like `add_column_to_rows`, this in-place `data:` rewrite is an
+        // uncovered mutation funnel — materialize any elided (flagged) latest
+        // version or COPY-marker-covered row before narrowing `data:`, else an
+        // AS-OF read predating the DROP loses the pre-drop (wider) value. Gate
+        // hoisted out of the row loop (one relaxed atomic load + one marker-map
+        // probe on the common no-elision/no-COPY path).
+        let needs_version_materialize =
+            self.snapshot_manager.table_has_copy_markers(table_name) || self.snapshot_manager.maybe_elided_rows();
 
         // Collect keys first to avoid iterator invalidation
         let mut keys_to_update = Vec::new();
@@ -8120,6 +8230,17 @@ impl StorageEngine {
                 } else {
                     new_value
                 };
+
+                // W3.2: materialize this row's elided/COPY-marker insert version
+                // BEFORE the in-place narrowing overwrite (only rows actually
+                // rewritten need it — an out-of-bounds col_idx leaves `data:`
+                // untouched, so its elided version stays valid).
+                if needs_version_materialize {
+                    if let Some(row_id) = Self::parse_row_id_after_prefix(&key, prefix_bytes.len()) {
+                        self.snapshot_manager
+                            .materialize_copy_marker_row_durable(table_name, row_id)?;
+                    }
+                }
 
                 self.db
                     .put(&key, &final_value)
@@ -10588,6 +10709,12 @@ impl StorageEngine {
             // (batched or non-batched) `data:` row became visible, so a
             // concurrent reader with an older snapshot keeps taking the
             // snapshot path for this table.
+            // W3.2: eliding the `v:` copy is sound only when `data:` holds this
+            // version's logical value byte-for-byte — true for the default
+            // row-store, NOT for side-storage (where `data:` is the sidecar image
+            // and `logical_value` is the full tuple). Gate on `!uses_side_storage`;
+            // the funnel then elides iff `storage.elide_latest_version` is on.
+            let allow_elide = !uses_side_storage;
             if data_and_version_batched {
                 self.snapshot_manager.write_data_version_and_register_snapshot(
                     &key,
@@ -10598,6 +10725,7 @@ impl StorageEngine {
                     logical_value,
                     self.wal_lsn(),
                     self.memory_write_options.as_ref(),
+                    allow_elide,
                 )?;
             } else {
                 self.snapshot_manager.write_version_and_register_snapshot(
@@ -10606,6 +10734,7 @@ impl StorageEngine {
                     timestamp,
                     logical_value,
                     self.wal_lsn(),
+                    allow_elide,
                 )?;
             }
         }
@@ -10760,7 +10889,10 @@ impl StorageEngine {
                 // this is the copy-marker elision W3.2 generalizes.
                 if wv {
                     crate::write_volume::add_row();
-                    crate::write_volume::add(crate::write_volume::Category::Data, (key_buf.len() + value.len()) as u64);
+                    crate::write_volume::add(
+                        crate::write_volume::Category::Data,
+                        (key_buf.len() + value.len()) as u64,
+                    );
                 }
 
                 final_row_id = row_id;
@@ -10803,7 +10935,10 @@ impl StorageEngine {
                 batch.put(&key_buf, &value);
                 if wv {
                     crate::write_volume::add_row();
-                    crate::write_volume::add(crate::write_volume::Category::Data, (key_buf.len() + value.len()) as u64);
+                    crate::write_volume::add(
+                        crate::write_volume::Category::Data,
+                        (key_buf.len() + value.len()) as u64,
+                    );
                 }
 
                 version_key_buf.clear();
@@ -10845,7 +10980,10 @@ impl StorageEngine {
                 batch.put(&key_buf, &value);
                 if wv {
                     crate::write_volume::add_row();
-                    crate::write_volume::add(crate::write_volume::Category::Data, (key_buf.len() + value.len()) as u64);
+                    crate::write_volume::add(
+                        crate::write_volume::Category::Data,
+                        (key_buf.len() + value.len()) as u64,
+                    );
                 }
 
                 final_row_id = row_id;
@@ -10903,18 +11041,20 @@ impl StorageEngine {
             }
         }
 
-        // W3.4: per-row secondary-index (ART) + HNSW maintenance — the phase
-        // W3.4 measures against total COPY wall time. `on_insert_tuple` walks
-        // the global index registry per row (`art_manager.rs:1555`).
+        // W3.4: secondary-index (ART) + HNSW maintenance — the phase W3.4
+        // measures against total COPY wall time. §3.2/§3.3: `on_insert_tuples`
+        // resolves the table's own index set ONCE for the batch (was a per-row
+        // global-registry scan) and reuses one encode-once fragment cache.
         let _cps_am = crate::copy_phase_stats::time(crate::copy_phase_stats::Phase::ArtMaintain, batch_rows);
+        if let Err(e) = self
+            .art_index_manager
+            .on_insert_tuples(table_name, schema, &indexed_rows)
+        {
+            tracing::debug!("ART index batch insert for table '{}': {}", table_name, e);
+        }
         for (row_id, tuple) in &indexed_rows {
-            if let Err(e) = self
-                .art_index_manager
-                .on_insert_tuple(table_name, *row_id, schema, tuple)
-            {
-                tracing::debug!("ART index batch insert for table '{}': {}", table_name, e);
-            }
-            // R5.V1: maintain HNSW vector indexes.
+            // R5.V1: maintain HNSW vector indexes (single atomic load when the
+            // table has none).
             let _ = self.vector_indexes.on_row_insert(table_name, *row_id, schema, tuple);
         }
         drop(_cps_am);
@@ -11502,8 +11642,15 @@ impl StorageEngine {
     /// never-mutated row and wrongly treat it as never-existing — a regression
     /// from the per-row baseline, which leaves its `v:` intact across TRUNCATE.
     /// No-op (one atomic + one map probe) when the table has no markers.
+    ///
+    /// W3.2: this ALSO materializes flagged (elided) rows before the bulk `data:`
+    /// removal — for an elided, never-mutated row the version value lives in
+    /// `data:`, so removing `data:` without materializing would lose it for AS-OF
+    /// reads predating the TRUNCATE. The per-row `materialize_copy_marker_row_durable`
+    /// call handles both concerns; only the early-out gate needs to admit the
+    /// scan when elided rows may exist.
     pub(crate) fn materialize_copy_markers_for_table(&self, table_name: &str) -> Result<()> {
-        if !self.snapshot_manager.table_has_copy_markers(table_name) {
+        if !self.snapshot_manager.table_has_copy_markers(table_name) && !self.snapshot_manager.maybe_elided_rows() {
             return Ok(());
         }
         let prefix = format!("data:{}:", table_name);
@@ -11578,6 +11725,23 @@ impl StorageEngine {
             }
         }
 
+        // W3.5 Stage 1: the query plan is built against the CURRENT catalog, so
+        // a resolved version written under an older schema is shaped to the
+        // current width — a pre-ADD-COLUMN version (narrower) is NULL-padded, a
+        // pre-DROP-COLUMN version (wider; `drop_column_from_rows` writes no new
+        // version, so a pre-DROP snapshot legitimately resolves the wide version)
+        // is truncated, matching the pre-W3.5 projection. Resolved once; `None`
+        // disables the shaping (strict mode, or an unresolvable schema — never
+        // worse than the pre-W3.5 raw decode).
+        let target_width = if self.null_pad_snapshot_schema() {
+            self.catalog()
+                .get_table_schema(table_name)
+                .ok()
+                .map(|s| s.columns.len())
+        } else {
+            None
+        };
+
         // For each row, read the version at the snapshot timestamp
         // This implements MVCC snapshot isolation: we see the most recent
         // version <= snapshot_ts
@@ -11592,6 +11756,10 @@ impl StorageEngine {
 
                 // Attach row_id to tuple for DML operations
                 tuple.row_id = Some(row_id);
+
+                if let Some(width) = target_width {
+                    Self::shape_base_tuple_to_width(&mut tuple, width);
+                }
 
                 tuples.push(tuple);
             }
@@ -11712,6 +11880,36 @@ impl StorageEngine {
         let value =
             bincode::serialize(&current).map_err(|e| Error::storage(format!("Failed to serialize counter: {}", e)))?;
         self.put_internal(&key, &value)
+    }
+
+    /// Persist EVERY in-memory row counter to its durable `counter:{table}` key.
+    ///
+    /// The fast single-INSERT path (`insert_tuple_fast`) allocates row ids from
+    /// the volatile in-memory counter and only re-persists the durable counter
+    /// every 64 rows (`row_id % 64 == 0`), and in relaxed WAL mode logs nothing
+    /// to the logical WAL. `create_table` durably seeds the counter at 0, and
+    /// `rebuild_all_indexes` never reseeds it from the rows. So a table that took
+    /// fewer than 64 fast inserts before a clean shutdown would reopen with its
+    /// counter still at 0 (or the last %64 multiple) and hand the NEXT insert an
+    /// already-used row id — silently overwriting an existing `data:` row.
+    ///
+    /// Called at clean shutdown (`EmbeddedDatabase::drop`) alongside the R4.2
+    /// index-snapshot checkpoint so a reopen restores the true next row id.
+    /// Monotonic-safe: the in-memory counter is loaded from the durable value on
+    /// open and only ever increases, so this can never write a lower value than
+    /// what is already on disk. No-op for memory-only engines (they never reopen).
+    pub fn flush_all_row_counters(&self) -> Result<()> {
+        if self.config.storage.memory_only {
+            return Ok(());
+        }
+        for entry in self.row_counters.iter() {
+            let current = entry.value().load(Ordering::Relaxed);
+            let key = format!("counter:{}", entry.key()).into_bytes();
+            let value = bincode::serialize(&current)
+                .map_err(|e| Error::storage(format!("Failed to serialize counter: {}", e)))?;
+            self.put_internal(&key, &value)?;
+        }
+        Ok(())
     }
 }
 
@@ -12695,6 +12893,19 @@ impl StorageEngine {
         let mut result_tuples: std::collections::HashMap<u64, Tuple> = std::collections::HashMap::new();
         let mut deleted_rows: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
+        // W3.5 Stage 1: shape both overlay decodes (main `data:` and branch
+        // `bdata:`) to the current catalog width. A row forked into `bdata:`
+        // before a main ALTER stays at its pre-ALTER arity (the ALTER rewrites
+        // main's `data:`, not `bdata:`), so without this it errors under the
+        // mismatched plan: a pre-ADD fork is narrower (padded to NULL, design §7),
+        // a pre-DROP fork is wider (truncated to the current width, matching the
+        // pre-W3.5 projection — a forked wide row is legitimate, not corruption).
+        // The un-forked main-overlay rows are already at the current width (the
+        // ALTER rewrote them), so the main arm is a no-op — the branch-model case
+        // where an un-forked row shows main's backfill is intentionally unchanged.
+        let null_pad = self.null_pad_snapshot_schema();
+        let target_width = schema.columns.len();
+
         // Step 1: Start with main branch data
         let main_prefix = format!("data:{}:", table_name);
         let main_prefix_bytes = main_prefix.as_bytes();
@@ -12717,6 +12928,9 @@ impl StorageEngine {
                     .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
                 tuple.row_id = Some(row_id);
                 tuple.branch_id = None; // From main
+                if null_pad {
+                    Self::shape_base_tuple_to_width(&mut tuple, target_width);
+                }
                 result_tuples.insert(row_id, tuple);
             }
         }
@@ -12766,6 +12980,9 @@ impl StorageEngine {
                         .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
                     tuple.row_id = Some(row_id);
                     tuple.branch_id = Some(chain_branch_id);
+                    if null_pad {
+                        Self::shape_base_tuple_to_width(&mut tuple, target_width);
+                    }
                     // Override any parent data for this row_id
                     result_tuples.insert(row_id, tuple);
                 }

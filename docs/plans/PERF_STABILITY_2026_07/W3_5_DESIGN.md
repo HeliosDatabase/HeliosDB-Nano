@@ -1,18 +1,46 @@
 # W3.5 — Version-aware tuple decode for snapshot reads after ALTER
 
-Status: **DESIGN-FIRST. Characterization tests landed; NO engine decode change ships
-this campaign.** Base: `perf/w3-design` off v4.2.0 (`a2e1b5b`). Filed during the W2
-gate as the follow-up to `w2_5_watermark_read_tests::alter_add_column_hidden_from_open_snapshot_reader`.
+Status: **STAGE 1 IMPLEMENTED (decode-side NULL-pad).** Base for the design was
+`perf/w3-design` off v4.2.0 (`a2e1b5b`); Stage 1 landed on `perf/w3-impl-2026-07-17`
+off v4.3.0 (`e4d26c7`). Filed during the W2 gate as the follow-up to
+`w2_5_watermark_read_tests::alter_add_column_hidden_from_open_snapshot_reader`.
 Companion analysis: `PERF_ANALYSIS_2026_07_13.md`; spec `WAVE_IMPL_SPEC_2026_07_16.md`
 §W2.5 (the watermark that fail-closes ALTER to the snapshot path — the leak direction
 this item inherits already fixed).
 
-> **STOP rule (binding).** No decode-side padding or catalog time-travel is implemented
-> this campaign. This document ships (1) the version-aware-decode design and (2)
-> `tests/w3_5_alter_snapshot_characterization.rs`, which pins today's error/leak behavior
-> for the three read shapes (open-txn snapshot, AS OF, branch overlay). The behavior flip
-> (error → correctly-shaped rows) and its config default are coordinator decisions, not
-> assumptions.
+> **What shipped (Stage 1).** The base-table scan decode boundaries (the
+> `RowDecodeHint::Full` arm of `scan_table_with_schema_opt`, the version-resolved decode
+> in `scan_table_at_snapshot`, and both arms of `scan_table_branch_aware_with_schema`)
+> now shape a decoded base row to the current catalog width: a row SHORT of the width
+> (post-`ADD COLUMN`) is NULL-padded; a row WIDER than the width (post-`DROP COLUMN`) is
+> TRUNCATED to it. **Corrected during adversarial review (was: wider = hard error):** a
+> wider row is a legitimately-old/forked version, not corruption — `drop_column_from_rows`
+> rewrites `data:` in place with no new version, so a pre-DROP snapshot resolves the wider
+> old version and a `bdata:` fork made before a main DROP is left un-rewritten; hard-erroring
+> those regressed correct pre-W3.5 time-travel/branch reads and the DROP crash-recovery read
+> (a durable wide `data:` under a narrowed catalog) into an "unreadable table" error.
+> Truncation reproduces the pre-W3.5 projection exactly (the plan, built from the current
+> catalog, only references the surviving indices, so trailing values were already ignored).
+> Gated by `[storage] snapshot_schema_evolution` (`"null_pad"` = Stage 1, **default**;
+> `"strict"` = the pre-W3.5 arity error, kept as a rollback; `"versioned"` = Stage 2,
+> RESERVED and rejected at config parse). The three error-shape characterization tests now
+> assert the Stage-1 `Ok(c IS NULL)` flip; `wider_than_catalog_row_truncates` asserts the
+> DROP/wider truncate-to-Ok; `branch_before_alter_sees_main_backfill_today` stays pinned
+> (branch-model, §7). The shaper is localized to the scan boundary per §1.1 — the generic
+> evaluator/aggregate/join arity guards are UNCHANGED and stay planner-bug detectors.
+>
+> **What remains (follow-ups).**
+> - **Stage 2 — catalog time-travel (§3.1, §4b):** resolve the schema as-of the snapshot
+>   (`W_snap`) and build the plan / `RowDescription` against it for full PG column-set
+>   parity. Not implemented; `snapshot_schema_evolution = "versioned"` is reserved for it.
+> - **COPY/vmeta backfill leak (§6):** Stage 1 does NOT cover COPY-inserted rows. A COPY
+>   fast-batch row carries no per-row version; after an ALTER in-place rewrite its current
+>   `data:` is the 3-value backfilled tuple, so a pre-ALTER snapshot / AS OF read resolves
+>   `c = 42` directly — a value leak, not an arity one (nothing to pad). Closed only by
+>   Stage 2 (truncate to `W_snap`) or the `add_column_to_rows` pre-image write (§6).
+> - **Per-branch schema pin (§7):** an un-forked branch row still reads main's live
+>   rewritten `data:` (sees the backfill); insulating a pre-ALTER branch from a main ALTER
+>   is out of tuple-decode scope.
 
 ---
 
@@ -121,13 +149,28 @@ values, the catalog has 3" but cannot, from the row alone, distinguish "written 
 
 ### Stage 1 — decode-side NULL-pad to current catalog width (cheap, no format change)
 
-**Change (future, not this campaign).** At the base-table scan decode — the `RowDecodeHint::Full`
+**Change.** At the base-table scan decode — the `RowDecodeHint::Full`
 arm of `scan_table_with_schema_opt` (`engine.rs:6982`/`:6994`), the version-resolved decode
 in `scan_table_at_snapshot` (`engine.rs:11590`), and the two branch-overlay decodes in
-`scan_table_branch_aware_with_schema` (`engine.rs:12716` main, `:12765` bdata) — pad a
-decoded tuple whose arity `A < schema.columns.len()` with `Value::Null` up to
-`schema.columns.len()`, and leave `A > schema.columns.len()` a hard error (a row wider than
-the catalog is genuine corruption).
+`scan_table_branch_aware_with_schema` (`engine.rs:12716` main, `:12765` bdata) — shape a
+decoded tuple to `schema.columns.len()` (`Vec::resize`): pad `A < W` with `Value::Null`, and
+**truncate** `A > W`.
+
+**Wider is NOT corruption (corrected during adversarial review).** The original design
+hard-errored `A > W` on the premise that a row wider than the catalog is corruption. That is
+false under `DROP COLUMN`: `drop_column_from_rows` (`engine.rs:8132`) rewrites `data:` in
+place with **no** new snapshot-resolvable version and does **not** touch a branch's `bdata:`,
+so a pre-DROP snapshot / `AS OF` legitimately resolves the wider old version, an open txn
+reading across a concurrent DROP sees it, and a `bdata:` fork taken before a main DROP stays
+wide. Erroring there converted correct pre-W3.5 reads into a hard "corruption" error (and,
+on the `Full` current-read path, made a table unreadable in the DROP crash window between the
+durable narrow-catalog write at `lib.rs` `update_table_schema` and the row rewrite). The
+correct shaping is **truncate to `W`**, which reproduces the pre-W3.5 projection exactly: the
+plan is built from the current catalog and only references indices `< W`, so the trailing
+values were already silently ignored (`Tuple::get(idx)` is `Some` iff `idx < len`). The only
+genuine wrong-arity — a plan referencing a column index that does not exist even in the
+current catalog — is an INTERMEDIATE-tuple concern caught by the generic
+evaluator/aggregate/join guards (§1.1), which this base-scan shaper never touches.
 
 **This is not a new idiom — it is the existing one made consistent.** The projected-decode
 paths already do exactly this: `decode_tuple_prefix`/`decode_tuple_columns`

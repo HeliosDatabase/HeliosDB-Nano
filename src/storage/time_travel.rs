@@ -32,7 +32,7 @@ use rocksdb::{WriteBatch, WriteOptions, DB};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// System Change Number (Oracle-compatible)
@@ -40,6 +40,51 @@ pub type Scn = u64;
 
 /// Transaction ID
 pub type TransactionId = u64;
+
+/// W3.2: durable sentinel key. Written once (per DB) the first time elision is
+/// enabled, so a later reopen with `elide_latest_version = false` still knows a
+/// prior session may have left flagged rows and keeps the materialize-before-
+/// overwrite gate armed. Point-read/written only; sorts after every `v*`/`vmeta:`
+/// /`vgc:` range so no version scan touches it.
+const ELIDE_SENTINEL_KEY: &[u8] = b"w3_2_elide_used";
+
+/// W3.2: reserved high bit of a `v_idx:` event's 8-byte big-endian value (the
+/// event's `commit_ts`). SET ⇒ the row version for this event is ELIDED — no
+/// `v:` key was written and the value equals the current `data:` row (this is
+/// the latest version, not yet materialized by a mutation). CLEAR ⇒ a `v:` key
+/// is present, resolved exactly as before W3.2.
+///
+/// EVERY legacy/pre-W3.2 value has this bit clear (a `commit_ts` is a logical or
+/// epoch-micros counter far below 2^62), so an unflagged value decodes as
+/// "flag CLEAR = `v:` present" — the forever-fallback that keeps pre-W3.2
+/// databases correct (`W3_2_DESIGN.md` §4). NEVER remove that default. Bit 63 is
+/// free for ~292k years of epoch-micros (2^63 µs), so it can never collide with
+/// a real timestamp.
+const VERSION_VALUE_ELIDED_FLAG: u64 = 1 << 63;
+
+/// W3.2: encode a `v_idx:` event value — the 8-byte big-endian `commit_ts`, with
+/// the high bit SET when the `v:` copy was elided. `commit_ts` MUST be below
+/// 2^63 (always true for logical/epoch-micros timestamps), else the flag bit
+/// would corrupt the timestamp.
+#[inline]
+fn encode_version_index_value(commit_ts: u64, elided: bool) -> [u8; 8] {
+    let raw = if elided {
+        commit_ts | VERSION_VALUE_ELIDED_FLAG
+    } else {
+        commit_ts
+    };
+    raw.to_be_bytes()
+}
+
+/// W3.2: decode a `v_idx:` event value into `(commit_ts, elided)`. A value
+/// shorter than 8 bytes yields `None`. A value with the high bit clear — which
+/// includes every legacy pre-W3.2 value — decodes as `elided = false`.
+#[inline]
+fn decode_version_index_value(bytes: &[u8]) -> Option<(u64, bool)> {
+    let raw = u64::from_be_bytes(bytes.get(0..8)?.try_into().ok()?);
+    let elided = raw & VERSION_VALUE_ELIDED_FLAG != 0;
+    Some((raw & !VERSION_VALUE_ELIDED_FLAG, elided))
+}
 
 /// Snapshot metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -198,6 +243,19 @@ pub struct SnapshotManager {
     /// and drives materialization on the first UPDATE/DELETE of a covered row.
     /// Guarded by an internal atomic fast-out (one relaxed load when empty).
     copy_markers: crate::storage::copy_marker::CopyMarkers,
+    /// W3.2: whether NEW main-branch inserts elide the `v:` copy and write a
+    /// flagged `v_idx:` event instead (`storage.elide_latest_version`). Set at
+    /// open via [`configure_elision`]. Old flagged rows stay flagged when this
+    /// is toggled off — the read/materialize paths key off each row's own
+    /// durable flag, not this switch.
+    elide_latest_version: AtomicBool,
+    /// W3.2: whether any elided (flagged) `v_idx:` event might exist in this
+    /// database — `true` when elision is enabled now OR the durable
+    /// [`ELIDE_SENTINEL_KEY`] was found at open (a prior session may have left
+    /// flagged rows even though elision is off now). Gates the
+    /// materialize-before-overwrite seek on the mutation hot path: `false` ⇒ one
+    /// relaxed atomic load and skip, because no flagged row can exist.
+    maybe_elided_rows: AtomicBool,
 }
 
 /// Snapshot cache configuration
@@ -261,6 +319,8 @@ impl SnapshotManager {
             gc_low_watermark: AtomicU64::new(0),
             persist_metadata: true,
             copy_markers: crate::storage::copy_marker::CopyMarkers::new(),
+            elide_latest_version: AtomicBool::new(false),
+            maybe_elided_rows: AtomicBool::new(false),
         }
     }
 
@@ -293,6 +353,8 @@ impl SnapshotManager {
             gc_low_watermark: AtomicU64::new(0),
             persist_metadata: true,
             copy_markers: crate::storage::copy_marker::CopyMarkers::new(),
+            elide_latest_version: AtomicBool::new(false),
+            maybe_elided_rows: AtomicBool::new(false),
         }
     }
 
@@ -316,7 +378,74 @@ impl SnapshotManager {
             gc_low_watermark: AtomicU64::new(0),
             persist_metadata: true,
             copy_markers: crate::storage::copy_marker::CopyMarkers::new(),
+            elide_latest_version: AtomicBool::new(false),
+            maybe_elided_rows: AtomicBool::new(false),
         }
+    }
+
+    /// W3.2: wire the `storage.elide_latest_version` knob at open (called from
+    /// `StorageEngine` construction after `recover_snapshots`). Loads the durable
+    /// [`ELIDE_SENTINEL_KEY`] so a reopen with elision OFF still arms the
+    /// materialize gate for rows a prior session left flagged, and — when
+    /// elision is ON — persists the sentinel BEFORE any flagged insert so every
+    /// flagged row is preceded by a durable "elision used" marker (crash-safe:
+    /// the sentinel rides the WAL ahead of the inserts it gates).
+    ///
+    /// If that sentinel write FAILS on a durable DB, elision is disabled for this
+    /// session instead of proceeding: a flagged insert with no durable sentinel
+    /// would be silently unprotected on a later OFF-reopen (which finds no
+    /// sentinel, leaves the materialize gate disarmed, and loses the row's AS-OF
+    /// value on its next overwrite). Falling back to full `v:` is correct — it
+    /// only forgoes the space saving.
+    ///
+    /// State is per-`SnapshotManager` (one per engine, published via `Arc` before
+    /// any concurrent access, so these Relaxed stores are safe), NOT process-global.
+    pub fn configure_elision(&self, elide_latest_version: bool) {
+        self.elide_latest_version.store(elide_latest_version, Ordering::Relaxed);
+
+        let sentinel_present = matches!(self.db.get(ELIDE_SENTINEL_KEY), Ok(Some(_)));
+        if sentinel_present {
+            self.maybe_elided_rows.store(true, Ordering::Relaxed);
+        }
+        if elide_latest_version {
+            // Persist the sentinel eagerly (idempotent) so it is durable ahead of
+            // the first flagged insert. Memory-only DBs (persist_metadata=false)
+            // never reopen, so the sentinel is unnecessary and the in-process flag
+            // alone suffices.
+            let sentinel_durable = if sentinel_present || !self.persist_metadata {
+                true
+            } else {
+                match self.db.put(ELIDE_SENTINEL_KEY, [1u8]) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        eprintln!(
+                            "Warning: W3.2 failed to persist elision sentinel; disabling elision \
+                             this session to avoid unprotected flagged rows: {}",
+                            e
+                        );
+                        false
+                    }
+                }
+            };
+            if sentinel_durable {
+                self.maybe_elided_rows.store(true, Ordering::Relaxed);
+            } else {
+                // No durable sentinel ⇒ do not create flagged inserts a later
+                // OFF-reopen could not protect. Fall back to full `v:`.
+                self.elide_latest_version.store(false, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// W3.2: whether NEW main-branch inserts elide the `v:` copy (config knob).
+    pub(crate) fn elide_latest_version(&self) -> bool {
+        self.elide_latest_version.load(Ordering::Relaxed)
+    }
+
+    /// W3.2: whether any flagged (elided) row might exist — the mutation-path
+    /// materialize gate. `false` ⇒ skip the per-row `v_idx:` seek entirely.
+    pub(crate) fn maybe_elided_rows(&self) -> bool {
+        self.maybe_elided_rows.load(Ordering::Relaxed)
     }
 
     fn write_batch(&self, batch: WriteBatch, context: &str) -> Result<()> {
@@ -761,19 +890,29 @@ impl SnapshotManager {
         if let Some(Ok((key, value))) = iter.next() {
             if let Ok(key_str) = std::str::from_utf8(&key) {
                 if key_str.starts_with(&expected_prefix) {
-                    // Decode the actual timestamp from the index value
-                    if value.len() >= 8 {
-                        let actual_ts = u64::from_be_bytes(
-                            value
-                                .get(0..8)
-                                .ok_or_else(|| Error::storage("Timestamp bytes too short"))?
-                                .try_into()
-                                .map_err(|e| Error::storage(format!("Invalid timestamp bytes: {}", e)))?,
-                        );
-
-                        // Verify this version is visible to our snapshot
+                    // Decode the actual timestamp (and W3.2 elision flag) from the
+                    // index value. An unflagged/legacy value decodes as
+                    // `elided = false` — the pre-W3.2 `v:`-present invariant.
+                    if let Some((actual_ts, elided)) = decode_version_index_value(&value) {
+                        // Verify this version is visible to our snapshot. The seek
+                        // lands on the newest version at-or-before `snapshot_ts`;
+                        // an OLDER-than-newest version is always flag-CLEAR (any
+                        // overwrite materializes the prior flagged event first), so
+                        // only a truly-latest event can be elided here.
                         if actual_ts <= snapshot_ts {
-                            // Now fetch the actual versioned data
+                            if elided {
+                                // W3.2: the `v:` copy was elided — this is the
+                                // latest version and its value is the current
+                                // `data:` row (no later mutation materialized it,
+                                // else the flag would be clear). Read `data:`.
+                                let data_key = format!("data:{}:{}", table_name, row_id);
+                                return self
+                                    .db
+                                    .get(data_key.as_bytes())
+                                    .map_err(|e| Error::storage(format!("Failed to read elided version data: {}", e)))
+                                    .map(|opt| opt.map(|v| v.to_vec()));
+                            }
+                            // Non-elided: fetch the actual versioned `v:` data.
                             return self.get_version_by_exact_timestamp(table_name, row_id, actual_ts);
                         }
                     }
@@ -869,6 +1008,11 @@ impl SnapshotManager {
     /// `register_snapshot(_with_lsn)`, but issuing five separate RocksDB writes
     /// per row dominates single-row insert throughput. This method keeps the
     /// same keys and in-memory indexes while committing them together.
+    /// `allow_elide` (W3.2): when the caller can guarantee `data:` holds exactly
+    /// this version's logical value (default row-store, NOT side-storage), and
+    /// `elide_latest_version` is on, the `v:` copy is elided in favor of a
+    /// flagged `v_idx:` event. Callers on the side-storage path (where `data:`
+    /// holds the sidecar image, not the version value) MUST pass `false`.
     pub fn write_version_and_register_snapshot(
         &self,
         table_name: &str,
@@ -876,10 +1020,19 @@ impl SnapshotManager {
         timestamp: u64,
         value: &[u8],
         lsn: Option<u64>,
+        allow_elide: bool,
     ) -> Result<SnapshotMetadata> {
         let (metadata, txn_id, scn) = self.allocate_snapshot_metadata(timestamp, lsn);
         let mut batch = WriteBatch::default();
-        self.append_version_snapshot_to_batch(&mut batch, table_name, row_id, timestamp, value, &metadata)?;
+        self.append_version_snapshot_to_batch(
+            &mut batch,
+            table_name,
+            row_id,
+            timestamp,
+            value,
+            &metadata,
+            allow_elide,
+        )?;
         self.write_batch(batch, "Failed to write version snapshot batch")?;
         self.finish_version_snapshot(table_name, row_id, timestamp, txn_id, scn, metadata)
     }
@@ -887,6 +1040,11 @@ impl SnapshotManager {
     /// Write current row data plus its time-travel version/snapshot metadata in
     /// one RocksDB batch. Used by fast autocommit INSERT after logical-WAL/HA
     /// has been ruled out by the caller.
+    ///
+    /// `allow_elide` (W3.2): see `write_version_and_register_snapshot`. This path
+    /// puts `data_value` and appends the version in ONE batch, so eliding is only
+    /// sound when `data_value == version_value` — the caller (non-side-storage
+    /// fast INSERT) guarantees that and passes `!uses_side_storage`.
     pub fn write_data_version_and_register_snapshot(
         &self,
         data_key: &[u8],
@@ -897,11 +1055,20 @@ impl SnapshotManager {
         version_value: &[u8],
         lsn: Option<u64>,
         write_options: Option<&WriteOptions>,
+        allow_elide: bool,
     ) -> Result<SnapshotMetadata> {
         let (metadata, txn_id, scn) = self.allocate_snapshot_metadata(timestamp, lsn);
         let mut batch = WriteBatch::default();
         batch.put(data_key, data_value);
-        self.append_version_snapshot_to_batch(&mut batch, table_name, row_id, timestamp, version_value, &metadata)?;
+        self.append_version_snapshot_to_batch(
+            &mut batch,
+            table_name,
+            row_id,
+            timestamp,
+            version_value,
+            &metadata,
+            allow_elide,
+        )?;
 
         if let Some(opts) = write_options {
             self.db
@@ -991,10 +1158,25 @@ impl SnapshotManager {
     /// relaxed atomic load — when no markers exist, so the hot fast-DML path is
     /// untaxed on non-COPY workloads. Idempotent: a row that already has a
     /// `v_idx:` is treated as materialized and skipped.
+    ///
+    /// W3.2: this is ALSO the flagged-latest-version materialize site. Every fast
+    /// / generic UPDATE/DELETE funnel that overwrites or removes main `data:`
+    /// already calls this before its write, so extending it here covers all those
+    /// sites at once: if the row's newest `v_idx:` event is elided (flag SET),
+    /// its real `v:` is materialized from the current `data:` and the flag is
+    /// cleared BEFORE `data:` changes. Gated by `maybe_elided_rows` (one relaxed
+    /// load) so non-elision databases pay nothing.
     pub(crate) fn materialize_copy_marker_row_durable(&self, table_name: &str, row_id: u64) -> Result<()> {
-        if self.copy_markers.is_empty() {
-            return Ok(());
+        if !self.copy_markers.is_empty() {
+            self.materialize_copy_marker_row_durable_inner(table_name, row_id)?;
         }
+        if self.maybe_elided_rows() {
+            self.materialize_elided_latest_version_durable(table_name, row_id)?;
+        }
+        Ok(())
+    }
+
+    fn materialize_copy_marker_row_durable_inner(&self, table_name: &str, row_id: u64) -> Result<()> {
         let marker_ts = match self.copy_markers.covering_ts(table_name, row_id) {
             Some(ts) => ts,
             None => return Ok(()),
@@ -1015,6 +1197,82 @@ impl SnapshotManager {
             let index_key = format!("v_idx:{}:{}:{:020}", table_name, row_id, reverse_ts);
             batch.put(index_key.as_bytes(), marker_ts.to_be_bytes());
             self.write_batch(batch, "copy marker materialize")?;
+        }
+        Ok(())
+    }
+
+    /// W3.2: locate the row's NEWEST `v_idx:` event and, if it is elided (flag
+    /// SET), return its `(commit_ts, index_key)`. Only the latest version can be
+    /// flagged (every overwrite materializes the prior flagged event first), so
+    /// checking the first entry in the row's `v_idx:` prefix — which sorts newest
+    /// first (smallest reverse_ts) — is sufficient. `None` when the row has no
+    /// `v_idx:` or its newest event is already materialized (flag clear).
+    fn find_flagged_latest_version(&self, table_name: &str, row_id: u64) -> Result<Option<(u64, Vec<u8>)>> {
+        let prefix = format!("v_idx:{}:{}:", table_name, row_id);
+        let mut iter = self.db.iterator(rocksdb::IteratorMode::From(
+            prefix.as_bytes(),
+            rocksdb::Direction::Forward,
+        ));
+        if let Some(item) = iter.next() {
+            let (key, value) = item.map_err(|e| Error::storage(format!("flagged version seek failed: {}", e)))?;
+            if key.starts_with(prefix.as_bytes()) {
+                if let Some((event_ts, elided)) = decode_version_index_value(&value) {
+                    if elided {
+                        return Ok(Some((event_ts, key.to_vec())));
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// W3.2: durably materialize the row's flagged (elided) latest version NOW,
+    /// in its own write, BEFORE a caller overwrites/removes `data:`. Writes the
+    /// real `v:{event_ts}` from the current `data:` value and rewrites the
+    /// `v_idx:` event value with the flag CLEARED. Idempotent — an
+    /// already-materialized (or absent) event is a no-op.
+    fn materialize_elided_latest_version_durable(&self, table_name: &str, row_id: u64) -> Result<()> {
+        let Some((event_ts, index_key)) = self.find_flagged_latest_version(table_name, row_id)? else {
+            return Ok(());
+        };
+        let data_key = format!("data:{}:{}", table_name, row_id);
+        let old_value = self
+            .db
+            .get(data_key.as_bytes())
+            .map_err(|e| Error::storage(format!("elided version materialize data read failed: {}", e)))?;
+        if let Some(old_value) = old_value {
+            let mut batch = WriteBatch::default();
+            let version_key = format!("v:{}:{}:{}", table_name, row_id, event_ts);
+            batch.put(version_key.as_bytes(), &old_value);
+            batch.put(&index_key, encode_version_index_value(event_ts, false));
+            self.write_batch(batch, "elided version materialize")?;
+        }
+        Ok(())
+    }
+
+    /// W3.2: stage the row's flagged (elided) latest-version materialization into
+    /// `batch` BEFORE the caller's own `data:` overwrite/delete rides the same
+    /// batch (crash-atomic). The `data:` read returns the pre-batch value because
+    /// `batch` is not yet committed. Idempotent (no-op if the newest event is
+    /// already materialized). Callers gate on `maybe_elided_rows`.
+    pub(crate) fn materialize_elided_latest_version(
+        &self,
+        batch: &mut WriteBatch,
+        table_name: &str,
+        row_id: u64,
+    ) -> Result<()> {
+        let Some((event_ts, index_key)) = self.find_flagged_latest_version(table_name, row_id)? else {
+            return Ok(());
+        };
+        let data_key = format!("data:{}:{}", table_name, row_id);
+        let old_value = self
+            .db
+            .get(data_key.as_bytes())
+            .map_err(|e| Error::storage(format!("elided version backfill data read failed: {}", e)))?;
+        if let Some(old_value) = old_value {
+            let version_key = format!("v:{}:{}:{}", table_name, row_id, event_ts);
+            batch.put(version_key.as_bytes(), &old_value);
+            batch.put(&index_key, encode_version_index_value(event_ts, false));
         }
         Ok(())
     }
@@ -1064,6 +1322,7 @@ impl SnapshotManager {
         timestamp: u64,
         value: &[u8],
         metadata: &SnapshotMetadata,
+        allow_elide: bool,
     ) -> Result<()> {
         // Item #2: if this row is still covered by a live COPY marker (inserted
         // via the version-eliding fast batch) and has not yet been materialized,
@@ -1074,22 +1333,32 @@ impl SnapshotManager {
         // is a single relaxed atomic load when no markers exist.
         self.materialize_copy_marker_row(batch, table_name, row_id, timestamp)?;
 
-        let version_key = format!("v:{}:{}:{}", table_name, row_id, timestamp);
-        batch.put(version_key.as_bytes(), value);
+        // W3.2: this funnel is INSERT-only (fresh row_id via `insert_tuple_fast`),
+        // so there is never a prior flagged version of this row to materialize —
+        // the flagged-latest materialize is a mutation-path concern only.
+        let elide = allow_elide && self.elide_latest_version();
 
         let reverse_ts = u64::MAX - timestamp;
         let index_key = format!("v_idx:{}:{}:{:020}", table_name, row_id, reverse_ts);
-        batch.put(index_key.as_bytes(), timestamp.to_be_bytes());
+
+        let version_bytes = if elide {
+            // W3.2: elide the `v:` copy. Write only the flagged `v_idx:` event;
+            // its value is served from `data:` (written by the caller in this same
+            // batch) until the row's first mutation materializes the real `v:`.
+            batch.put(index_key.as_bytes(), encode_version_index_value(timestamp, true));
+            (index_key.len() + 8) as u64
+        } else {
+            let version_key = format!("v:{}:{}:{}", table_name, row_id, timestamp);
+            batch.put(version_key.as_bytes(), value);
+            batch.put(index_key.as_bytes(), encode_version_index_value(timestamp, false));
+            (version_key.len() + value.len() + index_key.len() + 8) as u64
+        };
 
         // W3.2: version-chain bytes for the autocommit INSERT path (fast single
-        // INSERT via `insert_tuple_fast`). The `v:` value is the row's logical
-        // value — identical to `data:` for the default row-store, larger under
-        // side-storage (`W3_2_DESIGN.md` §1.1) — the duplication W3.2 quantifies.
+        // INSERT via `insert_tuple_fast`). With elision ON the `v:` copy is gone,
+        // so this collapses to the `v_idx:` event size — the §7 re-measurement.
         if crate::write_volume::enabled() {
-            crate::write_volume::add(
-                crate::write_volume::Category::Version,
-                (version_key.len() + value.len() + index_key.len() + 8) as u64,
-            );
+            crate::write_volume::add(crate::write_volume::Category::Version, version_bytes);
         }
 
         if self.persist_metadata {
@@ -1518,7 +1787,7 @@ mod tests {
         let manager = SnapshotManager::new_non_durable(Arc::clone(&db));
 
         let metadata = manager
-            .write_version_and_register_snapshot("users", 1, 100, b"value_at_100", Some(42))
+            .write_version_and_register_snapshot("users", 1, 100, b"value_at_100", Some(42), false)
             .unwrap();
 
         assert_eq!(manager.get_snapshot_metadata(100).unwrap().transaction_id, 42);
@@ -1687,5 +1956,174 @@ mod tests {
 
         // The previously cached entry is now stale and must be recomputed to B.
         assert_eq!(manager.read_at_snapshot("t", 1, u64::MAX).unwrap(), Some(b"B".to_vec()));
+    }
+
+    // ----- W3.2: single-copy latest version (elide_latest_version) -----
+
+    #[test]
+    fn test_w3_2_encode_decode_flag_roundtrip_and_legacy_fallback() {
+        // The flag round-trips, a flag-clear encoding is byte-identical to the
+        // legacy raw big-endian ts, and a raw (never-flagged) value decodes as
+        // CLEAR — the forever-fallback. Flips on pre-W3.2 code (helpers absent).
+        for ts in [1u64, 100, 1_700_000_000_000_000, (1u64 << 62) - 1] {
+            let elided = encode_version_index_value(ts, true);
+            let full = encode_version_index_value(ts, false);
+            assert_eq!(full, ts.to_be_bytes(), "flag-clear encoding IS the legacy layout");
+            assert_ne!(elided, full, "the flag must change the bytes");
+            assert_eq!(decode_version_index_value(&elided), Some((ts, true)));
+            assert_eq!(decode_version_index_value(&full), Some((ts, false)));
+            assert_eq!(
+                decode_version_index_value(&ts.to_be_bytes()),
+                Some((ts, false)),
+                "a legacy raw value decodes as flag CLEAR"
+            );
+        }
+        assert_eq!(decode_version_index_value(&[0u8; 4]), None, "a short value is rejected");
+    }
+
+    #[test]
+    fn test_w3_2_elided_insert_omits_v_and_reads_from_data() {
+        // With elision on, a versioned INSERT writes NO `v:` copy — only a flagged
+        // `v_idx:` event — and AS-OF reads resolve via `data:`. Flips on pre-W3.2
+        // code, which always writes a full `v:` (version_keys would be 1, not 0).
+        let (db, _temp) = create_test_db();
+        let manager = SnapshotManager::new(Arc::clone(&db));
+        manager.configure_elision(true);
+
+        manager
+            .write_data_version_and_register_snapshot(b"data:t:1", b"A", "t", 1, 100, b"A", Some(1), None, true)
+            .unwrap();
+
+        assert!(db.get(b"v:t:1:100").unwrap().is_none(), "the `v:` copy must be elided");
+        let stats = crate::storage::version_gc::version_storage_stats(&db).unwrap();
+        assert_eq!(stats.version_keys, 0, "no `v:` key ⇒ nothing for version-GC to reclaim");
+        assert_eq!(stats.version_index_keys, 1, "the `v_idx:` event survives");
+
+        assert_eq!(manager.read_at_snapshot("t", 1, 150).unwrap(), Some(b"A".to_vec()));
+        assert_eq!(
+            manager.read_at_snapshot("t", 1, 50).unwrap(),
+            None,
+            "not visible before the insert ts"
+        );
+    }
+
+    #[test]
+    fn test_w3_2_materialize_on_first_overwrite_preserves_as_of_history() {
+        // The first mutation materializes the elided insert version from `data:`
+        // and clears the flag BEFORE `data:` is overwritten, so AS-OF at the
+        // insert ts keeps returning the pre-overwrite value.
+        let (db, _temp) = create_test_db();
+        let manager = SnapshotManager::new(Arc::clone(&db));
+        manager.configure_elision(true);
+        manager
+            .write_data_version_and_register_snapshot(b"data:t:1", b"A", "t", 1, 100, b"A", Some(1), None, true)
+            .unwrap();
+
+        // Mutation-path order: materialize first, then overwrite `data:`.
+        manager.materialize_copy_marker_row_durable("t", 1).unwrap();
+        db.put(b"data:t:1", b"B").unwrap();
+
+        assert_eq!(
+            db.get(b"v:t:1:100").unwrap().as_deref(),
+            Some(b"A".as_slice()),
+            "insert `v:` materialized"
+        );
+        assert_eq!(
+            manager.read_at_snapshot("t", 1, 150).unwrap(),
+            Some(b"A".to_vec()),
+            "AS-OF survives overwrite"
+        );
+
+        // Idempotent: a second materialize is a no-op (newest event now clear).
+        manager.materialize_copy_marker_row_durable("t", 1).unwrap();
+        assert_eq!(manager.read_at_snapshot("t", 1, 150).unwrap(), Some(b"A".to_vec()));
+    }
+
+    #[test]
+    fn test_w3_2_mixed_flagged_and_full_rows_resolve_per_row() {
+        // A flagged (elided) row and a full-`v:` row in the same table resolve by
+        // their own per-row flag — the transition is per-row, not global.
+        let (db, _temp) = create_test_db();
+        let manager = SnapshotManager::new(Arc::clone(&db));
+        manager.configure_elision(true);
+
+        manager
+            .write_data_version_and_register_snapshot(b"data:t:1", b"one", "t", 1, 100, b"one", Some(1), None, true)
+            .unwrap();
+        // Row 2 with allow_elide=false (the side-storage / legacy path): full `v:`.
+        manager
+            .write_data_version_and_register_snapshot(b"data:t:2", b"two", "t", 2, 100, b"two", Some(2), None, false)
+            .unwrap();
+
+        assert!(db.get(b"v:t:1:100").unwrap().is_none(), "row 1 elided");
+        assert_eq!(
+            db.get(b"v:t:2:100").unwrap().as_deref(),
+            Some(b"two".as_slice()),
+            "row 2 full `v:`"
+        );
+        assert_eq!(manager.read_at_snapshot("t", 1, 150).unwrap(), Some(b"one".to_vec()));
+        assert_eq!(manager.read_at_snapshot("t", 2, 150).unwrap(), Some(b"two".to_vec()));
+    }
+
+    #[test]
+    fn test_w3_2_legacy_unflagged_value_reads_v_forever_fallback() {
+        // A pre-W3.2 database wrote `v_idx:` values as the raw big-endian ts (high
+        // bit clear) alongside a full `v:`. The new decoder must read those via
+        // `v:` forever — never as an elided `data:` read.
+        let (db, _temp) = create_test_db();
+        let manager = SnapshotManager::new(Arc::clone(&db));
+        db.put(b"v:t:1:100", b"legacy").unwrap();
+        db.put(
+            format!("v_idx:t:1:{:020}", u64::MAX - 100).as_bytes(),
+            100u64.to_be_bytes(),
+        )
+        .unwrap();
+        // A DIFFERENT current `data:` proves `v:` (not `data:`) is read.
+        db.put(b"data:t:1", b"current").unwrap();
+
+        assert_eq!(
+            manager.read_at_snapshot("t", 1, 150).unwrap(),
+            Some(b"legacy".to_vec()),
+            "an unflagged legacy value must resolve via `v:`, not `data:`"
+        );
+    }
+
+    #[test]
+    fn test_w3_2_elision_sentinel_arms_gate_across_reopen() {
+        // The durable sentinel makes a reopen with elision OFF still materialize a
+        // row a prior session left flagged — without it, `maybe_elided_rows` would
+        // be false and the overwrite would silently destroy the AS-OF value.
+        let temp = tempdir().unwrap();
+        let path = temp.path();
+        {
+            let mut opts = rocksdb::Options::default();
+            opts.create_if_missing(true);
+            let db = Arc::new(DB::open(&opts, path).unwrap());
+            let manager = SnapshotManager::new(Arc::clone(&db));
+            manager.configure_elision(true); // session 1: elision ON
+            manager
+                .write_data_version_and_register_snapshot(b"data:t:1", b"A", "t", 1, 100, b"A", Some(1), None, true)
+                .unwrap();
+            assert!(db.get(ELIDE_SENTINEL_KEY).unwrap().is_some(), "sentinel persisted");
+        }
+        {
+            let mut opts = rocksdb::Options::default();
+            opts.create_if_missing(true);
+            let db = Arc::new(DB::open(&opts, path).unwrap());
+            let manager = SnapshotManager::new(Arc::clone(&db));
+            manager.configure_elision(false); // session 2: elision OFF
+            assert!(
+                manager.maybe_elided_rows(),
+                "the sentinel must re-arm the materialize gate"
+            );
+
+            manager.materialize_copy_marker_row_durable("t", 1).unwrap();
+            db.put(b"data:t:1", b"B").unwrap();
+            assert_eq!(
+                manager.read_at_snapshot("t", 1, 150).unwrap(),
+                Some(b"A".to_vec()),
+                "AS-OF at the insert ts must survive the overwrite via the materialized `v:`"
+            );
+        }
     }
 }

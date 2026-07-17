@@ -1,18 +1,37 @@
 # W3.3 — Same-row statement retry: typed `WriteConflict` + contended-writer bench + retry design
 
-Status: **DESIGN-FIRST. Typed error + microbench landed; NO retry loop ships this
-campaign.** Base: `perf/w3-design` off v4.2.0 (`a2e1b5b`). Companion analysis:
-`PERF_ANALYSIS_2026_07_13.md` §"WAVE 3" (W3.3), spec `WAVE_IMPL_SPEC_2026_07_16.md` §W3.3.
-Prior art this design builds on: the optimistic first-committer-wins registry
-(`src/storage/conflict.rs`, `WriteConflictRegistry::validate_and_record:464`) and the
-D4 SQLSTATE mapping (`protocol/postgres/handler.rs sqlstate_for_error:2782`).
+Status: **RETRY LOOP IMPLEMENTED behind a default-OFF knob (W3.3 impl, `perf/w3-impl-2026-07-17`
+off v4.3.0 `e4d26c7`).** Prior deliverables (typed error + 40001 mapping + microbench)
+shipped in the design campaign. Base of the design: `perf/w3-design` off v4.2.0 (`a2e1b5b`).
+Companion analysis: `PERF_ANALYSIS_2026_07_13.md` §"WAVE 3" (W3.3), spec
+`WAVE_IMPL_SPEC_2026_07_16.md` §W3.3. Prior art this design builds on: the optimistic
+first-committer-wins registry (`src/storage/conflict.rs`,
+`WriteConflictRegistry::validate_and_record:464`) and the D4 SQLSTATE mapping
+(`protocol/postgres/handler.rs sqlstate_for_error:2782`).
 
-> **STOP rule (binding).** No retry loop is implemented this campaign. This document
-> ships (1) the typed `Error::WriteConflict` variant produced at the lock-timeout site
-> and mapped to SQLSTATE 40001, and (2) an `#[ignore]`d contended-writer microbench that
-> documents today's pessimistic spin. The retry loop itself (§5) is a SEPARATE, gated
-> task; the go/no-go and the config-default choice are coordinator decisions, not
-> assumptions.
+> **STOP rule (updated — retry loop landed, gated OFF).** The §5 statement-retry loop is
+> now implemented behind `[locks] statement_retry_max` (default `0` = OFF, so the wire path
+> is behavior-preserving until a deployment opts in). The backoff is a scheduler-yielding
+> `tokio::time::sleep(..).await` at the wire-handler boundary (design §5.4 sub-case 2a),
+> keyed ONLY on `Error::WriteConflict`; explicit transactions surface 40001 untouched. The
+> config knobs are genuinely wired (and the previously-orphaned `[locks] timeout_ms` now
+> reaches the `LockManager`, env `NANO_LOCK_TIMEOUT_MS` still overriding). **The remaining
+> gate is the coordinator's: a concurrent wire A/B (§7) that flips the knob on and shows
+> full-timeout conflict latency collapse from ~timeout to holder-commit + backoff — that
+> A/B, not this implementation, is the go/no-go for making the default non-zero.**
+>
+> **Anchor-divergence note (verified at `e4d26c7` / v4.3.0).** The §1.2 table's "session
+> (wire) statement, no open txn" row was written at the design base (v4.2.0), where that
+> statement ran through the lock-carrying `new_with_session` implicit branch. At v4.3.0 the
+> wire autocommit path is optimized to route through the lock-**free** `execute()` fast path
+> (`execute_for_session` → `execute()` when `!session_in_transaction`), which takes no row
+> lock and so produces no pessimistic `WriteConflict` — only the in-explicit-txn branch still
+> spins on the row lock, and that branch (correctly) surfaces 40001 without retry. The retry
+> loop is therefore implemented at the handler boundary exactly per the lease (default OFF,
+> keyed on `WriteConflict`, autocommit-gated) but is **inert on the current autocommit wire
+> path** until that path takes a row lock. The coordinator's A/B must account for this: it is
+> the §7 "confirm the regime" decision — either re-route autocommit through the lock when the
+> knob is on, or re-scope per §7's DO-NOT-PROCEED branch.
 
 ---
 
