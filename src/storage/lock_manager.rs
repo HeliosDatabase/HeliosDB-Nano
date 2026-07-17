@@ -258,11 +258,21 @@ impl LockManager {
                             timeout_ms = self.timeout_ms,
                             "Lock acquisition timeout"
                         );
+                        // Capture the holder before cleanup so the typed
+                        // conflict can name who won the row. Waiting was futile
+                        // (the futility note on `with_default_timeout`): the
+                        // waiter could never have been granted this lock, so a
+                        // timeout here is always a write-write conflict.
+                        let holder_txn = self.primary_holder(resource);
                         self.cleanup_transaction(transaction_id);
-                        return Err(Error::transaction(format!(
-                            "Lock acquisition timeout after {}ms for transaction {}",
-                            self.timeout_ms, transaction_id
-                        )));
+                        let (table, row) = split_row_resource(resource);
+                        return Err(Error::write_conflict(
+                            table,
+                            row,
+                            holder_txn,
+                            transaction_id,
+                            self.timeout_ms,
+                        ));
                     }
 
                     // Wait briefly before retrying
@@ -309,6 +319,16 @@ impl LockManager {
                 resource, transaction_id, lock_type
             )))
         }
+    }
+
+    /// Best-effort current holder of `resource`, for diagnostics on a lock
+    /// timeout. Returns 0 if the lock was released between the timeout check
+    /// and this read (a benign race — the conflict is already decided).
+    fn primary_holder(&self, resource: &str) -> u64 {
+        self.locks
+            .get(resource)
+            .and_then(|state| state.holders.first().copied())
+            .unwrap_or(0)
     }
 
     /// Internal lock release logic
@@ -546,6 +566,19 @@ impl Clone for LockManager {
     }
 }
 
+/// Split a storage lock resource key (`data:{table}:{row_id}`) into its table
+/// and row-identity parts for the typed [`Error::WriteConflict`]. Resources
+/// that do not follow the storage-key convention (non-row locks, test strings)
+/// yield `("", resource)`.
+fn split_row_resource(resource: &str) -> (&str, &str) {
+    if let Some(body) = resource.strip_prefix("data:") {
+        if let Some((table, row)) = body.split_once(':') {
+            return (table, row);
+        }
+    }
+    ("", resource)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -646,5 +679,45 @@ mod tests {
         drop(guard1);
         drop(guard2);
         let _ = handle1.join();
+    }
+
+    #[test]
+    fn write_lock_timeout_yields_typed_write_conflict() {
+        // A short timeout bounds the futile spin: while the holder keeps the
+        // lock the waiter can never be granted it, so it always times out.
+        let manager = Arc::new(LockManager::new(200));
+        let _held = manager
+            .acquire_lock("data:accounts:42", 1, LockType::Write)
+            .expect("holder acquires write lock");
+
+        let err = manager
+            .acquire_lock("data:accounts:42", 2, LockType::Write)
+            .expect_err("second writer must time out");
+
+        match err {
+            Error::WriteConflict {
+                table,
+                row,
+                holder_txn,
+                waiter_txn,
+                waited_ms,
+            } => {
+                assert_eq!(table, "accounts");
+                assert_eq!(row, "42");
+                assert_eq!(holder_txn, 1);
+                assert_eq!(waiter_txn, 2);
+                assert_eq!(waited_ms, 200);
+            }
+            other => panic!("expected WriteConflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn split_row_resource_parses_only_data_keys() {
+        assert_eq!(split_row_resource("data:users:7"), ("users", "7"));
+        assert_eq!(split_row_resource("data:orders:a:b"), ("orders", "a:b"));
+        // Non-storage resources (tests, non-row locks) keep the whole string.
+        assert_eq!(split_row_resource("resource1"), ("", "resource1"));
+        assert_eq!(split_row_resource("data:"), ("", "data:"));
     }
 }

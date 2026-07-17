@@ -37,7 +37,7 @@ impl SystemViewRegistry {
     ///
     /// The Phase-3 system-view set is static — `register_phase3_views` consumes
     /// no runtime/storage state, it only allocates string/enum literals — so a
-    /// fresh `new()` produces a byte-identical 46-view, hundreds-of-`Column`
+    /// fresh `new()` produces a byte-identical 48-view, hundreds-of-`Column`
     /// HashMap every time. Table resolution (`Planner::table_factor_to_plan`
     /// and the executor scan twins) rebuilt it per query just to answer one
     /// `is_system_view()` membership test, which the profile showed hotter than
@@ -1987,6 +1987,55 @@ impl SystemViewRegistry {
             description: "Shows row cache statistics and hit rates".to_string(),
         });
 
+        // heliosdb_lock_census - Read-hot-path lock-contention counters (W3.1).
+        // Empty unless built with the `lock-census` feature AND enabled via
+        // `[performance] lock_census`. One row per instrumented lock site.
+        self.register_view(SystemViewSchema {
+            name: "heliosdb_lock_census".to_string(),
+            schema: Schema {
+                columns: vec![
+                    sv_col("lock_site", DataType::Text),
+                    sv_col("acquisitions", DataType::Int8),
+                    sv_col("contended", DataType::Int8),
+                    sv_col("contended_wait_nanos", DataType::Int8),
+                ],
+            },
+            description: "Read-hot-path lock-contention census (W3.1 plateau attribution)".to_string(),
+        });
+
+        // heliosdb_write_volume - Per-statement-class write-volume census (W3.2).
+        // Zero unless `[performance] write_volume_stats` is enabled. One row per
+        // statement class: data:/version/index-key byte totals + a row count.
+        self.register_view(SystemViewSchema {
+            name: "heliosdb_write_volume".to_string(),
+            schema: Schema {
+                columns: vec![
+                    sv_col("stmt_class", DataType::Text),
+                    sv_col("data_bytes", DataType::Int8),
+                    sv_col("version_bytes", DataType::Int8),
+                    sv_col("index_key_bytes", DataType::Int8),
+                    sv_col("rows", DataType::Int8),
+                ],
+            },
+            description: "Per-statement-class write-volume census (W3.2 version-format quantification)".to_string(),
+        });
+
+        // heliosdb_copy_phase_stats - COPY fast-path phase-timing census (W3.4).
+        // Zero unless `[performance] copy_phase_stats` is enabled. One row per
+        // funnel phase: cumulative wall nanos, a call count, and a row count.
+        self.register_view(SystemViewSchema {
+            name: "heliosdb_copy_phase_stats".to_string(),
+            schema: Schema {
+                columns: vec![
+                    sv_col("phase", DataType::Text),
+                    sv_col("total_nanos", DataType::Int8),
+                    sv_col("calls", DataType::Int8),
+                    sv_col("rows", DataType::Int8),
+                ],
+            },
+            description: "COPY fast-path phase-timing census (W3.4 ART-maintenance attribution)".to_string(),
+        });
+
         // pg_tables — make the basic catalog query work over SQL.
         // The legacy SystemViewRegistry in sql/system_views.rs has
         // a richer implementation we delegate to at execute time.
@@ -2773,6 +2822,12 @@ impl SystemViewRegistry {
             "heliosdb_simd_capabilities" => Self::execute_heliosdb_simd_capabilities(),
             // Row cache stats
             "heliosdb_row_cache_stats" => Self::execute_heliosdb_row_cache_stats(storage),
+            // Read-hot-path lock-contention census (W3.1)
+            "heliosdb_lock_census" => Self::execute_heliosdb_lock_census(),
+            // Per-statement-class write-volume census (W3.2)
+            "heliosdb_write_volume" => Self::execute_heliosdb_write_volume(),
+            // COPY fast-path phase-timing census (W3.4)
+            "heliosdb_copy_phase_stats" => Self::execute_heliosdb_copy_phase_stats(),
             // Code-graph track grammar inventory.
             "hdb_code_languages" => Self::execute_hdb_code_languages(),
             // pg_tables — delegate to the legacy SystemViewRegistry
@@ -4576,6 +4631,71 @@ impl SystemViewRegistry {
             Value::String("Cache hit rate percentage".to_string()),
         ]));
 
+        Ok(results)
+    }
+
+    /// Execute heliosdb_lock_census view (W3.1 plateau attribution).
+    ///
+    /// One row per instrumented read-hot-path lock site: acquisitions,
+    /// try-lock-contended count, and cumulative contended-wait nanos. Always
+    /// empty unless the binary was built with the `lock-census` feature and
+    /// `[performance] lock_census` is enabled — the counters are process-global
+    /// (see `crate::lock_census`).
+    fn execute_heliosdb_lock_census() -> Result<Vec<Tuple>> {
+        let results = crate::lock_census::snapshot()
+            .into_iter()
+            .map(|site| {
+                Tuple::new(vec![
+                    Value::String(site.name.to_string()),
+                    Value::Int8(site.acquisitions as i64),
+                    Value::Int8(site.contended as i64),
+                    Value::Int8(site.contended_wait_nanos as i64),
+                ])
+            })
+            .collect();
+        Ok(results)
+    }
+
+    /// Execute heliosdb_write_volume view (W3.2 version-format quantification).
+    ///
+    /// One row per statement class: bytes written to `data:`, to the
+    /// `v:`/`v_idx:` version chain, and to secondary-index keys, plus a written-
+    /// row count. All zero unless `[performance] write_volume_stats` is enabled;
+    /// the counters are process-global (see `crate::write_volume`).
+    fn execute_heliosdb_write_volume() -> Result<Vec<Tuple>> {
+        let results = crate::write_volume::snapshot()
+            .into_iter()
+            .map(|stat| {
+                Tuple::new(vec![
+                    Value::String(stat.class.to_string()),
+                    Value::Int8(stat.data_bytes as i64),
+                    Value::Int8(stat.version_bytes as i64),
+                    Value::Int8(stat.index_key_bytes as i64),
+                    Value::Int8(stat.rows as i64),
+                ])
+            })
+            .collect();
+        Ok(results)
+    }
+
+    /// Execute heliosdb_copy_phase_stats view (W3.4 ART-maintenance attribution).
+    ///
+    /// One row per COPY fast-path funnel phase: cumulative wall nanos, a call
+    /// count (COPY batches through the phase), and a processed-row count. All
+    /// zero unless `[performance] copy_phase_stats` is enabled; the counters are
+    /// process-global (see `crate::copy_phase_stats`).
+    fn execute_heliosdb_copy_phase_stats() -> Result<Vec<Tuple>> {
+        let results = crate::copy_phase_stats::snapshot()
+            .into_iter()
+            .map(|stat| {
+                Tuple::new(vec![
+                    Value::String(stat.phase.to_string()),
+                    Value::Int8(stat.total_nanos as i64),
+                    Value::Int8(stat.calls as i64),
+                    Value::Int8(stat.rows as i64),
+                ])
+            })
+            .collect();
         Ok(results)
     }
 }

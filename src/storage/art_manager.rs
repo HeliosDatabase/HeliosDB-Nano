@@ -18,7 +18,7 @@ use crate::{DataType, Schema, Tuple, Value};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, RwLockReadGuard};
 
 /// Shared handle to a single ART index tree.
 ///
@@ -803,19 +803,33 @@ impl ArtIndexManager {
     // INDEX ACCESS
     // =========================================================================
 
+    /// Read-lock the index registry through the lock-census (W3.1). Off the
+    /// `lock-census` feature this inlines to the previous
+    /// `self.indexes.read().unwrap_or_else(poison)` at zero cost.
+    #[inline]
+    fn indexes_read(&self) -> RwLockReadGuard<'_, HashMap<String, IndexEntry>> {
+        crate::lock_census::rwlock_read(crate::lock_census::Site::ArtIndexRegistry, &self.indexes)
+    }
+
+    /// Read-lock the table→PK-index-name map through the lock-census (W3.1).
+    #[inline]
+    fn pk_indexes_read(&self) -> RwLockReadGuard<'_, HashMap<String, String>> {
+        crate::lock_census::rwlock_read(crate::lock_census::Site::ArtPkRegistry, &self.pk_indexes)
+    }
+
     /// Get a shared handle to an index by name.
     ///
     /// Returns an `Arc<RwLock<…>>` handle instead of cloning the whole tree.
     /// Keep the lock scope on the returned handle as tight as possible.
     pub fn get_index(&self, name: &str) -> Option<SharedArtIndex> {
-        let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
+        let indexes = self.indexes_read();
         indexes.get(name).map(|entry| Arc::clone(&entry.tree))
     }
 
     /// Get the primary key index for a table
     pub fn get_pk_index(&self, table: &str) -> Option<SharedArtIndex> {
         let pk_name = {
-            let pk_indexes = self.pk_indexes.read().unwrap_or_else(|e| e.into_inner());
+            let pk_indexes = self.pk_indexes_read();
             pk_indexes.get(table).cloned()
         };
 
@@ -924,11 +938,11 @@ impl ArtIndexManager {
     /// PK index point lookup without cloning the tree (~50μs saved vs get_pk_index)
     pub fn pk_index_lookup(&self, table: &str, key: &[u8]) -> Option<RowId> {
         let pk_name = {
-            let pk_indexes = self.pk_indexes.read().unwrap_or_else(|e| e.into_inner());
+            let pk_indexes = self.pk_indexes_read();
             pk_indexes.get(table).cloned()
         };
         pk_name.and_then(|name| {
-            let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
+            let indexes = self.indexes_read();
             indexes.get(&name).and_then(|entry| {
                 let tree = entry.tree.read().unwrap_or_else(|e| e.into_inner());
                 tree.get(key)
@@ -939,11 +953,11 @@ impl ArtIndexManager {
     /// Check if a PK value exists without cloning the tree
     pub fn pk_index_contains(&self, table: &str, key: &[u8]) -> Option<bool> {
         let pk_name = {
-            let pk_indexes = self.pk_indexes.read().unwrap_or_else(|e| e.into_inner());
+            let pk_indexes = self.pk_indexes_read();
             pk_indexes.get(table).cloned()
         };
         pk_name.map(|name| {
-            let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
+            let indexes = self.indexes_read();
             indexes.get(&name).is_some_and(|entry| {
                 let tree = entry.tree.read().unwrap_or_else(|e| e.into_inner());
                 tree.contains(key)
@@ -1533,6 +1547,9 @@ impl ArtIndexManager {
     /// Update indexes after INSERT using an already-materialized tuple.
     pub fn on_insert_tuple(&self, table: &str, row_id: RowId, schema: &Schema, tuple: &Tuple) -> ArtResult<()> {
         self.note_mutation();
+        // W3.2: hoist the write-volume census fast-out (one relaxed load for the
+        // whole per-index loop). Attributed to the ambient INSERT class scope.
+        let wv = crate::write_volume::enabled();
         let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
 
         for entry in indexes.values() {
@@ -1542,6 +1559,10 @@ impl ArtIndexManager {
 
             if let Some(values) = Self::index_value_refs_from_tuple(&entry.columns, schema, tuple) {
                 let key = Self::encode_key_from_values(values.iter().copied());
+                // W3.2: one ART entry = encoded key + the u64 row-id payload.
+                if wv {
+                    crate::write_volume::add(crate::write_volume::Category::IndexKey, (key.len() + 8) as u64);
+                }
                 let mut index = entry.tree.write().unwrap_or_else(|e| e.into_inner());
                 match entry.index_type {
                     ArtIndexType::PrimaryKey | ArtIndexType::Unique => {
@@ -1572,6 +1593,8 @@ impl ArtIndexManager {
         tuple: &Tuple,
     ) -> ArtResult<HashMap<String, Value>> {
         self.note_mutation();
+        // W3.2: census fast-out for the buffered/txn insert index path.
+        let wv = crate::write_volume::enabled();
         let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
         let mut indexed_values = HashMap::new();
 
@@ -1596,6 +1619,10 @@ impl ArtIndexManager {
 
             if values.len() == entry.columns.len() {
                 let key = Self::encode_key_from_values(values.iter().copied());
+                // W3.2: one ART entry = encoded key + the u64 row-id payload.
+                if wv {
+                    crate::write_volume::add(crate::write_volume::Category::IndexKey, (key.len() + 8) as u64);
+                }
                 let mut index = entry.tree.write().unwrap_or_else(|e| e.into_inner());
                 match entry.index_type {
                     ArtIndexType::PrimaryKey | ArtIndexType::Unique => {

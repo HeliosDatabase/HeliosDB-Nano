@@ -184,6 +184,45 @@ simd_enabled = true
 # Enable parallel query execution
 parallel_query = true
 
+# Read-hot-path lock-contention census (diagnostic; W3.1 plateau attribution).
+# When enabled, per-query acquisitions of the plan/parse/result cache shard
+# mutexes, the ART index registry, and the prepared-statement fast-select
+# registry try-lock first; a would-block bumps a relaxed contention counter and
+# accumulates blocked-wait nanos. Inspect via
+#   SELECT * FROM heliosdb_lock_census;
+# Requires a build with the `lock-census` cargo feature; on any other build
+# this flag is ignored and carries zero runtime cost. Leave false in production.
+lock_census = false
+
+# Per-statement-class write-volume census (diagnostic; W3.2 version-format
+# quantification). When enabled, durable writes are counted by statement class
+# (single INSERT, multi-row INSERT, COPY, UPDATE, DELETE) and split across three
+# key families: the current row (`data:`), the time-travel version chain
+# (`v:`/`v_idx:` + COPY `vmeta:` marker), and secondary-index (ART) keys. Use it
+# to see what fraction of INSERT byte volume is the `v:` duplicate of every row.
+# Inspect via
+#   SELECT * FROM heliosdb_write_volume;
+# The version-chain counter reads zero under the `fast`/`fast_ingest` profiles
+# (time_travel_enabled = false) — those profiles write no `v:`/`v_idx:` at all;
+# version bytes appear only for time-travel-on configs (default/safe/balanced/agent).
+# Runtime-only (no build feature required); zero-cost when off (one relaxed
+# atomic load per write funnel). Leave false in production.
+write_volume_stats = false
+
+# COPY fast-path phase-timing census (diagnostic; W3.4 ART-maintenance
+# attribution). When enabled, the COPY bulk-insert funnel's wall time is split
+# across its phases — wire decode, type conversion, CHECK/FK constraint checks,
+# PK auto-fill, the data:/version WriteBatch build, the durable RocksDB commit,
+# and per-row ART secondary-index maintenance — to measure what share of a COPY
+# is index maintenance. Inspect via
+#   SELECT * FROM heliosdb_copy_phase_stats;
+# ART share = art_maintain.total_nanos / (total.total_nanos + decode.total_nanos).
+# The batch_build/commit/art_maintain phases are shared with multi-row
+# INSERT ... VALUES, so read the view after a COPY-only workload. Runtime-only
+# (no build feature required); zero-cost when off (one relaxed atomic load per
+# phase boundary). Leave false in production.
+copy_phase_stats = false
+
 # ============================================================================
 # AUDIT CONFIGURATION
 # ============================================================================

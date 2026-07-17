@@ -796,7 +796,14 @@ impl Transaction {
                         &mut version_index_key_buf,
                     );
                 }
-                None => batch.delete(key),
+                None => {
+                    batch.delete(key);
+                    // W3.2: buffered DELETE tombstone (`data:` key bytes).
+                    if crate::write_volume::enabled() {
+                        crate::write_volume::add_row();
+                        crate::write_volume::add(crate::write_volume::Category::Data, key.len() as u64);
+                    }
+                }
             }
         }
 
@@ -972,6 +979,14 @@ impl Transaction {
         version_index_key_buf: &mut Vec<u8>,
     ) {
         batch.put(key, val);
+        // W3.2: `data:` bytes for the buffered commit path (explicit txns and
+        // autocommit-implicit txns). Class is the ambient scope — `other` for a
+        // multi-statement txn whose writes land at COMMIT, decoupled from the
+        // staging statement (documented in `W3_2_DESIGN.md`).
+        if crate::write_volume::enabled() {
+            crate::write_volume::add_row();
+            crate::write_volume::add(crate::write_volume::Category::Data, (key.len() + val.len()) as u64);
+        }
 
         // Create version history (value + reverse-ts index) for AS OF /
         // snapshot-history reads. P0#1: skip entirely when versioning is
@@ -1031,6 +1046,15 @@ impl Transaction {
         version_index_key_buf.push(b':');
         version_index_key_buf.extend_from_slice(reverse_ts_text);
         batch.put(&version_index_key_buf, commit_ts_bytes);
+
+        // W3.2: version-chain bytes for the buffered commit path. `v:` value ==
+        // the row payload (`val`) — the byte-identical duplicate W3.2 quantifies.
+        if crate::write_volume::enabled() {
+            crate::write_volume::add(
+                crate::write_volume::Category::Version,
+                (version_key_buf.len() + val.len() + version_index_key_buf.len() + commit_ts_bytes.len()) as u64,
+            );
+        }
     }
 
     /// Commit the transaction
