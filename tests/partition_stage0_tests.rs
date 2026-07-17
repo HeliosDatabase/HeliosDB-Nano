@@ -114,17 +114,25 @@ fn schema_qualified_parent_and_child() -> Result<()> {
 #[test]
 fn drop_in_both_orders() -> Result<()> {
     let db = EmbeddedDatabase::new_in_memory()?;
-    // child-then-parent
+    // child-then-parent: dropping the child directly unregisters it (PG parity),
+    // then the parent drops with no child left to cascade.
     db.execute("CREATE TABLE p1 (a INT) PARTITION BY RANGE (a)")?;
     db.execute("CREATE TABLE p1_c PARTITION OF p1 FOR VALUES FROM (0) TO (10)")?;
     db.execute("DROP TABLE p1_c")?;
     db.execute("DROP TABLE p1")?;
 
-    // parent-then-child (children are independent tables, so either order works)
+    // parent-then-child: round-3 makes `DROP TABLE parent` CASCADE to its
+    // partition children (PostgreSQL parity — the behavior this feature adds),
+    // so the child is already gone after the parent drop. A bare `DROP TABLE
+    // p2_c` would now correctly error; an explicit follow-up must use IF EXISTS.
     db.execute("CREATE TABLE p2 (a INT) PARTITION BY RANGE (a)")?;
     db.execute("CREATE TABLE p2_c PARTITION OF p2 FOR VALUES FROM (0) TO (10)")?;
     db.execute("DROP TABLE p2")?;
-    db.execute("DROP TABLE p2_c")?;
+    assert!(
+        db.query("SELECT a FROM p2_c", &[]).is_err(),
+        "parent drop cascades to the child (round-3 behavior change)"
+    );
+    db.execute("DROP TABLE IF EXISTS p2_c")?;
     Ok(())
 }
 
@@ -169,14 +177,28 @@ fn child_of_missing_parent_errors_cleanly() {
 fn empty_column_inherits_is_not_treated_as_partition() -> Result<()> {
     let db = EmbeddedDatabase::new_in_memory()?;
     db.execute("CREATE TABLE base_tbl (a INT, b TEXT)")?;
+    db.execute("CREATE TABLE plain_empty ()")?;
     // `CREATE TABLE fail () INHERITS (base_tbl)` also has empty columns, but is
-    // NOT a PARTITION OF — the partition column-copy must not fire for it. (If
-    // the engine rejects a zero-column table outright that pre-existing
-    // behavior is unchanged; the point is only that base_tbl's columns are not
-    // injected via the partition path.)
+    // NOT a PARTITION OF — the partition column-copy must not fire for it. The
+    // observable is the CATALOG column count: if the partition path had fired,
+    // `fail` would register base_tbl's 2 columns; it must instead register
+    // exactly what a plain zero-column CREATE registers (whatever that is on
+    // this engine — SELECT permissiveness on empty tables is pre-existing
+    // behavior this test deliberately does not pin).
     if db.execute("CREATE TABLE fail () INHERITS (base_tbl)").is_ok() {
-        assert!(
-            db.query("SELECT a FROM fail", &[]).is_err(),
+        let count = |t: &str| -> Result<usize> {
+            Ok(db
+                .query(
+                    &format!(
+                        "SELECT column_name FROM information_schema.columns WHERE table_name = '{t}'"
+                    ),
+                    &[],
+                )?
+                .len())
+        };
+        assert_eq!(
+            count("fail")?,
+            count("plain_empty")?,
             "empty INHERITS table must not gain parent columns via the partition path"
         );
     }
@@ -206,5 +228,198 @@ fn multi_statement_batch_two_parents_no_cross_contamination() -> Result<()> {
     // Cross columns must NOT exist on the wrong child.
     assert!(db.query("SELECT x FROM mp1_c", &[]).is_err());
     assert!(db.query("SELECT a FROM mp2_c", &[]).is_err());
+    Ok(())
+}
+
+// --------------------------------------------------------------------------
+// Round-3 partition-round3: DROP TABLE parent cascades to its Stage-0
+// PARTITION OF children (PostgreSQL parity). Under the flatten, children are
+// independent tables that would otherwise ORPHAN when the parent drops, so a
+// corpus file that re-creates a child name later hit "table already exists".
+// --------------------------------------------------------------------------
+
+/// (a) `DROP TABLE parent` drops BOTH a `FOR VALUES` child and a `DEFAULT`
+/// child; the freed child name is then re-creatable as a plain table.
+/// FAILS on pre-fix code: the children orphan, so the re-CREATE hits
+/// "already exists" and the post-drop SELECTs wrongly succeed.
+#[test]
+fn drop_parent_drops_children() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute("CREATE TABLE cas_parent (id INT NOT NULL, v TEXT) PARTITION BY RANGE (id)")?;
+    db.execute("CREATE TABLE cas_named PARTITION OF cas_parent FOR VALUES FROM (0) TO (100)")?;
+    db.execute("CREATE TABLE cas_def PARTITION OF cas_parent DEFAULT")?;
+
+    // Children are usable standalone tables at Stage 0.
+    db.execute("INSERT INTO cas_named (id, v) VALUES (5, 'a')")?;
+    db.execute("INSERT INTO cas_def (id, v) VALUES (999, 'b')")?;
+
+    // Dropping the parent cascades to every registered child.
+    db.execute("DROP TABLE cas_parent")?;
+    assert!(
+        db.query("SELECT id FROM cas_named", &[]).is_err(),
+        "FOR VALUES child must be dropped with its parent"
+    );
+    assert!(
+        db.query("SELECT id FROM cas_def", &[]).is_err(),
+        "DEFAULT child must be dropped with its parent"
+    );
+
+    // The freed child name is re-creatable as an ordinary (non-partition) table.
+    db.execute("CREATE TABLE cas_named (a INT, b INT)")?;
+    db.execute("INSERT INTO cas_named (a, b) VALUES (1, 2)")?;
+    assert_eq!(db.query("SELECT a, b FROM cas_named", &[])?.len(), 1);
+    Ok(())
+}
+
+/// (b) A sub-partitioned child cascades RECURSIVELY: dropping the grandparent
+/// removes the sub-partitioned child and its own grandchild.
+/// FAILS on pre-fix code (no cascade at all).
+#[test]
+fn sub_partitioned_child_cascades_recursively() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute("CREATE TABLE sp_parent (k INT, v TEXT) PARTITION BY LIST (k)")?;
+    // A DEFAULT child that is itself sub-partitioned (its own PARTITION BY tail).
+    db.execute("CREATE TABLE sp_mid PARTITION OF sp_parent DEFAULT PARTITION BY RANGE (k)")?;
+    db.execute("CREATE TABLE sp_leaf PARTITION OF sp_mid FOR VALUES FROM (100) TO (200)")?;
+    db.execute("INSERT INTO sp_leaf (k, v) VALUES (150, 'g')")?;
+
+    // Drop the top parent → the mid child AND the leaf grandchild both go.
+    db.execute("DROP TABLE sp_parent")?;
+    assert!(
+        db.query("SELECT k FROM sp_mid", &[]).is_err(),
+        "sub-partitioned child dropped with grandparent"
+    );
+    assert!(
+        db.query("SELECT k FROM sp_leaf", &[]).is_err(),
+        "grandchild dropped recursively"
+    );
+
+    // Names are free again.
+    db.execute("CREATE TABLE sp_leaf (z INT)")?;
+    assert_eq!(db.query("SELECT z FROM sp_leaf", &[])?.len(), 0);
+    Ok(())
+}
+
+/// (c) A child dropped DIRECTLY is unregistered (PG parity): the later parent
+/// drop cascades only to the surviving children, and every name re-creates
+/// cleanly. PARTIALLY fails on pre-fix code — the direct child drop worked,
+/// but the parent drop did not cascade, so the surviving child orphaned and
+/// its post-drop SELECT wrongly succeeded / its re-CREATE hit "already exists".
+#[test]
+fn drop_child_directly_then_parent() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute("CREATE TABLE dc_parent (a INT) PARTITION BY RANGE (a)")?;
+    db.execute("CREATE TABLE dc_c1 PARTITION OF dc_parent FOR VALUES FROM (0) TO (10)")?;
+    db.execute("CREATE TABLE dc_c2 PARTITION OF dc_parent FOR VALUES FROM (10) TO (20)")?;
+
+    // Drop one child directly — allowed, and it unregisters from the parent.
+    db.execute("DROP TABLE dc_c1")?;
+    assert!(db.query("SELECT a FROM dc_c1", &[]).is_err());
+    // The other child is untouched.
+    db.execute("INSERT INTO dc_c2 (a) VALUES (11)")?;
+    assert_eq!(db.query("SELECT a FROM dc_c2", &[])?.len(), 1);
+
+    // Dropping the parent cascades to the surviving child only.
+    db.execute("DROP TABLE dc_parent")?;
+    assert!(
+        db.query("SELECT a FROM dc_c2", &[]).is_err(),
+        "surviving child cascaded with the parent"
+    );
+
+    // Every freed name re-creates cleanly (dc_c1 was already unregistered, so
+    // its earlier direct drop must not have left a link that touches this one).
+    db.execute("CREATE TABLE dc_c1 (a INT, b INT)")?;
+    assert_eq!(db.query("SELECT a, b FROM dc_c1", &[])?.len(), 0);
+    db.execute("CREATE TABLE dc_parent (a INT) PARTITION BY RANGE (a)")?;
+    db.execute("CREATE TABLE dc_c2 PARTITION OF dc_parent FOR VALUES FROM (0) TO (10)")?;
+    Ok(())
+}
+
+/// (d) Schema-qualified parent + child: registration and drop-lookup must
+/// normalize IDENTICALLY (both collapse `sq.<name>` to the bare catalog key),
+/// so `DROP TABLE sq.parent` cascades to `sq.child`. This is the exact shape
+/// behind the triage note about a bare `pk11` printed for `fkpart11.pk11`.
+/// FAILS on pre-fix code (no cascade).
+#[test]
+fn schema_qualified_parent_child_cascade() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute("CREATE TABLE sq.fkpart11 (id INT NOT NULL, note TEXT) PARTITION BY RANGE (id)")?;
+    db.execute("CREATE TABLE sq.pk11 PARTITION OF sq.fkpart11 FOR VALUES FROM (0) TO (10)")?;
+    db.execute("INSERT INTO pk11 (id, note) VALUES (3, 'n')")?;
+
+    // Drop the schema-qualified parent; the schema-qualified child cascades.
+    db.execute("DROP TABLE sq.fkpart11")?;
+    assert!(
+        db.query("SELECT id FROM pk11", &[]).is_err(),
+        "schema-qualified child cascaded (bare-name view)"
+    );
+    assert!(
+        db.query("SELECT id FROM sq.pk11", &[]).is_err(),
+        "schema-qualified child cascaded (qualified view)"
+    );
+
+    // Freed bare name re-usable as a plain table.
+    db.execute("CREATE TABLE pk11 (x INT)")?;
+    assert_eq!(db.query("SELECT x FROM pk11", &[])?.len(), 0);
+    Ok(())
+}
+
+/// (e) `DROP TABLE IF EXISTS parent` twice, plus a multi-table DROP list. The
+/// first drop cascades and clears the registry; the second is a clean no-op;
+/// a multi-table list mixing a partitioned parent with a missing name works.
+/// The second `IF EXISTS` drop errors on pre-fix code only if a stale link is
+/// left; here it exercises that the registry is fully cleaned.
+#[test]
+fn drop_if_exists_parent_twice_and_multi() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute("CREATE TABLE ie_parent (a INT) PARTITION BY RANGE (a)")?;
+    db.execute("CREATE TABLE ie_child PARTITION OF ie_parent FOR VALUES FROM (0) TO (10)")?;
+
+    // First drop cascades and removes the registry entries.
+    db.execute("DROP TABLE IF EXISTS ie_parent")?;
+    assert!(db.query("SELECT a FROM ie_child", &[]).is_err());
+    // Second drop is a clean no-op (no stale registry, no error).
+    assert_eq!(db.execute("DROP TABLE IF EXISTS ie_parent")?, 0);
+
+    // Re-create and drop via a multi-table list that also names a missing table.
+    db.execute("CREATE TABLE ie_parent (a INT) PARTITION BY RANGE (a)")?;
+    db.execute("CREATE TABLE ie_child PARTITION OF ie_parent FOR VALUES FROM (0) TO (10)")?;
+    db.execute("DROP TABLE IF EXISTS ie_parent, ie_other_missing")?;
+    assert!(
+        db.query("SELECT a FROM ie_child", &[]).is_err(),
+        "multi-table DROP cascades the partitioned parent's child"
+    );
+    Ok(())
+}
+
+/// (f) pg_class exposes `relpartbound` as NULL for every Stage-0 row (the
+/// corpus reads `SELECT relname, relpartbound FROM pg_class WHERE relname IN
+/// (...)`). The query must also succeed (empty) when the tables do not exist.
+/// ERRORS on pre-fix code (no `relpartbound` column).
+#[test]
+fn pg_class_relpartbound_is_null() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    // Empty catalog: the exact corpus SELECT shape returns no rows, not an error.
+    let empty = db.query(
+        "SELECT relname, relpartbound FROM pg_class WHERE relname IN ('pb_parent', 'pb_child')",
+        &[],
+    )?;
+    assert!(empty.is_empty(), "no matching relations yet → empty result, not an error");
+
+    db.execute("CREATE TABLE pb_parent (id INT) PARTITION BY RANGE (id)")?;
+    db.execute("CREATE TABLE pb_child PARTITION OF pb_parent FOR VALUES FROM (0) TO (10)")?;
+    let rows = db.query(
+        "SELECT relname, relpartbound FROM pg_class WHERE relname IN ('pb_parent', 'pb_child')",
+        &[],
+    )?;
+    assert_eq!(rows.len(), 2, "parent and child both present in pg_class");
+    for row in &rows {
+        assert!(matches!(row.values[0], Value::String(_)), "relname is text");
+        assert!(
+            matches!(row.values[1], Value::Null),
+            "relpartbound must be NULL at Stage 0, got {:?}",
+            row.values[1]
+        );
+    }
     Ok(())
 }

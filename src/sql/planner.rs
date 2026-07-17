@@ -4266,7 +4266,11 @@ impl<'a> Planner<'a> {
     /// collapses a parsed `ObjectName`, so the parent lookup and the child-name
     /// key match how tables are stored in the catalog. Reuses the real
     /// normalizer by reconstructing an `ObjectName` from the raw parts.
-    fn normalize_partition_name(raw: &str) -> String {
+    ///
+    /// `pub(crate)` so the DROP-cascade registration in the executor path can
+    /// normalize a `PARTITION OF` parent name IDENTICALLY to how the child was
+    /// planned — registration and drop-lookup must agree byte-for-byte.
+    pub(crate) fn normalize_partition_name(raw: &str) -> String {
         let idents: Vec<sqlparser::ast::Ident> = Self::split_dotted_ident(raw)
             .into_iter()
             .map(|(value, quoted)| {

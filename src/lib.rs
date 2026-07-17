@@ -2682,6 +2682,37 @@ impl EmbeddedDatabase {
                     catalog.register_identity_columns(name, &identity_cols)?;
                 }
 
+                // Round-3 PARTITION BY Stage-0: if this CREATE was a
+                // `… PARTITION OF parent` child, record the parent→child
+                // dependency so a later `DROP TABLE parent` cascades to its
+                // partition children (PostgreSQL parity). Re-derived from the
+                // ORIGINAL SQL exactly as the planner does (`extract_partition_of`
+                // + `normalize_partition_name`), and keyed on the SAME normalized
+                // names that key the catalog — so a schema-qualified
+                // `s.parent`/`s.child` resolves to the same bare keys the tables
+                // are stored under. A plain, non-partition CREATE returns `None`
+                // here → no registry write (zero cost). This runs only after
+                // `create_table` above succeeded (the `?` short-circuits a
+                // duplicate-name / bad-DDL failure before we reach this point).
+                //
+                // COVERAGE CONSTRAINT (review-pinned): this arm is reached by
+                // embedded execute()/execute_batch and the PG/MySQL SIMPLE-query
+                // wire path. The EXTENDED/parameterized route has NO CreateTable
+                // handler today (executor default arm errors on every CREATE),
+                // so no child can be created — and thus none can miss
+                // registration — over Parse/Bind/Execute. If executor CreateTable
+                // support is ever added, it MUST register partition children the
+                // same way, or parent DROPs will orphan extended-created
+                // children. Stage-0 semantics also pinned here: DDL is
+                // non-transactional (ROLLBACK keeps both the child and its
+                // registry entry — consistent), and dump/restore flattens
+                // children to standalone CREATEs (a restored setup does not
+                // cascade-drop; Stage 1 owns the durable partition catalog).
+                if let Some(spec) = sql::Parser::extract_partition_of(sql) {
+                    let parent = sql::Planner::normalize_partition_name(&spec.parent);
+                    catalog.register_partition_child(&parent, name)?;
+                }
+
                 // Save table constraints if any
                 if !constraints.is_empty() {
                     let mut table_constraints = sql::TableConstraints::new();
