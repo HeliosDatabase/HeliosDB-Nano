@@ -124,9 +124,7 @@ fn take_ident(s: &str) -> Option<(String, &str)> {
         let end = after_q.find('"')?;
         return Some((after_q[..end].to_string(), &after_q[end + 1..]));
     }
-    let end = s
-        .find(|c: char| c.is_whitespace() || c == '(')
-        .unwrap_or(s.len());
+    let end = s.find(|c: char| c.is_whitespace() || c == '(').unwrap_or(s.len());
     if end == 0 {
         return None;
     }
@@ -169,6 +167,12 @@ pub(crate) fn decode_text_field(raw: &str) -> Option<String> {
 /// Parse accumulated COPY-text bytes into rows of optional fields (None = NULL).
 /// Stops at the `\.` end-of-data marker; drops the trailing empty segment left
 /// by a final newline. UTF-8 is decoded lossily.
+///
+/// Since W2.4 the wire path streams frames through `CopyStreamDecoder` instead of
+/// buffering the whole stream, so this whole-buffer parser is retained only as the
+/// independent oracle the streaming tests assert byte-for-byte equivalence against
+/// (hence `#[cfg(test)]`).
+#[cfg(test)]
 pub(crate) fn parse_text_rows(data: &[u8]) -> Vec<Vec<Option<String>>> {
     let text = String::from_utf8_lossy(data);
     let mut rows = Vec::new();
@@ -202,11 +206,7 @@ fn sql_value(v: &Option<String>) -> String {
 
 /// Build an injection-safe multi-row INSERT for a batch of COPY rows.
 /// `None` if the batch is empty.
-pub(crate) fn build_insert_sql(
-    table: &str,
-    columns: &[String],
-    rows: &[Vec<Option<String>>],
-) -> Option<String> {
+pub(crate) fn build_insert_sql(table: &str, columns: &[String], rows: &[Vec<Option<String>>]) -> Option<String> {
     if rows.is_empty() {
         return None;
     }
@@ -278,6 +278,11 @@ fn finish_csv_field(field: &str, was_quoted: bool) -> Option<String> {
 /// Parse COPY CSV bytes into rows of optional fields. A proper stateful parser:
 /// quoted fields may contain the comma delimiter, embedded newlines, and `""`
 /// (escaped quote). Comma delimiter, newline (LF or CRLF) row separator.
+///
+/// Retained since W2.4 only as the streaming decoder's test oracle (see
+/// `parse_text_rows`); the wire path decodes incrementally via
+/// `CopyStreamDecoder`.
+#[cfg(test)]
 pub(crate) fn parse_csv_rows(data: &[u8]) -> Vec<Vec<Option<String>>> {
     let text = String::from_utf8_lossy(data);
     let mut rows: Vec<Vec<Option<String>>> = Vec::new();
@@ -359,6 +364,379 @@ pub(crate) fn encode_csv_row(fields: &[Option<Vec<u8>>]) -> Vec<u8> {
     let mut line = parts.join(",");
     line.push('\n');
     line.into_bytes()
+}
+
+// ── streaming decode (W2.4) ──────────────────────────────────────────────────
+
+/// Byte length of the prefix of `buf` that is safe to lossily UTF-8-decode right
+/// now: the whole buffer, unless it ends with the leading 1–3 bytes of a
+/// still-incomplete multibyte UTF-8 character, whose bytes are withheld for the
+/// next frame so a code point split across a CopyData boundary is never turned
+/// into a premature replacement char. Genuinely invalid interior bytes are left
+/// in place — the caller's `from_utf8_lossy` replaces them exactly as the batch
+/// parsers do. A delimiter/newline byte is ASCII, so it is never withheld.
+fn decodable_prefix_len(buf: &[u8]) -> usize {
+    // Walk back from the end over UTF-8 continuation bytes (0b10xx_xxxx), at most
+    // 3, to the lead byte of the final character. `trailing` counts the bytes of
+    // that final sequence (lead + its continuation bytes).
+    let mut trailing = 0usize;
+    let mut lead = None;
+    for &b in buf.iter().rev().take(4) {
+        trailing += 1;
+        if b & 0xC0 != 0x80 {
+            lead = Some(b);
+            break;
+        }
+    }
+    let Some(lead) = lead else {
+        // Empty buffer, or 4+ continuation bytes with no lead (malformed):
+        // nothing to withhold — decode now and let lossy replacement handle it.
+        return buf.len();
+    };
+    let expected = if lead < 0x80 {
+        1
+    } else if lead & 0xE0 == 0xC0 {
+        2
+    } else if lead & 0xF0 == 0xE0 {
+        3
+    } else if lead & 0xF8 == 0xF0 {
+        4
+    } else {
+        // Not a valid lead byte (stray continuation or 0xF8..=0xFF): decode now.
+        return buf.len();
+    };
+    if trailing < expected {
+        buf.len() - trailing // incomplete final character — hold its bytes back
+    } else {
+        buf.len()
+    }
+}
+
+/// Incremental `COPY … FROM STDIN` decoder (W2.4). `handle_copy` feeds it the raw
+/// bytes of each `CopyData` frame as they arrive; it produces TYPED rows and
+/// drops the raw bytes, so peak memory tracks the parsed batch instead of (~4–6×)
+/// the whole stream buffered as one `Vec<u8>` (the pre-W2.4 OOM vector). Frames
+/// split at arbitrary byte offsets — mid-line, mid-quoted-field, and
+/// mid-UTF8-character — so the decoder carries the partial trailing line (text),
+/// the CSV quote/field state, and any incomplete-UTF8 tail across `push` calls.
+/// On a fully-buffered stream it yields byte-identical rows to `parse_text_rows`
+/// / `parse_csv_rows` (asserted by the streaming unit tests). Two independent
+/// caps bound memory: a *row* cap (`max_rows`, over completed rows) and a
+/// *per-record byte* cap (`max_record_bytes`, over the in-progress record state —
+/// the partial text line `pending`, or the growing CSV `csv_field`/`csv_row`).
+/// The per-record cap closes the hole the row cap never sees: an unterminated
+/// record — a multi-GB single-line blob loaded in text mode, or an unclosed
+/// quoted CSV field — accumulates raw bytes with no completed row to trip the
+/// row cap. Exceeding EITHER cap drops everything buffered and reports
+/// `overflowed()` (with `overflow_reason()` naming which cap tripped), letting
+/// the caller abort the COPY with zero rows applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CopyOverflow {
+    /// More than `max_rows` completed rows were buffered.
+    Rows,
+    /// The in-progress record exceeded `max_record_bytes`.
+    RecordBytes,
+}
+
+pub(crate) struct CopyStreamDecoder {
+    format: CopyFormat,
+    rows: Vec<Vec<Option<String>>>,
+    /// Maximum rows to buffer; 0 = unlimited.
+    max_rows: usize,
+    /// Maximum bytes for a single in-progress record; 0 = unlimited.
+    max_record_bytes: usize,
+    /// Bytes accumulated for the current, not-yet-terminated record. Reset to 0
+    /// at every record boundary (text newline / CSV unquoted newline).
+    record_bytes: usize,
+    overflow: bool,
+    /// Which cap tripped `overflow`, for the caller's error message.
+    overflow_kind: Option<CopyOverflow>,
+    /// Text: raw bytes of the current partial line (no `\n` seen yet).
+    /// CSV: only the incomplete-UTF8 tail (row/field state lives in the fields
+    /// below).
+    pending: Vec<u8>,
+    /// Text: the `\.` end-of-data marker was seen — ignore all further input.
+    text_done: bool,
+    // CSV state — mirrors the locals of `parse_csv_rows` so a frame boundary
+    // anywhere inside a record is transparent.
+    csv_field: String,
+    csv_row: Vec<Option<String>>,
+    csv_in_quotes: bool,
+    csv_was_quoted: bool,
+    csv_field_started: bool,
+    /// A `"` seen while inside a quoted field whose escaped-vs-closing meaning
+    /// depends on the NEXT char — which may arrive in the next frame.
+    csv_quote_pending: bool,
+}
+
+impl CopyStreamDecoder {
+    pub(crate) fn new(format: CopyFormat, max_rows: usize, max_record_bytes: usize) -> Self {
+        Self {
+            format,
+            rows: Vec::new(),
+            max_rows,
+            max_record_bytes,
+            record_bytes: 0,
+            overflow: false,
+            overflow_kind: None,
+            pending: Vec::new(),
+            text_done: false,
+            csv_field: String::new(),
+            csv_row: Vec::new(),
+            csv_in_quotes: false,
+            csv_was_quoted: false,
+            csv_field_started: false,
+            csv_quote_pending: false,
+        }
+    }
+
+    /// True once a memory cap tripped; the buffers have been dropped and the COPY
+    /// must be aborted with no rows applied. `overflow_reason` names which cap.
+    pub(crate) fn overflowed(&self) -> bool {
+        self.overflow
+    }
+
+    /// Which memory cap tripped `overflowed`, or `None` if it has not.
+    pub(crate) fn overflow_reason(&self) -> Option<CopyOverflow> {
+        self.overflow_kind
+    }
+
+    /// Feed one `CopyData` frame's bytes.
+    pub(crate) fn push(&mut self, chunk: &[u8]) {
+        if self.overflow {
+            return;
+        }
+        match self.format {
+            CopyFormat::Csv => self.push_csv(chunk),
+            // Text (and Binary, which handle_copy rejects before we are reached)
+            // use the newline-delimited line decoder.
+            _ => self.push_text(chunk),
+        }
+    }
+
+    /// Consume all buffered rows, flushing any partial trailing record. After
+    /// this the decoder is spent. Returns no rows when it has overflowed.
+    pub(crate) fn finish(mut self) -> Vec<Vec<Option<String>>> {
+        if self.overflow {
+            return Vec::new();
+        }
+        match self.format {
+            CopyFormat::Csv => self.finish_csv(),
+            _ => self.finish_text(),
+        }
+        self.rows
+    }
+
+    /// Append a completed row, tripping the row cap (and releasing everything
+    /// buffered) if it is exceeded.
+    fn push_row(&mut self, row: Vec<Option<String>>) {
+        if self.overflow {
+            return;
+        }
+        self.rows.push(row);
+        if self.max_rows != 0 && self.rows.len() > self.max_rows {
+            self.trip_overflow(CopyOverflow::Rows);
+        }
+    }
+
+    /// Account for `n` more bytes in the current in-progress record, tripping the
+    /// per-record byte cap (and releasing everything buffered) if it is exceeded.
+    /// Bounds the partial-record state the row cap never sees: the unterminated
+    /// text line (`pending`) and the growing CSV `csv_field`/`csv_row`. Callers
+    /// reset `record_bytes` to 0 at each record boundary (a completed row).
+    fn bump_record_bytes(&mut self, n: usize) {
+        if self.overflow || self.max_record_bytes == 0 {
+            return;
+        }
+        self.record_bytes = self.record_bytes.saturating_add(n);
+        if self.record_bytes > self.max_record_bytes {
+            self.trip_overflow(CopyOverflow::RecordBytes);
+        }
+    }
+
+    /// Trip the overflow flag, record which cap fired, and release every buffer
+    /// (parsed rows AND in-progress record state) so a rejected COPY frees its
+    /// memory immediately.
+    fn trip_overflow(&mut self, kind: CopyOverflow) {
+        self.overflow = true;
+        self.overflow_kind = Some(kind);
+        self.rows = Vec::new();
+        self.pending = Vec::new();
+        self.csv_field = String::new();
+        self.csv_row = Vec::new();
+    }
+
+    // ── text format ──────────────────────────────────────────────────────────
+    // Slices are `chunk[start..i]` / `chunk[start..]` with `start <= i < len`
+    // maintained by the loop, so every range is in bounds by construction.
+    #[allow(clippy::indexing_slicing)]
+    fn push_text(&mut self, chunk: &[u8]) {
+        if self.text_done {
+            return;
+        }
+        let mut start = 0;
+        for (i, &b) in chunk.iter().enumerate() {
+            if b == b'\n' {
+                // The bytes of this frame since the last terminator complete the
+                // record ending here; a single over-cap line (even one delivered
+                // whole, so `pending` is empty) must trip before we consume it.
+                self.bump_record_bytes(i - start);
+                if self.overflow {
+                    return;
+                }
+                if self.pending.is_empty() {
+                    self.consume_text_line(&chunk[start..i]);
+                } else {
+                    self.pending.extend_from_slice(&chunk[start..i]);
+                    let line = std::mem::take(&mut self.pending);
+                    self.consume_text_line(&line);
+                }
+                self.record_bytes = 0; // newline = record boundary
+                start = i + 1;
+                if self.text_done {
+                    self.pending.clear();
+                    return;
+                }
+            }
+        }
+        // Buffer the trailing partial line (no `\n` yet) for the next frame — the
+        // unbounded-accumulation vector: count it before it grows `pending`.
+        let tail = &chunk[start..];
+        self.bump_record_bytes(tail.len());
+        if self.overflow {
+            return;
+        }
+        self.pending.extend_from_slice(tail);
+    }
+
+    fn finish_text(&mut self) {
+        // A final record without a trailing newline is still a row (matches
+        // `parse_text_rows` processing the last `split('\n')` segment).
+        if !self.text_done && !self.pending.is_empty() {
+            let line = std::mem::take(&mut self.pending);
+            self.consume_text_line(&line);
+        }
+    }
+
+    /// Decode one text line (bytes between newlines, `\n` already stripped),
+    /// mirroring the body of `parse_text_rows`' loop.
+    fn consume_text_line(&mut self, line: &[u8]) {
+        let cow = String::from_utf8_lossy(line);
+        let s: &str = cow.strip_suffix('\r').unwrap_or(&cow);
+        if s == "\\." {
+            self.text_done = true;
+            return;
+        }
+        if s.is_empty() {
+            return;
+        }
+        let row: Vec<Option<String>> = s.split('\t').map(decode_text_field).collect();
+        self.push_row(row);
+    }
+
+    // ── csv format ───────────────────────────────────────────────────────────
+    fn push_csv(&mut self, chunk: &[u8]) {
+        self.pending.extend_from_slice(chunk);
+        let take = decodable_prefix_len(&self.pending);
+        if take == 0 {
+            return; // whole buffer is one still-incomplete UTF-8 character
+        }
+        let consumed: Vec<u8> = self.pending.drain(..take).collect();
+        let text = String::from_utf8_lossy(&consumed);
+        for c in text.chars() {
+            self.feed_csv_char(c);
+            if self.overflow {
+                return;
+            }
+        }
+    }
+
+    fn finish_csv(&mut self) {
+        // Flush any remaining incomplete-UTF8 tail lossily, exactly as the
+        // whole-buffer `parse_csv_rows` would.
+        if !self.pending.is_empty() {
+            let tail = std::mem::take(&mut self.pending);
+            let text = String::from_utf8_lossy(&tail);
+            for c in text.chars() {
+                self.feed_csv_char(c);
+                if self.overflow {
+                    return;
+                }
+            }
+        }
+        // A `"` at end-of-stream closes the quoted field (no escaped-quote
+        // partner followed) — matches `parse_csv_rows`' `peek() == None` arm.
+        if self.csv_quote_pending {
+            self.csv_quote_pending = false;
+            self.csv_in_quotes = false;
+        }
+        // Trailing field/row when the data does not end with a newline.
+        if self.csv_field_started || self.csv_was_quoted || !self.csv_row.is_empty() {
+            let f = finish_csv_field(&self.csv_field, self.csv_was_quoted);
+            self.csv_row.push(f);
+            let row = std::mem::take(&mut self.csv_row);
+            self.push_row(row);
+        }
+    }
+
+    /// Advance the CSV state machine by one char — equivalent to one iteration of
+    /// `parse_csv_rows`' loop, with that loop's `""`-escape lookahead expressed
+    /// as the `csv_quote_pending` flag so it can straddle a frame boundary.
+    fn feed_csv_char(&mut self, c: char) {
+        // Every char either grows `csv_field`/`csv_row` or is structural; count
+        // its bytes toward the in-progress record so an unclosed quoted field
+        // (embedded newlines and all) or a comma-only row cannot grow without
+        // limit. The count resets when a record terminates (the `'\n'` arm).
+        self.bump_record_bytes(c.len_utf8());
+        if self.overflow {
+            return;
+        }
+        if self.csv_quote_pending {
+            self.csv_quote_pending = false;
+            if c == '"' {
+                self.csv_field.push('"'); // "" -> a literal quote; stay in quotes
+                return;
+            }
+            // The pending quote closed the field; handle `c` as an unquoted char.
+            self.csv_in_quotes = false;
+        } else if self.csv_in_quotes {
+            if c == '"' {
+                self.csv_quote_pending = true;
+            } else {
+                self.csv_field.push(c);
+            }
+            return;
+        }
+        match c {
+            '"' if !self.csv_field_started => {
+                self.csv_in_quotes = true;
+                self.csv_was_quoted = true;
+                self.csv_field_started = true;
+            }
+            ',' => {
+                let f = finish_csv_field(&self.csv_field, self.csv_was_quoted);
+                self.csv_row.push(f);
+                self.csv_field.clear();
+                self.csv_was_quoted = false;
+                self.csv_field_started = false;
+            }
+            '\r' => {} // tolerate CRLF
+            '\n' => {
+                let f = finish_csv_field(&self.csv_field, self.csv_was_quoted);
+                self.csv_row.push(f);
+                let row = std::mem::take(&mut self.csv_row);
+                self.push_row(row);
+                self.csv_field.clear();
+                self.csv_was_quoted = false;
+                self.csv_field_started = false;
+                self.record_bytes = 0; // unquoted newline = record boundary
+            }
+            other => {
+                self.csv_field.push(other);
+                self.csv_field_started = true;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -450,8 +828,7 @@ mod tests {
     #[test]
     fn encode_decode_roundtrip() {
         // a row encodes to a line that decodes back to the same fields
-        let fields: Vec<Option<Vec<u8>>> =
-            vec![Some(b"1".to_vec()), None, Some(b"has\ttab\nand nl".to_vec())];
+        let fields: Vec<Option<Vec<u8>>> = vec![Some(b"1".to_vec()), None, Some(b"has\ttab\nand nl".to_vec())];
         let line = encode_text_row(&fields);
         assert_eq!(line.last(), Some(&b'\n'));
         let rows = parse_text_rows(&line);
@@ -474,7 +851,10 @@ mod tests {
             rows[1],
             vec![Some("2".into()), Some("a,b".into()), Some("she said \"hi\"".into())]
         );
-        assert_eq!(rows[2], vec![Some("3".into()), Some("line1\nline2".into()), Some("x".into())]);
+        assert_eq!(
+            rows[2],
+            vec![Some("3".into()), Some("line1\nline2".into()), Some("x".into())]
+        );
     }
 
     #[test]
@@ -488,8 +868,7 @@ mod tests {
 
     #[test]
     fn csv_encode_decode_roundtrip() {
-        let fields: Vec<Option<Vec<u8>>> =
-            vec![Some(b"1".to_vec()), None, Some(b"a,b\"c\nd".to_vec())];
+        let fields: Vec<Option<Vec<u8>>> = vec![Some(b"1".to_vec()), None, Some(b"a,b\"c\nd".to_vec())];
         let line = encode_csv_row(&fields);
         let rows = parse_csv_rows(&line);
         assert_eq!(rows.len(), 1);
@@ -497,5 +876,169 @@ mod tests {
             rows[0],
             vec![Some("1".to_string()), None, Some("a,b\"c\nd".to_string())]
         );
+    }
+
+    // ── streaming decode (W2.4) ──────────────────────────────────────────────
+
+    /// Feed `data` to a `CopyStreamDecoder` broken at the given cut points and
+    /// return the decoded rows. `splits` are absolute byte offsets; the segments
+    /// between them (and the final remainder) are pushed as separate frames.
+    #[allow(clippy::indexing_slicing)]
+    fn stream_split(format: CopyFormat, data: &[u8], splits: &[usize]) -> Vec<Vec<Option<String>>> {
+        let mut d = CopyStreamDecoder::new(format, 0, 0);
+        let mut prev = 0;
+        for &s in splits {
+            d.push(&data[prev..s]);
+            prev = s;
+        }
+        d.push(&data[prev..]);
+        d.finish()
+    }
+
+    #[test]
+    fn stream_text_every_two_way_split_matches_batch() {
+        // Frames split mid-line, mid-field, and mid-NULL-sentinel at every byte
+        // offset must all reproduce the single-frame `parse_text_rows` result.
+        let data = b"1\thello\n2\t\\N\n3\tworld\n";
+        let want = parse_text_rows(data);
+        for k in 0..=data.len() {
+            assert_eq!(stream_split(CopyFormat::Text, data, &[k]), want, "split at {k}");
+        }
+    }
+
+    #[test]
+    fn stream_text_terminator_and_no_trailing_newline() {
+        // `\.` end-of-data marker halts decoding wherever the frame boundary
+        // falls, and a final record without a trailing newline is still a row.
+        let term = b"1\ta\n2\tb\n\\.\n3\tignored";
+        let want = parse_text_rows(term);
+        assert_eq!(want.len(), 2); // stops at \.
+        for k in 0..=term.len() {
+            assert_eq!(stream_split(CopyFormat::Text, term, &[k]), want, "term split at {k}");
+        }
+        let no_nl = b"x\ty\nz\tw";
+        let want2 = parse_text_rows(no_nl);
+        for k in 0..=no_nl.len() {
+            assert_eq!(stream_split(CopyFormat::Text, no_nl, &[k]), want2, "no-nl split at {k}");
+        }
+    }
+
+    #[test]
+    fn stream_csv_every_two_way_split_matches_batch() {
+        // Splits fall inside quoted fields, on the "" escape, and inside embedded
+        // newlines — the CSV quote/field state must carry across every boundary.
+        let data = b"1,,\"\"\n2,\"a,b\",\"she said \"\"hi\"\"\"\n3,\"line1\nline2\",x\n";
+        let want = parse_csv_rows(data);
+        for k in 0..=data.len() {
+            assert_eq!(stream_split(CopyFormat::Csv, data, &[k]), want, "split at {k}");
+        }
+    }
+
+    #[test]
+    fn stream_split_mid_utf8_char_matches_batch() {
+        // é (2 bytes), € (3 bytes) and 😀 (4 bytes): a 2-way split at EVERY byte
+        // offset lands inside each multibyte char. Wrong mid-UTF8 handling would
+        // emit a premature U+FFFD and diverge from the batch oracle here.
+        let text = "1\tcafé\n2\t€uro\n3\t😀smile\n".as_bytes();
+        let want_t = parse_text_rows(text);
+        for k in 0..=text.len() {
+            assert_eq!(stream_split(CopyFormat::Text, text, &[k]), want_t, "text split at {k}");
+        }
+        let csv = "1,café\n2,\"€,uro\"\n3,😀smile\n".as_bytes();
+        let want_c = parse_csv_rows(csv);
+        for k in 0..=csv.len() {
+            assert_eq!(stream_split(CopyFormat::Csv, csv, &[k]), want_c, "csv split at {k}");
+        }
+    }
+
+    #[test]
+    fn stream_byte_by_byte_matches_batch() {
+        // The pathological one-byte-per-frame stream exercises the carry logic to
+        // its limit for both formats.
+        let text = b"a\tb\tc\n\\N\tx\ty\n";
+        let mut dt = CopyStreamDecoder::new(CopyFormat::Text, 0, 0);
+        for b in text {
+            dt.push(std::slice::from_ref(b));
+        }
+        assert_eq!(dt.finish(), parse_text_rows(text));
+
+        let csv = b"a,b,c\n\"q1\",\"q,2\",\"q\"\"3\"\n";
+        let mut dc = CopyStreamDecoder::new(CopyFormat::Csv, 0, 0);
+        for b in csv {
+            dc.push(std::slice::from_ref(b));
+        }
+        assert_eq!(dc.finish(), parse_csv_rows(csv));
+    }
+
+    #[test]
+    fn stream_row_cap_overflows_and_drops_rows() {
+        let data = b"1\ta\n2\tb\n3\tc\n4\td\n";
+        // Cap of 2: the 3rd row trips overflow; finish() yields zero rows.
+        let mut over = CopyStreamDecoder::new(CopyFormat::Text, 2, 0);
+        over.push(data);
+        assert!(over.overflowed());
+        assert_eq!(over.overflow_reason(), Some(CopyOverflow::Rows));
+        assert!(over.finish().is_empty(), "overflow applies zero rows");
+        // Exactly at the cap is allowed (overflow is strictly > max_rows).
+        let two = b"1\ta\n2\tb\n";
+        let mut ok = CopyStreamDecoder::new(CopyFormat::Text, 2, 0);
+        ok.push(two);
+        assert!(!ok.overflowed());
+        assert_eq!(ok.finish().len(), 2);
+        // 0 = unlimited.
+        let mut unlimited = CopyStreamDecoder::new(CopyFormat::Text, 0, 0);
+        unlimited.push(data);
+        assert!(!unlimited.overflowed());
+        assert_eq!(unlimited.finish().len(), 4);
+    }
+
+    #[test]
+    fn stream_record_byte_cap_bounds_unterminated_records() {
+        // The row cap (arg 2) never fires on an UNTERMINATED record — no row ever
+        // completes — so the per-record byte cap (arg 3) is what bounds memory for
+        // the OOM class this item retires. Every assertion below is false on
+        // pre-change code, where no per-record cap exists (the constructor took no
+        // such argument and the in-progress buffer grew without limit).
+
+        // Text: a 1000-byte line with NO newline (the multi-GB single-line blob)
+        // trips the 64-byte record cap even with an unlimited row cap.
+        let blob = vec![b'a'; 1000];
+        let mut d = CopyStreamDecoder::new(CopyFormat::Text, 0, 64);
+        d.push(&blob);
+        assert!(d.overflowed(), "unterminated 1000-byte line trips 64-byte record cap");
+        assert_eq!(d.overflow_reason(), Some(CopyOverflow::RecordBytes));
+        assert!(d.finish().is_empty(), "overflow applies zero rows");
+
+        // CSV: an unclosed quoted field grows `csv_field` (embedded newlines and
+        // all) without a completed row — the per-record cap must still catch it.
+        let mut open_quote = vec![b'"']; // a lone opening quote, never closed …
+        open_quote.resize(1001, b'x'); // … followed by 1000 field bytes.
+        let mut c = CopyStreamDecoder::new(CopyFormat::Csv, 0, 64);
+        c.push(&open_quote);
+        assert!(c.overflowed(), "unclosed quoted field trips 64-byte record cap");
+        assert_eq!(c.overflow_reason(), Some(CopyOverflow::RecordBytes));
+        assert!(c.finish().is_empty());
+
+        // Byte-at-a-time delivery trips at the same boundary (carry across frames).
+        let mut bb = CopyStreamDecoder::new(CopyFormat::Text, 0, 64);
+        for _ in 0..1000 {
+            bb.push(b"a");
+        }
+        assert!(bb.overflowed(), "record cap carries the count across frames");
+
+        // 0 = unlimited: the same blob decodes as one row, no trip.
+        let mut unbounded = CopyStreamDecoder::new(CopyFormat::Text, 0, 0);
+        unbounded.push(&blob);
+        assert!(!unbounded.overflowed());
+        assert_eq!(unbounded.finish().len(), 1);
+
+        // The cap is PER-RECORD, not cumulative: many short rows whose SUM far
+        // exceeds the cap never trip, because each newline resets the counter.
+        let mut many = CopyStreamDecoder::new(CopyFormat::Text, 0, 8);
+        for _ in 0..100 {
+            many.push(b"ab\n"); // 2-byte record, well under the 8-byte cap
+        }
+        assert!(!many.overflowed(), "per-record cap resets at each record boundary");
+        assert_eq!(many.finish().len(), 100);
     }
 }
