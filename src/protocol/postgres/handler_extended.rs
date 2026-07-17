@@ -319,17 +319,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
             // being spliced back into SQL. The pinned plan (populated at
             // first Execute, revalidated against the plan-cache epoch)
             // skips the per-Execute plan-cache lookup (R5.W2).
-            let results = match self.pinned_plan_for(&statement) {
+            // Guard the synchronous planner/executor call so a panic (e.g. an
+            // arithmetic-overflow panic under overflow-checks) becomes a
+            // recoverable XX000 error instead of dropping the connection.
+            let results = super::handler::run_guarded(|| match self.pinned_plan_for(&statement) {
                 Some(plan) => self.database.query_params_for_session_with_plan(
                     self.session_id,
                     &statement.query,
                     &param_values,
                     &plan,
-                )?,
+                ),
                 None => self
                     .database
-                    .query_params_for_session(self.session_id, &statement.query, &param_values)?,
-            };
+                    .query_params_for_session(self.session_id, &statement.query, &param_values),
+            })?;
 
             // Handle max_rows limit
             let results_to_send = if max_rows > 0 {
@@ -381,9 +384,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
             let is_delete = super::handler::starts_with_icase(trimmed, "DELETE");
             let is_dml_returning = upper.contains("RETURNING") && (is_insert || is_update || is_delete);
             if is_dml_returning {
-                let (affected, tuples) = self
-                    .database
-                    .execute_params_returning(&statement.query, &param_values)?;
+                // Guard the synchronous DML-RETURNING execution too (the third
+                // execution entry on the extended path, alongside the SELECT
+                // and non-SELECT param arms below): a panic in the
+                // planner/evaluator becomes a recoverable XX000 error instead
+                // of unwinding the connection task and dropping the client.
+                let (affected, tuples) = super::handler::run_guarded(|| {
+                    self.database
+                        .execute_params_returning(&statement.query, &param_values)
+                })?;
                 self.prepared_statements
                     .update_portal_state(&portal_name, PortalState::Complete)?;
                 // RowDescription was already sent during Describe; Execute
@@ -402,17 +411,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
             }
 
             // Non-SELECT query — params-aware execution.
-            let affected = match self.pinned_plan_for(&statement) {
+            // Guard the synchronous planner/executor call (see the SELECT arm
+            // above): convert a panic into a recoverable XX000 error.
+            let affected = super::handler::run_guarded(|| match self.pinned_plan_for(&statement) {
                 Some(plan) => self.database.execute_params_for_session_with_plan(
                     self.session_id,
                     &statement.query,
                     &param_values,
                     &plan,
-                )?,
+                ),
                 None => self
                     .database
-                    .execute_params_for_session(self.session_id, &statement.query, &param_values)?,
-            };
+                    .execute_params_for_session(self.session_id, &statement.query, &param_values),
+            })?;
             let tag = self.get_command_tag(&statement.query, affected);
             self.send_command_complete(&tag).await?;
 

@@ -942,3 +942,69 @@ async fn view_redefine_via_extended_protocol_invalidates_describe_schema() {
          the added TEXT column (a stale shared-plan-cache entry would still report only id)"
     );
 }
+
+/// Per-statement panic isolation must cover the extended/prepared path — and
+/// specifically its third execution entry, the `is_dml_returning` branch that
+/// calls `execute_params_returning`. A statement that fails at execute time on
+/// that path must surface as a recoverable error (which the connection loop
+/// renders as an ErrorResponse) and leave the connection fully usable for the
+/// next statement, rather than unwinding the task and dropping the client.
+///
+/// The `run_guarded` unit test in `handler.rs` proves the panic→XX000
+/// conversion deterministically; this drives the guarded DML-RETURNING path
+/// end-to-end over the wire with a deterministic execute-time failure
+/// (BIGINT overflow) and asserts the handler stays healthy afterwards.
+#[tokio::test]
+async fn extended_dml_returning_failure_keeps_connection_usable() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    db.execute("CREATE TABLE ov (id BIGINT PRIMARY KEY)").expect("create");
+    // i64::MAX — `id + 1` overflows when the UPDATE is evaluated.
+    db.execute("INSERT INTO ov VALUES (9223372036854775807)").expect("insert");
+
+    let (mut handler, mut client) = test_handler(Arc::clone(&db));
+
+    // `UPDATE ... RETURNING` is not a row-returning (SELECT/CTE) query, so it
+    // routes through the `is_dml_returning` branch -> the guarded
+    // `execute_params_returning` call. The `id + 1` overflow raises a checked-
+    // arithmetic error at execute time.
+    handler
+        .handle_parse_extended("bad".into(), "UPDATE ov SET id = id + 1 RETURNING id".into(), vec![])
+        .await
+        .expect("parse");
+    handler
+        .handle_bind_extended("bp".into(), "bad".into(), vec![], vec![], vec![])
+        .await
+        .expect("bind");
+    let err = handler
+        .handle_execute_extended("bp".into(), 0)
+        .await
+        .expect_err("overflowing UPDATE ... RETURNING must surface an error, not panic/drop");
+    assert_eq!(
+        super::handler::sqlstate_for_error(&err),
+        "XX000",
+        "a failure on the guarded DML-RETURNING path must map to a recoverable SQLSTATE; got {err}"
+    );
+    let _ = drain(&mut client).await;
+
+    // The connection/handler must still be fully usable — the failed statement
+    // did not corrupt state or drop the client.
+    handler
+        .handle_parse_extended("ok".into(), "SELECT id FROM ov ORDER BY id".into(), vec![])
+        .await
+        .expect("parse after error");
+    handler
+        .handle_bind_extended("op".into(), "ok".into(), vec![], vec![], vec![])
+        .await
+        .expect("bind after error");
+    handler
+        .handle_execute_extended("op".into(), 0)
+        .await
+        .expect("a fresh statement after the error must execute normally");
+    let rows = data_rows(&drain(&mut client).await);
+    assert_eq!(rows.len(), 1, "the row must be unchanged and the connection healthy");
+    assert_eq!(
+        rows[0][0].as_deref(),
+        Some(b"9223372036854775807".as_ref()),
+        "the overflowing UPDATE must not have mutated the row"
+    );
+}

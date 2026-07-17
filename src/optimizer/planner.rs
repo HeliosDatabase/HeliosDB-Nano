@@ -349,6 +349,7 @@ impl Planner {
             | LogicalPlan::CreateEnumType { .. }
             | LogicalPlan::DropEnumType { .. }
             | LogicalPlan::CreateSchema { .. }
+            | LogicalPlan::Noop
             | LogicalPlan::CreateExtension { .. }
             | LogicalPlan::DropExtension { .. }
             | LogicalPlan::CreateDatabase { .. }

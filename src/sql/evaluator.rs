@@ -12,6 +12,12 @@ use std::sync::Arc;
 
 const ANY_ARRAY_MARKER_FUNCTION: &str = "__hdb_any_array";
 
+/// Upper bound (1 GiB) on a string length that string-building functions
+/// (repeat/lpad/rpad) will attempt to allocate. Beyond this the allocation
+/// would panic on capacity overflow and drop the connection; PostgreSQL
+/// likewise rejects fields above ~1GB with "requested length too large".
+const MAX_STRING_LEN: usize = 1_073_741_824;
+
 /// Expression evaluator
 ///
 /// Evaluates expressions in the context of a tuple and schema.
@@ -4017,7 +4023,14 @@ impl Evaluator {
                 Ok(Value::Date(new_date))
             }
             // Interval + Interval
-            (Value::Interval(a), Value::Interval(b)) => Ok(Value::Interval(a + b)),
+            // checked_add: interval micros are a single i64; summing two large
+            // intervals overflows and (with overflow-checks=true) panics, dropping
+            // the connection (corpus interval seq 383-386). PostgreSQL returns
+            // 'interval out of range'.
+            (Value::Interval(a), Value::Interval(b)) => a
+                .checked_add(*b)
+                .map(Value::Interval)
+                .ok_or_else(|| Error::query_execution("interval out of range")),
             _ => Err(Error::query_execution(format!("Cannot add {:?} and {:?}", left, right))),
         }
     }
@@ -4173,7 +4186,13 @@ impl Evaluator {
                 Ok(Value::Interval(micros))
             }
             // Interval - Interval
-            (Value::Interval(a), Value::Interval(b)) => Ok(Value::Interval(a - b)),
+            // checked_sub mirrors checked_add in arithmetic_add: an i64
+            // microsecond overflow panics under overflow-checks; PostgreSQL
+            // returns 'interval out of range' (corpus interval seq 383-386).
+            (Value::Interval(a), Value::Interval(b)) => a
+                .checked_sub(*b)
+                .map(Value::Interval)
+                .ok_or_else(|| Error::query_execution("interval out of range")),
             _ => Err(Error::query_execution(format!(
                 "Cannot subtract {:?} and {:?}",
                 left, right
@@ -5216,7 +5235,15 @@ impl Evaluator {
                             }
                         })
                 }
+                // `.trim()` before parsing: Postgres' pg_strtoint16
+                // explicitly skips leading/trailing whitespace, but Rust's
+                // FromStr for integers does not, so whitespace-padded
+                // literals (CSV imports, fixed-width exports) previously
+                // failed here with a spurious "Cannot cast" error. Same
+                // trim applied to the other five numeric String arms
+                // below (INT4/INT8/FLOAT4/FLOAT8/NUMERIC).
                 Value::String(s) => s
+                    .trim()
                     .parse::<i16>()
                     .map(Value::Int2)
                     .map_err(|e| Error::query_execution(format!("Cannot cast '{}' to INT2: {}", s, e))),
@@ -5247,6 +5274,7 @@ impl Evaluator {
                         })
                 }
                 Value::String(s) => s
+                    .trim()
                     .parse::<i32>()
                     .map(Value::Int4)
                     .map_err(|e| Error::query_execution(format!("Cannot cast '{}' to INT4: {}", s, e))),
@@ -5277,6 +5305,7 @@ impl Evaluator {
                         })
                 }
                 Value::String(s) => s
+                    .trim()
                     .parse::<i64>()
                     .map(Value::Int8)
                     .map_err(|e| Error::query_execution(format!("Cannot cast '{}' to INT8: {}", s, e))),
@@ -5300,6 +5329,7 @@ impl Evaluator {
                         })
                 }
                 Value::String(s) => s
+                    .trim()
                     .parse::<f32>()
                     .map(Value::Float4)
                     .map_err(|e| Error::query_execution(format!("Cannot cast '{}' to FLOAT4: {}", s, e))),
@@ -5323,6 +5353,7 @@ impl Evaluator {
                         })
                 }
                 Value::String(s) => s
+                    .trim()
                     .parse::<f64>()
                     .map(Value::Float8)
                     .map_err(|e| Error::query_execution(format!("Cannot cast '{}' to FLOAT8: {}", s, e))),
@@ -5452,8 +5483,13 @@ impl Evaluator {
                 Value::Float8(f) => Ok(Value::Numeric(format!("{}", f))),
                 // String to Numeric: parse and validate
                 Value::String(s) => {
-                    // Validate that the string is a valid numeric value
-                    s.parse::<Decimal>()
+                    // Validate that the string is a valid numeric value.
+                    // Trim leading/trailing whitespace first: Postgres'
+                    // numeric-in accepts it (pg_strtoint16/32/64 and the
+                    // numeric parser both skip surrounding whitespace),
+                    // but rust_decimal::Decimal::from_str does not.
+                    s.trim()
+                        .parse::<Decimal>()
                         .map(|dec| Value::Numeric(format!("{}", dec)))
                         .map_err(|e| Error::query_execution(format!("Cannot cast '{}' to NUMERIC: {}", s, e)))
                 }
@@ -6480,12 +6516,21 @@ impl Evaluator {
             Value::String(s) => s,
             _ => return Err(Error::query_execution("REPEAT first argument must be a string")),
         };
+        // Clamp negative length to 0 (PostgreSQL returns an empty string). A
+        // negative int cast `as usize` would become ~1.8e19 and str::repeat would
+        // panic on capacity overflow, dropping the client connection (corpus
+        // strings seq 475, CONN_LOST).
         let n = match b {
-            Value::Int2(n) => *n as usize,
-            Value::Int4(n) => *n as usize,
-            Value::Int8(n) => *n as usize,
+            Value::Int2(n) => usize::try_from(*n).unwrap_or(0),
+            Value::Int4(n) => usize::try_from(*n).unwrap_or(0),
+            Value::Int8(n) => usize::try_from(*n).unwrap_or(0),
             _ => return Err(Error::query_execution("REPEAT second argument must be an integer")),
         };
+        // Guard an absurd positive result size (str::repeat panics on capacity
+        // overflow); PostgreSQL rejects fields above ~1GB with this same error.
+        if s.len().checked_mul(n).is_none_or(|total| total > MAX_STRING_LEN) {
+            return Err(Error::query_execution("requested length too large"));
+        }
         Ok(Value::String(s.repeat(n)))
     }
 
@@ -6612,12 +6657,19 @@ impl Evaluator {
             Value::String(s) => s,
             _ => return Err(Error::query_execution("LPAD first argument must be a string")),
         };
+        // Clamp negative length to 0 (PostgreSQL returns an empty string). A
+        // negative int cast `as usize` would become ~1.8e19 and the subsequent
+        // String::with_capacity / extend would panic on capacity overflow,
+        // dropping the client connection (corpus strings seq 458, CONN_LOST).
         let length = match arg1 {
-            Value::Int2(n) => *n as usize,
-            Value::Int4(n) => *n as usize,
-            Value::Int8(n) => *n as usize,
+            Value::Int2(n) => usize::try_from(*n).unwrap_or(0),
+            Value::Int4(n) => usize::try_from(*n).unwrap_or(0),
+            Value::Int8(n) => usize::try_from(*n).unwrap_or(0),
             _ => return Err(Error::query_execution("LPAD second argument must be an integer")),
         };
+        if length > MAX_STRING_LEN {
+            return Err(Error::query_execution("requested length too large"));
+        }
         let fill = if let Some(arg2) = args.get(2) {
             match arg2 {
                 Value::String(f) => f.clone(),
@@ -6659,12 +6711,19 @@ impl Evaluator {
             Value::String(s) => s,
             _ => return Err(Error::query_execution("RPAD first argument must be a string")),
         };
+        // Clamp negative length to 0 (PostgreSQL returns an empty string). A
+        // negative int cast `as usize` would become ~1.8e19 and the subsequent
+        // extend would panic on capacity overflow, dropping the client
+        // connection (corpus strings seq 463, CONN_LOST).
         let length = match arg1 {
-            Value::Int2(n) => *n as usize,
-            Value::Int4(n) => *n as usize,
-            Value::Int8(n) => *n as usize,
+            Value::Int2(n) => usize::try_from(*n).unwrap_or(0),
+            Value::Int4(n) => usize::try_from(*n).unwrap_or(0),
+            Value::Int8(n) => usize::try_from(*n).unwrap_or(0),
             _ => return Err(Error::query_execution("RPAD second argument must be an integer")),
         };
+        if length > MAX_STRING_LEN {
+            return Err(Error::query_execution("requested length too large"));
+        }
         let fill = if let Some(arg2) = args.get(2) {
             match arg2 {
                 Value::String(f) => f.clone(),
@@ -6712,9 +6771,22 @@ impl Evaluator {
         };
         match arg {
             Value::Null => Ok(Value::Null),
-            Value::Int2(n) => Ok(Value::Int2(n.abs())),
-            Value::Int4(n) => Ok(Value::Int4(n.abs())),
-            Value::Int8(n) => Ok(Value::Int8(n.abs())),
+            // checked_abs: abs() of the type minimum (e.g. i64::MIN) overflows.
+            // With overflow-checks=true (forced by .cargo/config.toml) the plain
+            // `.abs()` panics and drops the client connection; PostgreSQL instead
+            // returns an out-of-range error. Return that error rather than panic.
+            Value::Int2(n) => n
+                .checked_abs()
+                .map(Value::Int2)
+                .ok_or_else(|| Error::query_execution("smallint out of range")),
+            Value::Int4(n) => n
+                .checked_abs()
+                .map(Value::Int4)
+                .ok_or_else(|| Error::query_execution("integer out of range")),
+            Value::Int8(n) => n
+                .checked_abs()
+                .map(Value::Int8)
+                .ok_or_else(|| Error::query_execution("bigint out of range")),
             Value::Float4(f) => Ok(Value::Float4(f.abs())),
             Value::Float8(f) => Ok(Value::Float8(f.abs())),
             Value::Numeric(s) => {
