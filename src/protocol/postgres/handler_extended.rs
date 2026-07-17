@@ -384,9 +384,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
             let is_delete = super::handler::starts_with_icase(trimmed, "DELETE");
             let is_dml_returning = upper.contains("RETURNING") && (is_insert || is_update || is_delete);
             if is_dml_returning {
-                let (affected, tuples) = self
-                    .database
-                    .execute_params_returning(&statement.query, &param_values)?;
+                // Guard the synchronous DML-RETURNING execution too (the third
+                // execution entry on the extended path, alongside the SELECT
+                // and non-SELECT param arms below): a panic in the
+                // planner/evaluator becomes a recoverable XX000 error instead
+                // of unwinding the connection task and dropping the client.
+                let (affected, tuples) = super::handler::run_guarded(|| {
+                    self.database
+                        .execute_params_returning(&statement.query, &param_values)
+                })?;
                 self.prepared_statements
                     .update_portal_state(&portal_name, PortalState::Complete)?;
                 // RowDescription was already sent during Describe; Execute

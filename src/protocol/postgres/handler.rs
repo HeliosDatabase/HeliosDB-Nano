@@ -3201,9 +3201,9 @@ mod sqlstate_mapping_unit_tests {
     //! LockManager itself uses (a second OS-level session race is not
     //! reproducible deterministically in a unit test).
 
-    use super::{detail_hint_for_error, first_single_quoted, sqlstate_for_error};
+    use super::{detail_hint_for_error, first_single_quoted, run_guarded, sqlstate_for_error};
     use crate::session::IsolationLevel;
-    use crate::{EmbeddedDatabase, Error};
+    use crate::{EmbeddedDatabase, Error, Result};
 
     fn sql_error(db: &EmbeddedDatabase, sql: &str) -> Error {
         db.execute(sql).expect_err("statement must fail")
@@ -3346,5 +3346,42 @@ mod sqlstate_mapping_unit_tests {
         assert_eq!(first_single_quoted("Table 'users' does not exist"), Some("users"));
         assert_eq!(first_single_quoted("no quotes here"), None);
         assert_eq!(first_single_quoted("dangling 'quote"), None);
+    }
+
+    /// The per-statement panic guard (used on every simple-query and
+    /// extended/prepared execution entry) must convert a panic in the
+    /// planner/evaluator into a recoverable `XX000` error instead of letting
+    /// it unwind the connection task and drop the client (the CONN_LOST
+    /// class). This is the mechanism both protocol paths rely on for
+    /// isolation.
+    #[test]
+    fn run_guarded_isolates_panic_into_recoverable_internal_error() {
+        let result: Result<i32> = run_guarded(|| panic!("simulated planner/evaluator panic"));
+        let err = result.expect_err("a panic must be caught and returned as Err, not unwound");
+        assert!(
+            err.to_string().contains("internal error while executing statement"),
+            "guard must map a caught panic to the canonical statement-failure message; got {err}"
+        );
+        assert_eq!(
+            sqlstate_for_error(&err),
+            "XX000",
+            "the converted panic must report SQLSTATE XX000 (internal_error); got {err}"
+        );
+    }
+
+    /// The guard must be transparent for non-panicking calls in both the Ok
+    /// and Err directions — no value change, no error-mapping change.
+    #[test]
+    fn run_guarded_passes_ok_and_err_through_unchanged() {
+        let ok: Result<i32> = run_guarded(|| Ok(42));
+        assert_eq!(ok.expect("Ok must pass through"), 42);
+
+        let passed: Result<i32> = run_guarded(|| Err(Error::query_execution("no such table 'z' does not exist")));
+        let err = passed.expect_err("inner Err must pass through");
+        assert_eq!(
+            sqlstate_for_error(&err),
+            "42P01",
+            "a passed-through error must keep its own SQLSTATE mapping; got {err}"
+        );
     }
 }
