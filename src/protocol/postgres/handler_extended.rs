@@ -72,16 +72,33 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
             // legacy per-Execute scan for this statement.
             Err(_) => (None, None),
         };
-        let result_schema = if let Some(s) = catalog_schema {
-            Some(s)
+        // W2.3: for a plain row-returning query, take the Describe schema from
+        // the SHARED parameterized plan cache — the very `Arc<LogicalPlan>` the
+        // Execute path pins — and seed the prepared statement's `cached_plan`
+        // with it. This replaces the throwaway private plan `derive_result_schema`
+        // built here AND removes the redundant first-Execute plan build (the plan
+        // is now built once, at Parse, and reused). Catalog queries keep the
+        // catalog schema; anything the shared planner cannot pre-plan (DML — even
+        // with RETURNING — DDL, unknown/catalog-only tables, or any planner bail)
+        // falls through to the private `derive_result_schema` + AST-synthesis
+        // path, which preserves the exact RETURNING RowDescription / NoData
+        // behavior. OID parity is exact: both paths plan the SAME parsed statement
+        // through `Planner::with_catalog` and read `LogicalPlan::schema()`, so
+        // `datatype_to_oid` sees identical types (numeric → 1700, text → 25,
+        // int2/4/8 → 21/23/20, …).
+        let (result_schema, cached_plan, cached_plan_epoch) = if let Some(s) = catalog_schema {
+            (Some(s), None, 0)
+        } else if let Some((schema, plan, epoch)) = self.shared_query_schema(&statement, &query) {
+            (Some(schema), Some(plan), epoch)
         } else {
-            match self.derive_result_schema(&statement) {
+            let schema = match self.derive_result_schema(&statement) {
                 Ok(schema) => schema,
                 Err(e) => {
                     tracing::debug!("Schema derivation failed (falling back to AST): {}", e);
                     Self::synthesise_schema_from_ast(&statement)
                 }
-            }
+            };
+            (schema, None, 0)
         };
 
         tracing::debug!(
@@ -97,8 +114,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
             query: query.clone(),
             param_types: inferred_param_types,
             result_schema,
-            cached_plan: None, // Populated at first Execute (R5.W2)
-            cached_plan_epoch: 0,
+            // W2.3: seeded from the shared parameterized plan for SELECTs
+            // (None/0 for catalog / DML / DDL / planner-bail fallback, which
+            // populate `cached_plan` lazily at first Execute via R5.W2).
+            cached_plan,
+            cached_plan_epoch,
             is_catalog,
         };
 
@@ -426,6 +446,46 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
             .prepared_statements
             .set_cached_plan(&statement.name, std::sync::Arc::clone(&plan), epoch);
         Some(plan)
+    }
+
+    /// W2.3: derive the Describe result schema for a plain row-returning query
+    /// (SELECT / CTE / set-op) from the SHARED parameterized plan cache,
+    /// returning the schema together with the pinned `Arc<LogicalPlan>` and the
+    /// plan-cache epoch so Parse can seed `cached_plan`. The Execute path then
+    /// reuses that pin via `pinned_plan_for`, so the plan is built once (at
+    /// Parse) instead of twice (a throwaway private plan at Parse + a fresh one
+    /// at first Execute).
+    ///
+    /// Returns `None` — deferring to the private `derive_result_schema` path —
+    /// for:
+    ///   * non-`Query` statements: INSERT / UPDATE / DELETE produce an EMPTY
+    ///     `LogicalPlan::schema()` even with a RETURNING clause, so the shared
+    ///     path cannot distinguish "returns the RETURNING columns" from "returns
+    ///     nothing"; the private path computes the RETURNING schema explicitly
+    ///     (and correctly emits `NoData` for plain DML / DDL).
+    ///   * planner bail-outs (unknown table, catalog-only relation, unsupported
+    ///     shape): `wire_parameterized_plan` returns `Err` → fall back.
+    ///   * an empty result schema (defensive; a plain `Query` should not hit it).
+    ///
+    /// OID parity with the pre-W2.3 path is exact: both build the plan with
+    /// `Planner::with_catalog(&catalog)` from the SAME parsed statement and read
+    /// `LogicalPlan::schema()`. The only extra input on the shared path,
+    /// `with_sql`, feeds AS-OF / column-storage parsing only — never result
+    /// column types — so `datatype_to_oid` sees identical `DataType`s.
+    fn shared_query_schema(
+        &self,
+        statement: &sqlparser::ast::Statement,
+        query: &str,
+    ) -> Option<(crate::Schema, std::sync::Arc<crate::sql::LogicalPlan>, u64)> {
+        if !matches!(statement, sqlparser::ast::Statement::Query(_)) {
+            return None;
+        }
+        let (plan, epoch) = self.database.wire_parameterized_plan(query).ok()?;
+        let schema = (*plan.schema()).clone();
+        if schema.columns.is_empty() {
+            return None;
+        }
+        Some((schema, plan, epoch))
     }
 
     /// Handle Describe message (extended protocol) with full implementation

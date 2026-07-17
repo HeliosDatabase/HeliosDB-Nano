@@ -181,8 +181,8 @@ fn test_as_of_timestamp() {
 
     assert!(snapshots.len() >= 2, "Need at least 2 snapshots for this test");
 
-    // Use timestamp of second snapshot
-    let timestamp_str = &snapshots[1].wall_clock_time;
+    // Use timestamp of second snapshot (W2.2(b): reconstructed RFC3339)
+    let timestamp_str = snapshots[1].wall_clock_rfc3339();
 
     // Query AS OF TIMESTAMP
     let plan = LogicalPlan::Scan {

@@ -1519,7 +1519,7 @@ impl SystemViewRegistry {
                 Value::Timestamp(DateTime::from_timestamp(snapshot.timestamp as i64, 0).unwrap_or_else(Utc::now)),
                 Value::Int8(snapshot.scn as i64),
                 Value::Int8(snapshot.transaction_id as i64),
-                Value::String(snapshot.wall_clock_time.clone()),
+                Value::String(snapshot.wall_clock_rfc3339()),
                 Value::Int8(size_bytes as i64),
                 Value::Boolean(!snapshot.gc_eligible), // is_automatic if not gc_eligible
             ]);
@@ -1535,10 +1535,7 @@ impl SystemViewRegistry {
         let mut results = Vec::new();
 
         for snapshot in snapshots {
-            let created_at = DateTime::parse_from_rfc3339(&snapshot.wall_clock_time)
-                .ok()
-                .and_then(|dt| DateTime::from_timestamp(dt.timestamp(), 0))
-                .unwrap_or_else(Utc::now);
+            let created_at = DateTime::from_timestamp(snapshot.wall_clock_unix_secs(), 0).unwrap_or_else(Utc::now);
 
             let tuple = Tuple::new(vec![
                 Value::Int8(snapshot.transaction_id as i64),
@@ -1571,10 +1568,7 @@ impl SystemViewRegistry {
         let mut results = Vec::new();
 
         for snapshot in snapshots {
-            let created_at = DateTime::parse_from_rfc3339(&snapshot.wall_clock_time)
-                .ok()
-                .and_then(|dt| DateTime::from_timestamp(dt.timestamp(), 0))
-                .unwrap_or_else(Utc::now);
+            let created_at = DateTime::from_timestamp(snapshot.wall_clock_unix_secs(), 0).unwrap_or_else(Utc::now);
 
             let tuple = Tuple::new(vec![
                 Value::Int8(snapshot.scn as i64),
