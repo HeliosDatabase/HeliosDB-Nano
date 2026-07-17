@@ -314,7 +314,7 @@ mod tests {
             let _g = mutex_lock(Site::PlanCache, &m);
         }
         let after = snapshot();
-        assert!(after[0].acquisitions >= before + 1, "enabled census must record acquisition");
+        assert!(after[0].acquisitions > before, "enabled census must record acquisition");
         assert_eq!(after[0].contended, contended_before, "uncontended lock must not count as contended");
 
         // Unlabeled sites are never recorded (write-path spec caches).
