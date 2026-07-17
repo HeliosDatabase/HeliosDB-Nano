@@ -907,6 +907,26 @@ pub struct PerformanceConfig {
     pub simd_enabled: bool,
     /// Parallel query execution
     pub parallel_query: bool,
+    /// Read-hot-path lock-contention census (W3.1). Samples the plan/parse/
+    /// result cache shard mutexes and the ART index registry via
+    /// try-lock-first accounting and surfaces the `heliosdb_lock_census`
+    /// system view. Requires the `lock-census` build feature — ignored, and
+    /// zero-cost, otherwise. Off by default: diagnostic only.
+    pub lock_census: bool,
+    /// Per-statement-class write-volume census (W3.2). Counts durable bytes
+    /// written to `data:` vs the `v:`/`v_idx:` version chain vs secondary-index
+    /// keys, split by statement class, and surfaces the `heliosdb_write_volume`
+    /// system view. Runtime-only (no build feature); zero-cost when off — one
+    /// relaxed atomic load per write funnel. Off by default: diagnostic only.
+    pub write_volume_stats: bool,
+    /// COPY fast-path phase-timing census (W3.4). Splits the COPY bulk-insert
+    /// funnel's wall time across its phases (wire decode, type conversion,
+    /// constraint checks, WriteBatch build, durable commit, ART maintenance) and
+    /// surfaces the `heliosdb_copy_phase_stats` system view, to measure the ART-
+    /// maintenance share of a COPY. Runtime-only (no build feature); zero-cost
+    /// when off — one relaxed atomic load per phase boundary. Off by default:
+    /// diagnostic only.
+    pub copy_phase_stats: bool,
 }
 
 impl Default for PerformanceConfig {
@@ -916,6 +936,9 @@ impl Default for PerformanceConfig {
             query_timeout_secs: 300,
             simd_enabled: true,
             parallel_query: true,
+            lock_census: false,
+            write_volume_stats: false,
+            copy_phase_stats: false,
         }
     }
 }

@@ -1411,7 +1411,13 @@ where
         let mut client_fail: Option<String> = None;
         loop {
             match self.read_message().await? {
-                Some(FrontendMessage::CopyData(chunk)) => decoder.push(&chunk),
+                Some(FrontendMessage::CopyData(chunk)) => {
+                    // W3.4: time the synchronous per-frame decode only (never the
+                    // `read_message().await` network wait). Inert unless
+                    // `copy_phase_stats` is on.
+                    let _cps = crate::copy_phase_stats::time(crate::copy_phase_stats::Phase::Decode, 0);
+                    decoder.push(&chunk);
+                }
                 Some(FrontendMessage::CopyDone) => break,
                 Some(FrontendMessage::CopyFail(msg)) => {
                     client_fail = Some(msg);
@@ -1464,7 +1470,10 @@ where
         }
 
         // Flush the decoder into the typed row batch and bulk-insert.
-        let rows = decoder.finish();
+        let rows = {
+            let _cps = crate::copy_phase_stats::time(crate::copy_phase_stats::Phase::Decode, 0);
+            decoder.finish()
+        };
         let total = rows.len();
 
         // R-B1: typed fast path — apply the whole COPY as one atomic batch
@@ -2797,6 +2806,10 @@ pub(crate) fn sqlstate_for_error(error: &Error) -> &'static str {
         }
         Error::SqlParse(_) => sqlstate::SYNTAX_ERROR,            // 42601
         Error::TypeConversion(_) => sqlstate::DATATYPE_MISMATCH, // 42804
+        // Typed write-write conflict (pessimistic row-lock timeout,
+        // storage/lock_manager.rs): a retriable serialization failure, like the
+        // string-sniffed first-committer-wins path below.
+        Error::WriteConflict { .. } => sqlstate::SERIALIZATION_FAILURE, // 40001
         Error::Transaction(message) => {
             let lower = message.to_ascii_lowercase();
             if lower.contains("serialization failure") {
@@ -3302,6 +3315,25 @@ mod sqlstate_mapping_unit_tests {
             .unwrap_or_default()
             .to_ascii_lowercase()
             .contains("retry"));
+    }
+
+    #[test]
+    fn write_conflict_maps_to_40001_with_retry_hint() {
+        // The typed lock-timeout conflict (storage/lock_manager.rs) is a
+        // retriable serialization failure, exactly like first-committer-wins —
+        // both surface SQLSTATE 40001 so drivers retry.
+        let err = Error::write_conflict("accounts", "42", 7, 9, 1000);
+        let code = sqlstate_for_error(&err);
+        assert_eq!(code, "40001", "got error: {err}");
+        let (detail, hint) = detail_hint_for_error(code, &err);
+        assert!(detail.is_some());
+        assert!(
+            hint.as_deref()
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .contains("retry"),
+            "hint must suggest retrying; got {hint:?}"
+        );
     }
 
     #[test]

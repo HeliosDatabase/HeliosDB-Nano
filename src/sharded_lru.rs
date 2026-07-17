@@ -45,6 +45,11 @@ pub(crate) struct ShardedLruCache<K: Hash + Eq, V> {
     /// R5.W2) cheaply detect that the cache was invalidated (DDL) and
     /// refresh, without re-keying into the cache per use.
     epoch: AtomicU64,
+    /// Lock-census site label for shard-mutex contention accounting (W3.1).
+    /// `Unlabeled` unless set via [`with_site`]; carried by value into the
+    /// zero-cost `lock_census::mutex_lock` shim, so the field is read (never
+    /// dead) even when the `lock-census` feature compiles the sampling out.
+    site: crate::lock_census::Site,
 }
 
 impl<K: Hash + Eq, V: Clone> ShardedLruCache<K, V> {
@@ -59,7 +64,17 @@ impl<K: Hash + Eq, V: Clone> ShardedLruCache<K, V> {
             shards: shards.into_boxed_slice(),
             hasher: RandomState::new(),
             epoch: AtomicU64::new(0),
+            site: crate::lock_census::Site::Unlabeled,
         }
+    }
+
+    /// Label this cache's shard mutexes for the lock-census (W3.1). Chained at
+    /// construction on the read-hot caches (plan / parse / result); the DML
+    /// spec caches keep the default `Unlabeled` and are never sampled.
+    #[inline]
+    pub(crate) fn with_site(mut self, site: crate::lock_census::Site) -> Self {
+        self.site = site;
+        self
     }
 
     #[allow(clippy::expect_used)] // Safety: index is masked to SHARD_COUNT-1; `shards` holds SHARD_COUNT entries.
@@ -72,11 +87,13 @@ impl<K: Hash + Eq, V: Clone> ShardedLruCache<K, V> {
         self.shards.get(idx).expect("masked shard index in range")
     }
 
-    fn lock_shard<'a>(shard: &'a Mutex<lru::LruCache<K, V>>) -> std::sync::MutexGuard<'a, lru::LruCache<K, V>> {
-        match shard.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        }
+    /// Take a shard's lock through the lock-census shim. When the `lock-census`
+    /// feature is off this is exactly the previous `shard.lock()` +
+    /// poison-recovery, inlined at zero cost; when on and enabled at runtime it
+    /// try-locks first and records contention against `self.site`.
+    #[inline]
+    fn lock_shard<'a>(&self, shard: &'a Mutex<lru::LruCache<K, V>>) -> std::sync::MutexGuard<'a, lru::LruCache<K, V>> {
+        crate::lock_census::mutex_lock(self.site, shard)
     }
 
     /// Clone-on-hit lookup. Updates the key's recency within its shard.
@@ -85,13 +102,13 @@ impl<K: Hash + Eq, V: Clone> ShardedLruCache<K, V> {
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        Self::lock_shard(self.shard_for(key)).get(key).cloned()
+        self.lock_shard(self.shard_for(key)).get(key).cloned()
     }
 
     /// Insert (or refresh) an entry, evicting the LRU entry of the key's
     /// shard if that shard is full.
     pub(crate) fn put(&self, key: K, value: V) {
-        Self::lock_shard(self.shard_for(&key)).put(key, value);
+        self.lock_shard(self.shard_for(&key)).put(key, value);
     }
 
     /// Recency-neutral membership probe (matches `LruCache::contains`).
@@ -100,7 +117,7 @@ impl<K: Hash + Eq, V: Clone> ShardedLruCache<K, V> {
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        Self::lock_shard(self.shard_for(key)).contains(key)
+        self.lock_shard(self.shard_for(key)).contains(key)
     }
 
     /// Clear every shard. Shards are cleared one at a time; concurrent
@@ -109,7 +126,7 @@ impl<K: Hash + Eq, V: Clone> ShardedLruCache<K, V> {
     pub(crate) fn clear(&self) {
         self.epoch.fetch_add(1, Ordering::Release);
         for shard in self.shards.iter() {
-            Self::lock_shard(shard).clear();
+            self.lock_shard(shard).clear();
         }
     }
 
@@ -122,7 +139,7 @@ impl<K: Hash + Eq, V: Clone> ShardedLruCache<K, V> {
 
     /// True when every shard is empty.
     pub(crate) fn is_empty(&self) -> bool {
-        self.shards.iter().all(|shard| Self::lock_shard(shard).is_empty())
+        self.shards.iter().all(|shard| self.lock_shard(shard).is_empty())
     }
 }
 

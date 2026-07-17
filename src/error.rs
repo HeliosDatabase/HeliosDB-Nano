@@ -79,6 +79,26 @@ pub enum Error {
     #[error("Transaction error: {0}")]
     Transaction(String),
 
+    /// Write-write conflict: a pessimistic row-lock wait timed out because
+    /// another transaction holds the write lock on the same row. A retriable
+    /// serialization failure — maps to PostgreSQL SQLSTATE 40001 on the wire.
+    /// The leading `serialization failure` text also drives the MySQL
+    /// error-code sniffing (`protocol/mysql/handler.rs`).
+    #[error("serialization failure: write-write conflict on {table} row {row} (held by transaction {holder_txn}, waiter {waiter_txn} timed out after {waited_ms}ms); retry the transaction")]
+    WriteConflict {
+        /// Table owning the contended row.
+        table: String,
+        /// Row identity within the table (primary-key / row-id text).
+        row: String,
+        /// Transaction currently holding the write lock (0 if released between
+        /// the timeout and the report — a benign race).
+        holder_txn: u64,
+        /// The waiting transaction that gave up.
+        waiter_txn: u64,
+        /// Milliseconds the waiter spun before giving up (the lock-acquire timeout).
+        waited_ms: u64,
+    },
+
     /// Type conversion error
     #[error("Type conversion error: {0}")]
     TypeConversion(String),
@@ -161,6 +181,26 @@ impl Error {
     /// Create a transaction error
     pub fn transaction(msg: impl Into<String>) -> Self {
         Error::Transaction(msg.into())
+    }
+
+    /// Create a write-write conflict error (serialization failure, SQLSTATE
+    /// 40001). Carries the contended row's identity and the holding
+    /// transaction so a client — or an autocommit statement-retry layer — can
+    /// act on it instead of parsing a message string.
+    pub fn write_conflict(
+        table: impl Into<String>,
+        row: impl Into<String>,
+        holder_txn: u64,
+        waiter_txn: u64,
+        waited_ms: u64,
+    ) -> Self {
+        Error::WriteConflict {
+            table: table.into(),
+            row: row.into(),
+            holder_txn,
+            waiter_txn,
+            waited_ms,
+        }
     }
 
     /// Create a type conversion error

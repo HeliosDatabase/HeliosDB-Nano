@@ -1943,6 +1943,9 @@ impl MetaCommand {
                 println!("  {}", "SELECT * FROM pg_database_branches();".cyan());
                 println!("  {}", "SELECT * FROM pg_mv_staleness();".cyan());
                 println!("  {}", "SELECT * FROM pg_vector_index_stats();".cyan());
+                println!("  {}", "SELECT * FROM heliosdb_lock_census();".cyan());
+                println!("  {}", "SELECT * FROM heliosdb_write_volume();".cyan());
+                println!("  {}", "SELECT * FROM heliosdb_copy_phase_stats();".cyan());
                 println!();
                 Ok(MetaCommandResult::Continue)
             }

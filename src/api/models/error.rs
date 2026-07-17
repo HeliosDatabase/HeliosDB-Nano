@@ -117,6 +117,9 @@ impl From<Error> for ApiError {
             Error::BranchMerge(msg) => ApiError::unprocessable_entity(msg),
             Error::MergeConflict(msg) => ApiError::conflict(msg),
             Error::ConstraintViolation(msg) => ApiError::conflict(msg),
+            // Write-write conflict (serialization failure) — 409 Conflict; the
+            // client retries the whole statement/transaction.
+            Error::WriteConflict { .. } => ApiError::conflict(format!("{}", err)),
             Error::Encryption(_)
             | Error::VectorIndex(_)
             | Error::MultiTenant(_)

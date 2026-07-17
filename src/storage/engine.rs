@@ -10438,6 +10438,10 @@ impl StorageEngine {
     /// Skips delta tracking (MV/SMFI). Used for SQL fast paths where
     /// parser/planner overhead and per-row counter persistence dominate.
     pub fn insert_tuple_fast(&self, table_name: &str, tuple: Tuple, schema: &crate::Schema) -> Result<u64> {
+        // W3.2: single-row autocommit INSERT class scope. Version bytes are
+        // recorded in `append_version_snapshot_to_batch`, index-key bytes in
+        // `on_insert_tuple`, both of which run inside this scope.
+        let _wv = crate::write_volume::stmt_scope(crate::write_volume::StmtClass::InsertSingle);
         let row_id = self.next_row_id_volatile(table_name);
 
         // Fill NULL PK columns with auto-generated row_id (SERIAL semantics)
@@ -10482,6 +10486,12 @@ impl StorageEngine {
         };
 
         let key = Self::build_data_key(table_name, row_id);
+        // W3.2: `data:` bytes for this row (both the batched and non-batched
+        // branches below write the same key+value).
+        if crate::write_volume::enabled() {
+            crate::write_volume::add_row();
+            crate::write_volume::add(crate::write_volume::Category::Data, (key.len() + value.len()) as u64);
+        }
         let requires_logical_wal = self.fast_dml_requires_logical_wal();
         let needs_logical_value = requires_logical_wal || self.config.storage.time_travel_enabled;
         let logical_value = if needs_logical_value {
@@ -10685,6 +10695,11 @@ impl StorageEngine {
             self.note_committed_write(table_name, ts);
         }
         let reverse_ts = commit_ts.map(|ts| u64::MAX - ts);
+        // W3.4: time the `data:`/`v:`/`vmeta:`/columnar WriteBatch build. Inert
+        // unless `copy_phase_stats` is on. Shared with multi-row INSERT — read
+        // the census after a COPY-only workload (see `copy_phase_stats`).
+        let batch_rows = prepared.len() as u64;
+        let _cps_bb = crate::copy_phase_stats::time(crate::copy_phase_stats::Phase::BatchBuild, batch_rows);
         let mut batch = WriteBatch::default();
         let mut indexed_rows = Vec::with_capacity(prepared.len());
         let mut final_row_id = 0_u64;
@@ -10717,6 +10732,10 @@ impl StorageEngine {
         // Columnar tables keep the per-row path (item #3 territory).
         let use_vrange = commit_ts.is_some() && !uses_columnar && copy_vrange_enabled();
         let mut vrange: Option<(u64, u64)> = None;
+        // W3.2: hoist the census fast-out so each of the three write branches
+        // below pays one relaxed load, not one per row. Class (COPY vs multi-row
+        // INSERT) is the ambient scope set by the lib.rs caller.
+        let wv = crate::write_volume::enabled();
 
         if use_vrange {
             let ts = commit_ts.unwrap_or(0);
@@ -10736,6 +10755,13 @@ impl StorageEngine {
                 key_buf.extend_from_slice(data_prefix.as_bytes());
                 key_buf.extend_from_slice(row_id_str.as_bytes());
                 batch.put(&key_buf, &value);
+                // W3.2: `data:` bytes. The version chain here is a SINGLE
+                // `vmeta:` marker (recorded below), not per-row `v:`/`v_idx:` —
+                // this is the copy-marker elision W3.2 generalizes.
+                if wv {
+                    crate::write_volume::add_row();
+                    crate::write_volume::add(crate::write_volume::Category::Data, (key_buf.len() + value.len()) as u64);
+                }
 
                 final_row_id = row_id;
                 indexed_rows.push((row_id, tuple));
@@ -10745,6 +10771,10 @@ impl StorageEngine {
                 // SAME WriteBatch as the data rows (atomic with the insert).
                 let marker_key = crate::storage::copy_marker::CopyMarkers::marker_key(table_name, vfirst, vlast);
                 batch.put(marker_key.as_bytes(), ts.to_be_bytes());
+                // W3.2: one marker's version bytes for the whole batch.
+                if wv {
+                    crate::write_volume::add(crate::write_volume::Category::Version, (marker_key.len() + 8) as u64);
+                }
                 vrange = Some((vfirst, vlast));
             }
         } else if let (Some(ts), Some(reverse_ts)) = (commit_ts, reverse_ts) {
@@ -10771,6 +10801,10 @@ impl StorageEngine {
                 key_buf.extend_from_slice(data_prefix.as_bytes());
                 key_buf.extend_from_slice(row_id_str.as_bytes());
                 batch.put(&key_buf, &value);
+                if wv {
+                    crate::write_volume::add_row();
+                    crate::write_volume::add(crate::write_volume::Category::Data, (key_buf.len() + value.len()) as u64);
+                }
 
                 version_key_buf.clear();
                 version_key_buf.extend_from_slice(version_prefix.as_bytes());
@@ -10788,6 +10822,14 @@ impl StorageEngine {
                 }
                 version_index_key_buf.extend_from_slice(reverse_ts_str.as_bytes());
                 batch.put(&version_index_key_buf, ts.to_be_bytes());
+                // W3.2: per-row version chain (the columnar / vrange-disabled
+                // COPY path). `v:` value == the row payload (byte-identical dup).
+                if wv {
+                    crate::write_volume::add(
+                        crate::write_volume::Category::Version,
+                        (version_key_buf.len() + logical_value.len() + version_index_key_buf.len() + 8) as u64,
+                    );
+                }
 
                 final_row_id = row_id;
                 indexed_rows.push((row_id, tuple));
@@ -10801,6 +10843,10 @@ impl StorageEngine {
                 key_buf.extend_from_slice(data_prefix.as_bytes());
                 key_buf.extend_from_slice(row_id_str.as_bytes());
                 batch.put(&key_buf, &value);
+                if wv {
+                    crate::write_volume::add_row();
+                    crate::write_volume::add(crate::write_volume::Category::Data, (key_buf.len() + value.len()) as u64);
+                }
 
                 final_row_id = row_id;
                 indexed_rows.push((row_id, tuple));
@@ -10835,6 +10881,9 @@ impl StorageEngine {
             None
         };
 
+        drop(_cps_bb);
+        // W3.4: the durable RocksDB write itself (the funnel's I/O phase).
+        let _cps_cm = crate::copy_phase_stats::time(crate::copy_phase_stats::Phase::Commit, batch_rows);
         let result = if let Some(opts) = &self.memory_write_options {
             self.db.write_opt(batch, opts)
         } else {
@@ -10842,6 +10891,7 @@ impl StorageEngine {
         };
         drop(columnar_guard);
         result.map_err(|e| Error::storage(format!("Fast batch insert failed: {}", e)))?;
+        drop(_cps_cm);
 
         if let Some(ts) = commit_ts {
             let _ = self.snapshot_manager.register_snapshot(ts);
@@ -10853,6 +10903,10 @@ impl StorageEngine {
             }
         }
 
+        // W3.4: per-row secondary-index (ART) + HNSW maintenance — the phase
+        // W3.4 measures against total COPY wall time. `on_insert_tuple` walks
+        // the global index registry per row (`art_manager.rs:1555`).
+        let _cps_am = crate::copy_phase_stats::time(crate::copy_phase_stats::Phase::ArtMaintain, batch_rows);
         for (row_id, tuple) in &indexed_rows {
             if let Err(e) = self
                 .art_index_manager
@@ -10863,6 +10917,7 @@ impl StorageEngine {
             // R5.V1: maintain HNSW vector indexes.
             let _ = self.vector_indexes.on_row_insert(table_name, *row_id, schema, tuple);
         }
+        drop(_cps_am);
 
         Ok(indexed_rows.len() as u64)
     }
@@ -11203,6 +11258,10 @@ impl StorageEngine {
         schema: &crate::Schema,
         index_update_needed: Option<bool>,
     ) -> Result<u64> {
+        // W3.2: UPDATE class scope. This fast path is version-SKIPPING (no
+        // `v:`/`v_idx:` write), so the census records `data:` bytes only — the
+        // measured absence of version bytes here is itself a W3.2 finding.
+        let _wv = crate::write_volume::stmt_scope(crate::write_volume::StmtClass::Update);
         // Item #2: preserve a COPY marker-covered row's insert version before
         // this version-skipping fast UPDATE overwrites `data:` (no-op — one
         // atomic load — when no COPY markers are live).
@@ -11227,6 +11286,10 @@ impl StorageEngine {
         // (SQL fast paths bail on branches), so no branch guard is needed.
         self.invalidate_write_watermark(table_name);
         self.put(&key, &value)?;
+        if crate::write_volume::enabled() {
+            crate::write_volume::add_row();
+            crate::write_volume::add(crate::write_volume::Category::Data, (key.len() + value.len()) as u64);
+        }
 
         // Update ART indexes only if an indexed column actually changed.
         // Common OLTP updates mutate payload columns while the PK/unique keys
@@ -11286,6 +11349,8 @@ impl StorageEngine {
         schema: &crate::Schema,
         vector_old_tuple: Option<&Tuple>,
     ) -> Result<u64> {
+        // W3.2: UPDATE class scope (version-skipping; `data:` bytes only).
+        let _wv = crate::write_volume::stmt_scope(crate::write_volume::StmtClass::Update);
         // Item #2: preserve a COPY marker-covered row's insert version before
         // this version-skipping fast UPDATE overwrites `data:`.
         self.snapshot_manager
@@ -11302,6 +11367,10 @@ impl StorageEngine {
         // W2.5: versionless overwrite — see `invalidate_write_watermark`.
         self.invalidate_write_watermark(table_name);
         self.put(&key, &value)?;
+        if crate::write_volume::enabled() {
+            crate::write_volume::add_row();
+            crate::write_volume::add(crate::write_volume::Category::Data, (key.len() + value.len()) as u64);
+        }
 
         // R5.V1: callers proved no *ART* index column changed, which says
         // nothing about vector columns; maintain HNSW indexes here. The
@@ -11326,6 +11395,8 @@ impl StorageEngine {
         old_tuple: &Tuple,
         schema: &crate::Schema,
     ) -> Result<u64> {
+        // W3.2: DELETE class scope. A tombstone carries the `data:` key only.
+        let _wv = crate::write_volume::stmt_scope(crate::write_volume::StmtClass::Delete);
         // Item #2: preserve a COPY marker-covered row's insert version before
         // this version-skipping fast DELETE removes `data:`.
         self.snapshot_manager
@@ -11339,6 +11410,10 @@ impl StorageEngine {
             self.db
                 .delete(&key)
                 .map_err(|e| Error::storage(format!("Fast delete failed: {}", e)))?;
+        }
+        if crate::write_volume::enabled() {
+            crate::write_volume::add_row();
+            crate::write_volume::add(crate::write_volume::Category::Data, key.len() as u64);
         }
 
         if let Err(e) = self
@@ -11371,6 +11446,8 @@ impl StorageEngine {
         pk_key: &[u8],
         pk_value: &crate::Value,
     ) -> Result<u64> {
+        // W3.2: DELETE class scope (PK-only tombstone; `data:` key bytes).
+        let _wv = crate::write_volume::stmt_scope(crate::write_volume::StmtClass::Delete);
         // Item #2: preserve a COPY marker-covered row's insert version before
         // this version-skipping fast DELETE removes `data:`.
         self.snapshot_manager
@@ -11384,6 +11461,10 @@ impl StorageEngine {
             self.db
                 .delete(&key)
                 .map_err(|e| Error::storage(format!("Fast PK delete failed: {}", e)))?;
+        }
+        if crate::write_volume::enabled() {
+            crate::write_volume::add_row();
+            crate::write_volume::add(crate::write_volume::Category::Data, key.len() as u64);
         }
 
         if let Err(e) = self

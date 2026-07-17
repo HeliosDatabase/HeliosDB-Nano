@@ -309,8 +309,11 @@ pub mod replication;
 pub mod ab_testing;
 
 // Internal modules
+mod copy_phase_stats;
 mod error;
+mod lock_census;
 mod sharded_lru;
+mod write_volume;
 mod types;
 // `config` was originally private but the encryption / sync
 // benchmarks reference its `KeySource` enum directly.  Promoted
@@ -1245,7 +1248,12 @@ impl EmbeddedDatabase {
             return Ok(plan);
         }
 
-        let source_sql = if self.prepared_fast_selects.read().contains_key(name) {
+        let source_sql = if lock_census::pl_rwlock_read(
+            lock_census::Site::StatementRegistry,
+            &self.prepared_fast_selects,
+        )
+        .contains_key(name)
+        {
             self.prepared_statement_sql.read().get(name).cloned()
         } else {
             None
@@ -1340,7 +1348,12 @@ impl EmbeddedDatabase {
         if self.in_transaction() {
             return None;
         }
-        let spec = self.prepared_fast_selects.read().get(name).cloned()?;
+        let spec = lock_census::pl_rwlock_read(
+            lock_census::Site::StatementRegistry,
+            &self.prepared_fast_selects,
+        )
+        .get(name)
+        .cloned()?;
         let mut value = match params.get(spec.param_index - 1) {
             Some(value) => value.clone(),
             None => {
@@ -5199,15 +5212,18 @@ impl EmbeddedDatabase {
             prepared_fast_selects: std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             session_settings: sql::SessionSettings::new(),
             savepoints: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
-            plan_cache: std::sync::Arc::new(sharded_lru::ShardedLruCache::new(
-                std::num::NonZeroUsize::new(256).expect("256 is non-zero"),
-            )),
-            parse_cache: std::sync::Arc::new(sharded_lru::ShardedLruCache::new(
-                std::num::NonZeroUsize::new(512).expect("512 is non-zero"),
-            )),
-            result_cache: std::sync::Arc::new(sharded_lru::ShardedLruCache::new(
-                std::num::NonZeroUsize::new(128).expect("128 is non-zero"),
-            )),
+            plan_cache: std::sync::Arc::new(
+                sharded_lru::ShardedLruCache::new(std::num::NonZeroUsize::new(256).expect("256 is non-zero"))
+                    .with_site(lock_census::Site::PlanCache),
+            ),
+            parse_cache: std::sync::Arc::new(
+                sharded_lru::ShardedLruCache::new(std::num::NonZeroUsize::new(512).expect("512 is non-zero"))
+                    .with_site(lock_census::Site::ParseCache),
+            ),
+            result_cache: std::sync::Arc::new(
+                sharded_lru::ShardedLruCache::new(std::num::NonZeroUsize::new(128).expect("128 is non-zero"))
+                    .with_site(lock_census::Site::ResultCache),
+            ),
             result_cache_nonempty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             hot_result_cache_entry: std::sync::Arc::new(parking_lot::RwLock::new(None)),
             last_fast_select_fingerprint: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -5292,15 +5308,18 @@ impl EmbeddedDatabase {
             prepared_fast_selects: std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             session_settings: sql::SessionSettings::new(),
             savepoints: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
-            plan_cache: std::sync::Arc::new(sharded_lru::ShardedLruCache::new(
-                std::num::NonZeroUsize::new(256).expect("256 is non-zero"),
-            )),
-            parse_cache: std::sync::Arc::new(sharded_lru::ShardedLruCache::new(
-                std::num::NonZeroUsize::new(512).expect("512 is non-zero"),
-            )),
-            result_cache: std::sync::Arc::new(sharded_lru::ShardedLruCache::new(
-                std::num::NonZeroUsize::new(128).expect("128 is non-zero"),
-            )),
+            plan_cache: std::sync::Arc::new(
+                sharded_lru::ShardedLruCache::new(std::num::NonZeroUsize::new(256).expect("256 is non-zero"))
+                    .with_site(lock_census::Site::PlanCache),
+            ),
+            parse_cache: std::sync::Arc::new(
+                sharded_lru::ShardedLruCache::new(std::num::NonZeroUsize::new(512).expect("512 is non-zero"))
+                    .with_site(lock_census::Site::ParseCache),
+            ),
+            result_cache: std::sync::Arc::new(
+                sharded_lru::ShardedLruCache::new(std::num::NonZeroUsize::new(128).expect("128 is non-zero"))
+                    .with_site(lock_census::Site::ResultCache),
+            ),
             result_cache_nonempty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             hot_result_cache_entry: std::sync::Arc::new(parking_lot::RwLock::new(None)),
             last_fast_select_fingerprint: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -5387,6 +5406,20 @@ impl EmbeddedDatabase {
         // volatile-but-working). Weak downgrade, zero per-statement cost.
         crate::sql::sequences::install_persistence(&storage);
 
+        // W3.1: apply the runtime lock-census toggle. No-op unless built with
+        // the `lock-census` feature; process-global (last config wins).
+        lock_census::set_enabled(config.performance.lock_census);
+
+        // W3.2: apply the runtime write-volume census toggle. Process-global
+        // (last config wins); zero-cost when off (one relaxed load per write
+        // funnel — see `write_volume`).
+        write_volume::set_enabled(config.performance.write_volume_stats);
+
+        // W3.4: apply the runtime COPY phase-timing census toggle. Process-
+        // global (last config wins); zero-cost when off (one relaxed load per
+        // phase boundary — see `copy_phase_stats`).
+        copy_phase_stats::set_enabled(config.performance.copy_phase_stats);
+
         Ok(Self {
             storage,
             config,
@@ -5407,15 +5440,18 @@ impl EmbeddedDatabase {
             prepared_fast_selects: std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             session_settings: sql::SessionSettings::new(),
             savepoints: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
-            plan_cache: std::sync::Arc::new(sharded_lru::ShardedLruCache::new(
-                std::num::NonZeroUsize::new(256).expect("256 is non-zero"),
-            )),
-            parse_cache: std::sync::Arc::new(sharded_lru::ShardedLruCache::new(
-                std::num::NonZeroUsize::new(512).expect("512 is non-zero"),
-            )),
-            result_cache: std::sync::Arc::new(sharded_lru::ShardedLruCache::new(
-                std::num::NonZeroUsize::new(128).expect("128 is non-zero"),
-            )),
+            plan_cache: std::sync::Arc::new(
+                sharded_lru::ShardedLruCache::new(std::num::NonZeroUsize::new(256).expect("256 is non-zero"))
+                    .with_site(lock_census::Site::PlanCache),
+            ),
+            parse_cache: std::sync::Arc::new(
+                sharded_lru::ShardedLruCache::new(std::num::NonZeroUsize::new(512).expect("512 is non-zero"))
+                    .with_site(lock_census::Site::ParseCache),
+            ),
+            result_cache: std::sync::Arc::new(
+                sharded_lru::ShardedLruCache::new(std::num::NonZeroUsize::new(128).expect("128 is non-zero"))
+                    .with_site(lock_census::Site::ResultCache),
+            ),
             result_cache_nonempty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             hot_result_cache_entry: std::sync::Arc::new(parking_lot::RwLock::new(None)),
             last_fast_select_fingerprint: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -6376,6 +6412,12 @@ impl EmbeddedDatabase {
         if rows.is_empty() {
             return Some(Ok(0));
         }
+        // W3.2: multi-row INSERT class scope for the direct-batch and
+        // autocommit-txn-commit branches below. The per-row logical-WAL fallback
+        // (`insert_tuple_fast`) opens its own `InsertSingle` scope per row, so
+        // under HA/logical-WAL those rows attribute to `insert_single`
+        // (`W3_2_DESIGN.md` §2.3 note 4), not `insert_multi`.
+        let _wv = write_volume::stmt_scope(write_volume::StmtClass::InsertMulti);
         if !self.savepoints.read().is_empty()
             || self.session_txns_block_fast_inserts()
             || self.tenant_manager.get_current_context().is_some()
@@ -6512,6 +6554,8 @@ impl EmbeddedDatabase {
         if rows.is_empty() {
             return Some(Ok(0));
         }
+        // W3.2: COPY class scope for the batch write below.
+        let _wv = write_volume::stmt_scope(write_volume::StmtClass::Copy);
         // Fall back for every shape the fast batch path does not preserve.
         if self.in_transaction()
             || self.any_session_txns()
@@ -6547,13 +6591,21 @@ impl EmbeddedDatabase {
             }
         }
 
+        // W3.4: total COPY-funnel wall time (the ART-share denominator). Starts
+        // here, past the shape bails/spec resolve, so it measures pure insert
+        // work; drops at function end. Inert unless `copy_phase_stats` is on.
+        let _cps_total = copy_phase_stats::time(copy_phase_stats::Phase::Total, rows.len() as u64);
+
         // Decode every row up front. Any malformed row or failed cast rejects
         // the whole COPY before a single write (atomicity).
         let mut tuples = Vec::with_capacity(rows.len());
-        for row in rows {
-            match Self::materialize_copy_tuple(&spec, row) {
-                Ok(tuple) => tuples.push(tuple),
-                Err(e) => return Some(Err(e)),
+        {
+            let _cps = copy_phase_stats::time(copy_phase_stats::Phase::TypeConvert, rows.len() as u64);
+            for row in rows {
+                match Self::materialize_copy_tuple(&spec, row) {
+                    Ok(tuple) => tuples.push(tuple),
+                    Err(e) => return Some(Err(e)),
+                }
             }
         }
 
@@ -6562,6 +6614,7 @@ impl EmbeddedDatabase {
         // auto-fill (lib.rs `Insert` arm), reusing `validate_check_constraints`.
         if let Some(constraints) = spec.constraints.as_deref() {
             if !constraints.check_constraints.is_empty() {
+                let _cps = copy_phase_stats::time(copy_phase_stats::Phase::CheckConstraint, tuples.len() as u64);
                 for tuple in &tuples {
                     if let Err(e) = self.validate_check_constraints(constraints, &spec.schema, &tuple.values) {
                         return Some(Err(e));
@@ -6576,12 +6629,18 @@ impl EmbeddedDatabase {
             .storage
             .suspend_smfi_for_bulk_load(table_name, storage::filter_index_delta::BulkLoadReason::CopyFrom);
 
-        let prepared = match self.prepare_fast_insert_batch(table_name, tuples, &spec.schema) {
-            Ok(prepared) => prepared,
-            Err(e) => return Some(Err(e)),
+        let prepared = {
+            let _cps = copy_phase_stats::time(copy_phase_stats::Phase::Prepare, tuples.len() as u64);
+            match self.prepare_fast_insert_batch(table_name, tuples, &spec.schema) {
+                Ok(prepared) => prepared,
+                Err(e) => return Some(Err(e)),
+            }
         };
-        if let Err(e) = self.validate_fast_insert_batch(table_name, &spec.schema, &prepared) {
-            return Some(Err(e));
+        {
+            let _cps = copy_phase_stats::time(copy_phase_stats::Phase::ValidateBatch, prepared.len() as u64);
+            if let Err(e) = self.validate_fast_insert_batch(table_name, &spec.schema, &prepared) {
+                return Some(Err(e));
+            }
         }
         // W2.1: FK validation on the prepared (PK-filled) tuples — matches the
         // slow path's `check_fk_constraints_on_write`, which runs after the PK
@@ -6590,6 +6649,7 @@ impl EmbeddedDatabase {
         // violation aborts with zero rows written (atomicity by construction).
         if let Some(constraints) = spec.constraints.as_deref() {
             if !constraints.foreign_keys.is_empty() {
+                let _cps = copy_phase_stats::time(copy_phase_stats::Phase::FkConstraint, prepared.len() as u64);
                 if let Err(e) = self.validate_copy_batch_fks(table_name, constraints, &spec.schema, &prepared) {
                     return Some(Err(e));
                 }
