@@ -5,6 +5,51 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.2.0] - 2026-07-17
+
+Waves 1–2 of the 2026-07 performance & stability campaign
+(docs/plans/PERF_STABILITY_2026_07/), every item implemented via a reviewed
+subagent workflow and gated per docs/GATES.md:
+
+- **Extended/prepared protocol unlock** — parameterized autocommit reads no
+  longer serialize on the session-transaction mutex (atomic fast-out):
+  extended point-read **30k-TPS ceiling → 122k @ 64 clients (4.0×)**; prepared
+  **34k → 202k @ 32 clients (5.9×)** — the PostgreSQL driver-path gap is
+  reversed to ~2.4× in Nano's favor.
+- **Extended-protocol Parse reuse** — Describe metadata now derives from the
+  shared parameterized plan cache: extended point-read **+10–18% on top of the
+  unlock** (c64 115k → 132k TPS). View DDL (CREATE OR REPLACE / DROP VIEW) now
+  invalidates the plan cache (stale-Describe fix).
+- **COPY fast path for FK/CHECK tables** — bulk loads into constrained tables
+  no longer fall back to row-at-a-time validation: **FK+CHECK COPY 100k rows
+  3172 ms → 326 ms (9.7×)**, with batched index FK probes (including
+  batch-local parents), CHECK parity with the slow path, and single-WriteBatch
+  all-or-nothing semantics.
+- **Streaming COPY decode with bounded memory** — the wire COPY path decodes
+  incrementally across protocol frames (partial-line/quote/UTF-8 state carried)
+  instead of buffering the whole stream; new `[server] copy_max_buffered_rows`
+  knob (0 = unlimited) aborts cleanly with zero rows applied when exceeded.
+- **MVCC bookkeeping diet** — prefix-bounded version scans, epoch-micros
+  version timestamps (permanent fallback deserializer keeps old on-disk data
+  readable), O(1) snapshot-cache invalidation, and unchanged-value
+  index-maintenance elision on UPDATE (PG-HOT-style).
+- **In-transaction read watermark** — reads inside a transaction of tables
+  unchanged since the snapshot serve from the normal fast read path instead of
+  the snapshot scan (30–150×); fail-closed policy (any version-skipping write
+  funnel invalidates back to the snapshot path).
+- **Fix (branch isolation, wrong-data class):** ~11 DML sites across both
+  execution engines maintained the process-wide value index for branch-routed
+  writes — phantom UNIQUE violations on main, and branch DELETEs stripping
+  main's index entries for inherited rows. All sites now gate on the same
+  predicate that routes branch data.
+- **Fix:** SQL/plan/result caches and the row cache survived `USE BRANCH` and
+  could serve another branch's data; both are invalidated at branch switch.
+- **Fix (planner):** `ORDER BY` over grouped plans uses the select-list
+  aggregate rewrite (was fragile alias-position slicing).
+- **Fix:** `TRUNCATE` reports no affected-row count (PostgreSQL parity);
+  `ALTER TABLE` bumps the schema generation so stale fast-path caches cannot
+  leak backfilled values to open snapshot readers.
+
 ## [4.1.0] - 2026-07-06
 
 Next performance batch (all gated through regression + scalability suites):
