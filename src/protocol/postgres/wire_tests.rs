@@ -461,7 +461,10 @@ async fn pipelined_executes_emit_exactly_one_ready_for_query() {
             params: vec![],
             result_formats: vec![],
         },
-        FrontendMessage::Execute { portal_name: "p1".into(), max_rows: 0 },
+        FrontendMessage::Execute {
+            portal_name: "p1".into(),
+            max_rows: 0,
+        },
         FrontendMessage::Bind {
             portal_name: "p2".into(),
             statement_name: "s1".into(),
@@ -469,7 +472,10 @@ async fn pipelined_executes_emit_exactly_one_ready_for_query() {
             params: vec![],
             result_formats: vec![],
         },
-        FrontendMessage::Execute { portal_name: "p2".into(), max_rows: 0 },
+        FrontendMessage::Execute {
+            portal_name: "p2".into(),
+            max_rows: 0,
+        },
         FrontendMessage::Sync,
     ];
     for msg in pipeline {
@@ -486,9 +492,21 @@ async fn pipelined_executes_emit_exactly_one_ready_for_query() {
         "exactly one ReadyForQuery for the whole pipeline: {render}"
     );
     assert_eq!(*types.last().unwrap(), b'Z', "ReadyForQuery must be last: {render}");
-    assert_eq!(types.iter().filter(|&&t| t == b'1').count(), 1, "one ParseComplete: {render}");
-    assert_eq!(types.iter().filter(|&&t| t == b'2').count(), 2, "two BindComplete: {render}");
-    assert_eq!(types.iter().filter(|&&t| t == b'C').count(), 2, "two CommandComplete: {render}");
+    assert_eq!(
+        types.iter().filter(|&&t| t == b'1').count(),
+        1,
+        "one ParseComplete: {render}"
+    );
+    assert_eq!(
+        types.iter().filter(|&&t| t == b'2').count(),
+        2,
+        "two BindComplete: {render}"
+    );
+    assert_eq!(
+        types.iter().filter(|&&t| t == b'C').count(),
+        2,
+        "two CommandComplete: {render}"
+    );
     assert_eq!(
         types.iter().filter(|&&t| t == b'D').count(),
         6,
@@ -697,7 +715,8 @@ async fn parse_seeds_shared_plan_for_select() {
 #[tokio::test]
 async fn dml_returning_keeps_private_schema_path() {
     let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
-    db.execute("CREATE TABLE ins (id INT PRIMARY KEY, v TEXT)").expect("create");
+    db.execute("CREATE TABLE ins (id INT PRIMARY KEY, v TEXT)")
+        .expect("create");
     let (mut handler, _client) = test_handler(db);
     handler
         .handle_parse_extended(
@@ -768,8 +787,10 @@ async fn describe_reports_pg_type_oids() {
 #[tokio::test]
 async fn describe_aggregate_alias_names_and_types() {
     let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
-    db.execute("CREATE TABLE ev (id INT PRIMARY KEY, k TEXT)").expect("create");
-    db.execute("INSERT INTO ev VALUES (1,'a'),(2,'b'),(3,'a')").expect("insert");
+    db.execute("CREATE TABLE ev (id INT PRIMARY KEY, k TEXT)")
+        .expect("create");
+    db.execute("INSERT INTO ev VALUES (1,'a'),(2,'b'),(3,'a')")
+        .expect("insert");
     let (mut handler, mut client) = test_handler(db);
     handler
         .handle_parse_extended("ag".into(), "SELECT count(*) AS n FROM ev".into(), vec![])
@@ -780,7 +801,11 @@ async fn describe_aggregate_alias_names_and_types() {
         .await
         .expect("describe");
     let fields = row_description(&drain(&mut client).await);
-    assert_eq!(fields, vec![("n".to_string(), 20)], "count(*) AS n → int8 (OID 20) named n");
+    assert_eq!(
+        fields,
+        vec![("n".to_string(), 20)],
+        "count(*) AS n → int8 (OID 20) named n"
+    );
 }
 
 /// W2.3 regression (review finding): the Describe schema is now sourced from

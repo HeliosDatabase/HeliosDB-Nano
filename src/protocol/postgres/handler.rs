@@ -428,8 +428,7 @@ where
             // escape format into the wrong bytes — silently corrupting BLOB/RAW
             // round-trips. Sending it makes those drivers emit single-backslash
             // literals that Nano decodes correctly.
-            self.send_parameter_status("standard_conforming_strings", "on")
-                .await?;
+            self.send_parameter_status("standard_conforming_strings", "on").await?;
 
             // Item 10: advertise the helios.* opt-in capabilities so a
             // capability-probing client (HeliosProxy) auto-enables only what
@@ -786,10 +785,7 @@ where
                 )
             } else if param.eq_ignore_ascii_case("helios.fast_autocommit") {
                 // Item 9: SHOW helios.fast_autocommit.
-                let on = self
-                    .database
-                    .session_fast_autocommit(self.session_id)
-                    .unwrap_or(false);
+                let on = self.database.session_fast_autocommit(self.session_id).unwrap_or(false);
                 (
                     "helios.fast_autocommit".to_string(),
                     if on { "on".to_string() } else { "off".to_string() },
@@ -906,10 +902,9 @@ where
                     // Reset session GUCs to their defaults.
                     let _ = self.database.set_session_synchronous_commit(self.session_id, None);
                     let _ = self.database.set_session_fast_autocommit(self.session_id, false);
-                    let _ = self.database.set_session_isolation(
-                        self.session_id,
-                        crate::session::IsolationLevel::ReadCommitted,
-                    );
+                    let _ = self
+                        .database
+                        .set_session_isolation(self.session_id, crate::session::IsolationLevel::ReadCommitted);
                     // Item 10: GUC_REPORT the reset helios.* GUC.
                     self.send_parameter_status("helios.fast_autocommit", "off").await?;
                 }
@@ -1412,8 +1407,7 @@ where
         // tail across frames, which split at arbitrary byte offsets.
         let max_buffered_rows = self.database.copy_max_buffered_rows();
         let max_record_bytes = self.database.copy_max_record_bytes();
-        let mut decoder =
-            super::copy::CopyStreamDecoder::new(copy.format, max_buffered_rows, max_record_bytes);
+        let mut decoder = super::copy::CopyStreamDecoder::new(copy.format, max_buffered_rows, max_record_bytes);
         let mut client_fail: Option<String> = None;
         loop {
             match self.read_message().await? {
@@ -1451,12 +1445,12 @@ where
         // cap tripped so the operator knows which knob to raise.
         if let Some(reason) = decoder.overflow_reason() {
             let detail = match reason {
-                super::copy::CopyOverflow::Rows => format!(
-                    "buffered row count exceeded copy_max_buffered_rows ({max_buffered_rows})"
-                ),
-                super::copy::CopyOverflow::RecordBytes => format!(
-                    "in-progress record size exceeded copy_max_record_bytes ({max_record_bytes})"
-                ),
+                super::copy::CopyOverflow::Rows => {
+                    format!("buffered row count exceeded copy_max_buffered_rows ({max_buffered_rows})")
+                }
+                super::copy::CopyOverflow::RecordBytes => {
+                    format!("in-progress record size exceeded copy_max_record_bytes ({max_record_bytes})")
+                }
             };
             return self
                 .send_error(
@@ -1529,10 +1523,7 @@ where
                 .join(", ")
         };
         let sql = format!("SELECT {} FROM \"{}\"", cols_sql, copy.table.replace('"', "\"\""));
-        let (rows, columns) = match self
-            .database
-            .query_with_columns_for_session(self.session_id, &sql)
-        {
+        let (rows, columns) = match self.database.query_with_columns_for_session(self.session_id, &sql) {
             Ok(r) => r,
             Err(e) => {
                 return self

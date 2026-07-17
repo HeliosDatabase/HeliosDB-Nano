@@ -689,7 +689,10 @@ fn w2_branch_txn_insert_does_not_poison_shared_secondary_art() {
 
     // The branch sees its own overlay row (full-scan path — must stay correct).
     assert_eq!(
-        first_col_ints(&db.query("SELECT id FROM t WHERE code = 200", &[]).expect("branch probe")),
+        first_col_ints(
+            &db.query("SELECT id FROM t WHERE code = 200", &[])
+                .expect("branch probe")
+        ),
         vec![2],
         "branch must see its own overlay row"
     );
@@ -719,7 +722,10 @@ fn w2_branch_txn_insert_does_not_poison_shared_secondary_art() {
         "main must not see the branch's row via the secondary index"
     );
     assert_eq!(
-        first_col_ints(&db.query("SELECT id FROM t WHERE code = 100", &[]).expect("main probe 100")),
+        first_col_ints(
+            &db.query("SELECT id FROM t WHERE code = 100", &[])
+                .expect("main probe 100")
+        ),
         vec![1],
         "main must still see its own row"
     );
@@ -775,8 +781,7 @@ fn w2_branch_update_does_not_poison_secondary_index_on_main() {
     let db = EmbeddedDatabase::new_in_memory().expect("in-memory db");
     db.execute("CREATE TABLE t (id INT PRIMARY KEY, code INT)")
         .expect("create table");
-    db.execute("CREATE INDEX idx_t_code ON t(code)")
-        .expect("create index");
+    db.execute("CREATE INDEX idx_t_code ON t(code)").expect("create index");
     db.execute("INSERT INTO t (id, code) VALUES (1, 100)")
         .expect("seed main row");
     assert_eq!(
@@ -857,7 +862,10 @@ fn w2_branch_autocommit_insert_does_not_poison_shared_secondary_art() {
 
     // The branch sees its own overlay row (full-scan path — must stay correct).
     assert_eq!(
-        first_col_ints(&db.query("SELECT id FROM t WHERE code = 200", &[]).expect("branch probe")),
+        first_col_ints(
+            &db.query("SELECT id FROM t WHERE code = 200", &[])
+                .expect("branch probe")
+        ),
         vec![2],
         "branch must see its own overlay row"
     );
@@ -886,7 +894,10 @@ fn w2_branch_autocommit_insert_does_not_poison_shared_secondary_art() {
         "main must not see the branch's row via the secondary index"
     );
     assert_eq!(
-        first_col_ints(&db.query("SELECT id FROM t WHERE code = 100", &[]).expect("main probe 100")),
+        first_col_ints(
+            &db.query("SELECT id FROM t WHERE code = 100", &[])
+                .expect("main probe 100")
+        ),
         vec![1],
         "main must still see its own row"
     );
@@ -922,8 +933,7 @@ fn w2_branch_delete_does_not_strip_secondary_index_on_main() {
         .expect("branch autocommit delete");
     // In-transaction branch DELETE of a second inherited row (txn DELETE arm).
     db.execute("BEGIN").expect("begin on branch");
-    db.execute("DELETE FROM t WHERE id = 2")
-        .expect("branch delete in txn");
+    db.execute("DELETE FROM t WHERE id = 2").expect("branch delete in txn");
     db.execute("COMMIT").expect("commit on branch");
 
     // The branch no longer sees either row (overlay tombstone — full-scan path).

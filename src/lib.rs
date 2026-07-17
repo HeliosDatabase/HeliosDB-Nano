@@ -5066,7 +5066,11 @@ impl EmbeddedDatabase {
                 self.storage.art_indexes().clear_table_indexes(table_name);
                 // DDL-like contract (PostgreSQL parity): TRUNCATE reports no
                 // affected-row count, in or out of a transaction.
-                tracing::debug!(table = table_name.as_str(), rows = count, "TRUNCATE staged row deletes in txn");
+                tracing::debug!(
+                    table = table_name.as_str(),
+                    rows = count,
+                    "TRUNCATE staged row deletes in txn"
+                );
                 Ok(0)
             }
             sql::LogicalPlan::CreateDatabase { name, if_not_exists } => {
@@ -6907,9 +6911,7 @@ impl EmbeddedDatabase {
         // callers still bail on `constraints.is_some()` (they can't validate);
         // `copy_bulk_insert` validates the batch against these and stays fast.
         let constraints = match catalog.load_table_constraints(table_name) {
-            Ok(tc) if !tc.foreign_keys.is_empty() || !tc.check_constraints.is_empty() => {
-                Some(std::sync::Arc::new(tc))
-            }
+            Ok(tc) if !tc.foreign_keys.is_empty() || !tc.check_constraints.is_empty() => Some(std::sync::Arc::new(tc)),
             _ => None,
         };
 
@@ -28981,7 +28983,11 @@ mod tests {
         assert_eq!(fast_err, slow_err, "FK error must match the slow path verbatim");
 
         let got = db.query("SELECT count(*) FROM cbi_c2", &[]).unwrap();
-        assert_eq!(got[0].values[0], Value::Int8(0), "no partial rows may survive a rejected COPY");
+        assert_eq!(
+            got[0].values[0],
+            Value::Int8(0),
+            "no partial rows may survive a rejected COPY"
+        );
     }
 
     #[test]
@@ -29005,11 +29011,17 @@ mod tests {
         // still fails, atomically.
         let bad = copy_rows(&[&[Some("3"), Some("404")]]);
         assert!(
-            db.copy_bulk_insert("cbi_emp", &[], &bad).expect("fast path taken").is_err(),
+            db.copy_bulk_insert("cbi_emp", &[], &bad)
+                .expect("fast path taken")
+                .is_err(),
             "missing self-parent must reject"
         );
         let got = db.query("SELECT count(*) FROM cbi_emp", &[]).unwrap();
-        assert_eq!(got[0].values[0], Value::Int8(2), "rejected COPY leaves the table unchanged");
+        assert_eq!(
+            got[0].values[0],
+            Value::Int8(2),
+            "rejected COPY leaves the table unchanged"
+        );
     }
 
     #[test]
@@ -29018,10 +29030,7 @@ mod tests {
         db.execute("CREATE TABLE cbi_ck (id INT PRIMARY KEY, n INT CHECK (n > 0))")
             .unwrap();
 
-        let slow_err = db
-            .execute("INSERT INTO cbi_ck VALUES (5, -3)")
-            .unwrap_err()
-            .to_string();
+        let slow_err = db.execute("INSERT INTO cbi_ck VALUES (5, -3)").unwrap_err().to_string();
 
         let rows = copy_rows(&[&[Some("1"), Some("10")], &[Some("2"), Some("-3")]]);
         let fast_err = db
@@ -29298,7 +29307,8 @@ mod tests {
         // session transaction is open, so it is unreachable with an open reader
         // through the query surface.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE fw (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+        db.execute("CREATE TABLE fw (id INTEGER PRIMARY KEY, v INTEGER)")
+            .unwrap();
         db.execute("INSERT INTO fw (id, v) VALUES (1, 100)").unwrap();
 
         let schema = db.storage.catalog().get_table_schema("fw").unwrap();

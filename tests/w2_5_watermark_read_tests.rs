@@ -48,9 +48,7 @@ fn in_txn_full_scan_matches_autocommit_when_unchanged() {
     assert_eq!(ids(&in_txn), vec![1, 2], "in-txn scan must see the committed rows");
 
     // A filtered (pushdown) scan takes the FilteredScan fast path.
-    let filtered = db
-        .query_in_session(a, "SELECT * FROM t WHERE v >= 150", &[])
-        .unwrap();
+    let filtered = db.query_in_session(a, "SELECT * FROM t WHERE v >= 150", &[]).unwrap();
     assert_eq!(ids(&filtered), vec![2], "in-txn filtered scan must match the predicate");
 
     db.commit_transaction_for_session(a).unwrap();

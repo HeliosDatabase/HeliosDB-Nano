@@ -464,9 +464,7 @@ impl SnapshotManager {
             let snap_timestamp = metadata.wall_clock_unix_secs() as u64;
             if snap_timestamp <= target_time {
                 let diff = target_time - snap_timestamp;
-                if diff < best_diff
-                    || (diff == best_diff && best_match.is_none_or(|best| metadata.timestamp > best))
-                {
+                if diff < best_diff || (diff == best_diff && best_match.is_none_or(|best| metadata.timestamp > best)) {
                     best_diff = diff;
                     best_match = Some(metadata.timestamp);
                 }
@@ -993,11 +991,7 @@ impl SnapshotManager {
     /// relaxed atomic load — when no markers exist, so the hot fast-DML path is
     /// untaxed on non-COPY workloads. Idempotent: a row that already has a
     /// `v_idx:` is treated as materialized and skipped.
-    pub(crate) fn materialize_copy_marker_row_durable(
-        &self,
-        table_name: &str,
-        row_id: u64,
-    ) -> Result<()> {
+    pub(crate) fn materialize_copy_marker_row_durable(&self, table_name: &str, row_id: u64) -> Result<()> {
         if self.copy_markers.is_empty() {
             return Ok(());
         }
