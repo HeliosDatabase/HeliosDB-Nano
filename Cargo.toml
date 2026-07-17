@@ -65,8 +65,13 @@ sqlparser = { version = "0.53", features = ["visitor"] }
 # Async Runtime
 tokio = { version = "1.40", features = ["full"] }
 async-trait = "0.1"
-reqwest = { version = "0.12", features = ["json", "stream"] }
-oauth2 = "4.4"
+# default-features = false drops native-tls (-> openssl-sys, banned in deny.toml
+# and absent from manylinux wheel builds); rustls-tls-native-roots keeps the
+# system trust store so custom-CA deployments behave as before.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls-native-roots", "http2", "charset"] }
+# default-features = false drops oauth2's native-tls option (openssl stack,
+# banned) — rustls only, matching the reqwest pin above.
+oauth2 = { version = "4.4", default-features = false, features = ["reqwest", "rustls-tls"] }
 futures = "0.3"
 async-stream = "0.3"
 
