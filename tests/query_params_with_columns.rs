@@ -103,10 +103,13 @@ fn param_read_sees_open_txn_write_set_and_committed_state() {
     assert_eq!(ids_plan(&db), vec![1, 3], "plan path: committed row visible");
 }
 
-/// W1.4: a normalized `WHERE c.id = $1` feeding a join must return the SAME
-/// rows as its literal twin (now routed through index-nested-loop instead of a
-/// hash join), and a NULL parameter on the pushed predicate must match nothing
-/// (SQL three-valued logic — `col = NULL` is UNKNOWN → zero rows).
+/// W1.4 correctness guards (kept through the 2026-07-16 revert of the
+/// Parameter-pushdown widening — see rules.rs "W1.4 HISTORY"): a parameterized
+/// `WHERE c.id = $1` feeding a join must return the SAME rows as its literal
+/// twin regardless of which plan shape it takes, and a NULL parameter must
+/// match nothing (SQL three-valued logic — `col = NULL` is UNKNOWN → zero
+/// rows). These row-level assertions hold on both the Filter{Scan} path
+/// (current) and any future FilteredScan/INLJ re-land.
 #[test]
 fn param_equality_join_matches_literal_and_null_matches_nothing() {
     let db = EmbeddedDatabase::new_in_memory().unwrap();
@@ -146,12 +149,11 @@ fn param_equality_join_matches_literal_and_null_matches_nothing() {
     );
 }
 
-/// W1.4 correctness guard for the non-indexed FilteredScan path: widening the
-/// pushdown gate lets `WHERE note = $1` (note is NOT indexed) become a
-/// FilteredScan whose predicate resolves to a runtime value. A NULL parameter
-/// must still yield zero rows even though rows with `note IS NULL` exist — the
-/// storage-safety gate defers the NULL bound to the executor's NULL-correct
-/// evaluator instead of the SIMD kernel (which would match `NULL = NULL`).
+/// NULL-parameter three-valued-logic guard on a non-indexed column: a NULL
+/// parameter must yield zero rows even though rows with `note IS NULL` exist,
+/// on whatever plan shape the equality takes (evaluator path today; the
+/// storage-safety gate + evaluator re-filter if a future re-land pushes
+/// parameters to FilteredScan — see rules.rs "W1.4 HISTORY").
 #[test]
 fn param_equality_null_does_not_match_null_column_rows() {
     let db = EmbeddedDatabase::new_in_memory().unwrap();
@@ -162,7 +164,7 @@ fn param_equality_null_does_not_match_null_column_rows() {
     let sql = "SELECT id FROM t2 WHERE note = $1 ORDER BY id";
     let ids = |rows: &[heliosdb_nano::Tuple]| -> Vec<i64> { rows.iter().map(|r| as_i64(&r.values[0])).collect() };
 
-    // Non-null param still filters correctly through the widened FilteredScan.
+    // Non-null param filters correctly.
     let matched = db.query_params(sql, &[Value::String("x".into())]).unwrap();
     assert_eq!(ids(&matched), vec![1, 3]);
 
@@ -175,14 +177,11 @@ fn param_equality_null_does_not_match_null_column_rows() {
     );
 }
 
-/// W1.4 review guard: widening the pushdown gate to accept `(Column, Parameter)`
-/// must not let an out-of-range `$n` silently drop the conjunct and return every
-/// row. `WHERE note = $2` with a single bound param (note is NOT indexed → a
-/// FilteredScan on the non-indexed path) resolves nothing at runtime, so
-/// `analyze_predicate` drops the conjunct and `analyzed_predicates` is shorter
-/// than the predicate. The completeness check treats that pushdown as unsafe and
-/// the executor re-filter reproduces the pre-widening `Parameter $2 not provided`
-/// error instead of returning the whole table unfiltered.
+/// Out-of-range `$n` must error ("Parameter $2 not provided"), never silently
+/// drop the conjunct and return every row. Today the evaluator raises it on the
+/// Filter{Scan} path; the scan.rs extraction-completeness check (kept from the
+/// W1.4 review) guarantees the same outcome if pushed-parameter plans ever
+/// return (see rules.rs "W1.4 HISTORY").
 #[test]
 fn param_out_of_range_on_pushed_predicate_errors_not_all_rows() {
     let db = EmbeddedDatabase::new_in_memory().unwrap();
