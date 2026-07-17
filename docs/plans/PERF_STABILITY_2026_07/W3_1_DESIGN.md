@@ -363,12 +363,31 @@ seqlock registry — a different fix, recorded here, not the plan-cache slot.
 Record the actual counter readings inline here when the gate runs:
 
 ```
-# c=__ , protocol=__ , build=lock-census, lock_census=true
-plan_cache_shard      acq=____  contended=____  wait_ns=____   (mutex — GO anchor)
-parse_cache_shard     acq=____  contended=____  wait_ns=____   (mutex)
-result_cache_shard    acq=____  contended=____  wait_ns=____   (mutex)
-art_index_registry    acq=____  contended=____  wait_ns=____   (reader — §2.1 blind, contended non-informative)
-art_pk_registry       acq=____  contended=____  wait_ns=____   (reader — §2.1 blind)
-statement_registry    acq=____  contended=____  wait_ns=____   (reader — prepared-path, §2.1 blind)
-Verdict: GO / NO-GO  because ______________________________
+# MEASURED 2026-07-17 (coordinator gate, chain B run bm5ek1l05):
+# c=32, protocol=extended, pgbench point-read 50k rows, -T 15, tps=129,181
+# build=lock-census @ c5c762a, [performance] lock_census=true
+plan_cache_shard      acq=1,937,308  contended=321,484  wait_ns=381,446,234   (mutex — GO anchor)
+parse_cache_shard     acq=29         contended=1        wait_ns=340           (mutex)
+result_cache_shard    acq=0          contended=0        wait_ns=0             (mutex)
+art_index_registry    acq=0          contended=0        wait_ns=0             (reader — §2.1 blind)
+art_pk_registry       acq=0          contended=0        wait_ns=0             (reader — §2.1 blind)
+statement_registry    acq=0          contended=0        wait_ns=0             (reader — prepared-path, §2.1 blind)
+Verdict: NO-GO  because the contended RATE is high (321,484/1,937,308 = 16.6%
+of acquisitions) but the blocked TIME is negligible: 381 ms total across
+32 clients x 15 s = 480 client-seconds, i.e. ~0.08% of wall-time. Failed
+try-locks resolve almost instantly under parking_lot's adaptive spin; nothing
+queues. The c>=32 plateau (129k tps @c32 -> 130k @c64 extended in this same
+harness) is NOT lock-blocking on any instrumented mutex — per the §7 NO-GO
+arm, the serializer is outside the lock-blocking path (reader cache-line
+per §2.1, allocator, or socket/runtime). The epoch-validated slot as designed
+would not move the plateau; do not implement. Next measurement round should
+attribute via perf/off-CPU profiling rather than lock counters.
+
+Instrumentation bug found during the run (does not affect the verdict — the
+first sweep is a complete 15 s sample): counters FROZE after the first pgbench
+sweep; the three subsequent sweeps (extended c=64, prepared c=32/64 — tps
+130k/194k/203k) added zero acquisitions. Suspected label loss on a cache
+rebuild after the 32-session disconnect storm (rebuilt shards default to
+Unlabeled) — census sites must survive cache reconstruction. Filed with the
+W3-implementation lease.
 ```

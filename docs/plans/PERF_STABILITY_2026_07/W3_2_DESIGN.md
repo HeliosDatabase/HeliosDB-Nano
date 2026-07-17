@@ -93,13 +93,29 @@ version-skipping, §1.5).
 > rules forbid live-server and benchmark runs.
 
 ```
-# workload=__ , build=release, write_volume_stats=true
-insert_single   data=____  version=____  index=____  rows=____   version_share=____
-insert_multi    data=____  version=____  index=____  rows=____   version_share=____
-copy            data=____  version=____  index=____  rows=____   version_share=____
-update          data=____  version=____  index=____  rows=____   (expect version=0)
-delete          data=____  version=____  index=____  rows=____   (expect version=0)
-Verdict: PROCEED / DEPRIORITIZE  because ______________________________
+# MEASURED 2026-07-17 (coordinator gate, chain B run bm5ek1l05):
+# build=release @ c5c762a (default profile, time-travel ON), write_volume_stats=true
+insert_single   data=43      version=80  index=12      rows=1      version_share=65%
+insert_multi    (recorded 0 — landed in `other`: data=114 version=225 rows=3 -> 66%;
+                 classification gap: the 3-row VALUES insert is not tagged
+                 insert_multi. Filed with the lease; the share itself is consistent.)
+copy            data=467,804 version=57  index=120,000 rows=10,000 version_share=~0%
+                (v4.1.0 vmeta: range markers already collapse COPY version writes
+                 to one marker — independent cross-validation of that design.)
+update          data=40      version=0   index=0       rows=1      (expect 0 ✓ — §1.5:
+                 fast UPDATE/DELETE are version-skipping, watermark-invalidating)
+delete          data=8       version=0   index=0       rows=1      (expect 0 ✓)
+# fast-profile cross-check (§1.6): insert_single version=0 ✓ (all classes 0).
+# Anomaly: fast-profile COPY recorded rows=0 — the \copy under profile="fast"
+# either failed silently or routes around the instrumented funnel; filed with
+# the lease (does not affect the verdict, which needs the time-travel-ON run).
+Verdict: PROCEED  because the measured version_share on single-row INSERT is
+65% (and 66% on the 3-row batch via `other`) — above both the 15% deprioritize
+floor and the 50% expectation from §1.2's analytic prior. The single-copy
+latest-version design (flagged v_idx: event + materialize-on-first-mutation)
+targets a majority of INSERT byte volume. COPY is already solved by vmeta:.
+NO format change ships this campaign (binding stop rule); implementation goes
+with the W3 lease.
 ```
 
 ### 1.5 A finding the census makes explicit
