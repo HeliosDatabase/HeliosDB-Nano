@@ -280,6 +280,14 @@ impl Parser {
         // sqlparser requires INCREMENT before START, etc.).
         processed_sql = Self::preprocess_create_sequence_clause_order(&processed_sql);
 
+        // Round-2 pgrust-corpus compat: strip the PostgreSQL
+        // `INHERITS (parent[, …])` table-option clause off CREATE TABLE
+        // (sqlparser 0.53 has no INHERITS grammar, so it fails at the parse
+        // stage). Faithful parent column/constraint merge is out of scope for
+        // this pass; stripping the clause lets the child table create with
+        // its own explicitly-listed columns, the pragmatic compatibility win.
+        processed_sql = Self::preprocess_strip_inherits(&processed_sql);
+
         let mut statements = SqlParser::parse_sql(&self.dialect, &processed_sql)
             .map_err(|e| Error::sql_parse(format!("Failed to parse SQL: {}", e)))?;
 
@@ -351,6 +359,202 @@ impl Parser {
     pub fn is_vacuum_versions(sql: &str) -> bool {
         let upper = sql.trim().trim_end_matches(';').trim().to_uppercase();
         upper == "VACUUM VERSIONS"
+    }
+
+    /// Priority #5 of the pgrust-corpus diagnosis: does this statement begin
+    /// with the standard PostgreSQL `VACUUM` keyword? sqlparser 0.53
+    /// implements NO form of the VACUUM grammar at all (confirmed: no
+    /// `Keyword::VACUUM` dispatch anywhere in its parser), so every VACUUM
+    /// form -- bare, `ANALYZE`, `FULL`, with/without a table list -- fails
+    /// at the parse stage with "Expected: an SQL statement, found: VACUUM"
+    /// before it ever reaches the planner. This is a pre-parse intercept in
+    /// the same spirit as `is_vacuum_versions` above, checked separately
+    /// (and excluding the Nano-specific `VACUUM VERSIONS` form, which is
+    /// handled by `is_vacuum_versions` earlier in the same dispatch chain).
+    ///
+    /// Runs on the shared pre-parse dispatch path for every statement
+    /// (alongside `is_transaction_control` / `is_vacuum_versions`), so this
+    /// is deliberately a single cheap prefix check via `starts_with_icase`
+    /// -- no full uppercasing, no allocation -- before any further string
+    /// work happens.
+    pub fn is_vacuum_statement(sql: &str) -> bool {
+        let trimmed = sql.trim();
+        crate::starts_with_icase(trimmed, "VACUUM") && !Self::is_vacuum_versions(trimmed)
+    }
+
+    /// Hand-parse the optional FULL/FREEZE/VERBOSE/ANALYZE flags (either the
+    /// modern `VACUUM (option [, ...])` parenthesized form or the older
+    /// bare-keyword form) and an optional comma-separated table list off a
+    /// statement already confirmed by `is_vacuum_statement`. Per-table
+    /// column lists (`VACUUM t (col1, col2)`) are accepted and ignored --
+    /// Nano's `vacuum_table` operates on the whole table.
+    ///
+    /// Returns the requested table names (already case-folded per the
+    /// unquoted-lowercase / quoted-preserved rule used elsewhere in the
+    /// planner). An empty vec means "no table list" (whole-database
+    /// VACUUM). Flags themselves are deliberately not returned: this pass
+    /// accepts-and-ignores FULL/FREEZE/VERBOSE/ANALYZE, matching Postgres's
+    /// own idempotent, safe-anytime VACUUM semantics -- a real
+    /// ANALYZE-driven stats refresh is a reasonable fast-follow, not a
+    /// blocker.
+    pub fn parse_vacuum_tables(sql: &str) -> Vec<String> {
+        let cleaned = sql.trim().trim_end_matches(';').trim();
+        // Strip the leading VACUUM keyword.
+        let after_vacuum = cleaned.get(6..).unwrap_or("").trim_start();
+
+        // Modern parenthesized option list: `VACUUM (FULL, ANALYZE) t1, t2`.
+        let after_options = if let Some(rest) = after_vacuum.strip_prefix('(') {
+            match rest.find(')') {
+                Some(close) => rest[close + 1..].trim_start(),
+                None => "", // Malformed options list; nothing usable follows.
+            }
+        } else {
+            // Older bare-keyword flags: `VACUUM FULL ANALYZE t1, t2`.
+            let mut rest = after_vacuum;
+            loop {
+                let word_end = rest.find(|c: char| c.is_whitespace() || c == ',').unwrap_or(rest.len());
+                let word = &rest[..word_end];
+                if word.eq_ignore_ascii_case("FULL")
+                    || word.eq_ignore_ascii_case("FREEZE")
+                    || word.eq_ignore_ascii_case("VERBOSE")
+                    || word.eq_ignore_ascii_case("ANALYZE")
+                    || word.eq_ignore_ascii_case("ANALYSE")
+                {
+                    rest = rest[word_end..].trim_start();
+                } else {
+                    break;
+                }
+            }
+            rest
+        };
+
+        if after_options.is_empty() {
+            return Vec::new();
+        }
+
+        // Comma-separated `table_and_columns` list. Each entry is a table
+        // name optionally followed by a parenthesized column list, which we
+        // accept and discard.
+        after_options
+            .split(',')
+            .filter_map(|entry| {
+                let name_part = entry.trim().split(|c: char| c.is_whitespace() || c == '(').next()?.trim();
+                if name_part.is_empty() {
+                    return None;
+                }
+                // Preserve double-quoted identifiers as written; fold
+                // unquoted identifiers to lowercase, matching
+                // `Planner::normalize_ident`'s PostgreSQL rule.
+                if name_part.starts_with('"') && name_part.ends_with('"') && name_part.len() >= 2 {
+                    Some(name_part[1..name_part.len() - 1].to_string())
+                } else {
+                    Some(name_part.to_lowercase())
+                }
+            })
+            .collect()
+    }
+
+    /// Priority #7 of the pgrust-corpus diagnosis: does this statement begin
+    /// with `CREATE TABLESPACE`? sqlparser 0.53 has no `CreateTablespace`
+    /// grammar at all (confirmed: no `TABLESPACE` keyword anywhere in its
+    /// parser), so this fails at the parse stage ("Expected: an object type
+    /// after CREATE, found: TABLESPACE"), not at the planner's generic
+    /// "Statement not yet supported" catch-all. A minimal no-op stub
+    /// therefore needs the same pre-parse-intercept treatment as VACUUM
+    /// above, rather than a `Statement::CreateTablespace` planner match arm
+    /// (there is no such variant to match).
+    ///
+    /// Real multi-tablespace functionality (LOCATION handling, DROP
+    /// TABLESPACE, ALTER ... SET TABLESPACE) is explicitly out of scope --
+    /// this only lets the statement parse-and-succeed as a no-op so fixture
+    /// loads that issue it (e.g. `CREATE TABLESPACE regress_tblspace
+    /// LOCATION '';`) don't fail outright.
+    pub fn is_create_tablespace_statement(sql: &str) -> bool {
+        let trimmed = sql.trim();
+        crate::starts_with_icase(trimmed, "CREATE TABLESPACE")
+    }
+
+    /// Round-2 pgrust-corpus compat (~464 corpus statements): standard
+    /// PostgreSQL `RESET name` / `RESET ALL`. sqlparser 0.53 has no
+    /// top-level RESET grammar at all (the RESET keyword appears only inside
+    /// `ALTER … RESET` in its parser), so a `RESET <guc>` / `RESET ALL` that
+    /// is not one of Nano's already-modelled session settings fails at the
+    /// parse stage with "Expected: an SQL statement, found: RESET" before it
+    /// ever reaches the planner. This is a pre-parse intercept in the same
+    /// spirit as `is_create_tablespace_statement` above.
+    ///
+    /// It is deliberately checked only AFTER the specific SET/RESET handlers
+    /// (`try_handle_db_setting_statement_with_columns`,
+    /// `try_handle_fk_setting`, `try_handle_trace_*`), so a `RESET` of a
+    /// real session setting still performs its actual reset; only the
+    /// otherwise-unhandled GUCs (`RESET search_path`, `RESET
+    /// statement_timeout`, `RESET ALL`, …) fall through to here and are
+    /// accepted as a no-op — matching PostgreSQL's safe-anytime RESET
+    /// semantics (a GUC Nano does not model has no session state to
+    /// restore). A single cheap `starts_with_icase` prefix check, no
+    /// allocation, matching the cost profile of the checks it sits beside.
+    /// The trailing space excludes a bare `RESET` (not valid PostgreSQL)
+    /// and any identifier that merely begins with those letters.
+    pub fn is_reset_statement(sql: &str) -> bool {
+        let trimmed = sql.trim();
+        crate::starts_with_icase(trimmed, "RESET ")
+    }
+
+    /// Round-2 pgrust-corpus compat (~80 corpus statements): PostgreSQL
+    /// `REINDEX [ ( option … ) ] { INDEX | TABLE | SCHEMA | DATABASE |
+    /// SYSTEM } name`. sqlparser 0.53 has no REINDEX statement dispatch at
+    /// all (the word appears only in doc comments in its AST, never in the
+    /// parser), so every REINDEX form fails at the parse stage before the
+    /// planner. Accepted as a pre-parse no-op: Nano's LSM/index storage has
+    /// no external-fragmentation rebuild need that a user-issued REINDEX
+    /// must satisfy, and PostgreSQL REINDEX is itself an idempotent,
+    /// safe-anytime maintenance command, so a success-returning no-op is a
+    /// faithful-enough surface.
+    ///
+    /// Whole-keyword boundary check: the byte immediately after `REINDEX`
+    /// (if any) must not continue an identifier, so a hypothetical
+    /// `REINDEXED`-prefixed token never matches. Valid REINDEX forms
+    /// continue with whitespace (`REINDEX TABLE t`) or `(` (`REINDEX
+    /// (VERBOSE) TABLE t`), both of which pass the boundary.
+    pub fn is_reindex_statement(sql: &str) -> bool {
+        let trimmed = sql.trim();
+        if !crate::starts_with_icase(trimmed, "REINDEX") {
+            return false;
+        }
+        // "REINDEX" is 7 ASCII bytes; index 7 is the byte right after it.
+        match trimmed.as_bytes().get(7) {
+            None => true,
+            Some(&c) => !(c.is_ascii_alphanumeric() || c == b'_'),
+        }
+    }
+
+    /// Round-2 pgrust-corpus compat (~144 corpus statements): PostgreSQL
+    /// `CREATE DOMAIN name [AS] base_type [constraints]` and `DROP DOMAIN
+    /// [IF EXISTS] name`. sqlparser 0.53 has no DOMAIN object type at all
+    /// (no `parse_create_domain`, no `ObjectType::Domain`), so both fail at
+    /// the parse stage before the planner -- CREATE DOMAIN as "Expected: an
+    /// object type after CREATE, found: DOMAIN", DROP DOMAIN similarly.
+    ///
+    /// Accepted as a parse-and-accept no-op, the same "single flat
+    /// namespace" precedent used for CREATE SCHEMA / CREATE TABLESPACE:
+    /// the statement parse-and-succeeds so a fixture load that issues it no
+    /// longer aborts. Faithful domain semantics (registering the domain as
+    /// an alias of its base type so a later `CREATE TABLE t (c my_domain)`
+    /// resolves, plus its CHECK/NOT NULL/DEFAULT constraints) are a
+    /// deliberate non-goal for this zero-regression pass: that would touch
+    /// the type-resolution / column-binding path. A table that references
+    /// an undefined domain therefore still fails on the unknown custom type
+    /// exactly as it did before -- this change is strictly additive (a hard
+    /// parse error becomes a success for the DOMAIN statement itself) and
+    /// regresses nothing.
+    ///
+    /// The trailing space anchors the whole keyword and excludes an
+    /// identifier that merely begins with these letters. `DROP DOMAIN IF
+    /// EXISTS name` is covered because it still begins with `DROP DOMAIN `.
+    pub fn is_domain_ddl_statement(sql: &str) -> bool {
+        let trimmed = sql.trim();
+        crate::starts_with_icase(trimmed, "CREATE DOMAIN ")
+            || crate::starts_with_icase(trimmed, "DROP DOMAIN ")
     }
 
     /// Check if SQL is a REFRESH MATERIALIZED VIEW statement
@@ -1876,6 +2080,144 @@ impl Parser {
         }
         rewrite_unquoted(&sql[seg_start..], &mut out);
         out
+    }
+
+    /// Round-2 pgrust-corpus compat (~207 corpus statements): strip the
+    /// PostgreSQL `INHERITS (parent[, …])` table-option clause from a
+    /// CREATE TABLE so the statement parses. sqlparser 0.53 has no INHERITS
+    /// grammar at all, so `CREATE TABLE child (…) INHERITS (parent)` fails
+    /// at the parse stage before the planner. Faithful column/constraint
+    /// merge from the parent(s) is intentionally out of scope for this
+    /// zero-regression pass -- stripping the clause lets the child table be
+    /// created with its own explicitly-listed columns, which is the
+    /// pragmatic compatibility win the round-2 diagnosis asked for.
+    ///
+    /// Quote-aware and keyword-boundary-aware, mirroring
+    /// `preprocess_strip_trailing_commas` above: an `INHERITS (` sequence
+    /// inside a single-quoted string literal or a double-quoted identifier
+    /// is copied through untouched, a column named `inherits` (not followed
+    /// by `(`) is left alone, and an identifier that merely embeds the
+    /// letters (`my_inherits`) never matches. Only the first INHERITS clause
+    /// is removed -- a CREATE TABLE carries at most one. Any options that
+    /// follow the clause (`WITH (…)`, `TABLESPACE …`, …) are preserved.
+    ///
+    /// Cheap early-outs keep this off the hot path: an allocation-free
+    /// `starts_with_icase("CREATE TABLE")` gate, then a single
+    /// case-insensitive substring probe for "INHERITS"; only a CREATE TABLE
+    /// statement that actually contains those letters does any byte-walk
+    /// work. This runs only at parse time (once per statement, alongside the
+    /// sibling preprocessors).
+    pub fn preprocess_strip_inherits(sql: &str) -> String {
+        // Gate strictly to `CREATE TABLE`, matching the sibling
+        // preprocess_strip_trailing_commas. This is where INHERITS lives and
+        // -- critically -- it excludes CREATE FUNCTION / PROCEDURE / TRIGGER,
+        // whose dollar-quoted bodies this ' / "-only quote walk does not
+        // track. UNLOGGED / TEMP table variants are not covered (the same
+        // deliberate tradeoff the sibling makes); the corpus INHERITS cases
+        // are all plain CREATE TABLE.
+        if !crate::starts_with_icase(sql.trim_start(), "CREATE TABLE") {
+            return sql.to_string();
+        }
+        // The keyword must be literally present before any byte walk.
+        if !sql.to_ascii_uppercase().contains("INHERITS") {
+            return sql.to_string();
+        }
+
+        let bytes = sql.as_bytes();
+        let n = bytes.len();
+        let mut i = 0usize;
+        while i < n {
+            let c = bytes[i];
+            // Copy single-quoted string literals / double-quoted identifiers
+            // verbatim (a doubled quote is an escape: stay in the literal).
+            if c == b'\'' || c == b'"' {
+                let quote = c;
+                i += 1;
+                while i < n {
+                    if bytes[i] == quote {
+                        i += 1;
+                        if i < n && bytes[i] == quote {
+                            i += 1;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+
+            // A standalone INHERITS keyword (case-insensitive) with a left
+            // word boundary, immediately followed (after optional whitespace)
+            // by '('.
+            if (c == b'I' || c == b'i')
+                && i + 8 <= n
+                && bytes[i..i + 8].eq_ignore_ascii_case(b"INHERITS")
+                && (i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_'))
+            {
+                let after = i + 8;
+                let right_boundary_ok =
+                    after >= n || !(bytes[after].is_ascii_alphanumeric() || bytes[after] == b'_');
+                if right_boundary_ok {
+                    let mut j = after;
+                    while j < n && bytes[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                    if j < n && bytes[j] == b'(' {
+                        // Balance to the matching ')', skipping quoted spans.
+                        // depth is 0 only before the opening paren is counted,
+                        // which is the first byte examined here, so the ')'
+                        // decrement can never underflow.
+                        let mut depth = 0usize;
+                        let mut k = j;
+                        let mut close = None;
+                        while k < n {
+                            let ck = bytes[k];
+                            if ck == b'\'' || ck == b'"' {
+                                let q = ck;
+                                k += 1;
+                                while k < n {
+                                    if bytes[k] == q {
+                                        k += 1;
+                                        if k < n && bytes[k] == q {
+                                            k += 1;
+                                            continue;
+                                        }
+                                        break;
+                                    }
+                                    k += 1;
+                                }
+                                continue;
+                            }
+                            if ck == b'(' {
+                                depth += 1;
+                            } else if ck == b')' {
+                                depth -= 1;
+                                if depth == 0 {
+                                    close = Some(k);
+                                    break;
+                                }
+                            }
+                            k += 1;
+                        }
+                        if let Some(close) = close {
+                            // Also drop the whitespace run immediately before
+                            // INHERITS so `) INHERITS (p)` collapses to `)`.
+                            let mut left = i;
+                            while left > 0 && bytes[left - 1].is_ascii_whitespace() {
+                                left -= 1;
+                            }
+                            let mut out = String::with_capacity(n);
+                            out.push_str(&sql[..left]);
+                            out.push_str(&sql[close + 1..]);
+                            return out;
+                        }
+                    }
+                }
+            }
+            i += 1;
+        }
+        sql.to_string()
     }
 
     /// Convert DECIMAL type to NUMERIC for sqlparser compatibility

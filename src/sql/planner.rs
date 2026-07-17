@@ -1052,6 +1052,19 @@ impl<'a> Planner<'a> {
                     ))),
                 }
             }
+            // Priority #4 of the pgrust-corpus diagnosis:
+            // `GRANT privileges ON objects TO grantees` /
+            // `REVOKE privileges ON objects FROM grantees`. HeliosDB has no
+            // SQL-level roles/permissions/ACL module to hang real
+            // enforcement off of (checked src/**/role*, permission*, rbac*,
+            // auth* — only HTTP/OAuth/replication-role/MCP auth exist,
+            // nothing privilege-shaped at the SQL layer), so — following
+            // the exact CREATE SCHEMA "single flat namespace" precedent
+            // above — these are accepted as a parse-and-accept no-op rather
+            // than erroring "Statement not yet supported". This is
+            // deliberately NOT real privilege enforcement; see
+            // `LogicalPlan::Noop`'s doc comment.
+            Statement::Grant { .. } | Statement::Revoke { .. } => Ok(LogicalPlan::Noop),
             _ => Err(Error::query_execution(format!(
                 "Statement not yet supported: {:?}",
                 statement
@@ -1834,10 +1847,19 @@ impl<'a> Planner<'a> {
                     if Self::is_table_function(&lower_name) {
                         let logical_args = self.extract_table_function_args(tf_args)?;
                         let table_alias = alias.as_ref().map(|a| a.name.value.clone());
+                        // Priority #6: `FROM generate_series(1, 10) g(i)`
+                        // parses as this Table-with-args shape (not
+                        // TableFactor::TableFunction), so the column alias
+                        // `(i)` lives on `alias.columns` here too.
+                        let column_alias = alias
+                            .as_ref()
+                            .and_then(|a| a.columns.first())
+                            .map(|c| c.name.value.clone());
                         return Ok(LogicalPlan::TableFunction {
                             function_name: lower_name,
                             args: logical_args,
                             alias: table_alias,
+                            column_alias,
                         });
                     }
                 }
@@ -1992,10 +2014,15 @@ impl<'a> Planner<'a> {
                                 }
                             }
                             let table_alias = alias.as_ref().map(|a| a.name.value.clone());
+                            let column_alias = alias
+                                .as_ref()
+                                .and_then(|a| a.columns.first())
+                                .map(|c| c.name.value.clone());
                             Ok(LogicalPlan::TableFunction {
                                 function_name: func_name,
                                 args: logical_args,
                                 alias: table_alias,
+                                column_alias,
                             })
                         } else {
                             Err(Error::query_execution(format!(
@@ -2017,10 +2044,15 @@ impl<'a> Planner<'a> {
                     logical_args.push(self.expr_to_logical(expr)?);
                 }
                 let table_alias = alias.as_ref().map(|a| a.name.value.clone());
+                let column_alias = alias
+                    .as_ref()
+                    .and_then(|a| a.columns.first())
+                    .map(|c| c.name.value.clone());
                 Ok(LogicalPlan::TableFunction {
                     function_name: "unnest".to_string(),
                     args: logical_args,
                     alias: table_alias,
+                    column_alias,
                 })
             }
             TableFactor::NestedJoin {
@@ -4500,6 +4532,11 @@ impl<'a> Planner<'a> {
             }
             // Handle NUMERIC/DECIMAL types (PostgreSQL arbitrary precision decimal)
             SqlDataType::Numeric(_) | SqlDataType::Decimal(_) => Ok(DataType::Numeric),
+            // Bit / bit-varying. sqlparser exposes these as dedicated
+            // variants (not Custom). Stored as TEXT carrying the
+            // canonical '0'/'1' string form -- same simplification
+            // pattern used throughout this function (e.g. Clob -> Text).
+            SqlDataType::Bit(_) | SqlDataType::BitVarying(_) => Ok(DataType::Text),
             // Handle PostgreSQL SERIAL types
             SqlDataType::Custom(object_name, type_modifiers) => {
                 let type_name = object_name.to_string().to_uppercase();
@@ -4507,6 +4544,30 @@ impl<'a> Planner<'a> {
                     "SERIAL" => Ok(DataType::Int4),      // SERIAL is Int4 with auto-increment
                     "BIGSERIAL" => Ok(DataType::Int8),   // BIGSERIAL is Int8 with auto-increment
                     "SMALLSERIAL" => Ok(DataType::Int2), // SMALLSERIAL is Int2 with auto-increment
+                    // PostgreSQL fixed-length internal identifier type.
+                    // sqlparser has no dedicated `NAME` keyword dispatch
+                    // (confirmed: no `Keyword::NAME`-to-DataType arm
+                    // anywhere in its parser), so it falls in here rather
+                    // than as a top-level DataType variant. Real Postgres
+                    // stores this as a 64-byte blank-padded string used for
+                    // catalog columns (pg_class.relname etc) and is
+                    // exercised directly by fixture tables like onek/tenk1
+                    // (`stringu1/stringu2/string4 name`). TEXT is the same
+                    // simplification already applied to CLOB elsewhere in
+                    // this function: no 63-byte truncation enforcement in
+                    // this first pass.
+                    "NAME" => Ok(DataType::Text),
+                    // Geometric POINT type (and, by the same Stage-1
+                    // simplification, PATH used by fixtures like `road`).
+                    // Stage 1 (this fix): round-trip through Nano's
+                    // canonical `(x,y)` textual form as TEXT so CREATE
+                    // TABLE POINT_TBL/person/road succeed and unblock
+                    // the large set of downstream fixture-dependent
+                    // files. Stage 2 (fast-follow, not in this pass):
+                    // a real DataType::Point with (f64,f64) storage and
+                    // operator support (`<->` etc), mirroring how
+                    // DataType::Vector(usize) was added.
+                    "POINT" | "PATH" => Ok(DataType::Text),
                     "VECTOR" | "VECTOR_F16" | "VECTOR_I8" | "VECTOR_I16" | "HALFVEC" => {
                         // Parse dimension from type modifiers: VECTOR(1536).
                         // Multi-precision aliases are accepted as schema-level

@@ -768,6 +768,14 @@ pub enum LogicalPlan {
         args: Vec<LogicalExpr>,
         /// Optional alias for the virtual table
         alias: Option<String>,
+        /// Optional column alias for the function's single output column,
+        /// e.g. the `i` in `FROM generate_series(1, 10) g(i)`. Priority #6
+        /// of the pgrust-corpus diagnosis: previously dropped entirely, so
+        /// a `SELECT i FROM ... g(i)` referencing the aliased column name
+        /// failed with "Column 'i' not found in schema" because the output
+        /// column stayed named after the function itself
+        /// (`generate_series`/`unnest`).
+        column_alias: Option<String>,
     },
 
     /// Common Table Expression (WITH clause)
@@ -991,6 +999,27 @@ pub enum LogicalPlan {
     /// Example: SHOW TOPOLOGY
     #[cfg(feature = "ha-tier1")]
     ShowTopology,
+
+    /// Parse-and-accept no-op for statements HeliosDB deliberately does not
+    /// enforce/implement yet, following the exact `CreateSchema` precedent
+    /// elsewhere in this enum. Currently used for `GRANT`/`REVOKE`
+    /// (priority #4 of the pgrust-corpus diagnosis): there is no SQL-level
+    /// roles/permissions/ACL module in HeliosDB to hang real enforcement
+    /// off of, so these parse and succeed with zero effect rather than
+    /// erroring "Statement not yet supported". This intentionally does NOT
+    /// imply any ACL guarantee — real privilege enforcement is out of scope
+    /// for this pass.
+    ///
+    /// Deliberately declared as the LAST variant in this enum (not grouped
+    /// next to `CreateSchema` above): `LogicalPlan` derives
+    /// `Serialize`/`Deserialize` and is persisted via bincode for
+    /// materialized-view query plans (`storage/materialized_view.rs`,
+    /// `query_plan_bytes`), which encodes enum variants by positional
+    /// declaration index. Inserting a new variant in the middle would shift
+    /// every later variant's on-disk discriminant and break deserialization
+    /// of any materialized view persisted by an older binary; appending at
+    /// the end preserves every existing variant's index.
+    Noop,
 }
 
 /// Function/Procedure parameter
@@ -1998,7 +2027,11 @@ impl LogicalPlan {
                     Arc::new(Schema { columns: vec![] })
                 }
             }
-            LogicalPlan::TableFunction { function_name, .. } => {
+            LogicalPlan::TableFunction {
+                function_name,
+                column_alias,
+                ..
+            } => {
                 // Table functions produce a virtual table with a single column
                 use crate::DataType;
                 let col_name = match function_name.as_str() {
@@ -2006,9 +2039,13 @@ impl LogicalPlan {
                     "unnest" => "unnest",
                     _ => function_name.as_str(),
                 };
+                // Priority #6: an explicit column alias (`g(i)` in
+                // `FROM generate_series(1, 10) g(i)`) renames the single
+                // output column, mirroring CTE column-alias handling.
+                let col_name = column_alias.clone().unwrap_or_else(|| col_name.to_string());
                 Arc::new(Schema {
                     columns: vec![crate::Column {
-                        name: col_name.to_string(),
+                        name: col_name,
                         data_type: DataType::Int8,
                         nullable: false,
                         primary_key: false,
@@ -2148,7 +2185,8 @@ impl LogicalPlan {
             }
             LogicalPlan::CreateEnumType { .. }
             | LogicalPlan::DropEnumType { .. }
-            | LogicalPlan::CreateSchema { .. } => {
+            | LogicalPlan::CreateSchema { .. }
+            | LogicalPlan::Noop => {
                 // KanttBan #20 (v3.31.0): DDL — no output rows.
                 Arc::new(Schema { columns: vec![] })
             }

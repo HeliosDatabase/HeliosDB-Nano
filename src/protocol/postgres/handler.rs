@@ -1055,17 +1055,17 @@ where
                 let schema = Self::schema_from_query_columns(&columns, cached_results.as_slice());
                 self.send_query_result(schema, cached_results.as_slice()).await?;
             } else {
-                let (results, columns) = self.database.query_with_columns_for_session(self.session_id, query)?;
+                let (results, columns) = run_guarded(|| self.database.query_with_columns_for_session(self.session_id, query))?;
                 let schema = Self::schema_from_query_columns(&columns, &results);
                 self.send_query_result(schema, &results).await?;
             }
         } else if is_cte {
-            let (results, columns) = self.database.query_with_columns_for_session(self.session_id, query)?;
+            let (results, columns) = run_guarded(|| self.database.query_with_columns_for_session(self.session_id, query))?;
             let schema = Self::schema_from_query_columns(&columns, &results);
             self.send_query_result(schema, &results).await?;
         } else if is_dml_returning {
             // DML with RETURNING clause - returns rows like a query
-            let (affected, tuples) = self.database.execute_returning_for_session(self.session_id, query)?;
+            let (affected, tuples) = run_guarded(|| self.database.execute_returning_for_session(self.session_id, query))?;
             if tuples.is_empty() {
                 // No rows returned - send command complete with count
                 let tag = self.get_command_tag(query, affected);
@@ -1082,7 +1082,7 @@ where
                 self.send_query_result(schema, &tuples).await?;
             }
         } else {
-            let affected = self.database.execute_for_session(self.session_id, query)?;
+            let affected = run_guarded(|| self.database.execute_for_session(self.session_id, query))?;
             let tag = self.get_command_tag(query, affected);
             self.send_command_complete(&tag).await?;
         }
@@ -2782,6 +2782,31 @@ mod datatype_oid_tests {
 // SQLSTATE mapping (D4 phase 1)
 // ============================================================================
 
+/// Run a synchronous, per-statement database call under `catch_unwind`.
+///
+/// A panic in the planner/evaluator — e.g. an integer-overflow panic under
+/// `overflow-checks = true`, or an allocation-size panic — would otherwise
+/// unwind the connection's Tokio task and drop the client (observed as
+/// CONN_LOST in the corpus). This guard converts such a panic into a
+/// recoverable `XX000` error that flows through the normal `?` /
+/// `send_error_for_query` path, so the connection survives and the
+/// transaction is marked failed exactly as for any other statement error.
+///
+/// Cost: `catch_unwind` installs a landing pad but fires **once per
+/// statement**, never per row, on a path already dominated by planning and
+/// I/O; in the non-panicking case it is a no-op guard, so throughput is
+/// unaffected. `parking_lot` locks (used throughout the engine) do not
+/// poison, so a caught panic releases its guards cleanly and cannot wedge or
+/// cascade into other connections.
+pub(crate) fn run_guarded<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(result) => result,
+        Err(_) => Err(Error::query_execution(
+            "internal error while executing statement",
+        )),
+    }
+}
+
 /// Map an [`Error`] to the SQLSTATE the wire reports (D4 phase 1).
 ///
 /// Pattern-matches the engine's existing message shapes (same approach as
@@ -3189,9 +3214,9 @@ mod sqlstate_mapping_unit_tests {
     //! LockManager itself uses (a second OS-level session race is not
     //! reproducible deterministically in a unit test).
 
-    use super::{detail_hint_for_error, first_single_quoted, sqlstate_for_error};
+    use super::{detail_hint_for_error, first_single_quoted, run_guarded, sqlstate_for_error};
     use crate::session::IsolationLevel;
-    use crate::{EmbeddedDatabase, Error};
+    use crate::{EmbeddedDatabase, Error, Result};
 
     fn sql_error(db: &EmbeddedDatabase, sql: &str) -> Error {
         db.execute(sql).expect_err("statement must fail")
@@ -3353,5 +3378,42 @@ mod sqlstate_mapping_unit_tests {
         assert_eq!(first_single_quoted("Table 'users' does not exist"), Some("users"));
         assert_eq!(first_single_quoted("no quotes here"), None);
         assert_eq!(first_single_quoted("dangling 'quote"), None);
+    }
+
+    /// The per-statement panic guard (used on every simple-query and
+    /// extended/prepared execution entry) must convert a panic in the
+    /// planner/evaluator into a recoverable `XX000` error instead of letting
+    /// it unwind the connection task and drop the client (the CONN_LOST
+    /// class). This is the mechanism both protocol paths rely on for
+    /// isolation.
+    #[test]
+    fn run_guarded_isolates_panic_into_recoverable_internal_error() {
+        let result: Result<i32> = run_guarded(|| panic!("simulated planner/evaluator panic"));
+        let err = result.expect_err("a panic must be caught and returned as Err, not unwound");
+        assert!(
+            err.to_string().contains("internal error while executing statement"),
+            "guard must map a caught panic to the canonical statement-failure message; got {err}"
+        );
+        assert_eq!(
+            sqlstate_for_error(&err),
+            "XX000",
+            "the converted panic must report SQLSTATE XX000 (internal_error); got {err}"
+        );
+    }
+
+    /// The guard must be transparent for non-panicking calls in both the Ok
+    /// and Err directions — no value change, no error-mapping change.
+    #[test]
+    fn run_guarded_passes_ok_and_err_through_unchanged() {
+        let ok: Result<i32> = run_guarded(|| Ok(42));
+        assert_eq!(ok.expect("Ok must pass through"), 42);
+
+        let passed: Result<i32> = run_guarded(|| Err(Error::query_execution("no such table 'z' does not exist")));
+        let err = passed.expect_err("inner Err must pass through");
+        assert_eq!(
+            sqlstate_for_error(&err),
+            "42P01",
+            "a passed-through error must keep its own SQLSTATE mapping; got {err}"
+        );
     }
 }

@@ -3864,6 +3864,22 @@ impl<'a> Executor<'a> {
                     .with_timeout(self.timeout_ctx()),
                 ))
             }
+            LogicalPlan::Noop => {
+                // Priority #4 of the pgrust-corpus diagnosis: GRANT/REVOKE
+                // (and any other statement the planner maps to Noop) parse
+                // and succeed with zero effect — same empty-result shape as
+                // CreateSchema above.
+                Ok(Box::new(
+                    ScanOperator::new(
+                        String::new(),
+                        Arc::new(crate::Schema { columns: vec![] }),
+                        None,
+                        vec![],
+                        vec![],
+                    )
+                    .with_timeout(self.timeout_ctx()),
+                ))
+            }
             LogicalPlan::DropEnumType { name, if_exists } => {
                 let storage = self
                     .storage
