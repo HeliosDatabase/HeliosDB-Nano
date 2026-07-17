@@ -88,7 +88,10 @@ storage "$PGHOST" "$PGPORT" "$PGDB" "-e PGPASSWORD=$PGPASS"
 port=$NANO_PORT0
 for pair in "$@"; do
   ver="${pair%%:*}"; bin="${pair#*:}"; dir="$W/data-$port"; mkdir -p "$dir"
-  RUST_LOG=error "$bin" start --listen 127.0.0.1 --port "$port" --auth trust --http-port 0 --data-dir "$dir" >"$W/nano-$port.log" 2>&1 &
+  # SERVER_EXTRA_FLAGS: optional extra `start` flags (e.g. --config for the
+  # W3 instrumentation knobs: lock_census / write_volume / copy_phase stats).
+  # shellcheck disable=SC2086
+  RUST_LOG=error "$bin" start --listen 127.0.0.1 --port "$port" --auth trust --http-port 0 --data-dir "$dir" ${SERVER_EXTRA_FLAGS:-} >"$W/nano-$port.log" 2>&1 &
   NPID=$!; ready=0
   for _ in $(seq 1 25); do
     docker run --rm --network host "$IMG" psql -h 127.0.0.1 -p "$port" -U "$NANO_USER" -d "$NANO_DB" -tAc "select 1" >/dev/null 2>&1 && { ready=1; break; }

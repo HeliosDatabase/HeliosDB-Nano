@@ -1081,6 +1081,17 @@ impl SnapshotManager {
         let index_key = format!("v_idx:{}:{}:{:020}", table_name, row_id, reverse_ts);
         batch.put(index_key.as_bytes(), timestamp.to_be_bytes());
 
+        // W3.2: version-chain bytes for the autocommit INSERT path (fast single
+        // INSERT via `insert_tuple_fast`). The `v:` value is the row's logical
+        // value — identical to `data:` for the default row-store, larger under
+        // side-storage (`W3_2_DESIGN.md` §1.1) — the duplication W3.2 quantifies.
+        if crate::write_volume::enabled() {
+            crate::write_volume::add(
+                crate::write_volume::Category::Version,
+                (version_key.len() + value.len() + index_key.len() + 8) as u64,
+            );
+        }
+
         if self.persist_metadata {
             // R1.4: snapshot: alone — txn_map:/scn_map: were write-only
             // (recover_snapshots rebuilds every in-memory map from the

@@ -206,6 +206,13 @@ default = ["encryption", "vector-search", "ring-crypto", "ha-tier1"]
 encryption = []
 vector-search = []
 simd = []
+# Read-hot-path lock-contention census (W3.1 plateau attribution). Compiles
+# per-query try-lock-first contention accounting into the plan/parse/result
+# cache shard mutexes and the ART index registry, surfaced by the
+# `heliosdb_lock_census` system view. Off by default and additionally gated at
+# runtime by `[performance] lock_census`; when this feature is off the sampling
+# compiles out entirely (the lock helpers inline to a plain `.lock()`/`.read()`).
+lock-census = []
 sync-experimental = []  # Sync/replication module - Core features implemented (conflict detection, vector clocks, field-level merge)
 test-utils = []  # Test utilities for integration tests and benchmarks
 server = []  # Server-mode features requiring async runtime
