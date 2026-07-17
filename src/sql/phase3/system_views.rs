@@ -523,6 +523,14 @@ impl SystemViewRegistry {
                     // hid this; now that pg_class flows through the
                     // planner, the column needs to actually exist.
                     sv_col("relrowsecurity", DataType::Boolean),
+                    // Round-3 PARTITION BY Stage-0: partition-bound text for a
+                    // partition child. The pgrust corpus reads
+                    // `SELECT relname, relpartbound FROM pg_class WHERE …`. At
+                    // Stage 0 the flatten keeps no typed bound, so every row
+                    // reports NULL (nullable text, exactly what PostgreSQL
+                    // returns for a non-partition relation); Stage 1 fills real
+                    // `pg_get_expr`-style bounds for partition children.
+                    sv_col("relpartbound", DataType::Text),
                 ],
             },
             description: "Catalog of tables, indexes, sequences, and views".to_string(),
@@ -3048,6 +3056,7 @@ impl SystemViewRegistry {
                 Value::String("r".to_string()),       // relkind (r = relation/table)
                 Value::Int4(oid),                     // relfilenode
                 Value::Boolean(false),                // relrowsecurity (Nano RLS is via TenantManager, not pg_catalog)
+                Value::Null,                          // relpartbound (Stage-0 flatten keeps no typed bound)
             ]);
             results.push(tuple);
         }
@@ -3062,6 +3071,7 @@ impl SystemViewRegistry {
                 Value::String("i".to_string()),
                 Value::Int4(oid),
                 Value::Boolean(false),
+                Value::Null, // relpartbound
             ]));
         }
 
@@ -3085,6 +3095,7 @@ impl SystemViewRegistry {
                 Value::String("S".to_string()),       // relkind (S = sequence)
                 Value::Int4(oid),                     // relfilenode
                 Value::Boolean(false),                // relrowsecurity
+                Value::Null,                          // relpartbound
             ]));
         }
         for table_name in &tables {
@@ -3103,6 +3114,7 @@ impl SystemViewRegistry {
                     Value::String("S".to_string()),
                     Value::Int4(oid),
                     Value::Boolean(false),
+                    Value::Null, // relpartbound
                 ]));
             }
         }
