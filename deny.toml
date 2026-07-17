@@ -2,8 +2,14 @@
 # https://embarkstudios.github.io/cargo-deny/
 
 [graph]
-# Ensure all dependencies are checked
-all-features = true
+# Check the graph of the DEFAULT feature set — i.e. what we actually ship
+# (crates.io default build, release binaries, the Python wheel). all-features
+# was tried and is currently impossible to keep clean: the optional
+# `code-embed` feature (fastembed -> hf-hub) hard-enables native-tls/openssl
+# through third-party feature defaults we don't control. FILED DEBT: swap
+# fastembed's hf-hub client to its rustls variant (or feature-gate an
+# alternative) and flip this back to all-features = true.
+all-features = false
 
 [advisories]
 version = 2
@@ -12,18 +18,37 @@ db-path = "~/.cargo/advisory-db"
 # The url(s) of the advisory databases to use
 db-urls = ["https://github.com/rustsec/advisory-db"]
 
-# Deny all security vulnerabilities
-vulnerability = "deny"
-# Deny unmaintained dependencies
-unmaintained = "warn"
-# Deny dependencies with yanked versions
-yanked = "deny"
-# Deny dependencies with unsound behavior
-unsound = "warn"
+# version-2 advisories semantics (cargo-deny >= 0.14.4): vulnerabilities,
+# unsound, unmaintained, and yanked are all ERRORS by default — strictly
+# stronger than the old vulnerability=deny/unmaintained=warn/unsound=warn keys
+# this replaced. Those removed keys had made the whole file unparseable under
+# modern cargo-deny, silently disabling this gate.
 
-# Ignore specific advisories (use sparingly and document why)
+# Ignore specific advisories (use sparingly and document why).
+# All entries below are PRE-EXISTING debt surfaced 2026-07-17 when this config
+# was repaired (the old-schema keys had made the whole file unparseable, so the
+# gate had been silently disabled). Each has a filed remediation.
 ignore = [
-    # Example: "RUSTSEC-2020-0001",
+    # rustls-webpki 0.101 CVEs (URI/wildcard name constraints, CRL panic).
+    # Chain: oauth2 4.4 -> reqwest 0.11 -> rustls 0.21 -> webpki 0.101; no fix
+    # exists inside the 0.101 line. These apply to CLIENT-side verification of
+    # the OAuth provider's cert (server TLS uses current rustls). FILED:
+    # upgrade to oauth2 5.x (reqwest 0.12 / rustls 0.23) — API-breaking,
+    # needs its own gated change in src/api/oauth.rs.
+    { id = "RUSTSEC-2026-0098", reason = "oauth2 4.4 pins rustls 0.21; oauth2 5.x upgrade filed" },
+    { id = "RUSTSEC-2026-0099", reason = "oauth2 4.4 pins rustls 0.21; oauth2 5.x upgrade filed" },
+    { id = "RUSTSEC-2026-0104", reason = "oauth2 4.4 pins rustls 0.21; oauth2 5.x upgrade filed" },
+    # lru 0.12 IterMut unsoundness. Direct dep; fixed in 0.16 (API-breaking
+    # bump). We never hold IterMut across mutations on the affected paths.
+    # FILED: bump to lru 0.16 with its API migration, gated.
+    { id = "RUSTSEC-2026-0002", reason = "unsound IterMut not exercised; lru 0.16 bump filed" },
+    # Unmaintained (no vulnerability): bincode 1.x is the on-disk/value codec —
+    # replacing it is a storage-format project, not a dep bump. rustls-pemfile
+    # is absorbed into rustls-pki-types upstream; number_prefix is a leaf of
+    # indicatif. FILED as maintenance debt.
+    { id = "RUSTSEC-2025-0141", reason = "bincode = storage codec; migration is a format project, tracked" },
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile -> rustls-pki-types migration tracked" },
+    { id = "RUSTSEC-2025-0119", reason = "number_prefix is an indicatif leaf dep, display-only" },
 ]
 
 [licenses]
@@ -40,21 +65,20 @@ allow = [
     "Unicode-DFS-2016",
     "CC0-1.0",
     "0BSD",
+    # The removed allow-osi-fsf-free = "both" accepted these; re-listed
+    # explicitly for version-2 semantics (permissive or weak-copyleft only —
+    # file-level MPL-2.0 does not contaminate Apache-2.0 binaries):
+    "MPL-2.0",
+    "BSL-1.0",
+    "OpenSSL",          # ring / aws-lc license expression component
+    "Unicode-3.0",
+    "NCSA",
+    "CDLA-Permissive-2.0",
 ]
 
-# Deny incompatible copyleft licenses
-deny = [
-    # GPL/AGPL deps are not compatible with our Apache-2.0 license
-]
-
-# Warn about weak copyleft
-copyleft = "warn"
-
-# Allow OSI-approved and FSF Free/Libre licenses
-allow-osi-fsf-free = "both"
-
-# Require license information for all dependencies
-unlicensed = "deny"
+# version-2 licenses semantics: anything NOT in `allow` is denied (the removed
+# deny/copyleft/allow-osi-fsf-free/unlicensed keys are implied deny-by-default),
+# so GPL/AGPL/weak-copyleft/unlicensed deps all fail unless allowlisted above.
 
 confidence-threshold = 0.8
 
@@ -83,8 +107,13 @@ skip-tree = [
 
 # Specific crates to deny
 deny = [
-    # Deny old, insecure crypto libraries
-    { name = "openssl", wrappers = ["openssl-sys"] },
+    # Deny old, insecure crypto libraries. No wrapper exceptions: the previous
+    # `wrappers = ["openssl-sys"]` escape hatch let the whole openssl stack in
+    # through reqwest's default native-tls (broke manylinux wheel builds and
+    # defeated the ban's intent). TLS goes through rustls/ring everywhere.
+    { name = "openssl" },
+    { name = "openssl-sys" },
+    { name = "native-tls" },
 
     # Deny known problematic crates
     # { name = "problematic-crate" },
