@@ -464,6 +464,14 @@ fn default_idle_timeout_secs() -> u64 {
     300 // 5 minutes
 }
 
+fn default_copy_max_buffered_rows() -> usize {
+    10_000_000 // generous cap on rows buffered per COPY FROM STDIN; 0 disables
+}
+
+fn default_copy_max_record_bytes() -> usize {
+    1_073_741_824 // 1 GiB per in-progress COPY record (PG's own per-field limit); 0 disables
+}
+
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
@@ -847,6 +855,21 @@ pub struct ServerConfig {
     /// Idle connection timeout in seconds (0 = no timeout, default 300s = 5 min)
     #[serde(default = "default_idle_timeout_secs")]
     pub idle_timeout_secs: u64,
+    /// Maximum number of rows buffered in memory while decoding a single
+    /// `COPY … FROM STDIN` stream before the server aborts the copy with a clean
+    /// error and zero rows applied (0 = unlimited). Bounds peak RSS on very large
+    /// streaming COPY loads: the PG-wire decoder holds typed rows, not the raw
+    /// byte stream, so this caps the dominant remaining allocation.
+    #[serde(default = "default_copy_max_buffered_rows")]
+    pub copy_max_buffered_rows: usize,
+    /// Maximum bytes accumulated for a SINGLE in-progress `COPY … FROM STDIN`
+    /// record before the server aborts the copy with a clean error and zero rows
+    /// applied (0 = unlimited). `copy_max_buffered_rows` only counts COMPLETED
+    /// rows; this caps the partial-record state it never sees — an unterminated
+    /// text line, or an unclosed quoted CSV field — so a stream with no record
+    /// separator (e.g. a multi-GB single-line blob) cannot accumulate unbounded.
+    #[serde(default = "default_copy_max_record_bytes")]
+    pub copy_max_record_bytes: usize,
     /// TLS enabled
     pub tls_enabled: bool,
     /// TLS certificate path
@@ -863,6 +886,8 @@ impl Default for ServerConfig {
             oracle_port: Some(1521), // Enable Oracle protocol by default
             max_connections: 100,
             idle_timeout_secs: default_idle_timeout_secs(),
+            copy_max_buffered_rows: default_copy_max_buffered_rows(),
+            copy_max_record_bytes: default_copy_max_record_bytes(),
             tls_enabled: false,
             tls_cert_path: None,
             tls_key_path: None,

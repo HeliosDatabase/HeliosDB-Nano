@@ -1845,6 +1845,21 @@ pub struct StorageEngine {
     /// Monotonic schema generation backing `existence_cache`; bumped by
     /// `bump_schema_generation` on every catalog-existence change.
     schema_generation: Arc<AtomicU64>,
+    /// W2.5: per-table high-water timestamp of the latest committed write.
+    /// An in-transaction reader whose snapshot timestamp is >= a table's
+    /// watermark (and which has no own staged writes to it) can read the
+    /// current `data:` image directly instead of the per-row snapshot/version
+    /// path (`scan_table_at_snapshot`, ~30-150x costlier): no commit touched
+    /// the table after the reader's snapshot, so current data == the snapshot
+    /// image row-for-row. Raised to the commit timestamp BEFORE the write
+    /// becomes visible (commit path + versioned autocommit inserts), so a
+    /// reader that passes the gate then re-validates after its scan can never
+    /// keep a scan that observed a too-new commit. Default-closed: a table
+    /// with no entry always takes the snapshot path. Branch-blind by design —
+    /// only main-branch `data:` writes populate it and it is cleared on any
+    /// branch switch / DDL via `bump_schema_generation` (mirrors the row-cache
+    /// clear precedent, since branch reads must not trust main's watermarks).
+    write_watermarks: Arc<dashmap::DashMap<String, u64>>,
     /// In-memory table-constraints cache (avoids repeated metadata gets on DML)
     constraints_cache: Arc<parking_lot::Mutex<std::collections::HashMap<String, crate::sql::TableConstraints>>>,
     /// In-memory reverse-FK cache (referenced table -> constraints that point at it)
@@ -2291,6 +2306,7 @@ impl StorageEngine {
             schema_cache: Arc::new(dashmap::DashMap::new()),
             existence_cache: Arc::new(dashmap::DashMap::new()),
             schema_generation: Arc::new(AtomicU64::new(0)),
+            write_watermarks: Arc::new(dashmap::DashMap::new()),
             constraints_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             referencing_fk_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             index_snapshots_on_close: Arc::new(AtomicBool::new(true)),
@@ -2518,6 +2534,7 @@ impl StorageEngine {
             schema_cache: Arc::new(dashmap::DashMap::new()),
             existence_cache: Arc::new(dashmap::DashMap::new()),
             schema_generation: Arc::new(AtomicU64::new(0)),
+            write_watermarks: Arc::new(dashmap::DashMap::new()),
             constraints_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             referencing_fk_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             index_snapshots_on_close: Arc::new(AtomicBool::new(true)),
@@ -2558,6 +2575,69 @@ impl StorageEngine {
     /// probe recomputes against the post-mutation catalog state.
     pub fn bump_schema_generation(&self) {
         self.schema_generation.fetch_add(1, Ordering::Release);
+        // W2.5: the same existence/visibility changes that invalidate the
+        // existence cache also make the per-table committed-write watermarks
+        // untrustworthy — a branch switch changes which branch a table name
+        // resolves to (watermarks are branch-blind), and DDL (DROP/RENAME/
+        // TRUNCATE-via-recreate/ALTER) changes the table's identity or content
+        // outside the tracked commit-timestamp funnel. Clearing resets every
+        // table to default-closed (the safe snapshot path) until the next
+        // tracked commit re-establishes a watermark. O(distinct tables), and
+        // only on DDL / branch switch — never on the DML hot path.
+        self.write_watermarks.clear();
+    }
+
+    /// W2.5: raise `table`'s committed-write watermark to `commit_ts`
+    /// (monotonic). Callers MUST invoke this BEFORE the write becomes visible
+    /// in `data:` so a concurrent in-transaction reader whose snapshot
+    /// predates `commit_ts` never fast-reads the not-yet-permitted value.
+    pub fn note_committed_write(&self, table: &str, commit_ts: u64) {
+        self.write_watermarks
+            .entry(table.to_string())
+            .and_modify(|w| {
+                if commit_ts > *w {
+                    *w = commit_ts;
+                }
+            })
+            .or_insert(commit_ts);
+    }
+
+    /// W2.5: drop `table`'s committed-write watermark, returning the table to
+    /// the default-closed snapshot path for in-transaction reads. Called by the
+    /// version-skipping fast-UPDATE funnels (`update_tuple_fast*`), whose
+    /// in-place `data:` overwrite records NO snapshot-resolvable version for the
+    /// new value: the current `data:` image then differs from what
+    /// `read_at_snapshot` resolves for the row, so the table must NOT stay
+    /// fast-read eligible. A watermark *bump* would instead let a reader whose
+    /// snapshot post-dates the overwrite fast-read the new value while the
+    /// snapshot path resolves the old one (a non-repeatable read once that
+    /// reader flips onto the snapshot path via its own write / DDL); removing
+    /// the entry forces every in-transaction reader onto the snapshot path,
+    /// matching the pre-W2.5 behavior exactly. A reader whose snapshot predates
+    /// the overwrite is likewise forced there by the post-scan re-check reading
+    /// an absent entry as "changed". Re-established by the next snapshot-correct
+    /// write (commit path / versioned or batch insert / COPY marker).
+    pub fn invalidate_write_watermark(&self, table: &str) {
+        self.write_watermarks.remove(table);
+    }
+
+    /// W2.5: has `table` had no committed write since `snapshot_ts`? True only
+    /// when a watermark entry exists AND is at or below the snapshot
+    /// (default-closed: an absent entry answers `false`, forcing the snapshot
+    /// path). An in-transaction reader uses this to decide whether the current
+    /// `data:` image equals its snapshot image for `table`; it must re-check
+    /// after the scan (a racing commit bumps the watermark before its batch is
+    /// visible) before trusting a fast-path result.
+    pub fn table_unchanged_since(&self, table: &str, snapshot_ts: u64) -> bool {
+        self.write_watermarks
+            .get(table)
+            .is_some_and(|w| *w.value() <= snapshot_ts)
+    }
+
+    /// W2.5: clone the shared watermark map so a `Transaction` can raise
+    /// entries inside `commit_with_timestamp` (before the batch is visible).
+    pub(crate) fn write_watermarks_arc(&self) -> Arc<dashmap::DashMap<String, u64>> {
+        Arc::clone(&self.write_watermarks)
     }
 
     /// Classify `table_name` as a regular table / materialized view / missing
@@ -3386,6 +3466,8 @@ impl StorageEngine {
         txn.set_sync_commit(self.statement_durability_required());
         txn.set_group_committer(self.group_committer());
         txn.set_row_cache(Arc::clone(self.row_cache()));
+        // W2.5: commit raises per-table committed-write watermarks in-band.
+        txn.set_write_watermarks(self.write_watermarks_arc());
         // R0.2: embedded global-slot transactions read from a snapshot, so
         // complete those semantics with first-committer-wins validation.
         txn.set_conflict_registry(self.conflict_registry(), true);
@@ -3407,6 +3489,8 @@ impl StorageEngine {
         txn.set_sync_commit(self.statement_durability_required());
         txn.set_group_committer(self.group_committer());
         txn.set_row_cache(Arc::clone(self.row_cache()));
+        // W2.5: commit raises per-table committed-write watermarks in-band.
+        txn.set_write_watermarks(self.write_watermarks_arc());
         txn.set_conflict_registry(self.conflict_registry(), false);
         Ok(txn)
     }
@@ -7886,6 +7970,18 @@ impl StorageEngine {
         let prefix_bytes = prefix.as_bytes();
         let mut updated = 0;
 
+        // W2.5: this rewrites every `data:` row in place via a raw `db.put` that
+        // records NO snapshot-resolvable version — the current `data:` image then
+        // diverges from what `read_at_snapshot` resolves for each row (the same
+        // shape as the version-skipping fast-UPDATE funnels). Drop the committed-
+        // write watermark BEFORE the first overwrite so an in-transaction reader
+        // whose fast-read gate was open on this table cannot keep fast-reading the
+        // rewritten rows past its snapshot: its post-scan re-check reads the absent
+        // entry as "changed" and falls to the snapshot path (see
+        // `invalidate_write_watermark`). `update_table_schema` on the caller path
+        // does NOT bump the schema generation, so nothing else fences this write.
+        self.invalidate_write_watermark(table_name);
+
         // Evaluate default expression if provided
         let default_value = if let Some(expr) = default_expr {
             // For simple literal defaults, extract the value
@@ -7948,6 +8044,12 @@ impl StorageEngine {
             updated += 1;
         }
 
+        // W2.5: close any watermark entry a concurrent tracked commit
+        // re-established mid-rewrite (mirrors the merge-to-main choke point in
+        // `merge_branch`); the whole map resets to the default-closed snapshot
+        // path until the next snapshot-correct write re-establishes an entry.
+        self.bump_schema_generation();
+
         Ok(updated)
     }
 
@@ -7966,6 +8068,13 @@ impl StorageEngine {
         let prefix = format!("data:{}:", table_name);
         let prefix_bytes = prefix.as_bytes();
         let mut updated = 0;
+
+        // W2.5: like `add_column_to_rows`, this rewrites every `data:` row in
+        // place with NO snapshot-resolvable version. Drop the committed-write
+        // watermark BEFORE the first overwrite so an in-transaction reader whose
+        // fast-read gate was open on this table falls to the snapshot path (see
+        // `invalidate_write_watermark`).
+        self.invalidate_write_watermark(table_name);
 
         // Collect keys first to avoid iterator invalidation
         let mut keys_to_update = Vec::new();
@@ -8019,6 +8128,10 @@ impl StorageEngine {
                 updated += 1;
             }
         }
+
+        // W2.5: close any watermark entry a concurrent tracked commit
+        // re-established mid-rewrite (mirrors the merge-to-main choke point).
+        self.bump_schema_generation();
 
         Ok(updated)
     }
@@ -8828,6 +8941,25 @@ impl StorageEngine {
             }
         }
 
+        // W2.5 fence: the Step 2/Step 3 loops below raw-put branch rows into
+        // main's `data:` keyspace, outside every tracked commit funnel and with
+        // no version. Clear the committed-write watermarks BEFORE any of those
+        // writes becomes visible, so the load-bearing invariant "the committer
+        // clears/raises the watermark before its write is visible" (scan.rs
+        // `txn_base_tuples`) holds for the WHOLE copy loop, not just after it: an
+        // in-transaction reader open across the merge either sees the cleared
+        // entry in its pre-check, or passes the pre-check but fails the post-scan
+        // re-check (the entry is gone before it could read an overwritten row) and
+        // falls to the snapshot path, which resolves the pre-merge version. The
+        // existing bump AFTER the loops still closes entries a concurrent commit
+        // re-establishes mid-merge. Gated on `merge_to_main` — only then do the
+        // loops touch `data:` (non-main merges write `bdata:` for the target,
+        // which the branch-switch clear already covers). Also protects a merge
+        // that errors out mid-loop (it returns before the post-loop bump).
+        if merge_to_main {
+            self.bump_schema_generation();
+        }
+
         // Step 2: Copy data from source branch to target
         for table_name in &tables {
             let branch_prefix = format!("bdata:{}:{}:", source_id, table_name);
@@ -8855,6 +8987,11 @@ impl StorageEngine {
                     self.db
                         .put(target_key.as_bytes(), &value)
                         .map_err(|e| Error::storage(format!("Failed to merge data: {}", e)))?;
+                    // The row cache is keyed (table, row_id) with NO branch
+                    // dimension; the merged write changes the row's value, so
+                    // evict any cached entry (else an autocommit read serves the
+                    // pre-merge value).
+                    self.row_cache.invalidate(table_name, row_id);
                     merged_keys += 1;
                 }
             }
@@ -8868,6 +9005,7 @@ impl StorageEngine {
                     self.db
                         .delete(target_key.as_bytes())
                         .map_err(|e| Error::storage(format!("Failed to apply delete: {}", e)))?;
+                    self.row_cache.invalidate(table_name, *row_id);
                 }
             }
         } else {
@@ -8880,6 +9018,20 @@ impl StorageEngine {
                         .map_err(|e| Error::storage(format!("Failed to copy delete marker: {}", e)))?;
                 }
             }
+        }
+
+        // W2.5 + caches: MERGE writes branch rows straight into the target's
+        // `data:`/`bdata:` keyspace outside every tracked commit funnel — no
+        // version, no watermark bump, and (crucially) no branch-context switch,
+        // so `set_current_branch`'s watermark + existence-cache invalidation
+        // never fires. When merging into main, bump the schema generation: it
+        // clears every per-table committed-write watermark (and the existence
+        // cache) so an in-transaction reader open across the merge cannot keep
+        // fast-reading the merged `data:` values past its snapshot — its next
+        // read drops to the snapshot path, which resolves the pre-merge version.
+        // The row cache was invalidated per merged / deleted row above.
+        if merge_to_main {
+            self.bump_schema_generation();
         }
 
         // Step 4: Update branch metadata to mark as merged
@@ -10192,6 +10344,24 @@ impl StorageEngine {
             value.clone()
         };
 
+        // W2.5: allocate the version timestamp and raise the committed-write
+        // watermark BEFORE the `data:` row becomes visible via `self.put` below.
+        // The in-transaction fast read serves rows straight from `data:` (not
+        // from version history), so the watermark — not the later `write_version`
+        // — is what must be raised before the row is observable: otherwise a
+        // concurrent older-snapshot reader could fast-read this not-yet-permitted
+        // row in the window between the `data:` put and the bump. This mirrors the
+        // commit-path fence (transaction.rs) and the batched-insert path, and
+        // upholds the invariant `txn_base_tuples` relies on (scan.rs). Over-raising
+        // on a later failed write only forces the safe snapshot path.
+        let version_timestamp = if self.config.storage.time_travel_enabled {
+            let timestamp = self.next_timestamp();
+            self.note_committed_write(table_name, timestamp);
+            Some(timestamp)
+        } else {
+            None
+        };
+
         // Write current version (for fast non-time-travel queries)
         let key = Self::build_data_key(table_name, row_id);
         self.put(&key, &value)?;
@@ -10223,9 +10393,10 @@ impl StorageEngine {
         // table has none).
         let _ = self.vector_indexes.on_row_insert(table_name, row_id, schema, &tuple);
 
-        if self.config.storage.time_travel_enabled {
-            // Write versioned copy (for time-travel queries)
-            let timestamp = self.next_timestamp();
+        if let Some(timestamp) = version_timestamp {
+            // Write versioned copy (for time-travel queries). The committed-write
+            // watermark was already raised to `timestamp` above, before the
+            // `data:` row became visible (W2.5 ordering).
             self.snapshot_manager
                 .write_version(table_name, row_id, timestamp, &logical_value)?;
 
@@ -10326,6 +10497,24 @@ impl StorageEngine {
         let data_and_version_batched =
             self.config.storage.time_travel_enabled && !requires_logical_wal && !uses_side_storage;
 
+        // W2.5: allocate the version timestamp and raise the committed-write
+        // watermark BEFORE any `data:` write becomes visible. The non-batched
+        // branch below puts the row immediately via `self.put`, and the
+        // in-transaction fast read observes `data:` directly — so the watermark
+        // must gate an older-snapshot reader onto the snapshot path before the
+        // row is observable, or that reader could fast-read it in the window
+        // before the bump. (The batched branch defers the row into a WriteBatch
+        // written further below, so raising the watermark here keeps the same
+        // before-visible ordering for both.) Over-raising on a later failed
+        // write only forces the safe snapshot path.
+        let version_timestamp = if self.config.storage.time_travel_enabled {
+            let timestamp = self.next_timestamp();
+            self.note_committed_write(table_name, timestamp);
+            Some(timestamp)
+        } else {
+            None
+        };
+
         if data_and_version_batched {
             // Mirrors the checks in `put()` before writing this direct batch.
             if let Some(ref db_path) = self.db_path {
@@ -10377,11 +10566,18 @@ impl StorageEngine {
             let _ = self.flush_row_counter(table_name);
         }
 
-        if self.config.storage.time_travel_enabled {
+        if let Some(timestamp) = version_timestamp {
             let logical_value = logical_value
                 .as_deref()
                 .ok_or_else(|| Error::internal("missing logical insert value"))?;
-            let timestamp = self.next_timestamp();
+            // W2.5: this autocommit insert is NOT blocked by open session
+            // transactions when versioning is on (see
+            // `session_txns_block_fast_inserts`), so it can commit a new,
+            // snapshot-gated version WHILE another session reads. The table
+            // watermark was already raised to `timestamp` above, BEFORE the
+            // (batched or non-batched) `data:` row became visible, so a
+            // concurrent reader with an older snapshot keeps taking the
+            // snapshot path for this table.
             if data_and_version_batched {
                 self.snapshot_manager.write_data_version_and_register_snapshot(
                     &key,
@@ -10472,6 +10668,22 @@ impl StorageEngine {
         } else {
             None
         };
+        // W2.5: raise the committed-write watermark to this batch's commit
+        // timestamp BEFORE the rows (and their `vmeta:` COPY marker / per-row
+        // `v:` versions) become visible in the single WriteBatch below. This
+        // batch path (autocommit COPY + multi-row INSERT ... VALUES) is NOT
+        // blocked while a session transaction is open (its callers only bail on
+        // `session_txns_block_fast_inserts`, which is off when time-travel is
+        // on), so it can commit rows a concurrent older-snapshot reader must not
+        // see. The marker/version gate those rows out on the snapshot path; the
+        // watermark bump forces such a reader off the fast path (its post-scan
+        // re-check observes the raised watermark). Writes to `data:` only (never
+        // a branch overlay — callers bail on an active branch), matching the
+        // branch-blind map. When time-travel is off there is no marker/version
+        // gate (rows are visible to every snapshot), so no bump is needed.
+        if let Some(ts) = commit_ts {
+            self.note_committed_write(table_name, ts);
+        }
         let reverse_ts = commit_ts.map(|ts| u64::MAX - ts);
         let mut batch = WriteBatch::default();
         let mut indexed_rows = Vec::with_capacity(prepared.len());
@@ -11009,6 +11221,11 @@ impl StorageEngine {
 
         // Overwrite the row in storage
         let key = Self::build_data_key(table_name, row_id);
+        // W2.5: versionless overwrite — drop the fast-read watermark BEFORE the
+        // new value becomes visible so in-transaction readers take the snapshot
+        // path (see `invalidate_write_watermark`). Always main's `data:` here
+        // (SQL fast paths bail on branches), so no branch guard is needed.
+        self.invalidate_write_watermark(table_name);
         self.put(&key, &value)?;
 
         // Update ART indexes only if an indexed column actually changed.
@@ -11082,6 +11299,8 @@ impl StorageEngine {
         };
 
         let key = Self::build_data_key(table_name, row_id);
+        // W2.5: versionless overwrite — see `invalidate_write_watermark`.
+        self.invalidate_write_watermark(table_name);
         self.put(&key, &value)?;
 
         // R5.V1: callers proved no *ART* index column changed, which says
@@ -11257,18 +11476,24 @@ impl StorageEngine {
         // This gives us the universe of rows that might have versions
         let mut read_opts = ReadOptions::default();
         read_opts.set_total_order_seek(true);
-        let iter = self.db.iterator_opt(IteratorMode::Start, read_opts);
+        // W2.2(a): seek straight to the `data:{table}:` prefix instead of
+        // walking the whole keyspace from the start, and stop at the first key
+        // past the prefix. A single-table recovery/AS-OF scan no longer pays
+        // for every earlier key in sort order (mirrors the prefix-seek idiom in
+        // materialize_copy_markers_for_table above).
+        let iter = self
+            .db
+            .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read_opts);
         for item in iter {
             let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
 
-            if key.starts_with(prefix_bytes) {
-                // Parse row ID from key: data:{table}:{row_id}
-                if let Some(row_id) = Self::parse_row_id_after_prefix(&key, prefix_bytes.len()) {
-                    seen_rows.insert(row_id);
-                }
-            } else if key.first() > prefix_bytes.first() {
-                // Optimization: break early if we've passed the prefix range
+            if !key.starts_with(prefix_bytes) {
+                // Past the prefix range — every remaining key sorts higher.
                 break;
+            }
+            // Parse row ID from key: data:{table}:{row_id}
+            if let Some(row_id) = Self::parse_row_id_after_prefix(&key, prefix_bytes.len()) {
+                seen_rows.insert(row_id);
             }
         }
 
@@ -12627,6 +12852,28 @@ impl StorageEngine {
             // Get current timestamp for versioning
             let timestamp = self.next_timestamp();
 
+            // W2.5: this generic autocommit UPDATE funnel (reached when the fast
+            // update path bails — e.g. a non-PK predicate, or any UPDATE issued
+            // while a session transaction is open) writes the new `v:` version
+            // WITHOUT a `v_idx:` reverse-index entry (the intentional un-indexed
+            // -autocommit-version design that `version_gc_tests.rs`'s C15 chain
+            // rule depends on), so `read_at_snapshot` keeps resolving the
+            // PRE-update version for every snapshot. A watermark bump to
+            // `timestamp` would leave the table fast-read eligible for a reader
+            // whose snapshot post-dates this update, which would then fast-read
+            // the NEW `data:` value while the snapshot path resolves the OLD one
+            // — a non-repeatable read once that reader flips onto the snapshot
+            // path (its own write / DDL). Instead INVALIDATE the watermark: the
+            // table returns to the default-closed snapshot path (matching the
+            // pre-W2.5 behavior exactly) until a snapshot-correct write
+            // re-establishes it. A reader whose snapshot predates this update is
+            // still forced onto the snapshot path by the post-scan re-check
+            // (absent entry => "changed"). Branch overlays (`bdata:`/`bv:`) are
+            // branch-blind and never enter the map (cleared on switch).
+            if branch_id.is_none() {
+                self.invalidate_write_watermark(table_name);
+            }
+
             // Item #2: on the main branch, preserve a COPY marker-covered row's
             // insert version (at the COPY ts) before this path rewrites `data:`
             // and records the old value at `timestamp-1`. Without it the copy
@@ -12793,6 +13040,15 @@ impl StorageEngine {
         let Some(branch_id) = branch_id else {
             // Main branch delete: preserve old value for time-travel before deleting
             let mut delete_count = 0u64;
+            // W2.5 note: no watermark bump here. This path removes the row's
+            // `data:` key (`self.delete` below), and `scan_table_at_snapshot`
+            // seeds its row-id universe from the CURRENT `data:` prefix — so a
+            // deleted row is uniformly absent from BOTH the fast (current-data)
+            // and the slow (snapshot) read path. There is no fast/slow
+            // divergence for a delete, so the watermark need not (and, to keep
+            // the fast path available, should not) advance on it. Contrast the
+            // UPDATE/INSERT funnels, which leave the row present in `data:` with
+            // a newer version the snapshot path must hide.
             for row_id in &row_ids {
                 // Item #2: preserve a COPY marker-covered row's insert version
                 // (at the COPY ts) before removing `data:`, so AS-OF reads in

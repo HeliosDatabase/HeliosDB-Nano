@@ -86,7 +86,7 @@ def main():
     check(cur.fetchone()[0] == 2, "R-B4: COPY rows commit with the transaction")
     conn.rollback()
 
-    # ---- Fallback path still works: FK table takes the generic route ----
+    # ---- FK table COPY: W2.1 validates constraints in-batch on the fast path ----
     conn.autocommit = True
     cur.execute("DROP TABLE IF EXISTS copy_child")
     cur.execute("DROP TABLE IF EXISTS copy_parent")
@@ -95,7 +95,33 @@ def main():
     cur.execute("INSERT INTO copy_parent VALUES (1)")
     cur.copy_expert("COPY copy_child FROM STDIN WITH (FORMAT csv)", csv_buf([["10", "1"], ["11", "1"]]))
     cur.execute("SELECT count(*) FROM copy_child")
-    check(cur.fetchone()[0] == 2, "FK table COPY works via fallback path")
+    check(cur.fetchone()[0] == 2, "FK table COPY inserts rows with valid parents")
+
+    # ---- W2.4: streaming decode preserves quoted newlines + UTF-8 across the
+    #      many CopyData frames psycopg's chunked send splits the stream into.
+    #      Pre-W2.4 the server buffered the whole stream then parsed once, so the
+    #      cross-frame carry of quote state was never exercised on the wire. ----
+    conn.autocommit = True
+    cur.execute("DROP TABLE IF EXISTS copy_stream")
+    cur.execute("CREATE TABLE copy_stream (id INT PRIMARY KEY, note TEXT)")
+
+    def note(i):
+        # embedded newline + comma + an escaped quote + a 3-byte UTF-8 char
+        return f"li€ne1\nline2,\"q\"{i}"
+
+    def csv_quote(s):
+        return '"' + s.replace('"', '""') + '"'
+
+    m = 4000
+    body = "".join(f"{i},{csv_quote(note(i))}\n" for i in range(1, m + 1))
+    cur.copy_expert("COPY copy_stream (id, note) FROM STDIN WITH (FORMAT csv)", io.StringIO(body))
+    cur.execute("SELECT count(*) FROM copy_stream")
+    check(cur.fetchone()[0] == m, f"W2.4: streaming COPY loaded all {m} quoted/UTF-8 rows")
+    cur.execute("SELECT note FROM copy_stream WHERE id = 2000")
+    check(
+        cur.fetchone()[0] == note(2000),
+        "W2.4: quoted newline + UTF-8 value round-trips across frame boundaries",
+    )
 
     cur.close()
     conn.close()

@@ -230,7 +230,7 @@ fn test_tri_modal_resolution() {
             table_name: "orders".to_string(),
             schema: schema.clone(),
             projection: None,
-            as_of: Some(AsOfClause::Timestamp(metadata.wall_clock_time.clone())),
+            as_of: Some(AsOfClause::Timestamp(metadata.wall_clock_rfc3339())),
         };
         let results_ts = executor.execute(&plan_ts).expect("AS OF TIMESTAMP should work");
         assert!(results_ts.len() >= 2, "Should see at least 2 orders");

@@ -50,12 +50,67 @@ pub struct SnapshotMetadata {
     pub transaction_id: TransactionId,
     /// System Change Number
     pub scn: Scn,
-    /// Wall-clock time when snapshot was created (RFC3339 format)
-    pub wall_clock_time: String,
+    /// W2.2(b): wall-clock creation time as microseconds since the Unix epoch.
+    /// Formerly an `Utc::now().to_rfc3339()` `String` — a per-DML heap
+    /// allocation + calendar format on the version-write path. Databases
+    /// written before this change stored the RFC3339 string; `SnapshotMetadataLegacy`
+    /// + `deserialize_snapshot_metadata` read those forever (never remove that
+    /// fallback). Display surfaces reconstruct RFC3339 via `wall_clock_rfc3339`.
+    pub wall_clock_micros: i64,
     /// Number of active transactions at snapshot time
     pub active_transactions: u64,
     /// Whether this snapshot can be garbage collected
     pub gc_eligible: bool,
+}
+
+/// W2.2(b): legacy on-disk layout — `wall_clock_time` was an RFC3339 `String`.
+/// Only used by `deserialize_snapshot_metadata` as a fallback when the current
+/// (epoch-micros) layout fails to decode. NEVER remove: pre-W2.2 databases keep
+/// this format on disk forever.
+#[derive(Deserialize)]
+struct SnapshotMetadataLegacy {
+    timestamp: u64,
+    transaction_id: TransactionId,
+    scn: Scn,
+    wall_clock_time: String,
+    active_transactions: u64,
+    gc_eligible: bool,
+}
+
+impl From<SnapshotMetadataLegacy> for SnapshotMetadata {
+    fn from(legacy: SnapshotMetadataLegacy) -> Self {
+        let wall_clock_micros = DateTime::parse_from_rfc3339(&legacy.wall_clock_time)
+            .map(|dt| dt.timestamp_micros())
+            .unwrap_or(0);
+        SnapshotMetadata {
+            timestamp: legacy.timestamp,
+            transaction_id: legacy.transaction_id,
+            scn: legacy.scn,
+            wall_clock_micros,
+            active_transactions: legacy.active_transactions,
+            gc_eligible: legacy.gc_eligible,
+        }
+    }
+}
+
+/// W2.2(b): decode persisted `snapshot:` metadata, tolerating both the current
+/// epoch-micros layout and the legacy RFC3339-string layout forever.
+///
+/// bincode is not self-describing, so the two layouts differ on the wire (an
+/// `i64` micros field vs a length-prefixed `String`). We try the current layout
+/// first; a legacy record fails it deterministically — the string's length
+/// prefix is consumed as the `i64`, shifting the trailing `gc_eligible` bool
+/// onto an ASCII digit of the timestamp (`'0'..='3'`), which bincode's bool
+/// decoder rejects — so we fall back to the legacy layout and convert. The
+/// reverse can never misfire: a real micros value read as a `String` length
+/// asks for petabytes and overruns the buffer.
+fn deserialize_snapshot_metadata(bytes: &[u8]) -> Option<SnapshotMetadata> {
+    if let Ok(metadata) = bincode::deserialize::<SnapshotMetadata>(bytes) {
+        return Some(metadata);
+    }
+    bincode::deserialize::<SnapshotMetadataLegacy>(bytes)
+        .ok()
+        .map(SnapshotMetadata::from)
 }
 
 impl SnapshotMetadata {
@@ -65,10 +120,26 @@ impl SnapshotMetadata {
             timestamp,
             transaction_id,
             scn,
-            wall_clock_time: Utc::now().to_rfc3339(),
+            wall_clock_micros: Utc::now().timestamp_micros(),
             active_transactions: 0,
             gc_eligible: true,
         }
+    }
+
+    /// W2.2(b): wall-clock creation time truncated to whole Unix seconds — the
+    /// granularity every AS-OF/GC comparison site already used.
+    pub fn wall_clock_unix_secs(&self) -> i64 {
+        self.wall_clock_micros / 1_000_000
+    }
+
+    /// W2.2(b): wall-clock creation time rendered as RFC3339 for display
+    /// surfaces (REPL `\snapshots`, `pg`/system-view timestamp columns) that
+    /// previously read the raw string field. Epoch fallback on an out-of-range
+    /// micros value (corruption only).
+    pub fn wall_clock_rfc3339(&self) -> String {
+        DateTime::from_timestamp_micros(self.wall_clock_micros)
+            .unwrap_or_default()
+            .to_rfc3339()
     }
 }
 
@@ -87,12 +158,25 @@ pub struct SnapshotManager {
     txn_to_timestamp: Arc<RwLock<HashMap<TransactionId, u64>>>,
     /// SCN to timestamp mapping
     scn_to_timestamp: Arc<RwLock<HashMap<Scn, u64>>>,
-    /// Current SCN counter
-    current_scn: Arc<RwLock<Scn>>,
-    /// Current transaction ID counter
-    current_txn_id: Arc<RwLock<TransactionId>>,
-    /// Snapshot read cache for performance
-    snapshot_cache: Arc<Mutex<LruCache<SnapshotCacheKey, Option<Vec<u8>>>>>,
+    /// Current SCN counter.
+    /// W2.2(d): a lock-free `AtomicU64` — every DML allocated an SCN under a
+    /// `RwLock<u64>` write lock, one of ~6 SnapshotManager lock acquisitions
+    /// per version write and a global serialization point at high concurrency.
+    current_scn: Arc<AtomicU64>,
+    /// Current transaction ID counter (W2.2(d): lock-free `AtomicU64`, see above).
+    current_txn_id: Arc<AtomicU64>,
+    /// Snapshot read cache for performance. W2.2(c): each entry carries the
+    /// per-table generation it was computed at (`snapshot_cache_gen`); a stale
+    /// entry is rejected on read and overwritten, replacing the former
+    /// per-write O(cache-size) linear scan of `invalidate_cache_for_row`.
+    snapshot_cache: Arc<Mutex<LruCache<SnapshotCacheKey, (u64, Option<Vec<u8>>)>>>,
+    /// W2.2(c): per-table snapshot-cache generation counters. A committed write
+    /// to a table bumps its counter (O(1)); reads compare the cached entry's
+    /// stamp and lazily evict on mismatch. Per-table (not per-row) is a safe
+    /// over-approximation — over-invalidation only recomputes, never serves
+    /// stale data. Not shared across `EmbeddedDatabase` instances (owned here,
+    /// beside the cache it guards).
+    snapshot_cache_gen: Arc<dashmap::DashMap<String, AtomicU64>>,
     /// Cache configuration
     cache_config: CacheConfig,
     /// GC configuration
@@ -167,9 +251,10 @@ impl SnapshotManager {
             snapshots: Arc::new(RwLock::new(HashMap::new())),
             txn_to_timestamp: Arc::new(RwLock::new(HashMap::new())),
             scn_to_timestamp: Arc::new(RwLock::new(HashMap::new())),
-            current_scn: Arc::new(RwLock::new(1)),
-            current_txn_id: Arc::new(RwLock::new(1)),
+            current_scn: Arc::new(AtomicU64::new(1)),
+            current_txn_id: Arc::new(AtomicU64::new(1)),
             snapshot_cache: Arc::new(Mutex::new(LruCache::new(cache_size))),
+            snapshot_cache_gen: Arc::new(dashmap::DashMap::new()),
             cache_config,
             gc_config: GcConfig::default(),
             non_durable_writes: false,
@@ -198,9 +283,10 @@ impl SnapshotManager {
             snapshots: Arc::new(RwLock::new(HashMap::new())),
             txn_to_timestamp: Arc::new(RwLock::new(HashMap::new())),
             scn_to_timestamp: Arc::new(RwLock::new(HashMap::new())),
-            current_scn: Arc::new(RwLock::new(1)),
-            current_txn_id: Arc::new(RwLock::new(1)),
+            current_scn: Arc::new(AtomicU64::new(1)),
+            current_txn_id: Arc::new(AtomicU64::new(1)),
             snapshot_cache: Arc::new(Mutex::new(LruCache::new(cache_size))),
+            snapshot_cache_gen: Arc::new(dashmap::DashMap::new()),
             cache_config,
             gc_config,
             non_durable_writes: false,
@@ -220,9 +306,10 @@ impl SnapshotManager {
             snapshots: Arc::new(RwLock::new(HashMap::new())),
             txn_to_timestamp: Arc::new(RwLock::new(HashMap::new())),
             scn_to_timestamp: Arc::new(RwLock::new(HashMap::new())),
-            current_scn: Arc::new(RwLock::new(1)),
-            current_txn_id: Arc::new(RwLock::new(1)),
+            current_scn: Arc::new(AtomicU64::new(1)),
+            current_txn_id: Arc::new(AtomicU64::new(1)),
             snapshot_cache: Arc::new(Mutex::new(LruCache::new(cache_size))),
+            snapshot_cache_gen: Arc::new(dashmap::DashMap::new()),
             cache_config,
             gc_config,
             non_durable_writes: false,
@@ -262,13 +349,10 @@ impl SnapshotManager {
     /// which enables AS OF TRANSACTION queries to use the same IDs that
     /// users see in the REPL.
     pub fn register_snapshot_with_lsn(&self, timestamp: u64, lsn: u64) -> Result<SnapshotMetadata> {
-        // Update our internal counter to stay ahead of externally provided LSNs
-        {
-            let mut txn_id = self.current_txn_id.write();
-            if lsn >= *txn_id {
-                *txn_id = lsn + 1;
-            }
-        }
+        // Update our internal counter to stay ahead of externally provided LSNs.
+        // W2.2(d): fetch_max is the atomic equivalent of the former
+        // `if lsn >= *txn_id { *txn_id = lsn + 1 }` guarded assignment.
+        self.current_txn_id.fetch_max(lsn + 1, Ordering::Relaxed);
         self.register_snapshot_internal(timestamp, lsn)
     }
 
@@ -299,18 +383,14 @@ impl SnapshotManager {
 
     /// Get next transaction ID
     fn next_transaction_id(&self) -> TransactionId {
-        let mut txn_id = self.current_txn_id.write();
-        let current = *txn_id;
-        *txn_id += 1;
-        current
+        // W2.2(d): lock-free increment; fetch_add returns the pre-increment value.
+        self.current_txn_id.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Get next SCN
     fn next_scn(&self) -> Scn {
-        let mut scn = self.current_scn.write();
-        let current = *scn;
-        *scn += 1;
-        current
+        // W2.2(d): lock-free increment; fetch_add returns the pre-increment value.
+        self.current_scn.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Resolve AS OF clause to a timestamp
@@ -380,16 +460,15 @@ impl SnapshotManager {
         let mut best_diff = u64::MAX;
 
         for metadata in snapshots.values() {
-            if let Ok(snap_time) = DateTime::parse_from_rfc3339(&metadata.wall_clock_time) {
-                let snap_timestamp = snap_time.timestamp() as u64;
-                if snap_timestamp <= target_time {
-                    let diff = target_time - snap_timestamp;
-                    if diff < best_diff
-                        || (diff == best_diff && best_match.is_none_or(|best| metadata.timestamp > best))
-                    {
-                        best_diff = diff;
-                        best_match = Some(metadata.timestamp);
-                    }
+            // W2.2(b): compare on epoch-micros metadata (seconds granularity, as before).
+            let snap_timestamp = metadata.wall_clock_unix_secs() as u64;
+            if snap_timestamp <= target_time {
+                let diff = target_time - snap_timestamp;
+                if diff < best_diff
+                    || (diff == best_diff && best_match.is_none_or(|best| metadata.timestamp > best))
+                {
+                    best_diff = diff;
+                    best_match = Some(metadata.timestamp);
                 }
             }
         }
@@ -453,34 +532,33 @@ impl SnapshotManager {
                 let mut best_match: Option<u64> = None;
 
                 for metadata in snapshots.values() {
-                    if let Ok(snap_time) = DateTime::parse_from_rfc3339(&metadata.wall_clock_time) {
-                        let snap_ts_seconds = snap_time.timestamp() as u64;
+                    // W2.2(b): epoch-micros metadata, seconds granularity as before.
+                    let snap_ts_seconds = metadata.wall_clock_unix_secs() as u64;
 
-                        if is_start {
-                            // For start: find earliest snapshot >= target
-                            if snap_ts_seconds >= target_time {
-                                match best_match {
-                                    Some(best) if metadata.timestamp < best => {
-                                        best_match = Some(metadata.timestamp);
-                                    }
-                                    None => {
-                                        best_match = Some(metadata.timestamp);
-                                    }
-                                    _ => {}
+                    if is_start {
+                        // For start: find earliest snapshot >= target
+                        if snap_ts_seconds >= target_time {
+                            match best_match {
+                                Some(best) if metadata.timestamp < best => {
+                                    best_match = Some(metadata.timestamp);
                                 }
+                                None => {
+                                    best_match = Some(metadata.timestamp);
+                                }
+                                _ => {}
                             }
-                        } else {
-                            // For end: find latest snapshot <= target
-                            if snap_ts_seconds <= target_time {
-                                match best_match {
-                                    Some(best) if metadata.timestamp > best => {
-                                        best_match = Some(metadata.timestamp);
-                                    }
-                                    None => {
-                                        best_match = Some(metadata.timestamp);
-                                    }
-                                    _ => {}
+                        }
+                    } else {
+                        // For end: find latest snapshot <= target
+                        if snap_ts_seconds <= target_time {
+                            match best_match {
+                                Some(best) if metadata.timestamp > best => {
+                                    best_match = Some(metadata.timestamp);
                                 }
+                                None => {
+                                    best_match = Some(metadata.timestamp);
+                                }
+                                _ => {}
                             }
                         }
                     }
@@ -572,10 +650,9 @@ impl SnapshotManager {
         let snapshots = self.snapshots.read();
         let mut best: Option<u64> = None;
         for metadata in snapshots.values() {
-            if let Ok(snap_time) = DateTime::parse_from_rfc3339(&metadata.wall_clock_time) {
-                if snap_time.timestamp() <= cutoff_unix_secs {
-                    best = Some(best.map_or(metadata.timestamp, |b: u64| b.max(metadata.timestamp)));
-                }
+            // W2.2(b): epoch-micros metadata, seconds granularity as before.
+            if metadata.wall_clock_unix_secs() <= cutoff_unix_secs {
+                best = Some(best.map_or(metadata.timestamp, |b: u64| b.max(metadata.timestamp)));
             }
         }
         best
@@ -629,22 +706,32 @@ impl SnapshotManager {
     /// The reverse index uses `u64::MAX - timestamp` to enable efficient lookups.
     /// Additionally, uses an LRU cache for frequently accessed snapshots.
     pub fn read_at_snapshot(&self, table_name: &str, row_id: u64, snapshot_ts: u64) -> Result<Option<Vec<u8>>> {
-        // Check cache first if enabled
-        if self.cache_config.enabled {
+        // W2.2(c): capture the table's cache generation BEFORE the lookup. An
+        // entry is a hit only when its stamp still matches; storing this
+        // pre-lookup generation means a write that bumps the counter during the
+        // uncached lookup leaves the fresh entry immediately stale (recomputed
+        // next read) rather than served as current.
+        let cache_gen = if self.cache_config.enabled {
+            let gen = self.table_cache_generation(table_name);
             let cache_key = (table_name.to_string(), row_id, snapshot_ts);
-            if let Some(cached_value) = self.snapshot_cache.lock().get(&cache_key) {
-                // Cache hit - return cloned value
-                return Ok(cached_value.clone());
+            if let Some((entry_gen, cached_value)) = self.snapshot_cache.lock().get(&cache_key) {
+                if *entry_gen == gen {
+                    // Cache hit - return cloned value
+                    return Ok(cached_value.clone());
+                }
             }
-        }
+            Some(gen)
+        } else {
+            None
+        };
 
         // Cache miss - perform database lookup
         let result = self.read_at_snapshot_uncached(table_name, row_id, snapshot_ts)?;
 
-        // Store in cache if enabled
-        if self.cache_config.enabled {
+        // Store in cache if enabled (stamped with the pre-lookup generation)
+        if let Some(gen) = cache_gen {
             let cache_key = (table_name.to_string(), row_id, snapshot_ts);
-            self.snapshot_cache.lock().put(cache_key, result.clone());
+            self.snapshot_cache.lock().put(cache_key, (gen, result.clone()));
         }
 
         Ok(result)
@@ -832,10 +919,8 @@ impl SnapshotManager {
     fn allocate_snapshot_metadata(&self, timestamp: u64, lsn: Option<u64>) -> (SnapshotMetadata, TransactionId, Scn) {
         let txn_id = match lsn {
             Some(lsn) => {
-                let mut txn_id = self.current_txn_id.write();
-                if lsn >= *txn_id {
-                    *txn_id = lsn + 1;
-                }
+                // W2.2(d): keep the counter ahead of externally provided LSNs (atomic fetch_max).
+                self.current_txn_id.fetch_max(lsn + 1, Ordering::Relaxed);
                 lsn
             }
             None => self.next_transaction_id(),
@@ -1039,33 +1124,36 @@ impl SnapshotManager {
         Ok(metadata)
     }
 
-    /// Invalidate all cache entries for a specific row
+    /// Invalidate cached snapshot reads after a new version is written.
     ///
-    /// This is called when a new version is written to ensure cache consistency.
-    fn invalidate_cache_for_row(&self, table_name: &str, row_id: u64) {
+    /// W2.2(c): O(1) — bumps the table's cache generation instead of the former
+    /// linear scan over up to `max_entries` (1000) LRU keys. Stale entries are
+    /// lazily rejected on the next `read_at_snapshot`. The bump is per-table (a
+    /// safe over-approximation of the former per-(table,row) removal): it can
+    /// only cost extra recomputation, never serve stale data. `row_id` is no
+    /// longer needed but the signature is kept for the existing call sites.
+    fn invalidate_cache_for_row(&self, table_name: &str, _row_id: u64) {
         if !self.cache_config.enabled {
             return;
         }
+        self.bump_table_cache_generation(table_name);
+    }
 
-        // Lock the cache and remove all entries matching (table_name, row_id, *)
-        let mut cache = self.snapshot_cache.lock();
+    /// W2.2(c): current snapshot-cache generation for a table (0 if never written).
+    fn table_cache_generation(&self, table_name: &str) -> u64 {
+        self.snapshot_cache_gen
+            .get(table_name)
+            .map(|g| g.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
 
-        // Collect keys to remove (we can't modify while iterating)
-        let keys_to_remove: Vec<SnapshotCacheKey> = cache
-            .iter()
-            .filter_map(|(key, _)| {
-                if key.0 == table_name && key.1 == row_id {
-                    Some(key.clone())
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        // Remove the keys
-        for key in keys_to_remove {
-            cache.pop(&key);
-        }
+    /// W2.2(c): advance a table's snapshot-cache generation, invalidating every
+    /// entry cached at an earlier generation on its next read.
+    fn bump_table_cache_generation(&self, table_name: &str) {
+        self.snapshot_cache_gen
+            .entry(table_name.to_string())
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Create reverse timestamp index for O(log N) lookups
@@ -1120,12 +1208,10 @@ impl SnapshotManager {
                 continue;
             }
 
-            // Parse wall clock time
-            if let Ok(snap_time) = DateTime::parse_from_rfc3339(&metadata.wall_clock_time) {
-                let age = now.saturating_sub(snap_time.timestamp() as u64);
-                if age > min_retention {
-                    to_remove.push(*ts);
-                }
+            // W2.2(b): wall-clock age from epoch-micros metadata (seconds granularity).
+            let age = now.saturating_sub(metadata.wall_clock_unix_secs() as u64);
+            if age > min_retention {
+                to_remove.push(*ts);
             }
         }
 
@@ -1195,12 +1281,12 @@ impl SnapshotManager {
 
     /// Get current SCN
     pub fn current_scn(&self) -> Scn {
-        *self.current_scn.read()
+        self.current_scn.load(Ordering::Relaxed)
     }
 
     /// Get current transaction ID
     pub fn current_transaction_id(&self) -> TransactionId {
-        *self.current_txn_id.read()
+        self.current_txn_id.load(Ordering::Relaxed)
     }
 
     /// Get snapshot count
@@ -1234,7 +1320,8 @@ impl SnapshotManager {
 
             if let Ok(key_str) = std::str::from_utf8(&key) {
                 if key_str.starts_with("snapshot:") {
-                    if let Ok(metadata) = bincode::deserialize::<SnapshotMetadata>(&value) {
+                    // W2.2(b): tolerate both epoch-micros and legacy RFC3339 layouts.
+                    if let Some(metadata) = deserialize_snapshot_metadata(&value) {
                         // Restore in-memory state
                         self.snapshots.write().insert(metadata.timestamp, metadata.clone());
                         self.txn_to_timestamp
@@ -1242,16 +1329,11 @@ impl SnapshotManager {
                             .insert(metadata.transaction_id, metadata.timestamp);
                         self.scn_to_timestamp.write().insert(metadata.scn, metadata.timestamp);
 
-                        // Update counters
-                        let mut scn = self.current_scn.write();
-                        if metadata.scn >= *scn {
-                            *scn = metadata.scn + 1;
-                        }
-
-                        let mut txn_id = self.current_txn_id.write();
-                        if metadata.transaction_id >= *txn_id {
-                            *txn_id = metadata.transaction_id + 1;
-                        }
+                        // Update counters. W2.2(d): fetch_max is the atomic
+                        // equivalent of the former `if id >= *counter { *counter = id + 1 }`.
+                        self.current_scn.fetch_max(metadata.scn + 1, Ordering::Relaxed);
+                        self.current_txn_id
+                            .fetch_max(metadata.transaction_id + 1, Ordering::Relaxed);
 
                         count += 1;
                     }
@@ -1524,5 +1606,81 @@ mod tests {
             assert_eq!(count, 2);
             assert_eq!(manager.snapshot_count(), 2);
         }
+    }
+
+    #[test]
+    fn test_snapshot_metadata_legacy_rfc3339_fallback() {
+        // W2.2(b): databases written before this change stored `wall_clock_time`
+        // as an RFC3339 String. The forever-fallback deserializer must still read
+        // those, and the current epoch-micros layout must round-trip through the
+        // same reader. Flips on pre-change code: `deserialize_snapshot_metadata`
+        // and `wall_clock_micros` did not exist.
+        #[derive(serde::Serialize)]
+        struct OldSnapshotMetadata {
+            timestamp: u64,
+            transaction_id: u64,
+            scn: u64,
+            wall_clock_time: String,
+            active_transactions: u64,
+            gc_eligible: bool,
+        }
+
+        let rfc = "2020-01-02T03:04:05.123456+00:00";
+        let old = OldSnapshotMetadata {
+            timestamp: 100,
+            transaction_id: 7,
+            scn: 3,
+            wall_clock_time: rfc.to_string(),
+            active_transactions: 0,
+            gc_eligible: true,
+        };
+        let legacy_bytes = bincode::serialize(&old).unwrap();
+
+        let decoded = deserialize_snapshot_metadata(&legacy_bytes).expect("legacy RFC3339 metadata must decode");
+        assert_eq!(decoded.timestamp, 100);
+        assert_eq!(decoded.transaction_id, 7);
+        assert_eq!(decoded.scn, 3);
+        assert!(decoded.gc_eligible);
+        let expected_micros = DateTime::parse_from_rfc3339(rfc).unwrap().timestamp_micros();
+        assert_eq!(decoded.wall_clock_micros, expected_micros);
+        assert_eq!(decoded.wall_clock_unix_secs(), expected_micros / 1_000_000);
+
+        let current = SnapshotMetadata::new(200, 9, 4);
+        let current_bytes = bincode::serialize(&current).unwrap();
+        let redecoded = deserialize_snapshot_metadata(&current_bytes).expect("current metadata must decode");
+        assert_eq!(redecoded.timestamp, 200);
+        assert_eq!(redecoded.transaction_id, 9);
+        assert_eq!(redecoded.scn, 4);
+        assert_eq!(redecoded.wall_clock_micros, current.wall_clock_micros);
+    }
+
+    #[test]
+    fn test_resolve_timestamp_via_reconstructed_rfc3339() {
+        // W2.2(b): the RFC3339 string display/API surfaces reconstruct from
+        // epoch-micros must still resolve back to the same snapshot.
+        let (db, _temp) = create_test_db();
+        let manager = SnapshotManager::new(db);
+        let metadata = manager.register_snapshot(500).unwrap();
+        let ts_str = metadata.wall_clock_rfc3339();
+        assert_eq!(manager.resolve_timestamp(&ts_str).unwrap(), 500);
+    }
+
+    #[test]
+    fn test_snapshot_cache_invalidated_on_new_version() {
+        // W2.2(c): the per-table generation bump must invalidate a cached read
+        // once a newer version is written. Flips if the generation is not bumped
+        // (the stale cached value `A` would be served instead of `B`).
+        let (db, _temp) = create_test_db();
+        let manager = SnapshotManager::new(db);
+
+        manager.write_version("t", 1, 100, b"A").unwrap();
+        // Populate the cache for the open-ended snapshot.
+        assert_eq!(manager.read_at_snapshot("t", 1, u64::MAX).unwrap(), Some(b"A".to_vec()));
+
+        // A newer version bumps the table's cache generation.
+        manager.write_version("t", 1, 200, b"B").unwrap();
+
+        // The previously cached entry is now stale and must be recomputed to B.
+        assert_eq!(manager.read_at_snapshot("t", 1, u64::MAX).unwrap(), Some(b"B".to_vec()));
     }
 }

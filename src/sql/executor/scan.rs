@@ -156,6 +156,52 @@ fn should_apply_columnar_predicates(predicates: &[AnalyzedPredicate]) -> bool {
         })
 }
 
+/// W2.5: base tuples for an in-transaction read of `actual_table_name`.
+///
+/// Every in-transaction read otherwise routes through
+/// `scan_table_at_snapshot`, which walks the table's `data:` keyspace and does
+/// a per-row `read_at_snapshot` version probe (a global-`Mutex` LRU) — the
+/// 30-150x-vs-autocommit cost the perf analysis measured. When the table's
+/// committed-write watermark is at or below the reader's snapshot (no commit
+/// touched it since) AND the transaction has no own staged writes to it, the
+/// current `data:` image is row-for-row identical to `scan_table_at_snapshot`
+/// (and `merge_with_write_set` is a no-op), so serve it directly.
+///
+/// Correctness under concurrency: a committer raises the watermark to its
+/// commit timestamp BEFORE its batch becomes visible, so re-reading the
+/// watermark AFTER the scan and requiring it to still be <= the snapshot
+/// discards any scan that could have observed a commit newer than the
+/// snapshot (that commit's bump is then visible and exceeds the snapshot).
+/// Default-closed: an absent watermark, an MV target (`actual_table_name !=
+/// table_name`), AS OF, or own writes all fall back to the exact prior
+/// snapshot+merge path. On a non-main branch the map is empty (cleared on
+/// switch), so branch reads always take the snapshot path unchanged.
+fn txn_base_tuples(
+    storage: &crate::storage::StorageEngine,
+    txn: &crate::storage::Transaction,
+    actual_table_name: &str,
+    table_name: &str,
+    schema: &Schema,
+    as_of_absent: bool,
+) -> Result<Vec<Tuple>> {
+    let snapshot = txn.snapshot_id();
+    if as_of_absent
+        && actual_table_name == table_name
+        && !txn.has_writes_for_table(actual_table_name)
+        && storage.table_unchanged_since(actual_table_name, snapshot)
+    {
+        let tuples = storage.scan_table_branch_aware_with_schema(actual_table_name, schema)?;
+        // Re-validate: a commit that raced this scan bumped the watermark
+        // above `snapshot` before its rows became visible, so a still-<=
+        // watermark proves the scan observed no commit newer than `snapshot`.
+        if storage.table_unchanged_since(actual_table_name, snapshot) {
+            return Ok(tuples);
+        }
+    }
+    let base_tuples = storage.scan_table_at_snapshot(actual_table_name, snapshot)?;
+    txn.merge_with_write_set(actual_table_name, base_tuples)
+}
+
 pub(crate) fn storage_predicates_are_sql_safe(schema: &Schema, predicates: &[AnalyzedPredicate]) -> bool {
     predicates.iter().all(|predicate| {
         let Some(column) = schema.columns.get(predicate.column_index) else {
@@ -2103,11 +2149,9 @@ pub(super) fn handle_scan(executor: &Executor, plan: &LogicalPlan) -> Result<Box
 
             // Handle time-travel or transactional queries
             let tuples = if let Some(txn) = executor.transaction() {
-                // Transactional scan: read at transaction's snapshot
-                let base_tuples = storage.scan_table_at_snapshot(&actual_table_name, txn.snapshot_id())?;
-
-                // Merge with write set from transaction for read-your-own-writes
-                txn.merge_with_write_set(&actual_table_name, base_tuples)?
+                // Transactional scan: at the txn snapshot (W2.5 fast-outs to a
+                // direct current-`data:` read for tables unchanged since it).
+                txn_base_tuples(storage, txn, &actual_table_name, table_name, &schema, as_of.is_none())?
             } else if let Some(as_of_clause) = as_of {
                 // P0#1: AS OF / historical queries require version history.
                 // With time_travel_enabled=false the commit path writes no
@@ -2445,13 +2489,12 @@ pub(super) fn handle_filtered_scan(executor: &Executor, plan: &LogicalPlan) -> R
 
             // Handle time-travel or transactional queries with filtered scan
             let tuples = if let Some(txn) = executor.transaction() {
-                // Transactional scan: read at transaction's snapshot
-                let base_tuples = storage.scan_table_at_snapshot(&actual_table_name, txn.snapshot_id())?;
+                // Transactional scan (W2.5 fast-outs to a direct current-`data:`
+                // read for tables unchanged since the txn snapshot), then apply
+                // the same storage-level pushdown filtering.
+                let merged_tuples =
+                    txn_base_tuples(storage, txn, &actual_table_name, table_name, &schema, as_of.is_none())?;
 
-                // Merge with write set
-                let merged_tuples = txn.merge_with_write_set(&actual_table_name, base_tuples)?;
-
-                // Apply storage-level filtering (on the merged set)
                 storage.predicate_pushdown().scan_with_pushdown(
                     &actual_table_name,
                     merged_tuples,

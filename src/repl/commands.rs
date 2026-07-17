@@ -1584,7 +1584,7 @@ impl MetaCommand {
                                 crate::Value::Int8(s.timestamp as i64),
                                 crate::Value::Int8(s.transaction_id as i64),
                                 crate::Value::Int8(s.scn as i64),
-                                crate::Value::String(s.wall_clock_time.clone()),
+                                crate::Value::String(s.wall_clock_rfc3339()),
                                 crate::Value::Int8(s.active_transactions as i64),
                                 crate::Value::Boolean(s.gc_eligible),
                             ])

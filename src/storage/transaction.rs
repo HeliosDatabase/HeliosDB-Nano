@@ -142,6 +142,15 @@ pub struct Transaction {
     /// R1.3-p2 group-fsync wait would have widened that window to a whole
     /// fsync).
     row_cache: Option<Arc<super::RowCache>>,
+    /// W2.5: engine per-table committed-write watermark map. When wired,
+    /// commit raises each written table's watermark to `commit_ts` BEFORE the
+    /// batch is applied (the same fence rationale as `row_cache`, but the
+    /// opposite direction: the watermark must be visible to a racing reader
+    /// *before* the write is, so a snapshot older than this commit keeps
+    /// taking the snapshot read path for these tables). Branch commits carry
+    /// `bdata:` keys that never enter `written_tables`, so this branch-blind
+    /// map only records main-branch tables.
+    write_watermarks: Option<Arc<DashMap<String, u64>>>,
     /// Write-write conflict registry (R0.2). When present, commits record
     /// their write-set keys; when `conflict_validation` is also set, commit
     /// aborts with a serialization failure if any key was committed after
@@ -217,6 +226,7 @@ impl Transaction {
             sync_commit: false,
             group_committer: None,
             row_cache: None,
+            write_watermarks: None,
             conflict_registry: None,
             conflict_validation: false,
             gc_pin_id: None,
@@ -244,6 +254,13 @@ impl Transaction {
     /// BEFORE lifting the snapshot barrier (see field docs).
     pub fn set_row_cache(&mut self, cache: Arc<super::RowCache>) {
         self.row_cache = Some(cache);
+    }
+
+    /// W2.5: attach the engine per-table committed-write watermark map so
+    /// commit can raise each written table's watermark to the commit
+    /// timestamp before the batch becomes visible (see field docs).
+    pub fn set_write_watermarks(&mut self, watermarks: Arc<DashMap<String, u64>>) {
+        self.write_watermarks = Some(watermarks);
     }
 
     /// True when the engine row cache is wired into this transaction, i.e.
@@ -301,6 +318,7 @@ impl Transaction {
             sync_commit: false,
             group_committer: None,
             row_cache: None,
+            write_watermarks: None,
             conflict_registry: None,
             conflict_validation: false,
             gc_pin_id: None,
@@ -806,6 +824,31 @@ impl Transaction {
         // R3.1: exclude zone-stats backfill while columnar batches + their
         // stats sidecars are applied (no-op guard for non-columnar commits).
         let _columnar_stats_guard = touches_columnar.then(super::columnar::stats_write_lock);
+
+        // W2.5: raise the committed-write watermark for every table this
+        // transaction wrote to `commit_ts` BEFORE the batch is applied. The
+        // ordering is load-bearing (opposite of the row-cache fence below): a
+        // concurrent in-transaction reader whose snapshot predates this commit
+        // must see the raised watermark no later than it could observe this
+        // commit's `data:` bytes, so it keeps taking the snapshot path for
+        // these tables (fast-path readers also re-check the watermark after
+        // their scan and discard a scan that raced a commit). `written_tables`
+        // holds only main-branch `data:` tables — branch `bdata:` writes and
+        // raw non-`data:` keys never enter it — matching the branch-blind map,
+        // which is cleared on branch switch. Over-raising on a later failed
+        // `db.write` only forces the safe snapshot path.
+        if let Some(watermarks) = &self.write_watermarks {
+            for table in self.written_tables.iter() {
+                watermarks
+                    .entry(table.key().clone())
+                    .and_modify(|w| {
+                        if commit_ts > *w {
+                            *w = commit_ts;
+                        }
+                    })
+                    .or_insert(commit_ts);
+            }
+        }
 
         // R1.3 phase 2: a durable commit with a group committer writes its
         // batch UNSYNCED here and pays durability via ONE cohort-wide
