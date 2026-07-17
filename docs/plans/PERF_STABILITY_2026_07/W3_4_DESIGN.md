@@ -125,34 +125,47 @@ push time). `unattributed = total − Σ(type_convert..art_maintain)`.
 > both workloads and set the verdict; the §5 STOP/GO is then a one-line edit.
 
 ```
-# WORKLOAD A — unconstrained COPY 100k  (build=release, copy_phase_stats=true)
-decode           total_nanos=____  calls=____  rows=____
-type_convert     total_nanos=____  calls=____  rows=____
-check_constraint total_nanos=____  calls=____  rows=____
-prepare          total_nanos=____  calls=____  rows=____
-validate_batch   total_nanos=____  calls=____  rows=____
-fk_constraint    total_nanos=____  calls=____  rows=____
-batch_build      total_nanos=____  calls=____  rows=____
-commit           total_nanos=____  calls=____  rows=____
-art_maintain     total_nanos=____  calls=____  rows=____
-total            total_nanos=____  calls=____  rows=____
-  ART share = art_maintain / (total + decode) = ____%      top cost = __________
+# MEASURED 2026-07-17 (coordinator gate, chain B run bm5ek1l05; build=release
+# @ c5c762a, copy_phase_stats=true, fresh process per workload)
 
-# WORKLOAD B — FK-COPY 100k (2-FK child)   (build=release, copy_phase_stats=true)
-decode           total_nanos=____  ...
-type_convert     total_nanos=____  ...
-check_constraint total_nanos=____  ...
-prepare          total_nanos=____  ...
-validate_batch   total_nanos=____  ...
-fk_constraint    total_nanos=____  ...
-batch_build      total_nanos=____  ...
-commit           total_nanos=____  ...
-art_maintain     total_nanos=____  ...
-total            total_nanos=____  ...
-  ART share = art_maintain / (total + decode) = ____%      top cost = __________
+# WORKLOAD A — unconstrained COPY 100k
+decode           total_nanos=35,688,832   calls=145  rows=0
+type_convert     total_nanos=34,501,153   calls=1    rows=100,000
+check_constraint total_nanos=0            calls=0    rows=0
+prepare          total_nanos=11,574,864   calls=1    rows=100,000
+validate_batch   total_nanos=24,631,353   calls=1    rows=100,000
+fk_constraint    total_nanos=0            calls=0    rows=0
+batch_build      total_nanos=22,283,721   calls=1    rows=100,000
+commit           total_nanos=28,051,491   calls=1    rows=100,000
+art_maintain     total_nanos=30,037,754   calls=1    rows=100,000
+total            total_nanos=153,878,141  calls=1    rows=100,000
+  ART share = 30.04M / (153.88M + 35.69M) = 15.8%      top cost = decode (18.8%),
+  then type_convert (18.2%), art_maintain (15.8%), commit (14.8%) — flat profile,
+  no single dominant phase on the unconstrained path.
 
-Verdict: STOP / GO  because ________________________________________________
-(GO iff EITHER workload's ART share ≥ 8%; else STOP and record the top cost + §5 replacement.)
+# WORKLOAD B — FK+CHECK COPY 100k (cat/item, 1 FK + 1 CHECK; the W2.1 fast path)
+decode           total_nanos=45,445,064   calls=165  rows=0
+type_convert     total_nanos=46,967,021   calls=2    rows=100,200
+check_constraint total_nanos=88,524,956   calls=1    rows=100,000
+prepare          total_nanos=9,964,778    calls=2    rows=100,200
+validate_batch   total_nanos=20,582,623   calls=2    rows=100,200
+fk_constraint    total_nanos=7,949,471    calls=1    rows=100,000
+batch_build      total_nanos=19,627,337   calls=2    rows=100,200
+commit           total_nanos=28,260,243   calls=2    rows=100,200
+art_maintain     total_nanos=27,065,979   calls=2    rows=100,200
+total            total_nanos=251,447,757  calls=2    rows=100,200
+  ART share = 27.07M / (251.45M + 45.45M) = 9.1%       top cost = check_constraint
+  (29.8% incl. decode in the denominator; 35.2% of `total`) — the per-row
+  slow-path CHECK evaluator from W2.1 is now the single largest constrained-COPY
+  cost. The batched ART FK probes themselves are cheap (2.7%).
+
+Verdict: GO  because BOTH workloads clear the 8% floor (15.8% unconstrained,
+9.1% constrained) — per-table entry lists + encode-once (§3) proceed with the
+W3 implementation lease. ADDITIONAL FINDING for §5: batch-evaluate or compile
+the CHECK expression (88.5ms for one trivial `qty >= 0` over 100k rows is
+~885ns/row through the generic evaluator) — on constrained tables that is a
+bigger prize than the ART batching this item was scoped for; file it as the
+follow-on item alongside the ART work.
 ```
 
 ---
