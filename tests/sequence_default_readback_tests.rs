@@ -11,6 +11,18 @@
 mod default_readback {
     use heliosdb_nano::{EmbeddedDatabase, Value};
 
+    /// The sequence store's persistence handle is PROCESS-GLOBAL and last-
+    /// writer-wins (see tests/sequence_cache_default.rs for the full note).
+    /// Under the threaded harness a sibling test's engine can overwrite the
+    /// global and drop, so this file's `DEFAULT nextval(...)` evaluates
+    /// against a dead Weak and inserts NULL (observed 2026-07-17 in the full
+    /// --no-fail-fast gate: "expected int, got Null"). Serialize until the
+    /// handle is per-instance (filed: unify SERIAL/sequence store).
+    static SEQ_GLOBAL_HANDLE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        SEQ_GLOBAL_HANDLE.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     fn s(v: &Value) -> String {
         match v {
             Value::String(x) => x.clone(),
@@ -20,6 +32,7 @@ mod default_readback {
 
     #[test]
     fn column_default_renders_back_to_sql() {
+        let _serial = serial();
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         db.execute("CREATE SEQUENCE actor_actor_id_seq").unwrap();
         db.execute("CREATE TABLE actor (actor_id integer DEFAULT nextval('actor_actor_id_seq'), name text)")
@@ -46,7 +59,9 @@ mod default_readback {
 
         // pg_get_expr over pg_attrdef returns the rendered default for an
         // explicit-DEFAULT (non-identity) column — previously absent/NULL.
-        let rows = db.query("SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef", &[]).unwrap();
+        let rows = db
+            .query("SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef", &[])
+            .unwrap();
         let rendered: Vec<String> = rows.iter().map(|r| s(&r.values[0])).collect();
         assert!(
             rendered.iter().any(|d| d.contains("nextval('actor_actor_id_seq')")),
@@ -69,10 +84,12 @@ mod default_readback {
 
     #[test]
     fn explicit_default_still_evaluates() {
+        let _serial = serial();
         // The readback fix must not disturb the functional default path.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         db.execute("CREATE SEQUENCE s1").unwrap();
-        db.execute("CREATE TABLE a (id integer DEFAULT nextval('s1'), v text)").unwrap();
+        db.execute("CREATE TABLE a (id integer DEFAULT nextval('s1'), v text)")
+            .unwrap();
         db.execute("INSERT INTO a (v) VALUES ('x')").unwrap();
         db.execute("INSERT INTO a (v) VALUES ('y')").unwrap();
         let rows = db.query("SELECT id FROM a ORDER BY id", &[]).unwrap();
