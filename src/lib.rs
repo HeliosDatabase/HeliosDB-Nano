@@ -5064,7 +5064,10 @@ impl EmbeddedDatabase {
                 }
                 // Clear ART indexes for this table (will be rebuilt if transaction commits)
                 self.storage.art_indexes().clear_table_indexes(table_name);
-                Ok(count)
+                // DDL-like contract (PostgreSQL parity): TRUNCATE reports no
+                // affected-row count, in or out of a transaction.
+                tracing::debug!(table = table_name.as_str(), rows = count, "TRUNCATE staged row deletes in txn");
+                Ok(0)
             }
             sql::LogicalPlan::CreateDatabase { name, if_not_exists } => {
                 let (count, _) = self.handle_create_database(name, *if_not_exists)?;
@@ -11770,7 +11773,16 @@ impl EmbeddedDatabase {
                     tracing::warn!("Failed to log TRUNCATE to WAL: {}", e);
                 }
 
-                Ok(keys_to_delete.len() as u64) // Return number of rows deleted
+                // DDL-like contract (PostgreSQL parity): TRUNCATE reports no
+                // affected-row count — its command tag is bare "TRUNCATE TABLE".
+                // (Returned keys_to_delete.len() until 2026-07-16; nothing
+                // consumed it, and truncate_hardening_tests pins 0.)
+                tracing::debug!(
+                    table = table_name.as_str(),
+                    rows = keys_to_delete.len() as u64,
+                    "TRUNCATE removed rows"
+                );
+                Ok(0)
             }
             sql::LogicalPlan::AlterColumnStorage {
                 table_name,
@@ -26546,10 +26558,14 @@ mod tests {
 
     #[test]
     fn test_truncate_returns_zero() {
-        // TRUNCATE is routed through the Executor path in execute_in_transaction,
-        // which returns results.len() (0 for DDL-like operations).
-        // The internal execute_plan_internal returns the actual count but the
-        // Executor wrapper discards it. This documents that actual behavior.
+        // DDL-like contract (PostgreSQL parity): TRUNCATE reports no
+        // affected-row count — its command tag is bare "TRUNCATE TABLE".
+        // History: this test's ASSERTION drifted to the then-current
+        // count-returning behavior (while keeping this name), contradicting
+        // truncate_hardening_tests::test_truncate_does_not_return_affected_row_count,
+        // which pinned 0 — the two could never both pass. Unified on the PG
+        // contract 2026-07-16; the removed-row count is still visible at
+        // tracing::debug.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         db.execute("CREATE TABLE trunc_count (id INT PRIMARY KEY)").unwrap();
         db.execute("INSERT INTO trunc_count VALUES (1)").unwrap();
@@ -26557,7 +26573,7 @@ mod tests {
         db.execute("INSERT INTO trunc_count VALUES (3)").unwrap();
 
         let count = db.execute("TRUNCATE TABLE trunc_count").unwrap();
-        assert_eq!(count, 3, "TRUNCATE returns actual row count");
+        assert_eq!(count, 0, "TRUNCATE reports no affected-row count (PG parity)");
 
         // Verify all rows are actually gone
         let rows = db.query("SELECT * FROM trunc_count", &[]).unwrap();

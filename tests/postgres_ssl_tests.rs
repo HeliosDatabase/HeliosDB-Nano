@@ -13,6 +13,21 @@ use tokio::net::TcpStream;
 /// SSL request message code
 const SSL_REQUEST_CODE: i32 = 80877103;
 
+/// Probe-derive a free loopback port. Hardcoded ports (15432/15433/…) collide
+/// with long-running containers on shared hosts (observed: heliosdb-lite-ca
+/// maps 0.0.0.0:15432-15433) — the test server's bind then fails inside its
+/// spawned task while connect() happily reaches the FOREIGN listener, which
+/// never answers the SSLRequest, wedging the test forever at 0 CPU. A small
+/// bind→drop→rebind race remains, but combined with the negotiation timeout
+/// below it can only produce a clean failure, never a hang.
+fn free_loopback_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind ephemeral probe port")
+        .local_addr()
+        .expect("probe local_addr")
+        .port()
+}
+
 /// Create test server with SSL
 async fn create_ssl_server(ssl_mode: SslMode, port: u16) -> Result<(Arc<EmbeddedDatabase>, SocketAddr)> {
     // Setup test certificates
@@ -82,7 +97,7 @@ async fn send_ssl_request(stream: &mut TcpStream) -> Result<bool> {
 #[tokio::test]
 #[ignore = "Requires Rustls CryptoProvider configuration"]
 async fn test_ssl_mode_allow_accepts_ssl_request() -> Result<()> {
-    let (_db, addr) = create_ssl_server(SslMode::Allow, 15432).await?;
+    let (_db, addr) = create_ssl_server(SslMode::Allow, free_loopback_port()).await?;
 
     // Connect to server
     let mut stream = TcpStream::connect(addr)
@@ -108,7 +123,10 @@ async fn test_ssl_mode_disable_rejects_ssl_request() -> Result<()> {
     // Configure SSL as disabled
     let ssl_config = SslConfig::new(SslMode::Disable, "certs/server.crt", "certs/server.key");
 
-    let addr: SocketAddr = "127.0.0.1:15433"
+    // Ephemeral port: 15433 collided with the heliosdb-lite-ca container on
+    // shared hosts (see free_loopback_port), turning this test into an
+    // indefinite hang against a foreign listener.
+    let addr: SocketAddr = format!("127.0.0.1:{}", free_loopback_port())
         .parse()
         .map_err(|e| heliosdb_nano::Error::config(format!("Invalid address: {}", e)))?;
 
@@ -129,13 +147,18 @@ async fn test_ssl_mode_disable_rejects_ssl_request() -> Result<()> {
     // Wait for server to start
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    // Connect to server
-    let mut stream = TcpStream::connect(server_addr)
-        .await
-        .map_err(|e| heliosdb_nano::Error::network(format!("Connection failed: {}", e)))?;
-
-    // Send SSL request
-    let ssl_accepted = send_ssl_request(&mut stream).await?;
+    // Connect + negotiate under a hard timeout: the test harness has no
+    // per-test timeout, so an unanswered SSLRequest read must fail loudly
+    // instead of wedging the whole suite (it wedged a gate run for 66 minutes
+    // on 2026-07-16).
+    let ssl_accepted = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut stream = TcpStream::connect(server_addr)
+            .await
+            .map_err(|e| heliosdb_nano::Error::network(format!("Connection failed: {}", e)))?;
+        send_ssl_request(&mut stream).await
+    })
+    .await
+    .expect("SSL negotiation timed out after 10s — server not answering (bind failure or foreign listener?)")?;
 
     // Server should reject SSL request
     assert!(!ssl_accepted, "Server should reject SSL request in Disable mode");
@@ -146,7 +169,7 @@ async fn test_ssl_mode_disable_rejects_ssl_request() -> Result<()> {
 #[tokio::test]
 #[ignore = "Requires Rustls CryptoProvider configuration"]
 async fn test_ssl_mode_require() -> Result<()> {
-    let (_db, addr) = create_ssl_server(SslMode::Require, 15434).await?;
+    let (_db, addr) = create_ssl_server(SslMode::Require, free_loopback_port()).await?;
 
     // Connect to server
     let mut stream = TcpStream::connect(addr)
@@ -222,7 +245,7 @@ async fn test_ssl_mode_properties() {
 #[tokio::test]
 #[ignore = "Requires Rustls CryptoProvider configuration"]
 async fn test_ssl_negotiation_protocol() -> Result<()> {
-    let (_db, addr) = create_ssl_server(SslMode::Allow, 15435).await?;
+    let (_db, addr) = create_ssl_server(SslMode::Allow, free_loopback_port()).await?;
 
     // Connect to server
     let mut stream = TcpStream::connect(addr)

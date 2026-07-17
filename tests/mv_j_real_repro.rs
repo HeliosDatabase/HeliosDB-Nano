@@ -45,6 +45,16 @@ fn quirk_j_mv_aggregates_against_real_data() {
     }
     let db = EmbeddedDatabase::new(DATA).expect("open data dir");
 
+    // Content guard, not just a path guard: /tmp cleaners have hollowed this
+    // fixture out before (dir survives, SSTs gone), and RocksDB re-initializes
+    // an empty DB in the husk on open — the path check then passes while the
+    // 448k-row dataset this repro is ABOUT is absent. An empty husk proves
+    // nothing either way, so skip unless the real table is present.
+    if db.query("SELECT COUNT(*) FROM dashboard.messages", &[]).is_err() {
+        eprintln!("SKIP: {DATA} exists but does not contain the Token-Dashboard dataset (hollowed fixture)");
+        return;
+    }
+
     // Ground truth via direct queries.
     let d_count = scalar(&db, "SELECT COUNT(*) FROM dashboard.messages");
     let d_distinct = scalar(&db, "SELECT COUNT(DISTINCT session_id) FROM dashboard.messages");

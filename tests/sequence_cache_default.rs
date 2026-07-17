@@ -9,6 +9,19 @@
 
 use heliosdb_nano::{EmbeddedDatabase, Value};
 
+/// The sequence store's persistence handle is PROCESS-GLOBAL and last-writer-
+/// wins (`sql::sequences::install_persistence` runs at every EmbeddedDatabase
+/// construction; `nextval` upgrades the global Weak at call time). Under the
+/// default multi-threaded harness a sibling test's engine can overwrite the
+/// global and then drop, so this test's nextval upgrades a dead Weak →
+/// "nextval requires storage context" (observed 2026-07-16 under
+/// RUST_TEST_THREADS=4). Serialize the tests in this binary until the handle
+/// is per-instance (filed: unify SERIAL/sequence store, per-db handle).
+static SEQ_GLOBAL_HANDLE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SEQ_GLOBAL_HANDLE.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 fn nextval(db: &EmbeddedDatabase, seq: &str) -> i64 {
     let rows = db.query(&format!("SELECT nextval('{seq}')"), &[]).unwrap();
     match &rows[0].values[0] {
@@ -20,6 +33,7 @@ fn nextval(db: &EmbeddedDatabase, seq: &str) -> i64 {
 
 #[test]
 fn default_cache_is_dense_within_session() {
+    let _serial = serial();
     let db = EmbeddedDatabase::new_in_memory().unwrap();
     db.execute("CREATE SEQUENCE s_default").unwrap();
     // Consecutive nextvals in one session are still gapless 1,2,3,… even though
@@ -30,6 +44,7 @@ fn default_cache_is_dense_within_session() {
 
 #[test]
 fn explicit_cache_is_honored() {
+    let _serial = serial();
     let db = EmbeddedDatabase::new_in_memory().unwrap();
     db.execute("CREATE SEQUENCE s_explicit CACHE 1").unwrap();
     // Explicit CACHE 1 still produces dense values within a session.
@@ -40,6 +55,7 @@ fn explicit_cache_is_honored() {
 
 #[test]
 fn default_cache_survives_restart_without_reuse() {
+    let _serial = serial();
     // The core no-duplicate invariant: after reopening the data dir, nextval
     // must never re-hand a value already served, regardless of the larger
     // default block (a crash may skip forward, but never backward).
