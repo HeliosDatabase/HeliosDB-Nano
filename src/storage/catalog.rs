@@ -339,6 +339,17 @@ impl<'a> Catalog<'a> {
         // Update in-memory schema cache
         self.storage.cache_schema(table_name, schema.clone());
 
+        // W2.5 (via the W1.3 primitive): every ALTER variant funnels through
+        // here, and a schema-shape change makes the per-table committed-write
+        // watermarks untrustworthy — an open-snapshot reader taking the
+        // watermark fast path would project the NEW catalog over OLD-shape
+        // tuples ("Column index N out of bounds"). bump_schema_generation
+        // clears the watermarks (and the existence cache, harmlessly — the
+        // name's kind is unchanged), forcing default-closed snapshot reads
+        // until the next tracked commit. Caught by
+        // w2_5_watermark_read_tests::alter_add_column_hidden_from_open_snapshot_reader.
+        self.storage.bump_schema_generation();
+
         Ok(())
     }
 
