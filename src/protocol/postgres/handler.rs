@@ -2002,6 +2002,12 @@ where
             "DROP TABLE".to_string()
         } else if starts_with_icase(trimmed, "CREATE INDEX") {
             "CREATE INDEX".to_string()
+        } else if starts_with_icase(trimmed, "ALTER TABLE") {
+            // PostgreSQL replies "ALTER TABLE" (no row count) for every ALTER
+            // TABLE form, including the Stage-0 ATTACH/DETACH PARTITION no-op.
+            "ALTER TABLE".to_string()
+        } else if starts_with_icase(trimmed, "ALTER INDEX") {
+            "ALTER INDEX".to_string()
         } else {
             format!("OK {}", affected)
         }

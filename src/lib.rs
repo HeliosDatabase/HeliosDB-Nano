@@ -1728,6 +1728,24 @@ impl EmbeddedDatabase {
         Ok(Some(0))
     }
 
+    /// Round-3 pgrust-corpus compat: PostgreSQL `ALTER TABLE … ATTACH/DETACH
+    /// PARTITION …` and `ALTER INDEX … ATTACH PARTITION …`. sqlparser 0.53 gates
+    /// ATTACH/DETACH PARTITION to the ClickHouse/Generic dialects, so under the
+    /// PostgreSQL dialect they fail at the parse stage; this accepts them as a
+    /// Stage-0 parse-and-accept no-op (the `PARTITION OF` child already exists
+    /// as an independent table, so an attach/detach has no flatten-model effect;
+    /// real catalog attach/detach + overlap validation is Stage 2). Mirrors the
+    /// CREATE DOMAIN / VACUUM intercept plumbing exactly — wired into `execute`
+    /// / `query` / `query_with_columns` so both the embedded and the wire
+    /// autocommit paths take it. The wire command tag ("ALTER TABLE" /
+    /// "ALTER INDEX") is derived from the statement prefix by `get_command_tag`.
+    fn try_handle_partition_attach_detach(&self, sql: &str) -> Result<Option<u64>> {
+        if !sql::Parser::is_partition_attach_detach_statement(sql) {
+            return Ok(None);
+        }
+        Ok(Some(0))
+    }
+
     /// R4.3: run a full MVCC version-GC pass (the library twin of the
     /// `VACUUM VERSIONS` SQL statement). Returns reclaimed version count.
     pub fn vacuum_versions(&self) -> Result<u64> {
@@ -6321,6 +6339,11 @@ impl EmbeddedDatabase {
 
         // Round-2: PostgreSQL CREATE DOMAIN / DROP DOMAIN no-op.
         if let Some(count) = self.try_handle_domain_ddl_statement(sql)? {
+            return Ok(count);
+        }
+
+        // Round-3: PostgreSQL ALTER TABLE/INDEX ATTACH/DETACH PARTITION no-op.
+        if let Some(count) = self.try_handle_partition_attach_detach(sql)? {
             return Ok(count);
         }
 
@@ -13798,6 +13821,11 @@ impl EmbeddedDatabase {
             return Ok(Vec::new());
         }
 
+        // Round-3: PostgreSQL ALTER TABLE/INDEX ATTACH/DETACH PARTITION no-op.
+        if let Some(_count) = self.try_handle_partition_attach_detach(sql)? {
+            return Ok(Vec::new());
+        }
+
         // DML belongs on the write executor.  `query()` is commonly used
         // by client adapters as a generic SQL entry point; without this
         // guard, INSERT/UPDATE/DELETE without RETURNING fall into the
@@ -14274,6 +14302,11 @@ impl EmbeddedDatabase {
 
         // Round-2: PostgreSQL CREATE DOMAIN / DROP DOMAIN no-op.
         if let Some(_count) = self.try_handle_domain_ddl_statement(sql)? {
+            return Ok((Vec::new(), Vec::new()));
+        }
+
+        // Round-3: PostgreSQL ALTER TABLE/INDEX ATTACH/DETACH PARTITION no-op.
+        if let Some(_count) = self.try_handle_partition_attach_detach(sql)? {
             return Ok((Vec::new(), Vec::new()));
         }
 
