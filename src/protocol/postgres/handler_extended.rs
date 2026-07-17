@@ -412,18 +412,25 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
 
             // Non-SELECT query — params-aware execution.
             // Guard the synchronous planner/executor call (see the SELECT arm
-            // above): convert a panic into a recoverable XX000 error.
-            let affected = super::handler::run_guarded(|| match self.pinned_plan_for(&statement) {
-                Some(plan) => self.database.execute_params_for_session_with_plan(
-                    self.session_id,
-                    &statement.query,
-                    &param_values,
-                    &plan,
-                ),
-                None => self
-                    .database
-                    .execute_params_for_session(self.session_id, &statement.query, &param_values),
-            })?;
+            // above): convert a panic into a recoverable XX000 error. W3.3:
+            // wrap the autocommit DML in the same same-row write-conflict retry
+            // as the simple-query path. The pinned plan is resolved ONCE up
+            // front (unchanged across retries), and `op` captures only
+            // `&self.database` (not `&self`) so the future stays Send.
+            let policy = self.database.statement_retry_policy();
+            let retriable = policy.is_enabled() && !self.database.session_in_transaction(self.session_id);
+            // Resolve the pinned plan once, still panic-guarded (it is stable
+            // across retries, so it stays out of the retried `op`).
+            let pinned = super::handler::run_guarded(|| Ok::<_, Error>(self.pinned_plan_for(&statement)))?;
+            let db = &self.database;
+            let sid = self.session_id;
+            let query = &statement.query;
+            let params = &param_values;
+            let affected = super::handler::run_with_retry(policy, retriable, || match &pinned {
+                Some(plan) => db.execute_params_for_session_with_plan(sid, query, params, plan),
+                None => db.execute_params_for_session(sid, query, params),
+            })
+            .await?;
             let tag = self.get_command_tag(&statement.query, affected);
             self.send_command_complete(&tag).await?;
 

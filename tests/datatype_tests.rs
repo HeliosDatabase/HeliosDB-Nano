@@ -133,6 +133,27 @@ fn test_varchar_type() -> Result<()> {
 }
 
 #[test]
+fn test_varbit_column_type() -> Result<()> {
+    // Regression: `VARBIT` (the single-word alias for BIT VARYING) arrives from
+    // sqlparser as `Custom("VARBIT")`, which the type-mapping match omitted
+    // before this fix — CREATE TABLE failed with "Custom data type not yet
+    // supported: VARBIT". It maps to TEXT (Stage-1 simplification, like BIT /
+    // BIT VARYING), so the column round-trips its canonical '0'/'1' string form.
+    let db = create_test_db()?;
+    db.execute("CREATE TABLE test_varbit (id INT PRIMARY KEY, flags VARBIT)")?;
+    db.execute("CREATE TABLE test_varbit_n (id INT PRIMARY KEY, flags VARBIT(8))")?;
+
+    db.execute("INSERT INTO test_varbit (id, flags) VALUES (1, '1010')")?;
+    db.execute("INSERT INTO test_varbit_n (id, flags) VALUES (1, '00001111')")?;
+
+    let results = db.query("SELECT flags FROM test_varbit WHERE id = 1", &[])?;
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].get(0).unwrap(), &Value::String("1010".to_string()));
+
+    Ok(())
+}
+
+#[test]
 fn test_text_with_special_characters() -> Result<()> {
     let db = create_test_db()?;
     db.execute("CREATE TABLE test_special (id INT PRIMARY KEY, value TEXT)")?;

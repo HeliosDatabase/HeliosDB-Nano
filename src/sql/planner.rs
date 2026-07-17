@@ -4717,6 +4717,14 @@ impl<'a> Planner<'a> {
                     // operator support (`<->` etc), mirroring how
                     // DataType::Vector(usize) was added.
                     "POINT" | "PATH" => Ok(DataType::Text),
+                    // `VARBIT` — the SQL-standard alias for BIT VARYING.
+                    // sqlparser 0.53 dispatches `BIT VARYING` to the dedicated
+                    // `SqlDataType::BitVarying` variant (mapped to Text above),
+                    // but the single-word `VARBIT` spelling has no keyword and
+                    // arrives here as `Custom("VARBIT")`. Map it to the same
+                    // Text form so `col VARBIT` / `col VARBIT(n)` match the
+                    // BitVarying arm — the Stage-1 simplification of c488ce2.
+                    "VARBIT" => Ok(DataType::Text),
                     "VECTOR" | "VECTOR_F16" | "VECTOR_I8" | "VECTOR_I16" | "HALFVEC" => {
                         // Parse dimension from type modifiers: VECTOR(1536).
                         // Multi-precision aliases are accepted as schema-level

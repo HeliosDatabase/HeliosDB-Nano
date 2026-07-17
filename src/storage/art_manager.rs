@@ -179,13 +179,22 @@ impl AtomicArtManagerStats {
 ///    while holding no other tree lock. Because no thread ever waits on a
 ///    tree lock while holding another tree lock, no lock-cycle (deadlock)
 ///    can form regardless of table/FK topology.
-/// 4. The name maps (`pk_indexes`, `fk_indexes`, `fk_info`, `unique_indexes`)
-///    are leaf locks: clone the names you need and release them before
-///    taking the global map lock or any tree lock.
+/// 4. The name maps (`pk_indexes`, `fk_indexes`, `fk_info`, `unique_indexes`,
+///    `table_indexes`) are leaf locks: clone the names you need and release
+///    them before taking the global map lock or any tree lock. In particular
+///    `table_indexes` is NEVER held while `indexes` (or a tree) is held, so it
+///    adds no new lock rank — a writer must not hold `indexes` and
+///    `table_indexes` at once (register/drop/rename take each in its own
+///    block), which is what keeps the leaf discipline cycle-free.
 /// 5. Per-table filtering uses the metadata cached in [`IndexEntry`]
-///    (no tree lock needed). The per-table name maps do not cover Manual
-///    (plain secondary) indexes, so iteration loops filter the entry map by
-///    `entry.table` instead of relying on those maps.
+///    (no tree lock needed). The DML mutation loops (`on_insert*`,
+///    `on_delete*`) resolve a table's complete index set from `table_indexes`
+///    (leaf lock: clone the names, release, then look each entry up in
+///    `indexes`) — an O(own indexes) lookup that DOES cover Manual (plain
+///    secondary) indexes, unlike the partial `pk_indexes`/`fk_indexes`/
+///    `unique_indexes` maps. DDL / snapshot scans (`drop_table_indexes`,
+///    `rename_table_indexes`, `export_table_snapshot`, `list_table_indexes`)
+///    still filter the entry map by `entry.table`.
 #[derive(Debug)]
 pub struct ArtIndexManager {
     /// All indexes by name
@@ -198,6 +207,16 @@ pub struct ArtIndexManager {
     fk_info: RwLock<HashMap<String, ForeignKeyInfo>>,
     /// Unique constraint indexes by table (table -> list of unique index names)
     unique_indexes: RwLock<HashMap<String, Vec<String>>>,
+    /// W3.4 §3.2: complete per-table index name list — PK, FK, Unique, AND
+    /// Manual. The DML mutation loops resolve a table's own indexes here in
+    /// O(own indexes) instead of scanning the global `indexes` map, whose cost
+    /// is O(all registered indexes system-wide) (the "many-table scaling
+    /// cliff"). It is a DERIVED index of `indexes`, kept in lock-step at every
+    /// register/drop/rename choke point so it can never drift (asserted by the
+    /// register/drop/rename/clear consistency test). TRUNCATE
+    /// (`clear_table_indexes`) does NOT touch it — the registrations survive,
+    /// only the trees are emptied. Leaf lock (see locking rules #4/#5).
+    table_indexes: RwLock<HashMap<String, Vec<String>>>,
     /// Statistics
     stats: AtomicArtManagerStats,
     /// R4.2 durable-snapshot validity tracking. `true` means the persisted
@@ -262,6 +281,7 @@ impl ArtIndexManager {
             fk_indexes: RwLock::new(HashMap::new()),
             fk_info: RwLock::new(HashMap::new()),
             unique_indexes: RwLock::new(HashMap::new()),
+            table_indexes: RwLock::new(HashMap::new()),
             stats: AtomicArtManagerStats::default(),
             // Armed at startup: markers from a previous clean shutdown must
             // be invalidated by the first mutation of this process.
@@ -401,6 +421,31 @@ impl ArtIndexManager {
         format!("{}_{}_key", table, columns.join("_"))
     }
 
+    /// W3.4 §3.2: record a newly-registered index in the per-table entry list.
+    /// Called at every `indexes` registration choke point AFTER the entry lands
+    /// in `indexes`, so the two never disagree. Leaf lock (rules #4/#5): taken
+    /// alone, never while holding `indexes` or a tree lock.
+    fn table_index_add(&self, table: &str, name: &str) {
+        let mut table_indexes = self.table_indexes.write().unwrap_or_else(|e| e.into_inner());
+        table_indexes
+            .entry(table.to_string())
+            .or_insert_with(Vec::new)
+            .push(name.to_string());
+    }
+
+    /// W3.4 §3.2: drop an index name from the per-table entry list, removing
+    /// the table key once its last index is gone (so the map stays byte-for-byte
+    /// identical to a full `indexes` filter — the §3.2 consistency invariant).
+    fn table_index_remove(&self, table: &str, name: &str) {
+        let mut table_indexes = self.table_indexes.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(list) = table_indexes.get_mut(table) {
+            list.retain(|n| n != name);
+            if list.is_empty() {
+                table_indexes.remove(table);
+            }
+        }
+    }
+
     // =========================================================================
     // INDEX CREATION
     // =========================================================================
@@ -435,6 +480,7 @@ impl ArtIndexManager {
             pk_indexes.insert(table.to_string(), index_name.clone());
         }
 
+        self.table_index_add(table, &index_name);
         self.stats.add_index(ArtIndexType::PrimaryKey);
 
         Ok(index_name)
@@ -497,6 +543,7 @@ impl ArtIndexManager {
             fk_info_map.insert(index_name.clone(), fk_info);
         }
 
+        self.table_index_add(table, &index_name);
         self.stats.add_index(ArtIndexType::ForeignKey);
 
         Ok(index_name)
@@ -539,6 +586,7 @@ impl ArtIndexManager {
                 .push(index_name.clone());
         }
 
+        self.table_index_add(table, &index_name);
         self.stats.add_index(ArtIndexType::Unique);
 
         Ok(index_name)
@@ -564,6 +612,7 @@ impl ArtIndexManager {
             indexes.insert(name.to_string(), IndexEntry::new(index));
         }
 
+        self.table_index_add(table, name);
         self.stats.add_index(ArtIndexType::Manual);
 
         Ok(name.to_string())
@@ -659,16 +708,22 @@ impl ArtIndexManager {
     pub fn drop_index(&self, name: &str) -> ArtResult<()> {
         self.note_mutation();
         let index_type;
+        let table;
 
         // Remove from main index map
         {
             let mut indexes = self.indexes.write().unwrap_or_else(|e| e.into_inner());
             if let Some(entry) = indexes.remove(name) {
                 index_type = entry.index_type;
+                table = entry.table;
             } else {
                 return Err(ArtIndexError::IndexNotFound(name.to_string()));
             }
         }
+
+        // W3.4 §3.2: drop the name from the per-table entry list (leaf lock,
+        // taken alone — never while `indexes` is held).
+        self.table_index_remove(&table, name);
 
         // Remove from type-specific maps
         match index_type {
@@ -754,6 +809,19 @@ impl ArtIndexManager {
                     entry.table = new_table.to_string();
                     indexes.insert(new_name.clone(), entry);
                     renames.push((old_name, new_name));
+                }
+            }
+        }
+
+        // W3.4 §3.2: move the per-table entry list to the new table key with
+        // the renamed index names (leaf lock, taken alone — after the `indexes`
+        // WRITE block above has been released).
+        {
+            let mut table_indexes = self.table_indexes.write().unwrap_or_else(|e| e.into_inner());
+            if table_indexes.remove(old_table).is_some() {
+                let new_names: Vec<String> = renames.iter().map(|(_, new_name)| new_name.clone()).collect();
+                if !new_names.is_empty() {
+                    table_indexes.insert(new_table.to_string(), new_names);
                 }
             }
         }
@@ -1224,6 +1292,123 @@ impl ArtIndexManager {
         Some(values)
     }
 
+    /// W3.4 §3.3 (encode-once): return the encoding of one column value,
+    /// building it once per `(schema column index, escape)` and caching it in
+    /// `cache` for reuse across the row's other indexes that share the column.
+    ///
+    /// The cache key includes `escape` because a value's encoding depends on
+    /// it: single-column keys are never escaped while multi-column keys escape
+    /// every value (`encode_key_from_values`), so a column shared by a
+    /// single-column and a multi-column index needs two distinct fragments.
+    /// `cache` holds row-scoped fragments and MUST be cleared between rows.
+    fn encode_fragment<'c>(
+        cache: &'c mut Vec<(usize, bool, Vec<u8>)>,
+        col_idx: usize,
+        value: &Value,
+        escape: bool,
+    ) -> &'c [u8] {
+        let pos = match cache.iter().position(|(ci, esc, _)| *ci == col_idx && *esc == escape) {
+            Some(pos) => pos,
+            None => {
+                let mut buf = Vec::new();
+                Self::encode_value_into(&mut buf, value, escape);
+                cache.push((col_idx, escape, buf));
+                cache.len() - 1
+            }
+        };
+        &cache[pos].2
+    }
+
+    /// W3.4 §3.3 (encode-once): build one index key from already-resolved
+    /// `(schema column index, value)` pairs, reusing per-column encoded
+    /// fragments from `cache`.
+    ///
+    /// BYTE-IDENTICAL to `encode_key_from_values(cols.iter().map(|(_, v)| v))`
+    /// (ART keys are on-disk-durable via snapshots, so this is load-bearing):
+    /// a single-column key is the column's unescaped fragment; a multi-column
+    /// key escapes every fragment and joins them with the `0x00` separator —
+    /// exactly the two branches of `encode_key_from_values`.
+    fn encode_key_cached(cache: &mut Vec<(usize, bool, Vec<u8>)>, cols: &[(usize, &Value)]) -> Vec<u8> {
+        let escape = cols.len() > 1;
+        let mut key = Vec::new();
+        for (i, (sidx, v)) in cols.iter().enumerate() {
+            if i > 0 {
+                key.push(0); // column separator (matches encode_key_from_values)
+            }
+            let frag = Self::encode_fragment(cache, *sidx, v, escape);
+            key.extend_from_slice(frag);
+        }
+        key
+    }
+
+    /// W3.4 §3.2 + §3.3: maintain every index in `names` (the table's complete
+    /// entry list, resolved by the caller) for one inserted row, reusing the
+    /// row-scoped encode-once `frag_cache` (cleared per row by the caller).
+    ///
+    /// `names` are looked up in the already-read `indexes` map (rule 2: the
+    /// global read lock is held by the caller, one tree write lock is taken at
+    /// a time). A column that does not resolve against `schema`/`tuple` skips
+    /// that index — matching `index_value_refs_from_tuple` returning `None`.
+    fn insert_row_indexes(
+        indexes: &HashMap<String, IndexEntry>,
+        names: &[String],
+        row_id: RowId,
+        schema: &Schema,
+        tuple: &Tuple,
+        frag_cache: &mut Vec<(usize, bool, Vec<u8>)>,
+        wv: bool,
+    ) -> ArtResult<()> {
+        // Encode-once only pays off when >1 index may share a column; a
+        // single-index table takes the original direct encode (zero overhead).
+        let multi_index = names.len() > 1;
+        for name in names {
+            let Some(entry) = indexes.get(name) else {
+                continue;
+            };
+            let cols = &entry.columns;
+            let mut resolved: Vec<(usize, &Value)> = Vec::with_capacity(cols.len());
+            let mut missing = false;
+            for column in cols {
+                let Some(sidx) = schema.get_column_index(column) else {
+                    missing = true;
+                    break;
+                };
+                let Some(v) = tuple.values.get(sidx) else {
+                    missing = true;
+                    break;
+                };
+                resolved.push((sidx, v));
+            }
+            if missing {
+                continue;
+            }
+            let key = if multi_index {
+                Self::encode_key_cached(frag_cache, &resolved)
+            } else {
+                Self::encode_key_from_values(resolved.iter().map(|(_, v)| *v))
+            };
+            // W3.2: one ART entry = encoded key + the u64 row-id payload.
+            if wv {
+                crate::write_volume::add(crate::write_volume::Category::IndexKey, (key.len() + 8) as u64);
+            }
+            let mut index = entry.tree.write().unwrap_or_else(|e| e.into_inner());
+            match entry.index_type {
+                ArtIndexType::PrimaryKey | ArtIndexType::Unique => {
+                    index.insert(&key, row_id)?;
+                    if entry.index_type == ArtIndexType::PrimaryKey && cols.len() == 1 {
+                        if let Some((value, key_width)) = Self::int_value_width(resolved[0].1) {
+                            index.record_dense_int_insert(key_width, value);
+                        }
+                    }
+                }
+                ArtIndexType::ForeignKey | ArtIndexType::Manual => {
+                    let _ = index.insert(&key, row_id);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Check primary key constraint before INSERT
     pub fn check_pk_constraint(&self, table: &str, key_values: &[Value]) -> ArtResult<()> {
         // Check for NULL values
@@ -1503,13 +1688,22 @@ impl ArtIndexManager {
     /// per-tree WRITE locks one at a time (serializes only same-index writers).
     pub fn on_insert(&self, table: &str, row_id: RowId, column_values: &HashMap<String, Value>) -> ArtResult<()> {
         self.note_mutation();
+        // W3.4 §3.2: resolve the table's own indexes from the per-table entry
+        // list (leaf lock: clone the names, release) instead of scanning the
+        // whole `indexes` map.
+        let names = {
+            let table_indexes = self.table_indexes.read().unwrap_or_else(|e| e.into_inner());
+            match table_indexes.get(table) {
+                Some(list) if !list.is_empty() => list.clone(),
+                _ => return Ok(()),
+            }
+        };
         let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
 
-        // Update all indexes for this table (metadata filter, no tree lock)
-        for entry in indexes.values() {
-            if entry.table != table {
+        for name in &names {
+            let Some(entry) = indexes.get(name) else {
                 continue;
-            }
+            };
 
             // Extract values for indexed columns
             let values: Vec<Value> = entry
@@ -1550,36 +1744,51 @@ impl ArtIndexManager {
         // W3.2: hoist the write-volume census fast-out (one relaxed load for the
         // whole per-index loop). Attributed to the ambient INSERT class scope.
         let wv = crate::write_volume::enabled();
-        let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
-
-        for entry in indexes.values() {
-            if entry.table != table {
-                continue;
+        // W3.4 §3.2: resolve the table's own indexes (leaf lock, cloned+released).
+        let names = {
+            let table_indexes = self.table_indexes.read().unwrap_or_else(|e| e.into_inner());
+            match table_indexes.get(table) {
+                Some(list) if !list.is_empty() => list.clone(),
+                _ => return Ok(()),
             }
+        };
+        let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
+        let mut frag_cache: Vec<(usize, bool, Vec<u8>)> = Vec::new();
+        Self::insert_row_indexes(&indexes, &names, row_id, schema, tuple, &mut frag_cache, wv)
+    }
 
-            if let Some(values) = Self::index_value_refs_from_tuple(&entry.columns, schema, tuple) {
-                let key = Self::encode_key_from_values(values.iter().copied());
-                // W3.2: one ART entry = encoded key + the u64 row-id payload.
-                if wv {
-                    crate::write_volume::add(crate::write_volume::Category::IndexKey, (key.len() + 8) as u64);
-                }
-                let mut index = entry.tree.write().unwrap_or_else(|e| e.into_inner());
-                match entry.index_type {
-                    ArtIndexType::PrimaryKey | ArtIndexType::Unique => {
-                        index.insert(&key, row_id)?;
-                        if entry.index_type == ArtIndexType::PrimaryKey && values.len() == 1 {
-                            if let Some((value, key_width)) = Self::int_value_width(values[0]) {
-                                index.record_dense_int_insert(key_width, value);
-                            }
-                        }
-                    }
-                    ArtIndexType::ForeignKey | ArtIndexType::Manual => {
-                        let _ = index.insert(&key, row_id);
-                    }
-                }
+    /// W3.4 §3.2/§3.3: batch INSERT index maintenance for the COPY funnel.
+    ///
+    /// Resolves the table's complete index set ONCE (one `table_indexes` read +
+    /// one `indexes` read for the whole batch) instead of per row, and reuses a
+    /// single encode-once fragment cache across the batch's rows. Tree write
+    /// locks are still taken one row at a time (rule 3); ART maintenance runs
+    /// post-commit, so single-WriteBatch durability is untouched. A per-row
+    /// maintenance error is logged and skipped (the durable row is already
+    /// committed), matching the pre-batch per-row call site.
+    pub fn on_insert_tuples(&self, table: &str, schema: &Schema, rows: &[(RowId, Tuple)]) -> ArtResult<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        self.note_mutation();
+        let wv = crate::write_volume::enabled();
+        let names = {
+            let table_indexes = self.table_indexes.read().unwrap_or_else(|e| e.into_inner());
+            match table_indexes.get(table) {
+                Some(list) if !list.is_empty() => list.clone(),
+                _ => return Ok(()),
+            }
+        };
+        let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
+        // One row-scoped fragment cache, cleared per row (fragments are
+        // row-specific but the buffer capacity is reused across the batch).
+        let mut frag_cache: Vec<(usize, bool, Vec<u8>)> = Vec::new();
+        for (row_id, tuple) in rows {
+            frag_cache.clear();
+            if let Err(e) = Self::insert_row_indexes(&indexes, &names, *row_id, schema, tuple, &mut frag_cache, wv) {
+                tracing::debug!("ART index batch insert for table '{}': {}", table, e);
             }
         }
-
         Ok(())
     }
 
@@ -1595,30 +1804,48 @@ impl ArtIndexManager {
         self.note_mutation();
         // W3.2: census fast-out for the buffered/txn insert index path.
         let wv = crate::write_volume::enabled();
+        // W3.4 §3.2: resolve the table's own indexes (leaf lock, cloned+released).
+        let names = {
+            let table_indexes = self.table_indexes.read().unwrap_or_else(|e| e.into_inner());
+            match table_indexes.get(table) {
+                Some(list) if !list.is_empty() => list.clone(),
+                _ => return Ok(HashMap::new()),
+            }
+        };
         let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
+        let multi_index = names.len() > 1;
+        let mut frag_cache: Vec<(usize, bool, Vec<u8>)> = Vec::new();
         let mut indexed_values = HashMap::new();
 
-        for entry in indexes.values() {
-            if entry.table != table {
+        for name in &names {
+            let Some(entry) = indexes.get(name) else {
                 continue;
-            }
+            };
 
-            let mut values = Vec::with_capacity(entry.columns.len());
+            let mut resolved: Vec<(usize, &Value)> = Vec::with_capacity(entry.columns.len());
+            let mut missing = false;
             for column in &entry.columns {
                 let Some(idx) = schema.get_column_index(column) else {
-                    values.clear();
+                    missing = true;
                     break;
                 };
                 let Some(value) = tuple.values.get(idx) else {
-                    values.clear();
+                    missing = true;
                     break;
                 };
+                // Record the value even for an index that later bails on a
+                // missing column — the undo log needs every value we resolved
+                // (byte-for-byte the pre-change accumulation order).
                 indexed_values.entry(column.clone()).or_insert_with(|| value.clone());
-                values.push(value);
+                resolved.push((idx, value));
             }
 
-            if values.len() == entry.columns.len() {
-                let key = Self::encode_key_from_values(values.iter().copied());
+            if !missing && resolved.len() == entry.columns.len() {
+                let key = if multi_index {
+                    Self::encode_key_cached(&mut frag_cache, &resolved)
+                } else {
+                    Self::encode_key_from_values(resolved.iter().map(|(_, v)| *v))
+                };
                 // W3.2: one ART entry = encoded key + the u64 row-id payload.
                 if wv {
                     crate::write_volume::add(crate::write_volume::Category::IndexKey, (key.len() + 8) as u64);
@@ -1627,8 +1854,8 @@ impl ArtIndexManager {
                 match entry.index_type {
                     ArtIndexType::PrimaryKey | ArtIndexType::Unique => {
                         index.insert(&key, row_id)?;
-                        if entry.index_type == ArtIndexType::PrimaryKey && values.len() == 1 {
-                            if let Some((value, key_width)) = Self::int_value_width(&values[0]) {
+                        if entry.index_type == ArtIndexType::PrimaryKey && entry.columns.len() == 1 {
+                            if let Some((value, key_width)) = Self::int_value_width(resolved[0].1) {
                                 index.record_dense_int_insert(key_width, value);
                             }
                         }
@@ -1648,12 +1875,20 @@ impl ArtIndexManager {
     /// Global map lock as READ + per-tree WRITE locks one at a time.
     pub fn on_delete(&self, table: &str, row_id: RowId, column_values: &HashMap<String, Value>) -> ArtResult<()> {
         self.note_mutation();
+        // W3.4 §3.2: resolve the table's own indexes (leaf lock, cloned+released).
+        let names = {
+            let table_indexes = self.table_indexes.read().unwrap_or_else(|e| e.into_inner());
+            match table_indexes.get(table) {
+                Some(list) if !list.is_empty() => list.clone(),
+                _ => return Ok(()),
+            }
+        };
         let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
 
-        for entry in indexes.values() {
-            if entry.table != table {
+        for name in &names {
+            let Some(entry) = indexes.get(name) else {
                 continue;
-            }
+            };
 
             let values: Vec<Value> = entry
                 .columns
@@ -1688,28 +1923,57 @@ impl ArtIndexManager {
     /// Update indexes after DELETE using the already-materialized tuple.
     pub fn on_delete_tuple(&self, table: &str, row_id: RowId, schema: &Schema, tuple: &Tuple) -> ArtResult<()> {
         self.note_mutation();
+        // W3.4 §3.2: resolve the table's own indexes (leaf lock, cloned+released).
+        let names = {
+            let table_indexes = self.table_indexes.read().unwrap_or_else(|e| e.into_inner());
+            match table_indexes.get(table) {
+                Some(list) if !list.is_empty() => list.clone(),
+                _ => return Ok(()),
+            }
+        };
         let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
+        let multi_index = names.len() > 1;
+        let mut frag_cache: Vec<(usize, bool, Vec<u8>)> = Vec::new();
 
-        for entry in indexes.values() {
-            if entry.table != table {
+        for name in &names {
+            let Some(entry) = indexes.get(name) else {
+                continue;
+            };
+
+            let mut resolved: Vec<(usize, &Value)> = Vec::with_capacity(entry.columns.len());
+            let mut missing = false;
+            for column in &entry.columns {
+                let Some(sidx) = schema.get_column_index(column) else {
+                    missing = true;
+                    break;
+                };
+                let Some(v) = tuple.values.get(sidx) else {
+                    missing = true;
+                    break;
+                };
+                resolved.push((sidx, v));
+            }
+            if missing {
                 continue;
             }
 
-            if let Some(values) = Self::index_value_refs_from_tuple(&entry.columns, schema, tuple) {
-                let key = Self::encode_key_from_values(values.iter().copied());
-                let mut index = entry.tree.write().unwrap_or_else(|e| e.into_inner());
-                match entry.index_type {
-                    ArtIndexType::PrimaryKey | ArtIndexType::Unique => {
-                        let removed = index.remove(&key)?.is_some();
-                        if removed && entry.index_type == ArtIndexType::PrimaryKey && values.len() == 1 {
-                            if let Some((value, _)) = Self::int_value_width(&values[0]) {
-                                index.record_dense_int_delete(value);
-                            }
+            let key = if multi_index {
+                Self::encode_key_cached(&mut frag_cache, &resolved)
+            } else {
+                Self::encode_key_from_values(resolved.iter().map(|(_, v)| *v))
+            };
+            let mut index = entry.tree.write().unwrap_or_else(|e| e.into_inner());
+            match entry.index_type {
+                ArtIndexType::PrimaryKey | ArtIndexType::Unique => {
+                    let removed = index.remove(&key)?.is_some();
+                    if removed && entry.index_type == ArtIndexType::PrimaryKey && entry.columns.len() == 1 {
+                        if let Some((value, _)) = Self::int_value_width(resolved[0].1) {
+                            index.record_dense_int_delete(value);
                         }
                     }
-                    ArtIndexType::ForeignKey | ArtIndexType::Manual => {
-                        let _ = index.remove_value(&key, row_id);
-                    }
+                }
+                ArtIndexType::ForeignKey | ArtIndexType::Manual => {
+                    let _ = index.remove_value(&key, row_id);
                 }
             }
         }
@@ -2216,5 +2480,149 @@ mod tests {
 
         let table_indexes = manager.list_table_indexes("users");
         assert_eq!(table_indexes.len(), 3);
+    }
+
+    // W3.4 §3.2: the per-table entry list must stay byte-for-byte identical to
+    // a full `indexes`-map filter after every register / drop / rename / clear.
+    #[test]
+    fn table_indexes_stays_consistent_across_register_drop_rename_clear() {
+        // Expected = group the source-of-truth `indexes` map by table.
+        fn expected(m: &ArtIndexManager) -> HashMap<String, Vec<String>> {
+            let indexes = m.indexes.read().unwrap();
+            let mut exp: HashMap<String, Vec<String>> = HashMap::new();
+            for (name, entry) in indexes.iter() {
+                exp.entry(entry.table.clone()).or_default().push(name.clone());
+            }
+            for v in exp.values_mut() {
+                v.sort();
+            }
+            exp
+        }
+        // Actual = the derived `table_indexes` map.
+        fn actual(m: &ArtIndexManager) -> HashMap<String, Vec<String>> {
+            let ti = m.table_indexes.read().unwrap();
+            let mut act: HashMap<String, Vec<String>> = ti.clone();
+            for v in act.values_mut() {
+                v.sort();
+            }
+            act
+        }
+
+        let m = ArtIndexManager::new();
+        assert_eq!(expected(&m), actual(&m));
+
+        // Register all four index kinds, incl. Manual (which the partial
+        // pk/fk/unique maps do NOT cover — the whole reason for this map).
+        m.create_pk_index("orders", &["id".to_string()]).unwrap();
+        m.create_unique_index("orders", &["code".to_string()], None).unwrap();
+        m.create_pk_index("cust", &["id".to_string()]).unwrap();
+        m.create_fk_index("orders", &["cust_id".to_string()], "cust", &["id".to_string()], None)
+            .unwrap();
+        m.create_manual_index("orders_total_idx", "orders", &["total".to_string()])
+            .unwrap();
+        assert_eq!(expected(&m), actual(&m));
+        assert!(actual(&m)["orders"].contains(&"orders_total_idx".to_string()));
+
+        // Drop a single (Manual) index.
+        m.drop_index("orders_total_idx").unwrap();
+        assert_eq!(expected(&m), actual(&m));
+
+        // TRUNCATE (clear): registrations survive → table_indexes UNCHANGED.
+        let before_clear = actual(&m);
+        m.clear_table_indexes("orders");
+        assert_eq!(before_clear, actual(&m));
+        assert_eq!(expected(&m), actual(&m));
+
+        // Rename: the whole entry list moves to the new table key.
+        m.rename_table_indexes("orders", "orders2").unwrap();
+        assert_eq!(expected(&m), actual(&m));
+        assert!(!actual(&m).contains_key("orders"));
+        assert!(actual(&m).contains_key("orders2"));
+
+        // Drop every index for a table → its key disappears entirely.
+        m.drop_table_indexes("orders2").unwrap();
+        assert_eq!(expected(&m), actual(&m));
+        assert!(!actual(&m).contains_key("orders2"));
+        // The untouched parent table's entry is still intact.
+        assert_eq!(actual(&m).get("cust"), Some(&vec!["cust_pkey".to_string()]));
+    }
+
+    // W3.4 §3.3: the encode-once fragment path must produce BYTE-IDENTICAL keys
+    // to `encode_key_from_values` for every DataType, single- and multi-column
+    // (ART keys are on-disk-durable via snapshots — a divergence corrupts them).
+    #[test]
+    fn encode_once_is_byte_identical_to_encode_key_from_values() {
+        let samples: Vec<Value> = vec![
+            Value::Null,
+            Value::Boolean(true),
+            Value::Boolean(false),
+            Value::Int2(-7),
+            Value::Int2(12345),
+            Value::Int4(0),
+            Value::Int4(i32::MIN),
+            Value::Int8(9_000_000_000),
+            Value::Float4(-1.5),
+            Value::Float4(0.0),
+            Value::Float8(3.25),
+            Value::String("hello".to_string()),
+            Value::String(String::new()),
+            // embedded 0x00: single-col (unescaped) vs multi-col (escaped) differ
+            Value::String("has\u{0}nul\u{0}bytes".to_string()),
+            Value::Bytes(vec![1, 0, 2, 0xFF, 0]),
+            Value::Bytes(Vec::new()),
+            Value::Numeric("123.45".to_string()),
+            Value::Json("{\"k\":1}".to_string()),
+            Value::Array(vec![Value::Int4(1), Value::Int4(2)]),
+            Value::Array(vec![Value::String("a\u{0}b".to_string())]),
+        ];
+
+        // Single-column keys (escape = false).
+        for v in &samples {
+            let direct = ArtIndexManager::encode_key_from_values(std::iter::once(v));
+            let mut cache: Vec<(usize, bool, Vec<u8>)> = Vec::new();
+            let cached = ArtIndexManager::encode_key_cached(&mut cache, &[(0usize, v)]);
+            assert_eq!(direct, cached, "single-column key mismatch for {:?}", v);
+        }
+
+        // Two-column keys (escape = true) — every ordered pair.
+        for a in &samples {
+            for b in &samples {
+                let direct = ArtIndexManager::encode_key_from_values([a, b].iter().copied());
+                let mut cache: Vec<(usize, bool, Vec<u8>)> = Vec::new();
+                let cached = ArtIndexManager::encode_key_cached(&mut cache, &[(0usize, a), (1usize, b)]);
+                assert_eq!(direct, cached, "two-column key mismatch for {:?} + {:?}", a, b);
+            }
+        }
+
+        // Three columns reusing the SAME column index (shared-fragment reuse
+        // must not corrupt later columns).
+        for a in &samples {
+            let direct = ArtIndexManager::encode_key_from_values([a, a, a].iter().copied());
+            let mut cache: Vec<(usize, bool, Vec<u8>)> = Vec::new();
+            let cached = ArtIndexManager::encode_key_cached(&mut cache, &[(0usize, a), (0usize, a), (0usize, a)]);
+            assert_eq!(direct, cached, "three-column repeated key mismatch for {:?}", a);
+        }
+
+        // One column shared by a single-column (escape=false) and a two-column
+        // (escape=true) index within one row must cache TWO distinct fragments
+        // and stay byte-identical to each direct form.
+        let shared = Value::String("x\u{0}y".to_string());
+        let other = Value::Int4(7);
+        let mut cache: Vec<(usize, bool, Vec<u8>)> = Vec::new();
+        let single = ArtIndexManager::encode_key_cached(&mut cache, &[(0usize, &shared)]);
+        let composite = ArtIndexManager::encode_key_cached(&mut cache, &[(0usize, &shared), (1usize, &other)]);
+        assert_eq!(
+            single,
+            ArtIndexManager::encode_key_from_values(std::iter::once(&shared))
+        );
+        assert_eq!(
+            composite,
+            ArtIndexManager::encode_key_from_values([&shared, &other].iter().copied())
+        );
+        assert_eq!(
+            cache.iter().filter(|(ci, _, _)| *ci == 0).count(),
+            2,
+            "shared column must cache one unescaped and one escaped fragment"
+        );
     }
 }

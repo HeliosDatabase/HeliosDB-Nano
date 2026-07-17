@@ -246,8 +246,12 @@ figure is a documentation constant in this file, not a runtime parameter.
 
 ## 3. Design: single-copy latest version (flagged `v_idx:` event + materialize-on-first-mutation)
 
-**This is a design. No format change ships this campaign.** The mechanism is a
-generalization of `copy_marker.rs` from contiguous COPY batches to every INSERT.
+**Status: IMPLEMENTED behind the default-OFF `[storage] elide_latest_version`
+knob (W3 lease, branch `perf/w3-impl-2026-07-17`).** The on-disk format is
+unchanged when the knob is off (the shipped default); turning it on is the
+one-way, release-noted door of §4/§6. The mechanism is a generalization of
+`copy_marker.rs` from contiguous COPY batches to every main-branch INSERT. See
+§8 for the as-built flag encoding and the funnels touched.
 
 ### 3.1 The prior art (`copy_marker.rs`, v4.1.0)
 
@@ -440,3 +444,97 @@ impossible, since `version_share > V/(2V) = 50%` whenever keys are non-negative 
 `v:` value equals the `data:` value; a <15% reading therefore indicates the workload is
 UPDATE/DELETE-dominated, not INSERT — in which case the single-copy latest version is
 correctly deprioritized because there is little INSERT volume to save).
+
+---
+
+## 8. Implementation notes (as built, W3 lease)
+
+Landed behind `[storage] elide_latest_version = false` (default OFF;
+`config.rs` `StorageConfig` + `config.example.toml`). Wired at
+`SnapshotManager::configure_elision`, called from both `StorageEngine` open
+paths (durable + in-memory) after `recover_snapshots`.
+
+**Flag encoding (§3.3 decision).** The elision flag is the reserved **high bit
+of the big-endian `commit_ts`** stored in the existing 8-byte `v_idx:` event
+value (`VERSION_VALUE_ELIDED_FLAG = 1 << 63`, `storage/time_travel.rs`).
+`commit_ts` is a logical/epoch-micros counter far below 2^62, so bit 63 is free
+for ~292k years and can never collide with a real timestamp. Chosen over a
+1-byte tag prefix because it keeps the value exactly 8 bytes (no read-path length
+change) and needs no separate probe. **Forever-fallback:** `decode_version_index_value`
+treats any value with the high bit clear — which is *every* pre-W3.2 value — as
+flag CLEAR = `v:` present (§4 row 1). `encode_version_index_value(ts, false)` is
+byte-identical to the legacy `ts.to_be_bytes()`, so an off-knob build is on-disk
+identical to pre-W3.2. NEVER remove the clear-flag default.
+
+**Funnels touched (§5.2 decision), main-branch only.**
+- *Elide* (write flagged event, skip `v:`): the fast single-INSERT version funnel
+  `append_version_snapshot_to_batch` (via `write_data_version_and_register_snapshot`
+  / `write_version_and_register_snapshot`, gated `allow_elide = !uses_side_storage`
+  — side-storage keeps full `v:` because `data:` there holds the sidecar image,
+  not the version value); and the buffered/txn-commit writers
+  `transaction.rs put_versioned_batch` / `put_version_index_batch`.
+  `insert_prepared_tuples_fast_batch` is deliberately NOT changed — its COPY
+  `vmeta:` range-marker path already elides, and its per-row branch (columnar /
+  vrange-off) keeps full `v:`.
+- *Materialize-before-overwrite* (write the real `v:` from `data:`, clear the
+  flag, in the mutation's WriteBatch): folded into the existing copy-marker
+  materialize sites so all mutation funnels are covered at once —
+  `materialize_copy_marker_row_durable` (the 7 fast/generic UPDATE/DELETE + bulk
+  sites) now also runs `materialize_elided_latest_version_durable`, and the
+  transaction commit loop calls `materialize_elided_latest_version` alongside
+  `materialize_copy_marker_row`. TRUNCATE's `materialize_copy_markers_for_table`
+  gate now also admits the scan when elided rows may exist. **ALTER TABLE
+  ADD/DROP COLUMN** (`add_column_to_rows` / `drop_column_from_rows`) rewrite every
+  main `data:` row in place with no new version — an otherwise-uncovered mutation
+  funnel — so they likewise call `materialize_copy_marker_row_durable` before each
+  row's overwrite, gated on `table_has_copy_markers` / `maybe_elided_rows` hoisted
+  out of the rewrite loop. Without this, a pre-ALTER AS-OF read of an elided row
+  would resolve its flagged event to the *rewritten* `data:` and W3.5's
+  `null_pad`/truncate would project the added/dropped column from that wrong
+  pre-image instead of the insert-time value; with it, the AS-OF read resolves the
+  materialized insert `v:` and W3.5 shapes the correct pre-image under the new
+  arity (§5.1 parity with the elision-OFF path).
+- *Read* (§5.1 case 2): `read_at_snapshot_uncached` decodes the flag; flag SET +
+  `snapshot_ts >= event_ts` ⇒ value is current `data:`; flag CLEAR ⇒ `v:`
+  (unchanged); no `v_idx:` ⇒ COPY-marker path (unchanged).
+
+**Materialize gate (durability / statelessness).** A durable sentinel key
+`w3_2_elide_used` is written once when elision is enabled and loaded on open into
+`maybe_elided_rows`; the mutation hot path pays one relaxed atomic load and skips
+the per-row `v_idx:` seek entirely when no flagged row can exist. This keeps
+recovery stateless (a point-get, not a scan) AND keeps a reopen with the knob
+toggled OFF correct: rows a prior session left flagged are still materialized on
+their next overwrite (old flagged rows stay flagged — no migration, §6).
+
+**GC (§5.1).** `version_gc` scans the `v:` keyspace only, so a flagged event with
+no `v:` never enters a collection group and its `data:`-backed value is never
+reclaimed while the row lives — asserted by the census/GC tests.
+
+**Tests.** Core mechanism (encode/decode + forever-fallback, elided-insert omits
+`v:`, materialize-on-first-overwrite preserves AS-OF, mixed per-row resolution,
+legacy-value fallback, sentinel re-arm across reopen) in `storage/time_travel.rs`
+unit tests; end-to-end SQL (version-key collapse vs the OFF control, AS-OF across
+insert→versioned-update and insert→fast-update, VACUUM skips elided rows, mixed
+coexistence) in `tests/w3_2_elide_latest_version_tests.rs`.
+
+**Deferred / recorded risks.** (a) The live `heliosdb_write_volume` §7
+re-measurement (`insert_single`/`insert_multi` version bucket collapse) is a
+coordinator gate — a unit test cannot enable the process-global census without
+racing the shared test binary, so it is left as the SQL-level `version_keys`
+collapse assertion plus the live re-run. (b) Logical streaming replication is
+format-agnostic (§5.3: the standby replays the logical insert through its own
+funnel and applies its own on-disk format), so no wire change is needed; a
+dedicated mixed-version HA replay test needs the multi-node HA harness and is not
+added here. (c) `merge_branch` into main still raw-`put`s branch rows into
+`data:` with NO version and materializes nothing (pre-existing, version-blind
+behavior — it does not call `materialize_copy_marker_row_durable` either).
+Consequences, unchanged by W3.2: a merged NEW row carries no `v_idx:` and
+resolves via the no-version → `data:` read path (case 3); a merge that OVERWRITES
+an existing main row whose latest version is elided loses that AS-OF value at the
+overwrite — but this is the SAME pre-existing limitation copy-marker rows already
+have under merge (merge preserves neither), so elided rows are no worse than the
+v4.1.0 baseline. Merge is a discouraged/unreliable path (the branches skill says
+"prefer discarding and re-applying validated SQL to main"). Routing merge through
+the insert funnel (design §5.2 aspiration) would fix the pre-existing
+version-blindness for both marker and elided rows and is a separate, larger
+change — NOT taken here to keep W3.2 contained.

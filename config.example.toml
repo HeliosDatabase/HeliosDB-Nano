@@ -65,6 +65,20 @@ compression = "Zstd"
 # for time-travel queries (AS OF TIMESTAMP/TRANSACTION/SCN)
 time_travel_enabled = true
 
+# W3.2: single-copy latest version. When true, a versioned main-branch INSERT
+# skips the full `v:` row copy (~65% of INSERT byte volume on the measured
+# shapes) and writes only a flag-bearing `v_idx:` event; the value is served
+# from `data:` until the row's first mutation materializes the real `v:`. Only
+# meaningful when time_travel_enabled = true.
+#
+# Default: false. Enabling it is a ONE-WAY, release-noted decision: rows written
+# elided cannot be read correctly by a binary that predates W3.2 (only `AS OF`
+# at the insert timestamp of a never-mutated elided row is affected — current
+# reads are unaffected). The downgrade escape hatch is dump/restore. The flag is
+# per-row and durable, so toggling this back off leaves already-elided rows
+# elided and simply stops eliding new inserts (no migration).
+elide_latest_version = false
+
 # Query timeout in milliseconds (None or 0 for unlimited)
 # Queries exceeding this duration will be automatically terminated
 # Recommended: 30000 (30 seconds) for production
@@ -94,6 +108,25 @@ slow_query_threshold_ms = 1000
 # Recommended together with profile = "safe" when durability matters more
 # than write latency.
 durable_commit = false
+
+# How a snapshot / AS OF read decodes rows written under an OLDER schema than
+# the current catalog (after ALTER ADD/DROP COLUMN). A version-resolved
+# (open-snapshot / AS OF) or branch-forked read can surface a pre-ALTER tuple
+# that has fewer columns than the table now has.
+#   "strict"    = decode at the stored arity; projecting the added column errors
+#                 "Column index N out of bounds in tuple" (pre-W3.5 behavior;
+#                 kept as a rollback).
+#   "null_pad"  = Stage 1 (default): shape the row to the current width — pad an
+#                 ADD-COLUMN-narrower row with NULL (a pre-ALTER snapshot projects
+#                 the added column as NULL, never the post-snapshot DEFAULT
+#                 backfill; isolation-preserving), and truncate a DROP-COLUMN-wider
+#                 row (a pre-DROP snapshot / branch fork legitimately resolves a
+#                 wider old version) to the current width, matching the pre-W3.5
+#                 projection.
+#   "versioned" = Stage 2 (RESERVED, not yet implemented): resolve the schema
+#                 as-of the snapshot (pre-ALTER column set; the new column is not
+#                 projected). Setting this value is rejected at config parse.
+snapshot_schema_evolution = "null_pad"
 
 # ============================================================================
 # ENCRYPTION CONFIGURATION
@@ -444,9 +477,13 @@ cleanup_interval_secs = 300
 # LOCK CONFIGURATION (v3.1.0 - Multi-User ACID)
 # ============================================================================
 [locks]
-# How long to wait for a lock before timing out (milliseconds)
-# Default: 30000 (30 seconds)
-timeout_ms = 30000
+# How long a same-row write waiter spins before timing out (milliseconds).
+# A same-row write-write waiter can never be granted the lock while the holder
+# stays open, so this bounds a FUTILE spin: a short bound turns a server-wide
+# stall into a fast, retriable serialization failure (SQLSTATE 40001). The env
+# var NANO_LOCK_TIMEOUT_MS overrides this value (env > config > default).
+# Default: 1000 (1 second)
+timeout_ms = 1000
 
 # How often to check for deadlocks (milliseconds)
 # Default: 100
@@ -455,6 +492,26 @@ deadlock_check_interval_ms = 100
 # Maximum number of concurrent lock holders
 # Default: 10000
 max_lock_holders = 10000
+
+# W3.3: auto-retry an AUTOCOMMIT statement that hits a same-row write conflict
+# (serialization failure, SQLSTATE 40001) against a fresh snapshot. Retries are
+# hard-bounded by this count; each waits a full-jitter exponential backoff
+# (base..cap below) that yields the async worker so a starved holder can commit
+# and release the row. 0 = OFF (surface 40001 to the client, today's behavior).
+# Explicit transactions NEVER auto-retry regardless of this setting — the client
+# owns their retry (the PostgreSQL contract).
+# Default: 0
+statement_retry_max = 0
+
+# Base backoff between statement retries in milliseconds; grows exponentially
+# with full jitter up to statement_retry_backoff_max_ms (anti-livelock).
+# Default: 5
+statement_retry_backoff_ms = 5
+
+# Cap on the backoff sleep per statement retry (milliseconds). Must be >=
+# statement_retry_backoff_ms.
+# Default: 100
+statement_retry_backoff_max_ms = 100
 
 # ============================================================================
 # DUMP CONFIGURATION (v3.1.0 - Memory-to-Disk Persistence)

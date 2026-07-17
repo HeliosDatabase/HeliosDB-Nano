@@ -284,6 +284,22 @@ pub struct StorageConfig {
     /// Set to false to disable automatic versioning and reduce write overhead
     /// for workloads that don't require time-travel queries.
     pub time_travel_enabled: bool,
+    /// W3.2: single-copy latest version. When true, a versioned main-branch
+    /// INSERT elides the full `v:` row copy (~65% of INSERT byte volume on the
+    /// measured shapes; `W3_2_DESIGN.md` §1) and writes only a flag-bearing
+    /// `v_idx:` event; the value is served from `data:` until the row's first
+    /// mutation materializes the real `v:`. Only meaningful with
+    /// `time_travel_enabled = true` (no version chain is written otherwise).
+    ///
+    /// Default: false. Enabling it is a ONE-WAY, release-noted decision: a row
+    /// written elided cannot be read by a binary that predates W3.2 (its `AS OF`
+    /// at the insert timestamp of a never-mutated elided row mis-resolves — see
+    /// `W3_2_DESIGN.md` §4). The downgrade escape hatch is dump/restore, which
+    /// re-serializes through logical row values and is format-agnostic. The flag
+    /// is per-row and durable, so toggling this off leaves already-elided rows
+    /// elided (no migration) and stops eliding new inserts.
+    #[serde(default)]
+    pub elide_latest_version: bool,
     /// Query timeout in milliseconds (None for unlimited)
     ///
     /// If set, queries that exceed this duration will be automatically
@@ -331,6 +347,15 @@ pub struct StorageConfig {
     /// crash-safe commits, matching the historical contract); flip per
     /// deployment when power-loss durability is required.
     pub durable_commit: bool,
+    /// W3.5: how a snapshot / AS OF / branch read decodes a stored base row
+    /// written under an OLDER schema than the current catalog (fewer columns
+    /// than the table now has, after `ALTER TABLE ... ADD COLUMN`). Homed here
+    /// beside `time_travel_enabled` because it only affects version-resolved
+    /// (`AS OF`, open-snapshot) and branch-overlay reads. See
+    /// [`SnapshotSchemaEvolution`] and
+    /// `docs/plans/PERF_STABILITY_2026_07/W3_5_DESIGN.md`.
+    #[serde(default = "default_snapshot_schema_evolution")]
+    pub snapshot_schema_evolution: SnapshotSchemaEvolution,
     /// R4.3: how long MVCC version history (`v:` / `v_idx:` keys written on
     /// every versioned INSERT/UPDATE/DELETE) is retained before the version
     /// garbage collector may reclaim it.
@@ -403,6 +428,61 @@ pub struct StorageConfig {
 
 fn default_slow_query_threshold() -> Option<u64> {
     Some(1000)
+}
+
+fn default_snapshot_schema_evolution() -> SnapshotSchemaEvolution {
+    SnapshotSchemaEvolution::NullPad
+}
+
+/// W3.5: how a base-table scan shapes a stored row that was written under an
+/// OLDER schema than the current catalog, when a version-resolved (`AS OF` /
+/// open-snapshot) or branch-forked read surfaces the pre-ALTER tuple. The row
+/// can be narrower than the current catalog (a later `ADD COLUMN`) or wider (a
+/// later `DROP COLUMN`, which rewrites `data:` in place with no new version and
+/// does not touch a branch's `bdata:`, so an old/forked wide row survives).
+///
+/// The `"versioned"` value (Stage 2: resolve the schema as-of the snapshot) is
+/// reserved and rejected at config parse until implemented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotSchemaEvolution {
+    /// Decode at the row's stored arity. Projecting a column the row predates
+    /// raises "Column index N out of bounds in tuple" (pre-W3.5 behavior).
+    /// Retained as a rollback for any consumer keyed on that error.
+    Strict,
+    /// Stage 1: shape a base row to the current catalog width. A short row
+    /// (post-`ADD COLUMN`) is padded with `NULL`, so a pre-ALTER snapshot
+    /// projects the added column as NULL — never the post-snapshot DEFAULT
+    /// backfill (isolation-preserving). A row WIDER than the catalog
+    /// (post-`DROP COLUMN`: a resolved old version or an un-rewritten branch
+    /// fork) is TRUNCATED to the current width, matching the pre-W3.5 projection
+    /// — it is legitimate schema evolution, not corruption.
+    NullPad,
+}
+
+impl<'de> Deserialize<'de> for SnapshotSchemaEvolution {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Hand-rolled (not derived) so the reserved Stage-2 value and any typo
+        // fail config parse with an actionable message rather than a bare
+        // "unknown variant" — the flip changes an error into rows, so a
+        // mis-set knob must be loud.
+        let raw = String::deserialize(deserializer)?;
+        match raw.as_str() {
+            "strict" => Ok(SnapshotSchemaEvolution::Strict),
+            "null_pad" => Ok(SnapshotSchemaEvolution::NullPad),
+            "versioned" => Err(serde::de::Error::custom(
+                "storage.snapshot_schema_evolution = \"versioned\" is reserved for W3.5 Stage 2 \
+                 (catalog time-travel) and is not implemented yet; use \"strict\" or \"null_pad\"",
+            )),
+            other => Err(serde::de::Error::custom(format!(
+                "invalid storage.snapshot_schema_evolution '{}': expected \"strict\" or \"null_pad\"",
+                other
+            ))),
+        }
+    }
 }
 
 fn default_version_gc_max_per_cycle() -> usize {
@@ -481,13 +561,18 @@ impl Default for StorageConfig {
             wal_sync_mode: WalSyncModeConfig::Sync, // Safest default for single-user workloads
             cache_size: 512 * 1024 * 1024,          // 512 MB
             compression: CompressionType::Zstd,
-            time_travel_enabled: true,  // Enable by default for zero-config transparency
-            query_timeout_ms: None,     // Unlimited by default
-            statement_timeout_ms: None, // Unlimited by default
+            time_travel_enabled: true,   // Enable by default for zero-config transparency
+            elide_latest_version: false, // W3.2: single-copy latest version OFF by default (one-way door)
+            query_timeout_ms: None,      // Unlimited by default
+            statement_timeout_ms: None,  // Unlimited by default
             transaction_isolation: TransactionIsolation::ReadCommitted, // PostgreSQL default
             slow_query_threshold_ms: Some(1000), // 1 second default
             logical_wal_per_statement: false, // rely on RocksDB WAL at commit (see field docs)
             durable_commit: false,
+            // W3.5 Stage 1 on by default: turn the pre-ALTER-snapshot arity
+            // error into isolation-preserving NULL-padded rows. `"strict"`
+            // restores the pre-W3.5 error as a rollback.
+            snapshot_schema_evolution: SnapshotSchemaEvolution::NullPad,
             version_retention: None,        // infinite retention: version GC disabled (R4.3)
             version_gc_interval_secs: None, // auto: off without retention, 300s with it
             version_gc_max_per_cycle: default_version_gc_max_per_cycle(),
@@ -1231,20 +1316,46 @@ impl SessionConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LockConfig {
-    /// Lock acquisition timeout in milliseconds (default: 30000 = 30 seconds)
+    /// Pessimistic row-lock acquisition timeout in milliseconds (default: 1000).
+    ///
+    /// A same-row write-write waiter can never be granted the lock while the
+    /// holder stays open, so this bounds a *futile* spin (see the futility note
+    /// on `storage::LockManager::with_default_timeout`): a short bound turns a
+    /// server-wide stall into a fast, retriable serialization failure (40001).
+    /// The env override `NANO_LOCK_TIMEOUT_MS` takes precedence over this value
+    /// for backward compatibility (env > config > built-in default).
     pub timeout_ms: u32,
     /// Deadlock detection interval in milliseconds (default: 100)
     pub deadlock_check_interval_ms: u32,
     /// Maximum number of concurrent lock holders (default: 10000)
     pub max_lock_holders: u32,
+    /// W3.3: maximum automatic retries for an AUTOCOMMIT statement that hits a
+    /// same-row write conflict (serialization failure, SQLSTATE 40001) against
+    /// a fresh snapshot. `0` = OFF (surface 40001, today's behavior). Explicit
+    /// transactions never auto-retry regardless of this setting — the client
+    /// owns their retry (PostgreSQL contract). Default: 0.
+    pub statement_retry_max: u32,
+    /// W3.3: base backoff between statement retries in milliseconds; grows
+    /// exponentially with full jitter up to `statement_retry_backoff_max_ms`
+    /// (anti-livelock). Default: 5.
+    pub statement_retry_backoff_ms: u64,
+    /// W3.3: cap on the backoff sleep per statement retry (milliseconds).
+    /// Default: 100.
+    pub statement_retry_backoff_max_ms: u64,
 }
 
 impl Default for LockConfig {
     fn default() -> Self {
         Self {
-            timeout_ms: 30000,
+            // 1000 ms is the effective production default the futility note
+            // established (previously only reachable via NANO_LOCK_TIMEOUT_MS;
+            // W3.3 wires this config value to the LockManager too).
+            timeout_ms: 1000,
             deadlock_check_interval_ms: 100,
             max_lock_holders: 10000,
+            statement_retry_max: 0,
+            statement_retry_backoff_ms: 5,
+            statement_retry_backoff_max_ms: 100,
         }
     }
 }
@@ -1264,6 +1375,13 @@ impl LockConfig {
         }
         if self.max_lock_holders < 1 {
             return Err(crate::Error::config("locks.max_lock_holders must be at least 1"));
+        }
+        // The backoff cap must not sit below the base, or the full-jitter
+        // exponential backoff would have an empty range to draw from.
+        if self.statement_retry_backoff_max_ms < self.statement_retry_backoff_ms {
+            return Err(crate::Error::config(
+                "locks.statement_retry_backoff_max_ms must be >= locks.statement_retry_backoff_ms",
+            ));
         }
         Ok(())
     }
@@ -1641,9 +1759,42 @@ mod tests {
     #[test]
     fn test_lock_config_default() {
         let config = LockConfig::default();
-        assert_eq!(config.timeout_ms, 30000);
+        // W3.3: the default now matches the effective production spin bound
+        // (was an orphaned 30000 never wired to the LockManager).
+        assert_eq!(config.timeout_ms, 1000);
         assert_eq!(config.deadlock_check_interval_ms, 100);
         assert_eq!(config.max_lock_holders, 10000);
+        // W3.3: statement-retry defaults OFF (behavior-preserving).
+        assert_eq!(config.statement_retry_max, 0);
+        assert_eq!(config.statement_retry_backoff_ms, 5);
+        assert_eq!(config.statement_retry_backoff_max_ms, 100);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_lock_config_retry_backoff_bounds_validation() {
+        let mut config = LockConfig::default();
+        // A cap below the base leaves the jitter range empty — rejected.
+        config.statement_retry_backoff_ms = 200;
+        config.statement_retry_backoff_max_ms = 100;
+        assert!(config.validate().is_err());
+        // Equal base/cap is fine (fixed backoff).
+        config.statement_retry_backoff_max_ms = 200;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_lock_config_retry_knobs_parse_from_toml() {
+        let toml_str = r#"
+            [locks]
+            statement_retry_max = 4
+            statement_retry_backoff_ms = 10
+            statement_retry_backoff_max_ms = 250
+        "#;
+        let config: Config = toml::from_str(toml_str).expect("Failed to deserialize config");
+        assert_eq!(config.locks.statement_retry_max, 4);
+        assert_eq!(config.locks.statement_retry_backoff_ms, 10);
+        assert_eq!(config.locks.statement_retry_backoff_max_ms, 250);
         assert!(config.validate().is_ok());
     }
 
@@ -1756,7 +1907,7 @@ mod tests {
 
         // Verify new sections are initialized
         assert_eq!(config.session.timeout_secs, 3600);
-        assert_eq!(config.locks.timeout_ms, 30000);
+        assert_eq!(config.locks.timeout_ms, 1000);
         assert_eq!(config.dump.compression, "zstd");
         assert_eq!(config.resource_quotas.memory_limit_per_user_mb, 1024);
 
@@ -1861,7 +2012,7 @@ mod tests {
 
         // New sections should have default values
         assert_eq!(config.session.timeout_secs, 3600);
-        assert_eq!(config.locks.timeout_ms, 30000);
+        assert_eq!(config.locks.timeout_ms, 1000);
         assert_eq!(config.dump.compression, "zstd");
         assert_eq!(config.resource_quotas.memory_limit_per_user_mb, 1024);
 

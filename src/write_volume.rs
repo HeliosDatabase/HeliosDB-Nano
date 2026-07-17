@@ -51,6 +51,50 @@
 //! statement, and are attributed to [`StmtClass::Other`] — documented in
 //! `W3_2_DESIGN.md` §"instrumentation coverage".
 //!
+//! ## Buffered autocommit-implicit commits (the multi-row `VALUES` funnel)
+//!
+//! A literal multi-row `INSERT … VALUES (…),(…),…` and any single-row INSERT
+//! the fast literal path rejects (constrained tables, `ON CONFLICT`,
+//! `RETURNING`) fall to the generic plan arm, which STAGES rows into an implicit
+//! transaction whose durable bytes are written by `txn.commit()` in
+//! `execute_with_implicit_transaction` — *after* the staging arm returns, so a
+//! bare `stmt_scope` in the arm would drop before the write. These are still
+//! autocommit-implicit (never explicit `BEGIN … COMMIT`), so they DO carry their
+//! true class: the wrapper takes a [`checkpoint`] spanning the commit and the
+//! arm upgrades the class via [`set_current_class_if_other`]
+//! (`insert_multi`/`insert_single`). The `if_other` guard preserves an enclosing
+//! `Copy` scope so a COPY that routes through the generic fallback (an
+//! ineligible/columnar/trigger table, `handler.rs`) still attributes to `copy`
+//! rather than being reclassified as `insert_multi`. Explicit `BEGIN … COMMIT`
+//! never reaches that wrapper (its COMMIT runs through `handle_transaction_control`),
+//! so it stays `Other` — `W3_2_DESIGN.md` §2.3 note 1 holds.
+//!
+//! ## Known label loss: parameterized / prepared re-execution (W3 follow-up)
+//!
+//! Prepared-statement re-execution — SQL `EXECUTE`, and the PG-wire extended
+//! protocol's pinned-plan Execute — dispatches DML straight through
+//! `execute_plan_with_params` → `execute_plan_with_params_inner` (`lib.rs`),
+//! BYPASSING the scoped fast paths (`try_autocommit_fast_insert_params`,
+//! `try_autocommit_fast_update_delete_params_cached`) that a simple-query
+//! statement would take. That funnel sets NO `stmt_scope`, and its
+//! autocommit (no active txn) main-branch INSERT lands in
+//! `insert_tuple_versioned_with_schema` — the non-fast versioned path that §2.3
+//! note 2 leaves UNINSTRUMENTED (recording its version without its `data:` write
+//! would skew the ratio), so those rows appear in NO bucket at all; the buffered
+//! / session-transaction sub-path instead records at COMMIT under the ambient
+//! class (`Other`). Either way the per-class INSERT/UPDATE/DELETE buckets stop
+//! growing once a workload shifts from cold simple-query execution (first
+//! pgbench sweep, scoped) onto pinned prepared plans (steady state) — the
+//! "counters freeze after the first sweep / label loss on cache rebuild" report.
+//! The process-global atomics never literally freeze; the CLASS is lost (or the
+//! whole write is omitted), not the count. Closing it means giving
+//! `execute_plan_with_params_inner`'s autocommit DML its own class scope AND
+//! instrumenting the versioned path's `data:`+version writes together, gated to
+//! `session_txn.is_none()` so explicit session-transaction COMMITs keep `Other`
+//! (note 1). That touches the hot OLTP path and must be validated by a live
+//! `heliosdb_write_volume` re-run under pgbench, so it is deferred to the
+//! coordinator gate rather than changed blind.
+//!
 //! Surfaced via the `heliosdb_write_volume` system view
 //! (`sql/phase3/system_views.rs`): one row per statement class with the three
 //! byte counters and a row-event count.
@@ -211,6 +255,48 @@ pub(crate) fn stmt_scope(class: StmtClass) -> ClassGuard {
         p
     });
     ClassGuard { prev, active: true }
+}
+
+/// Capture the current class and restore it when the returned guard drops,
+/// WITHOUT changing it. Used where the durable write of an autocommit statement
+/// lands at a `txn.commit()` decoupled from the plan arm that stages it (the
+/// literal multi-row `INSERT … VALUES` path funnels through
+/// `execute_with_implicit_transaction`, whose commit runs after the staging arm
+/// returns — `lib.rs`). The wrapper takes this checkpoint so the arm may upgrade
+/// the ambient class via [`set_current_class_if_other`] for the commit, and the
+/// original class is restored afterwards — bounding that upgrade to the one
+/// statement so a later explicit-transaction COMMIT is not misattributed
+/// (`W3_2_DESIGN.md` §2.3 note 1). Inert (one relaxed load) when disabled.
+pub(crate) fn checkpoint() -> ClassGuard {
+    if !enabled() {
+        return ClassGuard {
+            prev: StmtClass::Other,
+            active: false,
+        };
+    }
+    let prev = CURRENT.with(|c| c.get());
+    ClassGuard { prev, active: true }
+}
+
+/// Upgrade the current statement class to `class` ONLY when it is still the
+/// `Other` default, leaving any already-set enclosing scope untouched. Used by
+/// the generic (buffered) INSERT plan arm to attribute the durable bytes it
+/// stages — which are written by the enclosing autocommit COMMIT, not the arm —
+/// to `insert_single`/`insert_multi`, while preserving an enclosing `Copy`
+/// scope when the arm runs as a COPY generic-path fallback chunk. Does NOT
+/// capture a restore point (the enclosing [`checkpoint`] owns that); a bare
+/// non-restoring set would leak the class past the statement. Inert (no
+/// thread-local write) when disabled.
+#[inline]
+pub(crate) fn set_current_class_if_other(class: StmtClass) {
+    if !enabled() {
+        return;
+    }
+    CURRENT.with(|c| {
+        if matches!(c.get(), StmtClass::Other) {
+            c.set(class);
+        }
+    });
 }
 
 /// One census row for the system view.
