@@ -124,9 +124,7 @@ fn take_ident(s: &str) -> Option<(String, &str)> {
         let end = after_q.find('"')?;
         return Some((after_q[..end].to_string(), &after_q[end + 1..]));
     }
-    let end = s
-        .find(|c: char| c.is_whitespace() || c == '(')
-        .unwrap_or(s.len());
+    let end = s.find(|c: char| c.is_whitespace() || c == '(').unwrap_or(s.len());
     if end == 0 {
         return None;
     }
@@ -208,11 +206,7 @@ fn sql_value(v: &Option<String>) -> String {
 
 /// Build an injection-safe multi-row INSERT for a batch of COPY rows.
 /// `None` if the batch is empty.
-pub(crate) fn build_insert_sql(
-    table: &str,
-    columns: &[String],
-    rows: &[Vec<Option<String>>],
-) -> Option<String> {
+pub(crate) fn build_insert_sql(table: &str, columns: &[String], rows: &[Vec<Option<String>>]) -> Option<String> {
     if rows.is_empty() {
         return None;
     }
@@ -834,8 +828,7 @@ mod tests {
     #[test]
     fn encode_decode_roundtrip() {
         // a row encodes to a line that decodes back to the same fields
-        let fields: Vec<Option<Vec<u8>>> =
-            vec![Some(b"1".to_vec()), None, Some(b"has\ttab\nand nl".to_vec())];
+        let fields: Vec<Option<Vec<u8>>> = vec![Some(b"1".to_vec()), None, Some(b"has\ttab\nand nl".to_vec())];
         let line = encode_text_row(&fields);
         assert_eq!(line.last(), Some(&b'\n'));
         let rows = parse_text_rows(&line);
@@ -858,7 +851,10 @@ mod tests {
             rows[1],
             vec![Some("2".into()), Some("a,b".into()), Some("she said \"hi\"".into())]
         );
-        assert_eq!(rows[2], vec![Some("3".into()), Some("line1\nline2".into()), Some("x".into())]);
+        assert_eq!(
+            rows[2],
+            vec![Some("3".into()), Some("line1\nline2".into()), Some("x".into())]
+        );
     }
 
     #[test]
@@ -872,8 +868,7 @@ mod tests {
 
     #[test]
     fn csv_encode_decode_roundtrip() {
-        let fields: Vec<Option<Vec<u8>>> =
-            vec![Some(b"1".to_vec()), None, Some(b"a,b\"c\nd".to_vec())];
+        let fields: Vec<Option<Vec<u8>>> = vec![Some(b"1".to_vec()), None, Some(b"a,b\"c\nd".to_vec())];
         let line = encode_csv_row(&fields);
         let rows = parse_csv_rows(&line);
         assert_eq!(rows.len(), 1);
@@ -889,11 +884,7 @@ mod tests {
     /// return the decoded rows. `splits` are absolute byte offsets; the segments
     /// between them (and the final remainder) are pushed as separate frames.
     #[allow(clippy::indexing_slicing)]
-    fn stream_split(
-        format: CopyFormat,
-        data: &[u8],
-        splits: &[usize],
-    ) -> Vec<Vec<Option<String>>> {
+    fn stream_split(format: CopyFormat, data: &[u8], splits: &[usize]) -> Vec<Vec<Option<String>>> {
         let mut d = CopyStreamDecoder::new(format, 0, 0);
         let mut prev = 0;
         for &s in splits {

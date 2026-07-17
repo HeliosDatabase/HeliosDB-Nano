@@ -1535,8 +1535,7 @@ impl SystemViewRegistry {
         let mut results = Vec::new();
 
         for snapshot in snapshots {
-            let created_at =
-                DateTime::from_timestamp(snapshot.wall_clock_unix_secs(), 0).unwrap_or_else(Utc::now);
+            let created_at = DateTime::from_timestamp(snapshot.wall_clock_unix_secs(), 0).unwrap_or_else(Utc::now);
 
             let tuple = Tuple::new(vec![
                 Value::Int8(snapshot.transaction_id as i64),
@@ -1569,8 +1568,7 @@ impl SystemViewRegistry {
         let mut results = Vec::new();
 
         for snapshot in snapshots {
-            let created_at =
-                DateTime::from_timestamp(snapshot.wall_clock_unix_secs(), 0).unwrap_or_else(Utc::now);
+            let created_at = DateTime::from_timestamp(snapshot.wall_clock_unix_secs(), 0).unwrap_or_else(Utc::now);
 
             let tuple = Tuple::new(vec![
                 Value::Int8(snapshot.scn as i64),
