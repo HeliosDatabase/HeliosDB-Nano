@@ -636,6 +636,12 @@ struct FastLiteralInsertSpec {
     col_indices: Vec<usize>,
     target_types: Vec<DataType>,
     all_columns_explicit_no_default: bool,
+    /// FK/CHECK metadata for the table, `Some` iff the table declares any
+    /// foreign-key or CHECK constraint. The literal single/multi-row INSERT
+    /// fast paths bail (`return None`) whenever this is `Some` — they cannot
+    /// validate constraints — while the COPY batch path (W2.1,
+    /// `copy_bulk_insert`) validates them in-batch and stays on the fast path.
+    constraints: Option<std::sync::Arc<sql::TableConstraints>>,
 }
 
 struct FastParamUpdateAssignment {
@@ -946,6 +952,19 @@ impl EmbeddedDatabase {
                 | sql::LogicalPlan::Truncate { .. }
                 | sql::LogicalPlan::CreateMaterializedView { .. }
                 | sql::LogicalPlan::DropMaterializedView { .. }
+                // Regular (non-materialized) views are INLINED into query plans
+                // at plan time (planner.rs view-inlining), so a cached
+                // parameterized plan for `SELECT … FROM v` embeds the view's
+                // definition. CREATE/DROP VIEW (incl. CREATE OR REPLACE) changes
+                // that shape without any DML-path invalidation, so the shared
+                // plan cache — which feeds BOTH Execute (R5.W2 pinned plans) and
+                // Describe metadata (W2.3 shared_query_schema) keyed by SQL text
+                // — must be cleared and its epoch bumped, exactly as for
+                // materialized views. Without this, a Parse/Describe of an
+                // unchanged `SELECT … FROM v` text returns the pre-redefine
+                // column set.
+                | sql::LogicalPlan::CreateView { .. }
+                | sql::LogicalPlan::DropView { .. }
                 // Branch operations change the session's visible data WITHOUT
                 // any DML-path invalidation: a result cached on branch A must
                 // never be served on branch B (W1.3 branch-switch test). The
@@ -2661,6 +2680,14 @@ impl EmbeddedDatabase {
                         .iter()
                         .any(|c| c.storage_mode == ColumnStorageMode::Columnar);
                 let mut pending_columnar: Vec<(u64, Tuple)> = Vec::new();
+                // W2.0: a branch INSERT writes each row only to the `bdata:`
+                // overlay (via `branch_aware_data_key` below), so it must NOT
+                // mutate the process-wide, branch-blind ART secondary indexes —
+                // a phantom branch entry poisons main-branch indexed probes and
+                // unique checks (branch reads bail on `is_branch_active` and
+                // never consult the shared ART). Gate every ART mutation in this
+                // arm on the same main-branch predicate that routes the data key.
+                let on_branch = self.storage.get_current_branch_id().is_some();
 
                 let loop_result: Result<u64> = (|| {
                     let mut count = 0;
@@ -3010,8 +3037,10 @@ impl EmbeddedDatabase {
                                             .map_err(|err| Error::storage(err.to_string()))?;
                                         txn.put(existing_key.clone(), updated_val.clone())?;
 
-                                        // Update ART index
-                                        {
+                                        // Update ART index (main only — a branch
+                                        // ON CONFLICT DO UPDATE writes to `bdata:`
+                                        // and must not touch the shared ART; W2.0).
+                                        if !on_branch {
                                             let mut updated_col_values = std::collections::HashMap::new();
                                             for (i, col) in schema.columns.iter().enumerate() {
                                                 if let Some(v) = existing_tuple.values.get(i) {
@@ -3199,7 +3228,10 @@ impl EmbeddedDatabase {
                         }
 
                         // Update ART index for PK/unique constraint lookups
-                        {
+                        // (main only — a branch INSERT lands in `bdata:`; the
+                        // shared ART must stay branch-free, else main probes and
+                        // unique checks observe the branch row; W2.0).
+                        if !on_branch {
                             if let Err(e) = self.storage.art_indexes().on_insert(table_name, row_id, &col_values) {
                                 tracing::debug!("ART index insert for '{}': {}", table_name, e);
                             }
@@ -3577,8 +3609,10 @@ impl EmbeddedDatabase {
                         self.storage
                             .insert_tuple_branch_aware_with_schema(table_name, tuple.clone(), &schema)?;
 
-                    // Update ART index
-                    {
+                    // Update ART index (main only; a branch INSERT..SELECT row
+                    // lands in `bdata:` via `insert_tuple_branch_aware_with_schema`
+                    // above and must not touch the shared ART; W2.0).
+                    if self.storage.get_current_branch_id().is_none() {
                         let mut col_values = std::collections::HashMap::new();
                         for (i, col) in schema.columns.iter().enumerate() {
                             if let Some(v) = final_values_vec.get(i) {
@@ -3965,10 +3999,17 @@ impl EmbeddedDatabase {
                     // concurrent PK probes miss the row entirely, and a
                     // rollback replays the same gap — for payload-only
                     // updates both are pure hazard with zero effect.
-                    if self
-                        .storage
-                        .art_indexes()
-                        .tuple_update_affects_indexes(table_name, &schema, old_tuple, tuple)
+                    // W2.0: on a branch the row is written to `bdata:` (via
+                    // `branch_aware_data_key` above); the process-wide ART must
+                    // neither gain the branch's new value nor lose main's old one
+                    // (a main probe treats `index_get_all` as authoritative), so
+                    // skip ART maintenance on a branch — branch reads never use
+                    // the shared ART.
+                    if !on_branch
+                        && self
+                            .storage
+                            .art_indexes()
+                            .tuple_update_affects_indexes(table_name, &schema, old_tuple, tuple)
                     {
                         let mut old_col_values = std::collections::HashMap::with_capacity(schema.columns.len());
                         let mut new_col_values = std::collections::HashMap::with_capacity(schema.columns.len());
@@ -4353,25 +4394,33 @@ impl EmbeddedDatabase {
                         let _ = self.tenant_manager.update_storage_usage(context.tenant_id, new_storage);
                     }
                 }
-                // Update ART indexes for deleted rows
+                // Update ART indexes for deleted rows (main only — on a branch the
+                // delete writes only a `bdel:` tombstone and the row stays in
+                // main's `data:`; stripping its shared-ART entry would delete
+                // main's own mapping for an inherited row and a main point probe
+                // would then return authoritative-empty, and a RestoreDeleted undo
+                // would re-insert a phantom on rollback; branch reads never use the
+                // shared ART; W2.0).
                 for (row_id, tuple) in &deleted_tuples {
-                    let mut col_values = std::collections::HashMap::new();
-                    for (i, col) in schema_arc.columns.iter().enumerate() {
-                        if let Some(v) = tuple.values.get(i) {
-                            col_values.insert(col.name.clone(), v.clone());
+                    if !on_branch {
+                        let mut col_values = std::collections::HashMap::new();
+                        for (i, col) in schema_arc.columns.iter().enumerate() {
+                            if let Some(v) = tuple.values.get(i) {
+                                col_values.insert(col.name.clone(), v.clone());
+                            }
                         }
+                        if let Err(e) = self.storage.art_indexes().on_delete(table_name, *row_id, &col_values) {
+                            tracing::debug!("ART index delete for table '{}': {}", table_name, e);
+                        }
+                        self.push_art_undo(
+                            txn,
+                            ArtUndoOp::RestoreDeleted {
+                                table_name: table_name.clone(),
+                                row_id: *row_id,
+                                col_values,
+                            },
+                        );
                     }
-                    if let Err(e) = self.storage.art_indexes().on_delete(table_name, *row_id, &col_values) {
-                        tracing::debug!("ART index delete for table '{}': {}", table_name, e);
-                    }
-                    self.push_art_undo(
-                        txn,
-                        ArtUndoOp::RestoreDeleted {
-                            table_name: table_name.clone(),
-                            row_id: *row_id,
-                            col_values,
-                        },
-                    );
 
                     // R5.V1: eagerly drop the row from HNSW vector indexes
                     // (undo on rollback)
@@ -5434,6 +5483,21 @@ impl EmbeddedDatabase {
         self.config.storage.query_timeout_ms
     }
 
+    /// Maximum rows the PG-wire `COPY … FROM STDIN` decoder buffers before it
+    /// aborts the copy with no rows applied (0 = unlimited). Backs the wire-path
+    /// bounded-memory guard; see `[server] copy_max_buffered_rows`.
+    pub fn copy_max_buffered_rows(&self) -> usize {
+        self.config.server.copy_max_buffered_rows
+    }
+
+    /// Maximum bytes the PG-wire `COPY … FROM STDIN` decoder buffers for a single
+    /// in-progress record before it aborts the copy with no rows applied
+    /// (0 = unlimited). Bounds the partial-record state `copy_max_buffered_rows`
+    /// never sees; see `[server] copy_max_record_bytes`.
+    pub fn copy_max_record_bytes(&self) -> usize {
+        self.config.server.copy_max_record_bytes
+    }
+
     /// Check if a logical plan contains a JOIN node (used to skip optimizer for simple queries)
     fn plan_contains_join(plan: &sql::LogicalPlan) -> bool {
         match plan {
@@ -6418,12 +6482,20 @@ impl EmbeddedDatabase {
     /// old per-500-row-chunk commit (which left earlier chunks visible on a
     /// later failure).
     ///
+    /// W2.1: FK and CHECK constraints are validated in-batch before the single
+    /// WriteBatch commit — immediate FKs via batched ART probes (incl.
+    /// batch-local self-referential parents) reusing `check_referencing_rows_exist`,
+    /// CHECKs via the slow path's `validate_check_constraints`/`evaluate_check_constraint`
+    /// — so constrained tables (Pagila-like) stay on the fast path with identical
+    /// error SQLSTATE/message and all-or-nothing semantics.
+    ///
     /// Returns `None` to signal the caller to fall back to the generic SQL path
     /// — used for every shape this fast path does not cover, so semantics are
     /// preserved exactly: an open transaction (handled separately), triggers,
-    /// RLS/tenant context, an active branch, FK/CHECK constraints (via
-    /// `fast_literal_insert_spec`), dictionary/CAS column storage, or an HA/
-    /// logical-WAL requirement.
+    /// RLS/tenant context, an active branch, dictionary/CAS column storage, an
+    /// HA/logical-WAL requirement, or a constraint shape whose *timing* the
+    /// batch path does not replicate (DEFERRED / AUDIT FK validation — see
+    /// `copy_batch_constraints_eligible`).
     pub(crate) fn copy_bulk_insert(
         &self,
         table_name: &str,
@@ -6448,8 +6520,8 @@ impl EmbeddedDatabase {
         let explicit_columns: Option<Vec<&str>> =
             (!columns.is_empty()).then(|| columns.iter().map(String::as_str).collect());
         // `fast_literal_insert_spec` resolves the schema + column indices and
-        // itself bails (→ None) on FK/CHECK constraints or an unknown table/
-        // column — exactly the cases the generic path must handle.
+        // records the table's FK/CHECK metadata in `spec.constraints` (for an
+        // unknown table/column it still bails → the generic path handles that).
         let spec = match self.fast_literal_insert_spec(table_name, explicit_columns.as_deref(), None)? {
             Ok(spec) => spec,
             Err(e) => return Some(Err(e)),
@@ -6459,6 +6531,14 @@ impl EmbeddedDatabase {
         if !Self::fast_insert_batch_can_use_direct_write(&spec.schema) {
             return None;
         }
+        // W2.1: constrained tables validate in-batch (below). Bail to the
+        // generic path for FK-validation shapes whose *timing* this path does
+        // not reproduce (DEFERRED / AUDIT / per-FK deferred/lock-free).
+        if let Some(constraints) = spec.constraints.as_deref() {
+            if !self.copy_batch_constraints_eligible(constraints) {
+                return None;
+            }
+        }
 
         // Decode every row up front. Any malformed row or failed cast rejects
         // the whole COPY before a single write (atomicity).
@@ -6467,6 +6547,19 @@ impl EmbeddedDatabase {
             match Self::materialize_copy_tuple(&spec, row) {
                 Ok(tuple) => tuples.push(tuple),
                 Err(e) => return Some(Err(e)),
+            }
+        }
+
+        // W2.1: CHECK validation on the decoded (pre-PK-fill) tuples, exactly
+        // as the slow path evaluates `final_values_vec` before the SERIAL/PK
+        // auto-fill (lib.rs `Insert` arm), reusing `validate_check_constraints`.
+        if let Some(constraints) = spec.constraints.as_deref() {
+            if !constraints.check_constraints.is_empty() {
+                for tuple in &tuples {
+                    if let Err(e) = self.validate_check_constraints(constraints, &spec.schema, &tuple.values) {
+                        return Some(Err(e));
+                    }
+                }
             }
         }
 
@@ -6483,6 +6576,18 @@ impl EmbeddedDatabase {
         if let Err(e) = self.validate_fast_insert_batch(table_name, &spec.schema, &prepared) {
             return Some(Err(e));
         }
+        // W2.1: FK validation on the prepared (PK-filled) tuples — matches the
+        // slow path's `check_fk_constraints_on_write`, which runs after the PK
+        // auto-fill so self-referential parents inserted earlier in the batch
+        // are visible. All checks precede the single WriteBatch below, so a
+        // violation aborts with zero rows written (atomicity by construction).
+        if let Some(constraints) = spec.constraints.as_deref() {
+            if !constraints.foreign_keys.is_empty() {
+                if let Err(e) = self.validate_copy_batch_fks(table_name, constraints, &spec.schema, &prepared) {
+                    return Some(Err(e));
+                }
+            }
+        }
         let inserted = match self
             .storage
             .insert_prepared_tuples_fast_batch(table_name, prepared, &spec.schema)
@@ -6496,6 +6601,206 @@ impl EmbeddedDatabase {
         self.storage.increment_lsn();
         self.invalidate_result_cache();
         Some(Ok(inserted))
+    }
+
+    /// W2.1: decide whether the COPY batch path can validate `table`'s FK
+    /// constraints itself, or must defer to the generic slow path.
+    ///
+    /// CHECK constraints are always validated in-batch (like the slow path,
+    /// immediately) so they never affect eligibility. For FKs the batch path
+    /// only reproduces the *immediate, enforced* subset of
+    /// `check_fk_constraints_on_write`'s behaviour exactly; any shape whose
+    /// timing differs — DEFERRED / AUDIT global modes, per-FK DEFERRED /
+    /// LOCK-FREE enforcement, or a `DEFERRABLE INITIALLY DEFERRED` FK — is left
+    /// to the generic path so violation timing/recording stays identical.
+    fn copy_batch_constraints_eligible(&self, constraints: &sql::TableConstraints) -> bool {
+        if constraints.foreign_keys.is_empty() {
+            return true;
+        }
+        let mode = *self.fk_validation_mode.read();
+        let source = *self.fk_validation_source.read();
+        // Off / Proxy: the slow path skips FK validation entirely
+        // (`check_fk_constraints_on_write` early return); the batch path does
+        // the same in `validate_copy_batch_fks`, so it is eligible.
+        if mode == FkValidationMode::Off || source == FkValidationSource::Proxy {
+            return true;
+        }
+        // Deferred / Audit change *when*/*whether* a violation surfaces
+        // (COMMIT-time deferral, violation recording) — not replicated here.
+        if mode != FkValidationMode::Enforced {
+            return false;
+        }
+        // Immediate enforced mode: every FK must be plain immediate (NOT
+        // ENFORCED FKs are simply skipped downstream, matching the slow path,
+        // so they stay eligible).
+        constraints.foreign_keys.iter().all(|fk| {
+            !(fk.deferrable && fk.initially_deferred)
+                && !matches!(
+                    fk.enforcement,
+                    sql::ConstraintEnforcement::Deferred | sql::ConstraintEnforcement::LockFree
+                )
+        })
+    }
+
+    /// W2.1: validate every immediate FK of a COPY batch against the prepared
+    /// (PK-filled) tuples. Mirrors `check_fk_constraints_on_write`
+    /// (lib.rs — the slow path COPY falls back to) exactly for the immediate,
+    /// enforced subset, adding batch-local self-referential parents: a value is
+    /// valid if a committed parent row exists (via the shared
+    /// `check_referencing_rows_exist` ART probe) OR an earlier row in this same
+    /// batch supplies the referenced key. Distinct committed probes are cached
+    /// per FK so a 100k child COPY makes one ART probe per distinct parent key.
+    ///
+    /// On the first violation returns the identical
+    /// `Error::constraint_violation` message/SQLSTATE as the slow path; the
+    /// caller has written nothing yet, so the whole COPY aborts atomically.
+    fn validate_copy_batch_fks(
+        &self,
+        table_name: &str,
+        constraints: &sql::TableConstraints,
+        schema: &Schema,
+        prepared: &[(u64, Tuple)],
+    ) -> Result<()> {
+        let mode = *self.fk_validation_mode.read();
+        let source = *self.fk_validation_source.read();
+        // Matches `check_fk_constraints_on_write`'s early skip.
+        if mode == FkValidationMode::Off || source == FkValidationSource::Proxy {
+            return Ok(());
+        }
+
+        // Per-FK plan: child column indices, self-referential referenced-column
+        // indices (only when the FK points back at this table — COPY is
+        // single-table, so batch-local parents can only be self references),
+        // a committed-probe result cache, and the set of referenced keys
+        // supplied by earlier rows of this batch.
+        struct FkPlan<'a> {
+            fk: &'a sql::ForeignKeyConstraint,
+            child_idx: Vec<usize>,
+            self_ref_idx: Option<Vec<usize>>,
+            probe_cache: std::collections::HashMap<Vec<u8>, bool>,
+            batch_keys: std::collections::HashSet<Vec<u8>>,
+        }
+
+        let mut plans: Vec<FkPlan<'_>> = Vec::new();
+        for fk in &constraints.foreign_keys {
+            // NOT ENFORCED FKs are recorded but never checked (slow path skips
+            // them in `check_fk_constraints_on_write`).
+            if fk.enforcement == sql::ConstraintEnforcement::NotEnforced {
+                continue;
+            }
+            let mut child_idx = Vec::with_capacity(fk.columns.len());
+            let mut resolved = true;
+            for col in &fk.columns {
+                match schema.get_column_index(col) {
+                    Some(i) => child_idx.push(i),
+                    None => {
+                        resolved = false;
+                        break;
+                    }
+                }
+            }
+            if !resolved {
+                continue;
+            }
+            let self_ref_idx = if fk.references_table == table_name {
+                let mut ridx = Vec::with_capacity(fk.references_columns.len());
+                let mut rok = true;
+                for col in &fk.references_columns {
+                    match schema.get_column_index(col) {
+                        Some(i) => ridx.push(i),
+                        None => {
+                            rok = false;
+                            break;
+                        }
+                    }
+                }
+                rok.then_some(ridx)
+            } else {
+                None
+            };
+            plans.push(FkPlan {
+                fk,
+                child_idx,
+                self_ref_idx,
+                probe_cache: std::collections::HashMap::new(),
+                batch_keys: std::collections::HashSet::new(),
+            });
+        }
+        if plans.is_empty() {
+            return Ok(());
+        }
+
+        for (_row_id, tuple) in prepared {
+            for plan in &mut plans {
+                // Gather the child FK column values; a NULL in any FK column
+                // means MATCH SIMPLE "trivially satisfied" (slow path skips).
+                let mut parent_values = Vec::with_capacity(plan.child_idx.len());
+                let mut any_null = false;
+                for &ci in &plan.child_idx {
+                    match tuple.values.get(ci) {
+                        Some(Value::Null) | None => {
+                            any_null = true;
+                            break;
+                        }
+                        Some(v) => parent_values.push(v.clone()),
+                    }
+                }
+                if !any_null {
+                    let key = crate::storage::ArtIndexManager::encode_key(&parent_values);
+                    // `.copied()` drops the map borrow before the `None` arm
+                    // re-borrows it mutably to memoize the probe result.
+                    let cached = plan.probe_cache.get(&key).copied();
+                    let in_storage = match cached {
+                        Some(exists) => exists,
+                        None => {
+                            let exists = self.check_referencing_rows_exist(
+                                &plan.fk.references_table,
+                                &plan.fk.references_columns,
+                                &parent_values,
+                                None,
+                            )?;
+                            plan.probe_cache.insert(key.clone(), exists);
+                            exists
+                        }
+                    };
+                    let exists = in_storage || (plan.self_ref_idx.is_some() && plan.batch_keys.contains(&key));
+                    if !exists {
+                        let parent_repr: Vec<String> = parent_values.iter().map(|v| format!("{v}")).collect();
+                        return Err(Error::constraint_violation(format!(
+                            "Foreign key constraint '{}' violated: row references \
+                             non-existent {}({}) = ({})",
+                            plan.fk.name,
+                            plan.fk.references_table,
+                            plan.fk.references_columns.join(", "),
+                            parent_repr.join(", "),
+                        )));
+                    }
+                }
+
+                // Record this row's referenced-column key AFTER checking its own
+                // FK, so a row that references itself fails exactly as it would
+                // on the slow path (the row is not yet in the parent's index at
+                // its own FK-check time).
+                if let Some(ridx) = &plan.self_ref_idx {
+                    let mut ref_values = Vec::with_capacity(ridx.len());
+                    let mut ref_null = false;
+                    for &ri in ridx {
+                        match tuple.values.get(ri) {
+                            Some(Value::Null) | None => {
+                                ref_null = true;
+                                break;
+                            }
+                            Some(v) => ref_values.push(v.clone()),
+                        }
+                    }
+                    if !ref_null {
+                        plan.batch_keys
+                            .insert(crate::storage::ArtIndexManager::encode_key(&ref_values));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Materialize one decoded COPY row (`Vec<Option<String>>`, `None` = the
@@ -6595,11 +6900,15 @@ impl EmbeddedDatabase {
             Err(_) => return None,
         };
 
-        if let Ok(tc) = catalog.load_table_constraints(table_name) {
-            if !tc.foreign_keys.is_empty() || !tc.check_constraints.is_empty() {
-                return None;
+        // W2.1: capture FK/CHECK metadata instead of bailing. Literal INSERT
+        // callers still bail on `constraints.is_some()` (they can't validate);
+        // `copy_bulk_insert` validates the batch against these and stays fast.
+        let constraints = match catalog.load_table_constraints(table_name) {
+            Ok(tc) if !tc.foreign_keys.is_empty() || !tc.check_constraints.is_empty() => {
+                Some(std::sync::Arc::new(tc))
             }
-        }
+            _ => None,
+        };
 
         let column_names: Vec<&str> = explicit_columns.map_or_else(
             || schema.columns.iter().map(|c| c.name.as_str()).collect(),
@@ -6637,6 +6946,7 @@ impl EmbeddedDatabase {
             col_indices,
             target_types,
             all_columns_explicit_no_default: provided_columns.iter().all(|provided| *provided),
+            constraints,
         });
         self.fast_literal_insert_cache
             .put(cache_key, std::sync::Arc::clone(&spec));
@@ -8291,6 +8601,11 @@ impl EmbeddedDatabase {
             Ok(spec) => spec,
             Err(e) => return Some(Err(e)),
         };
+        // W2.1: this literal path cannot validate FK/CHECK — defer to the
+        // generic path for constrained tables (COPY has its own batch path).
+        if spec.constraints.is_some() {
+            return None;
+        }
         let tuple = match Self::materialize_fast_literal_insert_tuple(&spec, values_str)? {
             Ok(tuple) => tuple,
             Err(e) => return Some(Err(e)),
@@ -8384,6 +8699,10 @@ impl EmbeddedDatabase {
                 Ok(spec) => spec,
                 Err(e) => return Some(Err(e)),
             };
+            // W2.1: FK/CHECK validation is not performed on this literal path.
+            if spec.constraints.is_some() {
+                return None;
+            }
 
             let tuple = match Self::materialize_fast_literal_insert_tuple(&spec, values_str)? {
                 Ok(tuple) => tuple,
@@ -8400,6 +8719,10 @@ impl EmbeddedDatabase {
             Ok(spec) => spec,
             Err(e) => return Some(Err(e)),
         };
+        // W2.1: FK/CHECK validation is not performed on this literal path.
+        if spec.constraints.is_some() {
+            return None;
+        }
 
         let mut tuples = Vec::with_capacity(value_groups.len());
         for values_str in value_groups {
@@ -8670,17 +8993,35 @@ impl EmbeddedDatabase {
         // statement metadata. Avoid reloading constraint metadata on every row
         // in large explicit-transaction insert loops.
 
-        let col_values = match self
-            .storage
-            .art_indexes()
-            .on_insert_tuple_collect_index_values(table_name, row_id, schema, &tuple)
-        {
-            Ok(values) => values,
-            Err(e) if constraints_prechecked => {
-                tracing::debug!("ART index insert for '{}': {}", table_name, e);
-                Self::tuple_column_values(schema, &tuple)
+        // W2.0: an active branch writes the row only to the `bdata:` overlay
+        // (via `branch_aware_data_key` below), so it must NOT mutate the
+        // process-wide, branch-blind ART secondary indexes. A phantom branch
+        // entry would poison main-branch indexed probes and unique-constraint
+        // checks (`insert_tuple_fast` -> `check_unique_constraints_tuple` reads
+        // the shared ART unconditionally) — the same cross-branch wrong-data
+        // class Wave 1 fixed for the row cache. Branch reads bail on
+        // `is_branch_active` and use full branch-aware scans, so the ART entry
+        // is never needed on a branch; the normal branch insert path
+        // (`insert_tuple_branch_aware_with_schema`) already skips ART entirely.
+        // Gate on the SAME predicate as `branch_aware_data_key` so ART
+        // maintenance happens iff the row lands in the main `data:` keyspace;
+        // mirrors the columnar-staging branch gate below.
+        let on_branch = self.storage.get_current_branch_id().is_some();
+        let col_values = if on_branch {
+            Self::tuple_column_values(schema, &tuple)
+        } else {
+            match self
+                .storage
+                .art_indexes()
+                .on_insert_tuple_collect_index_values(table_name, row_id, schema, &tuple)
+            {
+                Ok(values) => values,
+                Err(e) if constraints_prechecked => {
+                    tracing::debug!("ART index insert for '{}': {}", table_name, e);
+                    Self::tuple_column_values(schema, &tuple)
+                }
+                Err(e) => return Err(Error::constraint_violation(e.to_string())),
             }
-            Err(e) => return Err(Error::constraint_violation(e.to_string())),
         };
 
         // R3.3: multi-row callers stage columnar side-data grouped per batch
@@ -8701,17 +9042,26 @@ impl EmbeddedDatabase {
         let val = bincode::serialize(&tuple).map_err(|e| Error::storage(e.to_string()))?;
         let key = self.storage.branch_aware_data_key(table_name, row_id);
         if let Err(e) = txn.put_insert_fast(key, val) {
-            let _ = self.storage.art_indexes().on_delete(table_name, row_id, &col_values);
+            // On a branch no ART entry was written (see the `on_branch` gate
+            // above), so there is nothing to roll back.
+            if !on_branch {
+                let _ = self.storage.art_indexes().on_delete(table_name, row_id, &col_values);
+            }
             return Err(e);
         }
-        self.push_art_undo(
-            txn,
-            ArtUndoOp::RemoveInserted {
-                table_name: table_name.to_string(),
-                row_id,
-                col_values,
-            },
-        );
+        // Only register the ART rollback undo when the shared ART was actually
+        // mutated (main branch); on a branch it would try to remove an entry
+        // that was never inserted.
+        if !on_branch {
+            self.push_art_undo(
+                txn,
+                ArtUndoOp::RemoveInserted {
+                    table_name: table_name.to_string(),
+                    row_id,
+                    col_values,
+                },
+            );
+        }
 
         // R5.V1: eagerly maintain HNSW vector indexes (undo on rollback)
         if self.vector_dml_gate(table_name) {
@@ -12159,6 +12509,28 @@ impl EmbeddedDatabase {
         params: &[Value],
         session_txn: Option<&storage::Transaction>,
     ) -> Result<(u64, Vec<Tuple>)> {
+        // Invalidate SQL metadata caches on DDL that reaches the executor
+        // through the parameterized / extended-protocol funnel. This is the
+        // THIRD DDL route: the non-parameterized paths gate at
+        // `execute_internal` and `execute_in_transaction_inner`, but DDL run
+        // via Parse/Bind/Execute (`execute_params[_for_session] ->
+        // execute_params_inner -> execute_plan_with_params`) lands in the
+        // catch-all `_` arm below, which hands CreateView/DropView/AlterTable/
+        // materialized-view + branch ops to the `Executor` without ever
+        // clearing the plan cache. psycopg3 / JDBC / Npgsql (e.g. Alembic
+        // migrations) run DDL through the extended protocol by default, so
+        // without this gate the shared `"\0params\0<sql>"` plan cache — which
+        // feeds BOTH Execute-side plan pinning (R5.W2) and W2.3 Describe
+        // metadata, keyed by SQL text — keeps serving the pre-redefine plan
+        // (stale RowDescription / OIDs, the 3.58.3 regression class the
+        // OID-parity contract protects). Idempotent with the two other sites
+        // (invalidate-before-execute); a cheap enum-discriminant match on the
+        // parameterized DML/DDL funnel (point-read SELECTs bypass this funnel
+        // via query_params_inner -> query_plan_with_params, so the hot read
+        // path is untouched).
+        if Self::plan_invalidates_sql_caches(plan) {
+            self.invalidate_plan_cache();
+        }
         // Session transactions manage their lifecycle through the session
         // API; routing plan-level transaction control at the global slot
         // from inside a session would corrupt both.
@@ -12379,21 +12751,28 @@ impl EmbeddedDatabase {
                                 let key = self.storage.branch_aware_data_key(table_name, row_id);
                                 let val = bincode::serialize(&staged).map_err(|e| Error::storage(e.to_string()))?;
                                 txn.put(key, val)?;
-                                if let Err(e) =
-                                    self.storage
-                                        .art_indexes()
-                                        .on_insert(table_name, row_id, &staged_col_values)
-                                {
-                                    tracing::debug!("ART index insert for '{}': {}", table_name, e);
+                                // W2.0: a branch INSERT writes to `bdata:` above;
+                                // keep the process-wide ART branch-free so main
+                                // probes/unique checks never observe the branch row
+                                // (the columnar-staging gate above already skips a
+                                // branch — this ART block sat outside it).
+                                if self.storage.get_current_branch_id().is_none() {
+                                    if let Err(e) =
+                                        self.storage
+                                            .art_indexes()
+                                            .on_insert(table_name, row_id, &staged_col_values)
+                                    {
+                                        tracing::debug!("ART index insert for '{}': {}", table_name, e);
+                                    }
+                                    self.push_art_undo(
+                                        txn,
+                                        ArtUndoOp::RemoveInserted {
+                                            table_name: table_name.clone(),
+                                            row_id,
+                                            col_values: staged_col_values,
+                                        },
+                                    );
                                 }
-                                self.push_art_undo(
-                                    txn,
-                                    ArtUndoOp::RemoveInserted {
-                                        table_name: table_name.clone(),
-                                        row_id,
-                                        col_values: staged_col_values,
-                                    },
-                                );
                                 row_id
                             } else {
                                 self.storage.insert_tuple_branch_aware_with_schema(
@@ -12562,9 +12941,14 @@ impl EmbeddedDatabase {
 
                             self.validate_check_constraints(&table_constraints, &schema, &updated_tuple.values)?;
 
-                            // Write the updated row.  `update_tuple_fast`
-                            // overwrites in place and updates ART
-                            // indexes; sufficient for the conflict path.
+                            // Write the updated row. `update_tuple_fast`
+                            // overwrites `data:` in place and updates ART
+                            // indexes; sufficient for the conflict path. Being a
+                            // version-skipping overwrite it also invalidates the
+                            // table's W2.5 committed-write watermark internally
+                            // (see `StorageEngine::invalidate_write_watermark`),
+                            // dropping in-transaction readers onto the snapshot
+                            // path so none fast-reads this un-versioned change.
                             self.storage.update_tuple_fast(
                                 table_name,
                                 existing_row_id,
@@ -12816,10 +13200,15 @@ impl EmbeddedDatabase {
 
                         // R0.2: only touch ART when an indexed column
                         // changed (see the text-path UPDATE arm).
-                        if self
-                            .storage
-                            .art_indexes()
-                            .tuple_update_affects_indexes(table_name, &schema, old_tuple, tuple)
+                        // W2.0: and never on a branch — the row is written to
+                        // `bdata:` above, so mutating the branch-blind shared ART
+                        // would poison main-branch probes; branch reads never use
+                        // the shared ART.
+                        if !on_branch
+                            && self
+                                .storage
+                                .art_indexes()
+                                .tuple_update_affects_indexes(table_name, &schema, old_tuple, tuple)
                         {
                             let mut old_col_values = std::collections::HashMap::with_capacity(schema.columns.len());
                             let mut new_col_values = std::collections::HashMap::with_capacity(schema.columns.len());
@@ -12941,47 +13330,55 @@ impl EmbeddedDatabase {
                     }
                 }
 
-                // Update ART indexes for deleted rows
-                for (row_id, tuple) in &deleted_tuples {
-                    let mut col_values = std::collections::HashMap::new();
-                    for (i, col) in schema.columns.iter().enumerate() {
-                        if let Some(v) = tuple.values.get(i) {
-                            col_values.insert(col.name.clone(), v.clone());
+                // Update ART indexes for deleted rows (main only — on a branch the
+                // deletes write only branch-aware tombstones and the rows stay in
+                // main's `data:`; stripping the shared ART would delete main's own
+                // entries for inherited rows, and a RestoreDeleted undo would
+                // re-insert a phantom on rollback; branch reads never use the
+                // shared ART; W2.0).
+                let on_branch = self.storage.get_current_branch_id().is_some();
+                if !on_branch {
+                    for (row_id, tuple) in &deleted_tuples {
+                        let mut col_values = std::collections::HashMap::new();
+                        for (i, col) in schema.columns.iter().enumerate() {
+                            if let Some(v) = tuple.values.get(i) {
+                                col_values.insert(col.name.clone(), v.clone());
+                            }
                         }
-                    }
-                    if let Err(e) = self.storage.art_indexes().on_delete(table_name, *row_id, &col_values) {
-                        tracing::debug!("ART index delete for table '{}': {}", table_name, e);
-                    }
-                    if let Some(txn) = active_txn {
-                        self.push_art_undo(
-                            txn,
-                            ArtUndoOp::RestoreDeleted {
-                                table_name: table_name.clone(),
-                                row_id: *row_id,
-                                col_values,
-                            },
-                        );
-
-                        // R5.V1: eagerly drop the row from HNSW vector indexes
-                        // (undo on rollback). Autocommit deletes go through
-                        // `delete_tuples_branch_aware`, whose engine-side hook
-                        // covers them — only the txn write-set path needs this.
-                        if self.vector_dml_gate(table_name) {
-                            let vops = self.storage.vector_indexes().on_row_delete(
-                                table_name,
-                                *row_id,
-                                Some(&schema),
-                                Some(tuple),
+                        if let Err(e) = self.storage.art_indexes().on_delete(table_name, *row_id, &col_values) {
+                            tracing::debug!("ART index delete for table '{}': {}", table_name, e);
+                        }
+                        if let Some(txn) = active_txn {
+                            self.push_art_undo(
+                                txn,
+                                ArtUndoOp::RestoreDeleted {
+                                    table_name: table_name.clone(),
+                                    row_id: *row_id,
+                                    col_values,
+                                },
                             );
-                            self.push_vector_undo(txn, vops);
+
+                            // R5.V1: eagerly drop the row from HNSW vector indexes
+                            // (undo on rollback). Autocommit deletes go through
+                            // `delete_tuples_branch_aware`, whose engine-side hook
+                            // covers them — only the txn write-set path needs this.
+                            if self.vector_dml_gate(table_name) {
+                                let vops = self.storage.vector_indexes().on_row_delete(
+                                    table_name,
+                                    *row_id,
+                                    Some(&schema),
+                                    Some(tuple),
+                                );
+                                self.push_vector_undo(txn, vops);
+                            }
                         }
                     }
                 }
 
                 let count = if let Some(txn) = active_txn {
-                    let on_branch = self.storage.get_current_branch().is_some();
                     // R3.3: null columnar slots + clear presence bits grouped
-                    // per touched batch.
+                    // per touched batch. (`on_branch` hoisted above for the ART
+                    // gate — reuse it here.)
                     if !on_branch {
                         self.storage.stage_columnar_deletes_grouped_in_transaction(
                             table_name,
@@ -13990,6 +14387,9 @@ impl EmbeddedDatabase {
         // R1.3-p2: invalidate written rows inside commit, before the
         // snapshot barrier lifts (stale-row-cache lost-update fence).
         txn.set_row_cache(std::sync::Arc::clone(self.storage.row_cache()));
+        // W2.5: commit raises per-table committed-write watermarks in-band so
+        // concurrent in-transaction readers can fast-path unchanged tables.
+        txn.set_write_watermarks(self.storage.write_watermarks_arc());
         // R0.2: record commits always; validate (first-committer-wins) for
         // RepeatableRead/Serializable. ReadCommitted keeps PostgreSQL's
         // blind-write semantics.
@@ -14206,6 +14606,9 @@ impl EmbeddedDatabase {
             txn.set_group_committer(self.storage.group_committer());
             // R1.3-p2: stale-row-cache lost-update fence (see above).
             txn.set_row_cache(std::sync::Arc::clone(self.storage.row_cache()));
+            // W2.5: commit raises per-table committed-write watermarks in-band so
+            // concurrent in-transaction readers can fast-path unchanged tables.
+            txn.set_write_watermarks(self.storage.write_watermarks_arc());
             // R0.2: implicit single-statement session transactions record
             // their commits so explicit transactions can validate against
             // them; they never validate (statement-atomic, RC semantics).
@@ -15389,9 +15792,17 @@ impl EmbeddedDatabase {
             row_ids.push(row_id);
         }
 
-        for (row_id, col_values) in art_updates {
-            if let Err(e) = self.storage.art_indexes().on_insert(table_name, row_id, &col_values) {
-                tracing::debug!("ART on_insert {}: {}", table_name, e);
+        // W2.0: this bulk path writes each row branch-aware (`bdata:` on a
+        // branch, `data:` on main); the process-wide, branch-blind ART must stay
+        // in sync with `data:` only. On a branch the rows live in the overlay and
+        // branch reads never consult the shared ART, so skip ART maintenance —
+        // adding branch entries here would poison main-branch probes (the vector
+        // twin above is already branch-gated via `vector_dml_gate`).
+        if self.storage.get_current_branch_id().is_none() {
+            for (row_id, col_values) in art_updates {
+                if let Err(e) = self.storage.art_indexes().on_insert(table_name, row_id, &col_values) {
+                    tracing::debug!("ART on_insert {}: {}", table_name, e);
+                }
             }
         }
 
@@ -16312,12 +16723,19 @@ impl EmbeddedDatabase {
         txn.commit()?;
 
         for (row_id, tuple) in rows_to_delete {
-            if let Err(e) = self
-                .storage
-                .art_indexes()
-                .on_delete_tuple(table_name, row_id, &schema, &tuple)
-            {
-                tracing::debug!("ART index delete for cascade table '{}': {}", table_name, e);
+            // W2.0: on a branch this cascade wrote only branch-aware tombstones
+            // (above) and the child rows stay in main's `data:`; stripping the
+            // shared ART's main entries would make a main point probe return
+            // authoritative-empty for an inherited row. Branch reads never use
+            // the shared ART, so skip ART maintenance on a branch.
+            if self.storage.get_current_branch_id().is_none() {
+                if let Err(e) = self
+                    .storage
+                    .art_indexes()
+                    .on_delete_tuple(table_name, row_id, &schema, &tuple)
+                {
+                    tracing::debug!("ART index delete for cascade table '{}': {}", table_name, e);
+                }
             }
             // R5.V1: drop cascade-deleted rows from HNSW vector indexes
             // (the cascade txn committed just above — no undo).
@@ -28497,26 +28915,163 @@ mod tests {
         assert_eq!(got[0].values[0], Value::Int8(0));
     }
 
+    // ---- W2.1 COPY fast path for FK + CHECK tables ----
+
     #[test]
-    fn copy_bulk_insert_falls_back_on_fk_and_check() {
-        // FK/CHECK tables must take the generic path (None) so their
-        // constraints still fire; copy_bulk_insert only claims tables it can
-        // fully validate through the fast batch.
+    fn copy_bulk_insert_fk_preexisting_parent_passes() {
+        // W2.1: a child COPY whose FK targets already-committed parents now
+        // takes the fast path (pre-change this returned None → the assertion
+        // `.expect("fast path taken")` flips).
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE cbi_parent (id INT PRIMARY KEY)").unwrap();
-        db.execute("CREATE TABLE cbi_child (id INT PRIMARY KEY, pid INT REFERENCES cbi_parent(id))")
+        db.execute("CREATE TABLE cbi_p (id INT PRIMARY KEY)").unwrap();
+        db.execute("CREATE TABLE cbi_c (id INT PRIMARY KEY, pid INT REFERENCES cbi_p(id))")
             .unwrap();
-        db.execute("CREATE TABLE cbi_chk (id INT PRIMARY KEY, n INT CHECK (n > 0))")
+        db.execute("INSERT INTO cbi_p VALUES (1), (2)").unwrap();
+        let rows = copy_rows(&[&[Some("10"), Some("1")], &[Some("11"), Some("2")], &[Some("12"), None]]);
+        let n = db
+            .copy_bulk_insert("cbi_c", &[], &rows)
+            .expect("fast path taken")
             .unwrap();
-        let rows = copy_rows(&[&[Some("1"), Some("1")]]);
+        assert_eq!(n, 3);
+        let got = db.query("SELECT count(*) FROM cbi_c", &[]).unwrap();
+        assert_eq!(got[0].values[0], Value::Int8(3));
+    }
+
+    #[test]
+    fn copy_bulk_insert_fk_missing_parent_is_atomic_and_matches_slow_path() {
+        // Violation → whole COPY rejected (zero rows) AND the error text is
+        // byte-identical to the generic slow path's FK message.
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE cbi_p2 (id INT PRIMARY KEY)").unwrap();
+        db.execute("CREATE TABLE cbi_c2 (id INT PRIMARY KEY, pid INT REFERENCES cbi_p2(id))")
+            .unwrap();
+        db.execute("INSERT INTO cbi_p2 VALUES (1)").unwrap();
+
+        // Slow-path reference error (single-row INSERT bails to the generic
+        // path because the table is constrained).
+        let slow_err = db
+            .execute("INSERT INTO cbi_c2 VALUES (5, 999)")
+            .unwrap_err()
+            .to_string();
+
+        // Fast-path COPY error for the same missing parent (999). Row 1 is
+        // valid, the violation is at row 2 → nothing may survive.
+        let rows = copy_rows(&[&[Some("6"), Some("1")], &[Some("7"), Some("999")]]);
+        let fast_err = db
+            .copy_bulk_insert("cbi_c2", &[], &rows)
+            .expect("fast path taken")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(fast_err, slow_err, "FK error must match the slow path verbatim");
+
+        let got = db.query("SELECT count(*) FROM cbi_c2", &[]).unwrap();
+        assert_eq!(got[0].values[0], Value::Int8(0), "no partial rows may survive a rejected COPY");
+    }
+
+    #[test]
+    fn copy_bulk_insert_fk_batch_local_self_parent_passes() {
+        // Self-referential FK: a parent inserted earlier in the SAME batch
+        // satisfies a later child's FK (pre-change: None → assertion flips).
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE cbi_emp (id INT PRIMARY KEY, mgr INT REFERENCES cbi_emp(id))")
+            .unwrap();
+        // Row 1 = manager (mgr NULL), row 2 = report referencing the manager.
+        let rows = copy_rows(&[&[Some("1"), None], &[Some("2"), Some("1")]]);
+        let n = db
+            .copy_bulk_insert("cbi_emp", &[], &rows)
+            .expect("fast path taken")
+            .unwrap();
+        assert_eq!(n, 2);
+        let got = db.query("SELECT count(*) FROM cbi_emp", &[]).unwrap();
+        assert_eq!(got[0].values[0], Value::Int8(2));
+
+        // A child whose self-parent is absent from both storage and the batch
+        // still fails, atomically.
+        let bad = copy_rows(&[&[Some("3"), Some("404")]]);
         assert!(
-            db.copy_bulk_insert("cbi_child", &[], &rows).is_none(),
-            "FK table must fall back to the generic path"
+            db.copy_bulk_insert("cbi_emp", &[], &bad).expect("fast path taken").is_err(),
+            "missing self-parent must reject"
         );
+        let got = db.query("SELECT count(*) FROM cbi_emp", &[]).unwrap();
+        assert_eq!(got[0].values[0], Value::Int8(2), "rejected COPY leaves the table unchanged");
+    }
+
+    #[test]
+    fn copy_bulk_insert_check_violation_is_atomic_and_matches_slow_path() {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE cbi_ck (id INT PRIMARY KEY, n INT CHECK (n > 0))")
+            .unwrap();
+
+        let slow_err = db
+            .execute("INSERT INTO cbi_ck VALUES (5, -3)")
+            .unwrap_err()
+            .to_string();
+
+        let rows = copy_rows(&[&[Some("1"), Some("10")], &[Some("2"), Some("-3")]]);
+        let fast_err = db
+            .copy_bulk_insert("cbi_ck", &[], &rows)
+            .expect("fast path taken")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(fast_err, slow_err, "CHECK error must match the slow path verbatim");
+
+        let got = db.query("SELECT count(*) FROM cbi_ck", &[]).unwrap();
+        assert_eq!(got[0].values[0], Value::Int8(0));
+    }
+
+    #[test]
+    fn copy_bulk_insert_check_satisfied_passes() {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE cbi_ck2 (id INT PRIMARY KEY, n INT CHECK (n > 0))")
+            .unwrap();
+        let rows = copy_rows(&[&[Some("1"), Some("5")], &[Some("2"), Some("7")]]);
+        let n = db
+            .copy_bulk_insert("cbi_ck2", &[], &rows)
+            .expect("fast path taken")
+            .unwrap();
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn copy_bulk_insert_deferred_mode_falls_back() {
+        // Global DEFERRED fk_validation defers violations to COMMIT — timing the
+        // batch path does not reproduce → it must fall back to the generic path
+        // (None). The same table under ENFORCED mode takes the fast path; the
+        // contrast is the point of the test.
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE cbi_dp (id INT PRIMARY KEY)").unwrap();
+        db.execute("CREATE TABLE cbi_dc (id INT PRIMARY KEY, pid INT REFERENCES cbi_dp(id))")
+            .unwrap();
+        db.execute("INSERT INTO cbi_dp VALUES (1)").unwrap();
+
+        let rows = copy_rows(&[&[Some("10"), Some("1")]]);
+        db.execute("SET fk_validation = deferred").unwrap();
         assert!(
-            db.copy_bulk_insert("cbi_chk", &[], &rows).is_none(),
-            "CHECK table must fall back to the generic path"
+            db.copy_bulk_insert("cbi_dc", &[], &rows).is_none(),
+            "deferred mode must fall back to the generic path"
         );
+        db.execute("SET fk_validation = enforced").unwrap();
+        assert!(
+            db.copy_bulk_insert("cbi_dc", &[], &rows).is_some(),
+            "enforced mode takes the fast path"
+        );
+    }
+
+    #[test]
+    fn copy_bulk_insert_fk_validation_off_skips_and_stays_fast() {
+        // With FK validation disabled the slow path inserts orphans; the fast
+        // path must match (skip FK, still insert) rather than reject.
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE cbi_p3 (id INT PRIMARY KEY)").unwrap();
+        db.execute("CREATE TABLE cbi_c3 (id INT PRIMARY KEY, pid INT REFERENCES cbi_p3(id))")
+            .unwrap();
+        db.execute("SET foreign_key_checks = 0").unwrap();
+        let rows = copy_rows(&[&[Some("1"), Some("999")]]);
+        let n = db
+            .copy_bulk_insert("cbi_c3", &[], &rows)
+            .expect("fast path taken")
+            .unwrap();
+        assert_eq!(n, 1, "orphan child inserted when FK checks are off");
     }
 
     #[test]
@@ -28713,6 +29268,59 @@ mod tests {
         // Current read reflects the update.
         let got = db.query("SELECT v FROM cvm8 WHERE id = 2", &[]).unwrap();
         assert_eq!(got[0].values[0], Value::Int4(200));
+    }
+
+    #[test]
+    fn fast_update_no_index_invalidates_watermark_for_open_reader() {
+        // W2.5 finding #2: the version-skipping fast UPDATE storage funnel
+        // (`update_tuple_fast*`) overwrites `data:` in place without recording a
+        // snapshot-resolvable version. It must invalidate the table's committed-
+        // write watermark so an in-transaction reader whose snapshot predates the
+        // overwrite is forced onto the snapshot path (which resolves the
+        // pre-update version) instead of fast-reading the new `data:` value.
+        // Driven at the storage level: the SQL fast-update path bails while a
+        // session transaction is open, so it is unreachable with an open reader
+        // through the query surface.
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE fw (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+        db.execute("INSERT INTO fw (id, v) VALUES (1, 100)").unwrap();
+
+        let schema = db.storage.catalog().get_table_schema("fw").unwrap();
+        let existing = db
+            .storage
+            .get_row_by_typed_pk_for_write_with_schema("fw", &Value::Int4(1), &schema)
+            .unwrap()
+            .expect("row 1 exists");
+        let row_id = existing.row_id.expect("row id assigned");
+
+        let a = db
+            .create_session("a", crate::session::IsolationLevel::RepeatableRead)
+            .unwrap();
+        db.begin_transaction_for_session(a).unwrap();
+        // Establish A's snapshot; fast-path eligible (the insert bumped fw's watermark).
+        let first = db.query_in_session(a, "SELECT * FROM fw", &[]).unwrap();
+        assert_eq!(first[0].values[1], Value::Int4(100));
+
+        // Simulate the autocommit fast-UPDATE storage write while A is open.
+        let new_tuple = Tuple::new(vec![Value::Int4(1), Value::Int4(999)]);
+        db.storage
+            .update_tuple_fast_no_index("fw", row_id, new_tuple, &schema, None)
+            .unwrap();
+
+        // Snapshot isolation: A must still resolve the pre-update value.
+        let second = db.query_in_session(a, "SELECT * FROM fw", &[]).unwrap();
+        assert_eq!(
+            second[0].values[1],
+            Value::Int4(100),
+            "the fast-update watermark invalidation must force A onto the snapshot path"
+        );
+
+        db.commit_transaction_for_session(a).unwrap();
+        db.destroy_session(a).unwrap();
+
+        // A fresh autocommit read observes the overwrite.
+        let fresh = db.query("SELECT * FROM fw", &[]).unwrap();
+        assert_eq!(fresh[0].values[1], Value::Int4(999));
     }
 
     #[test]

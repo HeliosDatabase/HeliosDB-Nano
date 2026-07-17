@@ -139,6 +139,25 @@ oracle_port = 1521
 # Maximum concurrent connections
 max_connections = 100
 
+# Maximum rows buffered in memory while decoding a single COPY ... FROM STDIN
+# stream. The wire decoder parses each CopyData frame into typed rows and drops
+# the raw bytes as it goes, so peak memory tracks the parsed batch rather than
+# (~4-6x) the whole stream buffered as one byte vector. If a COPY would buffer
+# more than this many rows the server aborts it with a clean error and applies
+# zero rows. Set to 0 to disable the cap (unbounded — not recommended on
+# memory-constrained hosts).
+copy_max_buffered_rows = 10000000
+
+# Maximum bytes accumulated for a SINGLE in-progress COPY ... FROM STDIN record
+# before the server aborts the copy with a clean error and applies zero rows.
+# copy_max_buffered_rows above only counts COMPLETED rows; this caps the
+# partial-record state it never sees — an unterminated text line, or an unclosed
+# quoted CSV field — so a stream with no record separator (e.g. a multi-GB
+# single-line blob accidentally loaded in text mode) cannot accumulate unbounded.
+# Default 1 GiB matches PostgreSQL's own per-field size limit. Set to 0 to
+# disable (unbounded — not recommended on memory-constrained hosts).
+copy_max_record_bytes = 1073741824
+
 # Enable TLS/SSL
 tls_enabled = false
 

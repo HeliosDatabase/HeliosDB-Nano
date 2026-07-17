@@ -629,3 +629,291 @@ async fn bytea_text_output_is_hex_not_raw_bytes() {
         "bytea text output must be `\\x`-hex encoded, not raw bytes"
     );
 }
+
+// ---------------------------------------------------------------------------
+// W2.3 — Extended-protocol Parse reuse from the shared parameterized plan
+// cache (OID-parity contract).
+// ---------------------------------------------------------------------------
+
+/// Decode a RowDescription ('T') payload stream into `(name, data_type_oid)`
+/// per field. Field layout after the null-terminated name: table_oid(i32),
+/// column_attr_num(i16), data_type_oid(i32), data_type_size(i16),
+/// type_modifier(i32), format_code(i16) — 18 fixed bytes.
+fn row_description(bytes: &[u8]) -> Vec<(String, i32)> {
+    let mut out = Vec::new();
+    for (ty, payload) in parse_messages(bytes) {
+        if ty != b'T' {
+            continue;
+        }
+        let nfields = i16::from_be_bytes([payload[0], payload[1]]) as usize;
+        let mut pos = 2;
+        for _ in 0..nfields {
+            let name_end = pos + payload[pos..].iter().position(|&b| b == 0).expect("field name cstring");
+            let name = String::from_utf8_lossy(&payload[pos..name_end]).to_string();
+            pos = name_end + 1;
+            let oid_pos = pos + 4 + 2; // skip table_oid(i32) + column_attr_num(i16)
+            let oid = i32::from_be_bytes([
+                payload[oid_pos],
+                payload[oid_pos + 1],
+                payload[oid_pos + 2],
+                payload[oid_pos + 3],
+            ]);
+            out.push((name, oid));
+            pos += 18; // table_oid+col_attr+type_oid+size+modifier+format
+        }
+    }
+    out
+}
+
+/// W2.3 flip: parsing a plain SELECT must seed the prepared statement's
+/// `cached_plan` from the SHARED parameterized plan cache AT PARSE TIME.
+/// Pre-W2.3 the Describe schema came from a throwaway private plan and
+/// `cached_plan` stayed `None` until the first Execute — this assertion flips
+/// `None` → `Some`.
+#[tokio::test]
+async fn parse_seeds_shared_plan_for_select() {
+    let db = wide_test_db(3);
+    let (mut handler, _client) = test_handler(db);
+    handler
+        .handle_parse_extended("sp".into(), "SELECT id, a FROM wide WHERE id = $1".into(), vec![23])
+        .await
+        .expect("parse");
+    let stmt = handler
+        .prepared_statements
+        .get_statement("sp")
+        .expect("get")
+        .expect("stmt present");
+    assert!(
+        stmt.cached_plan.is_some(),
+        "SELECT Parse must seed cached_plan from the shared parameterized plan cache"
+    );
+}
+
+/// W2.3 invariant: INSERT … RETURNING must NOT take the shared-plan path —
+/// `LogicalPlan::schema()` is EMPTY for DML even with a RETURNING clause, so
+/// routing it through the shared path would regress Describe to `NoData`. It
+/// stays on the private `derive_result_schema` path: its Describe schema keeps
+/// the RETURNING column and its `cached_plan` is left unseeded at Parse.
+#[tokio::test]
+async fn dml_returning_keeps_private_schema_path() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    db.execute("CREATE TABLE ins (id INT PRIMARY KEY, v TEXT)").expect("create");
+    let (mut handler, _client) = test_handler(db);
+    handler
+        .handle_parse_extended(
+            "dr".into(),
+            "INSERT INTO ins (id, v) VALUES ($1, $2) RETURNING id".into(),
+            vec![23, 25],
+        )
+        .await
+        .expect("parse");
+    let stmt = handler
+        .prepared_statements
+        .get_statement("dr")
+        .expect("get")
+        .expect("stmt present");
+    assert!(
+        stmt.cached_plan.is_none(),
+        "DML-RETURNING must not be seeded via the shared plan path (empty LogicalPlan::schema)"
+    );
+    let schema = stmt
+        .result_schema
+        .expect("RETURNING must still yield a result schema (RowDescription), not NoData");
+    assert_eq!(
+        schema.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+        vec!["id"],
+        "RETURNING column must survive the private fallback path"
+    );
+}
+
+/// W2.3 OID-parity contract: the Describe RowDescription derived from the
+/// SHARED plan cache must advertise the exact pg_type OIDs — crucially
+/// numeric → 1700 (the 3.58.3 regression class), plus text→25, int4→23,
+/// int8→20, varchar→1043 — and the correct column names.
+#[tokio::test]
+async fn describe_reports_pg_type_oids() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    db.execute("CREATE TABLE acct (id INT PRIMARY KEY, name TEXT, bal NUMERIC, big BIGINT, code VARCHAR(8))")
+        .expect("create");
+    let (mut handler, mut client) = test_handler(db);
+    handler
+        .handle_parse_extended(
+            "d".into(),
+            "SELECT id, name, bal, big, code FROM acct WHERE id = $1".into(),
+            vec![23],
+        )
+        .await
+        .expect("parse");
+    handler
+        .handle_describe_extended(super::messages::DescribeTarget::Statement, "d".into())
+        .await
+        .expect("describe");
+    let fields = row_description(&drain(&mut client).await);
+    assert_eq!(
+        fields,
+        vec![
+            ("id".to_string(), 23),
+            ("name".to_string(), 25),
+            ("bal".to_string(), 1700),
+            ("big".to_string(), 20),
+            ("code".to_string(), 1043),
+        ],
+        "Describe RowDescription names + pg_type OIDs (numeric MUST be 1700)"
+    );
+}
+
+/// W2.3 aggregate alias: `count(*) AS n` must Describe as one column named
+/// `n` with the int8 OID (20) — proving the shared path preserves projection
+/// aliases and aggregate result typing on the Describe metadata.
+#[tokio::test]
+async fn describe_aggregate_alias_names_and_types() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    db.execute("CREATE TABLE ev (id INT PRIMARY KEY, k TEXT)").expect("create");
+    db.execute("INSERT INTO ev VALUES (1,'a'),(2,'b'),(3,'a')").expect("insert");
+    let (mut handler, mut client) = test_handler(db);
+    handler
+        .handle_parse_extended("ag".into(), "SELECT count(*) AS n FROM ev".into(), vec![])
+        .await
+        .expect("parse");
+    handler
+        .handle_describe_extended(super::messages::DescribeTarget::Statement, "ag".into())
+        .await
+        .expect("describe");
+    let fields = row_description(&drain(&mut client).await);
+    assert_eq!(fields, vec![("n".to_string(), 20)], "count(*) AS n → int8 (OID 20) named n");
+}
+
+/// W2.3 regression (review finding): the Describe schema is now sourced from
+/// the SHARED parameterized plan cache, which is keyed by SQL TEXT. Regular
+/// (non-materialized) views are INLINED into that cached plan, so redefining a
+/// view (CREATE OR REPLACE VIEW) must invalidate the plan cache — otherwise a
+/// second Parse of the SAME `SELECT * FROM v` text Describes the STALE column
+/// set. Pre-fix `plan_invalidates_sql_caches` omitted CreateView/DropView, so
+/// the shared path served the pre-redefine one-column plan and the `name`
+/// column assertion below flips false → true with the fix. (Pre-W2.3 the
+/// private `derive_result_schema` re-planned against the live view catalog on
+/// every Parse, so this metadata was correct — W2.3 widened the hole to
+/// Describe.)
+#[tokio::test]
+async fn view_redefine_invalidates_describe_schema() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    db.execute("CREATE TABLE vt (id INT PRIMARY KEY, name TEXT)")
+        .expect("create table");
+    db.execute("CREATE VIEW vv AS SELECT id FROM vt").expect("create view");
+
+    let (mut handler, mut client) = test_handler(Arc::clone(&db));
+
+    // First Parse+Describe caches the parameterized plan for the view text.
+    handler
+        .handle_parse_extended("v1".into(), "SELECT * FROM vv".into(), vec![])
+        .await
+        .expect("parse v1");
+    handler
+        .handle_describe_extended(super::messages::DescribeTarget::Statement, "v1".into())
+        .await
+        .expect("describe v1");
+    let before = row_description(&drain(&mut client).await);
+    assert_eq!(
+        before,
+        vec![("id".to_string(), 23)],
+        "view Describe before redefine: single int4 column id"
+    );
+
+    // Redefine the SAME view name with an extra TEXT column. This must clear the
+    // shared plan cache (CreateView invalidation) so the identical SQL text
+    // re-plans against the new view shape instead of the stale cached entry.
+    db.execute("CREATE OR REPLACE VIEW vv AS SELECT id, name FROM vt")
+        .expect("replace view");
+
+    handler
+        .handle_parse_extended("v2".into(), "SELECT * FROM vv".into(), vec![])
+        .await
+        .expect("parse v2");
+    handler
+        .handle_describe_extended(super::messages::DescribeTarget::Statement, "v2".into())
+        .await
+        .expect("describe v2");
+    let after = row_description(&drain(&mut client).await);
+    assert_eq!(
+        after,
+        vec![("id".to_string(), 23), ("name".to_string(), 25)],
+        "view Describe after CREATE OR REPLACE must reflect the added TEXT column \
+         (a stale shared-plan-cache entry would still report only id)"
+    );
+}
+
+/// W2.3 regression (review finding): the same stale-Describe hole, but with the
+/// redefining DDL run over the EXTENDED protocol (Parse/Bind/Execute) — the
+/// route psycopg3 / JDBC / Npgsql use by default (e.g. Alembic migrations).
+/// That route lands in `execute_plan_with_params_inner`'s catch-all executor
+/// arm, which the first two `plan_invalidates_sql_caches` gates
+/// (`execute_internal`, `execute_in_transaction_inner`) never cover — so the
+/// `CREATE OR REPLACE VIEW` executed here left the shared `"\0params\0<sql>"`
+/// plan cache un-cleared and its epoch un-bumped, and the second Parse of the
+/// SAME `SELECT * FROM vv` text Described the STALE single-column plan. Unlike
+/// `view_redefine_invalidates_describe_schema` (which redefines via
+/// `db.execute`, i.e. the already-gated route), THIS test drives the DDL
+/// through the wire funnel, so the `name` column assertion below flips
+/// false → true only with the params-funnel gate.
+#[tokio::test]
+async fn view_redefine_via_extended_protocol_invalidates_describe_schema() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    db.execute("CREATE TABLE vt (id INT PRIMARY KEY, name TEXT)")
+        .expect("create table");
+    db.execute("CREATE VIEW vv AS SELECT id FROM vt").expect("create view");
+
+    let (mut handler, mut client) = test_handler(Arc::clone(&db));
+
+    // First Parse+Describe caches the parameterized plan for the view text.
+    handler
+        .handle_parse_extended("v1".into(), "SELECT * FROM vv".into(), vec![])
+        .await
+        .expect("parse v1");
+    handler
+        .handle_describe_extended(super::messages::DescribeTarget::Statement, "v1".into())
+        .await
+        .expect("describe v1");
+    let before = row_description(&drain(&mut client).await);
+    assert_eq!(
+        before,
+        vec![("id".to_string(), 23)],
+        "view Describe before redefine: single int4 column id"
+    );
+
+    // Redefine the SAME view via Parse/Bind/Execute — the extended-protocol
+    // DDL funnel. Without the params-path gate this executes the view change
+    // but never clears the shared plan cache.
+    handler
+        .handle_parse_extended(
+            "ddl".into(),
+            "CREATE OR REPLACE VIEW vv AS SELECT id, name FROM vt".into(),
+            vec![],
+        )
+        .await
+        .expect("parse ddl");
+    handler
+        .handle_bind_extended("ddlp".into(), "ddl".into(), vec![], vec![], vec![])
+        .await
+        .expect("bind ddl");
+    handler
+        .handle_execute_extended("ddlp".into(), 0)
+        .await
+        .expect("execute ddl");
+    let _ = drain(&mut client).await; // discard CommandComplete for the DDL
+
+    handler
+        .handle_parse_extended("v2".into(), "SELECT * FROM vv".into(), vec![])
+        .await
+        .expect("parse v2");
+    handler
+        .handle_describe_extended(super::messages::DescribeTarget::Statement, "v2".into())
+        .await
+        .expect("describe v2");
+    let after = row_description(&drain(&mut client).await);
+    assert_eq!(
+        after,
+        vec![("id".to_string(), 23), ("name".to_string(), 25)],
+        "view Describe after CREATE OR REPLACE via the extended protocol must reflect \
+         the added TEXT column (a stale shared-plan-cache entry would still report only id)"
+    );
+}

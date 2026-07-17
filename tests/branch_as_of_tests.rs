@@ -74,8 +74,8 @@ fn test_create_branch_as_of_timestamp_string() {
     let snapshot_mgr = engine.snapshot_manager();
     let snapshot_meta = snapshot_mgr.register_snapshot(100).unwrap();
 
-    // Parse the timestamp string from metadata
-    let timestamp_str = snapshot_meta.wall_clock_time;
+    // Parse the timestamp string from metadata (W2.2(b): reconstructed RFC3339)
+    let timestamp_str = snapshot_meta.wall_clock_rfc3339();
 
     // Create branch using AS OF TIMESTAMP
     let resolved = snapshot_mgr.resolve_as_of(&heliosdb_nano::sql::logical_plan::AsOfClause::Timestamp(timestamp_str));

@@ -1404,12 +1404,20 @@ where
         // waits for CopyData. (Found by Proxy live validation of 2c.)
         self.flush().await?;
 
-        // Drain CopyData frames until CopyDone / CopyFail.
-        let mut data: Vec<u8> = Vec::new();
+        // Drain CopyData frames until CopyDone / CopyFail, decoding each frame
+        // into typed rows as it arrives and dropping the raw bytes — so peak
+        // memory tracks the parsed batch, not (~4–6×) the whole stream buffered
+        // as one Vec<u8> (the pre-W2.4 OOM vector). The decoder carries the
+        // partial trailing line, the CSV quote state, and any incomplete-UTF8
+        // tail across frames, which split at arbitrary byte offsets.
+        let max_buffered_rows = self.database.copy_max_buffered_rows();
+        let max_record_bytes = self.database.copy_max_record_bytes();
+        let mut decoder =
+            super::copy::CopyStreamDecoder::new(copy.format, max_buffered_rows, max_record_bytes);
         let mut client_fail: Option<String> = None;
         loop {
             match self.read_message().await? {
-                Some(FrontendMessage::CopyData(chunk)) => data.extend_from_slice(&chunk),
+                Some(FrontendMessage::CopyData(chunk)) => decoder.push(&chunk),
                 Some(FrontendMessage::CopyDone) => break,
                 Some(FrontendMessage::CopyFail(msg)) => {
                     client_fail = Some(msg);
@@ -1436,12 +1444,33 @@ where
                 .await;
         }
 
-        // Parse rows (text or CSV) and bulk-insert.
-        let rows = if copy.format == CopyFormat::Csv {
-            super::copy::parse_csv_rows(&data)
-        } else {
-            super::copy::parse_text_rows(&data)
-        };
+        // Bounded-memory guard: either cap exceeded ⇒ abort the COPY with a clean
+        // PG-style error (program_limit_exceeded, 54000) and zero rows applied —
+        // the decoder has already released what it buffered. We still drained
+        // every frame to CopyDone above, so the wire stays in sync. Name whichever
+        // cap tripped so the operator knows which knob to raise.
+        if let Some(reason) = decoder.overflow_reason() {
+            let detail = match reason {
+                super::copy::CopyOverflow::Rows => format!(
+                    "buffered row count exceeded copy_max_buffered_rows ({max_buffered_rows})"
+                ),
+                super::copy::CopyOverflow::RecordBytes => format!(
+                    "in-progress record size exceeded copy_max_record_bytes ({max_record_bytes})"
+                ),
+            };
+            return self
+                .send_error(
+                    "ERROR",
+                    "54000",
+                    &format!("COPY aborted: {detail}; no rows inserted"),
+                    None,
+                    None,
+                )
+                .await;
+        }
+
+        // Flush the decoder into the typed row batch and bulk-insert.
+        let rows = decoder.finish();
         let total = rows.len();
 
         // R-B1: typed fast path — apply the whole COPY as one atomic batch
