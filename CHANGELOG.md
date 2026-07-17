@@ -5,6 +5,45 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.3.0] - 2026-07-17
+
+Wave 3 (design-first) of the 2026-07 perf & stability campaign, the July
+compat round 2, and a supply-chain hardening pass:
+
+- **Typed write-conflict errors** — same-row write conflicts now surface as a
+  typed `WriteConflict` error carrying table/row/holder context and map to
+  SQLSTATE **40001** (`serialization_failure`) on the wire (previously a
+  generic 25000), so PostgreSQL drivers' retry machinery engages. Timeout and
+  locking behavior are unchanged.
+- **Performance attribution instrumentation** (all zero-cost when disabled):
+  lock-contention census behind the new `lock-census` cargo feature +
+  `[performance] lock_census` knob (`heliosdb_lock_census` system view);
+  per-statement-class write-volume byte accounting (`[performance]
+  write_volume_stats` → `heliosdb_write_volume`); COPY wall-time phase
+  breakdown (`[performance] copy_phase_stats` → `heliosdb_copy_phase_stats`).
+  Measured verdicts and next-step designs live in
+  `docs/plans/PERF_STABILITY_2026_07/W3_*_DESIGN.md` (notable: the version
+  chain is 65% of single-INSERT byte volume; CHECK evaluation is 35% of
+  constrained-COPY time; the c≥32 wire plateau is not mutex-blocking).
+- **Compatibility round 2** (12 fixes + 1 hardening): `CREATE/DROP DOMAIN`
+  no-op intercepts, `CREATE TABLE … INHERITS` clause stripping, and other
+  pg-dialect gaps; `catch_unwind` isolation extended to the extended-protocol
+  DML-RETURNING path (an erroring `UPDATE … RETURNING` no longer kills the
+  connection).
+- **Supply chain**: the openssl stack is fully out of the default dependency
+  graph (`reqwest`/`oauth2` moved to rustls with the system trust store) —
+  this also unblocks manylinux Python-wheel builds; the `cargo deny` gate was
+  repaired (config had rotted unparseable) and now enforces hard bans on
+  openssl/native-tls, an explicit license allowlist, and remediated
+  advisories (aws-lc-rs 1.17, bytes 1.12.1, rustls-webpki 0.103.13,
+  tokio-postgres 0.7.18, rand 0.8.7, time 0.3.53, crossbeam-epoch 0.9.20).
+- **Python wheel**: `heliosdb-nano-embedded` (abi3, manylinux_2_28) now builds
+  in CI and publishes to PyPI via the `py-v*` tag lifecycle.
+- The CI perf-gate baseline (`benches/public/ci_baseline.json`) was
+  regenerated post-W1/W2 — the previous 2026-06-11 baseline sat 1.9–3.9×
+  below current throughput, leaving the 2.5× cliff-catcher unable to catch
+  anything.
+
 ## [4.2.0] - 2026-07-17
 
 Waves 1–2 of the 2026-07 performance & stability campaign
