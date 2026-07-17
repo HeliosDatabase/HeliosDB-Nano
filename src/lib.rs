@@ -323,7 +323,7 @@ pub mod config;
 mod embedded_db_dump;
 
 // Re-exports
-pub use config::{Config, KeySource, ProfileConfig, ZkeEncryptionConfig, ZkeMode};
+pub use config::{Config, KeySource, ProfileConfig, SnapshotSchemaEvolution, ZkeEncryptionConfig, ZkeMode};
 pub use crypto::{
     NonceTracker, TimestampValidator, ZeroKnowledgeSession, ZkeConfig, ZkeDerivedKeys, ZkeKeyDerivation,
     ZkeRequestContext,
@@ -549,6 +549,15 @@ impl Drop for EmbeddedDatabase {
             tracing::debug!("skipping index snapshot checkpoint: transaction still open at drop");
         }
 
+        // Persist row counters at clean shutdown. The fast INSERT path only
+        // re-persists the durable `counter:{table}` every 64 rows and (in
+        // relaxed WAL mode) logs no counter to the logical WAL, so a table with
+        // fewer than 64 inserts would otherwise reopen with a stale counter and
+        // hand the next insert an already-used row id, overwriting a live row.
+        if let Err(e) = self.storage.flush_all_row_counters() {
+            tracing::warn!("row counter flush at close failed: {}", e);
+        }
+
         // Signal the auto-refresh worker to stop (non-blocking)
         if let Some(ref worker) = *self.auto_refresh_worker.read() {
             worker.request_stop();
@@ -688,6 +697,73 @@ struct FastLiteralDeleteSpec {
     schema: std::sync::Arc<Schema>,
     pk_data_type: DataType,
     pk_only_delete: bool,
+}
+
+/// W3.4: one CHECK constraint compiled ONCE for a bulk load — the parsed +
+/// column-bound expression, plus the identity fields the per-row error path
+/// needs verbatim.
+struct CompiledCheck {
+    /// Constraint name (for the violation message).
+    name: String,
+    /// Owning table (for the violation message).
+    table_name: String,
+    /// Original expression text (for the "did not evaluate to boolean"
+    /// message, which the per-row `evaluate_check_constraint` emits verbatim).
+    expression: String,
+    /// Parsed once and column-bound once (`Evaluator::bind`): the common
+    /// `col op literal` / `col op col` / AND-OR shapes become `BoundColumn`
+    /// direct tuple access; anything bind can't resolve stays a by-name node
+    /// evaluated by the same generic evaluator.
+    expr: sql::LogicalExpr,
+}
+
+/// W3.4: a table's CHECK constraints compiled ONCE per bulk COPY/INSERT so the
+/// per-row hot path is a bound-expression `evaluate()` (a few ns) instead of a
+/// full SQL parse + plan + evaluator build + tuple clone per row (~885ns/row
+/// measured for a trivial `qty >= 0` through the generic per-row path).
+///
+/// The single shared [`sql::Evaluator`] carries the schema `Arc`; `evaluate`
+/// takes `&self`, so reuse across rows is sound. Semantics — including SQL
+/// three-valued logic where a NULL/UNKNOWN CHECK PASSES — are IDENTICAL to
+/// [`EmbeddedDatabase::validate_check_constraints`] by construction: this
+/// reuses the exact same `evaluate()` and the exact same result→bool mapping,
+/// only hoisting the per-row parse/plan/bind/build out of the loop.
+struct CompiledCheckConstraints {
+    evaluator: sql::Evaluator,
+    checks: Vec<CompiledCheck>,
+}
+
+impl CompiledCheckConstraints {
+    /// True when there is nothing to evaluate (no CHECK constraints).
+    fn is_empty(&self) -> bool {
+        self.checks.is_empty()
+    }
+
+    /// Validate one already-materialized row. Byte-for-byte the same errors as
+    /// the per-row `validate_check_constraints` / `evaluate_check_constraint`.
+    fn validate(&self, tuple: &Tuple) -> Result<()> {
+        for check in &self.checks {
+            let result = self.evaluator.evaluate(&check.expr, tuple)?;
+            let passed = match result {
+                Value::Boolean(b) => b,
+                // SQL three-valued logic: a NULL/UNKNOWN CHECK PASSES (PG).
+                Value::Null => true,
+                _ => {
+                    return Err(Error::constraint_violation(format!(
+                        "CHECK constraint expression '{}' did not evaluate to boolean",
+                        check.expression
+                    )))
+                }
+            };
+            if !passed {
+                return Err(Error::constraint_violation(format!(
+                    "new row violates CHECK constraint '{}' on table '{}'",
+                    check.name, check.table_name
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 struct FastSelectSpec {
@@ -2719,6 +2795,23 @@ impl EmbeddedDatabase {
                 returning,
                 on_conflict,
             } => {
+                // W3.2: this buffered arm stages rows into `txn`; their durable
+                // bytes are written by the enclosing autocommit COMMIT
+                // (`execute_with_implicit_transaction`, which took a census
+                // checkpoint spanning it). Upgrade the class from the `Other`
+                // default so those bytes attribute to `insert_multi` (multi-row
+                // VALUES) / `insert_single`. Only on the autocommit-implicit path
+                // (`!skip_fast_paths`): explicit/session transactions commit
+                // outside any scope and must stay `other` (W3_2_DESIGN §2.3
+                // note 1). `if_other` leaves an enclosing `Copy` scope intact so
+                // a COPY generic-path fallback chunk keeps attributing to `copy`.
+                if !skip_fast_paths {
+                    write_volume::set_current_class_if_other(if values.len() > 1 {
+                        write_volume::StmtClass::InsertMulti
+                    } else {
+                        write_volume::StmtClass::InsertSingle
+                    });
+                }
                 let catalog = self.storage.catalog();
                 let schema = catalog.get_table_schema(table_name)?;
                 let evaluator = sql::Evaluator::new(std::sync::Arc::new(Schema { columns: vec![] }));
@@ -5255,7 +5348,9 @@ impl EmbeddedDatabase {
         ));
 
         let session_manager = std::sync::Arc::new(crate::session::SessionManager::new());
-        let lock_manager = std::sync::Arc::new(storage::LockManager::with_default_timeout());
+        // W3.3: wire the `[locks]` spin timeout AND statement-retry policy from
+        // config (env `NANO_LOCK_TIMEOUT_MS` still overrides the timeout).
+        let lock_manager = std::sync::Arc::new(storage::LockManager::from_lock_config(&config.locks));
         let dirty_tracker = std::sync::Arc::new(storage::DirtyTracker::new());
 
         // Re-register and re-populate ART indexes from on-disk state. Without
@@ -5362,7 +5457,9 @@ impl EmbeddedDatabase {
             std::sync::Arc::new(storage::DumpManager::new(dump_path, storage::DumpCompressionType::Zstd));
 
         let session_manager = std::sync::Arc::new(crate::session::SessionManager::new());
-        let lock_manager = std::sync::Arc::new(storage::LockManager::with_default_timeout());
+        // W3.3: wire the `[locks]` spin timeout AND statement-retry policy from
+        // config (env `NANO_LOCK_TIMEOUT_MS` still overrides the timeout).
+        let lock_manager = std::sync::Arc::new(storage::LockManager::from_lock_config(&config.locks));
         let dirty_tracker = std::sync::Arc::new(storage::DirtyTracker::new());
 
         // Install the durable sequence persistence handle (mirrors `new` /
@@ -5471,7 +5568,9 @@ impl EmbeddedDatabase {
             std::sync::Arc::new(storage::DumpManager::new(dump_path, storage::DumpCompressionType::Zstd));
 
         let session_manager = std::sync::Arc::new(crate::session::SessionManager::new());
-        let lock_manager = std::sync::Arc::new(storage::LockManager::with_default_timeout());
+        // W3.3: wire the `[locks]` spin timeout AND statement-retry policy from
+        // config (env `NANO_LOCK_TIMEOUT_MS` still overrides the timeout).
+        let lock_manager = std::sync::Arc::new(storage::LockManager::from_lock_config(&config.locks));
         let dirty_tracker = std::sync::Arc::new(storage::DirtyTracker::new());
 
         // For persistent storage, replay existing rows through the ART so a
@@ -6721,13 +6820,23 @@ impl EmbeddedDatabase {
 
         // W2.1: CHECK validation on the decoded (pre-PK-fill) tuples, exactly
         // as the slow path evaluates `final_values_vec` before the SERIAL/PK
-        // auto-fill (lib.rs `Insert` arm), reusing `validate_check_constraints`.
+        // auto-fill (lib.rs `Insert` arm). W3.4: compile the CHECK expression(s)
+        // ONCE (parse + plan + column-bind hoisted out of the per-row loop),
+        // then evaluate the bound form per row against the tuple directly (no
+        // per-row Tuple clone) — semantics byte-identical to
+        // `validate_check_constraints`, including SQL three-valued logic.
         if let Some(constraints) = spec.constraints.as_deref() {
             if !constraints.check_constraints.is_empty() {
                 let _cps = copy_phase_stats::time(copy_phase_stats::Phase::CheckConstraint, tuples.len() as u64);
-                for tuple in &tuples {
-                    if let Err(e) = self.validate_check_constraints(constraints, &spec.schema, &tuple.values) {
-                        return Some(Err(e));
+                let compiled = match self.compile_check_constraints(constraints, &spec.schema) {
+                    Ok(compiled) => compiled,
+                    Err(e) => return Some(Err(e)),
+                };
+                if !compiled.is_empty() {
+                    for tuple in &tuples {
+                        if let Err(e) = compiled.validate(tuple) {
+                            return Some(Err(e));
+                        }
                     }
                 }
             }
@@ -8345,6 +8454,17 @@ impl EmbeddedDatabase {
 
     /// Execute SQL with an implicit transaction (auto-commit)
     fn execute_with_implicit_transaction(&self, sql: &str) -> Result<u64> {
+        // W3.2: this wrapper owns the begin→stage→commit unit for autocommit
+        // statements that fell out of every fast path (notably a literal
+        // multi-row `INSERT … VALUES`, whose durable bytes land at the
+        // `txn.commit()` below — not in the staging plan arm). Checkpoint the
+        // ambient census class across that commit so the generic INSERT arm can
+        // attribute those bytes to `insert_multi`/`insert_single`
+        // (`write_volume::set_current_class_if_other`), restoring the ambient
+        // class afterwards. Explicit `BEGIN … COMMIT` never reaches here, so its
+        // COMMIT stays `other` (W3_2_DESIGN §2.3 note 1). Inert when the census
+        // is disabled.
+        let _wv = write_volume::checkpoint();
         // Begin implicit transaction
         let txn_start = std::time::Instant::now();
         let txn = self.storage.begin_autocommit_transaction()?;
@@ -14952,6 +15072,12 @@ impl EmbeddedDatabase {
         self.session_transactions.contains_key(&session_id)
     }
 
+    /// W3.3 autocommit statement-retry policy (from `[locks]` config). Read by
+    /// the wire handler to decide whether to retry a same-row `WriteConflict`.
+    pub(crate) fn statement_retry_policy(&self) -> storage::StatementRetryPolicy {
+        self.lock_manager.statement_retry_policy()
+    }
+
     /// Create a session for a wire-protocol connection (one per connection).
     ///
     /// Skips the per-user `max_sessions` quota — wire connection counts are
@@ -17085,15 +17211,38 @@ impl EmbeddedDatabase {
         // Create a tuple from the values for evaluation
         let tuple = Tuple::new(values.to_vec());
 
+        let logical_expr = self.parse_check_expression(expression, schema)?;
+
+        // Evaluate the expression against the tuple
+        let evaluator = sql::Evaluator::new(std::sync::Arc::new(schema.clone()));
+        let result = evaluator.evaluate(&logical_expr, &tuple)?;
+
+        // CHECK constraint passes if result is true (or not explicitly false)
+        match result {
+            Value::Boolean(b) => Ok(b),
+            Value::Null => Ok(true), // NULL is treated as "unknown", typically passes
+            _ => Err(Error::constraint_violation(format!(
+                "CHECK constraint expression '{}' did not evaluate to boolean",
+                expression
+            ))),
+        }
+    }
+
+    /// Parse a stored CHECK expression into a `LogicalExpr`. Extracted from
+    /// `evaluate_check_constraint` so the bulk COPY path can compile the
+    /// expression ONCE per statement (see `compile_check_constraints`) while
+    /// the per-row slow path keeps calling it unchanged — identical parsing on
+    /// both paths by construction.
+    fn parse_check_expression(&self, expression: &str, schema: &Schema) -> Result<sql::LogicalExpr> {
         // First, try to deserialize as JSON (LogicalExpr was serialized with serde_json)
-        let logical_expr = if expression.starts_with('{') || expression.starts_with('[') {
+        if expression.starts_with('{') || expression.starts_with('[') {
             // Looks like JSON, try to deserialize as LogicalExpr
             serde_json::from_str::<sql::LogicalExpr>(expression).map_err(|e| {
                 Error::query_execution(format!(
                     "Failed to deserialize CHECK constraint expression '{}': {}",
                     expression, e
                 ))
-            })?
+            })
         } else {
             // Treat as SQL expression - parse it
             use sqlparser::dialect::PostgreSqlDialect;
@@ -17141,22 +17290,38 @@ impl EmbeddedDatabase {
             let planner = sql::Planner::with_catalog(&catalog);
 
             // Convert SQL Expr to LogicalExpr
-            planner.convert_expr_to_logical(&selection, Some(schema))?
-        };
-
-        // Evaluate the expression against the tuple
-        let evaluator = sql::Evaluator::new(std::sync::Arc::new(schema.clone()));
-        let result = evaluator.evaluate(&logical_expr, &tuple)?;
-
-        // CHECK constraint passes if result is true (or not explicitly false)
-        match result {
-            Value::Boolean(b) => Ok(b),
-            Value::Null => Ok(true), // NULL is treated as "unknown", typically passes
-            _ => Err(Error::constraint_violation(format!(
-                "CHECK constraint expression '{}' did not evaluate to boolean",
-                expression
-            ))),
+            planner.convert_expr_to_logical(&selection, Some(schema))
         }
+    }
+
+    /// W3.4: compile a table's CHECK constraints ONCE for a bulk load. Each
+    /// expression is parsed once and column-bound once (`Evaluator::bind`), so
+    /// the per-row hot path is a bound-expression `evaluate()` rather than a
+    /// full parse + plan + evaluator build + tuple clone per row. Semantics are
+    /// identical to `validate_check_constraints` — same `evaluate()`, same
+    /// result→bool mapping — see [`CompiledCheckConstraints`].
+    fn compile_check_constraints(
+        &self,
+        table_constraints: &sql::TableConstraints,
+        schema: &Schema,
+    ) -> Result<CompiledCheckConstraints> {
+        let evaluator = sql::Evaluator::new(std::sync::Arc::new(schema.clone()));
+        let mut checks = Vec::with_capacity(table_constraints.check_constraints.len());
+        for check in &table_constraints.check_constraints {
+            let expr = self.parse_check_expression(&check.expression, schema)?;
+            // Resolve column references to positional indices ONCE (the common
+            // `col op literal` / `col op col` / AND-OR shapes become
+            // `BoundColumn`; unresolvable nodes stay by-name → same generic
+            // per-row behavior and error).
+            let bound = evaluator.bind(expr);
+            checks.push(CompiledCheck {
+                name: check.name.clone(),
+                table_name: check.table_name.clone(),
+                expression: check.expression.clone(),
+                expr: bound,
+            });
+        }
+        Ok(CompiledCheckConstraints { evaluator, checks })
     }
 
     /// Check if any rows in the referencing table reference the given values
@@ -29277,6 +29442,107 @@ mod tests {
             .expect("fast path taken")
             .unwrap();
         assert_eq!(n, 2);
+    }
+
+    // W3.4 CHECK batching: the compiled COPY path (compile once + evaluate the
+    // bound expression per row) MUST agree with the generic per-row INSERT
+    // evaluator on every row — same accept/reject, same error text — including
+    // SQL three-valued logic where a NULL/UNKNOWN CHECK PASSES (PG semantics).
+    #[test]
+    fn copy_bulk_insert_check_three_valued_logic_matches_slow_path() {
+        struct Case {
+            ddl: &'static str,
+            insert_values: &'static str,
+            copy_row: &'static [Option<&'static str>],
+        }
+        let cases = [
+            // a > 0, a = NULL → UNKNOWN → PASS
+            Case {
+                ddl: "CREATE TABLE t (id INT PRIMARY KEY, a INT, CHECK (a > 0))",
+                insert_values: "(1, NULL)",
+                copy_row: &[Some("1"), None],
+            },
+            // a > 0, a = -3 → FALSE → REJECT
+            Case {
+                ddl: "CREATE TABLE t (id INT PRIMARY KEY, a INT, CHECK (a > 0))",
+                insert_values: "(1, -3)",
+                copy_row: &[Some("1"), Some("-3")],
+            },
+            // NOT (a < 0), a = NULL → NOT UNKNOWN = UNKNOWN → PASS
+            Case {
+                ddl: "CREATE TABLE t (id INT PRIMARY KEY, a INT, CHECK (NOT (a < 0)))",
+                insert_values: "(1, NULL)",
+                copy_row: &[Some("1"), None],
+            },
+            // NOT (a < 0), a = -5 → NOT TRUE = FALSE → REJECT
+            Case {
+                ddl: "CREATE TABLE t (id INT PRIMARY KEY, a INT, CHECK (NOT (a < 0)))",
+                insert_values: "(1, -5)",
+                copy_row: &[Some("1"), Some("-5")],
+            },
+            // a > 0 AND b > 0, a=1 b=NULL → TRUE AND UNKNOWN = UNKNOWN → PASS
+            Case {
+                ddl: "CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT, CHECK (a > 0 AND b > 0))",
+                insert_values: "(1, 1, NULL)",
+                copy_row: &[Some("1"), Some("1"), None],
+            },
+            // a > 0 AND b > 0, a=-1 b=NULL → FALSE AND UNKNOWN = FALSE → REJECT
+            Case {
+                ddl: "CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT, CHECK (a > 0 AND b > 0))",
+                insert_values: "(1, -1, NULL)",
+                copy_row: &[Some("1"), Some("-1"), None],
+            },
+            // a > 0 OR b > 0, a=NULL b=NULL → UNKNOWN OR UNKNOWN = UNKNOWN → PASS
+            Case {
+                ddl: "CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT, CHECK (a > 0 OR b > 0))",
+                insert_values: "(1, NULL, NULL)",
+                copy_row: &[Some("1"), None, None],
+            },
+            // a > 0 OR b > 0, a=-1 b=NULL → FALSE OR UNKNOWN = UNKNOWN → PASS
+            Case {
+                ddl: "CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT, CHECK (a > 0 OR b > 0))",
+                insert_values: "(1, -1, NULL)",
+                copy_row: &[Some("1"), Some("-1"), None],
+            },
+            // a > 0 OR b > 0, a=-1 b=-1 → FALSE OR FALSE = FALSE → REJECT
+            Case {
+                ddl: "CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT, CHECK (a > 0 OR b > 0))",
+                insert_values: "(1, -1, -1)",
+                copy_row: &[Some("1"), Some("-1"), Some("-1")],
+            },
+        ];
+
+        for (i, case) in cases.iter().enumerate() {
+            // Generic per-row path (INSERT → validate_check_constraints).
+            let slow_db = EmbeddedDatabase::new_in_memory().unwrap();
+            slow_db.execute(case.ddl).unwrap();
+            let slow = slow_db.execute(&format!("INSERT INTO t VALUES {}", case.insert_values));
+
+            // W3.4 compiled COPY path.
+            let fast_db = EmbeddedDatabase::new_in_memory().unwrap();
+            fast_db.execute(case.ddl).unwrap();
+            let rows = copy_rows(&[case.copy_row]);
+            let fast = fast_db.copy_bulk_insert("t", &[], &rows).expect("COPY fast path taken");
+
+            match (&slow, &fast) {
+                (Ok(_), Ok(_)) => {
+                    let s = slow_db.query("SELECT count(*) FROM t", &[]).unwrap();
+                    let f = fast_db.query("SELECT count(*) FROM t", &[]).unwrap();
+                    assert_eq!(s[0].values[0], Value::Int8(1), "case {i}: slow accepted count");
+                    assert_eq!(f[0].values[0], Value::Int8(1), "case {i}: fast accepted count");
+                }
+                (Err(se), Err(fe)) => {
+                    assert_eq!(fe.to_string(), se.to_string(), "case {i}: CHECK error text must match");
+                    let f = fast_db.query("SELECT count(*) FROM t", &[]).unwrap();
+                    assert_eq!(f[0].values[0], Value::Int8(0), "case {i}: COPY atomic on reject");
+                }
+                _ => panic!(
+                    "case {i}: paths disagree — slow_ok={} fast_ok={}",
+                    slow.is_ok(),
+                    fast.is_ok()
+                ),
+            }
+        }
     }
 
     #[test]

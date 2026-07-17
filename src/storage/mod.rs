@@ -82,7 +82,7 @@ pub(crate) use engine::{ColumnarAggregateOp, ColumnarAggregateSpec};
 pub use engine::{DirectBulkLoadResult, StorageEngine, StorageStats, SynchronousCommitOverrideGuard, TableKind};
 pub use gin_index::{GinIndex, GinIndexStats};
 pub use index_snapshot::{IndexOpenReport, IndexSnapshotPersistReport};
-pub use lock_manager::{LockGuard, LockManager, LockState, LockType};
+pub use lock_manager::{LockGuard, LockManager, LockState, LockType, StatementRetryPolicy};
 pub use materialized_view::{MaterializedViewCatalog, MaterializedViewMetadata};
 pub use mv_auto_refresh::{AutoRefreshConfig, AutoRefreshWorker};
 pub use mv_delta::{

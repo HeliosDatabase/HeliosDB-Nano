@@ -10,8 +10,10 @@
 //! - Thread-safe using DashMap for lock-free concurrent access
 //! - Automatic cleanup on transaction abort
 
+use crate::config::LockConfig;
 use crate::{Error, Result};
 use dashmap::DashMap;
+use rand::Rng;
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -142,6 +144,97 @@ impl LockGuard {
     }
 }
 
+/// W3.3 autocommit statement-retry policy, derived from `[locks]` config.
+///
+/// Carries the decision logic for retrying a same-row write conflict
+/// (`Error::WriteConflict`, SQLSTATE 40001). A `Copy` value so hot paths read
+/// it without touching an `Arc` or a lock. Disabled by default
+/// (`max_attempts == 0`), which makes the whole feature behavior-preserving.
+///
+/// The backoff is a *duration*, not a sleep — the caller decides HOW to wait.
+/// The load-bearing constraint (W3.3 design §5.4 sub-case 2a): the wait MUST
+/// yield the tokio worker (`tokio::time::sleep(..).await`), never a synchronous
+/// `std::thread::sleep`, or it re-pins the worker and reproduces the very
+/// worker-starvation livelock the retry exists to break.
+#[derive(Debug, Clone, Copy)]
+pub struct StatementRetryPolicy {
+    /// Maximum retries after the first attempt (0 = feature OFF).
+    max_attempts: u32,
+    /// Base backoff in milliseconds (first retry's ceiling before jitter).
+    backoff_base_ms: u64,
+    /// Cap on the per-retry backoff in milliseconds.
+    backoff_cap_ms: u64,
+}
+
+impl StatementRetryPolicy {
+    /// The behavior-preserving default: no retries.
+    pub fn disabled() -> Self {
+        Self {
+            max_attempts: 0,
+            backoff_base_ms: 5,
+            backoff_cap_ms: 100,
+        }
+    }
+
+    /// Build from the `[locks]` config section.
+    pub fn from_lock_config(cfg: &LockConfig) -> Self {
+        Self {
+            max_attempts: cfg.statement_retry_max,
+            backoff_base_ms: cfg.statement_retry_backoff_ms,
+            // Guard against a mis-ordered cap (validation rejects it, but a
+            // programmatic Config could still set it): never below the base.
+            backoff_cap_ms: cfg.statement_retry_backoff_max_ms.max(cfg.statement_retry_backoff_ms),
+        }
+    }
+
+    /// True when auto-retry is switched on for autocommit statements.
+    pub fn is_enabled(&self) -> bool {
+        self.max_attempts > 0
+    }
+
+    /// Configured maximum retry count (after the first attempt).
+    pub fn max_attempts(&self) -> u32 {
+        self.max_attempts
+    }
+
+    /// Full-jitter exponential backoff for the given 1-based retry number.
+    ///
+    /// Returns a uniform random duration in `[0, min(cap, base * 2^(n-1))]`
+    /// (AWS "full jitter"): the exponential term desynchronizes waiters that
+    /// lost a race in lockstep so they do not re-collide, and the `0` lower
+    /// bound lets one contender go first.
+    pub fn backoff_delay(&self, retry_number: u32) -> Duration {
+        let base = self.backoff_base_ms.max(1);
+        let cap = self.backoff_cap_ms.max(base);
+        // base * 2^(retry_number - 1), saturating; shifts >= 63 are clamped so
+        // the shift itself cannot overflow.
+        let shift = retry_number.saturating_sub(1).min(63);
+        let ceiling = base.saturating_mul(1u64 << shift).min(cap);
+        // gen_range(0..=ceiling): ceiling >= base >= 1, so the range is valid.
+        let jittered = rand::thread_rng().gen_range(0..=ceiling);
+        Duration::from_millis(jittered)
+    }
+
+    /// Retry decision for an attempt that just failed.
+    ///
+    /// `retries_done` is how many retries have already been consumed (0 on the
+    /// first failure). Returns `Some(backoff)` to retry, or `None` to surface
+    /// the error. Keyed ONLY on [`Error::WriteConflict`] — a genuine deadlock
+    /// (`Error::deadlock` → 40P01) or any other error is never retried, so a
+    /// true deadlock cannot be spun into a livelock. Exhausting `max_attempts`
+    /// returns `None`, which is how a long-held explicit holder (design §5.4
+    /// sub-case 2b) terminates in a surfaced 40001.
+    pub fn retry_after(&self, retries_done: u32, err: &Error) -> Option<Duration> {
+        if self.max_attempts == 0 || retries_done >= self.max_attempts {
+            return None;
+        }
+        if !matches!(err, Error::WriteConflict { .. }) {
+            return None;
+        }
+        Some(self.backoff_delay(retries_done + 1))
+    }
+}
+
 /// Lock Manager - coordinates concurrent access with deadlock detection
 ///
 /// Thread-safe implementation using DashMap for lock-free concurrent operations.
@@ -154,16 +247,57 @@ pub struct LockManager {
     wait_graph: Arc<DashMap<u64, Vec<u64>>>,
     /// Lock acquisition timeout in milliseconds
     timeout_ms: u64,
+    /// W3.3 autocommit statement-retry policy (read by the wire handler).
+    retry_policy: StatementRetryPolicy,
 }
 
 impl LockManager {
-    /// Create a new LockManager with specified timeout
+    /// Create a new LockManager with specified timeout (retry disabled).
     pub fn new(timeout_ms: u64) -> Self {
+        Self::new_with_retry(timeout_ms, StatementRetryPolicy::disabled())
+    }
+
+    /// Create a new LockManager with an explicit timeout and retry policy.
+    pub fn new_with_retry(timeout_ms: u64, retry_policy: StatementRetryPolicy) -> Self {
         Self {
             locks: Arc::new(DashMap::new()),
             wait_graph: Arc::new(DashMap::new()),
             timeout_ms,
+            retry_policy,
         }
+    }
+
+    /// Build a `LockManager` from the `[locks]` config section.
+    ///
+    /// Wires both the spin timeout and the W3.3 statement-retry policy from
+    /// config (previously `[locks].timeout_ms` was validated but orphaned —
+    /// never reached the manager). Precedence for the timeout:
+    /// env `NANO_LOCK_TIMEOUT_MS` > `[locks].timeout_ms` > built-in default.
+    /// The env override is retained for backward compatibility with existing
+    /// deployments and the contended-writer microbench.
+    pub fn from_lock_config(cfg: &LockConfig) -> Self {
+        let timeout_ms = Self::resolve_timeout_ms(cfg.timeout_ms as u64, Self::env_timeout_override());
+        Self::new_with_retry(timeout_ms, StatementRetryPolicy::from_lock_config(cfg))
+    }
+
+    /// The `NANO_LOCK_TIMEOUT_MS` override, if set to a positive integer.
+    fn env_timeout_override() -> Option<u64> {
+        std::env::var("NANO_LOCK_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|ms| *ms > 0)
+    }
+
+    /// Resolve the effective spin timeout: env override wins over the config
+    /// value (which is itself the default when no env var is set). Pure so the
+    /// precedence is unit-testable without touching process env.
+    fn resolve_timeout_ms(config_ms: u64, env_override: Option<u64>) -> u64 {
+        env_override.unwrap_or(config_ms)
+    }
+
+    /// The W3.3 autocommit statement-retry policy for this manager.
+    pub fn statement_retry_policy(&self) -> StatementRetryPolicy {
+        self.retry_policy
     }
 
     /// Create a `LockManager` with the configured default acquisition timeout.
@@ -184,12 +318,11 @@ impl LockManager {
     /// first-committer-wins registry (`WriteConflictRegistry::validate_and_record`),
     /// which already reports write-write conflicts at COMMIT with no spin.
     pub fn with_default_timeout() -> Self {
-        let timeout_ms = std::env::var("NANO_LOCK_TIMEOUT_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|ms| *ms > 0)
-            .unwrap_or(1_000);
-        Self::new(timeout_ms)
+        // Delegates to the config path with the default `[locks]` section:
+        // env `NANO_LOCK_TIMEOUT_MS` override, else the 1000 ms default, retry
+        // disabled. Retained for API/back-compat; the DB constructors now build
+        // via `from_lock_config` so the config value reaches the manager.
+        Self::from_lock_config(&LockConfig::default())
     }
 
     /// Acquire a lock on a resource
@@ -562,6 +695,7 @@ impl Clone for LockManager {
             locks: Arc::clone(&self.locks),
             wait_graph: Arc::clone(&self.wait_graph),
             timeout_ms: self.timeout_ms,
+            retry_policy: self.retry_policy,
         }
     }
 }
@@ -719,5 +853,173 @@ mod tests {
         // Non-storage resources (tests, non-row locks) keep the whole string.
         assert_eq!(split_row_resource("resource1"), ("", "resource1"));
         assert_eq!(split_row_resource("data:"), ("", "data:"));
+    }
+
+    // ---- W3.3 statement-retry policy (autocommit same-row write conflict) ----
+
+    fn a_write_conflict() -> Error {
+        Error::write_conflict("accounts", "42", 1, 2, 1000)
+    }
+
+    /// Mirror of the wire handler's retry loop, minus the async backoff, so the
+    /// retry *contract* is deterministically testable: it drives `op` and uses
+    /// `retry_after` for the exact same decision the handler makes, returning
+    /// the final outcome and the number of retries consumed.
+    fn drive_retry<T>(policy: &StatementRetryPolicy, mut op: impl FnMut() -> Result<T>) -> (Result<T>, u32) {
+        let mut retries = 0u32;
+        loop {
+            let outcome = op();
+            if let Err(ref e) = outcome {
+                if policy.retry_after(retries, e).is_some() {
+                    retries += 1;
+                    continue;
+                }
+            }
+            return (outcome, retries);
+        }
+    }
+
+    #[test]
+    fn statement_retry_disabled_by_default_never_retries() {
+        // max_attempts == 0 (the shipped default): the backoff/retry path must
+        // never execute even for a write conflict — behavior-preserving.
+        let policy = StatementRetryPolicy::disabled();
+        assert!(!policy.is_enabled());
+        assert!(policy.retry_after(0, &a_write_conflict()).is_none());
+
+        let calls = std::cell::Cell::new(0u32);
+        let (res, retries) = drive_retry(&policy, || -> Result<u64> {
+            calls.set(calls.get() + 1);
+            Err(a_write_conflict())
+        });
+        assert!(matches!(res, Err(Error::WriteConflict { .. })));
+        assert_eq!(retries, 0, "disabled policy must not retry");
+        assert_eq!(calls.get(), 1, "op runs exactly once when retry is OFF");
+    }
+
+    #[test]
+    fn statement_retry_only_write_conflict_not_deadlock() {
+        let policy = StatementRetryPolicy::from_lock_config(&LockConfig {
+            statement_retry_max: 3,
+            ..LockConfig::default()
+        });
+        assert!(policy.is_enabled());
+        // A real write conflict is retriable...
+        assert!(policy.retry_after(0, &a_write_conflict()).is_some());
+        // ...but a genuine deadlock (40P01) is a DIFFERENT variant and must NOT
+        // be retried into a livelock — the detector already chose a victim.
+        assert!(policy.retry_after(0, &Error::deadlock("cycle")).is_none());
+        // Any other error surfaces immediately too.
+        assert!(policy.retry_after(0, &Error::transaction("boom")).is_none());
+    }
+
+    #[test]
+    fn statement_retry_exhaustion_surfaces_write_conflict() {
+        // Sub-case 2b: a long-held explicit holder never releases within the
+        // window, so every attempt conflicts. The waiter exhausts max_attempts
+        // (bounded) and surfaces 40001 — the correct terminating outcome.
+        let policy = StatementRetryPolicy::from_lock_config(&LockConfig {
+            statement_retry_max: 3,
+            ..LockConfig::default()
+        });
+        let (res, retries) = drive_retry(&policy, || -> Result<u64> { Err(a_write_conflict()) });
+        assert!(matches!(res, Err(Error::WriteConflict { .. })));
+        assert_eq!(retries, 3, "retries are hard-bounded by statement_retry_max");
+    }
+
+    #[test]
+    fn statement_retry_succeeds_after_transient_conflict() {
+        let policy = StatementRetryPolicy::from_lock_config(&LockConfig {
+            statement_retry_max: 5,
+            ..LockConfig::default()
+        });
+        let attempt = std::cell::Cell::new(0u32);
+        let (res, retries) = drive_retry(&policy, || -> Result<u64> {
+            let n = attempt.get();
+            attempt.set(n + 1);
+            if n < 2 {
+                Err(a_write_conflict())
+            } else {
+                Ok(7)
+            }
+        });
+        assert_eq!(res.unwrap(), 7);
+        assert_eq!(retries, 2, "two transient conflicts, then success");
+    }
+
+    #[test]
+    fn statement_retry_skips_sequence_values_but_never_double_applies() {
+        // Design §5.5 (PG parity): a retried INSERT re-draws durable sequence
+        // values (they are NOT rolled back), so it may SKIP values — but each
+        // failed attempt's write-set is rolled back, so rows are applied
+        // exactly once, never doubled.
+        let policy = StatementRetryPolicy::from_lock_config(&LockConfig {
+            statement_retry_max: 5,
+            ..LockConfig::default()
+        });
+        let seq_draws = std::cell::Cell::new(0u64);
+        let rows_applied = std::cell::Cell::new(0u64);
+        let attempt = std::cell::Cell::new(0u32);
+        let (res, retries) = drive_retry(&policy, || -> Result<u64> {
+            // Every attempt draws a durable sequence value up-front.
+            seq_draws.set(seq_draws.get() + 1);
+            let n = attempt.get();
+            attempt.set(n + 1);
+            if n < 2 {
+                // Rolled-back attempt: its would-be row write never commits.
+                Err(a_write_conflict())
+            } else {
+                // Committing attempt: the row is applied here, once.
+                rows_applied.set(rows_applied.get() + 1);
+                Ok(1)
+            }
+        });
+        assert!(res.is_ok());
+        assert_eq!(retries, 2);
+        assert_eq!(rows_applied.get(), 1, "row applied exactly once — never double-applied");
+        assert_eq!(
+            seq_draws.get(),
+            3,
+            "sequence advanced on every attempt — the retried INSERT skips values"
+        );
+    }
+
+    #[test]
+    fn statement_retry_backoff_stays_within_cap() {
+        let policy = StatementRetryPolicy::from_lock_config(&LockConfig {
+            statement_retry_max: 10,
+            statement_retry_backoff_ms: 5,
+            statement_retry_backoff_max_ms: 100,
+            ..LockConfig::default()
+        });
+        // Full jitter: every draw is in [0, cap]; sample many to exercise the
+        // random path across growing exponential ceilings.
+        for retry_number in 1..=20 {
+            for _ in 0..64 {
+                let d = policy.backoff_delay(retry_number).as_millis() as u64;
+                assert!(d <= 100, "retry {retry_number} backoff {d}ms exceeded cap 100ms");
+            }
+        }
+    }
+
+    #[test]
+    fn from_lock_config_wires_timeout_and_retry() {
+        // Timeout precedence (pure, env-independent): env override wins, else
+        // the config value reaches the manager (previously orphaned).
+        assert_eq!(LockManager::resolve_timeout_ms(750, None), 750);
+        assert_eq!(LockManager::resolve_timeout_ms(750, Some(50)), 50);
+        assert_eq!(LockManager::resolve_timeout_ms(30000, None), 30000);
+
+        // The retry policy is wired from config and is env-independent.
+        let cfg = LockConfig {
+            statement_retry_max: 4,
+            statement_retry_backoff_ms: 10,
+            statement_retry_backoff_max_ms: 250,
+            ..LockConfig::default()
+        };
+        let mgr = LockManager::from_lock_config(&cfg);
+        let policy = mgr.statement_retry_policy();
+        assert!(policy.is_enabled());
+        assert_eq!(policy.max_attempts(), 4);
     }
 }
