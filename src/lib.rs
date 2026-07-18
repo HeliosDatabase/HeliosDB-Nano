@@ -587,6 +587,12 @@ pub struct EmbeddedDatabase {
     fk_validation_source: std::sync::Arc<parking_lot::RwLock<FkValidationSource>>,
     /// Deferred FK checks queued until COMMIT.
     deferred_fk_checks: std::sync::Arc<parking_lot::Mutex<Vec<PendingFkCheck>>>,
+    /// `SET CONSTRAINTS ... DEFERRED` — a transaction-scoped request to defer
+    /// every enforceable FK check to COMMIT (PostgreSQL scopes SET CONSTRAINTS to
+    /// the current transaction). ORed into the `check_fk_constraints_on_write`
+    /// defer decision, and reset to `false` at every transaction
+    /// begin/commit/rollback so it never leaks past the block it was set in.
+    constraints_all_deferred: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Lazily-constructed, shared read-only optimizer for the cold (cache-miss)
     /// planning path. Every cache-miss query previously rebuilt a fresh
     /// `StatsCatalog` + 5 boxed rules + `Optimizer`; the rules are stateless
@@ -2213,6 +2219,55 @@ impl EmbeddedDatabase {
         }
     }
 
+    /// True for a `SET CONSTRAINTS …` statement (any name list, DEFERRED or
+    /// IMMEDIATE). Handled on the embedded `execute()` path (library API + REPL);
+    /// the deferral switch it arms is honored by every FK-validating path,
+    /// embedded and wire, since `constraints_all_deferred` is process-scoped like
+    /// `fk_validation_mode`.
+    pub(crate) fn is_set_constraints_statement(sql: &str) -> bool {
+        sql.trim_start().to_ascii_uppercase().starts_with("SET CONSTRAINTS")
+    }
+
+    /// Intercept `SET CONSTRAINTS { ALL | <name>[, …] } { DEFERRED | IMMEDIATE }`.
+    /// sqlparser 0.53 has no grammar for it and no engine path builds the
+    /// `SetConstraints` plan, so it was previously a silent no-op — a DEFERRABLE
+    /// FK stayed IMMEDIATE and the valid "insert child (deferred), then parent,
+    /// then COMMIT" sequence spuriously failed (foreign_key corpus fkpart9/10/11).
+    /// Nano's deferred-FK machinery already re-validates every queued check at
+    /// COMMIT (`validate_deferred_fk_checks`); the only missing piece was the
+    /// switch that arms it, which `constraints_all_deferred` now provides.
+    ///
+    /// The named-constraint list is ACCEPTED but treated as ALL: Nano's
+    /// auto-generated FK names (`fk_<t>_<c>__<ref>`) never match PostgreSQL's
+    /// (`<t>_<c>_fkey`), so per-name matching would silently no-op on ported SQL;
+    /// deferring the whole set is a safe superset because each deferred check is
+    /// still validated at COMMIT. Transaction-scoped — the flag is reset at the
+    /// next txn begin/commit/rollback.
+    fn try_handle_set_constraints(&self, sql: &str) -> Result<Option<u64>> {
+        if !Self::is_set_constraints_statement(sql) {
+            return Ok(None);
+        }
+        let upper = sql.trim().trim_end_matches(';').trim().to_ascii_uppercase();
+        if upper.ends_with(" DEFERRED") {
+            self.constraints_all_deferred
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            Ok(Some(0))
+        } else if upper.ends_with(" IMMEDIATE") {
+            self.constraints_all_deferred
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            // PostgreSQL parity: switching back to IMMEDIATE checks all pending
+            // deferred constraints NOW, so a violation surfaces here rather than
+            // at COMMIT. Validate against the current (global) transaction so the
+            // queued checks see this txn's own writes.
+            let txn_ref = self.current_transaction.lock();
+            self.validate_deferred_fk_checks(txn_ref.as_ref())?;
+            Ok(Some(0))
+        } else {
+            // No recognizable mode word — leave it for the normal path.
+            Ok(None)
+        }
+    }
+
     fn try_handle_trace_execute(&self, sql: &str) -> Result<Option<u64>> {
         match self.try_handle_trace_control(sql)? {
             Some(TraceControl::SetEnabled(_)) | Some(TraceControl::Reset) => Ok(Some(0)),
@@ -2356,14 +2411,39 @@ impl EmbeddedDatabase {
         // Updated under the mutex: readers that skip the lock on a `false`
         // load behave exactly as if they had locked before this BEGIN.
         self.global_txn_active.store(true, std::sync::atomic::Ordering::Release);
+        // `SET CONSTRAINTS ... DEFERRED` is transaction-scoped — start clean.
+        self.constraints_all_deferred
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
     /// Internal method to commit the current transaction
     fn commit_internal(&self) -> Result<()> {
         let mut txn_ref = self.current_transaction.lock();
-        if let Some(txn) = txn_ref.as_ref() {
-            self.validate_deferred_fk_checks(Some(txn))?;
+        // Deferred-FK validation runs BEFORE the durable commit. A failure here
+        // ABORTS the transaction — PostgreSQL rolls back a COMMIT that trips a
+        // deferred constraint — rather than leaving the slot occupied (which
+        // wedged every later `BEGIN` with "Transaction already active"). Undo the
+        // eager ART mutations, drain the deferred queue, and clear the
+        // `SET CONSTRAINTS` deferral flag, mirroring `rollback_internal` and the
+        // session-commit abort path.
+        if txn_ref.is_some() {
+            let validation = {
+                let txn = txn_ref.as_ref().expect("transaction present");
+                self.validate_deferred_fk_checks(Some(txn))
+            };
+            if let Err(e) = validation {
+                if let Some(txn) = txn_ref.take() {
+                    self.global_txn_active
+                        .store(false, std::sync::atomic::Ordering::Release);
+                    let _ = txn.rollback();
+                    self.rollback_art_undo_log();
+                }
+                self.deferred_fk_checks.lock().clear();
+                self.constraints_all_deferred
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                return Err(e);
+            }
         }
         if let Some(txn) = txn_ref.take() {
             // The slot is empty from here on (even if the commit below
@@ -2388,6 +2468,8 @@ impl EmbeddedDatabase {
             // Clear ART undo log (changes are now committed)
             self.art_undo_log.write().clear();
             self.deferred_fk_checks.lock().clear();
+            self.constraints_all_deferred
+                .store(false, std::sync::atomic::Ordering::Relaxed);
             self.invalidate_result_cache();
             // Increment LSN to track transaction commits
             self.storage.increment_lsn();
@@ -2408,6 +2490,8 @@ impl EmbeddedDatabase {
             txn.rollback()?;
             self.rollback_art_undo_log();
             self.deferred_fk_checks.lock().clear();
+            self.constraints_all_deferred
+                .store(false, std::sync::atomic::Ordering::Relaxed);
             Ok(())
         } else {
             Err(Error::transaction("No active transaction to rollback"))
@@ -5739,6 +5823,7 @@ impl EmbeddedDatabase {
             fk_validation_mode: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationMode::Enforced)),
             fk_validation_source: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationSource::Engine)),
             deferred_fk_checks: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
+            constraints_all_deferred: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cold_optimizer: std::sync::OnceLock::new(),
         })
     }
@@ -5840,6 +5925,7 @@ impl EmbeddedDatabase {
             fk_validation_mode: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationMode::Enforced)),
             fk_validation_source: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationSource::Engine)),
             deferred_fk_checks: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
+            constraints_all_deferred: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cold_optimizer: std::sync::OnceLock::new(),
         })
     }
@@ -5977,6 +6063,7 @@ impl EmbeddedDatabase {
             fk_validation_mode: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationMode::Enforced)),
             fk_validation_source: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationSource::Engine)),
             deferred_fk_checks: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
+            constraints_all_deferred: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cold_optimizer: std::sync::OnceLock::new(),
         })
     }
@@ -6713,6 +6800,12 @@ impl EmbeddedDatabase {
             return Ok(count);
         }
 
+        // `SET CONSTRAINTS … DEFERRED|IMMEDIATE` — arm/disarm transaction-scoped
+        // FK deferral (sqlparser has no grammar for it; a no-op before).
+        if let Some(count) = self.try_handle_set_constraints(sql)? {
+            return Ok(count);
+        }
+
         // R4.3: VACUUM VERSIONS — manual MVCC version-history collection.
         if let Some(count) = self.try_handle_vacuum_versions(sql)? {
             return Ok(count);
@@ -7243,7 +7336,14 @@ impl EmbeddedDatabase {
         }
         // Deferred / Audit change *when*/*whether* a violation surfaces
         // (COMMIT-time deferral, violation recording) — not replicated here.
-        if mode != FkValidationMode::Enforced {
+        // `SET CONSTRAINTS ALL DEFERRED` (transaction-scoped) has the same
+        // effect, so it likewise disqualifies the eager batch fast path and
+        // routes through the deferring slow path.
+        if mode != FkValidationMode::Enforced
+            || self
+                .constraints_all_deferred
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
             return false;
         }
         // Immediate enforced mode: every FK must be plain immediate (NOT
@@ -8976,11 +9076,21 @@ impl EmbeddedDatabase {
     fn alter_table_set_schema(&self, old_key: &str, new_schema: &str, if_exists: bool) -> Result<u64> {
         let catalog = self.storage.catalog();
 
-        // Destination key: bare under `public`, else `<new_schema>.<table>`.
-        // The bare table component is the last dotted segment of the (possibly
-        // qualified) source key.
+        // Destination key: bare for the schemas Nano keeps in the bare
+        // key-space, else `<new_schema>.<table>`. The bare table component is the
+        // last dotted segment of the (possibly qualified) source key.
+        //
+        // `public` AND `pg_catalog` both collapse to the bare key-space in
+        // `Planner::normalize_object_name` / `dealias_schema` (a `pg_catalog.t`
+        // reference resolves to bare `t`, same as `public.t`). So a table moved
+        // to EITHER must use the bare key — keying it `pg_catalog.t` would strand
+        // it: no later reference, bare OR qualified, could resolve that key
+        // again (alter_table corpus: CREATE new_system_table, SET SCHEMA
+        // pg_catalog, SET SCHEMA public, then bare RENAME/UPDATE/…/DROP all
+        // failed "does not exist" because the pg_catalog move produced an
+        // unreachable `pg_catalog.new_system_table` key).
         let (_old_schema, bare) = sql::Planner::split_schema_key(old_key);
-        let new_key = if new_schema == "public" {
+        let new_key = if new_schema == "public" || new_schema == "pg_catalog" {
             bare
         } else {
             format!("{new_schema}.{bare}")
@@ -17586,6 +17696,60 @@ impl EmbeddedDatabase {
         catalog.primary_key_columns(references_table).unwrap_or_default()
     }
 
+    /// Coerce a foreign-key probe's values to the DECLARED types of the columns
+    /// being probed (`schema` is the schema of the table the probe targets;
+    /// `column_names` names its probed columns). PostgreSQL permits cross-type
+    /// foreign keys via implicit cast (int8 child → int4 parent, int child →
+    /// NUMERIC parent, …); the referencing row stores the value under the CHILD
+    /// column's type while the parent's PK/UNIQUE ART index encodes the PARENT
+    /// column's type. `ArtIndexManager::encode_key` is type-width-sensitive
+    /// (Int4 = 4 bytes, Int8 = 8 bytes; int vs NUMERIC differ entirely), so an
+    /// un-coerced probe key can never match the parent index and the ART fast
+    /// path in `check_referencing_rows_exist` reports a phantom violation.
+    /// Coercing to the probed table's own column types makes the probe key (and
+    /// the slow-scan `Value`-equality) match in BOTH FK directions — probing the
+    /// parent for a child INSERT/UPDATE, and probing the child for a parent
+    /// DELETE/UPDATE. A column absent from `schema`, or a length mismatch, is
+    /// left unchanged. (Round-3 first populated the referenced-column list for
+    /// column-less FKs, which correctly validates the VALUE but exposed this
+    /// pre-existing type gap; before, the empty list skipped the fast path.)
+    fn coerce_fk_probe_values(schema: &Schema, column_names: &[String], values: &[Value]) -> Vec<Value> {
+        if column_names.len() != values.len() {
+            return values.to_vec();
+        }
+        column_names
+            .iter()
+            .zip(values.iter())
+            .map(|(col_name, v)| match schema.columns.iter().find(|c| &c.name == col_name) {
+                Some(col) => Self::coerce_probe_value_to_type(v, &col.data_type),
+                None => v.clone(),
+            })
+            .collect()
+    }
+
+    /// Non-failing value coercion for FK probe keys — the read-path twin of the
+    /// write-path `StorageEngine::coerce_pk_value` that populates the parent
+    /// PK/UNIQUE index. Only the coercions that change a value's ART key
+    /// ENCODING matter (integer width; int → NUMERIC); every other pair is
+    /// returned unchanged so an unencodable pairing degrades to the honest
+    /// slow-scan / no-match result rather than erroring inside a constraint
+    /// probe. Kept in lockstep with `coerce_pk_value` so the probe key matches
+    /// the key the parent value was indexed under, byte-for-byte.
+    fn coerce_probe_value_to_type(value: &Value, target: &DataType) -> Value {
+        match (value, target) {
+            (Value::Int2(v), DataType::Int8) => Value::Int8(i64::from(*v)),
+            (Value::Int4(v), DataType::Int8) => Value::Int8(i64::from(*v)),
+            (Value::Int2(v), DataType::Int4) => Value::Int4(i32::from(*v)),
+            (Value::Int8(v), DataType::Int4) => Value::Int4(*v as i32),
+            (Value::Int8(v), DataType::Int2) => Value::Int2(*v as i16),
+            (Value::Int4(v), DataType::Int2) => Value::Int2(*v as i16),
+            (Value::Int2(v), DataType::Numeric) => Value::Numeric(format!("{v}")),
+            (Value::Int4(v), DataType::Numeric) => Value::Numeric(format!("{v}")),
+            (Value::Int8(v), DataType::Numeric) => Value::Numeric(format!("{v}")),
+            _ => value.clone(),
+        }
+    }
+
     /// Check if a foreign key reference exists in the referenced table
     ///
     /// Used for FK constraint validation during INSERT/UPDATE operations.
@@ -18023,6 +18187,9 @@ impl EmbeddedDatabase {
             }
             let should_defer = active_txn.is_some()
                 && (mode == FkValidationMode::Deferred
+                    || self
+                        .constraints_all_deferred
+                        .load(std::sync::atomic::Ordering::Relaxed)
                     || fk.enforcement == sql::ConstraintEnforcement::Deferred
                     || (fk.deferrable && fk.initially_deferred));
             if should_defer {
@@ -18148,6 +18315,33 @@ impl EmbeddedDatabase {
         values: &[Value],
         active_txn: Option<&storage::Transaction>,
     ) -> Result<bool> {
+        // Coerce the probe values to the probed columns' declared types so a
+        // cross-type FK (int8 child → int4 parent, int child → NUMERIC parent,
+        // …) probes the same type-encoded key the parent's PK/UNIQUE index was
+        // built from. Without this the width-sensitive `encode_key` misses on
+        // the fast path below (phantom violation). Only INTEGER probe values can
+        // change encoding under coercion (integer width; int → NUMERIC), so the
+        // schema fetch is skipped entirely unless one is present — the default
+        // string/uuid-keyed FK path stays allocation-free. No-op when the types
+        // already match, and the original values are kept if the table has no
+        // schema (the slow path re-fetches it and errors identically). See
+        // `coerce_fk_probe_values`.
+        let coerced_probe: Vec<Value>;
+        let values: &[Value] = if values
+            .iter()
+            .any(|v| matches!(v, Value::Int2(_) | Value::Int4(_) | Value::Int8(_)))
+        {
+            match self.storage.catalog().get_table_schema(table_name) {
+                Ok(schema) => {
+                    coerced_probe = Self::coerce_fk_probe_values(&schema, column_names, values);
+                    &coerced_probe
+                }
+                Err(_) => values,
+            }
+        } else {
+            values
+        };
+
         // Fast path: ART index lookup. KanttBan / Token-Dashboard Quirk H
         // (DELETE / DROP on 11k-row table hangs >5min) introduced the
         // O(log N) ART path for autocommit/implicit-tx callers. The
