@@ -1263,6 +1263,25 @@ impl<'a> Planner<'a> {
             // not a real value type, so record None rather than failing type
             // mapping. The trigger machinery interprets the body separately.
             Some(sqlparser::ast::DataType::Trigger) => None,
+            // `RETURNS TABLE(col defs)` — the set-returning composite return
+            // form. sqlparser 0.53 has no dedicated `DataType::Table` variant,
+            // so `TABLE(...)` arrives here as `Custom("TABLE", [flattened
+            // col/type word tokens])` and would otherwise fail
+            // `sql_data_type_to_data_type` with "Custom data type not yet
+            // supported: TABLE". Accept it (acceptance-first, mirroring the
+            // `Trigger` arm): CREATE FUNCTION succeeds and the function is
+            // stored. The column list is NOT preserved — neither
+            // `LogicalPlan::CreateFunction` nor `StoredFunction` has a slot for
+            // a composite/set return signature — and set-returning EXECUTION is
+            // NOT wired: `FunctionRegistry::execute_*` returns a single scalar
+            // `Value`, so calling such a function keeps today's scalar behavior
+            // (first cell of the first row). A real table-function return type
+            // + `SELECT * FROM f()` expansion is a separate, larger project.
+            Some(sqlparser::ast::DataType::Custom(object_name, _))
+                if object_name.to_string().eq_ignore_ascii_case("TABLE") =>
+            {
+                None
+            }
             Some(rt) => Some(self.sql_data_type_to_data_type(rt)?),
             None => None,
         };
