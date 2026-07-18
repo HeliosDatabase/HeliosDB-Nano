@@ -650,3 +650,198 @@ fn drop_schema_removes_marker_and_allows_recreate() -> Result<()> {
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// FIX A — PUBLIC-path cross-type FK enforcement (round-3 regression).
+// ---------------------------------------------------------------------------
+
+/// Regression (FIX A): a PUBLIC-schema cross-type foreign key — an `int8` child
+/// referencing an `int4` PRIMARY-KEY parent (a PostgreSQL implicit-cast FK) —
+/// must ACCEPT a matching reference and REJECT a dangling one. Round-3 populated
+/// the referenced-column list for column-less FKs (correct), which routed the
+/// check onto the type-width-sensitive ART fast path; the child's `Int8` probe
+/// key never matched the parent's `Int4` index, so a VALID row got a phantom
+/// violation. Mirrors the foreign_key corpus 260-268 cluster.
+#[test]
+fn public_cross_type_fk_enforces_by_value() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute("CREATE TABLE pktable (ptest1 int PRIMARY KEY)")?;
+    db.execute("INSERT INTO pktable VALUES (42)")?;
+    // int8 child referencing an int4 parent, column-less REFERENCES (binds PK).
+    db.execute("CREATE TABLE fktable (ftest1 int8 REFERENCES pktable)")?;
+
+    // The matching reference must be ACCEPTED (this is the regression).
+    db.execute("INSERT INTO fktable VALUES (42)")?;
+    assert_eq!(one_i64(&db, "SELECT ftest1 FROM fktable"), 42);
+
+    // A dangling reference is still rejected (round-3's correct value check).
+    assert!(
+        db.execute("INSERT INTO fktable VALUES (43)").is_err(),
+        "cross-type FK must reject a key the parent does not hold"
+    );
+
+    // A no-op UPDATE keeps the valid value; +1 (=43) becomes dangling.
+    db.execute("UPDATE fktable SET ftest1 = ftest1")?;
+    assert!(
+        db.execute("UPDATE fktable SET ftest1 = ftest1 + 1").is_err(),
+        "UPDATE to a dangling key must be rejected"
+    );
+    Ok(())
+}
+
+/// Regression (FIX A): the referenced table is DROPped and re-CREATEd (a fresh
+/// PK index) between references, and the child/parent types differ again
+/// (int child → NUMERIC parent). Mirrors the foreign_key corpus 269-278 cluster.
+#[test]
+fn public_fk_survives_parent_drop_recreate_cross_type() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute("CREATE TABLE pktable (ptest1 int PRIMARY KEY)")?;
+    db.execute("INSERT INTO pktable VALUES (42)")?;
+    db.execute("CREATE TABLE fktable (ftest1 int8 REFERENCES pktable)")?;
+    db.execute("INSERT INTO fktable VALUES (42)")?;
+    db.execute("DROP TABLE fktable")?;
+    db.execute("DROP TABLE pktable")?;
+
+    // Re-create the parent with a NUMERIC PK; a fresh int child references it.
+    db.execute("CREATE TABLE pktable (ptest1 numeric PRIMARY KEY)")?;
+    db.execute("INSERT INTO pktable VALUES (42)")?;
+    db.execute("CREATE TABLE fktable (ftest1 int REFERENCES pktable)")?;
+    // int → numeric must still match by value after the DROP+reCREATE.
+    db.execute("INSERT INTO fktable VALUES (42)")?;
+    assert_eq!(one_i64(&db, "SELECT ftest1 FROM fktable"), 42);
+    assert!(
+        db.execute("INSERT INTO fktable VALUES (43)").is_err(),
+        "int -> numeric FK must reject a dangling reference after DROP+reCREATE"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// FIX C — ALTER TABLE ... SET SCHEMA into the bare key-space (public/pg_catalog).
+// ---------------------------------------------------------------------------
+
+/// Regression (FIX C): `pg_catalog` is part of Nano's BARE key-space (a
+/// `pg_catalog.t` reference dealiases to bare `t`, exactly like `public.t`), so
+/// `ALTER TABLE ... SET SCHEMA pg_catalog` must re-key to the BARE name — never a
+/// stranded `pg_catalog.t` key that no later reference could resolve. Mirrors the
+/// alter_table corpus 1222-1235 chain (SET SCHEMA pg_catalog / public, then bare
+/// RENAME/UPDATE/DELETE/TRUNCATE/DROP).
+#[test]
+fn set_schema_to_bare_space_keeps_table_addressable() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute("CREATE TABLE new_system_table (id int PRIMARY KEY, othercol text)")?;
+    db.execute("INSERT INTO new_system_table (id, othercol) VALUES (1, 'somedata')")?;
+
+    // public -> pg_catalog -> public are all no-op re-keys onto the SAME bare
+    // key, so the table stays addressable by its bare name throughout.
+    db.execute("ALTER TABLE new_system_table SET SCHEMA pg_catalog")?;
+    assert_eq!(
+        one_i64(&db, "SELECT id FROM new_system_table"),
+        1,
+        "addressable bare after SET SCHEMA pg_catalog"
+    );
+    db.execute("ALTER TABLE new_system_table SET SCHEMA public")?;
+    assert_eq!(
+        one_i64(&db, "SELECT id FROM new_system_table"),
+        1,
+        "addressable bare after SET SCHEMA public"
+    );
+
+    // The corpus's failing bare ops: RENAME/INSERT/UPDATE/DELETE/TRUNCATE/DROP.
+    db.execute("ALTER TABLE new_system_table RENAME TO old_system_table")?;
+    db.execute("INSERT INTO old_system_table (id, othercol) VALUES (2, 'otherdata')")?;
+    db.execute("UPDATE old_system_table SET id = id + 100 WHERE id = 2")?;
+    db.execute("DELETE FROM old_system_table WHERE othercol = 'somedata'")?;
+    assert_eq!(one_i64(&db, "SELECT count(*) FROM old_system_table"), 1);
+    db.execute("TRUNCATE old_system_table")?;
+    assert_eq!(one_i64(&db, "SELECT count(*) FROM old_system_table"), 0);
+    db.execute("DROP TABLE old_system_table")?;
+    assert!(
+        db.query("SELECT id FROM old_system_table", &[]).is_err(),
+        "table dropped"
+    );
+    Ok(())
+}
+
+/// FIX C, from-a-real-schema direction: moving `s1.moved` INTO `pg_catalog`
+/// lands it on the BARE key (the pg_catalog dealias), not a stranded
+/// `pg_catalog.moved`; the old qualified key is gone.
+#[test]
+fn set_schema_from_schema_into_pg_catalog_is_bare() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute("CREATE SCHEMA s1")?;
+    db.execute("CREATE TABLE s1.moved (k int PRIMARY KEY)")?;
+    db.execute("INSERT INTO s1.moved (k) VALUES (7)")?;
+
+    db.execute("ALTER TABLE s1.moved SET SCHEMA pg_catalog")?;
+    assert_eq!(one_i64(&db, "SELECT k FROM moved"), 7, "addressable bare after move to pg_catalog");
+    assert!(db.query("SELECT k FROM s1.moved", &[]).is_err(), "old qualified key gone");
+
+    // And back out to a real schema keys it qualified again.
+    db.execute("CREATE SCHEMA s2")?;
+    db.execute("ALTER TABLE moved SET SCHEMA s2")?;
+    assert_eq!(one_i64(&db, "SELECT k FROM s2.moved"), 7, "moved -> s2 qualified");
+    assert!(db.query("SELECT k FROM moved", &[]).is_err(), "bare key gone after move to s2");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// FIX B — SET CONSTRAINTS … DEFERRED on a qualified, partitioned FK parent.
+// ---------------------------------------------------------------------------
+
+/// Regression (FIX B): a DEFERRABLE foreign key whose parent is a QUALIFIED,
+/// partitioned table (`fkpart9.pk`), deferred with `SET CONSTRAINTS ... DEFERRED`
+/// inside a transaction. Round-3 already made the enforcement probe and the ART
+/// PK-index agree on the qualified key `fkpart9.pk`, but `SET CONSTRAINTS` was a
+/// complete no-op, so the check ran IMMEDIATELY against the still-empty parent
+/// and the valid "insert child, then parent, then COMMIT" sequence failed.
+/// Mirrors the foreign_key corpus 968-984 (fkpart9). The auto-generated FK name
+/// is `fk_fk_a__pk`, so the corpus's `SET CONSTRAINTS fk_a_fkey DEFERRED` is
+/// honored as ALL.
+#[test]
+fn set_constraints_defers_fk_on_partitioned_qualified_parent() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute("CREATE SCHEMA fkpart9")?;
+    db.execute("SET search_path TO fkpart9")?;
+    db.execute("CREATE TABLE pk (a int PRIMARY KEY) PARTITION BY LIST (a)")?;
+    db.execute("CREATE TABLE pk1 PARTITION OF pk FOR VALUES IN (1, 2) PARTITION BY LIST (a)")?;
+    db.execute("CREATE TABLE pk11 PARTITION OF pk1 FOR VALUES IN (1)")?;
+    db.execute("CREATE TABLE pk3 PARTITION OF pk FOR VALUES IN (3)")?;
+    db.execute("CREATE TABLE fk (a int REFERENCES pk DEFERRABLE INITIALLY IMMEDIATE)")?;
+
+    // Immediate (no SET CONSTRAINTS): a reference to the empty parent is rejected.
+    assert!(
+        db.execute("INSERT INTO fk VALUES (1)").is_err(),
+        "immediate FK must reject a reference to the empty parent"
+    );
+
+    // Deferred, parent STILL empty at COMMIT: the deferred check fires at COMMIT
+    // and rejects; the failed COMMIT rolls back cleanly (so BEGIN below works).
+    db.execute("BEGIN")?;
+    db.execute("SET CONSTRAINTS fk_a_fkey DEFERRED")?;
+    db.execute("INSERT INTO fk VALUES (1)")?; // deferred — accepted for now
+    assert!(
+        db.execute("COMMIT").is_err(),
+        "deferred FK must fail at COMMIT when the parent is still empty"
+    );
+    // The failed COMMIT aborted the txn: fk is empty and a new txn can start.
+    assert_eq!(one_i64(&db, "SELECT count(*) FROM fkpart9.fk"), 0);
+
+    // Deferred, parent gains the row LATER in the same txn (the classic case).
+    db.execute("BEGIN")?;
+    db.execute("SET CONSTRAINTS fk_a_fkey DEFERRED")?;
+    db.execute("INSERT INTO fk VALUES (1)")?;         // child first
+    db.execute("INSERT INTO fkpart9.pk VALUES (1)")?; // parent gains a=1 (lands in the parent)
+    db.execute("COMMIT")?;                            // deferred check finds fkpart9.pk(a)=1
+
+    assert_eq!(one_i64(&db, "SELECT a FROM fkpart9.fk"), 1);
+    assert_eq!(one_i64(&db, "SELECT a FROM fkpart9.pk"), 1);
+
+    // SET CONSTRAINTS is transaction-scoped: after COMMIT the flag is cleared,
+    // so a plain autocommit dangling reference is rejected immediately again.
+    assert!(
+        db.execute("INSERT INTO fk VALUES (2)").is_err(),
+        "deferral must not leak past the transaction it was set in"
+    );
+    Ok(())
+}

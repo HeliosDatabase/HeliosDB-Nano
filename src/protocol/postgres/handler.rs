@@ -1093,10 +1093,30 @@ where
                 let schema = Self::schema_from_query_columns(&columns, cached_results.as_slice());
                 self.send_query_result(schema, cached_results.as_slice()).await?;
             } else {
-                let (results, columns) =
-                    run_guarded(|| self.database.query_with_columns_for_session(self.session_id, query))?;
-                let schema = Self::schema_from_query_columns(&columns, &results);
-                self.send_query_result(schema, &results).await?;
+                match run_guarded(|| self.database.query_with_columns_for_session(self.session_id, query)) {
+                    Ok((results, columns)) => {
+                        let schema = Self::schema_from_query_columns(&columns, &results);
+                        self.send_query_result(schema, &results).await?;
+                    }
+                    // A STANDALONE row-returning statement surfaces its own error
+                    // as a wire ErrorResponse and completes with Ok — the same
+                    // self-contained contract the `SET` arms above already use,
+                    // and wire-equivalent to the run-loop's `send_error_for_query`
+                    // (which then sees Ok and does nothing). A bare name under
+                    // `public` that resolves to no table (search_path correctly
+                    // scoped) lands here: the query rightly errors, and the client
+                    // must observe an 'E', not a dropped connection. Inside a
+                    // multi-statement simple query (`suppress_ready_for_query`),
+                    // the error is PROPAGATED instead so the batch aborts on the
+                    // first failure (PostgreSQL implicit-transaction semantics).
+                    Err(e) => {
+                        if self.suppress_ready_for_query {
+                            return Err(e);
+                        }
+                        self.send_error_for_query(&e, false).await?;
+                        return Ok(());
+                    }
+                }
             }
         } else if is_cte {
             let (results, columns) =
