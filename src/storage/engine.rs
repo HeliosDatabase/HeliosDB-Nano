@@ -1192,6 +1192,9 @@ enum ColumnarSumState {
     Empty,
     Int(i64),
     Decimal(rust_decimal::Decimal),
+    /// A NaN/±Infinity numeric value was folded in; PG makes the whole SUM
+    /// special and finite values no longer change it.
+    Special(crate::sql::numeric_special::Special),
 }
 
 impl ColumnarSumState {
@@ -1203,6 +1206,10 @@ impl ColumnarSumState {
             Self::Int(value) => update_columnar_int_sum(self, value),
             Self::Decimal(value) => {
                 update_columnar_decimal_sum(self, value);
+                Ok(())
+            }
+            Self::Special(sp) => {
+                update_columnar_special_sum(self, sp);
                 Ok(())
             }
         }
@@ -1590,6 +1597,7 @@ impl ColumnarAggregateState {
                 ColumnarSumState::Empty => Ok(Value::Null),
                 ColumnarSumState::Int(sum) => Ok(Value::Int8(sum)),
                 ColumnarSumState::Decimal(sum) => Ok(Value::Numeric(format!("{sum}"))),
+                ColumnarSumState::Special(sp) => Ok(sp.to_value()),
             },
             Self::Avg { sum, count } => {
                 if count == 0 {
@@ -1622,8 +1630,12 @@ fn update_columnar_sum(state: &mut ColumnarSumState, value: &Value) -> Result<()
             Ok(())
         }
         Value::Numeric(n) => {
-            let dec = n.parse::<rust_decimal::Decimal>().unwrap_or_default();
-            update_columnar_decimal_sum(state, dec);
+            if let Some(sp) = crate::sql::numeric_special::special_of(n) {
+                update_columnar_special_sum(state, sp);
+            } else {
+                let dec = n.parse::<rust_decimal::Decimal>().unwrap_or_default();
+                update_columnar_decimal_sum(state, dec);
+            }
             Ok(())
         }
         _ => Err(Error::query_execution("SUM requires numeric values")),
@@ -1639,6 +1651,8 @@ fn update_columnar_int_sum(state: &mut ColumnarSumState, value: i64) -> Result<(
                 .ok_or_else(|| Error::query_execution("integer overflow: BIGINT SUM"))?;
         }
         ColumnarSumState::Decimal(sum) => *sum += rust_decimal::Decimal::from(value),
+        // A special (NaN/±Infinity) sum absorbs finite addends unchanged.
+        ColumnarSumState::Special(_) => {}
     }
     Ok(())
 }
@@ -1648,7 +1662,18 @@ fn update_columnar_decimal_sum(state: &mut ColumnarSumState, value: rust_decimal
         ColumnarSumState::Empty => *state = ColumnarSumState::Decimal(value),
         ColumnarSumState::Int(sum) => *state = ColumnarSumState::Decimal(rust_decimal::Decimal::from(*sum) + value),
         ColumnarSumState::Decimal(sum) => *sum += value,
+        // A special (NaN/±Infinity) sum absorbs finite addends unchanged.
+        ColumnarSumState::Special(_) => {}
     }
+}
+
+fn update_columnar_special_sum(state: &mut ColumnarSumState, incoming: crate::sql::numeric_special::Special) {
+    let cur = if let ColumnarSumState::Special(c) = state {
+        Some(*c)
+    } else {
+        None
+    };
+    *state = ColumnarSumState::Special(crate::sql::numeric_special::combine_sum(cur, incoming));
 }
 
 fn primitive_numeric_data_type(data_type: &crate::DataType) -> bool {

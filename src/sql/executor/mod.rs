@@ -118,6 +118,13 @@ pub(crate) fn coerce_literal_to_column_type(v: crate::Value, col_type: &crate::D
             Ok(t) => Value::Timestamp(t.to_utc()),
             Err(_) => v,
         },
+        // A quoted numeric literal (`WHERE numcol = 'NaN'` / `= '5.5'`) reaches
+        // the comparison as Value::String; coerce it to the column's Numeric
+        // type so it can match — including the special NaN/±Infinity tokens.
+        (Value::String(s), DataType::Numeric) => match crate::sql::numeric_special::parse_numeric_text(s) {
+            Some(canon) => Value::Numeric(canon),
+            None => v,
+        },
         _ => v,
     }
 }
@@ -4433,11 +4440,14 @@ pub(crate) fn compare_values(a: &crate::Value, b: &crate::Value) -> std::cmp::Or
         (Value::Date(a), Value::Date(b)) => a.cmp(b),
         (Value::Time(a), Value::Time(b)) => a.cmp(b),
         (Value::Interval(a), Value::Interval(b)) => a.cmp(b),
-        // Numeric compares lexicographically on the decimal string
-        // representation — not perfect across different scales but
-        // matches the existing Hash impl, which is enough to keep
-        // GROUP BY / ORDER BY correct.
-        (Value::Numeric(a), Value::Numeric(b)) => a.cmp(b),
+        // Numeric compares by exact NUMERIC value via `cmp_sort` (parses the
+        // canonical decimal strings to `rust_decimal::Decimal`), so ORDER BY /
+        // MIN / MAX / DISTINCT over a numeric column order numerically
+        // (2 < 10 < 100) rather than lexicographically ("10" < "2"). `cmp_sort`
+        // overlays PG rank ordering (-Inf < finite < +Inf < NaN) as soon as a
+        // NaN/±Infinity token participates. The string-based `Value` `Hash`/`Eq`
+        // still agree because a canonical decimal string is unique per value.
+        (Value::Numeric(a), Value::Numeric(b)) => crate::sql::numeric_special::cmp_sort(a, b),
         // For JSON and complex types, compare as strings
         (Value::Json(a), Value::Json(b)) => a.to_string().cmp(&b.to_string()),
         (Value::Array(a), Value::Array(b)) => {

@@ -128,6 +128,11 @@ impl PushdownStats {
 fn coerce_literal_for_column(value: Value, data_type: &DataType) -> Value {
     match (&value, data_type) {
         (Value::String(s), DataType::Uuid) => parse_uuid_literal(s).map(Value::Uuid).unwrap_or(value),
+        // Quoted numeric literals (incl. NaN/±Infinity) coerce to Numeric so
+        // pushdown compares Numeric-vs-Numeric consistently with the evaluator.
+        (Value::String(s), DataType::Numeric) => {
+            crate::sql::numeric_special::parse_numeric_text(s).map_or(value, Value::Numeric)
+        }
         _ => value,
     }
 }

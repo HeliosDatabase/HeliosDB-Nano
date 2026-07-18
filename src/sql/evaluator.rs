@@ -2890,8 +2890,13 @@ impl Evaluator {
                 Value::Float4(f) => serde_json::json!(f),
                 Value::Float8(f) => serde_json::json!(f),
                 Value::Numeric(n) => {
-                    // Try to parse as number, fallback to string
-                    if let Ok(num) = n.parse::<f64>() {
+                    // JSON has no NaN/±Infinity; PG renders numeric specials as
+                    // JSON strings ("NaN" etc.), so check for them before the
+                    // f64 parse (which would otherwise succeed and collapse to
+                    // a JSON null).
+                    if crate::sql::numeric_special::is_special(n) {
+                        serde_json::json!(n.as_str())
+                    } else if let Ok(num) = n.parse::<f64>() {
                         serde_json::json!(num)
                     } else {
                         serde_json::json!(n.as_str())
@@ -2967,7 +2972,12 @@ impl Evaluator {
                 Value::Float4(f) => serde_json::json!(f),
                 Value::Float8(f) => serde_json::json!(f),
                 Value::Numeric(n) => {
-                    if let Ok(num) = n.parse::<f64>() {
+                    // JSON has no NaN/±Infinity; PG renders numeric specials as
+                    // JSON strings, so check before the f64 parse (which would
+                    // otherwise succeed and collapse them to a JSON null).
+                    if crate::sql::numeric_special::is_special(n) {
+                        serde_json::json!(n.as_str())
+                    } else if let Ok(num) = n.parse::<f64>() {
                         serde_json::json!(num)
                     } else {
                         serde_json::json!(n.as_str())
@@ -3387,9 +3397,14 @@ impl Evaluator {
                 Value::Float4(f) => Ok(Value::Float4(-f)),
                 Value::Float8(f) => Ok(Value::Float8(-f)),
                 Value::Numeric(n) => {
-                    // Negate a numeric value by parsing and inverting sign
-                    let negated = if n.starts_with('-') {
-                        n[1..].to_string()
+                    // Negate a numeric value by inverting the sign of its string
+                    // form. `-NaN` is NaN in PG (and would be an invalid token),
+                    // so NaN negates to itself; `-Infinity`/`Infinity` flip via
+                    // the generic sign-toggle below.
+                    let negated = if n == crate::sql::numeric_special::NAN_TEXT {
+                        n.clone()
+                    } else if let Some(rest) = n.strip_prefix('-') {
+                        rest.to_string()
                     } else {
                         format!("-{}", n)
                     };
@@ -3519,6 +3534,15 @@ impl Evaluator {
         // SQL standard: any comparison with NULL yields NULL (three-valued logic)
         if matches!(left, Value::Null) || matches!(right, Value::Null) {
             return Ok(Value::Null);
+        }
+
+        // PG special-numeric semantics: when a NaN/±Infinity Numeric operand is
+        // involved, the finite Decimal-parsing arms below cannot handle it
+        // (`Decimal` can't represent it). Resolve the ordering here per PG rules
+        // (NaN greatest, `NaN = NaN` true, ±Infinity vs finite). Fires only when
+        // a special Numeric participates; finite comparisons fall through.
+        if let Some(ord) = crate::sql::numeric_special::special_operator_cmp(left, right) {
+            return Ok(Value::Boolean(cmp(ord)));
         }
 
         let ordering = match (left, right) {
@@ -3878,6 +3902,14 @@ impl Evaluator {
         if matches!(left, Value::Null) || matches!(right, Value::Null) {
             return Ok(Value::Null);
         }
+        // PG NaN/±Infinity arithmetic (NaN propagates, Inf+(-Inf)=NaN, …). Fires
+        // only when a special Numeric meets a Numeric/Int operand; float-mixed
+        // and finite cases fall through to the Decimal/f64 arms below.
+        if let Some(v) =
+            crate::sql::numeric_special::special_arith(crate::sql::numeric_special::ArithOp::Add, left, right)?
+        {
+            return Ok(v);
+        }
         match (left, right) {
             // Numeric + Numeric: preserve precision
             (Value::Numeric(a), Value::Numeric(b)) => {
@@ -4039,6 +4071,12 @@ impl Evaluator {
         // SQL standard: NULL - anything = NULL
         if matches!(left, Value::Null) || matches!(right, Value::Null) {
             return Ok(Value::Null);
+        }
+        // PG NaN/±Infinity arithmetic (Inf-Inf=NaN, finite-Inf=-Inf, …).
+        if let Some(v) =
+            crate::sql::numeric_special::special_arith(crate::sql::numeric_special::ArithOp::Sub, left, right)?
+        {
+            return Ok(v);
         }
         match (left, right) {
             // Numeric - Numeric: preserve precision
@@ -4205,6 +4243,12 @@ impl Evaluator {
         if matches!(left, Value::Null) || matches!(right, Value::Null) {
             return Ok(Value::Null);
         }
+        // PG NaN/±Infinity arithmetic (Inf*0=NaN, sign of In*finite, …).
+        if let Some(v) =
+            crate::sql::numeric_special::special_arith(crate::sql::numeric_special::ArithOp::Mul, left, right)?
+        {
+            return Ok(v);
+        }
         match (left, right) {
             // Numeric * Numeric: preserve precision
             (Value::Numeric(a), Value::Numeric(b)) => {
@@ -4337,6 +4381,13 @@ impl Evaluator {
         // SQL standard: NULL / anything = NULL
         if matches!(left, Value::Null) || matches!(right, Value::Null) {
             return Ok(Value::Null);
+        }
+        // PG NaN/±Infinity arithmetic (Inf/Inf=NaN, finite/Inf=0, NaN/0=NaN;
+        // Inf/0 still raises division-by-zero).
+        if let Some(v) =
+            crate::sql::numeric_special::special_arith(crate::sql::numeric_special::ArithOp::Div, left, right)?
+        {
+            return Ok(v);
         }
         match (left, right) {
             // Numeric / Numeric: preserve precision
@@ -5318,14 +5369,20 @@ impl Evaluator {
                 Value::Float4(f) => Ok(Value::Float4(f)),
                 Value::Float8(f) => Ok(Value::Float4(f as f32)),
                 Value::Numeric(n) => {
-                    // Parse as decimal and convert to f32
-                    n.parse::<Decimal>()
-                        .map_err(|e| Error::query_execution(format!("Cannot cast '{}' to FLOAT4: {}", n, e)))
-                        .and_then(|dec| {
-                            dec.to_f32().map(Value::Float4).ok_or_else(|| {
-                                Error::query_execution(format!("Cannot cast '{}' to FLOAT4: value out of range", n))
+                    // NaN/±Infinity have native float representations (PG allows
+                    // 'NaN'::numeric::float4 etc.), so map them directly.
+                    if let Some(sp) = crate::sql::numeric_special::special_of(&n) {
+                        Ok(Value::Float4(sp.to_f64() as f32))
+                    } else {
+                        // Parse as decimal and convert to f32
+                        n.parse::<Decimal>()
+                            .map_err(|e| Error::query_execution(format!("Cannot cast '{}' to FLOAT4: {}", n, e)))
+                            .and_then(|dec| {
+                                dec.to_f32().map(Value::Float4).ok_or_else(|| {
+                                    Error::query_execution(format!("Cannot cast '{}' to FLOAT4: value out of range", n))
+                                })
                             })
-                        })
+                    }
                 }
                 Value::String(s) => s
                     .trim()
@@ -5342,14 +5399,20 @@ impl Evaluator {
                 Value::Float4(f) => Ok(Value::Float8(f as f64)),
                 Value::Float8(f) => Ok(Value::Float8(f)),
                 Value::Numeric(n) => {
-                    // Parse as decimal and convert to f64
-                    n.parse::<Decimal>()
-                        .map_err(|e| Error::query_execution(format!("Cannot cast '{}' to FLOAT8: {}", n, e)))
-                        .and_then(|dec| {
-                            dec.to_f64().map(Value::Float8).ok_or_else(|| {
-                                Error::query_execution(format!("Cannot cast '{}' to FLOAT8: value out of range", n))
+                    // NaN/±Infinity have native float representations (PG allows
+                    // 'NaN'::numeric::float8 etc.), so map them directly.
+                    if let Some(sp) = crate::sql::numeric_special::special_of(&n) {
+                        Ok(Value::Float8(sp.to_f64()))
+                    } else {
+                        // Parse as decimal and convert to f64
+                        n.parse::<Decimal>()
+                            .map_err(|e| Error::query_execution(format!("Cannot cast '{}' to FLOAT8: {}", n, e)))
+                            .and_then(|dec| {
+                                dec.to_f64().map(Value::Float8).ok_or_else(|| {
+                                    Error::query_execution(format!("Cannot cast '{}' to FLOAT8: value out of range", n))
+                                })
                             })
-                        })
+                    }
                 }
                 Value::String(s) => s
                     .trim()
@@ -5477,21 +5540,30 @@ impl Evaluator {
                 Value::Int2(i) => Ok(Value::Numeric(format!("{}", i))),
                 Value::Int4(i) => Ok(Value::Numeric(format!("{}", i))),
                 Value::Int8(i) => Ok(Value::Numeric(format!("{}", i))),
-                // Float to Numeric: convert with precision loss warning (converted as string for precision)
-                Value::Float4(f) => Ok(Value::Numeric(format!("{}", f))),
-                Value::Float8(f) => Ok(Value::Numeric(format!("{}", f))),
-                // String to Numeric: parse and validate
-                Value::String(s) => {
-                    // Validate that the string is a valid numeric value.
-                    // Trim leading/trailing whitespace first: Postgres'
-                    // numeric-in accepts it (pg_strtoint16/32/64 and the
-                    // numeric parser both skip surrounding whitespace),
-                    // but rust_decimal::Decimal::from_str does not.
-                    s.trim()
-                        .parse::<Decimal>()
-                        .map(|dec| Value::Numeric(format!("{}", dec)))
-                        .map_err(|e| Error::query_execution(format!("Cannot cast '{}' to NUMERIC: {}", s, e)))
-                }
+                // Float to Numeric: convert with precision loss warning (converted as string for precision).
+                // Finite floats keep their per-type Display; NaN/±Infinity map to
+                // the canonical PG tokens (not Rust's "inf"/"-inf").
+                Value::Float4(f) => Ok(Value::Numeric(if f.is_finite() {
+                    format!("{}", f)
+                } else {
+                    crate::sql::numeric_special::float_to_numeric_text(f64::from(f))
+                })),
+                Value::Float8(f) => Ok(Value::Numeric(if f.is_finite() {
+                    format!("{}", f)
+                } else {
+                    crate::sql::numeric_special::float_to_numeric_text(f)
+                })),
+                // String to Numeric: parse and validate. Accepts the three PG
+                // special tokens (NaN / [+/-]Inf[inity], case-insensitive) in
+                // addition to finite decimals — without this the corpus
+                // `INSERT ... VALUES (...,'NaN')` aborted the whole load txn.
+                // Whitespace is trimmed (PG numeric-in skips it; Decimal::from_str
+                // does not) inside `parse_numeric_text`.
+                Value::String(s) => crate::sql::numeric_special::parse_numeric_text(&s)
+                    .map(Value::Numeric)
+                    .ok_or_else(|| {
+                        Error::query_execution(format!("Cannot cast '{}' to NUMERIC: invalid numeric value", s))
+                    }),
                 _ => Err(Error::query_execution(format!("Cannot cast {:?} to NUMERIC", value))),
             },
 
@@ -5783,6 +5855,13 @@ impl Evaluator {
     }
 
     fn values_equal(&self, left: &Value, right: &Value) -> bool {
+        // PG special-numeric equality: `NaN = NaN` is TRUE, `NaN = anything
+        // else` is FALSE, ±Infinity equal only to the same infinity. Handled
+        // up front (the finite arms below parse Decimal / f64 and would give
+        // IEEE `NaN != NaN`). Fires only when a special Numeric participates.
+        if let Some(ord) = crate::sql::numeric_special::special_operator_cmp(left, right) {
+            return ord == std::cmp::Ordering::Equal;
+        }
         match (left, right) {
             // Exact matches
             (Value::Int2(a), Value::Int2(b)) => a == b,
@@ -6785,7 +6864,10 @@ impl Evaluator {
             Value::Float4(f) => Ok(Value::Float4(f.abs())),
             Value::Float8(f) => Ok(Value::Float8(f.abs())),
             Value::Numeric(s) => {
-                if let Ok(d) = s.parse::<Decimal>() {
+                if let Some(sp) = crate::sql::numeric_special::special_of(s) {
+                    // |NaN| = NaN, |±Infinity| = +Infinity
+                    Ok(sp.abs().to_value())
+                } else if let Ok(d) = s.parse::<Decimal>() {
                     Ok(Value::Numeric(d.abs().to_string()))
                 } else {
                     Err(Error::query_execution("Invalid numeric value"))
@@ -6831,7 +6913,10 @@ impl Evaluator {
                 Ok(Value::Float8((f * factor).round() / factor))
             }
             Value::Numeric(s) => {
-                if let Ok(d) = s.parse::<Decimal>() {
+                if let Some(sp) = crate::sql::numeric_special::special_of(s) {
+                    // ROUND(NaN)=NaN, ROUND(±Infinity)=±Infinity
+                    Ok(sp.to_value())
+                } else if let Ok(d) = s.parse::<Decimal>() {
                     Ok(Value::Numeric(d.round_dp(precision as u32).to_string()))
                 } else {
                     Err(Error::query_execution("Invalid numeric value"))
@@ -6854,7 +6939,10 @@ impl Evaluator {
             Value::Float4(f) => Ok(Value::Float8((*f as f64).ceil())),
             Value::Float8(f) => Ok(Value::Float8(f.ceil())),
             Value::Numeric(s) => {
-                if let Ok(d) = s.parse::<Decimal>() {
+                if let Some(sp) = crate::sql::numeric_special::special_of(s) {
+                    // CEIL(NaN)=NaN, CEIL(±Infinity)=±Infinity
+                    Ok(sp.to_value())
+                } else if let Ok(d) = s.parse::<Decimal>() {
                     Ok(Value::Numeric(d.ceil().to_string()))
                 } else {
                     Err(Error::query_execution("Invalid numeric value"))
@@ -6877,7 +6965,10 @@ impl Evaluator {
             Value::Float4(f) => Ok(Value::Float8((*f as f64).floor())),
             Value::Float8(f) => Ok(Value::Float8(f.floor())),
             Value::Numeric(s) => {
-                if let Ok(d) = s.parse::<Decimal>() {
+                if let Some(sp) = crate::sql::numeric_special::special_of(s) {
+                    // FLOOR(NaN)=NaN, FLOOR(±Infinity)=±Infinity
+                    Ok(sp.to_value())
+                } else if let Ok(d) = s.parse::<Decimal>() {
                     Ok(Value::Numeric(d.floor().to_string()))
                 } else {
                     Err(Error::query_execution("Invalid numeric value"))
@@ -6923,7 +7014,10 @@ impl Evaluator {
                 Ok(Value::Float8((f * factor).trunc() / factor))
             }
             Value::Numeric(s) => {
-                if let Ok(d) = s.parse::<Decimal>() {
+                if let Some(sp) = crate::sql::numeric_special::special_of(s) {
+                    // TRUNC(NaN)=NaN, TRUNC(±Infinity)=±Infinity
+                    Ok(sp.to_value())
+                } else if let Ok(d) = s.parse::<Decimal>() {
                     Ok(Value::Numeric(d.trunc_with_scale(precision as u32).to_string()))
                 } else {
                     Err(Error::query_execution("Invalid numeric value"))
@@ -7050,6 +7144,17 @@ impl Evaluator {
     /// Helper for comparing values (returns Ordering)
     fn compare_values_internal(&self, left: &Value, right: &Value) -> Result<std::cmp::Ordering> {
         use std::cmp::Ordering;
+        // PG special-numeric ranking (NaN greatest; -Inf < finite < +Inf < NaN),
+        // handled up front — mirroring `values_equal` — before the finite arms
+        // below, which parse a NaN/±Infinity token as Decimal and would error.
+        // This backs GREATEST/LEAST, which per PG return 'NaN' as greatest and
+        // keep a finite value over an Infinity. Fires only when a special
+        // `Value::Numeric` participates and both sides are numeric-comparable;
+        // otherwise the finite ordering below is unchanged (in particular finite
+        // NUMERIC keeps exact Decimal order, not lexicographic).
+        if let Some(ord) = crate::sql::numeric_special::special_operator_cmp(left, right) {
+            return Ok(ord);
+        }
         match (left, right) {
             (Value::Int2(a), Value::Int2(b)) => Ok(a.cmp(b)),
             (Value::Int4(a), Value::Int4(b)) => Ok(a.cmp(b)),
@@ -7057,6 +7162,8 @@ impl Evaluator {
             (Value::Float4(a), Value::Float4(b)) => Ok(a.partial_cmp(b).unwrap_or(Ordering::Equal)),
             (Value::Float8(a), Value::Float8(b)) => Ok(a.partial_cmp(b).unwrap_or(Ordering::Equal)),
             (Value::String(a), Value::String(b)) => Ok(a.cmp(b)),
+            // Any special operand was already ranked by the guard above, so both
+            // payloads here are finite: keep exact numeric Decimal ordering.
             (Value::Numeric(a), Value::Numeric(b)) => match (a.parse::<Decimal>(), b.parse::<Decimal>()) {
                 (Ok(a_dec), Ok(b_dec)) => Ok(a_dec.cmp(&b_dec)),
                 _ => Err(Error::query_execution(format!(

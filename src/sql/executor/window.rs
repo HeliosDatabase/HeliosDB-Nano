@@ -716,6 +716,17 @@ fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
         (Value::Float8(a), Value::Float8(b)) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
         (Value::String(a), Value::String(b)) => a.cmp(b),
         (Value::Boolean(a), Value::Boolean(b)) => a.cmp(b),
+        // Numeric-vs-Numeric: finite payloads compare by exact NUMERIC value —
+        // the historical behaviour here, since with no explicit arm this fell
+        // through to the `_` branch's `value_to_f64` compare. As soon as a
+        // NaN/±Infinity token participates, PG rank ordering (-Inf < finite <
+        // +Inf < NaN) takes over. `cmp_numeric_pushdown` orders finite values
+        // numerically (2 < 10 < 100, never the lexicographic "10" < "2") so
+        // window ORDER BY / RANK / MIN/MAX OVER stay correct, with an Equal
+        // fallback on an unparseable payload (matching the old `_` arm).
+        (Value::Numeric(a), Value::Numeric(b)) => {
+            crate::sql::numeric_special::cmp_numeric_pushdown(a, b).unwrap_or(Ordering::Equal)
+        }
         // Cross-type numeric comparison
         _ => {
             if let (Some(a), Some(b)) = (value_to_f64(a), value_to_f64(b)) {

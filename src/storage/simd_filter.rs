@@ -276,11 +276,8 @@ impl FilterPredicate {
             (Value::Bytes(a), Value::Bytes(b)) => a < b,
             (Value::Timestamp(a), Value::Timestamp(b)) => a < b,
             (Value::Numeric(a), Value::Numeric(b)) => {
-                if let (Ok(a), Ok(b)) = (a.parse::<f64>(), b.parse::<f64>()) {
-                    a < b
-                } else {
-                    false
-                }
+                // PG rank ordering for NaN/±Infinity; f64 value order for finite.
+                crate::sql::numeric_special::cmp_numeric_pushdown(a, b) == Some(std::cmp::Ordering::Less)
             }
             _ => false,
         }
@@ -309,11 +306,8 @@ impl FilterPredicate {
             (Value::Bytes(a), Value::Bytes(b)) => a > b,
             (Value::Timestamp(a), Value::Timestamp(b)) => a > b,
             (Value::Numeric(a), Value::Numeric(b)) => {
-                if let (Ok(a), Ok(b)) = (a.parse::<f64>(), b.parse::<f64>()) {
-                    a > b
-                } else {
-                    false
-                }
+                // PG rank ordering for NaN/±Infinity; f64 value order for finite.
+                crate::sql::numeric_special::cmp_numeric_pushdown(a, b) == Some(std::cmp::Ordering::Greater)
             }
             _ => false,
         }

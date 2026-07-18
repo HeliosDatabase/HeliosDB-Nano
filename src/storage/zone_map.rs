@@ -254,12 +254,15 @@ impl ValueRange {
         }
     }
 
-    /// Compare numeric strings
+    /// Compare numeric strings.
+    ///
+    /// Finite payloads compare by `f64` value (as before); NaN/±Infinity
+    /// tokens use PG rank ordering so zone min/max bounds — and therefore
+    /// pruning decisions — stay consistent for numeric columns holding
+    /// specials (a NaN otherwise parsed as an IEEE NaN and poisoned the
+    /// bound, silently dropping matching rows).
     fn compare_numeric_strings(a: &str, b: &str) -> Option<Ordering> {
-        // Try parsing as floats for comparison
-        let a_val: f64 = a.parse().ok()?;
-        let b_val: f64 = b.parse().ok()?;
-        a_val.partial_cmp(&b_val)
+        crate::sql::numeric_special::cmp_numeric_pushdown(a, b)
     }
 }
 
