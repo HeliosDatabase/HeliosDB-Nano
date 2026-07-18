@@ -556,7 +556,8 @@ mod cte_hardening {
         // WITH RECURSIVE.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         db.execute("CREATE TABLE shadow_t (id INT, category TEXT)").unwrap();
-        db.execute("INSERT INTO shadow_t VALUES (1,'A'),(2,'A'),(3,'B')").unwrap();
+        db.execute("INSERT INTO shadow_t VALUES (1,'A'),(2,'A'),(3,'B')")
+            .unwrap();
         let rows = try_q(
             &db,
             "WITH shadow_t AS (SELECT id FROM shadow_t WHERE category = 'A') SELECT id FROM shadow_t ORDER BY id",

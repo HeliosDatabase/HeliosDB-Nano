@@ -313,8 +313,8 @@ mod copy_phase_stats;
 mod error;
 mod lock_census;
 mod sharded_lru;
-mod write_volume;
 mod types;
+mod write_volume;
 // `config` was originally private but the encryption / sync
 // benchmarks reference its `KeySource` enum directly.  Promoted
 // to `pub` so the benches compile.  External consumers should
@@ -1494,16 +1494,14 @@ impl EmbeddedDatabase {
             return Ok(plan);
         }
 
-        let source_sql = if lock_census::pl_rwlock_read(
-            lock_census::Site::StatementRegistry,
-            &self.prepared_fast_selects,
-        )
-        .contains_key(name)
-        {
-            self.prepared_statement_sql.read().get(name).cloned()
-        } else {
-            None
-        };
+        let source_sql =
+            if lock_census::pl_rwlock_read(lock_census::Site::StatementRegistry, &self.prepared_fast_selects)
+                .contains_key(name)
+            {
+                self.prepared_statement_sql.read().get(name).cloned()
+            } else {
+                None
+            };
 
         let Some(source_sql) = source_sql else {
             return Err(Error::query_execution(format!(
@@ -1594,12 +1592,9 @@ impl EmbeddedDatabase {
         if self.in_transaction() {
             return None;
         }
-        let spec = lock_census::pl_rwlock_read(
-            lock_census::Site::StatementRegistry,
-            &self.prepared_fast_selects,
-        )
-        .get(name)
-        .cloned()?;
+        let spec = lock_census::pl_rwlock_read(lock_census::Site::StatementRegistry, &self.prepared_fast_selects)
+            .get(name)
+            .cloned()?;
         let mut value = match params.get(spec.param_index - 1) {
             Some(value) => value.clone(),
             None => {
@@ -2661,8 +2656,7 @@ impl EmbeddedDatabase {
         // transaction is open.
         let insert_fast_paths_blocked = self.session_txns_block_fast_inserts();
         let use_fast_paths = !skip_fast_paths && !has_savepoints && !has_session_txns && !schema_active;
-        let use_insert_fast_paths =
-            !skip_fast_paths && !has_savepoints && !insert_fast_paths_blocked && !schema_active;
+        let use_insert_fast_paths = !skip_fast_paths && !has_savepoints && !insert_fast_paths_blocked && !schema_active;
 
         // Explicit transactions can still use transaction-aware INSERT fast
         // paths. These buffer rows in the transaction write set, so
@@ -2920,9 +2914,21 @@ impl EmbeddedDatabase {
                                 initially_deferred,
                                 enforcement,
                             } => {
+                                // Dedup auto-generated names against the FKs already
+                                // staged on THIS table in this CREATE TABLE: the schema
+                                // no longer participates in the name, so two FKs to
+                                // like-named tables in different schemas would otherwise
+                                // collide (see `generate_unique_name`).
+                                let existing_fk_names: Vec<String> =
+                                    table_constraints.foreign_keys.iter().map(|f| f.name.clone()).collect();
                                 let fk = sql::ForeignKeyConstraint::new(
                                     fk_name.clone().unwrap_or_else(|| {
-                                        sql::ForeignKeyConstraint::generate_name(name, fk_cols, references_table)
+                                        sql::ForeignKeyConstraint::generate_unique_name(
+                                            name,
+                                            fk_cols,
+                                            references_table,
+                                            &existing_fk_names,
+                                        )
                                     }),
                                     name.clone(),
                                     fk_cols.clone(),
@@ -5332,9 +5338,22 @@ impl EmbeddedDatabase {
                 catalog.get_table_schema(table_name)?;
                 catalog.get_table_schema(references_table)?;
 
-                let fk_name = constraint_name
-                    .clone()
-                    .unwrap_or_else(|| sql::ForeignKeyConstraint::generate_name(table_name, columns, references_table));
+                let fk_name = constraint_name.clone().unwrap_or_else(|| {
+                    // Dedup the auto-name against the FKs already on this table:
+                    // the schema no longer disambiguates the generated name, so
+                    // two FKs to like-named tables in different schemas would
+                    // otherwise collide (see `generate_unique_name`).
+                    let existing_fk_names: Vec<String> = catalog
+                        .load_table_constraints(table_name)
+                        .map(|c| c.foreign_keys.into_iter().map(|f| f.name).collect())
+                        .unwrap_or_default();
+                    sql::ForeignKeyConstraint::generate_unique_name(
+                        table_name,
+                        columns,
+                        references_table,
+                        &existing_fk_names,
+                    )
+                });
                 let mut fk = sql::ForeignKeyConstraint::new(
                     fk_name,
                     table_name.clone(),
@@ -15570,10 +15589,7 @@ impl EmbeddedDatabase {
     }
 
     /// Read this session's `search_path` current schema (default `None`).
-    pub(crate) fn session_current_schema(
-        &self,
-        session_id: crate::session::SessionId,
-    ) -> Result<Option<String>> {
+    pub(crate) fn session_current_schema(&self, session_id: crate::session::SessionId) -> Result<Option<String>> {
         let session_lock = self.session_manager.get_session(session_id)?;
         let value = session_lock.read().current_schema.clone();
         Ok(value)

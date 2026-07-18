@@ -86,6 +86,11 @@ pub struct Planner<'a> {
     /// from the session's current schema so it composes with the plan cache
     /// (which is invalidated whenever `search_path` changes).
     current_schema: Option<String>,
+    /// The chain of view names currently being expanded (ancestor path), used to
+    /// break cyclic / self-referential view references before they overflow the
+    /// stack. Empty for a top-level statement; each nested view-expansion planner
+    /// inherits the parent's chain plus the view it is about to expand.
+    view_expansion_stack: Vec<String>,
 }
 
 impl<'a> Planner<'a> {
@@ -97,6 +102,7 @@ impl<'a> Planner<'a> {
             cte_schemas: RefCell::new(HashMap::new()),
             named_windows: RefCell::new(HashMap::new()),
             current_schema: None,
+            view_expansion_stack: Vec::new(),
         }
     }
 
@@ -108,6 +114,7 @@ impl<'a> Planner<'a> {
             cte_schemas: RefCell::new(HashMap::new()),
             named_windows: RefCell::new(HashMap::new()),
             current_schema: None,
+            view_expansion_stack: Vec::new(),
         }
     }
 
@@ -121,6 +128,14 @@ impl<'a> Planner<'a> {
     /// the default `public` flat-namespace behavior.
     pub fn with_current_schema(mut self, current_schema: Option<String>) -> Self {
         self.current_schema = current_schema;
+        self
+    }
+
+    /// Seed the view-expansion ancestor chain (see [`Self::view_expansion_stack`]).
+    /// Used when building the nested planner that expands a view body, so cyclic
+    /// references are detected across expansion levels.
+    fn with_view_expansion_stack(mut self, stack: Vec<String>) -> Self {
+        self.view_expansion_stack = stack;
         self
     }
 
@@ -703,8 +718,12 @@ impl<'a> Planner<'a> {
                 let first_table = table_names
                     .first()
                     .ok_or_else(|| Error::query_execution("TRUNCATE requires a table name"))?;
+                // TRUNCATE resolves its target through the session `search_path`
+                // (bare `pk` under `SET search_path TO s` → `s.pk`) — it must
+                // route through the same choke point as DML/DROP, not a raw
+                // `to_string()` that leaves a bare key the schema owns.
                 Ok(LogicalPlan::Truncate {
-                    table_name: first_table.to_string(),
+                    table_name: self.resolve_table_ref(&first_table.name),
                 })
             }
             Statement::Update {
@@ -904,14 +923,23 @@ impl<'a> Planner<'a> {
                     )
                 } else {
                     // Regular (non-materialized) view
-                    // Store the query SQL for expansion at query time
+                    // Store the query SQL for expansion at query time. A view is
+                    // a non-table object, so its NAME collapses to the bare key
+                    // (matching `DropView`, which uses `normalize_nontable_name`)
+                    // — views stay FLAT on BOTH create and reference so a bare or
+                    // schema-qualified read resolves to the same stored view.
                     let query_sql = query.to_string();
 
                     Ok(LogicalPlan::CreateView {
-                        name: name.to_string(),
+                        name: Self::normalize_nontable_name(&name),
                         query_sql,
                         if_not_exists,
                         or_replace,
+                        // Capture the CREATING session's schema so the body binds
+                        // to it at CREATE — a later reader under a different
+                        // `search_path` must see the SAME rows (PG binds at
+                        // CREATE). `None` = created under `public`.
+                        creator_schema: self.current_schema.clone(),
                     })
                 }
             }
@@ -1286,8 +1314,7 @@ impl<'a> Planner<'a> {
     fn set_expr_references_table(set_expr: &SetExpr, target: &str) -> bool {
         match set_expr {
             SetExpr::SetOperation { left, right, .. } => {
-                Self::set_expr_references_table(left, target)
-                    || Self::set_expr_references_table(right, target)
+                Self::set_expr_references_table(left, target) || Self::set_expr_references_table(right, target)
             }
             SetExpr::Query(q) => Self::set_expr_references_table(q.body.as_ref(), target),
             SetExpr::Select(select) => select
@@ -1309,12 +1336,8 @@ impl<'a> Planner<'a> {
 
     fn table_factor_references(tf: &TableFactor, target: &str) -> bool {
         match tf {
-            TableFactor::Table { name, .. } => {
-                Self::normalize_object_name(name).eq_ignore_ascii_case(target)
-            }
-            TableFactor::Derived { subquery, .. } => {
-                Self::set_expr_references_table(subquery.body.as_ref(), target)
-            }
+            TableFactor::Table { name, .. } => Self::normalize_object_name(name).eq_ignore_ascii_case(target),
+            TableFactor::Derived { subquery, .. } => Self::set_expr_references_table(subquery.body.as_ref(), target),
             _ => false,
         }
     }
@@ -1603,9 +1626,7 @@ impl<'a> Planner<'a> {
         let mut combined: Option<LogicalPlan> = None;
         for row in &values.rows {
             if row.len() != ncols {
-                return Err(Error::query_execution(
-                    "VALUES lists must all be the same length",
-                ));
+                return Err(Error::query_execution("VALUES lists must all be the same length"));
             }
             let exprs = row
                 .iter()
@@ -2045,20 +2066,69 @@ impl<'a> Planner<'a> {
                     });
                 }
 
-                // Check if this is a regular view (non-materialized)
+                // Check if this is a regular view (non-materialized).
                 if let Some(catalog) = self.catalog {
                     let storage = catalog.storage();
                     let view_catalog = storage.view_catalog();
-                    if view_catalog.view_exists(&table_name)? {
+                    // Views are stored FLAT (the CREATE VIEW name is collapsed
+                    // via `normalize_nontable_name`). `resolve_table_ref` above
+                    // may have produced a `schema.` qualified key (from a
+                    // qualified reference or a two-probe against a same-named
+                    // TABLE), so a qualified view reference must fall back to the
+                    // bare view key to match the CREATE-site collapse.
+                    let view_key = if view_catalog.view_exists(&table_name)? {
+                        Some(table_name.clone())
+                    } else {
+                        // Fall back to the flat view key ONLY when there is no
+                        // real TABLE at the resolved key: a schema-local table
+                        // `s.v` must keep precedence over a flat view `v`.
+                        // `flat` is computed lazily here so a bare-`public` scan
+                        // (the first probe already resolved to `table_name`) pays
+                        // no extra allocation.
+                        let flat = Self::normalize_nontable_name(name);
+                        if flat != table_name
+                            && !catalog.table_exists(&table_name).unwrap_or(false)
+                            && view_catalog.view_exists(&flat)?
+                        {
+                            Some(flat)
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(view_key) = view_key {
+                        // Break cyclic / self-referential views before they
+                        // overflow the stack: if this view is already on the
+                        // expansion ancestor chain, the body reaches back to
+                        // itself. Error cleanly instead of recursing forever.
+                        if self.view_expansion_stack.iter().any(|v| v == &view_key) {
+                            return Err(Error::query_execution(format!(
+                                "cyclic view reference detected while expanding view \"{}\"",
+                                view_key
+                            )));
+                        }
+
                         // This is a regular view - expand it by parsing and planning its query
-                        let view_metadata = view_catalog.get_view(&table_name)?;
+                        let view_metadata = view_catalog.get_view(&view_key)?;
 
                         // Parse the view's query SQL
                         let parser = super::Parser::new();
                         let stmt = parser.parse_one(&view_metadata.query_sql)?;
 
-                        // Create a new planner for the view query (to avoid self-borrow issues)
-                        let view_planner = Planner::with_catalog(catalog);
+                        // Create a new planner for the view query (to avoid
+                        // self-borrow issues). BIND THE BODY TO THE CREATOR'S
+                        // schema, captured at CREATE — NOT the reading session's
+                        // `search_path`. Otherwise `CREATE VIEW v AS SELECT * FROM
+                        // t` under `search_path=a` would return `b.t`'s rows to a
+                        // reader under `search_path=b` (silent wrong data). A view
+                        // stored without a creator schema (created under `public`,
+                        // or pre-namespacing) carries `None` and resolves bare
+                        // names as `public`. The ancestor chain is extended with
+                        // this view so nested expansions detect cycles.
+                        let mut next_stack = self.view_expansion_stack.clone();
+                        next_stack.push(view_key.clone());
+                        let view_planner = Planner::with_catalog(catalog)
+                            .with_current_schema(view_metadata.creator_schema.clone())
+                            .with_view_expansion_stack(next_stack);
                         let view_plan = view_planner.statement_to_plan(stmt)?;
 
                         // If there's an alias, wrap in a subquery with alias
@@ -3008,11 +3078,7 @@ impl<'a> Planner<'a> {
         let delimiter = match args.len() {
             2 => match args.get(1) {
                 Some(LogicalExpr::Literal(crate::Value::String(s))) => s.clone(),
-                _ => {
-                    return Err(Error::query_execution(
-                        "STRING_AGG delimiter must be a string literal",
-                    ))
-                }
+                _ => return Err(Error::query_execution("STRING_AGG delimiter must be a string literal")),
             },
             1 if is_group_concat => ",".to_string(),
             _ => {
@@ -3990,8 +4056,9 @@ impl<'a> Planner<'a> {
             // literals (e.g. `E'\\x89504e470001'`), which the CDC replicat's
             // INSERT ... ON CONFLICT upsert emits — previously rejected with
             // "Value type not yet supported: EscapedStringLiteral".
-            sqlparser::ast::Value::EscapedStringLiteral(s)
-            | sqlparser::ast::Value::UnicodeStringLiteral(s) => Ok(Value::String(s.clone())),
+            sqlparser::ast::Value::EscapedStringLiteral(s) | sqlparser::ast::Value::UnicodeStringLiteral(s) => {
+                Ok(Value::String(s.clone()))
+            }
             // Dollar-quoted strings: `$$hello$$` or `$tag$hello$tag$`. The
             // content is already safely delimited by the parser, so we
             // just lift it to a plain String value — the tag is
@@ -4667,13 +4734,11 @@ impl<'a> Planner<'a> {
             // range-delete + reload pass and re-add them after. CASCADE is
             // accepted but not propagated (Nano drops the named constraint
             // only; dependent objects are handled by their own DDL).
-            AlterTableOperation::DropConstraint { name, if_exists, .. } => {
-                Ok(LogicalPlan::AlterTableDropConstraint {
-                    table_name,
-                    constraint_name: name.value,
-                    if_exists,
-                })
-            }
+            AlterTableOperation::DropConstraint { name, if_exists, .. } => Ok(LogicalPlan::AlterTableDropConstraint {
+                table_name,
+                constraint_name: name.value,
+                if_exists,
+            }),
             _ => Err(Error::query_execution(format!(
                 "Unsupported ALTER TABLE operation: {operation:?}",
             ))),
@@ -4773,9 +4838,7 @@ impl<'a> Planner<'a> {
                 let len = char_len
                     .as_ref()
                     .and_then(|cl| match cl {
-                        sqlparser::ast::CharacterLength::IntegerLength { length, .. } => {
-                            Some(*length as usize)
-                        }
+                        sqlparser::ast::CharacterLength::IntegerLength { length, .. } => Some(*length as usize),
                         _ => None,
                     })
                     .unwrap_or(1);
@@ -4795,9 +4858,9 @@ impl<'a> Planner<'a> {
                 Ok(DataType::Varchar(len))
             }
             // Character large objects map to unbounded TEXT.
-            SqlDataType::Clob(_)
-            | SqlDataType::CharacterLargeObject(_)
-            | SqlDataType::CharLargeObject(_) => Ok(DataType::Text),
+            SqlDataType::Clob(_) | SqlDataType::CharacterLargeObject(_) | SqlDataType::CharLargeObject(_) => {
+                Ok(DataType::Text)
+            }
             SqlDataType::Text => Ok(DataType::Text),
             SqlDataType::Bytea => Ok(DataType::Bytea),
             SqlDataType::Date => Ok(DataType::Date),
@@ -5364,8 +5427,11 @@ impl<'a> Planner<'a> {
         // Convert trigger name
         let trigger_name = name.to_string();
 
-        // Convert table name
-        let table_name_str = table_name.to_string();
+        // Convert table name — the trigger's TARGET table is schema-resolved
+        // through the session `search_path` (bare `t` under a non-`public`
+        // schema → `s.t`), so `CREATE TRIGGER … ON t` attaches to the same key
+        // the table was created under.
+        let table_name_str = self.resolve_table_ref(&table_name);
 
         // Convert timing
         let timing = match period {
@@ -5564,7 +5630,9 @@ impl<'a> Planner<'a> {
 
         Ok(LogicalPlan::DropTrigger {
             name: trigger_name.to_string(),
-            table_name: Some(table_name.to_string()),
+            // Resolve the trigger's target table through the session
+            // `search_path`, matching how CREATE TRIGGER registered it.
+            table_name: Some(self.resolve_table_ref(&table_name)),
             if_exists,
         })
     }
@@ -5709,16 +5777,28 @@ mod tests {
         // coexist across schemas. `normalize_object_name` is the pure AST→key
         // map (no `search_path` resolution — that lives in `resolve_table_ref`).
         assert_eq!(Planner::normalize_object_name(&on(&["public", "t"])), "t");
-        assert_eq!(Planner::normalize_object_name(&on(&["pg_catalog", "pg_type"])), "pg_type");
-        assert_eq!(Planner::normalize_object_name(&on(&["smoke", "____smoketest"])), "smoke.____smoketest");
-        assert_eq!(Planner::normalize_object_name(&on(&["myschema", "qualtest"])), "myschema.qualtest");
+        assert_eq!(
+            Planner::normalize_object_name(&on(&["pg_catalog", "pg_type"])),
+            "pg_type"
+        );
+        assert_eq!(
+            Planner::normalize_object_name(&on(&["smoke", "____smoketest"])),
+            "smoke.____smoketest"
+        );
+        assert_eq!(
+            Planner::normalize_object_name(&on(&["myschema", "qualtest"])),
+            "myschema.qualtest"
+        );
         // bare name unchanged
         assert_eq!(Planner::normalize_object_name(&on(&["____smoketest"])), "____smoketest");
         // a single (quoted) identifier that contains a dot is ONE part -> intact
         assert_eq!(Planner::normalize_object_name(&on(&["my.table"])), "my.table");
         // A catalog/database prefix beyond schema.table is dropped (PostgreSQL
         // resolves catalog.schema.table against the current database).
-        assert_eq!(Planner::normalize_object_name(&on(&["mydb", "myschema", "t"])), "myschema.t");
+        assert_eq!(
+            Planner::normalize_object_name(&on(&["mydb", "myschema", "t"])),
+            "myschema.t"
+        );
         assert_eq!(Planner::normalize_object_name(&on(&["mydb", "public", "t"])), "t");
         // information_schema.* system views KEEP their qualifier (registered/
         // resolved under the qualified name — non-`public`, so preserved).
@@ -5739,6 +5819,52 @@ mod tests {
             Planner::normalize_dotted_name("information_schema.columns"),
             "information_schema.columns"
         );
+    }
+
+    /// RESOLUTION COVERAGE — every table-carrying arm must route its target
+    /// through the choke point (`resolve_table_ref`/`resolve_table_create`) or
+    /// the non-table collapse, never a raw `to_string()`. With no catalog and no
+    /// session schema, the observable contract is: a `public.`/`pg_catalog.`
+    /// qualifier collapses to the bare key (proving the arm went through the
+    /// choke point) while a NON-`public` qualifier is preserved. These arms
+    /// previously used `to_string()`, which left `public.pk` uncollapsed.
+    #[test]
+    fn secondary_arms_route_through_resolution_choke_point() {
+        let parser = Parser::new();
+        let plan = |sql: &str| Planner::new().statement_to_plan(parser.parse_one(sql).expect("parse"));
+
+        // TRUNCATE — the target resolves through `resolve_table_ref`.
+        match plan("TRUNCATE TABLE public.pk").expect("truncate plan") {
+            LogicalPlan::Truncate { table_name } => assert_eq!(table_name, "pk"),
+            other => panic!("expected Truncate, got {other:?}"),
+        }
+        match plan("TRUNCATE TABLE myschema.pk").expect("truncate plan") {
+            LogicalPlan::Truncate { table_name } => assert_eq!(table_name, "myschema.pk"),
+            other => panic!("expected Truncate, got {other:?}"),
+        }
+
+        // CREATE TRIGGER — the ON <table> target resolves through the choke point.
+        match plan("CREATE TRIGGER t AFTER INSERT ON public.orders FOR EACH ROW EXECUTE FUNCTION f()")
+            .expect("trigger plan")
+        {
+            LogicalPlan::CreateTrigger { table_name, .. } => assert_eq!(table_name, "orders"),
+            other => panic!("expected CreateTrigger, got {other:?}"),
+        }
+
+        // DROP TRIGGER — the ON <table> target resolves through the choke point.
+        match plan("DROP TRIGGER t ON public.orders").expect("drop trigger plan") {
+            LogicalPlan::DropTrigger { table_name, .. } => {
+                assert_eq!(table_name.as_deref(), Some("orders"));
+            }
+            other => panic!("expected DropTrigger, got {other:?}"),
+        }
+
+        // CREATE VIEW — a non-table object: its NAME collapses on BOTH create and
+        // reference (views stay flat), so a qualified create name collapses.
+        match plan("CREATE VIEW alter2.v1 AS SELECT 1").expect("view plan") {
+            LogicalPlan::CreateView { name, .. } => assert_eq!(name, "v1"),
+            other => panic!("expected CreateView, got {other:?}"),
+        }
     }
 
     #[test]

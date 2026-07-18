@@ -47,8 +47,9 @@ mod aggjoin {
         db.execute("CREATE TABLE dim (k INT8 PRIMARY KEY, label TEXT)").unwrap();
         {
             let sql = "INSERT INTO dim (k, label) VALUES ($1, $2)";
-            let batch: Vec<Vec<Value>> =
-                (0..DIM).map(|i| vec![Value::Int8(i), Value::String(pad(i, 20))]).collect();
+            let batch: Vec<Vec<Value>> = (0..DIM)
+                .map(|i| vec![Value::Int8(i), Value::String(pad(i, 20))])
+                .collect();
             db.execute_many_params(sql, &batch).unwrap();
         }
 
@@ -59,7 +60,8 @@ mod aggjoin {
         )
         .unwrap();
         // NARROW twin: only the referenced columns.
-        db.execute("CREATE TABLE narrow (id INT8 PRIMARY KEY, k INT8, g INT8, v INT8)").unwrap();
+        db.execute("CREATE TABLE narrow (id INT8 PRIMARY KEY, k INT8, g INT8, v INT8)")
+            .unwrap();
 
         let wide_sql = "INSERT INTO wide (id,k,g,v,t1,t2,t3,t4,t5,t6,t7,t8) \
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)";
@@ -85,18 +87,23 @@ mod aggjoin {
         }
 
         println!("\n=== Item #4 aggregate-over-join pruning opportunity ({FACT} fact / {DIM} dim) ===");
-        let q = |t: &str| {
-            format!("SELECT f.g, COUNT(*), SUM(f.v) FROM {t} f JOIN dim d ON f.k = d.k GROUP BY f.g")
-        };
+        let q = |t: &str| format!("SELECT f.g, COUNT(*), SUM(f.v) FROM {t} f JOIN dim d ON f.k = d.k GROUP BY f.g");
         let wide_ms = time_query(&db, &q("wide"), 4) * 1e3;
         let narrow_ms = time_query(&db, &q("narrow"), 4) * 1e3;
         println!("wide fact (12 cols, 8 unused TEXT): {wide_ms:.1} ms", wide_ms = wide_ms);
-        println!("narrow twin (4 cols, all used):     {narrow_ms:.1} ms", narrow_ms = narrow_ms);
+        println!(
+            "narrow twin (4 cols, all used):     {narrow_ms:.1} ms",
+            narrow_ms = narrow_ms
+        );
         let ceiling = wide_ms / narrow_ms;
         println!("PRUNE CEILING = {ceiling:.1}x  (wide/narrow — the most column pruning could win)");
         println!(
             "  {} (>= ~1.5x makes item #4 worthwhile; < ~1.2x => scan cost isn't column-count-bound)",
-            if ceiling >= 1.5 { "WORTHWHILE" } else { "MARGINAL - reconsider" }
+            if ceiling >= 1.5 {
+                "WORTHWHILE"
+            } else {
+                "MARGINAL - reconsider"
+            }
         );
     }
 }

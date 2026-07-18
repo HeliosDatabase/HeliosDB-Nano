@@ -52,18 +52,27 @@ fn export_interval_year_month_lowers() {
         .query("SELECT DATE '2020-01-01' + INTERVAL '2' YEAR AS d", &[])
         .unwrap();
     assert_eq!(y.len(), 1);
-    assert!(!matches!(y[0].values[0], Value::Null), "INTERVAL '2' YEAR must compute a date");
+    assert!(
+        !matches!(y[0].values[0], Value::Null),
+        "INTERVAL '2' YEAR must compute a date"
+    );
 
     let m = db
         .query("SELECT DATE '2020-01-01' + INTERVAL '3' MONTH AS d", &[])
         .unwrap();
-    assert!(!matches!(m[0].values[0], Value::Null), "INTERVAL '3' MONTH must compute a date");
+    assert!(
+        !matches!(m[0].values[0], Value::Null),
+        "INTERVAL '3' MONTH must compute a date"
+    );
 
     // String-form parity.
     let ys = db
         .query("SELECT DATE '2020-01-01' + INTERVAL '2 years' AS d", &[])
         .unwrap();
-    assert!(!matches!(ys[0].values[0], Value::Null), "INTERVAL '2 years' must compute a date");
+    assert!(
+        !matches!(ys[0].values[0], Value::Null),
+        "INTERVAL '2 years' must compute a date"
+    );
 
     // DAY stays exact: 2020-01-01 + 1 day = 2020-01-02.
     let d = db

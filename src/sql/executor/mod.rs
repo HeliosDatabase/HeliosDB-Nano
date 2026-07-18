@@ -2410,7 +2410,11 @@ impl<'a> Executor<'a> {
         }
         let analyzed_predicates = predicate
             .as_ref()
-            .map(|predicate| storage.predicate_pushdown().analyze_predicate(predicate, schema, &self.parameters))
+            .map(|predicate| {
+                storage
+                    .predicate_pushdown()
+                    .analyze_predicate(predicate, schema, &self.parameters)
+            })
             .unwrap_or_default();
         if predicate.is_some() && analyzed_predicates.is_empty() {
             return Ok(None);
@@ -2504,7 +2508,11 @@ impl<'a> Executor<'a> {
         }
         let analyzed_predicates = predicate
             .as_ref()
-            .map(|predicate| storage.predicate_pushdown().analyze_predicate(predicate, schema, &self.parameters))
+            .map(|predicate| {
+                storage
+                    .predicate_pushdown()
+                    .analyze_predicate(predicate, schema, &self.parameters)
+            })
             .unwrap_or_default();
         if predicate.is_some() && analyzed_predicates.is_empty() {
             return Ok(None);
@@ -3805,9 +3813,7 @@ impl<'a> Executor<'a> {
                     .ok_or_else(|| Error::query_execution("DROP SEQUENCE requires storage context".to_string()))?;
                 let catalog = storage.catalog();
                 if !*if_exists && !catalog.sequence_exists(name)? {
-                    return Err(Error::query_execution(format!(
-                        "sequence \"{name}\" does not exist"
-                    )));
+                    return Err(Error::query_execution(format!("sequence \"{name}\" does not exist")));
                 }
                 catalog.drop_sequence(name)?;
                 crate::sql::sequences::invalidate_cache(name);

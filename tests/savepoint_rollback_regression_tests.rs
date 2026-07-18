@@ -112,7 +112,8 @@ fn rollback_to_outer_savepoint_undoes_inner() {
 #[test]
 fn repeated_savepoint_insert_rollback_commit_does_not_wedge() {
     let db = EmbeddedDatabase::new_in_memory().unwrap();
-    db.execute("CREATE TABLE bench_ins (id INT PRIMARY KEY, label TEXT)").unwrap();
+    db.execute("CREATE TABLE bench_ins (id INT PRIMARY KEY, label TEXT)")
+        .unwrap();
 
     for i in 0..50 {
         db.execute("BEGIN").unwrap();
@@ -121,7 +122,10 @@ fn repeated_savepoint_insert_rollback_commit_does_not_wedge() {
             .unwrap_or_else(|e| panic!("iteration {i}: INSERT hit spurious error: {e}"));
         db.execute("ROLLBACK TO SAVEPOINT sp1").unwrap();
         db.execute("COMMIT").unwrap();
-        assert!(!db.in_transaction(), "iteration {i}: connection left wedged in a transaction");
+        assert!(
+            !db.in_transaction(),
+            "iteration {i}: connection left wedged in a transaction"
+        );
     }
 
     // 99999 was rolled back every time, so the table is empty.

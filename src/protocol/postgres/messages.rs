@@ -437,10 +437,7 @@ impl FrontendMessage {
                 params.push(None);
             } else {
                 if param_len < 0 {
-                    return Err(Error::protocol(format!(
-                        "Invalid Bind parameter length: {}",
-                        param_len
-                    )));
+                    return Err(Error::protocol(format!("Invalid Bind parameter length: {}", param_len)));
                 }
                 let param_len = param_len as usize;
                 if param_len > buf.remaining() {

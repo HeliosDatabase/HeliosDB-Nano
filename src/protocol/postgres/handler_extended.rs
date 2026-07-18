@@ -390,8 +390,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
                 // planner/evaluator becomes a recoverable XX000 error instead
                 // of unwinding the connection task and dropping the client.
                 let (affected, tuples) = super::handler::run_guarded(|| {
-                    self.database
-                        .execute_params_returning(&statement.query, &param_values)
+                    self.database.execute_params_returning(&statement.query, &param_values)
                 })?;
                 self.prepared_statements
                     .update_portal_state(&portal_name, PortalState::Complete)?;
@@ -639,8 +638,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
             Statement::Query(_) => {
                 // SELECT and other queries - derive schema from logical plan
                 let catalog = self.database.storage.catalog();
-                let planner = crate::sql::planner::Planner::with_catalog(&catalog)
-                    .with_current_schema(current_schema.clone());
+                let planner =
+                    crate::sql::planner::Planner::with_catalog(&catalog).with_current_schema(current_schema.clone());
 
                 // Convert statement to logical plan
                 let logical_plan = planner.statement_to_plan(statement.clone())?;

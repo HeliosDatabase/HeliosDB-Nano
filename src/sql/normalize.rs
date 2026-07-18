@@ -222,10 +222,7 @@ pub(crate) fn normalize_select_literals(sql: &str) -> Option<(String, Vec<Value>
                 params.push(value);
                 out.push('$');
                 out.push_str(&params.len().to_string());
-            } else if depth == 0
-                && (in_limit || in_offset)
-                && bytes[i..end].iter().all(u8::is_ascii_digit)
-            {
+            } else if depth == 0 && (in_limit || in_offset) && bytes[i..end].iter().all(u8::is_ascii_digit) {
                 // A LIMIT/OFFSET bound: exactly ONE bare non-negative integer
                 // per clause keyword. Parameterizing it is result-preserving —
                 // the plan is identical for every bound value (the executor
@@ -253,11 +250,7 @@ pub(crate) fn normalize_select_literals(sql: &str) -> Option<(String, Vec<Value>
         // A bare `.` immediately before a digit would be a leading-dot decimal
         // (`.5`) that read_number (digit-led) would mis-split into `.` + `5`.
         // Rare in predicates; bail rather than risk it.
-        if b == b'.'
-            && i + 1 < n
-            && bytes[i + 1].is_ascii_digit()
-            && (in_where || in_limit || in_offset)
-        {
+        if b == b'.' && i + 1 < n && bytes[i + 1].is_ascii_digit() && (in_where || in_limit || in_offset) {
             return None;
         }
 
@@ -437,7 +430,17 @@ fn skip_double_quoted(bytes: &[u8], i: usize) -> Option<usize> {
 /// Top-level clause keywords that end the WHERE predicate region.
 fn is_where_terminator_kw(word: &str) -> bool {
     const KWS: [&str; 11] = [
-        "group", "order", "limit", "offset", "having", "window", "fetch", "for", "union", "intersect", "except",
+        "group",
+        "order",
+        "limit",
+        "offset",
+        "having",
+        "window",
+        "fetch",
+        "for",
+        "union",
+        "intersect",
+        "except",
     ];
     KWS.iter().any(|k| word.eq_ignore_ascii_case(k))
 }
@@ -714,7 +717,11 @@ mod tests {
         let (s7, _) = norm("SELECT x FROM t WHERE a IN (1,2,3,4,5,6,7)").unwrap();
         assert_eq!(s5.matches('$').count(), 8);
         assert_eq!(s7.matches('$').count(), 8);
-        assert_eq!(p5.len(), 5, "params carry the true arity, padding repeats the last placeholder");
+        assert_eq!(
+            p5.len(),
+            5,
+            "params carry the true arity, padding repeats the last placeholder"
+        );
     }
 
     #[test]
@@ -781,8 +788,7 @@ mod tests {
 
     #[test]
     fn whitelisted_cast_passes_through() {
-        let (s, p) =
-            norm("SELECT x FROM t WHERE id = '11111111-1111-1111-1111-111111111111'::uuid").unwrap();
+        let (s, p) = norm("SELECT x FROM t WHERE id = '11111111-1111-1111-1111-111111111111'::uuid").unwrap();
         assert_eq!(s, "SELECT x FROM t WHERE id = $1::uuid");
         assert_eq!(p.len(), 1);
         let (s2, _) = norm("SELECT x FROM t WHERE ts = '2026-01-01'::timestamp AND n = 5::int8").unwrap();
@@ -1021,7 +1027,9 @@ mod differential {
         let mut rng_state: u64 = 0x5eed_1e57_0BAD_F00D;
         let mut next = move || {
             // LCG (Numerical Recipes constants) — deterministic across runs.
-            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            rng_state = rng_state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (rng_state >> 33) as u32
         };
 

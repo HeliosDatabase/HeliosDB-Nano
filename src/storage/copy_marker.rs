@@ -155,7 +155,11 @@ mod tests {
 
     #[test]
     fn key_roundtrips_including_colon_in_table() {
-        for (t, f, l, ts) in [("t", 1u64, 100u64, 42u64), ("weird:name", 5, 9, 7), ("x", 0, u64::MAX, 1)] {
+        for (t, f, l, ts) in [
+            ("t", 1u64, 100u64, 42u64),
+            ("weird:name", 5, 9, 7),
+            ("x", 0, u64::MAX, 1),
+        ] {
             let k = CopyMarkers::marker_key(t, f, l);
             let v = ts.to_be_bytes();
             let (pt, pf, pl, pts) = CopyMarkers::parse_marker(k.as_bytes(), &v).unwrap();
@@ -183,7 +187,10 @@ mod tests {
     #[test]
     fn load_record_skips_garbage() {
         let m = CopyMarkers::new();
-        m.load_record(b"vmeta:t:00000000000000000001:00000000000000000009", &50u64.to_be_bytes());
+        m.load_record(
+            b"vmeta:t:00000000000000000001:00000000000000000009",
+            &50u64.to_be_bytes(),
+        );
         assert_eq!(m.covering_ts("t", 5), Some(50));
         // Garbage records are ignored, not fatal.
         m.load_record(b"vmeta:garbage", b"x");

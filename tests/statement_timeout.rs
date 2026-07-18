@@ -38,10 +38,7 @@ fn set_statement_timeout_is_enforced_on_a_long_scan() {
     let start = std::time::Instant::now();
     // A cross-ish product to guarantee the operator loop runs long enough to
     // cross a 1ms deadline on any realistic host.
-    let result = db.query(
-        "SELECT count(*) FROM big a JOIN big b ON a.v = b.v WHERE a.id > 0",
-        &[],
-    );
+    let result = db.query("SELECT count(*) FROM big a JOIN big b ON a.v = b.v WHERE a.id > 0", &[]);
     let elapsed = start.elapsed();
 
     match result {

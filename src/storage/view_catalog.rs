@@ -14,6 +14,11 @@ use serde::{Deserialize, Serialize};
 const VIEW_METADATA_PREFIX: &str = "__view_metadata__";
 
 /// Metadata for a regular view
+///
+/// `creator_schema` is declared LAST on purpose: bincode is positional and not
+/// self-describing, so appending the field keeps the layout append-compatible
+/// with views serialized before schema namespacing (the `LegacyViewMetadata`
+/// fallback in [`ViewCatalog::get_view`] reads those older blobs).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ViewMetadata {
     /// Unique view name
@@ -26,6 +31,41 @@ pub struct ViewMetadata {
     pub created_at: DateTime<Utc>,
     /// Whether this view was created with OR REPLACE
     pub or_replace: bool,
+    /// The creating session's `search_path` schema (first non-`public` entry),
+    /// captured at CREATE so the view body BINDS to the schema it was defined
+    /// under — not the reading session's `search_path`. `None` = created under
+    /// `public` (bare names in the body resolve as `public`), which also matches
+    /// the pre-namespacing semantics of any view stored without this field.
+    pub creator_schema: Option<String>,
+}
+
+/// Pre-namespacing on-disk layout of [`ViewMetadata`] (no `creator_schema`).
+///
+/// bincode encodes fields positionally with no length/tag framing, so a view
+/// written by an older build has no trailing `creator_schema` byte and fails to
+/// deserialize into the current struct (EOF). [`ViewCatalog::get_view`] falls
+/// back to this shape and treats the absent field as `None` (created under
+/// `public`), preserving those views' original resolution semantics.
+#[derive(Deserialize)]
+struct LegacyViewMetadata {
+    view_name: String,
+    query_sql: String,
+    schema: Schema,
+    created_at: DateTime<Utc>,
+    or_replace: bool,
+}
+
+impl From<LegacyViewMetadata> for ViewMetadata {
+    fn from(legacy: LegacyViewMetadata) -> Self {
+        Self {
+            view_name: legacy.view_name,
+            query_sql: legacy.query_sql,
+            schema: legacy.schema,
+            created_at: legacy.created_at,
+            or_replace: legacy.or_replace,
+            creator_schema: None,
+        }
+    }
 }
 
 impl ViewMetadata {
@@ -37,12 +77,20 @@ impl ViewMetadata {
             schema,
             created_at: Utc::now(),
             or_replace: false,
+            creator_schema: None,
         }
     }
 
     /// Create with OR REPLACE flag
     pub fn with_or_replace(mut self, or_replace: bool) -> Self {
         self.or_replace = or_replace;
+        self
+    }
+
+    /// Set the creating session's schema (from `search_path`) so the view body
+    /// binds at CREATE, not per-reader. `None` = created under `public`.
+    pub fn with_creator_schema(mut self, creator_schema: Option<String>) -> Self {
+        self.creator_schema = creator_schema;
         self
     }
 }
@@ -104,8 +152,15 @@ impl<'a> ViewCatalog<'a> {
     pub fn get_view(&self, view_name: &str) -> Result<ViewMetadata> {
         let key = Self::view_key(view_name);
         match self.storage.get(&key)? {
-            Some(data) => bincode::deserialize(&data)
-                .map_err(|e| Error::storage(format!("Failed to deserialize view metadata: {}", e))),
+            // Try the current layout first; a view stored by a pre-namespacing
+            // build lacks the trailing `creator_schema` field (bincode is
+            // positional), so fall back to the legacy shape and default its
+            // `creator_schema` to `None` (created under `public`).
+            Some(data) => bincode::deserialize::<ViewMetadata>(&data).or_else(|_| {
+                bincode::deserialize::<LegacyViewMetadata>(&data)
+                    .map(ViewMetadata::from)
+                    .map_err(|e| Error::storage(format!("Failed to deserialize view metadata: {}", e)))
+            }),
             None => Err(Error::query_execution(format!("View '{}' does not exist", view_name))),
         }
     }
@@ -233,5 +288,64 @@ mod tests {
 
         // Should succeed with IF EXISTS
         catalog.drop_view("nonexistent", true).unwrap();
+    }
+
+    /// A round-tripped view carries its `creator_schema` (view body binds at
+    /// CREATE).
+    #[test]
+    fn test_creator_schema_round_trips() {
+        let _dir = tempdir().unwrap();
+        let config = Config::in_memory();
+        let storage = StorageEngine::open_in_memory(&config).unwrap();
+        let catalog = ViewCatalog::new(&storage);
+
+        let schema = Schema::new(vec![Column::new("id", DataType::Int4)]);
+        let metadata = ViewMetadata::new("cs_view".to_string(), "SELECT id FROM t".to_string(), schema)
+            .with_creator_schema(Some("a".to_string()));
+        catalog.create_view(metadata, false, false).unwrap();
+
+        let got = catalog.get_view("cs_view").unwrap();
+        assert_eq!(got.creator_schema.as_deref(), Some("a"));
+    }
+
+    /// BACKWARD COMPAT: a view serialized in the PRE-namespacing layout (no
+    /// `creator_schema` field) must still deserialize, defaulting the field to
+    /// `None` (created under `public`). Proves the bincode append-compat +
+    /// legacy fallback in `get_view`.
+    #[test]
+    fn test_legacy_view_without_creator_schema_defaults_none() {
+        use serde::Serialize;
+
+        // The exact pre-change field layout (creator_schema absent).
+        #[derive(Serialize)]
+        struct OldViewMetadata {
+            view_name: String,
+            query_sql: String,
+            schema: Schema,
+            created_at: DateTime<Utc>,
+            or_replace: bool,
+        }
+
+        let _dir = tempdir().unwrap();
+        let config = Config::in_memory();
+        let storage = StorageEngine::open_in_memory(&config).unwrap();
+        let catalog = ViewCatalog::new(&storage);
+
+        let old = OldViewMetadata {
+            view_name: "legacy_view".to_string(),
+            query_sql: "SELECT id FROM t".to_string(),
+            schema: Schema::new(vec![Column::new("id", DataType::Int4)]),
+            created_at: Utc::now(),
+            or_replace: false,
+        };
+        // Store it under the same key the catalog uses, in the OLD layout.
+        let bytes = bincode::serialize(&old).unwrap();
+        storage.put(&ViewCatalog::view_key("legacy_view"), &bytes).unwrap();
+
+        // get_view must fall back to the legacy shape and yield creator_schema=None.
+        let got = catalog.get_view("legacy_view").unwrap();
+        assert_eq!(got.view_name, "legacy_view");
+        assert_eq!(got.query_sql, "SELECT id FROM t");
+        assert_eq!(got.creator_schema, None, "absent field must default to None (public)");
     }
 }

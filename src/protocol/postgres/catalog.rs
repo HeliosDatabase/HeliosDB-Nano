@@ -586,8 +586,7 @@ impl PgCatalog {
                             .as_ref()
                             .map(|d| {
                                 Value::String(
-                                    crate::sql::logical_plan::default_expr_json_to_sql(d)
-                                        .unwrap_or_else(|| d.clone()),
+                                    crate::sql::logical_plan::default_expr_json_to_sql(d).unwrap_or_else(|| d.clone()),
                                 )
                             })
                             .unwrap_or(Value::Null),
@@ -2554,7 +2553,12 @@ mod tests {
 
         let default_of = |sql: &str| -> String {
             let (_, rows) = catalog.handle_query(sql).unwrap().unwrap();
-            assert_eq!(rows.len(), 1, "expected exactly one row for `{sql}`, got {}", rows.len());
+            assert_eq!(
+                rows.len(),
+                1,
+                "expected exactly one row for `{sql}`, got {}",
+                rows.len()
+            );
             match rows[0].values.first() {
                 Some(Value::String(s)) => s.clone(),
                 other => panic!("expected a string column_default, got {other:?}"),
@@ -2565,13 +2569,22 @@ mod tests {
         let h = default_of(
             "select column_default from information_schema.columns where table_name='harden_t' and column_name='id'",
         );
-        assert!(h.contains("harden_seq"), "harden_t.id default should be harden_seq, got {h}");
-        assert!(!h.contains("actor"), "harden_t.id default must NOT leak actor's sequence, got {h}");
+        assert!(
+            h.contains("harden_seq"),
+            "harden_t.id default should be harden_seq, got {h}"
+        );
+        assert!(
+            !h.contains("actor"),
+            "harden_t.id default must NOT leak actor's sequence, got {h}"
+        );
 
         let a = default_of(
             "select column_default from information_schema.columns where table_name='actor' and column_name='actor_id'",
         );
-        assert!(a.contains("actor_actor_id_seq"), "actor.actor_id default should be actor_actor_id_seq, got {a}");
+        assert!(
+            a.contains("actor_actor_id_seq"),
+            "actor.actor_id default should be actor_actor_id_seq, got {a}"
+        );
     }
 
     // -------------------------------------------------------------------

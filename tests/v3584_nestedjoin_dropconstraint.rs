@@ -90,9 +90,15 @@ fn group_concat_one_arg_defaults_comma() -> Result<()> {
     };
 
     // 1-arg group_concat → comma-joined.
-    assert_eq!(parts(&db, "SELECT group_concat(name) FROM g", ',')?, vec!["a", "b", "c"]);
+    assert_eq!(
+        parts(&db, "SELECT group_concat(name) FROM g", ',')?,
+        vec!["a", "b", "c"]
+    );
     // 2-arg group_concat → explicit delimiter honored.
-    assert_eq!(parts(&db, "SELECT group_concat(name, '|') FROM g", '|')?, vec!["a", "b", "c"]);
+    assert_eq!(
+        parts(&db, "SELECT group_concat(name, '|') FROM g", '|')?,
+        vec!["a", "b", "c"]
+    );
     // STRING_AGG keeps requiring the explicit delimiter.
     assert!(db.query("SELECT string_agg(name) FROM g", &[]).is_err());
     Ok(())
