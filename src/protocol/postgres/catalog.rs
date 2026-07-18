@@ -48,10 +48,12 @@ impl PgCatalog {
             return Ok(Some(self.query_version()?));
         }
 
-        // Handle SELECT current_schema() - required by SQLAlchemy connection init
-        if query_lower.contains("current_schema()") {
-            return Ok(Some(Self::query_current_schema()?));
-        }
+        // `current_schema()` is deliberately NOT intercepted here: this handler
+        // has no session context, so a hardcoded `public` row would lie for a
+        // connection under `SET search_path`. Let it fall through to the query
+        // engine, whose scalar reads the session's effective schema (the wire
+        // session installs its schema-override before the engine runs). See
+        // `Evaluator` `current_schema` / `crate::session_current_schema_tls`.
 
         // Handle SELECT current_database() - required by SQLAlchemy / pgAdmin
         if query_lower.contains("current_database()") {
@@ -779,12 +781,6 @@ impl PgCatalog {
     }
 
     /// Return current schema (always "public")
-    fn query_current_schema() -> Result<(Schema, Vec<Tuple>)> {
-        let schema = Schema::new(vec![Column::new("current_schema", DataType::Text)]);
-        let row = Tuple::new(vec![Value::String("public".to_string())]);
-        Ok((schema, vec![row]))
-    }
-
     /// Return current database name
     fn query_current_database() -> Result<(Schema, Vec<Tuple>)> {
         let schema = Schema::new(vec![Column::new("current_database", DataType::Text)]);

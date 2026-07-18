@@ -632,14 +632,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
         // reports the schema-scoped relation's columns (and doesn't fail on a
         // relation that exists only in the session's schema, not `public`).
         let current_schema = self.database.session_current_schema(self.session_id).unwrap_or(None);
+        // I-SP: the full ordered path so Describe resolves a bare name the same
+        // way execution will (walking every search_path entry, not just the first).
+        let current_search_path = self.database.session_search_path(self.session_id).unwrap_or_default();
 
         // Only derive schema for queries that return results
         match statement {
             Statement::Query(_) => {
                 // SELECT and other queries - derive schema from logical plan
                 let catalog = self.database.storage.catalog();
-                let planner =
-                    crate::sql::planner::Planner::with_catalog(&catalog).with_current_schema(current_schema.clone());
+                let planner = crate::sql::planner::Planner::with_catalog(&catalog)
+                    .with_current_schema(current_schema.clone())
+                    .with_search_path(current_search_path.clone());
 
                 // Convert statement to logical plan
                 let logical_plan = planner.statement_to_plan(statement.clone())?;
@@ -661,7 +665,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
                     // Has RETURNING clause - derive schema
                     let catalog = self.database.storage.catalog();
                     let planner = crate::sql::planner::Planner::with_catalog(&catalog)
-                        .with_current_schema(current_schema.clone());
+                        .with_current_schema(current_schema.clone())
+                        .with_search_path(current_search_path.clone());
                     let plan = planner.statement_to_plan(statement.clone())?;
                     if let crate::sql::LogicalPlan::Insert {
                         table_name,
@@ -687,7 +692,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
                 if returning.is_some() {
                     let catalog = self.database.storage.catalog();
                     let planner = crate::sql::planner::Planner::with_catalog(&catalog)
-                        .with_current_schema(current_schema.clone());
+                        .with_current_schema(current_schema.clone())
+                        .with_search_path(current_search_path.clone());
                     let plan = planner.statement_to_plan(statement.clone())?;
                     if let crate::sql::LogicalPlan::Update {
                         table_name,
@@ -708,7 +714,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
                 if del.returning.is_some() {
                     let catalog = self.database.storage.catalog();
                     let planner = crate::sql::planner::Planner::with_catalog(&catalog)
-                        .with_current_schema(current_schema.clone());
+                        .with_current_schema(current_schema.clone())
+                        .with_search_path(current_search_path.clone());
                     let plan = planner.statement_to_plan(statement.clone())?;
                     if let crate::sql::LogicalPlan::Delete {
                         table_name,

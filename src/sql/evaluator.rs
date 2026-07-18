@@ -853,7 +853,37 @@ impl Evaluator {
                 "PostgreSQL 16.0 (HeliosDB Nano {})",
                 env!("CARGO_PKG_VERSION")
             ))),
-            "current_schema" => Ok(Value::String("public".to_string())),
+            // Session-aware: the effective current schema is the first
+            // `search_path` entry the session installed (threaded via the
+            // per-statement thread-local both the wire and embedded paths set),
+            // falling back to `public` for the default namespace.
+            "current_schema" => Ok(Value::String(
+                crate::session_current_schema_tls().unwrap_or_else(|| "public".to_string()),
+            )),
+            // `current_schemas(include_implicit)` returns the ordered array of
+            // schemas the `search_path` resolves to (I-SP): every entry in order,
+            // with `public` guaranteed present (it is always the bare fallback in
+            // `resolve_table_ref`). With `true`, the implicit `pg_catalog` is
+            // prepended (PostgreSQL parity). The default path is `[public]`.
+            "current_schemas" => {
+                let include_implicit = matches!(arg_values.first(), Some(Value::Boolean(true)));
+                let mut schemas: Vec<Value> = Vec::with_capacity(4);
+                if include_implicit {
+                    schemas.push(Value::String("pg_catalog".to_string()));
+                }
+                let path = crate::session_search_path_tls();
+                let mut has_public = false;
+                for s in &path {
+                    if s == "public" {
+                        has_public = true;
+                    }
+                    schemas.push(Value::String(s.clone()));
+                }
+                if !has_public {
+                    schemas.push(Value::String("public".to_string()));
+                }
+                Ok(Value::Array(schemas))
+            }
             "current_database" => Ok(Value::String("heliosdb".to_string())),
             "current_user" | "session_user" => Ok(Value::String("heliosdb".to_string())),
             // Random UUID v4 — the default for Postgres 13+ PK columns.
