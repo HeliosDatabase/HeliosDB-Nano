@@ -201,6 +201,56 @@ mod plpgsql_hardening_tests {
         }
     }
 
+    // ------------------------------------------------------------------------
+    // RETURNS TABLE(col defs) — set-returning composite return form.
+    // sqlparser 0.53 has no DataType::Table variant, so `TABLE(...)` arrives as
+    // Custom("TABLE", ...) and pre-fix failed with "Custom data type not yet
+    // supported: TABLE". Acceptance-first: CREATE must SUCCEED (strict assert —
+    // these tests fail on pre-change code). Column list is not preserved and
+    // set-returning execution is not wired (calls keep scalar behavior).
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn test_create_function_returns_table_multi_column() {
+        let db = new_db();
+        let result = db.execute(
+            "CREATE FUNCTION plp_rt_multi() RETURNS TABLE(id INT, name TEXT) LANGUAGE sql AS $$SELECT 1, 'a'$$",
+        );
+        assert!(
+            result.is_ok(),
+            "CREATE FUNCTION ... RETURNS TABLE(id int, name text) must succeed, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_create_function_returns_table_single_column() {
+        let db = new_db();
+        let result =
+            db.execute("CREATE FUNCTION plp_rt_single() RETURNS TABLE(n INTEGER) LANGUAGE sql AS $$SELECT 1$$");
+        assert!(
+            result.is_ok(),
+            "CREATE FUNCTION ... RETURNS TABLE(n integer) must succeed, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_create_function_returns_table_is_stored() {
+        // The function must actually be registered, not merely parsed: a
+        // duplicate CREATE without OR REPLACE is rejected only if the first was
+        // stored.
+        let db = new_db();
+        db.execute("CREATE FUNCTION plp_rt_stored() RETURNS TABLE(a INT, b TEXT) LANGUAGE sql AS $$SELECT 1, 'x'$$")
+            .expect("first CREATE FUNCTION RETURNS TABLE should succeed");
+        let dup = db
+            .execute("CREATE FUNCTION plp_rt_stored() RETURNS TABLE(a INT, b TEXT) LANGUAGE sql AS $$SELECT 2, 'y'$$");
+        assert!(
+            dup.is_err(),
+            "duplicate CREATE FUNCTION without OR REPLACE must fail, proving the RETURNS TABLE function was stored"
+        );
+    }
+
     #[test]
     fn test_function_in_select_scalar() {
         // NOTE: User-defined functions in SELECT are NOT wired up in the evaluator.
