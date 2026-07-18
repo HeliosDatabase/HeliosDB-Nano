@@ -4038,6 +4038,26 @@ impl<'a> Planner<'a> {
         sql_constraints: Vec<sqlparser::ast::TableConstraint>,
         with_options: Vec<sqlparser::ast::SqlOption>,
     ) -> Result<LogicalPlan> {
+        // Stage-0 partitioning: a child `CREATE TABLE child PARTITION OF parent
+        // …` was rewritten to an empty-column `CREATE TABLE child ()` by
+        // `Parser::preprocess_partition_of` so sqlparser 0.53 accepts it. This
+        // is the first layer with catalog access, so here we clone the parent's
+        // columns and materialize `child` as an independent, self-consistent
+        // standalone table (Stage-0 flatten: no tuple routing; direct child
+        // DML/SELECT/DROP are correct immediately). Triggered strictly when the
+        // ORIGINAL SQL carries `PARTITION OF` for THIS child name — a plain
+        // `CREATE TABLE t ()` (including `… () INHERITS (…)`) has no such spec
+        // and falls through to the ordinary empty-table path unchanged.
+        if columns.is_empty() {
+            if let (Some(catalog), Some(orig)) = (self.catalog, self.original_sql.as_deref()) {
+                if let Some(spec) = crate::sql::Parser::extract_partition_of(orig) {
+                    if Self::normalize_partition_name(&spec.child) == name {
+                        return self.partition_of_to_plan(name, if_not_exists, &spec, catalog);
+                    }
+                }
+            }
+        }
+
         // Extract storage modes from original SQL if available
         let storage_modes = if let Some(ref sql) = self.original_sql {
             crate::sql::Parser::extract_column_storage_modes(sql)
@@ -4180,6 +4200,139 @@ impl<'a> Planner<'a> {
             if_not_exists,
             constraints,
         })
+    }
+
+    /// Stage-0 partitioning: build the `CreateTable` plan for a
+    /// `PARTITION OF` child by cloning the parent's column shape.
+    ///
+    /// The parent must already exist (the corpus creates parents before
+    /// children in seq order); a missing parent surfaces the catalog's own
+    /// "does not exist" error class — never a panic. Only the column shape is
+    /// copied: name, data type, and NOT NULL. Parent PRIMARY KEY / UNIQUE / FK /
+    /// DEFAULT / IDENTITY are intentionally NOT propagated at Stage 0 — the
+    /// child is a plain standalone clone, and copying keys would fabricate
+    /// constraints the flatten model does not own (real parent/child linkage +
+    /// routing is Stage 1).
+    fn partition_of_to_plan(
+        &self,
+        name: String,
+        if_not_exists: bool,
+        spec: &crate::sql::parser::PartitionOfSpec,
+        catalog: &Catalog<'_>,
+    ) -> Result<LogicalPlan> {
+        let parent = Self::normalize_partition_name(&spec.parent);
+        let schema = catalog.get_table_schema(&parent)?;
+        let columns: Vec<ColumnDef> = schema
+            .columns
+            .iter()
+            .map(|col| ColumnDef {
+                name: col.name.clone(),
+                data_type: col.data_type.clone(),
+                not_null: !col.nullable,
+                primary_key: false,
+                unique: false,
+                default: None,
+                storage_mode: col.storage_mode,
+                is_identity: false,
+            })
+            .collect();
+        // Record the partition intent for Stage 1. The bound text is stored
+        // verbatim and never interpreted at Stage 0, so no bound evaluation
+        // happens here. A durable partition catalog (parent↔child links + typed
+        // bounds, persisted through the catalog + WAL) is Stage-1 scope; adding
+        // it now would exceed a parse-accept pass, and per-statement planning
+        // must stay side-effect-free (no process-global mutable state). We
+        // therefore surface the captured (parent, bound) via a structured log
+        // and leave the persistence hook as a marker.
+        // TODO(stage-1): persist (child `name` → parent, verbatim bound) in a
+        // durable partition side-record to drive INSERT routing / parent-scan
+        // union / pruning.
+        tracing::debug!(
+            child = %name,
+            parent = %parent,
+            bound = %spec.bound,
+            "Stage-0 PARTITION OF flattened to a standalone child (bound recorded, not routed)"
+        );
+        Ok(LogicalPlan::CreateTable {
+            name,
+            columns,
+            if_not_exists,
+            constraints: Vec::new(),
+        })
+    }
+
+    /// Normalize a raw (possibly schema-qualified / double-quoted) partition
+    /// table-name string the same way [`Planner::normalize_object_name`]
+    /// collapses a parsed `ObjectName`, so the parent lookup and the child-name
+    /// key match how tables are stored in the catalog. Reuses the real
+    /// normalizer by reconstructing an `ObjectName` from the raw parts.
+    ///
+    /// `pub(crate)` so the DROP-cascade registration in the executor path can
+    /// normalize a `PARTITION OF` parent name IDENTICALLY to how the child was
+    /// planned — registration and drop-lookup must agree byte-for-byte.
+    pub(crate) fn normalize_partition_name(raw: &str) -> String {
+        let idents: Vec<sqlparser::ast::Ident> = Self::split_dotted_ident(raw)
+            .into_iter()
+            .map(|(value, quoted)| {
+                if quoted {
+                    sqlparser::ast::Ident::with_quote('"', value)
+                } else {
+                    sqlparser::ast::Ident::new(value)
+                }
+            })
+            .collect();
+        if idents.is_empty() {
+            return raw.trim().to_lowercase();
+        }
+        Self::normalize_object_name(&sqlparser::ast::ObjectName(idents))
+    }
+
+    /// Split a raw dotted identifier into `(value, was_quoted)` parts, honoring
+    /// double-quoted spans (a `""` inside a quoted part is an embedded quote).
+    /// Quotes are stripped from the returned value.
+    fn split_dotted_ident(raw: &str) -> Vec<(String, bool)> {
+        let mut parts: Vec<(String, bool)> = Vec::new();
+        let mut chars = raw.trim().chars().peekable();
+        while chars.peek().is_some() {
+            // Consume any separator dots between parts.
+            while chars.peek() == Some(&'.') {
+                chars.next();
+            }
+            match chars.peek() {
+                None => break,
+                Some('"') => {
+                    chars.next(); // opening quote
+                    let mut value = String::new();
+                    while let Some(c) = chars.next() {
+                        if c == '"' {
+                            if chars.peek() == Some(&'"') {
+                                value.push('"');
+                                chars.next();
+                                continue;
+                            }
+                            break;
+                        }
+                        value.push(c);
+                    }
+                    parts.push((value, true));
+                }
+                Some(_) => {
+                    let mut value = String::new();
+                    while let Some(&c) = chars.peek() {
+                        if c == '.' || c == '"' {
+                            break;
+                        }
+                        value.push(c);
+                        chars.next();
+                    }
+                    let trimmed = value.trim().to_string();
+                    if !trimmed.is_empty() {
+                        parts.push((trimmed, false));
+                    }
+                }
+            }
+        }
+        parts
     }
 
     /// Convert sqlparser TableConstraint to our internal representation
