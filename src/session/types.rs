@@ -223,6 +223,20 @@ pub struct Session {
     /// B's bare names. Threaded into planning by the `_for_session` paths (see
     /// `EmbeddedDatabase::session_schema_override_guard`).
     pub current_schema: Option<String>,
+    /// Full ordered effective `search_path` for this session (I-SP): every
+    /// entry in declared order, `"$user"` already expanded to the login user's
+    /// schema, `public` kept in its position, duplicates removed. Empty = the
+    /// default namespace (behaves exactly like the flat `public` path). Bare
+    /// table references walk this list in order (see `Planner::resolve_table_ref`);
+    /// `current_schema` above stays the FIRST non-`public` entry (the CREATE
+    /// target + `current_schema()` scalar), so single-entry behavior is byte
+    /// identical to before.
+    pub search_path: Vec<String>,
+    /// The login role/username this session authenticated as (wire startup
+    /// `user` parameter), used to expand the `"$user"` `search_path` entry
+    /// (I-USER). `None` on the embedded path, which has no login identity — a
+    /// `"$user"` entry then resolves to nothing (dropped from the path).
+    pub login_user: Option<String>,
     /// Active transaction ID (None if no transaction in progress)
     pub active_txn: Option<u64>,
     /// Session creation timestamp (Unix epoch seconds)
@@ -248,6 +262,8 @@ impl Session {
             synchronous_commit: None,
             fast_autocommit: false,
             current_schema: None,
+            search_path: Vec::new(),
+            login_user: None,
             active_txn: None,
             created_at: now,
             last_activity: now,
