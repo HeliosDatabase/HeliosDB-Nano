@@ -4058,41 +4058,36 @@ impl EmbeddedDatabase {
                     let final_values_vec = final_values?;
                     let tuple = Tuple::new(final_values_vec.clone());
 
-                    // Validate foreign key constraints
+                    // Validate foreign key constraints.
+                    //
+                    // I-FK increment 0 — the cross-type FK "twin". This
+                    // INSERT..SELECT arm used to run its OWN inline
+                    // FK-membership probe: it built an ART key from the RAW
+                    // child values and called `pk_index_contains` UNCOERCED.
+                    // `encode_key` is type-width-sensitive, so a cross-type FK
+                    // (int child -> int8 parent, int -> NUMERIC parent, ...)
+                    // encoded a width-mismatched key that could never match the
+                    // parent's PK/UNIQUE index -> a PHANTOM 23503 on rows that
+                    // DO satisfy the FK. It also honored only `Immediate` FKs,
+                    // silently skipping deferred ones. Delete-and-delegate to
+                    // the shared, type-aware validator the direct-INSERT sibling
+                    // already uses (`check_fk_constraints_on_write`, see the
+                    // Insert arm ~lib.rs:3770): it coerces the probe to the
+                    // parent column type (`coerce_fk_probe_values`), queues
+                    // deferred checks for the commit-time
+                    // `validate_deferred_fk_checks`, and audits — while still
+                    // raising 23503 for a genuinely absent parent. Pass the
+                    // active `txn` for read-your-own-writes parity with the
+                    // sibling.
                     let table_constraints = catalog.load_table_constraints(table_name)?;
-                    for fk in &table_constraints.foreign_keys {
-                        if fk.enforcement == sql::ConstraintEnforcement::Immediate {
-                            let fk_values: Vec<Value> = fk
-                                .columns
-                                .iter()
-                                .map(|col_name| {
-                                    schema
-                                        .columns
-                                        .iter()
-                                        .position(|c| &c.name == col_name)
-                                        .and_then(|idx| final_values_vec.get(idx).cloned())
-                                        .unwrap_or(Value::Null)
-                                })
-                                .collect();
-                            if fk_values.iter().any(|v| matches!(v, Value::Null)) {
-                                continue;
-                            }
-                            let key = crate::storage::ArtIndexManager::encode_key(&fk_values);
-                            let exists = if let Some(found) =
-                                self.storage.art_indexes().pk_index_contains(&fk.references_table, &key)
-                            {
-                                found
-                            } else {
-                                self.check_foreign_key_exists(&fk.references_table, &fk.references_columns, &fk_values)?
-                            };
-                            if !exists {
-                                return Err(Error::constraint_violation(format!(
-                                    "Foreign key constraint '{}' violated: referenced row in table '{}' does not exist",
-                                    fk.name, fk.references_table
-                                )));
-                            }
+                    let mut fk_col_values =
+                        std::collections::HashMap::with_capacity(schema.columns.len());
+                    for (i, col) in schema.columns.iter().enumerate() {
+                        if let Some(v) = final_values_vec.get(i) {
+                            fk_col_values.insert(col.name.clone(), v.clone());
                         }
                     }
+                    self.check_fk_constraints_on_write(table_name, &fk_col_values, Some(txn))?;
 
                     // Validate CHECK constraints
                     for check in &table_constraints.check_constraints {
@@ -17808,45 +17803,6 @@ impl EmbeddedDatabase {
             (Value::Int8(v), DataType::Numeric) => Value::Numeric(format!("{v}")),
             _ => value.clone(),
         }
-    }
-
-    /// Check if a foreign key reference exists in the referenced table
-    ///
-    /// Used for FK constraint validation during INSERT/UPDATE operations.
-    fn check_foreign_key_exists(&self, table_name: &str, column_names: &[String], values: &[Value]) -> Result<bool> {
-        // Build a query to check if the referenced row exists
-        let catalog = self.storage.catalog();
-        let schema = catalog.get_table_schema(table_name)?;
-
-        // Scan the table and check for a matching row
-        let tuples = self.storage.scan_table(table_name)?;
-
-        for tuple in tuples {
-            let mut matches = true;
-            for (col_name, expected_value) in column_names.iter().zip(values.iter()) {
-                // Find column index
-                let col_idx = schema.columns.iter().position(|c| &c.name == col_name);
-
-                if let Some(idx) = col_idx {
-                    match tuple.values.get(idx) {
-                        Some(actual_value) if actual_value == expected_value => {}
-                        _ => {
-                            matches = false;
-                            break;
-                        }
-                    }
-                } else {
-                    matches = false;
-                    break;
-                }
-            }
-
-            if matches {
-                return Ok(true);
-            }
-        }
-
-        Ok(false)
     }
 
     /// Check if inserting the given values would violate a UNIQUE constraint
