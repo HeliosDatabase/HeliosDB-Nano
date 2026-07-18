@@ -5,6 +5,39 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.5.0] - 2026-07-18
+
+Real schema support:
+
+- **Schemas coexist** — same-named tables in different schemas are now
+  distinct objects (`a.t` and `b.t` no longer collide). Public-schema
+  behavior and existing data directories are unchanged (fully backward
+  compatible).
+- **`search_path` is honored per session** — `SET/SHOW/RESET search_path`
+  work over the wire and embedded; bare names resolve to the session's
+  schema, falling back to public; connection isolation guaranteed (two
+  connections with different search_paths cannot see each other's
+  resolution).
+- **Schema DDL** — `CREATE SCHEMA [IF NOT EXISTS]` registers (duplicates
+  error); `DROP SCHEMA [IF EXISTS] … RESTRICT|CASCADE` (cascade drops member
+  tables, composing with the partition-child cascade); `ALTER TABLE … SET
+  SCHEMA` moves tables between schemas.
+- **Deferred constraints** — `SET CONSTRAINTS {ALL|names} {DEFERRED|
+  IMMEDIATE}` implemented (wire + embedded); column-level `INITIALLY
+  DEFERRED` honored; deferred FK checks validate at COMMIT and evaporate if
+  the referenced table was dropped in-transaction (PG parity).
+- **Introspection** — `information_schema` reports real `table_schema`
+  values; `pg_class.relname` stays bare.
+- **Fix (wrong-data, pre-existing):** the first `INSERT` after any
+  `ALTER TABLE … RENAME` silently overwrote the oldest row (volatile row
+  counter was not migrated with the rename).
+- **Fix (pre-existing):** cross-type foreign keys (e.g. `int8` child
+  referencing `int4` parent) reported phantom violations on the indexed
+  fast path; probe values now coerce to the referenced columns' types.
+- Measured on the PG regression corpus: +158 statements flip to passing;
+  ~60 prior "passes" that depended on cross-schema name collisions now
+  correctly error (they were silently operating on the wrong tables).
+
 ## [4.4.0] - 2026-07-18
 
 Wave-3 implementation (leased to and delivered by the fleet's HDB session) and
