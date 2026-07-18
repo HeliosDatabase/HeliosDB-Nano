@@ -4311,8 +4311,20 @@ impl<'a> Planner<'a> {
                             references_columns: referred_columns.iter().map(Self::normalize_ident).collect(),
                             on_delete: on_delete.as_ref().map(|a| convert_referential_action(a)),
                             on_update: on_update.as_ref().map(|a| convert_referential_action(a)),
-                            deferrable: false,
-                            initially_deferred: false,
+                            // Mirror the table-level FK branch: PG treats
+                            // INITIALLY DEFERRED as implying DEFERRABLE.
+                            deferrable: characteristics
+                                .as_ref()
+                                .map(|c| {
+                                    c.deferrable.unwrap_or(false)
+                                        || matches!(c.initially, Some(sqlparser::ast::DeferrableInitial::Deferred))
+                                })
+                                .unwrap_or(false),
+                            initially_deferred: characteristics
+                                .as_ref()
+                                .and_then(|c| c.initially)
+                                .map(|i| matches!(i, sqlparser::ast::DeferrableInitial::Deferred))
+                                .unwrap_or(false),
                             enforcement: convert_constraint_enforcement(characteristics.as_ref()),
                         };
                         constraints.push(fk_constraint);
