@@ -959,7 +959,8 @@ async fn extended_dml_returning_failure_keeps_connection_usable() {
     let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
     db.execute("CREATE TABLE ov (id BIGINT PRIMARY KEY)").expect("create");
     // i64::MAX — `id + 1` overflows when the UPDATE is evaluated.
-    db.execute("INSERT INTO ov VALUES (9223372036854775807)").expect("insert");
+    db.execute("INSERT INTO ov VALUES (9223372036854775807)")
+        .expect("insert");
 
     let (mut handler, mut client) = test_handler(Arc::clone(&db));
 
@@ -1094,7 +1095,10 @@ async fn search_path_scopes_bare_names_over_wire() {
     );
 
     // A bare reference resolves to wa.wt.
-    handler.handle_single_query("SELECT v FROM wt").await.expect("bare select");
+    handler
+        .handle_single_query("SELECT v FROM wt")
+        .await
+        .expect("bare select");
     assert_eq!(
         first_data_row_text(&drain(&mut client).await).as_deref(),
         Some("42"),
@@ -1102,7 +1106,10 @@ async fn search_path_scopes_bare_names_over_wire() {
     );
 
     // The qualified reference resolves too.
-    handler.handle_single_query("SELECT v FROM wa.wt").await.expect("qualified select");
+    handler
+        .handle_single_query("SELECT v FROM wa.wt")
+        .await
+        .expect("qualified select");
     assert_eq!(
         first_data_row_text(&drain(&mut client).await).as_deref(),
         Some("42"),
@@ -1110,9 +1117,15 @@ async fn search_path_scopes_bare_names_over_wire() {
     );
 
     // Back to public: the bare name no longer resolves (no public `wt`).
-    handler.handle_single_query("SET search_path TO public").await.expect("reset to public");
+    handler
+        .handle_single_query("SET search_path TO public")
+        .await
+        .expect("reset to public");
     let _ = drain(&mut client).await;
-    handler.handle_single_query("SELECT v FROM wt").await.expect("bare select public");
+    handler
+        .handle_single_query("SELECT v FROM wt")
+        .await
+        .expect("bare select public");
     let out = drain(&mut client).await;
     assert!(
         parse_messages(&out).iter().any(|(t, _)| *t == b'E'),
@@ -1126,57 +1139,118 @@ async fn search_path_scopes_bare_names_over_wire() {
 /// regression guard — a shared `current_schema` field steers connection A's
 /// bare `INSERT` to whatever schema connection B set last (silent cross-tenant
 /// wrong-table write). Both connections use the SAME bare name `orders`.
-#[tokio::test]
-async fn search_path_is_isolated_per_connection() {
-    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
-    let (mut a, mut ca) = test_handler(db.clone());
-    let (mut b, mut cb) = test_handler(db);
+#[test]
+fn search_path_is_isolated_per_connection() {
+    // Dedicated 16 MiB thread: this test's async state machine (~22 awaits of
+    // 64 KB-class handler futures across TWO connections) exceeds the 2 MiB
+    // default test-thread stack in debug builds. Box::pin cannot help — the
+    // machine is constructed on the stack BEFORE the heap move (gdb: stack-
+    // probe SIGSEGV at first poll, no recursion). A bigger stack is the
+    // deterministic fix; the body is unchanged.
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime")
+                .block_on(async move {
+                    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+                    let (mut a, mut ca) = test_handler(db.clone());
+                    let (mut b, mut cb) = test_handler(db);
 
-    // Two schemas (created once, globally); each connection will own one.
-    for stmt in ["CREATE SCHEMA sa", "CREATE SCHEMA sb"] {
-        a.handle_single_query(stmt).await.expect("schema");
-        let _ = drain(&mut ca).await;
-    }
+                    // Two schemas (created once, globally); each connection will own one.
+                    for stmt in ["CREATE SCHEMA sa", "CREATE SCHEMA sb"] {
+                        a.handle_single_query(stmt).await.expect("schema");
+                        let _ = drain(&mut ca).await;
+                    }
 
-    // Pin each connection's search_path, then create a bare `orders` under each
-    // — they must land in different schemas (sa.orders vs sb.orders).
-    a.handle_single_query("SET search_path TO sa").await.expect("A set");
-    let _ = drain(&mut ca).await;
-    b.handle_single_query("SET search_path TO sb").await.expect("B set");
-    let _ = drain(&mut cb).await;
-    a.handle_single_query("CREATE TABLE orders (v INT)").await.expect("A create");
-    let _ = drain(&mut ca).await;
-    b.handle_single_query("CREATE TABLE orders (v INT)").await.expect("B create");
-    let _ = drain(&mut cb).await;
+                    // Pin each connection's search_path, then create a bare `orders` under each
+                    // — they must land in different schemas (sa.orders vs sb.orders).
+                    a.handle_single_query("SET search_path TO sa").await.expect("A set");
+                    let _ = drain(&mut ca).await;
+                    b.handle_single_query("SET search_path TO sb").await.expect("B set");
+                    let _ = drain(&mut cb).await;
+                    a.handle_single_query("CREATE TABLE orders (v INT)")
+                        .await
+                        .expect("A create");
+                    let _ = drain(&mut ca).await;
+                    b.handle_single_query("CREATE TABLE orders (v INT)")
+                        .await
+                        .expect("B create");
+                    let _ = drain(&mut cb).await;
 
-    // Interleaved bare INSERTs. B set its search_path most recently, so a shared
-    // selector would send BOTH rows to sb.orders. Correct behavior: A -> sa, B -> sb.
-    a.handle_single_query("INSERT INTO orders VALUES (1)").await.expect("A insert");
-    let _ = drain(&mut ca).await;
-    b.handle_single_query("INSERT INTO orders VALUES (2)").await.expect("B insert");
-    let _ = drain(&mut cb).await;
+                    // Interleaved bare INSERTs. B set its search_path most recently, so a shared
+                    // selector would send BOTH rows to sb.orders. Correct behavior: A -> sa, B -> sb.
+                    a.handle_single_query("INSERT INTO orders VALUES (1)")
+                        .await
+                        .expect("A insert");
+                    let _ = drain(&mut ca).await;
+                    b.handle_single_query("INSERT INTO orders VALUES (2)")
+                        .await
+                        .expect("B insert");
+                    let _ = drain(&mut cb).await;
 
-    // Qualified reads prove each row landed in its own schema.
-    a.handle_single_query("SELECT v FROM sa.orders").await.expect("read sa");
-    assert_eq!(first_data_row_text(&drain(&mut ca).await).as_deref(), Some("1"), "A's row is in sa.orders");
-    b.handle_single_query("SELECT v FROM sb.orders").await.expect("read sb");
-    assert_eq!(first_data_row_text(&drain(&mut cb).await).as_deref(), Some("2"), "B's row is in sb.orders");
+                    // Qualified reads prove each row landed in its own schema.
+                    a.handle_single_query("SELECT v FROM sa.orders").await.expect("read sa");
+                    assert_eq!(
+                        first_data_row_text(&drain(&mut ca).await).as_deref(),
+                        Some("1"),
+                        "A's row is in sa.orders"
+                    );
+                    b.handle_single_query("SELECT v FROM sb.orders").await.expect("read sb");
+                    assert_eq!(
+                        first_data_row_text(&drain(&mut cb).await).as_deref(),
+                        Some("2"),
+                        "B's row is in sb.orders"
+                    );
 
-    // Neither schema's table absorbed the other connection's row.
-    a.handle_single_query("SELECT count(*) FROM sa.orders").await.expect("count sa");
-    assert_eq!(first_data_row_text(&drain(&mut ca).await).as_deref(), Some("1"), "sa.orders holds exactly one row");
-    b.handle_single_query("SELECT count(*) FROM sb.orders").await.expect("count sb");
-    assert_eq!(first_data_row_text(&drain(&mut cb).await).as_deref(), Some("1"), "sb.orders holds exactly one row");
+                    // Neither schema's table absorbed the other connection's row.
+                    a.handle_single_query("SELECT count(*) FROM sa.orders")
+                        .await
+                        .expect("count sa");
+                    assert_eq!(
+                        first_data_row_text(&drain(&mut ca).await).as_deref(),
+                        Some("1"),
+                        "sa.orders holds exactly one row"
+                    );
+                    b.handle_single_query("SELECT count(*) FROM sb.orders")
+                        .await
+                        .expect("count sb");
+                    assert_eq!(
+                        first_data_row_text(&drain(&mut cb).await).as_deref(),
+                        Some("1"),
+                        "sb.orders holds exactly one row"
+                    );
 
-    // Each connection's BARE read resolves to its own schema.
-    a.handle_single_query("SELECT v FROM orders").await.expect("A bare");
-    assert_eq!(first_data_row_text(&drain(&mut ca).await).as_deref(), Some("1"), "A bare orders -> sa");
-    b.handle_single_query("SELECT v FROM orders").await.expect("B bare");
-    assert_eq!(first_data_row_text(&drain(&mut cb).await).as_deref(), Some("2"), "B bare orders -> sb");
+                    // Each connection's BARE read resolves to its own schema.
+                    a.handle_single_query("SELECT v FROM orders").await.expect("A bare");
+                    assert_eq!(
+                        first_data_row_text(&drain(&mut ca).await).as_deref(),
+                        Some("1"),
+                        "A bare orders -> sa"
+                    );
+                    b.handle_single_query("SELECT v FROM orders").await.expect("B bare");
+                    assert_eq!(
+                        first_data_row_text(&drain(&mut cb).await).as_deref(),
+                        Some("2"),
+                        "B bare orders -> sb"
+                    );
 
-    // SHOW search_path is per-connection.
-    a.handle_single_query("SHOW search_path").await.expect("A show");
-    assert_eq!(first_data_row_text(&drain(&mut ca).await).as_deref(), Some("sa, public"));
-    b.handle_single_query("SHOW search_path").await.expect("B show");
-    assert_eq!(first_data_row_text(&drain(&mut cb).await).as_deref(), Some("sb, public"));
+                    // SHOW search_path is per-connection.
+                    a.handle_single_query("SHOW search_path").await.expect("A show");
+                    assert_eq!(
+                        first_data_row_text(&drain(&mut ca).await).as_deref(),
+                        Some("sa, public")
+                    );
+                    b.handle_single_query("SHOW search_path").await.expect("B show");
+                    assert_eq!(
+                        first_data_row_text(&drain(&mut cb).await).as_deref(),
+                        Some("sb, public")
+                    );
+                });
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
 }

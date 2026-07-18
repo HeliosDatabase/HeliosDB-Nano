@@ -444,7 +444,10 @@ fn in_list_index_probe_matches_twin_and_explains() {
     }
     db.execute("CREATE INDEX ii_idx ON ii_indexed(aid)").unwrap();
     for t in ["ii_indexed", "ii_twin"] {
-        let vals: String = (1..=500).map(|i| format!("({i},{})", (i * 7) % 1000)).collect::<Vec<_>>().join(",");
+        let vals: String = (1..=500)
+            .map(|i| format!("({i},{})", (i * 7) % 1000))
+            .collect::<Vec<_>>()
+            .join(",");
         db.execute(&format!("INSERT INTO {t} VALUES {vals}")).unwrap();
     }
 
@@ -461,15 +464,24 @@ fn in_list_index_probe_matches_twin_and_explains() {
     }
 
     // EXPLAIN surfaces the probe (displayed plan == executed plan).
-    let plan = db.query("EXPLAIN SELECT v FROM ii_indexed WHERE aid IN (3, 7, 11)", &[]).unwrap();
+    let plan = db
+        .query("EXPLAIN SELECT v FROM ii_indexed WHERE aid IN (3, 7, 11)", &[])
+        .unwrap();
     let text = rows_exact(&plan).join("\n");
-    assert!(text.contains("Index IN Probe"), "EXPLAIN must show the IN probe, got:\n{text}");
+    assert!(
+        text.contains("Index IN Probe"),
+        "EXPLAIN must show the IN probe, got:\n{text}"
+    );
     // Unindexed twin must NOT claim a probe.
-    let plan = db.query("EXPLAIN SELECT v FROM ii_twin WHERE aid IN (3, 7, 11)", &[]).unwrap();
+    let plan = db
+        .query("EXPLAIN SELECT v FROM ii_twin WHERE aid IN (3, 7, 11)", &[])
+        .unwrap();
     assert!(!rows_exact(&plan).join("\n").contains("Index IN Probe"));
 
     // Parameterized IN (A2-normalized shape) agrees with literal.
-    let lit = db.query("SELECT aid FROM ii_indexed WHERE aid IN (3,7,11) ORDER BY aid", &[]).unwrap();
+    let lit = db
+        .query("SELECT aid FROM ii_indexed WHERE aid IN (3,7,11) ORDER BY aid", &[])
+        .unwrap();
     let par = db
         .query_params(
             "SELECT aid FROM ii_indexed WHERE aid IN ($1,$2,$3,$3) ORDER BY aid",

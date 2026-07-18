@@ -323,8 +323,9 @@ impl Parser {
             Err(orig_err) => {
                 let orig_msg = format!("Failed to parse SQL: {}", orig_err);
                 match Self::rewrite_partition_syntax(&processed_sql) {
-                    Some(rewritten) => SqlParser::parse_sql(&self.dialect, &rewritten)
-                        .map_err(|_| Error::sql_parse(orig_msg))?,
+                    Some(rewritten) => {
+                        SqlParser::parse_sql(&self.dialect, &rewritten).map_err(|_| Error::sql_parse(orig_msg))?
+                    }
                     None => return Err(Error::sql_parse(orig_msg)),
                 }
             }
@@ -477,7 +478,11 @@ impl Parser {
         after_options
             .split(',')
             .filter_map(|entry| {
-                let name_part = entry.trim().split(|c: char| c.is_whitespace() || c == '(').next()?.trim();
+                let name_part = entry
+                    .trim()
+                    .split(|c: char| c.is_whitespace() || c == '(')
+                    .next()?
+                    .trim();
                 if name_part.is_empty() {
                     return None;
                 }
@@ -592,8 +597,7 @@ impl Parser {
     /// EXISTS name` is covered because it still begins with `DROP DOMAIN `.
     pub fn is_domain_ddl_statement(sql: &str) -> bool {
         let trimmed = sql.trim();
-        crate::starts_with_icase(trimmed, "CREATE DOMAIN ")
-            || crate::starts_with_icase(trimmed, "DROP DOMAIN ")
+        crate::starts_with_icase(trimmed, "CREATE DOMAIN ") || crate::starts_with_icase(trimmed, "DROP DOMAIN ")
     }
 
     /// Round-3 pgrust-corpus compat (~341 ATTACH + ~78 DETACH + ~46 ALTER INDEX
@@ -612,13 +616,10 @@ impl Parser {
     /// only runs on the rare ALTER path.
     pub fn is_partition_attach_detach_statement(sql: &str) -> bool {
         let trimmed = sql.trim();
-        if !(crate::starts_with_icase(trimmed, "ALTER TABLE")
-            || crate::starts_with_icase(trimmed, "ALTER INDEX"))
-        {
+        if !(crate::starts_with_icase(trimmed, "ALTER TABLE") || crate::starts_with_icase(trimmed, "ALTER INDEX")) {
             return false;
         }
-        Self::contains_kw_phrase(trimmed, b"ATTACH PARTITION")
-            || Self::contains_kw_phrase(trimmed, b"DETACH PARTITION")
+        Self::contains_kw_phrase(trimmed, b"ATTACH PARTITION") || Self::contains_kw_phrase(trimmed, b"DETACH PARTITION")
     }
 
     /// Allocation-free case-insensitive search for a two-word keyword phrase
@@ -1114,9 +1115,10 @@ impl Parser {
         // Scan the action tail. Each entry: (kind, whole-clause matcher).
         // RESTART/START/AS/OWNED BY/CACHE/INCREMENT/MIN/MAX/CYCLE.
         static CLAUSES: OnceLock<Vec<(SeqClauseKind, Regex)>> = OnceLock::new();
-        let clauses = CLAUSES.get_or_init(|| {
-            use SeqClauseKind::*;
-            vec![
+        let clauses =
+            CLAUSES.get_or_init(|| {
+                use SeqClauseKind::*;
+                vec![
                 // RESTART must be tried before START so "RESTART" isn't seen as
                 // a bare token; the `RESTART\b` alternative (no value) is last
                 // in the alternation so `RESTART WITH n` wins greedily.
@@ -1142,7 +1144,7 @@ impl Parser {
                     .unwrap(),
                 ),
             ]
-        });
+            });
 
         let mut remaining = after_name.to_string();
         let mut action = AlterSequenceAction {
@@ -1198,7 +1200,9 @@ impl Parser {
             i += 1;
         }
         if in_quote {
-            return Err(Error::query_execution("Unterminated quoted identifier in ALTER SEQUENCE"));
+            return Err(Error::query_execution(
+                "Unterminated quoted identifier in ALTER SEQUENCE",
+            ));
         }
         let name = s[..i].trim().to_string();
         Ok((name, s[i..].trim_start()))
@@ -1270,7 +1274,8 @@ impl Parser {
                 // `OWNED BY NONE` → Some(None); `OWNED BY t.c` → Some(Some((t, c))).
                 // Strip the two leading keywords (OWNED, BY) by token, keeping
                 // the original-cased reference intact.
-                let after_owned = clause[clause.char_indices().nth(5).map(|(i, _)| i).unwrap_or(clause.len())..].trim_start();
+                let after_owned =
+                    clause[clause.char_indices().nth(5).map(|(i, _)| i).unwrap_or(clause.len())..].trim_start();
                 let ref_part = if after_owned.len() >= 2 && after_owned[..2].eq_ignore_ascii_case("BY") {
                     after_owned[2..].trim()
                 } else {
@@ -2265,8 +2270,7 @@ impl Parser {
                 && (i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_'))
             {
                 let after = i + 8;
-                let right_boundary_ok =
-                    after >= n || !(bytes[after].is_ascii_alphanumeric() || bytes[after] == b'_');
+                let right_boundary_ok = after >= n || !(bytes[after].is_ascii_alphanumeric() || bytes[after] == b'_');
                 if right_boundary_ok {
                     let mut j = after;
                     while j < n && bytes[j].is_ascii_whitespace() {
@@ -3300,7 +3304,9 @@ mod tests {
         #[test]
         fn strips_opclass_token_in_hash_key() {
             assert_eq!(
-                Parser::preprocess_strip_partition_by("CREATE TABLE t (a int) PARTITION BY HASH (a part_test_int4_ops)"),
+                Parser::preprocess_strip_partition_by(
+                    "CREATE TABLE t (a int) PARTITION BY HASH (a part_test_int4_ops)"
+                ),
                 "CREATE TABLE t (a int)"
             );
         }
@@ -3348,7 +3354,9 @@ mod tests {
         #[test]
         fn rewrites_for_values_forms() {
             assert_eq!(
-                Parser::preprocess_partition_of("CREATE TABLE parted_si_p_even PARTITION OF parted_si FOR VALUES IN (0)"),
+                Parser::preprocess_partition_of(
+                    "CREATE TABLE parted_si_p_even PARTITION OF parted_si FOR VALUES IN (0)"
+                ),
                 "CREATE TABLE parted_si_p_even ()"
             );
             assert_eq!(
@@ -3358,7 +3366,9 @@ mod tests {
                 "CREATE TABLE c ()"
             );
             assert_eq!(
-                Parser::preprocess_partition_of("create table part_aa_bb partition of list_parted FOR VALUES IN ('aa', 'bb')"),
+                Parser::preprocess_partition_of(
+                    "create table part_aa_bb partition of list_parted FOR VALUES IN ('aa', 'bb')"
+                ),
                 "CREATE TABLE part_aa_bb ()"
             );
         }
@@ -3366,7 +3376,9 @@ mod tests {
         #[test]
         fn rewrites_multi_column_bounds() {
             assert_eq!(
-                Parser::preprocess_partition_of("create table part1 partition of range_parted for values from ('a', 1) to ('a', 10)"),
+                Parser::preprocess_partition_of(
+                    "create table part1 partition of range_parted for values from ('a', 1) to ('a', 10)"
+                ),
                 "CREATE TABLE part1 ()"
             );
         }
@@ -3380,7 +3392,9 @@ mod tests {
             // A DEFAULT child that is itself sub-partitioned: its own
             // PARTITION BY tail is dropped by the rewrite too.
             assert_eq!(
-                Parser::preprocess_partition_of("create table part_default partition of list_parted default partition by range(b)"),
+                Parser::preprocess_partition_of(
+                    "create table part_default partition of list_parted default partition by range(b)"
+                ),
                 "CREATE TABLE part_default ()"
             );
         }
@@ -3430,9 +3444,13 @@ mod tests {
             assert_eq!(spec.parent, "stats_import.part_parent");
             // Verbatim bound keeps a trailing storage `WITH (…)` (never a cut
             // point, so HASH `FOR VALUES WITH (MODULUS …)` survives intact).
-            assert_eq!(spec.bound, "FOR VALUES FROM (0) TO (10) WITH (autovacuum_enabled = false)");
+            assert_eq!(
+                spec.bound,
+                "FOR VALUES FROM (0) TO (10) WITH (autovacuum_enabled = false)"
+            );
 
-            let def = Parser::extract_partition_of("create table part_def partition of range_parted default").expect("spec");
+            let def =
+                Parser::extract_partition_of("create table part_def partition of range_parted default").expect("spec");
             assert_eq!(def.parent, "range_parted");
             assert_eq!(def.bound, "default");
         }
@@ -3447,18 +3465,32 @@ mod tests {
             assert!(Parser::is_partition_attach_detach_statement(
                 "ALTER TABLE mlparted ATTACH PARTITION mlparted1 FOR VALUES FROM (1, 2) TO (1, 10)"
             ));
-            assert!(Parser::is_partition_attach_detach_statement("ALTER TABLE t DETACH PARTITION c"));
-            assert!(Parser::is_partition_attach_detach_statement("ALTER TABLE t DETACH PARTITION c CONCURRENTLY"));
-            assert!(Parser::is_partition_attach_detach_statement("ALTER TABLE t DETACH PARTITION c FINALIZE"));
-            assert!(Parser::is_partition_attach_detach_statement("ALTER INDEX idx ATTACH PARTITION idx_child"));
+            assert!(Parser::is_partition_attach_detach_statement(
+                "ALTER TABLE t DETACH PARTITION c"
+            ));
+            assert!(Parser::is_partition_attach_detach_statement(
+                "ALTER TABLE t DETACH PARTITION c CONCURRENTLY"
+            ));
+            assert!(Parser::is_partition_attach_detach_statement(
+                "ALTER TABLE t DETACH PARTITION c FINALIZE"
+            ));
+            assert!(Parser::is_partition_attach_detach_statement(
+                "ALTER INDEX idx ATTACH PARTITION idx_child"
+            ));
         }
 
         #[test]
         fn ignores_non_attach_detach_alters_and_other_statements() {
-            assert!(!Parser::is_partition_attach_detach_statement("ALTER TABLE t ADD COLUMN c int"));
-            assert!(!Parser::is_partition_attach_detach_statement("ALTER TABLE t RENAME TO t2"));
+            assert!(!Parser::is_partition_attach_detach_statement(
+                "ALTER TABLE t ADD COLUMN c int"
+            ));
+            assert!(!Parser::is_partition_attach_detach_statement(
+                "ALTER TABLE t RENAME TO t2"
+            ));
             assert!(!Parser::is_partition_attach_detach_statement("SELECT * FROM t"));
-            assert!(!Parser::is_partition_attach_detach_statement("CREATE TABLE c PARTITION OF p DEFAULT"));
+            assert!(!Parser::is_partition_attach_detach_statement(
+                "CREATE TABLE c PARTITION OF p DEFAULT"
+            ));
         }
 
         // Strict-additive safety: the phrase inside a string literal or quoted
@@ -3489,7 +3521,10 @@ mod tests {
             match stmt {
                 sqlparser::ast::Statement::CreateTable(ct) => {
                     assert_eq!(ct.name.to_string(), "c");
-                    assert!(ct.columns.is_empty(), "child rewrite yields empty columns for planner copy");
+                    assert!(
+                        ct.columns.is_empty(),
+                        "child rewrite yields empty columns for planner copy"
+                    );
                 }
                 other => panic!("expected CreateTable, got {other:?}"),
             }
@@ -3502,7 +3537,9 @@ mod tests {
                 .parse_one("CREATE TABLE t (a int, b int) PARTITION BY RANGE (a, b)")
                 .is_ok());
             // Single-column parent already parsed pre-change; still parses.
-            assert!(parser.parse_one("CREATE TABLE t (a int) PARTITION BY RANGE (a)").is_ok());
+            assert!(parser
+                .parse_one("CREATE TABLE t (a int) PARTITION BY RANGE (a)")
+                .is_ok());
         }
     }
 

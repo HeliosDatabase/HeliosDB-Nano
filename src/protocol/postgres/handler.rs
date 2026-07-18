@@ -1093,12 +1093,14 @@ where
                 let schema = Self::schema_from_query_columns(&columns, cached_results.as_slice());
                 self.send_query_result(schema, cached_results.as_slice()).await?;
             } else {
-                let (results, columns) = run_guarded(|| self.database.query_with_columns_for_session(self.session_id, query))?;
+                let (results, columns) =
+                    run_guarded(|| self.database.query_with_columns_for_session(self.session_id, query))?;
                 let schema = Self::schema_from_query_columns(&columns, &results);
                 self.send_query_result(schema, &results).await?;
             }
         } else if is_cte {
-            let (results, columns) = run_guarded(|| self.database.query_with_columns_for_session(self.session_id, query))?;
+            let (results, columns) =
+                run_guarded(|| self.database.query_with_columns_for_session(self.session_id, query))?;
             let schema = Self::schema_from_query_columns(&columns, &results);
             self.send_query_result(schema, &results).await?;
         } else if is_dml_returning {
@@ -1134,8 +1136,7 @@ where
             let retriable = policy.is_enabled() && !self.database.session_in_transaction(self.session_id);
             let db = &self.database;
             let sid = self.session_id;
-            let affected =
-                run_with_retry(policy, retriable, || db.execute_for_session(sid, query)).await?;
+            let affected = run_with_retry(policy, retriable, || db.execute_for_session(sid, query)).await?;
             let tag = self.get_command_tag(query, affected);
             self.send_command_complete(&tag).await?;
         }
@@ -2885,9 +2886,7 @@ mod datatype_oid_tests {
 pub(crate) fn run_guarded<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
         Ok(result) => result,
-        Err(_) => Err(Error::query_execution(
-            "internal error while executing statement",
-        )),
+        Err(_) => Err(Error::query_execution("internal error while executing statement")),
     }
 }
 

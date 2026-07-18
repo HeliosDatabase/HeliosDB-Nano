@@ -45,8 +45,7 @@ impl SystemViewRegistry {
     /// per-query rebuild at no behavioral cost (only `&self` accessors are used
     /// after construction).
     pub fn shared() -> &'static Self {
-        static SHARED: std::sync::LazyLock<SystemViewRegistry> =
-            std::sync::LazyLock::new(SystemViewRegistry::new);
+        static SHARED: std::sync::LazyLock<SystemViewRegistry> = std::sync::LazyLock::new(SystemViewRegistry::new);
         &SHARED
     }
 
@@ -2314,7 +2313,8 @@ impl SystemViewRegistry {
                     sv_col("last_value", DataType::Int8),
                 ],
             },
-            description: "PG-compat sequences view (real CREATE SEQUENCE defs + SERIAL/IDENTITY synthetics)".to_string(),
+            description: "PG-compat sequences view (real CREATE SEQUENCE defs + SERIAL/IDENTITY synthetics)"
+                .to_string(),
         });
 
         // information_schema.sequences — SQL-standard 12-col shape. Lists REAL
@@ -3322,17 +3322,17 @@ impl SystemViewRegistry {
                     .map(|c| serial_type_bounds(&c.data_type))
                     .unwrap_or(("bigint", i64::MAX));
                 rows.push(Tuple::new(vec![
-                    Value::String("public".into()),     // schemaname
-                    Value::String(seq_name),            // sequencename
-                    Value::String("postgres".into()),   // sequenceowner
-                    Value::String(data_type.into()),    // data_type
-                    Value::Int8(1),                     // start_value
-                    Value::Int8(1),                     // min_value
-                    Value::Int8(max_value),             // max_value
-                    Value::Int8(1),                     // increment_by
-                    Value::Boolean(false),              // cycle
-                    Value::Int8(1),                     // cache_size
-                    Value::Null,                        // last_value (synthetic counter)
+                    Value::String("public".into()),   // schemaname
+                    Value::String(seq_name),          // sequencename
+                    Value::String("postgres".into()), // sequenceowner
+                    Value::String(data_type.into()),  // data_type
+                    Value::Int8(1),                   // start_value
+                    Value::Int8(1),                   // min_value
+                    Value::Int8(max_value),           // max_value
+                    Value::Int8(1),                   // increment_by
+                    Value::Boolean(false),            // cycle
+                    Value::Int8(1),                   // cache_size
+                    Value::Null,                      // last_value (synthetic counter)
                 ]));
             }
         }
@@ -3353,17 +3353,17 @@ impl SystemViewRegistry {
                 _ => 64, // bigint (default)
             };
             rows.push(Tuple::new(vec![
-                Value::String("heliosdb".into()),              // sequence_catalog
-                Value::String("public".into()),               // sequence_schema
-                Value::String(def.name.clone()),              // sequence_name
-                Value::String(def.data_type.clone()),         // data_type
-                Value::Int4(precision),                       // numeric_precision
-                Value::Int4(2),                               // numeric_precision_radix
-                Value::Int4(0),                               // numeric_scale
-                Value::String(def.start_value.to_string()),   // start_value
-                Value::String(def.min_value.to_string()),     // minimum_value
-                Value::String(def.max_value.to_string()),     // maximum_value
-                Value::String(def.increment_by.to_string()),  // increment
+                Value::String("heliosdb".into()),                           // sequence_catalog
+                Value::String("public".into()),                             // sequence_schema
+                Value::String(def.name.clone()),                            // sequence_name
+                Value::String(def.data_type.clone()),                       // data_type
+                Value::Int4(precision),                                     // numeric_precision
+                Value::Int4(2),                                             // numeric_precision_radix
+                Value::Int4(0),                                             // numeric_scale
+                Value::String(def.start_value.to_string()),                 // start_value
+                Value::String(def.min_value.to_string()),                   // minimum_value
+                Value::String(def.max_value.to_string()),                   // maximum_value
+                Value::String(def.increment_by.to_string()),                // increment
                 Value::String(if def.cycle { "YES" } else { "NO" }.into()), // cycle_option
             ]));
         }

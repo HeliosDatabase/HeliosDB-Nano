@@ -884,10 +884,7 @@ async fn start_server(
                         let permit = match Arc::clone(&conn_limiter).try_acquire_owned() {
                             Ok(permit) => permit,
                             Err(_) => {
-                                tracing::warn!(
-                                    "MySQL UDS connection limit reached ({}), rejecting",
-                                    max_connections
-                                );
+                                tracing::warn!("MySQL UDS connection limit reached ({}), rejecting", max_connections);
                                 drop(stream);
                                 continue;
                             }

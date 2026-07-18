@@ -8,14 +8,12 @@ use heliosdb_nano::{EmbeddedDatabase, Value};
 
 fn seed() -> EmbeddedDatabase {
     let db = EmbeddedDatabase::new_in_memory().unwrap();
-    db.execute("CREATE TABLE t50 (aid INT, abalance INT, name TEXT)").unwrap();
+    db.execute("CREATE TABLE t50 (aid INT, abalance INT, name TEXT)")
+        .unwrap();
     db.execute("CREATE INDEX t50_aid ON t50(aid)").unwrap();
     for i in 1..=50 {
-        db.execute(&format!(
-            "INSERT INTO t50 VALUES ({i}, {}, 'n{i}')",
-            (i * 7) % 100000
-        ))
-        .unwrap();
+        db.execute(&format!("INSERT INTO t50 VALUES ({i}, {}, 'n{i}')", (i * 7) % 100000))
+            .unwrap();
     }
     db
 }
@@ -65,7 +63,9 @@ fn multi_predicate_and_string_literals_correct() {
 #[test]
 fn no_match_returns_empty() {
     let db = seed();
-    let (rows, _c) = db.query_with_columns("SELECT abalance FROM t50 WHERE aid = 99999").unwrap();
+    let (rows, _c) = db
+        .query_with_columns("SELECT abalance FROM t50 WHERE aid = 99999")
+        .unwrap();
     assert!(rows.is_empty());
 }
 

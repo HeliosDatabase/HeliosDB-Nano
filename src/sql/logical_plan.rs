@@ -753,6 +753,10 @@ pub enum LogicalPlan {
         if_not_exists: bool,
         /// OR REPLACE - replace existing view
         or_replace: bool,
+        /// The creating session's `search_path` schema (first non-`public`
+        /// entry), captured at plan time so the view body binds at CREATE, not
+        /// per-reader. `None` = created under `public`.
+        creator_schema: Option<String>,
     },
 
     /// Drop a regular view
@@ -1897,9 +1901,7 @@ impl LogicalPlan {
                 // CreateIndex doesn't have output schema
                 Arc::new(Schema { columns: vec![] })
             }
-            LogicalPlan::CreateSequence { .. }
-            | LogicalPlan::AlterSequence(_)
-            | LogicalPlan::DropSequence { .. } => {
+            LogicalPlan::CreateSequence { .. } | LogicalPlan::AlterSequence(_) | LogicalPlan::DropSequence { .. } => {
                 // CREATE / ALTER / DROP SEQUENCE are DDL — no output schema.
                 Arc::new(Schema { columns: vec![] })
             }
@@ -1930,9 +1932,7 @@ impl LogicalPlan {
             }
             LogicalPlan::AlterTableAddForeignKey { .. }
             | LogicalPlan::AlterTableAlterConstraintEnforcement { .. }
-            | LogicalPlan::AlterTableDropConstraint { .. } => {
-                Arc::new(Schema { columns: vec![] })
-            }
+            | LogicalPlan::AlterTableDropConstraint { .. } => Arc::new(Schema { columns: vec![] }),
             LogicalPlan::AlterTableMulti { .. } => {
                 // ALTER TABLE with multiple operations doesn't have output schema
                 Arc::new(Schema { columns: vec![] })

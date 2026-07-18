@@ -82,7 +82,10 @@ mod sequence_durability {
             let engine = open(&dir);
             let catalog = Catalog::new(&engine);
 
-            let loaded = catalog.get_sequence(&def.name).unwrap().expect("def missing after reopen");
+            let loaded = catalog
+                .get_sequence(&def.name)
+                .unwrap()
+                .expect("def missing after reopen");
             assert_eq!(loaded, def, "definition did not round-trip");
 
             let state = catalog
@@ -348,7 +351,8 @@ mod sequence_durability {
             .unwrap();
         assert_eq!(nextval(&db, name), 1);
         // Change INCREMENT and clamp MAXVALUE.
-        db.execute(&format!("ALTER SEQUENCE {name} INCREMENT BY 3 MAXVALUE 10")).unwrap();
+        db.execute(&format!("ALTER SEQUENCE {name} INCREMENT BY 3 MAXVALUE 10"))
+            .unwrap();
         // is_called was true (we served 1); next value steps from the durable
         // high-water by the NEW increment.
         let v = nextval(&db, name);
@@ -362,7 +366,8 @@ mod sequence_durability {
         let dir = scratch_dir();
         let db = open_db(&dir);
         // IF EXISTS on a missing sequence is a no-op.
-        db.execute("ALTER SEQUENCE seq3_absent_xyz IF EXISTS RESTART WITH 5").ok();
+        db.execute("ALTER SEQUENCE seq3_absent_xyz IF EXISTS RESTART WITH 5")
+            .ok();
         let ok = db.execute("ALTER SEQUENCE IF EXISTS seq3_absent_xyz RESTART WITH 5");
         assert!(ok.is_ok(), "ALTER SEQUENCE IF EXISTS missing should be a no-op: {ok:?}");
         // Without IF EXISTS, a missing sequence errors.
@@ -401,7 +406,8 @@ mod sequence_durability {
         assert_eq!(nextval(&db, name), 1);
         assert_eq!(nextval(&db, name), 2);
         // IF NOT EXISTS on an existing sequence must NOT reset it.
-        db.execute(&format!("CREATE SEQUENCE IF NOT EXISTS {name} START WITH 1000")).unwrap();
+        db.execute(&format!("CREATE SEQUENCE IF NOT EXISTS {name} START WITH 1000"))
+            .unwrap();
         let v = nextval(&db, name);
         assert!(v >= 3, "IF NOT EXISTS wrongly reset the sequence (got {v})");
         std::fs::remove_dir_all(&dir).ok();

@@ -108,7 +108,10 @@ fn schema_qualified_parent_and_child() -> Result<()> {
          FOR VALUES FROM (0) TO (10) WITH (autovacuum_enabled = false)",
     )?;
     db.execute("INSERT INTO stats_import.part_child_1 (id, note) VALUES (3, 'n')")?;
-    assert_eq!(db.query("SELECT id, note FROM stats_import.part_child_1", &[])?.len(), 1);
+    assert_eq!(
+        db.query("SELECT id, note FROM stats_import.part_child_1", &[])?.len(),
+        1
+    );
     Ok(())
 }
 
@@ -149,7 +152,10 @@ fn attach_and_detach_are_noops() -> Result<()> {
         0
     );
     assert_eq!(db.execute("ALTER TABLE ad_parent DETACH PARTITION ad_child")?, 0);
-    assert_eq!(db.execute("ALTER TABLE ad_parent DETACH PARTITION ad_child CONCURRENTLY")?, 0);
+    assert_eq!(
+        db.execute("ALTER TABLE ad_parent DETACH PARTITION ad_child CONCURRENTLY")?,
+        0
+    );
     // ALTER INDEX ... ATTACH PARTITION also a no-op.
     assert_eq!(db.execute("ALTER INDEX ad_idx ATTACH PARTITION ad_child_idx")?, 0);
 
@@ -190,9 +196,7 @@ fn empty_column_inherits_is_not_treated_as_partition() -> Result<()> {
         let count = |t: &str| -> Result<usize> {
             Ok(db
                 .query(
-                    &format!(
-                        "SELECT column_name FROM information_schema.columns WHERE table_name = '{t}'"
-                    ),
+                    &format!("SELECT column_name FROM information_schema.columns WHERE table_name = '{t}'"),
                     &[],
                 )?
                 .len())
@@ -402,7 +406,10 @@ fn pg_class_relpartbound_is_null() -> Result<()> {
         "SELECT relname, relpartbound FROM pg_class WHERE relname IN ('pb_parent', 'pb_child')",
         &[],
     )?;
-    assert!(empty.is_empty(), "no matching relations yet → empty result, not an error");
+    assert!(
+        empty.is_empty(),
+        "no matching relations yet → empty result, not an error"
+    );
 
     db.execute("CREATE TABLE pb_parent (id INT) PARTITION BY RANGE (id)")?;
     db.execute("CREATE TABLE pb_child PARTITION OF pb_parent FOR VALUES FROM (0) TO (10)")?;

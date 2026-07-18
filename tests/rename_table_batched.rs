@@ -57,9 +57,14 @@ fn rename_populated_table_on_disk_is_not_per_row_fsync() {
     // decisively if per-row fsyncs come back.
     let temp = tempfile::tempdir().unwrap();
     let db = EmbeddedDatabase::new(temp.path()).unwrap();
-    db.execute("CREATE TABLE ren_disk (id int primary key, v text)").unwrap();
+    db.execute("CREATE TABLE ren_disk (id int primary key, v text)")
+        .unwrap();
     for chunk in (1..=3000).collect::<Vec<i64>>().chunks(500) {
-        let vals: String = chunk.iter().map(|i| format!("({i},'v{i}')")).collect::<Vec<_>>().join(",");
+        let vals: String = chunk
+            .iter()
+            .map(|i| format!("({i},'v{i}')"))
+            .collect::<Vec<_>>()
+            .join(",");
         db.execute(&format!("INSERT INTO ren_disk VALUES {vals}")).unwrap();
     }
     assert_eq!(count(&db, "SELECT count(*) FROM ren_disk"), 3000);

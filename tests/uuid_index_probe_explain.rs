@@ -22,7 +22,8 @@ fn rows(rows: &[Tuple]) -> Vec<String> {
 
 fn build(db: &EmbeddedDatabase) {
     // UUID primary key table.
-    db.execute("CREATE TABLE files (file_id UUID PRIMARY KEY, path TEXT)").unwrap();
+    db.execute("CREATE TABLE files (file_id UUID PRIMARY KEY, path TEXT)")
+        .unwrap();
     // Secondary UUID index table + unindexed twin.
     for table in ["extr", "extr_twin"] {
         db.execute(&format!(
@@ -32,12 +33,17 @@ fn build(db: &EmbeddedDatabase) {
     }
     db.execute("CREATE INDEX extr_file_id ON extr(file_id)").unwrap();
 
-    db.execute(&format!("INSERT INTO files VALUES ('{U1}', 'one.txt')")).unwrap();
-    db.execute(&format!("INSERT INTO files VALUES ('{U2}', 'two.txt')")).unwrap();
+    db.execute(&format!("INSERT INTO files VALUES ('{U1}', 'one.txt')"))
+        .unwrap();
+    db.execute(&format!("INSERT INTO files VALUES ('{U2}', 'two.txt')"))
+        .unwrap();
     for table in ["extr", "extr_twin"] {
-        db.execute(&format!("INSERT INTO {table} VALUES (1, '{U1}', 'n1')")).unwrap();
-        db.execute(&format!("INSERT INTO {table} VALUES (2, '{U2}', 'n2')")).unwrap();
-        db.execute(&format!("INSERT INTO {table} VALUES (3, '{U1}', 'n3')")).unwrap();
+        db.execute(&format!("INSERT INTO {table} VALUES (1, '{U1}', 'n1')"))
+            .unwrap();
+        db.execute(&format!("INSERT INTO {table} VALUES (2, '{U2}', 'n2')"))
+            .unwrap();
+        db.execute(&format!("INSERT INTO {table} VALUES (3, '{U1}', 'n3')"))
+            .unwrap();
     }
 }
 
@@ -58,7 +64,9 @@ fn pk_literal_uuid_is_index_probe() {
         text.contains("Index Point Lookup using"),
         "PK UUID literal equality must probe the index, got:\n{text}"
     );
-    let got = db.query(&format!("SELECT path FROM files WHERE file_id = '{U1}'"), &[]).unwrap();
+    let got = db
+        .query(&format!("SELECT path FROM files WHERE file_id = '{U1}'"), &[])
+        .unwrap();
     assert_eq!(got.len(), 1);
 }
 
@@ -85,7 +93,9 @@ fn secondary_literal_uuid_is_index_probe_and_correct() {
         text.contains("Index Point Lookup using extr_file_id"),
         "secondary UUID equality must probe extr_file_id, got:\n{text}"
     );
-    let indexed = db.query(&format!("SELECT id FROM extr WHERE file_id = '{U1}'"), &[]).unwrap();
+    let indexed = db
+        .query(&format!("SELECT id FROM extr WHERE file_id = '{U1}'"), &[])
+        .unwrap();
     let twin = db
         .query(&format!("SELECT id FROM extr_twin WHERE file_id = '{U1}'"), &[])
         .unwrap();
@@ -137,10 +147,7 @@ fn raw_bytes_param_uuid_probes_and_matches() {
 fn unindexed_uuid_column_is_not_advertised_as_probe() {
     let db = EmbeddedDatabase::new_in_memory().unwrap();
     build(&db);
-    let text = explain_text(
-        &db,
-        &format!("EXPLAIN SELECT id FROM extr_twin WHERE file_id = '{U1}'"),
-    );
+    let text = explain_text(&db, &format!("EXPLAIN SELECT id FROM extr_twin WHERE file_id = '{U1}'"));
     assert!(
         !text.contains("Index Point Lookup"),
         "unindexed twin must not claim an index probe, got:\n{text}"
