@@ -313,8 +313,8 @@ mod copy_phase_stats;
 mod error;
 mod lock_census;
 mod sharded_lru;
-mod write_volume;
 mod types;
+mod write_volume;
 // `config` was originally private but the encryption / sync
 // benchmarks reference its `KeySource` enum directly.  Promoted
 // to `pub` so the benches compile.  External consumers should
@@ -400,6 +400,47 @@ fn new_cache_admission() -> std::sync::Arc<[[std::sync::atomic::AtomicU64; CACHE
     }))
 }
 
+thread_local! {
+    /// Per-thread `search_path` override a wire session installs for the
+    /// duration of ONE synchronous statement that routes through the global
+    /// (non-session) execute/query paths (see
+    /// `EmbeddedDatabase::session_schema_override_guard`). `Some(schema)` while
+    /// installed, `None` when absent — in which case `current_schema()` reads
+    /// the embedded shared field. This mirrors the thread-local
+    /// `synchronous_commit` override the durability guard installs: set before
+    /// the synchronous call, cleared on the guard's `Drop`, so no schema ever
+    /// leaks into the next connection a worker thread serves. Only ever holds a
+    /// non-`public` schema (a `public` session installs no guard).
+    static SESSION_SCHEMA_OVERRIDE: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+    /// Hot-path mirror of "a non-`public` schema override is installed on this
+    /// thread" (see `SESSION_SCHEMA_OVERRIDE`). The literal fast-path gates read
+    /// this `Cell` instead of borrowing the `RefCell`, so a wire session with an
+    /// active `search_path` yields to the planner two-probe without lock or
+    /// borrow traffic.
+    static SESSION_SCHEMA_OVERRIDE_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// RAII installer for the per-statement thread-local `search_path` override a
+/// wire session threads into planning. Clears both thread-locals on `Drop`.
+struct SessionSchemaOverrideGuard;
+
+impl SessionSchemaOverrideGuard {
+    /// Install a non-`public` schema as the current thread's override.
+    fn install(schema: String) -> Self {
+        SESSION_SCHEMA_OVERRIDE.with(|c| *c.borrow_mut() = Some(schema));
+        SESSION_SCHEMA_OVERRIDE_ACTIVE.with(|c| c.set(true));
+        Self
+    }
+}
+
+impl Drop for SessionSchemaOverrideGuard {
+    fn drop(&mut self) {
+        SESSION_SCHEMA_OVERRIDE.with(|c| *c.borrow_mut() = None);
+        SESSION_SCHEMA_OVERRIDE_ACTIVE.with(|c| c.set(false));
+    }
+}
+
 pub struct EmbeddedDatabase {
     /// Storage engine (public for REPL access)
     pub storage: std::sync::Arc<storage::StorageEngine>,
@@ -446,6 +487,30 @@ pub struct EmbeddedDatabase {
         std::sync::Arc<parking_lot::RwLock<std::collections::HashMap<String, PreparedFastSelectSpec>>>,
     /// Database-level settings for embedded SQL entry points.
     session_settings: sql::SessionSettings,
+    /// EMBEDDED single-session `search_path` current schema (first non-`public`,
+    /// non-`"$user"` entry). `None` = `public` (today's flat namespace). This
+    /// backs the embedded `db.execute("SET search_path …")` path ONLY — every
+    /// wire connection carries its own schema on its [`crate::session::Session`]
+    /// (see `set_session_current_schema` / `session_schema_override_guard`), so
+    /// two connections never share this selector. `current_schema()` reads the
+    /// per-session thread-local override first and falls back here for the
+    /// embedded caller. Every embedded mutation (`SET`/`RESET search_path`)
+    /// invalidates the plan/result caches, exactly like a branch switch, so
+    /// cached plans never cross a schema change.
+    current_schema: std::sync::Arc<parking_lot::RwLock<Option<String>>>,
+    /// Monotonic "some session has used a non-`public` `search_path`" gate.
+    /// `false` until the first `SET search_path TO <non-public>` on ANY wire
+    /// session; while `false` the `_for_session` paths skip the per-session
+    /// schema lookup entirely, so the default wire workload (pg35, always
+    /// `public`) pays zero extra thread-local / session traffic — mirroring the
+    /// cheap-atomic gate `result_cache_nonempty` uses for the result cache.
+    any_session_schema_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Hot-path mirror of "`current_schema` is set (non-`public`)". The literal
+    /// fast paths (fast INSERT/UPDATE/DELETE/SELECT) resolve bare names directly
+    /// and must yield to the planner when a `search_path` is active; they check
+    /// this relaxed atomic instead of taking the `current_schema` lock on every
+    /// query, so the default `public` path stays lock-free.
+    current_schema_set: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Active savepoints stack (name -> transaction state)
     savepoints: std::sync::Arc<parking_lot::RwLock<Vec<SavepointState>>>,
     /// Plan cache: SQL string → `Arc<LogicalPlan>` (sharded LRU, skips parse+plan for repeated queries)
@@ -522,6 +587,12 @@ pub struct EmbeddedDatabase {
     fk_validation_source: std::sync::Arc<parking_lot::RwLock<FkValidationSource>>,
     /// Deferred FK checks queued until COMMIT.
     deferred_fk_checks: std::sync::Arc<parking_lot::Mutex<Vec<PendingFkCheck>>>,
+    /// `SET CONSTRAINTS ... DEFERRED` — a transaction-scoped request to defer
+    /// every enforceable FK check to COMMIT (PostgreSQL scopes SET CONSTRAINTS to
+    /// the current transaction). ORed into the `check_fk_constraints_on_write`
+    /// defer decision, and reset to `false` at every transaction
+    /// begin/commit/rollback so it never leaks past the block it was set in.
+    constraints_all_deferred: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Lazily-constructed, shared read-only optimizer for the cold (cache-miss)
     /// planning path. Every cache-miss query previously rebuilt a fresh
     /// `StatsCatalog` + 5 boxed rules + `Optimizer`; the rules are stateless
@@ -1012,6 +1083,9 @@ impl EmbeddedDatabase {
             plan,
             sql::LogicalPlan::CreateTable { .. }
                 | sql::LogicalPlan::DropTable { .. }
+                // DROP SCHEMA CASCADE drops member tables; RESTRICT may still be
+                // a no-op, but invalidating on any DROP SCHEMA is safe + cheap.
+                | sql::LogicalPlan::DropSchema { .. }
                 | sql::LogicalPlan::CreateSequence { .. }
                 | sql::LogicalPlan::AlterSequence(_)
                 | sql::LogicalPlan::DropSequence { .. }
@@ -1019,6 +1093,7 @@ impl EmbeddedDatabase {
                 | sql::LogicalPlan::AlterTableAddColumn { .. }
                 | sql::LogicalPlan::AlterTableDropColumn { .. }
                 | sql::LogicalPlan::AlterTableRename { .. }
+                | sql::LogicalPlan::AlterTableSetSchema { .. }
                 | sql::LogicalPlan::AlterTableRenameColumn { .. }
                 | sql::LogicalPlan::AlterTableAlterColumnNullability { .. }
                 | sql::LogicalPlan::AlterTableAddForeignKey { .. }
@@ -1110,10 +1185,112 @@ impl EmbeddedDatabase {
         None
     }
 
+    /// The current schema (from `SET search_path`), or `None` for the default
+    /// `public`. Threaded to the planner so bare table names resolve against it
+    /// (see `Planner::resolve_table_ref` / `resolve_table_create`). A wire
+    /// session's per-statement thread-local override wins over the embedded
+    /// shared field, so each connection resolves against ITS OWN schema and one
+    /// connection can never steer another's bare names.
+    pub(crate) fn current_schema(&self) -> Option<String> {
+        // Wire session override (thread-local, installed by the `_for_session`
+        // paths). Only ever holds a non-`public` schema, so its presence alone
+        // is the answer.
+        if let Some(schema) = SESSION_SCHEMA_OVERRIDE.with(|c| c.borrow().clone()) {
+            return Some(schema);
+        }
+        // Embedded single-session path is lock-free on the default (`public`)
+        // path: only touch the lock when a non-`public` search_path is active.
+        if !self.current_schema_set.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+        self.current_schema.read().clone()
+    }
+
+    /// Lock-free "a non-`public` `search_path` is active for this statement"
+    /// check for the literal fast paths and the plan/result-cache gates. True
+    /// when either the embedded shared field is set OR the calling wire session
+    /// installed a non-`public` thread-local override.
+    fn current_schema_is_set(&self) -> bool {
+        self.current_schema_set.load(std::sync::atomic::Ordering::Relaxed)
+            || SESSION_SCHEMA_OVERRIDE_ACTIVE.with(|c| c.get())
+    }
+
+    /// Update the session's current schema and the hot-path atomic together.
+    fn set_current_schema(&self, schema: Option<String>) {
+        self.current_schema_set
+            .store(schema.is_some(), std::sync::atomic::Ordering::Relaxed);
+        *self.current_schema.write() = schema;
+    }
+
+    /// Derive the current schema from a `search_path` value string: the FIRST
+    /// entry that is neither `public` nor `"$user"`, folded to lower-case
+    /// (unquoted PostgreSQL identifiers are case-insensitive). Returns `None`
+    /// when only `public` / `"$user"` remain — i.e. the default namespace.
+    fn derive_search_path_schema(value: &str) -> Option<String> {
+        for raw in value.split(',') {
+            let entry = raw.trim().trim_matches('"').trim().trim_matches('\'').trim();
+            if entry.is_empty() {
+                continue;
+            }
+            let lowered = entry.to_ascii_lowercase();
+            if lowered == "public" || lowered == "$user" {
+                continue;
+            }
+            return Some(lowered);
+        }
+        None
+    }
+
+    /// Intercept `SET`/`SHOW`/`RESET search_path`. `search_path` is a
+    /// session-scoped schema selector, not a generic registered setting, so it
+    /// is handled here (before the registered-setting gate). A change to the
+    /// current schema invalidates the plan/result caches — a cached plan
+    /// resolved bare names under the previous schema and must not be served now
+    /// (the same reason a branch switch invalidates). Returns `Some(rows)` when
+    /// the statement targeted `search_path`, else `None` (fall through).
+    fn try_handle_search_path_setting(
+        &self,
+        statement: &DbSettingStatement,
+    ) -> Result<Option<(Vec<Tuple>, Vec<String>)>> {
+        match statement {
+            DbSettingStatement::Set { name, value } if name == "search_path" => {
+                self.set_current_schema(Self::derive_search_path_schema(value));
+                self.invalidate_plan_cache();
+                Ok(Some((Vec::new(), Vec::new())))
+            }
+            DbSettingStatement::Reset { name } if name == "search_path" => {
+                self.set_current_schema(None);
+                self.invalidate_plan_cache();
+                Ok(Some((Vec::new(), Vec::new())))
+            }
+            DbSettingStatement::Show { name } if name == "search_path" => {
+                // Reconstruct a PostgreSQL-shaped value from the derived schema:
+                // the default is `"$user", public`; a set schema shows first.
+                let val = match self.current_schema() {
+                    Some(cs) => format!("{cs}, public"),
+                    None => "\"$user\", public".to_string(),
+                };
+                Ok(Some((
+                    vec![Tuple {
+                        values: vec![Value::String(val)],
+                        row_id: None,
+                        branch_id: None,
+                    }],
+                    vec!["search_path".to_string()],
+                )))
+            }
+            _ => Ok(None),
+        }
+    }
+
     fn try_handle_db_setting_statement_with_columns(&self, sql: &str) -> Result<Option<(Vec<Tuple>, Vec<String>)>> {
         let Some(statement) = Self::parse_db_setting_statement(sql) else {
             return Ok(None);
         };
+
+        if let Some(handled) = self.try_handle_search_path_setting(&statement)? {
+            return Ok(Some(handled));
+        }
 
         match statement {
             DbSettingStatement::Set { name, value } => {
@@ -1324,16 +1501,14 @@ impl EmbeddedDatabase {
             return Ok(plan);
         }
 
-        let source_sql = if lock_census::pl_rwlock_read(
-            lock_census::Site::StatementRegistry,
-            &self.prepared_fast_selects,
-        )
-        .contains_key(name)
-        {
-            self.prepared_statement_sql.read().get(name).cloned()
-        } else {
-            None
-        };
+        let source_sql =
+            if lock_census::pl_rwlock_read(lock_census::Site::StatementRegistry, &self.prepared_fast_selects)
+                .contains_key(name)
+            {
+                self.prepared_statement_sql.read().get(name).cloned()
+            } else {
+                None
+            };
 
         let Some(source_sql) = source_sql else {
             return Err(Error::query_execution(format!(
@@ -1424,12 +1599,9 @@ impl EmbeddedDatabase {
         if self.in_transaction() {
             return None;
         }
-        let spec = lock_census::pl_rwlock_read(
-            lock_census::Site::StatementRegistry,
-            &self.prepared_fast_selects,
-        )
-        .get(name)
-        .cloned()?;
+        let spec = lock_census::pl_rwlock_read(lock_census::Site::StatementRegistry, &self.prepared_fast_selects)
+            .get(name)
+            .cloned()?;
         let mut value = match params.get(spec.param_index - 1) {
             Some(value) => value.clone(),
             None => {
@@ -1954,6 +2126,16 @@ impl EmbeddedDatabase {
                 || upper.contains("BULK_LOAD_MODE"))
     }
 
+    /// True for `SET`/`RESET search_path` (any `LOCAL`/`SESSION`/`TO`/`=`
+    /// form). The wire simple-query handler acks generic `SET` itself, so it
+    /// uses this to route `search_path` through `execute()` (which updates the
+    /// session's current schema) before that generic ack.
+    pub(crate) fn is_search_path_statement(sql: &str) -> bool {
+        let trimmed = sql.trim().trim_end_matches(';').trim();
+        let upper = trimmed.to_ascii_uppercase();
+        (upper.starts_with("SET ") || upper.starts_with("RESET ")) && upper.contains("SEARCH_PATH")
+    }
+
     fn try_handle_fk_setting(&self, sql: &str) -> Result<Option<u64>> {
         let trimmed = sql.trim().trim_end_matches(';').trim();
         let upper = trimmed.to_ascii_uppercase();
@@ -2033,6 +2215,55 @@ impl EmbeddedDatabase {
                 _ => Ok(None),
             }
         } else {
+            Ok(None)
+        }
+    }
+
+    /// True for a `SET CONSTRAINTS …` statement (any name list, DEFERRED or
+    /// IMMEDIATE). Handled on the embedded `execute()` path (library API + REPL);
+    /// the deferral switch it arms is honored by every FK-validating path,
+    /// embedded and wire, since `constraints_all_deferred` is process-scoped like
+    /// `fk_validation_mode`.
+    pub(crate) fn is_set_constraints_statement(sql: &str) -> bool {
+        sql.trim_start().to_ascii_uppercase().starts_with("SET CONSTRAINTS")
+    }
+
+    /// Intercept `SET CONSTRAINTS { ALL | <name>[, …] } { DEFERRED | IMMEDIATE }`.
+    /// sqlparser 0.53 has no grammar for it and no engine path builds the
+    /// `SetConstraints` plan, so it was previously a silent no-op — a DEFERRABLE
+    /// FK stayed IMMEDIATE and the valid "insert child (deferred), then parent,
+    /// then COMMIT" sequence spuriously failed (foreign_key corpus fkpart9/10/11).
+    /// Nano's deferred-FK machinery already re-validates every queued check at
+    /// COMMIT (`validate_deferred_fk_checks`); the only missing piece was the
+    /// switch that arms it, which `constraints_all_deferred` now provides.
+    ///
+    /// The named-constraint list is ACCEPTED but treated as ALL: Nano's
+    /// auto-generated FK names (`fk_<t>_<c>__<ref>`) never match PostgreSQL's
+    /// (`<t>_<c>_fkey`), so per-name matching would silently no-op on ported SQL;
+    /// deferring the whole set is a safe superset because each deferred check is
+    /// still validated at COMMIT. Transaction-scoped — the flag is reset at the
+    /// next txn begin/commit/rollback.
+    fn try_handle_set_constraints(&self, sql: &str) -> Result<Option<u64>> {
+        if !Self::is_set_constraints_statement(sql) {
+            return Ok(None);
+        }
+        let upper = sql.trim().trim_end_matches(';').trim().to_ascii_uppercase();
+        if upper.ends_with(" DEFERRED") {
+            self.constraints_all_deferred
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            Ok(Some(0))
+        } else if upper.ends_with(" IMMEDIATE") {
+            self.constraints_all_deferred
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            // PostgreSQL parity: switching back to IMMEDIATE checks all pending
+            // deferred constraints NOW, so a violation surfaces here rather than
+            // at COMMIT. Validate against the current (global) transaction so the
+            // queued checks see this txn's own writes.
+            let txn_ref = self.current_transaction.lock();
+            self.validate_deferred_fk_checks(txn_ref.as_ref())?;
+            Ok(Some(0))
+        } else {
+            // No recognizable mode word — leave it for the normal path.
             Ok(None)
         }
     }
@@ -2180,14 +2411,39 @@ impl EmbeddedDatabase {
         // Updated under the mutex: readers that skip the lock on a `false`
         // load behave exactly as if they had locked before this BEGIN.
         self.global_txn_active.store(true, std::sync::atomic::Ordering::Release);
+        // `SET CONSTRAINTS ... DEFERRED` is transaction-scoped — start clean.
+        self.constraints_all_deferred
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
     /// Internal method to commit the current transaction
     fn commit_internal(&self) -> Result<()> {
         let mut txn_ref = self.current_transaction.lock();
-        if let Some(txn) = txn_ref.as_ref() {
-            self.validate_deferred_fk_checks(Some(txn))?;
+        // Deferred-FK validation runs BEFORE the durable commit. A failure here
+        // ABORTS the transaction — PostgreSQL rolls back a COMMIT that trips a
+        // deferred constraint — rather than leaving the slot occupied (which
+        // wedged every later `BEGIN` with "Transaction already active"). Undo the
+        // eager ART mutations, drain the deferred queue, and clear the
+        // `SET CONSTRAINTS` deferral flag, mirroring `rollback_internal` and the
+        // session-commit abort path.
+        if txn_ref.is_some() {
+            let validation = {
+                let txn = txn_ref.as_ref().expect("transaction present");
+                self.validate_deferred_fk_checks(Some(txn))
+            };
+            if let Err(e) = validation {
+                if let Some(txn) = txn_ref.take() {
+                    self.global_txn_active
+                        .store(false, std::sync::atomic::Ordering::Release);
+                    let _ = txn.rollback();
+                    self.rollback_art_undo_log();
+                }
+                self.deferred_fk_checks.lock().clear();
+                self.constraints_all_deferred
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                return Err(e);
+            }
         }
         if let Some(txn) = txn_ref.take() {
             // The slot is empty from here on (even if the commit below
@@ -2212,6 +2468,8 @@ impl EmbeddedDatabase {
             // Clear ART undo log (changes are now committed)
             self.art_undo_log.write().clear();
             self.deferred_fk_checks.lock().clear();
+            self.constraints_all_deferred
+                .store(false, std::sync::atomic::Ordering::Relaxed);
             self.invalidate_result_cache();
             // Increment LSN to track transaction commits
             self.storage.increment_lsn();
@@ -2232,6 +2490,8 @@ impl EmbeddedDatabase {
             txn.rollback()?;
             self.rollback_art_undo_log();
             self.deferred_fk_checks.lock().clear();
+            self.constraints_all_deferred
+                .store(false, std::sync::atomic::Ordering::Relaxed);
             Ok(())
         } else {
             Err(Error::transaction("No active transaction to rollback"))
@@ -2468,20 +2728,26 @@ impl EmbeddedDatabase {
         //    breaking snapshot isolation for other sessions)
         let has_savepoints = !self.savepoints.read().is_empty();
         let has_session_txns = self.any_session_txns();
+        // These literal/param fast paths parse the target table name straight
+        // out of the SQL text (bare) and never apply the session `search_path`,
+        // so under a non-`public` schema they would write to the wrong table.
+        // Yield to the full planner path (which resolves via `current_schema()`)
+        // whenever a schema is active. The default public path is unaffected.
+        let schema_active = self.current_schema_is_set();
         // INSERT fast paths write MVCC version keys, so versioned session-txn
         // snapshot reads stay correct while they run; they only need to yield
         // when versioning is off. UPDATE/DELETE fast paths write no version
         // history (roadmap C15) and stay disabled whenever any session
         // transaction is open.
         let insert_fast_paths_blocked = self.session_txns_block_fast_inserts();
-        let use_fast_paths = !skip_fast_paths && !has_savepoints && !has_session_txns;
-        let use_insert_fast_paths = !skip_fast_paths && !has_savepoints && !insert_fast_paths_blocked;
+        let use_fast_paths = !skip_fast_paths && !has_savepoints && !has_session_txns && !schema_active;
+        let use_insert_fast_paths = !skip_fast_paths && !has_savepoints && !insert_fast_paths_blocked && !schema_active;
 
         // Explicit transactions can still use transaction-aware INSERT fast
         // paths. These buffer rows in the transaction write set, so
         // COMMIT/ROLLBACK semantics are preserved while avoiding full
         // parser/planner and per-row counter persistence overhead.
-        if skip_fast_paths && !has_savepoints && !insert_fast_paths_blocked {
+        if skip_fast_paths && !has_savepoints && !insert_fast_paths_blocked && !schema_active {
             if let Some(result) = self.try_fast_insert_literal_in_transaction(sql, txn) {
                 return result;
             }
@@ -2548,7 +2814,9 @@ impl EmbeddedDatabase {
             let (view_name, query_sql, if_not_exists) = sql::Parser::parse_create_materialized_view_sql(sql)?;
             let (statement, _) = self.parse_cached(&query_sql)?;
             let catalog = self.storage.catalog();
-            let planner = sql::Planner::with_catalog(&catalog).with_sql(query_sql);
+            let planner = sql::Planner::with_catalog(&catalog)
+                .with_sql(query_sql)
+                .with_current_schema(self.current_schema());
             let query_plan = planner.statement_to_plan(statement)?;
             sql::phase3::MaterializedViewParser::parse_create_mv(view_name, query_plan, None, if_not_exists)?
         } else if sql::Parser::is_refresh_materialized_view(sql) {
@@ -2585,6 +2853,22 @@ impl EmbeddedDatabase {
                 column_name,
                 storage_mode,
             }
+        } else if sql::Parser::is_alter_table_set_schema(sql) {
+            // `ALTER TABLE [IF EXISTS] <name> SET SCHEMA <schema>` — sqlparser
+            // 0.53 has no such op, so pre-parse it. Resolve the source name to
+            // its storage key through the session `search_path` HERE (the same
+            // two-probe `resolve_table_ref` uses) so the executor moves the
+            // right table; the destination key is derived at execute time.
+            let (table_raw, new_schema, if_exists) = sql::Parser::parse_alter_table_set_schema(sql)?;
+            let catalog = self.storage.catalog();
+            let table_name = sql::Planner::with_catalog(&catalog)
+                .with_current_schema(self.current_schema())
+                .resolve_partition_name(&table_raw);
+            sql::LogicalPlan::AlterTableSetSchema {
+                table_name,
+                new_schema,
+                if_exists,
+            }
         } else if let Some(plan) = Self::try_parse_alter_constraint_enforcement(sql)? {
             plan
         } else if sql::Parser::is_pg_create_procedure(sql) || sql::Parser::is_pg_create_or_replace_procedure(sql) {
@@ -2615,7 +2899,9 @@ impl EmbeddedDatabase {
 
             // Create logical plan with catalog access and original SQL for time-travel parsing
             let catalog = self.storage.catalog();
-            let planner = sql::Planner::with_catalog(&catalog).with_sql(sql.to_string());
+            let planner = sql::Planner::with_catalog(&catalog)
+                .with_sql(sql.to_string())
+                .with_current_schema(self.current_schema());
             planner.statement_to_plan(statement)?
         };
 
@@ -2687,10 +2973,11 @@ impl EmbeddedDatabase {
                 // dependency so a later `DROP TABLE parent` cascades to its
                 // partition children (PostgreSQL parity). Re-derived from the
                 // ORIGINAL SQL exactly as the planner does (`extract_partition_of`
-                // + `normalize_partition_name`), and keyed on the SAME normalized
-                // names that key the catalog — so a schema-qualified
-                // `s.parent`/`s.child` resolves to the same bare keys the tables
-                // are stored under. A plain, non-partition CREATE returns `None`
+                // + session-aware `resolve_partition_name`), and keyed on the
+                // SAME resolved names that key the catalog — so a schema-scoped
+                // `s.parent`/`s.child` resolves to the same qualified keys the
+                // tables are stored under. A plain, non-partition CREATE returns
+                // `None`
                 // here → no registry write (zero cost). This runs only after
                 // `create_table` above succeeded (the `?` short-circuits a
                 // duplicate-name / bad-DDL failure before we reach this point).
@@ -2709,7 +2996,20 @@ impl EmbeddedDatabase {
                 // children to standalone CREATEs (a restored setup does not
                 // cascade-drop; Stage 1 owns the durable partition catalog).
                 if let Some(spec) = sql::Parser::extract_partition_of(sql) {
-                    let parent = sql::Planner::normalize_partition_name(&spec.parent);
+                    // Resolve the parent through the SAME session-aware
+                    // resolution that produced the child's key `name`: a bare
+                    // `parent` under `SET search_path TO s` registers under
+                    // `s.parent` (the parent's real key), NOT the bare key.
+                    // Without this the registry keys the child under bare
+                    // `parent` while `DROP TABLE parent` resolves to `s.parent`,
+                    // finds no children, skips the cascade and orphans them
+                    // (foreign_key corpus fkpart6: the re-created child then
+                    // collides with the survivor). Reuse the planner
+                    // `resolve_table_ref` two-probe via `resolve_partition_name`
+                    // — never a second resolution reimplementation.
+                    let parent = sql::Planner::with_catalog(&catalog)
+                        .with_current_schema(self.current_schema())
+                        .resolve_partition_name(&spec.parent);
                     catalog.register_partition_child(&parent, name)?;
                 }
 
@@ -2729,14 +3029,37 @@ impl EmbeddedDatabase {
                                 initially_deferred,
                                 enforcement,
                             } => {
+                                // Dedup auto-generated names against the FKs already
+                                // staged on THIS table in this CREATE TABLE: the schema
+                                // no longer participates in the name, so two FKs to
+                                // like-named tables in different schemas would otherwise
+                                // collide (see `generate_unique_name`).
+                                let existing_fk_names: Vec<String> =
+                                    table_constraints.foreign_keys.iter().map(|f| f.name.clone()).collect();
+                                // `REFERENCES parent` with no column list binds to
+                                // the parent's PRIMARY KEY (PostgreSQL parity).
+                                // Default it HERE, against the already-resolved
+                                // `references_table` key, so the persisted metadata
+                                // carries the real referenced columns — enforcement
+                                // then probes the parent's PK-column index in the
+                                // right key-space instead of an empty list (which
+                                // degraded to "any parent row exists" and printed a
+                                // malformed `parent()` violation message).
+                                let references_columns =
+                                    Self::resolve_fk_referenced_columns(&catalog, references_table, references_columns);
                                 let fk = sql::ForeignKeyConstraint::new(
                                     fk_name.clone().unwrap_or_else(|| {
-                                        sql::ForeignKeyConstraint::generate_name(name, fk_cols, references_table)
+                                        sql::ForeignKeyConstraint::generate_unique_name(
+                                            name,
+                                            fk_cols,
+                                            references_table,
+                                            &existing_fk_names,
+                                        )
                                     }),
                                     name.clone(),
                                     fk_cols.clone(),
                                     references_table.clone(),
-                                    references_columns.clone(),
+                                    references_columns,
                                 );
                                 let fk = if let Some(action) = on_delete {
                                     fk.on_delete(convert_logical_referential_action(action))
@@ -5124,6 +5447,11 @@ impl EmbeddedDatabase {
 
                 Ok(0)
             }
+            sql::LogicalPlan::AlterTableSetSchema {
+                table_name,
+                new_schema,
+                if_exists,
+            } => self.alter_table_set_schema(table_name, new_schema, *if_exists),
             sql::LogicalPlan::AlterTableAddForeignKey {
                 table_name,
                 constraint_name,
@@ -5141,15 +5469,34 @@ impl EmbeddedDatabase {
                 catalog.get_table_schema(table_name)?;
                 catalog.get_table_schema(references_table)?;
 
-                let fk_name = constraint_name
-                    .clone()
-                    .unwrap_or_else(|| sql::ForeignKeyConstraint::generate_name(table_name, columns, references_table));
+                let fk_name = constraint_name.clone().unwrap_or_else(|| {
+                    // Dedup the auto-name against the FKs already on this table:
+                    // the schema no longer disambiguates the generated name, so
+                    // two FKs to like-named tables in different schemas would
+                    // otherwise collide (see `generate_unique_name`).
+                    let existing_fk_names: Vec<String> = catalog
+                        .load_table_constraints(table_name)
+                        .map(|c| c.foreign_keys.into_iter().map(|f| f.name).collect())
+                        .unwrap_or_default();
+                    sql::ForeignKeyConstraint::generate_unique_name(
+                        table_name,
+                        columns,
+                        references_table,
+                        &existing_fk_names,
+                    )
+                });
+                // `REFERENCES parent` without a column list binds to the
+                // parent's PRIMARY KEY (PostgreSQL parity); resolve it against
+                // the already-resolved `references_table` key so enforcement
+                // probes the right columns. See `resolve_fk_referenced_columns`.
+                let references_columns =
+                    Self::resolve_fk_referenced_columns(&catalog, references_table, references_columns);
                 let mut fk = sql::ForeignKeyConstraint::new(
                     fk_name,
                     table_name.clone(),
                     columns.clone(),
                     references_table.clone(),
-                    references_columns.clone(),
+                    references_columns,
                 );
                 if let Some(action) = on_delete {
                     fk = fk.on_delete(convert_logical_referential_action(action));
@@ -5439,6 +5786,9 @@ impl EmbeddedDatabase {
             prepared_statement_sql: std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             prepared_fast_selects: std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             session_settings: sql::SessionSettings::new(),
+            current_schema: std::sync::Arc::new(parking_lot::RwLock::new(None)),
+            current_schema_set: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            any_session_schema_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             savepoints: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
             plan_cache: std::sync::Arc::new(
                 sharded_lru::ShardedLruCache::new(std::num::NonZeroUsize::new(256).expect("256 is non-zero"))
@@ -5473,6 +5823,7 @@ impl EmbeddedDatabase {
             fk_validation_mode: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationMode::Enforced)),
             fk_validation_source: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationSource::Engine)),
             deferred_fk_checks: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
+            constraints_all_deferred: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cold_optimizer: std::sync::OnceLock::new(),
         })
     }
@@ -5537,6 +5888,9 @@ impl EmbeddedDatabase {
             prepared_statement_sql: std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             prepared_fast_selects: std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             session_settings: sql::SessionSettings::new(),
+            current_schema: std::sync::Arc::new(parking_lot::RwLock::new(None)),
+            current_schema_set: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            any_session_schema_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             savepoints: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
             plan_cache: std::sync::Arc::new(
                 sharded_lru::ShardedLruCache::new(std::num::NonZeroUsize::new(256).expect("256 is non-zero"))
@@ -5571,6 +5925,7 @@ impl EmbeddedDatabase {
             fk_validation_mode: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationMode::Enforced)),
             fk_validation_source: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationSource::Engine)),
             deferred_fk_checks: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
+            constraints_all_deferred: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cold_optimizer: std::sync::OnceLock::new(),
         })
     }
@@ -5671,6 +6026,9 @@ impl EmbeddedDatabase {
             prepared_statement_sql: std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             prepared_fast_selects: std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             session_settings: sql::SessionSettings::new(),
+            current_schema: std::sync::Arc::new(parking_lot::RwLock::new(None)),
+            current_schema_set: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            any_session_schema_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             savepoints: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
             plan_cache: std::sync::Arc::new(
                 sharded_lru::ShardedLruCache::new(std::num::NonZeroUsize::new(256).expect("256 is non-zero"))
@@ -5705,6 +6063,7 @@ impl EmbeddedDatabase {
             fk_validation_mode: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationMode::Enforced)),
             fk_validation_source: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationSource::Engine)),
             deferred_fk_checks: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
+            constraints_all_deferred: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cold_optimizer: std::sync::OnceLock::new(),
         })
     }
@@ -6441,6 +6800,12 @@ impl EmbeddedDatabase {
             return Ok(count);
         }
 
+        // `SET CONSTRAINTS … DEFERRED|IMMEDIATE` — arm/disarm transaction-scoped
+        // FK deferral (sqlparser has no grammar for it; a no-op before).
+        if let Some(count) = self.try_handle_set_constraints(sql)? {
+            return Ok(count);
+        }
+
         // R4.3: VACUUM VERSIONS — manual MVCC version-history collection.
         if let Some(count) = self.try_handle_vacuum_versions(sql)? {
             return Ok(count);
@@ -6583,6 +6948,10 @@ impl EmbeddedDatabase {
         if !self.savepoints.read().is_empty()
             || self.session_txns_block_fast_inserts()
             || self.tenant_manager.get_current_context().is_some()
+            // Under a non-`public` `search_path`, bare names resolve via the
+            // planner two-probe; this fast path resolves bare names directly, so
+            // yield to the full planner path to stay schema-correct.
+            || self.current_schema_is_set()
         {
             return None;
         }
@@ -6967,7 +7336,12 @@ impl EmbeddedDatabase {
         }
         // Deferred / Audit change *when*/*whether* a violation surfaces
         // (COMMIT-time deferral, violation recording) — not replicated here.
-        if mode != FkValidationMode::Enforced {
+        // `SET CONSTRAINTS ALL DEFERRED` (transaction-scoped) has the same
+        // effect, so it likewise disqualifies the eager batch fast path and
+        // routes through the deferring slow path.
+        if mode != FkValidationMode::Enforced
+            || self.constraints_all_deferred.load(std::sync::atomic::Ordering::Relaxed)
+        {
             return false;
         }
         // Immediate enforced mode: every FK must be plain immediate (NOT
@@ -7353,17 +7727,26 @@ impl EmbeddedDatabase {
         sql: &str,
         plan: &sql::LogicalPlan,
     ) -> Option<Result<std::sync::Arc<FastParamInsertSpec>>> {
+        // The spec caches the plan's RESOLVED table name under the SQL text, which
+        // is shared across sessions; under a non-`public` `search_path` the same
+        // SQL maps to different schemas per session, so bypass the cache (build
+        // fresh from the already-schema-resolved `plan`). Public path unchanged.
+        let schema_active = self.current_schema_is_set();
         let cache_key = format!("\0fast_param_insert\0{sql}");
-        if let Some(spec) = self.fast_param_insert_cache.get(&cache_key) {
-            return Some(Ok(spec));
+        if !schema_active {
+            if let Some(spec) = self.fast_param_insert_cache.get(&cache_key) {
+                return Some(Ok(spec));
+            }
         }
 
         let spec = match self.build_fast_param_insert_spec(plan)? {
             Ok(spec) => std::sync::Arc::new(spec),
             Err(e) => return Some(Err(e)),
         };
-        self.fast_param_insert_cache
-            .put(cache_key, std::sync::Arc::clone(&spec));
+        if !schema_active {
+            self.fast_param_insert_cache
+                .put(cache_key, std::sync::Arc::clone(&spec));
+        }
         Some(Ok(spec))
     }
 
@@ -8483,6 +8866,8 @@ impl EmbeddedDatabase {
         if !self.savepoints.read().is_empty()
             || self.any_session_txns()
             || self.tenant_manager.get_current_context().is_some()
+            // Non-`public` `search_path`: resolve bare names via the planner.
+            || self.current_schema_is_set()
         {
             return None;
         }
@@ -8667,6 +9052,92 @@ impl EmbeddedDatabase {
         }
         column.nullable = nullable;
         catalog.update_table_schema(table_name, &schema)?;
+        Ok(0)
+    }
+
+    /// `ALTER TABLE [IF EXISTS] <name> SET SCHEMA <new_schema>` — move a table
+    /// (or regular view) into another schema. Schema namespacing keys a table
+    /// as `schema.table` (bare for `public`), so a schema move is a rename of
+    /// that storage key. For a TABLE we reuse the RENAME-TABLE machinery
+    /// (`rename_table` moves data rows, schema metadata, row counter,
+    /// compression config and ART indexes atomically) and then migrate the
+    /// side records rename does not touch — constraints, IDENTITY record and
+    /// the Stage-0 partition registry — via `move_table_side_records`. For a
+    /// VIEW we move the view metadata record only.
+    ///
+    /// LIMITATION (documented): a moved view's stored body SQL is NOT rewritten,
+    /// so a view whose body references another object by its OLD schema-qualified
+    /// name (or a bare name that resolved to the old schema) may not re-resolve
+    /// after the move — Nano stores view bodies as text bound to the creator's
+    /// schema, not as PostgreSQL-style OID references. Table moves have no such
+    /// caveat.
+    fn alter_table_set_schema(&self, old_key: &str, new_schema: &str, if_exists: bool) -> Result<u64> {
+        let catalog = self.storage.catalog();
+
+        // Destination key: bare for the schemas Nano keeps in the bare
+        // key-space, else `<new_schema>.<table>`. The bare table component is the
+        // last dotted segment of the (possibly qualified) source key.
+        //
+        // `public` AND `pg_catalog` both collapse to the bare key-space in
+        // `Planner::normalize_object_name` / `dealias_schema` (a `pg_catalog.t`
+        // reference resolves to bare `t`, same as `public.t`). So a table moved
+        // to EITHER must use the bare key — keying it `pg_catalog.t` would strand
+        // it: no later reference, bare OR qualified, could resolve that key
+        // again (alter_table corpus: CREATE new_system_table, SET SCHEMA
+        // pg_catalog, SET SCHEMA public, then bare RENAME/UPDATE/…/DROP all
+        // failed "does not exist" because the pg_catalog move produced an
+        // unreachable `pg_catalog.new_system_table` key).
+        let (_old_schema, bare) = sql::Planner::split_schema_key(old_key);
+        let new_key = if new_schema == "public" || new_schema == "pg_catalog" {
+            bare
+        } else {
+            format!("{new_schema}.{bare}")
+        };
+
+        // `SET SCHEMA <current schema>` is a no-op success (PostgreSQL parity).
+        if new_key == old_key {
+            return Ok(0);
+        }
+
+        let is_table = catalog.get_table_schema(old_key).is_ok();
+        let is_view = !is_table && self.storage.view_catalog().view_exists(old_key)?;
+        if !is_table && !is_view {
+            if if_exists {
+                return Ok(0);
+            }
+            return Err(Error::query_execution(format!("relation \"{old_key}\" does not exist")));
+        }
+
+        // The destination name must be free (a table OR a view).
+        if catalog.get_table_schema(&new_key).is_ok() || self.storage.view_catalog().view_exists(&new_key)? {
+            return Err(Error::query_execution(format!("relation \"{new_key}\" already exists")));
+        }
+
+        if is_table {
+            // Data + schema + counter + compression + ART indexes.
+            self.storage.rename_table(old_key, &new_key)?;
+            // Constraints + IDENTITY + partition registry (rename skips these).
+            catalog.move_table_side_records(old_key, &new_key)?;
+        } else {
+            // Regular view: move the metadata record; rebind its creator schema
+            // to the destination so a bare reference in the body binds there.
+            let mut metadata = self.storage.view_catalog().get_view(old_key)?;
+            metadata.view_name = new_key.clone();
+            metadata.creator_schema = if new_schema == "public" {
+                None
+            } else {
+                Some(new_schema.to_string())
+            };
+            self.storage.view_catalog().create_view(metadata, false, false)?;
+            self.storage.view_catalog().drop_view(old_key, false)?;
+        }
+
+        tracing::info!(
+            "Moved relation '{}' to schema '{}' (key '{}')",
+            old_key,
+            new_schema,
+            new_key
+        );
         Ok(0)
     }
 
@@ -10117,6 +10588,11 @@ impl EmbeddedDatabase {
         if self.in_transaction() {
             return None;
         }
+        // Non-`public` `search_path`: bare names resolve via the planner
+        // two-probe, so bypass this direct fast path.
+        if self.current_schema_is_set() {
+            return None;
+        }
 
         let trimmed = sql.trim();
 
@@ -10229,6 +10705,8 @@ impl EmbeddedDatabase {
         if self.in_transaction()
             || self.storage.is_branch_active()
             || self.tenant_manager.get_current_context().is_some()
+            // Non-`public` `search_path`: resolve bare names via the planner.
+            || self.current_schema_is_set()
         {
             return None;
         }
@@ -10635,6 +11113,12 @@ impl EmbeddedDatabase {
 
     fn try_fast_select_params(&self, sql: &str, params: &[Value]) -> Option<Result<Vec<Tuple>>> {
         if self.in_transaction() {
+            return None;
+        }
+        // This path parses the table name straight from the SQL (bare) and never
+        // applies the session `search_path`; under a non-`public` schema resolve
+        // through the planner two-probe instead (mirrors `fast_select_lookup`).
+        if self.current_schema_is_set() {
             return None;
         }
 
@@ -11361,23 +11845,36 @@ impl EmbeddedDatabase {
             _ => return Err(Error::query_execution("unsupported trigger RHS".to_string())),
         };
         let catalog = self.storage.catalog();
-        let planner = sql::Planner::with_catalog(&catalog);
+        let planner = sql::Planner::with_catalog(&catalog).with_current_schema(self.current_schema());
         planner.expr_to_logical(&expr)
     }
 
     /// Parse and plan a parameterized statement with a cache key that cannot
     /// collide with the non-parameterized `query()` plan cache entries.
     fn parameterized_plan_cached(&self, sql: &str) -> Result<std::sync::Arc<sql::LogicalPlan>> {
+        // Under a non-`public` `search_path`, bare names resolve against a
+        // per-session schema. The plan cache is keyed by SQL text only and
+        // shared across every session, so a plan built for one schema must
+        // never be read by, or written for, another. Bypass it entirely (plan
+        // fresh) so the shared cache stays public-schema-only — the invariant
+        // that lets the default public path keep using it unchanged.
+        let schema_active = self.current_schema_is_set();
         let cache_key = format!("\0params\0{sql}");
-        if let Some(plan) = self.plan_cache.get(&cache_key) {
-            return Ok(plan);
+        if !schema_active {
+            if let Some(plan) = self.plan_cache.get(&cache_key) {
+                return Ok(plan);
+            }
         }
 
         let (statement, _) = self.parse_cached(sql)?;
         let catalog = self.storage.catalog();
-        let planner = sql::Planner::with_catalog(&catalog).with_sql(sql.to_string());
+        let planner = sql::Planner::with_catalog(&catalog)
+            .with_sql(sql.to_string())
+            .with_current_schema(self.current_schema());
         let plan = std::sync::Arc::new(planner.statement_to_plan(statement)?);
-        self.plan_cache.put(cache_key, std::sync::Arc::clone(&plan));
+        if !schema_active {
+            self.plan_cache.put(cache_key, std::sync::Arc::clone(&plan));
+        }
         Ok(plan)
     }
 
@@ -11430,7 +11927,7 @@ impl EmbeddedDatabase {
         // 3. Create logical plan with catalog access
         let plan_start = std::time::Instant::now();
         let catalog = self.storage.catalog();
-        let planner = sql::Planner::with_catalog(&catalog);
+        let planner = sql::Planner::with_catalog(&catalog).with_current_schema(self.current_schema());
         let plan = planner.statement_to_plan(statement)?;
         let plan_elapsed = plan_start.elapsed();
         tracing::debug!(
@@ -12469,10 +12966,18 @@ impl EmbeddedDatabase {
         params: &[Value],
         plan_override: Option<&std::sync::Arc<sql::LogicalPlan>>,
     ) -> Result<u64> {
-        if let Some(result) = self.try_autocommit_fast_update_delete_params_cached(sql, params) {
-            let count = result?;
-            self.invalidate_result_cache();
-            return Ok(count);
+        // These param fast paths resolve the target table from the SQL text
+        // (bare) or from SQL-keyed spec caches that are shared across sessions,
+        // so under a non-`public` `search_path` they would touch the wrong
+        // table. Yield to `execute_plan_with_params`, which runs the
+        // schema-resolved plan. The default public path is unchanged.
+        let schema_active = self.current_schema_is_set();
+        if !schema_active {
+            if let Some(result) = self.try_autocommit_fast_update_delete_params_cached(sql, params) {
+                let count = result?;
+                self.invalidate_result_cache();
+                return Ok(count);
+            }
         }
 
         let plan = match plan_override {
@@ -12480,19 +12985,21 @@ impl EmbeddedDatabase {
             None => self.parameterized_plan_cached(sql)?,
         };
 
-        if let Some(result) = self.try_transaction_fast_insert_params(sql, &plan, params) {
-            let count = result?;
-            return Ok(count);
-        }
-        if let Some(result) = self.try_autocommit_fast_insert_params(sql, &plan, params) {
-            let count = result?;
-            self.invalidate_result_cache();
-            return Ok(count);
-        }
-        if let Some(result) = self.try_autocommit_fast_update_delete_params(sql, &plan, params) {
-            let count = result?;
-            self.invalidate_result_cache();
-            return Ok(count);
+        if !schema_active {
+            if let Some(result) = self.try_transaction_fast_insert_params(sql, &plan, params) {
+                let count = result?;
+                return Ok(count);
+            }
+            if let Some(result) = self.try_autocommit_fast_insert_params(sql, &plan, params) {
+                let count = result?;
+                self.invalidate_result_cache();
+                return Ok(count);
+            }
+            if let Some(result) = self.try_autocommit_fast_update_delete_params(sql, &plan, params) {
+                let count = result?;
+                self.invalidate_result_cache();
+                return Ok(count);
+            }
         }
 
         let (count, _tuples) = self.execute_plan_with_params(&plan, params, None)?;
@@ -12511,17 +13018,22 @@ impl EmbeddedDatabase {
         }
 
         let plan = self.parameterized_plan_cached(sql)?;
-        if let Some(result) = self.try_fast_insert_many_params(sql, &plan, rows) {
-            let count = result?;
-            if !self.in_transaction() {
-                self.invalidate_result_cache();
+        // These batch fast paths cache a spec under the SQL text (shared across
+        // sessions); a non-`public` `search_path` maps the same SQL to a
+        // different schema, so yield to the per-row planner path below.
+        if !self.current_schema_is_set() {
+            if let Some(result) = self.try_fast_insert_many_params(sql, &plan, rows) {
+                let count = result?;
+                if !self.in_transaction() {
+                    self.invalidate_result_cache();
+                }
+                return Ok(count);
             }
-            return Ok(count);
-        }
-        if let Some(result) = self.try_autocommit_fast_update_delete_many_params(sql, &plan, rows) {
-            let count = result?;
-            self.invalidate_result_cache();
-            return Ok(count);
+            if let Some(result) = self.try_autocommit_fast_update_delete_many_params(sql, &plan, rows) {
+                let count = result?;
+                self.invalidate_result_cache();
+                return Ok(count);
+            }
         }
 
         let mut total = 0_u64;
@@ -14006,7 +14518,9 @@ impl EmbeddedDatabase {
             }
             let (statement, _) = self.parse_cached(sql)?;
             let catalog = self.storage.catalog();
-            let planner = sql::Planner::with_catalog(&catalog).with_sql(sql.to_string());
+            let planner = sql::Planner::with_catalog(&catalog)
+                .with_sql(sql.to_string())
+                .with_current_schema(self.current_schema());
             let plan = planner.statement_to_plan(statement)?;
             if let Some((rows, _columns)) = self.try_handle_prepared_query_plan_with_columns(&plan)? {
                 self.log_slow_query(sql, start.elapsed(), rows.len() as u64);
@@ -14030,7 +14544,9 @@ impl EmbeddedDatabase {
                 // Parse and execute through transaction-aware executor
                 let (statement, _) = self.parse_cached(sql)?;
                 let catalog = self.storage.catalog();
-                let planner = sql::Planner::with_catalog(&catalog).with_sql(sql.to_string());
+                let planner = sql::Planner::with_catalog(&catalog)
+                    .with_sql(sql.to_string())
+                    .with_current_schema(self.current_schema());
                 let plan = planner.statement_to_plan(statement)?;
                 let mut executor = sql::Executor::with_storage(&self.storage)
                     .with_timeout(self.effective_statement_timeout_ms())
@@ -14043,11 +14559,20 @@ impl EmbeddedDatabase {
 
         let result_cache_nonempty = self.result_cache_nonempty.load(std::sync::atomic::Ordering::Acquire);
 
+        // Under a non-`public` `search_path`, bare names resolve against a
+        // per-session schema; the plan/result caches are keyed by SQL text only
+        // and shared across sessions, so bypass every read and write here (plan
+        // fresh below with the active schema). Keeps the shared caches
+        // public-schema-only. The literal fast paths already yield under this
+        // same condition (`fast_select_lookup` / `try_fast_count_pk_query`), so
+        // the default public path (`schema_active == false`) is unchanged.
+        let schema_active = self.current_schema_is_set();
+
         // Preserve the v3.37 hot-result-cache behavior for repeated embedded
         // COUNT(*) probes. The COUNT fast path below is still the cold path,
         // but repeated deterministic COUNTs should not bypass an already-hot
         // single-entry result cache.
-        if result_cache_nonempty {
+        if !schema_active && result_cache_nonempty {
             if let Some(cached_results) = self.hot_cached_query_result(sql) {
                 tracing::debug!(phase = "result_cache", "Hot result cache hit");
                 self.log_slow_query(sql, start.elapsed(), cached_results.len() as u64);
@@ -14098,7 +14623,7 @@ impl EmbeddedDatabase {
         // must return a fresh value every time. Caching any of these
         // would serve stale rows to the caller.
         let is_non_deterministic = Self::query_is_non_deterministic(sql);
-        if !is_non_deterministic && result_cache_nonempty {
+        if !schema_active && !is_non_deterministic && result_cache_nonempty {
             if let Some(cached_results) = self.cached_query_result(sql) {
                 tracing::debug!(phase = "result_cache", "Result cache hit");
                 self.log_slow_query(sql, start.elapsed(), cached_results.len() as u64);
@@ -14106,8 +14631,9 @@ impl EmbeddedDatabase {
             }
         }
 
-        // Check plan cache (Arc::clone is O(1))
-        let cached_plan = self.plan_cache.get(sql);
+        // Check plan cache (Arc::clone is O(1)); bypass under a non-`public`
+        // search_path so the shared cache is never read for a schema-scoped name.
+        let cached_plan = if schema_active { None } else { self.plan_cache.get(sql) };
 
         if let Some(arc_plan) = cached_plan {
             tracing::debug!(phase = "parse", duration_us = 0_u64, "SQL parsed (cached)");
@@ -14185,7 +14711,7 @@ impl EmbeddedDatabase {
         // key) never re-hits and is harmless. Deterministic-only, and
         // write-invalidated exactly like every other result-cache entry, so it
         // can never serve stale rows.
-        if !is_non_deterministic {
+        if !schema_active && !is_non_deterministic {
             if let Some(result) = self.try_normalized_query_with_columns(sql) {
                 let (rows, _columns) = result?;
                 if self.cache_admits(sql) {
@@ -14209,7 +14735,9 @@ impl EmbeddedDatabase {
         // 2. Create logical plan
         let plan_start = std::time::Instant::now();
         let catalog = self.storage.catalog();
-        let planner = sql::Planner::with_catalog(&catalog).with_sql(sql.to_string());
+        let planner = sql::Planner::with_catalog(&catalog)
+            .with_sql(sql.to_string())
+            .with_current_schema(self.current_schema());
         let plan = planner.statement_to_plan(statement)?;
         tracing::debug!(
             phase = "plan",
@@ -14246,7 +14774,7 @@ impl EmbeddedDatabase {
         // result-cache insert below) so unique-literal one-shots stop churning
         // the plan/result caches. A genuinely repeated query warms on its
         // second run; a plan-cache hit thereafter takes the branch above.
-        let admit = !is_non_deterministic && self.cache_admits(sql);
+        let admit = !schema_active && !is_non_deterministic && self.cache_admits(sql);
         let plan_arc = std::sync::Arc::new(plan);
         if admit {
             self.plan_cache.put(sql.to_string(), plan_arc.clone());
@@ -14357,7 +14885,9 @@ impl EmbeddedDatabase {
                 Err(e) => return Some(Err(e)),
             };
             let catalog = self.storage.catalog();
-            let planner = sql::Planner::with_catalog(&catalog).with_sql(nsql.clone());
+            let planner = sql::Planner::with_catalog(&catalog)
+                .with_sql(nsql.clone())
+                .with_current_schema(self.current_schema());
             let plan = match planner.statement_to_plan(statement) {
                 Ok(p) => p,
                 Err(e) => return Some(Err(e)),
@@ -14395,7 +14925,9 @@ impl EmbeddedDatabase {
     pub(crate) fn query_raw_unnormalized(&self, sql: &str) -> Result<Vec<Tuple>> {
         let (statement, _) = self.parse_cached(sql)?;
         let catalog = self.storage.catalog();
-        let planner = sql::Planner::with_catalog(&catalog).with_sql(sql.to_string());
+        let planner = sql::Planner::with_catalog(&catalog)
+            .with_sql(sql.to_string())
+            .with_current_schema(self.current_schema());
         let plan = planner.statement_to_plan(statement)?;
         let plan = self.cold_optimizer().optimize_recursive(plan)?;
         let mut executor =
@@ -14461,20 +14993,30 @@ impl EmbeddedDatabase {
             return Ok((Vec::new(), Vec::new()));
         }
 
+        // Under a non-`public` `search_path`, bare names resolve against a
+        // per-session schema; the normalized-plan and plan/result caches are
+        // keyed by SQL text only and shared across sessions, so skip every one
+        // of them (plan fresh below) — the shared caches stay public-only so no
+        // session ever serves another's schema-resolved plan. The default
+        // public path (`schema_active == false`) is untouched.
+        let schema_active = self.current_schema_is_set();
+
         // A2: literal normalization → shared parameterized plan. A repeated
         // point read that differs only in its WHERE literals reuses one cached
         // plan under the normalized key instead of re-parsing/planning every
         // literal variant. Only fires for deterministic autocommit SELECTs it
         // can prove safe; everything else falls through to the raw path below.
-        if !Self::query_is_non_deterministic(sql) {
+        if !schema_active && !Self::query_is_non_deterministic(sql) {
             if let Some(result) = self.try_normalized_query_with_columns(sql) {
                 return result;
             }
         }
 
-        let cacheable = !self.in_transaction() && !Self::query_is_non_deterministic(sql);
-        if let Some((cached_results, columns)) = self.try_cached_query_with_columns(sql) {
-            return Ok(((*cached_results).clone(), columns));
+        let cacheable = !schema_active && !self.in_transaction() && !Self::query_is_non_deterministic(sql);
+        if !schema_active {
+            if let Some((cached_results, columns)) = self.try_cached_query_with_columns(sql) {
+                return Ok(((*cached_results).clone(), columns));
+            }
         }
         // R-A1: on a cold miss, only admit to the caches on a repeat sighting,
         // so unique-literal one-shots stop deep-cloning the plan/result and
@@ -14486,9 +15028,10 @@ impl EmbeddedDatabase {
         // aren't recognised by sqlparser; mirror the pre-detect that
         // `execute_in_transaction_inner` already does so the query path
         // produces rows instead of "Statement not yet supported".
+        let cached_plan = if schema_active { None } else { self.plan_cache.get(sql) };
         let plan = if sql::Parser::is_show_branches(sql) {
             sql::LogicalPlan::ShowBranches
-        } else if let Some(arc_plan) = self.plan_cache.get(sql) {
+        } else if let Some(arc_plan) = cached_plan {
             if let Some(result) = self.try_handle_prepared_query_plan_with_columns(&arc_plan)? {
                 return Ok(result);
             }
@@ -14502,7 +15045,9 @@ impl EmbeddedDatabase {
         } else {
             let (statement, _) = self.parse_cached(sql)?;
             let catalog = self.storage.catalog();
-            let planner = sql::Planner::with_catalog(&catalog).with_sql(sql.to_string());
+            let planner = sql::Planner::with_catalog(&catalog)
+                .with_sql(sql.to_string())
+                .with_current_schema(self.current_schema());
             planner.statement_to_plan(statement)?
         };
 
@@ -14827,6 +15372,11 @@ impl EmbeddedDatabase {
             .insert(session_id, std::sync::Arc::new(parking_lot::RwLock::new(Some(txn))));
         self.session_txn_count.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
 
+        // `SET CONSTRAINTS ALL DEFERRED` is transaction-scoped — start each
+        // session transaction clean (mirrors `begin_internal`).
+        self.constraints_all_deferred
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+
         Ok(())
     }
 
@@ -14874,6 +15424,24 @@ impl EmbeddedDatabase {
                 session.stats.transactions_committed += 1;
                 return Ok(());
             };
+            // Deferred-FK validation runs BEFORE the durable commit, mirroring
+            // the global-slot `commit_internal`: `SET CONSTRAINTS ALL DEFERRED`
+            // (or a `DEFERRABLE INITIALLY DEFERRED` FK) queued its checks to
+            // COMMIT. A failure ABORTS the commit — PostgreSQL rolls back a
+            // COMMIT that trips a deferred constraint — instead of silently
+            // persisting a dangling reference. `validate_deferred_fk_checks`
+            // fast-returns on the (common) empty queue.
+            if let Err(e) = self.validate_deferred_fk_checks(Some(&txn)) {
+                let _ = txn.rollback();
+                self.finish_session_art_undo(session_id, true);
+                self.deferred_fk_checks.lock().clear();
+                self.constraints_all_deferred
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                self.invalidate_result_cache();
+                session.active_txn = None;
+                session.stats.transactions_aborted += 1;
+                return Err(e);
+            }
             // R1.3-p2: commit itself runs the row-cache fence when the cache
             // is wired; only unwired transactions need the caller-side sweep.
             let written = if txn.has_row_cache() {
@@ -14902,6 +15470,11 @@ impl EmbeddedDatabase {
 
         // Invalidate result cache since committed data may affect cached query results
         self.invalidate_result_cache();
+
+        // `SET CONSTRAINTS` deferral is transaction-scoped — clear it at COMMIT
+        // (the queue was already drained by `validate_deferred_fk_checks`).
+        self.constraints_all_deferred
+            .store(false, std::sync::atomic::Ordering::Relaxed);
 
         session.active_txn = None;
         session.stats.transactions_committed += 1;
@@ -14942,6 +15515,13 @@ impl EmbeddedDatabase {
 
         // Invalidate result cache since rollback changes visible data state
         self.invalidate_result_cache();
+
+        // Drop any deferred-FK checks queued in the aborted transaction and
+        // clear the transaction-scoped `SET CONSTRAINTS` deferral (mirrors
+        // `rollback_internal`).
+        self.deferred_fk_checks.lock().clear();
+        self.constraints_all_deferred
+            .store(false, std::sync::atomic::Ordering::Relaxed);
 
         session.active_txn = None;
         session.stats.transactions_aborted += 1;
@@ -15109,7 +15689,9 @@ impl EmbeddedDatabase {
 
             // Create logical plan with catalog access and original SQL for time-travel parsing
             let catalog = self.storage.catalog();
-            let planner = sql::Planner::with_catalog(&catalog).with_sql(sql.to_string());
+            let planner = sql::Planner::with_catalog(&catalog)
+                .with_sql(sql.to_string())
+                .with_current_schema(self.current_schema());
             let plan = planner.statement_to_plan(statement)?;
 
             // Execute plan with transaction context
@@ -15258,6 +15840,92 @@ impl EmbeddedDatabase {
         }
     }
 
+    /// Store this session's `search_path` current schema (`None` = `public`).
+    /// Per-session (mirrors `set_session_fast_autocommit`) so concurrent wire
+    /// connections never share one selector. A non-`public` value also flips the
+    /// process-wide `any_session_schema_active` gate so the `_for_session` paths
+    /// begin consulting per-session schema; the default (always-`public`) wire
+    /// workload never trips it and pays nothing.
+    pub(crate) fn set_session_current_schema(
+        &self,
+        session_id: crate::session::SessionId,
+        schema: Option<String>,
+    ) -> Result<()> {
+        let session_lock = self.session_manager.get_session(session_id)?;
+        session_lock.write().current_schema = schema.clone();
+        if schema.is_some() {
+            self.any_session_schema_active
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    /// Read this session's `search_path` current schema (default `None`).
+    pub(crate) fn session_current_schema(&self, session_id: crate::session::SessionId) -> Result<Option<String>> {
+        let session_lock = self.session_manager.get_session(session_id)?;
+        let value = session_lock.read().current_schema.clone();
+        Ok(value)
+    }
+
+    /// True when this session has a non-`public` `search_path`. Cheap on the
+    /// default path — the `any_session_schema_active` atomic short-circuits
+    /// before any session lookup — so wire read paths can gate the shared
+    /// SQL-keyed caches (which are public-schema-only, see `query_with_columns`)
+    /// without cost until some connection actually uses a schema.
+    pub(crate) fn session_schema_active(&self, session_id: crate::session::SessionId) -> bool {
+        self.any_session_schema_active
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && matches!(self.session_current_schema(session_id), Ok(Some(_)))
+    }
+
+    /// Install this session's `search_path` as a thread-local override for the
+    /// duration of one statement that routes through the global (non-session)
+    /// execute/query paths, so bare names resolve against THIS session (see
+    /// `current_schema`). Returns `None` — no guard, zero thread-local / session
+    /// traffic — for a `public` session, exactly the shape
+    /// `session_durability_override_guard` uses so the default wire path is
+    /// byte-identical. The `any_session_schema_active` fast-out skips the session
+    /// lookup entirely until some session has used a non-`public` schema.
+    fn session_schema_override_guard(
+        &self,
+        session_id: crate::session::SessionId,
+    ) -> Option<SessionSchemaOverrideGuard> {
+        if !self
+            .any_session_schema_active
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return None;
+        }
+        match self.session_current_schema(session_id) {
+            Ok(Some(schema)) => Some(SessionSchemaOverrideGuard::install(schema)),
+            _ => None,
+        }
+    }
+
+    /// Intercept `SET`/`RESET search_path` for a wire session, storing the schema
+    /// per-session (never the shared embedded field). Mirrors
+    /// `try_handle_session_fast_autocommit`: the simple-query handler intercepts
+    /// the SET form itself, while the extended-protocol / RESET forms land here.
+    /// Returns `Some(0)` when handled; `SHOW search_path` is served by the wire
+    /// SHOW arm.
+    pub(crate) fn try_handle_session_search_path(
+        &self,
+        session_id: crate::session::SessionId,
+        sql: &str,
+    ) -> Result<Option<u64>> {
+        match Self::parse_db_setting_statement(sql) {
+            Some(DbSettingStatement::Set { name, value }) if name == "search_path" => {
+                self.set_session_current_schema(session_id, Self::derive_search_path_schema(&value))?;
+                Ok(Some(0))
+            }
+            Some(DbSettingStatement::Reset { name }) if name == "search_path" => {
+                self.set_session_current_schema(session_id, None)?;
+                Ok(Some(0))
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// Touch session stats and, for READ COMMITTED, refresh the open
     /// transaction's snapshot so the next statement sees the latest commits.
     fn touch_session_for_statement(&self, session_id: crate::session::SessionId) -> Result<()> {
@@ -15348,6 +16016,24 @@ impl EmbeddedDatabase {
         if let Some(handled) = self.try_handle_session_fast_autocommit(session_id, sql)? {
             return Ok(handled);
         }
+        // SET/RESET search_path lands per-session, never in the shared field
+        // (the extended-protocol path reaches here; the simple-query handler
+        // intercepts SET itself). No table resolution follows, so no override.
+        if let Some(handled) = self.try_handle_session_search_path(session_id, sql)? {
+            return Ok(handled);
+        }
+        // `SET CONSTRAINTS … DEFERRED|IMMEDIATE` arms transaction-scoped FK
+        // deferral. The simple-query handler intercepts SET itself; the
+        // extended protocol (and any in-transaction SET) reaches here, where the
+        // in-transaction planner has no grammar for it — so arm it directly on
+        // the process-wide switch before that path.
+        if let Some(count) = self.try_handle_set_constraints(sql)? {
+            return Ok(count);
+        }
+        // Resolve bare names against THIS session's schema for the rest of the
+        // statement — both the autocommit delegate below and the in-transaction
+        // planner (which reads `self.current_schema()`).
+        let _schema_override = self.session_schema_override_guard(session_id);
         if !self.session_transactions.contains_key(&session_id) {
             let _sync_override = self.session_durability_override_guard(session_id);
             return self.execute(sql);
@@ -15384,6 +16070,9 @@ impl EmbeddedDatabase {
         session_id: crate::session::SessionId,
         sql: &str,
     ) -> Result<(Vec<Tuple>, Vec<String>)> {
+        // Resolve bare names against THIS session's schema for both the
+        // autocommit delegate and the in-transaction planner below.
+        let _schema_override = self.session_schema_override_guard(session_id);
         if !self.session_transactions.contains_key(&session_id) {
             return self.query_with_columns(sql);
         }
@@ -15398,7 +16087,9 @@ impl EmbeddedDatabase {
 
         let (statement, _) = self.parse_cached(sql)?;
         let catalog = self.storage.catalog();
-        let planner = sql::Planner::with_catalog(&catalog).with_sql(sql.to_string());
+        let planner = sql::Planner::with_catalog(&catalog)
+            .with_sql(sql.to_string())
+            .with_current_schema(self.current_schema());
         let plan = planner.statement_to_plan(statement)?;
 
         let mut executor = sql::Executor::with_storage(&self.storage)
@@ -15424,6 +16115,15 @@ impl EmbeddedDatabase {
         if let Some(handled) = self.try_handle_session_synchronous_commit(session_id, sql)? {
             return Ok((handled, Vec::new()));
         }
+        if let Some(handled) = self.try_handle_session_search_path(session_id, sql)? {
+            return Ok((handled, Vec::new()));
+        }
+        // `SET CONSTRAINTS` arms transaction-scoped FK deferral (see
+        // `execute_for_session`); it never returns rows.
+        if let Some(count) = self.try_handle_set_constraints(sql)? {
+            return Ok((count, Vec::new()));
+        }
+        let _schema_override = self.session_schema_override_guard(session_id);
         if !self.session_transactions.contains_key(&session_id) {
             let _sync_override = self.session_durability_override_guard(session_id);
             return self.execute_returning(sql);
@@ -15485,6 +16185,16 @@ impl EmbeddedDatabase {
         if let Some(handled) = self.try_handle_session_fast_autocommit(session_id, sql)? {
             return Ok(handled);
         }
+        if let Some(handled) = self.try_handle_session_search_path(session_id, sql)? {
+            return Ok(handled);
+        }
+        // `SET CONSTRAINTS` arms transaction-scoped FK deferral (see
+        // `execute_for_session`) — arm it before the in-transaction planner,
+        // which has no grammar for it.
+        if let Some(count) = self.try_handle_set_constraints(sql)? {
+            return Ok(count);
+        }
+        let _schema_override = self.session_schema_override_guard(session_id);
         if !self.session_transactions.contains_key(&session_id) {
             let _sync_override = self.session_durability_override_guard(session_id);
             return self.execute_params_inner(sql, params, plan_override);
@@ -15537,6 +16247,7 @@ impl EmbeddedDatabase {
         params: &[Value],
         plan_override: Option<&std::sync::Arc<sql::LogicalPlan>>,
     ) -> Result<Vec<Tuple>> {
+        let _schema_override = self.session_schema_override_guard(session_id);
         if !self.session_transactions.contains_key(&session_id) {
             return self.query_params_inner(sql, params, plan_override);
         }
@@ -15578,6 +16289,7 @@ impl EmbeddedDatabase {
         sql: &str,
         params: &[Value],
     ) -> Result<(Vec<Tuple>, Vec<String>)> {
+        let _schema_override = self.session_schema_override_guard(session_id);
         if !self.session_transactions.contains_key(&session_id) {
             return self.query_params_with_columns(sql, params);
         }
@@ -15904,7 +16616,9 @@ impl EmbeddedDatabase {
         } else {
             let (statement, _) = self.parse_cached(sql)?;
             let catalog = self.storage.catalog();
-            let planner = sql::Planner::with_catalog(&catalog).with_sql(sql.to_string());
+            let planner = sql::Planner::with_catalog(&catalog)
+                .with_sql(sql.to_string())
+                .with_current_schema(self.current_schema());
             let plan = planner.statement_to_plan(statement)?;
             self.apply_rls_to_plan(plan)?
         };
@@ -16971,6 +17685,7 @@ impl EmbeddedDatabase {
             config: self.config.clone(),
             current_transaction: self.current_transaction.clone(),
             global_txn_active: self.global_txn_active.clone(),
+            constraints_all_deferred: self.constraints_all_deferred.clone(),
             tenant_manager: self.tenant_manager.clone(),
             trigger_registry: self.trigger_registry.clone(),
             function_registry: self.function_registry.clone(),
@@ -16985,6 +17700,9 @@ impl EmbeddedDatabase {
             prepared_statement_sql: self.prepared_statement_sql.clone(),
             prepared_fast_selects: self.prepared_fast_selects.clone(),
             session_settings: self.session_settings.clone(),
+            current_schema: self.current_schema.clone(),
+            current_schema_set: self.current_schema_set.clone(),
+            any_session_schema_active: self.any_session_schema_active.clone(),
             savepoints: self.savepoints.clone(),
             plan_cache: self.plan_cache.clone(),
             parse_cache: self.parse_cache.clone(),
@@ -17011,6 +17729,84 @@ impl EmbeddedDatabase {
             fk_validation_source: self.fk_validation_source.clone(),
             deferred_fk_checks: self.deferred_fk_checks.clone(),
             cold_optimizer: self.cold_optimizer.clone(),
+        }
+    }
+
+    /// Effective referenced-column list for a foreign key. If the
+    /// `REFERENCES parent (cols…)` clause listed columns, they are used
+    /// verbatim; an OMITTED list (`REFERENCES parent`) binds to the parent's
+    /// PRIMARY KEY (PostgreSQL parity). `references_table` MUST already be the
+    /// resolved storage key (schema-qualified when non-`public`) so the PK
+    /// lookup hits the real parent — a bare/unresolved name under an active
+    /// `search_path` would find no PK and leave the list empty, which both
+    /// prints a malformed `parent()` violation message and makes enforcement
+    /// degrade to "does the parent have ANY row" instead of the keyed probe.
+    /// A parent without a PRIMARY KEY yields an empty list (unchanged
+    /// behavior); the FK is recorded but the keyed fast path stays off.
+    fn resolve_fk_referenced_columns(
+        catalog: &storage::Catalog<'_>,
+        references_table: &str,
+        referenced_columns: &[String],
+    ) -> Vec<String> {
+        if !referenced_columns.is_empty() {
+            return referenced_columns.to_vec();
+        }
+        catalog.primary_key_columns(references_table).unwrap_or_default()
+    }
+
+    /// Coerce a foreign-key probe's values to the DECLARED types of the columns
+    /// being probed (`schema` is the schema of the table the probe targets;
+    /// `column_names` names its probed columns). PostgreSQL permits cross-type
+    /// foreign keys via implicit cast (int8 child → int4 parent, int child →
+    /// NUMERIC parent, …); the referencing row stores the value under the CHILD
+    /// column's type while the parent's PK/UNIQUE ART index encodes the PARENT
+    /// column's type. `ArtIndexManager::encode_key` is type-width-sensitive
+    /// (Int4 = 4 bytes, Int8 = 8 bytes; int vs NUMERIC differ entirely), so an
+    /// un-coerced probe key can never match the parent index and the ART fast
+    /// path in `check_referencing_rows_exist` reports a phantom violation.
+    /// Coercing to the probed table's own column types makes the probe key (and
+    /// the slow-scan `Value`-equality) match in BOTH FK directions — probing the
+    /// parent for a child INSERT/UPDATE, and probing the child for a parent
+    /// DELETE/UPDATE. A column absent from `schema`, or a length mismatch, is
+    /// left unchanged. (Round-3 first populated the referenced-column list for
+    /// column-less FKs, which correctly validates the VALUE but exposed this
+    /// pre-existing type gap; before, the empty list skipped the fast path.)
+    fn coerce_fk_probe_values(schema: &Schema, column_names: &[String], values: &[Value]) -> Vec<Value> {
+        if column_names.len() != values.len() {
+            return values.to_vec();
+        }
+        column_names
+            .iter()
+            .zip(values.iter())
+            .map(
+                |(col_name, v)| match schema.columns.iter().find(|c| &c.name == col_name) {
+                    Some(col) => Self::coerce_probe_value_to_type(v, &col.data_type),
+                    None => v.clone(),
+                },
+            )
+            .collect()
+    }
+
+    /// Non-failing value coercion for FK probe keys — the read-path twin of the
+    /// write-path `StorageEngine::coerce_pk_value` that populates the parent
+    /// PK/UNIQUE index. Only the coercions that change a value's ART key
+    /// ENCODING matter (integer width; int → NUMERIC); every other pair is
+    /// returned unchanged so an unencodable pairing degrades to the honest
+    /// slow-scan / no-match result rather than erroring inside a constraint
+    /// probe. Kept in lockstep with `coerce_pk_value` so the probe key matches
+    /// the key the parent value was indexed under, byte-for-byte.
+    fn coerce_probe_value_to_type(value: &Value, target: &DataType) -> Value {
+        match (value, target) {
+            (Value::Int2(v), DataType::Int8) => Value::Int8(i64::from(*v)),
+            (Value::Int4(v), DataType::Int8) => Value::Int8(i64::from(*v)),
+            (Value::Int2(v), DataType::Int4) => Value::Int4(i32::from(*v)),
+            (Value::Int8(v), DataType::Int4) => Value::Int4(*v as i32),
+            (Value::Int8(v), DataType::Int2) => Value::Int2(*v as i16),
+            (Value::Int4(v), DataType::Int2) => Value::Int2(*v as i16),
+            (Value::Int2(v), DataType::Numeric) => Value::Numeric(format!("{v}")),
+            (Value::Int4(v), DataType::Numeric) => Value::Numeric(format!("{v}")),
+            (Value::Int8(v), DataType::Numeric) => Value::Numeric(format!("{v}")),
+            _ => value.clone(),
         }
     }
 
@@ -17351,7 +18147,7 @@ impl EmbeddedDatabase {
 
             // Use the planner to convert the SQL expression to LogicalExpr
             let catalog = self.storage.catalog();
-            let planner = sql::Planner::with_catalog(&catalog);
+            let planner = sql::Planner::with_catalog(&catalog).with_current_schema(self.current_schema());
 
             // Convert SQL Expr to LogicalExpr
             planner.convert_expr_to_logical(&selection, Some(schema))
@@ -17451,6 +18247,7 @@ impl EmbeddedDatabase {
             }
             let should_defer = active_txn.is_some()
                 && (mode == FkValidationMode::Deferred
+                    || self.constraints_all_deferred.load(std::sync::atomic::Ordering::Relaxed)
                     || fk.enforcement == sql::ConstraintEnforcement::Deferred
                     || (fk.deferrable && fk.initially_deferred));
             if should_defer {
@@ -17509,6 +18306,19 @@ impl EmbeddedDatabase {
             return Ok(());
         }
         for check in &checks {
+            // A referenced table dropped since the check was queued took its
+            // FK constraint with it (PG: DROP ... CASCADE drops dependent
+            // constraints), so the pending check evaporates. Lazy skip here
+            // covers every drop path — DROP TABLE, DROP SCHEMA CASCADE, and
+            // the partition cascade — without per-path purge hooks.
+            if !self
+                .storage
+                .catalog()
+                .table_exists(&check.fk.references_table)
+                .unwrap_or(false)
+            {
+                continue;
+            }
             let parent_exists = self.check_referencing_rows_exist(
                 &check.fk.references_table,
                 &check.fk.references_columns,
@@ -17576,6 +18386,33 @@ impl EmbeddedDatabase {
         values: &[Value],
         active_txn: Option<&storage::Transaction>,
     ) -> Result<bool> {
+        // Coerce the probe values to the probed columns' declared types so a
+        // cross-type FK (int8 child → int4 parent, int child → NUMERIC parent,
+        // …) probes the same type-encoded key the parent's PK/UNIQUE index was
+        // built from. Without this the width-sensitive `encode_key` misses on
+        // the fast path below (phantom violation). Only INTEGER probe values can
+        // change encoding under coercion (integer width; int → NUMERIC), so the
+        // schema fetch is skipped entirely unless one is present — the default
+        // string/uuid-keyed FK path stays allocation-free. No-op when the types
+        // already match, and the original values are kept if the table has no
+        // schema (the slow path re-fetches it and errors identically). See
+        // `coerce_fk_probe_values`.
+        let coerced_probe: Vec<Value>;
+        let values: &[Value] = if values
+            .iter()
+            .any(|v| matches!(v, Value::Int2(_) | Value::Int4(_) | Value::Int8(_)))
+        {
+            match self.storage.catalog().get_table_schema(table_name) {
+                Ok(schema) => {
+                    coerced_probe = Self::coerce_fk_probe_values(&schema, column_names, values);
+                    &coerced_probe
+                }
+                Err(_) => values,
+            }
+        } else {
+            values
+        };
+
         // Fast path: ART index lookup. KanttBan / Token-Dashboard Quirk H
         // (DELETE / DROP on 11k-row table hangs >5min) introduced the
         // O(log N) ART path for autocommit/implicit-tx callers. The
@@ -18581,7 +19418,11 @@ impl Transaction<'_> {
 
         // Create logical plan with catalog access and original SQL for time-travel parsing
         let catalog = self.db.storage.catalog();
-        let planner = sql::Planner::with_catalog(&catalog).with_sql(sql.to_string());
+        let planner = sql::Planner::with_catalog(&catalog)
+            .with_sql(sql.to_string())
+            // `current_schema()` is inherent to `EmbeddedDatabase`; `Transaction`
+            // reaches it through its `db` field (no `Deref` to the database).
+            .with_current_schema(self.db.current_schema());
         let plan = planner.statement_to_plan(statement)?;
 
         // Execute plan with transaction context

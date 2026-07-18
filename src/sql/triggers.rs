@@ -413,18 +413,13 @@ impl TriggerRegistry {
                 return Ok(false);
             }
             for (col, expr) in &m.assignments {
-                let Some(idx) = schema
-                    .columns
-                    .iter()
-                    .position(|c| c.name.eq_ignore_ascii_case(col))
-                else {
+                let Some(idx) = schema.columns.iter().position(|c| c.name.eq_ignore_ascii_case(col)) else {
                     continue; // unknown column — ignore
                 };
                 // Evaluate the RHS against the current NEW row (so later
                 // assignments can see earlier ones).
                 let ctx = TriggerRowContext::for_insert(new_tuple.clone());
-                let evaluator =
-                    Evaluator::with_trigger_row_context(schema.clone(), Vec::new(), ctx, schema.clone());
+                let evaluator = Evaluator::with_trigger_row_context(schema.clone(), Vec::new(), ctx, schema.clone());
                 let empty = Tuple::new(Vec::new());
                 match evaluator.evaluate(expr, &empty) {
                     Ok(value) => {

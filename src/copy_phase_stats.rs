@@ -266,11 +266,18 @@ mod tests {
         record(Phase::ArtMaintain, 500, 100);
         let after = snapshot();
 
-        assert_eq!(after[8].total_nanos, before[8].total_nanos + 500, "nanos on art_maintain");
+        assert_eq!(
+            after[8].total_nanos,
+            before[8].total_nanos + 500,
+            "nanos on art_maintain"
+        );
         assert_eq!(after[8].calls, before[8].calls + 1, "calls on art_maintain");
         assert_eq!(after[8].rows, before[8].rows + 100, "rows on art_maintain");
 
         // Phases are independent: recording `art_maintain` must not move `total`.
-        assert_eq!(after[9].total_nanos, before[9].total_nanos, "total untouched by art_maintain write");
+        assert_eq!(
+            after[9].total_nanos, before[9].total_nanos,
+            "total untouched by art_maintain write"
+        );
     }
 }

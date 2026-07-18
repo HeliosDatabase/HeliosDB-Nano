@@ -488,6 +488,22 @@ pub enum LogicalPlan {
         if_not_exists: bool,
     },
 
+    /// `DROP SCHEMA [IF EXISTS] s1[, s2 …] [CASCADE|RESTRICT]`. Schema
+    /// membership is a catalog prefix scan over `schema.table` keys (the
+    /// namespacing makes it free — no separate member records). RESTRICT
+    /// (`cascade == false`, the default) errors when a schema still has member
+    /// tables; CASCADE drops every member through the ordinary DROP-table funnel
+    /// (so Stage-0 partition-child cascade composes). A missing schema errors
+    /// unless `if_exists`.
+    DropSchema {
+        /// Schema names to drop (already normalised, bare).
+        names: Vec<String>,
+        /// Silently succeed on a missing schema.
+        if_exists: bool,
+        /// CASCADE: drop member tables too. RESTRICT (false) errors if non-empty.
+        cascade: bool,
+    },
+
     /// `CREATE EXTENSION <name>` — install a named extension. For
     /// `hdb_code` this runs the code-graph bootstrap (see
     /// `src/code_graph/storage.rs::bootstrap_tables`). Unknown
@@ -590,6 +606,22 @@ pub enum LogicalPlan {
         table_name: String,
         /// New table name
         new_table_name: String,
+    },
+
+    /// `ALTER TABLE [IF EXISTS] <name> SET SCHEMA <new_schema>` — move a table
+    /// (or view) into another schema. Implemented as a rename of the storage
+    /// key to `<new_schema>.<table>` (or the bare name when moving to `public`),
+    /// reusing the RENAME-TABLE data/metadata migration. sqlparser 0.53 has no
+    /// `SetSchema` operation, so this is produced by a custom pre-parse
+    /// (mirroring `AlterSequence` / `AlterColumnStorage`).
+    AlterTableSetSchema {
+        /// Resolved storage key of the table to move (session `search_path`
+        /// applied at plan time).
+        table_name: String,
+        /// Target schema name (`public` moves the table to the bare key-space).
+        new_schema: String,
+        /// IF EXISTS — a missing table is a no-op rather than an error.
+        if_exists: bool,
     },
 
     /// Add a foreign-key constraint to an existing table.
@@ -737,6 +769,10 @@ pub enum LogicalPlan {
         if_not_exists: bool,
         /// OR REPLACE - replace existing view
         or_replace: bool,
+        /// The creating session's `search_path` schema (first non-`public`
+        /// entry), captured at plan time so the view body binds at CREATE, not
+        /// per-reader. `None` = created under `public`.
+        creator_schema: Option<String>,
     },
 
     /// Drop a regular view
@@ -1881,9 +1917,7 @@ impl LogicalPlan {
                 // CreateIndex doesn't have output schema
                 Arc::new(Schema { columns: vec![] })
             }
-            LogicalPlan::CreateSequence { .. }
-            | LogicalPlan::AlterSequence(_)
-            | LogicalPlan::DropSequence { .. } => {
+            LogicalPlan::CreateSequence { .. } | LogicalPlan::AlterSequence(_) | LogicalPlan::DropSequence { .. } => {
                 // CREATE / ALTER / DROP SEQUENCE are DDL — no output schema.
                 Arc::new(Schema { columns: vec![] })
             }
@@ -1912,11 +1946,13 @@ impl LogicalPlan {
                 // ALTER TABLE RENAME doesn't have output schema
                 Arc::new(Schema { columns: vec![] })
             }
-            LogicalPlan::AlterTableAddForeignKey { .. }
-            | LogicalPlan::AlterTableAlterConstraintEnforcement { .. }
-            | LogicalPlan::AlterTableDropConstraint { .. } => {
+            LogicalPlan::AlterTableSetSchema { .. } => {
+                // ALTER TABLE … SET SCHEMA doesn't have output schema
                 Arc::new(Schema { columns: vec![] })
             }
+            LogicalPlan::AlterTableAddForeignKey { .. }
+            | LogicalPlan::AlterTableAlterConstraintEnforcement { .. }
+            | LogicalPlan::AlterTableDropConstraint { .. } => Arc::new(Schema { columns: vec![] }),
             LogicalPlan::AlterTableMulti { .. } => {
                 // ALTER TABLE with multiple operations doesn't have output schema
                 Arc::new(Schema { columns: vec![] })
@@ -2186,6 +2222,7 @@ impl LogicalPlan {
             LogicalPlan::CreateEnumType { .. }
             | LogicalPlan::DropEnumType { .. }
             | LogicalPlan::CreateSchema { .. }
+            | LogicalPlan::DropSchema { .. }
             | LogicalPlan::Noop => {
                 // KanttBan #20 (v3.31.0): DDL — no output rows.
                 Arc::new(Schema { columns: vec![] })

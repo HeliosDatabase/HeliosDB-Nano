@@ -143,10 +143,7 @@ pub fn install_persistence(engine: &Arc<StorageEngine>) {
 /// Upgrade the persistence handle, if installed and still live. `None` means
 /// pure in-memory evaluation (no DB) — callers fall back to volatile mode.
 pub fn persist_handle() -> Option<Arc<StorageEngine>> {
-    PERSIST
-        .get()
-        .and_then(|m| m.lock().clone())
-        .and_then(|w| w.upgrade())
+    PERSIST.get().and_then(|m| m.lock().clone()).and_then(|w| w.upgrade())
 }
 
 /// Evict a sequence's cached runtime so the next `nextval` rebuilds it from
@@ -389,8 +386,7 @@ fn persist_high_water(rt: &SeqRuntime, name: &str, last_reserved: i64) -> Result
     if rt.volatile {
         return Ok(());
     }
-    let engine =
-        persist_handle().ok_or_else(|| Error::query_execution("nextval requires storage context"))?;
+    let engine = persist_handle().ok_or_else(|| Error::query_execution("nextval requires storage context"))?;
     engine.flush_sequence_state(
         name,
         PersistedSeqState {
@@ -657,8 +653,7 @@ pub fn try_setval(name: &str, value: i64, is_called: bool) -> Result<i64> {
     // Durably persist FIRST (skipped for volatile runtimes), so the new
     // high-water is on disk before any in-memory window change is observable.
     if !rt.volatile {
-        let engine =
-            persist_handle().ok_or_else(|| Error::query_execution("setval requires storage context"))?;
+        let engine = persist_handle().ok_or_else(|| Error::query_execution("setval requires storage context"))?;
         engine.flush_sequence_state(
             name,
             PersistedSeqState {
@@ -1014,7 +1009,10 @@ mod tests {
             assert_eq!(try_nextval("seq_clamp").unwrap(), expected);
         }
         // Sixth must error (no value > 5 ever served), not return a clamped dup.
-        assert!(try_nextval("seq_clamp").unwrap_err().to_string().contains("reached maximum value"));
+        assert!(try_nextval("seq_clamp")
+            .unwrap_err()
+            .to_string()
+            .contains("reached maximum value"));
     }
 
     #[test]

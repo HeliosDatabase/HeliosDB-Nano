@@ -145,7 +145,10 @@ fn nextval_cycle_wrap_point_survives_reopen_without_duplicate() {
         // After the wrap to 1, the next value must be 2 (resume past the wrapped
         // high-water), NOT 1 again.
         let v = nextval(&db, name);
-        assert_eq!(v, 2, "post-wrap reopen must resume at 2, not re-serve the wrapped value");
+        assert_eq!(
+            v, 2,
+            "post-wrap reopen must resume at 2, not re-serve the wrapped value"
+        );
     }
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -332,7 +335,11 @@ fn alter_sequence_restart_with_discards_cached_block() {
     // RESTART WITH must discard the in-flight cached block (which had reserved up
     // to 32) and make the very next value EXACTLY 100, not a stale cached value.
     db.execute(&format!("ALTER SEQUENCE {name} RESTART WITH 100")).unwrap();
-    assert_eq!(nextval(&db, name), 100, "RESTART WITH did not take effect (stale cache?)");
+    assert_eq!(
+        nextval(&db, name),
+        100,
+        "RESTART WITH did not take effect (stale cache?)"
+    );
     assert_eq!(nextval(&db, name), 101);
 
     // And RESTART survives a reopen.
@@ -383,7 +390,11 @@ fn setval_is_called_false_makes_next_value_exact() {
     // is_called=false: the next nextval returns EXACTLY the value.
     let r = scalar_i64(&db, &format!("SELECT setval('{name}', 7000, false)"));
     assert_eq!(r, 7000);
-    assert_eq!(nextval(&db, name), 7000, "setval(.,false) next value must equal the value");
+    assert_eq!(
+        nextval(&db, name),
+        7000,
+        "setval(.,false) next value must equal the value"
+    );
     assert_eq!(nextval(&db, name), 7001);
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -429,7 +440,10 @@ fn pg_sequences_and_information_schema_populate_after_create() {
         "pg_sequences must be populated (> 0 rows) after CREATE SEQUENCE (a2h discovery)"
     );
     let rows = db
-        .query("SELECT sequencename, increment_by, max_value, cycle FROM pg_sequences WHERE sequencename = 's_intro'", &[])
+        .query(
+            "SELECT sequencename, increment_by, max_value, cycle FROM pg_sequences WHERE sequencename = 's_intro'",
+            &[],
+        )
         .unwrap();
     assert_eq!(rows.len(), 1, "exactly one pg_sequences row for s_intro");
     // increment_by == 2 (captured), max_value == 999, cycle == true.
@@ -460,7 +474,11 @@ fn pg_sequences_and_information_schema_populate_after_create() {
             &[],
         )
         .unwrap();
-    assert_eq!(rows.len(), 1, "exactly one information_schema.sequences row for s_intro");
+    assert_eq!(
+        rows.len(),
+        1,
+        "exactly one information_schema.sequences row for s_intro"
+    );
     match &rows[0].values[1] {
         Value::String(s) => assert_eq!(s, "YES", "cycle_option should be YES for a CYCLE sequence"),
         other => panic!("cycle_option not text: {other:?}"),
@@ -505,14 +523,23 @@ fn pg_sequences_last_value_null_until_first_nextval() {
     assert_eq!(rows.len(), 2, "both sequences must appear in pg_sequences");
 
     // s_lv_called (advanced): last_value is populated and covers the served value.
-    let called = rows.iter().find(|r| matches!(&r.values[0], Value::String(s) if s == "s_lv_called")).unwrap();
+    let called = rows
+        .iter()
+        .find(|r| matches!(&r.values[0], Value::String(s) if s == "s_lv_called"))
+        .unwrap();
     match called.values[1] {
-        Value::Int8(v) => assert!(v >= 1, "advanced sequence last_value should cover the served value, got {v}"),
+        Value::Int8(v) => assert!(
+            v >= 1,
+            "advanced sequence last_value should cover the served value, got {v}"
+        ),
         ref other => panic!("last_value not int8 for an advanced sequence: {other:?}"),
     }
 
     // s_lv_virgin (never advanced): last_value is NULL (is_called == false).
-    let virgin = rows.iter().find(|r| matches!(&r.values[0], Value::String(s) if s == "s_lv_virgin")).unwrap();
+    let virgin = rows
+        .iter()
+        .find(|r| matches!(&r.values[0], Value::String(s) if s == "s_lv_virgin"))
+        .unwrap();
     assert!(
         matches!(virgin.values[1], Value::Null),
         "last_value must be NULL before the first nextval, got {:?}",
@@ -547,8 +574,10 @@ fn a2h_setval_then_default_nextval_resumes_past_max() {
 
         // Preload migrated rows with EXPLICIT ids (as a bulk data load does),
         // leaving the sequence untouched.
-        db.execute("INSERT INTO orders (id, note) VALUES (1000, 'migrated-a')").unwrap();
-        db.execute("INSERT INTO orders (id, note) VALUES (1001, 'migrated-b')").unwrap();
+        db.execute("INSERT INTO orders (id, note) VALUES (1000, 'migrated-a')")
+            .unwrap();
+        db.execute("INSERT INTO orders (id, note) VALUES (1001, 'migrated-b')")
+            .unwrap();
 
         // Advance the sequence to the current max id (the a2h fix-up step). a2h
         // tooling reads max(id) first and emits `setval(seq, <literal>)`, so we
@@ -561,7 +590,8 @@ fn a2h_setval_then_default_nextval_resumes_past_max() {
 
         // A new INSERT that relies on the column DEFAULT must get an id strictly
         // greater than the preloaded max, with NO collision.
-        db.execute("INSERT INTO orders (note) VALUES ('new-after-setval')").unwrap();
+        db.execute("INSERT INTO orders (note) VALUES ('new-after-setval')")
+            .unwrap();
         let new_id = scalar_i64(&db, "SELECT id FROM orders WHERE note = 'new-after-setval'");
         assert!(
             new_id > 1001,
@@ -665,12 +695,14 @@ fn recreate_without_if_not_exists_preserves_high_water() {
     let dir = scratch_dir();
     let name = "s_recreate";
     let db = open_db(&dir);
-    db.execute(&format!("CREATE SEQUENCE {name} START WITH 1 CACHE 1")).unwrap();
+    db.execute(&format!("CREATE SEQUENCE {name} START WITH 1 CACHE 1"))
+        .unwrap();
     for expected in 1..=5 {
         assert_eq!(nextval(&db, name), expected);
     }
     // Re-run the migration script: CREATE again WITHOUT IF NOT EXISTS.
-    db.execute(&format!("CREATE SEQUENCE {name} START WITH 1 CACHE 1")).unwrap();
+    db.execute(&format!("CREATE SEQUENCE {name} START WITH 1 CACHE 1"))
+        .unwrap();
     // The next value must continue PAST 5, never re-issue 1..=5.
     let v = nextval(&db, name);
     assert!(
@@ -731,7 +763,8 @@ fn pg_sequences_last_value_is_served_not_block_end() {
     let dir = scratch_dir();
     let name = "s_lv_served";
     let db = open_db(&dir);
-    db.execute(&format!("CREATE SEQUENCE {name} START WITH 1 CACHE 32")).unwrap();
+    db.execute(&format!("CREATE SEQUENCE {name} START WITH 1 CACHE 32"))
+        .unwrap();
     assert_eq!(nextval(&db, name), 1);
     let rows = db
         .query(
@@ -762,7 +795,8 @@ fn drop_then_recreate_starts_fresh() {
     let dir = scratch_dir();
     let name = "s_drop_recreate";
     let db = open_db(&dir);
-    db.execute(&format!("CREATE SEQUENCE {name} START WITH 1 CACHE 1")).unwrap();
+    db.execute(&format!("CREATE SEQUENCE {name} START WITH 1 CACHE 1"))
+        .unwrap();
     assert_eq!(nextval(&db, name), 1);
     assert_eq!(nextval(&db, name), 2);
     db.execute(&format!("DROP SEQUENCE {name}")).unwrap();
@@ -777,7 +811,8 @@ fn drop_then_recreate_starts_fresh() {
 
     // Re-create with a DIFFERENT start; must begin from the new start, not the
     // stale high-water (which was 1/durably reserved before the drop).
-    db.execute(&format!("CREATE SEQUENCE {name} START WITH 500 CACHE 1")).unwrap();
+    db.execute(&format!("CREATE SEQUENCE {name} START WITH 500 CACHE 1"))
+        .unwrap();
     assert_eq!(
         nextval(&db, name),
         500,
@@ -823,4 +858,3 @@ fn setval_false_then_reopen_serves_exact_target() {
     }
     std::fs::remove_dir_all(&dir).ok();
 }
-

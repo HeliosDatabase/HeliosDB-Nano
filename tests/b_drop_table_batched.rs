@@ -48,7 +48,10 @@ fn drop_fk_linked_child_then_parent() {
     db.execute("CREATE TABLE bchild (id int primary key, pid int references bparent(id), v text)")
         .unwrap();
     db.execute("INSERT INTO bparent VALUES (1,'p')").unwrap();
-    let vals: String = (1..=300).map(|i| format!("({i},1,'c{i}')")).collect::<Vec<_>>().join(",");
+    let vals: String = (1..=300)
+        .map(|i| format!("({i},1,'c{i}')"))
+        .collect::<Vec<_>>()
+        .join(",");
     db.execute(&format!("INSERT INTO bchild VALUES {vals}")).unwrap();
     db.execute("DROP TABLE bchild").unwrap();
     db.execute("DROP TABLE bparent").unwrap();

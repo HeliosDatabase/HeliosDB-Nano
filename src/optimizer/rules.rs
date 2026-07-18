@@ -2193,5 +2193,4 @@ mod tests {
         assert!(!rule.is_applicable(&plan));
         assert!(rule.apply(plan, &estimator).unwrap().is_none());
     }
-
 }

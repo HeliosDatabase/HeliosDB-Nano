@@ -139,10 +139,59 @@ impl ForeignKeyConstraint {
         self
     }
 
-    /// Generate automatic constraint name
+    /// Generate automatic constraint name.
+    ///
+    /// Under schema namespacing a table key can be `schema.table` (a non-`public`
+    /// schema). The auto-name uses the BARE table components so it stays free of
+    /// `.`  — a dotted auto-name (`fk_s.fk_a__s.pk`) is both unreadable in the
+    /// violation message and unsafe for any `.`-splitting consumer. The name is
+    /// only required to be unique per referencing table (constraints are keyed
+    /// `constraint:<qualified_table>:<name>`), so the bare form is sufficient.
+    ///
+    /// Because the schema no longer participates in the name, two auto-named FKs
+    /// on the SAME table that reference like-named tables in DIFFERENT schemas
+    /// (`s.fk(a) -> x.pk` and `s.fk(a) -> y.pk`) would both collapse to
+    /// `fk_fk_a__pk` and clash. This base generator does NOT deduplicate — the
+    /// per-table uniqueness that the constraint key relies on is enforced by
+    /// [`Self::generate_unique_name`], which callers use when they can see the
+    /// names already present on the table.
     pub fn generate_name(table: &str, columns: &[String], references_table: &str) -> String {
+        fn bare(s: &str) -> &str {
+            s.rsplit('.').next().unwrap_or(s)
+        }
         let cols = columns.join("_");
-        format!("fk_{}_{}__{}", table, cols, references_table)
+        format!("fk_{}_{}__{}", bare(table), cols, bare(references_table))
+    }
+
+    /// Generate an automatic constraint name that is unique among the FK names
+    /// already present on the referencing table.
+    ///
+    /// Starts from [`Self::generate_name`]; if that base name already exists in
+    /// `existing_names`, appends the smallest `_<n>` (n >= 1) suffix that does
+    /// not. This is what keeps same-table FKs to like-named tables in different
+    /// schemas (`s.fk(a) -> x.pk` and `s.fk(a) -> y.pk`, both base
+    /// `fk_fk_a__pk`) from clashing now that the schema no longer disambiguates
+    /// the generated name. `existing_names` should be the constraint names the
+    /// caller can already see on that table (from the constraint-lookup helper,
+    /// or the FKs staged so far within a single `CREATE TABLE`).
+    pub fn generate_unique_name(
+        table: &str,
+        columns: &[String],
+        references_table: &str,
+        existing_names: &[String],
+    ) -> String {
+        let base = Self::generate_name(table, columns, references_table);
+        if !existing_names.iter().any(|n| n == &base) {
+            return base;
+        }
+        let mut n = 1u32;
+        loop {
+            let candidate = format!("{base}_{n}");
+            if !existing_names.iter().any(|name| name == &candidate) {
+                return candidate;
+            }
+            n += 1;
+        }
     }
 }
 
@@ -509,6 +558,46 @@ mod tests {
     fn test_generate_constraint_name() {
         let name = ForeignKeyConstraint::generate_name("orders", &["customer_id".to_string()], "customers");
         assert_eq!(name, "fk_orders_customer_id__customers");
+    }
+
+    /// Schema namespacing: a `schema.table` storage key must NOT leak its `.`
+    /// into the auto-generated constraint name (unreadable in the violation
+    /// message, unsafe for any `.`-splitting consumer). The bare table
+    /// components are used, so `fkpart9.fk` / `fkpart9.pk` → `fk_fk_a__pk`.
+    #[test]
+    fn test_generate_constraint_name_is_dot_safe_under_schema() {
+        let name = ForeignKeyConstraint::generate_name("fkpart9.fk", &["a".to_string()], "fkpart9.pk");
+        assert_eq!(name, "fk_fk_a__pk");
+        assert!(!name.contains('.'), "auto FK name must be dot-free: {name}");
+    }
+
+    /// Because the schema is stripped from the auto-name, two FKs on the same
+    /// table to like-named tables in DIFFERENT schemas (`s.fk(a) -> x.pk` and
+    /// `s.fk(a) -> y.pk`) both base to `fk_fk_a__pk`. `generate_unique_name`
+    /// must suffix the collision so the per-table constraint key stays unique.
+    #[test]
+    fn test_generate_unique_name_suffixes_on_collision() {
+        // No existing names → the plain base.
+        let base = ForeignKeyConstraint::generate_unique_name("s.fk", &["a".to_string()], "x.pk", &[]);
+        assert_eq!(base, "fk_fk_a__pk");
+
+        // The base already present → first free `_N`.
+        let n1 = ForeignKeyConstraint::generate_unique_name(
+            "s.fk",
+            &["a".to_string()],
+            "y.pk",
+            &["fk_fk_a__pk".to_string()],
+        );
+        assert_eq!(n1, "fk_fk_a__pk_1");
+
+        // Base and `_1` present → `_2`.
+        let n2 = ForeignKeyConstraint::generate_unique_name(
+            "s.fk",
+            &["a".to_string()],
+            "z.pk",
+            &["fk_fk_a__pk".to_string(), "fk_fk_a__pk_1".to_string()],
+        );
+        assert_eq!(n2, "fk_fk_a__pk_2");
     }
 
     #[test]

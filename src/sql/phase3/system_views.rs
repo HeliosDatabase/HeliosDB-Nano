@@ -45,8 +45,7 @@ impl SystemViewRegistry {
     /// per-query rebuild at no behavioral cost (only `&self` accessors are used
     /// after construction).
     pub fn shared() -> &'static Self {
-        static SHARED: std::sync::LazyLock<SystemViewRegistry> =
-            std::sync::LazyLock::new(SystemViewRegistry::new);
+        static SHARED: std::sync::LazyLock<SystemViewRegistry> = std::sync::LazyLock::new(SystemViewRegistry::new);
         &SHARED
     }
 
@@ -2314,7 +2313,8 @@ impl SystemViewRegistry {
                     sv_col("last_value", DataType::Int8),
                 ],
             },
-            description: "PG-compat sequences view (real CREATE SEQUENCE defs + SERIAL/IDENTITY synthetics)".to_string(),
+            description: "PG-compat sequences view (real CREATE SEQUENCE defs + SERIAL/IDENTITY synthetics)"
+                .to_string(),
         });
 
         // information_schema.sequences — SQL-standard 12-col shape. Lists REAL
@@ -3048,9 +3048,14 @@ impl SystemViewRegistry {
 
         for (idx, table_name) in tables.iter().enumerate() {
             let oid = pg_table_oid(idx);
+            // Schema namespacing: the storage key is `schema.table` for a
+            // non-`public` table; `relname` is the BARE table (PostgreSQL keeps
+            // the schema in `relnamespace`, not `relname`), so two coexisting
+            // `a.t` / `b.t` both surface as `relname = 't'`.
+            let (_relschema, relname) = crate::sql::Planner::split_schema_key(table_name);
             let tuple = Tuple::new(vec![
                 Value::Int4(oid),                     // oid
-                Value::String(table_name.clone()),    // relname
+                Value::String(relname),               // relname
                 Value::Int4(PG_PUBLIC_NAMESPACE_OID), // relnamespace (public schema)
                 Value::Int4(oid + 1000),              // reltype
                 Value::String("r".to_string()),       // relkind (r = relation/table)
@@ -3317,17 +3322,17 @@ impl SystemViewRegistry {
                     .map(|c| serial_type_bounds(&c.data_type))
                     .unwrap_or(("bigint", i64::MAX));
                 rows.push(Tuple::new(vec![
-                    Value::String("public".into()),     // schemaname
-                    Value::String(seq_name),            // sequencename
-                    Value::String("postgres".into()),   // sequenceowner
-                    Value::String(data_type.into()),    // data_type
-                    Value::Int8(1),                     // start_value
-                    Value::Int8(1),                     // min_value
-                    Value::Int8(max_value),             // max_value
-                    Value::Int8(1),                     // increment_by
-                    Value::Boolean(false),              // cycle
-                    Value::Int8(1),                     // cache_size
-                    Value::Null,                        // last_value (synthetic counter)
+                    Value::String("public".into()),   // schemaname
+                    Value::String(seq_name),          // sequencename
+                    Value::String("postgres".into()), // sequenceowner
+                    Value::String(data_type.into()),  // data_type
+                    Value::Int8(1),                   // start_value
+                    Value::Int8(1),                   // min_value
+                    Value::Int8(max_value),           // max_value
+                    Value::Int8(1),                   // increment_by
+                    Value::Boolean(false),            // cycle
+                    Value::Int8(1),                   // cache_size
+                    Value::Null,                      // last_value (synthetic counter)
                 ]));
             }
         }
@@ -3348,17 +3353,17 @@ impl SystemViewRegistry {
                 _ => 64, // bigint (default)
             };
             rows.push(Tuple::new(vec![
-                Value::String("heliosdb".into()),              // sequence_catalog
-                Value::String("public".into()),               // sequence_schema
-                Value::String(def.name.clone()),              // sequence_name
-                Value::String(def.data_type.clone()),         // data_type
-                Value::Int4(precision),                       // numeric_precision
-                Value::Int4(2),                               // numeric_precision_radix
-                Value::Int4(0),                               // numeric_scale
-                Value::String(def.start_value.to_string()),   // start_value
-                Value::String(def.min_value.to_string()),     // minimum_value
-                Value::String(def.max_value.to_string()),     // maximum_value
-                Value::String(def.increment_by.to_string()),  // increment
+                Value::String("heliosdb".into()),                           // sequence_catalog
+                Value::String("public".into()),                             // sequence_schema
+                Value::String(def.name.clone()),                            // sequence_name
+                Value::String(def.data_type.clone()),                       // data_type
+                Value::Int4(precision),                                     // numeric_precision
+                Value::Int4(2),                                             // numeric_precision_radix
+                Value::Int4(0),                                             // numeric_scale
+                Value::String(def.start_value.to_string()),                 // start_value
+                Value::String(def.min_value.to_string()),                   // minimum_value
+                Value::String(def.max_value.to_string()),                   // maximum_value
+                Value::String(def.increment_by.to_string()),                // increment
                 Value::String(if def.cycle { "YES" } else { "NO" }.into()), // cycle_option
             ]));
         }
@@ -3667,10 +3672,13 @@ impl SystemViewRegistry {
         let table_names = storage.catalog().list_tables()?;
         let mut rows = Vec::with_capacity(table_names.len());
         for name in &table_names {
+            // Schema namespacing: `table_schema` is the real schema and
+            // `table_name` the bare table (split the `schema.table` key).
+            let (table_schema, table_name) = crate::sql::Planner::split_schema_key(name);
             rows.push(Tuple::new(vec![
                 Value::String("heliosdb".into()),
-                Value::String("public".into()),
-                Value::String(name.clone()),
+                Value::String(table_schema),
+                Value::String(table_name),
                 Value::String("BASE TABLE".into()),
             ]));
         }
@@ -3945,6 +3953,10 @@ impl SystemViewRegistry {
         let mut results = Vec::new();
 
         for table_name in tables.iter() {
+            // Schema namespacing: `table_name` is the raw storage key (used for
+            // the schema/identity lookups below); the introspection ROW shows
+            // the real schema and the bare table name.
+            let (disp_schema, disp_table) = crate::sql::Planner::split_schema_key(table_name);
             let identity_cols = catalog.list_identity_columns(table_name).unwrap_or_default();
             match catalog.get_table_schema(table_name) {
                 Ok(schema) => {
@@ -4000,8 +4012,8 @@ impl SystemViewRegistry {
                         };
 
                         let tuple = Tuple::new(vec![
-                            Value::String("public".to_string()),    // table_schema
-                            Value::String(table_name.clone()),      // table_name
+                            Value::String(disp_schema.clone()),     // table_schema
+                            Value::String(disp_table.clone()),      // table_name
                             Value::String(column.name.clone()),     // column_name
                             Value::Int4((col_idx + 1) as i32),      // ordinal_position
                             column_default,                         // column_default

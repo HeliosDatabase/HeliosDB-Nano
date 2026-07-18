@@ -221,15 +221,15 @@ fn query_fast_count_pk_shapes_preserve_sql_results() {
         .unwrap();
     assert_eq!(int(&rows[0].values[0]), 4);
 
-    let rows = db
-        .query("SELECT COUNT(*) FROM n WHERE id > 2 AND id < 2", &[])
-        .unwrap();
+    let rows = db.query("SELECT COUNT(*) FROM n WHERE id > 2 AND id < 2", &[]).unwrap();
     assert_eq!(int(&rows[0].values[0]), 0);
 
     // Non-PK COUNT must fall back to the planner and keep ordinary COUNT(col)
     // null semantics.
     db.execute("INSERT INTO n VALUES (10, NULL)").unwrap();
-    let rows = db.query("SELECT COUNT(bucket) FROM n WHERE id IN (0, 1, 10)", &[]).unwrap();
+    let rows = db
+        .query("SELECT COUNT(bucket) FROM n WHERE id IN (0, 1, 10)", &[])
+        .unwrap();
     assert_eq!(int(&rows[0].values[0]), 2);
 
     // Non-integer PKs are deliberately outside the COUNT shortcut and must
@@ -237,7 +237,9 @@ fn query_fast_count_pk_shapes_preserve_sql_results() {
     db.execute("CREATE TABLE kv (name TEXT PRIMARY KEY, v INT)").unwrap();
     db.execute("INSERT INTO kv VALUES ('a', 1)").unwrap();
     db.execute("INSERT INTO kv VALUES ('b', 2)").unwrap();
-    let rows = db.query("SELECT COUNT(*) FROM kv WHERE name IN ('a', 'missing')", &[]).unwrap();
+    let rows = db
+        .query("SELECT COUNT(*) FROM kv WHERE name IN ('a', 'missing')", &[])
+        .unwrap();
     assert_eq!(int(&rows[0].values[0]), 1);
 }
 
@@ -258,8 +260,7 @@ fn query_fast_count_pk_falls_back_for_transaction_and_materialized_view() {
     let rows = db.query("SELECT COUNT(*) FROM n", &[]).unwrap();
     assert_eq!(int(&rows[0].values[0]), 2);
 
-    db.execute("CREATE MATERIALIZED VIEW n_mv AS SELECT * FROM n")
-        .unwrap();
+    db.execute("CREATE MATERIALIZED VIEW n_mv AS SELECT * FROM n").unwrap();
     db.execute("REFRESH MATERIALIZED VIEW n_mv").unwrap();
     let rows = db.query("SELECT COUNT(*) FROM n_mv", &[]).unwrap();
     assert_eq!(int(&rows[0].values[0]), 2);

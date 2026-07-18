@@ -172,10 +172,7 @@ fn t8_order_by_group_key_with_reordered_projection_sorts_correctly() -> Result<(
     // by a: (1,30), (2,20), (3,10) — by b would reverse it.
     db.execute("INSERT INTO t8_reorder VALUES (1, 2, 20), (2, 1, 30), (3, 3, 10)")?;
 
-    let rows = db.query(
-        "SELECT b, a FROM t8_reorder GROUP BY a, b ORDER BY a",
-        &[],
-    )?;
+    let rows = db.query("SELECT b, a FROM t8_reorder GROUP BY a, b ORDER BY a", &[])?;
     // Output columns are (b, a); ordered by a ascending → a = 1, 2, 3.
     let a_values: Vec<i32> = rows.iter().map(|t| int_value(t, 1)).collect();
     assert_eq!(

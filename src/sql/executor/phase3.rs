@@ -92,7 +92,15 @@ pub(super) fn handle_phase3_operation(
             query_sql,
             if_not_exists,
             or_replace,
-        } => handle_create_view(executor, name, query_sql, *if_not_exists, *or_replace),
+            creator_schema,
+        } => handle_create_view(
+            executor,
+            name,
+            query_sql,
+            *if_not_exists,
+            *or_replace,
+            creator_schema.clone(),
+        ),
         LogicalPlan::DropView { name, if_exists } => handle_drop_view(executor, name, *if_exists),
         _ => Err(Error::query_execution("Unsupported advanced operation")),
     }
@@ -1052,6 +1060,7 @@ fn handle_create_view(
     query_sql: &str,
     if_not_exists: bool,
     or_replace: bool,
+    creator_schema: Option<String>,
 ) -> Result<Box<dyn PhysicalOperator>> {
     tracing::info!(
         "CREATE{}VIEW {} (IF NOT EXISTS: {})",
@@ -1068,15 +1077,20 @@ fn handle_create_view(
     let parser = crate::sql::Parser::new();
     let stmt = parser.parse_one(query_sql)?;
 
-    // Plan the query to get the schema
+    // Plan the query to get the schema. Plan under the CREATING session's schema
+    // so a body that references a schema-local table (bare name under a
+    // non-`public` `search_path`) derives the correct result columns — the same
+    // schema the body will later bind to at read time.
     let catalog = storage.catalog();
-    let planner = crate::sql::Planner::with_catalog(&catalog);
+    let planner = crate::sql::Planner::with_catalog(&catalog).with_current_schema(creator_schema.clone());
     let plan = planner.statement_to_plan(stmt)?;
     let schema = (*plan.schema()).clone();
 
-    // Create view metadata
-    let metadata =
-        crate::storage::ViewMetadata::new(name.to_string(), query_sql.to_string(), schema).with_or_replace(or_replace);
+    // Create view metadata, capturing the creator's schema so the body binds at
+    // CREATE (not per-reader).
+    let metadata = crate::storage::ViewMetadata::new(name.to_string(), query_sql.to_string(), schema)
+        .with_or_replace(or_replace)
+        .with_creator_schema(creator_schema);
 
     // Store the view
     let view_catalog = storage.view_catalog();
