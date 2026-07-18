@@ -36,7 +36,11 @@ mod inc0 {
                         Value::Int8((i * 7) % 100_000),
                         Value::Int8(i % 10),
                         Value::Int8(i % 50_000),
-                        if i % 17 == 0 { Value::Null } else { Value::Int8(i % 4000) },
+                        if i % 17 == 0 {
+                            Value::Null
+                        } else {
+                            Value::Int8(i % 4000)
+                        },
                     ]
                 })
                 .collect();
@@ -82,10 +86,16 @@ mod inc0 {
 
         let queries = [
             ("unfiltered SUM/MIN/MAX", "SELECT SUM(v), MIN(v), MAX(v) FROM t"),
-            ("WHERE v<1000 COUNT/SUM", "SELECT COUNT(*), SUM(v) FROM t WHERE v < 1000"),
+            (
+                "WHERE v<1000 COUNT/SUM",
+                "SELECT COUNT(*), SUM(v) FROM t WHERE v < 1000",
+            ),
             ("GROUP BY g SUM", "SELECT g, COUNT(*), SUM(v) FROM t GROUP BY g"),
             ("COUNT(DISTINCT s)", "SELECT COUNT(DISTINCT s) FROM t"),
-            ("WHERE w IS NULL GROUP BY g", "SELECT g, COUNT(*), SUM(v) FROM t WHERE w IS NULL GROUP BY g"),
+            (
+                "WHERE w IS NULL GROUP BY g",
+                "SELECT g, COUNT(*), SUM(v) FROM t WHERE w IS NULL GROUP BY g",
+            ),
         ];
         let mut speedups = Vec::new();
         for (name, sql) in queries {
@@ -105,7 +115,11 @@ mod inc0 {
         println!("VERDICT: best {best:.1}x, median {median:.1}x vs row-store.");
         println!(
             "  {} (gate: any analytical query >= 5x vs row-store => item #3 proceeds)",
-            if best >= 5.0 { "PROCEED" } else { "STOP - shipped kernels below 5x" }
+            if best >= 5.0 {
+                "PROCEED"
+            } else {
+                "STOP - shipped kernels below 5x"
+            }
         );
         println!("  (SQLite ref @1M: COUNT DISTINCT 27ms, filter 76ms, GROUP BY SUM 145ms)\n");
     }

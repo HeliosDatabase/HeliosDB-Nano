@@ -216,6 +216,13 @@ pub struct Session {
     /// independent capability a connection pool can flip. An explicit
     /// `synchronous_commit` override always wins over this flag.
     pub fast_autocommit: bool,
+    /// Session `search_path` current schema (the first entry that is neither
+    /// `public` nor `"$user"`). `None` = `public` (today's flat namespace).
+    /// Per-session so concurrent wire connections never share one selector:
+    /// connection A `SET search_path TO tenant_a` must never steer connection
+    /// B's bare names. Threaded into planning by the `_for_session` paths (see
+    /// `EmbeddedDatabase::session_schema_override_guard`).
+    pub current_schema: Option<String>,
     /// Active transaction ID (None if no transaction in progress)
     pub active_txn: Option<u64>,
     /// Session creation timestamp (Unix epoch seconds)
@@ -240,6 +247,7 @@ impl Session {
             isolation_level,
             synchronous_commit: None,
             fast_autocommit: false,
+            current_schema: None,
             active_txn: None,
             created_at: now,
             last_activity: now,

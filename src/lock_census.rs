@@ -137,7 +137,8 @@ fn record_contended(site: Site, waited: Duration) {
     if let Some(c) = site_index(site).and_then(|i| SITES.get(i)) {
         c.acquisitions.fetch_add(1, Ordering::Relaxed);
         c.contended.fetch_add(1, Ordering::Relaxed);
-        c.contended_wait_nanos.fetch_add(waited.as_nanos() as u64, Ordering::Relaxed);
+        c.contended_wait_nanos
+            .fetch_add(waited.as_nanos() as u64, Ordering::Relaxed);
     }
 }
 
@@ -220,10 +221,7 @@ pub(crate) fn rwlock_read<T>(_site: Site, l: &std::sync::RwLock<T>) -> std::sync
 // count still proves the lock is on the prepared hot path.
 #[cfg(feature = "lock-census")]
 #[inline]
-pub(crate) fn pl_rwlock_read<T>(
-    site: Site,
-    l: &parking_lot::RwLock<T>,
-) -> parking_lot::RwLockReadGuard<'_, T> {
+pub(crate) fn pl_rwlock_read<T>(site: Site, l: &parking_lot::RwLock<T>) -> parking_lot::RwLockReadGuard<'_, T> {
     if !is_enabled() {
         return l.read();
     }
@@ -243,10 +241,7 @@ pub(crate) fn pl_rwlock_read<T>(
 
 #[cfg(not(feature = "lock-census"))]
 #[inline]
-pub(crate) fn pl_rwlock_read<T>(
-    _site: Site,
-    l: &parking_lot::RwLock<T>,
-) -> parking_lot::RwLockReadGuard<'_, T> {
+pub(crate) fn pl_rwlock_read<T>(_site: Site, l: &parking_lot::RwLock<T>) -> parking_lot::RwLockReadGuard<'_, T> {
     l.read()
 }
 
@@ -304,7 +299,11 @@ mod tests {
         {
             let _g = mutex_lock(Site::PlanCache, &m);
         }
-        assert_eq!(snapshot()[0].acquisitions, before_off, "disabled census must not record");
+        assert_eq!(
+            snapshot()[0].acquisitions,
+            before_off,
+            "disabled census must not record"
+        );
 
         // Enabled: an uncontended acquisition bumps acquisitions, not contended.
         set_enabled(true);
@@ -315,7 +314,10 @@ mod tests {
         }
         let after = snapshot();
         assert!(after[0].acquisitions > before, "enabled census must record acquisition");
-        assert_eq!(after[0].contended, contended_before, "uncontended lock must not count as contended");
+        assert_eq!(
+            after[0].contended, contended_before,
+            "uncontended lock must not count as contended"
+        );
 
         // Unlabeled sites are never recorded (write-path spec caches).
         let unlabeled_acq = snapshot()[0].acquisitions;

@@ -349,6 +349,7 @@ impl Planner {
             | LogicalPlan::CreateEnumType { .. }
             | LogicalPlan::DropEnumType { .. }
             | LogicalPlan::CreateSchema { .. }
+            | LogicalPlan::DropSchema { .. }
             | LogicalPlan::Noop
             | LogicalPlan::CreateExtension { .. }
             | LogicalPlan::DropExtension { .. }
@@ -360,6 +361,7 @@ impl Planner {
             | LogicalPlan::AlterTableRenameColumn { .. }
             | LogicalPlan::AlterTableAlterColumnNullability { .. }
             | LogicalPlan::AlterTableRename { .. }
+            | LogicalPlan::AlterTableSetSchema { .. }
             | LogicalPlan::AlterTableAddForeignKey { .. }
             | LogicalPlan::AlterTableAlterConstraintEnforcement { .. }
             | LogicalPlan::AlterTableDropConstraint { .. }

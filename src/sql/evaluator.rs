@@ -232,13 +232,17 @@ impl Evaluator {
                         let qualifier = t.to_ascii_lowercase();
                         if qualifier == "new" || qualifier == "old" {
                             let is_new = qualifier == "new";
-                            let row = if is_new { ctx.new_tuple.as_ref() } else { ctx.old_tuple.as_ref() }
-                                .ok_or_else(|| {
-                                    Error::query_execution(format!(
-                                        "{} is not available in this trigger",
-                                        qualifier.to_uppercase()
-                                    ))
-                                })?;
+                            let row = if is_new {
+                                ctx.new_tuple.as_ref()
+                            } else {
+                                ctx.old_tuple.as_ref()
+                            }
+                            .ok_or_else(|| {
+                                Error::query_execution(format!(
+                                    "{} is not available in this trigger",
+                                    qualifier.to_uppercase()
+                                ))
+                            })?;
                             let idx = row_schema.get_column_index(name).ok_or_else(|| {
                                 Error::query_execution(format!(
                                     "Column '{}' not found in {} row",
@@ -1066,12 +1070,7 @@ impl Evaluator {
                 };
                 // Strip an optional schema qualifier (and surrounding quotes)
                 // from the table argument: 'public.t' / '"public"."t"' -> 't'.
-                let table = table
-                    .rsplit('.')
-                    .next()
-                    .unwrap_or(&table)
-                    .trim_matches('"')
-                    .to_string();
+                let table = table.rsplit('.').next().unwrap_or(&table).trim_matches('"').to_string();
                 let col = col.trim_matches('"').to_string();
 
                 match crate::sql::sequences::persist_handle() {
@@ -6299,15 +6298,11 @@ impl Evaluator {
     /// and never spuriously failing a NULL row during a migrate.
     fn func_json_valid(&self, args: &[Value]) -> Result<Value> {
         let [arg] = args else {
-            return Err(Error::query_execution(
-                "json_valid requires exactly one argument",
-            ));
+            return Err(Error::query_execution("json_valid requires exactly one argument"));
         };
         let valid = match arg {
             Value::Null => return Ok(Value::Null),
-            Value::Json(s) | Value::String(s) => {
-                serde_json::from_str::<serde_json::Value>(s).is_ok()
-            }
+            Value::Json(s) | Value::String(s) => serde_json::from_str::<serde_json::Value>(s).is_ok(),
             // Any other concrete (non-text) value is not JSON text.
             _ => false,
         };
@@ -7811,12 +7806,21 @@ mod tests {
         // Zone is DROPPED (wall-clock kept), not converted to UTC: an
         // offset-bearing value equals the same wall-clock with no offset.
         let with_off = evaluator
-            .cast_value(Value::String("2026-06-28 05:52:42.692688+05:30".to_string()), &DataType::Timestamp)
+            .cast_value(
+                Value::String("2026-06-28 05:52:42.692688+05:30".to_string()),
+                &DataType::Timestamp,
+            )
             .unwrap();
         let no_off = evaluator
-            .cast_value(Value::String("2026-06-28 05:52:42.692688".to_string()), &DataType::Timestamp)
+            .cast_value(
+                Value::String("2026-06-28 05:52:42.692688".to_string()),
+                &DataType::Timestamp,
+            )
             .unwrap();
-        assert_eq!(with_off, no_off, "offset must be dropped, wall-clock kept (not UTC-converted)");
+        assert_eq!(
+            with_off, no_off,
+            "offset must be dropped, wall-clock kept (not UTC-converted)"
+        );
 
         // Offset-less forms still parse (no regression).
         assert!(evaluator

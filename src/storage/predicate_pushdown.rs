@@ -285,7 +285,12 @@ impl PredicatePushdownManager {
     /// Analyze a logical expression to extract pushable predicates. `parameters`
     /// binds `$n` placeholders in a cached parameterized plan (empty slice for
     /// literal-only plans).
-    pub fn analyze_predicate(&self, expr: &LogicalExpr, schema: &Schema, parameters: &[Value]) -> Vec<AnalyzedPredicate> {
+    pub fn analyze_predicate(
+        &self,
+        expr: &LogicalExpr,
+        schema: &Schema,
+        parameters: &[Value],
+    ) -> Vec<AnalyzedPredicate> {
         let mut predicates = Vec::new();
         self.extract_predicates(expr, schema, parameters, &mut predicates);
         predicates

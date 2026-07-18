@@ -41,9 +41,7 @@ fn delete_and_update_by_decimal_pk_match_the_row() {
     // UPDATE by bare integer literal against the DECIMAL PK (same fast path).
     let updated = db.execute("UPDATE d_dml SET note = 'VII' WHERE id = 7").unwrap();
     assert_eq!(updated, 1, "UPDATE by DECIMAL PK should touch exactly 1 row");
-    let rows = db
-        .query("SELECT note FROM d_dml WHERE id = 7", &[])
-        .unwrap();
+    let rows = db.query("SELECT note FROM d_dml WHERE id = 7", &[]).unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].values[0], Value::String("VII".to_string()));
 }

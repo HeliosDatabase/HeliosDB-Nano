@@ -259,12 +259,10 @@ impl RowCache {
         let cur = self.total_len();
         let mut peak = self.stat_peak_entries.load(Ordering::Relaxed);
         while cur > peak {
-            match self.stat_peak_entries.compare_exchange_weak(
-                peak,
-                cur,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
+            match self
+                .stat_peak_entries
+                .compare_exchange_weak(peak, cur, Ordering::Relaxed, Ordering::Relaxed)
+            {
                 Ok(_) => break,
                 Err(observed) => peak = observed,
             }

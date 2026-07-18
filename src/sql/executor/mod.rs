@@ -2410,7 +2410,11 @@ impl<'a> Executor<'a> {
         }
         let analyzed_predicates = predicate
             .as_ref()
-            .map(|predicate| storage.predicate_pushdown().analyze_predicate(predicate, schema, &self.parameters))
+            .map(|predicate| {
+                storage
+                    .predicate_pushdown()
+                    .analyze_predicate(predicate, schema, &self.parameters)
+            })
             .unwrap_or_default();
         if predicate.is_some() && analyzed_predicates.is_empty() {
             return Ok(None);
@@ -2504,7 +2508,11 @@ impl<'a> Executor<'a> {
         }
         let analyzed_predicates = predicate
             .as_ref()
-            .map(|predicate| storage.predicate_pushdown().analyze_predicate(predicate, schema, &self.parameters))
+            .map(|predicate| {
+                storage
+                    .predicate_pushdown()
+                    .analyze_predicate(predicate, schema, &self.parameters)
+            })
             .unwrap_or_default();
         if predicate.is_some() && analyzed_predicates.is_empty() {
             return Ok(None);
@@ -3805,9 +3813,7 @@ impl<'a> Executor<'a> {
                     .ok_or_else(|| Error::query_execution("DROP SEQUENCE requires storage context".to_string()))?;
                 let catalog = storage.catalog();
                 if !*if_exists && !catalog.sequence_exists(name)? {
-                    return Err(Error::query_execution(format!(
-                        "sequence \"{name}\" does not exist"
-                    )));
+                    return Err(Error::query_execution(format!("sequence \"{name}\" does not exist")));
                 }
                 catalog.drop_sequence(name)?;
                 crate::sql::sequences::invalidate_cache(name);
@@ -3848,11 +3854,83 @@ impl<'a> Executor<'a> {
                 ))
             }
             LogicalPlan::CreateSchema { name, if_not_exists } => {
-                // HeliosDB has a single flat namespace; `schema.table` is just
-                // a composite table name. Accept CREATE SCHEMA as a no-op so
-                // migrations that issue it don't fail. `IF NOT EXISTS` is
-                // implicit here since nothing is created either way.
-                let _ = (name, if_not_exists);
+                // Record the schema in the catalog (`meta:schema:<name>`) so it
+                // exists as a namespace even while empty. Tables created under it
+                // key as `name.<table>` (planner resolution), so no member
+                // records are needed. Duplicate without IF NOT EXISTS errors
+                // (PostgreSQL parity).
+                let storage = self
+                    .storage
+                    .ok_or_else(|| Error::query_execution("CREATE SCHEMA requires storage context".to_string()))?;
+                let created = storage.catalog().register_schema(name)?;
+                if !created && !*if_not_exists {
+                    return Err(Error::query_execution(format!("schema \"{name}\" already exists")));
+                }
+                Ok(Box::new(
+                    ScanOperator::new(
+                        String::new(),
+                        Arc::new(crate::Schema { columns: vec![] }),
+                        None,
+                        vec![],
+                        vec![],
+                    )
+                    .with_timeout(self.timeout_ctx()),
+                ))
+            }
+            LogicalPlan::DropSchema {
+                names,
+                if_exists,
+                cascade,
+            } => {
+                let storage = self
+                    .storage
+                    .ok_or_else(|| Error::query_execution("DROP SCHEMA requires storage context".to_string()))?;
+                for name in names {
+                    let catalog = storage.catalog();
+                    if !catalog.schema_exists(name)? {
+                        if *if_exists {
+                            continue;
+                        }
+                        return Err(Error::query_execution(format!("schema \"{name}\" does not exist")));
+                    }
+                    let members = catalog.schema_members(name)?;
+                    if !members.is_empty() && !*cascade {
+                        // RESTRICT (default): refuse to drop a non-empty schema.
+                        return Err(Error::query_execution(format!(
+                            "cannot drop schema {name} because other objects depend on it (use CASCADE)"
+                        )));
+                    }
+                    // CASCADE: drop every member through the ordinary DROP-table
+                    // funnel, so ART indexes, columnar sidecars, the WAL log AND
+                    // the Stage-0 partition-child cascade all compose (a
+                    // partitioned parent in this schema takes its children,
+                    // including children registered under other schemas). A child
+                    // already removed by an earlier parent drop is a no-op
+                    // (IF EXISTS semantics on each member).
+                    //
+                    // CONSTRAINT (marker-leak fix): the schema marker MUST be
+                    // removed even if a member drop errors mid-cascade. DDL is
+                    // non-transactional here, so a partial CASCADE cannot roll
+                    // back; leaving `meta:schema:<name>` behind would strand the
+                    // namespace so a later `CREATE SCHEMA <name>` fails with a
+                    // phantom "already exists" (alter_table corpus: an earlier
+                    // partially-failed `DROP SCHEMA … CASCADE` blocked the
+                    // schema's re-creation). Continue past member errors,
+                    // remember the first, always clear the marker, then surface
+                    // the error so a genuine failure is still reported.
+                    let mut first_err: Option<Error> = None;
+                    for member in members {
+                        if let Err(e) = ddl::handle_drop_table(self, &member, true) {
+                            if first_err.is_none() {
+                                first_err = Some(e);
+                            }
+                        }
+                    }
+                    catalog.drop_schema_marker(name)?;
+                    if let Some(e) = first_err {
+                        return Err(e);
+                    }
+                }
                 Ok(Box::new(
                     ScanOperator::new(
                         String::new(),

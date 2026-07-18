@@ -341,7 +341,10 @@ mod tests {
     fn write_volume_counts_by_category_on_the_current_class() {
         // Snapshot shape is stable: six named rows, always.
         let names: Vec<&str> = snapshot().iter().map(|s| s.class).collect();
-        assert_eq!(names, vec!["insert_single", "insert_multi", "copy", "update", "delete", "other"]);
+        assert_eq!(
+            names,
+            vec!["insert_single", "insert_multi", "copy", "update", "delete", "other"]
+        );
 
         // `other` is index 5 and the default thread class. Record a known delta
         // directly (bypassing the caller-side `enabled()` gate) and assert it
@@ -354,13 +357,25 @@ mod tests {
         let after = snapshot();
 
         assert_eq!(after[5].data_bytes, before[5].data_bytes + 40, "data bytes on `other`");
-        assert_eq!(after[5].version_bytes, before[5].version_bytes + 48, "version bytes on `other`");
-        assert_eq!(after[5].index_key_bytes, before[5].index_key_bytes + 7, "index-key bytes on `other`");
+        assert_eq!(
+            after[5].version_bytes,
+            before[5].version_bytes + 48,
+            "version bytes on `other`"
+        );
+        assert_eq!(
+            after[5].index_key_bytes,
+            before[5].index_key_bytes + 7,
+            "index-key bytes on `other`"
+        );
         assert_eq!(after[5].rows, before[5].rows + 1, "row event on `other`");
 
         // Categories are independent: writing Data must not move Version.
         let base_ver = snapshot()[5].version_bytes;
         add(Category::Data, 11);
-        assert_eq!(snapshot()[5].version_bytes, base_ver, "Data write leaves Version untouched");
+        assert_eq!(
+            snapshot()[5].version_bytes,
+            base_ver,
+            "Data write leaves Version untouched"
+        );
     }
 }

@@ -99,15 +99,19 @@ fn default_and_subpartitioned_default_child() -> Result<()> {
 #[test]
 fn schema_qualified_parent_and_child() -> Result<()> {
     let db = EmbeddedDatabase::new_in_memory()?;
-    // Nano collapses any schema qualifier to the bare table name; the child
-    // must still resolve the parent's columns.
+    // Schema namespacing (coexistence): a non-`public` qualifier is a REAL
+    // namespace now — the child keys as `stats_import.part_child_1` and its
+    // parent's columns resolve; the child is addressed by its qualified name.
     db.execute("CREATE TABLE stats_import.part_parent (id INT NOT NULL, note TEXT) PARTITION BY RANGE (id)")?;
     db.execute(
         "CREATE TABLE stats_import.part_child_1 PARTITION OF stats_import.part_parent \
          FOR VALUES FROM (0) TO (10) WITH (autovacuum_enabled = false)",
     )?;
-    db.execute("INSERT INTO part_child_1 (id, note) VALUES (3, 'n')")?;
-    assert_eq!(db.query("SELECT id, note FROM part_child_1", &[])?.len(), 1);
+    db.execute("INSERT INTO stats_import.part_child_1 (id, note) VALUES (3, 'n')")?;
+    assert_eq!(
+        db.query("SELECT id, note FROM stats_import.part_child_1", &[])?.len(),
+        1
+    );
     Ok(())
 }
 
@@ -148,7 +152,10 @@ fn attach_and_detach_are_noops() -> Result<()> {
         0
     );
     assert_eq!(db.execute("ALTER TABLE ad_parent DETACH PARTITION ad_child")?, 0);
-    assert_eq!(db.execute("ALTER TABLE ad_parent DETACH PARTITION ad_child CONCURRENTLY")?, 0);
+    assert_eq!(
+        db.execute("ALTER TABLE ad_parent DETACH PARTITION ad_child CONCURRENTLY")?,
+        0
+    );
     // ALTER INDEX ... ATTACH PARTITION also a no-op.
     assert_eq!(db.execute("ALTER INDEX ad_idx ATTACH PARTITION ad_child_idx")?, 0);
 
@@ -189,9 +196,7 @@ fn empty_column_inherits_is_not_treated_as_partition() -> Result<()> {
         let count = |t: &str| -> Result<usize> {
             Ok(db
                 .query(
-                    &format!(
-                        "SELECT column_name FROM information_schema.columns WHERE table_name = '{t}'"
-                    ),
+                    &format!("SELECT column_name FROM information_schema.columns WHERE table_name = '{t}'"),
                     &[],
                 )?
                 .len())
@@ -335,30 +340,27 @@ fn drop_child_directly_then_parent() -> Result<()> {
     Ok(())
 }
 
-/// (d) Schema-qualified parent + child: registration and drop-lookup must
-/// normalize IDENTICALLY (both collapse `sq.<name>` to the bare catalog key),
-/// so `DROP TABLE sq.parent` cascades to `sq.child`. This is the exact shape
-/// behind the triage note about a bare `pk11` printed for `fkpart11.pk11`.
-/// FAILS on pre-fix code (no cascade).
+/// (d) Schema-qualified parent + child: registration and drop-lookup normalize
+/// IDENTICALLY (both key `sq.<name>`), so `DROP TABLE sq.parent` cascades to
+/// `sq.child` through the Stage-0 partition registry. With real schema
+/// namespacing the qualified `sq.pk11` and the bare `pk11` are DISTINCT tables
+/// (coexistence), so the bare name stays free for an independent table.
 #[test]
 fn schema_qualified_parent_child_cascade() -> Result<()> {
     let db = EmbeddedDatabase::new_in_memory()?;
     db.execute("CREATE TABLE sq.fkpart11 (id INT NOT NULL, note TEXT) PARTITION BY RANGE (id)")?;
     db.execute("CREATE TABLE sq.pk11 PARTITION OF sq.fkpart11 FOR VALUES FROM (0) TO (10)")?;
-    db.execute("INSERT INTO pk11 (id, note) VALUES (3, 'n')")?;
+    db.execute("INSERT INTO sq.pk11 (id, note) VALUES (3, 'n')")?;
+    assert_eq!(db.query("SELECT id FROM sq.pk11", &[])?.len(), 1);
 
     // Drop the schema-qualified parent; the schema-qualified child cascades.
     db.execute("DROP TABLE sq.fkpart11")?;
-    assert!(
-        db.query("SELECT id FROM pk11", &[]).is_err(),
-        "schema-qualified child cascaded (bare-name view)"
-    );
     assert!(
         db.query("SELECT id FROM sq.pk11", &[]).is_err(),
         "schema-qualified child cascaded (qualified view)"
     );
 
-    // Freed bare name re-usable as a plain table.
+    // The bare name `pk11` is a separate namespace — creatable and independent.
     db.execute("CREATE TABLE pk11 (x INT)")?;
     assert_eq!(db.query("SELECT x FROM pk11", &[])?.len(), 0);
     Ok(())
@@ -404,7 +406,10 @@ fn pg_class_relpartbound_is_null() -> Result<()> {
         "SELECT relname, relpartbound FROM pg_class WHERE relname IN ('pb_parent', 'pb_child')",
         &[],
     )?;
-    assert!(empty.is_empty(), "no matching relations yet → empty result, not an error");
+    assert!(
+        empty.is_empty(),
+        "no matching relations yet → empty result, not an error"
+    );
 
     db.execute("CREATE TABLE pb_parent (id INT) PARTITION BY RANGE (id)")?;
     db.execute("CREATE TABLE pb_child PARTITION OF pb_parent FOR VALUES FROM (0) TO (10)")?;

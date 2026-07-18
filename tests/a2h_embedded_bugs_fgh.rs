@@ -19,10 +19,8 @@ use heliosdb_nano::{EmbeddedDatabase, Value};
 #[test]
 fn bug_f_composite_pk_prefix_update_delete() {
     let db = EmbeddedDatabase::new_in_memory().expect("create db");
-    db.execute(
-        "CREATE TABLE c (run_id TEXT, chunk_id TEXT, state TEXT, PRIMARY KEY(run_id, chunk_id))",
-    )
-    .unwrap();
+    db.execute("CREATE TABLE c (run_id TEXT, chunk_id TEXT, state TEXT, PRIMARY KEY(run_id, chunk_id))")
+        .unwrap();
     db.execute("INSERT INTO c (run_id, chunk_id, state) VALUES ('r1','c0','pending')")
         .unwrap();
     db.execute("INSERT INTO c (run_id, chunk_id, state) VALUES ('r1','c1','pending')")
@@ -37,10 +35,7 @@ fn bug_f_composite_pk_prefix_update_delete() {
     // Prefix UPDATE must change exactly the 2 rows with run_id = 'r1'.
     let updated = db.execute("UPDATE c SET state = 'x' WHERE run_id = 'r1'").unwrap();
     assert_eq!(updated, 2, "prefix UPDATE must change 2 rows (BUG F)");
-    assert_eq!(
-        db.query("SELECT * FROM c WHERE state = 'x'", &[]).unwrap().len(),
-        2
-    );
+    assert_eq!(db.query("SELECT * FROM c WHERE state = 'x'", &[]).unwrap().len(), 2);
 
     // Prefix DELETE must remove exactly the 2 rows with run_id = 'r1'.
     let deleted = db.execute("DELETE FROM c WHERE run_id = 'r1'").unwrap();
@@ -132,8 +127,7 @@ fn bug_g_execute_many_composite_distinct_keys() {
     db.execute("CREATE TABLE s (id INT PRIMARY KEY)").unwrap();
     let sdup = vec![vec![Value::Int8(1)], vec![Value::Int8(1)]];
     assert!(
-        db.execute_many_params("INSERT INTO s (id) VALUES ($1)", &sdup)
-            .is_err(),
+        db.execute_many_params("INSERT INTO s (id) VALUES ($1)", &sdup).is_err(),
         "duplicate single-column PK in a batch must be rejected"
     );
 }
@@ -167,9 +161,7 @@ fn bug_h_is_json_bare_expression_semantics() {
     db.execute("INSERT INTO j VALUES (2, 'not json')").unwrap(); // invalid
     db.execute("INSERT INTO j VALUES (3, NULL)").unwrap(); // null
 
-    let r = db
-        .query("SELECT id, doc IS JSON AS v FROM j ORDER BY id", &[])
-        .unwrap();
+    let r = db.query("SELECT id, doc IS JSON AS v FROM j ORDER BY id", &[]).unwrap();
     assert_eq!(r.len(), 3);
     assert_eq!(r[0].values[1], Value::Boolean(true), "'{{}}' IS JSON => true");
     assert_eq!(r[1].values[1], Value::Boolean(false), "'not json' IS JSON => false");

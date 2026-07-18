@@ -280,9 +280,7 @@ mod cross_process_rebuild {
             );
 
             // ...and the indexes are still functional after rebuild.
-            let rows = db
-                .query("SELECT id FROM docs WHERE status = 'open'", &[])
-                .unwrap();
+            let rows = db.query("SELECT id FROM docs WHERE status = 'open'", &[]).unwrap();
             assert_eq!(
                 rows.len(),
                 25,
@@ -290,9 +288,7 @@ mod cross_process_rebuild {
                 rows.len()
             );
 
-            let rows = db
-                .query("SELECT id FROM docs WHERE owner = 'u3'", &[])
-                .unwrap();
+            let rows = db.query("SELECT id FROM docs WHERE owner = 'u3'", &[]).unwrap();
             assert_eq!(
                 rows.len(),
                 10,

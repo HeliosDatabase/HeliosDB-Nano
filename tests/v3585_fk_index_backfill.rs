@@ -28,9 +28,7 @@ fn add_fk_after_load_backfills_index() -> Result<()> {
     db.execute("CREATE TABLE film (film_id INT4 PRIMARY KEY)")?;
     // Composite PK with the FK column (category_id) as the NON-leading member,
     // exactly like Pagila's film_category(film_id, category_id).
-    db.execute(
-        "CREATE TABLE film_category (film_id INT4, category_id INT4, PRIMARY KEY (film_id, category_id))",
-    )?;
+    db.execute("CREATE TABLE film_category (film_id INT4, category_id INT4, PRIMARY KEY (film_id, category_id))")?;
 
     for i in 1..=5 {
         db.execute(&format!("INSERT INTO cat VALUES ({i})"))?;
@@ -53,7 +51,11 @@ fn add_fk_after_load_backfills_index() -> Result<()> {
 
     // Equality lookup on the FK column must see the pre-existing rows.
     let cnt = db.query("SELECT count(*) FROM film_category WHERE category_id = 1", &[])?;
-    assert_eq!(as_i64(&cnt[0].values[0]), 20, "FK-column equality must see pre-existing rows");
+    assert_eq!(
+        as_i64(&cnt[0].values[0]),
+        20,
+        "FK-column equality must see pre-existing rows"
+    );
 
     // The leading composite-PK column must still resolve too (a second FK
     // should not disturb it either).
@@ -62,13 +64,21 @@ fn add_fk_after_load_backfills_index() -> Result<()> {
          FOREIGN KEY (film_id) REFERENCES film (film_id)",
     )?;
     let cnt2 = db.query("SELECT count(*) FROM film_category WHERE category_id = 1", &[])?;
-    assert_eq!(as_i64(&cnt2[0].values[0]), 20, "second FK must not break the first FK's index");
+    assert_eq!(
+        as_i64(&cnt2[0].values[0]),
+        20,
+        "second FK must not break the first FK's index"
+    );
 
     // The join that previously returned 0 (film_list-style) now returns all rows.
     let j = db.query(
         "SELECT count(*) FROM cat c JOIN film_category fc ON c.category_id = fc.category_id",
         &[],
     )?;
-    assert_eq!(as_i64(&j[0].values[0]), 100, "FK-column join must return every matching row");
+    assert_eq!(
+        as_i64(&j[0].values[0]),
+        100,
+        "FK-column join must return every matching row"
+    );
     Ok(())
 }
