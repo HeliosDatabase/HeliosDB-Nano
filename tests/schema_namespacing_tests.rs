@@ -592,8 +592,15 @@ fn alter_table_set_schema_moves_table_between_schemas() -> Result<()> {
 
     // Move to public -> bare key.
     db.execute("ALTER TABLE alter2.t1 SET SCHEMA public")?;
-    assert_eq!(db.query("SELECT f1 FROM t1", &[])?.len(), 2, "addressable bare in public");
-    assert!(db.query("SELECT f1 FROM alter2.t1", &[]).is_err(), "old qualified key gone");
+    assert_eq!(
+        db.query("SELECT f1 FROM t1", &[])?.len(),
+        2,
+        "addressable bare in public"
+    );
+    assert!(
+        db.query("SELECT f1 FROM alter2.t1", &[]).is_err(),
+        "old qualified key gone"
+    );
     Ok(())
 }
 
@@ -774,14 +781,24 @@ fn set_schema_from_schema_into_pg_catalog_is_bare() -> Result<()> {
     db.execute("INSERT INTO s1.moved (k) VALUES (7)")?;
 
     db.execute("ALTER TABLE s1.moved SET SCHEMA pg_catalog")?;
-    assert_eq!(one_i64(&db, "SELECT k FROM moved"), 7, "addressable bare after move to pg_catalog");
-    assert!(db.query("SELECT k FROM s1.moved", &[]).is_err(), "old qualified key gone");
+    assert_eq!(
+        one_i64(&db, "SELECT k FROM moved"),
+        7,
+        "addressable bare after move to pg_catalog"
+    );
+    assert!(
+        db.query("SELECT k FROM s1.moved", &[]).is_err(),
+        "old qualified key gone"
+    );
 
     // And back out to a real schema keys it qualified again.
     db.execute("CREATE SCHEMA s2")?;
     db.execute("ALTER TABLE moved SET SCHEMA s2")?;
     assert_eq!(one_i64(&db, "SELECT k FROM s2.moved"), 7, "moved -> s2 qualified");
-    assert!(db.query("SELECT k FROM moved", &[]).is_err(), "bare key gone after move to s2");
+    assert!(
+        db.query("SELECT k FROM moved", &[]).is_err(),
+        "bare key gone after move to s2"
+    );
     Ok(())
 }
 
@@ -830,9 +847,9 @@ fn set_constraints_defers_fk_on_partitioned_qualified_parent() -> Result<()> {
     // Deferred, parent gains the row LATER in the same txn (the classic case).
     db.execute("BEGIN")?;
     db.execute("SET CONSTRAINTS fk_a_fkey DEFERRED")?;
-    db.execute("INSERT INTO fk VALUES (1)")?;         // child first
+    db.execute("INSERT INTO fk VALUES (1)")?; // child first
     db.execute("INSERT INTO fkpart9.pk VALUES (1)")?; // parent gains a=1 (lands in the parent)
-    db.execute("COMMIT")?;                            // deferred check finds fkpart9.pk(a)=1
+    db.execute("COMMIT")?; // deferred check finds fkpart9.pk(a)=1
 
     assert_eq!(one_i64(&db, "SELECT a FROM fkpart9.fk"), 1);
     assert_eq!(one_i64(&db, "SELECT a FROM fkpart9.pk"), 1);
@@ -843,5 +860,21 @@ fn set_constraints_defers_fk_on_partitioned_qualified_parent() -> Result<()> {
         db.execute("INSERT INTO fk VALUES (2)").is_err(),
         "deferral must not leak past the transaction it was set in"
     );
+    Ok(())
+}
+
+#[test]
+fn deferred_fk_check_evaporates_when_referenced_table_dropped() -> Result<()> {
+    // triggers:864-870 corpus shape: INITIALLY DEFERRED FK, child inserted
+    // before any parent row, referenced table dropped mid-txn — PG drops the
+    // constraint with the table, so COMMIT must succeed and cleanup must work.
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute("CREATE TABLE refd_table (id INT PRIMARY KEY)")?;
+    db.execute("CREATE TABLE trig_table (fk INT REFERENCES refd_table INITIALLY DEFERRED)")?;
+    db.execute("BEGIN")?;
+    db.execute("INSERT INTO trig_table VALUES (1)")?;
+    db.execute("DROP TABLE refd_table CASCADE")?;
+    db.execute("COMMIT")?;
+    db.execute("DROP TABLE trig_table")?;
     Ok(())
 }

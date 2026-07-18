@@ -7340,9 +7340,7 @@ impl EmbeddedDatabase {
         // effect, so it likewise disqualifies the eager batch fast path and
         // routes through the deferring slow path.
         if mode != FkValidationMode::Enforced
-            || self
-                .constraints_all_deferred
-                .load(std::sync::atomic::Ordering::Relaxed)
+            || self.constraints_all_deferred.load(std::sync::atomic::Ordering::Relaxed)
         {
             return false;
         }
@@ -9134,7 +9132,12 @@ impl EmbeddedDatabase {
             self.storage.view_catalog().drop_view(old_key, false)?;
         }
 
-        tracing::info!("Moved relation '{}' to schema '{}' (key '{}')", old_key, new_schema, new_key);
+        tracing::info!(
+            "Moved relation '{}' to schema '{}' (key '{}')",
+            old_key,
+            new_schema,
+            new_key
+        );
         Ok(0)
     }
 
@@ -17775,10 +17778,12 @@ impl EmbeddedDatabase {
         column_names
             .iter()
             .zip(values.iter())
-            .map(|(col_name, v)| match schema.columns.iter().find(|c| &c.name == col_name) {
-                Some(col) => Self::coerce_probe_value_to_type(v, &col.data_type),
-                None => v.clone(),
-            })
+            .map(
+                |(col_name, v)| match schema.columns.iter().find(|c| &c.name == col_name) {
+                    Some(col) => Self::coerce_probe_value_to_type(v, &col.data_type),
+                    None => v.clone(),
+                },
+            )
             .collect()
     }
 
@@ -18242,9 +18247,7 @@ impl EmbeddedDatabase {
             }
             let should_defer = active_txn.is_some()
                 && (mode == FkValidationMode::Deferred
-                    || self
-                        .constraints_all_deferred
-                        .load(std::sync::atomic::Ordering::Relaxed)
+                    || self.constraints_all_deferred.load(std::sync::atomic::Ordering::Relaxed)
                     || fk.enforcement == sql::ConstraintEnforcement::Deferred
                     || (fk.deferrable && fk.initially_deferred));
             if should_defer {
@@ -18303,6 +18306,19 @@ impl EmbeddedDatabase {
             return Ok(());
         }
         for check in &checks {
+            // A referenced table dropped since the check was queued took its
+            // FK constraint with it (PG: DROP ... CASCADE drops dependent
+            // constraints), so the pending check evaporates. Lazy skip here
+            // covers every drop path — DROP TABLE, DROP SCHEMA CASCADE, and
+            // the partition cascade — without per-path purge hooks.
+            if !self
+                .storage
+                .catalog()
+                .table_exists(&check.fk.references_table)
+                .unwrap_or(false)
+            {
+                continue;
+            }
             let parent_exists = self.check_referencing_rows_exist(
                 &check.fk.references_table,
                 &check.fk.references_columns,
