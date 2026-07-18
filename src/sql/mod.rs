@@ -10,6 +10,7 @@ pub mod executor;
 pub mod functions;
 pub mod logical_plan;
 pub(crate) mod normalize;
+pub mod numeric_special; // PG NaN/±Infinity semantics for String-backed Value::Numeric
 pub mod parser;
 pub mod planner;
 pub mod procedural;

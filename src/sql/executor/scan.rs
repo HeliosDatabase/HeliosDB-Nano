@@ -1063,7 +1063,18 @@ fn coerce_index_lookup_value(value: Value, data_type: &DataType) -> Option<Value
         },
         DataType::Bytea => matches!(value, Value::Bytes(_)).then_some(value),
         DataType::Interval => matches!(value, Value::Interval(_)).then_some(value),
-        DataType::Numeric => matches!(value, Value::Numeric(_)).then_some(value),
+        DataType::Numeric => {
+            if matches!(value, Value::Numeric(_)) {
+                Some(value)
+            } else if let Value::String(s) = value {
+                // Quoted numeric literal (incl. NaN/±Infinity) used as an index
+                // probe key: coerce to the canonical Numeric string so the ART
+                // key (raw decimal-string bytes) matches the stored value.
+                crate::sql::numeric_special::parse_numeric_text(&s).map(Value::Numeric)
+            } else {
+                None
+            }
+        }
         DataType::Json | DataType::Jsonb => matches!(value, Value::Json(_)).then_some(value),
         DataType::Vector(_) => matches!(value, Value::Vector(_)).then_some(value),
         DataType::Array(_) => matches!(value, Value::Array(_)).then_some(value),

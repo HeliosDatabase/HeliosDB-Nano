@@ -209,6 +209,12 @@ impl AggregateOperator {
                         Ok(Value::Int8(count as i64))
                     }
                     AggregateFunction::Sum => {
+                        // PG: a NaN/±Infinity numeric operand makes the whole SUM
+                        // special. Decimal accumulation below cannot represent it
+                        // and would silently drop it, so fold the specials first.
+                        if let Some(sp) = crate::sql::numeric_special::fold_sum_specials(values.iter()) {
+                            return Ok(sp.to_value());
+                        }
                         // Check if any value is Numeric or floating-point
                         let has_decimal = values
                             .iter()
@@ -726,6 +732,9 @@ enum SumState {
     Empty,
     Int(i64),
     Decimal(rust_decimal::Decimal),
+    /// A NaN/±Infinity numeric operand was seen; PG makes the whole SUM
+    /// special and finite operands no longer change it.
+    Special(crate::sql::numeric_special::Special),
 }
 
 /// Streaming accumulator for single-pass aggregation
@@ -751,21 +760,27 @@ impl StreamingAccumulator {
                 if matches!(val, Value::Null) {
                     return Ok(());
                 }
+                // A `SumState::Special` (a NaN/±Infinity was already seen) is
+                // never changed by a further finite operand — the `Special`
+                // arms below are the no-op that encodes that.
                 match val {
                     Value::Int2(i) => match state {
                         SumState::Empty => *state = SumState::Int(*i as i64),
                         SumState::Int(s) => *s += *i as i64,
                         SumState::Decimal(s) => *s += rust_decimal::Decimal::from(*i),
+                        SumState::Special(_) => {}
                     },
                     Value::Int4(i) => match state {
                         SumState::Empty => *state = SumState::Int(*i as i64),
                         SumState::Int(s) => *s += *i as i64,
                         SumState::Decimal(s) => *s += rust_decimal::Decimal::from(*i),
+                        SumState::Special(_) => {}
                     },
                     Value::Int8(i) => match state {
                         SumState::Empty => *state = SumState::Int(*i),
                         SumState::Int(s) => *s += *i,
                         SumState::Decimal(s) => *s += rust_decimal::Decimal::from(*i),
+                        SumState::Special(_) => {}
                     },
                     Value::Float4(f) => {
                         let dec = rust_decimal::Decimal::try_from(*f as f64).unwrap_or_default();
@@ -773,6 +788,7 @@ impl StreamingAccumulator {
                             SumState::Empty => *state = SumState::Decimal(dec),
                             SumState::Int(s) => *state = SumState::Decimal(rust_decimal::Decimal::from(*s) + dec),
                             SumState::Decimal(s) => *s += dec,
+                            SumState::Special(_) => {}
                         }
                     }
                     Value::Float8(f) => {
@@ -781,14 +797,26 @@ impl StreamingAccumulator {
                             SumState::Empty => *state = SumState::Decimal(dec),
                             SumState::Int(s) => *state = SumState::Decimal(rust_decimal::Decimal::from(*s) + dec),
                             SumState::Decimal(s) => *s += dec,
+                            SumState::Special(_) => {}
                         }
                     }
                     Value::Numeric(n) => {
-                        let dec = n.parse::<rust_decimal::Decimal>().unwrap_or_default();
-                        match state {
-                            SumState::Empty => *state = SumState::Decimal(dec),
-                            SumState::Int(s) => *state = SumState::Decimal(rust_decimal::Decimal::from(*s) + dec),
-                            SumState::Decimal(s) => *s += dec,
+                        if let Some(sp) = crate::sql::numeric_special::special_of(n) {
+                            // NaN/±Infinity: fold into (and switch to) the special state.
+                            let cur = if let SumState::Special(c) = state {
+                                Some(*c)
+                            } else {
+                                None
+                            };
+                            *state = SumState::Special(crate::sql::numeric_special::combine_sum(cur, sp));
+                        } else {
+                            let dec = n.parse::<rust_decimal::Decimal>().unwrap_or_default();
+                            match state {
+                                SumState::Empty => *state = SumState::Decimal(dec),
+                                SumState::Int(s) => *state = SumState::Decimal(rust_decimal::Decimal::from(*s) + dec),
+                                SumState::Decimal(s) => *s += dec,
+                                SumState::Special(_) => {}
+                            }
                         }
                     }
                     _ => return Err(Error::query_execution("SUM requires numeric values")),
@@ -869,6 +897,7 @@ impl StreamingAccumulator {
                 SumState::Empty => Ok(Value::Null),
                 SumState::Int(s) => Ok(Value::Int8(s)),
                 SumState::Decimal(s) => Ok(Value::Numeric(format!("{s}"))),
+                SumState::Special(sp) => Ok(sp.to_value()),
             },
             Self::Avg { sum, count } => {
                 if count == 0 {
