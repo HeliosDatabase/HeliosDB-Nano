@@ -361,6 +361,7 @@ impl Planner {
             | LogicalPlan::AlterTableRenameColumn { .. }
             | LogicalPlan::AlterTableAlterColumnNullability { .. }
             | LogicalPlan::AlterTableRename { .. }
+            | LogicalPlan::AlterTableSetSchema { .. }
             | LogicalPlan::AlterTableAddForeignKey { .. }
             | LogicalPlan::AlterTableAlterConstraintEnforcement { .. }
             | LogicalPlan::AlterTableDropConstraint { .. }

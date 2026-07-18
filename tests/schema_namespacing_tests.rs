@@ -435,3 +435,218 @@ fn show_search_path_reflects_current_schema() -> Result<()> {
     assert_eq!(set_rows[0].values[0], Value::String("showp, public".to_string()));
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// FIX 1 — partition registry is session-schema-aware at registration.
+//
+// Under `SET search_path TO s`, a `PARTITION OF` child is created as `s.child`
+// and its parent must register under `s.parent` (the parent's real key), not
+// the bare name. Before the fix the child registered under bare `parent`, so
+// `DROP TABLE parent` (which resolves to `s.parent`) found no children, skipped
+// the Stage-0 cascade, orphaned them, and the corpus's re-create then collided.
+// ---------------------------------------------------------------------------
+
+/// The exact foreign_key/fkpart6 corpus flow: a two-level partition tree under
+/// a search_path schema drops cleanly and the whole tree can be re-created.
+#[test]
+fn partition_tree_under_search_path_drops_and_recreates() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute("CREATE SCHEMA fkpart6")?;
+    db.execute("SET search_path TO fkpart6")?;
+
+    let create_tree = |db: &EmbeddedDatabase| -> Result<()> {
+        db.execute("CREATE TABLE fk (a int) PARTITION BY RANGE (a)")?;
+        db.execute("CREATE TABLE fk1 PARTITION OF fk FOR VALUES FROM (1) TO (100) PARTITION BY RANGE (a)")?;
+        db.execute("CREATE TABLE fk11 PARTITION OF fk1 FOR VALUES FROM (1) TO (10)")?;
+        db.execute("CREATE TABLE fk_d PARTITION OF fk DEFAULT")?;
+        Ok(())
+    };
+
+    // First build — every statement must succeed (parent-schema column copy is
+    // session-aware, so the child clones `fkpart6.fk`, not a stray bare `fk`).
+    create_tree(&db)?;
+
+    // Children are addressable while the tree stands.
+    db.execute("INSERT INTO fk1 (a) VALUES (5)")?;
+    assert_eq!(one_i64(&db, "SELECT a FROM fk1"), 5);
+
+    // Dropping the parent cascades to EVERY registered descendant (sub-
+    // partitioned children included), because registration keyed them under
+    // `fkpart6.fk` / `fkpart6.fk1`, matching what `DROP TABLE fk` resolves to.
+    db.execute("DROP TABLE fk")?;
+    for child in ["fk", "fk1", "fk11", "fk_d"] {
+        assert!(
+            db.query(&format!("SELECT a FROM {child}"), &[]).is_err(),
+            "{child} must be gone after DROP TABLE fk (orphan → collision otherwise)"
+        );
+    }
+
+    // Re-creating the identical tree must NOT collide with a survivor.
+    create_tree(&db)?;
+    assert_eq!(db.query("SELECT a FROM fk1", &[])?.len(), 0, "fk1 re-created empty");
+    Ok(())
+}
+
+/// DROP SCHEMA CASCADE tears down a qualified sub-partitioned tree via the
+/// registry — including a child that lives in ANOTHER schema.
+#[test]
+fn drop_schema_cascade_reaches_cross_schema_partition_children() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute("CREATE SCHEMA sp")?;
+    db.execute("CREATE SCHEMA other")?;
+    db.execute("SET search_path TO sp")?;
+    db.execute("CREATE TABLE p (a int) PARTITION BY RANGE (a)")?;
+    // A partition child created in a DIFFERENT schema (qualified child of a
+    // qualified parent). It is not enumerated by the `sp.` prefix scan, so it
+    // can only be reached through the partition registry cascade.
+    db.execute("CREATE TABLE other.c1 PARTITION OF sp.p FOR VALUES FROM (1) TO (10)")?;
+    db.execute("SET search_path TO public")?;
+
+    db.execute("DROP SCHEMA sp CASCADE")?;
+    assert!(db.query("SELECT a FROM sp.p", &[]).is_err(), "sp.p dropped");
+    assert!(
+        db.query("SELECT a FROM other.c1", &[]).is_err(),
+        "cross-schema partition child must cascade via the registry"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// FIX 2 — foreign-key enforcement is schema-aware.
+//
+// A `REFERENCES parent` FK under a search_path schema must (a) store the
+// resolved parent key and (b) default its referenced columns to the parent's
+// PRIMARY KEY, so enforcement probes the right table+columns instead of
+// degrading to "does the parent have ANY row" with an empty `parent()` message.
+// ---------------------------------------------------------------------------
+
+/// Parent+child in a search_path schema: a valid child row is accepted once the
+/// parent row exists; a dangling reference is still rejected. Covers both the
+/// explicit `REFERENCES parent(col)` and the column-less `REFERENCES parent`.
+#[test]
+fn fk_enforcement_resolves_parent_under_search_path() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute("CREATE SCHEMA fkpart9")?;
+    db.execute("SET search_path TO fkpart9")?;
+    db.execute("CREATE TABLE pk (a int PRIMARY KEY)")?;
+
+    // (1) Explicit referenced column.
+    db.execute("CREATE TABLE fk_explicit (b int REFERENCES pk(a))")?;
+    // (2) Column-less REFERENCES — must default to pk's PRIMARY KEY (a).
+    db.execute("CREATE TABLE fk_bare (b int REFERENCES pk)")?;
+
+    // With no parent row, both children reject the reference (real violation,
+    // not the empty-list false pass).
+    assert!(
+        db.execute("INSERT INTO fk_explicit (b) VALUES (1)").is_err(),
+        "FK must reject a reference to a non-existent parent row"
+    );
+    assert!(
+        db.execute("INSERT INTO fk_bare (b) VALUES (1)").is_err(),
+        "column-less FK must also reject a dangling reference"
+    );
+
+    // Insert the parent row, then both children accept the matching reference
+    // (this is the case that WRONGLY failed before the fix: the probe looked in
+    // the wrong key-space / with an empty column list).
+    db.execute("INSERT INTO pk (a) VALUES (1)")?;
+    db.execute("INSERT INTO fk_explicit (b) VALUES (1)")?;
+    db.execute("INSERT INTO fk_bare (b) VALUES (1)")?;
+    assert_eq!(one_i64(&db, "SELECT b FROM fk_explicit"), 1);
+    assert_eq!(one_i64(&db, "SELECT b FROM fk_bare"), 1);
+
+    // A non-matching reference is still rejected after the parent has rows.
+    assert!(
+        db.execute("INSERT INTO fk_explicit (b) VALUES (999)").is_err(),
+        "FK must reject a key the parent does not hold"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// FIX 3 — ALTER TABLE … SET SCHEMA, and DROP SCHEMA CASCADE marker hygiene.
+// ---------------------------------------------------------------------------
+
+/// A table (with data + a CHECK/PK) moves between schemas and is addressable at
+/// its new key; the old key is gone. Moving back to `public` yields a bare key.
+#[test]
+fn alter_table_set_schema_moves_table_between_schemas() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute("CREATE SCHEMA alter1")?;
+    db.execute("CREATE SCHEMA alter2")?;
+    db.execute("CREATE TABLE alter1.t1 (f1 int PRIMARY KEY, f2 int)")?;
+    db.execute("INSERT INTO alter1.t1 (f1, f2) VALUES (1, 11), (2, 12)")?;
+
+    // Move alter1.t1 -> alter2.t1.
+    db.execute("ALTER TABLE alter1.t1 SET SCHEMA alter2")?;
+    assert!(db.query("SELECT f1 FROM alter1.t1", &[]).is_err(), "old key gone");
+    assert_eq!(db.query("SELECT f1 FROM alter2.t1", &[])?.len(), 2, "rows moved");
+    assert_eq!(one_i64(&db, "SELECT f2 FROM alter2.t1 WHERE f1 = 1"), 11);
+
+    // Same-schema move is a no-op success.
+    db.execute("ALTER TABLE alter2.t1 SET SCHEMA alter2")?;
+    assert_eq!(db.query("SELECT f1 FROM alter2.t1", &[])?.len(), 2);
+
+    // IF EXISTS on a missing table is a silent no-op.
+    db.execute("ALTER TABLE IF EXISTS alter2.nope SET SCHEMA alter1")?;
+
+    // Move to public -> bare key.
+    db.execute("ALTER TABLE alter2.t1 SET SCHEMA public")?;
+    assert_eq!(db.query("SELECT f1 FROM t1", &[])?.len(), 2, "addressable bare in public");
+    assert!(db.query("SELECT f1 FROM alter2.t1", &[]).is_err(), "old qualified key gone");
+    Ok(())
+}
+
+/// SET SCHEMA carries the FK constraint along so enforcement still fires from
+/// the moved table's new key.
+#[test]
+fn alter_table_set_schema_preserves_fk_enforcement() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute("CREATE SCHEMA s1")?;
+    db.execute("CREATE SCHEMA s2")?;
+    db.execute("CREATE TABLE s1.parent (a int PRIMARY KEY)")?;
+    db.execute("CREATE TABLE s1.child (b int REFERENCES s1.parent(a))")?;
+    db.execute("INSERT INTO s1.parent (a) VALUES (1)")?;
+
+    db.execute("ALTER TABLE s1.child SET SCHEMA s2")?;
+    // Valid reference still accepted from the new location.
+    db.execute("INSERT INTO s2.child (b) VALUES (1)")?;
+    assert_eq!(one_i64(&db, "SELECT b FROM s2.child"), 1);
+    // Dangling reference still rejected (constraint metadata migrated).
+    assert!(
+        db.execute("INSERT INTO s2.child (b) VALUES (7)").is_err(),
+        "migrated FK must still reject a dangling reference"
+    );
+    Ok(())
+}
+
+/// DROP SCHEMA CASCADE clears the schema marker even when a member drop fails,
+/// so the schema name can be re-created. Mirrors the alter_table corpus chain
+/// where a stranded marker blocked a later `CREATE SCHEMA`.
+#[test]
+fn drop_schema_removes_marker_and_allows_recreate() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute("CREATE SCHEMA alt")?;
+    db.execute("CREATE TABLE alt.t (a int)")?;
+    db.execute("CREATE SCHEMA dst")?;
+
+    // Move the only member out, then RESTRICT-drop the now-empty schema.
+    db.execute("ALTER TABLE alt.t SET SCHEMA dst")?;
+    db.execute("DROP SCHEMA alt")?;
+
+    // The marker must be gone: re-creating the schema succeeds (no phantom
+    // "already exists").
+    db.execute("CREATE SCHEMA alt")?;
+    db.execute("CREATE TABLE alt.t2 (b int)")?;
+    db.execute("INSERT INTO alt.t2 (b) VALUES (42)")?;
+    assert_eq!(one_i64(&db, "SELECT b FROM alt.t2"), 42);
+
+    // And CASCADE on a populated schema also clears the marker + re-creatable.
+    db.execute("DROP SCHEMA alt CASCADE")?;
+    db.execute("CREATE SCHEMA alt")?;
+    assert!(
+        db.query("SELECT b FROM alt.t2", &[]).is_err(),
+        "member gone after CASCADE"
+    );
+    Ok(())
+}

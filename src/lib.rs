@@ -1087,6 +1087,7 @@ impl EmbeddedDatabase {
                 | sql::LogicalPlan::AlterTableAddColumn { .. }
                 | sql::LogicalPlan::AlterTableDropColumn { .. }
                 | sql::LogicalPlan::AlterTableRename { .. }
+                | sql::LogicalPlan::AlterTableSetSchema { .. }
                 | sql::LogicalPlan::AlterTableRenameColumn { .. }
                 | sql::LogicalPlan::AlterTableAlterColumnNullability { .. }
                 | sql::LogicalPlan::AlterTableAddForeignKey { .. }
@@ -2768,6 +2769,22 @@ impl EmbeddedDatabase {
                 column_name,
                 storage_mode,
             }
+        } else if sql::Parser::is_alter_table_set_schema(sql) {
+            // `ALTER TABLE [IF EXISTS] <name> SET SCHEMA <schema>` — sqlparser
+            // 0.53 has no such op, so pre-parse it. Resolve the source name to
+            // its storage key through the session `search_path` HERE (the same
+            // two-probe `resolve_table_ref` uses) so the executor moves the
+            // right table; the destination key is derived at execute time.
+            let (table_raw, new_schema, if_exists) = sql::Parser::parse_alter_table_set_schema(sql)?;
+            let catalog = self.storage.catalog();
+            let table_name = sql::Planner::with_catalog(&catalog)
+                .with_current_schema(self.current_schema())
+                .resolve_partition_name(&table_raw);
+            sql::LogicalPlan::AlterTableSetSchema {
+                table_name,
+                new_schema,
+                if_exists,
+            }
         } else if let Some(plan) = Self::try_parse_alter_constraint_enforcement(sql)? {
             plan
         } else if sql::Parser::is_pg_create_procedure(sql) || sql::Parser::is_pg_create_or_replace_procedure(sql) {
@@ -2872,10 +2889,11 @@ impl EmbeddedDatabase {
                 // dependency so a later `DROP TABLE parent` cascades to its
                 // partition children (PostgreSQL parity). Re-derived from the
                 // ORIGINAL SQL exactly as the planner does (`extract_partition_of`
-                // + `normalize_partition_name`), and keyed on the SAME normalized
-                // names that key the catalog — so a schema-qualified
-                // `s.parent`/`s.child` resolves to the same bare keys the tables
-                // are stored under. A plain, non-partition CREATE returns `None`
+                // + session-aware `resolve_partition_name`), and keyed on the
+                // SAME resolved names that key the catalog — so a schema-scoped
+                // `s.parent`/`s.child` resolves to the same qualified keys the
+                // tables are stored under. A plain, non-partition CREATE returns
+                // `None`
                 // here → no registry write (zero cost). This runs only after
                 // `create_table` above succeeded (the `?` short-circuits a
                 // duplicate-name / bad-DDL failure before we reach this point).
@@ -2894,7 +2912,20 @@ impl EmbeddedDatabase {
                 // children to standalone CREATEs (a restored setup does not
                 // cascade-drop; Stage 1 owns the durable partition catalog).
                 if let Some(spec) = sql::Parser::extract_partition_of(sql) {
-                    let parent = sql::Planner::normalize_partition_name(&spec.parent);
+                    // Resolve the parent through the SAME session-aware
+                    // resolution that produced the child's key `name`: a bare
+                    // `parent` under `SET search_path TO s` registers under
+                    // `s.parent` (the parent's real key), NOT the bare key.
+                    // Without this the registry keys the child under bare
+                    // `parent` while `DROP TABLE parent` resolves to `s.parent`,
+                    // finds no children, skips the cascade and orphans them
+                    // (foreign_key corpus fkpart6: the re-created child then
+                    // collides with the survivor). Reuse the planner
+                    // `resolve_table_ref` two-probe via `resolve_partition_name`
+                    // — never a second resolution reimplementation.
+                    let parent = sql::Planner::with_catalog(&catalog)
+                        .with_current_schema(self.current_schema())
+                        .resolve_partition_name(&spec.parent);
                     catalog.register_partition_child(&parent, name)?;
                 }
 
@@ -2921,6 +2952,17 @@ impl EmbeddedDatabase {
                                 // collide (see `generate_unique_name`).
                                 let existing_fk_names: Vec<String> =
                                     table_constraints.foreign_keys.iter().map(|f| f.name.clone()).collect();
+                                // `REFERENCES parent` with no column list binds to
+                                // the parent's PRIMARY KEY (PostgreSQL parity).
+                                // Default it HERE, against the already-resolved
+                                // `references_table` key, so the persisted metadata
+                                // carries the real referenced columns — enforcement
+                                // then probes the parent's PK-column index in the
+                                // right key-space instead of an empty list (which
+                                // degraded to "any parent row exists" and printed a
+                                // malformed `parent()` violation message).
+                                let references_columns =
+                                    Self::resolve_fk_referenced_columns(&catalog, references_table, references_columns);
                                 let fk = sql::ForeignKeyConstraint::new(
                                     fk_name.clone().unwrap_or_else(|| {
                                         sql::ForeignKeyConstraint::generate_unique_name(
@@ -2933,7 +2975,7 @@ impl EmbeddedDatabase {
                                     name.clone(),
                                     fk_cols.clone(),
                                     references_table.clone(),
-                                    references_columns.clone(),
+                                    references_columns,
                                 );
                                 let fk = if let Some(action) = on_delete {
                                     fk.on_delete(convert_logical_referential_action(action))
@@ -5321,6 +5363,11 @@ impl EmbeddedDatabase {
 
                 Ok(0)
             }
+            sql::LogicalPlan::AlterTableSetSchema {
+                table_name,
+                new_schema,
+                if_exists,
+            } => self.alter_table_set_schema(table_name, new_schema, *if_exists),
             sql::LogicalPlan::AlterTableAddForeignKey {
                 table_name,
                 constraint_name,
@@ -5354,12 +5401,18 @@ impl EmbeddedDatabase {
                         &existing_fk_names,
                     )
                 });
+                // `REFERENCES parent` without a column list binds to the
+                // parent's PRIMARY KEY (PostgreSQL parity); resolve it against
+                // the already-resolved `references_table` key so enforcement
+                // probes the right columns. See `resolve_fk_referenced_columns`.
+                let references_columns =
+                    Self::resolve_fk_referenced_columns(&catalog, references_table, references_columns);
                 let mut fk = sql::ForeignKeyConstraint::new(
                     fk_name,
                     table_name.clone(),
                     columns.clone(),
                     references_table.clone(),
-                    references_columns.clone(),
+                    references_columns,
                 );
                 if let Some(action) = on_delete {
                     fk = fk.on_delete(convert_logical_referential_action(action));
@@ -8901,6 +8954,77 @@ impl EmbeddedDatabase {
         }
         column.nullable = nullable;
         catalog.update_table_schema(table_name, &schema)?;
+        Ok(0)
+    }
+
+    /// `ALTER TABLE [IF EXISTS] <name> SET SCHEMA <new_schema>` — move a table
+    /// (or regular view) into another schema. Schema namespacing keys a table
+    /// as `schema.table` (bare for `public`), so a schema move is a rename of
+    /// that storage key. For a TABLE we reuse the RENAME-TABLE machinery
+    /// (`rename_table` moves data rows, schema metadata, row counter,
+    /// compression config and ART indexes atomically) and then migrate the
+    /// side records rename does not touch — constraints, IDENTITY record and
+    /// the Stage-0 partition registry — via `move_table_side_records`. For a
+    /// VIEW we move the view metadata record only.
+    ///
+    /// LIMITATION (documented): a moved view's stored body SQL is NOT rewritten,
+    /// so a view whose body references another object by its OLD schema-qualified
+    /// name (or a bare name that resolved to the old schema) may not re-resolve
+    /// after the move — Nano stores view bodies as text bound to the creator's
+    /// schema, not as PostgreSQL-style OID references. Table moves have no such
+    /// caveat.
+    fn alter_table_set_schema(&self, old_key: &str, new_schema: &str, if_exists: bool) -> Result<u64> {
+        let catalog = self.storage.catalog();
+
+        // Destination key: bare under `public`, else `<new_schema>.<table>`.
+        // The bare table component is the last dotted segment of the (possibly
+        // qualified) source key.
+        let (_old_schema, bare) = sql::Planner::split_schema_key(old_key);
+        let new_key = if new_schema == "public" {
+            bare
+        } else {
+            format!("{new_schema}.{bare}")
+        };
+
+        // `SET SCHEMA <current schema>` is a no-op success (PostgreSQL parity).
+        if new_key == old_key {
+            return Ok(0);
+        }
+
+        let is_table = catalog.get_table_schema(old_key).is_ok();
+        let is_view = !is_table && self.storage.view_catalog().view_exists(old_key)?;
+        if !is_table && !is_view {
+            if if_exists {
+                return Ok(0);
+            }
+            return Err(Error::query_execution(format!("relation \"{old_key}\" does not exist")));
+        }
+
+        // The destination name must be free (a table OR a view).
+        if catalog.get_table_schema(&new_key).is_ok() || self.storage.view_catalog().view_exists(&new_key)? {
+            return Err(Error::query_execution(format!("relation \"{new_key}\" already exists")));
+        }
+
+        if is_table {
+            // Data + schema + counter + compression + ART indexes.
+            self.storage.rename_table(old_key, &new_key)?;
+            // Constraints + IDENTITY + partition registry (rename skips these).
+            catalog.move_table_side_records(old_key, &new_key)?;
+        } else {
+            // Regular view: move the metadata record; rebind its creator schema
+            // to the destination so a bare reference in the body binds there.
+            let mut metadata = self.storage.view_catalog().get_view(old_key)?;
+            metadata.view_name = new_key.clone();
+            metadata.creator_schema = if new_schema == "public" {
+                None
+            } else {
+                Some(new_schema.to_string())
+            };
+            self.storage.view_catalog().create_view(metadata, false, false)?;
+            self.storage.view_catalog().drop_view(old_key, false)?;
+        }
+
+        tracing::info!("Moved relation '{}' to schema '{}' (key '{}')", old_key, new_schema, new_key);
         Ok(0)
     }
 
@@ -17438,6 +17562,28 @@ impl EmbeddedDatabase {
             deferred_fk_checks: self.deferred_fk_checks.clone(),
             cold_optimizer: self.cold_optimizer.clone(),
         }
+    }
+
+    /// Effective referenced-column list for a foreign key. If the
+    /// `REFERENCES parent (cols…)` clause listed columns, they are used
+    /// verbatim; an OMITTED list (`REFERENCES parent`) binds to the parent's
+    /// PRIMARY KEY (PostgreSQL parity). `references_table` MUST already be the
+    /// resolved storage key (schema-qualified when non-`public`) so the PK
+    /// lookup hits the real parent — a bare/unresolved name under an active
+    /// `search_path` would find no PK and leave the list empty, which both
+    /// prints a malformed `parent()` violation message and makes enforcement
+    /// degrade to "does the parent have ANY row" instead of the keyed probe.
+    /// A parent without a PRIMARY KEY yields an empty list (unchanged
+    /// behavior); the FK is recorded but the keyed fast path stays off.
+    fn resolve_fk_referenced_columns(
+        catalog: &storage::Catalog<'_>,
+        references_table: &str,
+        referenced_columns: &[String],
+    ) -> Vec<String> {
+        if !referenced_columns.is_empty() {
+            return referenced_columns.to_vec();
+        }
+        catalog.primary_key_columns(references_table).unwrap_or_default()
     }
 
     /// Check if a foreign key reference exists in the referenced table
