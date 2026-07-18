@@ -17628,6 +17628,7 @@ impl EmbeddedDatabase {
             config: self.config.clone(),
             current_transaction: self.current_transaction.clone(),
             global_txn_active: self.global_txn_active.clone(),
+            constraints_all_deferred: self.constraints_all_deferred.clone(),
             tenant_manager: self.tenant_manager.clone(),
             trigger_registry: self.trigger_registry.clone(),
             function_registry: self.function_registry.clone(),
