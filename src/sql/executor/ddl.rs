@@ -503,48 +503,76 @@ pub(super) fn handle_create_index(executor: &Executor, plan: &LogicalPlan) -> Re
     }
 }
 
-/// Handle DROP TABLE logical plan node
+/// Handle DROP TABLE logical plan node.
+///
+/// Round-3 PARTITION BY Stage-0: `DROP TABLE parent` also drops every table
+/// recorded as one of its Stage-0 `PARTITION OF` children (PostgreSQL parity),
+/// recursively — a child may itself be a sub-partitioned parent. The cascade
+/// reuses the ordinary `Catalog::drop_table` funnel for EVERY table (so ART
+/// indexes, statistics cache, schema cache, columnar sidecars and the WAL
+/// DropTable log are cleaned identically for parent and children), and is a
+/// no-op (one point get on the registry) for a table with no partition links.
 pub(super) fn handle_drop_table(
     executor: &Executor,
     table_name: &str,
     if_exists: bool,
 ) -> Result<Box<dyn PhysicalOperator>> {
     if let Some(storage) = executor.storage() {
-        let catalog = storage.catalog();
-
-        // Check if table exists
-        match catalog.get_table_schema(table_name) {
-            Ok(_) => {
-                // Table exists - drop it
-                catalog.drop_table(table_name)?;
-                // KanttBan #23 (v3.31.1 phase 2): clean up the
-                // identity side-table record. Best-effort; missing
-                // record is fine.
-                let _ = catalog.drop_identity_columns(table_name);
-            }
-            Err(_) => {
-                // Table doesn't exist
-                if !if_exists {
-                    return Err(Error::query_execution(format!("Table '{}' does not exist", table_name)));
-                }
-                // If IF EXISTS, silently succeed
-            }
-        }
-
+        drop_table_and_partition_children(storage, table_name, if_exists)?;
         // Return empty result set for DDL
-        Ok(Box::new(
-            ScanOperator::new(
-                "".to_string(),
-                Arc::new(crate::Schema { columns: vec![] }),
-                None,
-                vec![],
-                vec![],
-            )
-            .with_timeout(executor.timeout_ctx()),
-        ))
+        Ok(empty_ddl_result(executor))
     } else {
         Err(Error::query_execution("No storage engine available"))
     }
+}
+
+/// Drop `table_name` and, recursively, its registered Stage-0 partition
+/// children. `if_exists` governs only the top-level target; the cascade drops
+/// children with IF-EXISTS semantics (a child dropped directly earlier is
+/// simply absent). Every table is removed via the same `Catalog::drop_table`
+/// funnel a plain DROP uses.
+///
+/// NON-ATOMIC (review-pinned): a mid-cascade child-drop failure leaves the
+/// parent and earlier children dropped and the failing child alive with a
+/// dangling `meta:partparent:` record pointing at the gone parent. That record
+/// self-heals on the child's next direct drop and cannot mis-drop anything
+/// (cascade reads only the parent's forward list, which is consumed up front)
+/// — matching the engine's non-transactional DDL semantics generally.
+fn drop_table_and_partition_children(
+    storage: &crate::storage::StorageEngine,
+    table_name: &str,
+    if_exists: bool,
+) -> Result<()> {
+    let catalog = storage.catalog();
+
+    // Resolve existence first so error semantics match a plain DROP exactly.
+    if catalog.get_table_schema(table_name).is_err() {
+        if !if_exists {
+            return Err(Error::query_execution(format!("Table '{}' does not exist", table_name)));
+        }
+        // IF EXISTS on a missing table: nothing to drop or cascade. A missing
+        // table cannot carry live registry links in normal operation.
+        return Ok(());
+    }
+
+    // Drop this table via the ordinary funnel FIRST, so a drop failure leaves
+    // the registry untouched.
+    catalog.drop_table(table_name)?;
+    // KanttBan #23 (v3.31.1 phase 2): clean up the identity side-table record.
+    // Best-effort; a missing record is fine.
+    let _ = catalog.drop_identity_columns(table_name);
+
+    // Registry bookkeeping: detach this table from its own parent (if it is
+    // itself a partition child) and take the list of children registered under
+    // it. Empty for a non-partition table → no cascade.
+    let children = catalog.take_partition_children_on_drop(table_name)?;
+
+    // Cascade to partition children (dependents). Each recursion repeats the
+    // same funnel + registry cleanup, so sub-partitioned children unwind fully.
+    for child in children {
+        drop_table_and_partition_children(storage, &child, true)?;
+    }
+    Ok(())
 }
 
 /// Handle TRUNCATE logical plan node

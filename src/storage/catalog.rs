@@ -1368,6 +1368,103 @@ impl<'a> Catalog<'a> {
     }
 
     // -------------------------------------------------------------------
+    // Round-3 PARTITION BY Stage-0 — parent→child dependency registry.
+    //
+    // Stage-0 flattens `CREATE TABLE child PARTITION OF parent …` into an
+    // independent standalone `child` table, but PostgreSQL makes a partition a
+    // *dependent* of its parent: `DROP TABLE parent` drops every partition. To
+    // honor that under the flatten, we record the (parent → child) link here so
+    // the executor's DROP path can cascade. Two disjoint key families, mirroring
+    // the IDENTITY side-record above (durable catalog KV, so the registry
+    // survives a process restart on the same data dir — the same guarantee the
+    // schema/identity/enum side-records give; it is NOT separately WAL-shipped
+    // to standbys, which is Stage-1's durable-partition-catalog scope):
+    //   meta:partchild:<parent>  -> bincode Vec<String> (the parent's children)
+    //   meta:partparent:<child>  -> bincode String      (that child's parent)
+    // The forward record answers "does this table have children?" in one point
+    // get, so an ordinary DROP of a non-partition table stays O(1) and cheap.
+    // The reverse record lets a *direct* child DROP detach itself from its
+    // parent's list (PG parity: dropping a partition directly is allowed and
+    // unregisters it, so a later parent DROP never touches a re-created name).
+    //
+    // Names are keyed EXACTLY as they arrive — already collapsed to the bare,
+    // case-folded catalog key by `Planner::normalize_object_name` /
+    // `normalize_partition_name`, the same normalization `table_metadata_key`
+    // relies on — so a schema-qualified `stats_import.part_parent` and a later
+    // bare `part_parent` resolve to the identical registry key. No extra
+    // lowercasing here (unlike `identity_key`) precisely so the key derived from
+    // a name matches that name's `meta:table:` key byte-for-byte.
+    // -------------------------------------------------------------------
+
+    fn partition_children_key(parent: &str) -> Vec<u8> {
+        format!("meta:partchild:{}", parent).into_bytes()
+    }
+
+    fn partition_parent_key(child: &str) -> Vec<u8> {
+        format!("meta:partparent:{}", child).into_bytes()
+    }
+
+    /// Record a Stage-0 `PARTITION OF` dependency: `child` is a partition of
+    /// `parent`. Appends `child` (deduplicated) to the parent's child list and
+    /// stores the reverse `child → parent` link. Both names must already be
+    /// normalized (bare catalog keys). Idempotent for a repeated (parent, child).
+    pub fn register_partition_child(&self, parent: &str, child: &str) -> Result<()> {
+        let mut children = self.partition_children(parent)?;
+        if !children.iter().any(|c| c == child) {
+            children.push(child.to_string());
+            let value = bincode::serialize(&children)
+                .map_err(|e| Error::query_execution(format!("partition-child serialize: {e}")))?;
+            self.storage.put(&Self::partition_children_key(parent), &value)?;
+        }
+        let pv = bincode::serialize(parent)
+            .map_err(|e| Error::query_execution(format!("partition-parent serialize: {e}")))?;
+        self.storage.put(&Self::partition_parent_key(child), &pv)?;
+        Ok(())
+    }
+
+    /// The partition children registered under `parent`. Empty when the table
+    /// has no registered partitions (the common, zero-cost case).
+    pub fn partition_children(&self, parent: &str) -> Result<Vec<String>> {
+        match self.storage.get(&Self::partition_children_key(parent))? {
+            Some(bytes) => bincode::deserialize(&bytes)
+                .map_err(|e| Error::query_execution(format!("partition-child deserialize: {e}"))),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Called from the DROP TABLE path for `table`. Performs the registry
+    /// bookkeeping and returns the children that were registered under `table`
+    /// so the caller can cascade the drop to them. Specifically:
+    ///  1. If `table` is itself a registered partition child, detaches it from
+    ///     its parent's child list and deletes its reverse link (so a re-created
+    ///     name is never cascade-dropped by a later parent DROP).
+    ///  2. Removes `table`'s own child-list record and returns its children.
+    /// Idempotent; returns an empty Vec for a table with no partition links.
+    pub fn take_partition_children_on_drop(&self, table: &str) -> Result<Vec<String>> {
+        // (1) detach from parent, if any.
+        if let Some(bytes) = self.storage.get(&Self::partition_parent_key(table))? {
+            let parent: String = bincode::deserialize(&bytes)
+                .map_err(|e| Error::query_execution(format!("partition-parent deserialize: {e}")))?;
+            let mut siblings = self.partition_children(&parent)?;
+            siblings.retain(|c| c != table);
+            if siblings.is_empty() {
+                self.storage.delete(&Self::partition_children_key(&parent))?;
+            } else {
+                let value = bincode::serialize(&siblings)
+                    .map_err(|e| Error::query_execution(format!("partition-child serialize: {e}")))?;
+                self.storage.put(&Self::partition_children_key(&parent), &value)?;
+            }
+            self.storage.delete(&Self::partition_parent_key(table))?;
+        }
+        // (2) take + clear this table's own child list.
+        let children = self.partition_children(table)?;
+        if !children.is_empty() {
+            self.storage.delete(&Self::partition_children_key(table))?;
+        }
+        Ok(children)
+    }
+
+    // -------------------------------------------------------------------
     // v3.60.0 — durable + scalable SEQUENCES.
     //
     // Two records per sequence so the hot, explicitly-fsynced record stays

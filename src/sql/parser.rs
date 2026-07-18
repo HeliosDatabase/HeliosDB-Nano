@@ -10,6 +10,29 @@ pub struct Parser {
     dialect: PostgreSqlDialect,
 }
 
+/// Stage-0 partitioning: the pre-parse-captured shape of a
+/// `CREATE TABLE child PARTITION OF parent { FOR VALUES … | DEFAULT } …`
+/// child-table declaration. sqlparser 0.53 has no `PARTITION OF` grammar, so
+/// the statement is rewritten to a plain `CREATE TABLE child ()`
+/// ([`Parser::preprocess_partition_of`]) and this spec threads the parent
+/// reference to the planner (the first layer with catalog access), which
+/// clones the parent's columns onto the child.
+///
+/// `child` / `parent` are the raw name substrings exactly as written (possibly
+/// schema-qualified / quoted); `bound` is the verbatim bound text
+/// (`FOR VALUES …` or `DEFAULT`) — recorded, never interpreted, at Stage 0.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PartitionOfSpec {
+    /// `IF NOT EXISTS` was present on the child `CREATE TABLE`.
+    pub if_not_exists: bool,
+    /// Raw child table name (possibly schema-qualified / quoted).
+    pub child: String,
+    /// Raw parent table name (possibly schema-qualified / quoted).
+    pub parent: String,
+    /// Verbatim bound text (`FOR VALUES …` or `DEFAULT`), stored not interpreted.
+    pub bound: String,
+}
+
 impl Parser {
     /// Create a new parser
     pub fn new() -> Self {
@@ -288,8 +311,24 @@ impl Parser {
         // its own explicitly-listed columns, the pragmatic compatibility win.
         processed_sql = Self::preprocess_strip_inherits(&processed_sql);
 
-        let mut statements = SqlParser::parse_sql(&self.dialect, &processed_sql)
-            .map_err(|e| Error::sql_parse(format!("Failed to parse SQL: {}", e)))?;
+        // Attempt the normal parse first. Only if it fails do we apply the
+        // Stage-0 partitioning rewrites (strip a parent `PARTITION BY …` clause,
+        // rewrite a child `PARTITION OF …` to an empty-column CREATE), so
+        // currently-passing SQL is byte-identically untouched — the
+        // strictly-additive guarantee: the rewrite fires ONLY on SQL that fails
+        // to parse today. A rewrite that still won't parse reports the ORIGINAL
+        // diagnostic, never a masked one.
+        let mut statements = match SqlParser::parse_sql(&self.dialect, &processed_sql) {
+            Ok(statements) => statements,
+            Err(orig_err) => {
+                let orig_msg = format!("Failed to parse SQL: {}", orig_err);
+                match Self::rewrite_partition_syntax(&processed_sql) {
+                    Some(rewritten) => SqlParser::parse_sql(&self.dialect, &rewritten)
+                        .map_err(|_| Error::sql_parse(orig_msg))?,
+                    None => return Err(Error::sql_parse(orig_msg)),
+                }
+            }
+        };
 
         // If we extracted an index type from USING clause, inject it into the CreateIndex statement
         if let Some(index_type) = index_type_override {
@@ -555,6 +594,76 @@ impl Parser {
         let trimmed = sql.trim();
         crate::starts_with_icase(trimmed, "CREATE DOMAIN ")
             || crate::starts_with_icase(trimmed, "DROP DOMAIN ")
+    }
+
+    /// Round-3 pgrust-corpus compat (~341 ATTACH + ~78 DETACH + ~46 ALTER INDEX
+    /// ATTACH corpus statements): PostgreSQL
+    /// `ALTER TABLE … ATTACH PARTITION child { FOR VALUES … | DEFAULT }`,
+    /// `ALTER TABLE … DETACH PARTITION child [CONCURRENTLY | FINALIZE]`, and
+    /// `ALTER INDEX … ATTACH PARTITION idx`. sqlparser 0.53 gates ATTACH/DETACH
+    /// PARTITION to the ClickHouse/Generic dialects, so under `PostgreSqlDialect`
+    /// every form fails at the parse stage before the planner. Accepted as a
+    /// pre-parse no-op at Stage 0 — the child already exists as an independent
+    /// table, and real catalog attach/detach + overlap validation is Stage 2 —
+    /// the same parse-and-accept precedent as CREATE DOMAIN / VACUUM.
+    ///
+    /// A cheap `ALTER TABLE` / `ALTER INDEX` prefix gate runs first (no work on
+    /// the hot SELECT/INSERT path); the `{ATTACH|DETACH} PARTITION` phrase scan
+    /// only runs on the rare ALTER path.
+    pub fn is_partition_attach_detach_statement(sql: &str) -> bool {
+        let trimmed = sql.trim();
+        if !(crate::starts_with_icase(trimmed, "ALTER TABLE")
+            || crate::starts_with_icase(trimmed, "ALTER INDEX"))
+        {
+            return false;
+        }
+        Self::contains_kw_phrase(trimmed, b"ATTACH PARTITION")
+            || Self::contains_kw_phrase(trimmed, b"DETACH PARTITION")
+    }
+
+    /// Allocation-free case-insensitive search for a two-word keyword phrase
+    /// (`WORD1 WORD2`, single space in `phrase`), tolerating one-or-more
+    /// whitespace between the words and requiring word boundaries on both ends.
+    /// Quote-aware: `'`/`"` spans are skipped, so a currently-passing ALTER
+    /// carrying the phrase inside a string literal or quoted identifier (e.g.
+    /// `ADD COLUMN c int DEFAULT 'attach partition'`) is never mis-detected as
+    /// a no-op — the strict-additive safety invariant.
+    #[allow(clippy::indexing_slicing)] // Byte cursor bounded by `while i < n` + explicit `i + w1.len() <= n` check.
+    fn contains_kw_phrase(sql: &str, phrase: &[u8]) -> bool {
+        let sp = match phrase.iter().position(|&b| b == b' ') {
+            Some(p) => p,
+            None => return false,
+        };
+        let (w1, w2) = (&phrase[..sp], &phrase[sp + 1..]);
+        let bytes = sql.as_bytes();
+        let n = bytes.len();
+        let mut i = 0usize;
+        while i < n {
+            if bytes[i] == b'\'' || bytes[i] == b'"' {
+                i = Self::skip_quoted_span(bytes, i);
+                continue;
+            }
+            if i + w1.len() <= n
+                && bytes[i..i + w1.len()].eq_ignore_ascii_case(w1)
+                && (i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_'))
+            {
+                let mut j = i + w1.len();
+                let ws0 = j;
+                while j < n && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if j > ws0
+                    && j + w2.len() <= n
+                    && bytes[j..j + w2.len()].eq_ignore_ascii_case(w2)
+                    && (j + w2.len() >= n
+                        || !(bytes[j + w2.len()].is_ascii_alphanumeric() || bytes[j + w2.len()] == b'_'))
+                {
+                    return true;
+                }
+            }
+            i += 1;
+        }
+        false
     }
 
     /// Check if SQL is a REFRESH MATERIALIZED VIEW statement
@@ -2220,6 +2329,356 @@ impl Parser {
         sql.to_string()
     }
 
+    /// Stage-0 partitioning fallback (invoked by [`Parser::parse`] ONLY after
+    /// the normal parse fails): apply the child `PARTITION OF` rewrite then the
+    /// parent `PARTITION BY` strip. Returns `Some` only when something changed,
+    /// so a non-partition parse error is reported unchanged and currently-
+    /// passing SQL is never rewritten.
+    fn rewrite_partition_syntax(sql: &str) -> Option<String> {
+        let after_of = Self::preprocess_partition_of(sql);
+        let rewritten = Self::preprocess_strip_partition_by(&after_of);
+        if rewritten != sql {
+            Some(rewritten)
+        } else {
+            None
+        }
+    }
+
+    /// Stage-0 partitioning: rewrite a child
+    /// `CREATE TABLE [IF NOT EXISTS] [schema.]child PARTITION OF …` declaration
+    /// into a plain empty-column `CREATE TABLE [IF NOT EXISTS] [schema.]child ()`
+    /// that sqlparser 0.53 accepts (0.53 has no `PARTITION OF` grammar, so the
+    /// original fails as "Expected: end of statement, found: PARTITION"). This
+    /// only makes the statement parse; the parent-column clone happens later in
+    /// the planner (the first layer with catalog access) keyed off
+    /// [`Parser::extract_partition_of`] of the original SQL. Non-`PARTITION OF`
+    /// SQL is returned unchanged.
+    pub fn preprocess_partition_of(sql: &str) -> String {
+        match Self::extract_partition_of(sql) {
+            Some(spec) => {
+                let ine = if spec.if_not_exists { "IF NOT EXISTS " } else { "" };
+                let semi = if sql.trim_end().ends_with(';') { ";" } else { "" };
+                format!("CREATE TABLE {ine}{child} (){semi}", child = spec.child)
+            }
+            None => sql.to_string(),
+        }
+    }
+
+    /// Stage-0 partitioning: match `CREATE TABLE [IF NOT EXISTS]
+    /// [schema.]child PARTITION OF [schema.]parent { FOR VALUES … | DEFAULT }
+    /// [PARTITION BY …] [WITH (…)] [TABLESPACE …]` and capture the
+    /// `(child, parent, bound)` reference. Returns `None` for any statement that
+    /// is not a `CREATE TABLE … PARTITION OF …` child declaration — in
+    /// particular a plain `CREATE TABLE t ()` or `CREATE TABLE t () INHERITS
+    /// (…)` (no `PARTITION OF`) yields `None`, so the planner's empty-column
+    /// disambiguation holds. Whitespace/newline tolerant, case-insensitive,
+    /// quote-aware for the name tokens. Only plain `CREATE TABLE` is matched
+    /// (not `TEMP`/`UNLOGGED`), the same deliberate scope as the sibling
+    /// `preprocess_strip_inherits`.
+    pub(crate) fn extract_partition_of(sql: &str) -> Option<PartitionOfSpec> {
+        let trimmed = sql.trim().trim_end_matches(';').trim();
+        let after_create = Self::strip_kw(trimmed, "CREATE")?;
+        let after_table = Self::strip_kw(after_create, "TABLE")?;
+        let (after_head, if_not_exists) = match Self::strip_kw(after_table, "IF") {
+            Some(rest) => {
+                let rest = Self::strip_kw(rest, "NOT")?;
+                let rest = Self::strip_kw(rest, "EXISTS")?;
+                (rest, true)
+            }
+            None => (after_table, false),
+        };
+        let (child, after_child) = Self::read_object_name(after_head)?;
+        let after_partition = Self::strip_kw(after_child, "PARTITION")?;
+        let after_of = Self::strip_kw(after_partition, "OF")?;
+        let (parent, after_parent) = Self::read_object_name(after_of)?;
+        let bound_full = after_parent.trim();
+        // A genuine child clause continues with FOR VALUES / DEFAULT; this guard
+        // keeps a stray `PARTITION OF` in some other construct from mis-firing.
+        if !(Self::starts_kw(bound_full, "FOR") || Self::starts_kw(bound_full, "DEFAULT")) {
+            return None;
+        }
+        Some(PartitionOfSpec {
+            if_not_exists,
+            child,
+            parent,
+            bound: Self::trim_partition_of_bound(bound_full),
+        })
+    }
+
+    /// Stage-0 partitioning: strip a parent `PARTITION BY RANGE|LIST|HASH (…)`
+    /// clause (whole clause, balanced parens) off a `CREATE TABLE` so sqlparser
+    /// 0.53 can parse the parent. 0.53 already accepts a single-column key
+    /// (`PARTITION BY RANGE (a)`) but rejects multi-column / expression /
+    /// opclass keys (`RANGE (a, (b+0))`, `HASH (a part_test_int4_ops)`);
+    /// stripping the whole clause uniformly accepts them all, flattening the
+    /// parent to a plain empty table (Stage-0: the parent holds no rows).
+    /// Anything after the clause (`WITH (…)`, `TABLESPACE …`, `;`) is preserved.
+    ///
+    /// The scan matches only a `PARTITION BY {RANGE|LIST|HASH} (` at **paren
+    /// depth 0** inside a `CREATE TABLE`, which excludes window
+    /// `OVER (PARTITION BY …)` (always inside `OVER`'s parens, depth ≥ 1) even
+    /// within a `CREATE TABLE … AS SELECT …`. Quote-aware, case-insensitive,
+    /// whitespace/newline tolerant. Because [`Parser::parse`] only calls this on
+    /// the post-failure fallback path, a single-column parent that already
+    /// parses is never touched.
+    // Byte-scanner idiom (bounds guarded by `while i < n` + explicit
+    // `i + k <= n` checks), matching the sibling `preprocess_strip_inherits`.
+    #[allow(clippy::indexing_slicing)]
+    pub fn preprocess_strip_partition_by(sql: &str) -> String {
+        if !crate::starts_with_icase(sql.trim_start(), "CREATE TABLE") {
+            return sql.to_string();
+        }
+        // Cheap keyword pre-check before any byte walk.
+        if !sql.to_ascii_uppercase().contains("PARTITION") {
+            return sql.to_string();
+        }
+        let bytes = sql.as_bytes();
+        let n = bytes.len();
+        let mut i = 0usize;
+        let mut depth = 0i32;
+        while i < n {
+            let c = bytes[i];
+            if c == b'\'' || c == b'"' {
+                i = Self::skip_quoted_span(bytes, i);
+                continue;
+            }
+            if c == b'(' {
+                depth += 1;
+                i += 1;
+                continue;
+            }
+            if c == b')' {
+                depth -= 1;
+                i += 1;
+                continue;
+            }
+            // `PARTITION` at depth 0 with a left word boundary.
+            if depth == 0
+                && (c == b'P' || c == b'p')
+                && i + 9 <= n
+                && bytes[i..i + 9].eq_ignore_ascii_case(b"PARTITION")
+                && (i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_'))
+            {
+                // … whitespace … BY … whitespace … {RANGE|LIST|HASH} … '('
+                let mut j = i + 9;
+                let ws0 = j;
+                while j < n && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if j > ws0
+                    && j + 2 <= n
+                    && bytes[j..j + 2].eq_ignore_ascii_case(b"BY")
+                    && (j + 2 >= n || !(bytes[j + 2].is_ascii_alphanumeric() || bytes[j + 2] == b'_'))
+                {
+                    let mut k = j + 2;
+                    while k < n && bytes[k].is_ascii_whitespace() {
+                        k += 1;
+                    }
+                    let strat_start = k;
+                    while k < n && (bytes[k].is_ascii_alphanumeric() || bytes[k] == b'_') {
+                        k += 1;
+                    }
+                    let is_strategy = {
+                        let s = &sql[strat_start..k];
+                        s.eq_ignore_ascii_case("RANGE")
+                            || s.eq_ignore_ascii_case("LIST")
+                            || s.eq_ignore_ascii_case("HASH")
+                    };
+                    if is_strategy {
+                        let mut m = k;
+                        while m < n && bytes[m].is_ascii_whitespace() {
+                            m += 1;
+                        }
+                        if m < n && bytes[m] == b'(' {
+                            if let Some(close) = Self::matching_paren_bytes(bytes, m) {
+                                // Also drop the whitespace run before PARTITION.
+                                let mut left = i;
+                                while left > 0 && bytes[left - 1].is_ascii_whitespace() {
+                                    left -= 1;
+                                }
+                                let mut out = String::with_capacity(n);
+                                out.push_str(&sql[..left]);
+                                out.push_str(&sql[close + 1..]);
+                                return out;
+                            }
+                        }
+                    }
+                }
+            }
+            i += 1;
+        }
+        sql.to_string()
+    }
+
+    /// Strip a leading ASCII keyword `kw` (case-insensitive) from `s` (after
+    /// leading whitespace), requiring a right word boundary, and return the
+    /// remainder with leading whitespace trimmed. `None` if `s` does not start
+    /// with the whole keyword as a distinct token.
+    #[allow(clippy::indexing_slicing)] // kw is ASCII and `starts_with_icase` proved `s` starts with it.
+    fn strip_kw<'a>(s: &'a str, kw: &str) -> Option<&'a str> {
+        let s = s.trim_start();
+        if !crate::starts_with_icase(s, kw) {
+            return None;
+        }
+        let rest = &s[kw.len()..];
+        if let Some(c) = rest.chars().next() {
+            if c.is_alphanumeric() || c == '_' {
+                return None;
+            }
+        }
+        Some(rest.trim_start())
+    }
+
+    /// `starts_with_icase` plus a right word boundary — tests a clause's leading
+    /// keyword without consuming it.
+    #[allow(clippy::indexing_slicing)] // kw is ASCII and `starts_with_icase` proved `s` starts with it.
+    fn starts_kw(s: &str, kw: &str) -> bool {
+        let s = s.trim_start();
+        if !crate::starts_with_icase(s, kw) {
+            return false;
+        }
+        match s[kw.len()..].chars().next() {
+            Some(c) => !(c.is_alphanumeric() || c == '_'),
+            None => true,
+        }
+    }
+
+    /// Read one object-name token from the front of `s` (after leading
+    /// whitespace): a possibly schema-qualified, possibly double-quoted
+    /// identifier, terminated by ASCII whitespace at quote depth 0. Returns the
+    /// raw token (verbatim, quotes preserved) and the remaining slice.
+    #[allow(clippy::indexing_slicing)] // Byte cursor bounded by `while i < n`; slices are on ASCII boundaries.
+    fn read_object_name(s: &str) -> Option<(String, &str)> {
+        let s = s.trim_start();
+        let bytes = s.as_bytes();
+        let n = bytes.len();
+        if n == 0 {
+            return None;
+        }
+        let mut i = 0usize;
+        let mut in_quote = false;
+        while i < n {
+            let c = bytes[i];
+            if c == b'"' {
+                if in_quote {
+                    // Doubled "" is an embedded quote — stay inside.
+                    if i + 1 < n && bytes[i + 1] == b'"' {
+                        i += 2;
+                        continue;
+                    }
+                    in_quote = false;
+                } else {
+                    in_quote = true;
+                }
+                i += 1;
+                continue;
+            }
+            if !in_quote && c.is_ascii_whitespace() {
+                break;
+            }
+            i += 1;
+        }
+        if i == 0 {
+            return None;
+        }
+        Some((s[..i].to_string(), &s[i..]))
+    }
+
+    /// Trim a trailing sub-partition / storage tail (`PARTITION BY …`,
+    /// `TABLESPACE …`) off a captured bound clause, leaving the `FOR VALUES …`
+    /// / `DEFAULT` text (which may itself contain a `WITH (MODULUS …,
+    /// REMAINDER …)` HASH bound — so `WITH` is deliberately NOT a cut point).
+    /// Scans at paren depth 0, outside quotes. The result is recorded verbatim
+    /// and never interpreted at Stage 0.
+    #[allow(clippy::indexing_slicing)] // Byte cursor bounded by `while i < n`; slices are on ASCII boundaries.
+    fn trim_partition_of_bound(bound: &str) -> String {
+        let bytes = bound.as_bytes();
+        let n = bytes.len();
+        let mut i = 0usize;
+        let mut depth = 0i32;
+        while i < n {
+            let c = bytes[i];
+            if c == b'\'' || c == b'"' {
+                i = Self::skip_quoted_span(bytes, i);
+                continue;
+            }
+            if c == b'(' {
+                depth += 1;
+                i += 1;
+                continue;
+            }
+            if c == b')' {
+                depth -= 1;
+                i += 1;
+                continue;
+            }
+            if depth == 0 && c.is_ascii_whitespace() {
+                let mut ws_end = i;
+                while ws_end < n && bytes[ws_end].is_ascii_whitespace() {
+                    ws_end += 1;
+                }
+                let rest = &bound[ws_end..];
+                if Self::starts_kw(rest, "PARTITION") || Self::starts_kw(rest, "TABLESPACE") {
+                    return bound[..i].trim_end().to_string();
+                }
+                i = ws_end;
+                continue;
+            }
+            i += 1;
+        }
+        bound.trim_end().to_string()
+    }
+
+    /// If `bytes[i]` opens a `'`/`"` quoted span, return the index just past its
+    /// closing quote (a doubled quote is an escape); otherwise return `i`.
+    #[allow(clippy::indexing_slicing)] // Byte cursor bounded by `while k < n`; `i` is a valid caller index.
+    fn skip_quoted_span(bytes: &[u8], i: usize) -> usize {
+        let n = bytes.len();
+        let q = bytes[i];
+        if q != b'\'' && q != b'"' {
+            return i;
+        }
+        let mut k = i + 1;
+        while k < n {
+            if bytes[k] == q {
+                k += 1;
+                if k < n && bytes[k] == q {
+                    k += 1;
+                    continue;
+                }
+                return k;
+            }
+            k += 1;
+        }
+        k
+    }
+
+    /// Index of the `)` matching the `(` at `open`, honoring quoted spans.
+    /// `None` if unbalanced.
+    #[allow(clippy::indexing_slicing)] // Byte cursor bounded by `while i < n`.
+    fn matching_paren_bytes(bytes: &[u8], open: usize) -> Option<usize> {
+        let n = bytes.len();
+        let mut depth = 0i32;
+        let mut i = open;
+        while i < n {
+            let c = bytes[i];
+            if c == b'\'' || c == b'"' {
+                i = Self::skip_quoted_span(bytes, i);
+                continue;
+            }
+            if c == b'(' {
+                depth += 1;
+            } else if c == b')' {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            i += 1;
+        }
+        None
+    }
+
     /// Convert DECIMAL type to NUMERIC for sqlparser compatibility
     ///
     /// Converts: DECIMAL, DECIMAL(p), DECIMAL(p,s) → NUMERIC, NUMERIC(p), NUMERIC(p,s)
@@ -2805,6 +3264,246 @@ mod tests {
         let parser = Parser::new();
         let result = parser.parse_one("SELECT FROM");
         assert!(result.is_err());
+    }
+
+    // Stage-0 PARTITION BY / PARTITION OF / ATTACH-DETACH pre-parse rewrites.
+    mod partition_stage0 {
+        use super::*;
+
+        // ---- preprocess_strip_partition_by (parent, whole-clause strip) ----
+
+        #[test]
+        fn strips_single_column_range_key() {
+            assert_eq!(
+                Parser::preprocess_strip_partition_by("CREATE TABLE t (a int) PARTITION BY RANGE (a)"),
+                "CREATE TABLE t (a int)"
+            );
+        }
+
+        #[test]
+        fn strips_multi_column_and_expression_keys() {
+            assert_eq!(
+                Parser::preprocess_strip_partition_by("CREATE TABLE t (a int, b int) PARTITION BY RANGE (a, b)"),
+                "CREATE TABLE t (a int, b int)"
+            );
+            // Nested/expression key must balance correctly.
+            assert_eq!(
+                Parser::preprocess_strip_partition_by("CREATE TABLE t (a int, b int) PARTITION BY RANGE (a, (b+0))"),
+                "CREATE TABLE t (a int, b int)"
+            );
+            assert_eq!(
+                Parser::preprocess_strip_partition_by("CREATE TABLE t (a text) PARTITION BY LIST (lower(a))"),
+                "CREATE TABLE t (a text)"
+            );
+        }
+
+        #[test]
+        fn strips_opclass_token_in_hash_key() {
+            assert_eq!(
+                Parser::preprocess_strip_partition_by("CREATE TABLE t (a int) PARTITION BY HASH (a part_test_int4_ops)"),
+                "CREATE TABLE t (a int)"
+            );
+        }
+
+        #[test]
+        fn preserves_trailing_with_and_tablespace_and_semicolon() {
+            assert_eq!(
+                Parser::preprocess_strip_partition_by(
+                    "CREATE TABLE t (a int) PARTITION BY LIST (a) WITH (fillfactor = 70);"
+                ),
+                "CREATE TABLE t (a int) WITH (fillfactor = 70);"
+            );
+            assert_eq!(
+                Parser::preprocess_strip_partition_by("CREATE TABLE t (a int) PARTITION BY RANGE (a) TABLESPACE ts1"),
+                "CREATE TABLE t (a int) TABLESPACE ts1"
+            );
+        }
+
+        #[test]
+        fn tolerates_newlines_and_case() {
+            assert_eq!(
+                Parser::preprocess_strip_partition_by("create table t (a int)\n  partition by range (a)"),
+                "create table t (a int)"
+            );
+        }
+
+        #[test]
+        fn does_not_touch_window_over_partition_by_in_ctas() {
+            // The window PARTITION BY lives inside OVER(...) at paren depth ≥ 1
+            // and must be left byte-identical.
+            let sql = "CREATE TABLE t AS SELECT rank() OVER (PARTITION BY a ORDER BY b) FROM s";
+            assert_eq!(Parser::preprocess_strip_partition_by(sql), sql);
+        }
+
+        #[test]
+        fn passthrough_without_partition_syntax() {
+            let a = "CREATE TABLE t (a int, b text)";
+            assert_eq!(Parser::preprocess_strip_partition_by(a), a);
+            let b = "SELECT * FROM t WHERE a = 1";
+            assert_eq!(Parser::preprocess_strip_partition_by(b), b);
+        }
+
+        // ---- preprocess_partition_of (child rewrite to empty-column CREATE) ----
+
+        #[test]
+        fn rewrites_for_values_forms() {
+            assert_eq!(
+                Parser::preprocess_partition_of("CREATE TABLE parted_si_p_even PARTITION OF parted_si FOR VALUES IN (0)"),
+                "CREATE TABLE parted_si_p_even ()"
+            );
+            assert_eq!(
+                Parser::preprocess_partition_of(
+                    "CREATE TABLE c PARTITION OF p FOR VALUES FROM (0) TO (10) WITH (autovacuum_enabled = false)"
+                ),
+                "CREATE TABLE c ()"
+            );
+            assert_eq!(
+                Parser::preprocess_partition_of("create table part_aa_bb partition of list_parted FOR VALUES IN ('aa', 'bb')"),
+                "CREATE TABLE part_aa_bb ()"
+            );
+        }
+
+        #[test]
+        fn rewrites_multi_column_bounds() {
+            assert_eq!(
+                Parser::preprocess_partition_of("create table part1 partition of range_parted for values from ('a', 1) to ('a', 10)"),
+                "CREATE TABLE part1 ()"
+            );
+        }
+
+        #[test]
+        fn rewrites_default_and_default_subpartitioned() {
+            assert_eq!(
+                Parser::preprocess_partition_of("create table part_default partition of list_parted default"),
+                "CREATE TABLE part_default ()"
+            );
+            // A DEFAULT child that is itself sub-partitioned: its own
+            // PARTITION BY tail is dropped by the rewrite too.
+            assert_eq!(
+                Parser::preprocess_partition_of("create table part_default partition of list_parted default partition by range(b)"),
+                "CREATE TABLE part_default ()"
+            );
+        }
+
+        #[test]
+        fn rewrites_schema_qualified_and_if_not_exists_and_newlines() {
+            assert_eq!(
+                Parser::preprocess_partition_of(
+                    "CREATE TABLE stats_import.part_child_1\n  PARTITION OF stats_import.part_parent\n  FOR VALUES FROM (0) TO (10)\n  WITH (autovacuum_enabled = false);"
+                ),
+                "CREATE TABLE stats_import.part_child_1 ();"
+            );
+            assert_eq!(
+                Parser::preprocess_partition_of("CREATE TABLE IF NOT EXISTS c PARTITION OF p FOR VALUES IN (1)"),
+                "CREATE TABLE IF NOT EXISTS c ()"
+            );
+        }
+
+        #[test]
+        fn does_not_touch_inherits_empty_columns() {
+            // `CREATE TABLE fail () INHERITS (partitioned2)` has empty columns
+            // but no PARTITION OF — it must be returned unchanged so the
+            // planner's empty-column disambiguation stays correct.
+            let sql = "CREATE TABLE fail () INHERITS (partitioned2)";
+            assert_eq!(Parser::preprocess_partition_of(sql), sql);
+            assert!(Parser::extract_partition_of(sql).is_none());
+        }
+
+        #[test]
+        fn partition_of_passthrough_without_syntax() {
+            let a = "CREATE TABLE t (a int)";
+            assert_eq!(Parser::preprocess_partition_of(a), a);
+            let b = "INSERT INTO t VALUES (1)";
+            assert_eq!(Parser::preprocess_partition_of(b), b);
+        }
+
+        // ---- extract_partition_of (captured (child, parent, bound) spec) ----
+
+        #[test]
+        fn extract_captures_names_and_verbatim_bound() {
+            let spec = Parser::extract_partition_of(
+                "CREATE TABLE stats_import.part_child_1 PARTITION OF stats_import.part_parent FOR VALUES FROM (0) TO (10) WITH (autovacuum_enabled = false)"
+            )
+            .expect("spec");
+            assert!(!spec.if_not_exists);
+            assert_eq!(spec.child, "stats_import.part_child_1");
+            assert_eq!(spec.parent, "stats_import.part_parent");
+            // Verbatim bound keeps a trailing storage `WITH (…)` (never a cut
+            // point, so HASH `FOR VALUES WITH (MODULUS …)` survives intact).
+            assert_eq!(spec.bound, "FOR VALUES FROM (0) TO (10) WITH (autovacuum_enabled = false)");
+
+            let def = Parser::extract_partition_of("create table part_def partition of range_parted default").expect("spec");
+            assert_eq!(def.parent, "range_parted");
+            assert_eq!(def.bound, "default");
+        }
+
+        // ---- is_partition_attach_detach_statement (accept-as-no-op) ----
+
+        #[test]
+        fn detects_attach_detach_partition() {
+            assert!(Parser::is_partition_attach_detach_statement(
+                "alter table parted_copytest attach partition parted_copytest_a1 for values in(1)"
+            ));
+            assert!(Parser::is_partition_attach_detach_statement(
+                "ALTER TABLE mlparted ATTACH PARTITION mlparted1 FOR VALUES FROM (1, 2) TO (1, 10)"
+            ));
+            assert!(Parser::is_partition_attach_detach_statement("ALTER TABLE t DETACH PARTITION c"));
+            assert!(Parser::is_partition_attach_detach_statement("ALTER TABLE t DETACH PARTITION c CONCURRENTLY"));
+            assert!(Parser::is_partition_attach_detach_statement("ALTER TABLE t DETACH PARTITION c FINALIZE"));
+            assert!(Parser::is_partition_attach_detach_statement("ALTER INDEX idx ATTACH PARTITION idx_child"));
+        }
+
+        #[test]
+        fn ignores_non_attach_detach_alters_and_other_statements() {
+            assert!(!Parser::is_partition_attach_detach_statement("ALTER TABLE t ADD COLUMN c int"));
+            assert!(!Parser::is_partition_attach_detach_statement("ALTER TABLE t RENAME TO t2"));
+            assert!(!Parser::is_partition_attach_detach_statement("SELECT * FROM t"));
+            assert!(!Parser::is_partition_attach_detach_statement("CREATE TABLE c PARTITION OF p DEFAULT"));
+        }
+
+        // Strict-additive safety: the phrase inside a string literal or quoted
+        // identifier must NOT trigger the no-op — a currently-passing ALTER
+        // that stores the words as data (audit/DDL-logging schemas) mutates the
+        // schema and must reach the real ALTER path, not be swallowed as 0 rows.
+        #[test]
+        fn phrase_inside_quotes_is_not_treated_as_partition_alter() {
+            assert!(!Parser::is_partition_attach_detach_statement(
+                "ALTER TABLE t ADD COLUMN c int DEFAULT 'attach partition'"
+            ));
+            assert!(!Parser::is_partition_attach_detach_statement(
+                "ALTER TABLE t ADD CONSTRAINT ck CHECK (op <> 'DETACH PARTITION')"
+            ));
+            assert!(!Parser::is_partition_attach_detach_statement(
+                "ALTER TABLE t RENAME COLUMN \"attach partition\" TO c"
+            ));
+        }
+
+        // ---- parse() strip-and-reparse: only fires on failing SQL ----
+
+        #[test]
+        fn parse_accepts_child_partition_of_as_empty_columns() {
+            let parser = Parser::new();
+            let stmt = parser
+                .parse_one("CREATE TABLE c PARTITION OF p FOR VALUES IN (1)")
+                .expect("child parses");
+            match stmt {
+                sqlparser::ast::Statement::CreateTable(ct) => {
+                    assert_eq!(ct.name.to_string(), "c");
+                    assert!(ct.columns.is_empty(), "child rewrite yields empty columns for planner copy");
+                }
+                other => panic!("expected CreateTable, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn parse_accepts_multi_column_parent_key() {
+            let parser = Parser::new();
+            assert!(parser
+                .parse_one("CREATE TABLE t (a int, b int) PARTITION BY RANGE (a, b)")
+                .is_ok());
+            // Single-column parent already parsed pre-change; still parses.
+            assert!(parser.parse_one("CREATE TABLE t (a int) PARTITION BY RANGE (a)").is_ok());
+        }
     }
 
     // HA Switchover SQL tests (ha-tier1 feature)

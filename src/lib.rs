@@ -1804,6 +1804,24 @@ impl EmbeddedDatabase {
         Ok(Some(0))
     }
 
+    /// Round-3 pgrust-corpus compat: PostgreSQL `ALTER TABLE … ATTACH/DETACH
+    /// PARTITION …` and `ALTER INDEX … ATTACH PARTITION …`. sqlparser 0.53 gates
+    /// ATTACH/DETACH PARTITION to the ClickHouse/Generic dialects, so under the
+    /// PostgreSQL dialect they fail at the parse stage; this accepts them as a
+    /// Stage-0 parse-and-accept no-op (the `PARTITION OF` child already exists
+    /// as an independent table, so an attach/detach has no flatten-model effect;
+    /// real catalog attach/detach + overlap validation is Stage 2). Mirrors the
+    /// CREATE DOMAIN / VACUUM intercept plumbing exactly — wired into `execute`
+    /// / `query` / `query_with_columns` so both the embedded and the wire
+    /// autocommit paths take it. The wire command tag ("ALTER TABLE" /
+    /// "ALTER INDEX") is derived from the statement prefix by `get_command_tag`.
+    fn try_handle_partition_attach_detach(&self, sql: &str) -> Result<Option<u64>> {
+        if !sql::Parser::is_partition_attach_detach_statement(sql) {
+            return Ok(None);
+        }
+        Ok(Some(0))
+    }
+
     /// R4.3: run a full MVCC version-GC pass (the library twin of the
     /// `VACUUM VERSIONS` SQL statement). Returns reclaimed version count.
     pub fn vacuum_versions(&self) -> Result<u64> {
@@ -2662,6 +2680,37 @@ impl EmbeddedDatabase {
                     .collect();
                 if !identity_cols.is_empty() {
                     catalog.register_identity_columns(name, &identity_cols)?;
+                }
+
+                // Round-3 PARTITION BY Stage-0: if this CREATE was a
+                // `… PARTITION OF parent` child, record the parent→child
+                // dependency so a later `DROP TABLE parent` cascades to its
+                // partition children (PostgreSQL parity). Re-derived from the
+                // ORIGINAL SQL exactly as the planner does (`extract_partition_of`
+                // + `normalize_partition_name`), and keyed on the SAME normalized
+                // names that key the catalog — so a schema-qualified
+                // `s.parent`/`s.child` resolves to the same bare keys the tables
+                // are stored under. A plain, non-partition CREATE returns `None`
+                // here → no registry write (zero cost). This runs only after
+                // `create_table` above succeeded (the `?` short-circuits a
+                // duplicate-name / bad-DDL failure before we reach this point).
+                //
+                // COVERAGE CONSTRAINT (review-pinned): this arm is reached by
+                // embedded execute()/execute_batch and the PG/MySQL SIMPLE-query
+                // wire path. The EXTENDED/parameterized route has NO CreateTable
+                // handler today (executor default arm errors on every CREATE),
+                // so no child can be created — and thus none can miss
+                // registration — over Parse/Bind/Execute. If executor CreateTable
+                // support is ever added, it MUST register partition children the
+                // same way, or parent DROPs will orphan extended-created
+                // children. Stage-0 semantics also pinned here: DDL is
+                // non-transactional (ROLLBACK keeps both the child and its
+                // registry entry — consistent), and dump/restore flattens
+                // children to standalone CREATEs (a restored setup does not
+                // cascade-drop; Stage 1 owns the durable partition catalog).
+                if let Some(spec) = sql::Parser::extract_partition_of(sql) {
+                    let parent = sql::Planner::normalize_partition_name(&spec.parent);
+                    catalog.register_partition_child(&parent, name)?;
                 }
 
                 // Save table constraints if any
@@ -6420,6 +6469,11 @@ impl EmbeddedDatabase {
 
         // Round-2: PostgreSQL CREATE DOMAIN / DROP DOMAIN no-op.
         if let Some(count) = self.try_handle_domain_ddl_statement(sql)? {
+            return Ok(count);
+        }
+
+        // Round-3: PostgreSQL ALTER TABLE/INDEX ATTACH/DETACH PARTITION no-op.
+        if let Some(count) = self.try_handle_partition_attach_detach(sql)? {
             return Ok(count);
         }
 
@@ -13918,6 +13972,11 @@ impl EmbeddedDatabase {
             return Ok(Vec::new());
         }
 
+        // Round-3: PostgreSQL ALTER TABLE/INDEX ATTACH/DETACH PARTITION no-op.
+        if let Some(_count) = self.try_handle_partition_attach_detach(sql)? {
+            return Ok(Vec::new());
+        }
+
         // DML belongs on the write executor.  `query()` is commonly used
         // by client adapters as a generic SQL entry point; without this
         // guard, INSERT/UPDATE/DELETE without RETURNING fall into the
@@ -14394,6 +14453,11 @@ impl EmbeddedDatabase {
 
         // Round-2: PostgreSQL CREATE DOMAIN / DROP DOMAIN no-op.
         if let Some(_count) = self.try_handle_domain_ddl_statement(sql)? {
+            return Ok((Vec::new(), Vec::new()));
+        }
+
+        // Round-3: PostgreSQL ALTER TABLE/INDEX ATTACH/DETACH PARTITION no-op.
+        if let Some(_count) = self.try_handle_partition_attach_detach(sql)? {
             return Ok((Vec::new(), Vec::new()));
         }
 

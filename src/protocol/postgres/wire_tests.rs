@@ -1008,3 +1008,60 @@ async fn extended_dml_returning_failure_keeps_connection_usable() {
         "the overflowing UPDATE must not have mutated the row"
     );
 }
+
+/// Round-3 Stage-0 partitioning over the wire (simple-query path): a
+/// `PARTITION OF` child and `ATTACH`/`DETACH PARTITION` must succeed with the
+/// correct PostgreSQL command tags — the wire path diverges from embedded on
+/// the CommandComplete tag, so it is asserted here specifically.
+#[tokio::test]
+#[allow(clippy::expect_used)] // Test code: `expect` documents the failing step.
+async fn partition_of_and_attach_detach_over_the_wire() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+
+    // Parent + PARTITION OF child; the child must report "CREATE TABLE".
+    let (mut handler, mut client) = test_handler(Arc::clone(&db));
+    handler
+        .handle_single_query("CREATE TABLE w_parent (id INT, label TEXT) PARTITION BY RANGE (id)")
+        .await
+        .expect("parent create");
+    handler
+        .handle_single_query("CREATE TABLE w_child PARTITION OF w_parent FOR VALUES FROM (0) TO (100)")
+        .await
+        .expect("child create");
+    let tags = command_tags(&drain(&mut client).await);
+    assert!(
+        tags.iter().any(|t| t == "CREATE TABLE"),
+        "PARTITION OF child must complete as CREATE TABLE, got {tags:?}"
+    );
+
+    // Child cloned the parent's columns → INSERT/SELECT over the wire work.
+    let (mut handler, mut client) = test_handler(Arc::clone(&db));
+    handler
+        .handle_single_query("INSERT INTO w_child (id, label) VALUES (5, 'hi')")
+        .await
+        .expect("insert");
+    let _ = drain(&mut client).await;
+    handler
+        .handle_single_query("SELECT id, label FROM w_child")
+        .await
+        .expect("select");
+    let rows = data_rows(&drain(&mut client).await);
+    assert_eq!(rows.len(), 1, "child SELECT must return the inserted row");
+
+    // ATTACH / DETACH PARTITION accepted as no-ops with "ALTER TABLE" tags.
+    let (mut handler, mut client) = test_handler(Arc::clone(&db));
+    handler
+        .handle_single_query("ALTER TABLE w_parent ATTACH PARTITION w_child FOR VALUES FROM (0) TO (100)")
+        .await
+        .expect("attach");
+    handler
+        .handle_single_query("ALTER TABLE w_parent DETACH PARTITION w_child")
+        .await
+        .expect("detach");
+    let tags = command_tags(&drain(&mut client).await);
+    assert_eq!(
+        tags.iter().filter(|t| *t == "ALTER TABLE").count(),
+        2,
+        "ATTACH and DETACH PARTITION must each complete as ALTER TABLE, got {tags:?}"
+    );
+}
