@@ -741,6 +741,19 @@ where
                     self.send_error("ERROR", "22023", &e.to_string(), None, None).await?;
                     return Ok(());
                 }
+            } else if EmbeddedDatabase::is_set_constraints_statement(trimmed) {
+                // `SET CONSTRAINTS { ALL | names } { DEFERRED | IMMEDIATE }` arms
+                // transaction-scoped FK deferral. The generic ack below would drop
+                // it (a silent no-op), so a wire client's deferred FK never armed
+                // and a valid "insert child, then parent, then COMMIT" sequence
+                // spuriously failed. Route through `execute()` so
+                // `try_handle_set_constraints` runs; the process-wide
+                // `constraints_all_deferred` switch it flips is honored on the
+                // session/wire FK path too. The command tag stays "SET" (below).
+                if let Err(e) = self.database.execute(trimmed) {
+                    self.send_error("ERROR", "22023", &e.to_string(), None, None).await?;
+                    return Ok(());
+                }
             } else if EmbeddedDatabase::is_fk_setting_statement(trimmed) {
                 // FK/bulk-load knobs stay on the process-wide storage engine; the
                 // generic ack below would drop them.

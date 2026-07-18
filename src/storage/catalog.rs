@@ -1227,6 +1227,14 @@ impl<'a> Catalog<'a> {
             .write(batch)
             .map_err(|e| Error::storage(format!("Rename batch write failed: {}", e)))?;
 
+        // Carry the VOLATILE in-memory row-id counter to the new name. The batch
+        // above moved the durable `counter:{table}` key, but `next_row_id_volatile`
+        // seeds a missing in-memory entry at 0 (not from the durable key), so the
+        // first insert into the renamed table would otherwise reuse a row id and
+        // overwrite a pre-existing row (and strand its PK-index key, inflating the
+        // COUNT(*) fast path).
+        self.storage.rename_row_counter(old_name, new_name);
+
         // Rename compression manager resources (no-op - compression handled by RocksDB LZ4)
         super::CompressionManager::new().rename_table(old_name, new_name)?;
 

@@ -11847,6 +11847,27 @@ impl StorageEngine {
         counter.fetch_add(1, Ordering::Relaxed) + 1
     }
 
+    /// Carry the volatile in-memory row-id counter across a table RENAME /
+    /// `SET SCHEMA` re-key.
+    ///
+    /// `next_row_id_volatile` seeds a MISSING `row_counters` entry at 0 — NOT
+    /// from the durable `counter:{table}` key — so without this migration the
+    /// first insert into the renamed table hands back an already-used row id,
+    /// silently OVERWRITING a pre-existing `data:{new}:{row_id}` row. That
+    /// overwrite also strands the old row's key in the PK ART index, so the
+    /// `COUNT(*)` primary-key fast path (`pk_index_len`) then over-reports.
+    /// `rename_table` copies the DURABLE counter; this moves the live volatile
+    /// high-water mark (which leads the durable key — the fast path only
+    /// re-persists it every 64 rows) to the new name and drops the stale old
+    /// entry. No-op when the old table never allocated a row id this session.
+    pub fn rename_row_counter(&self, old_name: &str, new_name: &str) {
+        if let Some((_, counter)) = self.row_counters.remove(old_name) {
+            // `new_name` is guaranteed free by the rename precondition, so this
+            // is a plain move of the exact high-water mark.
+            self.row_counters.insert(new_name.to_string(), counter);
+        }
+    }
+
     /// Stage a row counter update in an active transaction.
     ///
     /// This pairs with `next_row_id_volatile` for transactional bulk inserts:
