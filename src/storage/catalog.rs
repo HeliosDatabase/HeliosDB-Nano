@@ -1262,6 +1262,61 @@ impl<'a> Catalog<'a> {
     }
 
     // -------------------------------------------------------------------
+    // Schema namespacing — CREATE SCHEMA / DROP SCHEMA.
+    //
+    // A declared schema is recorded at `meta:schema:<name>` (empty value).
+    // Member tables need NO separate record: a table in schema `s` is keyed
+    // `s.<table>` (see planner `normalize_object_name`), so membership is a
+    // catalog prefix scan (`schema_members`). The marker exists so an empty
+    // schema still reports as present (CREATE SCHEMA duplicate error / DROP
+    // SCHEMA existence) even before any table is created in it.
+    // -------------------------------------------------------------------
+
+    fn schema_metadata_key(name: &str) -> Vec<u8> {
+        format!("meta:schema:{}", name).into_bytes()
+    }
+
+    /// Record a declared schema. Returns `false` if it was already present
+    /// (so callers can honor CREATE SCHEMA duplicate semantics).
+    pub fn register_schema(&self, name: &str) -> Result<bool> {
+        if self.schema_exists(name)? {
+            return Ok(false);
+        }
+        let key = Self::schema_metadata_key(name);
+        self.storage.put(&key, &[])?;
+        Ok(true)
+    }
+
+    /// True if the schema is declared (`meta:schema:` marker) OR still has at
+    /// least one member table (a `schema.` key). Either makes DROP SCHEMA see
+    /// it as existing.
+    pub fn schema_exists(&self, name: &str) -> Result<bool> {
+        let key = Self::schema_metadata_key(name);
+        if self.storage.get(&key)?.is_some() {
+            return Ok(true);
+        }
+        Ok(!self.schema_members(name)?.is_empty())
+    }
+
+    /// Remove the schema marker. Member tables must be dropped separately
+    /// (CASCADE) — this only clears the declaration.
+    pub fn drop_schema_marker(&self, name: &str) -> Result<()> {
+        let key = Self::schema_metadata_key(name);
+        self.storage.delete(&key)
+    }
+
+    /// The member tables of a schema: every catalogued table whose key is
+    /// `<schema>.<table>`. Returns the FULL qualified keys (drop-ready).
+    pub fn schema_members(&self, schema: &str) -> Result<Vec<String>> {
+        let prefix = format!("{schema}.");
+        Ok(self
+            .list_tables()?
+            .into_iter()
+            .filter(|t| t.starts_with(prefix.as_str()))
+            .collect())
+    }
+
+    // -------------------------------------------------------------------
     // KanttBan #20 (v3.31.0) — CREATE TYPE … AS ENUM
     //
     // Storage: each registered enum type lives at

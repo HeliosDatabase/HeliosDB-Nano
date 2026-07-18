@@ -3848,11 +3848,64 @@ impl<'a> Executor<'a> {
                 ))
             }
             LogicalPlan::CreateSchema { name, if_not_exists } => {
-                // HeliosDB has a single flat namespace; `schema.table` is just
-                // a composite table name. Accept CREATE SCHEMA as a no-op so
-                // migrations that issue it don't fail. `IF NOT EXISTS` is
-                // implicit here since nothing is created either way.
-                let _ = (name, if_not_exists);
+                // Record the schema in the catalog (`meta:schema:<name>`) so it
+                // exists as a namespace even while empty. Tables created under it
+                // key as `name.<table>` (planner resolution), so no member
+                // records are needed. Duplicate without IF NOT EXISTS errors
+                // (PostgreSQL parity).
+                let storage = self
+                    .storage
+                    .ok_or_else(|| Error::query_execution("CREATE SCHEMA requires storage context".to_string()))?;
+                let created = storage.catalog().register_schema(name)?;
+                if !created && !*if_not_exists {
+                    return Err(Error::query_execution(format!("schema \"{name}\" already exists")));
+                }
+                Ok(Box::new(
+                    ScanOperator::new(
+                        String::new(),
+                        Arc::new(crate::Schema { columns: vec![] }),
+                        None,
+                        vec![],
+                        vec![],
+                    )
+                    .with_timeout(self.timeout_ctx()),
+                ))
+            }
+            LogicalPlan::DropSchema {
+                names,
+                if_exists,
+                cascade,
+            } => {
+                let storage = self
+                    .storage
+                    .ok_or_else(|| Error::query_execution("DROP SCHEMA requires storage context".to_string()))?;
+                for name in names {
+                    let catalog = storage.catalog();
+                    if !catalog.schema_exists(name)? {
+                        if *if_exists {
+                            continue;
+                        }
+                        return Err(Error::query_execution(format!("schema \"{name}\" does not exist")));
+                    }
+                    let members = catalog.schema_members(name)?;
+                    if !members.is_empty() && !*cascade {
+                        // RESTRICT (default): refuse to drop a non-empty schema.
+                        return Err(Error::query_execution(format!(
+                            "cannot drop schema {name} because other objects depend on it (use CASCADE)"
+                        )));
+                    }
+                    // CASCADE: drop every member through the ordinary DROP-table
+                    // funnel, so ART indexes, columnar sidecars, the WAL log AND
+                    // the Stage-0 partition-child cascade all compose (a
+                    // partitioned parent in this schema takes its children,
+                    // including children registered under other schemas). A child
+                    // already removed by an earlier parent drop is a no-op
+                    // (IF EXISTS semantics on each member).
+                    for member in members {
+                        ddl::handle_drop_table(self, &member, true)?;
+                    }
+                    catalog.drop_schema_marker(name)?;
+                }
                 Ok(Box::new(
                     ScanOperator::new(
                         String::new(),

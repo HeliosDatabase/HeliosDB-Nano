@@ -1065,3 +1065,118 @@ async fn partition_of_and_attach_detach_over_the_wire() {
         "ATTACH and DETACH PARTITION must each complete as ALTER TABLE, got {tags:?}"
     );
 }
+
+/// Schema namespacing over the wire: `SET search_path` scopes bare names, both
+/// bare and qualified access resolve to the schema-scoped table, and switching
+/// back to `public` un-resolves the bare name. FAILS on pre-change code, where
+/// `SET search_path` is a silent no-op and every qualifier collapses to bare.
+#[tokio::test]
+async fn search_path_scopes_bare_names_over_wire() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+
+    for stmt in [
+        "CREATE SCHEMA wa",
+        "SET search_path TO wa",
+        "CREATE TABLE wt (v INT)",
+        "INSERT INTO wt (v) VALUES (42)",
+    ] {
+        handler.handle_single_query(stmt).await.expect("setup stmt");
+        let _ = drain(&mut client).await;
+    }
+
+    // SHOW reflects the current schema over the wire.
+    handler.handle_single_query("SHOW search_path").await.expect("show");
+    assert_eq!(
+        first_data_row_text(&drain(&mut client).await).as_deref(),
+        Some("wa, public"),
+        "SHOW search_path must reflect the SET"
+    );
+
+    // A bare reference resolves to wa.wt.
+    handler.handle_single_query("SELECT v FROM wt").await.expect("bare select");
+    assert_eq!(
+        first_data_row_text(&drain(&mut client).await).as_deref(),
+        Some("42"),
+        "bare name resolves under search_path"
+    );
+
+    // The qualified reference resolves too.
+    handler.handle_single_query("SELECT v FROM wa.wt").await.expect("qualified select");
+    assert_eq!(
+        first_data_row_text(&drain(&mut client).await).as_deref(),
+        Some("42"),
+        "qualified name resolves"
+    );
+
+    // Back to public: the bare name no longer resolves (no public `wt`).
+    handler.handle_single_query("SET search_path TO public").await.expect("reset to public");
+    let _ = drain(&mut client).await;
+    handler.handle_single_query("SELECT v FROM wt").await.expect("bare select public");
+    let out = drain(&mut client).await;
+    assert!(
+        parse_messages(&out).iter().any(|(t, _)| *t == b'E'),
+        "bare `wt` must error under public search_path"
+    );
+}
+
+/// `search_path` is per-CONNECTION, not process-wide: two connections sharing
+/// one `Arc<EmbeddedDatabase>` each resolve bare names against THEIR OWN
+/// `search_path`, even when interleaved. This is the cross-session-leak
+/// regression guard — a shared `current_schema` field steers connection A's
+/// bare `INSERT` to whatever schema connection B set last (silent cross-tenant
+/// wrong-table write). Both connections use the SAME bare name `orders`.
+#[tokio::test]
+async fn search_path_is_isolated_per_connection() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut a, mut ca) = test_handler(db.clone());
+    let (mut b, mut cb) = test_handler(db);
+
+    // Two schemas (created once, globally); each connection will own one.
+    for stmt in ["CREATE SCHEMA sa", "CREATE SCHEMA sb"] {
+        a.handle_single_query(stmt).await.expect("schema");
+        let _ = drain(&mut ca).await;
+    }
+
+    // Pin each connection's search_path, then create a bare `orders` under each
+    // — they must land in different schemas (sa.orders vs sb.orders).
+    a.handle_single_query("SET search_path TO sa").await.expect("A set");
+    let _ = drain(&mut ca).await;
+    b.handle_single_query("SET search_path TO sb").await.expect("B set");
+    let _ = drain(&mut cb).await;
+    a.handle_single_query("CREATE TABLE orders (v INT)").await.expect("A create");
+    let _ = drain(&mut ca).await;
+    b.handle_single_query("CREATE TABLE orders (v INT)").await.expect("B create");
+    let _ = drain(&mut cb).await;
+
+    // Interleaved bare INSERTs. B set its search_path most recently, so a shared
+    // selector would send BOTH rows to sb.orders. Correct behavior: A -> sa, B -> sb.
+    a.handle_single_query("INSERT INTO orders VALUES (1)").await.expect("A insert");
+    let _ = drain(&mut ca).await;
+    b.handle_single_query("INSERT INTO orders VALUES (2)").await.expect("B insert");
+    let _ = drain(&mut cb).await;
+
+    // Qualified reads prove each row landed in its own schema.
+    a.handle_single_query("SELECT v FROM sa.orders").await.expect("read sa");
+    assert_eq!(first_data_row_text(&drain(&mut ca).await).as_deref(), Some("1"), "A's row is in sa.orders");
+    b.handle_single_query("SELECT v FROM sb.orders").await.expect("read sb");
+    assert_eq!(first_data_row_text(&drain(&mut cb).await).as_deref(), Some("2"), "B's row is in sb.orders");
+
+    // Neither schema's table absorbed the other connection's row.
+    a.handle_single_query("SELECT count(*) FROM sa.orders").await.expect("count sa");
+    assert_eq!(first_data_row_text(&drain(&mut ca).await).as_deref(), Some("1"), "sa.orders holds exactly one row");
+    b.handle_single_query("SELECT count(*) FROM sb.orders").await.expect("count sb");
+    assert_eq!(first_data_row_text(&drain(&mut cb).await).as_deref(), Some("1"), "sb.orders holds exactly one row");
+
+    // Each connection's BARE read resolves to its own schema.
+    a.handle_single_query("SELECT v FROM orders").await.expect("A bare");
+    assert_eq!(first_data_row_text(&drain(&mut ca).await).as_deref(), Some("1"), "A bare orders -> sa");
+    b.handle_single_query("SELECT v FROM orders").await.expect("B bare");
+    assert_eq!(first_data_row_text(&drain(&mut cb).await).as_deref(), Some("2"), "B bare orders -> sb");
+
+    // SHOW search_path is per-connection.
+    a.handle_single_query("SHOW search_path").await.expect("A show");
+    assert_eq!(first_data_row_text(&drain(&mut ca).await).as_deref(), Some("sa, public"));
+    b.handle_single_query("SHOW search_path").await.expect("B show");
+    assert_eq!(first_data_row_text(&drain(&mut cb).await).as_deref(), Some("sb, public"));
+}

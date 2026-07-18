@@ -488,6 +488,22 @@ pub enum LogicalPlan {
         if_not_exists: bool,
     },
 
+    /// `DROP SCHEMA [IF EXISTS] s1[, s2 …] [CASCADE|RESTRICT]`. Schema
+    /// membership is a catalog prefix scan over `schema.table` keys (the
+    /// namespacing makes it free — no separate member records). RESTRICT
+    /// (`cascade == false`, the default) errors when a schema still has member
+    /// tables; CASCADE drops every member through the ordinary DROP-table funnel
+    /// (so Stage-0 partition-child cascade composes). A missing schema errors
+    /// unless `if_exists`.
+    DropSchema {
+        /// Schema names to drop (already normalised, bare).
+        names: Vec<String>,
+        /// Silently succeed on a missing schema.
+        if_exists: bool,
+        /// CASCADE: drop member tables too. RESTRICT (false) errors if non-empty.
+        cascade: bool,
+    },
+
     /// `CREATE EXTENSION <name>` — install a named extension. For
     /// `hdb_code` this runs the code-graph bootstrap (see
     /// `src/code_graph/storage.rs::bootstrap_tables`). Unknown
@@ -2186,6 +2202,7 @@ impl LogicalPlan {
             LogicalPlan::CreateEnumType { .. }
             | LogicalPlan::DropEnumType { .. }
             | LogicalPlan::CreateSchema { .. }
+            | LogicalPlan::DropSchema { .. }
             | LogicalPlan::Noop => {
                 // KanttBan #20 (v3.31.0): DDL — no output rows.
                 Arc::new(Schema { columns: vec![] })
