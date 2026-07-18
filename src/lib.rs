@@ -15369,6 +15369,11 @@ impl EmbeddedDatabase {
             .insert(session_id, std::sync::Arc::new(parking_lot::RwLock::new(Some(txn))));
         self.session_txn_count.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
 
+        // `SET CONSTRAINTS ALL DEFERRED` is transaction-scoped — start each
+        // session transaction clean (mirrors `begin_internal`).
+        self.constraints_all_deferred
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+
         Ok(())
     }
 
@@ -15416,6 +15421,24 @@ impl EmbeddedDatabase {
                 session.stats.transactions_committed += 1;
                 return Ok(());
             };
+            // Deferred-FK validation runs BEFORE the durable commit, mirroring
+            // the global-slot `commit_internal`: `SET CONSTRAINTS ALL DEFERRED`
+            // (or a `DEFERRABLE INITIALLY DEFERRED` FK) queued its checks to
+            // COMMIT. A failure ABORTS the commit — PostgreSQL rolls back a
+            // COMMIT that trips a deferred constraint — instead of silently
+            // persisting a dangling reference. `validate_deferred_fk_checks`
+            // fast-returns on the (common) empty queue.
+            if let Err(e) = self.validate_deferred_fk_checks(Some(&txn)) {
+                let _ = txn.rollback();
+                self.finish_session_art_undo(session_id, true);
+                self.deferred_fk_checks.lock().clear();
+                self.constraints_all_deferred
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                self.invalidate_result_cache();
+                session.active_txn = None;
+                session.stats.transactions_aborted += 1;
+                return Err(e);
+            }
             // R1.3-p2: commit itself runs the row-cache fence when the cache
             // is wired; only unwired transactions need the caller-side sweep.
             let written = if txn.has_row_cache() {
@@ -15444,6 +15467,11 @@ impl EmbeddedDatabase {
 
         // Invalidate result cache since committed data may affect cached query results
         self.invalidate_result_cache();
+
+        // `SET CONSTRAINTS` deferral is transaction-scoped — clear it at COMMIT
+        // (the queue was already drained by `validate_deferred_fk_checks`).
+        self.constraints_all_deferred
+            .store(false, std::sync::atomic::Ordering::Relaxed);
 
         session.active_txn = None;
         session.stats.transactions_committed += 1;
@@ -15484,6 +15512,13 @@ impl EmbeddedDatabase {
 
         // Invalidate result cache since rollback changes visible data state
         self.invalidate_result_cache();
+
+        // Drop any deferred-FK checks queued in the aborted transaction and
+        // clear the transaction-scoped `SET CONSTRAINTS` deferral (mirrors
+        // `rollback_internal`).
+        self.deferred_fk_checks.lock().clear();
+        self.constraints_all_deferred
+            .store(false, std::sync::atomic::Ordering::Relaxed);
 
         session.active_txn = None;
         session.stats.transactions_aborted += 1;
@@ -15984,6 +16019,14 @@ impl EmbeddedDatabase {
         if let Some(handled) = self.try_handle_session_search_path(session_id, sql)? {
             return Ok(handled);
         }
+        // `SET CONSTRAINTS … DEFERRED|IMMEDIATE` arms transaction-scoped FK
+        // deferral. The simple-query handler intercepts SET itself; the
+        // extended protocol (and any in-transaction SET) reaches here, where the
+        // in-transaction planner has no grammar for it — so arm it directly on
+        // the process-wide switch before that path.
+        if let Some(count) = self.try_handle_set_constraints(sql)? {
+            return Ok(count);
+        }
         // Resolve bare names against THIS session's schema for the rest of the
         // statement — both the autocommit delegate below and the in-transaction
         // planner (which reads `self.current_schema()`).
@@ -16072,6 +16115,11 @@ impl EmbeddedDatabase {
         if let Some(handled) = self.try_handle_session_search_path(session_id, sql)? {
             return Ok((handled, Vec::new()));
         }
+        // `SET CONSTRAINTS` arms transaction-scoped FK deferral (see
+        // `execute_for_session`); it never returns rows.
+        if let Some(count) = self.try_handle_set_constraints(sql)? {
+            return Ok((count, Vec::new()));
+        }
         let _schema_override = self.session_schema_override_guard(session_id);
         if !self.session_transactions.contains_key(&session_id) {
             let _sync_override = self.session_durability_override_guard(session_id);
@@ -16136,6 +16184,12 @@ impl EmbeddedDatabase {
         }
         if let Some(handled) = self.try_handle_session_search_path(session_id, sql)? {
             return Ok(handled);
+        }
+        // `SET CONSTRAINTS` arms transaction-scoped FK deferral (see
+        // `execute_for_session`) — arm it before the in-transaction planner,
+        // which has no grammar for it.
+        if let Some(count) = self.try_handle_set_constraints(sql)? {
+            return Ok(count);
         }
         let _schema_override = self.session_schema_override_guard(session_id);
         if !self.session_transactions.contains_key(&session_id) {

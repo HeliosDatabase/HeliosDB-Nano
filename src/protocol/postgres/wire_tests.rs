@@ -1254,3 +1254,76 @@ fn search_path_is_isolated_per_connection() {
         .join()
         .expect("join");
 }
+
+/// FIX 1 over the wire: `SET CONSTRAINTS ALL DEFERRED` must arm transaction-
+/// scoped FK deferral on the PG simple-query path too. The handler used to ack
+/// `SET CONSTRAINTS` as a generic no-op SET, so a wire client's deferred FK
+/// never armed and the valid "insert child, then parent, then COMMIT" sequence
+/// was rejected IMMEDIATELY at the child insert. Mirrors the embedded
+/// `set_constraints_defers_fk_on_partitioned_qualified_parent` (partitioned,
+/// schema-qualified parent) but drives every statement through
+/// `handle_single_query`. FAILS on pre-change code at the deferred child insert.
+#[tokio::test]
+async fn set_constraints_defers_fk_over_wire() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(Arc::clone(&db));
+
+    for stmt in [
+        "CREATE SCHEMA fkpart9w",
+        "SET search_path TO fkpart9w",
+        "CREATE TABLE pk (a int PRIMARY KEY) PARTITION BY LIST (a)",
+        "CREATE TABLE pk1 PARTITION OF pk FOR VALUES IN (1, 2) PARTITION BY LIST (a)",
+        "CREATE TABLE pk11 PARTITION OF pk1 FOR VALUES IN (1)",
+        "CREATE TABLE pk3 PARTITION OF pk FOR VALUES IN (3)",
+        "CREATE TABLE fk (a int REFERENCES pk DEFERRABLE INITIALLY IMMEDIATE)",
+    ] {
+        handler.handle_single_query(stmt).await.expect("setup stmt");
+        let _ = drain(&mut client).await;
+    }
+
+    // Immediate (no SET CONSTRAINTS): a reference to the empty parent is rejected
+    // right away — the FK is real over the wire.
+    handler
+        .handle_single_query("INSERT INTO fk VALUES (1)")
+        .await
+        .expect_err("immediate FK must reject a reference to the empty parent");
+    let _ = drain(&mut client).await;
+
+    // Deferred: child before parent, both land, COMMIT finds the parent. On
+    // pre-change code the child INSERT below panics here (rejected immediately
+    // because `SET CONSTRAINTS` never armed deferral over the wire).
+    for stmt in [
+        "BEGIN",
+        "SET CONSTRAINTS ALL DEFERRED",
+        "INSERT INTO fk VALUES (1)", // child first — accepted only because deferral armed
+        "INSERT INTO pk VALUES (1)", // parent gains a=1 (lands in the partition)
+        "COMMIT",                    // deferred check finds fkpart9w.pk(a)=1
+    ] {
+        handler
+            .handle_single_query(stmt)
+            .await
+            .unwrap_or_else(|e| panic!("deferred flow `{stmt}` must succeed over the wire: {e}"));
+        let _ = drain(&mut client).await;
+    }
+
+    // Both rows are present after the deferred COMMIT.
+    handler.handle_single_query("SELECT a FROM fk").await.expect("select fk");
+    assert_eq!(
+        first_data_row_text(&drain(&mut client).await).as_deref(),
+        Some("1"),
+        "the deferred child row must be committed"
+    );
+    handler.handle_single_query("SELECT a FROM pk").await.expect("select pk");
+    assert_eq!(
+        first_data_row_text(&drain(&mut client).await).as_deref(),
+        Some("1"),
+        "the parent row must be committed"
+    );
+
+    // Transaction-scoped: after COMMIT the deferral is cleared, so a plain
+    // autocommit dangling reference is rejected again.
+    handler
+        .handle_single_query("INSERT INTO fk VALUES (2)")
+        .await
+        .expect_err("deferral must not leak past the transaction it was set in");
+}
