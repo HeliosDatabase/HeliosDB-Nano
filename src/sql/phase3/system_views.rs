@@ -3048,9 +3048,14 @@ impl SystemViewRegistry {
 
         for (idx, table_name) in tables.iter().enumerate() {
             let oid = pg_table_oid(idx);
+            // Schema namespacing: the storage key is `schema.table` for a
+            // non-`public` table; `relname` is the BARE table (PostgreSQL keeps
+            // the schema in `relnamespace`, not `relname`), so two coexisting
+            // `a.t` / `b.t` both surface as `relname = 't'`.
+            let (_relschema, relname) = crate::sql::Planner::split_schema_key(table_name);
             let tuple = Tuple::new(vec![
                 Value::Int4(oid),                     // oid
-                Value::String(table_name.clone()),    // relname
+                Value::String(relname),               // relname
                 Value::Int4(PG_PUBLIC_NAMESPACE_OID), // relnamespace (public schema)
                 Value::Int4(oid + 1000),              // reltype
                 Value::String("r".to_string()),       // relkind (r = relation/table)
@@ -3667,10 +3672,13 @@ impl SystemViewRegistry {
         let table_names = storage.catalog().list_tables()?;
         let mut rows = Vec::with_capacity(table_names.len());
         for name in &table_names {
+            // Schema namespacing: `table_schema` is the real schema and
+            // `table_name` the bare table (split the `schema.table` key).
+            let (table_schema, table_name) = crate::sql::Planner::split_schema_key(name);
             rows.push(Tuple::new(vec![
                 Value::String("heliosdb".into()),
-                Value::String("public".into()),
-                Value::String(name.clone()),
+                Value::String(table_schema),
+                Value::String(table_name),
                 Value::String("BASE TABLE".into()),
             ]));
         }
@@ -3945,6 +3953,10 @@ impl SystemViewRegistry {
         let mut results = Vec::new();
 
         for table_name in tables.iter() {
+            // Schema namespacing: `table_name` is the raw storage key (used for
+            // the schema/identity lookups below); the introspection ROW shows
+            // the real schema and the bare table name.
+            let (disp_schema, disp_table) = crate::sql::Planner::split_schema_key(table_name);
             let identity_cols = catalog.list_identity_columns(table_name).unwrap_or_default();
             match catalog.get_table_schema(table_name) {
                 Ok(schema) => {
@@ -4000,8 +4012,8 @@ impl SystemViewRegistry {
                         };
 
                         let tuple = Tuple::new(vec![
-                            Value::String("public".to_string()),    // table_schema
-                            Value::String(table_name.clone()),      // table_name
+                            Value::String(disp_schema.clone()),     // table_schema
+                            Value::String(disp_table.clone()),      // table_name
                             Value::String(column.name.clone()),     // column_name
                             Value::Int4((col_idx + 1) as i32),      // ordinal_position
                             column_default,                         // column_default

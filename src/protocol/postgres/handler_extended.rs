@@ -453,6 +453,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
     /// error or handles shapes that don't pre-plan (e.g. code-graph
     /// rewrites, SHOW BRANCHES).
     fn pinned_plan_for(&self, statement: &PreparedStatement) -> Option<std::sync::Arc<crate::sql::LogicalPlan>> {
+        // A pinned plan is built at Parse time against the SHARED (public) plan
+        // cache with no per-session `search_path` installed, so under a
+        // non-`public` session it would resolve bare names to the wrong schema.
+        // Fall back (`None`) to `query_params_for_session` / `execute_params_…`,
+        // which re-plan with THIS session's schema installed.
+        if self.database.session_schema_active(self.session_id) {
+            return None;
+        }
         let current_epoch = self.database.wire_plan_epoch();
         if let Some(plan) = &statement.cached_plan {
             if statement.cached_plan_epoch == current_epoch {
@@ -496,6 +504,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
         query: &str,
     ) -> Option<(crate::Schema, std::sync::Arc<crate::sql::LogicalPlan>, u64)> {
         if !matches!(statement, sqlparser::ast::Statement::Query(_)) {
+            return None;
+        }
+        // Under a non-`public` session, the shared (public) plan would derive
+        // the wrong table's columns; defer to the private schema path.
+        if self.database.session_schema_active(self.session_id) {
             return None;
         }
         let (plan, epoch) = self.database.wire_parameterized_plan(query).ok()?;
@@ -616,12 +629,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
     fn derive_result_schema(&self, statement: &sqlparser::ast::Statement) -> Result<Option<crate::Schema>> {
         use sqlparser::ast::Statement;
 
+        // Resolve bare names against THIS session's `search_path` so Describe
+        // reports the schema-scoped relation's columns (and doesn't fail on a
+        // relation that exists only in the session's schema, not `public`).
+        let current_schema = self.database.session_current_schema(self.session_id).unwrap_or(None);
+
         // Only derive schema for queries that return results
         match statement {
             Statement::Query(_) => {
                 // SELECT and other queries - derive schema from logical plan
                 let catalog = self.database.storage.catalog();
-                let planner = crate::sql::planner::Planner::with_catalog(&catalog);
+                let planner = crate::sql::planner::Planner::with_catalog(&catalog)
+                    .with_current_schema(current_schema.clone());
 
                 // Convert statement to logical plan
                 let logical_plan = planner.statement_to_plan(statement.clone())?;
@@ -642,7 +661,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
                 if insert.returning.is_some() {
                     // Has RETURNING clause - derive schema
                     let catalog = self.database.storage.catalog();
-                    let planner = crate::sql::planner::Planner::with_catalog(&catalog);
+                    let planner = crate::sql::planner::Planner::with_catalog(&catalog)
+                        .with_current_schema(current_schema.clone());
                     let plan = planner.statement_to_plan(statement.clone())?;
                     if let crate::sql::LogicalPlan::Insert {
                         table_name,
@@ -667,7 +687,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
             Statement::Update { ref returning, .. } => {
                 if returning.is_some() {
                     let catalog = self.database.storage.catalog();
-                    let planner = crate::sql::planner::Planner::with_catalog(&catalog);
+                    let planner = crate::sql::planner::Planner::with_catalog(&catalog)
+                        .with_current_schema(current_schema.clone());
                     let plan = planner.statement_to_plan(statement.clone())?;
                     if let crate::sql::LogicalPlan::Update {
                         table_name,
@@ -687,7 +708,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
             Statement::Delete(ref del) => {
                 if del.returning.is_some() {
                     let catalog = self.database.storage.catalog();
-                    let planner = crate::sql::planner::Planner::with_catalog(&catalog);
+                    let planner = crate::sql::planner::Planner::with_catalog(&catalog)
+                        .with_current_schema(current_schema.clone());
                     let plan = planner.statement_to_plan(statement.clone())?;
                     if let crate::sql::LogicalPlan::Delete {
                         table_name,

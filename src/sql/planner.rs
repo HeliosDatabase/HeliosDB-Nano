@@ -78,6 +78,14 @@ pub struct Planner<'a> {
     cte_schemas: RefCell<HashMap<String, Arc<Schema>>>,
     /// Named window definitions in scope (name -> WindowSpec) from WINDOW clause
     named_windows: RefCell<HashMap<String, sqlparser::ast::WindowSpec>>,
+    /// Session `search_path` current schema (the first non-`public`,
+    /// non-`"$user"` entry). `None` = `public`, which is today's flat-namespace
+    /// behavior (bare keys). When `Some(cs)`, a BARE table reference resolves via
+    /// the two-probe in [`Self::resolve_table_ref`] and a bare CREATE targets
+    /// `cs.<table>` via [`Self::resolve_table_create`]. Threaded per statement
+    /// from the session's current schema so it composes with the plan cache
+    /// (which is invalidated whenever `search_path` changes).
+    current_schema: Option<String>,
 }
 
 impl<'a> Planner<'a> {
@@ -88,6 +96,7 @@ impl<'a> Planner<'a> {
             original_sql: None,
             cte_schemas: RefCell::new(HashMap::new()),
             named_windows: RefCell::new(HashMap::new()),
+            current_schema: None,
         }
     }
 
@@ -98,12 +107,20 @@ impl<'a> Planner<'a> {
             original_sql: None,
             cte_schemas: RefCell::new(HashMap::new()),
             named_windows: RefCell::new(HashMap::new()),
+            current_schema: None,
         }
     }
 
     /// Set the original SQL for time-travel AS OF parsing
     pub fn with_sql(mut self, sql: String) -> Self {
         self.original_sql = Some(sql);
+        self
+    }
+
+    /// Set the session's current schema (from `SET search_path`). `None` keeps
+    /// the default `public` flat-namespace behavior.
+    pub fn with_current_schema(mut self, current_schema: Option<String>) -> Self {
+        self.current_schema = current_schema;
         self
     }
 
@@ -366,31 +383,109 @@ impl<'a> Planner<'a> {
     pub(crate) fn normalize_object_name(name: &sqlparser::ast::ObjectName) -> String {
         let joined = name.0.iter().map(Self::normalize_ident).collect::<Vec<_>>().join(".");
         // Schema-namespacing alias: `_hdb_code.<table>` → `_hdb_code_<table>`,
-        // `_hdb_graph.<table>` → `_hdb_graph_<table>`.  Lets users
-        // address the code-graph / graph-rag tables in dotted form
-        // without forcing a catalog refactor.  The flat-prefix names
-        // remain the canonical storage keys.
+        // `_hdb_graph.<table>` → `_hdb_graph_<table>`, and `pg_catalog.<view>`
+        // → `<view>`.  Lets users address the code-graph / graph-rag tables and
+        // catalog views in dotted form without forcing a catalog refactor.  The
+        // flat-prefix names remain the canonical storage keys.
         if let Some(dealiased) = Self::dealias_schema(&joined) {
             return dealiased;
         }
-        // Nano stores every table in the implicit `public` schema, so ANY
-        // schema qualifier collapses to the bare table name (the last
-        // dot-separated component): `public.`/`pg_catalog.` (most ORM-emitted
-        // DDL prefixes `"public"."tbl"` — KanttBan #13), AND any user schema.
-        // `CREATE SCHEMA` / `SET search_path` do not create a real separate
-        // namespace, so a table created unqualified (or under a non-default
-        // search_path that Nano resolves to `public`) must resolve identically
-        // whether later referenced bare OR schema-qualified — otherwise
-        // `CREATE TABLE t; DROP TABLE myschema.t` fails with "table does not
-        // exist" (reported as a search_path scoping error). A single quoted
-        // identifier that itself contains a dot (e.g. `"my.table"`) parses as
-        // ONE part and is correctly left intact. The one exception is
-        // `information_schema.*`, whose system views are registered/resolved
-        // under their qualified name — those keep the prefix.
+        // Schema namespacing (coexistence): the storage key becomes
+        // `schema.table` ONLY when the schema is non-`public`. A `public.` (or
+        // bare) reference keeps today's bare key, so pre-change data dirs — all
+        // bare — open and behave identically, and the default path costs nothing
+        // new. A non-`public` qualifier is PRESERVED so same-named tables in
+        // different schemas coexist (`a.t` and `b.t` are distinct keys). This is
+        // the pure AST→logical-key mapping and carries NO session `search_path`
+        // resolution: a BARE reference stays bare here and is resolved against
+        // the session's current schema by `resolve_table_ref` /
+        // `resolve_table_create` (the two instance wrappers used at the
+        // table-like call sites). A single quoted identifier that itself
+        // contains a dot (e.g. `"my.table"`) parses as ONE part and is left
+        // intact. `information_schema.*` is non-`public`, so it is preserved as
+        // a qualified key — matching how its system views are registered.
+        if name.0.len() >= 2 {
+            let table = Self::normalize_ident(&name.0[name.0.len() - 1]);
+            // Use the schema component (second-to-last); any catalog/database
+            // prefix beyond it is dropped, matching PostgreSQL's
+            // catalog.schema.table resolution against the current database.
+            let schema = Self::normalize_ident(&name.0[name.0.len() - 2]);
+            if schema == "public" {
+                return table;
+            }
+            return format!("{schema}.{table}");
+        }
+        joined
+    }
+
+    /// Namespace-collapse for NON-table objects (indexes, sequences, enum
+    /// types, databases, trigger functions). Schema namespacing is scoped to
+    /// TABLE-like objects: these keep today's behavior — ANY qualifier collapses
+    /// to the bare last component — so an index/sequence/type name is stored and
+    /// looked up under the SAME bare key it always was (a qualified index name
+    /// keyed as `schema.idx` would break every bare index lookup). This is the
+    /// pre-change `normalize_object_name` body verbatim.
+    pub(crate) fn normalize_nontable_name(name: &sqlparser::ast::ObjectName) -> String {
+        let joined = name.0.iter().map(Self::normalize_ident).collect::<Vec<_>>().join(".");
+        if let Some(dealiased) = Self::dealias_schema(&joined) {
+            return dealiased;
+        }
         if name.0.len() >= 2 && Self::normalize_ident(&name.0[0]) != "information_schema" {
             return Self::normalize_ident(&name.0[name.0.len() - 1]);
         }
         joined
+    }
+
+    /// Split a resolved storage key into `(schema, bare_table)`. The inverse of
+    /// the `schema.table` key layout `normalize_object_name` produces: a key
+    /// with a `.` is `schema.table`; a bare key is `("public", key)`. Used for
+    /// introspection (`pg_class.relname` bare; `information_schema.*.table_schema`
+    /// real). A quoted identifier that itself embedded a `.` is a rare edge that
+    /// this treats as a schema split — acceptable for display surfaces.
+    pub(crate) fn split_schema_key(key: &str) -> (String, String) {
+        match key.find('.') {
+            Some(idx) => (key[..idx].to_string(), key[idx + 1..].to_string()),
+            None => ("public".to_string(), key.to_string()),
+        }
+    }
+
+    /// Resolve a table REFERENCE (read / DML / FK target / DROP) to its storage
+    /// key, honoring the session `search_path`. Qualified names resolve exactly
+    /// (`normalize_object_name` preserved the schema). A BARE name under a
+    /// non-`public` current schema uses a two-probe: prefer `current_schema.t`
+    /// when that key exists, else fall back to the bare `public` key `t`. With
+    /// no current schema (the default) this is exactly `normalize_object_name`.
+    pub(crate) fn resolve_table_ref(&self, name: &sqlparser::ast::ObjectName) -> String {
+        let base = Self::normalize_object_name(name);
+        // ONLY an unqualified reference participates in search_path resolution.
+        // An EXPLICIT qualifier is exact — including `public.t` (which
+        // `normalize_object_name` collapses to bare `t`): the user asked for
+        // public, so it must NOT be re-scoped to the current schema. Detect the
+        // explicit qualifier from the parsed part count, not the collapsed key.
+        if name.0.len() >= 2 {
+            return base;
+        }
+        let Some(cs) = self.current_schema.as_deref() else {
+            return base;
+        };
+        let qualified = format!("{cs}.{base}");
+        if let Some(catalog) = self.catalog {
+            if catalog.table_exists(&qualified).unwrap_or(false) {
+                return qualified;
+            }
+        }
+        base
+    }
+
+    /// Resolve a table CREATE target to its storage key. An explicit qualifier
+    /// is exact; a BARE name under a non-`public` current schema targets
+    /// `current_schema.t` eagerly (no probe — the table does not exist yet).
+    pub(crate) fn resolve_table_create(&self, name: &sqlparser::ast::ObjectName) -> String {
+        let base = Self::normalize_object_name(name);
+        match self.current_schema.as_deref() {
+            Some(cs) if name.0.len() < 2 => format!("{cs}.{base}"),
+            _ => base,
+        }
     }
 
     /// Normalise a raw (possibly quoted / schema-qualified) dotted name string
@@ -482,7 +577,7 @@ impl<'a> Planner<'a> {
             Statement::Query(query) => self.query_to_plan(*query),
             Statement::Insert(insert) => {
                 // Extract fields from Insert struct for v0.53 API
-                let table_name = Self::normalize_object_name(&insert.table_name);
+                let table_name = self.resolve_table_ref(&insert.table_name);
                 let columns = insert.columns;
                 // `INSERT INTO t DEFAULT VALUES` — sqlparser leaves
                 // `source = None`. Emit an Insert with an empty
@@ -518,7 +613,9 @@ impl<'a> Planner<'a> {
             }
             Statement::CreateTable(create_table) => {
                 // Extract fields from CreateTable struct for v0.53 API
-                let name = Self::normalize_object_name(&create_table.name);
+                // A bare CREATE under a non-`public` `search_path` targets the
+                // current schema (`cs.<table>`); a qualified name is exact.
+                let name = self.resolve_table_create(&create_table.name);
                 let columns = create_table.columns;
                 let if_not_exists = create_table.if_not_exists;
                 let constraints = create_table.constraints;
@@ -529,27 +626,62 @@ impl<'a> Planner<'a> {
                 names,
                 if_exists,
                 object_type,
+                cascade,
                 ..
             } => {
                 if names.is_empty() {
                     return Err(Error::query_execution("DROP requires a name"));
+                }
+                // `DROP SCHEMA [IF EXISTS] s1[, s2 …] [CASCADE|RESTRICT]` — the
+                // schema name is NOT a `schema.table` key, so it keeps the bare
+                // form (`normalize_object_name` on a single ident is identity).
+                // RESTRICT (default, `cascade == false`) errors on a non-empty
+                // schema; CASCADE drops every member table through the ordinary
+                // DROP funnel. Member enumeration is a catalog prefix scan, so no
+                // separate member records are needed. Executed by the DropSchema
+                // arm.
+                if matches!(object_type, sqlparser::ast::ObjectType::Schema) {
+                    return Ok(LogicalPlan::DropSchema {
+                        names: names.iter().map(Self::normalize_nontable_name).collect(),
+                        if_exists,
+                        cascade,
+                    });
                 }
                 // Build one drop plan per object. `DROP TABLE a, b` (PostgreSQL's
                 // comma list) yields a DropMulti executed sequentially. DROP TYPE
                 // notes: removes the enum registration from the catalog; tables
                 // that referenced the type keep their synthesized CHECK constraint
                 // (we don't track back-pointers), which mirrors PG closely enough
-                // for an embedded DB.
+                // for an embedded DB. A DROP TABLE target resolves through the
+                // session `search_path` (bare → `cs.t` when it exists); other
+                // object kinds keep the plain namespace-collapse.
                 let to_plan = |name: &sqlparser::ast::ObjectName| -> LogicalPlan {
-                    let name = Self::normalize_object_name(name);
                     match object_type {
-                        sqlparser::ast::ObjectType::View => LogicalPlan::DropView { name, if_exists },
-                        sqlparser::ast::ObjectType::Table => LogicalPlan::DropTable { name, if_exists },
-                        sqlparser::ast::ObjectType::Database => LogicalPlan::DropDatabase { name, if_exists },
-                        sqlparser::ast::ObjectType::Type => LogicalPlan::DropEnumType { name, if_exists },
-                        sqlparser::ast::ObjectType::Sequence => LogicalPlan::DropSequence { name, if_exists },
+                        sqlparser::ast::ObjectType::View => LogicalPlan::DropView {
+                            name: Self::normalize_nontable_name(name),
+                            if_exists,
+                        },
+                        sqlparser::ast::ObjectType::Table => LogicalPlan::DropTable {
+                            name: self.resolve_table_ref(name),
+                            if_exists,
+                        },
+                        sqlparser::ast::ObjectType::Database => LogicalPlan::DropDatabase {
+                            name: Self::normalize_nontable_name(name),
+                            if_exists,
+                        },
+                        sqlparser::ast::ObjectType::Type => LogicalPlan::DropEnumType {
+                            name: Self::normalize_nontable_name(name),
+                            if_exists,
+                        },
+                        sqlparser::ast::ObjectType::Sequence => LogicalPlan::DropSequence {
+                            name: Self::normalize_nontable_name(name),
+                            if_exists,
+                        },
                         // Default to DROP TABLE for backwards compatibility.
-                        _ => LogicalPlan::DropTable { name, if_exists },
+                        _ => LogicalPlan::DropTable {
+                            name: self.resolve_table_ref(name),
+                            if_exists,
+                        },
                     }
                 };
 
@@ -620,16 +752,17 @@ impl<'a> Planner<'a> {
                 self.delete_to_plan(table, delete_stmt.selection.clone(), returning)
             }
             Statement::CreateIndex(create_index) => {
-                // Extract index name
-                let index_name = Self::normalize_object_name(
+                // Extract index name (non-table object → plain collapse).
+                let index_name = Self::normalize_nontable_name(
                     create_index
                         .name
                         .as_ref()
                         .ok_or_else(|| Error::query_execution("Index name is required"))?,
                 );
 
-                // Extract table name
-                let table = Self::normalize_object_name(&create_index.table_name);
+                // Extract table name (the index NAME above stays a plain
+                // namespace-collapse; only the TARGET table is schema-resolved).
+                let table = self.resolve_table_ref(&create_index.table_name);
 
                 // Extract column name. We support single-column B-tree / HNSW
                 // indexes natively; multi-column B-tree indexes are accepted
@@ -686,7 +819,7 @@ impl<'a> Planner<'a> {
                 })
             }
             Statement::AlterTable { name, operations, .. } => {
-                self.alter_table_to_plan(Self::normalize_object_name(&name), operations)
+                self.alter_table_to_plan(self.resolve_table_ref(&name), operations)
             }
             Statement::CreateTrigger {
                 or_replace,
@@ -953,7 +1086,7 @@ impl<'a> Planner<'a> {
                 owned_by,
                 temporary: _,
             } => {
-                let seq_name = Self::normalize_object_name(&name);
+                let seq_name = Self::normalize_nontable_name(&name);
                 let opts = Self::extract_sequence_options(&sequence_options);
                 let data_type = data_type.as_ref().map(Self::sequence_type_name);
                 // MINVALUE: Some(Some(n)) = explicit n; Some(None) = NO MINVALUE.
@@ -991,7 +1124,7 @@ impl<'a> Planner<'a> {
             Statement::CreateDatabase {
                 db_name, if_not_exists, ..
             } => {
-                let name = Self::normalize_object_name(&db_name);
+                let name = Self::normalize_nontable_name(&db_name);
                 Ok(LogicalPlan::CreateDatabase { name, if_not_exists })
             }
             // CREATE SCHEMA [IF NOT EXISTS] <name>. HeliosDB uses a single flat
@@ -1004,8 +1137,8 @@ impl<'a> Planner<'a> {
             } => {
                 use sqlparser::ast::SchemaName;
                 let name = match schema_name {
-                    SchemaName::Simple(object_name) => Self::normalize_object_name(&object_name),
-                    SchemaName::NamedAuthorization(object_name, _) => Self::normalize_object_name(&object_name),
+                    SchemaName::Simple(object_name) => Self::normalize_nontable_name(&object_name),
+                    SchemaName::NamedAuthorization(object_name, _) => Self::normalize_nontable_name(&object_name),
                     SchemaName::UnnamedAuthorization(ident) => Self::normalize_ident(&ident),
                 };
                 Ok(LogicalPlan::CreateSchema { name, if_not_exists })
@@ -1035,7 +1168,7 @@ impl<'a> Planner<'a> {
             // domain representations error here; only enums are
             // implemented in this slice.
             Statement::CreateType { name, representation } => {
-                let normalised = Self::normalize_object_name(&name);
+                let normalised = Self::normalize_nontable_name(&name);
                 use sqlparser::ast::UserDefinedTypeRepresentation;
                 match representation {
                     UserDefinedTypeRepresentation::Enum { labels } => {
@@ -1838,7 +1971,7 @@ impl<'a> Planner<'a> {
     fn table_factor_to_plan(&self, table_factor: &TableFactor) -> Result<LogicalPlan> {
         match table_factor {
             TableFactor::Table { name, alias, args, .. } => {
-                let table_name = Self::normalize_object_name(name);
+                let table_name = self.resolve_table_ref(name);
 
                 // Check if this is a table-valued function call (e.g., generate_series(1, 10))
                 // In sqlparser, FROM generate_series(1, 10) is parsed as Table with args
@@ -4100,7 +4233,7 @@ impl<'a> Planner<'a> {
                         let fk_constraint = TableConstraint::ForeignKey {
                             name: None,
                             columns: vec![Self::normalize_ident(&col.name)],
-                            references_table: Self::normalize_object_name(foreign_table),
+                            references_table: self.resolve_table_ref(foreign_table),
                             references_columns: referred_columns.iter().map(Self::normalize_ident).collect(),
                             on_delete: on_delete.as_ref().map(|a| convert_referential_action(a)),
                             on_update: on_update.as_ref().map(|a| convert_referential_action(a)),
@@ -4385,7 +4518,7 @@ impl<'a> Planner<'a> {
                     // `references_table = "\"users\""` that later
                     // FK-check lookups could not resolve (B36).
                     columns: columns.iter().map(Self::normalize_ident).collect(),
-                    references_table: Self::normalize_object_name(foreign_table),
+                    references_table: self.resolve_table_ref(foreign_table),
                     references_columns: referred_columns.iter().map(Self::normalize_ident).collect(),
                     on_delete: on_delete.as_ref().map(|a| convert_referential_action(a)),
                     on_update: on_update.as_ref().map(|a| convert_referential_action(a)),
@@ -4520,7 +4653,7 @@ impl<'a> Planner<'a> {
                     table_name,
                     constraint_name: name.as_ref().map(|n| n.to_string()),
                     columns: columns.iter().map(Self::normalize_ident).collect(),
-                    references_table: Self::normalize_object_name(&foreign_table),
+                    references_table: self.resolve_table_ref(&foreign_table),
                     references_columns: referred_columns.iter().map(Self::normalize_ident).collect(),
                     on_delete: on_delete.as_ref().map(convert_referential_action),
                     on_update: on_update.as_ref().map(convert_referential_action),
@@ -5032,7 +5165,7 @@ impl<'a> Planner<'a> {
     ) -> Result<LogicalPlan> {
         // Get table name
         let table_name = match &table.relation {
-            sqlparser::ast::TableFactor::Table { name, .. } => Self::normalize_object_name(name),
+            sqlparser::ast::TableFactor::Table { name, .. } => self.resolve_table_ref(name),
             _ => {
                 return Err(Error::query_execution(
                     "Complex table expressions in UPDATE not supported",
@@ -5188,7 +5321,7 @@ impl<'a> Planner<'a> {
     ) -> Result<LogicalPlan> {
         // Get table name
         let table_name = match &table.relation {
-            sqlparser::ast::TableFactor::Table { name, .. } => Self::normalize_object_name(name),
+            sqlparser::ast::TableFactor::Table { name, .. } => self.resolve_table_ref(name),
             _ => {
                 return Err(Error::query_execution(
                     "Complex table expressions in DELETE not supported",
@@ -5383,7 +5516,7 @@ impl<'a> Planner<'a> {
 
         // Capture the invoked function name (`EXECUTE FUNCTION f()`) so the
         // executor can resolve its body for BEFORE-row NEW mutation.
-        let function_name = Some(Self::normalize_object_name(&exec_body.func_desc.name));
+        let function_name = Some(Self::normalize_nontable_name(&exec_body.func_desc.name));
 
         Ok(LogicalPlan::CreateTrigger {
             name: trigger_name,
@@ -5570,24 +5703,32 @@ mod tests {
     fn schema_qualified_names_collapse_to_bare_table() {
         use sqlparser::ast::{Ident, ObjectName};
         let on = |parts: &[&str]| ObjectName(parts.iter().map(|p| Ident::new(*p)).collect());
-        // Nano is public-only: ANY schema qualifier -> the bare table name, so a
-        // table created bare resolves whether later referenced bare or
-        // schema-qualified. (Regression: `CREATE TABLE t; DROP TABLE sch.t`
-        // previously failed with "table does not exist".)
+        // Schema namespacing (coexistence): `public.`/`pg_catalog.` collapse to
+        // the bare key (default flat namespace, unchanged), but a non-`public`
+        // qualifier is PRESERVED as a `schema.table` key so same-named tables
+        // coexist across schemas. `normalize_object_name` is the pure AST→key
+        // map (no `search_path` resolution — that lives in `resolve_table_ref`).
         assert_eq!(Planner::normalize_object_name(&on(&["public", "t"])), "t");
         assert_eq!(Planner::normalize_object_name(&on(&["pg_catalog", "pg_type"])), "pg_type");
-        assert_eq!(Planner::normalize_object_name(&on(&["smoke", "____smoketest"])), "____smoketest");
-        assert_eq!(Planner::normalize_object_name(&on(&["myschema", "qualtest"])), "qualtest");
+        assert_eq!(Planner::normalize_object_name(&on(&["smoke", "____smoketest"])), "smoke.____smoketest");
+        assert_eq!(Planner::normalize_object_name(&on(&["myschema", "qualtest"])), "myschema.qualtest");
         // bare name unchanged
         assert_eq!(Planner::normalize_object_name(&on(&["____smoketest"])), "____smoketest");
         // a single (quoted) identifier that contains a dot is ONE part -> intact
         assert_eq!(Planner::normalize_object_name(&on(&["my.table"])), "my.table");
+        // A catalog/database prefix beyond schema.table is dropped (PostgreSQL
+        // resolves catalog.schema.table against the current database).
+        assert_eq!(Planner::normalize_object_name(&on(&["mydb", "myschema", "t"])), "myschema.t");
+        assert_eq!(Planner::normalize_object_name(&on(&["mydb", "public", "t"])), "t");
         // information_schema.* system views KEEP their qualifier (registered/
-        // resolved under the qualified name — must not collapse to bare).
+        // resolved under the qualified name — non-`public`, so preserved).
         assert_eq!(
             Planner::normalize_object_name(&on(&["information_schema", "tables"])),
             "information_schema.tables"
         );
+        // split_schema_key is the inverse used by introspection.
+        assert_eq!(Planner::split_schema_key("a.t"), ("a".to_string(), "t".to_string()));
+        assert_eq!(Planner::split_schema_key("t"), ("public".to_string(), "t".to_string()));
         // The string pre-parse path (ALTER SEQUENCE / OWNED BY) collapses ONLY
         // public./pg_catalog. — it must PRESERVE `table.col` (and other custom
         // dotted names) so OWNED BY can split them back into (table, col).

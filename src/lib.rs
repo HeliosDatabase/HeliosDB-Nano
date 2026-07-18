@@ -400,6 +400,47 @@ fn new_cache_admission() -> std::sync::Arc<[[std::sync::atomic::AtomicU64; CACHE
     }))
 }
 
+thread_local! {
+    /// Per-thread `search_path` override a wire session installs for the
+    /// duration of ONE synchronous statement that routes through the global
+    /// (non-session) execute/query paths (see
+    /// `EmbeddedDatabase::session_schema_override_guard`). `Some(schema)` while
+    /// installed, `None` when absent — in which case `current_schema()` reads
+    /// the embedded shared field. This mirrors the thread-local
+    /// `synchronous_commit` override the durability guard installs: set before
+    /// the synchronous call, cleared on the guard's `Drop`, so no schema ever
+    /// leaks into the next connection a worker thread serves. Only ever holds a
+    /// non-`public` schema (a `public` session installs no guard).
+    static SESSION_SCHEMA_OVERRIDE: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+    /// Hot-path mirror of "a non-`public` schema override is installed on this
+    /// thread" (see `SESSION_SCHEMA_OVERRIDE`). The literal fast-path gates read
+    /// this `Cell` instead of borrowing the `RefCell`, so a wire session with an
+    /// active `search_path` yields to the planner two-probe without lock or
+    /// borrow traffic.
+    static SESSION_SCHEMA_OVERRIDE_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// RAII installer for the per-statement thread-local `search_path` override a
+/// wire session threads into planning. Clears both thread-locals on `Drop`.
+struct SessionSchemaOverrideGuard;
+
+impl SessionSchemaOverrideGuard {
+    /// Install a non-`public` schema as the current thread's override.
+    fn install(schema: String) -> Self {
+        SESSION_SCHEMA_OVERRIDE.with(|c| *c.borrow_mut() = Some(schema));
+        SESSION_SCHEMA_OVERRIDE_ACTIVE.with(|c| c.set(true));
+        Self
+    }
+}
+
+impl Drop for SessionSchemaOverrideGuard {
+    fn drop(&mut self) {
+        SESSION_SCHEMA_OVERRIDE.with(|c| *c.borrow_mut() = None);
+        SESSION_SCHEMA_OVERRIDE_ACTIVE.with(|c| c.set(false));
+    }
+}
+
 pub struct EmbeddedDatabase {
     /// Storage engine (public for REPL access)
     pub storage: std::sync::Arc<storage::StorageEngine>,
@@ -446,6 +487,30 @@ pub struct EmbeddedDatabase {
         std::sync::Arc<parking_lot::RwLock<std::collections::HashMap<String, PreparedFastSelectSpec>>>,
     /// Database-level settings for embedded SQL entry points.
     session_settings: sql::SessionSettings,
+    /// EMBEDDED single-session `search_path` current schema (first non-`public`,
+    /// non-`"$user"` entry). `None` = `public` (today's flat namespace). This
+    /// backs the embedded `db.execute("SET search_path …")` path ONLY — every
+    /// wire connection carries its own schema on its [`crate::session::Session`]
+    /// (see `set_session_current_schema` / `session_schema_override_guard`), so
+    /// two connections never share this selector. `current_schema()` reads the
+    /// per-session thread-local override first and falls back here for the
+    /// embedded caller. Every embedded mutation (`SET`/`RESET search_path`)
+    /// invalidates the plan/result caches, exactly like a branch switch, so
+    /// cached plans never cross a schema change.
+    current_schema: std::sync::Arc<parking_lot::RwLock<Option<String>>>,
+    /// Monotonic "some session has used a non-`public` `search_path`" gate.
+    /// `false` until the first `SET search_path TO <non-public>` on ANY wire
+    /// session; while `false` the `_for_session` paths skip the per-session
+    /// schema lookup entirely, so the default wire workload (pg35, always
+    /// `public`) pays zero extra thread-local / session traffic — mirroring the
+    /// cheap-atomic gate `result_cache_nonempty` uses for the result cache.
+    any_session_schema_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Hot-path mirror of "`current_schema` is set (non-`public`)". The literal
+    /// fast paths (fast INSERT/UPDATE/DELETE/SELECT) resolve bare names directly
+    /// and must yield to the planner when a `search_path` is active; they check
+    /// this relaxed atomic instead of taking the `current_schema` lock on every
+    /// query, so the default `public` path stays lock-free.
+    current_schema_set: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Active savepoints stack (name -> transaction state)
     savepoints: std::sync::Arc<parking_lot::RwLock<Vec<SavepointState>>>,
     /// Plan cache: SQL string → `Arc<LogicalPlan>` (sharded LRU, skips parse+plan for repeated queries)
@@ -1012,6 +1077,9 @@ impl EmbeddedDatabase {
             plan,
             sql::LogicalPlan::CreateTable { .. }
                 | sql::LogicalPlan::DropTable { .. }
+                // DROP SCHEMA CASCADE drops member tables; RESTRICT may still be
+                // a no-op, but invalidating on any DROP SCHEMA is safe + cheap.
+                | sql::LogicalPlan::DropSchema { .. }
                 | sql::LogicalPlan::CreateSequence { .. }
                 | sql::LogicalPlan::AlterSequence(_)
                 | sql::LogicalPlan::DropSequence { .. }
@@ -1110,10 +1178,112 @@ impl EmbeddedDatabase {
         None
     }
 
+    /// The current schema (from `SET search_path`), or `None` for the default
+    /// `public`. Threaded to the planner so bare table names resolve against it
+    /// (see `Planner::resolve_table_ref` / `resolve_table_create`). A wire
+    /// session's per-statement thread-local override wins over the embedded
+    /// shared field, so each connection resolves against ITS OWN schema and one
+    /// connection can never steer another's bare names.
+    pub(crate) fn current_schema(&self) -> Option<String> {
+        // Wire session override (thread-local, installed by the `_for_session`
+        // paths). Only ever holds a non-`public` schema, so its presence alone
+        // is the answer.
+        if let Some(schema) = SESSION_SCHEMA_OVERRIDE.with(|c| c.borrow().clone()) {
+            return Some(schema);
+        }
+        // Embedded single-session path is lock-free on the default (`public`)
+        // path: only touch the lock when a non-`public` search_path is active.
+        if !self.current_schema_set.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+        self.current_schema.read().clone()
+    }
+
+    /// Lock-free "a non-`public` `search_path` is active for this statement"
+    /// check for the literal fast paths and the plan/result-cache gates. True
+    /// when either the embedded shared field is set OR the calling wire session
+    /// installed a non-`public` thread-local override.
+    fn current_schema_is_set(&self) -> bool {
+        self.current_schema_set.load(std::sync::atomic::Ordering::Relaxed)
+            || SESSION_SCHEMA_OVERRIDE_ACTIVE.with(|c| c.get())
+    }
+
+    /// Update the session's current schema and the hot-path atomic together.
+    fn set_current_schema(&self, schema: Option<String>) {
+        self.current_schema_set
+            .store(schema.is_some(), std::sync::atomic::Ordering::Relaxed);
+        *self.current_schema.write() = schema;
+    }
+
+    /// Derive the current schema from a `search_path` value string: the FIRST
+    /// entry that is neither `public` nor `"$user"`, folded to lower-case
+    /// (unquoted PostgreSQL identifiers are case-insensitive). Returns `None`
+    /// when only `public` / `"$user"` remain — i.e. the default namespace.
+    fn derive_search_path_schema(value: &str) -> Option<String> {
+        for raw in value.split(',') {
+            let entry = raw.trim().trim_matches('"').trim().trim_matches('\'').trim();
+            if entry.is_empty() {
+                continue;
+            }
+            let lowered = entry.to_ascii_lowercase();
+            if lowered == "public" || lowered == "$user" {
+                continue;
+            }
+            return Some(lowered);
+        }
+        None
+    }
+
+    /// Intercept `SET`/`SHOW`/`RESET search_path`. `search_path` is a
+    /// session-scoped schema selector, not a generic registered setting, so it
+    /// is handled here (before the registered-setting gate). A change to the
+    /// current schema invalidates the plan/result caches — a cached plan
+    /// resolved bare names under the previous schema and must not be served now
+    /// (the same reason a branch switch invalidates). Returns `Some(rows)` when
+    /// the statement targeted `search_path`, else `None` (fall through).
+    fn try_handle_search_path_setting(
+        &self,
+        statement: &DbSettingStatement,
+    ) -> Result<Option<(Vec<Tuple>, Vec<String>)>> {
+        match statement {
+            DbSettingStatement::Set { name, value } if name == "search_path" => {
+                self.set_current_schema(Self::derive_search_path_schema(value));
+                self.invalidate_plan_cache();
+                Ok(Some((Vec::new(), Vec::new())))
+            }
+            DbSettingStatement::Reset { name } if name == "search_path" => {
+                self.set_current_schema(None);
+                self.invalidate_plan_cache();
+                Ok(Some((Vec::new(), Vec::new())))
+            }
+            DbSettingStatement::Show { name } if name == "search_path" => {
+                // Reconstruct a PostgreSQL-shaped value from the derived schema:
+                // the default is `"$user", public`; a set schema shows first.
+                let val = match self.current_schema() {
+                    Some(cs) => format!("{cs}, public"),
+                    None => "\"$user\", public".to_string(),
+                };
+                Ok(Some((
+                    vec![Tuple {
+                        values: vec![Value::String(val)],
+                        row_id: None,
+                        branch_id: None,
+                    }],
+                    vec!["search_path".to_string()],
+                )))
+            }
+            _ => Ok(None),
+        }
+    }
+
     fn try_handle_db_setting_statement_with_columns(&self, sql: &str) -> Result<Option<(Vec<Tuple>, Vec<String>)>> {
         let Some(statement) = Self::parse_db_setting_statement(sql) else {
             return Ok(None);
         };
+
+        if let Some(handled) = self.try_handle_search_path_setting(&statement)? {
+            return Ok(Some(handled));
+        }
 
         match statement {
             DbSettingStatement::Set { name, value } => {
@@ -1954,6 +2124,16 @@ impl EmbeddedDatabase {
                 || upper.contains("BULK_LOAD_MODE"))
     }
 
+    /// True for `SET`/`RESET search_path` (any `LOCAL`/`SESSION`/`TO`/`=`
+    /// form). The wire simple-query handler acks generic `SET` itself, so it
+    /// uses this to route `search_path` through `execute()` (which updates the
+    /// session's current schema) before that generic ack.
+    pub(crate) fn is_search_path_statement(sql: &str) -> bool {
+        let trimmed = sql.trim().trim_end_matches(';').trim();
+        let upper = trimmed.to_ascii_uppercase();
+        (upper.starts_with("SET ") || upper.starts_with("RESET ")) && upper.contains("SEARCH_PATH")
+    }
+
     fn try_handle_fk_setting(&self, sql: &str) -> Result<Option<u64>> {
         let trimmed = sql.trim().trim_end_matches(';').trim();
         let upper = trimmed.to_ascii_uppercase();
@@ -2468,20 +2648,27 @@ impl EmbeddedDatabase {
         //    breaking snapshot isolation for other sessions)
         let has_savepoints = !self.savepoints.read().is_empty();
         let has_session_txns = self.any_session_txns();
+        // These literal/param fast paths parse the target table name straight
+        // out of the SQL text (bare) and never apply the session `search_path`,
+        // so under a non-`public` schema they would write to the wrong table.
+        // Yield to the full planner path (which resolves via `current_schema()`)
+        // whenever a schema is active. The default public path is unaffected.
+        let schema_active = self.current_schema_is_set();
         // INSERT fast paths write MVCC version keys, so versioned session-txn
         // snapshot reads stay correct while they run; they only need to yield
         // when versioning is off. UPDATE/DELETE fast paths write no version
         // history (roadmap C15) and stay disabled whenever any session
         // transaction is open.
         let insert_fast_paths_blocked = self.session_txns_block_fast_inserts();
-        let use_fast_paths = !skip_fast_paths && !has_savepoints && !has_session_txns;
-        let use_insert_fast_paths = !skip_fast_paths && !has_savepoints && !insert_fast_paths_blocked;
+        let use_fast_paths = !skip_fast_paths && !has_savepoints && !has_session_txns && !schema_active;
+        let use_insert_fast_paths =
+            !skip_fast_paths && !has_savepoints && !insert_fast_paths_blocked && !schema_active;
 
         // Explicit transactions can still use transaction-aware INSERT fast
         // paths. These buffer rows in the transaction write set, so
         // COMMIT/ROLLBACK semantics are preserved while avoiding full
         // parser/planner and per-row counter persistence overhead.
-        if skip_fast_paths && !has_savepoints && !insert_fast_paths_blocked {
+        if skip_fast_paths && !has_savepoints && !insert_fast_paths_blocked && !schema_active {
             if let Some(result) = self.try_fast_insert_literal_in_transaction(sql, txn) {
                 return result;
             }
@@ -2548,7 +2735,9 @@ impl EmbeddedDatabase {
             let (view_name, query_sql, if_not_exists) = sql::Parser::parse_create_materialized_view_sql(sql)?;
             let (statement, _) = self.parse_cached(&query_sql)?;
             let catalog = self.storage.catalog();
-            let planner = sql::Planner::with_catalog(&catalog).with_sql(query_sql);
+            let planner = sql::Planner::with_catalog(&catalog)
+                .with_sql(query_sql)
+                .with_current_schema(self.current_schema());
             let query_plan = planner.statement_to_plan(statement)?;
             sql::phase3::MaterializedViewParser::parse_create_mv(view_name, query_plan, None, if_not_exists)?
         } else if sql::Parser::is_refresh_materialized_view(sql) {
@@ -2615,7 +2804,9 @@ impl EmbeddedDatabase {
 
             // Create logical plan with catalog access and original SQL for time-travel parsing
             let catalog = self.storage.catalog();
-            let planner = sql::Planner::with_catalog(&catalog).with_sql(sql.to_string());
+            let planner = sql::Planner::with_catalog(&catalog)
+                .with_sql(sql.to_string())
+                .with_current_schema(self.current_schema());
             planner.statement_to_plan(statement)?
         };
 
@@ -5439,6 +5630,9 @@ impl EmbeddedDatabase {
             prepared_statement_sql: std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             prepared_fast_selects: std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             session_settings: sql::SessionSettings::new(),
+            current_schema: std::sync::Arc::new(parking_lot::RwLock::new(None)),
+            current_schema_set: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            any_session_schema_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             savepoints: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
             plan_cache: std::sync::Arc::new(
                 sharded_lru::ShardedLruCache::new(std::num::NonZeroUsize::new(256).expect("256 is non-zero"))
@@ -5537,6 +5731,9 @@ impl EmbeddedDatabase {
             prepared_statement_sql: std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             prepared_fast_selects: std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             session_settings: sql::SessionSettings::new(),
+            current_schema: std::sync::Arc::new(parking_lot::RwLock::new(None)),
+            current_schema_set: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            any_session_schema_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             savepoints: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
             plan_cache: std::sync::Arc::new(
                 sharded_lru::ShardedLruCache::new(std::num::NonZeroUsize::new(256).expect("256 is non-zero"))
@@ -5671,6 +5868,9 @@ impl EmbeddedDatabase {
             prepared_statement_sql: std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             prepared_fast_selects: std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             session_settings: sql::SessionSettings::new(),
+            current_schema: std::sync::Arc::new(parking_lot::RwLock::new(None)),
+            current_schema_set: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            any_session_schema_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             savepoints: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
             plan_cache: std::sync::Arc::new(
                 sharded_lru::ShardedLruCache::new(std::num::NonZeroUsize::new(256).expect("256 is non-zero"))
@@ -6583,6 +6783,10 @@ impl EmbeddedDatabase {
         if !self.savepoints.read().is_empty()
             || self.session_txns_block_fast_inserts()
             || self.tenant_manager.get_current_context().is_some()
+            // Under a non-`public` `search_path`, bare names resolve via the
+            // planner two-probe; this fast path resolves bare names directly, so
+            // yield to the full planner path to stay schema-correct.
+            || self.current_schema_is_set()
         {
             return None;
         }
@@ -7353,17 +7557,26 @@ impl EmbeddedDatabase {
         sql: &str,
         plan: &sql::LogicalPlan,
     ) -> Option<Result<std::sync::Arc<FastParamInsertSpec>>> {
+        // The spec caches the plan's RESOLVED table name under the SQL text, which
+        // is shared across sessions; under a non-`public` `search_path` the same
+        // SQL maps to different schemas per session, so bypass the cache (build
+        // fresh from the already-schema-resolved `plan`). Public path unchanged.
+        let schema_active = self.current_schema_is_set();
         let cache_key = format!("\0fast_param_insert\0{sql}");
-        if let Some(spec) = self.fast_param_insert_cache.get(&cache_key) {
-            return Some(Ok(spec));
+        if !schema_active {
+            if let Some(spec) = self.fast_param_insert_cache.get(&cache_key) {
+                return Some(Ok(spec));
+            }
         }
 
         let spec = match self.build_fast_param_insert_spec(plan)? {
             Ok(spec) => std::sync::Arc::new(spec),
             Err(e) => return Some(Err(e)),
         };
-        self.fast_param_insert_cache
-            .put(cache_key, std::sync::Arc::clone(&spec));
+        if !schema_active {
+            self.fast_param_insert_cache
+                .put(cache_key, std::sync::Arc::clone(&spec));
+        }
         Some(Ok(spec))
     }
 
@@ -8483,6 +8696,8 @@ impl EmbeddedDatabase {
         if !self.savepoints.read().is_empty()
             || self.any_session_txns()
             || self.tenant_manager.get_current_context().is_some()
+            // Non-`public` `search_path`: resolve bare names via the planner.
+            || self.current_schema_is_set()
         {
             return None;
         }
@@ -10117,6 +10332,11 @@ impl EmbeddedDatabase {
         if self.in_transaction() {
             return None;
         }
+        // Non-`public` `search_path`: bare names resolve via the planner
+        // two-probe, so bypass this direct fast path.
+        if self.current_schema_is_set() {
+            return None;
+        }
 
         let trimmed = sql.trim();
 
@@ -10229,6 +10449,8 @@ impl EmbeddedDatabase {
         if self.in_transaction()
             || self.storage.is_branch_active()
             || self.tenant_manager.get_current_context().is_some()
+            // Non-`public` `search_path`: resolve bare names via the planner.
+            || self.current_schema_is_set()
         {
             return None;
         }
@@ -10635,6 +10857,12 @@ impl EmbeddedDatabase {
 
     fn try_fast_select_params(&self, sql: &str, params: &[Value]) -> Option<Result<Vec<Tuple>>> {
         if self.in_transaction() {
+            return None;
+        }
+        // This path parses the table name straight from the SQL (bare) and never
+        // applies the session `search_path`; under a non-`public` schema resolve
+        // through the planner two-probe instead (mirrors `fast_select_lookup`).
+        if self.current_schema_is_set() {
             return None;
         }
 
@@ -11361,23 +11589,36 @@ impl EmbeddedDatabase {
             _ => return Err(Error::query_execution("unsupported trigger RHS".to_string())),
         };
         let catalog = self.storage.catalog();
-        let planner = sql::Planner::with_catalog(&catalog);
+        let planner = sql::Planner::with_catalog(&catalog).with_current_schema(self.current_schema());
         planner.expr_to_logical(&expr)
     }
 
     /// Parse and plan a parameterized statement with a cache key that cannot
     /// collide with the non-parameterized `query()` plan cache entries.
     fn parameterized_plan_cached(&self, sql: &str) -> Result<std::sync::Arc<sql::LogicalPlan>> {
+        // Under a non-`public` `search_path`, bare names resolve against a
+        // per-session schema. The plan cache is keyed by SQL text only and
+        // shared across every session, so a plan built for one schema must
+        // never be read by, or written for, another. Bypass it entirely (plan
+        // fresh) so the shared cache stays public-schema-only — the invariant
+        // that lets the default public path keep using it unchanged.
+        let schema_active = self.current_schema_is_set();
         let cache_key = format!("\0params\0{sql}");
-        if let Some(plan) = self.plan_cache.get(&cache_key) {
-            return Ok(plan);
+        if !schema_active {
+            if let Some(plan) = self.plan_cache.get(&cache_key) {
+                return Ok(plan);
+            }
         }
 
         let (statement, _) = self.parse_cached(sql)?;
         let catalog = self.storage.catalog();
-        let planner = sql::Planner::with_catalog(&catalog).with_sql(sql.to_string());
+        let planner = sql::Planner::with_catalog(&catalog)
+            .with_sql(sql.to_string())
+            .with_current_schema(self.current_schema());
         let plan = std::sync::Arc::new(planner.statement_to_plan(statement)?);
-        self.plan_cache.put(cache_key, std::sync::Arc::clone(&plan));
+        if !schema_active {
+            self.plan_cache.put(cache_key, std::sync::Arc::clone(&plan));
+        }
         Ok(plan)
     }
 
@@ -11430,7 +11671,7 @@ impl EmbeddedDatabase {
         // 3. Create logical plan with catalog access
         let plan_start = std::time::Instant::now();
         let catalog = self.storage.catalog();
-        let planner = sql::Planner::with_catalog(&catalog);
+        let planner = sql::Planner::with_catalog(&catalog).with_current_schema(self.current_schema());
         let plan = planner.statement_to_plan(statement)?;
         let plan_elapsed = plan_start.elapsed();
         tracing::debug!(
@@ -12469,10 +12710,18 @@ impl EmbeddedDatabase {
         params: &[Value],
         plan_override: Option<&std::sync::Arc<sql::LogicalPlan>>,
     ) -> Result<u64> {
-        if let Some(result) = self.try_autocommit_fast_update_delete_params_cached(sql, params) {
-            let count = result?;
-            self.invalidate_result_cache();
-            return Ok(count);
+        // These param fast paths resolve the target table from the SQL text
+        // (bare) or from SQL-keyed spec caches that are shared across sessions,
+        // so under a non-`public` `search_path` they would touch the wrong
+        // table. Yield to `execute_plan_with_params`, which runs the
+        // schema-resolved plan. The default public path is unchanged.
+        let schema_active = self.current_schema_is_set();
+        if !schema_active {
+            if let Some(result) = self.try_autocommit_fast_update_delete_params_cached(sql, params) {
+                let count = result?;
+                self.invalidate_result_cache();
+                return Ok(count);
+            }
         }
 
         let plan = match plan_override {
@@ -12480,19 +12729,21 @@ impl EmbeddedDatabase {
             None => self.parameterized_plan_cached(sql)?,
         };
 
-        if let Some(result) = self.try_transaction_fast_insert_params(sql, &plan, params) {
-            let count = result?;
-            return Ok(count);
-        }
-        if let Some(result) = self.try_autocommit_fast_insert_params(sql, &plan, params) {
-            let count = result?;
-            self.invalidate_result_cache();
-            return Ok(count);
-        }
-        if let Some(result) = self.try_autocommit_fast_update_delete_params(sql, &plan, params) {
-            let count = result?;
-            self.invalidate_result_cache();
-            return Ok(count);
+        if !schema_active {
+            if let Some(result) = self.try_transaction_fast_insert_params(sql, &plan, params) {
+                let count = result?;
+                return Ok(count);
+            }
+            if let Some(result) = self.try_autocommit_fast_insert_params(sql, &plan, params) {
+                let count = result?;
+                self.invalidate_result_cache();
+                return Ok(count);
+            }
+            if let Some(result) = self.try_autocommit_fast_update_delete_params(sql, &plan, params) {
+                let count = result?;
+                self.invalidate_result_cache();
+                return Ok(count);
+            }
         }
 
         let (count, _tuples) = self.execute_plan_with_params(&plan, params, None)?;
@@ -12511,17 +12762,22 @@ impl EmbeddedDatabase {
         }
 
         let plan = self.parameterized_plan_cached(sql)?;
-        if let Some(result) = self.try_fast_insert_many_params(sql, &plan, rows) {
-            let count = result?;
-            if !self.in_transaction() {
-                self.invalidate_result_cache();
+        // These batch fast paths cache a spec under the SQL text (shared across
+        // sessions); a non-`public` `search_path` maps the same SQL to a
+        // different schema, so yield to the per-row planner path below.
+        if !self.current_schema_is_set() {
+            if let Some(result) = self.try_fast_insert_many_params(sql, &plan, rows) {
+                let count = result?;
+                if !self.in_transaction() {
+                    self.invalidate_result_cache();
+                }
+                return Ok(count);
             }
-            return Ok(count);
-        }
-        if let Some(result) = self.try_autocommit_fast_update_delete_many_params(sql, &plan, rows) {
-            let count = result?;
-            self.invalidate_result_cache();
-            return Ok(count);
+            if let Some(result) = self.try_autocommit_fast_update_delete_many_params(sql, &plan, rows) {
+                let count = result?;
+                self.invalidate_result_cache();
+                return Ok(count);
+            }
         }
 
         let mut total = 0_u64;
@@ -14006,7 +14262,9 @@ impl EmbeddedDatabase {
             }
             let (statement, _) = self.parse_cached(sql)?;
             let catalog = self.storage.catalog();
-            let planner = sql::Planner::with_catalog(&catalog).with_sql(sql.to_string());
+            let planner = sql::Planner::with_catalog(&catalog)
+                .with_sql(sql.to_string())
+                .with_current_schema(self.current_schema());
             let plan = planner.statement_to_plan(statement)?;
             if let Some((rows, _columns)) = self.try_handle_prepared_query_plan_with_columns(&plan)? {
                 self.log_slow_query(sql, start.elapsed(), rows.len() as u64);
@@ -14030,7 +14288,9 @@ impl EmbeddedDatabase {
                 // Parse and execute through transaction-aware executor
                 let (statement, _) = self.parse_cached(sql)?;
                 let catalog = self.storage.catalog();
-                let planner = sql::Planner::with_catalog(&catalog).with_sql(sql.to_string());
+                let planner = sql::Planner::with_catalog(&catalog)
+                    .with_sql(sql.to_string())
+                    .with_current_schema(self.current_schema());
                 let plan = planner.statement_to_plan(statement)?;
                 let mut executor = sql::Executor::with_storage(&self.storage)
                     .with_timeout(self.effective_statement_timeout_ms())
@@ -14043,11 +14303,20 @@ impl EmbeddedDatabase {
 
         let result_cache_nonempty = self.result_cache_nonempty.load(std::sync::atomic::Ordering::Acquire);
 
+        // Under a non-`public` `search_path`, bare names resolve against a
+        // per-session schema; the plan/result caches are keyed by SQL text only
+        // and shared across sessions, so bypass every read and write here (plan
+        // fresh below with the active schema). Keeps the shared caches
+        // public-schema-only. The literal fast paths already yield under this
+        // same condition (`fast_select_lookup` / `try_fast_count_pk_query`), so
+        // the default public path (`schema_active == false`) is unchanged.
+        let schema_active = self.current_schema_is_set();
+
         // Preserve the v3.37 hot-result-cache behavior for repeated embedded
         // COUNT(*) probes. The COUNT fast path below is still the cold path,
         // but repeated deterministic COUNTs should not bypass an already-hot
         // single-entry result cache.
-        if result_cache_nonempty {
+        if !schema_active && result_cache_nonempty {
             if let Some(cached_results) = self.hot_cached_query_result(sql) {
                 tracing::debug!(phase = "result_cache", "Hot result cache hit");
                 self.log_slow_query(sql, start.elapsed(), cached_results.len() as u64);
@@ -14098,7 +14367,7 @@ impl EmbeddedDatabase {
         // must return a fresh value every time. Caching any of these
         // would serve stale rows to the caller.
         let is_non_deterministic = Self::query_is_non_deterministic(sql);
-        if !is_non_deterministic && result_cache_nonempty {
+        if !schema_active && !is_non_deterministic && result_cache_nonempty {
             if let Some(cached_results) = self.cached_query_result(sql) {
                 tracing::debug!(phase = "result_cache", "Result cache hit");
                 self.log_slow_query(sql, start.elapsed(), cached_results.len() as u64);
@@ -14106,8 +14375,9 @@ impl EmbeddedDatabase {
             }
         }
 
-        // Check plan cache (Arc::clone is O(1))
-        let cached_plan = self.plan_cache.get(sql);
+        // Check plan cache (Arc::clone is O(1)); bypass under a non-`public`
+        // search_path so the shared cache is never read for a schema-scoped name.
+        let cached_plan = if schema_active { None } else { self.plan_cache.get(sql) };
 
         if let Some(arc_plan) = cached_plan {
             tracing::debug!(phase = "parse", duration_us = 0_u64, "SQL parsed (cached)");
@@ -14185,7 +14455,7 @@ impl EmbeddedDatabase {
         // key) never re-hits and is harmless. Deterministic-only, and
         // write-invalidated exactly like every other result-cache entry, so it
         // can never serve stale rows.
-        if !is_non_deterministic {
+        if !schema_active && !is_non_deterministic {
             if let Some(result) = self.try_normalized_query_with_columns(sql) {
                 let (rows, _columns) = result?;
                 if self.cache_admits(sql) {
@@ -14209,7 +14479,9 @@ impl EmbeddedDatabase {
         // 2. Create logical plan
         let plan_start = std::time::Instant::now();
         let catalog = self.storage.catalog();
-        let planner = sql::Planner::with_catalog(&catalog).with_sql(sql.to_string());
+        let planner = sql::Planner::with_catalog(&catalog)
+            .with_sql(sql.to_string())
+            .with_current_schema(self.current_schema());
         let plan = planner.statement_to_plan(statement)?;
         tracing::debug!(
             phase = "plan",
@@ -14246,7 +14518,7 @@ impl EmbeddedDatabase {
         // result-cache insert below) so unique-literal one-shots stop churning
         // the plan/result caches. A genuinely repeated query warms on its
         // second run; a plan-cache hit thereafter takes the branch above.
-        let admit = !is_non_deterministic && self.cache_admits(sql);
+        let admit = !schema_active && !is_non_deterministic && self.cache_admits(sql);
         let plan_arc = std::sync::Arc::new(plan);
         if admit {
             self.plan_cache.put(sql.to_string(), plan_arc.clone());
@@ -14357,7 +14629,9 @@ impl EmbeddedDatabase {
                 Err(e) => return Some(Err(e)),
             };
             let catalog = self.storage.catalog();
-            let planner = sql::Planner::with_catalog(&catalog).with_sql(nsql.clone());
+            let planner = sql::Planner::with_catalog(&catalog)
+                .with_sql(nsql.clone())
+                .with_current_schema(self.current_schema());
             let plan = match planner.statement_to_plan(statement) {
                 Ok(p) => p,
                 Err(e) => return Some(Err(e)),
@@ -14395,7 +14669,9 @@ impl EmbeddedDatabase {
     pub(crate) fn query_raw_unnormalized(&self, sql: &str) -> Result<Vec<Tuple>> {
         let (statement, _) = self.parse_cached(sql)?;
         let catalog = self.storage.catalog();
-        let planner = sql::Planner::with_catalog(&catalog).with_sql(sql.to_string());
+        let planner = sql::Planner::with_catalog(&catalog)
+            .with_sql(sql.to_string())
+            .with_current_schema(self.current_schema());
         let plan = planner.statement_to_plan(statement)?;
         let plan = self.cold_optimizer().optimize_recursive(plan)?;
         let mut executor =
@@ -14461,20 +14737,30 @@ impl EmbeddedDatabase {
             return Ok((Vec::new(), Vec::new()));
         }
 
+        // Under a non-`public` `search_path`, bare names resolve against a
+        // per-session schema; the normalized-plan and plan/result caches are
+        // keyed by SQL text only and shared across sessions, so skip every one
+        // of them (plan fresh below) — the shared caches stay public-only so no
+        // session ever serves another's schema-resolved plan. The default
+        // public path (`schema_active == false`) is untouched.
+        let schema_active = self.current_schema_is_set();
+
         // A2: literal normalization → shared parameterized plan. A repeated
         // point read that differs only in its WHERE literals reuses one cached
         // plan under the normalized key instead of re-parsing/planning every
         // literal variant. Only fires for deterministic autocommit SELECTs it
         // can prove safe; everything else falls through to the raw path below.
-        if !Self::query_is_non_deterministic(sql) {
+        if !schema_active && !Self::query_is_non_deterministic(sql) {
             if let Some(result) = self.try_normalized_query_with_columns(sql) {
                 return result;
             }
         }
 
-        let cacheable = !self.in_transaction() && !Self::query_is_non_deterministic(sql);
-        if let Some((cached_results, columns)) = self.try_cached_query_with_columns(sql) {
-            return Ok(((*cached_results).clone(), columns));
+        let cacheable = !schema_active && !self.in_transaction() && !Self::query_is_non_deterministic(sql);
+        if !schema_active {
+            if let Some((cached_results, columns)) = self.try_cached_query_with_columns(sql) {
+                return Ok(((*cached_results).clone(), columns));
+            }
         }
         // R-A1: on a cold miss, only admit to the caches on a repeat sighting,
         // so unique-literal one-shots stop deep-cloning the plan/result and
@@ -14486,9 +14772,10 @@ impl EmbeddedDatabase {
         // aren't recognised by sqlparser; mirror the pre-detect that
         // `execute_in_transaction_inner` already does so the query path
         // produces rows instead of "Statement not yet supported".
+        let cached_plan = if schema_active { None } else { self.plan_cache.get(sql) };
         let plan = if sql::Parser::is_show_branches(sql) {
             sql::LogicalPlan::ShowBranches
-        } else if let Some(arc_plan) = self.plan_cache.get(sql) {
+        } else if let Some(arc_plan) = cached_plan {
             if let Some(result) = self.try_handle_prepared_query_plan_with_columns(&arc_plan)? {
                 return Ok(result);
             }
@@ -14502,7 +14789,9 @@ impl EmbeddedDatabase {
         } else {
             let (statement, _) = self.parse_cached(sql)?;
             let catalog = self.storage.catalog();
-            let planner = sql::Planner::with_catalog(&catalog).with_sql(sql.to_string());
+            let planner = sql::Planner::with_catalog(&catalog)
+                .with_sql(sql.to_string())
+                .with_current_schema(self.current_schema());
             planner.statement_to_plan(statement)?
         };
 
@@ -15109,7 +15398,9 @@ impl EmbeddedDatabase {
 
             // Create logical plan with catalog access and original SQL for time-travel parsing
             let catalog = self.storage.catalog();
-            let planner = sql::Planner::with_catalog(&catalog).with_sql(sql.to_string());
+            let planner = sql::Planner::with_catalog(&catalog)
+                .with_sql(sql.to_string())
+                .with_current_schema(self.current_schema());
             let plan = planner.statement_to_plan(statement)?;
 
             // Execute plan with transaction context
@@ -15258,6 +15549,95 @@ impl EmbeddedDatabase {
         }
     }
 
+    /// Store this session's `search_path` current schema (`None` = `public`).
+    /// Per-session (mirrors `set_session_fast_autocommit`) so concurrent wire
+    /// connections never share one selector. A non-`public` value also flips the
+    /// process-wide `any_session_schema_active` gate so the `_for_session` paths
+    /// begin consulting per-session schema; the default (always-`public`) wire
+    /// workload never trips it and pays nothing.
+    pub(crate) fn set_session_current_schema(
+        &self,
+        session_id: crate::session::SessionId,
+        schema: Option<String>,
+    ) -> Result<()> {
+        let session_lock = self.session_manager.get_session(session_id)?;
+        session_lock.write().current_schema = schema.clone();
+        if schema.is_some() {
+            self.any_session_schema_active
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    /// Read this session's `search_path` current schema (default `None`).
+    pub(crate) fn session_current_schema(
+        &self,
+        session_id: crate::session::SessionId,
+    ) -> Result<Option<String>> {
+        let session_lock = self.session_manager.get_session(session_id)?;
+        let value = session_lock.read().current_schema.clone();
+        Ok(value)
+    }
+
+    /// True when this session has a non-`public` `search_path`. Cheap on the
+    /// default path — the `any_session_schema_active` atomic short-circuits
+    /// before any session lookup — so wire read paths can gate the shared
+    /// SQL-keyed caches (which are public-schema-only, see `query_with_columns`)
+    /// without cost until some connection actually uses a schema.
+    pub(crate) fn session_schema_active(&self, session_id: crate::session::SessionId) -> bool {
+        self.any_session_schema_active
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && matches!(self.session_current_schema(session_id), Ok(Some(_)))
+    }
+
+    /// Install this session's `search_path` as a thread-local override for the
+    /// duration of one statement that routes through the global (non-session)
+    /// execute/query paths, so bare names resolve against THIS session (see
+    /// `current_schema`). Returns `None` — no guard, zero thread-local / session
+    /// traffic — for a `public` session, exactly the shape
+    /// `session_durability_override_guard` uses so the default wire path is
+    /// byte-identical. The `any_session_schema_active` fast-out skips the session
+    /// lookup entirely until some session has used a non-`public` schema.
+    fn session_schema_override_guard(
+        &self,
+        session_id: crate::session::SessionId,
+    ) -> Option<SessionSchemaOverrideGuard> {
+        if !self
+            .any_session_schema_active
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return None;
+        }
+        match self.session_current_schema(session_id) {
+            Ok(Some(schema)) => Some(SessionSchemaOverrideGuard::install(schema)),
+            _ => None,
+        }
+    }
+
+    /// Intercept `SET`/`RESET search_path` for a wire session, storing the schema
+    /// per-session (never the shared embedded field). Mirrors
+    /// `try_handle_session_fast_autocommit`: the simple-query handler intercepts
+    /// the SET form itself, while the extended-protocol / RESET forms land here.
+    /// Returns `Some(0)` when handled; `SHOW search_path` is served by the wire
+    /// SHOW arm.
+    pub(crate) fn try_handle_session_search_path(
+        &self,
+        session_id: crate::session::SessionId,
+        sql: &str,
+    ) -> Result<Option<u64>> {
+        match Self::parse_db_setting_statement(sql) {
+            Some(DbSettingStatement::Set { name, value }) if name == "search_path" => {
+                self.set_session_current_schema(session_id, Self::derive_search_path_schema(&value))?;
+                Ok(Some(0))
+            }
+            Some(DbSettingStatement::Reset { name }) if name == "search_path" => {
+                self.set_session_current_schema(session_id, None)?;
+                Ok(Some(0))
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// Touch session stats and, for READ COMMITTED, refresh the open
     /// transaction's snapshot so the next statement sees the latest commits.
     fn touch_session_for_statement(&self, session_id: crate::session::SessionId) -> Result<()> {
@@ -15348,6 +15728,16 @@ impl EmbeddedDatabase {
         if let Some(handled) = self.try_handle_session_fast_autocommit(session_id, sql)? {
             return Ok(handled);
         }
+        // SET/RESET search_path lands per-session, never in the shared field
+        // (the extended-protocol path reaches here; the simple-query handler
+        // intercepts SET itself). No table resolution follows, so no override.
+        if let Some(handled) = self.try_handle_session_search_path(session_id, sql)? {
+            return Ok(handled);
+        }
+        // Resolve bare names against THIS session's schema for the rest of the
+        // statement — both the autocommit delegate below and the in-transaction
+        // planner (which reads `self.current_schema()`).
+        let _schema_override = self.session_schema_override_guard(session_id);
         if !self.session_transactions.contains_key(&session_id) {
             let _sync_override = self.session_durability_override_guard(session_id);
             return self.execute(sql);
@@ -15384,6 +15774,9 @@ impl EmbeddedDatabase {
         session_id: crate::session::SessionId,
         sql: &str,
     ) -> Result<(Vec<Tuple>, Vec<String>)> {
+        // Resolve bare names against THIS session's schema for both the
+        // autocommit delegate and the in-transaction planner below.
+        let _schema_override = self.session_schema_override_guard(session_id);
         if !self.session_transactions.contains_key(&session_id) {
             return self.query_with_columns(sql);
         }
@@ -15398,7 +15791,9 @@ impl EmbeddedDatabase {
 
         let (statement, _) = self.parse_cached(sql)?;
         let catalog = self.storage.catalog();
-        let planner = sql::Planner::with_catalog(&catalog).with_sql(sql.to_string());
+        let planner = sql::Planner::with_catalog(&catalog)
+            .with_sql(sql.to_string())
+            .with_current_schema(self.current_schema());
         let plan = planner.statement_to_plan(statement)?;
 
         let mut executor = sql::Executor::with_storage(&self.storage)
@@ -15424,6 +15819,10 @@ impl EmbeddedDatabase {
         if let Some(handled) = self.try_handle_session_synchronous_commit(session_id, sql)? {
             return Ok((handled, Vec::new()));
         }
+        if let Some(handled) = self.try_handle_session_search_path(session_id, sql)? {
+            return Ok((handled, Vec::new()));
+        }
+        let _schema_override = self.session_schema_override_guard(session_id);
         if !self.session_transactions.contains_key(&session_id) {
             let _sync_override = self.session_durability_override_guard(session_id);
             return self.execute_returning(sql);
@@ -15485,6 +15884,10 @@ impl EmbeddedDatabase {
         if let Some(handled) = self.try_handle_session_fast_autocommit(session_id, sql)? {
             return Ok(handled);
         }
+        if let Some(handled) = self.try_handle_session_search_path(session_id, sql)? {
+            return Ok(handled);
+        }
+        let _schema_override = self.session_schema_override_guard(session_id);
         if !self.session_transactions.contains_key(&session_id) {
             let _sync_override = self.session_durability_override_guard(session_id);
             return self.execute_params_inner(sql, params, plan_override);
@@ -15537,6 +15940,7 @@ impl EmbeddedDatabase {
         params: &[Value],
         plan_override: Option<&std::sync::Arc<sql::LogicalPlan>>,
     ) -> Result<Vec<Tuple>> {
+        let _schema_override = self.session_schema_override_guard(session_id);
         if !self.session_transactions.contains_key(&session_id) {
             return self.query_params_inner(sql, params, plan_override);
         }
@@ -15578,6 +15982,7 @@ impl EmbeddedDatabase {
         sql: &str,
         params: &[Value],
     ) -> Result<(Vec<Tuple>, Vec<String>)> {
+        let _schema_override = self.session_schema_override_guard(session_id);
         if !self.session_transactions.contains_key(&session_id) {
             return self.query_params_with_columns(sql, params);
         }
@@ -15904,7 +16309,9 @@ impl EmbeddedDatabase {
         } else {
             let (statement, _) = self.parse_cached(sql)?;
             let catalog = self.storage.catalog();
-            let planner = sql::Planner::with_catalog(&catalog).with_sql(sql.to_string());
+            let planner = sql::Planner::with_catalog(&catalog)
+                .with_sql(sql.to_string())
+                .with_current_schema(self.current_schema());
             let plan = planner.statement_to_plan(statement)?;
             self.apply_rls_to_plan(plan)?
         };
@@ -16985,6 +17392,9 @@ impl EmbeddedDatabase {
             prepared_statement_sql: self.prepared_statement_sql.clone(),
             prepared_fast_selects: self.prepared_fast_selects.clone(),
             session_settings: self.session_settings.clone(),
+            current_schema: self.current_schema.clone(),
+            current_schema_set: self.current_schema_set.clone(),
+            any_session_schema_active: self.any_session_schema_active.clone(),
             savepoints: self.savepoints.clone(),
             plan_cache: self.plan_cache.clone(),
             parse_cache: self.parse_cache.clone(),
@@ -17351,7 +17761,7 @@ impl EmbeddedDatabase {
 
             // Use the planner to convert the SQL expression to LogicalExpr
             let catalog = self.storage.catalog();
-            let planner = sql::Planner::with_catalog(&catalog);
+            let planner = sql::Planner::with_catalog(&catalog).with_current_schema(self.current_schema());
 
             // Convert SQL Expr to LogicalExpr
             planner.convert_expr_to_logical(&selection, Some(schema))
@@ -18581,7 +18991,11 @@ impl Transaction<'_> {
 
         // Create logical plan with catalog access and original SQL for time-travel parsing
         let catalog = self.db.storage.catalog();
-        let planner = sql::Planner::with_catalog(&catalog).with_sql(sql.to_string());
+        let planner = sql::Planner::with_catalog(&catalog)
+            .with_sql(sql.to_string())
+            // `current_schema()` is inherent to `EmbeddedDatabase`; `Transaction`
+            // reaches it through its `db` field (no `Deref` to the database).
+            .with_current_schema(self.db.current_schema());
         let plan = planner.statement_to_plan(statement)?;
 
         // Execute plan with transaction context

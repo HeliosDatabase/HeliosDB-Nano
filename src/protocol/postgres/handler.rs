@@ -732,7 +732,18 @@ where
                 }
                 Ok(None) => {}
             }
-            if EmbeddedDatabase::is_fk_setting_statement(trimmed) {
+            if EmbeddedDatabase::is_search_path_statement(trimmed) {
+                // `SET search_path` is a per-session schema selector: store it on
+                // THIS connection's session, never the shared embedded field, so
+                // a concurrent connection's search_path can't steer this one's
+                // bare names.
+                if let Err(e) = self.database.try_handle_session_search_path(self.session_id, trimmed) {
+                    self.send_error("ERROR", "22023", &e.to_string(), None, None).await?;
+                    return Ok(());
+                }
+            } else if EmbeddedDatabase::is_fk_setting_statement(trimmed) {
+                // FK/bulk-load knobs stay on the process-wide storage engine; the
+                // generic ack below would drop them.
                 if let Err(e) = self.database.execute(trimmed) {
                     self.send_error("ERROR", "22023", &e.to_string(), None, None).await?;
                     return Ok(());
@@ -770,6 +781,15 @@ where
             self.send_command_complete("RESET").await?;
             self.send_ready_for_query().await?;
             return Ok(());
+        } else if starts_with_icase(trimmed, "RESET ") && EmbeddedDatabase::is_search_path_statement(trimmed) {
+            // RESET search_path -> back to `public` for THIS session only.
+            if let Err(e) = self.database.set_session_current_schema(self.session_id, None) {
+                self.send_error("ERROR", "22023", &e.to_string(), None, None).await?;
+                return Ok(());
+            }
+            self.send_command_complete("RESET").await?;
+            self.send_ready_for_query().await?;
+            return Ok(());
         } else if starts_with_icase(trimmed, "SHOW ") && !crate::sql::Parser::is_show_branches(trimmed) {
             // Handle SHOW commands for client compatibility
             let param = trimmed[5..].trim().trim_end_matches(';').trim();
@@ -790,6 +810,14 @@ where
                     "helios.fast_autocommit".to_string(),
                     if on { "on".to_string() } else { "off".to_string() },
                 )
+            } else if param.eq_ignore_ascii_case("search_path") {
+                // Reflect THIS session's real current schema (per-connection,
+                // not the shared embedded field or another connection's value).
+                let val = match self.database.session_current_schema(self.session_id).unwrap_or(None) {
+                    Some(cs) => format!("{cs}, public"),
+                    None => "\"$user\", public".to_string(),
+                };
+                ("search_path".to_string(), val)
             } else {
                 Self::resolve_show_parameter(param)
             };
@@ -902,6 +930,9 @@ where
                     // Reset session GUCs to their defaults.
                     let _ = self.database.set_session_synchronous_commit(self.session_id, None);
                     let _ = self.database.set_session_fast_autocommit(self.session_id, false);
+                    // Back to `public` so a pooled connection can't inherit the
+                    // previous client's search_path.
+                    let _ = self.database.set_session_current_schema(self.session_id, None);
                     let _ = self
                         .database
                         .set_session_isolation(self.session_id, crate::session::IsolationLevel::ReadCommitted);
@@ -1046,7 +1077,14 @@ where
         };
 
         if is_select || is_show_branches {
-            let cached_query = if is_show_branches || self.database.session_in_transaction(self.session_id) {
+            // The shared result/plan caches are keyed by SQL text only and hold
+            // public-schema resolutions only; a session with a non-`public`
+            // search_path must resolve through `query_with_columns_for_session`
+            // (which installs its per-session schema), never this shared read.
+            let cached_query = if is_show_branches
+                || self.database.session_in_transaction(self.session_id)
+                || self.database.session_schema_active(self.session_id)
+            {
                 None
             } else {
                 self.database.try_cached_query_with_columns(query)
@@ -1994,7 +2032,11 @@ where
     /// Derive schema for a DML statement with RETURNING clause
     fn derive_returning_schema(&self, sql: &str) -> Result<Schema> {
         let catalog = self.database.storage.catalog();
-        let planner = crate::sql::planner::Planner::with_catalog(&catalog).with_sql(sql.to_string());
+        // Resolve the RETURNING table against THIS session's `search_path` so the
+        // column metadata matches the schema the rows were actually written to.
+        let planner = crate::sql::planner::Planner::with_catalog(&catalog)
+            .with_sql(sql.to_string())
+            .with_current_schema(self.database.session_current_schema(self.session_id).unwrap_or(None));
         let (statement, _) = self.database.parse_cached(sql)?;
         let plan = planner.statement_to_plan(statement)?;
 
