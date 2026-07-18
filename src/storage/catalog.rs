@@ -1252,6 +1252,88 @@ impl<'a> Catalog<'a> {
         Ok(())
     }
 
+    /// Migrate the per-table SIDE records that [`Self::rename_table`] does NOT
+    /// move — the constraint metadata, the IDENTITY-column record and the
+    /// Stage-0 partition registry. Used by `ALTER TABLE … SET SCHEMA`, which
+    /// relocates a table to a new storage key via `rename_table` (data + schema
+    /// + counter + compression + ART indexes) and must carry these along or the
+    /// moved table loses its FK/CHECK enforcement and its partition-cascade
+    /// links. Best-effort per record; a missing record is a no-op. Not atomic
+    /// with the `rename_table` batch (Stage-0 DDL is non-transactional
+    /// generally), but every step is idempotent on replay.
+    pub fn move_table_side_records(&self, old: &str, new: &str) -> Result<()> {
+        // Constraint metadata (FK / UNIQUE / CHECK). Rewrite each constraint's
+        // owning-table field to the new key, and any SELF-referential FK's
+        // `references_table` too (a table that references itself moves both
+        // ends), so the moved table's constraints stay self-consistent.
+        let mut constraints = self.load_table_constraints(old)?;
+        for fk in constraints.foreign_keys.iter_mut() {
+            if fk.references_table == old {
+                fk.references_table = new.to_string();
+            }
+            fk.table_name = new.to_string();
+        }
+        for uc in constraints.unique_constraints.iter_mut() {
+            uc.table_name = new.to_string();
+        }
+        for cc in constraints.check_constraints.iter_mut() {
+            cc.table_name = new.to_string();
+        }
+        if !constraints.foreign_keys.is_empty()
+            || !constraints.unique_constraints.is_empty()
+            || !constraints.check_constraints.is_empty()
+        {
+            self.save_table_constraints(new, &constraints)?;
+        }
+        self.storage.delete(&Self::table_constraints_key(old))?;
+        self.storage.clear_referencing_fk_cache();
+
+        // IDENTITY-column side record.
+        let identity = self.list_identity_columns(old)?;
+        if !identity.is_empty() {
+            self.register_identity_columns(new, &identity)?;
+            self.drop_identity_columns(old)?;
+        }
+
+        // Partition registry — reverse link: `old` is itself a child of `parent`.
+        // Rewrite `parent`'s child-list entry old→new and move the reverse link,
+        // so a later `DROP TABLE parent` cascades to the moved child.
+        if let Some(bytes) = self.storage.get(&Self::partition_parent_key(old))? {
+            let parent: String = bincode::deserialize(&bytes)
+                .map_err(|e| Error::query_execution(format!("partition-parent deserialize: {e}")))?;
+            let mut siblings = self.partition_children(&parent)?;
+            for c in siblings.iter_mut() {
+                if c == old {
+                    *c = new.to_string();
+                }
+            }
+            let value = bincode::serialize(&siblings)
+                .map_err(|e| Error::query_execution(format!("partition-child serialize: {e}")))?;
+            self.storage.put(&Self::partition_children_key(&parent), &value)?;
+            self.storage.delete(&Self::partition_parent_key(old))?;
+            let pv = bincode::serialize(new)
+                .map_err(|e| Error::query_execution(format!("partition-parent serialize: {e}")))?;
+            self.storage.put(&Self::partition_parent_key(new), &pv)?;
+        }
+
+        // Partition registry — forward list: `old` is a parent with children.
+        // Repoint each child's reverse link at the new parent key and move the
+        // child list, so the moved parent still cascade-drops its children.
+        let children = self.partition_children(old)?;
+        if !children.is_empty() {
+            for child in &children {
+                let pv = bincode::serialize(new)
+                    .map_err(|e| Error::query_execution(format!("partition-parent serialize: {e}")))?;
+                self.storage.put(&Self::partition_parent_key(child), &pv)?;
+            }
+            let value = bincode::serialize(&children)
+                .map_err(|e| Error::query_execution(format!("partition-child serialize: {e}")))?;
+            self.storage.put(&Self::partition_children_key(new), &value)?;
+            self.storage.delete(&Self::partition_children_key(old))?;
+        }
+        Ok(())
+    }
+
     /// Build metadata key for table schema
     fn table_metadata_key(table_name: &str) -> Vec<u8> {
         format!("meta:table:{}", table_name).into_bytes()
@@ -1303,6 +1385,21 @@ impl<'a> Catalog<'a> {
     pub fn drop_schema_marker(&self, name: &str) -> Result<()> {
         let key = Self::schema_metadata_key(name);
         self.storage.delete(&key)
+    }
+
+    /// The PRIMARY KEY columns of `table` (its declared key, in column order),
+    /// or an empty Vec if it has none. `table` must be a resolved storage key
+    /// (schema-qualified when non-`public`). Used to default a foreign key's
+    /// referenced-column list when the `REFERENCES parent` clause omits it —
+    /// PostgreSQL parity: `REFERENCES parent` binds to `parent`'s primary key.
+    pub fn primary_key_columns(&self, table: &str) -> Result<Vec<String>> {
+        let schema = self.get_table_schema(table)?;
+        Ok(schema
+            .columns
+            .iter()
+            .filter(|c| c.primary_key)
+            .map(|c| c.name.clone())
+            .collect())
     }
 
     /// The member tables of a schema: every catalogued table whose key is
@@ -1442,13 +1539,14 @@ impl<'a> Catalog<'a> {
     // parent's list (PG parity: dropping a partition directly is allowed and
     // unregisters it, so a later parent DROP never touches a re-created name).
     //
-    // Names are keyed EXACTLY as they arrive — already collapsed to the bare,
-    // case-folded catalog key by `Planner::normalize_object_name` /
-    // `normalize_partition_name`, the same normalization `table_metadata_key`
-    // relies on — so a schema-qualified `stats_import.part_parent` and a later
-    // bare `part_parent` resolve to the identical registry key. No extra
-    // lowercasing here (unlike `identity_key`) precisely so the key derived from
-    // a name matches that name's `meta:table:` key byte-for-byte.
+    // Names are keyed EXACTLY as they arrive — already resolved to the catalog
+    // storage key by the planner's `resolve_partition_name` (session
+    // `search_path` applied: `s.parent` under a non-public schema, bare under
+    // public), the same key `table_metadata_key` relies on — so registration
+    // and the DROP-cascade lookup resolve a `PARTITION OF` parent to the
+    // identical registry key. No extra lowercasing here (unlike `identity_key`)
+    // precisely so the key derived from a name matches that name's `meta:table:`
+    // key byte-for-byte.
     // -------------------------------------------------------------------
 
     fn partition_children_key(parent: &str) -> Vec<u8> {

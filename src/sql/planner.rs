@@ -4251,7 +4251,14 @@ impl<'a> Planner<'a> {
         if columns.is_empty() {
             if let (Some(catalog), Some(orig)) = (self.catalog, self.original_sql.as_deref()) {
                 if let Some(spec) = crate::sql::Parser::extract_partition_of(orig) {
-                    if Self::normalize_partition_name(&spec.child) == name {
+                    // Match the child against the CREATE target key `name`. `name`
+                    // was produced by `resolve_table_create` (a bare child under
+                    // `SET search_path TO s` becomes `s.child`), so the raw
+                    // `spec.child` must be resolved the SAME way — the bare
+                    // `normalize_partition_name` collapse would never equal a
+                    // session-qualified `name`, silently skipping the column
+                    // clone and leaving the child a zero-column table.
+                    if self.resolve_partition_create_name(&spec.child) == name {
                         return self.partition_of_to_plan(name, if_not_exists, &spec, catalog);
                     }
                 }
@@ -4420,7 +4427,12 @@ impl<'a> Planner<'a> {
         spec: &crate::sql::parser::PartitionOfSpec,
         catalog: &Catalog<'_>,
     ) -> Result<LogicalPlan> {
-        let parent = Self::normalize_partition_name(&spec.parent);
+        // Resolve the parent through the session `search_path` (not the bare
+        // AST collapse): under `SET search_path TO s`, a bare `PARTITION OF
+        // parent` must copy columns from `s.parent`, the key the parent was
+        // created under — not a stray bare `parent` left over from another
+        // schema/corpus file (which would clone the WRONG column shape).
+        let parent = self.resolve_partition_name(&spec.parent);
         let schema = catalog.get_table_schema(&parent)?;
         let columns: Vec<ColumnDef> = schema
             .columns
@@ -4461,16 +4473,12 @@ impl<'a> Planner<'a> {
         })
     }
 
-    /// Normalize a raw (possibly schema-qualified / double-quoted) partition
-    /// table-name string the same way [`Planner::normalize_object_name`]
-    /// collapses a parsed `ObjectName`, so the parent lookup and the child-name
-    /// key match how tables are stored in the catalog. Reuses the real
-    /// normalizer by reconstructing an `ObjectName` from the raw parts.
-    ///
-    /// `pub(crate)` so the DROP-cascade registration in the executor path can
-    /// normalize a `PARTITION OF` parent name IDENTICALLY to how the child was
-    /// planned — registration and drop-lookup must agree byte-for-byte.
-    pub(crate) fn normalize_partition_name(raw: &str) -> String {
+    /// Reconstruct a parsed `ObjectName` from a raw (possibly schema-qualified /
+    /// double-quoted) partition table-name string, honoring double-quoted spans.
+    /// Returns `None` for an empty input. Shared by the partition-name resolvers
+    /// so the registration site, the DROP-cascade lookup and the column clone
+    /// all rebuild the child/parent name identically before resolution.
+    fn partition_object_name(raw: &str) -> Option<sqlparser::ast::ObjectName> {
         let idents: Vec<sqlparser::ast::Ident> = Self::split_dotted_ident(raw)
             .into_iter()
             .map(|(value, quoted)| {
@@ -4482,9 +4490,43 @@ impl<'a> Planner<'a> {
             })
             .collect();
         if idents.is_empty() {
-            return raw.trim().to_lowercase();
+            None
+        } else {
+            Some(sqlparser::ast::ObjectName(idents))
         }
-        Self::normalize_object_name(&sqlparser::ast::ObjectName(idents))
+    }
+
+    /// Resolve a raw partition parent/child REFERENCE to its storage key through
+    /// the session `search_path` (the [`Self::resolve_table_ref`] two-probe —
+    /// current-schema-qualified when that key exists in the catalog, else bare),
+    /// instead of a pure AST→key collapse. A bare `parent` under
+    /// `SET search_path TO s` therefore resolves to `s.parent` — the key the
+    /// `PARTITION OF` child was created under — so registration and DROP-cascade
+    /// lookup agree on the qualified key. With no current schema this is exactly
+    /// `normalize_object_name`.
+    ///
+    /// `pub(crate)` so the DROP-cascade registration in the executor path can
+    /// resolve a `PARTITION OF` parent name IDENTICALLY to how the child was
+    /// planned — registration and drop-lookup must agree byte-for-byte.
+    pub(crate) fn resolve_partition_name(&self, raw: &str) -> String {
+        match Self::partition_object_name(raw) {
+            Some(on) => self.resolve_table_ref(&on),
+            None => raw.trim().to_lowercase(),
+        }
+    }
+
+    /// CREATE-target sibling of [`Self::resolve_partition_name`]: resolve a raw
+    /// partition CHILD name the way a CREATE target is
+    /// ([`Self::resolve_table_create`] — a bare name under
+    /// `SET search_path TO s` becomes `s.child` EAGERLY, no catalog probe, since
+    /// the child does not exist yet). Used to match the `PARTITION OF` child
+    /// against the already-resolved CREATE key. With no current schema this is
+    /// exactly `normalize_object_name`.
+    fn resolve_partition_create_name(&self, raw: &str) -> String {
+        match Self::partition_object_name(raw) {
+            Some(on) => self.resolve_table_create(&on),
+            None => raw.trim().to_lowercase(),
+        }
     }
 
     /// Split a raw dotted identifier into `(value, was_quoted)` parts, honoring

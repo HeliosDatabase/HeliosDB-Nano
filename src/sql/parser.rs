@@ -1060,6 +1060,64 @@ impl Parser {
         Ok((table_name, column_name, storage_mode))
     }
 
+    /// Does this SQL look like `ALTER TABLE … SET SCHEMA …`?
+    ///
+    /// sqlparser 0.53 has no `SetSchema` ALTER-TABLE operation (its trailing
+    /// arm only accepts `SET [TBLPROPERTIES] (…)` and otherwise errors), so
+    /// `ALTER TABLE t SET SCHEMA s` is routed through a custom pre-parse path
+    /// (mirroring `is_alter_column_storage` / `is_alter_sequence`). Guarded to
+    /// exclude the column form (`ALTER TABLE … ALTER COLUMN … SET …`), which is
+    /// handled by sqlparser / `is_alter_column_storage`.
+    pub fn is_alter_table_set_schema(sql: &str) -> bool {
+        let upper = sql.trim().to_uppercase();
+        upper.starts_with("ALTER TABLE") && upper.contains(" SET SCHEMA") && !upper.contains(" ALTER COLUMN")
+    }
+
+    /// Parse `ALTER TABLE [IF EXISTS] <name> SET SCHEMA <new_schema>` into
+    /// `(table_name_raw, new_schema, if_exists)`. `table_name_raw` is the
+    /// verbatim (possibly schema-qualified / quoted) name — session
+    /// `search_path` resolution to a storage key happens in the caller. The
+    /// target schema is lowercased when unquoted, matching how schema keys are
+    /// stored; a double-quoted target keeps its case.
+    pub fn parse_alter_table_set_schema(sql: &str) -> Result<(String, String, bool)> {
+        let trimmed = sql.trim().trim_end_matches(';').trim();
+        let upper = trimmed.to_uppercase();
+        if !upper.starts_with("ALTER TABLE") {
+            return Err(Error::query_execution("Expected ALTER TABLE"));
+        }
+        // Peel "ALTER TABLE" and an optional "IF EXISTS".
+        let mut rest = trimmed["ALTER TABLE".len()..].trim_start();
+        let if_exists = rest.to_uppercase().starts_with("IF EXISTS");
+        if if_exists {
+            rest = rest["IF EXISTS".len()..].trim_start();
+        }
+
+        // Split on the (case-insensitive) " SET SCHEMA " delimiter.
+        let rest_upper = rest.to_uppercase();
+        let set_pos = rest_upper
+            .find(" SET SCHEMA")
+            .ok_or_else(|| Error::query_execution("ALTER TABLE … SET SCHEMA requires a SET SCHEMA clause"))?;
+        let table_name = rest[..set_pos].trim().to_string();
+        if table_name.is_empty() {
+            return Err(Error::query_execution("ALTER TABLE … SET SCHEMA requires a table name"));
+        }
+        let after = rest
+            .get(set_pos + " SET SCHEMA".len()..)
+            .ok_or_else(|| Error::query_execution("Invalid SET SCHEMA clause"))?
+            .trim();
+        if after.is_empty() {
+            return Err(Error::query_execution("ALTER TABLE … SET SCHEMA requires a target schema"));
+        }
+        // A quoted target keeps its case; an unquoted one is folded to lower
+        // (matching `normalize_object_name`'s schema handling).
+        let new_schema = if after.starts_with('"') && after.ends_with('"') && after.len() >= 2 {
+            after[1..after.len() - 1].to_string()
+        } else {
+            after.to_lowercase()
+        };
+        Ok((table_name, new_schema, if_exists))
+    }
+
     /// Does this SQL start an `ALTER SEQUENCE` statement?
     ///
     /// sqlparser 0.53 has no `AlterSequence` variant — `parse_alter` only

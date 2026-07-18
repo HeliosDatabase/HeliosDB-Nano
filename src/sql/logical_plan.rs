@@ -608,6 +608,22 @@ pub enum LogicalPlan {
         new_table_name: String,
     },
 
+    /// `ALTER TABLE [IF EXISTS] <name> SET SCHEMA <new_schema>` — move a table
+    /// (or view) into another schema. Implemented as a rename of the storage
+    /// key to `<new_schema>.<table>` (or the bare name when moving to `public`),
+    /// reusing the RENAME-TABLE data/metadata migration. sqlparser 0.53 has no
+    /// `SetSchema` operation, so this is produced by a custom pre-parse
+    /// (mirroring `AlterSequence` / `AlterColumnStorage`).
+    AlterTableSetSchema {
+        /// Resolved storage key of the table to move (session `search_path`
+        /// applied at plan time).
+        table_name: String,
+        /// Target schema name (`public` moves the table to the bare key-space).
+        new_schema: String,
+        /// IF EXISTS — a missing table is a no-op rather than an error.
+        if_exists: bool,
+    },
+
     /// Add a foreign-key constraint to an existing table.
     /// Mirrors the inline `REFERENCES …` form already supported in
     /// CREATE TABLE; persists FK metadata via
@@ -1928,6 +1944,10 @@ impl LogicalPlan {
             LogicalPlan::AlterTableAlterColumnNullability { .. } => Arc::new(Schema { columns: vec![] }),
             LogicalPlan::AlterTableRename { .. } => {
                 // ALTER TABLE RENAME doesn't have output schema
+                Arc::new(Schema { columns: vec![] })
+            }
+            LogicalPlan::AlterTableSetSchema { .. } => {
+                // ALTER TABLE … SET SCHEMA doesn't have output schema
                 Arc::new(Schema { columns: vec![] })
             }
             LogicalPlan::AlterTableAddForeignKey { .. }

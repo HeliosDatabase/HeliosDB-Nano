@@ -3907,10 +3907,29 @@ impl<'a> Executor<'a> {
                     // including children registered under other schemas). A child
                     // already removed by an earlier parent drop is a no-op
                     // (IF EXISTS semantics on each member).
+                    //
+                    // CONSTRAINT (marker-leak fix): the schema marker MUST be
+                    // removed even if a member drop errors mid-cascade. DDL is
+                    // non-transactional here, so a partial CASCADE cannot roll
+                    // back; leaving `meta:schema:<name>` behind would strand the
+                    // namespace so a later `CREATE SCHEMA <name>` fails with a
+                    // phantom "already exists" (alter_table corpus: an earlier
+                    // partially-failed `DROP SCHEMA … CASCADE` blocked the
+                    // schema's re-creation). Continue past member errors,
+                    // remember the first, always clear the marker, then surface
+                    // the error so a genuine failure is still reported.
+                    let mut first_err: Option<Error> = None;
                     for member in members {
-                        ddl::handle_drop_table(self, &member, true)?;
+                        if let Err(e) = ddl::handle_drop_table(self, &member, true) {
+                            if first_err.is_none() {
+                                first_err = Some(e);
+                            }
+                        }
                     }
                     catalog.drop_schema_marker(name)?;
+                    if let Some(e) = first_err {
+                        return Err(e);
+                    }
                 }
                 Ok(Box::new(
                     ScanOperator::new(
