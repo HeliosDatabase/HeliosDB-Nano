@@ -5,6 +5,41 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.4.0] - 2026-07-18
+
+Wave-3 implementation (leased to and delivered by the fleet's HDB session) and
+round-3 declarative-partitioning Stage 0:
+
+- **PARTITION BY support (Stage 0)** — PostgreSQL declarative-partitioning DDL
+  is now accepted: `CREATE TABLE … PARTITION BY RANGE/LIST/HASH` parents
+  (including multi-column, expression, and opclass keys), `CREATE TABLE …
+  PARTITION OF … FOR VALUES/DEFAULT` children (columns cloned from the
+  parent), and `ATTACH/DETACH PARTITION` as accepted no-ops. `DROP TABLE
+  parent` cascades to its partition children (PG parity);
+  `pg_class.relpartbound` is present (NULL). **Stage-0 semantics**: each child
+  is an independent table — INSERT into the *parent* is not routed and SELECT
+  from the *parent* does not union children yet (Stage 1). Measured on the
+  PG regression corpus: +1,427 statements flip to passing.
+- **Version-copy elision** — new `[storage] elide_latest_version` (default
+  off): the latest row version lives only in `data:`, cutting single-INSERT
+  version-write volume from 65% to 41% of bytes. **One-way door**: once
+  enabled on a data dir, downgrade requires dump/restore.
+- **Statement retry on write conflicts** — `[locks] statement_retry_max`
+  (default 0 = off) auto-retries autocommit statements that hit the typed
+  SQLSTATE 40001 write conflict; backoff knobs included.
+- **Snapshot schema evolution** — `[storage] snapshot_schema_evolution` now
+  defaults to `"null_pad"`: reads through a snapshot taken before an `ALTER
+  TABLE ADD/DROP COLUMN` return isolation-correct NULL-padded/truncated rows
+  instead of erroring. Set `"strict"` to restore the previous error behavior.
+- **`[locks] timeout_ms` is now genuinely wired** to the lock manager
+  (previously orphaned); default 1000 preserves the prior effective bound.
+- **Fix (durability):** the fast-INSERT row counter is flushed at clean
+  shutdown — prevents silent row overwrites on reopen after short sessions in
+  relaxed-WAL mode (crash-path reseed tracked separately).
+- COPY constraint batching: ART maintenance batched per-table; CHECK
+  expressions evaluated via a batched path (constrained-COPY follow-up from
+  the Wave-3 measurements).
+
 ## [4.3.0] - 2026-07-17
 
 Wave 3 (design-first) of the 2026-07 perf & stability campaign, the July
