@@ -353,6 +353,12 @@ where
 
             self.username = params.get("user").cloned();
 
+            // Thread the login role onto the session so a `"$user"` search_path
+            // entry expands to this user's schema (I-USER).
+            let _ = self
+                .database
+                .set_session_login_user(self.session_id, self.username.clone());
+
             // Bug 5 — validate the requested database name. Reject
             // unknown names rather than silently routing every
             // connection to the default `heliosdb` keyspace. Reserved
@@ -826,9 +832,18 @@ where
             } else if param.eq_ignore_ascii_case("search_path") {
                 // Reflect THIS session's real current schema (per-connection,
                 // not the shared embedded field or another connection's value).
-                let val = match self.database.session_current_schema(self.session_id).unwrap_or(None) {
-                    Some(cs) => format!("{cs}, public"),
-                    None => "\"$user\", public".to_string(),
+                let mut path = self.database.session_search_path(self.session_id).unwrap_or_default();
+                let val = if path.is_empty() {
+                    "\"$user\", public".to_string()
+                } else {
+                    // Preserve v4.5.0's SHOW convention: the displayed path
+                    // always ends with `public`. I-SP resolution uses the raw
+                    // ordered path verbatim; only the SHOW *display* appends the
+                    // implicit `public` (when it isn't already listed).
+                    if !path.iter().any(|s| s == "public") {
+                        path.push("public".to_string());
+                    }
+                    path.join(", ")
                 };
                 ("search_path".to_string(), val)
             } else {
@@ -2070,7 +2085,8 @@ where
         // column metadata matches the schema the rows were actually written to.
         let planner = crate::sql::planner::Planner::with_catalog(&catalog)
             .with_sql(sql.to_string())
-            .with_current_schema(self.database.session_current_schema(self.session_id).unwrap_or(None));
+            .with_current_schema(self.database.session_current_schema(self.session_id).unwrap_or(None))
+            .with_search_path(self.database.session_search_path(self.session_id).unwrap_or_default());
         let (statement, _) = self.database.parse_cached(sql)?;
         let plan = planner.statement_to_plan(statement)?;
 

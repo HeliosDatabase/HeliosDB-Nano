@@ -1216,14 +1216,28 @@ impl SystemViewRegistry {
         Ok(vec![tuple])
     }
 
-    fn execute_pg_namespace(&self, _storage: &StorageEngine) -> Result<Vec<Tuple>> {
-        // Return public schema
-        let tuple = Tuple::new(vec![
-            Value::String("public".to_string()),
-            Value::Int4(1), // nspowner
-        ]);
+    fn execute_pg_namespace(&self, storage: &StorageEngine) -> Result<Vec<Tuple>> {
+        use std::collections::BTreeSet;
+        // Built-in namespaces PostgreSQL always exposes, plus every user schema
+        // (implied by a `schema.table` key OR declared empty via CREATE SCHEMA).
+        let mut all: BTreeSet<String> = BTreeSet::new();
+        all.insert("pg_catalog".to_string());
+        all.insert("information_schema".to_string());
+        all.insert("public".to_string());
+        if let Ok(catalog_schemas) = storage.catalog().list_schemas() {
+            for s in catalog_schemas {
+                all.insert(s);
+            }
+        }
 
-        Ok(vec![tuple])
+        let mut results = Vec::with_capacity(all.len());
+        for nspname in all {
+            results.push(Tuple::new(vec![
+                Value::String(nspname),
+                Value::Int4(10), // nspowner (postgres super-user)
+            ]));
+        }
+        Ok(results)
     }
 
     fn execute_pg_class(&self, storage: &StorageEngine) -> Result<Vec<Tuple>> {
@@ -1231,7 +1245,7 @@ impl SystemViewRegistry {
         let tables = catalog.list_tables()?;
         let mut results = Vec::new();
 
-        for (idx, table_name) in tables.iter().enumerate() {
+        for table_name in tables.iter() {
             // Determine relation kind
             let relkind = if table_name.starts_with("mv_") {
                 'm' // materialized view
@@ -1239,9 +1253,13 @@ impl SystemViewRegistry {
                 'r' // regular table
             };
 
+            // `relname` is the BARE table; the schema lives in relnamespace via
+            // the shared schema→oid map (matches this file's pg_namespace and the
+            // phase3 registry).
+            let (relschema, relname) = crate::sql::Planner::split_schema_key(table_name);
             let tuple = Tuple::new(vec![
-                Value::String(table_name.clone()),
-                Value::Int4(1), // relnamespace (public)
+                Value::String(relname),
+                Value::Int4(crate::sql::Planner::schema_name_to_oid(&relschema)), // relnamespace
                 Value::String(relkind.to_string()),
                 Value::Int4(1),     // relowner
                 Value::Int4(0),     // relam

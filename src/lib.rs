@@ -413,6 +413,15 @@ thread_local! {
     /// non-`public` schema (a `public` session installs no guard).
     static SESSION_SCHEMA_OVERRIDE: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
+    /// Per-thread FULL ordered `search_path` a wire/embedded session installs
+    /// alongside `SESSION_SCHEMA_OVERRIDE` for the duration of ONE statement
+    /// (I-SP). Holds the effective ordered path (`"$user"` already expanded,
+    /// `public` in position, deduped) that `Planner::resolve_table_ref` walks;
+    /// empty when no non-`public` schema is active. `SESSION_SCHEMA_OVERRIDE`
+    /// above stays the single first-non-`public` entry the `current_schema()`
+    /// scalar reads, so both are installed/cleared together by the same guard.
+    static SESSION_SEARCH_PATH: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
     /// Hot-path mirror of "a non-`public` schema override is installed on this
     /// thread" (see `SESSION_SCHEMA_OVERRIDE`). The literal fast-path gates read
     /// this `Cell` instead of borrowing the `RefCell`, so a wire session with an
@@ -426,9 +435,13 @@ thread_local! {
 struct SessionSchemaOverrideGuard;
 
 impl SessionSchemaOverrideGuard {
-    /// Install a non-`public` schema as the current thread's override.
-    fn install(schema: String) -> Self {
+    /// Install a non-`public` schema (the single first-non-`public` selector the
+    /// `current_schema()` scalar reads) plus the FULL ordered `search_path` the
+    /// planner walks (I-SP) as this thread's override. The two are installed and
+    /// dropped together.
+    fn install(schema: String, path: Vec<String>) -> Self {
         SESSION_SCHEMA_OVERRIDE.with(|c| *c.borrow_mut() = Some(schema));
+        SESSION_SEARCH_PATH.with(|c| *c.borrow_mut() = path);
         SESSION_SCHEMA_OVERRIDE_ACTIVE.with(|c| c.set(true));
         Self
     }
@@ -437,8 +450,30 @@ impl SessionSchemaOverrideGuard {
 impl Drop for SessionSchemaOverrideGuard {
     fn drop(&mut self) {
         SESSION_SCHEMA_OVERRIDE.with(|c| *c.borrow_mut() = None);
+        SESSION_SEARCH_PATH.with(|c| c.borrow_mut().clear());
         SESSION_SCHEMA_OVERRIDE_ACTIVE.with(|c| c.set(false));
     }
+}
+
+/// The calling thread's effective `search_path` current schema, as seen by the
+/// storage-less expression evaluator serving `current_schema()` /
+/// `current_schemas()`. Reads the per-statement thread-local override that BOTH
+/// the wire `_for_session` paths and the embedded read/execute entry points
+/// install (see `SessionSchemaOverrideGuard` /
+/// `EmbeddedDatabase::embedded_current_schema_guard`). `None` means the default
+/// namespace (`public`). This is the same selector `EmbeddedDatabase::current_schema`
+/// threads into the planner, so a bare `current_schema()` agrees with how bare
+/// table names resolve.
+pub(crate) fn session_current_schema_tls() -> Option<String> {
+    SESSION_SCHEMA_OVERRIDE.with(|c| c.borrow().clone())
+}
+
+/// The calling thread's effective FULL ordered `search_path` (I-SP), as
+/// installed by the same guard as [`session_current_schema_tls`]. Empty when no
+/// non-`public` schema is active on this thread. Used by `current_schemas()` to
+/// report the ordered array.
+pub(crate) fn session_search_path_tls() -> Vec<String> {
+    SESSION_SEARCH_PATH.with(|c| c.borrow().clone())
 }
 
 pub struct EmbeddedDatabase {
@@ -498,6 +533,14 @@ pub struct EmbeddedDatabase {
     /// invalidates the plan/result caches, exactly like a branch switch, so
     /// cached plans never cross a schema change.
     current_schema: std::sync::Arc<parking_lot::RwLock<Option<String>>>,
+    /// EMBEDDED single-session FULL ordered `search_path` (I-SP): the effective
+    /// ordered list of schemas (`"$user"` dropped — the embedded path has no
+    /// login identity — `public` kept in position, deduped) that bare table
+    /// references walk. Empty = the default namespace. Kept in lock-step with
+    /// `current_schema` above (which stays the first non-`public` entry). Guarded
+    /// by the same `current_schema_set` atomic, so the default path never reads
+    /// this lock.
+    search_path: std::sync::Arc<parking_lot::RwLock<Vec<String>>>,
     /// Monotonic "some session has used a non-`public` `search_path`" gate.
     /// `false` until the first `SET search_path TO <non-public>` on ANY wire
     /// session; while `false` the `_for_session` paths skip the per-session
@@ -1206,6 +1249,29 @@ impl EmbeddedDatabase {
         self.current_schema.read().clone()
     }
 
+    /// The FULL ordered effective `search_path` for the calling statement (I-SP),
+    /// threaded into the planner so bare table references walk it in order (see
+    /// `Planner::resolve_table_ref`). Empty = the default namespace (one bare
+    /// probe, exactly as before). Same precedence as [`Self::current_schema`]: a
+    /// wire session's per-statement thread-local override wins, else the embedded
+    /// shared field. GATED so the common (default) path pays nothing new — the
+    /// `SESSION_SCHEMA_OVERRIDE_ACTIVE` cell and the `current_schema_set` atomic
+    /// both short-circuit before any lock/alloc, and a single-entry path returns
+    /// a 1-element vec (one probe, as today).
+    pub(crate) fn current_search_path(&self) -> Vec<String> {
+        // Wire session override: the thread-local guard is installed (cheap Cell
+        // read gates the RefCell borrow).
+        if SESSION_SCHEMA_OVERRIDE_ACTIVE.with(|c| c.get()) {
+            return session_search_path_tls();
+        }
+        // Embedded single-session path is lock-free on the default (`public`)
+        // path: only touch the lock when a non-`public` search_path is active.
+        if !self.current_schema_set.load(std::sync::atomic::Ordering::Relaxed) {
+            return Vec::new();
+        }
+        self.search_path.read().clone()
+    }
+
     /// Lock-free "a non-`public` `search_path` is active for this statement"
     /// check for the literal fast paths and the plan/result-cache gates. True
     /// when either the embedded shared field is set OR the calling wire session
@@ -1215,30 +1281,73 @@ impl EmbeddedDatabase {
             || SESSION_SCHEMA_OVERRIDE_ACTIVE.with(|c| c.get())
     }
 
-    /// Update the session's current schema and the hot-path atomic together.
+    /// Update the embedded session's current schema and the hot-path atomic
+    /// together. Also resets the ordered `search_path` to the single-entry form
+    /// (or empty) so the two representations never disagree — used by the RESET
+    /// path (`None`) and any single-schema caller.
     fn set_current_schema(&self, schema: Option<String>) {
         self.current_schema_set
             .store(schema.is_some(), std::sync::atomic::Ordering::Relaxed);
+        *self.search_path.write() = match &schema {
+            Some(s) => vec![s.clone()],
+            None => Vec::new(),
+        };
         *self.current_schema.write() = schema;
     }
 
-    /// Derive the current schema from a `search_path` value string: the FIRST
-    /// entry that is neither `public` nor `"$user"`, folded to lower-case
-    /// (unquoted PostgreSQL identifiers are case-insensitive). Returns `None`
-    /// when only `public` / `"$user"` remain — i.e. the default namespace.
-    fn derive_search_path_schema(value: &str) -> Option<String> {
+    /// Update the embedded session from a FULL ordered `search_path` (I-SP). The
+    /// single `current_schema` selector becomes the first non-`public` entry (the
+    /// CREATE target + `current_schema()` scalar — unchanged semantics), and the
+    /// hot-path atomic flips exactly when such an entry exists, so a `public`-only
+    /// path behaves as the default namespace.
+    fn set_current_schema_path(&self, path: Vec<String>) {
+        let cs = Self::first_non_public(&path);
+        self.current_schema_set
+            .store(cs.is_some(), std::sync::atomic::Ordering::Relaxed);
+        *self.search_path.write() = path;
+        *self.current_schema.write() = cs;
+    }
+
+    /// The single "current schema" selector for an ordered `search_path`: the
+    /// FIRST entry that is not `public` (drives the CREATE target and the
+    /// `current_schema()` scalar). `None` when the path is empty or `public`-only
+    /// — i.e. the default namespace.
+    fn first_non_public(path: &[String]) -> Option<String> {
+        path.iter().find(|s| s.as_str() != "public").cloned()
+    }
+
+    /// Derive the FULL ordered effective `search_path` from a `SET search_path`
+    /// value string (I-SP + I-USER). Each comma entry is unquoted and
+    /// lower-cased (unquoted PostgreSQL identifiers are case-insensitive);
+    /// `"$user"` expands to `login_user`'s schema when a login identity exists,
+    /// else it is dropped (the embedded path has no login user); `public` is kept
+    /// in its declared position; duplicates are removed keeping first occurrence.
+    /// The result feeds `resolve_table_ref`'s ordered walk; its first non-`public`
+    /// entry is the single `current_schema`. Returns an empty vec for a path that
+    /// reduces to nothing (only empty / dropped `$user` entries).
+    fn derive_search_path(value: &str, login_user: Option<&str>) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
         for raw in value.split(',') {
             let entry = raw.trim().trim_matches('"').trim().trim_matches('\'').trim();
             if entry.is_empty() {
                 continue;
             }
             let lowered = entry.to_ascii_lowercase();
-            if lowered == "public" || lowered == "$user" {
-                continue;
+            let resolved = if lowered == "$user" {
+                match login_user {
+                    Some(u) if !u.is_empty() => u.to_ascii_lowercase(),
+                    // No login identity (embedded) — `"$user"` resolves to
+                    // nothing, so it is simply dropped from the path.
+                    _ => continue,
+                }
+            } else {
+                lowered
+            };
+            if !out.iter().any(|e| e == &resolved) {
+                out.push(resolved);
             }
-            return Some(lowered);
         }
-        None
+        out
     }
 
     /// Intercept `SET`/`SHOW`/`RESET search_path`. `search_path` is a
@@ -1254,7 +1363,8 @@ impl EmbeddedDatabase {
     ) -> Result<Option<(Vec<Tuple>, Vec<String>)>> {
         match statement {
             DbSettingStatement::Set { name, value } if name == "search_path" => {
-                self.set_current_schema(Self::derive_search_path_schema(value));
+                // Embedded path has no login identity: `"$user"` is dropped.
+                self.set_current_schema_path(Self::derive_search_path(value, None));
                 self.invalidate_plan_cache();
                 Ok(Some((Vec::new(), Vec::new())))
             }
@@ -1264,11 +1374,20 @@ impl EmbeddedDatabase {
                 Ok(Some((Vec::new(), Vec::new())))
             }
             DbSettingStatement::Show { name } if name == "search_path" => {
-                // Reconstruct a PostgreSQL-shaped value from the derived schema:
-                // the default is `"$user", public`; a set schema shows first.
-                let val = match self.current_schema() {
-                    Some(cs) => format!("{cs}, public"),
-                    None => "\"$user\", public".to_string(),
+                // Reconstruct a PostgreSQL-shaped value from the ordered path:
+                // the default is `"$user", public`; a set path shows in order,
+                // always ending with `public` (v4.5.0's SHOW convention). I-SP
+                // resolution uses the raw ordered path verbatim; only the SHOW
+                // *display* appends the implicit `public` when it isn't already
+                // listed.
+                let mut path = self.current_search_path();
+                let val = if path.is_empty() {
+                    "\"$user\", public".to_string()
+                } else {
+                    if !path.iter().any(|s| s == "public") {
+                        path.push("public".to_string());
+                    }
+                    path.join(", ")
                 };
                 Ok(Some((
                     vec![Tuple {
@@ -2816,7 +2935,8 @@ impl EmbeddedDatabase {
             let catalog = self.storage.catalog();
             let planner = sql::Planner::with_catalog(&catalog)
                 .with_sql(query_sql)
-                .with_current_schema(self.current_schema());
+                .with_current_schema(self.current_schema())
+                .with_search_path(self.current_search_path());
             let query_plan = planner.statement_to_plan(statement)?;
             sql::phase3::MaterializedViewParser::parse_create_mv(view_name, query_plan, None, if_not_exists)?
         } else if sql::Parser::is_refresh_materialized_view(sql) {
@@ -2863,6 +2983,7 @@ impl EmbeddedDatabase {
             let catalog = self.storage.catalog();
             let table_name = sql::Planner::with_catalog(&catalog)
                 .with_current_schema(self.current_schema())
+                .with_search_path(self.current_search_path())
                 .resolve_partition_name(&table_raw);
             sql::LogicalPlan::AlterTableSetSchema {
                 table_name,
@@ -2901,7 +3022,8 @@ impl EmbeddedDatabase {
             let catalog = self.storage.catalog();
             let planner = sql::Planner::with_catalog(&catalog)
                 .with_sql(sql.to_string())
-                .with_current_schema(self.current_schema());
+                .with_current_schema(self.current_schema())
+                .with_search_path(self.current_search_path());
             planner.statement_to_plan(statement)?
         };
 
@@ -3009,6 +3131,7 @@ impl EmbeddedDatabase {
                     // — never a second resolution reimplementation.
                     let parent = sql::Planner::with_catalog(&catalog)
                         .with_current_schema(self.current_schema())
+                        .with_search_path(self.current_search_path())
                         .resolve_partition_name(&spec.parent);
                     catalog.register_partition_child(&parent, name)?;
                 }
@@ -4058,41 +4181,35 @@ impl EmbeddedDatabase {
                     let final_values_vec = final_values?;
                     let tuple = Tuple::new(final_values_vec.clone());
 
-                    // Validate foreign key constraints
+                    // Validate foreign key constraints.
+                    //
+                    // I-FK increment 0 — the cross-type FK "twin". This
+                    // INSERT..SELECT arm used to run its OWN inline
+                    // FK-membership probe: it built an ART key from the RAW
+                    // child values and called `pk_index_contains` UNCOERCED.
+                    // `encode_key` is type-width-sensitive, so a cross-type FK
+                    // (int child -> int8 parent, int -> NUMERIC parent, ...)
+                    // encoded a width-mismatched key that could never match the
+                    // parent's PK/UNIQUE index -> a PHANTOM 23503 on rows that
+                    // DO satisfy the FK. It also honored only `Immediate` FKs,
+                    // silently skipping deferred ones. Delete-and-delegate to
+                    // the shared, type-aware validator the direct-INSERT sibling
+                    // already uses (`check_fk_constraints_on_write`, see the
+                    // Insert arm ~lib.rs:3770): it coerces the probe to the
+                    // parent column type (`coerce_fk_probe_values`), queues
+                    // deferred checks for the commit-time
+                    // `validate_deferred_fk_checks`, and audits — while still
+                    // raising 23503 for a genuinely absent parent. Pass the
+                    // active `txn` for read-your-own-writes parity with the
+                    // sibling.
                     let table_constraints = catalog.load_table_constraints(table_name)?;
-                    for fk in &table_constraints.foreign_keys {
-                        if fk.enforcement == sql::ConstraintEnforcement::Immediate {
-                            let fk_values: Vec<Value> = fk
-                                .columns
-                                .iter()
-                                .map(|col_name| {
-                                    schema
-                                        .columns
-                                        .iter()
-                                        .position(|c| &c.name == col_name)
-                                        .and_then(|idx| final_values_vec.get(idx).cloned())
-                                        .unwrap_or(Value::Null)
-                                })
-                                .collect();
-                            if fk_values.iter().any(|v| matches!(v, Value::Null)) {
-                                continue;
-                            }
-                            let key = crate::storage::ArtIndexManager::encode_key(&fk_values);
-                            let exists = if let Some(found) =
-                                self.storage.art_indexes().pk_index_contains(&fk.references_table, &key)
-                            {
-                                found
-                            } else {
-                                self.check_foreign_key_exists(&fk.references_table, &fk.references_columns, &fk_values)?
-                            };
-                            if !exists {
-                                return Err(Error::constraint_violation(format!(
-                                    "Foreign key constraint '{}' violated: referenced row in table '{}' does not exist",
-                                    fk.name, fk.references_table
-                                )));
-                            }
+                    let mut fk_col_values = std::collections::HashMap::with_capacity(schema.columns.len());
+                    for (i, col) in schema.columns.iter().enumerate() {
+                        if let Some(v) = final_values_vec.get(i) {
+                            fk_col_values.insert(col.name.clone(), v.clone());
                         }
                     }
+                    self.check_fk_constraints_on_write(table_name, &fk_col_values, Some(txn))?;
 
                     // Validate CHECK constraints
                     for check in &table_constraints.check_constraints {
@@ -5787,6 +5904,7 @@ impl EmbeddedDatabase {
             prepared_fast_selects: std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             session_settings: sql::SessionSettings::new(),
             current_schema: std::sync::Arc::new(parking_lot::RwLock::new(None)),
+            search_path: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
             current_schema_set: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             any_session_schema_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             savepoints: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
@@ -5889,6 +6007,7 @@ impl EmbeddedDatabase {
             prepared_fast_selects: std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             session_settings: sql::SessionSettings::new(),
             current_schema: std::sync::Arc::new(parking_lot::RwLock::new(None)),
+            search_path: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
             current_schema_set: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             any_session_schema_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             savepoints: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
@@ -6027,6 +6146,7 @@ impl EmbeddedDatabase {
             prepared_fast_selects: std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             session_settings: sql::SessionSettings::new(),
             current_schema: std::sync::Arc::new(parking_lot::RwLock::new(None)),
+            search_path: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
             current_schema_set: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             any_session_schema_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             savepoints: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
@@ -6754,6 +6874,10 @@ impl EmbeddedDatabase {
     }
 
     pub fn execute(&self, sql: &str) -> Result<u64> {
+        // Reflect an embedded `SET search_path` into the evaluator's thread-local
+        // so a DML statement evaluating `current_schema()` sees the right schema
+        // (see `embedded_current_schema_guard`). Free on the default path.
+        let _embedded_schema = self.embedded_current_schema_guard();
         // SQLite-compat: PRAGMA without a result-set (assignments / no-op
         // tunables) — `execute()` callers don't expect rows back.
         if let Some((_, _)) = crate::sql::sqlite_compat::parse_pragma(sql) {
@@ -11845,7 +11969,9 @@ impl EmbeddedDatabase {
             _ => return Err(Error::query_execution("unsupported trigger RHS".to_string())),
         };
         let catalog = self.storage.catalog();
-        let planner = sql::Planner::with_catalog(&catalog).with_current_schema(self.current_schema());
+        let planner = sql::Planner::with_catalog(&catalog)
+            .with_current_schema(self.current_schema())
+            .with_search_path(self.current_search_path());
         planner.expr_to_logical(&expr)
     }
 
@@ -11870,7 +11996,8 @@ impl EmbeddedDatabase {
         let catalog = self.storage.catalog();
         let planner = sql::Planner::with_catalog(&catalog)
             .with_sql(sql.to_string())
-            .with_current_schema(self.current_schema());
+            .with_current_schema(self.current_schema())
+            .with_search_path(self.current_search_path());
         let plan = std::sync::Arc::new(planner.statement_to_plan(statement)?);
         if !schema_active {
             self.plan_cache.put(cache_key, std::sync::Arc::clone(&plan));
@@ -11927,7 +12054,9 @@ impl EmbeddedDatabase {
         // 3. Create logical plan with catalog access
         let plan_start = std::time::Instant::now();
         let catalog = self.storage.catalog();
-        let planner = sql::Planner::with_catalog(&catalog).with_current_schema(self.current_schema());
+        let planner = sql::Planner::with_catalog(&catalog)
+            .with_current_schema(self.current_schema())
+            .with_search_path(self.current_search_path());
         let plan = planner.statement_to_plan(statement)?;
         let plan_elapsed = plan_start.elapsed();
         tracing::debug!(
@@ -12966,6 +13095,10 @@ impl EmbeddedDatabase {
         params: &[Value],
         plan_override: Option<&std::sync::Arc<sql::LogicalPlan>>,
     ) -> Result<u64> {
+        // Reflect an embedded `SET search_path` into the evaluator's thread-local
+        // (see `embedded_current_schema_guard`). Free on the default path; a
+        // no-op when a wire session already installed its own override.
+        let _embedded_schema = self.embedded_current_schema_guard();
         // These param fast paths resolve the target table from the SQL text
         // (bare) or from SQL-keyed spec caches that are shared across sessions,
         // so under a non-`public` `search_path` they would touch the wrong
@@ -13078,6 +13211,10 @@ impl EmbeddedDatabase {
     /// # }
     /// ```
     pub fn execute_params_returning(&self, sql: &str, params: &[Value]) -> Result<(u64, Vec<Tuple>)> {
+        // Reflect an embedded `SET search_path` into the evaluator's thread-local
+        // so RETURNING `current_schema()` sees the right schema (see
+        // `embedded_current_schema_guard`). Free on the default path.
+        let _embedded_schema = self.embedded_current_schema_guard();
         let plan = self.parameterized_plan_cached(sql)?;
 
         let out = self.execute_plan_with_params(&plan, params, None);
@@ -14411,6 +14548,10 @@ impl EmbeddedDatabase {
     /// # }
     /// ```
     pub fn query(&self, sql: &str, _params: &[&dyn std::fmt::Display]) -> Result<Vec<Tuple>> {
+        // Reflect an embedded `SET search_path` into the thread-local the
+        // storage-less evaluator reads for `current_schema()`/`current_schemas()`.
+        // Free on the default path; a no-op under a wire session's own override.
+        let _embedded_schema = self.embedded_current_schema_guard();
         // SQLite-compat: PRAGMA short-circuit. `table_info(t)` returns
         // SQLite-shaped rows; everything else returns an empty result so
         // sqlite3-driven apps can issue PRAGMAs without parser errors.
@@ -14520,7 +14661,8 @@ impl EmbeddedDatabase {
             let catalog = self.storage.catalog();
             let planner = sql::Planner::with_catalog(&catalog)
                 .with_sql(sql.to_string())
-                .with_current_schema(self.current_schema());
+                .with_current_schema(self.current_schema())
+                .with_search_path(self.current_search_path());
             let plan = planner.statement_to_plan(statement)?;
             if let Some((rows, _columns)) = self.try_handle_prepared_query_plan_with_columns(&plan)? {
                 self.log_slow_query(sql, start.elapsed(), rows.len() as u64);
@@ -14546,7 +14688,8 @@ impl EmbeddedDatabase {
                 let catalog = self.storage.catalog();
                 let planner = sql::Planner::with_catalog(&catalog)
                     .with_sql(sql.to_string())
-                    .with_current_schema(self.current_schema());
+                    .with_current_schema(self.current_schema())
+                    .with_search_path(self.current_search_path());
                 let plan = planner.statement_to_plan(statement)?;
                 let mut executor = sql::Executor::with_storage(&self.storage)
                     .with_timeout(self.effective_statement_timeout_ms())
@@ -14737,7 +14880,8 @@ impl EmbeddedDatabase {
         let catalog = self.storage.catalog();
         let planner = sql::Planner::with_catalog(&catalog)
             .with_sql(sql.to_string())
-            .with_current_schema(self.current_schema());
+            .with_current_schema(self.current_schema())
+            .with_search_path(self.current_search_path());
         let plan = planner.statement_to_plan(statement)?;
         tracing::debug!(
             phase = "plan",
@@ -14887,7 +15031,8 @@ impl EmbeddedDatabase {
             let catalog = self.storage.catalog();
             let planner = sql::Planner::with_catalog(&catalog)
                 .with_sql(nsql.clone())
-                .with_current_schema(self.current_schema());
+                .with_current_schema(self.current_schema())
+                .with_search_path(self.current_search_path());
             let plan = match planner.statement_to_plan(statement) {
                 Ok(p) => p,
                 Err(e) => return Some(Err(e)),
@@ -14927,7 +15072,8 @@ impl EmbeddedDatabase {
         let catalog = self.storage.catalog();
         let planner = sql::Planner::with_catalog(&catalog)
             .with_sql(sql.to_string())
-            .with_current_schema(self.current_schema());
+            .with_current_schema(self.current_schema())
+            .with_search_path(self.current_search_path());
         let plan = planner.statement_to_plan(statement)?;
         let plan = self.cold_optimizer().optimize_recursive(plan)?;
         let mut executor =
@@ -14936,6 +15082,10 @@ impl EmbeddedDatabase {
     }
 
     pub fn query_with_columns(&self, sql: &str) -> Result<(Vec<Tuple>, Vec<String>)> {
+        // Reflect an embedded `SET search_path` into the evaluator's thread-local
+        // (see `embedded_current_schema_guard`). Free on the default path; a
+        // no-op when a wire session already installed its own override.
+        let _embedded_schema = self.embedded_current_schema_guard();
         if let Some(result) = self.try_fast_select_with_columns(sql) {
             return result;
         }
@@ -15047,7 +15197,8 @@ impl EmbeddedDatabase {
             let catalog = self.storage.catalog();
             let planner = sql::Planner::with_catalog(&catalog)
                 .with_sql(sql.to_string())
-                .with_current_schema(self.current_schema());
+                .with_current_schema(self.current_schema())
+                .with_search_path(self.current_search_path());
             planner.statement_to_plan(statement)?
         };
 
@@ -15691,7 +15842,8 @@ impl EmbeddedDatabase {
             let catalog = self.storage.catalog();
             let planner = sql::Planner::with_catalog(&catalog)
                 .with_sql(sql.to_string())
-                .with_current_schema(self.current_schema());
+                .with_current_schema(self.current_schema())
+                .with_search_path(self.current_search_path());
             let plan = planner.statement_to_plan(statement)?;
 
             // Execute plan with transaction context
@@ -15852,8 +16004,41 @@ impl EmbeddedDatabase {
         schema: Option<String>,
     ) -> Result<()> {
         let session_lock = self.session_manager.get_session(session_id)?;
-        session_lock.write().current_schema = schema.clone();
+        {
+            let mut session = session_lock.write();
+            session.current_schema = schema.clone();
+            // Keep the ordered path in lock-step: single-entry (or empty on
+            // RESET) so `session_search_path` never disagrees with the selector.
+            session.search_path = match &schema {
+                Some(s) => vec![s.clone()],
+                None => Vec::new(),
+            };
+        }
         if schema.is_some() {
+            self.any_session_schema_active
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    /// Store this session's FULL ordered `search_path` (I-SP). The single
+    /// `current_schema` selector becomes the first non-`public` entry (the CREATE
+    /// target + `current_schema()` scalar); the `any_session_schema_active` gate
+    /// flips exactly when such an entry exists, so a `public`-only path costs the
+    /// default workload nothing.
+    pub(crate) fn set_session_search_path(
+        &self,
+        session_id: crate::session::SessionId,
+        path: Vec<String>,
+    ) -> Result<()> {
+        let cs = Self::first_non_public(&path);
+        {
+            let session_lock = self.session_manager.get_session(session_id)?;
+            let mut session = session_lock.write();
+            session.current_schema = cs.clone();
+            session.search_path = path;
+        }
+        if cs.is_some() {
             self.any_session_schema_active
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
@@ -15864,6 +16049,33 @@ impl EmbeddedDatabase {
     pub(crate) fn session_current_schema(&self, session_id: crate::session::SessionId) -> Result<Option<String>> {
         let session_lock = self.session_manager.get_session(session_id)?;
         let value = session_lock.read().current_schema.clone();
+        Ok(value)
+    }
+
+    /// Read this session's FULL ordered `search_path` (default empty = the
+    /// default namespace).
+    pub(crate) fn session_search_path(&self, session_id: crate::session::SessionId) -> Result<Vec<String>> {
+        let session_lock = self.session_manager.get_session(session_id)?;
+        let value = session_lock.read().search_path.clone();
+        Ok(value)
+    }
+
+    /// Store this session's login role/username (wire startup `user` param), used
+    /// to expand the `"$user"` `search_path` entry (I-USER).
+    pub(crate) fn set_session_login_user(
+        &self,
+        session_id: crate::session::SessionId,
+        login_user: Option<String>,
+    ) -> Result<()> {
+        let session_lock = self.session_manager.get_session(session_id)?;
+        session_lock.write().login_user = login_user;
+        Ok(())
+    }
+
+    /// Read this session's login role/username (default `None`).
+    pub(crate) fn session_login_user(&self, session_id: crate::session::SessionId) -> Result<Option<String>> {
+        let session_lock = self.session_manager.get_session(session_id)?;
+        let value = session_lock.read().login_user.clone();
         Ok(value)
     }
 
@@ -15897,9 +16109,39 @@ impl EmbeddedDatabase {
             return None;
         }
         match self.session_current_schema(session_id) {
-            Ok(Some(schema)) => Some(SessionSchemaOverrideGuard::install(schema)),
+            Ok(Some(schema)) => {
+                let path = self.session_search_path(session_id).unwrap_or_default();
+                Some(SessionSchemaOverrideGuard::install(schema, path))
+            }
             _ => None,
         }
+    }
+
+    /// Install THIS embedded connection's `search_path` schema as the
+    /// thread-local override for the duration of one statement, so the
+    /// storage-less evaluator's `current_schema()` / `current_schemas()` (which
+    /// read the thread-local, see `crate::session_current_schema_tls`) reflect an
+    /// embedded `SET search_path`. Free on the default path: the
+    /// `current_schema_set` atomic short-circuits before any lock when no
+    /// embedded schema is active. Returns `None` (installs nothing) when a wire
+    /// session already installed an override on this thread — the evaluator reads
+    /// that one — so the two never nest and clobber each other's `Drop`.
+    fn embedded_current_schema_guard(&self) -> Option<SessionSchemaOverrideGuard> {
+        // Hot path: no embedded schema active → nothing to do (single relaxed load).
+        if !self.current_schema_set.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+        // A wire session's per-statement override is already installed on this
+        // thread; it is the authoritative value the evaluator reads. Do not
+        // stack a second guard (its Drop would clear the outer one early).
+        if SESSION_SCHEMA_OVERRIDE_ACTIVE.with(|c| c.get()) {
+            return None;
+        }
+        let schema = self.current_schema.read().clone();
+        schema.map(|s| {
+            let path = self.search_path.read().clone();
+            SessionSchemaOverrideGuard::install(s, path)
+        })
     }
 
     /// Intercept `SET`/`RESET search_path` for a wire session, storing the schema
@@ -15915,7 +16157,10 @@ impl EmbeddedDatabase {
     ) -> Result<Option<u64>> {
         match Self::parse_db_setting_statement(sql) {
             Some(DbSettingStatement::Set { name, value }) if name == "search_path" => {
-                self.set_session_current_schema(session_id, Self::derive_search_path_schema(&value))?;
+                // Expand `"$user"` against THIS session's login role (I-USER).
+                let login = self.session_login_user(session_id).unwrap_or(None);
+                let path = Self::derive_search_path(&value, login.as_deref());
+                self.set_session_search_path(session_id, path)?;
                 Ok(Some(0))
             }
             Some(DbSettingStatement::Reset { name }) if name == "search_path" => {
@@ -16089,7 +16334,8 @@ impl EmbeddedDatabase {
         let catalog = self.storage.catalog();
         let planner = sql::Planner::with_catalog(&catalog)
             .with_sql(sql.to_string())
-            .with_current_schema(self.current_schema());
+            .with_current_schema(self.current_schema())
+            .with_search_path(self.current_search_path());
         let plan = planner.statement_to_plan(statement)?;
 
         let mut executor = sql::Executor::with_storage(&self.storage)
@@ -16618,7 +16864,8 @@ impl EmbeddedDatabase {
             let catalog = self.storage.catalog();
             let planner = sql::Planner::with_catalog(&catalog)
                 .with_sql(sql.to_string())
-                .with_current_schema(self.current_schema());
+                .with_current_schema(self.current_schema())
+                .with_search_path(self.current_search_path());
             let plan = planner.statement_to_plan(statement)?;
             self.apply_rls_to_plan(plan)?
         };
@@ -17701,6 +17948,7 @@ impl EmbeddedDatabase {
             prepared_fast_selects: self.prepared_fast_selects.clone(),
             session_settings: self.session_settings.clone(),
             current_schema: self.current_schema.clone(),
+            search_path: self.search_path.clone(),
             current_schema_set: self.current_schema_set.clone(),
             any_session_schema_active: self.any_session_schema_active.clone(),
             savepoints: self.savepoints.clone(),
@@ -17808,45 +18056,6 @@ impl EmbeddedDatabase {
             (Value::Int8(v), DataType::Numeric) => Value::Numeric(format!("{v}")),
             _ => value.clone(),
         }
-    }
-
-    /// Check if a foreign key reference exists in the referenced table
-    ///
-    /// Used for FK constraint validation during INSERT/UPDATE operations.
-    fn check_foreign_key_exists(&self, table_name: &str, column_names: &[String], values: &[Value]) -> Result<bool> {
-        // Build a query to check if the referenced row exists
-        let catalog = self.storage.catalog();
-        let schema = catalog.get_table_schema(table_name)?;
-
-        // Scan the table and check for a matching row
-        let tuples = self.storage.scan_table(table_name)?;
-
-        for tuple in tuples {
-            let mut matches = true;
-            for (col_name, expected_value) in column_names.iter().zip(values.iter()) {
-                // Find column index
-                let col_idx = schema.columns.iter().position(|c| &c.name == col_name);
-
-                if let Some(idx) = col_idx {
-                    match tuple.values.get(idx) {
-                        Some(actual_value) if actual_value == expected_value => {}
-                        _ => {
-                            matches = false;
-                            break;
-                        }
-                    }
-                } else {
-                    matches = false;
-                    break;
-                }
-            }
-
-            if matches {
-                return Ok(true);
-            }
-        }
-
-        Ok(false)
     }
 
     /// Check if inserting the given values would violate a UNIQUE constraint
@@ -18147,7 +18356,9 @@ impl EmbeddedDatabase {
 
             // Use the planner to convert the SQL expression to LogicalExpr
             let catalog = self.storage.catalog();
-            let planner = sql::Planner::with_catalog(&catalog).with_current_schema(self.current_schema());
+            let planner = sql::Planner::with_catalog(&catalog)
+                .with_current_schema(self.current_schema())
+                .with_search_path(self.current_search_path());
 
             // Convert SQL Expr to LogicalExpr
             planner.convert_expr_to_logical(&selection, Some(schema))
@@ -19422,7 +19633,8 @@ impl Transaction<'_> {
             .with_sql(sql.to_string())
             // `current_schema()` is inherent to `EmbeddedDatabase`; `Transaction`
             // reaches it through its `db` field (no `Deref` to the database).
-            .with_current_schema(self.db.current_schema());
+            .with_current_schema(self.db.current_schema())
+            .with_search_path(self.db.current_search_path());
         let plan = planner.statement_to_plan(statement)?;
 
         // Execute plan with transaction context
@@ -29875,12 +30087,299 @@ mod tests {
         assert_eq!(rows[0].get(0).unwrap(), &Value::String("public".to_string()));
     }
 
+    // === Schema Stage-2 I-CAT: catalog tells the truth ===
+
+    /// pg_namespace must list a schema DECLARED with CREATE SCHEMA even when it
+    /// has no tables yet, plus the built-in namespaces. Pre-change this returned
+    /// only schemas derived from existing table keys (+ public/information_schema),
+    /// so an empty `s` and `pg_catalog` were both invisible.
+    #[test]
+    fn test_icat_pg_namespace_lists_user_and_builtin_schemas() {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE SCHEMA s").unwrap();
+        let rows = db.query("SELECT nspname FROM pg_namespace", &[]).unwrap();
+        let names: Vec<String> = rows
+            .iter()
+            .filter_map(|r| match r.get(0) {
+                Some(Value::String(s)) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "s"),
+            "pg_namespace must list the user schema 's' (got {names:?})"
+        );
+        assert!(
+            names.iter().any(|n| n == "public"),
+            "pg_namespace must list public ({names:?})"
+        );
+        assert!(
+            names.iter().any(|n| n == "pg_catalog"),
+            "pg_namespace must list the built-in pg_catalog ({names:?})"
+        );
+        assert!(
+            names.iter().any(|n| n == "information_schema"),
+            "pg_namespace must list information_schema ({names:?})"
+        );
+    }
+
+    /// pg_class.relnamespace must reflect a relation's REAL schema: a table in
+    /// `s` and a public table must land in different namespaces. Pre-change every
+    /// relation was hardcoded to public's oid (2200), so they were equal.
+    #[test]
+    fn test_icat_relnamespace_reflects_real_schema() {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE SCHEMA s").unwrap();
+        db.execute("CREATE TABLE s.foo (id INT)").unwrap();
+        db.execute("CREATE TABLE barpub (id INT)").unwrap();
+        let rows = db.query("SELECT relname, relnamespace FROM pg_class", &[]).unwrap();
+        let mut foo_ns = None;
+        let mut bar_ns = None;
+        for r in &rows {
+            if let (Some(Value::String(name)), Some(Value::Int4(ns))) = (r.get(0), r.get(1)) {
+                match name.as_str() {
+                    "foo" => foo_ns = Some(*ns),
+                    "barpub" => bar_ns = Some(*ns),
+                    _ => {}
+                }
+            }
+        }
+        let foo_ns = foo_ns.expect("s.foo must appear in pg_class");
+        let bar_ns = bar_ns.expect("barpub must appear in pg_class");
+        assert_eq!(bar_ns, 2200, "a public table's relnamespace must be public's oid 2200");
+        assert_ne!(
+            foo_ns, bar_ns,
+            "a table in schema 's' must have a relnamespace distinct from a public table"
+        );
+    }
+
+    /// current_schema() must reflect the session's search_path, not a hardcoded
+    /// "public". Pre-change it always returned "public".
+    #[test]
+    fn test_icat_current_schema_session_aware() {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE SCHEMA s").unwrap();
+        db.query("SET search_path TO s", &[]).unwrap();
+        let rows = db.query("SELECT current_schema()", &[]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("s".to_string()));
+
+        // Resetting returns to the default namespace.
+        db.query("SET search_path TO public", &[]).unwrap();
+        let rows = db.query("SELECT current_schema()", &[]).unwrap();
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("public".to_string()));
+    }
+
+    /// current_schemas(true) must return the effective schema array with the
+    /// implicit pg_catalog prepended; current_schemas(false) must omit it.
+    /// Pre-change the function did not exist at all.
+    #[test]
+    fn test_icat_current_schemas_implicit_pg_catalog() {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        let rows = db.query("SELECT current_schemas(true)", &[]).unwrap();
+        assert_eq!(rows.len(), 1);
+        match rows[0].get(0).unwrap() {
+            Value::Array(items) => {
+                let strs: Vec<String> = items
+                    .iter()
+                    .filter_map(|v| match v {
+                        Value::String(s) => Some(s.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                assert!(
+                    strs.iter().any(|s| s == "pg_catalog"),
+                    "current_schemas(true) must include the implicit pg_catalog (got {strs:?})"
+                );
+                assert!(
+                    strs.iter().any(|s| s == "public"),
+                    "current_schemas(true) must include public"
+                );
+            }
+            other => panic!("current_schemas(true) must return an array, got {other:?}"),
+        }
+
+        let rows = db.query("SELECT current_schemas(false)", &[]).unwrap();
+        match rows[0].get(0).unwrap() {
+            Value::Array(items) => {
+                let has_pg_catalog = items.iter().any(|v| matches!(v, Value::String(s) if s == "pg_catalog"));
+                assert!(!has_pg_catalog, "current_schemas(false) must NOT include pg_catalog");
+            }
+            other => panic!("current_schemas(false) must return an array, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_pg_compat_current_database() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         let rows = db.query("SELECT current_database()", &[]).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get(0).unwrap(), &Value::String("heliosdb".to_string()));
+    }
+
+    // === Schema Stage-2 I-SP: multi-entry ordered search_path (+ "$user") ===
+
+    /// Assert an `id` cell equals `expected` regardless of int width.
+    #[cfg(test)]
+    fn isp_assert_int(v: Option<&Value>, expected: i64, msg: &str) {
+        match v.expect(msg) {
+            Value::Int4(n) => assert_eq!(*n as i64, expected, "{msg}"),
+            Value::Int8(n) => assert_eq!(*n, expected, "{msg}"),
+            Value::Int2(n) => assert_eq!(*n as i64, expected, "{msg}"),
+            other => panic!("{msg}: unexpected value {other:?}"),
+        }
+    }
+
+    /// `SET search_path TO a, b` must resolve a bare table that lives in the
+    /// SECOND entry `b`. Pre-change the path collapsed to the first non-`public`
+    /// entry `a`, so `b`'s table was invisible and the query errored.
+    #[test]
+    fn test_isp_second_entry_resolves() {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE SCHEMA a").unwrap();
+        db.execute("CREATE SCHEMA b").unwrap();
+        db.execute("CREATE TABLE b.t (id INT)").unwrap();
+        db.execute("INSERT INTO b.t VALUES (42)").unwrap();
+        db.query("SET search_path TO a, b", &[]).unwrap();
+        let rows = db.query("SELECT id FROM t", &[]).unwrap();
+        assert_eq!(rows.len(), 1, "bare `t` must resolve to b.t (the 2nd path entry)");
+        isp_assert_int(rows[0].get(0), 42, "b.t row must be returned");
+    }
+
+    /// A THIRD entry must also be walked: table lives only in `c`.
+    #[test]
+    fn test_isp_third_entry_resolves() {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        for s in ["a", "b", "c"] {
+            db.execute(&format!("CREATE SCHEMA {s}")).unwrap();
+        }
+        db.execute("CREATE TABLE c.t (id INT)").unwrap();
+        db.execute("INSERT INTO c.t VALUES (9)").unwrap();
+        db.query("SET search_path TO a, b, c", &[]).unwrap();
+        let rows = db.query("SELECT id FROM t", &[]).unwrap();
+        assert_eq!(rows.len(), 1, "bare `t` must resolve to c.t (the 3rd path entry)");
+        isp_assert_int(rows[0].get(0), 9, "c.t row must be returned");
+    }
+
+    /// The FIRST matching entry wins: a same-named table in `a` shadows the one
+    /// in `b` under `search_path = a, b`.
+    #[test]
+    fn test_isp_first_entry_shadows_second() {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE SCHEMA a").unwrap();
+        db.execute("CREATE SCHEMA b").unwrap();
+        db.execute("CREATE TABLE a.t (id INT)").unwrap();
+        db.execute("CREATE TABLE b.t (id INT)").unwrap();
+        db.execute("INSERT INTO a.t VALUES (1)").unwrap();
+        db.execute("INSERT INTO b.t VALUES (2)").unwrap();
+        db.query("SET search_path TO a, b", &[]).unwrap();
+        let rows = db.query("SELECT id FROM t", &[]).unwrap();
+        assert_eq!(rows.len(), 1);
+        isp_assert_int(rows[0].get(0), 1, "first path entry `a` must shadow `b`");
+    }
+
+    /// An explicit `public.t` qualifier must BYPASS the path even when a bare `t`
+    /// resolves to `a.t` under `search_path = a` — the load-bearing
+    /// explicit-qualifier invariant.
+    #[test]
+    fn test_isp_explicit_qualifier_bypasses_path() {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE SCHEMA a").unwrap();
+        db.execute("CREATE TABLE a.t (id INT)").unwrap();
+        db.execute("CREATE TABLE t (id INT)").unwrap(); // public.t (bare key)
+        db.execute("INSERT INTO a.t VALUES (1)").unwrap();
+        db.execute("INSERT INTO t VALUES (2)").unwrap();
+        db.query("SET search_path TO a", &[]).unwrap();
+        // Bare `t` resolves to a.t.
+        let bare = db.query("SELECT id FROM t", &[]).unwrap();
+        isp_assert_int(bare[0].get(0), 1, "bare `t` resolves to a.t under the path");
+        // Explicit `public.t` must NOT be re-scoped to the path.
+        let pub_rows = db.query("SELECT id FROM public.t", &[]).unwrap();
+        isp_assert_int(pub_rows[0].get(0), 2, "public.t must bypass the search_path");
+    }
+
+    /// A session with NO `search_path` set resolves bare names against `public`
+    /// exactly as before (regression guard for the gated fast path).
+    #[test]
+    fn test_isp_no_search_path_unchanged() {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE t (id INT)").unwrap();
+        db.execute("INSERT INTO t VALUES (7)").unwrap();
+        let rows = db.query("SELECT id FROM t", &[]).unwrap();
+        assert_eq!(rows.len(), 1);
+        isp_assert_int(rows[0].get(0), 7, "public bare resolution unchanged");
+    }
+
+    /// `SHOW search_path` must echo the full ordered path, extended with v4.5.0's
+    /// implicit-`public` suffix (the SHOW display convention). Pre-I-SP it showed
+    /// only `<first>, public` (dropping the 2nd+ entries); I-SP keeps every entry
+    /// in order but the display still appends `public` when absent, so
+    /// `SET search_path TO a, b` shows `a, b, public`. Resolution uses the raw
+    /// ordered path (`a, b`) — only the display appends `public`.
+    #[test]
+    fn test_isp_show_reflects_ordered_path() {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE SCHEMA a").unwrap();
+        db.execute("CREATE SCHEMA b").unwrap();
+        db.query("SET search_path TO a, b", &[]).unwrap();
+        let rows = db.query("SHOW search_path", &[]).unwrap();
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("a, b, public".to_string()));
+    }
+
+    /// I-USER: `derive_search_path` must expand `"$user"` to the login role's
+    /// schema, keep `public` in position, order entries, and dedup; with no login
+    /// identity (embedded) `"$user"` is dropped. Pre-change this fn was a single
+    /// `Option<String>` selector (first non-public) — the ordered/expanded Vec
+    /// form did not exist.
+    #[test]
+    fn test_isp_derive_expands_user_and_orders() {
+        assert_eq!(
+            EmbeddedDatabase::derive_search_path("a, b, a", None),
+            vec!["a".to_string(), "b".to_string()],
+            "ordered + deduped"
+        );
+        assert_eq!(
+            EmbeddedDatabase::derive_search_path("\"$user\", public", Some("alice")),
+            vec!["alice".to_string(), "public".to_string()],
+            "$user expands to the login role; public kept in position"
+        );
+        assert_eq!(
+            EmbeddedDatabase::derive_search_path("\"$user\", public", None),
+            vec!["public".to_string()],
+            "no login identity: $user dropped"
+        );
+    }
+
+    /// I-USER end-to-end via the per-session wire APIs: a session whose login
+    /// role is `r` and whose `search_path` is `"$user", public` must resolve a
+    /// bare table living in schema `r`. Pre-change `"$user"` was skipped and the
+    /// session had no login identity threaded, so `r.t` was invisible.
+    #[test]
+    fn test_isp_user_entry_resolves_to_login_schema() {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE SCHEMA r").unwrap();
+        db.execute("CREATE TABLE r.t (id INT)").unwrap();
+        db.execute("INSERT INTO r.t VALUES (5)").unwrap();
+
+        // Simulate a wire login as role `r`.
+        let sid = db
+            .create_session("r", crate::session::IsolationLevel::ReadCommitted)
+            .unwrap();
+        db.set_session_login_user(sid, Some("r".to_string())).unwrap();
+        db.try_handle_session_search_path(sid, "SET search_path TO \"$user\", public")
+            .unwrap();
+
+        let path = db.session_search_path(sid).unwrap();
+        assert_eq!(
+            path,
+            vec!["r".to_string(), "public".to_string()],
+            "$user must expand to the login role's schema"
+        );
+        assert_eq!(
+            db.session_current_schema(sid).unwrap(),
+            Some("r".to_string()),
+            "the single selector is the first non-public entry (r)"
+        );
     }
 
     // =====================================================================

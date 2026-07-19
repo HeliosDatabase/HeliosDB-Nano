@@ -3052,16 +3052,19 @@ impl SystemViewRegistry {
             // non-`public` table; `relname` is the BARE table (PostgreSQL keeps
             // the schema in `relnamespace`, not `relname`), so two coexisting
             // `a.t` / `b.t` both surface as `relname = 't'`.
-            let (_relschema, relname) = crate::sql::Planner::split_schema_key(table_name);
+            let (relschema, relname) = crate::sql::Planner::split_schema_key(table_name);
             let tuple = Tuple::new(vec![
-                Value::Int4(oid),                     // oid
-                Value::String(relname),               // relname
-                Value::Int4(PG_PUBLIC_NAMESPACE_OID), // relnamespace (public schema)
-                Value::Int4(oid + 1000),              // reltype
-                Value::String("r".to_string()),       // relkind (r = relation/table)
-                Value::Int4(oid),                     // relfilenode
-                Value::Boolean(false),                // relrowsecurity (Nano RLS is via TenantManager, not pg_catalog)
-                Value::Null,                          // relpartbound (Stage-0 flatten keeps no typed bound)
+                Value::Int4(oid),       // oid
+                Value::String(relname), // relname
+                // relnamespace = the table's REAL schema oid (public tables map
+                // to 2200; a `s.t` key maps to s's oid), via the shared map that
+                // also fills pg_namespace.oid so JOINs line up.
+                Value::Int4(crate::sql::Planner::schema_name_to_oid(&relschema)),
+                Value::Int4(oid + 1000),        // reltype
+                Value::String("r".to_string()), // relkind (r = relation/table)
+                Value::Int4(oid),               // relfilenode
+                Value::Boolean(false),          // relrowsecurity (Nano RLS is via TenantManager, not pg_catalog)
+                Value::Null,                    // relpartbound (Stage-0 flatten keeps no typed bound)
             ]);
             results.push(tuple);
         }
@@ -3734,9 +3737,13 @@ impl SystemViewRegistry {
 
     fn execute_pg_namespace(storage: &StorageEngine) -> Result<Vec<Tuple>> {
         use std::collections::BTreeSet;
+        // The namespaces PostgreSQL always exposes, plus every user schema —
+        // whether implied by a `schema.table` key or DECLARED empty via
+        // `CREATE SCHEMA` (`list_schemas` now unions the `meta:schema:` markers).
         let mut all: BTreeSet<String> = BTreeSet::new();
-        all.insert("public".to_string());
+        all.insert("pg_catalog".to_string());
         all.insert("information_schema".to_string());
+        all.insert("public".to_string());
         if let Ok(catalog_schemas) = storage.catalog().list_schemas() {
             for s in catalog_schemas {
                 all.insert(s);
@@ -3744,20 +3751,14 @@ impl SystemViewRegistry {
         }
 
         let mut results = Vec::new();
-        let mut next_oid = 2200i32;
         for nspname in all {
-            let oid = match nspname.as_str() {
-                "public" => 2200,
-                "information_schema" => 11,
-                _ => {
-                    next_oid += 1;
-                    next_oid
-                }
-            };
+            // Shared schema→oid map (also drives `pg_class.relnamespace`), so a
+            // relation's relnamespace always matches its schema's oid here.
+            let oid = crate::sql::Planner::schema_name_to_oid(&nspname);
             results.push(Tuple::new(vec![
-                Value::Int4(oid),
-                Value::String(nspname),
-                Value::Int4(10),
+                Value::Int4(oid),       // oid
+                Value::String(nspname), // nspname
+                Value::Int4(10),        // nspowner (postgres super-user)
             ]));
         }
         Ok(results)

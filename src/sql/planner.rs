@@ -86,6 +86,15 @@ pub struct Planner<'a> {
     /// from the session's current schema so it composes with the plan cache
     /// (which is invalidated whenever `search_path` changes).
     current_schema: Option<String>,
+    /// Full ordered effective session `search_path` (I-SP): every entry in
+    /// declared order, `"$user"` already expanded, `public` in position, deduped.
+    /// Empty = single-schema/default behavior (drives the legacy two-probe via
+    /// `current_schema` above). When non-empty, a BARE table reference walks this
+    /// list in order in [`Self::resolve_table_ref`] (first `<schema_i>.t` that
+    /// exists, else the bare `public` fallback). `current_schema` stays the first
+    /// non-`public` entry so CREATE targeting is unchanged. Threaded per statement
+    /// from the session (see `EmbeddedDatabase::current_search_path`).
+    search_path: Vec<String>,
     /// The chain of view names currently being expanded (ancestor path), used to
     /// break cyclic / self-referential view references before they overflow the
     /// stack. Empty for a top-level statement; each nested view-expansion planner
@@ -102,6 +111,7 @@ impl<'a> Planner<'a> {
             cte_schemas: RefCell::new(HashMap::new()),
             named_windows: RefCell::new(HashMap::new()),
             current_schema: None,
+            search_path: Vec::new(),
             view_expansion_stack: Vec::new(),
         }
     }
@@ -114,6 +124,7 @@ impl<'a> Planner<'a> {
             cte_schemas: RefCell::new(HashMap::new()),
             named_windows: RefCell::new(HashMap::new()),
             current_schema: None,
+            search_path: Vec::new(),
             view_expansion_stack: Vec::new(),
         }
     }
@@ -128,6 +139,15 @@ impl<'a> Planner<'a> {
     /// the default `public` flat-namespace behavior.
     pub fn with_current_schema(mut self, current_schema: Option<String>) -> Self {
         self.current_schema = current_schema;
+        self
+    }
+
+    /// Set the session's FULL ordered `search_path` (I-SP). Empty keeps the
+    /// legacy single-schema two-probe (driven by [`Self::with_current_schema`]).
+    /// When non-empty, bare table references walk this list in order. Threaded
+    /// per statement alongside `with_current_schema`.
+    pub fn with_search_path(mut self, search_path: Vec<String>) -> Self {
+        self.search_path = search_path;
         self
     }
 
@@ -464,6 +484,33 @@ impl<'a> Planner<'a> {
         }
     }
 
+    /// The stable namespace OID for a schema name — the single authoritative
+    /// schema→oid map shared by the `pg_namespace` and `pg_class.relnamespace`
+    /// catalog surfaces so a relation's `relnamespace` always matches its
+    /// schema's `pg_namespace.oid`. Built-in namespaces use PostgreSQL's fixed
+    /// OIDs (`pg_catalog`=11, `information_schema`=13183, `public`=2200); a user
+    /// schema hashes to a deterministic OID above PG's FirstNormalObjectId
+    /// (16384). The hash is derived from the name alone (fixed-key
+    /// `DefaultHasher`, deterministic across restarts) so a schema keeps the
+    /// SAME oid regardless of which OTHER schemas exist — unlike sequential
+    /// assignment, which renumbers survivors when a schema is added or dropped.
+    pub(crate) fn schema_name_to_oid(schema: &str) -> i32 {
+        match schema {
+            "pg_catalog" => 11,
+            "information_schema" => 13_183,
+            "public" => 2200,
+            other => {
+                use std::collections::hash_map::DefaultHasher;
+                use std::hash::{Hash, Hasher};
+                let mut hasher = DefaultHasher::new();
+                other.hash(&mut hasher);
+                // 0..=999_999 fits i32; the +16_384 base keeps it clear of the
+                // reserved built-in OIDs above (max here ≈ 1_016_383).
+                16_384 + (hasher.finish() % 1_000_000) as i32
+            }
+        }
+    }
+
     /// Resolve a table REFERENCE (read / DML / FK target / DROP) to its storage
     /// key, honoring the session `search_path`. Qualified names resolve exactly
     /// (`normalize_object_name` preserved the schema). A BARE name under a
@@ -480,6 +527,31 @@ impl<'a> Planner<'a> {
         if name.0.len() >= 2 {
             return base;
         }
+        // I-SP: with a multi-entry `search_path` threaded in, walk it IN ORDER
+        // and return the first schema whose `<schema>.t` (bare `t` for `public`)
+        // exists; fall back to the bare `public` key when none match. A session
+        // with no override threads an empty path and takes the legacy branch
+        // below (one probe), so the common case pays nothing new.
+        if !self.search_path.is_empty() {
+            if let Some(catalog) = self.catalog {
+                for schema in &self.search_path {
+                    if schema == "public" {
+                        if catalog.table_exists(&base).unwrap_or(false) {
+                            return base;
+                        }
+                    } else {
+                        let qualified = format!("{schema}.{base}");
+                        if catalog.table_exists(&qualified).unwrap_or(false) {
+                            return qualified;
+                        }
+                    }
+                }
+            }
+            return base;
+        }
+        // Legacy single-schema two-probe (unchanged): used when only
+        // `current_schema` is threaded (e.g. the view-body / `creator_schema`
+        // path, where a view resolves against its single defining schema).
         let Some(cs) = self.current_schema.as_deref() else {
             return base;
         };
