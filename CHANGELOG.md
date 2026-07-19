@@ -5,6 +5,40 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.6.0] - 2026-07-19
+
+Two schema Stage-2 follow-up items (leased to and delivered by the fleet's
+HDB session) plus a round-3 cheap-root cascade:
+
+- **PostgreSQL `NaN`/`Infinity`/`-Infinity` `NUMERIC` support** — the three
+  special values are now accepted end-to-end (cast, comparison, equality,
+  sort, arithmetic, aggregates, predicate pushdown), matching PostgreSQL's
+  `numeric.c` contract: `NaN` sorts greater than all non-`NaN` values and
+  `NaN = NaN` is `TRUE` (deliberately, for btree/`GROUP BY`/`DISTINCT`/
+  `ORDER BY` usability, unlike IEEE-754); `+Infinity`/`-Infinity` compare and
+  propagate through arithmetic as PostgreSQL does (`Inf-Inf`, `Inf/Inf`,
+  `Inf*0` = `NaN`; `finite/Inf` = `0`; `Inf/0` still raises division-by-zero).
+- **`CREATE FUNCTION … RETURNS TABLE(cols)`** — the composite return form is
+  now accepted (previously rejected with "Custom data type not yet
+  supported"); the column list is not yet persisted and set-returning
+  execution is not yet wired (function calls keep existing scalar behavior).
+- **Real catalog schema truth (`pg_namespace`/`relnamespace`)** —
+  `pg_namespace` lists actual registered schemas (no longer hardcoded to
+  `public`); `pg_class.relnamespace` maps each relation to its real schema's
+  oid via a stable, deterministic name→oid map, so the two catalogs join
+  consistently. `current_schema()` is now session-aware; `current_schemas(bool)`
+  added.
+- **Multi-entry `search_path`** — `SET search_path TO a, b` now resolves bare
+  table references by walking the full ordered list (first match wins),
+  replacing the prior first-non-public-entry-only behavior; `SHOW search_path`
+  keeps the established append-`public` display convention.
+- **Fix (pre-existing):** cross-type foreign keys on the `INSERT ... SELECT`
+  path reported phantom violations (the twin of the direct-`INSERT` fix in
+  4.5.0); now routes through the same type-aware validator, which also fixes
+  deferred-FK skip on that path.
+- Measured on the PG regression corpus: +14 statements flip to passing across
+  both handbacks, 0 regressions.
+
 ## [4.5.0] - 2026-07-18
 
 Real schema support:
