@@ -478,7 +478,40 @@ impl<'a> Catalog<'a> {
         for (sch, _) in self.list_tables_qualified()? {
             s.insert(sch);
         }
+        // A schema DECLARED with `CREATE SCHEMA` but not yet populated exists
+        // only as a `meta:schema:` marker (no member-table key to derive it
+        // from). Fold those in so an empty schema still materialises a
+        // `pg_namespace` row.
+        for name in self.list_registered_schemas()? {
+            s.insert(name);
+        }
         Ok(s.into_iter().collect())
+    }
+
+    /// Names of all schemas DECLARED via `CREATE SCHEMA` — the `meta:schema:`
+    /// markers — including schemas that have no member tables yet. Does NOT
+    /// include schemas implied only by a `schema.table` storage key; callers
+    /// wanting the full set use [`Self::list_schemas`], which unions both.
+    pub fn list_registered_schemas(&self) -> Result<Vec<String>> {
+        let prefix = b"meta:schema:";
+        let mut out = Vec::new();
+        let mut read_opts = rocksdb::ReadOptions::default();
+        read_opts.set_total_order_seek(true);
+        let iter = self.storage.db.iterator_opt(
+            rocksdb::IteratorMode::From(prefix, rocksdb::Direction::Forward),
+            read_opts,
+        );
+        for item in iter {
+            let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+            if !key.starts_with(prefix) {
+                break; // Past the `meta:schema:` range.
+            }
+            let name = String::from_utf8_lossy(key.get(prefix.len()..).unwrap_or_default()).to_string();
+            if !name.is_empty() {
+                out.push(name);
+            }
+        }
+        Ok(out)
     }
 
     /// List all tables in the database
