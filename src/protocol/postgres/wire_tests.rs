@@ -1307,13 +1307,19 @@ async fn set_constraints_defers_fk_over_wire() {
     }
 
     // Both rows are present after the deferred COMMIT.
-    handler.handle_single_query("SELECT a FROM fk").await.expect("select fk");
+    handler
+        .handle_single_query("SELECT a FROM fk")
+        .await
+        .expect("select fk");
     assert_eq!(
         first_data_row_text(&drain(&mut client).await).as_deref(),
         Some("1"),
         "the deferred child row must be committed"
     );
-    handler.handle_single_query("SELECT a FROM pk").await.expect("select pk");
+    handler
+        .handle_single_query("SELECT a FROM pk")
+        .await
+        .expect("select pk");
     assert_eq!(
         first_data_row_text(&drain(&mut client).await).as_deref(),
         Some("1"),
