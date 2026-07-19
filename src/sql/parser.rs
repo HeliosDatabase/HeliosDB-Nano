@@ -1106,7 +1106,9 @@ impl Parser {
             .ok_or_else(|| Error::query_execution("Invalid SET SCHEMA clause"))?
             .trim();
         if after.is_empty() {
-            return Err(Error::query_execution("ALTER TABLE … SET SCHEMA requires a target schema"));
+            return Err(Error::query_execution(
+                "ALTER TABLE … SET SCHEMA requires a target schema",
+            ));
         }
         // A quoted target keeps its case; an unquoted one is folded to lower
         // (matching `normalize_object_name`'s schema handling).
