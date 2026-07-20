@@ -816,11 +816,13 @@ impl<'a> Catalog<'a> {
                 }
             };
 
+            let mut max_row_id: Option<u64> = None;
             for tuple in &tuples {
                 let row_id = match tuple.row_id {
                     Some(id) => id,
                     None => continue,
                 };
+                max_row_id = Some(max_row_id.map_or(row_id, |m| m.max(row_id)));
                 let mut col_values = std::collections::HashMap::with_capacity(schema.columns.len());
                 for (idx, col) in schema.columns.iter().enumerate() {
                     if let Some(v) = tuple.values.get(idx) {
@@ -836,6 +838,28 @@ impl<'a> Catalog<'a> {
                     );
                 }
                 total_rows += 1;
+            }
+
+            // Reconcile the row-id counter against the highest row id actually
+            // scanned. This scan-fallback branch only runs when no valid R4.2
+            // index snapshot exists — which is exactly the crash-reopen case
+            // where `load_counters` may have seeded `row_counters` from a stale
+            // durable `counter:{table}` value (the fast INSERT path only
+            // re-persists it every 64 rows, and the unconditional
+            // `flush_all_row_counters` runs only on a CLEAN shutdown). Without
+            // this, the next INSERT could hand back an already-used row id and
+            // silently overwrite an existing `data:` row. An empty table leaves
+            // `max_row_id` as None and is correctly a no-op (its durable counter,
+            // seeded at 0 by CREATE TABLE, is already correct).
+            if let Some(max_id) = max_row_id {
+                if let Err(e) = self.storage.reseed_row_counter_from_max_row_id(&table_name, max_id) {
+                    tracing::warn!(
+                        "Index rebuild: row-counter reseed for '{}' failed ({}) — a crash \
+                         before the next 64-row flush boundary could still reuse a row id",
+                        table_name,
+                        e
+                    );
+                }
             }
 
             report.tables_scanned += 1;
