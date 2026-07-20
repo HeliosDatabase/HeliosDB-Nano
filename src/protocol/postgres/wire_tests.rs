@@ -1333,3 +1333,240 @@ async fn set_constraints_defers_fk_over_wire() {
         .await
         .expect_err("deferral must not leak past the transaction it was set in");
 }
+
+// ---------------------------------------------------------------------------
+// Catalog pre-parse interceptor removal: `version()` / `current_database()` /
+// `current_user` were served by a blind `String::contains()` substring router
+// in `PgCatalog::handle_query` that ran BEFORE the real parser saw the
+// statement. ANY statement merely MENTIONING one of these substrings had its
+// real content silently discarded and replaced with a canned single-row reply
+// — including compound expressions (`current_database() ~ 'x'`), function
+// wrapping (`length(version())`), multi-column projections, table scans, and,
+// worst of all, WHERE clauses on UPDATE/DELETE (the write never executed while
+// the client got a fake SELECT-shaped row). The interceptor is now deleted; the
+// real parser/planner/evaluator handles all three uniformly. These tests guard
+// (a) the common client-probe forms the interceptor existed for still work, and
+// (b) the compound / DML danger cases are now answered correctly.
+// ---------------------------------------------------------------------------
+
+/// (a) Regression safety: the bare `version()` probe (SQLAlchemy / psql /
+/// pgAdmin / DBeaver) still returns exactly one row/column with the version
+/// string via the real evaluator path — no interceptor required.
+#[tokio::test]
+async fn test_wire_bare_version_still_works() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+    handler.handle_single_query("SELECT version()").await.unwrap();
+    let out = drain(&mut client).await;
+    let rows = data_rows(&out);
+    assert_eq!(rows.len(), 1, "version() must return exactly one row");
+    assert_eq!(rows[0].len(), 1, "version() must return exactly one column");
+    let text = first_data_row_text(&out).expect("version text");
+    assert!(
+        text.starts_with("PostgreSQL 16.0"),
+        "version() must return the PostgreSQL version banner, got {text:?}"
+    );
+}
+
+/// (a) Regression safety: `current_database()` still returns one row/column
+/// `"heliosdb"` via the real evaluator path.
+#[tokio::test]
+async fn test_wire_bare_current_database_still_works() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+    handler.handle_single_query("SELECT current_database()").await.unwrap();
+    let out = drain(&mut client).await;
+    let rows = data_rows(&out);
+    assert_eq!(rows.len(), 1, "current_database() must return exactly one row");
+    assert_eq!(rows[0].len(), 1, "current_database() must return exactly one column");
+    assert_eq!(
+        first_data_row_text(&out).as_deref(),
+        Some("heliosdb"),
+        "current_database() must return the database name"
+    );
+}
+
+/// (a) Regression safety — the critical one: bare `current_user` (the PG
+/// KEYWORD form, no parentheses — exactly how real clients write it, and the
+/// form the deleted interceptor's `contains("current_user") && starts_with
+/// ("select")` substring check was the ONLY thing answering) still returns one
+/// row/column `"heliosdb"`. This proves the real parser turns the bare keyword
+/// into an `Expr::Function` that the evaluator's `"current_user"` arm handles
+/// independently, with no interceptor.
+#[tokio::test]
+async fn test_wire_bare_current_user_still_works() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+    handler.handle_single_query("SELECT current_user").await.unwrap();
+    let out = drain(&mut client).await;
+    let rows = data_rows(&out);
+    assert_eq!(rows.len(), 1, "current_user must return exactly one row");
+    assert_eq!(rows[0].len(), 1, "current_user must return exactly one column");
+    assert_eq!(
+        first_data_row_text(&out).as_deref(),
+        Some("heliosdb"),
+        "bare current_user keyword must return the user name via the real evaluator"
+    );
+}
+
+/// (b) `current_database() ~ 'hel'` is a boolean predicate, NOT a request for
+/// the database name. Pre-fix the substring router hijacked it and returned
+/// `[('heliosdb',)]`. It must now evaluate to boolean `true` (`'heliosdb'`
+/// matches `hel`). Boolean text wire format is `t` / `f`.
+#[tokio::test]
+async fn test_wire_current_database_with_operator_not_hijacked() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+    handler
+        .handle_single_query("SELECT current_database() ~ 'hel'")
+        .await
+        .unwrap();
+    assert_eq!(
+        first_data_row_text(&drain(&mut client).await).as_deref(),
+        Some("t"),
+        "current_database() ~ 'hel' must evaluate to boolean true, not return the db name"
+    );
+}
+
+/// (b) `current_user ~ 'nomatchxyz'` must evaluate to boolean `false`
+/// (`'heliosdb'` does not match `nomatchxyz`), not return the canned user row.
+#[tokio::test]
+async fn test_wire_current_user_with_operator_not_hijacked() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+    handler
+        .handle_single_query("SELECT current_user ~ 'nomatchxyz'")
+        .await
+        .unwrap();
+    assert_eq!(
+        first_data_row_text(&drain(&mut client).await).as_deref(),
+        Some("f"),
+        "current_user ~ 'nomatchxyz' must evaluate to boolean false, not return the user name"
+    );
+}
+
+/// (b) `length(version()) > 0` proves the WRAPPING function call determines the
+/// query's real semantics now: the bare `version()` marker no longer short-
+/// circuits the statement. The version string is non-empty, so this is `true`.
+#[tokio::test]
+async fn test_wire_version_wrapped_in_function_not_hijacked() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+    handler
+        .handle_single_query("SELECT length(version()) > 0")
+        .await
+        .unwrap();
+    assert_eq!(
+        first_data_row_text(&drain(&mut client).await).as_deref(),
+        Some("t"),
+        "length(version()) > 0 must evaluate to boolean true, not return the raw version string"
+    );
+}
+
+/// (c) The high-severity case: a WHERE clause that merely MENTIONS
+/// `current_user` must still SCAN AND FILTER the real table, not short-circuit
+/// to a fake `current_user` row. Non-matching pattern → zero rows; matching
+/// pattern → the real table rows.
+#[tokio::test]
+async fn test_wire_where_clause_with_current_user_scans_real_table() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+    for stmt in [
+        "CREATE TABLE wcu (id INT PRIMARY KEY, name TEXT)",
+        "INSERT INTO wcu VALUES (1, 'alice'), (2, 'bob')",
+    ] {
+        handler.handle_single_query(stmt).await.expect("setup");
+        let _ = drain(&mut client).await;
+    }
+
+    // `current_user` ('heliosdb') does NOT match 'nomatchxyz' → the predicate is
+    // false for every row → the table is scanned and ZERO rows come back. A
+    // hijack would instead return a fake single 'heliosdb' row.
+    handler
+        .handle_single_query("SELECT * FROM wcu WHERE current_user ~ 'nomatchxyz'")
+        .await
+        .expect("filtered select");
+    let rows = data_rows(&drain(&mut client).await);
+    assert_eq!(
+        rows.len(),
+        0,
+        "non-matching current_user predicate must scan the table and return zero rows, not a fake row"
+    );
+
+    // `current_user` DOES match 'helios' (substring of 'heliosdb') → predicate
+    // true for every row → the REAL table rows come back (id/name), never the
+    // canned 'heliosdb' text.
+    handler
+        .handle_single_query("SELECT id, name FROM wcu WHERE current_user ~ 'helios' ORDER BY id")
+        .await
+        .expect("matching select");
+    let rows = data_rows(&drain(&mut client).await);
+    assert_eq!(rows.len(), 2, "matching predicate must return the real table rows");
+    assert_eq!(rows[0][0].as_deref(), Some(b"1".as_ref()));
+    assert_eq!(rows[0][1].as_deref(), Some(b"alice".as_ref()));
+    assert_eq!(rows[1][0].as_deref(), Some(b"2".as_ref()));
+    assert_eq!(rows[1][1].as_deref(), Some(b"bob".as_ref()));
+}
+
+/// (c) The worst case: an `UPDATE ... WHERE current_database() = '...'` must
+/// actually EXECUTE as an UPDATE (reporting a real `UPDATE <n>` command tag),
+/// not be hijacked into a fake SELECT-shaped reply the client can't distinguish
+/// from a real write. First an always-false condition → `UPDATE 0` and the row
+/// is untouched; then an always-true condition → the row is genuinely mutated.
+#[tokio::test]
+async fn test_wire_update_with_current_database_in_where_actually_executes() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+    for stmt in [
+        "CREATE TABLE wud (id INT PRIMARY KEY, name TEXT)",
+        "INSERT INTO wud VALUES (1, 'before')",
+    ] {
+        handler.handle_single_query(stmt).await.expect("setup");
+        let _ = drain(&mut client).await;
+    }
+
+    // Always-false: current_database() is 'heliosdb', never 'nonexistent_db_name'.
+    // A real UPDATE runs and matches zero rows → the `UPDATE 0` command tag. A
+    // hijack would emit a SELECT-shaped response with no UPDATE tag at all.
+    handler
+        .handle_single_query("UPDATE wud SET name = 'after' WHERE current_database() = 'nonexistent_db_name'")
+        .await
+        .expect("update with always-false predicate");
+    let tags = command_tags(&drain(&mut client).await);
+    assert!(
+        tags.iter().any(|t| t == "UPDATE 0"),
+        "an UPDATE whose WHERE mentions current_database() must execute and report `UPDATE 0`, got {tags:?}"
+    );
+
+    // The row must be untouched by the zero-match UPDATE.
+    handler
+        .handle_single_query("SELECT name FROM wud WHERE id = 1")
+        .await
+        .expect("verify unchanged");
+    assert_eq!(
+        first_data_row_text(&drain(&mut client).await).as_deref(),
+        Some("before"),
+        "the always-false UPDATE must not have mutated the row"
+    );
+
+    // Always-true: current_database() = 'heliosdb' → the UPDATE genuinely
+    // applies (`UPDATE 1`) and the follow-up read sees the new value.
+    handler
+        .handle_single_query("UPDATE wud SET name = 'after' WHERE current_database() = 'heliosdb'")
+        .await
+        .expect("update with always-true predicate");
+    let tags = command_tags(&drain(&mut client).await);
+    assert!(
+        tags.iter().any(|t| t == "UPDATE 1"),
+        "the always-true UPDATE must execute and report `UPDATE 1`, got {tags:?}"
+    );
+    handler
+        .handle_single_query("SELECT name FROM wud WHERE id = 1")
+        .await
+        .expect("verify changed");
+    assert_eq!(
+        first_data_row_text(&drain(&mut client).await).as_deref(),
+        Some("after"),
+        "the always-true UPDATE must have genuinely applied the new value"
+    );
+}
