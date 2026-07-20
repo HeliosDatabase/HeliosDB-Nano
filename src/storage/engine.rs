@@ -11957,6 +11957,43 @@ impl StorageEngine {
         }
         Ok(())
     }
+
+    /// Reconcile the in-memory row-id counter for `table_name` against the
+    /// largest row id actually observed in storage, bumping it up if the
+    /// scanned value is higher than what's currently tracked (monotonic-safe —
+    /// mirrors `flush_all_row_counters`'s guarantee; never moves the counter
+    /// DOWN). If the reconciled value increased, persists it durably right
+    /// away via `flush_row_counter` so a second crash before the next %64
+    /// boundary doesn't reopen the gap.
+    ///
+    /// Closes the crash-path counter-staleness gap `flush_all_row_counters`'s
+    /// doc comment flags as open: that method only runs on a CLEAN shutdown
+    /// (`EmbeddedDatabase::drop`); a hard crash skips it, so `load_counters`
+    /// can seed `row_counters` from a stale durable value. This method is
+    /// called from `Catalog::rebuild_all_indexes`'s scan-fallback path, which
+    /// only runs when no valid R4.2 index snapshot exists for the table —
+    /// and a valid snapshot exists if and only if the last shutdown was clean
+    /// (`persist_index_snapshots` and `flush_all_row_counters` are called
+    /// together, a few lines apart, in the same `Drop::drop`). So the scan
+    /// path — which is forced precisely on a crash reopen — is exactly where
+    /// the counter needs reconciling, and reconciling here costs nothing on a
+    /// clean reopen (which takes the snapshot fast path and skips this call
+    /// entirely).
+    pub fn reseed_row_counter_from_max_row_id(&self, table_name: &str, max_row_id: u64) -> Result<()> {
+        let target = max_row_id + 1;
+        let changed = if let Some(counter) = self.row_counters.get(table_name) {
+            let prev = counter.fetch_max(target, Ordering::Relaxed);
+            prev < target
+        } else {
+            self.row_counters
+                .insert(table_name.to_string(), std::sync::atomic::AtomicU64::new(target));
+            true
+        };
+        if changed {
+            self.flush_row_counter(table_name)?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
