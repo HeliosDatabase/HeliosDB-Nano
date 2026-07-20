@@ -33,6 +33,35 @@ pub(crate) struct PartitionOfSpec {
     pub bound: String,
 }
 
+/// The pre-parse-captured shape of a PostgreSQL `CREATE SCHEMA <name>
+/// [element …]` statement that carries one or more embedded schema elements
+/// (`CREATE SCHEMA foo CREATE TABLE … CREATE TABLE …`). sqlparser 0.53 has NO
+/// grammar for embedded schema elements — `Statement::CreateSchema` holds only
+/// `schema_name` + `if_not_exists`, and `parse_create_schema` returns
+/// unconditionally after the name/AUTHORIZATION — so the multi-element form is
+/// split, here, into the bare `CREATE SCHEMA` plus N standalone element
+/// statements, which the executor then runs atomically inside the new schema's
+/// implicit `search_path` (see
+/// `EmbeddedDatabase::execute_create_schema_with_elements`).
+///
+/// Only recognized when the trailing content after the schema name begins with a
+/// top-level `CREATE` keyword; the BARE form (`CREATE SCHEMA foo` /
+/// `CREATE SCHEMA foo AUTHORIZATION bob`, no elements) yields `None` from
+/// [`Parser::try_split_create_schema_elements`] and is left entirely to the
+/// existing sqlparser path.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CreateSchemaElementsSpec {
+    /// The schema name (surrounding double-quotes stripped), used both as the
+    /// forced single-entry `search_path` while the elements run and to
+    /// reconstruct the bare `CREATE SCHEMA` / compensating `DROP SCHEMA`.
+    pub schema_name: String,
+    /// `IF NOT EXISTS` was present on the `CREATE SCHEMA`.
+    pub if_not_exists: bool,
+    /// Each embedded element as a standalone, valid SQL statement string, e.g.
+    /// `"CREATE TABLE tbl1(f1 int PRIMARY KEY) PARTITION BY RANGE(f1)"`.
+    pub elements: Vec<String>,
+}
+
 impl Parser {
     /// Create a new parser
     pub fn new() -> Self {
@@ -2467,6 +2496,139 @@ impl Parser {
             parent,
             bound: Self::trim_partition_of_bound(bound_full),
         })
+    }
+
+    /// Detect and split a PostgreSQL `CREATE SCHEMA <name> [element …]`
+    /// statement that carries embedded schema elements, returning the schema
+    /// name, `IF NOT EXISTS` flag, and each embedded element as a standalone,
+    /// re-parseable SQL statement string. Returns `None` — leaving the statement
+    /// untouched for the normal (sqlparser) path — for every input that is NOT a
+    /// confident multi-element `CREATE SCHEMA`:
+    ///
+    /// * anything that does not begin `CREATE SCHEMA [IF NOT EXISTS] <name>`,
+    /// * the BARE form with no trailing content (`CREATE SCHEMA foo` /
+    ///   `CREATE SCHEMA foo;`) — the existing sqlparser path handles it,
+    /// * trailing content that does not begin with a top-level `CREATE` keyword
+    ///   (e.g. `AUTHORIZATION bob …`) — likewise deferred to sqlparser.
+    ///
+    /// SCOPE: only `CREATE` is recognized as an element-boundary keyword in this
+    /// first version (the real-world corpus need is `CREATE TABLE` and
+    /// `CREATE TABLE … PARTITION OF …` children). `GRANT` / `REVOKE` / other
+    /// element kinds are deliberately NOT split here; a future extension that
+    /// needs them adds their keyword to the depth-0 boundary scan below. This is
+    /// pure text scanning — no sqlparser call — so each split piece is parsed
+    /// normally later by the recursive execution path.
+    ///
+    /// Fail-safe: this function only ever returns a CONFIDENT correct split or
+    /// `None`; it never emits a silently-wrong split.
+    // Byte-scanner idiom mirrors `preprocess_strip_partition_by`: paren-depth
+    // tracking, quote-span skipping, explicit word-boundary checks. Bounds are
+    // guarded by `while i < n` plus `i + 6 <= n`.
+    #[allow(clippy::indexing_slicing)]
+    pub(crate) fn try_split_create_schema_elements(sql: &str) -> Option<CreateSchemaElementsSpec> {
+        let trimmed = sql.trim();
+        let after_create = Self::strip_kw(trimmed, "CREATE")?;
+        let after_schema = Self::strip_kw(after_create, "SCHEMA")?;
+        let (after_head, if_not_exists) = match Self::strip_kw(after_schema, "IF") {
+            Some(rest) => {
+                let rest = Self::strip_kw(rest, "NOT")?;
+                let rest = Self::strip_kw(rest, "EXISTS")?;
+                (rest, true)
+            }
+            None => (after_schema, false),
+        };
+        let (raw_name, after_name) = Self::read_object_name(after_head)?;
+
+        // Trailing content after the schema name. A BARE `CREATE SCHEMA name`
+        // (optionally `;`) has nothing here — defer to the existing sqlparser
+        // path unchanged.
+        let body = after_name.trim();
+        if body.is_empty() || body == ";" {
+            return None;
+        }
+        // The element list must begin with a `CREATE` keyword; anything else
+        // (e.g. `AUTHORIZATION …`) is not an element list this pass handles.
+        if !Self::starts_kw(body, "CREATE") {
+            return None;
+        }
+
+        // Strip surrounding double-quotes off the schema name (`"foo"` → `foo`)
+        // so the forced `search_path` entry matches how bare table names key.
+        let schema_name = Self::unquote_ident(&raw_name);
+        if schema_name.is_empty() {
+            return None;
+        }
+
+        // Scan the body for successive top-level (paren-depth-0, unquoted)
+        // `CREATE` keyword boundaries; each starts a new element.
+        let bytes = body.as_bytes();
+        let n = bytes.len();
+        let mut starts: Vec<usize> = Vec::new();
+        let mut i = 0usize;
+        let mut depth = 0i32;
+        while i < n {
+            let c = bytes[i];
+            if c == b'\'' || c == b'"' {
+                i = Self::skip_quoted_span(bytes, i);
+                continue;
+            }
+            if c == b'(' {
+                depth += 1;
+                i += 1;
+                continue;
+            }
+            if c == b')' {
+                depth -= 1;
+                i += 1;
+                continue;
+            }
+            if depth == 0
+                && (c == b'C' || c == b'c')
+                && i + 6 <= n
+                && bytes[i..i + 6].eq_ignore_ascii_case(b"CREATE")
+                && (i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_'))
+                && (i + 6 >= n || !(bytes[i + 6].is_ascii_alphanumeric() || bytes[i + 6] == b'_'))
+            {
+                starts.push(i);
+                i += 6;
+                continue;
+            }
+            i += 1;
+        }
+
+        // Defensive: `starts_kw` above already proved the body begins with
+        // `CREATE`, so there is at least one boundary and it sits at offset 0.
+        if starts.is_empty() || starts[0] != 0 {
+            return None;
+        }
+
+        let mut elements = Vec::with_capacity(starts.len());
+        for (idx, &start) in starts.iter().enumerate() {
+            let end = if idx + 1 < starts.len() { starts[idx + 1] } else { n };
+            // Trim whitespace and any trailing statement separator(s).
+            let piece = body[start..end].trim().trim_end_matches(';').trim();
+            if piece.is_empty() {
+                return None;
+            }
+            elements.push(piece.to_string());
+        }
+
+        Some(CreateSchemaElementsSpec {
+            schema_name,
+            if_not_exists,
+            elements,
+        })
+    }
+
+    /// Strip a single pair of surrounding double-quotes off an identifier token
+    /// and collapse any doubled `""` escapes, returning the logical name. A
+    /// token with no surrounding quotes is returned verbatim.
+    fn unquote_ident(tok: &str) -> String {
+        let t = tok.trim();
+        match t.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+            Some(inner) => inner.replace("\"\"", "\""),
+            None => t.to_string(),
+        }
     }
 
     /// Stage-0 partitioning: strip a parent `PARTITION BY RANGE|LIST|HASH (…)`

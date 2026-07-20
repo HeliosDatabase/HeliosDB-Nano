@@ -2827,6 +2827,127 @@ impl EmbeddedDatabase {
         self.execute_in_transaction_inner(sql, txn, true)
     }
 
+    /// Execute a multi-element `CREATE SCHEMA foo CREATE TABLE … CREATE TABLE …`
+    /// (pre-split by [`sql::Parser::try_split_create_schema_elements`]): create
+    /// the schema, then run every embedded element with `search_path` forced to
+    /// the new schema so bare names (each element's own name AND bare
+    /// cross-references to a sibling element, e.g. `REFERENCES tbl1` /
+    /// `PARTITION OF tbl1`) resolve into it — PostgreSQL's implicit-schema
+    /// semantics for a `CREATE SCHEMA` block.
+    ///
+    /// ATOMICITY: every element rides the SAME shared `txn`, but DDL in this
+    /// engine is deliberately NON-transactional (the catalog markers/tables are
+    /// written straight to storage and survive `txn.rollback()` — see the
+    /// `CreateTable`/`DropSchema` executor arms). So a bare `txn` rollback would
+    /// leave a half-built schema behind. To honor `CREATE SCHEMA`'s all-or-
+    /// nothing contract this method therefore performs COMPENSATING cleanup: if
+    /// any element fails, and this statement CREATED the schema fresh, it tears
+    /// the schema back down with `DROP SCHEMA … CASCADE` (which removes the
+    /// marker and every member table created so far) before propagating the
+    /// error. A pre-existing schema (the `IF NOT EXISTS` re-run case) is left
+    /// untouched — we never destroy contents this statement did not create.
+    fn execute_create_schema_with_elements(
+        &self,
+        spec: &sql::parser::CreateSchemaElementsSpec,
+        txn: &storage::Transaction,
+    ) -> Result<u64> {
+        // Did the schema already exist before this statement? Governs whether a
+        // failure may tear it down (only if WE created it fresh).
+        let schema_preexisted = self.storage.catalog().schema_exists(&spec.schema_name).unwrap_or(false);
+
+        // Step 1: create the bare schema through the EXISTING (already-correct)
+        // path. The detector returns `None` for this bare text (no trailing
+        // elements), so it recurses into the normal chain, not back into here.
+        let create_schema_sql = format!(
+            "CREATE SCHEMA {}{}",
+            if spec.if_not_exists { "IF NOT EXISTS " } else { "" },
+            spec.schema_name
+        );
+        self.execute_in_transaction_no_fast_path(&create_schema_sql, txn)?;
+
+        // Step 2: run every element with `search_path` forced to the new schema,
+        // restoring the caller's ambient override state exactly afterward.
+        let result = self.with_forced_search_path(vec![spec.schema_name.clone()], || {
+            for element_sql in &spec.elements {
+                self.execute_in_transaction_no_fast_path(element_sql, txn)?;
+            }
+            Ok(())
+        });
+
+        if let Err(e) = result {
+            // Compensating cleanup (DDL is non-transactional; see doc comment).
+            if !schema_preexisted {
+                let drop_sql = format!("DROP SCHEMA {} CASCADE", spec.schema_name);
+                let _ = self.execute_in_transaction_no_fast_path(&drop_sql, txn);
+            }
+            return Err(e);
+        }
+
+        Ok(0)
+    }
+
+    /// Force `search_path` to `forced_path` for the duration of `f`, saving and
+    /// exactly restoring whatever thread-local override state (or lack thereof)
+    /// was active before — regardless of whether the calling session is a wire
+    /// session with its own active override, an embedded session with a plain
+    /// (non-thread-local) schema field, or the default `public` session with no
+    /// override at all. Used by `execute_create_schema_with_elements` so bare
+    /// names inside a `CREATE SCHEMA foo CREATE TABLE … CREATE TABLE …` block
+    /// resolve into `foo` regardless of the CALLER's ambient search_path — real
+    /// PG always resolves schema-element bodies against the schema being
+    /// created, not the session's `search_path`. Does NOT nest a
+    /// `SessionSchemaOverrideGuard` (whose `Drop` unconditionally clears to
+    /// empty, which would corrupt an already-active OUTER override) — explicitly
+    /// saves and restores the exact prior state instead, reproducing the same
+    /// branching `current_search_path()` reads (active override vs. nothing).
+    fn with_forced_search_path<T>(&self, forced_path: Vec<String>, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        // Exact prior state, restored on scope exit INCLUDING an unwinding panic
+        // in `f` — a leaked forced override would steer the NEXT statement this
+        // worker thread serves into the wrong schema (the same cross-connection
+        // leak `SessionSchemaOverrideGuard`'s Drop guards against).
+        struct Restore {
+            was_active: bool,
+            saved_schema: Option<String>,
+            saved_path: Vec<String>,
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                if self.was_active {
+                    let schema = self.saved_schema.take();
+                    let path = std::mem::take(&mut self.saved_path);
+                    SESSION_SCHEMA_OVERRIDE.with(|c| *c.borrow_mut() = schema);
+                    SESSION_SEARCH_PATH.with(|c| *c.borrow_mut() = path);
+                    SESSION_SCHEMA_OVERRIDE_ACTIVE.with(|c| c.set(true));
+                } else {
+                    SESSION_SCHEMA_OVERRIDE.with(|c| *c.borrow_mut() = None);
+                    SESSION_SEARCH_PATH.with(|c| c.borrow_mut().clear());
+                    SESSION_SCHEMA_OVERRIDE_ACTIVE.with(|c| c.set(false));
+                }
+            }
+        }
+
+        let was_active = SESSION_SCHEMA_OVERRIDE_ACTIVE.with(|c| c.get());
+        let _restore = Restore {
+            was_active,
+            saved_schema: if was_active { session_current_schema_tls() } else { None },
+            saved_path: if was_active {
+                session_search_path_tls()
+            } else {
+                Vec::new()
+            },
+        };
+
+        let forced_schema = forced_path.first().cloned();
+        SESSION_SCHEMA_OVERRIDE.with(|c| *c.borrow_mut() = forced_schema);
+        SESSION_SEARCH_PATH.with(|c| *c.borrow_mut() = forced_path);
+        SESSION_SCHEMA_OVERRIDE_ACTIVE.with(|c| c.set(true));
+
+        // `_restore` drops here (normal return OR unwind), reproducing exactly
+        // the branching `current_search_path()` reads: an active outer override
+        // is restored verbatim; "nothing active" is restored to cleared/false.
+        f()
+    }
+
     fn execute_in_transaction_inner(
         &self,
         sql: &str,
@@ -2891,6 +3012,19 @@ impl EmbeddedDatabase {
             if let Some(result) = self.try_fast_delete(sql, txn) {
                 return result;
             }
+        }
+
+        // Multi-element `CREATE SCHEMA foo CREATE TABLE … CREATE TABLE …`:
+        // sqlparser 0.53 has no grammar for embedded schema elements, so split
+        // the text into the bare `CREATE SCHEMA` plus N standalone element
+        // statements and drive them ourselves, atomically, with `search_path`
+        // forced to the new schema. Structured as an early return (unlike the
+        // one-plan branches below) because it recursively executes MULTIPLE
+        // sub-statements. The detector returns `None` for the bare form, so the
+        // recursion into `CREATE SCHEMA foo` below lands on the normal path, not
+        // back here (no infinite loop).
+        if let Some(spec) = sql::Parser::try_split_create_schema_elements(sql) {
+            return self.execute_create_schema_with_elements(&spec, txn);
         }
 
         // Check if this is a Phase 3 branching statement (before trying to parse with sqlparser)
