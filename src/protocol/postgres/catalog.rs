@@ -43,30 +43,21 @@ impl PgCatalog {
             return Ok(Some(result));
         }
 
-        // Handle SELECT version() - required by SQLAlchemy, psql, pgAdmin, DBeaver
-        if query_lower.contains("version()") {
-            return Ok(Some(self.query_version()?));
-        }
-
-        // `current_schema()` is deliberately NOT intercepted here: this handler
-        // has no session context, so a hardcoded `public` row would lie for a
-        // connection under `SET search_path`. Let it fall through to the query
-        // engine, whose scalar reads the session's effective schema (the wire
-        // session installs its schema-override before the engine runs). See
-        // `Evaluator` `current_schema` / `crate::session_current_schema_tls`.
-
-        // Handle SELECT current_database() - required by SQLAlchemy / pgAdmin
-        if query_lower.contains("current_database()") {
-            return Ok(Some(Self::query_current_database()?));
-        }
-
-        // Handle SELECT current_user - required by various PG clients
-        if query_lower.contains("current_user")
-            && !query_lower.contains("current_user_id")
-            && (query_lower.starts_with("select") || query_lower.starts_with("show"))
-        {
-            return Ok(Some(Self::query_current_user()?));
-        }
+        // `version()` / `current_database()` / `current_user` / `session_user` /
+        // `current_schema()` are deliberately NOT intercepted here. This handler
+        // runs on the RAW, UNPARSED query text before the real parser/planner
+        // even sees the statement — a `contains()` check can't tell "this
+        // substring IS the whole statement" from "this substring occurs
+        // somewhere inside a larger expression" (e.g. `current_database() ~ 'x'`,
+        // `length(version())`, or a WHERE clause on an UPDATE/DELETE that happens
+        // to mention one of these names), so a hardcoded canned row here would
+        // silently discard the rest of the statement — including write
+        // statements, which would then return a fake SELECT-shaped result
+        // instead of executing. Falling through to `Ok(None)` lets the real
+        // parser/planner/evaluator answer these correctly and uniformly
+        // (session-aware where relevant) for both the wire and embedded paths —
+        // see `Evaluator`'s `"version"` / `"current_database"` / `"current_user"`
+        // / `"session_user"` / `"current_schema"` scalar-function arms.
 
         // Check for information_schema queries (table / column listing).
         // We must match the TABLE reference (`information_schema.<name>`
@@ -768,31 +759,6 @@ impl PgCatalog {
                 }
             }
         }
-    }
-
-    /// Return PostgreSQL-compatible version string
-    fn query_version(&self) -> Result<(Schema, Vec<Tuple>)> {
-        let schema = Schema::new(vec![Column::new("version", DataType::Text)]);
-        let row = Tuple::new(vec![Value::String(format!(
-            "PostgreSQL 16.0 (HeliosDB Nano {})",
-            env!("CARGO_PKG_VERSION")
-        ))]);
-        Ok((schema, vec![row]))
-    }
-
-    /// Return current schema (always "public")
-    /// Return current database name
-    fn query_current_database() -> Result<(Schema, Vec<Tuple>)> {
-        let schema = Schema::new(vec![Column::new("current_database", DataType::Text)]);
-        let row = Tuple::new(vec![Value::String("heliosdb".to_string())]);
-        Ok((schema, vec![row]))
-    }
-
-    /// Return current user
-    fn query_current_user() -> Result<(Schema, Vec<Tuple>)> {
-        let schema = Schema::new(vec![Column::new("current_user", DataType::Text)]);
-        let row = Tuple::new(vec![Value::String("heliosdb".to_string())]);
-        Ok((schema, vec![row]))
     }
 
     /// Query pg_type (type information)
