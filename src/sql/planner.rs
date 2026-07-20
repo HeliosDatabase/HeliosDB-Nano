@@ -4197,6 +4197,16 @@ impl<'a> Planner<'a> {
             SqlBinaryOp::StringConcat => Ok(BinaryOperator::StringConcat),
             // Postgres FTS match operator: tsvector @@ tsquery
             SqlBinaryOp::AtAt => Ok(BinaryOperator::TsMatch),
+            // PostgreSQL POSIX regex match operators: ~ ~* !~ !~*
+            SqlBinaryOp::PGRegexMatch => Ok(BinaryOperator::RegexMatch),
+            SqlBinaryOp::PGRegexIMatch => Ok(BinaryOperator::RegexIMatch),
+            SqlBinaryOp::PGRegexNotMatch => Ok(BinaryOperator::NotRegexMatch),
+            SqlBinaryOp::PGRegexNotIMatch => Ok(BinaryOperator::NotRegexIMatch),
+            // PostgreSQL raw-operator spellings of LIKE/ILIKE: ~~ ~~* !~~ !~~*
+            SqlBinaryOp::PGLikeMatch => Ok(BinaryOperator::Like),
+            SqlBinaryOp::PGILikeMatch => Ok(BinaryOperator::ILike),
+            SqlBinaryOp::PGNotLikeMatch => Ok(BinaryOperator::NotLike),
+            SqlBinaryOp::PGNotILikeMatch => Ok(BinaryOperator::NotILike),
             // Vector similarity operators (pgvector compatible)
             SqlBinaryOp::Custom(op_str) => match op_str.as_str() {
                 "<->" => Ok(BinaryOperator::VectorL2Distance),

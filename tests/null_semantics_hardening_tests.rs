@@ -989,6 +989,25 @@ mod null_semantics_hardening_tests {
         assert_eq!(id, 1);
     }
 
+    #[test]
+    fn test_regex_match_with_null_operand() {
+        // SQL standard: NULL ~ 'pattern' is NULL (falsy), filtering the row out.
+        // Mirrors test_like_with_null_returns_matching but for the POSIX `~` op.
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE str2c (id INT, val TEXT)").unwrap();
+        db.execute("INSERT INTO str2c VALUES (1, NULL)").unwrap();
+        db.execute("INSERT INTO str2c VALUES (2, 'hello')").unwrap();
+
+        let rows = db.query("SELECT id FROM str2c WHERE val ~ 'ell'", &[]).unwrap();
+        assert_eq!(rows.len(), 1, "Only non-NULL matching row should be returned");
+        let id = match rows[0].get(0).unwrap() {
+            Value::Int4(v) => *v as i64,
+            Value::Int8(v) => *v,
+            other => panic!("Unexpected type: {:?}", other),
+        };
+        assert_eq!(id, 2, "Only id=2 (val='hello') should match ~ 'ell'");
+    }
+
     // ========================================================================
     // 7. NULL in INSERT/UPDATE (~6 tests)
     // ========================================================================

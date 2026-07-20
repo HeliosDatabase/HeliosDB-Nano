@@ -1070,6 +1070,113 @@ mod string_and_date_tests {
     }
 
     // ========================================================================
+    // POSIX regex operator tests (~ !~ ~* !~*) and PG raw LIKE/ILIKE
+    // operator spellings (~~ ~~* !~~ !~~*).
+    //
+    // A scalar `SELECT 'x' ~ 'y'` yields a single Value::Boolean row, so
+    // these assert the boolean result of the operator directly (mirroring
+    // how the LIKE tests assert truthiness, but on a scalar select).
+    // ========================================================================
+
+    #[test]
+    fn test_string_func_regex_match_basic() {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        let rows = db.query("SELECT 'hello world' ~ 'wor'", &[]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get(0).unwrap(), &Value::Boolean(true));
+    }
+
+    #[test]
+    fn test_string_func_regex_match_no_match() {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        let rows = db.query("SELECT 'hello world' ~ 'xyz'", &[]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get(0).unwrap(), &Value::Boolean(false));
+    }
+
+    #[test]
+    fn test_string_func_regex_match_case_sensitive() {
+        // `~` is case-sensitive: 'Hello' does NOT match the lowercase 'hello'.
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        let rows = db.query("SELECT 'Hello' ~ 'hello'", &[]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get(0).unwrap(), &Value::Boolean(false));
+    }
+
+    #[test]
+    fn test_string_func_regex_imatch_case_insensitive() {
+        // `~*` is case-insensitive: 'Hello' DOES match 'hello'.
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        let rows = db.query("SELECT 'Hello' ~* 'hello'", &[]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get(0).unwrap(), &Value::Boolean(true));
+    }
+
+    #[test]
+    fn test_string_func_regex_not_match() {
+        // `!~` is the negation of `~` on the same inputs.
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        let match_rows = db.query("SELECT 'hello world' ~ 'wor'", &[]).unwrap();
+        let not_match_rows = db.query("SELECT 'hello world' !~ 'wor'", &[]).unwrap();
+        assert_eq!(match_rows.len(), 1);
+        assert_eq!(not_match_rows.len(), 1);
+        assert_eq!(match_rows[0].get(0).unwrap(), &Value::Boolean(true));
+        assert_eq!(not_match_rows[0].get(0).unwrap(), &Value::Boolean(false));
+    }
+
+    #[test]
+    fn test_string_func_regex_not_imatch() {
+        // `!~*` is the negation of `~*` on the same inputs.
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        let imatch_rows = db.query("SELECT 'Hello' ~* 'hello'", &[]).unwrap();
+        let not_imatch_rows = db.query("SELECT 'Hello' !~* 'hello'", &[]).unwrap();
+        assert_eq!(imatch_rows.len(), 1);
+        assert_eq!(not_imatch_rows.len(), 1);
+        assert_eq!(imatch_rows[0].get(0).unwrap(), &Value::Boolean(true));
+        assert_eq!(not_imatch_rows[0].get(0).unwrap(), &Value::Boolean(false));
+    }
+
+    #[test]
+    fn test_string_func_regex_anchors_and_classes() {
+        // Real POSIX regex syntax that LIKE/glob patterns cannot express:
+        // anchors (^ $), character classes ([a-z], [0-9]) and quantifiers (+).
+        // This proves the operator routes through genuine regex, not LIKE/glob.
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+
+        let matches = db.query("SELECT 'abc123' ~ '^[a-z]+[0-9]+$'", &[]).unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].get(0).unwrap(), &Value::Boolean(true));
+
+        let no_match = db.query("SELECT 'abc123' ~ '^[0-9]+$'", &[]).unwrap();
+        assert_eq!(no_match.len(), 1);
+        assert_eq!(no_match[0].get(0).unwrap(), &Value::Boolean(false));
+    }
+
+    #[test]
+    fn test_string_func_pg_like_match_operator() {
+        // The raw PG LIKE-spelling operator `~~` behaves identically to LIKE.
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        let op_rows = db.query("SELECT 'hello' ~~ 'hel%'", &[]).unwrap();
+        let like_rows = db.query("SELECT 'hello' LIKE 'hel%'", &[]).unwrap();
+        assert_eq!(op_rows.len(), 1);
+        assert_eq!(like_rows.len(), 1);
+        assert_eq!(op_rows[0].get(0).unwrap(), like_rows[0].get(0).unwrap());
+        assert_eq!(op_rows[0].get(0).unwrap(), &Value::Boolean(true));
+    }
+
+    #[test]
+    fn test_string_func_pg_ilike_match_operator() {
+        // The raw PG ILIKE-spelling operator `~~*` behaves identically to ILIKE.
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        let op_rows = db.query("SELECT 'Hello' ~~* 'hel%'", &[]).unwrap();
+        let ilike_rows = db.query("SELECT 'Hello' ILIKE 'hel%'", &[]).unwrap();
+        assert_eq!(op_rows.len(), 1);
+        assert_eq!(ilike_rows.len(), 1);
+        assert_eq!(op_rows[0].get(0).unwrap(), ilike_rows[0].get(0).unwrap());
+        assert_eq!(op_rows[0].get(0).unwrap(), &Value::Boolean(true));
+    }
+
+    // ========================================================================
     // Date/Time function tests
     //
     // Tests for NOW(), CURRENT_TIMESTAMP(), CURRENT_DATE(), CURRENT_TIME()
