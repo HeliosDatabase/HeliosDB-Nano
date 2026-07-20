@@ -2126,6 +2126,10 @@ where
             format!("DELETE {}", affected)
         } else if starts_with_icase(trimmed, "CREATE TABLE") {
             "CREATE TABLE".to_string()
+        } else if starts_with_icase(trimmed, "CREATE SCHEMA") {
+            // PostgreSQL replies "CREATE SCHEMA" (no row count) for a bare
+            // CREATE SCHEMA and for the multi-element form alike.
+            "CREATE SCHEMA".to_string()
         } else if starts_with_icase(trimmed, "DROP TABLE") {
             "DROP TABLE".to_string()
         } else if starts_with_icase(trimmed, "CREATE INDEX") {

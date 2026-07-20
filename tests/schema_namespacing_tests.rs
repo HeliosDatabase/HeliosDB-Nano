@@ -878,3 +878,226 @@ fn deferred_fk_check_evaporates_when_referenced_table_dropped() -> Result<()> {
     db.execute("DROP TABLE trig_table")?;
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Multi-element CREATE SCHEMA — `CREATE SCHEMA foo CREATE TABLE … CREATE TABLE …`
+//
+// PostgreSQL lets one statement create a schema and define N tables inside it,
+// with bare names (both each element's own name and bare cross-references to a
+// sibling element) resolving into the new schema. sqlparser 0.53 has NO grammar
+// for embedded schema elements, so the statement is text-split into the bare
+// CREATE SCHEMA plus N standalone element statements, run atomically with
+// `search_path` forced to the new schema. These prove the SAME end-state the
+// existing `fkpart*` tests reach via separate `CREATE SCHEMA; SET search_path;
+// CREATE TABLE; CREATE TABLE` statements is now reachable via ONE statement.
+// Every test FAILS on pre-change code with a `SQL parse error: … Expected: end
+// of statement, found: CREATE`.
+// ---------------------------------------------------------------------------
+
+/// Two tables in one CREATE SCHEMA statement, the second bare-referencing the
+/// first. Both must exist under the new schema, be insertable, and the FK must
+/// actually enforce — proving `tbl1`'s bare cross-reference inside `tbl2`'s
+/// element resolved to `mtest.tbl1`, not `public.tbl1`.
+#[test]
+fn multi_element_create_schema_basic() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute(
+        "CREATE SCHEMA mtest \
+         CREATE TABLE tbl1(f1 int PRIMARY KEY) \
+         CREATE TABLE tbl2(f1 int REFERENCES tbl1)",
+    )?;
+
+    // Both tables exist under the new schema.
+    assert!(db.storage.catalog().schema_exists("mtest").unwrap(), "mtest must exist");
+    assert_eq!(
+        db.query("SELECT f1 FROM mtest.tbl1", &[])?.len(),
+        0,
+        "mtest.tbl1 exists (empty)"
+    );
+    assert_eq!(
+        db.query("SELECT f1 FROM mtest.tbl2", &[])?.len(),
+        0,
+        "mtest.tbl2 exists (empty)"
+    );
+
+    // The FK (column-less `REFERENCES tbl1`, defaulting to tbl1's PK) enforces
+    // against mtest.tbl1: a reference to an ABSENT parent row is rejected.
+    assert!(
+        db.execute("INSERT INTO mtest.tbl2 (f1) VALUES (7)").is_err(),
+        "FK must reject a reference to a non-existent mtest.tbl1 row (proves it resolved to mtest.tbl1, not public.tbl1)"
+    );
+
+    // Insert the parent row, then the matching child reference is accepted.
+    db.execute("INSERT INTO mtest.tbl1 (f1) VALUES (7)")?;
+    db.execute("INSERT INTO mtest.tbl2 (f1) VALUES (7)")?;
+    assert_eq!(one_i64(&db, "SELECT f1 FROM mtest.tbl1"), 7);
+    assert_eq!(one_i64(&db, "SELECT f1 FROM mtest.tbl2"), 7);
+
+    // A non-matching reference is still rejected.
+    assert!(
+        db.execute("INSERT INTO mtest.tbl2 (f1) VALUES (999)").is_err(),
+        "FK must reject a key mtest.tbl1 does not hold"
+    );
+    Ok(())
+}
+
+/// The exact `fkpart10` corpus shape: a PARTITION BY RANGE parent, a PARTITION
+/// OF child, and independent tables referencing the partitioned parents — all as
+/// ONE CREATE SCHEMA statement. Every table lands under the new schema, the
+/// partition child inherits the parent's columns (session-aware parent-column
+/// copy under the forced search_path), and the cross-element FK resolves into
+/// the schema.
+#[test]
+fn multi_element_create_schema_partition_of() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute(
+        "CREATE SCHEMA fkpart10 \
+         CREATE TABLE tbl1(f1 int PRIMARY KEY) PARTITION BY RANGE(f1) \
+         CREATE TABLE tbl1_p1 PARTITION OF tbl1 FOR VALUES FROM (minvalue) TO (1) \
+         CREATE TABLE tbl2(f1 int REFERENCES tbl1 DEFERRABLE INITIALLY DEFERRED) \
+         CREATE TABLE tbl3(f1 int PRIMARY KEY) PARTITION BY RANGE(f1) \
+         CREATE TABLE tbl4(f1 int REFERENCES tbl3 DEFERRABLE INITIALLY DEFERRED)",
+    )?;
+
+    // All five tables exist under the new schema.
+    assert!(
+        db.storage.catalog().schema_exists("fkpart10").unwrap(),
+        "fkpart10 must exist"
+    );
+    for tbl in ["tbl1", "tbl1_p1", "tbl2", "tbl3", "tbl4"] {
+        assert_eq!(
+            db.query(&format!("SELECT f1 FROM fkpart10.{tbl}"), &[])?.len(),
+            0,
+            "fkpart10.{tbl} must exist (empty)"
+        );
+    }
+
+    // The partition child inherited the parent's `f1` column (proving the
+    // parent-column copy resolved `tbl1` to `fkpart10.tbl1` under the forced
+    // search_path, not a stray bare `tbl1`): it is directly insertable/queryable.
+    db.execute("INSERT INTO fkpart10.tbl1_p1 (f1) VALUES (0)")?;
+    assert_eq!(one_i64(&db, "SELECT f1 FROM fkpart10.tbl1_p1"), 0);
+
+    // The cross-element FK `tbl2 → tbl1` resolves into fkpart10: a matching
+    // parent reference is accepted (deferred check runs at implicit commit), a
+    // dangling one is rejected.
+    db.execute("INSERT INTO fkpart10.tbl1 (f1) VALUES (5)")?;
+    db.execute("INSERT INTO fkpart10.tbl2 (f1) VALUES (5)")?;
+    assert_eq!(one_i64(&db, "SELECT f1 FROM fkpart10.tbl2"), 5);
+    assert!(
+        db.execute("INSERT INTO fkpart10.tbl2 (f1) VALUES (404)").is_err(),
+        "FK must reject a key fkpart10.tbl1 does not hold"
+    );
+    Ok(())
+}
+
+/// All-or-nothing atomicity: a 3-element block whose SECOND element fails (it
+/// re-creates the first element's table name, a deterministic "already exists"
+/// error) must leave NOTHING behind — not the schema, not the first element's
+/// table, not the third. Proves true atomicity, not partial commit.
+#[test]
+fn multi_element_create_schema_atomicity_on_failure() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+
+    // Element 2 duplicates element 1's table name (no IF NOT EXISTS), forcing a
+    // deterministic mid-block failure after element 1 has already "succeeded".
+    let err = db.execute(
+        "CREATE SCHEMA atom_s \
+         CREATE TABLE keeper (id int PRIMARY KEY) \
+         CREATE TABLE keeper (id int PRIMARY KEY) \
+         CREATE TABLE never (id int)",
+    );
+    assert!(
+        err.is_err(),
+        "the whole multi-element statement must error on the failing element"
+    );
+
+    // The schema itself must NOT exist (compensating cleanup tore it down,
+    // because this statement created it fresh — DDL being non-transactional).
+    assert!(
+        !db.storage.catalog().schema_exists("atom_s").unwrap(),
+        "atom_s must not exist after a mid-block failure (all-or-nothing)"
+    );
+    // The first element's table (which succeeded before element 2 failed) must
+    // also be gone — no partial commit.
+    assert!(
+        db.query("SELECT id FROM atom_s.keeper", &[]).is_err(),
+        "atom_s.keeper must not survive the rolled-back block"
+    );
+    assert!(
+        db.query("SELECT id FROM atom_s.never", &[]).is_err(),
+        "atom_s.never (never reached) must not exist"
+    );
+
+    // The schema name is fully reusable afterward (marker hygiene): a fresh,
+    // valid CREATE SCHEMA with the same name succeeds.
+    db.execute("CREATE SCHEMA atom_s CREATE TABLE ok_now (id int)")?;
+    assert!(
+        db.storage.catalog().schema_exists("atom_s").unwrap(),
+        "atom_s re-creatable"
+    );
+    assert_eq!(db.query("SELECT id FROM atom_s.ok_now", &[])?.len(), 0);
+    Ok(())
+}
+
+/// Regression guard: the BARE form (zero elements) still works exactly as
+/// before — the new detector must return `None` for it and not interfere.
+#[test]
+fn multi_element_create_schema_bare_form_unaffected() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute("CREATE SCHEMA mtest3")?;
+    assert!(
+        db.storage.catalog().schema_exists("mtest3").unwrap(),
+        "bare CREATE SCHEMA still works"
+    );
+
+    // Bare with a trailing semicolon and IF NOT EXISTS also unaffected.
+    db.execute("CREATE SCHEMA mtest3b;")?;
+    db.execute("CREATE SCHEMA IF NOT EXISTS mtest3b;")?;
+    assert!(db.storage.catalog().schema_exists("mtest3b").unwrap());
+
+    // A bare CREATE SCHEMA lands as a namespace a qualified CREATE can use.
+    db.execute("CREATE TABLE mtest3.t (v int)")?;
+    db.execute("INSERT INTO mtest3.t (v) VALUES (1)")?;
+    assert_eq!(one_i64(&db, "SELECT v FROM mtest3.t"), 1);
+    Ok(())
+}
+
+/// The single most important session-state regression guard: a multi-element
+/// CREATE SCHEMA must NOT clobber the caller's ambient `search_path`. With the
+/// session pointed at `other`, a multi-element block that forces its own schema
+/// internally must leave the session pointing back at `other` afterward — so a
+/// SUBSEQUENT bare CREATE lands in `other`, NOT in the block's schema and NOT in
+/// `public`.
+#[test]
+fn multi_element_create_schema_ambient_search_path_restored() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute("CREATE SCHEMA other")?;
+    db.execute("SET search_path TO other")?;
+
+    // Multi-element block forces `mtest4` internally for the duration of its
+    // elements, then must restore the ambient `other`.
+    db.execute("CREATE SCHEMA mtest4 CREATE TABLE t1 (v int)")?;
+    assert_eq!(
+        db.query("SELECT v FROM mtest4.t1", &[])?.len(),
+        0,
+        "mtest4.t1 created in mtest4"
+    );
+
+    // A subsequent BARE create must land back in `other` — the ambient path.
+    db.execute("CREATE TABLE probe (w int)")?;
+    db.execute("INSERT INTO probe (w) VALUES (42)")?;
+    // Bare + `other`-qualified both resolve to other.probe.
+    assert_eq!(one_i64(&db, "SELECT w FROM probe"), 42);
+    assert_eq!(one_i64(&db, "SELECT w FROM other.probe"), 42);
+    // NOT in mtest4, NOT in public.
+    assert!(
+        db.query("SELECT w FROM mtest4.probe", &[]).is_err(),
+        "probe must NOT land in the multi-element block's schema"
+    );
+    assert!(
+        db.query("SELECT w FROM public.probe", &[]).is_err(),
+        "probe must NOT land in public — ambient search_path was `other`"
+    );
+    Ok(())
+}

@@ -1570,3 +1570,70 @@ async fn test_wire_update_with_current_database_in_where_actually_executes() {
         "the always-true UPDATE must have genuinely applied the new value"
     );
 }
+
+/// Multi-element `CREATE SCHEMA foo CREATE TABLE … CREATE TABLE …` over the
+/// wire: it must complete as `CREATE SCHEMA` and create both tables under the
+/// new schema (the second bare-referencing the first), reachable via a follow-up
+/// schema-qualified SELECT. Proves the fix routes through
+/// `execute_in_transaction_inner` and so is reachable from the wire path, not
+/// just the embedded `db.execute()` entry point. FAILS on pre-change code with a
+/// `SQL parse error: … Expected: end of statement, found: CREATE`.
+#[tokio::test]
+async fn test_wire_multi_element_create_schema() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+
+    handler
+        .handle_single_query(
+            "CREATE SCHEMA wms \
+             CREATE TABLE tbl1(f1 int PRIMARY KEY) \
+             CREATE TABLE tbl2(f1 int REFERENCES tbl1)",
+        )
+        .await
+        .expect("multi-element create schema over wire");
+    let tags = command_tags(&drain(&mut client).await);
+    assert!(
+        tags.iter().any(|t| t == "CREATE SCHEMA"),
+        "multi-element CREATE SCHEMA must complete as `CREATE SCHEMA`, got {tags:?}"
+    );
+
+    // Populate the schema-qualified tables (the FK resolves to wms.tbl1).
+    handler
+        .handle_single_query("INSERT INTO wms.tbl1 (f1) VALUES (11)")
+        .await
+        .expect("insert parent");
+    let _ = drain(&mut client).await;
+    handler
+        .handle_single_query("INSERT INTO wms.tbl2 (f1) VALUES (11)")
+        .await
+        .expect("insert child referencing parent");
+    let _ = drain(&mut client).await;
+
+    // A follow-up SELECT against the newly created schema-qualified table
+    // returns the row.
+    handler
+        .handle_single_query("SELECT f1 FROM wms.tbl2")
+        .await
+        .expect("select from newly created schema table");
+    assert_eq!(
+        first_data_row_text(&drain(&mut client).await).as_deref(),
+        Some("11"),
+        "the wire-created multi-element schema tables must be queryable and hold the inserted row"
+    );
+
+    // The cross-element FK genuinely enforces against wms.tbl1. A plain
+    // (non-RETURNING) DML error propagates as a genuine `Err` from
+    // `handle_single_query` itself — only the SELECT arm in handler.rs catches
+    // and converts an error to a wire ErrorResponse inline; the plain-DML arm
+    // propagates via `?` and relies on the higher-level simple-query run-loop
+    // (not present when calling `handle_single_query` directly here) to convert
+    // it to wire bytes. Assert on the propagated error directly instead.
+    let err = handler
+        .handle_single_query("INSERT INTO wms.tbl2 (f1) VALUES (999)")
+        .await
+        .expect_err("a dangling FK reference must be rejected");
+    assert!(
+        err.to_string().contains("wms.tbl1"),
+        "the FK violation must reference wms.tbl1, proving tbl2's FK resolved into the new schema, got: {err}"
+    );
+}
