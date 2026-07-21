@@ -5,6 +5,40 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.6.1] - 2026-07-21
+
+Four latent-bug fixes, none release-blocking on their own but worth a prompt
+patch given the severity of the wire-protocol issue:
+
+- **Fix (silent data corruption, pre-existing):** a hard crash (`kill -9`,
+  power loss, abort — anything that skips a clean shutdown) could leave a
+  table's row-id counter stale if fewer than 64 rows had been inserted since
+  its last periodic flush. On reopen, the next `INSERT` would then reuse an
+  already-in-use row id, silently overwriting the pre-existing row. Fixed by
+  reconciling the counter against the actual max row id scanned whenever the
+  index-rebuild-on-open path runs without a valid snapshot (which happens
+  precisely on a crash reopen, and is a no-op on a clean one).
+- **Fix (wire-protocol correctness hazard, pre-existing):** the PostgreSQL
+  wire handler intercepted any statement whose raw text merely *contained*
+  `version()`, `current_database()`, or `current_user` — anywhere, including
+  inside a WHERE clause — and answered with a hardcoded canned reply instead
+  of executing the real statement. In the worst case, an `UPDATE`/`DELETE`
+  referencing one of these in its `WHERE` clause never executed at all, while
+  the client received a reply indistinguishable from a real "0 rows matched"
+  result. Fixed by removing the interceptors; the real query engine already
+  answers all three correctly and session-aware.
+- **`~` `!~` `~*` `!~*` (PostgreSQL POSIX regex match operators) and the raw
+  `~~` `~~*` `!~~` `!~~*` operator spellings of LIKE/ILIKE** are now
+  implemented — previously errored with "Binary operator not yet supported"
+  for every case, including in `WHERE` clauses.
+- **`CREATE SCHEMA name CREATE TABLE ... CREATE TABLE ...`** (PostgreSQL's
+  multi-element schema-creation form) is now accepted — previously any
+  statement with more than one embedded element failed to parse entirely.
+  Bare names inside the block (including cross-references between sibling
+  tables, e.g. `REFERENCES`/`PARTITION OF`) resolve into the new schema; the
+  whole statement is all-or-nothing (a failure partway through leaves nothing
+  behind, matching PostgreSQL).
+
 ## [4.6.0] - 2026-07-19
 
 Two schema Stage-2 follow-up items (leased to and delivered by the fleet's
