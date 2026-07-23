@@ -1177,6 +1177,181 @@ mod string_and_date_tests {
     }
 
     // ========================================================================
+    // SQL `SIMILAR TO` operator tests (task #37 — first-ever coverage).
+    //
+    // SIMILAR TO is PostgreSQL's SQL-standard regex: it is fully anchored
+    // (whole-string match), `%`/`_` are wildcards, `| ( ) * + ? {m,n}` are
+    // genuine regex metacharacters, but `. ^ $` are LITERAL characters (no
+    // special meaning). ESCAPE 'x' (default backslash) marks the next char
+    // literal. A scalar `SELECT 'x' SIMILAR TO 'y'` yields a single
+    // Value::Boolean row, asserted directly.
+    // ========================================================================
+
+    #[test]
+    fn test_similar_to_anchored_full_match() {
+        // SIMILAR TO matches the WHOLE string (implicitly anchored).
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+
+        let full = db.query("SELECT 'abc' SIMILAR TO 'abc'", &[]).unwrap();
+        assert_eq!(full[0].get(0).unwrap(), &Value::Boolean(true));
+
+        // 'b' does NOT match 'abc' — the anchor forbids a substring match.
+        let substr = db.query("SELECT 'abc' SIMILAR TO 'b'", &[]).unwrap();
+        assert_eq!(substr[0].get(0).unwrap(), &Value::Boolean(false));
+
+        // But `%b%` (wildcards) does span the whole string.
+        let wild = db.query("SELECT 'abc' SIMILAR TO '%b%'", &[]).unwrap();
+        assert_eq!(wild[0].get(0).unwrap(), &Value::Boolean(true));
+    }
+
+    #[test]
+    fn test_similar_to_alternation_is_anchored() {
+        // Bug-A repro: a top-level `|` must still be fully anchored. Without
+        // the `^(?:...)$` grouping fix, `abc|xyz` would anchor as
+        // `(^abc)|(xyz$)` and wrongly match anything starting with `abc` or
+        // ending with `xyz`.
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+
+        let exact = db.query("SELECT 'xyz' SIMILAR TO 'abc|xyz'", &[]).unwrap();
+        assert_eq!(exact[0].get(0).unwrap(), &Value::Boolean(true));
+
+        // 'zzxyz' ends with xyz but is not exactly xyz → must be FALSE.
+        let suffix = db.query("SELECT 'zzxyz' SIMILAR TO 'abc|xyz'", &[]).unwrap();
+        assert_eq!(suffix[0].get(0).unwrap(), &Value::Boolean(false));
+
+        // 'abcqq' starts with abc but is not exactly abc → must be FALSE.
+        let prefix = db.query("SELECT 'abcqq' SIMILAR TO 'abc|xyz'", &[]).unwrap();
+        assert_eq!(prefix[0].get(0).unwrap(), &Value::Boolean(false));
+    }
+
+    #[test]
+    fn test_similar_to_quantifiers() {
+        // Bug-B repro: `* + ? {m,n}` are genuine quantifiers in SIMILAR TO,
+        // not literal characters.
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+
+        let plus = db.query("SELECT 'aaa' SIMILAR TO 'a+'", &[]).unwrap();
+        assert_eq!(plus[0].get(0).unwrap(), &Value::Boolean(true));
+
+        let opt = db.query("SELECT 'ab' SIMILAR TO 'a?b'", &[]).unwrap();
+        assert_eq!(opt[0].get(0).unwrap(), &Value::Boolean(true));
+
+        let bounded_ok = db.query("SELECT 'aaa' SIMILAR TO 'a{1,3}'", &[]).unwrap();
+        assert_eq!(bounded_ok[0].get(0).unwrap(), &Value::Boolean(true));
+
+        // 'aaaa' exceeds the {1,3} upper bound (anchored) → FALSE.
+        let bounded_no = db.query("SELECT 'aaaa' SIMILAR TO 'a{1,3}'", &[]).unwrap();
+        assert_eq!(bounded_no[0].get(0).unwrap(), &Value::Boolean(false));
+
+        // `a*` matches the empty string.
+        let star_empty = db.query("SELECT '' SIMILAR TO 'a*'", &[]).unwrap();
+        assert_eq!(star_empty[0].get(0).unwrap(), &Value::Boolean(true));
+    }
+
+    #[test]
+    fn test_similar_to_wildcards() {
+        // `_` matches exactly one char, `%` matches any run.
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+
+        let underscore = db.query("SELECT 'abc' SIMILAR TO 'a_c'", &[]).unwrap();
+        assert_eq!(underscore[0].get(0).unwrap(), &Value::Boolean(true));
+
+        // 'abbc' has two chars between a and c → `a_c` (single) is FALSE.
+        let underscore_no = db.query("SELECT 'abbc' SIMILAR TO 'a_c'", &[]).unwrap();
+        assert_eq!(underscore_no[0].get(0).unwrap(), &Value::Boolean(false));
+
+        let percent = db.query("SELECT 'abc' SIMILAR TO 'a%'", &[]).unwrap();
+        assert_eq!(percent[0].get(0).unwrap(), &Value::Boolean(true));
+    }
+
+    #[test]
+    fn test_similar_to_dot_is_literal() {
+        // In SIMILAR TO, `.` is an ORDINARY character, not "any char".
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+
+        // 'aXc' must NOT match 'a.c' because `.` is literal.
+        let not_wild = db.query("SELECT 'aXc' SIMILAR TO 'a.c'", &[]).unwrap();
+        assert_eq!(not_wild[0].get(0).unwrap(), &Value::Boolean(false));
+
+        // 'a.c' matches 'a.c' literally.
+        let literal = db.query("SELECT 'a.c' SIMILAR TO 'a.c'", &[]).unwrap();
+        assert_eq!(literal[0].get(0).unwrap(), &Value::Boolean(true));
+    }
+
+    #[test]
+    fn test_similar_to_class_and_grouping() {
+        // Character classes `[...]` and grouping `(...)` with quantifiers.
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+
+        let class_b = db.query("SELECT 'abc' SIMILAR TO 'a[bx]c'", &[]).unwrap();
+        assert_eq!(class_b[0].get(0).unwrap(), &Value::Boolean(true));
+
+        let class_x = db.query("SELECT 'axc' SIMILAR TO 'a[bx]c'", &[]).unwrap();
+        assert_eq!(class_x[0].get(0).unwrap(), &Value::Boolean(true));
+
+        let class_no = db.query("SELECT 'ayc' SIMILAR TO 'a[bx]c'", &[]).unwrap();
+        assert_eq!(class_no[0].get(0).unwrap(), &Value::Boolean(false));
+
+        // `(ab)+` — one or more repetitions of the group.
+        let group_ok = db.query("SELECT 'abab' SIMILAR TO '(ab)+'", &[]).unwrap();
+        assert_eq!(group_ok[0].get(0).unwrap(), &Value::Boolean(true));
+
+        // 'aba' is not a whole number of `ab` repetitions (anchored) → FALSE.
+        let group_no = db.query("SELECT 'aba' SIMILAR TO '(ab)+'", &[]).unwrap();
+        assert_eq!(group_no[0].get(0).unwrap(), &Value::Boolean(false));
+    }
+
+    #[test]
+    fn test_not_similar_to() {
+        // NOT SIMILAR TO is the boolean negation.
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+
+        let neg_true = db.query("SELECT 'abc' NOT SIMILAR TO 'xyz'", &[]).unwrap();
+        assert_eq!(neg_true[0].get(0).unwrap(), &Value::Boolean(true));
+
+        let neg_false = db.query("SELECT 'abc' NOT SIMILAR TO 'abc'", &[]).unwrap();
+        assert_eq!(neg_false[0].get(0).unwrap(), &Value::Boolean(false));
+    }
+
+    #[test]
+    fn test_similar_to_escape_default_backslash() {
+        // PG's default escape is backslash: `\%` matches a LITERAL percent.
+        // NOTE: under PostgreSqlDialect standard_conforming_strings is on, so a
+        // backslash inside a normal single-quoted literal is preserved as a
+        // literal backslash. In the Rust source `"...'50\\%'"` yields the SQL
+        // text `'50\%'` (one backslash), which genuinely exercises the
+        // backslash-escape path in similar_to_pattern_to_regex.
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+
+        let lit_match = db.query("SELECT '50%' SIMILAR TO '50\\%'", &[]).unwrap();
+        assert_eq!(lit_match[0].get(0).unwrap(), &Value::Boolean(true));
+
+        // 'ab50' does not equal literal '50%' → FALSE (proves `\%` is not a
+        // wildcard here).
+        let lit_no = db.query("SELECT 'ab50' SIMILAR TO '50\\%'", &[]).unwrap();
+        assert_eq!(lit_no[0].get(0).unwrap(), &Value::Boolean(false));
+    }
+
+    #[test]
+    fn test_similar_to_escape_custom_char() {
+        // Route 1 (full ESCAPE support): a custom ESCAPE char marks the next
+        // char literal. `50#%` ESCAPE '#' means literal '50%'.
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+
+        let custom_match = db.query("SELECT '50%' SIMILAR TO '50#%' ESCAPE '#'", &[]).unwrap();
+        assert_eq!(custom_match[0].get(0).unwrap(), &Value::Boolean(true));
+
+        // '50x' is not literal '50%' → FALSE (the `#%` is an escaped literal
+        // percent, not a wildcard).
+        let custom_no = db.query("SELECT '50x' SIMILAR TO '50#%' ESCAPE '#'", &[]).unwrap();
+        assert_eq!(custom_no[0].get(0).unwrap(), &Value::Boolean(false));
+
+        // NOT ... ESCAPE negates correctly (lowered to NOT similar_to_escape).
+        let not_custom = db.query("SELECT '50x' NOT SIMILAR TO '50#%' ESCAPE '#'", &[]).unwrap();
+        assert_eq!(not_custom[0].get(0).unwrap(), &Value::Boolean(true));
+    }
+
+    // ========================================================================
     // Date/Time function tests
     //
     // Tests for NOW(), CURRENT_TIMESTAMP(), CURRENT_DATE(), CURRENT_TIME()

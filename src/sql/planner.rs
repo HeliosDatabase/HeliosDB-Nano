@@ -3592,21 +3592,53 @@ impl<'a> Planner<'a> {
             }
 
             Expr::SimilarTo {
-                negated, expr, pattern, ..
+                negated,
+                expr,
+                pattern,
+                escape_char,
             } => {
                 let left_expr = self.expr_to_logical(expr)?;
                 let right_expr = self.expr_to_logical(pattern)?;
-                let op = if *negated {
-                    BinaryOperator::NotSimilarTo
-                } else {
-                    BinaryOperator::SimilarTo
-                };
 
-                Ok(LogicalExpr::BinaryExpr {
-                    left: Box::new(left_expr),
-                    op,
-                    right: Box::new(right_expr),
-                })
+                match escape_char {
+                    // No ESCAPE clause: keep the zero-risk BinaryOperator fast
+                    // path. The evaluator's binary-op arm calls
+                    // similar_to_pattern_to_regex with PG's default backslash
+                    // escape (`Some('\\')`).
+                    None => {
+                        let op = if *negated {
+                            BinaryOperator::NotSimilarTo
+                        } else {
+                            BinaryOperator::SimilarTo
+                        };
+                        Ok(LogicalExpr::BinaryExpr {
+                            left: Box::new(left_expr),
+                            op,
+                            right: Box::new(right_expr),
+                        })
+                    }
+                    // `SIMILAR TO pattern ESCAPE 'x'`: lower to the internal
+                    // `similar_to_escape(text, pattern, escape_str)` scalar
+                    // call (documented in the evaluator as internal-only). The
+                    // raw ESCAPE string is carried as a literal so the
+                    // evaluator can map ""→disabled / "x"→char / len>1→error.
+                    // The negated form wraps the call in a NOT unary expr,
+                    // which propagates NULL as NULL.
+                    Some(esc) => {
+                        let call = LogicalExpr::ScalarFunction {
+                            fun: "similar_to_escape".to_string(),
+                            args: vec![left_expr, right_expr, LogicalExpr::Literal(Value::String(esc.clone()))],
+                        };
+                        if *negated {
+                            Ok(LogicalExpr::UnaryExpr {
+                                op: UnaryOperator::Not,
+                                expr: Box::new(call),
+                            })
+                        } else {
+                            Ok(call)
+                        }
+                    }
+                }
             }
 
             Expr::RLike {

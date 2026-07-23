@@ -848,6 +848,11 @@ impl Evaluator {
             "locate" => self.func_locate(&arg_values),
             "instr" => self.func_instr(&arg_values),
 
+            // Internal lowering target for `SIMILAR TO ... ESCAPE 'x'` (emitted
+            // by the planner only when an ESCAPE clause is present — see
+            // `similar_to_escape_fn`). Not a user-facing function.
+            "similar_to_escape" => self.similar_to_escape_fn(&arg_values),
+
             // PostgreSQL compatibility functions (SQLAlchemy, psql, pgAdmin, DBeaver)
             "version" | "pg_catalog.version" => Ok(Value::String(format!(
                 "PostgreSQL 16.0 (HeliosDB Nano {})",
@@ -6276,8 +6281,9 @@ impl Evaluator {
             }
         };
 
-        // Convert SQL SIMILAR TO pattern to regex
-        let regex_pattern = self.similar_to_pattern_to_regex(pattern);
+        // Convert SQL SIMILAR TO pattern to regex. The bare-operator form
+        // uses PostgreSQL's default escape character (backslash).
+        let regex_pattern = self.similar_to_pattern_to_regex(pattern, Some('\\'));
 
         let result = match regex::Regex::new(&regex_pattern) {
             Ok(re) => re.is_match(text),
@@ -6292,33 +6298,141 @@ impl Evaluator {
         Ok(Value::Boolean(if negated { !result } else { result }))
     }
 
-    /// Convert SQL SIMILAR TO pattern to regex
-    /// % -> .*, _ -> ., | is kept, other regex chars need escaping
-    fn similar_to_pattern_to_regex(&self, pattern: &str) -> String {
-        let mut regex = String::with_capacity(pattern.len() * 2 + 2);
-        regex.push('^'); // Anchor at start
+    /// Internal lowering target for `expr SIMILAR TO pattern ESCAPE 'x'`.
+    ///
+    /// NOT a user-facing SQL function: the planner emits a
+    /// `similar_to_escape(text, pattern, escape_str)` scalar call ONLY when an
+    /// ESCAPE clause is written. The common no-ESCAPE case stays on the
+    /// zero-risk `BinaryOperator::SimilarTo` fast path (`similar_to_op`). If a
+    /// user happens to call `similar_to_escape('a','b','c')` directly it simply
+    /// works, which is acceptable.
+    ///
+    /// The raw SQL ESCAPE string maps to the internal escape trigger as:
+    ///   `""`    -> escaping disabled (`None`)
+    ///   `"x"`   -> that single character
+    ///   len > 1 -> query-execution error (PostgreSQL: escape must be one char)
+    ///
+    /// NULL text or NULL pattern yields SQL NULL, mirroring `similar_to_op`.
+    /// The `negated` form is handled by the planner wrapping this call in a
+    /// `NOT` unary expr (which correctly propagates NULL as NULL).
+    fn similar_to_escape_fn(&self, args: &[Value]) -> Result<Value> {
+        let text = match args.first() {
+            Some(Value::String(s)) => s.as_str(),
+            Some(Value::Null) => return Ok(Value::Null),
+            Some(other) => {
+                return Err(Error::query_execution(format!(
+                    "SIMILAR TO requires string operand, got {:?}",
+                    other
+                )))
+            }
+            None => {
+                return Err(Error::query_execution(
+                    "similar_to_escape requires 3 arguments (text, pattern, escape)",
+                ))
+            }
+        };
+
+        let pattern = match args.get(1) {
+            Some(Value::String(s)) => s.as_str(),
+            Some(Value::Null) => return Ok(Value::Null),
+            Some(other) => {
+                return Err(Error::query_execution(format!(
+                    "SIMILAR TO pattern must be a string, got {:?}",
+                    other
+                )))
+            }
+            None => {
+                return Err(Error::query_execution(
+                    "similar_to_escape requires 3 arguments (text, pattern, escape)",
+                ))
+            }
+        };
+
+        let escape: Option<char> = match args.get(2) {
+            Some(Value::String(s)) => {
+                let mut it = s.chars();
+                match (it.next(), it.next()) {
+                    (None, _) => None,            // empty string -> escaping disabled
+                    (Some(ch), None) => Some(ch), // single char -> escape trigger
+                    (Some(_), Some(_)) => {
+                        return Err(Error::query_execution(
+                            "invalid escape string: SIMILAR TO ESCAPE must be exactly one character",
+                        ))
+                    }
+                }
+            }
+            Some(Value::Null) => return Ok(Value::Null),
+            _ => {
+                return Err(Error::query_execution(
+                    "similar_to_escape escape argument must be a string",
+                ))
+            }
+        };
+
+        let regex_pattern = self.similar_to_pattern_to_regex(pattern, escape);
+        let result = match regex::Regex::new(&regex_pattern) {
+            Ok(re) => re.is_match(text),
+            Err(e) => {
+                return Err(Error::query_execution(format!(
+                    "Invalid SIMILAR TO pattern '{}': {}",
+                    pattern, e
+                )))
+            }
+        };
+        Ok(Value::Boolean(result))
+    }
+
+    /// Convert a SQL SIMILAR TO pattern to an equivalent anchored regex.
+    ///
+    /// `escape` is the escape trigger character: PG's default is backslash
+    /// (`Some('\\')`); a custom `ESCAPE 'x'` clause passes `Some('x')`; `None`
+    /// disables escaping entirely (`ESCAPE ''`).
+    ///
+    /// Translation rules (PostgreSQL SIMILAR TO semantics):
+    ///   - `%` -> `.*`, `_` -> `.`
+    ///   - `| ( ) * + ? { }` pass through as genuine regex metacharacters
+    ///     (`* + ? {m,n}` are real quantifiers, alternation/grouping bind)
+    ///   - `. ^ $` have NO special meaning in SIMILAR TO -> emitted as literals
+    ///   - `[...]` character classes copied through verbatim
+    ///   - the escape char triggers a literal emission of the following char
+    ///   - a bare backslash that is NOT the active escape char is an ordinary
+    ///     literal character (regex-escaped)
+    fn similar_to_pattern_to_regex(&self, pattern: &str, escape: Option<char>) -> String {
+        let mut regex = String::with_capacity(pattern.len() * 2 + 8);
+        // Bug A fix: wrap the whole translated body in a non-capturing group so
+        // the `^`…`$` anchors bind the ENTIRE pattern. Without the group a
+        // top-level alternation like `abc|xyz` would anchor as
+        // `(^abc)|(xyz$)`, matching any string that merely STARTS with `abc`
+        // or ENDS with `xyz`. `^(?:abc|xyz)$` is the correct full-match form
+        // (and the group is harmless when there is no alternation).
+        regex.push_str("^(?:");
 
         let mut chars = pattern.chars();
         while let Some(c) = chars.next() {
-            match c {
-                // Escape character
-                '\\' => {
-                    if let Some(next) = chars.next() {
-                        if "^$.*+?{}[]|()\\".contains(next) {
-                            regex.push('\\');
-                        }
-                        regex.push(next);
+            // Escape trigger fires first (when escaping is enabled): the next
+            // char is emitted as a literal, regex-escaped if it is a regex
+            // metacharacter.
+            if Some(c) == escape {
+                if let Some(next) = chars.next() {
+                    if "^$.*+?{}[]|()\\".contains(next) {
+                        regex.push('\\');
                     }
+                    regex.push(next);
                 }
+                continue;
+            }
+            match c {
                 // SQL wildcards
                 '%' => regex.push_str(".*"),
                 '_' => regex.push('.'),
-                // SIMILAR TO allows | for alternation and () for grouping
-                '|' | '(' | ')' => regex.push(c),
-                // Character class
+                // Bug B fix: `* + ? { }` are genuine quantifiers in SIMILAR TO
+                // (as are `|` alternation and `( )` grouping) — pass them
+                // through UNESCAPED so the regex engine treats them as
+                // metacharacters.
+                '|' | '(' | ')' | '*' | '+' | '?' | '{' | '}' => regex.push(c),
+                // Character class — copy through to the closing ']'.
                 '[' => {
                     regex.push('[');
-                    // Copy until closing ]
                     for inner in chars.by_ref() {
                         regex.push(inner);
                         if inner == ']' {
@@ -6326,17 +6440,21 @@ impl Evaluator {
                         }
                     }
                 }
-                // Escape other regex special characters
-                '^' | '$' | '.' | '*' | '+' | '?' | '{' | '}' => {
+                // `. ^ $` are ordinary literals in SIMILAR TO (no anchor / any
+                // meaning) — escape them into literal regex chars.
+                '^' | '$' | '.' => {
                     regex.push('\\');
                     regex.push(c);
                 }
+                // A bare backslash that is NOT the active escape char (custom
+                // ESCAPE, or escaping disabled) is an ordinary literal.
+                '\\' => regex.push_str("\\\\"),
                 // Regular character
                 _ => regex.push(c),
             }
         }
 
-        regex.push('$'); // Anchor at end
+        regex.push_str(")$"); // close the non-capturing group and anchor at end
         regex
     }
 
