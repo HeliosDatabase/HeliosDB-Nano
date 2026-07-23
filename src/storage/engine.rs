@@ -1987,6 +1987,12 @@ impl StorageEngine {
             return stripped.to_string();
         } else if key_str.starts_with("meta:counter:") {
             // Format: meta:counter:{table_name}
+            // LEGACY-READ COMPATIBILITY ONLY: nothing writes this key anymore
+            // (as of the task-#36 fix, direct_bulk_load persists row counters
+            // through the canonical `counter:{table}` key via flush_row_counter).
+            // This arm is retained so classifying/iterating keys in on-disk
+            // databases created by prior released versions still resolves a
+            // table name from any legacy `meta:counter:{table}` keys they hold.
             if let Some(stripped) = key_str.strip_prefix("meta:counter:") {
                 return stripped.to_string();
             }
@@ -3149,12 +3155,23 @@ impl StorageEngine {
                 .insert(table.to_string(), std::sync::atomic::AtomicU64::new(max_row_id + 1));
         }
 
-        // Persist counter
-        let counter_key = format!("meta:counter:{}", table);
-        let counter_value = (max_row_id + 1).to_le_bytes();
-        self.db
-            .put(counter_key.as_bytes(), counter_value)
-            .map_err(|e| Error::storage(format!("Failed to persist counter: {}", e)))?;
+        // Persist the counter durably through the CANONICAL `counter:{table}`
+        // key via flush_row_counter. The in-memory AtomicU64 was just
+        // reconciled above to `max_row_id + 1`, so this writes an
+        // equivalent-or-newer, monotonic-safe value.
+        //
+        // This deliberately replaces a former direct write to
+        // `meta:counter:{table}` — a key load_counters() NEVER reads on open
+        // (it scans only the `counter:` prefix), so that write was dead: never
+        // read back, pure wasted-and-misleading I/O, and it left the canonical
+        // `counter:{table}` key stale after a bulk load. Routing through
+        // flush_row_counter makes the durable value actually reload on reopen,
+        // which is the ONLY crash protection for `helios_`-prefixed internal
+        // tables — Catalog::rebuild_all_indexes' scan-fallback reseed
+        // explicitly skips those. flush_row_counter matches the surrounding
+        // bulk-load code's convention of always attempting the durable write
+        // (no memory-only guard).
+        self.flush_row_counter(table)?;
 
         // Sync if requested
         if sync_at_end {
@@ -12670,6 +12687,86 @@ mod tests {
         });
 
         assert!(has_fast_insert, "fast insert should be present in logical WAL");
+    }
+
+    #[test]
+    fn direct_bulk_load_persists_canonical_counter_key_not_meta() {
+        // Regression (task #36): direct_bulk_load used to persist its row
+        // counter under `meta:counter:{table}` — a key load_counters() never
+        // reads on open (it scans only the `counter:` prefix). That durable
+        // write was therefore dead: never read back, and the canonical
+        // `counter:{table}` key stayed stale after a bulk load. The fix routes
+        // the persist through flush_row_counter, which writes `counter:{table}`.
+        // This is exercised DISK-BACKED (not memory-only) because the assertion
+        // is about durable keys.
+        let dir = tempfile::Builder::new()
+            .prefix("heliosdb-nano-bulkload-counter-")
+            .tempdir()
+            .expect("Failed to create temp dir");
+        let config = Config::default(); // disk-backed: memory_only == false
+        let engine = StorageEngine::open(dir.path(), &config).expect("Failed to open disk-backed storage");
+
+        let schema = Schema {
+            columns: vec![Column {
+                name: "id".to_string(),
+                data_type: DataType::Int4,
+                nullable: false,
+                primary_key: true,
+                source_table: None,
+                source_table_name: None,
+                default_expr: None,
+                unique: false,
+                storage_mode: crate::ColumnStorageMode::Default,
+            }],
+        };
+
+        let table = "bulk_counter_tbl";
+        engine
+            .catalog()
+            .create_table(table, schema)
+            .expect("Failed to create table");
+
+        // A handful of rows with explicit row ids; the largest is 5, so the
+        // reconciled/persisted counter must land at max_row_id + 1 == 6.
+        let rows: Vec<(u64, Vec<u8>)> = (1u64..=5)
+            .map(|id| {
+                let tuple = Tuple {
+                    values: vec![Value::Int4(id as i32)],
+                    row_id: Some(id),
+                    branch_id: None,
+                };
+                (id, bincode::serialize(&tuple).expect("serialize tuple"))
+            })
+            .collect();
+
+        let result = engine
+            .direct_bulk_load(table, rows, 100_000, true)
+            .expect("direct_bulk_load failed");
+        assert_eq!(result.max_row_id, 5, "max row id should be the largest loaded id");
+
+        // (a) The canonical `counter:{table}` key exists and decodes to a u64
+        // that is at least max_row_id + 1. Read exactly how load_counters does:
+        // get_internal decrypts (a no-op for this unencrypted engine), then the
+        // caller bincode-deserializes to u64.
+        let canonical_key = format!("counter:{}", table).into_bytes();
+        let raw = engine
+            .get_internal(&canonical_key)
+            .expect("get_internal failed")
+            .expect("canonical counter key must exist after bulk load");
+        let counter: u64 = bincode::deserialize(&raw).expect("counter must bincode-deserialize to u64");
+        assert!(
+            counter > result.max_row_id,
+            "canonical counter ({}) must be >= max_row_id + 1 ({})",
+            counter,
+            result.max_row_id + 1
+        );
+
+        // (b) The dead `meta:counter:{table}` key must NOT be written anymore.
+        let legacy_key = format!("meta:counter:{}", table).into_bytes();
+        assert!(
+            engine.get_internal(&legacy_key).expect("get_internal failed").is_none(),
+            "direct_bulk_load must NOT write the dead meta-counter legacy key"
+        );
     }
 }
 
