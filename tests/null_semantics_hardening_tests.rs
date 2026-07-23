@@ -1008,6 +1008,28 @@ mod null_semantics_hardening_tests {
         assert_eq!(id, 2, "Only id=2 (val='hello') should match ~ 'ell'");
     }
 
+    #[test]
+    fn test_similar_to_with_null_operand() {
+        // SQL standard: NULL SIMILAR TO 'pattern' is NULL (falsy), filtering
+        // the row out. Mirrors test_regex_match_with_null_operand for the
+        // SIMILAR TO operator.
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE str2d (id INT, val TEXT)").unwrap();
+        db.execute("INSERT INTO str2d VALUES (1, NULL)").unwrap();
+        db.execute("INSERT INTO str2d VALUES (2, 'hello')").unwrap();
+
+        let rows = db
+            .query("SELECT id FROM str2d WHERE val SIMILAR TO '%ell%'", &[])
+            .unwrap();
+        assert_eq!(rows.len(), 1, "Only non-NULL matching row should be returned");
+        let id = match rows[0].get(0).unwrap() {
+            Value::Int4(v) => *v as i64,
+            Value::Int8(v) => *v,
+            other => panic!("Unexpected type: {:?}", other),
+        };
+        assert_eq!(id, 2, "Only id=2 (val='hello') should match SIMILAR TO '%ell%'");
+    }
+
     // ========================================================================
     // 7. NULL in INSERT/UPDATE (~6 tests)
     // ========================================================================
