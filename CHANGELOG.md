@@ -5,6 +5,39 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.6.2] - 2026-07-26
+
+Three fixes closing out the latent-bug backlog. The wire-protocol one is the
+significant find:
+
+- **Fix (wire-protocol correctness, pre-existing):** the PostgreSQL catalog
+  dispatch matched `pg_type` / `pg_tables` / `pg_views` / `pg_settings` /
+  `pg_indexes` / `information_schema.` as bare substrings of the raw statement
+  text, so a statement that merely *mentioned* one — inside a string literal,
+  a SQL comment, or as part of a longer identifier — had its real semantics
+  discarded and a canned catalog response returned instead. Worst case, an
+  `UPDATE ... SET note='see pg_tables'` silently never executed while the
+  client received a reply it could not distinguish from success; a
+  `CREATE TABLE pg_type_registry (...)` silently created nothing; and a user
+  table named `app_pg_settings` was permanently shadowed. Interception is now
+  restricted to read statements, matched against a literal- and
+  comment-stripped view of the query, with word-boundary-aware marker
+  matching. Client introspection (psql `\dt`, SQLAlchemy/pgAdmin/DBeaver/
+  Drizzle probes) is unaffected.
+- **`SIMILAR TO` now matches PostgreSQL semantics.** Three bugs fixed:
+  alternation was not bound by the implicit full-string anchoring (so
+  `'zzxyz' SIMILAR TO 'abc|xyz'` wrongly returned true); the repetition
+  quantifiers `*` `+` `?` `{m,n}` were treated as literal characters rather
+  than metacharacters (so `'aaa' SIMILAR TO 'a+'` wrongly returned false);
+  and the `ESCAPE` clause was parsed but silently ignored. `ESCAPE 'x'`,
+  `ESCAPE ''` (escaping disabled), and the default backslash escape all
+  behave per PostgreSQL now. This surface previously had no test coverage at
+  all; it now has 10 tests.
+- **Fix:** bulk loads persisted their row-id counter to a key the engine never
+  reads back on open, leaving the canonical counter stale. It now writes
+  through the canonical path — relevant for crash recovery of internal
+  bookkeeping tables, which are skipped by the counter reseed added in 4.6.1.
+
 ## [4.6.1] - 2026-07-21
 
 Four latent-bug fixes, none release-blocking on their own but worth a prompt
