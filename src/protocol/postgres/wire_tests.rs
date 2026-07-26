@@ -1637,3 +1637,47 @@ async fn test_wire_multi_element_create_schema() {
         "the FK violation must reference wms.tbl1, proving tbl2's FK resolved into the new schema, got: {err}"
     );
 }
+
+/// Task #38 — the exact silent-write-loss reproducer from the audit. An
+/// `UPDATE … SET note='see pg_tables' …` merely MENTIONS `pg_tables` inside a
+/// string literal. Before the fix, `PgCatalog::handle_query`'s bare `pg_tables`
+/// dispatch intercepted it on the raw statement text, returned the canned
+/// SELECT-shaped pg_tables rows, and the UPDATE NEVER EXECUTED — a silent write
+/// loss the client couldn't detect. After F1 (statement-kind gate) the UPDATE
+/// runs for real: the command tag is `UPDATE 1` (not a SELECT-shaped reply) and
+/// the mutated value is visible on read-back.
+#[tokio::test]
+async fn test_wire_update_with_pg_tables_in_literal_actually_executes() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+    for stmt in [
+        "CREATE TABLE inventory (id INT PRIMARY KEY, note TEXT)",
+        "INSERT INTO inventory VALUES (1, 'before')",
+    ] {
+        handler.handle_single_query(stmt).await.expect("setup");
+        let _ = drain(&mut client).await;
+    }
+
+    // The literal mentions `pg_tables`. This must EXECUTE as an UPDATE and
+    // report `UPDATE 1` — never a canned pg_tables SELECT response.
+    handler
+        .handle_single_query("UPDATE inventory SET note='see pg_tables' WHERE id=1")
+        .await
+        .expect("update with pg_tables in literal must execute");
+    let tags = command_tags(&drain(&mut client).await);
+    assert!(
+        tags.iter().any(|t| t == "UPDATE 1"),
+        "an UPDATE whose literal mentions pg_tables must execute and report `UPDATE 1`, got {tags:?}"
+    );
+
+    // The new value must have genuinely persisted.
+    handler
+        .handle_single_query("SELECT note FROM inventory WHERE id = 1")
+        .await
+        .expect("read back");
+    assert_eq!(
+        first_data_row_text(&drain(&mut client).await).as_deref(),
+        Some("see pg_tables"),
+        "the UPDATE must have genuinely written the new note value"
+    );
+}

@@ -35,6 +35,44 @@ impl PgCatalog {
     pub fn handle_query(&self, query: &str) -> Result<Option<(Schema, Vec<Tuple>)>> {
         let query_lower = query.trim().to_lowercase();
 
+        // --- F1: statement-kind gate (task #38) --------------------------
+        // This handler runs on the RAW, UNPARSED statement text and can only
+        // *substring-match*. Every legitimate interception it performs — psql
+        // meta-command signatures and client introspection probes — is a
+        // read: a `SELECT`, a CTE `WITH`, or a parenthesised `( SELECT … )`.
+        // A DML/DDL statement (UPDATE/INSERT/DELETE/CREATE/…) that merely
+        // *mentions* a catalog name (in a string literal, a column value, a
+        // comment) must NEVER be intercepted here — doing so silently discards
+        // the write and hands the client a fake SELECT-shaped result. Gate on
+        // the first keyword up front so no downstream substring check can
+        // hijack a write. This alone kills the live-verified silent-write-loss
+        // class: `UPDATE t SET note='see pg_tables'`,
+        // `CREATE TABLE pg_type_registry (…)`,
+        // `INSERT … VALUES ('… information_schema.sql_features …')`, and the
+        // full-psql-\dt-signature-inside-a-string-literal INSERT.
+        let first_word: String = query_lower.chars().take_while(|c| c.is_ascii_alphabetic()).collect();
+        let is_select_like = query_lower.starts_with('(') || first_word == "select" || first_word == "with";
+        if !is_select_like {
+            return Ok(None);
+        }
+
+        // --- F2: literal/comment-stripped view of the statement (task #38) -
+        // A raw `contains()` also fires on catalog names that appear INSIDE a
+        // single-quoted string literal or a SQL comment (e.g.
+        // `SELECT * FROM my_notes WHERE body = 'see pg_type docs'`, or
+        // `SELECT * FROM t -- see pg_tables`). Those are ordinary reads of a
+        // USER table, not catalog probes. `matchable` blanks out the CONTENTS
+        // of literals and comments (see `strip_literals_and_comments`) so the
+        // catalog-detection predicates only ever see real SQL. IMPORTANT:
+        // `matchable` is routed ONLY to the detection predicates below
+        // (`has_information_schema_ref`, `is_catalog_query`, and the pg_*
+        // dispatch). `try_psql_metacommand` and every result post-processing
+        // helper (`apply_where_filter` / `apply_aggregate` / `project_columns`
+        // / `extract_*`) keep receiving the ORIGINAL `query_lower` — they
+        // legitimately parse string literals (psql's `'r'` relkind fragment,
+        // WHERE filter values).
+        let matchable = Self::strip_literals_and_comments(&query_lower);
+
         // --- psql meta-command query detection ---------------------------
         // psql sends complex JOINs across pg_class / pg_namespace /
         // pg_attribute that our simple substring matcher can't resolve, so
@@ -60,14 +98,17 @@ impl PgCatalog {
         // / `"session_user"` / `"current_schema"` scalar-function arms.
 
         // Check for information_schema queries (table / column listing).
-        // We must match the TABLE reference (`information_schema.<name>`
-        // or `from information_schema.`) and NOT the string literal
-        // `'information_schema'` that Drizzle / postgres-js / Prisma
-        // pass in WHERE clauses like
-        //   SELECT … FROM pg_tables WHERE schemaname NOT IN
-        //   ('pg_catalog','information_schema');
-        let has_information_schema_ref =
-            query_lower.contains("information_schema.") || query_lower.contains(" information_schema ");
+        // Match the TABLE reference (`information_schema.<name>`) over the
+        // literal/comment-stripped `matchable` text. Historically this check
+        // was hand-rolled to avoid matching the `'information_schema'` string
+        // literal that Drizzle / postgres-js / Prisma pass in WHERE clauses
+        // like `… WHERE schemaname NOT IN ('pg_catalog','information_schema')`;
+        // F2 stripping now blanks that literal's contents generically, so the
+        // special-case dodge is no longer needed. The old bare
+        // space-delimited ` information_schema ` disjunct was dropped together
+        // with F4 (its only consumer was a degenerate empty-result branch that
+        // now falls through to the planner).
+        let has_information_schema_ref = matchable.contains("information_schema.");
         // KanttBan #22/#23 (v3.31.x) migrated several information_schema
         // views to the planner-backed SystemViewRegistry by returning
         // Ok(None) here. That delegation is required for drizzle-kit,
@@ -139,15 +180,19 @@ impl PgCatalog {
                     )));
                 }
             } else {
-                // Bare `from information_schema` reference without a view name
-                // (rare; psql `\dn`-style probes). Pass through.
-                Some((Schema::new(vec![]), vec![]))
+                // F4 (task #38): `information_schema.` is present but no view
+                // name is extractable (a degenerate trailing dot). The old
+                // behaviour returned a zero-column empty result, silently
+                // masking the real outcome. Fall through to the planner so a
+                // genuine "relation does not exist" surfaces instead of a fake
+                // empty rowset.
+                return Ok(None);
             }
-        } else if !Self::is_catalog_query(&query_lower) {
+        } else if !Self::is_catalog_query(&matchable) {
             return Ok(None);
-        } else if query_lower.contains("pg_type") {
+        } else if Self::contains_word(&matchable, "pg_type") {
             Some(self.query_pg_type()?)
-        } else if query_lower.contains("pg_inherits") {
+        } else if matchable.contains("pg_inherits") {
             // KanttBan #22 slice 5 regression carve-out: pg_inherits
             // is registered in the SystemViewRegistry but psql's `\d`
             // sub-queries against it use `c.oid::pg_catalog.regclass`
@@ -165,12 +210,12 @@ impl PgCatalog {
                 ]),
                 vec![],
             ))
-        } else if query_lower.contains("pg_publication") {
+        } else if matchable.contains("pg_publication") {
             // Same carve-out as pg_inherits: psql `\d` joins this with
             // `pg_relation_is_publishable(<oid>)`, which the planner
             // doesn't implement. Empty 1-col `pubname` response.
             Some((Schema::new(vec![Column::new("pubname", DataType::Text)]), vec![]))
-        } else if query_lower.contains("pg_statistic_ext") {
+        } else if matchable.contains("pg_statistic_ext") {
             // Same carve-out: psql's `\d` query against pg_statistic_ext
             // projects `stxrelid::pg_catalog.regclass` and
             // `stxnamespace::pg_catalog.regnamespace`, both regclass-family
@@ -190,16 +235,17 @@ impl PgCatalog {
                 ]),
                 vec![],
             ))
-        } else if query_lower.contains("pg_indexes") {
+        } else if Self::contains_word(&matchable, "pg_indexes") {
             // pg_indexes (the user-facing view) — not in the registry
             // yet. Leave as fixed-shape until migrated.
             Some(self.query_pg_indexes()?)
-        } else if query_lower.contains("pg_tables") {
-            // Same — leave until migrated to registry.
+        } else if Self::contains_word(&matchable, "pg_tables") {
+            // Same — leave until migrated to registry. `contains_word` still
+            // matches inside `pg_catalog.pg_tables` (the `.` is a boundary).
             Some(self.query_pg_tables()?)
-        } else if query_lower.contains("pg_views") {
+        } else if Self::contains_word(&matchable, "pg_views") {
             Some(self.query_pg_views()?)
-        } else if query_lower.contains("pg_settings") {
+        } else if Self::contains_word(&matchable, "pg_settings") {
             Some(self.query_pg_settings()?)
         } else {
             // KanttBan #22 (v3.31.0): pg_namespace / pg_class / pg_attribute /
@@ -1638,7 +1684,121 @@ impl PgCatalog {
             "pg_policies",
             "pg_matviews",
         ];
-        MARKERS.iter().any(|m| q.contains(m))
+        // Word-boundary match (task #38 F3): a marker must be a whole
+        // identifier token, not a substring of a larger name. Without this a
+        // user table like `app_pg_settings` or `my_pg_tables_backup` would be
+        // permanently shadowed by the canned catalog response. `contains_word`
+        // still matches qualified references (`pg_catalog.pg_class`) because
+        // `.` is a boundary character. Caller passes the literal/comment
+        // stripped `matchable` text so markers inside string literals /
+        // comments don't count either.
+        MARKERS.iter().any(|m| Self::contains_word(q, m))
+    }
+
+    /// Replace the CONTENTS of single-quoted string literals, line comments
+    /// (`-- … EOL`) and block comments (`/* … */`, non-nested) with spaces,
+    /// preserving every other byte verbatim (task #38 F2). This yields a
+    /// "matchable" view of the statement in which catalog-name substring
+    /// checks can't be fooled by a marker that only appears inside a literal
+    /// or a comment. Doubled `''` inside a literal is an escaped quote and
+    /// keeps us INSIDE the literal. Delimiter bytes (`'`, `-`, `/`, `*`,
+    /// newline) are all ASCII (<0x80) and so never collide with a UTF-8
+    /// continuation byte, making the byte scan safe for multibyte input.
+    fn strip_literals_and_comments(q: &str) -> String {
+        let bytes = q.as_bytes();
+        let n = bytes.len();
+        let mut out: Vec<u8> = Vec::with_capacity(n);
+        let mut i = 0;
+        while i < n {
+            let c = bytes[i];
+            // Line comment: `--` to end of line.
+            if c == b'-' && i + 1 < n && bytes[i + 1] == b'-' {
+                out.push(b' ');
+                out.push(b' ');
+                i += 2;
+                while i < n && bytes[i] != b'\n' {
+                    out.push(b' ');
+                    i += 1;
+                }
+                continue;
+            }
+            // Block comment: `/* … */` (non-nested).
+            if c == b'/' && i + 1 < n && bytes[i + 1] == b'*' {
+                out.push(b' ');
+                out.push(b' ');
+                i += 2;
+                while i < n {
+                    if bytes[i] == b'*' && i + 1 < n && bytes[i + 1] == b'/' {
+                        out.push(b' ');
+                        out.push(b' ');
+                        i += 2;
+                        break;
+                    }
+                    out.push(if bytes[i] == b'\n' { b'\n' } else { b' ' });
+                    i += 1;
+                }
+                continue;
+            }
+            // Single-quoted string literal (with `''` escape).
+            if c == b'\'' {
+                out.push(b'\''); // preserve the opening quote position
+                i += 1;
+                while i < n {
+                    if bytes[i] == b'\'' {
+                        if i + 1 < n && bytes[i + 1] == b'\'' {
+                            // Escaped quote: stay inside the literal.
+                            out.push(b' ');
+                            out.push(b' ');
+                            i += 2;
+                            continue;
+                        }
+                        out.push(b'\''); // closing quote
+                        i += 1;
+                        break;
+                    }
+                    out.push(if bytes[i] == b'\n' { b'\n' } else { b' ' });
+                    i += 1;
+                }
+                continue;
+            }
+            out.push(c);
+            i += 1;
+        }
+        // Every emitted byte is either a verbatim source byte or an ASCII
+        // space/newline; no multibyte sequence is ever split, so the result is
+        // valid UTF-8. Fall back to the original on the impossible error path.
+        String::from_utf8(out).unwrap_or_else(|_| q.to_string())
+    }
+
+    /// True iff `needle` occurs in `haystack` at an identifier-token boundary:
+    /// the character immediately before and after the match (if any) must NOT
+    /// be an identifier byte (`[a-z0-9_]`) (task #38 F3). This is what stops a
+    /// marker like `pg_settings` from matching inside `app_pg_settings`, while
+    /// still matching inside `pg_catalog.pg_settings` (the `.` is a boundary).
+    /// Operates on the already-lowercased text.
+    fn contains_word(haystack: &str, needle: &str) -> bool {
+        if needle.is_empty() {
+            return false;
+        }
+        let hb = haystack.as_bytes();
+        let nlen = needle.len();
+        let mut start = 0;
+        while let Some(rel) = haystack[start..].find(needle) {
+            let abs = start + rel;
+            let before_ok = abs == 0 || !Self::is_ident_byte(hb[abs - 1]);
+            let after_idx = abs + nlen;
+            let after_ok = after_idx >= hb.len() || !Self::is_ident_byte(hb[after_idx]);
+            if before_ok && after_ok {
+                return true;
+            }
+            start = abs + 1;
+        }
+        false
+    }
+
+    /// Identifier byte for `contains_word`: `[a-z0-9_]` (lowercased input).
+    fn is_ident_byte(b: u8) -> bool {
+        b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'
     }
 
     /// Query pg_index — per-table primary key and unique indexes.
@@ -2416,6 +2576,277 @@ mod tests {
             result.is_some(),
             "plain information_schema.tables SELECT is intercepted; got {result:?}"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // Task #38 — wire-protocol substring-hijack closure.
+    //
+    // `handle_query` runs on the RAW, lowercased statement text for EVERY
+    // statement on the PG wire path. Before this fix, a `contains()` marker
+    // check would intercept ANY statement mentioning a catalog name — even
+    // inside a string literal, a comment, or as a substring of a user
+    // identifier — silently discarding writes and shadowing user tables.
+    // F1 (statement-kind gate), F2 (literal/comment stripping) and F3
+    // (word-boundary matching) close that surface. These tests pin the
+    // exact live-verified hijacks from the audit.
+    // -------------------------------------------------------------------
+
+    /// F1: a write whose literal mentions `pg_tables` must NOT be intercepted
+    /// (it would silently never execute). Falls through to the real engine.
+    #[test]
+    fn task38_update_with_pg_tables_literal_falls_through() {
+        let catalog = PgCatalog::new();
+        let result = catalog
+            .handle_query("UPDATE inventory SET note='see pg_tables' WHERE id=1")
+            .unwrap();
+        assert!(result.is_none(), "UPDATE must fall through, got {result:?}");
+    }
+
+    /// F1: a write whose literal mentions `pg_settings` must fall through.
+    #[test]
+    fn task38_update_with_pg_settings_literal_falls_through() {
+        let catalog = PgCatalog::new();
+        let result = catalog
+            .handle_query("UPDATE inventory SET note='pg_settings changed' WHERE id=1")
+            .unwrap();
+        assert!(result.is_none(), "UPDATE must fall through, got {result:?}");
+    }
+
+    /// F1: `CREATE TABLE pg_type_registry` (marker as an identifier substring)
+    /// must fall through so the table is actually created.
+    #[test]
+    fn task38_create_table_pg_type_substring_falls_through() {
+        let catalog = PgCatalog::new();
+        let result = catalog.handle_query("CREATE TABLE pg_type_registry (id int)").unwrap();
+        assert!(result.is_none(), "CREATE TABLE must fall through, got {result:?}");
+    }
+
+    /// F1: `CREATE TABLE pg_views_cache` must fall through.
+    #[test]
+    fn task38_create_table_pg_views_substring_falls_through() {
+        let catalog = PgCatalog::new();
+        let result = catalog.handle_query("CREATE TABLE pg_views_cache (id int)").unwrap();
+        assert!(result.is_none(), "CREATE TABLE must fall through, got {result:?}");
+    }
+
+    /// F2: a SELECT of a USER table whose literal mentions `pg_type` must NOT
+    /// be intercepted by the pg_type dispatch — the marker is inside a string.
+    #[test]
+    fn task38_select_user_table_with_pg_type_literal_falls_through() {
+        let catalog = PgCatalog::new();
+        let result = catalog
+            .handle_query("SELECT * FROM my_notes WHERE body = 'see pg_type docs'")
+            .unwrap();
+        assert!(
+            result.is_none(),
+            "SELECT of user table must fall through, got {result:?}"
+        );
+    }
+
+    /// F3: a user table named `app_pg_settings` must NOT be shadowed by the
+    /// pg_settings canned response (word boundary: `_` before the marker).
+    #[test]
+    fn task38_select_word_boundary_app_pg_settings_falls_through() {
+        let catalog = PgCatalog::new();
+        let result = catalog.handle_query("SELECT * FROM app_pg_settings").unwrap();
+        assert!(result.is_none(), "app_pg_settings must not be shadowed, got {result:?}");
+    }
+
+    /// F1/F2: a write whose literal mentions `information_schema.columns` must
+    /// fall through (the write must execute).
+    #[test]
+    fn task38_update_with_information_schema_literal_falls_through() {
+        let catalog = PgCatalog::new();
+        let result = catalog
+            .handle_query("UPDATE inventory SET note='check information_schema.columns' WHERE id=1")
+            .unwrap();
+        assert!(result.is_none(), "UPDATE must fall through, got {result:?}");
+    }
+
+    /// F1: an INSERT mentioning an unknown information_schema view in a literal
+    /// must fall through as Ok(None) — NOT raise the spurious unknown-view
+    /// ERROR the old bare-branch produced.
+    #[test]
+    fn task38_insert_with_unknown_information_schema_literal_is_none_not_err() {
+        let catalog = PgCatalog::new();
+        let result =
+            catalog.handle_query("INSERT INTO my_notes VALUES (9, 'read information_schema.sql_features spec')");
+        assert!(
+            matches!(result, Ok(None)),
+            "INSERT with information_schema literal must be Ok(None), got {result:?}"
+        );
+    }
+
+    /// F2/F4: a SELECT of a user table whose literal contains the bare word
+    /// `information_schema` must fall through (no degenerate empty result).
+    #[test]
+    fn task38_select_user_table_with_bare_information_schema_literal_falls_through() {
+        let catalog = PgCatalog::new();
+        let result = catalog
+            .handle_query("SELECT * FROM my_notes WHERE body = 'the information_schema is useful'")
+            .unwrap();
+        assert!(
+            result.is_none(),
+            "bare information_schema literal must fall through, got {result:?}"
+        );
+    }
+
+    /// F1: an INSERT whose literal contains the verbatim psql `\dt` catalog
+    /// query must fall through — the psql signature must not intercept a write.
+    #[test]
+    fn task38_insert_with_psql_dt_signature_in_literal_falls_through() {
+        let catalog = PgCatalog::new();
+        let result = catalog
+            .handle_query(
+                "INSERT INTO query_log VALUES (1, 'SELECT n.nspname, c.relname FROM pg_catalog.pg_class c \
+                 LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE c.relkind IN (''r'') AND pg_catalog.pg_get_userbyid(c.relowner) = x')",
+            )
+            .unwrap();
+        assert!(
+            result.is_none(),
+            "INSERT with psql signature literal must fall through, got {result:?}"
+        );
+    }
+
+    /// F2: a trailing line comment mentioning `pg_tables` must not hijack a
+    /// plain user-table SELECT.
+    #[test]
+    fn task38_select_with_trailing_comment_marker_falls_through() {
+        let catalog = PgCatalog::new();
+        let result = catalog.handle_query("SELECT * FROM t -- see pg_tables").unwrap();
+        assert!(result.is_none(), "comment marker must not hijack, got {result:?}");
+    }
+
+    // ---- The introspection contract these branches exist for still holds ---
+
+    /// A real `pg_tables` reference is still intercepted.
+    #[test]
+    fn task38_real_pg_tables_still_intercepted() {
+        let catalog = PgCatalog::new();
+        let result = catalog.handle_query("SELECT tablename FROM pg_tables").unwrap();
+        assert!(result.is_some(), "real pg_tables SELECT must still be served");
+    }
+
+    /// The drizzle shape: markers inside ITS OWN literals get stripped, but the
+    /// real `FROM pg_tables` reference remains and must still be served.
+    #[test]
+    fn task38_drizzle_pg_tables_shape_still_intercepted() {
+        let catalog = PgCatalog::new();
+        let result = catalog
+            .handle_query(
+                "SELECT schemaname, tablename FROM pg_tables \
+                 WHERE schemaname NOT IN ('pg_catalog','information_schema')",
+            )
+            .unwrap();
+        assert!(result.is_some(), "drizzle pg_tables shape must still be served");
+    }
+
+    /// A schema-qualified `pg_catalog.pg_type` reference must survive
+    /// `contains_word` (the `.` is a token boundary).
+    #[test]
+    fn task38_qualified_pg_type_still_intercepted() {
+        let catalog = PgCatalog::new();
+        let result = catalog
+            .handle_query("SELECT oid, typname FROM pg_catalog.pg_type")
+            .unwrap();
+        assert!(result.is_some(), "qualified pg_catalog.pg_type must still be served");
+    }
+
+    /// A real `information_schema.columns` SELECT is still intercepted.
+    #[test]
+    fn task38_real_information_schema_columns_still_intercepted() {
+        let catalog = PgCatalog::new();
+        let result = catalog
+            .handle_query("SELECT column_name FROM information_schema.columns WHERE table_name = 'my_notes'")
+            .unwrap();
+        assert!(
+            result.is_some(),
+            "real information_schema.columns SELECT must still be served"
+        );
+    }
+
+    /// The verbatim psql `\dt` query still returns the 4-column
+    /// Schema/Name/Type/Owner shape (needs a live database handle).
+    #[test]
+    fn task38_psql_dt_still_returns_four_column_shape() {
+        use std::sync::Arc;
+        let db = crate::EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE widgets (id INT PRIMARY KEY)").unwrap();
+        let catalog = PgCatalog::with_database(Arc::new(db));
+        // The query psql sends for `\dt` (modern form, `!~` not OPERATOR()).
+        let dt = "SELECT n.nspname as \"Schema\", c.relname as \"Name\", \
+                  CASE c.relkind WHEN 'r' THEN 'table' WHEN 'v' THEN 'view' \
+                  WHEN 'm' THEN 'materialized view' WHEN 'S' THEN 'sequence' \
+                  WHEN 'f' THEN 'foreign table' WHEN 'p' THEN 'partitioned table' END as \"Type\", \
+                  pg_catalog.pg_get_userbyid(c.relowner) as \"Owner\" \
+                  FROM pg_catalog.pg_class c \
+                  LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                  WHERE c.relkind IN ('r','p','') AND n.nspname <> 'pg_catalog' \
+                  AND n.nspname !~ '^pg_toast' AND n.nspname <> 'information_schema' \
+                  AND pg_catalog.pg_table_is_visible(c.oid) ORDER BY 1,2";
+        let (schema, _rows) = catalog.handle_query(dt).unwrap().expect("psql \\dt must be served");
+        let names: Vec<&str> = schema.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["Schema", "Name", "Type", "Owner"],
+            "psql \\dt must return the 4-column Schema/Name/Type/Owner shape"
+        );
+    }
+
+    /// A real `pg_settings` reference is still intercepted.
+    #[test]
+    fn task38_real_pg_settings_still_intercepted() {
+        let catalog = PgCatalog::new();
+        let result = catalog.handle_query("SELECT name, setting FROM pg_settings").unwrap();
+        assert!(result.is_some(), "real pg_settings SELECT must still be served");
+    }
+
+    // ---- Direct unit coverage of the F2/F3 helpers ---------------------
+
+    #[test]
+    fn task38_strip_literals_and_comments_blanks_contents() {
+        // Literal contents blanked, quote positions preserved, `''` escape kept
+        // inside the literal, structure outside literals intact.
+        let out = PgCatalog::strip_literals_and_comments("select * from t where c='pg_tables' and d=1");
+        assert!(!out.contains("pg_tables"), "literal contents must be blanked: {out}");
+        assert!(
+            out.contains("select * from t where c="),
+            "outside-literal text intact: {out}"
+        );
+        assert!(out.contains("and d=1"), "trailing predicate intact: {out}");
+
+        // Line comment blanked.
+        let out = PgCatalog::strip_literals_and_comments("select * from t -- see pg_tables");
+        assert!(!out.contains("pg_tables"), "line comment must be blanked: {out}");
+
+        // Block comment blanked.
+        let out = PgCatalog::strip_literals_and_comments("select /* pg_settings */ 1");
+        assert!(!out.contains("pg_settings"), "block comment must be blanked: {out}");
+
+        // Doubled '' escape keeps us inside the literal (no marker leaks).
+        let out = PgCatalog::strip_literals_and_comments("x 'a''pg_type''b' y");
+        assert!(
+            !out.contains("pg_type"),
+            "escaped-quote literal must stay blanked: {out}"
+        );
+        assert!(out.contains('x') && out.contains('y'), "surrounding text intact: {out}");
+    }
+
+    #[test]
+    fn task38_contains_word_respects_boundaries() {
+        assert!(PgCatalog::contains_word("select * from pg_tables", "pg_tables"));
+        // Qualified reference: `.` is a boundary.
+        assert!(PgCatalog::contains_word("from pg_catalog.pg_tables x", "pg_tables"));
+        // Substring of a longer identifier must NOT match.
+        assert!(!PgCatalog::contains_word(
+            "select * from app_pg_settings",
+            "pg_settings"
+        ));
+        assert!(!PgCatalog::contains_word("select * from pg_tables_backup", "pg_tables"));
+        // Trailing/leading boundary at string ends.
+        assert!(PgCatalog::contains_word("pg_type", "pg_type"));
+        assert!(!PgCatalog::contains_word("pg_typeof(x)", "pg_type"));
     }
 
     #[test]
