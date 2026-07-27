@@ -189,12 +189,13 @@ impl ServerManager {
             self.config.enable_oracle, self.config.enable_postgres
         );
 
-        // Wait for Ctrl+C
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                info!("Received shutdown signal (Ctrl+C)");
-            }
-        }
+        // Wait for SIGINT or SIGTERM. Awaiting only `ctrl_c()` here left
+        // SIGTERM on its default Unix disposition — immediate termination with
+        // no `Drop`, so `EmbeddedDatabase::drop`'s ordered close-time work (row
+        // counters, then the R4.2 index-snapshot checkpoint) never ran under a
+        // service manager. See `crate::wait_for_shutdown_signal`.
+        let signal = crate::wait_for_shutdown_signal().await;
+        info!("Received shutdown signal ({})", signal);
 
         // Send shutdown signal to all servers
         let _ = self.shutdown_tx.send(());
