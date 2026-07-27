@@ -1894,6 +1894,12 @@ pub struct StorageEngine {
     /// crash-recovery tests to simulate a process that died without
     /// checkpointing.
     index_snapshots_on_close: Arc<AtomicBool>,
+    /// Flush the durable row-id counters at clean shutdown. Mirrors
+    /// `index_snapshots_on_close` so crash-recovery tests can simulate a
+    /// process that died between the two close-time durable writes (the pair
+    /// whose ORDER `EmbeddedDatabase::drop` is careful about). Defaults to
+    /// `true`; nothing in production ever clears it.
+    row_counter_flush_on_close: Arc<AtomicBool>,
     /// R4.2: how the last `rebuild_all_indexes` populated the in-memory
     /// indexes (snapshot-loaded vs scanned). Diagnostics + test surface.
     last_index_open_report: Arc<RwLock<Option<super::index_snapshot::IndexOpenReport>>>,
@@ -2346,6 +2352,7 @@ impl StorageEngine {
             constraints_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             referencing_fk_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             index_snapshots_on_close: Arc::new(AtomicBool::new(true)),
+            row_counter_flush_on_close: Arc::new(AtomicBool::new(true)),
             last_index_open_report: Arc::new(RwLock::new(None)),
         };
 
@@ -2577,6 +2584,7 @@ impl StorageEngine {
             constraints_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             referencing_fk_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             index_snapshots_on_close: Arc::new(AtomicBool::new(true)),
+            row_counter_flush_on_close: Arc::new(AtomicBool::new(true)),
             last_index_open_report: Arc::new(RwLock::new(None)),
         })
     }
@@ -8716,6 +8724,20 @@ impl StorageEngine {
         self.index_snapshots_on_close.load(Ordering::Acquire)
     }
 
+    /// Enable/disable the durable row-counter flush at clean shutdown.
+    /// Crash-recovery tests disable it to simulate a process killed mid-run,
+    /// mirroring `set_index_snapshots_on_close` — together the two toggles let
+    /// a test construct either "crash landed between the two close-time
+    /// durable writes" state without process-level kill injection.
+    pub fn set_row_counter_flush_on_close(&self, enabled: bool) {
+        self.row_counter_flush_on_close.store(enabled, Ordering::Release);
+    }
+
+    /// Whether the close path should flush row counters.
+    pub fn row_counter_flush_on_close(&self) -> bool {
+        self.row_counter_flush_on_close.load(Ordering::Acquire)
+    }
+
     /// Stash the report of how the last open populated the indexes.
     pub(crate) fn set_last_index_open_report(&self, report: super::index_snapshot::IndexOpenReport) {
         *self.last_index_open_report.write() = Some(report);
@@ -11988,14 +12010,19 @@ impl StorageEngine {
     /// (`EmbeddedDatabase::drop`); a hard crash skips it, so `load_counters`
     /// can seed `row_counters` from a stale durable value. This method is
     /// called from `Catalog::rebuild_all_indexes`'s scan-fallback path, which
-    /// only runs when no valid R4.2 index snapshot exists for the table —
-    /// and a valid snapshot exists if and only if the last shutdown was clean
-    /// (`persist_index_snapshots` and `flush_all_row_counters` are called
-    /// together, a few lines apart, in the same `Drop::drop`). So the scan
-    /// path — which is forced precisely on a crash reopen — is exactly where
-    /// the counter needs reconciling, and reconciling here costs nothing on a
-    /// clean reopen (which takes the snapshot fast path and skips this call
-    /// entirely).
+    /// only runs when no valid R4.2 index snapshot exists for the table. So
+    /// the scan path — which is forced precisely on a crash reopen — is
+    /// exactly where the counter needs reconciling, and reconciling here costs
+    /// nothing on a clean reopen (which takes the snapshot fast path and skips
+    /// this call entirely).
+    ///
+    /// Because this reconciliation is reachable ONLY from the scan fallback, a
+    /// valid snapshot paired with a stale durable counter is unrecoverable —
+    /// the fast path never reseeds. `EmbeddedDatabase::drop` therefore flushes
+    /// the counters BEFORE checkpointing the snapshots, so a crash between the
+    /// two can only ever leave the harmless combination (correct counter, no
+    /// snapshot → scan rebuild), never the harmful one. Do not reorder those
+    /// two calls.
     pub fn reseed_row_counter_from_max_row_id(&self, table_name: &str, max_row_id: u64) -> Result<()> {
         let target = max_row_id + 1;
         let changed = if let Some(counter) = self.row_counters.get(table_name) {

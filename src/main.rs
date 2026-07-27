@@ -763,7 +763,17 @@ async fn start_server(
     // late-life health failure cannot tear down the database listener.
     // `--http-port 0` opts out (no HTTP endpoint, no listener).
     let http_health_disabled = ha_config.http_port == 0;
-    if !http_health_disabled {
+    // The join handle is kept (rather than fully detaching the task) so the
+    // shutdown arm can abort it alongside the MySQL/Unix-socket listeners.
+    // This task holds an `Arc::clone(&db)`; leaving it running past shutdown
+    // pins the refcount above zero, so `EmbeddedDatabase::drop` — and with it
+    // the ordered close-time row-counter flush and R4.2 snapshot checkpoint —
+    // never runs at all under the default `--http-port 8080`. Aborting it is
+    // what lets that work happen on the default `start` invocation, not just
+    // under `--http-port 0`. The comment above still holds: the main
+    // `select!` never *observes* this task, so a late-life HTTP failure
+    // cannot tear the database listener down.
+    let http_handle: Option<tokio::task::JoinHandle<()>> = if !http_health_disabled {
         let http_listen = ha_config.http_listen.as_deref().unwrap_or(&listen);
         let http_addr: SocketAddr = format!("{}:{}", http_listen, ha_config.http_port)
             .parse()
@@ -774,11 +784,11 @@ async fn start_server(
                 let http_db = Arc::clone(&db);
                 let mcp_token = ha_config.mcp_token.clone();
                 let allow_remote_mcp = ha_config.allow_remote_mcp;
-                tokio::spawn(async move {
+                Some(tokio::spawn(async move {
                     if let Err(e) = run_http_listener(listener, http_db, mcp_token, allow_remote_mcp).await {
                         tracing::error!("HTTP server accept loop exited: {e}");
                     }
-                });
+                }))
             }
             Err(e) => {
                 tracing::error!(
@@ -789,11 +799,13 @@ async fn start_server(
                     e,
                     e.raw_os_error(),
                 );
+                None
             }
         }
     } else {
         info!("HTTP endpoint disabled (--http-port 0)");
-    }
+        None
+    };
 
     // Start MySQL listener if enabled
     let mysql_handle = if mysql_enabled {
@@ -987,9 +999,22 @@ async fn start_server(
             }
             result?;
         }
-        _ = tokio::signal::ctrl_c() => {
+        // SIGINT *and* SIGTERM. Awaiting only `ctrl_c()` here left SIGTERM on
+        // its default Unix disposition — immediate termination, no `Drop`, so
+        // none of `EmbeddedDatabase::drop`'s ordered close-time work (row
+        // counters, then the R4.2 index-snapshot checkpoint) ran under any
+        // service manager, nor under this binary's own `stop` subcommand,
+        // which sends `kill -TERM`. See `heliosdb_nano::wait_for_shutdown_signal`.
+        signal = heliosdb_nano::wait_for_shutdown_signal() => {
             println!();
             println!("{}", "Received shutdown signal...".yellow());
+            tracing::info!("{signal} received — running clean shutdown");
+            // Abort the HTTP accept loop first: it is the one listener task
+            // holding an `Arc<EmbeddedDatabase>` clone, so until it is gone
+            // the refcount cannot reach zero and `Drop` cannot run.
+            if let Some(h) = http_handle {
+                h.abort();
+            }
             if let Some(h) = mysql_handle {
                 h.abort();
             }

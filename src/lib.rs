@@ -335,6 +335,53 @@ pub use types::{
     Value, VectorStoreInfo,
 };
 
+/// Wait for an operating-system shutdown signal, returning its conventional
+/// name (`"SIGINT"` / `"SIGTERM"`) so the caller can log which one arrived.
+///
+/// Every server entry point used to await `tokio::signal::ctrl_c()` (SIGINT)
+/// and nothing else. SIGTERM had no handler, and the default Unix disposition
+/// for an unhandled SIGTERM is immediate termination — no unwinding, no `Drop`
+/// — so `EmbeddedDatabase::drop`'s close-time work never ran at all. That is
+/// the common case in production, not an edge case: `heliosdb-nano stop` itself
+/// sends SIGTERM (`kill -TERM`, see the `stop` subcommand in `src/main.rs`,
+/// which then sleeps waiting for a graceful shutdown), as do `systemctl stop`,
+/// `docker stop`, and Kubernetes pod termination.
+///
+/// **Paired with `impl Drop for EmbeddedDatabase`.** That `Drop` fixes the
+/// *order* of the two close-time durable writes (row counters first, then the
+/// R4.2 index-snapshot checkpoint — a crash between them must not leave a valid
+/// snapshot next to a stale counter). This function is what makes that ordered
+/// shutdown run *at all* under a service manager. Removing either one silently
+/// reopens the stale-counter / row-overwrite window; do not touch one without
+/// reading the other.
+#[cfg(unix)]
+pub async fn wait_for_shutdown_signal() -> &'static str {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut sigterm = match signal(SignalKind::terminate()) {
+        Ok(handler) => handler,
+        Err(e) => {
+            // Failing to register must not break shutdown entirely — degrade
+            // to the pre-existing Ctrl+C-only behavior rather than aborting.
+            tracing::warn!("failed to install SIGTERM handler: {}; Ctrl+C only", e);
+            let _ = tokio::signal::ctrl_c().await;
+            return "SIGINT";
+        }
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => "SIGINT",
+        _ = sigterm.recv() => "SIGTERM",
+    }
+}
+
+/// Ctrl+C-only variant for targets without POSIX signals. See the Unix version
+/// above for the full rationale and its pairing with `Drop`.
+#[cfg(not(unix))]
+pub async fn wait_for_shutdown_signal() -> &'static str {
+    let _ = tokio::signal::ctrl_c().await;
+    "SIGINT"
+}
+
 /// Convert logical plan ReferentialAction to constraints module ReferentialAction
 fn convert_logical_referential_action(
     action: &sql::logical_plan::ReferentialAction,
@@ -648,11 +695,46 @@ pub struct EmbeddedDatabase {
 
 impl Drop for EmbeddedDatabase {
     fn drop(&mut self) {
+        // Persist row counters at clean shutdown. The fast INSERT path only
+        // re-persists the durable `counter:{table}` every 64 rows and (in
+        // relaxed WAL mode) logs no counter to the logical WAL, so a table with
+        // fewer than 64 inserts would otherwise reopen with a stale counter and
+        // hand the next insert an already-used row id, overwriting a live row.
+        //
+        // ORDERING REQUIREMENT — this MUST stay ahead of the R4.2 index-snapshot
+        // checkpoint below; do not "tidy" the two blocks back together in the
+        // other order. The two writes are independent (disjoint key prefixes,
+        // disjoint in-memory state) but they are NOT atomic with each other, and
+        // the only place a stale counter is ever reconciled against the rows is
+        // `Catalog::rebuild_all_indexes`'s scan-fallback path — which a valid
+        // index snapshot skips entirely. So a crash landing between these two
+        // calls has an asymmetric outcome:
+        //   * snapshot-then-counter (the pre-fix order): valid snapshot + stale
+        //     counter → next open takes the no-reconciliation fast path and the
+        //     next fast INSERT silently overwrites a live row via a reused
+        //     internal row_id (the v4.6.1 row-overwrite class of bug, and not
+        //     catchable by any PK/UNIQUE check — row_id is not a user column).
+        //   * counter-then-snapshot (this order): correct counter + missing
+        //     snapshot → next open falls back to the scan rebuild, which is
+        //     slower but always correct and re-runs the (monotonic-safe,
+        //     therefore no-op) reseed anyway.
+        // Deliberately NOT gated on `txn_open`: `flush_all_row_counters` is
+        // monotonic-safe (it can never lower the durable value), so flushing a
+        // counter bumped by a still-open transaction costs at most a row-id gap
+        // — never a collision. Only the snapshot checkpoint needs that guard.
+        if self.storage.row_counter_flush_on_close() {
+            if let Err(e) = self.storage.flush_all_row_counters() {
+                tracing::warn!("row counter flush at close failed: {}", e);
+            }
+        }
+
         // R4.2: checkpoint ART/HNSW index snapshots at clean shutdown so the
         // next open loads them instead of re-scanning every table. Skipped
         // when any transaction is still open — its eagerly-applied index
         // entries are not committed data and must not be snapshotted (the
         // next open rebuilds from rows instead, which is always correct).
+        // Runs LAST of the two durable close-time writes — see the ordering
+        // requirement documented on the counter flush above.
         let txn_open = self.global_txn_active.load(std::sync::atomic::Ordering::Acquire)
             || self.session_txn_count.load(std::sync::atomic::Ordering::Acquire) > 0;
         if !txn_open && self.storage.index_snapshots_on_close() {
@@ -661,15 +743,6 @@ impl Drop for EmbeddedDatabase {
             }
         } else if txn_open {
             tracing::debug!("skipping index snapshot checkpoint: transaction still open at drop");
-        }
-
-        // Persist row counters at clean shutdown. The fast INSERT path only
-        // re-persists the durable `counter:{table}` every 64 rows and (in
-        // relaxed WAL mode) logs no counter to the logical WAL, so a table with
-        // fewer than 64 inserts would otherwise reopen with a stale counter and
-        // hand the next insert an already-used row id, overwriting a live row.
-        if let Err(e) = self.storage.flush_all_row_counters() {
-            tracing::warn!("row counter flush at close failed: {}", e);
         }
 
         // Signal the auto-refresh worker to stop (non-blocking)
@@ -4957,6 +5030,7 @@ impl EmbeddedDatabase {
                                 &schema_arc,
                                 &catalog,
                                 Some(txn),
+                                skip_fast_paths,
                             )?;
 
                             row_ids_to_delete.push(row_id);
@@ -14367,7 +14441,14 @@ impl EmbeddedDatabase {
                         // any row being staged — mirrors the text family's
                         // ordering in `execute_in_transaction_inner`.
                         if tuple.row_id.is_some() {
-                            self.enforce_referencing_fks_on_delete(table_name, &tuple, &schema, &catalog, active_txn)?;
+                            self.enforce_referencing_fks_on_delete(
+                                table_name,
+                                &tuple,
+                                &schema,
+                                &catalog,
+                                active_txn,
+                                active_txn.is_some(),
+                            )?;
                         }
 
                         // Collect tuple for RETURNING clause before deletion
@@ -18147,11 +18228,36 @@ impl EmbeddedDatabase {
     /// CASCADE DELETE: Delete all rows in a table that reference the given values
     ///
     /// Used for ON DELETE CASCADE foreign key action
+    ///
+    /// `active_txn` is the transaction the *parent* DELETE is staging into
+    /// (see `enforce_referencing_fks_on_delete`). Threading it in is what makes
+    /// the cascade atomic with the statement that triggered it: this helper used
+    /// to always open — and immediately commit — its own autocommit transaction,
+    /// so `BEGIN; DELETE FROM parent; ROLLBACK;` restored the parent row but left
+    /// the child rows permanently deleted (a silent atomicity violation, never
+    /// surfaced as an error). With a transaction in hand the child deletes land
+    /// in that transaction's buffered write set — discarded for free by ROLLBACK
+    /// — and the ART/HNSW maintenance, which lives OUTSIDE the write set, is
+    /// applied eagerly and paired with undo ops on the same transaction, exactly
+    /// like the ordinary in-transaction DELETE arm of
+    /// `execute_plan_with_params_inner`.
+    ///
+    /// `in_explicit_txn` says whether `active_txn` is a caller-owned
+    /// explicit/session transaction (one that may still ROLLBACK independently
+    /// of this statement) rather than the per-statement autocommit transaction
+    /// the text family always runs inside. It gates the logical-WAL append
+    /// exactly the way `skip_fast_paths` gates it for the ordinary DELETE arm:
+    /// `log_data_delete` appends straight to the logical WAL at call time and
+    /// no code path ever writes a compensating abort record, so logging a write
+    /// that a later ROLLBACK discards would leave a phantom entry for crash
+    /// replay and streaming replication.
     fn cascade_delete_referencing_rows(
         &self,
         table_name: &str,
         fk_columns: &[String],
         parent_values: &[Value],
+        active_txn: Option<&storage::Transaction>,
+        in_explicit_txn: bool,
     ) -> Result<()> {
         let catalog = self.storage.catalog();
         let schema = catalog.get_table_schema(table_name)?;
@@ -18185,10 +18291,91 @@ impl EmbeddedDatabase {
             }
         }
 
-        // Delete the matching rows
-        let txn = self.storage.begin_autocommit_transaction()?;
         // R3.3: null columnar slots + clear presence bits grouped per batch.
         let cascade_row_ids: Vec<u64> = rows_to_delete.iter().map(|(row_id, _)| *row_id).collect();
+
+        // Enclosing transaction: stage the cascade INTO it so COMMIT/ROLLBACK
+        // (and ROLLBACK TO SAVEPOINT) cover parent and children as one unit.
+        if let Some(txn) = active_txn {
+            // ART + HNSW maintenance first, mirroring the params-family
+            // ordinary DELETE arm: apply eagerly against the live index and
+            // push a compensating undo op onto the SAME transaction, because
+            // the indexes are not part of the transaction's write set and a
+            // rollback would otherwise leave them missing the child rows.
+            // `push_art_undo` routes to the per-session or the global-slot log
+            // off `txn` itself, so no session/global special-casing here.
+            //
+            // W2.0 (carve-out unchanged from the autocommit path below): on a
+            // branch this cascade writes only branch-aware tombstones and the
+            // child rows stay in main's `data:`, so stripping the shared ART's
+            // main entries would make a main point probe return
+            // authoritative-empty for an inherited row. Branch reads never use
+            // the shared ART, so skip ART maintenance on a branch.
+            if self.storage.get_current_branch_id().is_none() {
+                for (row_id, tuple) in &rows_to_delete {
+                    let mut col_values = std::collections::HashMap::new();
+                    for (i, col) in schema.columns.iter().enumerate() {
+                        if let Some(v) = tuple.values.get(i) {
+                            col_values.insert(col.name.clone(), v.clone());
+                        }
+                    }
+                    if let Err(e) = self.storage.art_indexes().on_delete(table_name, *row_id, &col_values) {
+                        tracing::debug!("ART index delete for cascade table '{}': {}", table_name, e);
+                    }
+                    // `ArtUndoOp::RestoreDeleted` replays as
+                    // `art_indexes().on_insert(.., &col_values)`, so the
+                    // col-values map is what makes this undo-compatible —
+                    // hence `on_delete` here where the autocommit path below
+                    // uses the schema-driven `on_delete_tuple` convenience
+                    // wrapper (which has no undo counterpart, and needs none:
+                    // nothing can roll that path back).
+                    self.push_art_undo(
+                        txn,
+                        ArtUndoOp::RestoreDeleted {
+                            table_name: table_name.to_string(),
+                            row_id: *row_id,
+                            col_values,
+                        },
+                    );
+                }
+            }
+            // R5.V1: eagerly drop cascade-deleted rows from HNSW vector indexes,
+            // undone on rollback. Not branch-gated — matches the autocommit
+            // path below, which also runs this unconditionally.
+            if self.vector_dml_gate(table_name) {
+                for (row_id, tuple) in &rows_to_delete {
+                    let vops =
+                        self.storage
+                            .vector_indexes()
+                            .on_row_delete(table_name, *row_id, Some(&schema), Some(tuple));
+                    self.push_vector_undo(txn, vops);
+                }
+            }
+
+            self.storage
+                .stage_columnar_deletes_grouped_in_transaction(table_name, &cascade_row_ids, &schema, txn)?;
+            for (row_id, _) in &rows_to_delete {
+                let key = self.storage.branch_aware_data_key(table_name, *row_id);
+                txn.delete(key.clone())?;
+
+                // Log to WAL for crash recovery — but only when this write
+                // cannot be rolled back out from under the log entry. Mirrors
+                // the `!skip_fast_paths` gate on the ordinary DELETE arm; see
+                // the `in_explicit_txn` note on this function.
+                if !in_explicit_txn {
+                    self.storage.log_data_delete(table_name, &key)?;
+                }
+
+                self.storage.row_cache().invalidate(table_name, *row_id);
+            }
+            return Ok(());
+        }
+
+        // No enclosing transaction (params-family autocommit DELETE): keep the
+        // original self-contained shape — own short-lived transaction,
+        // post-commit index/cache maintenance, no undo bookkeeping because
+        // nothing can roll this back.
+        let txn = self.storage.begin_autocommit_transaction()?;
         self.storage
             .stage_columnar_deletes_grouped_in_transaction(table_name, &cascade_row_ids, &schema, &txn)?;
         for (row_id, _) in &rows_to_delete {
@@ -18232,11 +18419,18 @@ impl EmbeddedDatabase {
     /// SET NULL: Set FK columns to NULL in all rows that reference the given values
     ///
     /// Used for ON DELETE SET NULL foreign key action
+    ///
+    /// `active_txn` / `in_explicit_txn` carry the same meaning, and exist for
+    /// the same reason, as on `cascade_delete_referencing_rows`: without them
+    /// this helper committed its own transaction immediately, so the nulled FK
+    /// column survived a `ROLLBACK` of the statement that triggered it.
     fn set_null_referencing_rows(
         &self,
         table_name: &str,
         fk_columns: &[String],
         parent_values: &[Value],
+        active_txn: Option<&storage::Transaction>,
+        in_explicit_txn: bool,
     ) -> Result<()> {
         let catalog = self.storage.catalog();
         let schema = catalog.get_table_schema(table_name)?;
@@ -18280,6 +18474,34 @@ impl EmbeddedDatabase {
             }
         }
 
+        // Enclosing transaction: stage the SET NULL INTO it so it rolls back
+        // with the parent DELETE. No ART/HNSW/row-cache maintenance is added
+        // here — this helper has never done any (in either branch), so a nulled
+        // FK column that also carries its own secondary index keeps a stale
+        // entry; that is a separate pre-existing gap, and the two branches stay
+        // symmetric about it.
+        if let Some(txn) = active_txn {
+            // R3.3 / W2.0 carve-out, unchanged from the autocommit path below.
+            if self.storage.get_current_branch().is_none() {
+                let row_refs: Vec<(u64, &Tuple)> =
+                    rows_to_update.iter().map(|(row_id, tuple)| (*row_id, tuple)).collect();
+                self.storage
+                    .stage_columnar_rows_grouped_in_transaction(table_name, &row_refs, &schema, txn, false)?;
+            }
+            for (row_id, new_tuple) in &rows_to_update {
+                let key = self.storage.branch_aware_data_key(table_name, *row_id);
+                let val = bincode::serialize(new_tuple).map_err(|e| Error::storage(e.to_string()))?;
+                txn.put(key.clone(), val.clone())?;
+
+                // Log to WAL for crash recovery — skipped inside an explicit or
+                // session transaction; see `cascade_delete_referencing_rows`.
+                if !in_explicit_txn {
+                    self.storage.log_data_update(table_name, &key, &val)?;
+                }
+            }
+            return Ok(());
+        }
+
         // Update the matching rows. R3.3: stage columnar side-data grouped
         // per touched batch (UPDATE — presence untouched).
         let txn = self.storage.begin_autocommit_transaction()?;
@@ -18316,7 +18538,18 @@ impl EmbeddedDatabase {
     /// so the FK validator merges the write-set into the base scan (covers
     /// the "DELETE child; DELETE parent" sequence — without it the
     /// just-tombstoned child rows are still visible to `scan_table` and raise
-    /// a phantom violation).
+    /// a phantom violation) — and, since the CASCADE / SET NULL atomicity fix,
+    /// on into the two referential-action helpers so their writes join the
+    /// caller's transaction instead of self-committing past a later ROLLBACK.
+    ///
+    /// `in_explicit_txn` distinguishes "the caller owns this transaction and it
+    /// may still roll back" (explicit `BEGIN` / session transaction) from "this
+    /// is the per-statement autocommit transaction the text family always runs
+    /// inside". The text family passes its own `skip_fast_paths` — for which
+    /// that is the exact meaning — and the params family, whose `active_txn` is
+    /// `None` unless a session/global-slot transaction is genuinely open,
+    /// passes `active_txn.is_some()`. Only the logical-WAL append depends on it
+    /// (see `cascade_delete_referencing_rows`).
     fn enforce_referencing_fks_on_delete(
         &self,
         table_name: &str,
@@ -18324,6 +18557,7 @@ impl EmbeddedDatabase {
         schema: &Schema,
         catalog: &storage::Catalog<'_>,
         active_txn: Option<&storage::Transaction>,
+        in_explicit_txn: bool,
     ) -> Result<()> {
         // Validate FK constraints - check if any other table references this row
         let referencing_fks = if *self.fk_validation_mode.read() == FkValidationMode::Off
@@ -18364,12 +18598,26 @@ impl EmbeddedDatabase {
                     )));
                 }
                 sql::constraints::ReferentialAction::Cascade => {
-                    // CASCADE: Delete all referencing rows in child table
-                    self.cascade_delete_referencing_rows(&fk.table_name, &fk.columns, &ref_values)?;
+                    // CASCADE: Delete all referencing rows in child table.
+                    // `active_txn` is forwarded so the child deletes join the
+                    // caller's transaction instead of self-committing.
+                    self.cascade_delete_referencing_rows(
+                        &fk.table_name,
+                        &fk.columns,
+                        &ref_values,
+                        active_txn,
+                        in_explicit_txn,
+                    )?;
                 }
                 sql::constraints::ReferentialAction::SetNull => {
                     // SET NULL: Set FK columns to NULL in referencing rows
-                    self.set_null_referencing_rows(&fk.table_name, &fk.columns, &ref_values)?;
+                    self.set_null_referencing_rows(
+                        &fk.table_name,
+                        &fk.columns,
+                        &ref_values,
+                        active_txn,
+                        in_explicit_txn,
+                    )?;
                 }
                 sql::constraints::ReferentialAction::SetDefault => {
                     // SET DEFAULT is not implemented yet - treat as RESTRICT

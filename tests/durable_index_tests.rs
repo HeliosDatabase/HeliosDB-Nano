@@ -4,6 +4,12 @@
 //! between checkpoint and later mutations (markers invalidated → scan
 //! rebuild, never a stale snapshot), marker consumption at open, HNSW graph
 //! reload, and the open-transaction guard on the close-time checkpoint.
+//!
+//! Also covers the ORDER of the two durable writes `EmbeddedDatabase::drop`
+//! performs — the row-counter flush and the index-snapshot checkpoint. They
+//! are independent but not atomic with each other, and a crash landing between
+//! them has an asymmetric outcome, so the counter flush must run first. See
+//! the `drop_*` / `*_counter_*` tests at the bottom of this file.
 
 use heliosdb_nano::storage::ArtIndexManager;
 use heliosdb_nano::{EmbeddedDatabase, Value};
@@ -330,4 +336,160 @@ fn checkpoint_then_clean_close_refreshes_snapshot() {
     let report = db.storage.last_index_open_report().unwrap();
     assert_eq!(report.tables_from_snapshot, 1, "clean close must rewrite the snapshot");
     assert_eq!(index_row_count(&db, "idx_d_fresh_v", Value::Int4(10)), 2);
+}
+
+// ---------------------------------------------------------------------------
+// Close-time write ORDER: row counters BEFORE the index-snapshot checkpoint.
+//
+// `Catalog::rebuild_all_indexes` reconciles a stale row-id counter
+// (`reseed_row_counter_from_max_row_id`) ONLY on its scan-fallback path, which a
+// valid snapshot skips wholesale. So of the two states a crash between the two
+// `Drop::drop` writes can leave:
+//   * valid snapshot + stale counter  → unrecoverable: the next fast INSERT
+//     reuses a live internal row_id and silently overwrites that row.
+//   * correct counter + no snapshot   → harmless: the scan rebuild is slower
+//     but always correct.
+// Only the flush-first order can produce the second state, never the first.
+// ---------------------------------------------------------------------------
+
+/// Seed `rows` single-row literal INSERTs — the fast path that only re-persists
+/// the durable `counter:{table}` every 64 rows, i.e. the one that leaves a stale
+/// counter behind when the close-time flush does not run.
+fn seed_counter_table(db: &EmbeddedDatabase, table: &str, rows: i32) {
+    let ddl = format!("CREATE TABLE {table} (id INT PRIMARY KEY, v INT)");
+    db.execute(&ddl).unwrap();
+    let idx = format!("CREATE INDEX idx_{table}_v ON {table}(v)");
+    db.execute(&idx).unwrap();
+    for i in 0..rows {
+        let dml = format!("INSERT INTO {table} VALUES ({i}, {i})");
+        db.execute(&dml).unwrap();
+    }
+}
+
+/// Every listed id must still resolve to exactly one row. A reused internal
+/// row_id overwrites one row's tuple in place while leaving the total count
+/// plausible, so a count assertion alone would not catch it.
+fn assert_all_ids_present(db: &EmbeddedDatabase, table: &str, ids: impl IntoIterator<Item = i32>) {
+    for id in ids {
+        let sql = format!("SELECT COUNT(*) FROM {table} WHERE id = {id}");
+        let hits = count_rows(db, &sql);
+        assert_eq!(hits, 1, "row id={id} must be present, not overwritten");
+    }
+}
+
+/// The mechanism that makes the order matter: with a valid snapshot on disk the
+/// open takes the bulk-load fast path and scans NO rows, so it never observes
+/// the true max row_id and can never reconcile a stale counter. That is why the
+/// counter flush must be the FIRST of the two close-time writes — this state
+/// (snapshot written, counter flush skipped) is exactly what a crash between
+/// them produced under the old order, and nothing downstream repairs it.
+#[test]
+fn valid_snapshot_open_scans_no_rows_so_never_reseeds_the_counter() {
+    let temp = TempDir::new().unwrap();
+
+    {
+        let db = EmbeddedDatabase::new(temp.path()).unwrap();
+        seed_counter_table(&db, "d_ctr_trap", 10);
+
+        // Crash simulation under the OLD order: the snapshot checkpoint
+        // completed (left enabled, so `Drop` writes it) and the process died
+        // before the counter flush ever ran.
+        db.storage.set_row_counter_flush_on_close(false);
+    }
+
+    let db = EmbeddedDatabase::new(temp.path()).unwrap();
+    let report = db.storage.last_index_open_report().unwrap();
+    assert_eq!(
+        report.tables_from_snapshot, 1,
+        "the snapshot must be trusted here — that is the trap: {report:?}"
+    );
+    // No scan fallback ⇒ `reseed_row_counter_from_max_row_id` is unreachable,
+    // and zero rows observed ⇒ the open cannot learn the true max row_id.
+    assert_eq!(report.tables_scanned, 0, "no scan fallback: {report:?}");
+    assert_eq!(report.rows_scanned, 0, "no rows observed: {report:?}");
+}
+
+/// The post-fix crash window: the counter flush completed, the snapshot
+/// checkpoint did not. The reopen must fall back to the scan rebuild (always
+/// correct) and the next INSERT must not collide with a live row.
+#[test]
+fn counter_flushed_without_snapshot_reopens_without_row_id_collision() {
+    let temp = TempDir::new().unwrap();
+
+    {
+        let db = EmbeddedDatabase::new(temp.path()).unwrap();
+        seed_counter_table(&db, "d_ctr_safe", 10);
+
+        // Crash simulation under the FIXED order: the counter flush completed
+        // (left enabled, so `Drop` runs it first) and the process died before
+        // the snapshot checkpoint.
+        db.storage.set_index_snapshots_on_close(false);
+    }
+
+    let db = EmbeddedDatabase::new(temp.path()).unwrap();
+    let report = db.storage.last_index_open_report().unwrap();
+    assert_eq!(report.tables_from_snapshot, 0, "no snapshot: {report:?}");
+    assert_eq!(report.tables_scanned, 1, "scan rebuild: {report:?}");
+
+    db.execute("INSERT INTO d_ctr_safe VALUES (999, 999)").unwrap();
+    let total = count_rows(&db, "SELECT COUNT(*) FROM d_ctr_safe");
+    assert_eq!(total, 11, "the new row must not overwrite an old one");
+    assert_all_ids_present(&db, "d_ctr_safe", (0..10).chain(std::iter::once(999)));
+}
+
+/// Non-regression for the ordinary path: an uninterrupted `Drop` still leaves
+/// BOTH a valid snapshot and a correct counter, so the reopen takes the fast
+/// path AND the next INSERT lands on a fresh row_id. This is the test that
+/// fails outright if the close-time counter flush is ever dropped, or moved
+/// behind a guard that skips it.
+#[test]
+fn clean_drop_leaves_snapshot_and_counter_consistent() {
+    let temp = TempDir::new().unwrap();
+
+    {
+        let db = EmbeddedDatabase::new(temp.path()).unwrap();
+        seed_counter_table(&db, "d_ctr_clean", 10);
+        // Full, uninterrupted Drop: counter flush, then snapshot checkpoint.
+    }
+
+    let db = EmbeddedDatabase::new(temp.path()).unwrap();
+    let report = db.storage.last_index_open_report().unwrap();
+    assert_eq!(report.tables_from_snapshot, 1, "snapshot: {report:?}");
+    assert_eq!(report.tables_scanned, 0, "no scan needed: {report:?}");
+
+    db.execute("INSERT INTO d_ctr_clean VALUES (999, 999)").unwrap();
+    let total = count_rows(&db, "SELECT COUNT(*) FROM d_ctr_clean");
+    assert_eq!(total, 11, "the new row must not overwrite an old one");
+    assert_all_ids_present(&db, "d_ctr_clean", (0..10).chain(std::iter::once(999)));
+}
+
+/// The `txn_open` guard applies to the snapshot checkpoint ONLY. The counter
+/// flush stays unconditional: it is monotonic-safe, so flushing a counter that a
+/// still-open transaction bumped costs at most a row-id gap, never a collision —
+/// while gating it would reopen the stale-counter window this ordering closes.
+#[test]
+fn open_transaction_at_drop_skips_snapshot_but_not_the_counter_flush() {
+    let temp = TempDir::new().unwrap();
+
+    {
+        let db = EmbeddedDatabase::new(temp.path()).unwrap();
+        seed_counter_table(&db, "d_ctr_txn", 10);
+        db.execute("BEGIN").unwrap();
+        db.execute("INSERT INTO d_ctr_txn VALUES (500, 500)").unwrap();
+        // Drop with the transaction still open: the snapshot is skipped by
+        // design, the counter flush runs anyway. No toggles — the real
+        // `Drop::drop` runs here, exactly as written.
+    }
+
+    let db = EmbeddedDatabase::new(temp.path()).unwrap();
+    let report = db.storage.last_index_open_report().unwrap();
+    assert_eq!(report.tables_from_snapshot, 0, "no snapshot: {report:?}");
+
+    let stale = count_rows(&db, "SELECT COUNT(*) FROM d_ctr_txn WHERE id = 500");
+    assert_eq!(stale, 0, "uncommitted row must not survive the drop");
+
+    db.execute("INSERT INTO d_ctr_txn VALUES (999, 999)").unwrap();
+    let total = count_rows(&db, "SELECT COUNT(*) FROM d_ctr_txn");
+    assert_eq!(total, 11, "the new row must not overwrite an old one");
+    assert_all_ids_present(&db, "d_ctr_txn", (0..10).chain(std::iter::once(999)));
 }
