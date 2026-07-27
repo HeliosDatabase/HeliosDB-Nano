@@ -5,6 +5,50 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.7.0] - 2026-07-27
+
+Transaction and shutdown correctness. One atomicity violation, plus three fixes
+that together are the reason the engine's clean-shutdown work never ran in a
+real deployment.
+
+- **Fix (atomicity, pre-existing):** `ON DELETE CASCADE` and `ON DELETE SET NULL`
+  escaped the enclosing transaction. Both ran in their own autocommit
+  transaction that committed immediately, so `BEGIN; DELETE parent; ROLLBACK;`
+  restored the parent row while the cascaded child deletions — or the NULLed
+  child FK columns — stayed permanently applied. The child effects now join the
+  caller's transaction and roll back with it. Autocommit behavior is unchanged.
+- **Fix (durability, pre-existing):** at close, index snapshots were persisted
+  *before* row counters were flushed. Because a valid index snapshot is what
+  tells the next open that shutdown was clean, a crash between those two steps
+  produced a database that looked cleanly shut down while carrying a stale row
+  counter — and the next insert would reuse a live row id, overwriting data.
+  This is the failure 4.6.1's counter reseed was meant to prevent. Counters are
+  now flushed first.
+- **Fix (shutdown, pre-existing):** the server had no `SIGTERM` handler; only
+  `Ctrl+C` was handled. Since the Unix default for an unhandled `SIGTERM` is
+  immediate termination, no close-time work ran under `systemctl stop`,
+  `docker stop`, Kubernetes pod termination — or `heliosdb-nano stop`, which
+  sends `SIGTERM` itself and then waits two seconds for a graceful shutdown that
+  could not occur. The documented way to stop a server was an abrupt kill.
+  `SIGTERM` and `SIGINT` now follow the same shutdown path, and the log records
+  which signal arrived.
+- **Fix (shutdown, pre-existing):** the HTTP endpoint's accept loop held a
+  reference to the database and was never shut down, so the database was never
+  dropped and its close-time work never ran under the default `--http-port 8080`
+  — not even on `Ctrl+C`. Without this fix the two items above have no effect on
+  a default `heliosdb-nano start`.
+
+**Upgrade note:** if you relied on cascaded deletes persisting after a rolled-back
+parent `DELETE` — behavior no standard SQL database exhibits — that no longer
+happens. Servers now do measurable work on `SIGTERM`; if you run under a process
+supervisor with a very short kill timeout, verify it allows shutdown to finish.
+`heliosdb-nano stop` still hardcodes a 2-second grace period before `SIGKILL`,
+which a large database may exceed; making it configurable is tracked for 4.8.
+
+Also adds `docs/plans/ROADMAP_V5.md`, an audited inventory of known outstanding
+issues sequenced toward 5.0. It documents several limitations candidly,
+including that row-level security is currently not enforced on write paths.
+
 ## [4.6.3] - 2026-07-27
 
 Constraint enforcement is now identical across both DML executor families.
