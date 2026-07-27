@@ -5,6 +5,47 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.6.3] - 2026-07-27
+
+Constraint enforcement is now identical across both DML executor families.
+
+HeliosDB Nano runs two parallel DML paths, selected by the wire frame type: a
+*text* family (PostgreSQL simple-query, all MySQL wire, the REPL, the embedded
+`execute()` API) and a *params* family (PostgreSQL extended protocol, plus every
+REST/BaaS write). The params family had drifted, and three constraint checks the
+text family performed were missing from it. Any client that uses the extended
+protocol — psycopg2 server-side cursors, JDBC, sqlx, Drizzle, node-postgres — or
+that writes through `/rest/v1/`, could bypass them.
+
+- **Fix (data integrity, pre-existing):** a parameterized `DELETE` did not
+  enforce *referencing* (inbound) foreign keys. `NO ACTION` / `RESTRICT` were
+  not rejected, and `ON DELETE CASCADE` / `SET NULL` never ran — so deleting a
+  parent row through the extended protocol silently orphaned its children, with
+  no error and no cascade. The same statement over the simple-query protocol
+  behaved correctly, which made this hard to spot: the bug depended on the
+  client driver, not the SQL.
+- **Fix (data integrity, pre-existing):** a parameterized `UPDATE` did not
+  enforce `UNIQUE`, for either single-column constraints or multi-column table
+  constraints, admitting duplicate keys.
+- **Fix (data integrity, pre-existing):** `INSERT ... ON CONFLICT DO UPDATE`
+  never revalidated the post-merge row on *either* family. `CHECK` constraints
+  were not re-evaluated — a conflict update could set a column to a value the
+  table's own `CHECK` forbids — and foreign keys on the updated row went
+  unverified.
+
+The three enforcement blocks now live in shared helpers called from both
+families rather than in two implementations that can diverge again. Error
+messages are unchanged. New suite `tests/constraint_parity_tests.rs` runs each
+affected statement through both families and asserts they agree.
+
+Known limitations left unchanged by this release, each pre-existing and tracked
+separately: `ON CONFLICT DO UPDATE` does not re-check `NOT NULL` (matching the
+general `UPDATE` arm); the `UNIQUE` self-collision guard tests "value changed"
+rather than "different row", so a same-statement key swap or cycle is rejected;
+`ON DELETE CASCADE` / `SET NULL` run in their own autocommit transaction, so
+child-row effects survive a `ROLLBACK` of the parent statement; and the `UNIQUE`
+probe reads the branch-blind shared index.
+
 ## [4.6.2] - 2026-07-26
 
 Three fixes closing out the latent-bug backlog. The wire-protocol one is the
