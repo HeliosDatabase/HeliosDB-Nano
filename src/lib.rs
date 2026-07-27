@@ -3812,6 +3812,11 @@ impl EmbeddedDatabase {
                                                 }
                                             }
                                         }
+                                        // Snapshot the pre-update row so the
+                                        // post-update re-validation below can
+                                        // tell which UNIQUE / PK columns the
+                                        // DO UPDATE actually changed.
+                                        let pre_update_tuple = existing_tuple.clone();
                                         for (col_name, expr) in assignments {
                                             let target_idx = schema
                                                 .columns
@@ -3844,6 +3849,20 @@ impl EmbeddedDatabase {
                                                 }
                                             }
                                         }
+
+                                        // The DO UPDATE mutated an existing row —
+                                        // re-validate FK / CHECK / UNIQUE exactly
+                                        // as an ordinary UPDATE would, BEFORE the
+                                        // row is written. Shared with the params
+                                        // family so both arms agree.
+                                        self.validate_on_conflict_updated_row(
+                                            table_name,
+                                            &schema,
+                                            &table_constraints,
+                                            &pre_update_tuple,
+                                            &existing_tuple,
+                                            Some(txn),
+                                        )?;
 
                                         // Write updated tuple back; columnar side-data is staged
                                         // grouped after the row loop (R3.3). Keep the row bytes
@@ -4637,103 +4656,19 @@ impl EmbeddedDatabase {
                             }
                         }
 
-                        for (idx, col) in schema.columns.iter().enumerate() {
-                            if !col.primary_key && !col.unique {
-                                continue;
-                            }
-                            let old_value = old_tuple.values.get(idx).unwrap_or(&Value::Null);
-                            let new_value = new_tuple.values.get(idx).unwrap_or(&Value::Null);
-                            if old_value == new_value {
-                                continue;
-                            }
-                            if col.primary_key && matches!(new_value, Value::Null) {
-                                return Err(Error::constraint_violation(format!(
-                                    "PRIMARY KEY constraint '{}' violated: NULL value",
-                                    col.name
-                                )));
-                            }
-                            if col.unique && matches!(new_value, Value::Null) {
-                                continue;
-                            }
-                            if seen_column_unique_update_keys
-                                .iter()
-                                .any(|(seen_col, seen_value)| seen_col == &col.name && seen_value == new_value)
-                            {
-                                return Err(Error::constraint_violation(format!(
-                                    "UNIQUE constraint violated: duplicate value for column '{}'",
-                                    col.name
-                                )));
-                            }
-                            let columns = [col.name.clone()];
-                            if self.storage.art_indexes().unique_key_exists(
-                                table_name,
-                                &columns,
-                                std::slice::from_ref(new_value),
-                            ) {
-                                return Err(Error::constraint_violation(format!(
-                                    "UNIQUE constraint violated: duplicate value for column '{}'",
-                                    col.name
-                                )));
-                            }
-                            seen_column_unique_update_keys.push((col.name.clone(), new_value.clone()));
-                        }
-
-                        for unique in &table_constraints.unique_constraints {
-                            let mut old_values = Vec::with_capacity(unique.columns.len());
-                            let mut new_values = Vec::with_capacity(unique.columns.len());
-                            let mut changed = false;
-                            let mut has_null = false;
-                            for col_name in &unique.columns {
-                                let Some(idx) = schema.get_column_index(col_name) else {
-                                    continue;
-                                };
-                                let old_value = old_tuple.values.get(idx).cloned().unwrap_or(Value::Null);
-                                let new_value = new_tuple.values.get(idx).cloned().unwrap_or(Value::Null);
-                                if old_value != new_value {
-                                    changed = true;
-                                }
-                                if matches!(new_value, Value::Null) {
-                                    has_null = true;
-                                }
-                                old_values.push(old_value);
-                                new_values.push(new_value);
-                            }
-                            if !changed {
-                                continue;
-                            }
-                            if unique.is_primary_key && has_null {
-                                return Err(Error::constraint_violation(format!(
-                                    "PRIMARY KEY constraint '{}' violated: NULL value",
-                                    unique.name
-                                )));
-                            }
-                            if !unique.is_primary_key && has_null {
-                                continue;
-                            }
-                            if old_values.len() == unique.columns.len() && new_values.len() == unique.columns.len() {
-                                if seen_table_unique_update_keys.iter().any(|(seen_cols, seen_values)| {
-                                    seen_cols == &unique.columns && seen_values == &new_values
-                                }) {
-                                    return Err(Error::constraint_violation(format!(
-                                        "UNIQUE constraint '{}' violated: duplicate value for columns ({})",
-                                        unique.name,
-                                        unique.columns.join(", ")
-                                    )));
-                                }
-                                if self.storage.art_indexes().unique_key_exists(
-                                    table_name,
-                                    &unique.columns,
-                                    &new_values,
-                                ) {
-                                    return Err(Error::constraint_violation(format!(
-                                        "UNIQUE constraint '{}' violated: duplicate value for columns ({})",
-                                        unique.name,
-                                        unique.columns.join(", ")
-                                    )));
-                                }
-                                seen_table_unique_update_keys.push((unique.columns.clone(), new_values));
-                            }
-                        }
+                        // UNIQUE / PRIMARY KEY enforcement (column-level +
+                        // table-level). Shared with the params family
+                        // (`execute_plan_with_params_inner`); the two `seen_*`
+                        // vectors carry the intra-statement dedup across rows.
+                        self.enforce_unique_on_update(
+                            table_name,
+                            &schema,
+                            &table_constraints,
+                            &old_tuple,
+                            &new_tuple,
+                            &mut seen_column_unique_update_keys,
+                            &mut seen_table_unique_update_keys,
+                        )?;
 
                         let row_id = new_tuple.row_id.unwrap_or(0);
                         updates.push((row_id, old_tuple.clone(), new_tuple.clone()));
@@ -5014,79 +4949,15 @@ impl EmbeddedDatabase {
                         }
 
                         if let Some(row_id) = tuple.row_id {
-                            // Validate FK constraints - check if any other table references this row
-                            let referencing_fks = if *self.fk_validation_mode.read() == FkValidationMode::Off
-                                || *self.fk_validation_source.read() == FkValidationSource::Proxy
-                            {
-                                Vec::new()
-                            } else {
-                                catalog.get_referencing_fks(table_name)?
-                            };
-                            for fk in &referencing_fks {
-                                if fk.enforcement == sql::ConstraintEnforcement::Immediate {
-                                    // Get the referenced column values from the tuple being deleted
-                                    let ref_values: Vec<Value> = fk
-                                        .references_columns
-                                        .iter()
-                                        .map(|col_name| {
-                                            schema_arc
-                                                .columns
-                                                .iter()
-                                                .position(|c| &c.name == col_name)
-                                                .and_then(|idx| tuple.values.get(idx).cloned())
-                                                .unwrap_or(Value::Null)
-                                        })
-                                        .collect();
-
-                                    // Check if any row in the referencing table uses these values.
-                                    // Pass the active txn so the FK validator merges its
-                                    // write-set into the base scan (covers the
-                                    // "DELETE child; DELETE parent" sequence — without this
-                                    // the just-tombstoned child rows are still visible to
-                                    // `scan_table` and raise a phantom violation).
-                                    let has_refs = self.check_referencing_rows_exist(
-                                        &fk.table_name,
-                                        &fk.columns,
-                                        &ref_values,
-                                        Some(txn),
-                                    )?;
-
-                                    if has_refs {
-                                        match fk.on_delete {
-                                            sql::constraints::ReferentialAction::NoAction
-                                            | sql::constraints::ReferentialAction::Restrict => {
-                                                return Err(Error::constraint_violation(format!(
-                                                    "Foreign key constraint '{}' violated: cannot delete row from '{}' - referenced by '{}'",
-                                                    fk.name, table_name, fk.table_name
-                                                )));
-                                            }
-                                            sql::constraints::ReferentialAction::Cascade => {
-                                                // CASCADE: Delete all referencing rows in child table
-                                                self.cascade_delete_referencing_rows(
-                                                    &fk.table_name,
-                                                    &fk.columns,
-                                                    &ref_values,
-                                                )?;
-                                            }
-                                            sql::constraints::ReferentialAction::SetNull => {
-                                                // SET NULL: Set FK columns to NULL in referencing rows
-                                                self.set_null_referencing_rows(
-                                                    &fk.table_name,
-                                                    &fk.columns,
-                                                    &ref_values,
-                                                )?;
-                                            }
-                                            sql::constraints::ReferentialAction::SetDefault => {
-                                                // SET DEFAULT is not implemented yet - treat as RESTRICT
-                                                return Err(Error::constraint_violation(format!(
-                                                    "Foreign key constraint '{}' with SET DEFAULT action: not implemented",
-                                                    fk.name
-                                                )));
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+                            // Validate FK constraints - check if any other table references this row.
+                            // Shared with the params family (`execute_plan_with_params_inner`).
+                            self.enforce_referencing_fks_on_delete(
+                                table_name,
+                                &tuple,
+                                &schema_arc,
+                                &catalog,
+                                Some(txn),
+                            )?;
 
                             row_ids_to_delete.push(row_id);
                             deleted_tuples.push((row_id, tuple.clone()));
@@ -14080,7 +13951,21 @@ impl EmbeddedDatabase {
                                 }
                             }
 
-                            self.validate_check_constraints(&table_constraints, &schema, &updated_tuple.values)?;
+                            // The DO UPDATE mutated an existing row —
+                            // re-validate FK / CHECK / UNIQUE exactly as an
+                            // ordinary UPDATE would, BEFORE the row is
+                            // written. Shared with the text family so both
+                            // arms agree. (This call subsumes the
+                            // `validate_check_constraints` that used to live
+                            // here — do not add it back separately.)
+                            self.validate_on_conflict_updated_row(
+                                table_name,
+                                &schema,
+                                &table_constraints,
+                                &old_tuple_for_art,
+                                &updated_tuple,
+                                active_txn,
+                            )?;
 
                             // Write the updated row. `update_tuple_fast`
                             // overwrites `data:` in place and updates ART
@@ -14232,6 +14117,11 @@ impl EmbeddedDatabase {
                     base_tuples
                 };
                 let mut updates: Vec<(u64, Tuple, Tuple)> = Vec::new();
+                // Intra-statement UNIQUE/PK dedup state — declared before the
+                // per-row loop so a multi-row UPDATE that creates a duplicate
+                // *within itself* is caught, exactly as in the text family.
+                let mut seen_column_unique_update_keys: Vec<(String, Value)> = Vec::new();
+                let mut seen_table_unique_update_keys: Vec<(Vec<String>, Vec<Value>)> = Vec::new();
 
                 for tuple in tuples {
                     let matches = if let Some(predicate) = selection {
@@ -14307,6 +14197,20 @@ impl EmbeddedDatabase {
                         }
                         self.check_fk_constraints_on_write(table_name, &new_col_values, active_txn)?;
                         self.validate_check_constraints(&table_constraints, &schema, &tuple.values)?;
+
+                        // UNIQUE / PRIMARY KEY enforcement — the params family
+                        // ran none at all before this, so a bound-parameter
+                        // UPDATE could create a duplicate on a UNIQUE column.
+                        // Shared with the text family.
+                        self.enforce_unique_on_update(
+                            table_name,
+                            &schema,
+                            &table_constraints,
+                            &old_tuple,
+                            &tuple,
+                            &mut seen_column_unique_update_keys,
+                            &mut seen_table_unique_update_keys,
+                        )?;
 
                         let row_id = tuple.row_id.unwrap_or(0);
                         updates.push((row_id, old_tuple, tuple));
@@ -14457,6 +14361,15 @@ impl EmbeddedDatabase {
                     };
 
                     if matches {
+                        // Referencing-FK enforcement (CASCADE / SET NULL /
+                        // RESTRICT / NO ACTION). Runs BEFORE the row is queued
+                        // so a RESTRICT violation aborts the statement without
+                        // any row being staged — mirrors the text family's
+                        // ordering in `execute_in_transaction_inner`.
+                        if tuple.row_id.is_some() {
+                            self.enforce_referencing_fks_on_delete(table_name, &tuple, &schema, &catalog, active_txn)?;
+                        }
+
                         // Collect tuple for RETURNING clause before deletion
                         if has_returning {
                             if let Some(projected) = Self::project_returning_columns(&tuple, &schema, returning) {
@@ -18386,6 +18299,261 @@ impl EmbeddedDatabase {
         txn.commit()?;
 
         Ok(())
+    }
+
+    /// Enforce every *referencing* foreign key before a row is deleted.
+    ///
+    /// Shared by both DML executor families: the text family
+    /// (`execute_in_transaction_inner`, i.e. psql simple-query + MySQL wire)
+    /// and the params family (`execute_plan_with_params_inner`, i.e. the PG
+    /// extended protocol used by psycopg server-side bind / JDBC / sqlx /
+    /// Drizzle / node-postgres, plus REST/BaaS writes). Before this was
+    /// factored out only the text family ran it, so a parameterized DELETE
+    /// silently skipped `ON DELETE CASCADE` (leaving orphans), `ON DELETE
+    /// SET NULL`, and `ON DELETE RESTRICT` (permitting the delete outright).
+    ///
+    /// `active_txn` is threaded straight into `check_referencing_rows_exist`
+    /// so the FK validator merges the write-set into the base scan (covers
+    /// the "DELETE child; DELETE parent" sequence — without it the
+    /// just-tombstoned child rows are still visible to `scan_table` and raise
+    /// a phantom violation).
+    fn enforce_referencing_fks_on_delete(
+        &self,
+        table_name: &str,
+        tuple: &Tuple,
+        schema: &Schema,
+        catalog: &storage::Catalog<'_>,
+        active_txn: Option<&storage::Transaction>,
+    ) -> Result<()> {
+        // Validate FK constraints - check if any other table references this row
+        let referencing_fks = if *self.fk_validation_mode.read() == FkValidationMode::Off
+            || *self.fk_validation_source.read() == FkValidationSource::Proxy
+        {
+            Vec::new()
+        } else {
+            catalog.get_referencing_fks(table_name)?
+        };
+        for fk in &referencing_fks {
+            if fk.enforcement != sql::ConstraintEnforcement::Immediate {
+                continue;
+            }
+            // Get the referenced column values from the tuple being deleted
+            let ref_values: Vec<Value> = fk
+                .references_columns
+                .iter()
+                .map(|col_name| {
+                    schema
+                        .columns
+                        .iter()
+                        .position(|c| &c.name == col_name)
+                        .and_then(|idx| tuple.values.get(idx).cloned())
+                        .unwrap_or(Value::Null)
+                })
+                .collect();
+
+            // Check if any row in the referencing table uses these values.
+            let has_refs = self.check_referencing_rows_exist(&fk.table_name, &fk.columns, &ref_values, active_txn)?;
+            if !has_refs {
+                continue;
+            }
+            match fk.on_delete {
+                sql::constraints::ReferentialAction::NoAction | sql::constraints::ReferentialAction::Restrict => {
+                    return Err(Error::constraint_violation(format!(
+                        "Foreign key constraint '{}' violated: cannot delete row from '{}' - referenced by '{}'",
+                        fk.name, table_name, fk.table_name
+                    )));
+                }
+                sql::constraints::ReferentialAction::Cascade => {
+                    // CASCADE: Delete all referencing rows in child table
+                    self.cascade_delete_referencing_rows(&fk.table_name, &fk.columns, &ref_values)?;
+                }
+                sql::constraints::ReferentialAction::SetNull => {
+                    // SET NULL: Set FK columns to NULL in referencing rows
+                    self.set_null_referencing_rows(&fk.table_name, &fk.columns, &ref_values)?;
+                }
+                sql::constraints::ReferentialAction::SetDefault => {
+                    // SET DEFAULT is not implemented yet - treat as RESTRICT
+                    return Err(Error::constraint_violation(format!(
+                        "Foreign key constraint '{}' with SET DEFAULT action: not implemented",
+                        fk.name
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Enforce column-level and table-level UNIQUE / PRIMARY KEY constraints
+    /// for a row that is about to be updated.
+    ///
+    /// Shared by both DML executor families (see
+    /// `enforce_referencing_fks_on_delete` for what those are). Before this
+    /// was factored out only the text family ran it, so a parameterized
+    /// UPDATE could create a duplicate on a UNIQUE / PK column.
+    ///
+    /// `seen_column_keys` / `seen_table_keys` carry the intra-statement dedup
+    /// state: a multi-row UPDATE that creates a duplicate *within itself* must
+    /// still be rejected, so callers declare both vectors once before their
+    /// per-row loop and pass them in for every row.
+    ///
+    /// Self-collision: `unique_key_exists` probes an ART index that still
+    /// contains the row being updated, so every check is gated on the value
+    /// having actually *changed* (`old == new` → skip). A no-op
+    /// `SET email = <the value it already holds>` therefore does not raise.
+    fn enforce_unique_on_update(
+        &self,
+        table_name: &str,
+        schema: &Schema,
+        table_constraints: &sql::TableConstraints,
+        old_tuple: &Tuple,
+        new_tuple: &Tuple,
+        seen_column_keys: &mut Vec<(String, Value)>,
+        seen_table_keys: &mut Vec<(Vec<String>, Vec<Value>)>,
+    ) -> Result<()> {
+        for (idx, col) in schema.columns.iter().enumerate() {
+            if !col.primary_key && !col.unique {
+                continue;
+            }
+            let old_value = old_tuple.values.get(idx).unwrap_or(&Value::Null);
+            let new_value = new_tuple.values.get(idx).unwrap_or(&Value::Null);
+            if old_value == new_value {
+                continue;
+            }
+            if col.primary_key && matches!(new_value, Value::Null) {
+                return Err(Error::constraint_violation(format!(
+                    "PRIMARY KEY constraint '{}' violated: NULL value",
+                    col.name
+                )));
+            }
+            if col.unique && matches!(new_value, Value::Null) {
+                continue;
+            }
+            if seen_column_keys
+                .iter()
+                .any(|(seen_col, seen_value)| seen_col == &col.name && seen_value == new_value)
+            {
+                return Err(Error::constraint_violation(format!(
+                    "UNIQUE constraint violated: duplicate value for column '{}'",
+                    col.name
+                )));
+            }
+            let columns = [col.name.clone()];
+            if self
+                .storage
+                .art_indexes()
+                .unique_key_exists(table_name, &columns, std::slice::from_ref(new_value))
+            {
+                return Err(Error::constraint_violation(format!(
+                    "UNIQUE constraint violated: duplicate value for column '{}'",
+                    col.name
+                )));
+            }
+            seen_column_keys.push((col.name.clone(), new_value.clone()));
+        }
+
+        for unique in &table_constraints.unique_constraints {
+            let mut old_values = Vec::with_capacity(unique.columns.len());
+            let mut new_values = Vec::with_capacity(unique.columns.len());
+            let mut changed = false;
+            let mut has_null = false;
+            for col_name in &unique.columns {
+                let Some(idx) = schema.get_column_index(col_name) else {
+                    continue;
+                };
+                let old_value = old_tuple.values.get(idx).cloned().unwrap_or(Value::Null);
+                let new_value = new_tuple.values.get(idx).cloned().unwrap_or(Value::Null);
+                if old_value != new_value {
+                    changed = true;
+                }
+                if matches!(new_value, Value::Null) {
+                    has_null = true;
+                }
+                old_values.push(old_value);
+                new_values.push(new_value);
+            }
+            if !changed {
+                continue;
+            }
+            if unique.is_primary_key && has_null {
+                return Err(Error::constraint_violation(format!(
+                    "PRIMARY KEY constraint '{}' violated: NULL value",
+                    unique.name
+                )));
+            }
+            if !unique.is_primary_key && has_null {
+                continue;
+            }
+            if old_values.len() == unique.columns.len() && new_values.len() == unique.columns.len() {
+                if seen_table_keys
+                    .iter()
+                    .any(|(seen_cols, seen_values)| seen_cols == &unique.columns && seen_values == &new_values)
+                {
+                    return Err(Error::constraint_violation(format!(
+                        "UNIQUE constraint '{}' violated: duplicate value for columns ({})",
+                        unique.name,
+                        unique.columns.join(", ")
+                    )));
+                }
+                if self
+                    .storage
+                    .art_indexes()
+                    .unique_key_exists(table_name, &unique.columns, &new_values)
+                {
+                    return Err(Error::constraint_violation(format!(
+                        "UNIQUE constraint '{}' violated: duplicate value for columns ({})",
+                        unique.name,
+                        unique.columns.join(", ")
+                    )));
+                }
+                seen_table_keys.push((unique.columns.clone(), new_values));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Re-validate the post-update row produced by
+    /// `INSERT ... ON CONFLICT ... DO UPDATE SET ...`.
+    ///
+    /// The DO UPDATE assignment loop mutates an already-persisted row, so the
+    /// result must satisfy the same constraints an ordinary UPDATE would.
+    /// Both executor families used to skip most of this: the text family
+    /// validated nothing at all (a `CHECK (qty > 0)` column happily accepted
+    /// `DO UPDATE SET qty = -99`), the params family validated only CHECK.
+    ///
+    /// NOT NULL is deliberately *not* checked here: neither general UPDATE arm
+    /// checks it either, and this helper's contract is parity with UPDATE, not
+    /// a new rule for one statement type.
+    fn validate_on_conflict_updated_row(
+        &self,
+        table_name: &str,
+        schema: &Schema,
+        table_constraints: &sql::TableConstraints,
+        old_tuple: &Tuple,
+        updated_tuple: &Tuple,
+        active_txn: Option<&storage::Transaction>,
+    ) -> Result<()> {
+        let mut new_col_values = std::collections::HashMap::with_capacity(schema.columns.len());
+        for (i, col) in schema.columns.iter().enumerate() {
+            if let Some(v) = updated_tuple.values.get(i) {
+                new_col_values.insert(col.name.clone(), v.clone());
+            }
+        }
+        self.check_fk_constraints_on_write(table_name, &new_col_values, active_txn)?;
+        self.validate_check_constraints(table_constraints, schema, &updated_tuple.values)?;
+        // ON CONFLICT handles one conflicting row at a time, so the
+        // intra-statement dedup state starts empty for every conflicting row.
+        let mut seen_column_keys: Vec<(String, Value)> = Vec::new();
+        let mut seen_table_keys: Vec<(Vec<String>, Vec<Value>)> = Vec::new();
+        self.enforce_unique_on_update(
+            table_name,
+            schema,
+            table_constraints,
+            old_tuple,
+            updated_tuple,
+            &mut seen_column_keys,
+            &mut seen_table_keys,
+        )
     }
 
     /// Evaluate a CHECK constraint expression against a row's values
