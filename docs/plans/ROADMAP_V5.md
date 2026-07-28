@@ -519,37 +519,63 @@ fallback, or document the move loudly — an existing deployment's replication W
 appear to vanish on upgrade. **Interface coverage (CLAUDE.md gate 5) currently fails for this
 parameter**, which is itself the reason to fix it.
 
-### 2.8 `ha_integration` hangs on this class of host — **found 2026-07-28**
+### 2.8 `WalStore::init()` hangs forever on a torn WAL segment — **CORRECTED AND UPGRADED 2026-07-28**
 
-**Status:** open, **blocks a mandatory gate**. **Effort: investigation first.** Verified on
-unmodified v4.7.0 (`7649a39`), i.e. not caused by any in-flight change.
+**Status:** open. **Severity: high — a primary that is killed mid-segment-write does not restart.**
+**Effort: small** (bound the segment scan and treat a short/!invalid trailing record as end-of-segment,
+which is what every WAL reader must already assume). Isolated to a single file by bisection.
 
-`cargo test --features ha-tier1 --test ha_integration` runs 30 tests green and then hangs
-indefinitely (killed at the runner's timeout) on WAL-store/streaming tests. Observed hangs:
-`ha_tests::cluster_tests::test_wal_entry_broadcasting`, `::test_wal_store_batch_streaming`,
-`::test_streaming_server_creation`, plus several in `ha_tests::streaming_tests`.
+**This entry originally read "`ha_integration` hangs on this class of host" and was wrong.** It was
+filed from single-target runs and generalised into a property of the host. The real cause is a
+single malformed WAL segment, and the real defect is in the engine, not the test harness. The
+correction matters because the original framing invited exactly the wrong response — adding a skip.
 
-Two things make this more than an annoyance:
-- **The documented skip does not cover it.** `CLAUDE.md` sanctions skipping
-  `ha_tests::streaming_tests`, but three of the hanging tests live in `cluster_tests`.
-- **`CLAUDE.md` mandates this suite for HA-touching changes** (`src/storage/wal.rs`,
-  `src/replication/`, …). §1.8's fix is the most HA-touching change in the project's recent
-  history and **cannot satisfy its own required gate** on this host. That is a gate integrity
-  problem, not just a flake.
+**Isolation, by bisection on the same test binary:**
 
-Ruled out: port contention (`test_server_config` binds `127.0.0.1:0`, kernel-assigned) and
-segment-loading volume (`data/wal` holds 29 files / 464 KB). The test bodies themselves are
-trivial — `test_wal_entry_broadcasting` only inits a `WalStore`, constructs a `StreamingServer`,
-and asserts `standby_count() == 0` — so the hang is inside `WalStore::init()` or
-`StreamingServer::new`, plausibly a `#[tokio::test]` current-thread runtime interacting badly with
-blocking filesystem work, and/or contention between parallel tests all sharing the single
-`./data/wal` directory from §2.7. **Not root-caused; do not assume the above.**
+| `./data/wal` contents | Result |
+|---|---|
+| absent (clean working directory) | **33 passed, 0 failed, 1.48s** |
+| all 29 segments from the repo's `data/wal` | hangs indefinitely, killed at timeout |
+| the same 29 **minus `segment_000032.wal`** | **33 passed, 0 failed, 1.74s** |
 
-**Why it matters beyond CI convenience:** these are the only tests that exercise primary→standby
-WAL streaming end to end. While they do not run, §1.8-class replication defects have no automated
-detection at all — which is a plausible part of why §1.8 survived as long as it did.
+`segment_000032.wal` is 129,073 bytes; every other segment in that directory is ~3 KB. It was
+produced by a test run that was SIGTERMed mid-write, so its trailing record is torn.
+
+**Why this is a production defect and not test detritus.** `WalStore::init()`
+(`src/replication/wal_store.rs:193`) scans `wal_dir` and calls `load_segment_metadata` /
+`load_segment_entries` on every `.wal` file it finds. Given a segment whose final record is
+truncated, that scan does not error and does not stop — it hangs. **A torn trailing record is the
+normal, expected state of a write-ahead log after any unclean shutdown.** That is the entire premise
+of a WAL. So:
+
+- A primary killed by SIGKILL, OOM, or power loss mid-segment-write **will hang on startup**, with
+  no error and no log line, forever.
+- v4.7.0's SIGTERM handler reduces how often this is reached but cannot eliminate it — SIGKILL, OOM
+  and power loss still tear segments.
+- Combined with §2.7 (the directory is CWD-relative and unconfigurable), an operator would have a
+  primary that will not start and no documented place to look for the cause.
+
+**Fix shape:** `load_segment_entries` must treat a truncated or checksum-failing trailing record as
+end-of-segment — recover the records before it, log a warning naming the file and offset, and
+continue. It must also bound its read loop so a malformed length prefix cannot spin. A WAL reader
+that cannot survive its own torn tail has the failure mode inverted: it is strictest exactly when
+recovery matters most. Consider truncating the segment to the last valid record on open, as
+mainstream WAL implementations do.
+
+**Gate:** a unit test that writes a segment, truncates it mid-record, and asserts `init()` returns
+promptly having recovered the intact prefix — plus the same for a corrupted checksum and for a
+zero-length file.
+
+**Operational note for this repo, 2026-07-28:** `data/wal/segment_000032.wal` in the working tree is
+currently torn, which makes `cargo test --tests` from the repo root hang for everyone until it is
+removed. `CLAUDE.md` forbids this session from touching `data/`, so it has been left in place and is
+flagged here instead. Removing that one file restores the suite; the directory is gitignored and
+holds no production data. Until then, the HA tests can be run non-destructively by executing the
+test binary from any other working directory, since §2.7 makes `wal_dir` CWD-relative.
 
 ---
+
+## Section 3 — Do not touch---
 
 ## Section 3 — Do not touch
 
