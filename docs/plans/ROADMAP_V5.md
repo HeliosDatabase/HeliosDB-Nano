@@ -232,45 +232,79 @@ parameter and the ART lookup needs to resolve to a row id it can compare against
 boolean "does this value exist." Gate: `constraint_parity_tests` + a same-statement key-swap /
 2-cycle regression case.
 
-### 1.8 Writes inside an explicit transaction may never reach the logical WAL — **UNVERIFIED LEAD, investigate before anything else in Section 1**
+### 1.8 Writes inside an explicit transaction never reach the logical WAL — **CONFIRMED 2026-07-28**
 
-**Status:** open, **unverified**. Potentially the highest-severity item in this document if it
-confirms; a non-issue if the two WAL stores turn out to be distinct. **Effort: investigation
-first (small), then unknown.** Do not schedule a fix until the question below is answered.
+**Status:** open, **CONFIRMED by code trace and by direct measurement.** This is the
+highest-severity item in this document: it silently breaks HA replication for the majority of
+real write traffic. **Effort: substantial** (needs a transactional logical-WAL design, not a
+one-line gate change).
 
-This surfaced while designing the 1.2 cascade fix and has *not* been run to ground. Recording the
-evidence and the disproof condition rather than the conclusion.
+Filed on 2026-07-27 as an unverified lead; verified 2026-07-28. The original disproof condition
+was "the replication `WalEntry` stream might be a physically separate log fed from RocksDB." It
+is not. Both halves of the chain are now established.
 
-**What is established:**
+**The mechanism, end to end:**
 
-- Every logical-WAL append in the DML paths is gated behind `!skip_fast_paths` — `src/lib.rs:3915`
-  (insert), `:4060` (insert), `:4815` (update), `:5060` (delete).
-- `skip_fast_paths == true` means "inside an explicit or session transaction". Confirmed by the
-  comment at `src/lib.rs:3433`–`3437`: *"Only on the autocommit-implicit path
-  (`!skip_fast_paths`): explicit/session transactions commit outside any scope."*
-- `src/storage/transaction.rs` contains **zero** references to `log_data_*`, `logical_wal`, or
-  `wal()`. `commit()` (`:1105`) delegates to `commit_with_timestamp` (`:637`); neither emits a
-  logical-WAL entry.
-- Therefore: a row written inside `BEGIN … COMMIT` appears to produce **no logical-WAL record at
-  all**, at any point.
-- Physical durability on the primary is unaffected — that comes from the RocksDB WriteBatch at
-  commit, per the comment at `src/lib.rs:4808`–`4814`.
-- Replication consumes logical entries: `src/replication/logical_replication.rs:521`–`526`
-  decodes `WalEntryType::Insert|Update|Delete` into `ChangeEvent`s for the standby.
+1. Every logical-WAL append in the DML paths is gated behind `!skip_fast_paths` —
+   `src/lib.rs:3915` (insert), `:4060` (insert), `:4815` (update), `:5060` (delete).
+   `skip_fast_paths == true` means "inside an explicit or session transaction", per the comment
+   at `src/lib.rs:3433`-`3437`.
+2. Transaction commit does not compensate. `Transaction::commit_with_timestamp`
+   (`src/storage/transaction.rs:637`) builds a `rocksdb::WriteBatch` and writes it *directly*
+   via `self.db.write_opt(batch, ...)` / `self.db.write(batch)` (`:886`-`:902`), bypassing
+   `StorageEngine::put`/`delete` — and therefore bypassing `wal.append()` — entirely.
+   `transaction.rs` contains no reference to `log_data_*`, `logical_wal`, or `wal()`.
+3. `wal.append()` is the **sole replication broadcast point**: `WalLog::append`
+   (`src/storage/wal.rs:475`) calls `broadcast_after_append` (`:486`), which calls
+   `ha_state().broadcast_wal_operation(lsn, operation)` (`:498`) and then honours the
+   sync/semi-sync ACK wait (`:510`). `append_nosync` deliberately broadcasts too (`:541`-`:543`,
+   "the nosync path only skips the local fsync — it must NOT skip replication"), which shows the
+   invariant was consciously maintained on that path and simply never considered for the
+   explicit-transaction path.
+4. Therefore a row written inside `BEGIN … COMMIT` produces no `WalOperation`, no LSN, and no
+   broadcast. The standby never hears about it.
 
-**The open question that resolves this:** is the `WalEntry` stream consumed by
-`src/replication/wal_replicator.rs` / `wal_store.rs` the *same* store that `log_data_*` writes to
-in `src/storage/wal.rs`, or a physically separate replication log fed from RocksDB? If the same:
-**a standby silently diverges from its primary for every write made inside an explicit
-transaction** — which is most writes from any ORM or any client using `BEGIN`. If separate, this
-item is void and should be deleted.
+**Measured, not just reasoned.** A probe using the existing `wal_entries_for_tests()` harness,
+counting `WalOperation` entries for one table with `wal_enabled = true` and
+`logical_wal_per_statement = true`:
 
-**How to answer it:** trace the write side of `wal_store.rs` back to its producer and compare
-against `storage::wal`'s file/keyspace. This is a half-day read, no benchmarking required.
+```
+baseline (after DDL only):        insert=0 update=0 delete=0
+after AUTOCOMMIT insert/update/delete:   delta 1 / 1 / 1
+after EXPLICIT TXN insert/update/delete: delta 0 / 0 / 0
+committed-txn row visible in table:      true
+explicit-txn INSERT alone:               insert delta = 0
+```
 
-**Why it is ranked here despite being unverified:** the failure mode is silent, affects HA
-correctness rather than a single query, and the cost of *checking* is trivial compared to the cost
-of shipping more HA work on a false premise. If it confirms, it outranks 1.1.
+The committed transaction's data is present and queryable locally, and emits zero logical-WAL
+records. (The probe was temporary and has been reverted; re-create it from this snippet.)
+
+**Blast radius.** Local durability is NOT affected — that comes from the RocksDB WriteBatch,
+synced per `sync_commit`/group-commit config. What is affected is everything fed by the logical
+WAL: Tier-1 warm-standby replication, logical replication / CDC (`ChangeEvent` decoding at
+`src/replication/logical_replication.rs:521`-`526`), and any consumer of the WAL entry stream.
+A primary and its standby silently diverge for **every write issued inside an explicit
+transaction** — which is most writes from any ORM, any `BEGIN`-wrapping client, and any
+multi-statement unit of work. Nothing errors; the standby simply never receives the data. Worse,
+sync/semi-sync mode gives false assurance: `wait_for_sync` is only reached from `append`, so a
+transaction that broadcasts nothing also waits for nothing and returns "acknowledged".
+
+**Why this was not caught:** autocommit single statements — what most tests and every benchmark
+issue — take the `!skip_fast_paths` branch and replicate correctly. The bug is invisible unless a
+test wraps writes in `BEGIN`/`COMMIT` *and* asserts on standby or WAL state. No such test exists.
+
+**Fix shape (needs design, do not start blind):** the logical WAL needs transaction awareness —
+buffer the per-row operations on the `Transaction` and emit them at commit (ideally bracketed by
+Begin/Commit markers so the standby can apply them atomically), or have the commit path replay
+the write set into `wal.append()` before/with the batch write. Note the roadmap's own finding
+that no Begin/Commit/Abort marker mechanism currently exists in the logical WAL — adding one is
+likely part of this work. Ordering against the RocksDB batch write matters for crash-vs-replica
+consistency and must be reasoned about explicitly, not assumed.
+
+**Gate:** a new test asserting WAL/broadcast parity between an autocommit statement and the same
+statement inside a transaction; `ha_integration` under `--features ha-tier1`; and a
+primary/standby convergence test that writes inside `BEGIN`. Per `CLAUDE.md`, HA-touching changes
+additionally require `cargo test --features ha-tier1 --test ha_integration`.
 
 ---
 
@@ -599,15 +633,20 @@ tagged version is already correct; only the publish step is failing.
 
 ### v4.7 — Transaction- and session-boundary correctness
 
-**Contents:** 1.2 (CASCADE/SET NULL escape transaction) · 1.3 (Drop ordering) · **1.8
-(logical-WAL-in-explicit-transaction investigation — do this FIRST)** · 2.4 (SIGTERM handler) ·
-2.3 (five session-unscoped globals) · 2.6 (doc fix, ships immediately regardless).
+**Contents:** ~~1.2 (CASCADE/SET NULL escape transaction)~~ · ~~1.3 (Drop ordering)~~ ·
+~~2.4 (SIGTERM handler)~~ — **all three shipped in v4.7.0 (`1c0eaf5`)**, along with an unlisted
+fourth fix (the detached HTTP task pinning `Arc<EmbeddedDatabase>`, without which 1.3 and 2.4
+were inert under the default `--http-port 8080`).
 
-**1.8 is sequenced ahead of the rest of this milestone** even though it is unverified: it asks
-whether an explicit transaction boundary is *also* a replication blind spot, which is the same
-question as 1.2 and 2.3 one layer down. It is a half-day read with no benchmarking, and if it
-confirms it re-ranks the entire document — so it is cheaper to answer now than to schedule more
-transaction work on an unknown premise.
+**Still open in this milestone:** 2.3 (five session-unscoped globals) · 2.6 (doc fix, ships
+immediately regardless).
+
+**1.8 has been promoted OUT of this milestone.** It was listed here as an investigation to run
+first; it was run on 2026-07-28 and **confirmed**. It is no longer a half-day read — it is a
+substantial design task (transaction-aware logical WAL, probably including Begin/Commit markers
+that do not exist today), and it is now the highest-severity open item in this document. It
+should lead v4.8 rather than trail v4.7, and it must not be bundled with unrelated work. See
+§1.8 for the measured evidence.
 
 **Rationale:** every item here is about the same question — *what does a transaction or session
 boundary actually isolate?* — and they share failure surface: 1.2 and 1.3 are already in flight
@@ -624,13 +663,23 @@ to record it's in scope.
 `savepoint_hardening_tests` + a new SIGTERM-vs-SIGINT parity smoke test + a new
 concurrent-session savepoint/deferred-constraint isolation test.
 
-### v4.8 — Write-path constraint and security parity
+### v4.8 — Replication integrity, then write-path constraint and security parity
 
-**Contents:** 1.1 (RLS not enforced on writes) · 1.5 (NOT NULL bypass on UPDATE/upsert) · 1.7
+**Contents:** **1.8 (explicit transactions emit no logical-WAL records — leads this milestone)** ·
+1.1 (RLS not enforced on writes) · 1.5 (NOT NULL bypass on UPDATE/upsert) · 1.7
 (UNIQUE self-collision false positive) · 2.5 (parameterized INSERT...SELECT) · 1.6
 (`purge_table_data` defense-in-depth).
 
-**Rationale:** 1.1 is the single highest-impact item in this document and deserves its own
+**On sequencing 1.8 first:** it is now the highest-severity confirmed item in this document, and
+unlike 1.1 it has no workaround available to a user — an operator cannot avoid it by configuration
+or by careful SQL, because wrapping writes in a transaction is the *correct* thing for a client to
+do. It also has a false-assurance property that 1.1 lacks: synchronous replication mode reports
+success for transactions it never shipped, because `wait_for_sync` is only reachable from the
+`append` path that a transaction never takes. An operator running sync replication today believes
+they have a guarantee they do not have. If capacity forces a split, 1.8 should ship alone and the
+constraint items slide to v4.9.
+
+**Rationale for the rest:** 1.1 is the highest-impact item on the *query* surface and deserves its own
 focused milestone with dedicated adversarial review (per the merge-validation skill's two
 independent reviewer passes) rather than being bundled with unrelated work — this is a security
 boundary, not just a correctness bug. Its fix pattern (shared validation helper called from both
@@ -676,9 +725,9 @@ wheel actually reaches users on release day).
 **Release criteria (explicit):**
 1. Every item in Sections 1 and 2 of this document is either shipped and gate-verified, or has
    an explicit, written decision in this file to defer it past v5.0 with a stated reason — no
-   silent drops. Item 1.8 additionally must have been *resolved as a question* — confirmed and
-   fixed, or disproved and deleted from this file. An unverified lead of that severity may not
-   still be open at a v5.0 tag.
+   silent drops. Item 1.8 is confirmed as of 2026-07-28 and is a **hard blocker**: v5.0 must not
+   be tagged while explicit transactions are invisible to the logical WAL, because every HA and
+   CDC claim the project makes is false for transactional write traffic until it is fixed.
 2. Section 3 (branch GC) remains disarmed, unchanged, and re-verified inert (`run_gc` /
    `gc_eligible_branches` still have zero non-test callers) at v5.0 tag time, unless a dedicated
    design (not part of this roadmap) fixes the encoding disagreement first.
