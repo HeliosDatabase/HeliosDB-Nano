@@ -1,9 +1,16 @@
 # HeliosDB-Nano — Roadmap to v5.0
 
-**Status:** draft, 2026-07-27. **Current release:** v4.6.3 (`208611d`, crates.io + `gh release
-list` confirmed latest). **Scope:** every known outstanding item as of this date, sequenced into
-milestones. **v5.0 ships when this roadmap is empty** — no item deferred without an explicit
+**Status:** living document. Created 2026-07-27, last updated 2026-07-28. **Current release:**
+v4.7.0 (`7649a39`, crates.io verified live). **Scope:** every known outstanding item, sequenced
+into milestones. **v5.0 ships when this roadmap is empty** — no item deferred without an explicit
 decision recorded in this file.
+
+**Changes since creation:** §1.2, §1.3 and §2.4 shipped in v4.7.0 (plus an unlisted fourth fix —
+the detached HTTP task pinning `Arc<EmbeddedDatabase>`, without which the other two were inert
+under the default `--http-port 8080`). §1.8 was promoted from unverified lead to **confirmed**
+and now leads v4.8 as a hard blocker on the v5.0 tag. §2.7 and §2.8 were found while gating
+v4.7.0 and added. One claim in §1.8 was **corrected** — see the correction notice in that
+section.
 
 ## How this document was built
 
@@ -294,12 +301,33 @@ issue — take the `!skip_fast_paths` branch and replicate correctly. The bug is
 test wraps writes in `BEGIN`/`COMMIT` *and* asserts on standby or WAL state. No such test exists.
 
 **Fix shape (needs design, do not start blind):** the logical WAL needs transaction awareness —
-buffer the per-row operations on the `Transaction` and emit them at commit (ideally bracketed by
-Begin/Commit markers so the standby can apply them atomically), or have the commit path replay
-the write set into `wal.append()` before/with the batch write. Note the roadmap's own finding
-that no Begin/Commit/Abort marker mechanism currently exists in the logical WAL — adding one is
-likely part of this work. Ordering against the RocksDB batch write matters for crash-vs-replica
-consistency and must be reasoned about explicitly, not assumed.
+emit the transaction's operations at commit, either by buffering them per-statement or by
+replaying `write_set`/`insert_log` into the WAL at commit time. Ordering against the RocksDB
+batch write matters for crash-vs-replica consistency and must be reasoned about explicitly, not
+assumed.
+
+**CORRECTION (2026-07-28):** an earlier revision of this entry claimed no `Begin`/`Commit`/`Abort`
+marker mechanism exists and that adding one was likely part of this work. **That was wrong.**
+`WalOperation::Begin { tx_id }` / `Commit { tx_id }` / `Abort { tx_id }` exist at
+`src/storage/wal.rs:124`-`128`, with replay handling in `src/storage/engine.rs` (`:9757`, `:10189`,
+`:10372`) and HA classification in `src/replication/ha_state.rs:574`-`576` mapping them to
+`WalEntryType::TxBegin`/`TxCommit`/`TxRollback`. What is missing is any **producer**: a
+tree-wide search finds zero production constructors — the only site that ever builds one is
+`tests/wal_crash_recovery_tests.rs:298`. The markers are fully specified, fully handled on the
+consuming side, and never emitted.
+
+Two consequences. First, emitting them is **mixed-version safe** — the variants already occupy
+fixed bincode indices, so an older standby deserializes them and routes them through existing
+handling rather than failing. Second, emitting them is nonetheless of limited value in this
+change: the standby's apply loop treats them as inert, so without also teaching the consumer to
+buffer-and-apply atomically they are cosmetic. Recommendation: do not emit markers here; treat
+atomic standby apply as a separate follow-up that would use them.
+
+This is the third instance in this codebase of *machinery that exists, is wired on the consuming
+side, and has no producer or caller* — alongside RLS write enforcement (§1.1, `execute_internal`
+has zero callers) and trigger loading (§2.2, `load_triggers()` has zero callers). Worth treating
+as a review heuristic: when a feature looks implemented, grep for who **calls** it, not just
+whether it exists.
 
 **Gate:** a new test asserting WAL/broadcast parity between an autocommit statement and the same
 statement inside a transaction; `ha_integration` under `--features ha-tier1`; and a
@@ -457,6 +485,69 @@ immediately, independent of any enclosing `BEGIN`), and that schema changes insi
 transaction should be treated as already-applied even on `ROLLBACK`. This doc fix has no code
 dependency and should ship immediately, independent of milestone sequencing — it's actively
 telling users something false about data-loss-adjacent behavior today.
+
+### 2.7 Replication WAL directory is CWD-relative and unconfigurable — **found 2026-07-28**
+
+**Status:** open. **Effort: small** (plumb a config/CLI parameter; the harder half is choosing a
+migration-safe default). Verified.
+
+`WalStoreConfig::default()` sets `wal_dir: PathBuf::from("./data/wal")` — a **relative** path
+(`src/replication/wal_store.rs:84`). `src/main.rs:1640`, in the `"primary"` role branch, constructs
+the replication WAL store with exactly that default, and a tree-wide search finds **no site that
+ever sets `wal_dir` from `config.toml` or any CLI flag** — the field is unreachable from user
+configuration.
+
+Consequences on a real primary:
+- The replication WAL lands wherever the server's **current working directory** happens to point.
+  Started from `/` (the systemd default) it writes `/data/wal`; started from a home directory it
+  writes there instead.
+- `--data-dir` does **not** govern it, which is precisely where an operator would expect it to live
+  and where they would look for it.
+- Two primaries launched from the same working directory silently share one replication WAL
+  directory.
+- `init()` (`:193`) calls `create_dir_all` on that path, so the directory is created wherever the
+  process happens to be — this is a write, not just a read.
+
+This also has a test-hygiene consequence that bit this session: the HA test suite uses
+`WalStoreConfig::default()`, so running `ha_integration` from the repo root writes into the repo's
+own `data/` directory — the one `CLAUDE.md` forbids touching. Any fix here should also give the
+tests an isolated directory.
+
+**Fix shape:** add `wal_dir` to the replication config section and a matching CLI flag, defaulting
+to a path derived from `--data-dir` rather than the process CWD. Preserve the old location as a
+fallback, or document the move loudly — an existing deployment's replication WAL would otherwise
+appear to vanish on upgrade. **Interface coverage (CLAUDE.md gate 5) currently fails for this
+parameter**, which is itself the reason to fix it.
+
+### 2.8 `ha_integration` hangs on this class of host — **found 2026-07-28**
+
+**Status:** open, **blocks a mandatory gate**. **Effort: investigation first.** Verified on
+unmodified v4.7.0 (`7649a39`), i.e. not caused by any in-flight change.
+
+`cargo test --features ha-tier1 --test ha_integration` runs 30 tests green and then hangs
+indefinitely (killed at the runner's timeout) on WAL-store/streaming tests. Observed hangs:
+`ha_tests::cluster_tests::test_wal_entry_broadcasting`, `::test_wal_store_batch_streaming`,
+`::test_streaming_server_creation`, plus several in `ha_tests::streaming_tests`.
+
+Two things make this more than an annoyance:
+- **The documented skip does not cover it.** `CLAUDE.md` sanctions skipping
+  `ha_tests::streaming_tests`, but three of the hanging tests live in `cluster_tests`.
+- **`CLAUDE.md` mandates this suite for HA-touching changes** (`src/storage/wal.rs`,
+  `src/replication/`, …). §1.8's fix is the most HA-touching change in the project's recent
+  history and **cannot satisfy its own required gate** on this host. That is a gate integrity
+  problem, not just a flake.
+
+Ruled out: port contention (`test_server_config` binds `127.0.0.1:0`, kernel-assigned) and
+segment-loading volume (`data/wal` holds 29 files / 464 KB). The test bodies themselves are
+trivial — `test_wal_entry_broadcasting` only inits a `WalStore`, constructs a `StreamingServer`,
+and asserts `standby_count() == 0` — so the hang is inside `WalStore::init()` or
+`StreamingServer::new`, plausibly a `#[tokio::test]` current-thread runtime interacting badly with
+blocking filesystem work, and/or contention between parallel tests all sharing the single
+`./data/wal` directory from §2.7. **Not root-caused; do not assume the above.**
+
+**Why it matters beyond CI convenience:** these are the only tests that exercise primary→standby
+WAL streaming end to end. While they do not run, §1.8-class replication defects have no automated
+detection at all — which is a plausible part of why §1.8 survived as long as it did.
 
 ---
 
@@ -643,8 +734,8 @@ immediately regardless).
 
 **1.8 has been promoted OUT of this milestone.** It was listed here as an investigation to run
 first; it was run on 2026-07-28 and **confirmed**. It is no longer a half-day read — it is a
-substantial design task (transaction-aware logical WAL, probably including Begin/Commit markers
-that do not exist today), and it is now the highest-severity open item in this document. It
+substantial design task (transaction-aware logical WAL), and it is now the highest-severity open
+item in this document. It
 should lead v4.8 rather than trail v4.7, and it must not be bundled with unrelated work. See
 §1.8 for the measured evidence.
 
