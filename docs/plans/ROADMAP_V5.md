@@ -71,6 +71,64 @@ tenant's rows, which is exactly the false confidence that makes this dangerous: 
 correctly isolated while writes are not. A tenant's application bug (or a malicious actor with
 any write access) can create, modify, or delete another tenant's rows outright.
 
+**CORRECTION (2026-07-29) — the blast radius above is wrong, and the direction matters.** The
+claim that "every INSERT/UPDATE/DELETE through psql, MySQL, the embedded API, the extended protocol,
+or `/rest/v1/` bypasses RLS" overstates the *wire* exposure and understates a different problem.
+Verified at `f2c0e29`:
+
+- **`set_current_context` has exactly ONE production caller tree-wide** — `src/repl/commands.rs:3522`.
+  Every other call site is a test. No protocol handler, no HTTP handler, no wire path ever sets a
+  tenant context.
+- Therefore over psql / MySQL / `/rest/v1/`, `get_current_context()` is always `None`,
+  `should_apply_rls` always returns false, and **RLS does nothing at all — reads included.** There is
+  no cross-tenant write vulnerability over the network, because there is no RLS over the network.
+- The write bypass is real and live, but reachable via the **embedded API and the REPL** — which is
+  how it was demonstrated (see below).
+- Separately: `current_context` is a single **process-wide** `Arc<RwLock<Option<TenantContext>>>`
+  (`src/tenant/mod.rs:758`), not session-scoped. So naively wiring it to the wire would make one
+  session's tenant context apply to every concurrent session — a worse bug than the one being fixed.
+  **Wiring RLS to the wire is therefore blocked on session-scoping this global** (related: §2.3).
+
+So the honest statement is two defects, not one: *the write paths do not enforce RLS* (this item), and
+*the multi-tenancy feature is inert over every network protocol* (new, file separately). Fixing the
+first does not make RLS safe for concurrent wire serving.
+
+**Demonstrated live** (embedded API, policy `owner = 'alice'` with `RLSCommand::All`, tenant context
+set, `should_apply_rls` true for all four commands):
+
+```
+SELECT sees 1 row(s)                    (policy-correct = 1)   correct
+UPDATE bob's row -> 1 row affected      (policy-correct = 0)   BYPASS
+INSERT violating WITH CHECK -> Ok(1)    (policy-correct = Err) BYPASS
+DELETE bob's row -> 1 row affected      (policy-correct = 0)   BYPASS
+final table: alice's row + mallory's row; bob's row deleted
+```
+
+A session that could *see* exactly one row deleted a row it could not see. The read path being
+correct is what makes this dangerous — an operator verifying isolation with `SELECT` gets a clean
+result.
+
+**WHY IT SHIPPED — the RLS test suite cannot fail on this bug.** `tests/multi_tenancy_integration.rs`
+has tests named for exactly this scenario, and they assert nothing:
+
+```rust
+// Try to update Tenant B's data (should fail - RLS blocks it)
+let result = db.execute("UPDATE sales SET amount = 1600 WHERE id = 2");
+println!("✓ UPDATE affected 0 rows for Tenant B's data (RLS protected)");
+```
+
+`result` is bound, never asserted on, and shadowed by the next `let result` so no unused-variable
+warning fires — then the test prints a success checkmark unconditionally. The DELETE case
+(`:354`-`355`) is identical. `tests/multi_tenancy_tests.rs` barely touches `EmbeddedDatabase` at all.
+**A test that prints a checkmark instead of asserting is worse than no test: it manufactures
+documented confidence in a property nobody verified.** Hardening these two files is part of this
+item's scope, not optional cleanup.
+
+**Also found, filed separately:** with a policy on `owner`, `SELECT id FROM docs` fails with
+"Column 'owner' not found in schema" — the injected RLS `Filter` references a column the projection
+excludes (`SELECT *` works). Fails closed, so availability not security, but RLS-enabled tables
+reject ordinary projections, which is plausibly why this surface saw so little real use.
+
 **Fix shape:** move (or duplicate, verified identical) the `should_apply_rls` /
 `get_rls_conditions` / `WITH CHECK` / `USING` evaluation blocks from the dead `execute_internal`
 arms into the live generic INSERT/UPDATE/DELETE handling inside both
