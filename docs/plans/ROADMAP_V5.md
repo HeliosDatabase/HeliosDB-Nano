@@ -239,12 +239,16 @@ parameter and the ART lookup needs to resolve to a row id it can compare against
 boolean "does this value exist." Gate: `constraint_parity_tests` + a same-statement key-swap /
 2-cycle regression case.
 
-### 1.8 Writes inside an explicit transaction never reach the logical WAL — **CONFIRMED 2026-07-28**
+### 1.8 Writes inside an explicit transaction never reach the logical WAL — **SHIPPED in v4.8.0 (`563a084`)**
 
-**Status:** open, **CONFIRMED by code trace and by direct measurement.** This is the
-highest-severity item in this document: it silently breaks HA replication for the majority of
-real write traffic. **Effort: substantial** (needs a transactional logical-WAL design, not a
-one-line gate change).
+**Status:** FIXED and shipped in v4.8.0 (`563a084`). `commit_with_timestamp` now collects the
+transaction's operations from `write_set`/`insert_log` and emits them through a new
+`WriteAheadLog::append_batch` before the RocksDB batch write — one batch, one broadcast, one
+sync-wait. Verified by 13 unit tests including autocommit-vs-transaction parity and an
+end-to-end convergence test, plus `ha_integration` 33/0 and a dedicated sync-ACK target.
+
+**No longer a v5.0 blocker.** Retained here for the mechanism write-up and because the
+follow-ups below are still open.
 
 Filed on 2026-07-27 as an unverified lead; verified 2026-07-28. The original disproof condition
 was "the replication `WalEntry` stream might be a physically separate log fed from RocksDB." It
