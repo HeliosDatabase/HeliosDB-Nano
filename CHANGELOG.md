@@ -5,6 +5,52 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.8.0] - 2026-07-29
+
+Replication integrity. If you run HA replication or consume the logical WAL,
+read this entry before upgrading.
+
+- **Fix (replication, pre-existing):** writes made inside an explicit or session
+  transaction produced **no logical-WAL records at all**, and were therefore
+  never sent to standbys. A primary and its standby silently diverged for every
+  write issued inside `BEGIN … COMMIT` — which is most writes from any ORM or
+  any client that groups work into transactions. Nothing errored; the standby
+  simply never received the data. Plain autocommit statements were unaffected,
+  which is why this went unnoticed: the failure depended on how a client framed
+  its writes, not on what it wrote.
+
+  Local durability was never affected — committed data was always written and
+  visible on the primary. What was lost was everything downstream of the logical
+  WAL: warm-standby replication and logical replication/CDC.
+
+- **Fix (replication, pre-existing):** synchronous and semi-synchronous
+  replication reported success for transactions it had never shipped. The
+  acknowledgement wait was only reachable from the per-statement path, so a
+  transaction that broadcast nothing also waited for nothing and returned
+  "acknowledged". Anyone running `sync_mode` other than async held a guarantee
+  that did not exist for transactional writes.
+
+**Upgrade notes.**
+
+- **Standbys may be behind.** A standby that has been replicating from an
+  affected primary is missing every transactional write since it was seeded.
+  Upgrading the primary fixes replication going forward but does **not**
+  backfill what was already lost — re-seed any standby whose contents you need
+  to trust.
+- **Synchronous commits now actually wait.** Under `sync`/`semi-sync`, a
+  `COMMIT` inside a transaction now blocks for standby acknowledgement where it
+  previously returned immediately. This is the intended behaviour, but it is a
+  real latency change: transactional commit times under sync replication will
+  increase from "no wait at all" to the round-trip your topology actually costs.
+  Async replication is unaffected.
+- Transaction throughput otherwise measures flat (pg35 `Transaction ctl`
+  36.1 µs → 35.9 µs).
+
+Known limitation, tracked: a standby applies replicated operations one at a time,
+so it can transiently observe a partially-applied transaction before converging.
+The WAL format already carries transaction markers for atomic apply, but nothing
+emits them yet; wiring that is a separate change.
+
 ## [4.7.0] - 2026-07-27
 
 Transaction and shutdown correctness. One atomicity violation, plus three fixes
