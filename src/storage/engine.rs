@@ -3529,6 +3529,13 @@ impl StorageEngine {
         // R0.2: embedded global-slot transactions read from a snapshot, so
         // complete those semantics with first-committer-wins validation.
         txn.set_conflict_registry(self.conflict_registry(), true);
+        // ROADMAP_V5.md §1.8: every statement in an explicit transaction runs
+        // with `skip_fast_paths = true`, which suppresses the per-statement
+        // `log_data_*` calls, so COMMIT is the only place these writes can
+        // reach the logical WAL and the HA broadcast. NEVER add this to
+        // `begin_autocommit_transaction` below — that path already logs per
+        // statement and would double-log every autocommit write.
+        txn.set_wal(self.wal_arc(), self.config.storage.logical_wal_per_statement);
         Ok(txn)
     }
 
@@ -9354,6 +9361,15 @@ impl StorageEngine {
     /// Check if WAL is enabled
     pub fn is_wal_enabled(&self) -> bool {
         self.wal.is_some()
+    }
+
+    /// Clone of the logical-WAL handle, for `Transaction::set_wal`
+    /// (ROADMAP_V5.md §1.8). `None` when WAL is disabled
+    /// (`StorageConfig::wal_enabled = false`, `memory_only`, or a read-only
+    /// handle), which simply leaves commit-time emission off. Cloning an
+    /// `Option<Arc<_>>` is a refcount bump on `Some` and free on `None`.
+    pub(crate) fn wal_arc(&self) -> Option<Arc<RwLock<WriteAheadLog>>> {
+        self.wal.clone()
     }
 
     /// Whether fast DML should append a per-statement logical WAL entry
