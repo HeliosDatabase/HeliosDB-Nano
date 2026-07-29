@@ -545,6 +545,81 @@ impl WriteAheadLog {
         Ok(lsn)
     }
 
+    /// Append a whole batch of operations as ONE RocksDB write, then broadcast
+    /// the batch and wait for sync ONCE — not once per entry.
+    ///
+    /// Built for `Transaction::commit_with_timestamp`: an explicit or session
+    /// transaction's writes are only fully known at COMMIT, so they arrive here
+    /// as a set rather than one at a time (ROADMAP_V5.md §1.8). Looping over
+    /// `append`/`append_nosync` instead would be quietly catastrophic under
+    /// sync/semi-sync replication: each call runs its own
+    /// `broadcast_after_append`, so an N-row transaction would pay N
+    /// independent `wait_for_sync` calls of up to `DEFAULT_SYNC_TIMEOUT_MS`
+    /// each. `broadcast_after_batch`'s existing "wait once, on the highest LSN"
+    /// contract is exactly right for a committed batch and is reused verbatim.
+    ///
+    /// `sync` fsyncs this WAL-keyspace write (legacy strict logical-WAL
+    /// durability — `StorageConfig::logical_wal_per_statement`). The default,
+    /// `false`, follows the same P0#2 rationale as `append_nosync`: the
+    /// caller's own commit WriteBatch is the durability boundary, not this
+    /// one — and, exactly as there, skipping the fsync must NOT skip
+    /// replication, so both arms broadcast.
+    ///
+    /// LSNs are handed out by a tight `next_lsn()` loop with no yield point, so
+    /// one transaction's entries land on contiguous LSNs that no other
+    /// committer can interleave into. That is a property a future atomic-apply
+    /// standby can lean on instead of adding a `tx_id` field to the per-row
+    /// variants (ROADMAP_V5.md §1.8 follow-up).
+    ///
+    /// Returns the assigned LSNs in the same order as `operations`, or
+    /// `Ok(vec![])` — touching neither RocksDB nor the broadcast channel — when
+    /// `operations` is empty (a transaction that staged nothing loggable).
+    pub fn append_batch(&self, operations: Vec<WalOperation>, sync: bool) -> Result<Vec<u64>> {
+        if operations.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut batch = WriteBatch::default();
+        let mut entries = Vec::with_capacity(operations.len());
+        let mut lsns = Vec::with_capacity(operations.len());
+        let mut highest_lsn = 0u64;
+
+        for operation in operations {
+            let lsn = self.next_lsn();
+            let entry = WalEntry::new(lsn, operation);
+            let data = entry.serialize()?;
+            let key = format!("wal:entries:{:020}", lsn);
+            batch.put(key.as_bytes(), &data);
+            highest_lsn = lsn;
+            lsns.push(lsn);
+            entries.push(entry);
+        }
+        batch.put(b"wal:last_lsn", highest_lsn.to_le_bytes());
+
+        // Deliberately bypasses `WalSyncMode::GroupCommit` the way
+        // `append_nosync` does: the "batched/nosync family" of appends always
+        // writes directly, because the caller already owns the batching
+        // decision. Not a new inconsistency — the existing convention.
+        if sync {
+            self.db
+                .write_opt(batch, &self.write_opts)
+                .map_err(|e| Error::storage(format!("Failed to append WAL batch: {}", e)))?;
+        } else {
+            let mut nosync_opts = WriteOptions::default();
+            nosync_opts.set_sync(false);
+            self.db
+                .write_opt(batch, &nosync_opts)
+                .map_err(|e| Error::storage(format!("Failed to append WAL batch: {}", e)))?;
+        }
+
+        // Same broadcast + single highest-LSN sync-wait every other append path
+        // uses (P0#2: the nosync arm above must not have skipped replication).
+        Self::broadcast_after_batch(entries.iter().map(|e| (e.lsn, &e.operation)));
+
+        debug!("Appended WAL batch: {} entries, LSN {}", lsns.len(), highest_lsn);
+        Ok(lsns)
+    }
+
     /// Append a WAL entry and wait for synchronous replication acknowledgement
     ///
     /// This method appends the operation to WAL and then blocks until standbys
@@ -1263,6 +1338,85 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].lsn, 1);
         assert_eq!(entries[1].lsn, 2);
+    }
+
+    /// ROADMAP_V5.md §1.8: `append_batch` is the primitive
+    /// `Transaction::commit_with_timestamp` uses to emit a whole explicit
+    /// transaction at once. It must assign CONTIGUOUS LSNs (the property a
+    /// future atomic-apply standby leans on instead of a per-row `tx_id`),
+    /// persist every entry, and advance `wal:last_lsn` to the highest — all
+    /// from ONE RocksDB write, so the batch pays ONE sync-wait rather than one
+    /// per row.
+    #[test]
+    fn test_append_batch_assigns_contiguous_lsns_and_persists_all() {
+        let (_temp, db) = create_test_db();
+        let wal = WriteAheadLog::open(Arc::clone(&db), WalSyncMode::Async).unwrap();
+
+        // Pre-existing entry, so the batch does not start at LSN 1.
+        wal.append(WalOperation::CreateTable {
+            table: "batched".to_string(),
+            schema: vec![1],
+        })
+        .unwrap();
+
+        let ops = vec![
+            WalOperation::Insert {
+                table: "batched".to_string(),
+                key: b"data:batched:1".to_vec(),
+                tuple: vec![1],
+            },
+            WalOperation::Update {
+                table: "batched".to_string(),
+                key: b"data:batched:2".to_vec(),
+                tuple: vec![2],
+            },
+            WalOperation::Delete {
+                table: "batched".to_string(),
+                key: b"data:batched:3".to_vec(),
+            },
+            WalOperation::UpdateCounter {
+                table_name: "batched".to_string(),
+                new_value: 3,
+            },
+        ];
+        let lsns = wal.append_batch(ops, false).unwrap();
+
+        assert_eq!(lsns, vec![2, 3, 4, 5], "batch LSNs must be contiguous");
+        assert_eq!(wal.current_lsn(), 5);
+
+        let entries = wal.replay().unwrap();
+        assert_eq!(entries.len(), 5, "every batched entry must be persisted");
+        let ops: Vec<&WalOperation> = entries.iter().map(|e| &e.operation).collect();
+        assert!(ops
+            .iter()
+            .any(|op| matches!(op, WalOperation::Insert { table, .. } if table == "batched")));
+        assert!(ops
+            .iter()
+            .any(|op| matches!(op, WalOperation::Update { table, .. } if table == "batched")));
+        assert!(ops
+            .iter()
+            .any(|op| matches!(op, WalOperation::Delete { table, .. } if table == "batched")));
+        assert!(ops
+            .iter()
+            .any(|op| matches!(op, WalOperation::UpdateCounter { new_value, .. } if *new_value == 3)));
+
+        // `wal:last_lsn` must reflect the highest LSN in the batch, so a
+        // reopened WAL resumes after it rather than reusing LSNs.
+        let reopened = WriteAheadLog::open(Arc::clone(&db), WalSyncMode::Async).unwrap();
+        assert_eq!(reopened.current_lsn(), 5);
+    }
+
+    /// An empty batch (a transaction that staged nothing WAL-loggable) must
+    /// not touch RocksDB, burn an LSN, or broadcast.
+    #[test]
+    fn test_append_batch_empty_is_a_noop() {
+        let (_temp, db) = create_test_db();
+        let wal = WriteAheadLog::open(db, WalSyncMode::Async).unwrap();
+
+        let lsns = wal.append_batch(Vec::new(), false).unwrap();
+        assert!(lsns.is_empty());
+        assert_eq!(wal.current_lsn(), 0);
+        assert!(wal.replay().unwrap().is_empty());
     }
 
     #[test]

@@ -15641,6 +15641,17 @@ impl EmbeddedDatabase {
             self.storage.conflict_registry(),
             session.isolation_level != crate::session::IsolationLevel::ReadCommitted,
         );
+        // ROADMAP_V5.md §1.8: a session transaction's statements all run
+        // through `execute_in_transaction_no_fast_path`, which suppresses the
+        // per-statement `log_data_*` calls, so COMMIT is the only place its
+        // writes can reach the logical WAL and the HA broadcast. Wire autocommit
+        // traffic here and it would double-log — but it never lands here:
+        // `execute_for_session` short-circuits to the embedded autocommit path
+        // whenever no explicit session transaction is open.
+        txn.set_wal(
+            self.storage.wal_arc(),
+            self.storage.config().storage.logical_wal_per_statement,
+        );
 
         let txn_id = txn.snapshot_id();
         session.active_txn = Some(txn_id);
@@ -15892,6 +15903,14 @@ impl EmbeddedDatabase {
             // their commits so explicit transactions can validate against
             // them; they never validate (statement-atomic, RC semantics).
             txn.set_conflict_registry(self.storage.conflict_registry(), false);
+            // ROADMAP_V5.md §1.8: this arm executes through
+            // `execute_in_transaction_no_fast_path` too (see below), so its
+            // statement logs nothing per-statement and COMMIT is the only
+            // place the write can reach the logical WAL / HA broadcast.
+            txn.set_wal(
+                self.storage.wal_arc(),
+                self.storage.config().storage.logical_wal_per_statement,
+            );
 
             let result = self.execute_in_transaction_no_fast_path(sql, &txn);
 
@@ -20648,6 +20667,491 @@ mod tests {
 
         assert!(has_update, "strict fast UPDATE should be present in logical WAL");
         assert!(has_delete, "strict fast DELETE should be present in logical WAL");
+    }
+
+    // ---------------------------------------------------------------------
+    // ROADMAP_V5.md §1.8 — writes inside an explicit/session transaction must
+    // reach the logical WAL (and therefore the HA broadcast).
+    //
+    // Every test below is deliberately in-process and in-memory: the WAL lives
+    // in the same temp RocksDB the engine opens, so nothing touches a real
+    // data directory, no standby is needed, and none of them mutate the
+    // process-global `ha_state()`.
+    // ---------------------------------------------------------------------
+
+    /// Engine used by the §1.8 tests: in-memory, with the LOGICAL WAL on.
+    /// `strict_logical_wal` maps to `StorageConfig::logical_wal_per_statement`,
+    /// which only chooses fsync-vs-nosync for the append — never whether the
+    /// entry is written or broadcast.
+    fn txn_wal_db(strict_logical_wal: bool) -> EmbeddedDatabase {
+        let mut config = Config::in_memory();
+        config.storage.wal_enabled = true;
+        config.storage.logical_wal_per_statement = strict_logical_wal;
+        EmbeddedDatabase::with_config(config).unwrap()
+    }
+
+    /// (inserts, updates, deletes) currently in the logical WAL for `table`.
+    /// DDL and `UpdateCounter` entries are deliberately excluded: this is the
+    /// row-mutation stream a standby replays for data convergence.
+    fn wal_row_ops(db: &EmbeddedDatabase, table: &str) -> (usize, usize, usize) {
+        let entries = db.storage.wal_entries_for_tests().unwrap();
+        let mut inserts = 0;
+        let mut updates = 0;
+        let mut deletes = 0;
+        for entry in &entries {
+            match &entry.operation {
+                storage::WalOperation::Insert { table: t, .. } if t == table => inserts += 1,
+                storage::WalOperation::Update { table: t, .. } if t == table => updates += 1,
+                storage::WalOperation::Delete { table: t, .. } if t == table => deletes += 1,
+                _ => {}
+            }
+        }
+        (inserts, updates, deletes)
+    }
+
+    /// Total row-mutation entries for `table`. Used wherever the
+    /// INSERT-vs-UPDATE distinction is not the point: a transaction's write
+    /// set carries no SQL-level operation kind, so a general-path INSERT
+    /// emits `Update` (documented on `Transaction::collect_logical_wal_ops`).
+    fn wal_row_op_total(db: &EmbeddedDatabase, table: &str) -> usize {
+        let (inserts, updates, deletes) = wal_row_ops(db, table);
+        inserts + updates + deletes
+    }
+
+    /// Headline P0 regression pin. The same three statements must reach the
+    /// logical WAL whether they run autocommit or inside BEGIN/COMMIT.
+    /// Measured before the fix: autocommit deltas 1/1/1, explicit transaction
+    /// 0/0/0 — every transactional write was silently unreplicated.
+    ///
+    /// The autocommit half doubles as the §4.6 no-double-log pin: each delta
+    /// must be exactly 1, not 2. An autocommit transaction never gets a `wal`
+    /// handle (`begin_autocommit_transaction` never calls `set_wal`), so
+    /// commit-time emission must not fire on top of its per-statement logs.
+    #[test]
+    fn explicit_txn_logical_wal_parity_with_autocommit() {
+        let db = txn_wal_db(true);
+        db.execute("CREATE TABLE par (id INT PRIMARY KEY, v INT)").unwrap();
+
+        // --- autocommit reference (must be untouched by this fix) ---
+        let before = wal_row_ops(&db, "par");
+        db.execute("INSERT INTO par (id, v) VALUES (1, 10)").unwrap();
+        let after_insert = wal_row_ops(&db, "par");
+        assert_eq!(
+            after_insert.0 - before.0,
+            1,
+            "autocommit INSERT must log exactly one WAL Insert (not two — no double-logging)"
+        );
+
+        db.execute("UPDATE par SET v = 20 WHERE id = 1").unwrap();
+        let after_update = wal_row_ops(&db, "par");
+        assert_eq!(
+            after_update.1 - after_insert.1,
+            1,
+            "autocommit UPDATE must log exactly one WAL Update"
+        );
+
+        db.execute("DELETE FROM par WHERE id = 1").unwrap();
+        let after_delete = wal_row_ops(&db, "par");
+        assert_eq!(
+            after_delete.2 - after_update.2,
+            1,
+            "autocommit DELETE must log exactly one WAL Delete"
+        );
+
+        // --- the same statements inside explicit transactions ---
+        // One transaction per statement on purpose: a single transaction that
+        // inserts, updates and deletes the SAME row collapses in the write set
+        // to its final state (one Delete). Correct, but not a parity check.
+        let base = wal_row_op_total(&db, "par");
+        db.execute("BEGIN").unwrap();
+        db.execute("INSERT INTO par (id, v) VALUES (2, 10)").unwrap();
+        db.execute("COMMIT").unwrap();
+        assert_eq!(
+            wal_row_op_total(&db, "par") - base,
+            1,
+            "explicit-transaction INSERT must emit exactly one row-mutation WAL entry (was 0 pre-fix)"
+        );
+
+        let base = wal_row_ops(&db, "par");
+        db.execute("BEGIN").unwrap();
+        db.execute("UPDATE par SET v = 20 WHERE id = 2").unwrap();
+        db.execute("COMMIT").unwrap();
+        let after = wal_row_ops(&db, "par");
+        assert_eq!(
+            after.1 - base.1,
+            1,
+            "explicit-transaction UPDATE must emit one WAL Update (was 0 pre-fix)"
+        );
+
+        let base = wal_row_ops(&db, "par");
+        db.execute("BEGIN").unwrap();
+        db.execute("DELETE FROM par WHERE id = 2").unwrap();
+        db.execute("COMMIT").unwrap();
+        let after = wal_row_ops(&db, "par");
+        assert_eq!(
+            after.2 - base.2,
+            1,
+            "explicit-transaction DELETE must emit one WAL Delete (was 0 pre-fix)"
+        );
+    }
+
+    /// Commit-time emission is NOT gated on `logical_wal_per_statement` —
+    /// that flag only picks fsync vs nosync for the append. A transaction must
+    /// replicate under the shipped default too, or the P0 would simply return
+    /// for every out-of-the-box deployment.
+    ///
+    /// Note the deliberate asymmetry with autocommit here: the autocommit
+    /// UPDATE/DELETE *fast* paths carve themselves out of the logical WAL in
+    /// relaxed standalone mode (`fast_dml_requires_logical_wal`, pinned by
+    /// `test_fast_update_delete_skip_logical_wal_in_relaxed_standalone`). The
+    /// transaction path has no equivalent carve-out: its durability and
+    /// replication boundary is the commit itself, which happens exactly once
+    /// per transaction rather than once per row.
+    #[test]
+    fn explicit_txn_emits_logical_wal_under_relaxed_default() {
+        let db = txn_wal_db(false);
+        db.execute("CREATE TABLE relaxed_txn (id INT PRIMARY KEY, v INT)")
+            .unwrap();
+
+        let before = wal_row_op_total(&db, "relaxed_txn");
+        db.execute("BEGIN").unwrap();
+        db.execute("INSERT INTO relaxed_txn (id, v) VALUES (1, 10)").unwrap();
+        db.execute("COMMIT").unwrap();
+
+        assert_eq!(
+            wal_row_op_total(&db, "relaxed_txn") - before,
+            1,
+            "a committed transaction must replicate under the default (nosync) logical-WAL config"
+        );
+    }
+
+    /// ROLLBACK must emit nothing. `Transaction::rollback` clears `write_set`
+    /// and `insert_log` and never calls `commit_with_timestamp` at all, so the
+    /// commit-time emission never runs — no compensating logic needed.
+    #[test]
+    fn explicit_txn_rollback_emits_no_logical_wal_entries() {
+        let db = txn_wal_db(true);
+        db.execute("CREATE TABLE rb (id INT PRIMARY KEY, v INT)").unwrap();
+        db.execute("INSERT INTO rb (id, v) VALUES (1, 10)").unwrap();
+
+        let before = wal_row_op_total(&db, "rb");
+        db.execute("BEGIN").unwrap();
+        db.execute("INSERT INTO rb (id, v) VALUES (2, 20)").unwrap();
+        db.execute("UPDATE rb SET v = 99 WHERE id = 1").unwrap();
+        db.execute("DELETE FROM rb WHERE id = 1").unwrap();
+        db.execute("ROLLBACK").unwrap();
+
+        assert_eq!(
+            wal_row_op_total(&db, "rb"),
+            before,
+            "a rolled-back transaction must not ship a single row to a standby"
+        );
+        assert_eq!(
+            db.query("SELECT id FROM rb", &[]).unwrap().len(),
+            1,
+            "rollback must also leave the local row intact"
+        );
+    }
+
+    /// ROLLBACK TO SAVEPOINT must emit only the surviving operations.
+    /// `rollback_to_savepoint` has already restored `write_set` and truncated
+    /// `insert_log` by the time COMMIT reads them, so this needs no
+    /// savepoint-aware code in the emission path — it falls out of reading the
+    /// same structures the data batch is built from.
+    ///
+    /// Two tables rather than two rows so the assertion keys off the
+    /// `WalOperation`'s own `table` field. SAVEPOINT goes through
+    /// `execute_returning` per `tests/savepoint_hardening_tests.rs`'s
+    /// documented `execute()` limitation.
+    #[test]
+    fn explicit_txn_rollback_to_savepoint_emits_only_survivors() {
+        let db = txn_wal_db(true);
+        db.execute("CREATE TABLE sp_keep (id INT PRIMARY KEY)").unwrap();
+        db.execute("CREATE TABLE sp_drop (id INT PRIMARY KEY)").unwrap();
+
+        let keep_before = wal_row_op_total(&db, "sp_keep");
+        let drop_before = wal_row_op_total(&db, "sp_drop");
+
+        db.execute("BEGIN").unwrap();
+        db.execute("INSERT INTO sp_keep (id) VALUES (1)").unwrap();
+        db.execute_returning("SAVEPOINT sp1").unwrap();
+        db.execute("INSERT INTO sp_drop (id) VALUES (1)").unwrap();
+        db.execute_returning("ROLLBACK TO SAVEPOINT sp1").unwrap();
+        db.execute("COMMIT").unwrap();
+
+        assert_eq!(
+            wal_row_op_total(&db, "sp_keep") - keep_before,
+            1,
+            "the pre-savepoint INSERT survived the partial rollback and must replicate"
+        );
+        assert_eq!(
+            wal_row_op_total(&db, "sp_drop"),
+            drop_before,
+            "the rolled-back INSERT must not replicate"
+        );
+        assert_eq!(db.query("SELECT id FROM sp_keep", &[]).unwrap().len(), 1);
+        assert_eq!(db.query("SELECT id FROM sp_drop", &[]).unwrap().len(), 0);
+    }
+
+    /// `ON DELETE CASCADE` child rows are the case this fix must not miss.
+    /// v4.7.0 routed them into the caller's transaction and made them
+    /// deliberately skip `log_data_delete` (`in_explicit_txn`), so commit-time
+    /// emission is now the ONLY thing that replicates them — without it, the
+    /// atomicity fix would have opened a replication hole exactly where it
+    /// closed a rollback hole.
+    #[test]
+    fn cascade_delete_in_explicit_txn_emits_child_delete() {
+        let db = txn_wal_db(true);
+        db.execute("CREATE TABLE cas_p (id INT PRIMARY KEY)").unwrap();
+        db.execute("CREATE TABLE cas_c (id INT PRIMARY KEY, p_id INT REFERENCES cas_p(id) ON DELETE CASCADE)")
+            .unwrap();
+        db.execute("INSERT INTO cas_p VALUES (1)").unwrap();
+        db.execute("INSERT INTO cas_c VALUES (10, 1)").unwrap();
+
+        let (_, _, parent_before) = wal_row_ops(&db, "cas_p");
+        let (_, _, child_before) = wal_row_ops(&db, "cas_c");
+
+        db.execute("BEGIN").unwrap();
+        db.execute("DELETE FROM cas_p WHERE id = 1").unwrap();
+        db.execute("COMMIT").unwrap();
+
+        let (_, _, parent_after) = wal_row_ops(&db, "cas_p");
+        let (_, _, child_after) = wal_row_ops(&db, "cas_c");
+        assert_eq!(parent_after - parent_before, 1, "the parent DELETE must replicate");
+        assert_eq!(
+            child_after - child_before,
+            1,
+            "the CASCADEd child DELETE must replicate too, or the standby keeps an orphan row forever"
+        );
+        assert_eq!(db.query("SELECT id FROM cas_c", &[]).unwrap().len(), 0);
+    }
+
+    /// The other referential action with the same shape: `ON DELETE SET NULL`
+    /// nulls the child's FK column through `txn.put` and likewise skips
+    /// `log_data_update` inside an explicit transaction, so the nulled row is
+    /// only replicated by commit-time emission.
+    #[test]
+    fn set_null_in_explicit_txn_emits_child_update() {
+        let db = txn_wal_db(true);
+        db.execute("CREATE TABLE sn_p (id INT PRIMARY KEY)").unwrap();
+        db.execute("CREATE TABLE sn_c (id INT PRIMARY KEY, p_id INT REFERENCES sn_p(id) ON DELETE SET NULL)")
+            .unwrap();
+        db.execute("INSERT INTO sn_p VALUES (1)").unwrap();
+        db.execute("INSERT INTO sn_c VALUES (10, 1)").unwrap();
+
+        let (_, child_updates_before, _) = wal_row_ops(&db, "sn_c");
+
+        db.execute("BEGIN").unwrap();
+        db.execute("DELETE FROM sn_p WHERE id = 1").unwrap();
+        db.execute("COMMIT").unwrap();
+
+        let (_, child_updates_after, _) = wal_row_ops(&db, "sn_c");
+        assert_eq!(
+            child_updates_after - child_updates_before,
+            1,
+            "the SET NULL child row must replicate, or the standby keeps a dangling FK value"
+        );
+        assert_eq!(
+            db.query("SELECT p_id FROM sn_c WHERE id = 10", &[])
+                .unwrap()
+                .first()
+                .and_then(|row| row.get(0).cloned()),
+            Some(Value::Null)
+        );
+    }
+
+    /// The mirror image: a rolled-back cascade must ship nothing for EITHER
+    /// table. The direct-WAL-count version of
+    /// `tests/fk_cascade_txn_atomicity_tests.rs`'s reopen-and-check test,
+    /// which cannot reach `wal_entries_for_tests()` from `tests/`.
+    #[test]
+    fn cascade_delete_rollback_in_explicit_txn_emits_nothing() {
+        let db = txn_wal_db(true);
+        db.execute("CREATE TABLE casrb_p (id INT PRIMARY KEY)").unwrap();
+        db.execute("CREATE TABLE casrb_c (id INT PRIMARY KEY, p_id INT REFERENCES casrb_p(id) ON DELETE CASCADE)")
+            .unwrap();
+        db.execute("INSERT INTO casrb_p VALUES (1)").unwrap();
+        db.execute("INSERT INTO casrb_c VALUES (10, 1)").unwrap();
+
+        let parent_before = wal_row_op_total(&db, "casrb_p");
+        let child_before = wal_row_op_total(&db, "casrb_c");
+
+        db.execute("BEGIN").unwrap();
+        db.execute("DELETE FROM casrb_p WHERE id = 1").unwrap();
+        db.execute("ROLLBACK").unwrap();
+
+        assert_eq!(wal_row_op_total(&db, "casrb_p"), parent_before);
+        assert_eq!(
+            wal_row_op_total(&db, "casrb_c"),
+            child_before,
+            "a rolled-back cascade must not leave a phantom child DELETE on a standby"
+        );
+        assert_eq!(db.query("SELECT id FROM casrb_c", &[]).unwrap().len(), 1);
+    }
+
+    /// `CreateTable` entries in the logical WAL for `table`.
+    fn wal_create_table_entries(db: &EmbeddedDatabase, table: &str) -> usize {
+        let entries = db.storage.wal_entries_for_tests().unwrap();
+        entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    &entry.operation,
+                    storage::WalOperation::CreateTable { table: t, .. } if t == table
+                )
+            })
+            .count()
+    }
+
+    /// DDL writes `meta:` keys straight to storage and logs itself — it never
+    /// enters `write_set`/`insert_log`, so commit-time emission structurally
+    /// cannot double-log it. Proves the negative by COMPARING against the same
+    /// DDL outside a transaction rather than asserting an absolute count:
+    /// `CREATE TABLE` is already logged twice per statement today (once by
+    /// `LogicalPlan::CreateTable`'s arm and once inside `Catalog::create_table`)
+    /// — a pre-existing duplicate unrelated to this fix, which this test
+    /// deliberately neither encodes nor perturbs.
+    #[test]
+    fn ddl_in_explicit_txn_is_not_double_logged() {
+        let db = txn_wal_db(true);
+
+        // Reference: identical DDL, no enclosing transaction.
+        db.execute("CREATE TABLE ddl_autocommit (id INT PRIMARY KEY, v INT)")
+            .unwrap();
+        let baseline = wal_create_table_entries(&db, "ddl_autocommit");
+        assert!(baseline > 0, "CREATE TABLE must reach the logical WAL at all");
+
+        db.execute("BEGIN").unwrap();
+        db.execute("CREATE TABLE ddl_in_txn (id INT PRIMARY KEY, v INT)")
+            .unwrap();
+        db.execute("COMMIT").unwrap();
+
+        assert_eq!(
+            wal_create_table_entries(&db, "ddl_in_txn"),
+            baseline,
+            "an enclosing transaction must not add a duplicate CreateTable entry"
+        );
+        assert_eq!(
+            wal_row_op_total(&db, "ddl_in_txn"),
+            0,
+            "DDL must not produce row-mutation WAL entries"
+        );
+    }
+
+    /// Branch-scoped writes must NOT replicate. On a branch the transaction
+    /// stages `bdata:`-prefixed keys, which `parse_data_key_table` rejects at
+    /// the first byte — branches are local, ephemeral sandboxes and a standby
+    /// exists to take over serving main.
+    #[test]
+    fn branch_scoped_writes_in_explicit_txn_are_not_replicated() {
+        let db = txn_wal_db(true);
+        db.execute("CREATE TABLE br (id INT PRIMARY KEY, v INT)").unwrap();
+        db.execute("INSERT INTO br (id, v) VALUES (1, 10)").unwrap();
+
+        db.execute("CREATE BRANCH wal_br AS OF NOW").unwrap();
+        db.execute("USE BRANCH wal_br").unwrap();
+
+        let before = wal_row_op_total(&db, "br");
+        db.execute("BEGIN").unwrap();
+        db.execute("INSERT INTO br (id, v) VALUES (2, 20)").unwrap();
+        db.execute("COMMIT").unwrap();
+
+        assert_eq!(
+            wal_row_op_total(&db, "br"),
+            before,
+            "a branch-sandbox write must never be shipped to a standby serving main"
+        );
+
+        db.execute("USE BRANCH main").unwrap();
+        assert_eq!(
+            db.query("SELECT id FROM br", &[]).unwrap().len(),
+            1,
+            "main must be unaffected by the branch write"
+        );
+    }
+
+    /// Row counters staged by the fast-insert-in-transaction path must
+    /// replicate as `UpdateCounter`, the same variant the durable
+    /// `next_row_id` allocator already emits. The standby's Insert handler
+    /// never derives a counter from the row ids it applies, so without this a
+    /// promoted standby could reissue an already-used row id.
+    #[test]
+    fn row_counter_replicated_for_fast_insert_in_explicit_txn() {
+        let db = txn_wal_db(true);
+        db.execute("CREATE TABLE ctr (id INT PRIMARY KEY, v INT)").unwrap();
+
+        db.execute("BEGIN").unwrap();
+        for i in 1..=3 {
+            db.execute(&format!("INSERT INTO ctr (id, v) VALUES ({i}, {i})"))
+                .unwrap();
+        }
+        db.execute("COMMIT").unwrap();
+
+        let entries = db.storage.wal_entries_for_tests().unwrap();
+        let counter = entries.iter().rev().find_map(|entry| match &entry.operation {
+            storage::WalOperation::UpdateCounter { table_name, new_value } if table_name == "ctr" => Some(*new_value),
+            _ => None,
+        });
+        assert_eq!(
+            counter,
+            Some(3),
+            "the transaction's final staged row counter must reach the WAL"
+        );
+    }
+
+    /// End-to-end convergence: replay the transaction's emitted entries into a
+    /// SECOND engine through the real `apply_replicated_operation` path a
+    /// standby uses, then compare rows. No network, no HA role, and no
+    /// `ha_state()` mutation — this exercises the apply logic, not the
+    /// streaming transport.
+    #[test]
+    fn explicit_txn_writes_converge_on_replica_via_wal_replay() {
+        let primary = txn_wal_db(true);
+        let replica = txn_wal_db(true);
+        let ddl = "CREATE TABLE conv (id INT PRIMARY KEY, v INT)";
+        primary.execute(ddl).unwrap();
+        replica.execute(ddl).unwrap();
+        primary.execute("INSERT INTO conv (id, v) VALUES (1, 10)").unwrap();
+        replica.execute("INSERT INTO conv (id, v) VALUES (1, 10)").unwrap();
+
+        let already_shipped = primary.storage.wal_entries_for_tests().unwrap().len();
+
+        primary.execute("BEGIN").unwrap();
+        primary.execute("INSERT INTO conv (id, v) VALUES (2, 20)").unwrap();
+        primary.execute("UPDATE conv SET v = 11 WHERE id = 1").unwrap();
+        primary.execute("COMMIT").unwrap();
+
+        let shipped: Vec<_> = primary
+            .storage
+            .wal_entries_for_tests()
+            .unwrap()
+            .into_iter()
+            .skip(already_shipped)
+            .collect();
+        assert!(
+            !shipped.is_empty(),
+            "the transaction must have produced WAL entries to ship (this is the P0 itself)"
+        );
+        for entry in shipped {
+            replica.storage.apply_replicated_operation(entry.operation).unwrap();
+        }
+
+        let sorted_rows = |db: &EmbeddedDatabase| {
+            let mut rows: Vec<String> = db
+                .storage
+                .scan_table("conv")
+                .unwrap()
+                .into_iter()
+                .map(|tuple| format!("{:?}", tuple.values))
+                .collect();
+            rows.sort();
+            rows
+        };
+        assert_eq!(
+            sorted_rows(&replica),
+            sorted_rows(&primary),
+            "the replica must converge on the primary after replaying the transaction's WAL entries"
+        );
     }
 
     #[test]

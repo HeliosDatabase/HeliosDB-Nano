@@ -9,7 +9,7 @@ use super::conflict::WriteConflictRegistry;
 use super::dirty_tracker::DirtyTracker;
 use super::lock_manager::{LockGuard, LockManager, LockType};
 use super::time_travel::SnapshotManager;
-use super::{Key, Snapshot, SnapshotId};
+use super::{Key, Snapshot, SnapshotId, WalOperation, WriteAheadLog};
 use crate::session::{IsolationLevel, SessionId};
 use crate::{Error, Result, Tuple};
 use dashmap::{DashMap, DashSet};
@@ -125,6 +125,25 @@ pub struct Transaction {
     /// Disabled only for `memory_only` databases, where durability is not a
     /// contract and the temporary RocksDB directory is discarded on close.
     rocksdb_wal_enabled: bool,
+    /// LOGICAL WAL handle for commit-time replication of this transaction's
+    /// writes (ROADMAP_V5.md §1.8). Distinct from `rocksdb_wal_enabled` above,
+    /// which is RocksDB's *physical* WAL: this one is the logical stream HA
+    /// standbys and CDC consume. Explicit and session transactions suppress
+    /// the per-statement `log_data_*` calls (`skip_fast_paths`) and this
+    /// function writes straight to RocksDB, so COMMIT is the only point where
+    /// their writes can reach that stream at all.
+    ///
+    /// `None` for every transaction from
+    /// `StorageEngine::begin_autocommit_transaction` — that path already logs
+    /// each statement as it executes, so wiring it here would double-log. See
+    /// `set_wal`'s doc comment for that hazard.
+    wal: Option<Arc<RwLock<WriteAheadLog>>>,
+    /// Whether the commit-time logical-WAL batch (see `wal`) is fsynced.
+    /// Mirrors `StorageConfig::logical_wal_per_statement`; default `false`,
+    /// the same nosync-by-default rationale autocommit already uses (P0#2) —
+    /// durability for these rows comes from this commit's own RocksDB batch,
+    /// and the nosync arm still broadcasts.
+    logical_wal_sync: bool,
     /// R1.3: fsync the commit WriteBatch (power-loss durable commits).
     sync_commit: bool,
     /// R1.3 phase 2: engine-wide leader/follower group committer. When set
@@ -223,6 +242,8 @@ impl Transaction {
             dirty_tracker: None,
             versioning_enabled: true,
             rocksdb_wal_enabled: true,
+            wal: None,
+            logical_wal_sync: false,
             sync_commit: false,
             group_committer: None,
             row_cache: None,
@@ -275,6 +296,32 @@ impl Transaction {
         self.rocksdb_wal_enabled = enabled;
     }
 
+    /// Wire the LOGICAL WAL for commit-time emission (ROADMAP_V5.md §1.8).
+    ///
+    /// Call this ONLY for transactions that will NOT also log per statement —
+    /// i.e. explicit (`StorageEngine::begin_transaction`) and session
+    /// (`Transaction::new_with_session` call sites in `lib.rs`) transactions,
+    /// every statement of which runs with `skip_fast_paths = true`.
+    ///
+    /// MUST NOT be called for `StorageEngine::begin_autocommit_transaction`
+    /// transactions: `execute_in_transaction_inner` already calls
+    /// `log_data_insert`/`log_data_update`/`log_data_delete` for each of their
+    /// statements (the `!skip_fast_paths` gate), so wiring `wal` there too
+    /// would double-log every autocommit statement to every standby.
+    ///
+    /// `wal: None` (e.g. `StorageEngine::wal_arc()` when WAL is disabled) is
+    /// accepted and simply leaves commit-time emission off, matching every
+    /// other `Option`-typed engine handle on this struct (`row_cache`,
+    /// `write_watermarks`, `conflict_registry`).
+    ///
+    /// `sync` mirrors `StorageConfig::logical_wal_per_statement` (see
+    /// `logical_wal_sync`); it controls only the local fsync, never whether
+    /// the batch is broadcast.
+    pub fn set_wal(&mut self, wal: Option<Arc<RwLock<WriteAheadLog>>>, sync: bool) {
+        self.wal = wal;
+        self.logical_wal_sync = sync;
+    }
+
     /// Create a new transaction with session and lock manager support
     pub fn new_with_session(
         db: Arc<DB>,
@@ -315,6 +362,8 @@ impl Transaction {
             dirty_tracker: Some(dirty_tracker),
             versioning_enabled: true,
             rocksdb_wal_enabled: true,
+            wal: None,
+            logical_wal_sync: false,
             sync_commit: false,
             group_committer: None,
             row_cache: None,
@@ -847,6 +896,77 @@ impl Transaction {
             batch.put(key.as_bytes(), value);
         }
 
+        // P0 (ROADMAP_V5.md §1.8): explicit and session transactions appended
+        // NOTHING to the logical WAL and were never broadcast to an HA standby
+        // — `skip_fast_paths` suppresses every per-statement
+        // `log_data_insert`/`log_data_update`/`log_data_delete` call, and this
+        // function writes straight to RocksDB. Emit now, from the SAME
+        // `insert_log`/`write_set`/`row_counter_stages` the batch above was
+        // just built from; `collect_logical_wal_ops` documents why sharing
+        // that source of truth is what makes ROLLBACK, ROLLBACK TO SAVEPOINT
+        // and cascading FK actions correct with no extra code here. `wal` is
+        // `None` for autocommit transactions, which already log per statement
+        // — see `set_wal` for that double-logging hazard.
+        //
+        // ORDERING IS LOAD-BEARING — DO NOT MOVE THIS BELOW THE BATCH WRITE.
+        // This is write-ahead, matching the shipped autocommit contract
+        // exactly (`txn.put()`, then `log_data_insert()`, then — later — the
+        // enclosing `execute_with_implicit_transaction`'s `txn.commit()`). If
+        // the batch write below then fails, a WAL entry (and, in sync mode, a
+        // standby ACK) exists for data that did not land locally: the SAME
+        // risk every autocommit statement has always carried, and one that
+        // `replay_wal()` at open repairs for a true crash. Emitting AFTER the
+        // write instead trades it for a strictly worse failure — a crash
+        // between a successful local commit and the append leaves the standby
+        // silently and permanently missing a transaction the client was
+        // already told succeeded, with no error and no retry signal. That is a
+        // second instance of the exact silent-divergence bug being fixed here.
+        //
+        // Placed before `_columnar_stats_guard` below on purpose too: in
+        // sync/semi-sync mode this call blocks on a standby ACK, and it must
+        // not hold the columnar zone-stats write lock while it does.
+        if let Some(wal) = &self.wal {
+            let ops = Self::collect_logical_wal_ops(
+                &self.insert_log.read(),
+                &self.write_set,
+                &self.row_counter_stages.read(),
+            );
+            if !ops.is_empty() {
+                // Guard released by the end of this statement, before the
+                // abort bookkeeping below.
+                let appended = wal.read().append_batch(ops, self.logical_wal_sync);
+                if let Err(e) = appended {
+                    // Fatal to the commit, mirroring the autocommit contract:
+                    // there, a failing `log_data_*` propagates out of
+                    // `execute_in_transaction_inner` and
+                    // `execute_with_implicit_transaction` rolls back instead of
+                    // committing. Falling through to the batch write would
+                    // commit data locally that was never logged — a narrower
+                    // rerun of this very bug, gated on WAL I/O failure instead
+                    // of `skip_fast_paths`. Unwind exactly like the
+                    // counter-serialize failure above: an announced in-flight
+                    // commit that never reaches `end_commit` stalls the
+                    // snapshot barrier forever.
+                    if inflight {
+                        if let Some(registry) = &self.conflict_registry {
+                            registry.end_commit(commit_ts);
+                        }
+                    }
+                    self.acquired_locks.write().clear();
+                    self.state.store(TransactionState::Aborted.to_u8(), Ordering::Release);
+                    warn!(
+                        txn_id = self.transaction_id,
+                        error = %e,
+                        "Commit aborted: logical WAL append failed"
+                    );
+                    return Err(Error::transaction(format!(
+                        "Commit failed: logical WAL append failed: {}",
+                        e
+                    )));
+                }
+            }
+        }
+
         // R3.1: exclude zone-stats backfill while columnar batches + their
         // stats sidecars are applied (no-op guard for non-columnar commits).
         let _columnar_stats_guard = touches_columnar.then(super::columnar::stats_write_lock);
@@ -984,6 +1104,121 @@ impl Transaction {
         );
 
         Ok(())
+    }
+
+    /// Build this commit's logical-WAL operations (ROADMAP_V5.md §1.8) from
+    /// the SAME staging structures — and with the SAME `insert_log`-vs-
+    /// `write_set` precedence, `write_set` winning on a key collision — that
+    /// the RocksDB data batch above is built from.
+    ///
+    /// Sharing the source of truth is the whole design: "logged" and
+    /// "committed" then cover the same writes *by construction*, so no present
+    /// or future write call site can be silently missed the way the
+    /// per-statement `log_data_*` gate missed every explicit-transaction write.
+    /// Three correctness properties fall out for free, with no code here:
+    ///   * `ROLLBACK` clears both structures, and never calls commit anyway.
+    ///   * `ROLLBACK TO SAVEPOINT` has already restored `write_set` and
+    ///     truncated `insert_log` by the time a later COMMIT reads them, so
+    ///     only the surviving operations are emitted.
+    ///   * `ON DELETE CASCADE` / `SET NULL` child writes stage into the
+    ///     caller's transaction (`txn.delete`/`txn.put`) and only skip the
+    ///     *per-statement* log, so they are picked up here like any other row.
+    ///
+    /// Only literal `data:{table}:{row_id}` keys replicate. Everything else in
+    /// the write set is excluded, and each exclusion is deliberate:
+    ///   * `bdata:`/`bdel:` — branch-scoped writes. Branches are local,
+    ///     ephemeral fork-test-discard sandboxes; a standby exists to take
+    ///     over serving main, so shipping a throwaway branch experiment into
+    ///     it is never the intent. Follows the DELETE arm's W2.0 branch
+    ///     carve-out in `lib.rs`, which also logs nothing for branch writes.
+    ///   * `counter:` — staged separately in `row_counter_stages` and emitted
+    ///     below as `UpdateCounter`.
+    ///   * `col:`/`colz:`/`colp:` — columnar side-data, derived on the standby
+    ///     from the rows that DO replicate.
+    /// The parse is deliberately the same literal-prefix match
+    /// `written_data_keys` uses, so those exclusions fall out of it rather
+    /// than being special-cased (`"bdata:…"` fails `strip_prefix(b"data:")` at
+    /// the very first byte).
+    ///
+    /// `row_counter_stages` becomes one `WalOperation::UpdateCounter` per
+    /// table, the same variant the durable `next_row_id` allocator already
+    /// emits "to ensure sequence values are preserved across failover" — the
+    /// standby's `Insert` handler never derives a counter from the row ids it
+    /// applies, so without this a promoted standby could reissue a row id for
+    /// any table populated through the fast-insert-in-transaction path.
+    ///
+    /// Known, accepted fidelity gap: `write_set` carries no SQL-level
+    /// operation kind, so a general-path INSERT (anything past the literal
+    /// fast-insert shortcut, which is the only writer of `insert_log`) emits
+    /// `Update` rather than `Insert`. Both are the identical `put` on replay,
+    /// so convergence is unaffected; only a CDC consumer that distinguishes
+    /// them would notice. Closing that needs operation-kind tagging at the
+    /// statement call sites — a follow-up layered on top of this fix, not a
+    /// replacement for it.
+    fn collect_logical_wal_ops(
+        insert_log: &[(Key, Vec<u8>)],
+        write_set: &DashMap<Key, Option<Vec<u8>>>,
+        row_counter_stages: &std::collections::HashMap<String, u64>,
+    ) -> Vec<WalOperation> {
+        let write_set_has_entries = !write_set.is_empty();
+        let mut ops = Vec::with_capacity(insert_log.len() + write_set.len() + row_counter_stages.len());
+
+        for (key, val) in insert_log {
+            // Same dedup as the data-batch loop: a key that was fast-inserted
+            // and then updated in the same transaction must emit one final
+            // Update, not a stale Insert followed by an Update.
+            if write_set_has_entries && write_set.contains_key(key) {
+                continue;
+            }
+            if let Some(table) = Self::parse_data_key_table(key) {
+                ops.push(WalOperation::Insert {
+                    table,
+                    key: key.clone(),
+                    tuple: val.clone(),
+                });
+            }
+        }
+
+        for entry in write_set.iter() {
+            let (key, value) = (entry.key(), entry.value());
+            let Some(table) = Self::parse_data_key_table(key) else {
+                continue;
+            };
+            match value {
+                Some(val) => ops.push(WalOperation::Update {
+                    table,
+                    key: key.clone(),
+                    tuple: val.clone(),
+                }),
+                None => ops.push(WalOperation::Delete {
+                    table,
+                    key: key.clone(),
+                }),
+            }
+        }
+
+        for (table_name, row_id) in row_counter_stages {
+            ops.push(WalOperation::UpdateCounter {
+                table_name: table_name.clone(),
+                new_value: *row_id,
+            });
+        }
+
+        ops
+    }
+
+    /// Parse a `data:{table}:{row_id}` key into its table name. Returns `None`
+    /// for every other key shape (branch, counter, columnar, meta, …) — see
+    /// `collect_logical_wal_ops` for why that is exactly the wanted filter.
+    fn parse_data_key_table(key: &[u8]) -> Option<String> {
+        let rest = key.strip_prefix(b"data:".as_slice())?;
+        let text = std::str::from_utf8(rest).ok()?;
+        let pos = text.rfind(':')?;
+        let row_id = &text[pos + 1..];
+        if row_id.is_empty() || !row_id.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        Some(text[..pos].to_string())
     }
 
     fn put_versioned_batch(
