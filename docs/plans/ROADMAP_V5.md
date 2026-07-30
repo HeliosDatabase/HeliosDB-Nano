@@ -34,9 +34,21 @@ does not restate them, only calls out which apply per item.
 Ranked by **user impact**: can this happen under ordinary, correct SQL, with no error message,
 against data the user has every reason to trust? Effort is a secondary sort key.
 
-### 1.1 Row-Level Security is not enforced on any write path a real client uses
+### 1.1 Row-Level Security is not enforced on any write path — **SHIPPED in v4.9.0 (`bfe9115`)**
 
-**Status:** open, unfixed. **Severity: highest in this document.** **Effort: substantial.**
+**Status:** FIXED and shipped in v4.9.0 (`bfe9115`). Enforcement lives in `RlsWriteGuard` plus
+three shared helpers called from the generic Insert/InsertSelect/Update/Delete arms of BOTH executor
+families; violations map to SQLSTATE 42501. Two colocated `get_rls_conditions` bugs fixed alongside
+(first-policy-only instead of OR-combination; missing WITH CHECK -> USING fallback), both of which
+affected reads too. Verified by a 15-test both-families parity suite AND by an independent
+coordinator-authored probe: UPDATE 0 rows, INSERT Err, DELETE 0 rows, hidden row intact.
+
+**Residual, and it gates any future work to expose RLS over the wire** (all found during the fix,
+all deliberately out of its scope): `execute()` on a SELECT bypasses RLS via the text family's
+catch-all arm; the result cache is not tenant-keyed, so a no-context read can serve a later
+RLS-active read unfiltered; and wire simple-query SELECT never calls `apply_rls_to_plan`. None are
+reachable today because no wire connection can set a `TenantContext` — which is exactly why they
+must be closed BEFORE that changes, alongside session-scoping the process-global context.
 
 **Correction, not an echo.** The original characterization ("RLS is enforced on read paths
 only, not on writes") undersells this. There *is* write-enforcement code — `LogicalPlan::Insert

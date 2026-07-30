@@ -5,6 +5,47 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.9.0] - 2026-07-30
+
+**Security fix.** If you use row-level security, upgrade.
+
+- **Fix (security, pre-existing):** row-level security was **not enforced on any
+  write path**. Policies were evaluated for every `INSERT`, `UPDATE`, and
+  `DELETE` — and the result was then discarded. A session subject to a policy
+  could modify and delete rows the policy hid from it, with no error.
+
+  `SELECT` filtering worked correctly throughout, which is what made this
+  dangerous: reads looked properly isolated, so verifying tenant isolation with
+  a query returned a clean result while writes were unrestricted.
+
+  Enforcement now follows PostgreSQL semantics on both the simple-query and
+  extended-protocol paths. `USING` decides which existing rows a statement may
+  touch — rows outside the policy are silently not affected, exactly as in
+  PostgreSQL. `WITH CHECK` validates the row being written and raises
+  `new row violates row-level security policy for table "…"` (SQLSTATE 42501).
+
+- **Fix (pre-existing):** when a table had several applicable policies, only the
+  first was applied instead of combining them with `OR`. Tables relying on
+  multiple permissive policies were more restrictive than declared. This
+  affected reads as well as writes.
+
+- **Fix (pre-existing):** a policy declared without a `WITH CHECK` expression did
+  not fall back to its `USING` expression, as PostgreSQL specifies.
+
+**Scope — please read.** Tenant context can currently only be established
+through the embedded Rust API and the REPL; no network protocol sets one. So
+row-level security has never been active for clients connecting over PostgreSQL
+wire, MySQL wire, or `/rest/v1/` — this fix does not change that, and RLS should
+not be considered available to networked clients. Making it so additionally
+requires session-scoping the tenant context, which is currently a single
+process-wide value: were it wired up as-is, one connection's tenant would apply
+to every concurrent connection. That work is tracked and is not in this release.
+
+**Upgrade note.** Writes that previously succeeded against policy-protected
+tables will now be rejected or silently affect fewer rows. That is the intended
+behaviour, but if an application has come to depend on the missing enforcement,
+it will see new `42501` errors and lower affected-row counts.
+
 ## [4.8.0] - 2026-07-29
 
 Replication integrity. If you run HA replication or consume the logical WAL,
