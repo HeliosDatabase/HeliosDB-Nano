@@ -181,14 +181,26 @@ fn test_04_rls_insert_isolation() {
     assert!(result.is_ok());
     println!("✓ INSERT succeeded with matching tenant_id");
 
-    // Try to insert with different tenant_id (should fail RLS check)
+    // Try to insert with a different tenant_id: the policy's WITH CHECK must
+    // REJECT it (PG: `new row violates row-level security policy for table …`).
+    //
+    // This assertion is the point of the test. It used to be a `match` with a
+    // `println!` in BOTH arms — including one reading "⚠ INSERT succeeded (RLS
+    // check may need enhancement)" — so the test could not fail no matter what
+    // the write path did, and the vulnerability it names shipped anyway.
     let result = db.execute("INSERT INTO sales VALUES (2, 'other-tenant', 'Mouse', 50)");
+    assert!(
+        result.is_err(),
+        "cross-tenant INSERT must be rejected by the policy's WITH CHECK; got {result:?}"
+    );
 
-    // Note: RLS with_check_expr will prevent this
-    match result {
-        Ok(_) => println!("⚠ INSERT succeeded (RLS check may need enhancement)"),
-        Err(e) => println!("✓ INSERT blocked by RLS: {}", e),
-    }
+    // ...and nothing may have been written. This policy covers ALL commands, so
+    // the verification read runs with the context CLEARED: under the context RLS
+    // filters SELECT too, and an accepted cross-tenant row would look absent.
+    db.tenant_manager.clear_current_context();
+    let rows = db.query("SELECT id FROM sales", &[]).unwrap();
+    assert_eq!(rows.len(), 1, "only tenant A's own row may exist; got {rows:?}");
+    println!("✓ INSERT blocked by RLS and no row was written");
 }
 
 #[test]
@@ -297,11 +309,37 @@ fn test_06_rls_update_isolation() {
 
     // Try to update Tenant A's data (should succeed)
     let result = db.execute("UPDATE sales SET amount = 1300 WHERE id = 1");
-    assert!(result.is_ok());
+    assert_eq!(
+        result.as_ref().ok().copied(),
+        Some(1),
+        "tenant A must still be able to update its own row; got {result:?}"
+    );
     println!("✓ UPDATE succeeded for Tenant A's data");
 
-    // Try to update Tenant B's data (should fail - RLS blocks it)
+    // Try to update Tenant B's data. RLS `USING` is a FILTER on UPDATE, not an
+    // error: the statement must SUCCEED and touch ZERO rows.
+    //
+    // These two assertions are the point of the test. It used to bind `result`
+    // and never read it (shadowed by the next binding, so not even an
+    // unused-variable warning fired), then print "✓ UPDATE affected 0 rows …
+    // (RLS protected)" unconditionally — while the write path was in fact
+    // updating the row.
     let result = db.execute("UPDATE sales SET amount = 1600 WHERE id = 2");
+    assert_eq!(
+        result.as_ref().ok().copied(),
+        Some(0),
+        "cross-tenant UPDATE must affect 0 rows AND must not raise an error; got {result:?}"
+    );
+    // This policy is UPDATE-only, so SELECT is not filtered and can be read
+    // directly under the active context.
+    let untouched = db
+        .query("SELECT id FROM sales WHERE id = 2 AND amount = 1500", &[])
+        .unwrap();
+    assert_eq!(
+        untouched.len(),
+        1,
+        "tenant B's row must still hold its original amount of 1500"
+    );
     println!("✓ UPDATE affected 0 rows for Tenant B's data (RLS protected)");
 }
 
@@ -350,13 +388,37 @@ fn test_07_rls_delete_isolation() {
         isolation_mode: IsolationMode::SharedSchema,
     });
 
-    // Try to delete Tenant B's data (should be blocked by RLS)
+    // Try to delete Tenant B's data. RLS `USING` filters silently on DELETE too:
+    // the statement must SUCCEED, delete NOTHING, and leave the row in place.
+    //
+    // These assertions are the point of the test. It used to bind `result` and
+    // never read it, then print "✓ DELETE affected 0 rows … (RLS protected)"
+    // unconditionally — while the row was in fact being deleted. This is the
+    // exact live-verified bypass: a session that could see one row deleted a row
+    // it could not see.
     let result = db.execute("DELETE FROM sales WHERE id = 2");
+    assert_eq!(
+        result.as_ref().ok().copied(),
+        Some(0),
+        "cross-tenant DELETE must affect 0 rows AND must not raise an error; got {result:?}"
+    );
+    // This policy is DELETE-only, so SELECT is not filtered.
+    let survivor = db.query("SELECT id FROM sales WHERE id = 2", &[]).unwrap();
+    assert_eq!(survivor.len(), 1, "tenant B's row must survive a cross-tenant DELETE");
     println!("✓ DELETE affected 0 rows for Tenant B's data (RLS protected)");
 
     // Delete Tenant A's data (should succeed)
     let result = db.execute("DELETE FROM sales WHERE id = 1");
-    assert!(result.is_ok());
+    assert_eq!(
+        result.as_ref().ok().copied(),
+        Some(1),
+        "tenant A must still be able to delete its own row; got {result:?}"
+    );
+    let gone = db.query("SELECT id FROM sales WHERE id = 1", &[]).unwrap();
+    assert!(
+        gone.is_empty(),
+        "tenant A's own row must actually be gone; got {gone:?}"
+    );
     println!("✓ DELETE succeeded for Tenant A's data");
 }
 

@@ -3006,7 +3006,14 @@ pub(crate) fn sqlstate_for_error(error: &Error) -> &'static str {
     match error {
         Error::ConstraintViolation(message) => {
             let lower = message.to_ascii_lowercase();
-            if lower.contains("duplicate") || lower.contains("unique") {
+            // Checked first: real PostgreSQL reports an RLS policy violation as
+            // 42501 insufficient_privilege, not a 235xx integrity code — and a
+            // table name embedded in the message could otherwise contain one of
+            // the keywords below. Raised by `EmbeddedDatabase::enforce_rls_with_check`
+            // ("new row violates row-level security policy for table …").
+            if lower.contains("row-level security") {
+                sqlstate::INSUFFICIENT_PRIVILEGE // 42501
+            } else if lower.contains("duplicate") || lower.contains("unique") {
                 sqlstate::UNIQUE_VIOLATION // 23505
             } else if lower.contains("foreign key") {
                 sqlstate::FOREIGN_KEY_VIOLATION // 23503
@@ -3473,6 +3480,40 @@ mod sqlstate_mapping_unit_tests {
         db.execute("INSERT INTO t23505 VALUES (1)").unwrap();
         let err = sql_error(&db, "INSERT INTO t23505 VALUES (1)");
         assert_eq!(sqlstate_for_error(&err), "23505", "got error: {err}");
+    }
+
+    /// An RLS `WITH CHECK` violation is 42501 insufficient_privilege, not a
+    /// 235xx integrity code — same as real PostgreSQL. Guards the ordering of
+    /// the substring sniffing too: this branch must be tested before the
+    /// `"unique"` / `"check"` ones (ROADMAP_V5 §1.1).
+    #[test]
+    fn rls_policy_violation_maps_to_42501() {
+        use crate::tenant::{IsolationMode, RLSCommand, TenantContext};
+
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE t42501 (id INTEGER PRIMARY KEY, owner TEXT NOT NULL)")
+            .unwrap();
+        let tenant = db
+            .tenant_manager
+            .register_tenant("t42501-tenant".to_string(), IsolationMode::SharedSchema);
+        db.tenant_manager.create_rls_policy(
+            "t42501".to_string(),
+            "owner_only".to_string(),
+            "Only alice's rows".to_string(),
+            RLSCommand::All,
+            "owner = 'alice'".to_string(),
+            Some("owner = 'alice'".to_string()),
+        );
+        db.tenant_manager.set_current_context(TenantContext {
+            tenant_id: tenant.id,
+            user_id: "alice".to_string(),
+            roles: vec![],
+            isolation_mode: IsolationMode::SharedSchema,
+        });
+
+        let err = sql_error(&db, "INSERT INTO t42501 VALUES (1, 'bob')");
+        assert_eq!(sqlstate_for_error(&err), "42501", "got error: {err}");
+        db.tenant_manager.clear_current_context();
     }
 
     #[test]

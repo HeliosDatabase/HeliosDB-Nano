@@ -1142,38 +1142,79 @@ impl TenantManager {
 
     /// Get RLS conditions for current context and table
     /// Returns a tuple of (using_expression, with_check_expression) if RLS should be applied
+    ///
+    /// Both elements follow PostgreSQL's policy-combination rules (ROADMAP_V5 §1.1):
+    ///
+    /// * **Multiple permissive policies OR together.** This used to return only
+    ///   `applicable_policies.first()`, so a table carrying both an `ALL` policy and a
+    ///   command-specific one silently enforced whichever happened to sit first in
+    ///   `rls_policies` insertion order — under-enforcing one policy and over-enforcing
+    ///   the other, on the read path as much as on the write path.
+    /// * **A policy with no `WITH CHECK` reuses its own `USING` as the check.** The
+    ///   fallback is applied *per policy, before* the OR: OR-ing the `USING`s and then
+    ///   falling back once would drop a check-less policy's contribution whenever any
+    ///   sibling policy did declare a `WITH CHECK`.
+    ///
+    /// The returned strings are policy expressions, not full predicates — callers parse
+    /// them with [`crate::tenant::RLSExpressionEvaluator`]. `should_apply_rls` has
+    /// already established that a context exists, its tenant exists, `rls_enabled` is
+    /// set, and at least one policy applies to `cmd`.
     pub fn get_rls_conditions(&self, table_name: &str, cmd: &str) -> Option<(String, Option<String>)> {
         if !self.should_apply_rls(table_name, cmd) {
             return None;
         }
 
-        if let Some(context) = self.get_current_context() {
-            if let Some(_tenant) = self.get_tenant(context.tenant_id) {
-                let policies = self.get_rls_policies(table_name);
-                let cmd_upper = cmd.to_uppercase();
+        let policies = self.get_rls_policies(table_name);
+        let cmd_upper = cmd.to_uppercase();
 
-                // Collect applicable policies
-                let applicable_policies: Vec<_> = policies
-                    .iter()
-                    .filter(|p| {
-                        matches!(p.cmd, RLSCommand::All)
-                            || (matches!(p.cmd, RLSCommand::Select) && cmd_upper == "SELECT")
-                            || (matches!(p.cmd, RLSCommand::Insert) && cmd_upper == "INSERT")
-                            || (matches!(p.cmd, RLSCommand::Update) && cmd_upper == "UPDATE")
-                            || (matches!(p.cmd, RLSCommand::Delete) && cmd_upper == "DELETE")
-                    })
-                    .collect();
+        // Collect applicable policies
+        let applicable_policies: Vec<&RLSPolicy> = policies
+            .iter()
+            .filter(|p| {
+                matches!(p.cmd, RLSCommand::All)
+                    || (matches!(p.cmd, RLSCommand::Select) && cmd_upper == "SELECT")
+                    || (matches!(p.cmd, RLSCommand::Insert) && cmd_upper == "INSERT")
+                    || (matches!(p.cmd, RLSCommand::Update) && cmd_upper == "UPDATE")
+                    || (matches!(p.cmd, RLSCommand::Delete) && cmd_upper == "DELETE")
+            })
+            .collect();
 
-                if !applicable_policies.is_empty() {
-                    // For now, combine with first applicable policy
-                    // In production, would combine multiple policies with OR
-                    if let Some(policy) = applicable_policies.first() {
-                        return Some((policy.using_expr.clone(), policy.with_check_expr.clone()));
-                    }
-                }
-            }
+        if applicable_policies.is_empty() {
+            return None;
         }
-        None
+
+        // One applicable policy is the overwhelmingly common case (and the only
+        // shape the SELECT path ever resolved before this): hand back its
+        // expressions directly. Byte-identical to the pre-fix output, and it
+        // keeps this per-statement resolution at the same two clones it always
+        // cost rather than collecting and joining a one-element list.
+        if let [policy] = applicable_policies.as_slice() {
+            let with_check = match &policy.with_check_expr {
+                Some(expr) => expr.clone(),
+                None => policy.using_expr.clone(),
+            };
+            return Some((policy.using_expr.clone(), Some(with_check)));
+        }
+
+        // Joined WITHOUT wrapping each policy in parentheses, deliberately:
+        //
+        // * It is safe. `OR` is the lowest-precedence boolean operator in SQL, so
+        //   `a AND b` OR-joined with `c` parses as `(a AND b) OR c` — the intended
+        //   grouping — and `NOT`/comparison/`IS` all bind tighter still. There is
+        //   no policy expression shape that re-associates across a bare ` OR `.
+        // * Parentheses would actively break it. `RLSExpressionEvaluator`'s
+        //   `sql_expr_to_logical` (src/tenant/expression.rs) has no
+        //   `Expr::Nested` arm — the AST node sqlparser emits for `( … )` — and
+        //   falls through to "Unsupported expression in RLS policy". Wrapping the
+        //   operands would therefore turn every multi-policy table into a hard
+        //   error on both the read and the write path.
+        let usings: Vec<&str> = applicable_policies.iter().map(|p| p.using_expr.as_str()).collect();
+        let checks: Vec<&str> = applicable_policies
+            .iter()
+            .map(|p| p.with_check_expr.as_deref().unwrap_or(&p.using_expr))
+            .collect();
+
+        Some((usings.join(" OR "), Some(checks.join(" OR "))))
     }
 
     // ============================================================================
@@ -1661,6 +1702,103 @@ mod tests {
 
         let policies = manager.get_rls_policies("orders");
         assert!(policies[0].with_check_expr.is_some());
+    }
+
+    /// PG rule: multiple permissive policies OR together. The old body returned
+    /// `applicable_policies.first()` and dropped the rest (ROADMAP_V5 §1.1).
+    #[test]
+    fn test_get_rls_conditions_combines_policies_with_or() {
+        let manager = TenantManager::new();
+        let tenant = manager.register_tenant("Test".to_string(), IsolationMode::SharedSchema);
+
+        // An `ALL` policy plus an UPDATE-specific one: both apply to UPDATE.
+        manager.create_rls_policy(
+            "orders".to_string(),
+            "all_policy".to_string(),
+            "desc".to_string(),
+            RLSCommand::All,
+            "owner = 'alice'".to_string(),
+            None,
+        );
+        manager.create_rls_policy(
+            "orders".to_string(),
+            "update_policy".to_string(),
+            "desc".to_string(),
+            RLSCommand::Update,
+            "owner = 'bob'".to_string(),
+            Some("owner = 'carol'".to_string()),
+        );
+
+        manager.set_current_context(TenantContext {
+            tenant_id: tenant.id,
+            user_id: "user1".to_string(),
+            roles: vec![],
+            isolation_mode: IsolationMode::SharedSchema,
+        });
+
+        let (using_expr, with_check) = manager
+            .get_rls_conditions("orders", "UPDATE")
+            .expect("both policies apply to UPDATE");
+
+        assert!(
+            using_expr.contains("alice"),
+            "USING must keep the ALL policy: {using_expr}"
+        );
+        assert!(
+            using_expr.contains("bob"),
+            "USING must keep the UPDATE policy: {using_expr}"
+        );
+        assert!(using_expr.contains(" OR "), "USING must OR-combine: {using_expr}");
+
+        let with_check = with_check.expect("UPDATE has a WITH CHECK");
+        // Per-policy fallback happens BEFORE the OR: the ALL policy contributes
+        // its own USING (`alice`), the UPDATE policy its explicit check (`carol`).
+        assert!(
+            with_check.contains("alice"),
+            "check-less policy must fall back to its USING: {with_check}"
+        );
+        assert!(
+            with_check.contains("carol"),
+            "explicit WITH CHECK must be kept: {with_check}"
+        );
+        assert!(
+            !with_check.contains("bob"),
+            "the UPDATE policy declared a WITH CHECK, so its USING must not be used: {with_check}"
+        );
+    }
+
+    /// PG rule: a policy with no `WITH CHECK` reuses its own `USING` as the check.
+    /// The old body returned `with_check_expr.clone()` verbatim, so `None` stayed
+    /// `None` and the new row was never validated at all.
+    #[test]
+    fn test_get_rls_conditions_with_check_falls_back_to_using() {
+        let manager = TenantManager::new();
+        let tenant = manager.register_tenant("Test".to_string(), IsolationMode::SharedSchema);
+
+        manager.create_rls_policy(
+            "orders".to_string(),
+            "no_check".to_string(),
+            "desc".to_string(),
+            RLSCommand::All,
+            "owner = 'alice'".to_string(),
+            None,
+        );
+
+        manager.set_current_context(TenantContext {
+            tenant_id: tenant.id,
+            user_id: "user1".to_string(),
+            roles: vec![],
+            isolation_mode: IsolationMode::SharedSchema,
+        });
+
+        let (using_expr, with_check) = manager
+            .get_rls_conditions("orders", "INSERT")
+            .expect("the ALL policy applies to INSERT");
+        assert_eq!(
+            with_check.as_deref(),
+            Some(using_expr.as_str()),
+            "a policy with no WITH CHECK must reuse its USING"
+        );
     }
 
     #[test]
