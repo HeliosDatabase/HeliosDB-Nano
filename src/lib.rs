@@ -1049,6 +1049,32 @@ struct PendingFkCheck {
     parent_values: Vec<Value>,
 }
 
+/// Per-statement, pre-parsed row-level-security policy for one (table, command)
+/// pair. Built ONCE before a DML row loop and reused for every row.
+///
+/// `RLSExpressionEvaluator::parse` (src/tenant/expression.rs) re-tokenizes and
+/// re-parses the policy expression string through `sqlparser` on every call — it
+/// caches nothing — so building this inside a per-row loop would turn an
+/// O(1)-parses-per-statement cost into O(rows). The dead `execute_internal`
+/// UPDATE/DELETE arms do exactly that (`rls_evaluator.parse` inside
+/// `for tuple in tuples`); that is the mistake this type exists to prevent.
+///
+/// The `USING`/`WITH CHECK` asymmetry is PostgreSQL's, not an oversight — see
+/// `docs/plans/ROADMAP_V5.md` §1.1 and `EmbeddedDatabase::build_rls_write_guard`.
+struct RlsWriteGuard {
+    /// Table the policy belongs to — only used to build the PG error message.
+    table_name: String,
+    /// Parsed, OR-combined `USING`. `None` for INSERT: PostgreSQL has no
+    /// `USING` concept for INSERT (there is no pre-image row to filter).
+    using: Option<sql::LogicalExpr>,
+    /// Parsed, OR-combined, per-policy-fallback-applied effective `WITH CHECK`
+    /// (see `TenantManager::get_rls_conditions`). `None` for DELETE:
+    /// PostgreSQL has no `WITH CHECK` concept for DELETE (no new row).
+    with_check: Option<sql::LogicalExpr>,
+    /// Schema- and tenant-context-bound evaluator shared by both expressions.
+    evaluator: tenant::RLSExpressionEvaluator,
+}
+
 enum TraceControl {
     SetEnabled(bool),
     ShowEnabled,
@@ -3581,6 +3607,22 @@ impl EmbeddedDatabase {
                 // arm on the same main-branch predicate that routes the data key.
                 let on_branch = self.storage.get_current_branch_id().is_some();
 
+                // RLS (ROADMAP_V5 §1.1): resolve + parse the policy ONCE per
+                // statement, never per row (see `RlsWriteGuard`). `None` when no
+                // tenant context is active or the table has no applicable policy —
+                // the free path every non-multi-tenant workload takes.
+                let rls_guard_insert = self.build_rls_write_guard(table_name, "INSERT", &schema)?;
+                // The DO UPDATE leg below mutates an EXISTING row, so it is governed
+                // by the UPDATE policy, not the INSERT one. Resolved only when this
+                // statement can actually reach that leg, so a plain INSERT pays
+                // nothing extra.
+                let do_update = matches!(on_conflict, Some(sql::logical_plan::OnConflictAction::DoUpdate { .. }));
+                let rls_guard_update = if do_update {
+                    self.build_rls_write_guard(table_name, "UPDATE", &schema)?
+                } else {
+                    None
+                };
+
                 let loop_result: Result<u64> = (|| {
                     let mut count = 0;
                     for value_row in values {
@@ -3857,6 +3899,17 @@ impl EmbeddedDatabase {
                                             })?;
                                         existing_tuple.row_id = Some(existing_row_id);
 
+                                        // RLS: the conflicting row is a pre-image the
+                                        // UPDATE policy's USING governs. Skip silently
+                                        // (like an ordinary UPDATE's USING filter) when
+                                        // this session cannot see it, so it can neither
+                                        // read nor overwrite another tenant's row through
+                                        // an upsert. Runs BEFORE the optional DO UPDATE
+                                        // WHERE below, and before any write.
+                                        if !Self::rls_row_visible(rls_guard_update.as_ref(), &existing_tuple)? {
+                                            continue;
+                                        }
+
                                         // R5.V1: snapshot the pre-update row for HNSW vector
                                         // maintenance (vector-indexed tables only).
                                         let vector_pre_update_tuple = if self.vector_dml_gate(table_name) {
@@ -3922,6 +3975,14 @@ impl EmbeddedDatabase {
                                                 }
                                             }
                                         }
+
+                                        // RLS: the post-assignment row must satisfy the
+                                        // UPDATE policy's WITH CHECK — an ERROR on
+                                        // violation, not a filter (so an upsert cannot
+                                        // hand a row to another tenant). Same position as
+                                        // the FK/CHECK/UNIQUE re-validation below: all are
+                                        // gates the row must clear before it is written.
+                                        Self::enforce_rls_with_check(rls_guard_update.as_ref(), &existing_tuple)?;
 
                                         // The DO UPDATE mutated an existing row —
                                         // re-validate FK / CHECK / UNIQUE exactly
@@ -4112,6 +4173,15 @@ impl EmbeddedDatabase {
                             }
                         }
 
+                        // RLS WITH CHECK on the row that is actually about to be
+                        // persisted: after BEFORE-row trigger mutations
+                        // (`apply_before_row_mutations` above) and after the
+                        // SERIAL/IDENTITY PK auto-fill, so a trigger cannot smuggle a
+                        // policy-violating value past the boundary and a policy over
+                        // the PK column sees its generated value rather than NULL.
+                        // A violation is an ERROR (PG semantics), never a silent skip.
+                        Self::enforce_rls_with_check(rls_guard_insert.as_ref(), &tuple)?;
+
                         // FK validation on INSERT (Kanttban bug #6 fix).
                         // Pass the active txn so the parent-existence check
                         // sees in-flight inserts to the parent table within
@@ -4260,15 +4330,34 @@ impl EmbeddedDatabase {
                 source,
                 returning,
             } => {
+                // RLS on the SOURCE read: the rows this statement copies must be the
+                // rows the session may SELECT, or an RLS-protected table could be
+                // drained wholesale through `INSERT INTO t2 SELECT * FROM t1`. The
+                // plan is only cloned when a tenant context exists — `apply_rls_to_plan`
+                // is a no-op otherwise and the clone would be pure cost.
+                let rls_filtered_source = if self.tenant_manager.get_current_context().is_some() {
+                    Some(self.apply_rls_to_plan((**source).clone())?)
+                } else {
+                    None
+                };
+                let source_plan: &sql::LogicalPlan = match &rls_filtered_source {
+                    Some(plan) => plan,
+                    None => source,
+                };
+
                 // Execute the source SELECT plan to get rows
                 let mut executor =
                     sql::Executor::with_storage(&self.storage).with_timeout(self.effective_statement_timeout_ms());
-                let source_rows = executor.execute(source)?;
+                let source_rows = executor.execute(source_plan)?;
 
                 let catalog = self.storage.catalog();
                 let schema = catalog.get_table_schema(table_name)?;
                 let evaluator = sql::Evaluator::new(std::sync::Arc::new(Schema { columns: vec![] }));
                 let empty_tuple = Tuple::new(vec![]);
+
+                // RLS WITH CHECK on the TARGET table, resolved once per statement
+                // (see `RlsWriteGuard`); `None` on the free no-context path.
+                let rls_guard_insert = self.build_rls_write_guard(table_name, "INSERT", &schema)?;
 
                 // Build column index mapping for INSERT with explicit column list
                 let column_indices: Option<Vec<usize>> = columns.as_ref().map(|cols| {
@@ -4509,6 +4598,12 @@ impl EmbeddedDatabase {
                         }
                     }
 
+                    // RLS WITH CHECK on the row about to be persisted — an ERROR on
+                    // violation, aborting the whole INSERT ... SELECT (PG semantics:
+                    // WITH CHECK never filters). Placed after the BEFORE trigger block
+                    // for the same reason as the plain INSERT arm.
+                    Self::enforce_rls_with_check(rls_guard_insert.as_ref(), &tuple)?;
+
                     // Insert the tuple
                     let row_id =
                         self.storage
@@ -4588,6 +4683,12 @@ impl EmbeddedDatabase {
                 let trigger_event = sql::logical_plan::TriggerEvent::Update(Some(updated_columns));
                 let has_triggers = self.trigger_registry.has_triggers_for_table(table_name);
 
+                // RLS (ROADMAP_V5 §1.1): resolved + parsed once per statement, before
+                // the tuple-fetch strategy is chosen, so the PK-point-lookup branch
+                // below stays exactly as it was — the per-row loop is identical code
+                // whether `tuples` holds one row or the whole table.
+                let rls_guard = self.build_rls_write_guard(table_name, "UPDATE", &schema)?;
+
                 // Try PK point lookup optimization: if WHERE is `pk_col = literal`,
                 // fetch only the matching row instead of scanning the entire table.
                 // Skip optimization on non-main branches: branch-inherited rows are stored
@@ -4620,7 +4721,13 @@ impl EmbeddedDatabase {
                         true
                     };
 
-                    if matches {
+                    // RLS USING is a FILTER, not an error: a row this session cannot
+                    // see is silently not updated (PG semantics). Folded into the
+                    // WHERE-match boolean so an invisible row never fires a BEFORE
+                    // trigger and never reaches `updates` — which is also what keeps
+                    // it out of the RETURNING projection below. `&&` short-circuits,
+                    // so the policy is only evaluated for rows the WHERE selected.
+                    if matches && Self::rls_row_visible(rls_guard.as_ref(), &old_tuple)? {
                         // Create new tuple with updated values
                         let mut new_tuple = old_tuple.clone();
                         for (col_name, value_expr) in assignments {
@@ -4706,6 +4813,14 @@ impl EmbeddedDatabase {
                                 }
                             }
                         }
+
+                        // RLS WITH CHECK on the POST-assignment row: an ERROR on
+                        // violation, unlike USING above which filters (ROADMAP_V5
+                        // §1.1). This is what stops an UPDATE from moving a row the
+                        // session legitimately owns out of its own policy's reach
+                        // (e.g. `SET tenant_id = <someone else>`). One more pass/fail
+                        // gate alongside FK / CHECK / UNIQUE below.
+                        Self::enforce_rls_with_check(rls_guard.as_ref(), &new_tuple)?;
 
                         // FK validation on UPDATE (Kanttban bug #6 fix).
                         // Only validate if the assigned columns include
@@ -4938,6 +5053,10 @@ impl EmbeddedDatabase {
             } => {
                 let catalog = self.storage.catalog();
                 let schema = catalog.get_table_schema(table_name)?;
+                // RLS (ROADMAP_V5 §1.1): resolved + parsed once per statement, before
+                // the tuple-fetch strategy is chosen (see the UPDATE arm). DELETE has
+                // no WITH CHECK — only USING, and only as a filter.
+                let rls_guard = self.build_rls_write_guard(table_name, "DELETE", &schema)?;
                 let schema_arc = std::sync::Arc::new(schema);
                 // Stamp source_table_name so qualified predicates
                 // `WHERE "t"."col" = …` resolve (B31).
@@ -4985,7 +5104,12 @@ impl EmbeddedDatabase {
                         true
                     };
 
-                    if matches {
+                    // RLS USING is a FILTER, not an error: a row this session cannot
+                    // see is silently not deleted (PG semantics). Folded into the
+                    // WHERE-match boolean, which puts it ahead of the BEFORE DELETE
+                    // triggers, the referencing-FK enforcement, and the RETURNING
+                    // projection below — none of which may observe an invisible row.
+                    if matches && Self::rls_row_visible(rls_guard.as_ref(), &tuple)? {
                         // Execute BEFORE DELETE triggers (skip if no triggers)
                         if has_triggers {
                             let row_context = sql::triggers::TriggerRowContext::for_delete(tuple.clone());
@@ -12104,6 +12228,21 @@ impl EmbeddedDatabase {
     }
 
     /// Internal execute method without transaction management
+    ///
+    /// **DEAD CODE — do not copy from it, and do not treat it as a reference.**
+    /// It has zero callers (its only other mentions in the tree are comments).
+    /// Its four DML arms are also *wrong* relative to the live executors: the
+    /// UPDATE arm resolves RLS conditions and then discards the `WITH CHECK`
+    /// element outright (`if let Some((using_expr, _)) = &rls_condition`), none
+    /// of the arms implement PG's "no WITH CHECK → fall back to USING" rule, its
+    /// `InsertSelect` arm reads the source with no `apply_rls_to_plan`, and its
+    /// UPDATE/DELETE arms call `RLSExpressionEvaluator::parse` *inside* the
+    /// per-tuple loop (that parse is uncached — O(rows) full `sqlparser` reparses).
+    /// The live, correct implementations are `execute_in_transaction_inner` and
+    /// `execute_plan_with_params_inner`, which share `build_rls_write_guard` /
+    /// `rls_row_visible` / `enforce_rls_with_check` (ROADMAP_V5 §1.1). This
+    /// function should be deleted in its own commit, once each of its DDL /
+    /// savepoint / database arms has been confirmed to have a live counterpart.
     fn execute_internal(&self, sql: &str) -> Result<u64> {
         // 1. Record query for quota tracking (QPS enforcement)
         if let Some(context) = self.tenant_manager.get_current_context() {
@@ -13664,6 +13803,19 @@ impl EmbeddedDatabase {
                     sql::Evaluator::with_parameters(std::sync::Arc::new(Schema { columns: vec![] }), params.to_vec());
                 let empty_tuple = Tuple::new(vec![]);
 
+                // RLS (ROADMAP_V5 §1.1): same policy resolution as the text family's
+                // Insert arm, through the same shared helpers, so the two families
+                // cannot drift. Once per statement; `None` on the free no-context path.
+                let rls_guard_insert = self.build_rls_write_guard(table_name, "INSERT", &schema)?;
+                // The DO UPDATE leg mutates an EXISTING row → UPDATE policy, resolved
+                // only when this statement can reach that leg.
+                let do_update = matches!(on_conflict, Some(sql::logical_plan::OnConflictAction::DoUpdate { .. }));
+                let rls_guard_update = if do_update {
+                    self.build_rls_write_guard(table_name, "UPDATE", &schema)?
+                } else {
+                    None
+                };
+
                 // R0.2: resolve the active transaction so parameterized
                 // INSERTs stage through the write set. Previously this arm
                 // always wrote directly to storage — inside a transaction
@@ -13794,6 +13946,14 @@ impl EmbeddedDatabase {
                             // which is correct for the autocommit /
                             // implicit-tx surface this path serves.
                             self.check_fk_constraints_on_write(table_name, &col_values_map, active_txn)?;
+                            // RLS WITH CHECK on the new row — an ERROR on violation,
+                            // never a filter (ROADMAP_V5 §1.1). Sits next to the
+                            // FK/CHECK gates, before anything is staged or written.
+                            // Note this arm's SERIAL/IDENTITY PK auto-fill happens
+                            // later (inside the write below), so a policy over the
+                            // generated PK sees NULL here — pre-existing shape of this
+                            // arm, unlike the text family which fills the PK first.
+                            Self::enforce_rls_with_check(rls_guard_insert.as_ref(), &tuple)?;
                             let row_id = if let Some(txn) = active_txn {
                                 // Transactional staging (mirrors the
                                 // execute_in_transaction_inner INSERT arm):
@@ -13962,6 +14122,14 @@ impl EmbeddedDatabase {
                                 .map_err(|err| Error::storage(format!("Failed to deserialize tuple: {}", err)))?;
                             updated_tuple.row_id = Some(existing_row_id);
 
+                            // RLS: the conflicting row is a pre-image governed by the
+                            // UPDATE policy's USING — skip silently when this session
+                            // cannot see it (mirrors the text family's DO UPDATE leg),
+                            // before the optional DO UPDATE WHERE and any write.
+                            if !Self::rls_row_visible(rls_guard_update.as_ref(), &updated_tuple)? {
+                                continue;
+                            }
+
                             // Snapshot the old tuple for the ART diff.
                             let old_tuple_for_art: Tuple = bincode::deserialize(&existing_raw)
                                 .map_err(|err| Error::storage(format!("Failed to deserialize tuple: {}", err)))?;
@@ -14025,6 +14193,10 @@ impl EmbeddedDatabase {
                                 }
                             }
 
+                            // RLS WITH CHECK on the post-assignment row — an ERROR on
+                            // violation, not a filter (see the text family's leg).
+                            Self::enforce_rls_with_check(rls_guard_update.as_ref(), &updated_tuple)?;
+
                             // The DO UPDATE mutated an existing row —
                             // re-validate FK / CHECK / UNIQUE exactly as an
                             // ordinary UPDATE would, BEFORE the row is
@@ -14080,15 +14252,31 @@ impl EmbeddedDatabase {
                 source,
                 returning,
             } => {
+                // RLS on the SOURCE read (see the text family's InsertSelect arm):
+                // rows hidden from this session must not be copyable into another
+                // table. Cloned only when a tenant context exists.
+                let rls_filtered_source = if self.tenant_manager.get_current_context().is_some() {
+                    Some(self.apply_rls_to_plan((**source).clone())?)
+                } else {
+                    None
+                };
+                let source_plan: &sql::LogicalPlan = match &rls_filtered_source {
+                    Some(plan) => plan,
+                    None => source,
+                };
+
                 // Execute source SELECT plan
                 let mut executor =
                     sql::Executor::with_storage(&self.storage).with_timeout(self.effective_statement_timeout_ms());
-                let source_rows = executor.execute(source)?;
+                let source_rows = executor.execute(source_plan)?;
 
                 let catalog = self.storage.catalog();
                 let schema = catalog.get_table_schema(table_name)?;
                 let table_constraints = catalog.load_table_constraints(table_name)?;
                 let evaluator = sql::Evaluator::new(std::sync::Arc::new(Schema { columns: vec![] }));
+
+                // RLS WITH CHECK on the TARGET table, once per statement.
+                let rls_guard_insert = self.build_rls_write_guard(table_name, "INSERT", &schema)?;
 
                 let column_indices: Option<Vec<usize>> = columns.as_ref().map(|cols| {
                     cols.iter()
@@ -14146,6 +14334,11 @@ impl EmbeddedDatabase {
 
                     let tuple = Tuple::new(tuple_values);
                     self.validate_check_constraints(&table_constraints, &schema, &tuple.values)?;
+                    // RLS WITH CHECK on the row about to be persisted. An INSERT
+                    // violation is an error that aborts the statement, so it runs
+                    // BEFORE the RETURNING projection — no point projecting a row
+                    // we are about to reject.
+                    Self::enforce_rls_with_check(rls_guard_insert.as_ref(), &tuple)?;
                     if has_returning {
                         if let Some(projected) = Self::project_returning_columns(&tuple, &schema, returning) {
                             returned_tuples.push(projected);
@@ -14171,6 +14364,10 @@ impl EmbeddedDatabase {
                 // resolve against this evaluator schema (B31).
                 let eval_schema = schema.clone().with_source_table_name(table_name);
                 let evaluator = sql::Evaluator::with_parameters(std::sync::Arc::new(eval_schema), params.to_vec());
+
+                // RLS (ROADMAP_V5 §1.1): same helpers as the text family's Update arm.
+                // Once per statement, before the row loop.
+                let rls_guard = self.build_rls_write_guard(table_name, "UPDATE", &schema)?;
 
                 let mut _txn_guard = None;
                 let active_txn: Option<&storage::Transaction> = match session_txn {
@@ -14208,7 +14405,11 @@ impl EmbeddedDatabase {
                         true
                     };
 
-                    if matches {
+                    // RLS USING filters silently — see the text family's Update arm.
+                    // `&&` short-circuits, so the policy is only evaluated for rows
+                    // the WHERE selected, and an invisible row never reaches `updates`
+                    // (and therefore never reaches RETURNING).
+                    if matches && Self::rls_row_visible(rls_guard.as_ref(), &tuple)? {
                         let old_tuple = tuple.clone();
                         let mut tuple = tuple;
                         for (col_name, value_expr) in assignments {
@@ -14255,6 +14456,11 @@ impl EmbeddedDatabase {
                                 *slot = new_value;
                             }
                         }
+
+                        // RLS WITH CHECK on the POST-assignment row — an ERROR on
+                        // violation, unlike USING above which filters (ROADMAP_V5
+                        // §1.1). Mirrors the text family's Update arm.
+                        Self::enforce_rls_with_check(rls_guard.as_ref(), &tuple)?;
 
                         // FK validation on UPDATE — KanttBan #15 fix.
                         // The extended-query path (Drizzle's
@@ -14400,6 +14606,10 @@ impl EmbeddedDatabase {
                 let eval_schema = schema.clone().with_source_table_name(table_name);
                 let evaluator = sql::Evaluator::with_parameters(std::sync::Arc::new(eval_schema), params.to_vec());
 
+                // RLS (ROADMAP_V5 §1.1): same helpers as the text family's Delete arm.
+                // DELETE has USING only, and only as a filter.
+                let rls_guard = self.build_rls_write_guard(table_name, "DELETE", &schema)?;
+
                 let mut _txn_guard = None;
                 let active_txn: Option<&storage::Transaction> = match session_txn {
                     Some(txn) => Some(txn),
@@ -14434,7 +14644,10 @@ impl EmbeddedDatabase {
                         true
                     };
 
-                    if matches {
+                    // RLS USING filters silently — see the text family's Delete arm.
+                    // Ahead of the referencing-FK enforcement and the RETURNING
+                    // projection below, neither of which may observe an invisible row.
+                    if matches && Self::rls_row_visible(rls_guard.as_ref(), &tuple)? {
                         // Referencing-FK enforcement (CASCADE / SET NULL /
                         // RESTRICT / NO ACTION). Runs BEFORE the row is queued
                         // so a RESTRICT violation aborts the statement without
@@ -18540,6 +18753,115 @@ impl EmbeddedDatabase {
         txn.commit()?;
 
         Ok(())
+    }
+
+    /// Resolve + parse the RLS policy applying to `table_name` / `cmd`
+    /// (`"INSERT"` | `"UPDATE"` | `"DELETE"`), once per statement.
+    ///
+    /// Shared by both DML executor families — the text family
+    /// (`execute_in_transaction_inner`: psql simple-query, MySQL wire, the COPY
+    /// generic fallback) and the params family
+    /// (`execute_plan_with_params_inner`: PG extended protocol, `RETURNING`
+    /// statements, trigger bodies via `execute_plan_internal`, REST/BaaS) — the
+    /// same shape as `enforce_referencing_fks_on_delete` and
+    /// `validate_on_conflict_updated_row`, so the two arms cannot drift apart
+    /// again. Before this existed, RLS was enforced on `SELECT` only
+    /// (`apply_rls_to_plan`) and *every* write path ignored policies outright:
+    /// a session that could see one row could still UPDATE/DELETE rows it could
+    /// not see, and INSERT ignored `WITH CHECK` (`docs/plans/ROADMAP_V5.md` §1.1).
+    ///
+    /// Which clause applies to which command is PostgreSQL's asymmetry, and
+    /// getting it backwards is a bug in both directions (spurious errors on
+    /// legitimate statements, or silent under-enforcement) — do not "simplify"
+    /// this into one symmetric check:
+    ///
+    /// | command | `USING` (pre-image) | `WITH CHECK` (new row) |
+    /// |---|---|---|
+    /// | INSERT | n/a — no pre-image row exists | error on violation |
+    /// | UPDATE | **filters** — invisible rows are silently not updated | error on violation |
+    /// | DELETE | **filters** — invisible rows are silently not deleted | n/a — no new row |
+    ///
+    /// Returns `Ok(None)` after a single `get_current_context()` probe (inside
+    /// `should_apply_rls`) when no tenant context is active or no policy applies
+    /// to this table/command — mirroring `apply_rls_to_plan`'s early exit, so the
+    /// no-tenant case pays exactly the one extra branch the read path already
+    /// pays and constructs nothing.
+    fn build_rls_write_guard(&self, table_name: &str, cmd: &str, schema: &Schema) -> Result<Option<RlsWriteGuard>> {
+        let Some((using_str, with_check_str)) = self.tenant_manager.get_rls_conditions(table_name, cmd) else {
+            return Ok(None);
+        };
+
+        let tenant_context = self.tenant_manager.get_current_context();
+        let evaluator = tenant::RLSExpressionEvaluator::new(std::sync::Arc::new(schema.clone()), tenant_context);
+
+        // `get_rls_conditions` already applied PG's per-policy
+        // "no WITH CHECK → reuse this policy's USING" fallback before OR-ing the
+        // policies together; the `unwrap_or` here is only a belt-and-braces
+        // default for a caller that hands back `None`.
+        let check_src = with_check_str.as_deref().unwrap_or(&using_str);
+        // INSERT has no pre-image row, so no USING. Everything else (UPDATE and
+        // the DO UPDATE leg of INSERT ... ON CONFLICT) filters on it.
+        let using = if cmd == "INSERT" {
+            None
+        } else {
+            Some(evaluator.parse(&using_str)?)
+        };
+        // DELETE produces no new row, so no WITH CHECK. Everything else errors on it.
+        let with_check = if cmd == "DELETE" {
+            None
+        } else {
+            Some(evaluator.parse(check_src)?)
+        };
+
+        Ok(Some(RlsWriteGuard {
+            table_name: table_name.to_string(),
+            using,
+            with_check,
+            evaluator,
+        }))
+    }
+
+    /// UPDATE / DELETE: does this pre-image row pass the policy's `USING`?
+    ///
+    /// A `false` answer is a **filter**, never an error — PostgreSQL silently
+    /// leaves rows failing `USING` untouched, and they never even reach `BEFORE`
+    /// row triggers. Call sites therefore fold this straight into the existing
+    /// WHERE-match boolean (`if matches && Self::rls_row_visible(..)?`), which
+    /// also keeps invisible rows out of the `updates`/`deleted_tuples`
+    /// collections that feed `RETURNING`.
+    ///
+    /// `Ok(true)` when `guard` is `None` (no context / no policy) so no call
+    /// site needs an extra branch.
+    fn rls_row_visible(guard: Option<&RlsWriteGuard>, tuple: &Tuple) -> Result<bool> {
+        let Some(guard) = guard else { return Ok(true) };
+        let Some(using) = &guard.using else { return Ok(true) };
+        guard.evaluator.evaluate(using, tuple)
+    }
+
+    /// INSERT (fresh row), UPDATE (post-assignment row), and the DO UPDATE leg
+    /// of `ON CONFLICT`: does this row pass the policy's `WITH CHECK`?
+    ///
+    /// **Errors** on violation — never filters, which is the other half of the
+    /// asymmetry documented on `build_rls_write_guard`. The message is
+    /// PostgreSQL's own wording so wire clients get the text they expect, and
+    /// `Error::ConstraintViolation` is the variant every other row-content
+    /// violation in this file uses (FK / UNIQUE / CHECK / NOT NULL). Its
+    /// `"row-level security"` substring is also what `sqlstate_for_error` keys
+    /// on to report SQLSTATE 42501 (`insufficient_privilege`) — keep the two in
+    /// step if this text ever changes.
+    fn enforce_rls_with_check(guard: Option<&RlsWriteGuard>, tuple: &Tuple) -> Result<()> {
+        let Some(guard) = guard else { return Ok(()) };
+        let Some(with_check) = &guard.with_check else {
+            return Ok(());
+        };
+        if guard.evaluator.evaluate(with_check, tuple)? {
+            Ok(())
+        } else {
+            Err(Error::constraint_violation(format!(
+                "new row violates row-level security policy for table \"{}\"",
+                guard.table_name
+            )))
+        }
     }
 
     /// Enforce every *referencing* foreign key before a row is deleted.

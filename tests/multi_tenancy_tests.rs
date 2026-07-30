@@ -10,6 +10,21 @@
 //!
 //! **CRITICAL**: These tests verify that no tenant can access another tenant's data.
 //! Any failure in RLS tests indicates a SECURITY VULNERABILITY.
+//!
+//! **Scope, so the next reader does not repeat this investigation's false start:**
+//! the RLS tests in this file (`test_rls_prevents_cross_tenant_select` /
+//! `_update` / `_delete`, `test_rls_with_check_insert`) assert against the
+//! `TenantManager` API directly — `should_apply_rls`, `get_rls_conditions`,
+//! `get_rls_policies`. They verify that policy *bookkeeping* is configured and
+//! resolved correctly. They never construct an `EmbeddedDatabase` and never run
+//! a statement, so they cannot observe whether any executor honours a policy —
+//! which is why they all passed throughout the period when no write path enforced
+//! RLS at all (`docs/plans/ROADMAP_V5.md` §1.1).
+//!
+//! End-to-end enforcement — INSERT `WITH CHECK` errors, UPDATE/DELETE `USING`
+//! filters, policy OR-combination, `RETURNING` non-leakage — lives in
+//! `tests/rls_write_parity_tests.rs`, which runs every case through both DML
+//! executor families. Add enforcement tests there, not here.
 
 use heliosdb_nano::tenant::{
     ChangeType, IsolationMode, MigrationState, RLSCommand, ResourceLimits, TenantContext, TenantManager,
