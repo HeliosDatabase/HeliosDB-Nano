@@ -5,6 +5,35 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.9.1] - 2026-08-02
+
+- **Fix (availability, pre-existing):** a replication primary that was killed
+  while writing a WAL segment would not restart. Startup did not fail with an
+  error — it never finished.
+
+  A partially-written trailing record is the normal state of a write-ahead log
+  after any unclean shutdown, so this was reachable by `SIGKILL`, an OOM kill, or
+  power loss. (4.7.0's `SIGTERM` handling made ordinary stops clean, which
+  reduced how often this was hit but could not prevent it.)
+
+  The segment scanner read a length field from the file and used it to skip over
+  the record's payload — and skipping past the end of a file succeeds rather than
+  failing, so a corrupt length was never detected. The scan continued into the
+  remains of the partial record, read those bytes as if they were a record
+  header, and derived an end-of-log position around 8.7 quintillion. Startup then
+  tried to build an index entry for every position from the start of the segment
+  to that number.
+
+  Segment loading now validates each record's checksum and stops at the first one
+  that fails, keeping every record before it. Record sizes are bounded by the
+  remaining bytes in the file and by the configured maximum segment size, so a
+  corrupt length can no longer drive a large allocation. Damaged segments are
+  left on disk untouched rather than truncated, so they remain available for
+  inspection.
+
+  A primary in this state now starts normally and recovers every intact record.
+  Healthy segments load exactly as before.
+
 ## [4.9.0] - 2026-07-30
 
 **Security fix.** If you use row-level security, upgrade.

@@ -593,11 +593,21 @@ fallback, or document the move loudly — an existing deployment's replication W
 appear to vanish on upgrade. **Interface coverage (CLAUDE.md gate 5) currently fails for this
 parameter**, which is itself the reason to fix it.
 
-### 2.8 `WalStore::init()` hangs forever on a torn WAL segment — **CORRECTED AND UPGRADED 2026-07-28**
+### 2.8 `WalStore::init()` hangs forever on a torn WAL segment — **SHIPPED in v4.9.1 (`b568e95`)**
 
-**Status:** open. **Severity: high — a primary that is killed mid-segment-write does not restart.**
-**Effort: small** (bound the segment scan and treat a short/!invalid trailing record as end-of-segment,
-which is what every WAL reader must already assume). Isolated to a single file by bisection.
+**Status:** FIXED and shipped in v4.9.1 (`b568e95`). `load_segment_metadata` and
+`load_segment_entries` now share one checksum-aware bounded scan, so the two readers can no longer
+disagree about where a segment ends. Allocations are bounded by remaining file bytes and
+`max_segment_size`; record count by `max_entries_per_segment`; the scan stops at the first bad
+record rather than continuing into a misaligned stream. Torn segments are left on disk, not
+truncated. The real artifact ships as `tests/fixtures/wal_segments/segment_000032_torn.wal` and is
+asserted to recover exactly its 3 CRC-valid records promptly.
+
+**Residual (filed, not fixed):** `WalSegmentInfo::is_complete` is still hardcoded `true` even when
+the scan found the segment torn (zero readers today, so inert); a segment with zero recoverable
+records still reports `end_lsn = start_lsn`, advertising one LSN it cannot serve; and
+`ha_tests::streaming_tests` still writes into the repo's `data/` dir via §2.7's CWD-relative
+default — this fix stops it hanging there, not writing there.
 
 **This entry originally read "`ha_integration` hangs on this class of host" and was wrong.** It was
 filed from single-target runs and generalised into a property of the host. The real cause is a
