@@ -41,6 +41,200 @@ use tokio::sync::RwLock;
 const WAL_MAGIC: u32 = 0x57414C31; // "WAL1"
 const WAL_VERSION: u32 = 1;
 const SEGMENT_HEADER_SIZE: usize = 32;
+// Per-record header: length (4) | entry_type (1) | lsn (8) | checksum (4)
+const RECORD_HEADER_SIZE: usize = 17;
+
+// =============================================================================
+// SEGMENT RECORD SCANNING
+// =============================================================================
+
+/// Why a segment scan stopped before reaching a clean end-of-file.
+///
+/// Every variant is a *normal*, expected outcome, not an error: a torn trailing
+/// record is the ordinary state of a write-ahead log after any unclean shutdown,
+/// which is the entire premise of a WAL (`docs/plans/ROADMAP_V5.md` §2.8). None of
+/// these are reported as `Err` — only genuine I/O failure is.
+#[derive(Debug, Clone, Copy)]
+enum ScanStop {
+    /// Fewer than `RECORD_HEADER_SIZE` bytes remained for a record header.
+    HeaderTruncated,
+    /// The record's `length` exceeds the bytes physically remaining in the file.
+    TornTail { claimed: u64, remaining_in_file: u64 },
+    /// The record's `length` fits inside the file but exceeds `max_entry_size`
+    /// (`WalStoreConfig::max_segment_size`). Defence in depth for a large file whose
+    /// length prefix is corrupt yet still smaller than the file itself.
+    ExceedsMaxEntrySize { claimed: u64, max_entry_size: u64 },
+    /// `max_entries_per_segment` records were already accepted and the file has more.
+    /// Just as plausibly a lowered `max_entries_per_segment` as a hostile file, so
+    /// the log message must not claim to know which.
+    TooManyEntries { max_entries_per_segment: u64 },
+    /// The payload was read in full but does not hash to the checksum its header
+    /// promised, so no record boundary after it is provable (see trap 2 below).
+    ChecksumMismatch { lsn: Lsn, expected: u32, computed: u32 },
+}
+
+/// Result of one pass over a segment's records.
+struct ScanOutcome {
+    /// Records that passed every check: length in bounds, count in bounds, checksum verified.
+    accepted: u64,
+    /// LSN of the last accepted record, or the segment's `start_lsn` if none were accepted.
+    end_lsn: Lsn,
+    /// Byte offset of the offending record and why, if the scan stopped before clean EOF.
+    stopped_early: Option<(u64, ScanStop)>,
+}
+
+/// The one authoritative pass over a segment's records, running from the reader's
+/// current position (immediately after the 32-byte segment header) to either a clean
+/// EOF on a record boundary or the first record that cannot be trusted.
+///
+/// `load_segment_metadata` and `load_segment_entries` both go through here so they
+/// cannot disagree about where a segment ends. They used to run two separate
+/// hand-rolled loops under different rules — metadata skipped payloads with `seek`
+/// and never verified a checksum, entries verified checksums but skipped past
+/// failures — and that divergence is what let a single torn segment stop a primary
+/// from restarting at all (`docs/plans/ROADMAP_V5.md` §2.8).
+///
+/// Two traps this function exists to close. Both read as harmless simplifications
+/// and must not be "cleaned up" back into the bug:
+///
+/// 1. **Seeking past EOF succeeds.** `Seek` on a regular file is a pure position
+///   update, not I/O, so `seek(SeekFrom::Current(length))` returns `Ok` for any
+///   `length`, however absurd. A corrupt length therefore cannot be detected by
+///   asking whether the skip failed; it has to be range-checked against the file's
+///   real size *before* it is used for anything. That is what `file_len` is for.
+///   The old metadata scan skipped this check, walked into a fabricated position,
+///   and promoted a garbage LSN into the segment's reported `end_lsn`.
+/// 2. **A failed record stops the scan; it is never skipped.** Once a record fails
+///   we cannot distinguish payload corruption (length honest, stream still aligned)
+///   from a lying length (stream now misaligned, so every "header" after it is
+///   really payload noise). Continuing is safe only in the first case and nothing
+///   at the point of failure says which case you are in — a misread noise header
+///   can claim any length at all, which is exactly how a run of `0x78` filler came
+///   to claim a 1.88 GiB record. So any failure keeps the validated prefix and
+///   discards the rest of the file. `src/storage/wal.rs`'s replay path already
+///   applies the same rule for the same reason.
+///
+/// Never allocates more than `min(bytes remaining in the file, max_entry_size)` for
+/// a single record, and never allocates at all for a record it rejects.
+///
+/// `on_accept` receives `(lsn, entry_type, checksum, payload)` for every record that
+/// passes every check, in file order.
+fn scan_segment_records<R: Read + Seek>(
+    reader: &mut R,
+    file_len: u64,
+    start_lsn: Lsn,
+    max_entry_size: u64,
+    max_entries_per_segment: u64,
+    mut on_accept: impl FnMut(Lsn, u8, u32, Vec<u8>),
+) -> std::io::Result<ScanOutcome> {
+    let mut outcome = ScanOutcome {
+        accepted: 0,
+        end_lsn: start_lsn,
+        stopped_early: None,
+    };
+
+    // Tracked arithmetically rather than re-queried per record: on a `BufReader`
+    // every `stream_position()` is an `lseek` syscall, and `read_exact` consumes
+    // exactly the bytes it was asked for whenever it succeeds, so this stays exact.
+    let mut position = reader.stream_position()?;
+
+    loop {
+        // A healthy, cleanly-closed segment always terminates here: its final record
+        // ends exactly at EOF, so every record is accepted exactly as it was before
+        // this function existed.
+        if position >= file_len {
+            break;
+        }
+
+        if outcome.accepted >= max_entries_per_segment {
+            let reason = ScanStop::TooManyEntries {
+                max_entries_per_segment,
+            };
+            outcome.stopped_early = Some((position, reason));
+            break;
+        }
+
+        let mut entry_header = [0u8; RECORD_HEADER_SIZE];
+        match reader.read_exact(&mut entry_header) {
+            Ok(()) => {}
+            // Ran out of bytes mid-header: an ordinary torn tail, not a failure.
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                outcome.stopped_early = Some((position, ScanStop::HeaderTruncated));
+                break;
+            }
+            // A real I/O problem (bad disk, permissions) is a different thing entirely
+            // and must not be silently reported as a torn segment.
+            Err(e) => return Err(e),
+        }
+
+        let length = u32::from_le_bytes([entry_header[0], entry_header[1], entry_header[2], entry_header[3]]);
+        let entry_type = entry_header[4];
+        let lsn = u64::from_le_bytes([
+            entry_header[5],
+            entry_header[6],
+            entry_header[7],
+            entry_header[8],
+            entry_header[9],
+            entry_header[10],
+            entry_header[11],
+            entry_header[12],
+        ]);
+        let checksum = u32::from_le_bytes([entry_header[13], entry_header[14], entry_header[15], entry_header[16]]);
+
+        // Bound the claimed length before it is used for anything at all (trap 1), so
+        // the largest allocation this code can make for one record is `max_entry_size`.
+        let claimed = u64::from(length);
+        let payload_start = position + RECORD_HEADER_SIZE as u64;
+        let remaining = file_len.saturating_sub(payload_start);
+        if claimed > remaining {
+            let reason = ScanStop::TornTail {
+                claimed,
+                remaining_in_file: remaining,
+            };
+            outcome.stopped_early = Some((position, reason));
+            break;
+        }
+        if claimed > max_entry_size {
+            let reason = ScanStop::ExceedsMaxEntrySize {
+                claimed,
+                max_entry_size,
+            };
+            outcome.stopped_early = Some((position, reason));
+            break;
+        }
+
+        // Provably bounded by the two checks above.
+        let mut data = vec![0u8; length as usize];
+        match reader.read_exact(&mut data) {
+            Ok(()) => {}
+            // Only reachable if the file shrank between the size snapshot and this
+            // read. Handled like any other torn tail rather than assumed impossible.
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                outcome.stopped_early = Some((position, ScanStop::HeaderTruncated));
+                break;
+            }
+            Err(e) => return Err(e),
+        }
+
+        let computed = crc32fast::hash(&data);
+        if computed != checksum {
+            let reason = ScanStop::ChecksumMismatch {
+                lsn,
+                expected: checksum,
+                computed,
+            };
+            outcome.stopped_early = Some((position, reason));
+            break;
+        }
+
+        outcome.accepted += 1;
+        outcome.end_lsn = lsn;
+        position = payload_start + claimed;
+        on_accept(lsn, entry_type, checksum, data);
+    }
+
+    Ok(outcome)
+}
 
 /// WAL segment metadata
 #[derive(Debug, Clone)]
@@ -230,10 +424,27 @@ impl WalStore {
                             tracing::warn!("Failed to load segment entries: {}", e);
                         }
 
-                        // Update LSN index
+                        // Update LSN index with exactly the LSNs that were recovered,
+                        // which is what `write_entry_to_disk` already does for live
+                        // appends. This used to backfill every value in
+                        // `start_lsn..=end_lsn`, and *that* loop is what actually hung
+                        // startup (ROADMAP_V5 §2.8): the old metadata scan trusted a
+                        // corrupt record's LSN straight into `end_lsn`, so the range
+                        // became ~8.7e18 `BTreeMap` inserts. The scan now guarantees
+                        // `end_lsn` is a validated LSN, but deriving the index from the
+                        // entries actually in memory keeps this loop bounded by
+                        // `max_entries_per_segment` through *any* future path, and it
+                        // never indexes an LSN the store cannot serve.
+                        let recovered_lsns: Vec<Lsn> = {
+                            let entries = self.entries.read().await;
+                            entries
+                                .range(segment_info.start_lsn..=segment_info.end_lsn)
+                                .map(|(lsn, _)| *lsn)
+                                .collect()
+                        };
                         {
                             let mut index = self.lsn_index.write().await;
-                            for lsn in segment_info.start_lsn..=segment_info.end_lsn {
+                            for lsn in recovered_lsns {
                                 index.insert(lsn, segment_info.segment_id);
                             }
                         }
@@ -279,6 +490,9 @@ impl WalStore {
     /// Load segment metadata from file header
     async fn load_segment_metadata(&self, path: &PathBuf) -> Option<WalSegmentInfo> {
         let file = File::open(path).ok()?;
+        // Taken from the open handle before the scan: the scan needs the file's real
+        // size to range-check every record's length prefix against it.
+        let file_size = file.metadata().ok()?.len();
         let mut reader = BufReader::new(file);
 
         // Read header
@@ -299,50 +513,49 @@ impl WalStore {
         let start_lsn = u64::from_le_bytes([
             header[16], header[17], header[18], header[19], header[20], header[21], header[22], header[23],
         ]);
-        let entry_count = u64::from_le_bytes([
-            header[24], header[25], header[26], header[27], header[28], header[29], header[30], header[31],
-        ]);
-
-        // Scan to find end_lsn and actual entry count
-        let mut actual_count = 0u64;
-        let mut end_lsn = start_lsn;
-
-        loop {
-            // Read entry header: length (4) + type (1) + lsn (8) + checksum (4)
-            let mut entry_header = [0u8; 17];
-            if reader.read_exact(&mut entry_header).is_err() {
-                break;
+        // Bytes 24..32 hold the header's `entry_count`, deliberately not read here.
+        // `close_segment` is the only writer of that field, so it is still 0 in every
+        // segment whose process died mid-write — precisely the segments this function
+        // has to survive. The scan below is the sole source of truth for the count,
+        // and the old `if actual_count > 0 { actual_count } else { entry_count }`
+        // fallback to the raw header value is gone with it: "the scan found nothing"
+        // and "report nothing" are the same fact.
+        let scan = scan_segment_records(
+            &mut reader,
+            file_size,
+            start_lsn,
+            self.config.max_segment_size as u64,
+            self.config.max_entries_per_segment as u64,
+            |_, _, _, _| {},
+        );
+        // A real I/O error here (as opposed to a torn record, which the scan reports
+        // as a normal outcome) means this segment cannot be read at all, so it is
+        // skipped rather than half-trusted — but never silently.
+        let outcome = match scan {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                tracing::warn!("Failed to scan WAL segment {:?}: {}", path, e);
+                return None;
             }
+        };
 
-            let length =
-                u32::from_le_bytes([entry_header[0], entry_header[1], entry_header[2], entry_header[3]]) as usize;
-            let lsn = u64::from_le_bytes([
-                entry_header[5],
-                entry_header[6],
-                entry_header[7],
-                entry_header[8],
-                entry_header[9],
-                entry_header[10],
-                entry_header[11],
-                entry_header[12],
-            ]);
-
-            // Skip data
-            if reader.seek(SeekFrom::Current(length as i64)).is_err() {
-                break;
-            }
-
-            actual_count += 1;
-            end_lsn = lsn;
+        if let Some((offset, reason)) = outcome.stopped_early {
+            // Debug, not warn: `load_segment_entries` scans the same file immediately
+            // afterwards and emits the single operator-facing warning for this event.
+            tracing::debug!(
+                "Segment {:?} scan stopped at byte offset {} ({:?}) after {} valid records",
+                path,
+                offset,
+                reason,
+                outcome.accepted
+            );
         }
-
-        let file_size = fs::metadata(path).ok()?.len();
 
         Some(WalSegmentInfo {
             segment_id,
             start_lsn,
-            end_lsn,
-            entry_count: if actual_count > 0 { actual_count } else { entry_count },
+            end_lsn: outcome.end_lsn,
+            entry_count: outcome.accepted,
             size_bytes: file_size,
             is_complete: true, // Existing segments are complete
             path: path.clone(),
@@ -352,6 +565,10 @@ impl WalStore {
     /// Load segment entries into memory
     async fn load_segment_entries(&self, path: &PathBuf, info: &WalSegmentInfo) -> Result<()> {
         let file = File::open(path).map_err(|e| ReplicationError::Storage(format!("Failed to open segment: {}", e)))?;
+        let file_size = file
+            .metadata()
+            .map_err(|e| ReplicationError::Storage(format!("Failed to stat segment: {}", e)))?
+            .len();
         let mut reader = BufReader::new(file);
 
         // Skip header
@@ -359,57 +576,48 @@ impl WalStore {
             .seek(SeekFrom::Start(SEGMENT_HEADER_SIZE as u64))
             .map_err(|e| ReplicationError::Storage(format!("Seek failed: {}", e)))?;
 
-        let mut entries = self.entries.write().await;
+        // `info.entry_count` deliberately does not bound this loop any more. It used
+        // to (`for _ in 0..info.entry_count`), which made recovery depend on a count
+        // that a mid-write crash never gets written. The scan is driven by file
+        // position and stops itself (ROADMAP_V5 §2.8).
+        let outcome = {
+            let mut entries = self.entries.write().await;
+            let scan = scan_segment_records(
+                &mut reader,
+                file_size,
+                info.start_lsn,
+                self.config.max_segment_size as u64,
+                self.config.max_entries_per_segment as u64,
+                |lsn, entry_type, checksum, data| {
+                    let entry = WalEntry {
+                        lsn,
+                        tx_id: None, // tx_id not stored in segment format v1
+                        entry_type: Self::u8_to_entry_type(entry_type),
+                        data,
+                        checksum,
+                    };
+                    entries.insert(lsn, entry);
+                },
+            );
+            scan.map_err(|e| ReplicationError::Storage(format!("Failed to read segment: {}", e)))?
+        };
 
-        for _ in 0..info.entry_count {
-            // Read entry header
-            let mut entry_header = [0u8; 17];
-            if reader.read_exact(&mut entry_header).is_err() {
-                break;
-            }
-
-            let length =
-                u32::from_le_bytes([entry_header[0], entry_header[1], entry_header[2], entry_header[3]]) as usize;
-            let entry_type = entry_header[4];
-            let lsn = u64::from_le_bytes([
-                entry_header[5],
-                entry_header[6],
-                entry_header[7],
-                entry_header[8],
-                entry_header[9],
-                entry_header[10],
-                entry_header[11],
-                entry_header[12],
-            ]);
-            let checksum = u32::from_le_bytes([entry_header[13], entry_header[14], entry_header[15], entry_header[16]]);
-
-            // Read data
-            let mut data = vec![0u8; length];
-            if reader.read_exact(&mut data).is_err() {
-                break;
-            }
-
-            // Verify checksum
-            let computed_checksum = crc32fast::hash(&data);
-            if computed_checksum != checksum {
-                tracing::warn!(
-                    "Checksum mismatch for LSN {}: expected {}, got {}",
-                    lsn,
-                    checksum,
-                    computed_checksum
-                );
-                continue;
-            }
-
-            let entry = WalEntry {
-                lsn,
-                tx_id: None, // tx_id not stored in segment format v1
-                entry_type: Self::u8_to_entry_type(entry_type),
-                data,
-                checksum,
-            };
-
-            entries.insert(lsn, entry);
+        if let Some((offset, reason)) = outcome.stopped_early {
+            // The operator-facing signal ROADMAP_V5 §2.8 asks for: name the file and
+            // the offset. Still `Ok(())` — a torn tail is expected WAL behaviour, not
+            // a failure of this function, and `Err` stays reserved for real I/O errors.
+            // The segment itself is left on disk exactly as found: truncating it here
+            // would destroy the only forensic record of how it was torn, and would be
+            // a silent side effect of every startup rather than a deliberate act.
+            tracing::warn!(
+                "Torn WAL segment {:?}: scan stopped at byte offset {} ({:?}); recovered {} entries up to LSN {}. \
+                 Segment left on disk unmodified.",
+                path,
+                offset,
+                reason,
+                outcome.accepted,
+                outcome.end_lsn
+            );
         }
 
         Ok(())
@@ -996,6 +1204,7 @@ impl BatchStreamState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     use tempfile::tempdir;
 
     fn make_entry(lsn: Lsn, data: Vec<u8>) -> WalEntry {
@@ -1009,14 +1218,23 @@ mod tests {
         }
     }
 
-    /// Create a test config with temp directory and fsync disabled
-    fn test_config() -> (WalStoreConfig, tempfile::TempDir) {
-        let dir = tempdir().unwrap();
-        let config = WalStoreConfig {
+    /// Create a config rooted at an explicit temp directory, with fsync disabled.
+    ///
+    /// Never use `WalStoreConfig::default()` unoverridden in a test: its `wal_dir` is
+    /// the CWD-relative `./data/wal` (ROADMAP_V5 §2.7, still open), so a test run from
+    /// the repository root would read and write the repository's own `data/` tree.
+    fn config_for(dir: &tempfile::TempDir) -> WalStoreConfig {
+        WalStoreConfig {
             wal_dir: dir.path().to_path_buf(),
             fsync_on_write: false, // Disable for fast tests
             ..Default::default()
-        };
+        }
+    }
+
+    /// Create a test config with temp directory and fsync disabled
+    fn test_config() -> (WalStoreConfig, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let config = config_for(&dir);
         (config, dir)
     }
 
@@ -1165,5 +1383,323 @@ mod tests {
         let checkpoint = store.checkpoint().await.expect("checkpoint failed");
         assert_eq!(checkpoint, 10);
         assert_eq!(store.checkpoint_lsn(), 10);
+    }
+
+    // -------------------------------------------------------------------------
+    // Torn / corrupt segment recovery (ROADMAP_V5 §2.8)
+    //
+    // A torn trailing record is the normal state of a WAL after any unclean
+    // shutdown, so every case below is a state a primary must restart from.
+    // -------------------------------------------------------------------------
+
+    /// Hard wall-clock deadline for `init()` in the recovery tests below.
+    const INIT_DEADLINE: Duration = Duration::from_secs(10);
+
+    /// Run `WalStore::init()` under a hard deadline and assert it succeeded.
+    ///
+    /// `tokio::time::timeout(d, store.init())` on its own would NOT work here. The
+    /// regression being guarded against is a synchronous loop inside a single `poll()`
+    /// — the `lsn_index` backfill over a garbage `end_lsn` — which never yields, so a
+    /// timer future sharing its thread would never be polled and the test would hang
+    /// anyway. Driving `init()` as its own task on a multi-threaded runtime is what
+    /// makes the deadline real, and it needs to be real: this bug hung the repository's
+    /// test suite for two days.
+    async fn init_within_deadline(store: &Arc<WalStore>) {
+        let store = Arc::clone(store);
+        let handle = tokio::spawn(async move { store.init().await });
+        tokio::time::timeout(INIT_DEADLINE, handle)
+            .await
+            .expect("WalStore::init() exceeded its deadline - the segment scan is unbounded again")
+            .expect("WalStore::init() task panicked")
+            .expect("WalStore::init() failed");
+    }
+
+    /// A segment header byte-identical to `create_segment`'s, with `entry_count` set
+    /// to whatever `close_segment` would have backpatched at offset 24.
+    fn segment_header(segment_id: u64, start_lsn: Lsn, entry_count: u64) -> Vec<u8> {
+        let mut header = vec![0u8; SEGMENT_HEADER_SIZE];
+        header[0..4].copy_from_slice(&WAL_MAGIC.to_le_bytes());
+        header[4..8].copy_from_slice(&WAL_VERSION.to_le_bytes());
+        header[8..16].copy_from_slice(&segment_id.to_le_bytes());
+        header[16..24].copy_from_slice(&start_lsn.to_le_bytes());
+        header[24..32].copy_from_slice(&entry_count.to_le_bytes());
+        header
+    }
+
+    /// One record in the layout `write_entry_to_disk` produces. `claimed_length` and
+    /// `checksum` are separate arguments so a test can lie about either one.
+    fn record_bytes(lsn: Lsn, data: &[u8], claimed_length: u32, checksum: u32) -> Vec<u8> {
+        let mut out = Vec::with_capacity(RECORD_HEADER_SIZE + data.len());
+        out.extend_from_slice(&claimed_length.to_le_bytes());
+        out.push(0); // WalEntryType::Insert
+        out.extend_from_slice(&lsn.to_le_bytes());
+        out.extend_from_slice(&checksum.to_le_bytes());
+        out.extend_from_slice(data);
+        out
+    }
+
+    /// A well-formed record whose stored checksum matches its payload.
+    fn valid_record(lsn: Lsn, data: &[u8]) -> Vec<u8> {
+        record_bytes(lsn, data, data.len() as u32, crc32fast::hash(data))
+    }
+
+    /// Write raw bytes as `segment_<id>.wal` inside `dir`.
+    fn write_segment_file(dir: &std::path::Path, segment_id: u64, bytes: &[u8]) {
+        let path = dir.join(format!("segment_{:06}.wal", segment_id));
+        fs::write(path, bytes).expect("failed to write test segment");
+    }
+
+    /// Every entry currently held by the store, in LSN order.
+    async fn recovered_entries(store: &WalStore) -> Vec<WalEntry> {
+        store.get_range(0, u64::MAX).await
+    }
+
+    /// Case 1: a healthy, cleanly-closed segment must load exactly as it always did.
+    /// This is the regression guard for the "byte-identical for healthy segments"
+    /// requirement — the new bounds and checksum enforcement may only ever reject
+    /// records that were already going to fail.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn valid_segment_loads_all_records() {
+        let dir = tempdir().expect("tempdir");
+        let mut bytes = segment_header(1, 1, 4);
+        for lsn in 1..=4u64 {
+            bytes.extend_from_slice(&valid_record(lsn, format!("payload-{}", lsn).as_bytes()));
+        }
+        write_segment_file(dir.path(), 1, &bytes);
+
+        let store = Arc::new(WalStore::new(config_for(&dir)));
+        init_within_deadline(&store).await;
+
+        let recovered = recovered_entries(&store).await;
+        assert_eq!(recovered.len(), 4, "a healthy segment must load every record");
+        for (idx, entry) in recovered.iter().enumerate() {
+            let lsn = idx as u64 + 1;
+            assert_eq!(entry.lsn, lsn, "records must be recovered in file order");
+            assert_eq!(entry.data, format!("payload-{}", lsn).into_bytes());
+            assert_eq!(entry.checksum, crc32fast::hash(&entry.data));
+            assert_eq!(entry.entry_type, WalEntryType::Insert);
+        }
+
+        assert_eq!(store.current_lsn(), 4);
+        let segments = store.list_segments().await;
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].start_lsn, 1);
+        assert_eq!(segments[0].end_lsn, 4);
+        assert_eq!(segments[0].entry_count, 4);
+    }
+
+    /// Case 3: killed between two writes, leaving a partial record header.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn header_truncated_mid_record() {
+        let dir = tempdir().expect("tempdir");
+        let mut bytes = segment_header(1, 1, 0);
+        bytes.extend_from_slice(&valid_record(1, b"first"));
+        // Nine bytes: fewer than one RECORD_HEADER_SIZE.
+        bytes.extend_from_slice(&[0xAB; 9]);
+        write_segment_file(dir.path(), 1, &bytes);
+
+        let store = Arc::new(WalStore::new(config_for(&dir)));
+        init_within_deadline(&store).await;
+
+        assert_eq!(recovered_entries(&store).await.len(), 1);
+        assert!(store.get(1).await.is_some());
+        assert_eq!(store.current_lsn(), 1);
+        assert_eq!(store.list_segments().await[0].entry_count, 1);
+    }
+
+    /// Case 4: killed mid-payload, so the length prefix outruns the file.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn payload_truncated_mid_payload() {
+        let dir = tempdir().expect("tempdir");
+        let mut bytes = segment_header(1, 1, 0);
+        bytes.extend_from_slice(&valid_record(1, b"first"));
+        // Claims 4096 payload bytes; only 100 ever made it to disk.
+        bytes.extend_from_slice(&record_bytes(2, &[0x5A; 100], 4096, 0));
+        write_segment_file(dir.path(), 1, &bytes);
+
+        let store = Arc::new(WalStore::new(config_for(&dir)));
+        init_within_deadline(&store).await;
+
+        assert_eq!(recovered_entries(&store).await.len(), 1);
+        assert!(
+            store.get(2).await.is_none(),
+            "a record that outruns the file is not data"
+        );
+        assert_eq!(store.current_lsn(), 1);
+    }
+
+    /// Case 5: the allocation bomb, isolated from the checksum path. Before the
+    /// remaining-bytes bound this length reached `vec![0u8; length]` directly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn absurd_length_field_rejected_without_allocating() {
+        let dir = tempdir().expect("tempdir");
+        let mut bytes = segment_header(1, 1, 0);
+        bytes.extend_from_slice(&valid_record(1, b"first"));
+        bytes.extend_from_slice(&record_bytes(2, &[0x5A; 32], 2_000_000_000, 0));
+        assert!(bytes.len() < 1024, "the file must be tiny next to the claimed length");
+        write_segment_file(dir.path(), 1, &bytes);
+
+        let store = Arc::new(WalStore::new(config_for(&dir)));
+        init_within_deadline(&store).await;
+
+        assert_eq!(recovered_entries(&store).await.len(), 1);
+        assert!(store.get(2).await.is_none());
+        assert_eq!(store.current_lsn(), 1);
+    }
+
+    /// Case 6: the case the old `continue`-past-a-mismatch reader got wrong. The
+    /// records after the bad one are individually perfect and must still be dropped:
+    /// once a record fails, the stream's alignment is no longer provable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn checksum_mismatch_stops_scan_does_not_continue() {
+        let dir = tempdir().expect("tempdir");
+        let mut bytes = segment_header(1, 1, 0);
+        bytes.extend_from_slice(&valid_record(1, b"one"));
+        bytes.extend_from_slice(&valid_record(2, b"two"));
+        // Correct length, correct LSN, deliberately wrong checksum.
+        let corrupt = b"three";
+        let bad_checksum = crc32fast::hash(corrupt) ^ 0xFF;
+        bytes.extend_from_slice(&record_bytes(3, corrupt, corrupt.len() as u32, bad_checksum));
+        bytes.extend_from_slice(&valid_record(4, b"four"));
+        bytes.extend_from_slice(&valid_record(5, b"five"));
+        write_segment_file(dir.path(), 1, &bytes);
+
+        let store = Arc::new(WalStore::new(config_for(&dir)));
+        init_within_deadline(&store).await;
+
+        assert_eq!(recovered_entries(&store).await.len(), 2);
+        assert!(store.get(1).await.is_some());
+        assert!(store.get(2).await.is_some());
+        for lsn in 3..=5u64 {
+            assert!(
+                store.get(lsn).await.is_none(),
+                "LSN {} follows a checksum failure and must be discarded",
+                lsn
+            );
+        }
+        assert_eq!(store.current_lsn(), 2);
+        assert_eq!(store.list_segments().await[0].entry_count, 2);
+    }
+
+    /// Case 7: a zero-length segment file must be skipped without stopping recovery
+    /// of the segments beside it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn zero_length_file() {
+        let dir = tempdir().expect("tempdir");
+        write_segment_file(dir.path(), 1, &[]);
+        let mut healthy = segment_header(2, 10, 2);
+        healthy.extend_from_slice(&valid_record(10, b"ten"));
+        healthy.extend_from_slice(&valid_record(11, b"eleven"));
+        write_segment_file(dir.path(), 2, &healthy);
+
+        let store = Arc::new(WalStore::new(config_for(&dir)));
+        let empty_path = dir.path().join("segment_000001.wal");
+        assert!(
+            store.load_segment_metadata(&empty_path).await.is_none(),
+            "an empty file cannot even yield a segment header"
+        );
+
+        init_within_deadline(&store).await;
+
+        assert_eq!(recovered_entries(&store).await.len(), 2);
+        assert_eq!(store.current_lsn(), 11);
+        assert_eq!(store.list_segments().await.len(), 1);
+    }
+
+    /// Case 8: a file whose magic does not match is not a WAL segment at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn garbage_magic_rejected() {
+        let dir = tempdir().expect("tempdir");
+        let mut bytes = segment_header(1, 1, 2);
+        bytes[0..4].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+        bytes.extend_from_slice(&valid_record(1, b"one"));
+        bytes.extend_from_slice(&valid_record(2, b"two"));
+        write_segment_file(dir.path(), 1, &bytes);
+
+        let store = Arc::new(WalStore::new(config_for(&dir)));
+        let path = dir.path().join("segment_000001.wal");
+        assert!(store.load_segment_metadata(&path).await.is_none());
+
+        init_within_deadline(&store).await;
+
+        assert!(recovered_entries(&store).await.is_empty());
+        assert!(store.list_segments().await.is_empty());
+        assert_eq!(store.current_lsn(), 0);
+    }
+
+    /// Case 9: the header's `entry_count` is untrusted input. Recovery is driven by
+    /// file position, so a wildly inflated count changes nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn entry_count_header_lies_high_not_trusted() {
+        let dir = tempdir().expect("tempdir");
+        let mut bytes = segment_header(1, 1, 500_000);
+        bytes.extend_from_slice(&valid_record(1, b"one"));
+        bytes.extend_from_slice(&valid_record(2, b"two"));
+        write_segment_file(dir.path(), 1, &bytes);
+
+        let store = Arc::new(WalStore::new(config_for(&dir)));
+        init_within_deadline(&store).await;
+
+        assert_eq!(recovered_entries(&store).await.len(), 2);
+        assert!(store.get(3).await.is_none());
+        assert_eq!(store.current_lsn(), 2);
+        assert_eq!(store.list_segments().await[0].entry_count, 2);
+    }
+
+    /// Case 10: `max_entries_per_segment` is enforced on the read path too, not only
+    /// as a write-time rotation trigger. Without it, a file of many small, correctly
+    /// checksummed records would drive an unbounded number of iterations.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn more_records_than_max_entries_per_segment_rejected() {
+        let dir = tempdir().expect("tempdir");
+        let mut bytes = segment_header(1, 1, 5);
+        for lsn in 1..=5u64 {
+            bytes.extend_from_slice(&valid_record(lsn, b"payload"));
+        }
+        write_segment_file(dir.path(), 1, &bytes);
+
+        let config = WalStoreConfig {
+            max_entries_per_segment: 3,
+            ..config_for(&dir)
+        };
+        let store = Arc::new(WalStore::new(config));
+        init_within_deadline(&store).await;
+
+        let recovered = recovered_entries(&store).await;
+        assert_eq!(recovered.len(), 3, "the read path enforces the count ceiling");
+        assert!(store.get(4).await.is_none());
+        assert_eq!(store.current_lsn(), 3);
+    }
+
+    /// Case 11: `max_segment_size` does real work independently of the
+    /// remaining-bytes bound. The oversized record here fits comfortably inside its
+    /// file, so only the configured ceiling can be what rejects it — proven by
+    /// loading the very same bytes again under the default ceiling.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn oversized_single_record_rejected_by_max_segment_size() {
+        let mut bytes = segment_header(1, 1, 2);
+        bytes.extend_from_slice(&valid_record(1, b"small-payload"));
+        bytes.extend_from_slice(&valid_record(2, &[b'z'; 200]));
+
+        let capped_dir = tempdir().expect("tempdir");
+        write_segment_file(capped_dir.path(), 1, &bytes);
+        let capped_config = WalStoreConfig {
+            max_segment_size: 100,
+            ..config_for(&capped_dir)
+        };
+        let capped = Arc::new(WalStore::new(capped_config));
+        init_within_deadline(&capped).await;
+        assert_eq!(recovered_entries(&capped).await.len(), 1);
+        assert!(capped.get(2).await.is_none(), "200 bytes exceeds a 100-byte ceiling");
+
+        let open_dir = tempdir().expect("tempdir");
+        write_segment_file(open_dir.path(), 1, &bytes);
+        let open = Arc::new(WalStore::new(config_for(&open_dir)));
+        init_within_deadline(&open).await;
+        assert_eq!(
+            recovered_entries(&open).await.len(),
+            2,
+            "the same bytes are structurally fine; only the ceiling rejected record 2"
+        );
     }
 }
