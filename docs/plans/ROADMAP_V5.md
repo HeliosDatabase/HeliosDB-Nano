@@ -629,6 +629,43 @@ of a WAL. So:
 - Combined with §2.7 (the directory is CWD-relative and unconfigurable), an operator would have a
   primary that will not start and no documented place to look for the cause.
 
+**CORRECTION (2026-08-02) — the mechanism above is wrong, and the wrong fix follows from it.**
+I attributed the hang to `load_segment_entries` allocating from an untrusted length
+(`vec![0u8; length]` with `length` read from the file). Verified against the artifact, that is not
+what happens:
+
+- The header is `magic(4) version(4) segment_id(8) start_lsn(8) entry_count(8)`. I had read
+  offset 8 as `entry_count`; it is `segment_id`. The artifact's real `entry_count` is **0**, because
+  `close_segment` is the only code that ever backpatches that field — so **every** segment killed
+  before close has zero there, by construction.
+- `load_segment_entries` loops `for _ in 0..entry_count`, so on a torn segment **it never iterates
+  at all**. The 1.88 GiB allocation I described never occurs on this path, and would terminate in
+  under a second if it did.
+
+**The real mechanism is `load_segment_metadata` (`src/replication/wal_store.rs:280`) plus the
+`lsn_index` backfill in `init()` (`:236`).** `load_segment_metadata` runs its own independent,
+unbounded `loop` that validates no checksums and skips each payload with
+`reader.seek(SeekFrom::Current(length as i64))`. **Seeking past EOF succeeds**, so a garbage length
+does not error — it simply advances the cursor. The loop therefore keeps consuming, reaches a run of
+`0x78` bytes, parses them as a record header, and sets `end_lsn = 0x7878787878787878 =
+8,680,820,740,569,200,760`. `init()` then executes:
+
+```rust
+for lsn in segment_info.start_lsn..=segment_info.end_lsn { index.insert(lsn, segment_info.segment_id); }
+```
+
+— **8.68 quintillion `BTreeMap` inserts.** That is the hang, and it is unbounded in wall-clock terms,
+not merely slow.
+
+Measured on the artifact (`segment_id=32`, `start_lsn=1`, `entry_count=0`): records at LSN 1–3 pass
+CRC-32; **LSN 4 at offset 3101 fails checksum**; the oversized-length record lies beyond it. A
+correct scan stops at LSN 4 and recovers **3** records — not the 7 an earlier revision of this entry
+claimed, which counted structural well-formedness without verifying checksums.
+
+**Consequence for the fix:** scoping it to `load_segment_entries` — which the earlier text implied —
+would have left the primary unable to restart. Both readers need the same checksum-aware, bounded
+scan, and they must share one implementation so they cannot disagree about where a segment ends.
+
 **Fix shape:** `load_segment_entries` must treat a truncated or checksum-failing trailing record as
 end-of-segment — recover the records before it, log a warning naming the file and offset, and
 continue. It must also bound its read loop so a malformed length prefix cannot spin. A WAL reader
