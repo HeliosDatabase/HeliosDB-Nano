@@ -2032,7 +2032,31 @@ impl EmbeddedDatabase {
         self.cache_query_result(sql, results);
     }
 
+    /// R1.1 (ROADMAP_V5 §1.1 Residual, "the result cache is not tenant-keyed"):
+    /// never populate the shared result cache while a tenant context is active.
+    ///
+    /// Both `result_cache` and `hot_result_cache_entry` are keyed on SQL text
+    /// alone, with no tenant/user component, so rows filtered for one context
+    /// would be served verbatim to a later reader in a different — or no —
+    /// context. Keying the cache by tenant would not fix it: visibility is
+    /// determined by the whole `TenantContext`, not `tenant_id` (a policy may
+    /// read `current_setting('app.current_user')` from `user_id`, and `roles`
+    /// exists for policies to grow into — see
+    /// `RLSExpressionEvaluator::evaluate_scalar_function`). A hand-maintained
+    /// key would be a second, separately-maintained copy of "what determines
+    /// visibility" and would drift from the RLS expression language.
+    ///
+    /// Gating writes here AND reads in `cached_query_result` /
+    /// `hot_cached_query_result` makes the invariant self-enforcing: every
+    /// entry in the cache was necessarily written by a no-context caller, so
+    /// it is unfiltered, so it is correct for every no-context reader — and no
+    /// context-active reader can reach it. Entries cached *before* a context
+    /// was ever set (the poisoned-pre-existing-entry case) need no migration or
+    /// epoch bump for the same reason: the read gate makes them inert.
     fn cache_query_result(&self, sql: &str, results: &[Tuple]) {
+        if self.tenant_manager.has_current_context() {
+            return;
+        }
         let cached = std::sync::Arc::new(results.to_vec());
         self.result_cache.put(sql.to_string(), std::sync::Arc::clone(&cached));
         *self.hot_result_cache_entry.write() = Some((sql.to_string(), cached));
@@ -2040,7 +2064,14 @@ impl EmbeddedDatabase {
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
+    /// R1.1: never serve a cache entry while a tenant context is active. The
+    /// entry may have been written by a no-context caller (unfiltered rows) or,
+    /// before this gate existed, by a different tenant's context. See
+    /// `cache_query_result` for why this is context-presence and not tenant-keyed.
     fn cached_query_result(&self, sql: &str) -> Option<std::sync::Arc<Vec<Tuple>>> {
+        if self.tenant_manager.has_current_context() {
+            return None;
+        }
         if let Some(cached) = self.hot_cached_query_result(sql) {
             return Some(cached);
         }
@@ -2050,7 +2081,14 @@ impl EmbeddedDatabase {
         Some(cached)
     }
 
+    /// R1.1: same gate as `cached_query_result`. This needs its own check
+    /// rather than a rely-on-the-caller contract because `query()`'s
+    /// "preserve the v3.37 hot-result-cache behavior" block calls this
+    /// directly, not through `cached_query_result`.
     fn hot_cached_query_result(&self, sql: &str) -> Option<std::sync::Arc<Vec<Tuple>>> {
+        if self.tenant_manager.has_current_context() {
+            return None;
+        }
         self.hot_result_cache_entry
             .read()
             .as_ref()
@@ -5989,27 +6027,21 @@ impl EmbeddedDatabase {
             }
             _ => {
                 // For other operations (CREATE INDEX, SELECT, etc.), use executor
-                // with transaction context so reads see uncommitted writes
-                let mut executor = sql::Executor::with_storage(&self.storage)
-                    .with_timeout(self.effective_statement_timeout_ms())
-                    .with_transaction(txn);
-                let results = executor.execute(&plan)?;
-                // Return results as tuples for SELECT queries, empty for DDL
-                let is_select = matches!(
-                    plan,
-                    sql::LogicalPlan::Scan { .. }
-                        | sql::LogicalPlan::Filter { .. }
-                        | sql::LogicalPlan::Project { .. }
-                        | sql::LogicalPlan::Aggregate { .. }
-                        | sql::LogicalPlan::Join { .. }
-                        | sql::LogicalPlan::Sort { .. }
-                        | sql::LogicalPlan::Limit { .. }
-                        | sql::LogicalPlan::With { .. }
-                        | sql::LogicalPlan::TableFunction { .. }
-                        | sql::LogicalPlan::SystemView { .. }
-                );
-                let _ = is_select; // Results handled by execute_returning
-                Ok(results.len() as u64)
+                // with transaction context so reads see uncommitted writes.
+                //
+                // R1.2 (ROADMAP_V5 §1.1 Residual, "`execute()` on a SELECT
+                // bypasses RLS via the text family's catch-all arm"): route
+                // through the shared read choke point so the row count this
+                // returns is the RLS-FILTERED count. `execute()` deliberately
+                // still accepts arbitrary SQL and still returns `u64` — the leak
+                // was the count, not the surface. `session_txn` is `Some(txn)`
+                // here, so the choke point reuses this transaction and never
+                // touches the `current_transaction` mutex `execute()` may
+                // already be holding one frame up.
+                //
+                // The old `is_select` bookkeeping was dead (`let _ = is_select`)
+                // and is dropped with it.
+                Ok(self.query_plan_with_params(&plan, &[], Some(txn))?.len() as u64)
             }
         }
     }
@@ -14857,11 +14889,33 @@ impl EmbeddedDatabase {
                 Ok((0, Vec::new()))
             }
             _ => {
-                // For query plans and other operations, use executor with parameters
+                // For query plans and other operations, use executor with parameters.
+                //
+                // R1.2 (ROADMAP_V5 §1.1 Residual): the params-family twin of the
+                // text family's catch-all leak — `execute_params("SELECT …", &[])`
+                // returned an unfiltered row count under an active context,
+                // exactly like `execute()` did. Filter the plan so the returned
+                // count is the RLS-filtered one.
+                //
+                // DELIBERATELY NOT routed through `query_plan_with_params` (which
+                // is where every OTHER read site in this fix funnels). That helper
+                // also resolves the *global* transaction when `session_txn` is
+                // `None`, which this arm has never done — and adopting it here
+                // would deadlock: trigger bodies reach this arm via
+                // `execute_plan_internal` → `execute_plan_with_params(plan, &[],
+                // None)` while `execute()` is holding `current_transaction` across
+                // `execute_in_transaction_no_fast_path`, and `parking_lot::Mutex`
+                // is not reentrant. Attaching the global transaction here is a
+                // transaction-VISIBILITY change, not an RLS fix; it needs its own
+                // investigation (and a fix for the same latent re-entrancy in the
+                // Insert/Update/Delete arms above, which already lock
+                // unconditionally). So this arm shares the RLS rule via
+                // `rls_filtered_plan` and leaves its executor construction alone.
+                let plan = self.rls_filtered_plan(plan)?;
                 let mut executor = sql::Executor::with_storage(&self.storage)
                     .with_timeout(self.effective_statement_timeout_ms())
                     .with_parameters(params.to_vec());
-                let results = executor.execute(plan)?;
+                let results = executor.execute(&plan)?;
                 Ok((results.len() as u64, Vec::new()))
             }
         }
@@ -15032,10 +15086,10 @@ impl EmbeddedDatabase {
                     .with_current_schema(self.current_schema())
                     .with_search_path(self.current_search_path());
                 let plan = planner.statement_to_plan(statement)?;
-                let mut executor = sql::Executor::with_storage(&self.storage)
-                    .with_timeout(self.effective_statement_timeout_ms())
-                    .with_transaction(txn_ref);
-                let results = executor.execute(&plan)?;
+                // R1.2 (Hole 5a): this branch hand-rolled its own executor and
+                // never applied RLS, so the FIRST read inside a SQL-text `BEGIN`
+                // saw every row — no cache state or query shape required.
+                let results = self.query_plan_with_params(&plan, &[], Some(txn_ref))?;
                 self.log_slow_query(sql, start.elapsed(), results.len() as u64);
                 return Ok(results);
             }
@@ -15526,8 +15580,20 @@ impl EmbeddedDatabase {
             if let Some(result) = self.try_handle_prepared_query_plan_with_columns(&arc_plan)? {
                 return Ok(result);
             }
+            // R1.2 (ROADMAP_V5 §1.1 Residual, "wire simple-query SELECT never
+            // calls apply_rls_to_plan"): give this branch the fast/slow split
+            // `query()`'s plan-cache-hit branch already has. No context → the
+            // `Arc` executes directly with no clone and the existing `admit`
+            // gate still decides caching. Context active → rewrite an owned
+            // clone and skip the cache write entirely; `cache_query_result`
+            // would no-op after R1.1, but omitting the call matches `query()`'s
+            // template and saves a pointless lock acquisition.
             let mut executor =
                 sql::Executor::with_storage(&self.storage).with_timeout(self.effective_statement_timeout_ms());
+            if self.tenant_manager.has_current_context() {
+                let plan = self.apply_rls_to_plan_recursive((*arc_plan).clone())?;
+                return executor.execute_with_columns(&plan);
+            }
             let result = executor.execute_with_columns(&arc_plan)?;
             if admit {
                 self.cache_query_result(sql, &result.0);
@@ -15560,6 +15626,15 @@ impl EmbeddedDatabase {
 
         let mut executor =
             sql::Executor::with_storage(&self.storage).with_timeout(self.effective_statement_timeout_ms());
+        // R1.2: same split as the plan-cache-hit branch above, mirroring
+        // `query()`'s cold path. The plan cached at `plan_arc` above is always
+        // the PRE-RLS plan (the rewrite runs on a clone and never mutates the
+        // cached entry), so a context-active read still gets the parse+plan
+        // saving — only the rewrite-and-execute step re-runs per call.
+        if self.tenant_manager.has_current_context() {
+            let plan = self.apply_rls_to_plan_recursive((*plan_arc).clone())?;
+            return executor.execute_with_columns(&plan);
+        }
         let result = executor.execute_with_columns(&plan_arc)?;
         if admit && !is_show_branches {
             self.cache_query_result(sql, &result.0);
@@ -16206,12 +16281,10 @@ impl EmbeddedDatabase {
                 .with_search_path(self.current_search_path());
             let plan = planner.statement_to_plan(statement)?;
 
-            // Execute plan with transaction context
-            let mut executor = sql::Executor::with_storage(&self.storage)
-                .with_timeout(self.effective_statement_timeout_ms())
-                .with_transaction(&txn);
-
-            executor.execute(&plan)
+            // Execute plan with transaction context.
+            // R1.2 (Hole 5g): the third, older session-query entry point had the
+            // same hand-rolled, RLS-blind executor as 5c/5e.
+            self.query_plan_with_params(&plan, &[], Some(&txn))
         } else {
             self.query(sql, _params)
         }
@@ -16698,10 +16771,9 @@ impl EmbeddedDatabase {
             .with_search_path(self.current_search_path());
         let plan = planner.statement_to_plan(statement)?;
 
-        let mut executor = sql::Executor::with_storage(&self.storage)
-            .with_timeout(self.effective_statement_timeout_ms())
-            .with_transaction(&txn);
-        let result = executor.execute_with_columns(&plan);
+        // R1.2 (Hole 5c): the wire simple-query path inside an open session
+        // transaction built its own executor and skipped RLS entirely.
+        let result = self.query_plan_with_params_with_columns(&plan, &[], Some(&txn));
         if let Ok((rows, _)) = &result {
             self.log_slow_query(sql, start.elapsed(), rows.len() as u64);
         }
@@ -16949,11 +17021,9 @@ impl EmbeddedDatabase {
             return Ok((returned, columns));
         }
 
-        let mut executor = sql::Executor::with_storage(&self.storage)
-            .with_timeout(self.effective_statement_timeout_ms())
-            .with_parameters(params.to_vec())
-            .with_transaction(&txn);
-        executor.execute_with_columns(&plan)
+        // R1.2 (Hole 5e): MySQL binary `COM_STMT_EXECUTE` inside an open session
+        // transaction skipped RLS the same way the simple-query path did.
+        self.query_plan_with_params_with_columns(&plan, params, Some(&txn))
     }
 
     /// Session-transaction variant of the parameterized fast INSERT path:
@@ -17106,12 +17176,12 @@ impl EmbeddedDatabase {
 
         let plan_start = std::time::Instant::now();
         // W1.2: hold the cached plan by `Arc` and execute it directly when no
-        // tenant context is active, mirroring the raw `query()` precedent at
-        // lib.rs:13455. `apply_rls_to_plan` is a semantic no-op without a
-        // context (lib.rs:17283), so the deep `LogicalPlan` clone this used to
-        // pay on *every* parameterized statement (10–30 allocations for a
-        // point read) only bought an owned tree for the RLS rewrite — which the
-        // no-context path never performs. Clone lazily, on the RLS branch only.
+        // tenant context is active, mirroring the raw `query()` precedent.
+        // The deep `LogicalPlan` clone this used to pay on *every* parameterized
+        // statement (10–30 allocations for a point read) only bought an owned
+        // tree for the RLS rewrite — which the no-context path never performs.
+        // R1.2 moved that lazy clone into `rls_filtered_plan`, so it now happens
+        // once, inside the shared read choke point, on the RLS branch only.
         let plan_arc: std::sync::Arc<sql::LogicalPlan> = match plan_override {
             Some(p) => std::sync::Arc::clone(p),
             None => self.parameterized_plan_cached(sql)?,
@@ -17122,33 +17192,32 @@ impl EmbeddedDatabase {
             "Parameterized logical plan ready"
         );
 
-        // `owned_plan` is declared before the borrow so it outlives `plan`; it
-        // is only initialized on the RLS branch, where it is also the only
-        // thing `plan` borrows. Same gating as the raw path: a tenant context
-        // is the sole trigger for the (owning) RLS rewrite.
-        let owned_plan;
-        let plan: &sql::LogicalPlan = if self.tenant_manager.get_current_context().is_none() {
-            &plan_arc
-        } else {
-            owned_plan = self.apply_rls_to_plan((*plan_arc).clone())?;
-            &owned_plan
-        };
-
+        // R1.2: the RLS rewrite this used to do here moved into
+        // `query_plan_with_params` (the shared read choke point), so the plan
+        // travels as the cached `Arc` all the way down. This is a pure
+        // simplification, not a behavior change: `apply_rls_to_plan_recursive`
+        // has no `Insert`/`InsertSelect`/`Update`/`Delete` arm — they fall into
+        // its `other => Ok(other)` catch-all — so rewriting a DML plan here was
+        // always an identity clone. Dropping it also stops paying that deep
+        // `LogicalPlan` clone on every parameterized DML statement under an
+        // active context, which is exactly the cost the comment above avoids on
+        // the read side. (Write-side RLS for these arms is enforced by
+        // `RlsWriteGuard` inside `execute_plan_with_params_inner`, not here.)
         if matches!(
-            plan,
+            &*plan_arc,
             sql::LogicalPlan::Insert { .. }
                 | sql::LogicalPlan::InsertSelect { .. }
                 | sql::LogicalPlan::Update { .. }
                 | sql::LogicalPlan::Delete { .. }
         ) {
-            let (_count, returned) = self.execute_plan_with_params(plan, params, None)?;
+            let (_count, returned) = self.execute_plan_with_params(&plan_arc, params, None)?;
             self.log_slow_query(sql, start.elapsed(), returned.len() as u64);
             return Ok(returned);
         }
 
         // 4. Execute plan with parameters and return results
         let exec_start = std::time::Instant::now();
-        let results = self.query_plan_with_params(plan, params, None)?;
+        let results = self.query_plan_with_params(&plan_arc, params, None)?;
         tracing::debug!(
             phase = "execute",
             duration_us = exec_start.elapsed().as_micros() as u64,
@@ -17160,6 +17229,34 @@ impl EmbeddedDatabase {
         Ok(results)
     }
 
+    /// R1.2 (ROADMAP_V5 §1.1 Residual): the ONE place a read plan is filtered
+    /// for row-level security before execution.
+    ///
+    /// The v4.9.0 write-path fix landed because enforcement lived in one shared
+    /// helper called from both executor families; the read-path holes it left
+    /// behind were the opposite shape — `apply_rls_to_plan` was correct, but
+    /// five-plus execution sites hand-rolled a `sql::Executor` and never called
+    /// it. This wraps the rewrite so every such site closes with a single line
+    /// instead of re-deriving the "is a context active / clone / rewrite" dance,
+    /// which is how those sites drifted apart in the first place.
+    ///
+    /// `Cow::Borrowed` on the no-context path: the caller's plan is handed back
+    /// by reference, so the common case pays one `RwLock::read()` and no clone —
+    /// the same fast-out shape as `apply_rls_to_plan`.
+    ///
+    /// FAIL-CLOSED: the `?` propagates a policy-parse error to the caller, so a
+    /// read that cannot be filtered returns `Err` and never rows. Do NOT add a
+    /// `.unwrap_or(plan)` / `.ok()` fallback here or at any call site — that
+    /// would silently downgrade an unparseable policy to "no policy" and serve
+    /// the unfiltered table. Pinned by `rls_parse_error_on_read_fails_closed`
+    /// in `tests/rls_read_parity_tests.rs`.
+    fn rls_filtered_plan<'p>(&self, plan: &'p sql::LogicalPlan) -> Result<std::borrow::Cow<'p, sql::LogicalPlan>> {
+        if !self.tenant_manager.has_current_context() {
+            return Ok(std::borrow::Cow::Borrowed(plan));
+        }
+        Ok(std::borrow::Cow::Owned(self.apply_rls_to_plan_recursive(plan.clone())?))
+    }
+
     /// Internal method to execute a query plan with parameters
     fn query_plan_with_params(
         &self,
@@ -17167,6 +17264,14 @@ impl EmbeddedDatabase {
         params: &[Value],
         session_txn: Option<&storage::Transaction>,
     ) -> Result<Vec<Tuple>> {
+        // R1.2 (Hole 5 closure): filter here, once, so every caller — the
+        // in-transaction branches of `query()` / `query_in_session` /
+        // `query_*_for_session`, `Transaction::query`, the PREPARE/EXECUTE
+        // emulation, and `execute()`'s catch-all — gets a filtered plan whether
+        // or not it remembered to pre-rewrite. Before this, "did you call
+        // apply_rls_to_plan first?" was a per-call-site question and seven sites
+        // answered it wrong.
+        let plan = self.rls_filtered_plan(plan)?;
         // Keep parameterized SELECT consistent with `query()`: explicit
         // transactions must see rows staged in the transaction write set.
         let mut _txn_guard = None;
@@ -17193,7 +17298,38 @@ impl EmbeddedDatabase {
             executor = executor.with_transaction(txn_ref);
         }
 
-        executor.execute(plan)
+        executor.execute(&plan)
+    }
+
+    /// Column-aware twin of [`query_plan_with_params`](Self::query_plan_with_params),
+    /// for the `_with_columns`-shaped read sites (wire simple-query inside a
+    /// session transaction, MySQL `COM_STMT_EXECUTE`). Same RLS gate, same
+    /// transaction resolution; only the executor call differs.
+    fn query_plan_with_params_with_columns(
+        &self,
+        plan: &sql::LogicalPlan,
+        params: &[Value],
+        session_txn: Option<&storage::Transaction>,
+    ) -> Result<(Vec<Tuple>, Vec<String>)> {
+        let plan = self.rls_filtered_plan(plan)?;
+        let mut _txn_guard = None;
+        let active_txn: Option<&storage::Transaction> = match session_txn {
+            Some(txn) => Some(txn),
+            None if self.global_txn_active.load(std::sync::atomic::Ordering::Acquire) => {
+                _txn_guard = Some(self.current_transaction.lock());
+                _txn_guard.as_ref().and_then(|guard| guard.as_ref())
+            }
+            None => None,
+        };
+
+        let mut executor = sql::Executor::with_storage(&self.storage)
+            .with_timeout(self.effective_statement_timeout_ms())
+            .with_parameters(params.to_vec());
+        if let Some(txn_ref) = active_txn {
+            executor = executor.with_transaction(txn_ref);
+        }
+
+        executor.execute_with_columns(&plan)
     }
 
     /// Run a query with `$1..$n` parameter binding and return the result rows
@@ -20528,14 +20664,19 @@ impl Transaction<'_> {
             .with_search_path(self.db.current_search_path());
         let plan = planner.statement_to_plan(statement)?;
 
-        // Execute plan with transaction context
-        // For SELECT queries, we need to see our own writes
-        // This is handled by the transaction's get() method which checks the write set first
-        let mut executor = sql::Executor::with_storage(&self.db.storage)
-            .with_timeout(self.db.config.storage.query_timeout_ms)
-            .with_transaction(&self.tx);
-
-        executor.execute(&plan)
+        // Execute plan with transaction context.
+        // For SELECT queries, we need to see our own writes — handled by the
+        // transaction's get() method, which checks the write set first.
+        //
+        // R1.2 (Hole 5b): the RAII handle is the documented way to group reads
+        // and writes (`heliosdb-nano-transactions`), and this tail hand-rolled
+        // its own executor with no `apply_rls_to_plan` anywhere — so every
+        // `tx.query(...)` was unfiltered. Routing through the shared read choke
+        // point also aligns the timeout with the rest of the crate: this used
+        // `config.storage.query_timeout_ms` directly and so ignored both
+        // `statement_timeout_ms` and a session `SET statement_timeout`, which
+        // `effective_statement_timeout_ms()` honors.
+        self.db.query_plan_with_params(&plan, &[], Some(&self.tx))
     }
 }
 
