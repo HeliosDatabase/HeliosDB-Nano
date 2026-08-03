@@ -910,6 +910,20 @@ impl TenantManager {
         self.current_context.read().clone()
     }
 
+    /// Is a tenant context active?
+    ///
+    /// Definitionally identical to `get_current_context().is_some()`, but
+    /// without the `TenantContext` clone that predicate pays (a `String`
+    /// `user_id` plus a `Vec<String>` `roles`) only to drop it again.
+    ///
+    /// This is the spelling the RLS read-path gates use (ROADMAP_V5 §1.1
+    /// Residual): they run on the result-cache probe and plan-execution
+    /// choke points — several times per statement — and need only the
+    /// yes/no answer, never the context itself.
+    pub fn has_current_context(&self) -> bool {
+        self.current_context.read().is_some()
+    }
+
     /// Clear current tenant context
     pub fn clear_current_context(&self) {
         set_current_tenant_id(None);
