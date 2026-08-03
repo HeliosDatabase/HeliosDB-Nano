@@ -5,6 +5,52 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.10.0] - 2026-08-03
+
+**Security fix.** Completes the row-level security work begun in 4.9.0. If you
+use RLS, upgrade.
+
+- **Fix (security, pre-existing):** the query result cache was shared across
+  tenant contexts. Results were cached under the query text alone, and the cache
+  was consulted before any policy was applied — so a query run under a policy
+  cached its *filtered* rows and a later caller received them, and a query run
+  with no policy cached unfiltered rows that a later policy-bound caller
+  received. Both directions were reproduced. Under an active tenant context the
+  result cache is now bypassed entirely.
+- **Fix (security, pre-existing):** reads inside an explicit transaction applied
+  no policy at all. This affected every transactional read — including the
+  documented `Transaction` API, which is the recommended way to group reads and
+  writes — and required no particular query shape: the first read after `BEGIN`
+  was already unfiltered.
+- **Fix (security, pre-existing):** `execute()` and `execute_params()` returned
+  an unfiltered row count for a `SELECT`, which discloses information a policy is
+  meant to hide.
+- **Fix (security, pre-existing):** the PostgreSQL simple-query read path did not
+  apply policies.
+
+**Scope, unchanged from 4.9.0 and worth repeating.** Tenant context can still
+only be established through the embedded Rust API and the REPL; no network
+protocol sets one. Row-level security therefore remains unavailable to clients
+connecting over PostgreSQL wire, MySQL wire, or `/rest/v1/`, and this release does
+not change that. Exposing it additionally requires session-scoping the tenant
+context, which is currently one process-wide value.
+
+**Upgrade notes.**
+- Queries against policy-protected tables will return fewer rows than before
+  wherever a policy was previously being skipped. That is the intended
+  behaviour; applications that had come to rely on the missing filtering will
+  see the difference.
+- While a tenant context is active, the result cache is bypassed, so repeated
+  identical queries re-execute. This is a deliberate trade: a shared cache
+  cannot safely serve results whose visibility depends on who is asking.
+  Behaviour and performance without a tenant context are unchanged.
+
+**Known limitations, tracked.** Policies are not applied inside CTEs, unions, or
+table functions, nor to scalar and correlated subqueries. Two library-only
+execution paths (the Lite protocol adapter and the Oracle handler) have no access
+to tenant state and cannot apply policies at all. Row-level security should not
+be relied upon as a security boundary for these constructs.
+
 ## [4.9.1] - 2026-08-02
 
 - **Fix (availability, pre-existing):** a replication primary that was killed

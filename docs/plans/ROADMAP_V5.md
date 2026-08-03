@@ -43,12 +43,23 @@ families; violations map to SQLSTATE 42501. Two colocated `get_rls_conditions` b
 affected reads too. Verified by a 15-test both-families parity suite AND by an independent
 coordinator-authored probe: UPDATE 0 rows, INSERT Err, DELETE 0 rows, hidden row intact.
 
-**Residual, and it gates any future work to expose RLS over the wire** (all found during the fix,
-all deliberately out of its scope): `execute()` on a SELECT bypasses RLS via the text family's
-catch-all arm; the result cache is not tenant-keyed, so a no-context read can serve a later
-RLS-active read unfiltered; and wire simple-query SELECT never calls `apply_rls_to_plan`. None are
-reachable today because no wire connection can set a `TenantContext` — which is exactly why they
-must be closed BEFORE that changes, alongside session-scoping the process-global context.
+**Residual CLOSED in v4.10.0 (`399124a`).** All three listed holes fixed, plus two more found
+while fixing them: `execute_params()` had the same catch-all defect as `execute()`, and reads
+inside an explicit transaction applied no RLS at all (eight call sites, one root cause — the
+choke-point fix closed an eighth the design had not found). The result cache leaked in BOTH
+directions, measured, not just the no-context→RLS-active direction recorded here; under an active
+context it is now bypassed entirely rather than tenant-keyed, because policies can reference
+`current_setting()` and roles, so any hand-maintained key would be a second driftable copy of what
+determines visibility. Poisoned pre-existing entries are handled by gating reads, not only writes.
+
+**Still open, and these now gate wire exposure** (filed 2026-08-03): RLS does not walk into CTEs,
+unions or table functions; scalar/correlated subqueries execute via a fresh RLS-blind `Executor`;
+`protocols::adapters::executor::LiteQueryExecutorAdapter` and `protocols::oracle::handler` plan and
+execute holding only `Arc<StorageEngine>` with no `TenantManager`, so they cannot apply RLS even in
+principle (public library surface, not wired into `main.rs`). Also found: a latent re-entrant
+deadlock in DML trigger bodies (`current_transaction` locked unconditionally with no
+`global_txn_active` fast-out), and `max_qps` is a lifetime quota rather than a rate — nothing ever
+resets the window, so a free-plan tenant gets 10 statements for the life of the process.
 
 **Correction, not an echo.** The original characterization ("RLS is enforced on read paths
 only, not on writes") undersells this. There *is* write-enforcement code — `LogicalPlan::Insert
