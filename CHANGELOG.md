@@ -5,6 +5,67 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+**Documentation correction: triggers are not implemented.** No code behaviour
+changes in this entry — what changes is what we tell you about it. Previous
+releases listed triggers as a feature ("Triggers: BEFORE/AFTER
+INSERT/UPDATE/DELETE"). That was wrong, and wrong in the most costly way: a
+`CREATE TRIGGER` you write today **succeeds, reports no error, registers the
+trigger — and then never runs it.** If you built an audit log, a derived-column
+maintainer, or any integrity check on a HeliosDB Nano trigger, it has never
+fired. Check that data.
+
+- **Docs (correction):** `README.md`, `AGENTS.md`, `docs/llms.txt`,
+  `docs/guides/upgrade.md`, the `heliosdb-nano-schema` /
+  `heliosdb-nano-overview` agent skills, and the three `examples/trigger_*.rs`
+  demos now state that triggers do not execute. The schema skill's trigger
+  recipe previously showed a worked audit-log example written in SQLite
+  `BEGIN … END` syntax, which this parser cannot parse at all; it has been
+  replaced with an accurate description of what each form actually does.
+- **What actually happens, precisely.**
+  - `CREATE TRIGGER … EXECUTE FUNCTION f()` (PostgreSQL form) parses and
+    registers, for every timing (`BEFORE` / `AFTER` / `INSTEAD OF`), every
+    event, `FOR EACH ROW` and `FOR EACH STATEMENT`, with or without
+    `WHEN (…)`. Nothing fires on INSERT/UPDATE/DELETE. There is no error, no
+    warning, and no log line.
+  - `CREATE TRIGGER … BEGIN … END` (SQLite/MySQL inline body) is a **parse
+    error** — that grammar does not exist here. `CREATE TRIGGER IF NOT EXISTS`
+    is likewise a parse error; use `CREATE OR REPLACE TRIGGER`.
+  - **The one exception that does have an effect:** `BEFORE INSERT … FOR EACH
+    ROW EXECUTE FUNCTION f()` where `f`'s body contains literal
+    `NEW.<col> = <expr>` assignments and/or `RETURN NULL` rewrites or skips the
+    row being inserted (shipped in 3.58.1). It does not extend to `BEFORE
+    UPDATE`/`BEFORE DELETE`, to `AFTER` timings, or to side effects such as
+    `INSERT INTO audit_log …` inside the body.
+  - `DROP TRIGGER [IF EXISTS] <name> ON <table>` works and deregisters
+    correctly. `DROP TABLE`, however, does **not** — the table's trigger
+    registrations survive it, so re-creating the table and its trigger fails
+    with `Trigger '<name>' already exists on table '<t>'`. That trigger name is
+    unusable for the lifetime of the process; `DROP TRIGGER` it before
+    `DROP TABLE`, or use a different name.
+  - There is no trigger introspection: no `pg_trigger` relation,
+    `information_schema.triggers` is empty by design, `pg_class.relhastriggers`
+    is always `false`, and no REPL command lists triggers. On a disk-backed
+    database a registered trigger survives exactly one restart (WAL replay
+    restores it, then the WAL is truncated and nothing reloads it from the
+    catalog), so registration is not durable either.
+- **What to use instead:** do the work in your application, in an explicit
+  second statement inside the same transaction, or in a `CREATE PROCEDURE`
+  invoked with `CALL` (procedures do execute).
+- **Tests (correction):** removed `tests/trigger_tests.rs`,
+  `tests/decimal_trigger_integration_tests.rs`,
+  `tests/trigger_hardening_tests.rs`, `tests/test_trigger_errors.rs` and
+  `tests/test_trigger_manual.rs` — about 2,600 lines that read as a
+  comprehensive, fully-green trigger suite while providing zero regression
+  protection (every assertion sat behind an `if result.is_ok()` /
+  `match { Ok => …, Err => eprintln! }` guard that was always taken, and two of
+  the files were `fn main()` scripts with no `#[test]` and no assertions at
+  all). They are replaced by `tests/trigger_unimplemented_tests.rs`, which
+  asserts unconditionally what ships today — including that a registered
+  trigger leaves the audit table empty — so the day triggers start working, the
+  suite goes red on purpose.
+
 ## [4.10.0] - 2026-08-03
 
 **Security fix.** Completes the row-level security work begun in 4.9.0. If you

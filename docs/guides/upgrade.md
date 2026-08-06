@@ -52,6 +52,16 @@ upgrade (server-side changes; no client or driver bump needed):
 Nothing here changes existing behavior — they are additive compatibility fixes.
 See the `CHANGELOG.md` `[3.58.1]` entry for the full list.
 
+> **Scope note on the trigger row (read before relying on it).** That row is the
+> *only* trigger behaviour HeliosDB Nano has. Triggers as a feature are **not
+> implemented**: `CREATE TRIGGER` parses and registers, but no trigger body is ever
+> executed and nothing fires on INSERT/UPDATE/DELETE — silently, with no error.
+> The exception above is narrow: `BEFORE INSERT … FOR EACH ROW EXECUTE FUNCTION f()`
+> where `f`'s body contains literal `NEW.<col> = <expr>` assignments and/or
+> `RETURN NULL` rewrites or skips the row being inserted. It does not extend to
+> `BEFORE UPDATE`/`BEFORE DELETE`, to `AFTER` timings, or to side effects such as
+> `INSERT INTO audit_log …` inside the body.
+
 ## Wire-protocol notes
 
 After upgrading, a few SQL-side features may become available that older

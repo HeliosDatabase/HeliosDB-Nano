@@ -394,7 +394,7 @@ All PostgreSQL types plus MySQL type aliases (automatically translated):
 - **Full-text search**: `tsvector`, `tsquery`, `@@`, `ts_rank_cd`, `CREATE INDEX ... USING gin` (see [FTS scope](docs/compatibility/fts.md))
 - **Keyset pagination**: row-constructor comparison `WHERE (col, id) < ($1, $2)`; top-K sort; constant-time deep OFFSET
 - **Foreign keys**: CASCADE, SET NULL, RESTRICT, deferred/audit/off validation modes, `NOT ENFORCED` constraints
-- **Triggers**: BEFORE/AFTER INSERT/UPDATE/DELETE
+- **Triggers**: ⚠️ **not implemented** — `CREATE TRIGGER … EXECUTE FUNCTION f()` parses and registers, but no trigger body ever runs: nothing fires on INSERT/UPDATE/DELETE and there is no error or warning. SQLite/MySQL-style `BEGIN … END` bodies do not parse at all. The single exception that has an effect: `BEFORE INSERT … FOR EACH ROW EXECUTE FUNCTION f()` where `f`'s body is `NEW.<col> = <expr>` and/or `RETURN NULL` rewrites or skips the row being inserted. Do not use triggers for audit logs or derived-data maintenance — do that work in the application or in a `CREATE PROCEDURE` invoked with `CALL`.
 - **Row-Level Security**: Per-tenant data isolation via policies
 - **EXPLAIN**: Cost-based optimizer, ANALYZE, JSON/XML/YAML output
 - **Code-graph** *(opt-in, `--features code-graph`)*: tree-sitter-backed AST index + `lsp_definition` / `lsp_references` / `lsp_call_hierarchy` / `lsp_hover` as Rust API & SQL table functions — see [code-graph overview](docs/code_graph/overview.md)
@@ -607,7 +607,7 @@ The cache path exists once cargo has extracted the crate (`cargo install` does t
 | `heliosdb-nano-overview` | Top-level navigation; routes to the domain skills |
 | `heliosdb-nano-install` | crates.io, source, feature flags (code-graph, mcp-endpoint, fips, ha-full…) |
 | `heliosdb-nano-connect` | Embedded library, REPL, PG wire, MySQL wire, Python sqlite3 drop-in, TLS |
-| `heliosdb-nano-schema` | DDL: tables, indexes (B-tree + HNSW), views, triggers, PL/pgSQL |
+| `heliosdb-nano-schema` | DDL: tables, indexes (B-tree + HNSW), views, PL/pgSQL; why `CREATE TRIGGER` registers but never fires |
 | `heliosdb-nano-query` | DML, parameter styles (`?` `$1` `:name` `@name`), `ON CONFLICT`, `RETURNING` |
 | `heliosdb-nano-transactions` | BEGIN/COMMIT/ROLLBACK, savepoints, bulk-load patterns |
 | `heliosdb-nano-branches` | Fork-test-discard sandboxes: `CREATE/USE/DROP DATABASE BRANCH`, `AS OF` forks |
