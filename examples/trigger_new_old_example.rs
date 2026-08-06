@@ -1,6 +1,10 @@
-// Example demonstrating NEW and OLD context variables in triggers
+// Example demonstrating the NEW / OLD row-context evaluator API
 //
-// This example shows how to use NEW and OLD to access row data in trigger bodies
+// ⚠️ This is a LIBRARY-LEVEL example. It drives `Evaluator::with_trigger_row_context`
+// directly, which works. It is NOT reachable from SQL triggers: trigger bodies never
+// execute (see `tests/trigger_unimplemented_tests.rs` and the `heliosdb-nano-schema`
+// skill), so `NEW.col` / `OLD.col` written inside a `CREATE TRIGGER` function body is
+// never evaluated by this or any other code path during DML.
 
 use heliosdb_nano::sql::{triggers::TriggerRowContext, Evaluator, LogicalExpr};
 use heliosdb_nano::{Column, ColumnStorageMode, DataType, Schema, Tuple, Value};

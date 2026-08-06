@@ -121,7 +121,8 @@ Source of truth: `src/main.rs`, `src/repl/commands.rs`, `src/lib.rs`, `src/mcp/t
 
 | Statement | Skill |
 |-----------|-------|
-| `CREATE / ALTER / DROP TABLE / INDEX / VIEW / MATERIALIZED VIEW / TRIGGER / FUNCTION` | `heliosdb-nano-schema` |
+| `CREATE / ALTER / DROP TABLE / INDEX / VIEW / MATERIALIZED VIEW / FUNCTION` | `heliosdb-nano-schema` |
+| `CREATE / DROP TRIGGER` (registers, but **triggers never fire** — see the skill) | `heliosdb-nano-schema` |
 | `INSERT [OR REPLACE/IGNORE] / … ON CONFLICT … / … RETURNING` | `heliosdb-nano-query` |
 | `UPDATE … RETURNING` / `DELETE … RETURNING` / `MERGE` | `heliosdb-nano-query` |
 | `SELECT` (windows, CTEs, set ops) / `EXPLAIN [ANALYZE]` | `heliosdb-nano-query` |

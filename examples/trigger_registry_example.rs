@@ -2,6 +2,11 @@
 //!
 //! Demonstrates how to use the TriggerRegistry for managing trigger definitions
 //! in HeliosDB Nano.
+//!
+//! ⚠️ Registration is not execution. Everything below (register / lookup / enable /
+//! disable / drop / persist) works, but HeliosDB Nano never executes a trigger body:
+//! a registered trigger has no observable effect on INSERT/UPDATE/DELETE. See
+//! `tests/trigger_unimplemented_tests.rs` and the `heliosdb-nano-schema` skill.
 
 use heliosdb_nano::{
     sql::{

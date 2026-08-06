@@ -541,7 +541,9 @@ pub struct EmbeddedDatabase {
     global_txn_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Tenant manager for multi-tenancy and RLS (optional)
     pub tenant_manager: std::sync::Arc<crate::tenant::TenantManager>,
-    /// Trigger registry for trigger management and execution
+    /// Trigger registry: registration/lookup only. Trigger bodies are never executed
+    /// (`Planner::create_trigger_to_plan` always produces an empty body, and the DML
+    /// executor closures discard the row context) — see `tests/trigger_unimplemented_tests.rs`.
     pub trigger_registry: std::sync::Arc<sql::TriggerRegistry>,
     /// Function registry for stored functions and procedures
     pub function_registry: std::sync::Arc<sql::FunctionRegistry>,

@@ -18,7 +18,7 @@ Single-binary embedded database (Rust). PostgreSQL- and MySQL-wire compatible. O
 |----------------------|------|
 | Installing the binary, building from source, listing features | `heliosdb-nano-install` |
 | Opening a connection (embedded, PG wire, MySQL wire, REPL, Python) | `heliosdb-nano-connect` |
-| Tables / indexes / views / triggers / introspection | `heliosdb-nano-schema` |
+| Tables / indexes / views / introspection (also: why triggers never fire) | `heliosdb-nano-schema` |
 | INSERT / UPDATE / DELETE / SELECT / EXPLAIN | `heliosdb-nano-query` |
 | BEGIN / COMMIT / SAVEPOINT / bulk-load patterns | `heliosdb-nano-transactions` |
 | Branching: fork-test-discard sandboxes, create / switch / drop / AS OF forks (merge: see warning there) | `heliosdb-nano-branches` |

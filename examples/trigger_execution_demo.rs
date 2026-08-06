@@ -1,13 +1,22 @@
-//! Trigger Execution Demo
+//! Trigger Registration / DML-hook Demo
 //!
-//! This example demonstrates how trigger execution is integrated into DML operations.
-//! It shows the execution flow for INSERT, UPDATE, and DELETE with BEFORE and AFTER triggers.
+//! ⚠️ TRIGGERS ARE NOT IMPLEMENTED IN HELIOSDB NANO. This example demonstrates the
+//! trigger *hooks* the DML paths call into — registration, per-table lookup, and the
+//! cascade-depth guard. It does NOT demonstrate a trigger body running, because no
+//! trigger body ever runs: `TriggerDefinition.body` is always empty (the planner
+//! hardcodes it, `src/sql/planner.rs`), and the DML executor closures discard the
+//! NEW/OLD row context. INSERT/UPDATE/DELETE below take the trigger-aware slow path
+//! and invoke the hooks, and the hooks do nothing observable.
+//!
+//! See the `heliosdb-nano-schema` skill ("Triggers — NOT IMPLEMENTED") before using
+//! triggers for anything.
 
 use heliosdb_nano::{sql, EmbeddedDatabase, Result};
 
 fn main() -> Result<()> {
     println!("========================================");
-    println!("HeliosDB Nano Trigger Execution Demo");
+    println!("HeliosDB Nano Trigger Registration Demo");
+    println!("(triggers are NOT implemented: bodies never run)");
     println!("========================================\n");
 
     // Create an in-memory database
@@ -49,10 +58,13 @@ fn main() -> Result<()> {
     db.trigger_registry.register_trigger(audit_trigger)?;
     println!("   ✓ AFTER INSERT audit trigger registered\n");
 
-    // Insert data (triggers will execute)
-    println!("4. Inserting data (triggers will fire)...");
+    // Insert data (the trigger hooks are called; nothing happens)
+    println!("4. Inserting data (BEFORE/AFTER INSERT hooks are called, and do nothing)...");
     let count = db.execute("INSERT INTO users (id, name, email) VALUES (1, 'Alice', 'alice@example.com')")?;
-    println!("   ✓ Inserted {} row (triggers executed)\n", count);
+    println!(
+        "   ✓ Inserted {} row (no trigger body ran — audit_log is still empty)\n",
+        count
+    );
 
     // Verify triggers are registered
     println!("5. Verifying trigger registration...");
@@ -78,10 +90,10 @@ fn main() -> Result<()> {
     db.trigger_registry.register_trigger(update_trigger)?;
     println!("   ✓ BEFORE UPDATE trigger registered\n");
 
-    // Update data (trigger will execute)
-    println!("7. Updating data (UPDATE trigger will fire)...");
+    // Update data (the trigger hook is called; nothing happens)
+    println!("7. Updating data (BEFORE UPDATE hook is called, and does nothing)...");
     let count = db.execute("UPDATE users SET email = 'alice.new@example.com' WHERE id = 1")?;
-    println!("   ✓ Updated {} row(s) (UPDATE trigger executed)\n", count);
+    println!("   ✓ Updated {} row(s) (no trigger body ran)\n", count);
 
     // Test DELETE triggers
     println!("8. Registering DELETE trigger...");
@@ -101,10 +113,10 @@ fn main() -> Result<()> {
     // Insert another row for deletion test
     db.execute("INSERT INTO users (id, name, email) VALUES (2, 'Bob', 'bob@example.com')")?;
 
-    // Delete data (trigger will execute)
-    println!("9. Deleting data (DELETE trigger will fire)...");
+    // Delete data (the trigger hook is called; nothing happens)
+    println!("9. Deleting data (BEFORE DELETE hook is called, and does nothing)...");
     let count = db.execute("DELETE FROM users WHERE id = 2")?;
-    println!("   ✓ Deleted {} row(s) (DELETE trigger executed)\n", count);
+    println!("   ✓ Deleted {} row(s) (no trigger body ran)\n", count);
 
     // Query final state
     println!("10. Final state of users table:");
@@ -150,18 +162,18 @@ fn main() -> Result<()> {
     println!("Demo completed successfully!");
     println!("========================================");
     println!();
-    println!("Summary:");
-    println!("  ✓ Trigger registration working");
-    println!("  ✓ INSERT trigger hooks integrated");
-    println!("  ✓ UPDATE trigger hooks integrated");
-    println!("  ✓ DELETE trigger hooks integrated");
+    println!("Summary — what this demo actually showed:");
+    println!("  ✓ Trigger registration / lookup / drop (the registry works)");
+    println!("  ✓ DML paths call the BEFORE/AFTER hooks for a table with triggers");
     println!("  ✓ Cascading depth tracking (16-level limit)");
     println!("  ✓ TriggerContext depth protection");
     println!();
-    println!("Next steps:");
-    println!("  - Implement CREATE TRIGGER parser (Task 7)");
-    println!("  - Add NEW/OLD context evaluation (Task 10)");
-    println!("  - Test with real trigger bodies");
+    println!("What it did NOT show, because it does not exist:");
+    println!("  ✗ Executing a trigger body — TriggerDefinition.body is always empty");
+    println!("  ✗ NEW/OLD resolution during DML — the executor discards the row context");
+    println!("  ✗ Any observable effect of a trigger on INSERT/UPDATE/DELETE");
+    println!();
+    println!("Regression coverage for this behaviour: tests/trigger_unimplemented_tests.rs");
 
     Ok(())
 }
