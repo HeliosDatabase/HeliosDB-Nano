@@ -386,7 +386,8 @@ All PostgreSQL types plus MySQL type aliases (automatically translated):
 ## Features at a Glance
 
 - **Full SQL**: JOINs, CTEs, window functions, subqueries, set operations, aggregates, CASE
-- **PL/pgSQL**: Stored procedures and functions
+- **User-defined functions**: ⚠️ **not callable** — `CREATE FUNCTION` (all forms: `LANGUAGE plpgsql`, `LANGUAGE sql`, `RETURNS … RETURN expr`) parses and registers, but no invocation route resolves it: `SELECT f(x)` in a select list, a `WHERE` clause or `FROM`, `CALL f(x)`, and bound-parameter queries all error with `Unknown scalar function: f`. `information_schema.routines`, `information_schema.parameters` and `pg_proc` are always empty, so a registered function is also invisible to catalog clients. Inline the expression, use a view, or keep the logic in the application
+- **Stored procedures**: `CREATE PROCEDURE p(a INT, b TEXT) LANGUAGE sql AS $$INSERT INTO t VALUES ($a, $b)$$` + `CALL p(1, 'x')` works, arguments included. Two rules: the procedure must be **`LANGUAGE sql`** (a `LANGUAGE plpgsql` body substitutes nothing — `$name` errors `Invalid parameter placeholder`, `$1` errors `Parameter $1 not provided`), and the body must reference parameters with a **`$` sigil**, by name (`$a`) or positionally (`$1`) — a bare parameter name fails with `Column 'a' not found in schema` in either language
 - **Materialized views**: `CREATE` / `REFRESH MATERIALIZED VIEW`, staleness tracking (`\dmv`, `pg_mv_staleness()`)
 - **MVCC transactions**: snapshot isolation; `READ COMMITTED` / `REPEATABLE READ` / `SERIALIZABLE`; first-committer-wins write-write conflict detection (SQLSTATE `40001`)
 - **COPY (PostgreSQL wire)**: `COPY … FROM STDIN` / `TO STDOUT` in text and CSV — works with `psql \copy` and high-throughput PG→Nano bulk migration
@@ -394,7 +395,7 @@ All PostgreSQL types plus MySQL type aliases (automatically translated):
 - **Full-text search**: `tsvector`, `tsquery`, `@@`, `ts_rank_cd`, `CREATE INDEX ... USING gin` (see [FTS scope](docs/compatibility/fts.md))
 - **Keyset pagination**: row-constructor comparison `WHERE (col, id) < ($1, $2)`; top-K sort; constant-time deep OFFSET
 - **Foreign keys**: CASCADE, SET NULL, RESTRICT, deferred/audit/off validation modes, `NOT ENFORCED` constraints
-- **Triggers**: ⚠️ **not implemented** — `CREATE TRIGGER … EXECUTE FUNCTION f()` parses and registers, but no trigger body ever runs: nothing fires on INSERT/UPDATE/DELETE and there is no error or warning. SQLite/MySQL-style `BEGIN … END` bodies do not parse at all. The single exception that has an effect: `BEFORE INSERT … FOR EACH ROW EXECUTE FUNCTION f()` where `f`'s body is `NEW.<col> = <expr>` and/or `RETURN NULL` rewrites or skips the row being inserted. Do not use triggers for audit logs or derived-data maintenance — do that work in the application or in a `CREATE PROCEDURE` invoked with `CALL`.
+- **Triggers**: ⚠️ **not implemented** — `CREATE TRIGGER … EXECUTE FUNCTION f()` parses and registers, but no trigger body ever runs: nothing fires on INSERT/UPDATE/DELETE and there is no error or warning. SQLite/MySQL-style `BEGIN … END` bodies do not parse at all. The single exception that has an effect: `BEFORE INSERT … FOR EACH ROW EXECUTE FUNCTION f()` where `f`'s body is `NEW.<col> = <expr>` and/or `RETURN NULL` rewrites or skips the row being inserted. Do not use triggers for audit logs or derived-data maintenance — do that work in the application, in an explicit second statement in the same transaction, or in a `CREATE PROCEDURE` invoked with `CALL`. Procedures execute and bind their arguments, provided you use `LANGUAGE sql` and `$`-sigil parameters (see the **Stored procedures** bullet above).
 - **Row-Level Security**: Per-tenant data isolation via policies
 - **EXPLAIN**: Cost-based optimizer, ANALYZE, JSON/XML/YAML output
 - **Code-graph** *(opt-in, `--features code-graph`)*: tree-sitter-backed AST index + `lsp_definition` / `lsp_references` / `lsp_call_hierarchy` / `lsp_hover` as Rust API & SQL table functions — see [code-graph overview](docs/code_graph/overview.md)
@@ -607,7 +608,7 @@ The cache path exists once cargo has extracted the crate (`cargo install` does t
 | `heliosdb-nano-overview` | Top-level navigation; routes to the domain skills |
 | `heliosdb-nano-install` | crates.io, source, feature flags (code-graph, mcp-endpoint, fips, ha-full…) |
 | `heliosdb-nano-connect` | Embedded library, REPL, PG wire, MySQL wire, Python sqlite3 drop-in, TLS |
-| `heliosdb-nano-schema` | DDL: tables, indexes (B-tree + HNSW), views, PL/pgSQL; why `CREATE TRIGGER` registers but never fires |
+| `heliosdb-nano-schema` | DDL: tables, indexes (B-tree + HNSW), views; why `CREATE TRIGGER` registers but never fires, and why `CREATE FUNCTION` registers but nothing can call it |
 | `heliosdb-nano-query` | DML, parameter styles (`?` `$1` `:name` `@name`), `ON CONFLICT`, `RETURNING` |
 | `heliosdb-nano-transactions` | BEGIN/COMMIT/ROLLBACK, savepoints, bulk-load patterns |
 | `heliosdb-nano-branches` | Fork-test-discard sandboxes: `CREATE/USE/DROP DATABASE BRANCH`, `AS OF` forks |

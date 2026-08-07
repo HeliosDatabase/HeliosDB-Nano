@@ -2,9 +2,12 @@
 
 > Nano exposes the long-tail SQL-standard `information_schema` views
 > that ORMs, migration tools, and dashboard builders commonly probe,
-> including `character_sets`, `routines`, `parameters`, and view-usage
-> metadata. Unknown `information_schema` views raise a loud error rather
-> than silently returning rows from the wrong view.
+> including `character_sets` and view-usage metadata. Unknown
+> `information_schema` views raise a loud error rather than silently
+> returning rows from the wrong view. A few views are present for shape
+> only and are **always empty** — `routines` and `parameters` are the
+> ones that matter in practice; check the Status column before relying
+> on a view to return data.
 
 Nano implements the PostgreSQL flavour of the SQL-standard
 `information_schema`. All views are read-only and reflect the catalog
@@ -37,8 +40,13 @@ state at query time (no caching, no staleness).
 
 | View | Status | Notes |
 |------|--------|-------|
-| `information_schema.routines` | Complete | PL/pgSQL functions registered via `CREATE FUNCTION` |
-| `information_schema.parameters` | Complete | Per-routine parameter rows (ordinal, mode, data type) |
+| `information_schema.routines` | Schema only — always empty | The view resolves and reports the full SQL-standard column list, but returns **zero rows**, including when functions and procedures have been registered via `CREATE FUNCTION` / `CREATE PROCEDURE`. Nano does not expose its runtime routine catalog through this view (`query_information_schema_routines` returns an empty row set by construction). ORM probes see "no user-defined routines" |
+| `information_schema.parameters` | Schema only — always empty | Same: correct column list, zero rows, always. No per-routine parameter rows are ever produced |
+
+A registered routine is invisible to every catalog client. `pg_proc` is empty for
+the same reason — see [`pg_catalog`](#pairs-with-pg_catalog) below. Note also that
+a registered function cannot be *called* by any SQL surface; see the
+`heliosdb-nano-schema` skill (Recipe 6) for what does and does not run.
 
 ### Views and views-on-views
 

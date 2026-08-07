@@ -5,6 +5,84 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+**Documentation correction: user-defined functions are not callable. Plus a
+needed qualification to 4.10.1's stored-procedure advice.** No code behaviour
+changes in this entry. If you wrote a `CREATE FUNCTION` against HeliosDB Nano, it
+registered and it has never run — nothing in the database can call it. Stored
+procedures, by contrast, do work; 4.10.1 just did not tell you the two rules for
+writing one that binds its arguments.
+
+- **Qualification to [4.10.1].** That entry said, of triggers: *"What to use
+  instead: … a `CREATE PROCEDURE` invoked with `CALL` (procedures do execute)."*
+  That advice stands — procedures execute and their arguments do bind — but it
+  was under-specified, and following it without the two rules below lands you on
+  a form that errors:
+  - **Use `LANGUAGE sql`.** A `LANGUAGE plpgsql` procedure body performs no
+    parameter substitution at all: `$p_id` fails with
+    `Invalid parameter placeholder: $p_id. Expected format: $1, $2, etc.`, and
+    `$1` fails with `Parameter $1 not provided. Expected 1 parameters, got 0`.
+  - **Reference parameters with a `$` sigil** — by name (`$p_id`) or
+    positionally (`$1`). A *bare* parameter name fails with
+    `Column 'n' not found in schema` in **either** language.
+
+  ```sql
+  CREATE PROCEDURE log_named(p_id INTEGER, p_op TEXT) LANGUAGE sql
+      AS $$INSERT INTO audit VALUES ($p_id, $p_op)$$;
+  CALL log_named(42, 'hello');   -- OK, (42, 'hello') is inserted
+  ```
+
+  A zero-parameter body works, and a body that never mentions its parameter
+  succeeds while silently discarding the argument. Within these rules a procedure
+  is a legitimate replacement for a trigger. (The 4.10.1 entry itself is left
+  intact as released history.)
+- **User-defined functions are registered but callable by nothing.** All three
+  `CREATE FUNCTION` forms — `LANGUAGE plpgsql`, `LANGUAGE sql`, and
+  `RETURNS <type> RETURN <expr>` — parse, register, and return OK. Every
+  invocation route then fails:
+  - `SELECT f(x)` as a bare select, in a projection alongside columns, and in a
+    `WHERE` clause → `Unknown scalar function: f`. Schema-qualifying it
+    (`SELECT public.f(x)`) → `Unknown scalar function: public.f`.
+  - `SELECT * FROM f(x)` → `Table 'f' does not exist`.
+  - `CALL f(x)` → `Procedure 'f' does not exist` (a function is not a procedure).
+  - `PERFORM f(x)` → SQL parse error; `PERFORM` is not a statement here.
+  - The bound-parameter path fails identically:
+    `execute_params("SELECT f($1)", …)` → `Unknown scalar function: f`.
+
+  This is the same on the embedded API and over the PostgreSQL wire. Nothing
+  silently returns a wrong answer — every route errors — but there is no route at
+  all, and `CREATE FUNCTION` returning OK is the only signal you get.
+- **No routine introspection.** `information_schema.routines`,
+  `information_schema.parameters`, and `pg_proc` are structurally present on the
+  wire and return **zero rows even with a function registered**. On the embedded
+  path `information_schema.routines` does not resolve at all and `pg_proc`
+  returns no rows. A registered routine is invisible to every ORM probe and
+  catalog client.
+- **What to use instead of a function:** inline the expression
+  (`SELECT id * 2 FROM t`), a view, a column your application maintains, or move
+  the logic into application code. There is no in-database replacement — in
+  particular, a custom SQLite function ported via the sqlite3 drop-in cannot be
+  reimplemented as a `CREATE FUNCTION`.
+- **Docs (correction):** `README.md`, `AGENTS.md`, `docs/llms.txt`,
+  `docs/compatibility/plpgsql.md`, `docs/compatibility/information_schema.md`,
+  and the `heliosdb-nano-schema` / `heliosdb-nano-migrate` agent skills now state
+  that user-defined functions are not callable, and carry the working stored-procedure
+  recipe with its two rules. The schema skill's Recipe 6 previously ended with
+  `SELECT post_count(1);`, a line that errors — it has been replaced with what
+  each form actually does. `docs/compatibility/information_schema.md` listed
+  `routines` and `parameters` as "Complete" with notes describing rows they have
+  never returned; both are now marked as schema-only and always empty.
+- **Tests:** added `tests/function_unimplemented_tests.rs`, which asserts
+  unconditionally what ships today — every `CREATE FUNCTION` form registers,
+  every call route fails with the exact error class, `LANGUAGE sql` procedures
+  bind their arguments both by `$name` and by `$1` (asserted on the inserted
+  row), `LANGUAGE plpgsql` bodies fail with their two verbatim errors, bare
+  parameter names fail in both languages, and all three introspection surfaces
+  are empty. Modelled on `tests/trigger_unimplemented_tests.rs`: the function
+  half is designed to go red on purpose the day functions start working, and
+  should be rewritten rather than relaxed.
+
 ## [4.10.1] - 2026-08-07
 
 **Documentation correction: triggers are not implemented.** No code behaviour
