@@ -412,7 +412,9 @@ This is the third instance in this codebase of *machinery that exists, is wired 
 side, and has no producer or caller* — alongside RLS write enforcement (§1.1, `execute_internal`
 has zero callers) and trigger loading (§2.2, `load_triggers()` has zero callers). Worth treating
 as a review heuristic: when a feature looks implemented, grep for who **calls** it, not just
-whether it exists.
+whether it exists. (A fourth instance landed later and is the most complete example: §2.2 turned
+out to be the whole trigger subsystem, not just its loader — registry, DML hooks, cascade guard and
+row context all present and wired, with a planner that never populates a body.)
 
 **Gate:** a new test asserting WAL/broadcast parity between an autocommit statement and the same
 statement inside a transaction; `ha_integration` under `--features ha-tier1`; and a
@@ -446,22 +448,40 @@ the base name on both), and `DROP INDEX` silently drops that table's data instea
 `Catalog::drop_index_definition` / `ArtManager::drop_index` / WAL-log path (all still functional,
 just disconnected from the parser). Gate: new DDL test, `information_schema_completion`.
 
-### 2.2 Triggers do not survive a restart
+### 2.2 Triggers are not implemented at all
 
-**Status:** open. **Effort: small** (one call-site wiring) **+ verification that the persisted
-format round-trips.**
+**Status:** documented as unimplemented in v4.10.1 (`e0a3d31`). **Effort to actually implement:
+large**, and not currently scheduled.
 
-**Verified.** `StorageEngine::load_triggers` (`src/storage/engine.rs:8459`) has zero callers
-anywhere in the crate (`grep -rn "load_triggers("` matches only the definition). Whatever writes
-trigger definitions durably, nothing reads them back on open — every trigger a user created is
-silently gone after any restart (clean or crash), with no error at trigger-creation time and no
-error at restart. For anyone using triggers to enforce derived-data consistency, this is a
-silent, wholesale loss of enforcement, not a one-off row.
+**CORRECTION (2026-08-07).** This section previously read "Triggers do not survive a restart" and
+proposed wiring `load_triggers()` at startup as a small fix. That framing was wrong in a way that
+would have wasted the work: it treats persistence as the defect, which presumes triggers otherwise
+*run*. They do not. Wiring `load_triggers()` would restore **registration** only, and would make
+triggers look more correct while still executing nothing. Do not do it as a standalone fix.
 
-**Fix shape:** call `load_triggers()` during the same startup sequence that rebuilds ART/vector
-index snapshots. Gate: `trigger`-related integration tests (verify a create-trigger-restart-fire
-round trip; none currently exist per the "zero callers" finding, since nothing exercises the
-reload path).
+**Measured** (`tests/trigger_unimplemented_tests.rs`, 21 unconditional tests):
+`CREATE TRIGGER … EXECUTE FUNCTION f()` parses, registers, and returns Ok for every timing
+(`BEFORE`/`AFTER`/`INSTEAD OF`), every event, row- and statement-level, with or without `WHEN` —
+and **no trigger body ever executes**, with no error, warning, or log line. Two independent,
+unconditional breaks: `Planner::create_trigger_to_plan` (`src/sql/planner.rs:5763`) hardcodes
+`let body = vec![]; // will be populated in Phase 2`, so `execute_triggers`' `for stmt in
+&trigger_def.body` loop is structurally unreachable; and the four DML call sites pass an
+`executor_fn` that discards the `TriggerRowContext`, so `NEW`/`OLD` could not resolve even if a
+body existed. The SQLite/MySQL `BEGIN … END` form does not parse at all.
+
+Sole working mechanism: `BEFORE INSERT … FOR EACH ROW` whose function body contains literal
+`NEW.<col> = <expr>` and/or `RETURN NULL` rewrites or skips the inserted row — a text scan
+(`parse_trigger_assignments`), not execution. INSERT-only; no `OLD`; no side effects.
+Also measured: `DROP TABLE` does **not** deregister triggers (the name stays burned for the
+process), and `CALL` on a `CREATE PROCEDURE` *does* execute — that is the alternative to recommend.
+
+**If this is ever scheduled**, the work is: populate the body in the planner, thread
+`TriggerRowContext` through the DML executor closures (both families — see §1.1's lesson), fix the
+lock asymmetry noted in the closed trigger-deadlock item (`execute()` holds `current_transaction`
+while the Insert/Update/Delete arms re-acquire it, non-reentrant `parking_lot::Mutex`), add
+`pg_trigger`/`information_schema.triggers`/`relhastriggers`, and only then wire `load_triggers()`.
+Rewrite `tests/trigger_unimplemented_tests.rs` rather than relaxing it — it is designed to go red
+on purpose the day triggers start working.
 
 ### 2.3 Five process-wide globals are not session-keyed
 
@@ -946,14 +966,19 @@ marginal cost.
 
 ### v4.9 — Index/branch correctness + performance re-baseline
 
-**Contents:** 1.4 (branch-blind UNIQUE) · 2.1 (`DROP INDEX` → `DropTable`) · 2.2 (triggers don't
-survive restart) · §4's re-measurement pass (4.1, 4.2, 4.3) and, if confirmed, whatever
-follow-up each produces.
+**Contents:** 1.4 (branch-blind UNIQUE) · 2.1 (`DROP INDEX` → `DropTable`) · ~~2.2~~ · §4's
+re-measurement pass (4.1, 4.2, 4.3) and, if confirmed, whatever follow-up each produces.
+
+**2.2 was dropped from this milestone.** It was scoped here as a cheap one-call-site fix on the
+premise that only trigger *persistence* was broken. Investigation found the entire trigger
+subsystem never executes, so the small fix would have been wasted work on a dead feature. v4.10.1
+documents triggers as unimplemented and replaces the test suite; actually implementing them is a
+large, unscheduled item. See §2.2.
 
 **Rationale:** 1.4 needs a real design decision (branch-scoped ART vs. branch-aware scan
 fallback) that shouldn't be rushed into the same milestone as the mechanical fixes in v4.8; 2.1
-and 2.2 are both "a piece of real, working machinery got disconnected from its SQL entry point"
-bugs — cheap, unrelated to each other in code, but natural to batch as a DDL-hygiene pass. The
+was a "a piece of real, working machinery got disconnected from its SQL entry point" bug — cheap,
+and natural to fold into a DDL-hygiene pass. The
 performance re-baseline is sequenced last among engineering work specifically so it measures
 *post*-v4.7/v4.8 changes (both touch hot DML paths; a stale baseline measured before them would
 be invalid), and because two of its three items may turn out to need zero further engineering
