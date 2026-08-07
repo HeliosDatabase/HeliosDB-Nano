@@ -148,7 +148,7 @@ Acceptance bar: row counts identical, numeric aggregates within ≤ 0.01 % drift
 - **`PRAGMA foreign_keys = OFF;` is a no-op-with-ack.** FKs are always enforced. If your old app relied on toggling this off mid-migration, restructure the migration as `BEGIN; … COMMIT;` (see `heliosdb-nano-transactions`).
 - **Per-`Connection` subprocess** in Python embedded mode means high request rates create many processes. For threaded servers prefer `mode='daemon'`.
 - **Cross-process `INSERT … ON CONFLICT (path) DO UPDATE`** has a known regression. Single-process workflows are unaffected.
-- **Custom SQLite functions / collations** registered via `register_function` / `create_function` aren't supported. Reimplement as PL/pgSQL (`heliosdb-nano-schema` Recipe 6) or move that logic into the app.
+- **Custom SQLite functions / collations** registered via `register_function` / `create_function` aren't supported, **and there is no in-database replacement.** `CREATE FUNCTION` registers but nothing can call the result (`SELECT f(x)` → `Unknown scalar function: f`), so move that logic into the app, inline the expression, or wrap it in a view. See `heliosdb-nano-schema` Recipe 6.
 - **MySQL `ENGINE=InnoDB` and `CHARSET=…` clauses are accepted but ignored.** The storage engine is fixed; charset is UTF-8.
 
 ## See also

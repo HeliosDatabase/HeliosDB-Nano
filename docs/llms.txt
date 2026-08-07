@@ -208,9 +208,13 @@ automatically after `git clone`; install globally with
   MySQL wire, REPL, Python sqlite3 drop-in; auth + TLS. `heliosdb-nano repl`,
   `psql -h 127.0.0.1 -p 5432`, `mysql -h 127.0.0.1 -P 3306`.
 - heliosdb-nano-schema — DDL: tables, constraints, B-tree + HNSW indexes,
-  views, materialized views, PL/pgSQL; introspection. `\d`, `\dt`,
+  views, materialized views; introspection. `\d`, `\dt`,
   `\dS`, `\dmv`, `CREATE INDEX … USING hnsw`. Also documents why triggers
-  are unimplemented: `CREATE TRIGGER` registers but never fires.
+  are unimplemented (`CREATE TRIGGER` registers but never fires) and why
+  user-defined functions are unusable (`CREATE FUNCTION` registers, but
+  every call route errors `Unknown scalar function`). Stored procedures
+  DO work: `CREATE PROCEDURE p(a INT) LANGUAGE sql AS $$… $a …$$` +
+  `CALL p(1)` — must be `LANGUAGE sql`, params need the `$` sigil.
 - heliosdb-nano-query — DML: INSERT (OR REPLACE/IGNORE, ON CONFLICT,
   RETURNING), UPDATE/DELETE RETURNING, parameter styles, CTEs, window
   functions, EXPLAIN [ANALYZE], result cache.

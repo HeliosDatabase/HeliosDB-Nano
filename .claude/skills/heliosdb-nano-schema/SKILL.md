@@ -1,13 +1,13 @@
 ---
 name: heliosdb-nano-schema
-description: Define and inspect schema in HeliosDB-Nano. Covers CREATE/ALTER/DROP TABLE with PK/FK/UNIQUE/CHECK/DEFAULT constraints, regular and HNSW vector indexes, views, materialized views, PL/pgSQL functions, and introspection through Postgres (`pg_class`, `information_schema`), SQLite (`sqlite_master`, `PRAGMA table_info`), and Nano-specific (`\d`, `\dt`, `\dS`, `\dmv`) surfaces. Also documents why `CREATE TRIGGER` succeeds but triggers never fire — read this before proposing a trigger. Use this when the user asks "create a table", "add an index", "describe", "what columns does X have", or anything about triggers.
+description: Define and inspect schema in HeliosDB-Nano. Covers CREATE/ALTER/DROP TABLE with PK/FK/UNIQUE/CHECK/DEFAULT constraints, regular and HNSW vector indexes, views, materialized views, stored procedures, and introspection through Postgres (`pg_class`, `information_schema`), SQLite (`sqlite_master`, `PRAGMA table_info`), and Nano-specific (`\d`, `\dt`, `\dS`, `\dmv`) surfaces. Also documents why `CREATE TRIGGER` succeeds but triggers never fire, why a `CREATE FUNCTION` registers but nothing can call it, and the two rules that make `CREATE PROCEDURE` + `CALL` actually work — read this before proposing a trigger or a user-defined function. Use this when the user asks "create a table", "add an index", "describe", "what columns does X have", or anything about triggers, functions, or stored procedures.
 allowed-tools: Bash(heliosdb-nano *), Bash(psql *), Read
 ---
 
 # Schema (DDL & Introspection)
 
 ## When to use
-Any DDL operation: `CREATE`, `ALTER`, `DROP` against tables/indexes/views/functions; or asking the database what schema exists. Also read this before answering any trigger question — triggers are **not implemented** (§ "Triggers — not implemented" below), and `CREATE TRIGGER` returning `OK` does not mean the trigger works.
+Any DDL operation: `CREATE`, `ALTER`, `DROP` against tables/indexes/views/functions; or asking the database what schema exists. Also read this before answering any trigger, function, or stored-procedure question — triggers are **not implemented** (Recipe 5) and user-defined functions are **registered but not callable by anything** (Recipe 6). `CREATE TRIGGER` and `CREATE FUNCTION` returning `OK` does not mean either one works. Stored procedures *do* work, under the two rules in Recipe 6.
 
 ## Verbs
 
@@ -22,7 +22,8 @@ Any DDL operation: `CREATE`, `ALTER`, `DROP` against tables/indexes/views/functi
 | create view | SQL | `CREATE VIEW v AS SELECT …` |
 | create materialized view | SQL | `CREATE MATERIALIZED VIEW mv AS SELECT … WITH (auto_refresh = true)` |
 | create trigger | SQL | ⚠️ **registered but never fires** — see "Triggers — not implemented" below before writing any `CREATE TRIGGER` |
-| create function | SQL (PL/pgSQL subset) | `CREATE FUNCTION f(x INT) RETURNS INT AS $$ BEGIN RETURN x*2; END $$ LANGUAGE plpgsql` |
+| create function | SQL | ⚠️ **registers, but nothing can call it** — `SELECT f(1)` errors `Unknown scalar function: f`. See Recipe 6 before writing any `CREATE FUNCTION` |
+| create procedure | SQL | ✅ works — `CREATE PROCEDURE p(a INT) LANGUAGE sql AS $$…$a…$$` + `CALL p(1)`. Must be `LANGUAGE sql`, and params need the `$` sigil. See Recipe 6 |
 | list tables | REPL / SQL | `\dt` / `SELECT * FROM pg_tables` |
 | describe table | REPL / SQL | `\d t` / `PRAGMA table_info(t)` / `SELECT * FROM information_schema.columns WHERE table_name='t'` |
 | list materialized views | REPL | `\dmv` |
@@ -93,6 +94,11 @@ INSERT/UPDATE/DELETE, and there is no error, no warning, and no log line — an 
 trigger just silently produces nothing. Use the application layer, an explicit second
 statement in the same transaction, or a `CREATE PROCEDURE` invoked with `CALL`.
 
+Procedures are a real escape hatch — they execute and their arguments bind — with two
+rules: the procedure must be `LANGUAGE sql`, and its body must reference parameters with
+a `$` sigil (`$p_id` or `$1`), never a bare name. See Recipe 6 for the working form.
+Note that `CREATE FUNCTION` is *not* an option: nothing can call a user-defined function.
+
 What each form actually does today:
 
 ```sql
@@ -151,7 +157,15 @@ hardcoded `false`, and no REPL meta-command lists triggers. On a disk-backed dat
 registered trigger survives exactly one restart (WAL replay restores it, then the WAL is
 truncated and nothing reloads it from the catalog), so registration is not durable either.
 
-### Recipe 6: PL/pgSQL function
+### Recipe 6: User-defined functions — NOT CALLABLE (read this instead of writing one)
+
+**Do not propose a `CREATE FUNCTION` as a solution.** Every `CREATE FUNCTION` form is
+accepted and the function is registered — and then **nothing in the database can call
+it.** There is no working invocation route: not a `SELECT` list, not a `WHERE` clause,
+not `FROM`, not `CALL`, not a bound-parameter query. All of them error.
+
+All three registration forms succeed:
+
 ```sql
 CREATE FUNCTION post_count(uid INTEGER) RETURNS INTEGER AS $$
 DECLARE
@@ -160,10 +174,118 @@ BEGIN
     SELECT COUNT(*) INTO cnt FROM posts WHERE author_id = uid;
     RETURN cnt;
 END;
-$$ LANGUAGE plpgsql;
+$$ LANGUAGE plpgsql;                                              -- OK, registered
 
-SELECT post_count(1);
+CREATE FUNCTION dbl(x INTEGER) RETURNS INTEGER
+    AS $$ SELECT x * 2 $$ LANGUAGE sql;                           -- OK, registered
+
+CREATE FUNCTION dbl2(x INTEGER) RETURNS INTEGER RETURN x * 2;     -- OK, registered
 ```
+
+Every way to call one:
+
+```sql
+SELECT post_count(7);                      -- ERROR: Unknown scalar function: post_count
+SELECT dbl(21);                            -- ERROR: Unknown scalar function: dbl
+SELECT public.dbl(21);                     -- ERROR: Unknown scalar function: public.dbl
+SELECT id, dbl(id) FROM posts;             -- ERROR: Unknown scalar function: dbl
+SELECT id FROM posts WHERE dbl(id) = 2;    -- ERROR: Unknown scalar function: dbl
+SELECT * FROM dbl(21);                     -- ERROR: Table 'dbl' does not exist
+CALL dbl(21);                              -- ERROR: Procedure 'dbl' does not exist
+PERFORM dbl(21);                           -- ERROR: SQL parse error (PERFORM is not a statement)
+```
+
+This is identical on the embedded API and over the PostgreSQL wire, and identical
+through the bound-parameter path — `execute_params("SELECT dbl($1)", …)` also returns
+`Unknown scalar function: dbl`.
+
+**Why.** The expression evaluator has no link to the function registry at all: its
+scalar-function match ends in `_ => Err("Unknown scalar function: {}")`
+(`src/sql/evaluator.rs:1154`), so no expression on any path can resolve a user
+function. `FunctionRegistry::execute_function` (`src/sql/functions.rs:190`) has exactly
+one call site in `src/`, and it is inside `#[cfg(test)] mod tests`
+(`src/sql/functions.rs:603`) — the executor works in its unit test and is never reached
+in production. `SELECT * FROM f()` is blocked separately: table-valued functions are a
+fixed whitelist, `matches!(name, "generate_series" | "unnest")`
+(`src/sql/planner.rs:2078`).
+
+**No introspection either.** `information_schema.routines`, `information_schema.parameters`
+and `pg_proc` are structurally present on the wire path and return zero rows *with a
+function registered* — `query_information_schema_routines` returns `(schema, vec![])` by
+construction (`src/protocol/postgres/catalog.rs:2398`). On the embedded path
+`information_schema.routines` does not resolve at all and `pg_proc` returns no rows. A
+registered function is invisible to every catalog client and every ORM probe.
+
+**Use instead:** inline the expression (`SELECT id * 2 FROM posts`), a view
+(`CREATE VIEW post_dbl AS SELECT id, id * 2 AS dbl FROM posts`), a column the
+application maintains, or move the logic into application code.
+
+#### Procedures DO work — use `LANGUAGE sql` and `$`-sigil parameters
+
+Unlike functions, `CREATE PROCEDURE` + `CALL` genuinely executes, **and its arguments do
+bind** — subject to two rules. Syntax is Nano's own parser (`src/sql/parser.rs:1789`):
+`CREATE [OR REPLACE] PROCEDURE name(params) LANGUAGE lang AS $$body$$`.
+
+> **Rule 1 — use `LANGUAGE sql`.** `LANGUAGE plpgsql` bodies substitute nothing.
+> **Rule 2 — reference parameters with a `$` sigil**, either by name (`$p_id`) or
+> positionally (`$1`). A bare parameter name never resolves in either language.
+
+The working recipe:
+
+```sql
+CREATE TABLE audit_log (id INTEGER, op TEXT);
+
+-- By name. Both parameters bind.
+CREATE PROCEDURE log_named(p_id INTEGER, p_op TEXT) LANGUAGE sql
+    AS $$INSERT INTO audit_log VALUES ($p_id, $p_op)$$;
+CALL log_named(42, 'hello');    -- OK → row (42, 'hello') is inserted
+
+-- Positionally. Same result.
+CREATE PROCEDURE log_pos(p_id INTEGER, p_op TEXT) LANGUAGE sql
+    AS $$INSERT INTO audit_log VALUES ($1, $2)$$;
+CALL log_pos(7, 'seven');       -- OK → row (7, 'seven') is inserted
+```
+
+A zero-parameter body works too (`CREATE PROCEDURE touch() LANGUAGE sql AS $$INSERT INTO
+audit_log VALUES (0, 'touch')$$;` → `CALL touch();`), and a body that simply never mentions
+its parameter succeeds while discarding the argument — silently, with no warning.
+
+What fails:
+
+```sql
+-- plpgsql substitutes nothing, by any spelling.
+CREATE PROCEDURE bad1(p_id INTEGER) LANGUAGE plpgsql
+    AS $$BEGIN INSERT INTO audit_log VALUES ($p_id, 'x'); END$$;
+CALL bad1(7);
+-- ERROR: Invalid parameter placeholder: $p_id. Expected format: $1, $2, etc.
+
+CREATE PROCEDURE bad2(p_id INTEGER) LANGUAGE plpgsql
+    AS $$BEGIN INSERT INTO audit_log VALUES ($1, 'x'); END$$;
+CALL bad2(7);
+-- ERROR: Parameter $1 not provided. Expected 1 parameters, got 0
+
+-- A bare name never works — in EITHER language. The `$` is required.
+CREATE PROCEDURE bad3(n INTEGER) LANGUAGE sql
+    AS $$INSERT INTO audit_log VALUES (n, 'x')$$;
+CALL bad3(7);                   -- ERROR: Column 'n' not found in schema
+```
+
+**Why.** `LANGUAGE sql` routes to `execute_sql_procedure` (`src/sql/functions.rs:353`),
+which textually substitutes `$1`…`$N` from the call's arguments and then `$<paramname>`
+from the declared parameter list (`:361`–`:372`) before handing the body to the executor —
+that is the whole binding mechanism, and it only ever looks for `$`-prefixed tokens, which
+is why a bare `n` survives and reaches the planner as a column reference. `LANGUAGE
+plpgsql` routes to `execute_plpgsql_procedure` (`:381`) instead: it declares the parameters
+into the procedural scope, but body statements are passed on as verbatim text
+(`ProceduralStatement::Execute { sql, .. } => (ctx.sql_executor)(sql)?`,
+`src/sql/procedural/runtime.rs:446`) and the executor closure runs them with no bind
+parameters (`db_clone.query(sql, &[])` / `db_clone.execute(sql)`, `src/lib.rs:5557`) — so
+`$p_id` reaches the planner's placeholder parser, which demands a numeric index
+(`src/sql/planner.rs:3476`), and `$1` reaches it as an unbound placeholder.
+
+`CALL` executes at all because `FunctionRegistry::execute_procedure` has a real call site
+(`src/lib.rs:5571`) — unlike `execute_function`, which is why functions are dead and
+procedures are not.
 
 ### Recipe 7: Inspect schema (three ways)
 **Postgres-style (works in any client):**
@@ -202,6 +324,9 @@ DROP TRIGGER IF EXISTS posts_audit ON posts;   -- works; `ON <table>` is mandato
 - **`PRAGMA foreign_keys = ON;` is a no-op-with-ack** — Nano enforces FKs by default; the PRAGMA exists only for sqlite3 source compatibility.
 - **HNSW indexes require explicit `dim`** in `WITH (...)`. Mismatched embedding dimensions will fail at insert time, not at index creation.
 - **Triggers never fire at all** — row-level *and* statement-level, every timing, every event. `CREATE TRIGGER` returning `OK` only means it was registered. See Recipe 5; never rely on a trigger for correctness.
+- **User-defined functions are not callable by anything** — `CREATE FUNCTION` returning `OK` only means it was registered. `SELECT f(x)` errors `Unknown scalar function: f`, in a `SELECT` list, a `WHERE` clause, a `FROM` clause, via `CALL`, and via bound parameters, on both the embedded API and the wire. There is no `PERFORM`. See Recipe 6.
+- **Procedures work, but only `LANGUAGE sql` binds parameters** — a `LANGUAGE plpgsql` body substitutes nothing (`Invalid parameter placeholder: $p_id…` by name, `Parameter $1 not provided…` positionally). In either language a *bare* parameter name fails with `Column 'n' not found in schema`; the `$` sigil is mandatory. An argument a body never mentions is silently discarded. See Recipe 6.
+- **`information_schema.routines`, `information_schema.parameters` and `pg_proc` are always empty** — they return zero rows even with a function registered, so no ORM or catalog client can discover a user-defined routine.
 - **Materialized view auto-refresh** competes for CPU with foreground queries. Tune `max_cpu_percent`.
 
 ## See also
@@ -209,4 +334,5 @@ DROP TRIGGER IF EXISTS posts_audit ON posts;   -- works; `ON <table>` is mandato
 - `heliosdb-nano-vector` — full HNSW + similarity workflow.
 - `heliosdb-nano-migrate` — sqlite3 / PG / MySQL DDL compatibility notes.
 - `docs/compatibility/sqlite.md` — SQLite-ism support matrix.
-- `docs/compatibility/plpgsql.md` — PL/pgSQL feature support.
+- `docs/compatibility/plpgsql.md` — `DO`-block support, plus the `CREATE FUNCTION` / `CREATE PROCEDURE` limits behind Recipe 6.
+- `docs/compatibility/information_schema.md` — which `information_schema` views return data and which are always empty (`routines`, `parameters`).
