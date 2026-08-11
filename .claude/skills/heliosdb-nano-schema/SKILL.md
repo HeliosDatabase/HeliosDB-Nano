@@ -1,13 +1,13 @@
 ---
 name: heliosdb-nano-schema
-description: Define and inspect schema in HeliosDB-Nano. Covers CREATE/ALTER/DROP TABLE with PK/FK/UNIQUE/CHECK/DEFAULT constraints, regular and HNSW vector indexes, views, materialized views, stored procedures, and introspection through Postgres (`pg_class`, `information_schema`), SQLite (`sqlite_master`, `PRAGMA table_info`), and Nano-specific (`\d`, `\dt`, `\dS`, `\dmv`) surfaces. Also documents why `CREATE TRIGGER` succeeds but triggers never fire, why a `CREATE FUNCTION` registers but nothing can call it, and the two rules that make `CREATE PROCEDURE` + `CALL` actually work — read this before proposing a trigger or a user-defined function. Use this when the user asks "create a table", "add an index", "describe", "what columns does X have", or anything about triggers, functions, or stored procedures.
+description: Define and inspect schema in HeliosDB-Nano. Covers CREATE/ALTER/DROP TABLE with PK/FK/UNIQUE/CHECK/DEFAULT constraints, regular and HNSW vector indexes, views, materialized views, stored procedures, and introspection through Postgres (`pg_class`, `information_schema`), SQLite (`sqlite_master`, `PRAGMA table_info`), and Nano-specific (`\d`, `\dt`, `\dS`, `\dmv`) surfaces. Also documents why `CREATE TRIGGER` succeeds but triggers never fire, why a `CREATE FUNCTION` registers but nothing can call it, and the one rule that makes `CREATE PROCEDURE` + `CALL` actually work — read this before proposing a trigger or a user-defined function. Use this when the user asks "create a table", "add an index", "describe", "what columns does X have", or anything about triggers, functions, or stored procedures.
 allowed-tools: Bash(heliosdb-nano *), Bash(psql *), Read
 ---
 
 # Schema (DDL & Introspection)
 
 ## When to use
-Any DDL operation: `CREATE`, `ALTER`, `DROP` against tables/indexes/views/functions; or asking the database what schema exists. Also read this before answering any trigger, function, or stored-procedure question — triggers are **not implemented** (Recipe 5) and user-defined functions are **registered but not callable by anything** (Recipe 6). `CREATE TRIGGER` and `CREATE FUNCTION` returning `OK` does not mean either one works. Stored procedures *do* work, under the two rules in Recipe 6.
+Any DDL operation: `CREATE`, `ALTER`, `DROP` against tables/indexes/views/functions; or asking the database what schema exists. Also read this before answering any trigger, function, or stored-procedure question — triggers are **not implemented** (Recipe 5) and user-defined functions are **registered but not callable by anything** (Recipe 6). `CREATE TRIGGER` and `CREATE FUNCTION` returning `OK` does not mean either one works. Stored procedures *do* work, under the one rule in Recipe 6.
 
 ## Verbs
 
@@ -23,7 +23,7 @@ Any DDL operation: `CREATE`, `ALTER`, `DROP` against tables/indexes/views/functi
 | create materialized view | SQL | `CREATE MATERIALIZED VIEW mv AS SELECT … WITH (auto_refresh = true)` |
 | create trigger | SQL | ⚠️ **registered but never fires** — see "Triggers — not implemented" below before writing any `CREATE TRIGGER` |
 | create function | SQL | ⚠️ **registers, but nothing can call it** — `SELECT f(1)` errors `Unknown scalar function: f`. See Recipe 6 before writing any `CREATE FUNCTION` |
-| create procedure | SQL | ✅ works — `CREATE PROCEDURE p(a INT) LANGUAGE sql AS $$…$a…$$` + `CALL p(1)`. Must be `LANGUAGE sql`, and params need the `$` sigil. See Recipe 6 |
+| create procedure | SQL | ✅ works — `CREATE PROCEDURE p(a INT) LANGUAGE sql AS $$…$a…$$` + `CALL p(1)`. Either language (sql or plpgsql); params need the `$` sigil. See Recipe 6 |
 | list tables | REPL / SQL | `\dt` / `SELECT * FROM pg_tables` |
 | describe table | REPL / SQL | `\d t` / `PRAGMA table_info(t)` / `SELECT * FROM information_schema.columns WHERE table_name='t'` |
 | list materialized views | REPL | `\dmv` |
@@ -94,9 +94,9 @@ INSERT/UPDATE/DELETE, and there is no error, no warning, and no log line — an 
 trigger just silently produces nothing. Use the application layer, an explicit second
 statement in the same transaction, or a `CREATE PROCEDURE` invoked with `CALL`.
 
-Procedures are a real escape hatch — they execute and their arguments bind — with two
-rules: the procedure must be `LANGUAGE sql`, and its body must reference parameters with
-a `$` sigil (`$p_id` or `$1`), never a bare name. See Recipe 6 for the working form.
+Procedures are a real escape hatch — they execute and their arguments bind, in either
+language — with one rule: the body must reference parameters with a `$` sigil (`$p_id` or
+`$1`), never a bare name. See Recipe 6 for the working form.
 Note that `CREATE FUNCTION` is *not* an option: nothing can call a user-defined function.
 
 What each form actually does today:
@@ -220,15 +220,17 @@ registered function is invisible to every catalog client and every ORM probe.
 (`CREATE VIEW post_dbl AS SELECT id, id * 2 AS dbl FROM posts`), a column the
 application maintains, or move the logic into application code.
 
-#### Procedures DO work — use `LANGUAGE sql` and `$`-sigil parameters
+#### Procedures DO work — in either language, with `$`-sigil parameters
 
 Unlike functions, `CREATE PROCEDURE` + `CALL` genuinely executes, **and its arguments do
-bind** — subject to two rules. Syntax is Nano's own parser (`src/sql/parser.rs:1789`):
+bind** — in both `LANGUAGE sql` and `LANGUAGE plpgsql` bodies, subject to one rule. Syntax
+is Nano's own parser (`src/sql/parser.rs:1789`):
 `CREATE [OR REPLACE] PROCEDURE name(params) LANGUAGE lang AS $$body$$`.
 
-> **Rule 1 — use `LANGUAGE sql`.** `LANGUAGE plpgsql` bodies substitute nothing.
-> **Rule 2 — reference parameters with a `$` sigil**, either by name (`$p_id`) or
-> positionally (`$1`). A bare parameter name never resolves in either language.
+> **The rule — reference parameters and `DECLARE`d variables with a `$` sigil**, either by
+> name (`$p_id`) or positionally (`$1`). A bare name is always a column reference, in
+> either language. PostgreSQL resolves bare PL/pgSQL variable names; Nano deliberately
+> does not, so that a variable can never silently shadow a column of the same name.
 
 The working recipe:
 
@@ -244,44 +246,57 @@ CALL log_named(42, 'hello');    -- OK → row (42, 'hello') is inserted
 CREATE PROCEDURE log_pos(p_id INTEGER, p_op TEXT) LANGUAGE sql
     AS $$INSERT INTO audit_log VALUES ($1, $2)$$;
 CALL log_pos(7, 'seven');       -- OK → row (7, 'seven') is inserted
+
+-- LANGUAGE plpgsql, same sigil, same result. NEW: through 4.10.2 a plpgsql body
+-- substituted nothing at all, by any spelling.
+CREATE PROCEDURE log_pg(p_id INTEGER, p_op TEXT) LANGUAGE plpgsql
+    AS $$BEGIN INSERT INTO audit_log VALUES ($p_id, $p_op); END$$;
+CALL log_pg(7, 'seven');        -- OK → row (7, 'seven') is inserted
 ```
 
 A zero-parameter body works too (`CREATE PROCEDURE touch() LANGUAGE sql AS $$INSERT INTO
 audit_log VALUES (0, 'touch')$$;` → `CALL touch();`), and a body that simply never mentions
 its parameter succeeds while discarding the argument — silently, with no warning.
 
+Substitution is **literal-aware**: a `$`-token inside a `'string literal'`, an `E'…'`
+escape string, a `"quoted identifier"`, a `--` or `/* … */` comment, or a `$tag$ … $tag$`
+block is data, not a placeholder. Names use longest-match, so `$p` never captures the
+prefix of `$p_id` and `$1` never captures the prefix of `$10`, in any declaration order.
+Substituted values are never re-scanned, so argument data cannot influence how another
+placeholder is interpolated.
+
 What fails:
 
 ```sql
--- plpgsql substitutes nothing, by any spelling.
-CREATE PROCEDURE bad1(p_id INTEGER) LANGUAGE plpgsql
-    AS $$BEGIN INSERT INTO audit_log VALUES ($p_id, 'x'); END$$;
-CALL bad1(7);
--- ERROR: Invalid parameter placeholder: $p_id. Expected format: $1, $2, etc.
-
-CREATE PROCEDURE bad2(p_id INTEGER) LANGUAGE plpgsql
-    AS $$BEGIN INSERT INTO audit_log VALUES ($1, 'x'); END$$;
-CALL bad2(7);
--- ERROR: Parameter $1 not provided. Expected 1 parameters, got 0
-
 -- A bare name never works — in EITHER language. The `$` is required.
-CREATE PROCEDURE bad3(n INTEGER) LANGUAGE sql
+CREATE PROCEDURE bad1(n INTEGER) LANGUAGE sql
     AS $$INSERT INTO audit_log VALUES (n, 'x')$$;
-CALL bad3(7);                   -- ERROR: Column 'n' not found in schema
+CALL bad1(7);                   -- ERROR: Column 'n' not found in schema
+
+CREATE PROCEDURE bad2(n INTEGER) LANGUAGE plpgsql
+    AS $$BEGIN INSERT INTO audit_log VALUES (n, 'x'); END$$;
+CALL bad2(7);                   -- ERROR: Column 'n' not found in schema
+
+-- A placeholder naming nothing is left verbatim on purpose, so typos still fail loudly.
+CREATE PROCEDURE bad3(p_id INTEGER) LANGUAGE sql
+    AS $$INSERT INTO audit_log VALUES ($oops, 'x')$$;
+CALL bad3(7);
+-- ERROR: Invalid parameter placeholder: $oops. Expected format: $1, $2, etc.
 ```
 
-**Why.** `LANGUAGE sql` routes to `execute_sql_procedure` (`src/sql/functions.rs:353`),
-which textually substitutes `$1`…`$N` from the call's arguments and then `$<paramname>`
-from the declared parameter list (`:361`–`:372`) before handing the body to the executor —
-that is the whole binding mechanism, and it only ever looks for `$`-prefixed tokens, which
-is why a bare `n` survives and reaches the planner as a column reference. `LANGUAGE
-plpgsql` routes to `execute_plpgsql_procedure` (`:381`) instead: it declares the parameters
-into the procedural scope, but body statements are passed on as verbatim text
-(`ProceduralStatement::Execute { sql, .. } => (ctx.sql_executor)(sql)?`,
-`src/sql/procedural/runtime.rs:446`) and the executor closure runs them with no bind
-parameters (`db_clone.query(sql, &[])` / `db_clone.execute(sql)`, `src/lib.rs:5557`) — so
-`$p_id` reaches the planner's placeholder parser, which demands a numeric index
-(`src/sql/planner.rs:3476`), and `$1` reaches it as an unbound placeholder.
+**Why.** Both languages go through one shared scanner, `src/sql/interpolate.rs`.
+`LANGUAGE sql` calls it from `execute_sql_procedure` (`src/sql/functions.rs`) with the
+declared parameters plus the call's arguments; `LANGUAGE plpgsql` calls it from
+`ExecutionContext::interpolate` (`src/sql/procedural/runtime.rs`) with the procedural
+variable scope plus the call's arguments, immediately before each body statement runs.
+Because the scanner only matches `$`-prefixed tokens, a bare `n` survives and reaches the
+planner as a column reference.
+
+**Limitation — `:=` assignments.** The procedural expression parser does not evaluate
+expressions; it stores the raw expression TEXT, so a local assigned `v := a + 1` holds the
+string `a + 1` and `$v` interpolates that text quoted, not a computed value. Parameter
+references are the reliable case. `EXECUTE '<dynamic sql>'` is *not* interpolated, matching
+PostgreSQL.
 
 `CALL` executes at all because `FunctionRegistry::execute_procedure` has a real call site
 (`src/lib.rs:5571`) — unlike `execute_function`, which is why functions are dead and
@@ -325,7 +340,7 @@ DROP TRIGGER IF EXISTS posts_audit ON posts;   -- works; `ON <table>` is mandato
 - **HNSW indexes require explicit `dim`** in `WITH (...)`. Mismatched embedding dimensions will fail at insert time, not at index creation.
 - **Triggers never fire at all** — row-level *and* statement-level, every timing, every event. `CREATE TRIGGER` returning `OK` only means it was registered. See Recipe 5; never rely on a trigger for correctness.
 - **User-defined functions are not callable by anything** — `CREATE FUNCTION` returning `OK` only means it was registered. `SELECT f(x)` errors `Unknown scalar function: f`, in a `SELECT` list, a `WHERE` clause, a `FROM` clause, via `CALL`, and via bound parameters, on both the embedded API and the wire. There is no `PERFORM`. See Recipe 6.
-- **Procedures work, but only `LANGUAGE sql` binds parameters** — a `LANGUAGE plpgsql` body substitutes nothing (`Invalid parameter placeholder: $p_id…` by name, `Parameter $1 not provided…` positionally). In either language a *bare* parameter name fails with `Column 'n' not found in schema`; the `$` sigil is mandatory. An argument a body never mentions is silently discarded. See Recipe 6.
+- **Procedures work in either language, but the `$` sigil is mandatory** — a *bare* parameter name fails with `Column 'n' not found in schema` in both `LANGUAGE sql` and `LANGUAGE plpgsql`, deliberately, so a variable can never shadow a column. (plpgsql binding is new; through 4.10.2 a plpgsql body substituted nothing at all.) An argument a body never mentions is silently discarded, and a `$`-token inside a string literal, comment or `$tag$…$tag$` block is data, not a placeholder. See Recipe 6.
 - **`information_schema.routines`, `information_schema.parameters` and `pg_proc` are always empty** — they return zero rows even with a function registered, so no ORM or catalog client can discover a user-defined routine.
 - **Materialized view auto-refresh** competes for CPU with foreground queries. Tune `max_cpu_percent`.
 

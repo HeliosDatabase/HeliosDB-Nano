@@ -117,6 +117,8 @@ pub struct ExecutionContext<'a> {
     pub return_value: Option<Value>,
     /// Whether RETURN was executed
     pub returned: bool,
+    /// Call-site arguments, for `$1..$N` in body SQL. Empty outside a routine call.
+    pub positional_params: Vec<Value>,
 }
 
 impl<'a> ExecutionContext<'a> {
@@ -132,7 +134,31 @@ impl<'a> ExecutionContext<'a> {
             continue_label: None,
             return_value: None,
             returned: false,
+            positional_params: Vec::new(),
         }
+    }
+
+    /// Interpolate `$<name>` from the variable scope and `$N` from the call's arguments
+    /// into a body SQL statement, immediately before it is handed to `sql_executor`.
+    ///
+    /// This is the PL/pgSQL half of the shared placeholder contract; the `LANGUAGE sql`
+    /// half lives in `FunctionRegistry::execute_sql_procedure`. Both go through
+    /// `crate::sql::interpolate` — see that module before changing either.
+    ///
+    /// The `$` sigil is mandatory: a bare identifier is left alone and reaches the
+    /// planner as a column reference, so a variable can never silently shadow a column.
+    /// Name lookup is exact-case, matching `VariableScope`.
+    pub fn interpolate(&self, sql: &str) -> String {
+        use crate::sql::interpolate::{interpolate_sql_placeholders, value_to_sql_literal, Placeholder};
+
+        interpolate_sql_placeholders(sql, |ph| match ph {
+            // `checked_sub` — `$0` must resolve to None, not underflow.
+            Placeholder::Positional(n) => n
+                .checked_sub(1)
+                .and_then(|i| self.positional_params.get(i))
+                .map(value_to_sql_literal),
+            Placeholder::Named(name) => self.scope.get(name).map(|var| value_to_sql_literal(&var.value)),
+        })
     }
 
     /// Push a new variable scope
@@ -444,7 +470,9 @@ impl ProceduralExecutor {
             }
 
             ProceduralStatement::Execute { sql, into_variables } => {
-                let results = (ctx.sql_executor)(sql)?;
+                // Compute the interpolated text BEFORE borrowing `sql_executor` mutably.
+                let sql = ctx.interpolate(sql);
+                let results = (ctx.sql_executor)(&sql)?;
                 if !into_variables.is_empty() && !results.is_empty() && !results[0].is_empty() {
                     for (i, var_name) in into_variables.iter().enumerate() {
                         if i < results[0].len() {
@@ -576,7 +604,8 @@ impl ProceduralExecutor {
 
             ProceduralStatement::SelectInto { query, variables } => {
                 // Execute query and store first row's columns into variables
-                let results = (ctx.sql_executor)(query)?;
+                let query = ctx.interpolate(query);
+                let results = (ctx.sql_executor)(&query)?;
                 if !results.is_empty() && !results[0].is_empty() {
                     for (i, var_name) in variables.iter().enumerate() {
                         if i < results[0].len() {
@@ -645,7 +674,8 @@ impl ProceduralExecutor {
                 record_variable, query, ..
             } => {
                 // Simple implementation: execute query and iterate over results
-                let results = (ctx.sql_executor)(query)?;
+                let query = ctx.interpolate(query);
+                let results = (ctx.sql_executor)(&query)?;
                 for row in results {
                     // Store the row as a composite value in the record variable
                     // For simplicity, store first column value

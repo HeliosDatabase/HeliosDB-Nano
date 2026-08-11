@@ -4,6 +4,7 @@
 //! Functions are stored in-memory and can be called from SQL queries.
 
 use super::evaluator::Evaluator;
+use super::interpolate::{interpolate_sql_placeholders, value_to_sql_literal, Placeholder};
 use super::logical_plan::{FunctionParam, ParamMode};
 use super::procedural::{ExecutionContext, ProceduralExecutor, ProceduralParser};
 use crate::{DataType, Error, Result, Value};
@@ -236,7 +237,7 @@ impl FunctionRegistry {
     }
 
     /// Execute a SQL language function
-    // SAFETY: args[i] guarded by i < args.len(); results[0][0] guarded by is_empty() checks.
+    // SAFETY: results[0][0] guarded by is_empty() checks.
     #[allow(clippy::indexing_slicing)]
     fn execute_sql_function(
         &self,
@@ -244,24 +245,10 @@ impl FunctionRegistry {
         args: &[Value],
         mut sql_executor: impl FnMut(&str) -> Result<Vec<Vec<Value>>>,
     ) -> Result<Value> {
-        // For SQL functions, the body is raw SQL
-        // Replace $1, $2, etc. with actual argument values
-        let mut body = func.body.clone();
-
-        for (i, arg) in args.iter().enumerate() {
-            let placeholder = format!("${}", i + 1);
-            let value_str = value_to_sql_literal(arg);
-            body = body.replace(&placeholder, &value_str);
-        }
-
-        // Also replace named parameters
-        for (i, param) in func.params.iter().enumerate() {
-            if i < args.len() {
-                let value_str = value_to_sql_literal(&args[i]);
-                // Replace both $name and name patterns
-                body = body.replace(&format!("${}", param.name), &value_str);
-            }
-        }
+        // For SQL functions the body is raw SQL: interpolate `$1`/`$<paramname>` from the
+        // call's arguments. See `crate::sql::interpolate` — the shared scanner is the only
+        // implementation, and it never substitutes inside literals or comments.
+        let body = interpolate_sql_placeholders(&func.body, |ph| resolve_from_args(&func.params, args, ph));
 
         // Execute the SQL and get the result
         let results = sql_executor(&body)?;
@@ -318,6 +305,10 @@ impl FunctionRegistry {
             )?;
         }
 
+        // `$1..$N` in body SQL resolve against the call's arguments, exactly as they do
+        // in a `LANGUAGE sql` body (PostgreSQL allows `$n` in PL/pgSQL too).
+        ctx.positional_params = args.to_vec();
+
         // Execute the block
         ProceduralExecutor::execute_block(&block, &mut ctx)?;
 
@@ -348,28 +339,15 @@ impl FunctionRegistry {
     }
 
     /// Execute a SQL language procedure
-    // SAFETY: args[i] guarded by i < args.len() check.
-    #[allow(clippy::indexing_slicing)]
     fn execute_sql_procedure(
         &self,
         proc: &StoredProcedure,
         args: &[Value],
         mut sql_executor: impl FnMut(&str) -> Result<Vec<Vec<Value>>>,
     ) -> Result<()> {
-        let mut body = proc.body.clone();
-
-        for (i, arg) in args.iter().enumerate() {
-            let placeholder = format!("${}", i + 1);
-            let value_str = value_to_sql_literal(arg);
-            body = body.replace(&placeholder, &value_str);
-        }
-
-        for (i, param) in proc.params.iter().enumerate() {
-            if i < args.len() {
-                let value_str = value_to_sql_literal(&args[i]);
-                body = body.replace(&format!("${}", param.name), &value_str);
-            }
-        }
+        // Same interpolation contract as `execute_sql_function`; see
+        // `crate::sql::interpolate`.
+        let body = interpolate_sql_placeholders(&proc.body, |ph| resolve_from_args(&proc.params, args, ph));
 
         sql_executor(&body)?;
         Ok(())
@@ -417,6 +395,9 @@ impl FunctionRegistry {
             )?;
         }
 
+        // Same as the function variant: make `$1..$N` resolvable inside the body.
+        ctx.positional_params = args.to_vec();
+
         ProceduralExecutor::execute_block(&block, &mut ctx)?;
         Ok(())
     }
@@ -428,34 +409,28 @@ impl Default for FunctionRegistry {
     }
 }
 
-/// Convert a Value to a SQL literal string
-fn value_to_sql_literal(value: &Value) -> String {
-    match value {
-        Value::Null => "NULL".to_string(),
-        Value::Boolean(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
-        Value::Int2(v) => v.to_string(),
-        Value::Int4(v) => v.to_string(),
-        Value::Int8(v) => v.to_string(),
-        Value::Float4(v) => v.to_string(),
-        Value::Float8(v) => v.to_string(),
-        Value::String(s) => format!("'{}'", s.replace('\'', "''")),
-        Value::Numeric(d) => d.clone(),
-        Value::Date(d) => format!("'{}'", d),
-        Value::Time(t) => format!("'{}'", t),
-        Value::Timestamp(ts) => format!("'{}'", ts),
-        Value::Uuid(u) => format!("'{}'", u),
-        Value::Json(j) => format!("'{}'", j.replace('\'', "''")),
-        Value::Bytes(b) => format!("E'\\\\x{}'", hex::encode(b)),
-        Value::Vector(v) => format!("[{}]", v.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(",")),
-        Value::Array(arr) => {
-            let elements: Vec<String> = arr.iter().map(value_to_sql_literal).collect();
-            format!("ARRAY[{}]", elements.join(","))
-        }
-        // Storage references (should be resolved before reaching here)
-        Value::DictRef { dict_id } => format!("'dict:{}'", dict_id),
-        Value::CasRef { hash } => format!("E'\\\\x{}'", hex::encode(hash)),
-        Value::ColumnarRef => "NULL".to_string(), // Placeholder
-        Value::Interval(iv) => format!("INTERVAL '{} microseconds'", iv),
+/// Resolve one placeholder from a routine's declared parameters and the call's arguments.
+///
+/// Shared by the `LANGUAGE sql` function and procedure paths. Behavioural contract,
+/// unchanged from the `String::replace` implementation this replaced:
+///
+/// * positional indices range over the ARGUMENTS, not the declared parameters, so a
+///   caller who passes more arguments than the routine declares can still reference the
+///   extras as `$N`;
+/// * a named reference resolves only when an argument was actually supplied for that
+///   parameter — a reference to a defaulted-but-unsupplied parameter stays verbatim and
+///   errors downstream, because this path has never evaluated parameter defaults;
+/// * name matching is exact-case (PostgreSQL folds unquoted identifiers; Nano does not);
+/// * a body that never mentions a parameter silently discards the argument.
+fn resolve_from_args(params: &[FunctionParam], args: &[Value], ph: Placeholder<'_>) -> Option<String> {
+    match ph {
+        // `checked_sub` — not `args.get(n - 1)`, which would underflow-panic on `$0`.
+        Placeholder::Positional(n) => n.checked_sub(1).and_then(|i| args.get(i)).map(value_to_sql_literal),
+        Placeholder::Named(name) => params
+            .iter()
+            .position(|p| p.name == name)
+            .and_then(|i| args.get(i))
+            .map(value_to_sql_literal),
     }
 }
 
@@ -608,14 +583,5 @@ mod tests {
             .unwrap();
 
         assert_eq!(result, Value::Int4(42));
-    }
-
-    #[test]
-    fn test_value_to_sql_literal() {
-        assert_eq!(value_to_sql_literal(&Value::Null), "NULL");
-        assert_eq!(value_to_sql_literal(&Value::Boolean(true)), "TRUE");
-        assert_eq!(value_to_sql_literal(&Value::Int4(42)), "42");
-        assert_eq!(value_to_sql_literal(&Value::String("hello".to_string())), "'hello'");
-        assert_eq!(value_to_sql_literal(&Value::String("it's".to_string())), "'it''s'");
     }
 }
