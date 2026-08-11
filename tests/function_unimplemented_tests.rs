@@ -1,4 +1,4 @@
-//! User-defined FUNCTIONS are NOT callable. PROCEDURES work, under two specific rules.
+//! User-defined FUNCTIONS are NOT callable. PROCEDURES work, under one specific rule.
 //! This suite pins both, exactly as they ship today.
 //!
 //! HeliosDB Nano accepts and registers every `CREATE FUNCTION` form, and then nothing in the
@@ -17,24 +17,26 @@
 //!      `SELECT * FROM my_udf()` cannot resolve a user function either.
 //!
 //! PROCEDURES ARE THE OPPOSITE CASE, and the contrast is the point: `execute_procedure` HAS a
-//! real call site (`src/lib.rs:5571`), so `CALL` runs and its arguments bind. Two rules govern
-//! the binding, and this suite pins both:
+//! real call site (`src/lib.rs:5571`), so `CALL` runs and its arguments bind. One rule governs
+//! the binding, and this suite pins it:
 //!
-//!   * **`LANGUAGE sql` binds; `LANGUAGE plpgsql` does not.** The sql path routes to
-//!     `execute_sql_procedure` (`src/sql/functions.rs:353`), which textually substitutes
-//!     `$1`…`$N` from the call's arguments and then `$<paramname>` from the declared parameter
-//!     list (`:361`–`:372`). The plpgsql path (`:381`) declares parameters into the procedural
-//!     scope but passes body statements on verbatim
-//!     (`ProceduralStatement::Execute { sql, .. } => (ctx.sql_executor)(sql)?`,
-//!     `src/sql/procedural/runtime.rs:446`) and runs them with no bind parameters
-//!     (`src/lib.rs:5557`) — so nothing is substituted, by any spelling.
-//!   * **The `$` sigil is mandatory.** The substitution only matches `$`-prefixed tokens, so a
-//!     bare parameter name survives into the planner as a column reference — in BOTH languages.
+//!   * **The `$` sigil is mandatory.** Only `$<paramname>` and `$N` are placeholders, so a
+//!     bare parameter name survives into the planner as a column reference — in BOTH
+//!     languages. This is deliberate: PostgreSQL resolves bare PL/pgSQL variable names, and
+//!     Nano does not, so that a variable can never silently shadow a column of the same name.
+//!
+//! Both languages bind, through the SAME scanner (`src/sql/interpolate.rs`, called from
+//! `execute_sql_procedure` and from `ExecutionContext::interpolate`). `LANGUAGE plpgsql` used
+//! not to substitute anything at all — it declared parameters into the procedural scope and
+//! then passed body statements to the executor verbatim — which is what the two `plpgsql`
+//! tests below used to pin; they now assert the substitution instead. See
+//! `tests/procedure_interpolation_tests.rs` for the full interpolation matrix (literal,
+//! comment and dollar-quote regions, prefix capture, and re-scanning of substituted values).
 //!
 //! WHY THIS SUITE EXISTS. v4.10.1 documented triggers as unimplemented and told users to reach
 //! for "a `CREATE PROCEDURE` invoked with `CALL` (procedures do execute)" instead. Both halves of
 //! that advice needed checking. Functions cannot be called at all; the procedure advice was
-//! sound but under-specified, and an agent following it without the two rules above lands on a
+//! sound but under-specified, and an agent following it without the sigil rule above lands on a
 //! form that errors. The pre-existing `tests/plpgsql_hardening_tests.rs` covers the same ground in the
 //! `if result.is_ok()` / `match { Ok => assert…, Err => eprintln! }` style that provides no
 //! regression protection — `test_function_in_select_scalar` and
@@ -55,10 +57,10 @@
 //! exactly one row whether the count is 0 or 10,000, so that assertion is always true and proves
 //! nothing. Use `rows_in()` below instead.
 //!
-//! THE PROCEDURE TESTS ARE NOT "UNIMPLEMENTED" PINS. The `LANGUAGE sql` ones assert a feature
-//! that works and must keep working; treat a failure there as a regression. Only the
-//! `LANGUAGE plpgsql` and bare-name tests pin a limitation, and of those only the plpgsql pair
-//! is a filed gap (ROADMAP §2.9 fix shape (b)) — the bare-name requirement is by design.
+//! THE PROCEDURE TESTS ARE NOT "UNIMPLEMENTED" PINS. Every one of them asserts a feature that
+//! works and must keep working; treat a failure there as a regression. The only limitation
+//! among them is the bare-name pair, and that is by design (the sigil rule above), not a filed
+//! gap. ROADMAP §2.9 fix shape (b) — plpgsql argument binding — has landed.
 //!
 //! IF A CALL TEST FAILS BECAUSE THE FUNCTION RESOLVED: user-defined functions have been
 //! implemented. Do NOT "fix" the test. Delete this suite, write real function tests (scalar calls
@@ -302,9 +304,9 @@ fn bound_parameter_family_is_also_unknown() {
 }
 
 // ===========================================================================
-// Procedures: `CALL` executes AND binds arguments — in `LANGUAGE sql` bodies, via a
-// `$`-sigil reference. These are the two working forms; a failure here is a REGRESSION,
-// not a limitation that started working. See the file header.
+// Procedures: `CALL` executes AND binds arguments, in both languages, via a `$`-sigil
+// reference. These are the working forms; a failure here is a REGRESSION, not a
+// limitation that started working. See the file header.
 // ===========================================================================
 
 /// The single table every procedure body below writes into.
@@ -399,11 +401,11 @@ fn procedure_argument_is_silently_discarded_when_the_body_ignores_it() {
 }
 
 // ---------------------------------------------------------------------------
-// The two rules, pinned by their failures.
+// `LANGUAGE plpgsql` binds too, through the same scanner...
 // ---------------------------------------------------------------------------
 
 #[test]
-fn language_plpgsql_procedure_does_not_substitute_named_parameters() {
+fn language_plpgsql_procedure_binds_named_parameters() {
     let db = db();
     proc_setup(&db);
 
@@ -413,21 +415,18 @@ fn language_plpgsql_procedure_does_not_substitute_named_parameters() {
     )
     .expect("CREATE PROCEDURE must be accepted");
 
-    // Nothing substitutes it, so `$p_id` reaches the planner's placeholder parser, which
-    // requires a numeric index (`src/sql/planner.rs:3476`).
-    let err = db
-        .execute("CALL fn_p_pg_named(7)")
-        .expect_err("a plpgsql body must not substitute $<paramname>")
-        .to_string();
-    assert!(
-        err.contains("Invalid parameter placeholder"),
-        "expected 'Invalid parameter placeholder', got: {err}"
-    );
-    assert_eq!(rows_in(&db, "fn_audit"), 0, "nothing may have been written");
+    // Was: `Invalid parameter placeholder: $p_id` — nothing substituted `$p_id`, so it
+    // reached the planner's placeholder parser, which requires a numeric index. The
+    // procedural runtime now interpolates it from the variable scope before the
+    // statement is executed (`ExecutionContext::interpolate`).
+    db.execute("CALL fn_p_pg_named(7)")
+        .expect("a plpgsql body must substitute $<paramname>");
+
+    assert_eq!(only_audit_row(&db), (7, "x".to_string()));
 }
 
 #[test]
-fn language_plpgsql_procedure_does_not_substitute_positional_parameters() {
+fn language_plpgsql_procedure_binds_positional_parameters() {
     let db = db();
     proc_setup(&db);
 
@@ -437,18 +436,19 @@ fn language_plpgsql_procedure_does_not_substitute_positional_parameters() {
     )
     .expect("CREATE PROCEDURE must be accepted");
 
-    // The executor closure runs body statements with no bind parameters at all
-    // (`db_clone.execute(sql)`, `src/lib.rs:5557`), so `$1` arrives unbound.
-    let err = db
-        .execute("CALL fn_p_pg_pos(7)")
-        .expect_err("a plpgsql body must not substitute $1")
-        .to_string();
-    assert!(
-        err.contains("Parameter $1 not provided"),
-        "expected an unbound-placeholder error, got: {err}"
-    );
-    assert_eq!(rows_in(&db, "fn_audit"), 0, "nothing may have been written");
+    // Was: `Parameter $1 not provided` — the executor closure runs body statements with
+    // no bind parameters (`db_clone.execute(sql)`, `src/lib.rs:5557`), so `$1` arrived
+    // unbound. The call's arguments now reach the runtime as
+    // `ExecutionContext::positional_params` and are interpolated textually.
+    db.execute("CALL fn_p_pg_pos(7)")
+        .expect("a plpgsql body must substitute $1 from the call's arguments");
+
+    assert_eq!(only_audit_row(&db), (7, "x".to_string()));
 }
+
+// ---------------------------------------------------------------------------
+// ...but the `$` sigil is still mandatory, pinned by its failures.
+// ---------------------------------------------------------------------------
 
 #[test]
 fn bare_parameter_name_fails_in_language_sql() {

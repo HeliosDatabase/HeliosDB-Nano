@@ -5,6 +5,89 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+**Stored-procedure parameter substitution was corrupting bodies, silently. It is now
+one literal-aware scanner, and it also works in `LANGUAGE plpgsql`.** If you have a
+`CREATE PROCEDURE` with more than nine parameters, with two parameter names where one
+is a prefix of the other, or with a `$` anywhere inside a string literal in its body,
+re-read the Fixed section below — some of those cases wrote *wrong data* with no error.
+
+### Fixed
+
+- **Substitution no longer happens inside string literals.** A body such as
+  `INSERT INTO t VALUES ($1, 'price is $1 dollars')` called with `5` used to store
+  `price is 5 dollars`. It now stores `price is $1 dollars` — the literal text, as
+  written. This is the silent one: no error was ever raised. The same now holds for
+  `E'…'` escape strings, `"quoted identifiers"`, `--` and `/* … */` comments (comments
+  nest, as in PostgreSQL), and `$tag$ … $tag$` dollar-quoted blocks.
+- **`$1` no longer captures the prefix of `$10`.** With ten parameters, a body
+  containing `$10` had its `$1` replaced first, leaving the substituted value followed
+  by a stray `0` — for `CALL p(1,…,9,99)` that produced the text `10`, which is a valid
+  integer, so the row stored `10` instead of `99`. Also silent. Placeholder names are
+  now matched by longest-match.
+- **`$p` no longer captures the prefix of `$p_id`.** Parameters `p` and `p_id` in the
+  same body produced `7_id` — a loud parse error outside a string literal, a silently
+  wrong string inside one. It was also declaration-order dependent: declaring the longer
+  name first happened to work. Order no longer matters.
+- **Argument data can no longer influence how other placeholders are interpolated.** The
+  positional pass ran before the named pass, so a value inserted by the first pass was
+  re-scanned by the second: `CALL p('$name', 'INJECTED')` failed with
+  `Expected: ), found: INJECTED`. Substituted text is never re-scanned now, by
+  construction — a single left-to-right pass.
+- The never-reachable `LANGUAGE sql` **function** path (`execute_sql_function`) had the
+  identical defects and was fixed with the same routine.
+- Escaping of `'` in interpolated values is unchanged: `O'Brien` still round-trips.
+
+### Added
+
+- **`LANGUAGE plpgsql` procedure bodies now bind parameters**, by name (`$p_id`) and
+  positionally (`$1`). Through 4.10.2 a plpgsql body substituted nothing at all — `$p_id`
+  failed with `Invalid parameter placeholder: $p_id. Expected format: $1, $2, etc.` and
+  `$1` with `Parameter $1 not provided. Expected 1 parameters, got 0`. Both languages now
+  go through the same scanner (`src/sql/interpolate.rs`), called from
+  `execute_sql_procedure` for `LANGUAGE sql` and from `ExecutionContext::interpolate` for
+  the procedural runtime. `DECLARE`d variables interpolate from the procedural scope by the
+  same rule. `EXECUTE '<dynamic sql>'` is deliberately *not* interpolated, matching
+  PostgreSQL.
+- Unresolvable placeholders are now left verbatim **by design**, so the planner still
+  raises its existing loud error (`Invalid parameter placeholder: $oops`,
+  `Parameter $9 not provided`). Typos do not become silent no-ops.
+
+### Unchanged, and deliberate
+
+- **The `$` sigil is still mandatory, in both languages.** A bare parameter name remains a
+  column reference and still fails with `Column 'n' not found in schema`. PostgreSQL
+  resolves bare PL/pgSQL variable names; HeliosDB Nano does not, so that a procedure
+  variable can never silently shadow a column of the same name — which is the same
+  wrong-data class as the bugs above. Real PostgreSQL plpgsql bodies that reference
+  parameters bare need a `$` added when porting.
+- Substitution remains **textual** (values render to SQL literals and the statement is
+  re-parsed), not bound parameters. Moving to real binding is a follow-up that will reuse
+  the same scanner.
+- `SELECT … INTO <var>` inside a plpgsql body still does not populate the variable, `:=`
+  assignments still store the raw expression *text* rather than a computed value (so
+  interpolating such a local yields quoted text), `CALL` still does not validate argument
+  count, and a `;` inside a string literal still splits a plpgsql body statement. All
+  pre-existing; all tracked in `docs/plans/ROADMAP_V5.md` §2.9.
+
+### Behavioural note
+
+- `$01` used to survive verbatim (the old code searched for the exact text `$1`) and then
+  failed downstream; the digit run now parses as `1` and substitutes. `$0` and `$00` still
+  resolve to nothing and are left verbatim.
+
+### Docs
+
+- `README.md` (stored-procedure and trigger bullets), `AGENTS.md`, `docs/llms.txt`,
+  `docs/compatibility/plpgsql.md` ("works, with two rules" → one rule),
+  `docs/plans/ROADMAP_V5.md` §2.9 (fix shape (b) marked done; §2.2's qualification
+  annotated), the `heliosdb-nano-schema` skill (Recipe 6, verb table, pitfalls) and the
+  skills verb-map index all now state the one-rule form.
+- `tests/procedure_interpolation_tests.rs` is the new regression matrix;
+  `tests/function_unimplemented_tests.rs` had its two `LANGUAGE plpgsql` pins rewritten to
+  assert the new behaviour (the bare-name pins stay failing by design).
+
 ## [4.10.2] - 2026-08-11
 
 **Documentation correction: user-defined functions are not callable. Plus a

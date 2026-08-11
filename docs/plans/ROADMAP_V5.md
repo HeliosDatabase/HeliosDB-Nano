@@ -478,13 +478,15 @@ process), and `CALL` on a `CREATE PROCEDURE` *does* execute the body.
 **QUALIFICATION (2026-08-07), second pass.** This entry ended "`CALL` on a `CREATE PROCEDURE`
 *does* execute — that is the alternative to recommend", and v4.10.1 shipped that advice verbatim.
 The advice stands, but it was **under-specified**, and an agent following it can easily land on a
-form that errors. Two rules must be stated with it: the procedure must be **`LANGUAGE sql`**
+form that errors. Two rules were stated with it: the procedure must be **`LANGUAGE sql`**
 (a `LANGUAGE plpgsql` body substitutes nothing — `$p_id` errors `Invalid parameter placeholder:
 $p_id. Expected format: $1, $2, etc.`, and `$1` errors `Parameter $1 not provided. Expected 1
 parameters, got 0`), and the body must reference parameters with a **`$` sigil**, by name
 (`$p_id`) or positionally (`$1`) — a bare parameter name fails `Column 'n' not found in schema`
-in *either* language. Within those rules arguments bind correctly and a procedure is a genuine
-escape hatch. `CREATE FUNCTION` is not an alternative at all; nothing can call it. See §2.9.
+in *either* language. **Rule 1 no longer applies** (§2.9 fix shape (b) landed): both languages now
+bind through one shared scanner, so only the `$`-sigil rule remains. Within that rule arguments
+bind correctly and a procedure is a genuine escape hatch. `CREATE FUNCTION` is not an alternative
+at all; nothing can call it. See §2.9.
 
 **If this is ever scheduled**, the work is: populate the body in the planner, thread
 `TriggerRowContext` through the DML executor closures (both families — see §1.1's lesson), fix the
@@ -738,9 +740,10 @@ test binary from any other working directory, since §2.7 makes `wal_dir` CWD-re
 
 ### 2.9 User-defined functions are registered but callable by nothing — **found 2026-08-07**
 
-**Status:** open, documented (not fixed). **Effort to make functions callable: medium** — the
-executor already exists and passes its own unit test; what is missing is the wiring. Not currently
-scheduled.
+**Status:** open for FUNCTIONS, documented (not fixed). **Effort to make functions callable:
+medium** — the executor already exists and passes its own unit test; what is missing is the wiring.
+Not currently scheduled. **Fix shape (b) — `LANGUAGE plpgsql` procedure argument binding — is DONE**
+(see the procedure sub-entry below); everything else in this section stands.
 
 This is the same class of defect as §2.2 and was found by checking v4.10.1's own remediation advice.
 That release told users to replace triggers with "a `CREATE PROCEDURE` invoked with `CALL`
@@ -779,23 +782,33 @@ form:
 | `sql` | `$p_id` / `$p_name` | **Ok** — `(42, 'hello')` inserted |
 | `sql` | `$1` / `$2` | **Ok** — `(7, 'seven')` inserted |
 | `sql` | bare `n` | `Column 'n' not found in schema` |
-| `plpgsql` | `$p_id` | `Invalid parameter placeholder: $p_id. Expected format: $1, $2, etc.` |
-| `plpgsql` | `$1` | `Parameter $1 not provided. Expected 1 parameters, got 0` |
-| `plpgsql` | bare `n` | `Column 'n' not found in schema` |
+| ~~`plpgsql`~~ | ~~`$p_id`~~ | ~~`Invalid parameter placeholder: $p_id. Expected format: $1, $2, etc.`~~ **FIXED — now Ok, `(7, 'x')` inserted** |
+| ~~`plpgsql`~~ | ~~`$1`~~ | ~~`Parameter $1 not provided. Expected 1 parameters, got 0`~~ **FIXED — now Ok** |
+| `plpgsql` | bare `n` | `Column 'n' not found in schema` (by design, unchanged) |
 
-So the rule is: **arguments bind in `LANGUAGE sql` bodies, referenced with a `$` sigil (by name or
-positionally). `LANGUAGE plpgsql` bodies substitute nothing, by any spelling. A bare name never
-works in either language.** A zero-parameter body works, and a body that never mentions its
-parameter succeeds while silently discarding the argument.
+So the rule is now: **arguments bind in BOTH languages, referenced with a `$` sigil (by name or
+positionally). A bare name never works in either language.** A zero-parameter body works, and a
+body that never mentions its parameter succeeds while silently discarding the argument.
 
-**Residual procedure gap (narrow):** `LANGUAGE plpgsql` procedure bodies perform no parameter
-substitution. `execute_plpgsql_procedure` (`src/sql/functions.rs:381`) declares parameters into the
-procedural scope, but `ProceduralStatement::Execute` passes body statements on verbatim
-(`src/sql/procedural/runtime.rs:446`) and the executor closure supplies no bind parameters
-(`src/lib.rs:5557`). The `LANGUAGE sql` path already solves this by textual substitution in
-`execute_sql_procedure` (`src/sql/functions.rs:359`–`375`); the fix is to give the plpgsql path
-equivalent interpolation from `ctx.scope`, not to invent a third mechanism. `tests/plpgsql_hardening_tests.rs:56`
-already covers the working `LANGUAGE sql` + `$<paramname>` case unconditionally.
+**Residual procedure gap — RESOLVED.** `LANGUAGE plpgsql` procedure bodies now interpolate
+parameters. Both languages share one scanner, `src/sql/interpolate.rs`: `execute_sql_procedure`
+(`src/sql/functions.rs`) resolves against the declared parameters and call arguments, and
+`ExecutionContext::interpolate` (`src/sql/procedural/runtime.rs`) resolves `$<name>` against the
+procedural scope and `$1..$N` against `ExecutionContext::positional_params`, immediately before each
+body statement is executed (`Execute`, `SelectInto`, `ForQuery`; `ExecuteDynamic` stays verbatim,
+matching PostgreSQL). The same change fixed three silent corruption modes in the `LANGUAGE sql`
+path that the sequential `String::replace` implementation had — see CHANGELOG `[Unreleased]`.
+`tests/procedure_interpolation_tests.rs` is the matrix; `tests/function_unimplemented_tests.rs`
+flipped its two plpgsql pins to assert the new behaviour.
+
+**Still open here:** the sigil requirement is permanent by design (a bare name must stay a column
+reference); `SELECT … INTO <var>` inside a plpgsql body is still not populated
+(`ProceduralStatement::SelectInto` is never constructed — the procedural parser has no `INTO`
+detection, so the statement goes to the engine verbatim and the variable is never filled); the
+procedural expression parser still stores raw expression TEXT rather than evaluating it, so `:=`
+locals hold strings and `IF`/`WHILE` conditions never evaluate to Boolean; `execute_procedure`
+still does not validate argument count; and `parse_until_semicolon` is still quote-blind, so a `;`
+inside a string literal splits a plpgsql body statement.
 
 **Introspection, measured.** `information_schema.routines`, `information_schema.parameters` and
 `pg_proc` all return zero rows on the wire *with a function registered*; on the embedded path
@@ -815,15 +828,12 @@ already covers the working `LANGUAGE sql` + `$<paramname>` case unconditionally.
 3. `Planner::is_table_function` (`src/sql/planner.rs:2078`) is
    `matches!(name, "generate_series" | "unnest")` — a fixed whitelist — so `SELECT * FROM my_udf()`
    cannot resolve a user function regardless of (1) and (2).
-4. (Procedures only, and narrow.) `LANGUAGE plpgsql` procedure parameters are declared into the
-   procedural scope but never interpolated into the body's SQL:
-   `ProceduralStatement::Execute { sql, .. } => (ctx.sql_executor)(sql)?`
-   (`src/sql/procedural/runtime.rs:446`) passes the statement text verbatim, and the executor
-   closure runs it with no bind parameters — `db_clone.query(sql, &[])` / `db_clone.execute(sql)`
-   (`src/lib.rs:5557`). The `LANGUAGE sql` path does not have this problem. Note the contrast that
-   defines this whole entry: `CALL` works because `execute_procedure` *does* have a real call site
-   (`src/lib.rs:5571`) — `execute_function` does not, which is the entire difference between a
-   procedural surface that ships working and one that ships dead.
+4. ~~(Procedures only, and narrow.) `LANGUAGE plpgsql` procedure parameters are declared into the
+   procedural scope but never interpolated into the body's SQL.~~ **FIXED** — `Execute` now calls
+   `ExecutionContext::interpolate` before handing the statement to the executor closure. Note the
+   contrast that defines this whole entry: `CALL` works because `execute_procedure` *does* have a
+   real call site (`src/lib.rs:5571`) — `execute_function` does not, which is the entire difference
+   between a procedural surface that ships working and one that ships dead.
 
 `query_information_schema_routines` (`src/protocol/postgres/catalog.rs:2398`) returns
 `(schema, vec![])` by construction; its own doc comment concedes Nano "does not currently expose its
@@ -837,12 +847,13 @@ runtime function catalog through this view".
      hard part is the `sql_executor` closure — the evaluator has no database handle today, and
      `clone_for_trigger` + closure is how the `CALL` path solves it (`src/lib.rs:5556`). Volatility
      and the result cache interact: a `VOLATILE` function must not be cached.
-  b. **`LANGUAGE plpgsql` procedure argument binding** — the narrow residual above, and the only
-     procedure defect. Interpolate scope variables into `ProceduralStatement::Execute` bodies, or
-     thread bind parameters through `sql_executor` so `$1` resolves. `execute_sql_procedure`
-     (`src/sql/functions.rs:361`–`372`) already does the textual `$1` / `$<paramname>` substitution
-     that makes `LANGUAGE sql` work — unify the two paths rather than adding a third. Lowest-cost
-     item here and independent of (a).
+  b. ~~**`LANGUAGE plpgsql` procedure argument binding**~~ — **DONE.** Unified as directed: one
+     scanner in `src/sql/interpolate.rs`, called from `execute_sql_procedure` /
+     `execute_sql_function` and from `ExecutionContext::interpolate`
+     (`src/sql/procedural/runtime.rs`). No third mechanism. Binding stayed TEXTUAL (values render
+     through `value_to_sql_literal`); moving to real bind parameters through `sql_executor` is a
+     follow-up that would reuse the same scanner, emitting `$1..$k` plus a value vector instead of
+     literals.
   c. **Table functions** (`SELECT * FROM f()`) and `RETURNS TABLE`, which need a planner change at
      `planner.rs:2078` beyond the whitelist.
   d. **Introspection**: populate `information_schema.routines` / `parameters` and `pg_proc` from the
@@ -855,6 +866,13 @@ working. Also update `README.md`, `AGENTS.md`, `docs/llms.txt`,
 `docs/compatibility/plpgsql.md`, `docs/compatibility/information_schema.md`, and the
 `heliosdb-nano-schema` (Recipe 6) / `heliosdb-nano-migrate` skills, all of which now document this
 as unimplemented.
+
+*Gate status for fix shape (b), done:* the two plpgsql pins in `tests/function_unimplemented_tests.rs`
+were rewritten to assert binding (not relaxed), its header prose was corrected, and `README.md`,
+`AGENTS.md`, `docs/llms.txt`, `docs/compatibility/plpgsql.md` and the `heliosdb-nano-schema` skill
+now state the one-rule (sigil) form. `docs/compatibility/information_schema.md` and the
+`heliosdb-nano-migrate` skill were NOT touched — they document the function/introspection half,
+which is unchanged. The rest of this gate applies to fix shapes (a)/(c)/(d) and is still pending.
 
 **Pre-existing test-suite note:** `tests/plpgsql_hardening_tests.rs` covers this area in the
 `is_ok()`-guarded style that §2.2's cleanup removed for triggers — `test_function_in_select_scalar`

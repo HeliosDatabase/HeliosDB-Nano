@@ -8,6 +8,7 @@ pub mod constraints;
 pub mod evaluator;
 pub mod executor;
 pub mod functions;
+pub mod interpolate; // Shared `$`-placeholder scanner + SQL-literal renderer for routine bodies
 pub mod logical_plan;
 pub(crate) mod normalize;
 pub mod numeric_special; // PG NaN/±Infinity semantics for String-backed Value::Numeric

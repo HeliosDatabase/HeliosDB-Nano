@@ -83,15 +83,16 @@ A registered function is also invisible: `information_schema.routines`,
 `information_schema.parameters` and `pg_proc` return zero rows with it registered (see
 [`information_schema` compatibility](information_schema.md)).
 
-### `CREATE PROCEDURE`: works, with two rules
+### `CREATE PROCEDURE`: works, with one rule
 
 Syntax is Nano's own: `CREATE [OR REPLACE] PROCEDURE name(params) LANGUAGE lang AS $$body$$`.
-`CALL` executes the body **and binds the call's arguments into it**, provided you follow two
-rules.
+`CALL` executes the body **and binds the call's arguments into it**, in **both**
+`LANGUAGE sql` and `LANGUAGE plpgsql` bodies, provided you follow one rule.
 
-**Rule 1 — the procedure must be `LANGUAGE sql`.** **Rule 2 — the body must reference
-parameters with a `$` sigil**, by name (`$p_id`) or positionally (`$1`). A bare parameter name
-never resolves.
+**The rule — reference parameters and `DECLARE`d variables with the `$` sigil**, by name
+(`$p_id`) or positionally (`$1`). A bare name is always a column reference. (PostgreSQL itself
+resolves bare PL/pgSQL variable names; Nano deliberately does not, so that a variable can never
+silently shadow a column.)
 
 ```sql
 CREATE TABLE audit (id INTEGER, op TEXT);
@@ -105,41 +106,57 @@ CALL log_named(42, 'hello');   -- OK → (42, 'hello') inserted
 CREATE PROCEDURE log_pos(p_id INTEGER, p_op TEXT) LANGUAGE sql
     AS $$INSERT INTO audit VALUES ($1, $2)$$;
 CALL log_pos(7, 'seven');      -- OK → (7, 'seven') inserted
+
+-- LANGUAGE plpgsql, same sigil, same result. (New: through 4.10.2 a plpgsql body
+-- substituted nothing — `$p_id` errored `Invalid parameter placeholder` and `$1`
+-- errored `Parameter $1 not provided`.)
+CREATE PROCEDURE log_pg(p_id INTEGER) LANGUAGE plpgsql
+    AS $$BEGIN INSERT INTO audit VALUES ($p_id, 'x'); END$$;
+CALL log_pg(7);                -- OK → (7, 'x') inserted
 ```
 
 A zero-parameter body works, and a body that never mentions its parameter succeeds while
 silently discarding the argument.
 
+Substitution is **literal-aware**: a `$`-token inside a `'string literal'`, an `E'…'` escape
+string, a `"quoted identifier"`, a `--` or `/* … */` comment, or a `$tag$ … $tag$` block is
+data, not a placeholder, and is passed through untouched. Names use longest-match, so `$p` can
+never capture the prefix of `$p_id` and `$1` can never capture the prefix of `$10`, in any
+declaration order. Substituted values are never re-scanned, so argument data cannot influence
+the interpolation of another placeholder. A placeholder that resolves to nothing is left
+verbatim on purpose, so a typo still fails loudly downstream.
+
 What fails:
 
 ```sql
--- LANGUAGE plpgsql substitutes nothing, by any spelling.
-CREATE PROCEDURE bad1(p_id INTEGER) LANGUAGE plpgsql
-    AS $$BEGIN INSERT INTO audit VALUES ($p_id, 'x'); END$$;
-CALL bad1(7);   -- ERROR: Invalid parameter placeholder: $p_id. Expected format: $1, $2, etc.
-
-CREATE PROCEDURE bad2(p_id INTEGER) LANGUAGE plpgsql
-    AS $$BEGIN INSERT INTO audit VALUES ($1, 'x'); END$$;
-CALL bad2(7);   -- ERROR: Parameter $1 not provided. Expected 1 parameters, got 0
-
 -- A bare name fails in EITHER language — the `$` is required.
-CREATE PROCEDURE bad3(n INTEGER) LANGUAGE sql AS $$INSERT INTO audit VALUES (n, 'x')$$;
-CALL bad3(7);   -- ERROR: Column 'n' not found in schema
+CREATE PROCEDURE bad1(n INTEGER) LANGUAGE sql AS $$INSERT INTO audit VALUES (n, 'x')$$;
+CALL bad1(7);   -- ERROR: Column 'n' not found in schema
+
+CREATE PROCEDURE bad2(n INTEGER) LANGUAGE plpgsql
+    AS $$BEGIN INSERT INTO audit VALUES (n, 'x'); END$$;
+CALL bad2(7);   -- ERROR: Column 'n' not found in schema
+
+-- A placeholder that names nothing stays verbatim and reaches the planner.
+CREATE PROCEDURE bad3(p_id INTEGER) LANGUAGE sql AS $$INSERT INTO audit VALUES ($oops, 'x')$$;
+CALL bad3(7);   -- ERROR: Invalid parameter placeholder: $oops. Expected format: $1, $2, etc.
 ```
 
-**Why.** `LANGUAGE sql` routes to `execute_sql_procedure` (`src/sql/functions.rs:353`), which
-textually substitutes `$1`…`$N` from the call's arguments and then `$<paramname>` from the
-declared parameter list (`:361`–`:372`) before executing the body — that is the entire binding
-mechanism, and it only matches `$`-prefixed tokens, which is why a bare `n` survives and
-reaches the planner as a column reference. `LANGUAGE plpgsql` routes to
-`execute_plpgsql_procedure` (`:381`), which declares the parameters into the procedural scope
-but passes body statements on as verbatim text
-(`ProceduralStatement::Execute { sql, .. } => (ctx.sql_executor)(sql)?`,
-`src/sql/procedural/runtime.rs:446`) and runs them with no bind parameters
-(`src/lib.rs:5557`). So `$p_id` reaches the planner's placeholder parser, which requires a
-numeric index (`src/sql/planner.rs:3476`), and `$1` arrives unbound.
+**Why.** Both languages go through one shared scanner, `src/sql/interpolate.rs`. The
+`LANGUAGE sql` path calls it from `execute_sql_procedure` (`src/sql/functions.rs`) with the
+call's declared parameters and arguments; the `LANGUAGE plpgsql` path calls it from
+`ExecutionContext::interpolate` (`src/sql/procedural/runtime.rs`) with the procedural variable
+scope plus the call's arguments, immediately before each body statement is executed. Because
+the scanner matches only `$`-prefixed tokens, a bare `n` survives and reaches the planner as a
+column reference.
 
-Within those rules a procedure is a legitimate replacement for a trigger. It is **not** a
+**Limitation — `:=` assignments.** The procedural expression parser does not evaluate
+expressions; it stores the raw expression TEXT. So a local assigned with `v := a + 1` holds the
+string `a + 1`, and `$v` interpolates that text quoted, not a computed value. Parameter
+references are the reliable case. `EXECUTE '<dynamic sql>'` is *not* interpolated, matching
+PostgreSQL.
+
+Within that rule a procedure is a legitimate replacement for a trigger. It is **not** a
 replacement for a callable function — the body is a SQL statement to run, not an expression to
 evaluate, and `CALL` returns no value.
 

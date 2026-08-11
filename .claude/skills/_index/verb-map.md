@@ -124,7 +124,7 @@ Source of truth: `src/main.rs`, `src/repl/commands.rs`, `src/lib.rs`, `src/mcp/t
 | `CREATE / ALTER / DROP TABLE / INDEX / VIEW / MATERIALIZED VIEW` | `heliosdb-nano-schema` |
 | `CREATE / DROP TRIGGER` (registers, but **triggers never fire** — see the skill) | `heliosdb-nano-schema` |
 | `CREATE / DROP FUNCTION` (registers, but **nothing can call it** — see the skill) | `heliosdb-nano-schema` |
-| `CREATE PROCEDURE` / `CALL` (works — must be `LANGUAGE sql`, params need a `$` sigil) | `heliosdb-nano-schema` |
+| `CREATE PROCEDURE` / `CALL` (works — either language, params need a `$` sigil) | `heliosdb-nano-schema` |
 | `INSERT [OR REPLACE/IGNORE] / … ON CONFLICT … / … RETURNING` | `heliosdb-nano-query` |
 | `UPDATE … RETURNING` / `DELETE … RETURNING` / `MERGE` | `heliosdb-nano-query` |
 | `SELECT` (windows, CTEs, set ops) / `EXPLAIN [ANALYZE]` | `heliosdb-nano-query` |

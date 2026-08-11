@@ -214,7 +214,8 @@ automatically after `git clone`; install globally with
   user-defined functions are unusable (`CREATE FUNCTION` registers, but
   every call route errors `Unknown scalar function`). Stored procedures
   DO work: `CREATE PROCEDURE p(a INT) LANGUAGE sql AS $$… $a …$$` +
-  `CALL p(1)` — must be `LANGUAGE sql`, params need the `$` sigil.
+  `CALL p(1)` — either language (sql or plpgsql), params need the `$`
+  sigil (`$a` or `$1`); a bare name is a column reference.
 - heliosdb-nano-query — DML: INSERT (OR REPLACE/IGNORE, ON CONFLICT,
   RETURNING), UPDATE/DELETE RETURNING, parameter styles, CTEs, window
   functions, EXPLAIN [ANALYZE], result cache.
