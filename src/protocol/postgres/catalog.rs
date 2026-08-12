@@ -168,15 +168,21 @@ impl PgCatalog {
                 if let Some(empty) = Self::known_empty_information_schema_view(&name) {
                     Some(empty)
                 } else {
+                    // Keep this list HONEST: "populated" means the view returns rows
+                    // reflecting real schema state, measured over the wire. Several
+                    // views resolve and report the correct column list but return zero
+                    // rows by construction — listing those as implemented is what sent
+                    // users looking for their own mistake. See
+                    // docs/compatibility/information_schema.md.
                     return Err(crate::Error::QueryExecution(format!(
                         "information_schema.{name} is not a recognised view; \
-                         HeliosDB Nano implements the SQL-standard subset \
-                         (tables, columns, schemata, key_column_usage, \
-                         table_constraints, referential_constraints, routines, \
-                         check_constraints, views) and a whitelist of empty \
-                         placeholder views (triggers, parameters, sequences, \
-                         domains, character_sets, collations, *_privileges, \
-                         role_*). Please file an issue if this view is needed."
+                         HeliosDB Nano populates tables (base tables only, not views), \
+                         columns, schemata, key_column_usage, table_constraints and \
+                         referential_constraints. These resolve but are ALWAYS EMPTY: \
+                         views, view_table_usage, view_column_usage, check_constraints, \
+                         constraint_column_usage, routines, parameters, triggers, \
+                         sequences, domains, character_sets, collations, *_privileges, \
+                         role_*. Please file an issue if this view is needed."
                     )));
                 }
             } else {

@@ -251,3 +251,158 @@ fn existing_views_still_work() {
         );
     }
 }
+
+// ===========================================================================
+// Status-column pins (added 2026-08-12, task #61).
+//
+// docs/compatibility/information_schema.md marked most of these views
+// "Complete" for a long time while they returned zero rows — the tests in this
+// file were right and the doc contradicted them, and nobody reconciled the two.
+// These pins exist so the doc cannot drift back: every view the doc calls
+// "always empty" is asserted to have ZERO ROWS **with the objects it describes
+// actually present**, which is stronger than the older whitelist test above
+// (that one only asserts the view is intercepted, not that it stays empty).
+//
+// If one of these starts returning rows, that view was implemented: update
+// docs/compatibility/information_schema.md's Status column and the unknown-view
+// error text in src/protocol/postgres/catalog.rs, then rewrite the test.
+// ===========================================================================
+
+/// A database with a view, a view-on-a-view, a CHECK constraint and an FK —
+/// i.e. data that SHOULD populate every view asserted empty below.
+fn catalog_with_populated_schema() -> (PgCatalog, Arc<EmbeddedDatabase>) {
+    let (cat, db) = catalog_with_db();
+    db.execute("CREATE TABLE is_parent (id INT PRIMARY KEY, code TEXT UNIQUE)")
+        .unwrap();
+    db.execute(
+        "CREATE TABLE is_child (id INT PRIMARY KEY, pid INT REFERENCES is_parent(id), \
+         qty INT CHECK (qty > 0))",
+    )
+    .unwrap();
+    db.execute("CREATE VIEW is_v AS SELECT id, qty FROM is_child").unwrap();
+    db.execute("CREATE VIEW is_v2 AS SELECT id FROM is_v").unwrap();
+    (cat, db)
+}
+
+fn row_count(cat: &PgCatalog, view: &str) -> usize {
+    let q = format!("SELECT * FROM information_schema.{view}");
+    cat.handle_query(&q)
+        .unwrap_or_else(|e| panic!("{view}: should be recognised, got Err({e})"))
+        .unwrap_or_else(|| panic!("{view}: should be intercepted by the catalog, got None"))
+        .1
+        .len()
+}
+
+#[test]
+fn always_empty_views_stay_empty_even_with_the_objects_they_describe_present() {
+    let (cat, _db) = catalog_with_populated_schema();
+    for view in &[
+        "views",
+        "view_table_usage",
+        "view_column_usage",
+        "check_constraints",
+        "constraint_column_usage",
+        "routines",
+        "parameters",
+        "character_sets",
+        "collations",
+    ] {
+        assert_eq!(
+            row_count(&cat, view),
+            0,
+            "information_schema.{view} is documented as always empty, but returned rows"
+        );
+    }
+}
+
+#[test]
+fn populated_views_do_return_rows() {
+    // The other half of the contract: these six are documented "Populated", so a
+    // regression that emptied them must fail here rather than quietly matching
+    // the always-empty expectation above.
+    let (cat, _db) = catalog_with_populated_schema();
+    for view in &[
+        "tables",
+        "columns",
+        "schemata",
+        "key_column_usage",
+        "table_constraints",
+        "referential_constraints",
+    ] {
+        assert!(
+            row_count(&cat, view) > 0,
+            "information_schema.{view} is documented as populated, but returned no rows"
+        );
+    }
+}
+
+#[test]
+fn tables_view_lists_base_tables_but_not_views() {
+    // PostgreSQL lists views here with table_type = 'VIEW'. Nano does not, so a
+    // client enumerating relations through this view will miss every view.
+    let (cat, _db) = catalog_with_populated_schema();
+    let (schema, rows) = cat
+        .handle_query("SELECT * FROM information_schema.tables")
+        .unwrap()
+        .expect("tables must be intercepted");
+    let name_idx = schema
+        .columns
+        .iter()
+        .position(|c| c.name == "table_name")
+        .expect("table_name column");
+    let names: Vec<String> = rows.iter().map(|r| s(&r.values[name_idx])).collect();
+    assert!(names.iter().any(|n| n == "is_parent"), "base tables listed: {names:?}");
+    assert!(
+        !names.iter().any(|n| n == "is_v"),
+        "views are NOT listed in information_schema.tables; got {names:?}"
+    );
+}
+
+#[test]
+fn privilege_views_stay_empty_after_a_grant() {
+    let (cat, db) = catalog_with_populated_schema();
+    // GRANT is accepted (CREATE ROLE is not supported at all), and changes nothing here.
+    let _ = db.execute("GRANT SELECT ON is_parent TO app_user");
+    for view in &[
+        "table_privileges",
+        "column_privileges",
+        "role_table_grants",
+        "role_column_grants",
+    ] {
+        assert_eq!(
+            row_count(&cat, view),
+            0,
+            "information_schema.{view} does not reflect grants; it returned rows"
+        );
+    }
+}
+
+#[test]
+fn catalog_name_is_not_implemented_at_all() {
+    // Documented as "Not implemented": it raises the unknown-view error rather
+    // than returning an empty result, exactly like a typo does.
+    let (cat, _db) = catalog_with_db();
+    let real = cat.handle_query("SELECT * FROM information_schema.catalog_name");
+    let typo = cat.handle_query("SELECT * FROM information_schema.does_not_exist");
+    assert!(real.is_err(), "catalog_name should error, got {real:?}");
+    assert!(typo.is_err(), "an unknown view should error, got {typo:?}");
+}
+
+#[test]
+fn unknown_view_error_lists_the_always_empty_views_honestly() {
+    // The error text is the most-read description of this surface. It used to
+    // claim routines/check_constraints/views were implemented; they are not.
+    let (cat, _db) = catalog_with_db();
+    let err = cat
+        .handle_query("SELECT * FROM information_schema.does_not_exist")
+        .expect_err("unknown view must error")
+        .to_string();
+    assert!(err.contains("ALWAYS EMPTY"), "error should flag the empty views: {err}");
+    for empty in &["views", "check_constraints", "routines"] {
+        let tail = err.split("ALWAYS EMPTY").nth(1).unwrap_or("");
+        assert!(
+            tail.contains(empty),
+            "`{empty}` must be listed as always-empty, not as populated: {err}"
+        );
+    }
+}
