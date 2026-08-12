@@ -885,7 +885,54 @@ no regression protection. Left in place deliberately: unlike the deleted trigger
 
 ---
 
-## Section 3 — Do not touch---
+### 2.10 `information_schema` / `pg_catalog` introspection is largely unpopulated — **found 2026-08-12**
+
+**Status:** open, documented (not fixed) in v4.11.0+. **Effort: medium**, and separable — each
+view is independent, so this can be taken in slices rather than as one project.
+
+Documented honestly in `docs/compatibility/information_schema.md`; this entry is the *functional*
+follow-up. The doc previously marked most of these "Complete".
+
+**Measured over the PG wire** against a database that had base tables, a view, a view-on-a-view,
+a `CHECK` constraint, a foreign key, a registered function and an executed `GRANT` — i.e. data
+that should have populated every one. Of 20 documented views, 6 return rows, 13 are always empty,
+and 1 does not exist:
+
+| Result | Views |
+|---|---|
+| Populated | `tables`, `columns`, `schemata`, `key_column_usage`, `table_constraints`, `referential_constraints` |
+| **Always empty** | `views`, `view_table_usage`, `view_column_usage`, `check_constraints`, `constraint_column_usage`, `routines`, `parameters`, `character_sets`, `collations`, `table_privileges`, `column_privileges`, `role_table_grants`, `role_column_grants` |
+| **Not implemented** | `catalog_name` (raises the unknown-view error, like a typo) |
+
+`pg_catalog` is not a fallback: `pg_views` returns zero rows with a view defined and `pg_proc`
+zero with a function registered. `information_schema.tables` lists base tables only — no
+`table_type = 'VIEW'` row — so a client enumerating relations through it misses every view.
+
+**Why it matters:** an empty result is indistinguishable from "you have no views / constraints /
+routines". ORMs and migration tools that introspect before acting will conclude the schema is
+emptier than it is. This is the failure mode the strict-unknown-view behaviour (§ doc) was
+introduced to prevent, reintroduced one layer down.
+
+**Suggested slices, cheapest first and independently shippable:**
+  a. **`views` + `pg_views`** — the view definitions already exist in the catalog; this is the
+     most-requested of the set and the only way to recover a view's SQL text (today `\d` in the
+     REPL is the sole surface).
+  b. **`check_constraints` + `constraint_column_usage`** — `table_constraints` already reports a
+     `CHECK` row, so existence is known; only `check_clause` and the column mapping are missing.
+  c. **`routines` / `parameters` / `pg_proc`** — same item as §2.9(d); the registry has the data.
+  d. **`character_sets` / `collations`** — constant single-row content, effectively free.
+  e. **`catalog_name`** — a single-row view returning the current database name.
+  f. **The four privilege views** — the largest, and arguably should stay empty until `CREATE ROLE`
+     is supported at all (it currently returns "Statement not yet supported: CreateRole" while
+     `GRANT` returns Ok, which is its own inconsistency worth resolving first).
+
+**Gate:** `tests/information_schema_completion.rs` pins the current state deliberately —
+`always_empty_views_stay_empty_even_with_the_objects_they_describe_present` will go red on purpose
+when any slice lands. Move the view from that list to `populated_views_do_return_rows`, and update
+both `docs/compatibility/information_schema.md`'s Status column and the unknown-view error text in
+`src/protocol/postgres/catalog.rs`, which enumerates the always-empty set.
+
+---
 
 ## Section 3 — Do not touch
 
