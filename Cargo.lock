@@ -1943,7 +1943,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "heliosdb-nano"
-version = "4.12.0"
+version = "4.12.1"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -2027,7 +2027,7 @@ dependencies = [
 
 [[package]]
 name = "heliosdb-nano-py"
-version = "4.12.0"
+version = "4.12.1"
 dependencies = [
  "heliosdb-nano",
  "pyo3",
