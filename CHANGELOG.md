@@ -5,6 +5,66 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+**`CALL <procedure>` was a silent no-op for every extended-protocol and REST client.**
+If your application invokes a stored procedure through psycopg with server-side bind,
+JDBC, sqlx, Drizzle, node-postgres, or a PostgREST-style `/rest/v1` write — rather than
+through psql simple-query, the MySQL wire, the REPL, or the embedded `execute()` — the
+procedure body **never ran**, the statement reported one affected row, and `CALL` on a
+procedure that did not exist reported success. Re-run any procedure you believed had
+executed on those paths.
+
+### Fixed
+
+- **`CALL` now executes the procedure body in BOTH DML executor families.** Nano has two:
+  `db.execute()` → `execute_in_transaction_inner` (psql simple-query, the whole MySQL wire,
+  the REPL, embedded), and `db.execute_params()` → `execute_plan_with_params_inner` (the
+  PostgreSQL extended protocol and every REST/BaaS write). Only the first had a
+  `LogicalPlan::Call` arm. The second fell through to a `sql::Executor`, which holds no
+  function registry and could only answer with a status message — so `CALL p()` returned
+  `Ok(1)` and wrote nothing. Measured before the fix:
+
+  | statement | `execute()` | `execute_params()` |
+  |---|---|---|
+  | `CALL p0()` | Ok, row inserted | **Ok(1), no row inserted** |
+  | `CALL p1($1)` | n/a | **Ok(1), no row inserted** |
+  | `CALL nonexistent_proc()` | `Err: Procedure … does not exist` | **Ok(1)** |
+
+  Both families now dispatch to one shared implementation, `execute_call_plan`, so they
+  cannot drift again. Bound arguments bind: `CALL p($1)` with a server-side parameter now
+  reaches the body.
+- **`CALL` on a procedure that does not exist now errors on every path.** The params family
+  never consulted the procedure registry at all, so a typo'd or dropped procedure was
+  indistinguishable from a successful call.
+- **`rows_affected` for `CALL` is 0 in both families** (it was 1 in the params family — the
+  stub's own status *message*, counted as a row). PostgreSQL's command tag for `CALL`
+  carries no row count; 0 is the honest value, and it is what the text family always
+  returned.
+- **The `sql::Executor` `Call` stub returns an error instead of a fake success.** An
+  `Executor` cannot run a procedure body, so any remaining route into it — notably
+  `query("CALL …")` — now fails loudly rather than returning a one-row status message that
+  reads like success.
+
+### Known limitation
+
+- **`CALL` inside an explicit `BEGIN` on the embedded API / REPL is refused with an error.**
+  A procedure body is run by re-entering the executor, which re-takes the process-wide
+  transaction lock; that lock is not reentrant, so this combination previously **hung the
+  calling thread**. It is now a clear error naming the procedure and stating the body did
+  not run. Issue the `CALL` outside the transaction, or inline the body. This does **not**
+  affect the PostgreSQL or MySQL wire: a wire `BEGIN` opens a per-session transaction, which
+  does not use the global lock. Tracked as `docs/plans/ROADMAP_V5.md` §2.11 together with the
+  pre-existing behaviour that a procedure body does not join its caller's transaction.
+
+### Documentation
+
+- `README.md`, `AGENTS.md`, `docs/llms.txt`, `docs/compatibility/plpgsql.md` and the
+  `heliosdb-nano-schema` skill all recommend a `CREATE PROCEDURE` invoked with `CALL` as the
+  replacement for the unimplemented triggers. That advice was inert for extended-protocol and
+  REST clients; it is now true on every path, and each of those documents states the
+  transaction limitation above.
+
 ## [4.11.0] - 2026-08-11
 
 **Stored-procedure parameter substitution was corrupting bodies, silently. It is now

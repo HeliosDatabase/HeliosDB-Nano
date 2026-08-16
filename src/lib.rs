@@ -475,6 +475,39 @@ thread_local! {
     /// active `search_path` yields to the planner two-probe without lock or
     /// borrow traffic.
     static SESSION_SCHEMA_OVERRIDE_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// True while THIS thread holds the global `current_transaction`
+    /// `parking_lot::Mutex` **across** statement execution — i.e. inside
+    /// `execute()`'s in-transaction branch.
+    ///
+    /// Read by `EmbeddedDatabase::execute_call_plan`, the one implementation of
+    /// `CALL`. A procedure body is run by re-entering `execute()` / `query()` on a
+    /// `clone_for_trigger()` handle, and BOTH of those take that same mutex when
+    /// `global_txn_active` is set. `parking_lot::Mutex` is NOT reentrant, so a
+    /// `CALL` reached while the guard is held (`BEGIN; CALL p();` on the text
+    /// family, or a trigger body that CALLs, which reaches the params family via
+    /// `execute_plan_internal`) blocks the worker thread forever. This flag turns
+    /// that hang into a loud error. It is set only on the explicit-transaction
+    /// branch — the autocommit path, which is every measured working `CALL`, never
+    /// touches it.
+    static GLOBAL_TXN_LOCK_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// RAII marker for `GLOBAL_TXN_LOCK_HELD`. Restores the PREVIOUS value on
+/// `Drop` (including an unwinding panic) rather than clearing unconditionally, so
+/// nesting and early returns can never leak a stale flag onto a pooled worker
+/// thread — the same failure mode `SessionSchemaOverrideGuard` guards against.
+struct GlobalTxnLockMarker(bool);
+
+impl GlobalTxnLockMarker {
+    fn set() -> Self {
+        Self(GLOBAL_TXN_LOCK_HELD.with(|c| c.replace(true)))
+    }
+}
+
+impl Drop for GlobalTxnLockMarker {
+    fn drop(&mut self) {
+        GLOBAL_TXN_LOCK_HELD.with(|c| c.set(self.0));
+    }
 }
 
 /// RAII installer for the per-statement thread-local `search_path` override a
@@ -3087,6 +3120,113 @@ impl EmbeddedDatabase {
         f()
     }
 
+    /// Execute a `CALL <procedure>(<args>)` plan.
+    ///
+    /// **This is the ONE implementation of `CALL`, shared by both DML executor
+    /// families.** It is called from `execute_in_transaction_inner`'s
+    /// `LogicalPlan::Call` arm (the text family: psql simple-query, all of the
+    /// MySQL wire, the REPL, `db.execute()`) and from
+    /// `execute_plan_with_params_inner`'s `LogicalPlan::Call` arm (the params
+    /// family: the PG extended protocol, every REST/BaaS write, `db.execute_params()`).
+    /// Until this helper existed the params family had no arm at all and fell to a
+    /// `StatusMessageOperator` stub in `src/sql/executor/mod.rs` that returned
+    /// success without running the body and without checking that the procedure
+    /// existed. Keep it a single choke point: "one rule, several implementations"
+    /// is this codebase's most expensive recurring defect class.
+    ///
+    /// `params` are the statement's bound values, so `CALL p($1)` binds its
+    /// argument on the params family. The text family passes an empty slice, which
+    /// makes the evaluator here byte-for-byte the `Evaluator::new(schema)` its arm
+    /// used before.
+    ///
+    /// ## Observed transaction behaviour — deliberately NOT changed here
+    ///
+    /// The body does not join the caller's transaction. Both families reach this
+    /// helper while holding a `&storage::Transaction` (`txn` in the text family,
+    /// `session_txn` in the params family), and this helper ignores both: it runs
+    /// body statements on a `clone_for_trigger()` handle through `execute()` /
+    /// `query()`, which resolve their own transaction from scratch. Observed
+    /// consequences, worth knowing before relying on it:
+    ///
+    /// * Under a wire **session** transaction (`BEGIN` over PG/MySQL) or the RAII
+    ///   `db.begin_transaction()` handle, `global_txn_active` is false — neither
+    ///   populates the global slot — so body writes autocommit *outside* the
+    ///   caller's transaction and survive its `ROLLBACK`.
+    /// * Under a **global** text `BEGIN` (`db.execute("BEGIN")`) the body does pick
+    ///   that transaction up, because `execute()` resolves the global slot. Only
+    ///   the params family gets there; the text family is refused by the gate below.
+    ///
+    /// That inconsistency is a separate filed item (ROADMAP_V5 §2.11). This
+    /// helper's job is parity between the two families, and it is faithful to the
+    /// behaviour the text family already shipped.
+    ///
+    /// ## Deadlock gate
+    ///
+    /// Running the body re-enters `execute()`/`query()`, which take the global
+    /// `current_transaction` mutex whenever `global_txn_active` is set. That mutex
+    /// is NOT reentrant, so if THIS thread already holds it across the statement
+    /// the re-entry blocks forever. `GLOBAL_TXN_LOCK_HELD` marks exactly that
+    /// window (`execute()`'s in-transaction branch) and we refuse loudly instead.
+    /// Two cases hit it:
+    ///
+    /// * `BEGIN; CALL p();` through `db.execute()` — a PRE-EXISTING hang, now an error.
+    /// * A trigger body containing `CALL`, under a global transaction: trigger
+    ///   bodies reach the params family via `execute_plan_internal` while
+    ///   `execute()` holds the mutex. That route only became live with this fix,
+    ///   so the gate is what keeps it from being a new hang.
+    ///
+    /// Autocommit — every measured working `CALL` — never sets the flag. Neither
+    /// does a WIRE `BEGIN`: `execute_for_session` / `execute_params_for_session`
+    /// route transaction control to the per-session slot
+    /// (`handle_transaction_control_for_session`), leaving `global_txn_active`
+    /// false. So the gate is reachable only from the embedded API and the REPL,
+    /// which are the two callers that use the process-wide global transaction.
+    fn execute_call_plan(&self, name: &str, args: &[sql::LogicalExpr], params: &[Value]) -> Result<u64> {
+        if GLOBAL_TXN_LOCK_HELD.with(|held| held.get()) {
+            return Err(Error::query_execution(format!(
+                "Procedure '{}' was NOT executed: CALL is not supported inside an explicit \
+                 transaction statement on this path. The procedure body re-enters the executor, \
+                 which would deadlock on the global transaction lock. Issue the CALL outside the \
+                 transaction, or inline the procedure body as ordinary statements.",
+                name
+            )));
+        }
+
+        let schema = std::sync::Arc::new(Schema { columns: vec![] });
+        let evaluator = sql::Evaluator::with_parameters(schema, params.to_vec());
+
+        // Evaluate arguments
+        let arg_values: Vec<Value> = args
+            .iter()
+            .map(|expr| evaluator.evaluate(expr, &Tuple::new(vec![])))
+            .collect::<Result<Vec<_>>>()?;
+
+        // Clone self for SQL execution within procedure
+        let db_clone = self.clone_for_trigger();
+        let sql_executor = |sql: &str| -> Result<Vec<Vec<Value>>> {
+            // Detect if this is a SELECT query or DML
+            let sql_trimmed = sql.trim();
+            if starts_with_icase(sql_trimmed, "SELECT") || starts_with_icase(sql_trimmed, "WITH") {
+                let tuples = db_clone.query(sql, &[])?;
+                Ok(tuples.iter().map(|t| t.values.clone()).collect())
+            } else {
+                // For INSERT, UPDATE, DELETE, etc., use execute
+                db_clone.execute(sql)?;
+                Ok(vec![])
+            }
+        };
+
+        // Errors here include `Procedure '<name>' does not exist` — the existence
+        // check both families now share.
+        self.function_registry
+            .execute_procedure(name, &arg_values, sql_executor)?;
+        // `CALL` affects no rows of its own. PostgreSQL's command tag is a bare
+        // `CALL` with no count; 0 is the honest answer and the text family has
+        // always returned it. (The params family used to return 1, counting the
+        // stub's status *message* as a row.)
+        Ok(0)
+    }
+
     fn execute_in_transaction_inner(
         &self,
         sql: &str,
@@ -5542,34 +5682,14 @@ impl EmbeddedDatabase {
                 Ok(0)
             }
             sql::LogicalPlan::Call { name, args } => {
-                // Execute procedure
-                let schema = std::sync::Arc::new(Schema { columns: vec![] });
-                let evaluator = sql::Evaluator::new(schema);
-
-                // Evaluate arguments
-                let arg_values: Vec<Value> = args
-                    .iter()
-                    .map(|expr| evaluator.evaluate(expr, &Tuple::new(vec![])))
-                    .collect::<Result<Vec<_>>>()?;
-
-                // Clone self for SQL execution within procedure
-                let db_clone = self.clone_for_trigger();
-                let sql_executor = |sql: &str| -> Result<Vec<Vec<Value>>> {
-                    // Detect if this is a SELECT query or DML
-                    let sql_trimmed = sql.trim();
-                    if starts_with_icase(sql_trimmed, "SELECT") || starts_with_icase(sql_trimmed, "WITH") {
-                        let tuples = db_clone.query(sql, &[])?;
-                        Ok(tuples.iter().map(|t| t.values.clone()).collect())
-                    } else {
-                        // For INSERT, UPDATE, DELETE, etc., use execute
-                        db_clone.execute(sql)?;
-                        Ok(vec![])
-                    }
-                };
-
-                self.function_registry
-                    .execute_procedure(name, &arg_values, sql_executor)?;
-                Ok(0)
+                // Text family. The implementation is shared with the params
+                // family's arm in `execute_plan_with_params_inner` — see
+                // `execute_call_plan`. This arm has no bound parameters (the text
+                // family carries literals only), hence the empty slice.
+                //
+                // NOTE: `txn` is deliberately not forwarded; `execute_call_plan`
+                // documents the transaction behaviour this preserves.
+                self.execute_call_plan(name, args, &[])
             }
             sql::LogicalPlan::AlterColumnStorage {
                 table_name,
@@ -7220,6 +7340,15 @@ impl EmbeddedDatabase {
             };
             if let Some(txn_ref) = txn_lock.as_ref().and_then(|guard| guard.as_ref()) {
                 // Execute within existing transaction context.
+                //
+                // The mutex guard above is held across this entire call. Mark the
+                // thread so `execute_call_plan` can refuse loudly instead of
+                // hanging: a `CALL` reached from here (directly, or from a trigger
+                // body, which routes into the params family via
+                // `execute_plan_internal`) runs its procedure body by re-entering
+                // `execute()`/`query()`, and both re-take this same NON-reentrant
+                // `parking_lot::Mutex`. See `GLOBAL_TXN_LOCK_HELD`.
+                let _global_txn_marker = GlobalTxnLockMarker::set();
                 (self.execute_in_transaction_no_fast_path(sql, txn_ref), true)
             } else {
                 drop(txn_lock);
@@ -14889,6 +15018,24 @@ impl EmbeddedDatabase {
                     self.prepared_fast_selects.write().clear();
                 }
                 Ok((0, Vec::new()))
+            }
+            sql::LogicalPlan::Call { name, args } => {
+                // Params family. Before this arm existed, `CALL` fell to the
+                // catch-all below, which built a `sql::Executor` — and an
+                // `Executor` has no `FunctionRegistry` handle, so its `Call` arm
+                // could only return a status message. The result was a SILENT
+                // NO-OP that reported `rows_affected = 1`: the procedure body
+                // never ran, and `CALL no_such_proc()` "succeeded". Every
+                // extended-protocol client (psycopg server-side bind, JDBC, sqlx,
+                // Drizzle, node-postgres) and every REST/BaaS write took that
+                // path, which is exactly the population the docs were telling to
+                // use `CALL` in place of a trigger.
+                //
+                // Same helper, same behaviour, same errors as the text family.
+                // `session_txn` is not forwarded — see `execute_call_plan` for the
+                // transaction behaviour that preserves.
+                let count = self.execute_call_plan(name, args, params)?;
+                Ok((count, Vec::new()))
             }
             _ => {
                 // For query plans and other operations, use executor with parameters.

@@ -17,8 +17,13 @@
 //!      `SELECT * FROM my_udf()` cannot resolve a user function either.
 //!
 //! PROCEDURES ARE THE OPPOSITE CASE, and the contrast is the point: `execute_procedure` HAS a
-//! real call site (`src/lib.rs:5571`), so `CALL` runs and its arguments bind. One rule governs
-//! the binding, and this suite pins it:
+//! real call site (`EmbeddedDatabase::execute_call_plan`, `src/lib.rs`), so `CALL` runs and its
+//! arguments bind. One rule governs the binding, and this suite pins it:
+//!
+//! NOTE: this suite exercises the TEXT executor family only (`db.execute()`). That was once the
+//! only family in which `CALL` did anything at all — see `tests/call_parity_tests.rs` and
+//! ROADMAP §2.11 for the params family, where `CALL` was a silent no-op until both families were
+//! routed through one shared implementation.
 //!
 //!   * **The `$` sigil is mandatory.** Only `$<paramname>` and `$N` are placeholders, so a
 //!     bare parameter name survives into the planner as a column reference — in BOTH
@@ -437,7 +442,7 @@ fn language_plpgsql_procedure_binds_positional_parameters() {
     .expect("CREATE PROCEDURE must be accepted");
 
     // Was: `Parameter $1 not provided` — the executor closure runs body statements with
-    // no bind parameters (`db_clone.execute(sql)`, `src/lib.rs:5557`), so `$1` arrived
+    // no bind parameters (`db_clone.execute(sql)` in `execute_call_plan`), so `$1` arrived
     // unbound. The call's arguments now reach the runtime as
     // `ExecutionContext::positional_params` and are interpolated textually.
     db.execute("CALL fn_p_pg_pos(7)")
