@@ -2,14 +2,22 @@
 //!
 //! This module is the SINGLE implementation of `$`-placeholder substitution into SQL
 //! text, and the single place values are rendered as SQL literals. Do not fork a second
-//! copy — both routine families call in here:
+//! copy — every consumer calls in here:
 //!
 //! * the `LANGUAGE sql` paths (`FunctionRegistry::execute_sql_function` and
 //!   `execute_sql_procedure` in `src/sql/functions.rs`), which resolve `$1` and
-//!   `$<paramname>` against the call-site argument list; and
+//!   `$<paramname>` against the call-site argument list;
 //! * the procedural runtime (`ExecutionContext::interpolate` in
 //!   `src/sql/procedural/runtime.rs`), which resolves `$<name>` against the PL/pgSQL
-//!   variable scope and `$1` against the call-site arguments.
+//!   variable scope and `$1` against the call-site arguments; and
+//! * `substitute_parameters` on the PostgreSQL extended-query path
+//!   (`src/protocol/postgres/prepared.rs`), which has its own placeholder scanner but
+//!   shares this module's `value_to_sql_literal`. It carried a private FORK of that
+//!   renderer until the "Unreleased" CHANGELOG entry; the fork's catch-all re-quoted
+//!   `Display for Value`, so DATE / TIME / UUID parameters rendered triple-quoted and
+//!   could not be cast, while this copy's `Timestamp` arm rendered a timezone NAME the
+//!   TIMESTAMP cast rejects. Each copy was broken for exactly the types the other got
+//!   right — the standing argument for never forking it again.
 //!
 //! `interpolate_sql_placeholders` replaces a sequence of `String::replace` calls that
 //! corrupted bodies four ways: `$1` prefix-matched inside `$10`, `$p` prefix-matched
@@ -293,11 +301,103 @@ fn munch_digits(sql: &str, start: usize) -> usize {
     i
 }
 
-/// Render a `Value` as a SQL literal for textual interpolation.
+/// Wrap `s` as a single-quoted SQL literal, doubling any embedded `'`.
 ///
-/// The `'` doubling for string-ish variants is load-bearing: it is what keeps
-/// `O'Brien` a value rather than a syntax error or an injection point.
-pub(crate) fn value_to_sql_literal(value: &Value) -> String {
+/// The doubling is load-bearing: it is what keeps `O'Brien` a value rather than a
+/// syntax error or an injection point. Every quoted arm of `value_to_sql_literal`
+/// goes through here so no arm can forget it.
+fn quoted(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+/// True when `s` is a bare decimal number that is safe to emit UNQUOTED.
+///
+/// `Value::Numeric` is String-backed and can legitimately hold the PostgreSQL
+/// special tokens (`NaN`, `Infinity`, `-Infinity` — see `crate::sql::numeric_special`)
+/// as well as any text a storage/cast path put there. Emitting those raw would splice
+/// a bare identifier into SQL (`WHERE n = NaN`) or worse. Numbers stay unquoted so they
+/// keep their numeric-ness (and so `ARRAY[...]` elements keep parsing as numbers);
+/// anything else is quoted and cast.
+fn is_bare_decimal(s: &str) -> bool {
+    let body = s.strip_prefix(['+', '-']).unwrap_or(s);
+    let (mantissa, exponent) = match body.split_once(['e', 'E']) {
+        Some((m, e)) => (m, Some(e.strip_prefix(['+', '-']).unwrap_or(e))),
+        None => (body, None),
+    };
+    let (int_part, frac_part) = match mantissa.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (mantissa, ""),
+    };
+    let digits_only = |t: &str| t.bytes().all(|b| b.is_ascii_digit());
+    // At least one digit in the mantissa; every part digits-only; a non-empty exponent.
+    !(int_part.is_empty() && frac_part.is_empty())
+        && digits_only(int_part)
+        && digits_only(frac_part)
+        && exponent.is_none_or(|e| !e.is_empty() && digits_only(e))
+}
+
+/// Render a `Value` as a SQL literal. **This is the single implementation** — see the
+/// module header. Both textual-substitution consumers call it:
+///
+/// * routine bodies (`interpolate_sql_placeholders`, above, via
+///   `crate::sql::functions` and `crate::sql::procedural::runtime`), whose output is
+///   re-parsed and re-planned by the ordinary planner; and
+/// * `substitute_parameters` in `src/protocol/postgres/prepared.rs`, the PostgreSQL
+///   extended-protocol path, whose output feeds the regex-driven catalog dispatcher.
+///
+/// It used to be two functions, and each was broken for types the other got right (see
+/// CHANGELOG "Unreleased"). The rule for keeping it one: **a rendering must be valid SQL
+/// that re-parses to an equal `Value`**, which is strictly stronger than what the catalog
+/// dispatcher needs (it only ever substring-matches, and only ever on string/int
+/// parameters), so the parsed consumer's requirement subsumes the wire consumer's.
+///
+/// A `::type` cast is added ONLY where the bare literal would otherwise be lost or unsafe:
+/// `vector` (there is no bare vector-literal syntax at all; `ARRAY[1,2]` re-parses as an
+/// integer ARRAY, not a vector) and the non-numeric contents of `Numeric` (see
+/// `is_bare_decimal`). Timestamp / Date / Time / Uuid / Json / Bytea are deliberately left
+/// bare: the quoted form already round-trips through the target column's implicit cast,
+/// and gratuitous casts are extra SQL for the planner and extra text for the catalog
+/// dispatcher to trip over.
+///
+/// | variant | rendering | re-parses as |
+/// |---|---|---|
+/// | `Null` / `ColumnarRef` | `NULL` | `Null` |
+/// | `Boolean` | `TRUE` / `FALSE` | `Boolean` |
+/// | `Int2` / `Int4` / `Int8` | `42` | `Int4` / `Int8` (widens) |
+/// | `Float4` / `Float8` | `1.5` | `Float8` (widens) |
+/// | `Numeric` | `12.34`, or `'NaN'::numeric` when not a bare decimal | `Float8` / `Numeric` |
+/// | `String` | `'O''Brien'` | `String` |
+/// | `Bytes` / `CasRef` | `E'\\xdead'` | `String` → `Bytes` on cast |
+/// | `Uuid` | `'0000…'` | `String` → `Uuid` on cast |
+/// | `Timestamp` | `'2026-08-16T01:11:00+00:00'` | `String` → `Timestamp` on cast |
+/// | `Date` | `'2026-08-16'` | `String` → `Date` on cast |
+/// | `Time` | `'01:11:00'` | `String` → `Time` on cast |
+/// | `Interval` | `INTERVAL '5 microseconds'` | `Interval` |
+/// | `Json` | `'{"a":1}'` | `String` → `Json` on cast |
+/// | `Array` | `ARRAY[1,2]` | `Array` (numeric/string/bool/null elements only) |
+/// | `Vector` | `'[1,2]'::vector` | `Vector` |
+/// | `DictRef` | `'dict:7'` | `String` (unresolved marker; see below) |
+///
+/// `DictRef` / `CasRef` / `ColumnarRef` are storage-internal references that are meant to
+/// be resolved before a value reaches here; their renderings are best-effort markers, not
+/// round-trips.
+///
+/// KNOWN RESIDUALS, deliberately not changed here (both pre-date the merge and are the
+/// same defect class — a rendering that is not valid SQL — but neither is on a measured
+/// path, so they stay separable):
+///
+/// * a NON-FINITE `Float4`/`Float8` renders as Rust's `NaN` / `inf` / `-inf`, which SQL
+///   reads as a bare identifier. It errors loudly ("Column 'NaN' not found") rather than
+///   corrupting data;
+/// * a bare decimal `Numeric` re-parses through `f64`, so more than ~17 significant
+///   digits are lost. Quoting every `Numeric` would fix it but would also stop
+///   `ARRAY[<numeric>…]` elements from parsing as numbers.
+pub fn value_to_sql_literal(value: &Value) -> String {
+    // EXHAUSTIVE ON PURPOSE — there is deliberately no `_` arm. The bug this replaced was
+    // a catch-all (`format!("'{}'", value.to_string())`) that re-quoted `Display for
+    // Value`, which already emits its own quotes for Date/Time/Uuid/String/Json/Timestamp:
+    // every one of those came out triple-quoted (`'''2026-08-16'''`) and failed to cast. A
+    // new `Value` variant must break this build rather than silently inherit a rendering.
     match value {
         Value::Null => "NULL".to_string(),
         Value::Boolean(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
@@ -306,24 +406,41 @@ pub(crate) fn value_to_sql_literal(value: &Value) -> String {
         Value::Int8(v) => v.to_string(),
         Value::Float4(v) => v.to_string(),
         Value::Float8(v) => v.to_string(),
-        Value::String(s) => format!("'{}'", s.replace('\'', "''")),
-        Value::Numeric(d) => d.clone(),
+        Value::Numeric(d) => {
+            if is_bare_decimal(d) {
+                d.clone()
+            } else {
+                format!("{}::numeric", quoted(d))
+            }
+        }
+        Value::String(s) => quoted(s),
+        // `E'\\x…'`: sqlparser processes the escape, so the planner sees the text
+        // `\xdead`, which `CAST(... AS BYTEA)` hex-decodes.
+        Value::Bytes(b) => format!("E'\\\\x{}'", hex::encode(b)),
+        Value::Uuid(u) => format!("'{}'", u),
+        // `to_rfc3339()`, NOT `Display for DateTime<Utc>` — the latter appends a timezone
+        // NAME (`2026-08-16 01:11:00 UTC`), which the TIMESTAMP cast rejects with
+        // "trailing input".
+        Value::Timestamp(ts) => format!("'{}'", ts.to_rfc3339()),
         Value::Date(d) => format!("'{}'", d),
         Value::Time(t) => format!("'{}'", t),
-        Value::Timestamp(ts) => format!("'{}'", ts),
-        Value::Uuid(u) => format!("'{}'", u),
-        Value::Json(j) => format!("'{}'", j.replace('\'', "''")),
-        Value::Bytes(b) => format!("E'\\\\x{}'", hex::encode(b)),
-        Value::Vector(v) => format!("[{}]", v.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(",")),
+        Value::Interval(iv) => format!("INTERVAL '{} microseconds'", iv),
+        Value::Json(j) => quoted(j),
         Value::Array(arr) => {
             let elements: Vec<String> = arr.iter().map(value_to_sql_literal).collect();
             format!("ARRAY[{}]", elements.join(","))
         }
+        // pgvector text form. A bare `[1,2]` is not SQL at all, and `ARRAY[1,2]` re-parses
+        // as an integer ARRAY. An empty vector has no valid literal (the dimension cannot
+        // be inferred); it renders as `'[]'::vector`, which fails loudly at plan time.
+        Value::Vector(v) => format!(
+            "'[{}]'::vector",
+            v.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(",")
+        ),
         // Storage references (should be resolved before reaching here)
         Value::DictRef { dict_id } => format!("'dict:{}'", dict_id),
         Value::CasRef { hash } => format!("E'\\\\x{}'", hex::encode(hash)),
         Value::ColumnarRef => "NULL".to_string(), // Placeholder
-        Value::Interval(iv) => format!("INTERVAL '{} microseconds'", iv),
     }
 }
 
@@ -490,6 +607,61 @@ mod tests {
         assert_eq!(value_to_sql_literal(&Value::Int4(42)), "42");
         assert_eq!(value_to_sql_literal(&Value::String("hello".to_string())), "'hello'");
         assert_eq!(value_to_sql_literal(&Value::String("it's".to_string())), "'it''s'");
+    }
+
+    #[test]
+    fn timestamp_renders_rfc3339_not_a_timezone_name() {
+        // Regression: `format!("'{}'", ts)` used `Display for DateTime<Utc>`, which
+        // appends a zone NAME — `'2026-08-16 01:11:00 UTC'` — and the TIMESTAMP cast
+        // rejected it with "trailing input".
+        let ts = chrono::DateTime::parse_from_rfc3339("2026-08-16T01:11:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let rendered = value_to_sql_literal(&Value::Timestamp(ts));
+        assert_eq!(rendered, "'2026-08-16T01:11:00+00:00'");
+        assert!(!rendered.contains("UTC"), "rendered a timezone name: {rendered}");
+    }
+
+    #[test]
+    fn numeric_special_tokens_are_never_emitted_bare() {
+        // `Value::Numeric` is String-backed: PG's special tokens are legal contents and
+        // must not become bare identifiers (`WHERE n = NaN`).
+        assert_eq!(value_to_sql_literal(&Value::Numeric("12.34".to_string())), "12.34");
+        assert_eq!(value_to_sql_literal(&Value::Numeric("-1.5e10".to_string())), "-1.5e10");
+        assert_eq!(
+            value_to_sql_literal(&Value::Numeric("NaN".to_string())),
+            "'NaN'::numeric"
+        );
+        assert_eq!(
+            value_to_sql_literal(&Value::Numeric("-Infinity".to_string())),
+            "'-Infinity'::numeric"
+        );
+        // The injection shape the raw arm allowed.
+        assert_eq!(
+            value_to_sql_literal(&Value::Numeric("1); DROP TABLE t; --".to_string())),
+            "'1); DROP TABLE t; --'::numeric"
+        );
+    }
+
+    #[test]
+    fn vector_renders_as_a_pgvector_literal_not_bare_brackets() {
+        // `[1,2]` is not SQL at all, and `ARRAY[1,2]` re-parses as an integer ARRAY.
+        assert_eq!(
+            value_to_sql_literal(&Value::Vector(vec![1.5, 2.5])),
+            "'[1.5,2.5]'::vector"
+        );
+    }
+
+    #[test]
+    fn is_bare_decimal_accepts_numbers_and_rejects_everything_else() {
+        for ok in ["0", "12", "-12", "+12", "12.34", ".5", "5.", "1e10", "1.5E-10", "-0.0"] {
+            assert!(is_bare_decimal(ok), "{ok} should be bare");
+        }
+        let bad_cases = ["", "-", ".", "NaN", "Infinity", "-Infinity", "1e", "1e+"];
+        let more_bad = ["0x10", "1 2", " 12", "12 ", "1_0", "1); DROP TABLE t; --"];
+        for bad in bad_cases.iter().chain(more_bad.iter()) {
+            assert!(!is_bare_decimal(bad), "{bad:?} should be quoted");
+        }
     }
 
     #[test]
