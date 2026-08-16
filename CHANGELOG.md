@@ -5,6 +5,86 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+**Two broken copies of one rule.** HeliosDB Nano renders `Value`s into SQL text in two
+places — stored-routine bodies and the PostgreSQL extended protocol's parameter
+substitution — and each place had its own copy of the renderer. Each copy was broken for
+exactly the types the other got right. Both are fixed, and there is now **one** renderer.
+
+### Fixed
+
+- **A `TIMESTAMP` argument to a `LANGUAGE sql` procedure or function failed the call.**
+  `CALL p($1)` (and any `$1` / `$<paramname>` in a `LANGUAGE sql` body, and any PL/pgSQL
+  `$name`) rendered a timestamp with Rust's `Display for DateTime<Utc>`, which appends a
+  timezone **name**: `'2026-08-16 01:11:00 UTC'`. Nano's `TIMESTAMP` cast accepts an
+  offset but not a name, so the body died with
+  `Cannot cast '2026-08-16 01:11:00 UTC' to TIMESTAMP: trailing input`. Affects every
+  client — this is not protocol-specific — and it was reachable from the moment routine
+  bodies gained working argument interpolation in v4.11.0 / `CALL` started running in
+  v4.12.0. Timestamps now render as RFC 3339 (`'2026-08-16T01:11:00+00:00'`).
+  *Fix:* `src/sql/interpolate.rs` — `ts.to_rfc3339()`.
+- **`DATE`, `TIME` and `UUID` values rendered triple-quoted in extended-protocol
+  parameter substitution.** `src/protocol/postgres/prepared.rs` carried a private copy of
+  the renderer whose catch-all arm wrapped `impl Display for Value` output in quotes —
+  but `Display` already emits its own quotes for `Date` / `Time` / `Uuid` / `String` /
+  `Json` / `Timestamp`. Everything that reached the catch-all came out as
+  `'''2026-08-16'''`, which fails with `Cannot cast ''2026-08-16'' to DATE`. The same arm
+  rendered `Interval` as a lossy `'01:11:00'` clock string and `Array` as a quoted
+  `'{1, 2}'` **string** rather than an array.
+  *Scope, precisely:* on the live wire path the substituted text is handed only to the
+  regex-driven catalog dispatcher (real execution threads the values through
+  `query_params` / `execute_params`), and the wire parameter decoder never produces
+  `Date` / `Time` / `Numeric` / `Interval` / `Array` / `Vector` — so the wire-reachable
+  case was a binary `UUID` (OID 2950) parameter feeding a `pg_catalog` /
+  `information_schema` probe, where it silently mis-filtered. The full breakage was
+  reachable through the public library API
+  `heliosdb_nano::protocol::postgres::prepared::substitute_parameters`.
+- **`Value::Vector` did not render as SQL at all.** The routine-body copy emitted a bare
+  `[1.5,2.5]`, which is not valid SQL; the extended-protocol copy emitted `ARRAY[1.5,2.5]`,
+  which re-parses as an `ARRAY`, not a vector. Both now render pgvector's text form,
+  `'[1.5,2.5]'::vector`, which round-trips.
+- **A `Value::Numeric` holding a non-number was spliced into SQL unquoted.**
+  `Value::Numeric` is String-backed and legitimately holds PostgreSQL's special tokens
+  (`NaN`, `Infinity`, `-Infinity`), which were emitted bare — SQL reads them as column
+  references. Non-numeric contents are now quoted and cast (`'NaN'::numeric`); plain
+  decimals stay unquoted so they keep their numeric-ness and so `ARRAY[…]` elements keep
+  parsing as numbers.
+
+### Changed
+
+- **One renderer, not two.** `src/protocol/postgres/prepared.rs::substitute_parameters`
+  now calls the shared `crate::sql::interpolate::value_to_sql_literal`; its private copy
+  is deleted. The shared function is exhaustive over `Value` with **no** catch-all arm, so
+  a new variant is a compile error rather than a silently-wrong rendering. The contract is
+  documented on the function: *a rendering must be valid SQL that re-parses to an equal
+  `Value`*.
+- **Extended-protocol substitution output changed for four types** (visible only to direct
+  callers of the public `substitute_parameters`, and to the catalog dispatcher): `Timestamp`
+  loses its `::timestamp` suffix, `Json` loses its `::jsonb` suffix (neither is needed —
+  the substituted text is no longer executed), `Numeric` loses its quotes for plain
+  decimals, and `Bytes` renders as `E'\xdead'` instead of `'\xdead'` (identical text after
+  escape processing). `Int`/`Float`/`Bool`/`String`/`Null` rendering is unchanged.
+
+### Added
+
+- `tests/value_rendering_tests.rs` — the pinned per-variant rendering table, plus a
+  round-trip of **every** `Value` variant through both consumers (`CALL p($1)` into a
+  `LANGUAGE sql` body via `execute_params`, and `substitute_parameters` followed by
+  `execute`), the three measured regressions as named tests, an assertion that the two
+  entry points produce byte-identical output, and a property test that no rendering ever
+  begins with a doubled quote — the shape of the extended-protocol bug.
+
+### Known gaps (unchanged by this release, documented for the first time)
+
+- A non-finite `Float4` / `Float8` still renders as Rust's `NaN` / `inf`, which SQL reads
+  as an identifier. It fails loudly rather than corrupting data.
+- `CAST(… AS INTERVAL)` is unimplemented in the evaluator, so an `INTERVAL` column cannot
+  be written at all — independent of rendering. The `INTERVAL '<n> microseconds'` literal
+  itself parses and evaluates correctly.
+- A plain-decimal `Value::Numeric` re-parses through `f64`, so beyond ~17 significant
+  digits it loses precision.
+
 ## [4.12.0] - 2026-08-16
 
 **`CALL <procedure>` was a silent no-op for every extended-protocol and REST client.**

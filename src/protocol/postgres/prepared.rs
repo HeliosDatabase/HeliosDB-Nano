@@ -3,6 +3,7 @@
 //! This module implements storage and execution of prepared statements and portals
 //! for the PostgreSQL extended query protocol.
 
+use crate::sql::interpolate::value_to_sql_literal;
 use crate::sql::logical_plan::LogicalPlan;
 use crate::{Error, Result, Schema, Tuple, Value};
 use std::collections::HashMap;
@@ -489,7 +490,20 @@ fn decode_binary_parameter(data: &[u8], type_oid: i32) -> Result<Value> {
     }
 }
 
-/// Substitute parameters in SQL query
+/// Substitute parameters in SQL query.
+///
+/// Values are rendered by the SHARED `crate::sql::interpolate::value_to_sql_literal` —
+/// the same renderer the routine-body interpolator uses. This module used to carry its
+/// own copy, whose catch-all arm re-quoted `Display for Value` (which already emits its
+/// own quotes for Date / Time / Uuid / String / Json / Timestamp), so DATE, TIME and UUID
+/// parameters came out triple-quoted (`'''2026-08-16'''`) and could not be cast. See the
+/// renderer's doc comment for the per-variant table.
+///
+/// Consumer note: on the live extended-protocol path this text is handed ONLY to the
+/// regex-driven catalog dispatcher (`handler_extended.rs:302`); real execution threads
+/// the `Value`s through `query_params` / `execute_params`. The renderer's contract
+/// ("valid SQL that re-parses to an equal `Value`") is therefore strictly stronger than
+/// what this caller needs, which is why one renderer can serve both.
 pub fn substitute_parameters(sql: &str, params: &[Value]) -> Result<String> {
     if params.is_empty() {
         return Ok(sql.to_string());
@@ -531,27 +545,6 @@ pub fn substitute_parameters(sql: &str, params: &[Value]) -> Result<String> {
     }
 
     Ok(result)
-}
-
-/// Convert Value to SQL literal string
-fn value_to_sql_literal(value: &Value) -> String {
-    match value {
-        Value::Null => "NULL".to_string(),
-        Value::Boolean(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
-        Value::Int2(i) => i.to_string(),
-        Value::Int4(i) => i.to_string(),
-        Value::Int8(i) => i.to_string(),
-        Value::Float4(f) => f.to_string(),
-        Value::Float8(f) => f.to_string(),
-        Value::String(s) => format!("'{}'", s.replace('\'', "''")),
-        Value::Json(j) => format!("'{}'::jsonb", j.to_string().replace('\'', "''")),
-        Value::Timestamp(ts) => format!("'{}'::timestamp", ts.to_rfc3339()),
-        Value::Vector(v) => {
-            let arr_str = v.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(",");
-            format!("ARRAY[{}]", arr_str)
-        }
-        _ => format!("'{}'", value.to_string().replace('\'', "''")),
-    }
 }
 
 #[cfg(test)]

@@ -1016,6 +1016,93 @@ covers the procedure-argument-binding rules and still passes unchanged.
 
 ---
 
+### 2.12 Two copies of the `Value` → SQL-literal renderer, each broken for the other's types — **found 2026-08-16, FIXED**
+
+**Status:** FIXED — both defects, plus the merge. What remains open are three smaller gaps in
+the same area, listed at the end; none is on a measured path. **Effort for the residual: small.**
+
+Same class as §2.9 and §2.11, and it is now the third instance in three releases: **one rule,
+several implementations.** v4.11.0 shipped the interpolation bug; v4.12.0 shipped the `CALL`
+no-op; this is the renderer those two features both depend on. The lesson recurs verbatim —
+*a rule verified in one implementation is not verified.*
+
+**Measured** (embedded API, in-memory), before the fix:
+
+| path | value | rendered literal | result |
+|---|---|---|---|
+| `CALL p($1)` → `LANGUAGE sql` body | `Timestamp` | `'2026-08-16 01:11:00 UTC'` | `Err: Cannot cast … to TIMESTAMP: trailing input` |
+| `substitute_parameters` → `execute` | `Date` | `'''2026-08-16'''` | `Err: Cannot cast ''2026-08-16'' to DATE` |
+| `substitute_parameters` → `execute` | `Time` | `'''01:11:00'''` | `Err: Cannot cast ''01:11:00'' to TIME` |
+| `substitute_parameters` → `execute` | `Uuid` | `'''0000…'''` | `Err: Cannot cast ''0000…'' to UUID` |
+| either | `Vector` | `[1.5,2.5]` (routine) / `ARRAY[1.5,2.5]` (wire) | not SQL / re-parses as an ARRAY |
+
+Everything else round-tripped: int4, text (quote doubling preserved), bool, float8, numeric,
+date, time, uuid, json, null through the routine-body copy; int4, text, bool, json, timestamp
+through the wire copy.
+
+**Root cause — two functions, two different mistakes:**
+
+1. `src/sql/interpolate.rs:313` (pre-fix) — `Value::Timestamp(ts) => format!("'{}'", ts)`. Rust's
+   `Display for DateTime<Utc>` appends a timezone **name** (`… 01:11:00 UTC`). Nano's TIMESTAMP
+   cast (`src/sql/evaluator.rs:5624`) accepts an offset but not a name, so it errored with
+   "trailing input". Reachable from every client, on exactly the routine paths v4.11.0 and
+   v4.12.0 enabled.
+2. `src/protocol/postgres/prepared.rs:537` (pre-fix) — a private FORK of the same function whose
+   catch-all was `_ => format!("'{}'", value.to_string().replace('\'', "''"))`. That routes
+   through `impl Display for Value` (`src/types.rs:293-355`), which **already emits its own
+   quotes** for `String` / `Json` / `Uuid` / `Timestamp` / `Date` / `Time`. Every variant that
+   reached the catch-all — Date, Time, Uuid, Numeric, Bytes, Interval, Array and the three
+   storage-ref markers — came out double-wrapped.
+
+**Blast radius, stated precisely** (the fork's is narrower than the error messages suggest, and
+the correction matters for anyone triaging from this entry): the fork's only in-crate caller is
+`substitute_parameters` (`prepared.rs:493`), called from `handler_extended.rs:302`, and that
+call site feeds the **regex-driven catalog dispatcher only** — real execution threads the
+`Value`s through `query_params` / `execute_params` (see the comment at
+`handler_extended.rs:256-272`, which is where the substituted-then-executed path was removed).
+Additionally, `decode_parameter` (`prepared.rs:303`) never produces `Date`, `Time`, `Numeric`,
+`Interval`, `Array` or `Vector` from the wire. So the wire-reachable case was a **binary UUID
+(OID 2950) parameter in a `pg_catalog` / `information_schema` probe**, which mis-filtered
+silently rather than erroring. The full breakage was reachable through the public library API
+`heliosdb_nano::protocol::postgres::prepared::substitute_parameters`. Defect 1 (Timestamp) has
+no such narrowing: it is on a real user path for every client.
+
+**Fix shape (SHIPPED).** ONE renderer, in `src/sql/interpolate.rs`; the fork is deleted and
+`prepared.rs` imports it. The shared function is **exhaustive over `Value` with no `_` arm**, so
+a new variant is a compile error instead of a silently-wrong rendering — that is what stops this
+recurring, not the individual arm fixes. Its documented contract is *a rendering must be valid
+SQL that re-parses to an equal `Value`*, which is strictly stronger than what the catalog
+dispatcher needs, which is why one function can serve both consumers rather than needing a
+mode parameter. Per-type decisions: `Timestamp` → `to_rfc3339()`, no cast; `Json` → bare
+quoted (the fork's `::jsonb` existed for a substituted-then-executed path that no longer
+exists); `Vector` → pgvector's `'[1,2]'::vector` (the only form that round-trips); `Numeric` →
+bare when it is a plain decimal, `'NaN'::numeric` otherwise (it is String-backed and could
+splice a bare identifier); `Bytes` → `E'\xdead'`.
+
+**Residual, still open — three same-class gaps, all newly documented, none measured:**
+
+- a non-finite `Float4`/`Float8` renders as Rust's `NaN` / `inf` / `-inf`, which SQL reads as an
+  identifier. Fails loudly ("Column 'NaN' not found"), does not corrupt. Fixing it needs a
+  verified cast spelling for the float types, which is why it was left separable;
+- `cast_value` (`src/sql/evaluator.rs:5262`) has **no `DataType::Interval` arm**, and INSERT
+  casts every value to its column type, so an `INTERVAL` column cannot be written at all —
+  independent of rendering;
+- a plain-decimal `Value::Numeric` re-parses through `f64` (`Planner::number_literal_to_value`,
+  `src/sql/planner.rs:4150`), losing precision beyond ~17 significant digits. Quoting every
+  `Numeric` would fix it but would stop `ARRAY[<numeric>…]` elements parsing as numbers.
+
+**Gate:** `tests/value_rendering_tests.rs` — a pinned per-variant rendering table, EVERY `Value`
+variant round-tripped through BOTH consumers (`CALL p($1)` into a `LANGUAGE sql` body via
+`execute_params`, and `substitute_parameters` then `execute`), the measured failures above as
+named regression tests, `the_two_renderers_are_one_function` (byte-identical output from both
+entry points — it fails if a fork is reintroduced), and
+`no_rendering_ever_produces_a_doubled_leading_quote` (the *shape* of the fork's bug, asserted
+over every variant). Every assertion is unconditional. `tests/procedure_interpolation_tests.rs`,
+`tests/postgres_extended_protocol_tests.rs` and `tests/drizzle_compat_tests.rs` cover the
+unchanged int/text/null renderings and pass without modification.
+
+---
+
 ## Section 3 — Do not touch
 
 ### 3.1 Branch GC must stay disarmed
