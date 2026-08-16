@@ -215,7 +215,13 @@ automatically after `git clone`; install globally with
   every call route errors `Unknown scalar function`). Stored procedures
   DO work: `CREATE PROCEDURE p(a INT) LANGUAGE sql AS $$… $a …$$` +
   `CALL p(1)` — either language (sql or plpgsql), params need the `$`
-  sigil (`$a` or `$1`); a bare name is a column reference.
+  sigil (`$a` or `$1`); a bare name is a column reference. `CALL` runs
+  the body on every client path and reports 0 rows affected; through
+  4.11.0 it was a silent no-op over the PG extended protocol and the
+  REST layer (returned 1 row affected, ran nothing, and "succeeded" for
+  a procedure that did not exist). Limitation: on the embedded API and
+  the REPL, `CALL` inside an explicit `BEGIN` is refused with an error;
+  a wire `BEGIN` (per-session transaction) is unaffected.
 - heliosdb-nano-query — DML: INSERT (OR REPLACE/IGNORE, ON CONFLICT,
   RETURNING), UPDATE/DELETE RETURNING, parameter styles, CTEs, window
   functions, EXPLAIN [ANALYZE], result cache.

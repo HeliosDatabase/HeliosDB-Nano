@@ -4220,10 +4220,24 @@ impl<'a> Executor<'a> {
                 };
                 Ok(Box::new(StatusMessageOperator::new(msg)))
             }
-            LogicalPlan::Call { name, args } => {
-                // For now, return a status message. Full procedure execution will be implemented later.
-                let msg = format!("Procedure '{}' called with {} arguments", name, args.len());
-                Ok(Box::new(StatusMessageOperator::new(msg)))
+            LogicalPlan::Call { name, .. } => {
+                // An `Executor` holds no `FunctionRegistry` handle, so it cannot run a
+                // procedure body — only `EmbeddedDatabase::execute_call_plan` can, and both
+                // DML executor families now dispatch `Call` there before reaching this
+                // operator builder. Anything that still lands here (e.g. `query("CALL …")`,
+                // which plans a statement and hands it straight to the executor) must FAIL.
+                //
+                // This used to return `StatusMessageOperator::new("Procedure '<name>' called
+                // with N arguments")` — a success that ran nothing, checked nothing, and
+                // counted its own status line as one affected row. That silent no-op was the
+                // whole of `CALL` for the params family. A loud error is strictly better: it
+                // cannot be mistaken for the body having run.
+                Err(Error::query_execution(format!(
+                    "Procedure '{}' was NOT executed: this execution path cannot run procedure \
+                     bodies. Invoke the procedure with a CALL statement through execute() or \
+                     execute_params() (CALL returns no rows, so it is not a query).",
+                    name
+                )))
             }
 
             // HA Operations (ha-tier1 feature)

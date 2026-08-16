@@ -832,7 +832,9 @@ inside a string literal splits a plpgsql body statement.
    procedural scope but never interpolated into the body's SQL.~~ **FIXED** — `Execute` now calls
    `ExecutionContext::interpolate` before handing the statement to the executor closure. Note the
    contrast that defines this whole entry: `CALL` works because `execute_procedure` *does* have a
-   real call site (`src/lib.rs:5571`) — `execute_function` does not, which is the entire difference
+   real call site (`execute_call_plan`, `src/lib.rs:3184` — see §2.11, which is where that call
+   site had to be *shared* before both executor families could reach it) — `execute_function` does
+   not, which is the entire difference
    between a procedural surface that ships working and one that ships dead.
 
 `query_information_schema_routines` (`src/protocol/postgres/catalog.rs:2398`) returns
@@ -931,6 +933,86 @@ introduced to prevent, reintroduced one layer down.
 when any slice lands. Move the view from that list to `populated_views_do_return_rows`, and update
 both `docs/compatibility/information_schema.md`'s Status column and the unknown-view error text in
 `src/protocol/postgres/catalog.rs`, which enumerates the always-empty set.
+
+### 2.11 `CALL` was a silent no-op in the params executor family — **found 2026-08-15, FIXED; transaction semantics still open**
+
+**Status:** the silent no-op is FIXED (see below). What remains open is the *transaction* half:
+a procedure body does not join its caller's transaction, and `CALL` inside an embedded/REPL
+`BEGIN` is refused rather than run. **Effort for the residual: medium** — it means changing how
+body statements are executed, not where `CALL` is dispatched. Not currently scheduled.
+
+Same class as §2.9 and §2.2, and found the same way: by checking v4.10.1 / v4.10.2 / v4.11.0's own
+remediation advice, which tells users to replace the unimplemented triggers with "a
+`CREATE PROCEDURE` invoked with `CALL`". §2.9 verified that advice — but only on the embedded
+`db.execute()` path. It was inert for exactly the clients most likely to follow it. The lesson
+from §1.1 recurs verbatim: **this codebase has two DML executor families, and a feature verified
+in one is not verified.** That is now five instances (constraint checks, RLS writes, the
+`execute_params` RLS leak, WAL readers, and this).
+
+**Measured** (`tests/call_parity_tests.rs`), embedded API, in-memory, before the fix:
+
+| statement | text family (`db.execute()`) | params family (`db.execute_params()`) |
+|---|---|---|
+| `CALL p0()` (no args) | Ok(0), row inserted | **Ok(1), NO row inserted** |
+| `CALL p1($1)` | n/a (no bind values) | **Ok(1), NO row inserted** |
+| `CALL nonexistent_proc()` | `Err: Procedure 'nonexistent_proc' does not exist` | **Ok(1)** |
+
+Not merely a no-op: `rows_affected = 1` actively claimed work was done, and the existence of the
+procedure was never checked. The affected population is the params family — the PostgreSQL
+**extended** protocol (psycopg with server-side bind, JDBC, sqlx, Drizzle, node-postgres), every
+REST/BaaS write, and trigger bodies via `execute_plan_internal`.
+
+**Root cause — one missing match arm and one lying stub:**
+
+1. `execute_plan_with_params_inner` (`src/lib.rs:13894`) had **no `LogicalPlan::Call` arm**. `CALL`
+   fell to its catch-all (`src/lib.rs:~15040`), which builds a `sql::Executor`.
+2. `sql::Executor` holds **no `FunctionRegistry` handle**, so its `Call` arm
+   (`src/sql/executor/mod.rs:4223`) could only do what it did:
+   `StatusMessageOperator::new(format!("Procedure '{}' called with {} arguments", …))` — a
+   one-row success. Its own comment read *"For now, return a status message. Full procedure
+   execution will be implemented later."* The `results.len()` of that one status row is where the
+   `rows_affected = 1` came from.
+
+**Fix shape (SHIPPED).** Extract the text family's arm into ONE shared private helper,
+`EmbeddedDatabase::execute_call_plan` (`src/lib.rs:3184`), and dispatch to it from both families'
+`Call` arms (`src/lib.rs:5684` text, `src/lib.rs:15022` params) — a single choke point, not a
+copy. `params` are threaded in so `CALL p($1)` binds a server-side bound argument; the text family
+passes an empty slice, which reproduces its previous evaluator exactly. The `Executor` stub now
+returns an `Err` naming the procedure and stating the body was NOT run, so any remaining route
+into it (notably `query("CALL …")`) fails loudly. **`rows_affected` is 0 in both families** —
+PostgreSQL's `CALL` command tag carries no row count, and 0 is what the text family always
+returned.
+
+**Residual, still open — the transaction half.** `execute_call_plan` runs body statements on a
+`clone_for_trigger()` handle through `execute()` / `query()`, ignoring the `&storage::Transaction`
+its caller holds (`txn` in the text family, `session_txn` in the params family). Two consequences,
+both pinned in `tests/call_parity_tests.rs`:
+
+- **A procedure body does not join its caller's transaction.** Under a wire `BEGIN` (per-session
+  transaction) or the embedded RAII `db.begin_transaction()` handle, body writes autocommit and
+  survive a `ROLLBACK` of the enclosing transaction. Long-standing; not introduced here.
+- **`CALL` inside an embedded/REPL `BEGIN` is refused, not run.** Re-entering `execute()` re-takes
+  the process-wide `current_transaction` `parking_lot::Mutex`, which is not reentrant — this
+  combination previously **hung the calling thread**, and a trigger body containing `CALL` would
+  have become a second hang once the params arm went live. A `GLOBAL_TXN_LOCK_HELD` thread-local
+  (`src/lib.rs:492`, set at `src/lib.rs:7351`) marks the window in which `execute()` holds that
+  guard across a statement, and `execute_call_plan` returns an error instead. A loud error beats a
+  hang. The PG/MySQL wire is unaffected: `execute_for_session` routes `BEGIN` to
+  `handle_transaction_control_for_session`, which never populates the global slot.
+
+The real fix for both is to execute body statements against the caller's transaction — thread the
+`&Transaction` into `execute_call_plan` and use `execute_in_transaction_no_fast_path` instead of
+re-entering `execute()`. That removes the re-entrancy entirely (making the thread-local gate
+deletable) and gives `CALL` PostgreSQL's atomicity. It is a *visibility* change, so it needs the
+same care as the identical latent issue the params catch-all's comment documents at
+`src/lib.rs:~15040`, and it must be measured for the wire-session path, whose in-session arm holds
+a `RwLockReadGuard` on the session-transaction slot across the call (`src/lib.rs:17043`).
+
+**Gate:** `tests/call_parity_tests.rs` — every case runs the same logical statement through BOTH
+families and asserts they agree, unconditionally. The two `known_gap_*` tests pin the transaction
+behaviour above; **delete them** when this residual lands, and replace them with assertions that a
+body runs and joins its caller's transaction in both families. `tests/function_unimplemented_tests.rs`
+covers the procedure-argument-binding rules and still passes unchanged.
 
 ---
 

@@ -95,8 +95,11 @@ trigger just silently produces nothing. Use the application layer, an explicit s
 statement in the same transaction, or a `CREATE PROCEDURE` invoked with `CALL`.
 
 Procedures are a real escape hatch — they execute and their arguments bind, in either
-language — with one rule: the body must reference parameters with a `$` sigil (`$p_id` or
-`$1`), never a bare name. See Recipe 6 for the working form.
+language, on every client path — with one rule: the body must reference parameters with a
+`$` sigil (`$p_id` or `$1`), never a bare name. See Recipe 6 for the working form, and for
+the two things to know before recommending it: through 4.11.0 `CALL` was a **silent no-op**
+over the PostgreSQL extended protocol and the REST layer (fixed), and `CALL` inside an
+explicit `BEGIN` on the embedded API / REPL is refused with an error.
 Note that `CREATE FUNCTION` is *not* an option: nothing can call a user-defined function.
 
 What each form actually does today:
@@ -232,6 +235,26 @@ is Nano's own parser (`src/sql/parser.rs:1789`):
 > either language. PostgreSQL resolves bare PL/pgSQL variable names; Nano deliberately
 > does not, so that a variable can never silently shadow a column of the same name.
 
+> **Fixed since 4.11.0 — which client you use mattered, and it does not any more.** Nano
+> has two DML executor families. `db.execute()` — psql simple-query, the whole MySQL wire,
+> the REPL, the embedded API — had a real `CALL` handler. `db.execute_params()` — the
+> PostgreSQL **extended** protocol (psycopg with server-side bind, JDBC, sqlx, Drizzle,
+> node-postgres) and every REST/BaaS write — did not: `CALL p()` returned success with `1`
+> row affected, **never ran the body**, and "succeeded" for a procedure that did not exist.
+> Both now share one implementation, and `CALL` reports **0** rows affected on both. If you
+> are auditing an existing deployment, procedures invoked from an extended-protocol driver
+> or `/rest/v1` before this fix did not run.
+
+> **Limitation — `CALL` inside an explicit `BEGIN`, embedded API and REPL only.** A
+> procedure body runs by re-entering the executor, which re-takes the process-wide
+> transaction lock; that lock is not reentrant, so `db.execute("BEGIN")` then `CALL p()`
+> used to hang the calling thread. It is now refused with an error naming the procedure and
+> saying the body did not run. Issue the `CALL` outside the transaction, or inline the body.
+> A `BEGIN` over the PG or MySQL **wire** is a per-session transaction and is unaffected.
+> Related, and long-standing: a procedure body does **not** join its caller's transaction —
+> its writes autocommit and survive a `ROLLBACK` of the enclosing transaction
+> (`docs/plans/ROADMAP_V5.md` §2.11).
+
 The working recipe:
 
 ```sql
@@ -298,9 +321,12 @@ string `a + 1` and `$v` interpolates that text quoted, not a computed value. Par
 references are the reliable case. `EXECUTE '<dynamic sql>'` is *not* interpolated, matching
 PostgreSQL.
 
-`CALL` executes at all because `FunctionRegistry::execute_procedure` has a real call site
-(`src/lib.rs:5571`) — unlike `execute_function`, which is why functions are dead and
-procedures are not.
+`CALL` executes at all because `FunctionRegistry::execute_procedure` has a real call site —
+unlike `execute_function`, which is why functions are dead and procedures are not. That call
+site is now `EmbeddedDatabase::execute_call_plan` (`src/lib.rs`), the single implementation
+both executor families dispatch to; the `sql::Executor` `Call` arm
+(`src/sql/executor/mod.rs`) returns an error rather than a status message, because an
+`Executor` holds no function registry and cannot run a body.
 
 ### Recipe 7: Inspect schema (three ways)
 **Postgres-style (works in any client):**
@@ -340,7 +366,7 @@ DROP TRIGGER IF EXISTS posts_audit ON posts;   -- works; `ON <table>` is mandato
 - **HNSW indexes require explicit `dim`** in `WITH (...)`. Mismatched embedding dimensions will fail at insert time, not at index creation.
 - **Triggers never fire at all** — row-level *and* statement-level, every timing, every event. `CREATE TRIGGER` returning `OK` only means it was registered. See Recipe 5; never rely on a trigger for correctness.
 - **User-defined functions are not callable by anything** — `CREATE FUNCTION` returning `OK` only means it was registered. `SELECT f(x)` errors `Unknown scalar function: f`, in a `SELECT` list, a `WHERE` clause, a `FROM` clause, via `CALL`, and via bound parameters, on both the embedded API and the wire. There is no `PERFORM`. See Recipe 6.
-- **Procedures work in either language, but the `$` sigil is mandatory** — a *bare* parameter name fails with `Column 'n' not found in schema` in both `LANGUAGE sql` and `LANGUAGE plpgsql`, deliberately, so a variable can never shadow a column. (plpgsql binding is new; through 4.10.2 a plpgsql body substituted nothing at all.) An argument a body never mentions is silently discarded, and a `$`-token inside a string literal, comment or `$tag$…$tag$` block is data, not a placeholder. See Recipe 6.
+- **Procedures work in either language, but the `$` sigil is mandatory** — a *bare* parameter name fails with `Column 'n' not found in schema` in both `LANGUAGE sql` and `LANGUAGE plpgsql`, deliberately, so a variable can never shadow a column. (plpgsql binding is new; through 4.10.2 a plpgsql body substituted nothing at all.) An argument a body never mentions is silently discarded, and a `$`-token inside a string literal, comment or `$tag$…$tag$` block is data, not a placeholder. `CALL` now runs the body on every client path and reports 0 rows affected — through 4.11.0 it was a silent no-op (returning 1 row affected, and "succeeding" for a missing procedure) over the PG extended protocol and the REST layer. On the embedded API / REPL only, `CALL` inside an explicit `BEGIN` is refused with an error. See Recipe 6.
 - **`information_schema.routines`, `information_schema.parameters` and `pg_proc` are always empty** — they return zero rows even with a function registered, so no ORM or catalog client can discover a user-defined routine.
 - **Materialized view auto-refresh** competes for CPU with foreground queries. Tune `max_cpu_percent`.
 

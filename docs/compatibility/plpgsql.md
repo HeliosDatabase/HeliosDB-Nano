@@ -89,6 +89,17 @@ Syntax is Nano's own: `CREATE [OR REPLACE] PROCEDURE name(params) LANGUAGE lang 
 `CALL` executes the body **and binds the call's arguments into it**, in **both**
 `LANGUAGE sql` and `LANGUAGE plpgsql` bodies, provided you follow one rule.
 
+> **Fixed since 4.11.0 — `CALL` used to run nothing over the extended protocol.** Nano has two
+> DML executor families. `db.execute()` (psql simple-query, the whole MySQL wire, the REPL, the
+> embedded API) had a real `CALL` handler; `db.execute_params()` — the PostgreSQL **extended**
+> protocol (psycopg with server-side bind, JDBC, sqlx, Drizzle, node-postgres) and every
+> REST/BaaS write — did not. On that path `CALL p()` returned success with `1` row affected,
+> **never ran the body**, and reported success even for a procedure that did not exist. Both
+> families now dispatch to one shared implementation, and `CALL` reports **0** rows affected
+> (PostgreSQL's `CALL` command tag carries no row count). If you relied on a procedure invoked
+> from an extended-protocol driver or through `/rest/v1`, re-check that its work actually
+> happened.
+
 **The rule — reference parameters and `DECLARE`d variables with the `$` sigil**, by name
 (`$p_id`) or positionally (`$1`). A bare name is always a column reference. (PostgreSQL itself
 resolves bare PL/pgSQL variable names; Nano deliberately does not, so that a variable can never
@@ -155,6 +166,20 @@ expressions; it stores the raw expression TEXT. So a local assigned with `v := a
 string `a + 1`, and `$v` interpolates that text quoted, not a computed value. Parameter
 references are the reliable case. `EXECUTE '<dynamic sql>'` is *not* interpolated, matching
 PostgreSQL.
+
+**Limitation — `CALL` inside an explicit transaction, embedded API and REPL only.** A procedure
+body runs by re-entering the executor, which re-takes the process-wide transaction lock; that
+lock is not reentrant, so `db.execute("BEGIN")` followed by `CALL p()` used to **hang the
+calling thread**. It is now refused with an error naming the procedure and stating that the body
+did not run. Issue the `CALL` outside the transaction, or inline the body as ordinary
+statements. A `BEGIN` over the PostgreSQL or MySQL **wire** opens a per-session transaction,
+which does not use that lock, and is unaffected.
+
+**Behaviour to know — a procedure body does not join its caller's transaction.** Body statements
+are executed through a fresh autocommit path, so under a wire `BEGIN` (or the embedded RAII
+`db.begin_transaction()` handle) the body's writes commit independently and survive a
+`ROLLBACK` of the enclosing transaction. This is long-standing behaviour, not new; it is tracked
+in `docs/plans/ROADMAP_V5.md` §2.11.
 
 Within that rule a procedure is a legitimate replacement for a trigger. It is **not** a
 replacement for a callable function — the body is a SQL statement to run, not an expression to
