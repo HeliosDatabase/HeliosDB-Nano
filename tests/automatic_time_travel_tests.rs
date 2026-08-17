@@ -21,24 +21,9 @@ use std::sync::Arc;
 fn create_simple_schema() -> Schema {
     Schema {
         columns: vec![
-            Column {
-                name: "id".to_string(),
-                data_type: DataType::Int4,
-                nullable: false,
-                primary_key: true,
-            },
-            Column {
-                name: "name".to_string(),
-                data_type: DataType::Text,
-                nullable: false,
-                primary_key: false,
-            },
-            Column {
-                name: "value".to_string(),
-                data_type: DataType::Float8,
-                nullable: false,
-                primary_key: false,
-            },
+            Column::new("id".to_string(), DataType::Int4).primary_key(),
+            Column::new("name".to_string(), DataType::Text).not_null(),
+            Column::new("value".to_string(), DataType::Float8).not_null(),
         ],
     }
 }
@@ -60,9 +45,11 @@ fn test_automatic_versioning_enabled_by_default() {
         .expect("Failed to create table");
 
     // Insert using the default insert_tuple() - should automatically version
-    let tuple = Tuple {
-        values: vec![Value::Int4(1), Value::String("Alice".to_string()), Value::Float8(100.0)],
-    };
+    let tuple = Tuple::new(vec![
+        Value::Int4(1),
+        Value::String("Alice".to_string()),
+        Value::Float8(100.0),
+    ]);
 
     engine.insert_tuple("users", tuple).expect("Failed to insert tuple");
 
@@ -76,6 +63,7 @@ fn test_automatic_versioning_enabled_by_default() {
     // Verify we can query with AS OF
     let plan = LogicalPlan::Scan {
         table_name: "users".to_string(),
+        alias: None,
         schema: Arc::new(create_simple_schema()),
         projection: None,
         as_of: Some(AsOfClause::Transaction(1)),
@@ -101,9 +89,11 @@ fn test_automatic_versioning_disabled() {
         .expect("Failed to create table");
 
     // Insert with versioning disabled
-    let tuple = Tuple {
-        values: vec![Value::Int4(1), Value::String("Bob".to_string()), Value::Float8(200.0)],
-    };
+    let tuple = Tuple::new(vec![
+        Value::Int4(1),
+        Value::String("Bob".to_string()),
+        Value::Float8(200.0),
+    ]);
 
     engine.insert_tuple("users", tuple).expect("Failed to insert tuple");
 
@@ -134,13 +124,11 @@ fn test_transparent_versioning_workflow() {
     // Insert multiple tuples using normal insert_tuple()
     // No need to call insert_tuple_versioned() explicitly
     for i in 1..=5 {
-        let tuple = Tuple {
-            values: vec![
-                Value::Int4(i),
-                Value::String(format!("Product {}", i)),
-                Value::Float8(i as f64 * 10.0),
-            ],
-        };
+        let tuple = Tuple::new(vec![
+            Value::Int4(i),
+            Value::String(format!("Product {}", i)),
+            Value::Float8(i as f64 * 10.0),
+        ]);
         engine.insert_tuple("products", tuple).expect("Failed to insert tuple");
     }
 
@@ -151,6 +139,7 @@ fn test_transparent_versioning_workflow() {
     // Query at different transaction points
     let plan_tx2 = LogicalPlan::Scan {
         table_name: "products".to_string(),
+        alias: None,
         schema: Arc::new(create_simple_schema()),
         projection: None,
         as_of: Some(AsOfClause::Transaction(2)),
@@ -158,6 +147,7 @@ fn test_transparent_versioning_workflow() {
 
     let plan_tx4 = LogicalPlan::Scan {
         table_name: "products".to_string(),
+        alias: None,
         schema: Arc::new(create_simple_schema()),
         projection: None,
         as_of: Some(AsOfClause::Transaction(4)),
@@ -190,13 +180,11 @@ fn test_tri_modal_resolution() {
 
     // Insert test data
     for i in 1..=3 {
-        let tuple = Tuple {
-            values: vec![
-                Value::Int4(i),
-                Value::String(format!("Order {}", i)),
-                Value::Float8(i as f64 * 100.0),
-            ],
-        };
+        let tuple = Tuple::new(vec![
+            Value::Int4(i),
+            Value::String(format!("Order {}", i)),
+            Value::Float8(i as f64 * 100.0),
+        ]);
         engine.insert_tuple("orders", tuple).expect("Failed to insert tuple");
     }
 
@@ -206,6 +194,7 @@ fn test_tri_modal_resolution() {
     // Test AS OF TRANSACTION
     let plan_txn = LogicalPlan::Scan {
         table_name: "orders".to_string(),
+        alias: None,
         schema: schema.clone(),
         projection: None,
         as_of: Some(AsOfClause::Transaction(2)),
@@ -216,6 +205,7 @@ fn test_tri_modal_resolution() {
     // Test AS OF SCN
     let plan_scn = LogicalPlan::Scan {
         table_name: "orders".to_string(),
+        alias: None,
         schema: schema.clone(),
         projection: None,
         as_of: Some(AsOfClause::Scn(2)),
@@ -228,6 +218,7 @@ fn test_tri_modal_resolution() {
     if let Some(metadata) = snapshot_mgr.get_snapshot_metadata(2) {
         let plan_ts = LogicalPlan::Scan {
             table_name: "orders".to_string(),
+            alias: None,
             schema: schema.clone(),
             projection: None,
             as_of: Some(AsOfClause::Timestamp(metadata.wall_clock_rfc3339())),
@@ -249,13 +240,11 @@ fn test_backward_compatibility() {
         .expect("Failed to create table");
 
     // Explicitly call insert_tuple_versioned (old API)
-    let tuple = Tuple {
-        values: vec![
-            Value::Int4(1),
-            Value::String("Legacy".to_string()),
-            Value::Float8(999.0),
-        ],
-    };
+    let tuple = Tuple::new(vec![
+        Value::Int4(1),
+        Value::String("Legacy".to_string()),
+        Value::Float8(999.0),
+    ]);
 
     engine
         .insert_tuple_versioned("legacy", tuple)
@@ -267,6 +256,7 @@ fn test_backward_compatibility() {
 
     let plan = LogicalPlan::Scan {
         table_name: "legacy".to_string(),
+        alias: None,
         schema: Arc::new(create_simple_schema()),
         projection: None,
         as_of: Some(AsOfClause::Transaction(1)),
@@ -291,25 +281,21 @@ fn test_force_versioning_when_disabled() {
         .expect("Failed to create table");
 
     // Use insert_tuple() - should NOT version
-    let tuple1 = Tuple {
-        values: vec![
-            Value::Int4(1),
-            Value::String("NoVersion".to_string()),
-            Value::Float8(100.0),
-        ],
-    };
+    let tuple1 = Tuple::new(vec![
+        Value::Int4(1),
+        Value::String("NoVersion".to_string()),
+        Value::Float8(100.0),
+    ]);
     engine.insert_tuple("manual", tuple1).expect("Failed to insert");
 
     assert_eq!(engine.snapshot_manager().snapshot_count(), 0);
 
     // Use insert_tuple_versioned() - SHOULD version
-    let tuple2 = Tuple {
-        values: vec![
-            Value::Int4(2),
-            Value::String("Versioned".to_string()),
-            Value::Float8(200.0),
-        ],
-    };
+    let tuple2 = Tuple::new(vec![
+        Value::Int4(2),
+        Value::String("Versioned".to_string()),
+        Value::Float8(200.0),
+    ]);
     engine
         .insert_tuple_versioned("manual", tuple2)
         .expect("Failed to insert versioned");
@@ -333,13 +319,11 @@ fn test_automatic_gc_integration() {
     // Insert enough tuples to trigger GC (GC default max is 1000)
     // We'll insert a smaller number to verify GC can run
     for i in 1..=50 {
-        let tuple = Tuple {
-            values: vec![
-                Value::Int4(i),
-                Value::String(format!("Item {}", i)),
-                Value::Float8(i as f64),
-            ],
-        };
+        let tuple = Tuple::new(vec![
+            Value::Int4(i),
+            Value::String(format!("Item {}", i)),
+            Value::Float8(i as f64),
+        ]);
         engine.insert_tuple("gc_test", tuple).expect("Failed to insert");
     }
 
@@ -360,13 +344,11 @@ fn test_snapshot_isolation_automatic() {
 
     // Insert data points
     for i in 1..=5 {
-        let tuple = Tuple {
-            values: vec![
-                Value::Int4(i),
-                Value::String(format!("Data {}", i)),
-                Value::Float8(i as f64 * 50.0),
-            ],
-        };
+        let tuple = Tuple::new(vec![
+            Value::Int4(i),
+            Value::String(format!("Data {}", i)),
+            Value::Float8(i as f64 * 50.0),
+        ]);
         engine.insert_tuple("isolation", tuple).expect("Failed to insert");
     }
 
@@ -376,6 +358,7 @@ fn test_snapshot_isolation_automatic() {
     // Create two snapshots at different points
     let plan_early = LogicalPlan::Scan {
         table_name: "isolation".to_string(),
+        alias: None,
         schema: schema.clone(),
         projection: None,
         as_of: Some(AsOfClause::Transaction(2)),
@@ -383,6 +366,7 @@ fn test_snapshot_isolation_automatic() {
 
     let plan_late = LogicalPlan::Scan {
         table_name: "isolation".to_string(),
+        alias: None,
         schema: schema.clone(),
         projection: None,
         as_of: Some(AsOfClause::Transaction(4)),
@@ -419,13 +403,11 @@ fn test_performance_overhead_automatic() {
 
     let start = Instant::now();
     for i in 1..=100 {
-        let tuple = Tuple {
-            values: vec![
-                Value::Int4(i),
-                Value::String(format!("Item {}", i)),
-                Value::Float8(i as f64),
-            ],
-        };
+        let tuple = Tuple::new(vec![
+            Value::Int4(i),
+            Value::String(format!("Item {}", i)),
+            Value::Float8(i as f64),
+        ]);
         engine_no_tt
             .insert_tuple("perf_no_tt", tuple)
             .expect("Failed to insert");
@@ -443,13 +425,11 @@ fn test_performance_overhead_automatic() {
 
     let start = Instant::now();
     for i in 1..=100 {
-        let tuple = Tuple {
-            values: vec![
-                Value::Int4(i),
-                Value::String(format!("Item {}", i)),
-                Value::Float8(i as f64),
-            ],
-        };
+        let tuple = Tuple::new(vec![
+            Value::Int4(i),
+            Value::String(format!("Item {}", i)),
+            Value::Float8(i as f64),
+        ]);
         engine_with_tt
             .insert_tuple("perf_with_tt", tuple)
             .expect("Failed to insert");
@@ -486,24 +466,29 @@ fn test_zero_config_experience() {
     engine
         .insert_tuple(
             "simple",
-            Tuple {
-                values: vec![Value::Int4(1), Value::String("First".to_string()), Value::Float8(1.0)],
-            },
+            Tuple::new(vec![
+                Value::Int4(1),
+                Value::String("First".to_string()),
+                Value::Float8(1.0),
+            ]),
         )
         .expect("Failed to insert");
 
     engine
         .insert_tuple(
             "simple",
-            Tuple {
-                values: vec![Value::Int4(2), Value::String("Second".to_string()), Value::Float8(2.0)],
-            },
+            Tuple::new(vec![
+                Value::Int4(2),
+                Value::String("Second".to_string()),
+                Value::Float8(2.0),
+            ]),
         )
         .expect("Failed to insert");
 
     // Step 3: Query historical data (it just works!)
     let plan = LogicalPlan::Scan {
         table_name: "simple".to_string(),
+        alias: None,
         schema: Arc::new(create_simple_schema()),
         projection: None,
         as_of: Some(AsOfClause::Transaction(1)),

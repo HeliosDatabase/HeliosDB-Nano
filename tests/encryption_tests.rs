@@ -178,22 +178,12 @@ fn test_encrypted_table_operations() {
 
     // Create table with schema
     let schema = Schema::new(vec![
-        Column {
-            name: "id".to_string(),
-            data_type: DataType::Int4,
-            nullable: false,
-            primary_key: true,
-            source_table: None,
-            source_table_name: None,
-        },
-        Column {
-            name: "secret".to_string(),
-            data_type: DataType::Text,
-            nullable: false,
-            primary_key: false,
-            source_table: None,
-            source_table_name: None,
-        },
+        // Built via the constructor + builders rather than a struct literal: a literal
+        // has to name every field, which is why this file stopped compiling when
+        // `Column` gained `default_expr`, `unique` and `storage_mode`. `Column::new`
+        // supplies defaults for anything added later.
+        Column::new("id", DataType::Int4).not_null().primary_key(),
+        Column::new("secret", DataType::Text).not_null(),
     ]);
 
     catalog

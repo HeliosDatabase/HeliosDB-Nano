@@ -16,6 +16,7 @@
 
 #![cfg(feature = "internal-tests")]
 
+use heliosdb_nano::sql::{AsOfClause, LogicalPlan};
 use heliosdb_nano::storage::{
     AutoRefreshConfig, AutoRefreshWorker, BranchOptions, MVScheduler, MaterializedViewCatalog,
     MaterializedViewMetadata, MvSystemViews, Priority, SchedulerConfig, StorageEngine,
@@ -32,32 +33,53 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 fn create_test_schema() -> Schema {
     Schema {
         columns: vec![
-            Column {
-                name: "id".to_string(),
-                data_type: DataType::Int4,
-                nullable: false,
-                primary_key: true,
-            },
-            Column {
-                name: "name".to_string(),
-                data_type: DataType::Text,
-                nullable: false,
-                primary_key: false,
-            },
-            Column {
-                name: "value".to_string(),
-                data_type: DataType::Float8,
-                nullable: false,
-                primary_key: false,
-            },
+            Column::new("id".to_string(), DataType::Int4).primary_key(),
+            Column::new("name".to_string(), DataType::Text).not_null(),
+            Column::new("value".to_string(), DataType::Float8).not_null(),
         ],
     }
 }
 
 fn create_test_tuple(id: i32, name: &str, value: f64) -> Tuple {
-    Tuple {
-        values: vec![Value::Int4(id), Value::String(name.to_string()), Value::Float8(value)],
+    Tuple::new(vec![
+        Value::Int4(id),
+        Value::String(name.to_string()),
+        Value::Float8(value),
+    ])
+}
+
+/// Build MV metadata the way the current catalog wants it: a name, the query
+/// text, a *serialized logical plan* for REFRESH to re-execute, the base-table
+/// list, and the result schema. Auto-refresh is no longer a struct field — it
+/// is an entry in the free-form `metadata` map, which is what the auto-refresh
+/// worker and `pg_mv_auto_refresh_status` both read.
+fn mv_metadata(
+    name: &str,
+    query: &str,
+    base_tables: &[&str],
+    schema: Schema,
+    auto_refresh: bool,
+) -> MaterializedViewMetadata {
+    let plan = LogicalPlan::Scan {
+        table_name: base_tables.first().copied().unwrap_or(name).to_string(),
+        alias: None,
+        schema: Arc::new(schema.clone()),
+        projection: None,
+        as_of: None,
+    };
+    let plan_bytes = bincode::serialize(&plan).expect("Failed to serialize query plan");
+
+    let mut metadata = MaterializedViewMetadata::new(
+        name.to_string(),
+        query.to_string(),
+        plan_bytes,
+        base_tables.iter().map(|t| t.to_string()).collect(),
+        schema,
+    );
+    if auto_refresh {
+        metadata.metadata.insert("auto_refresh".to_string(), "true".to_string());
     }
+    metadata
 }
 
 fn current_timestamp_ms() -> u64 {
@@ -227,28 +249,26 @@ fn test_05_snapshot_creation_and_retrieval() {
 
     // Insert version 1
     storage
-        .catalog()
-        .insert("history_test", create_test_tuple(1, "v1", 100.0))
+        .insert_tuple("history_test", create_test_tuple(1, "v1", 100.0))
         .expect("Failed to insert v1");
 
     let snapshot1 = current_timestamp_ms();
     storage
         .snapshot_manager()
-        .create_snapshot(snapshot1, 1001)
+        .register_snapshot_with_lsn(snapshot1, 1001)
         .expect("Failed to create snapshot 1");
 
     thread::sleep(Duration::from_millis(10));
 
     // Insert version 2
     storage
-        .catalog()
-        .insert("history_test", create_test_tuple(1, "v2", 200.0))
+        .insert_tuple("history_test", create_test_tuple(1, "v2", 200.0))
         .expect("Failed to insert v2");
 
     let snapshot2 = current_timestamp_ms();
     storage
         .snapshot_manager()
-        .create_snapshot(snapshot2, 1002)
+        .register_snapshot_with_lsn(snapshot2, 1002)
         .expect("Failed to create snapshot 2");
 
     // Verify snapshots are created
@@ -271,7 +291,7 @@ fn test_06_transaction_to_snapshot_mapping() {
     let snapshot1 = current_timestamp_ms();
     storage
         .snapshot_manager()
-        .create_snapshot(snapshot1, txn_id1)
+        .register_snapshot_with_lsn(snapshot1, txn_id1)
         .expect("Failed to create snapshot 1");
 
     thread::sleep(Duration::from_millis(10));
@@ -279,21 +299,23 @@ fn test_06_transaction_to_snapshot_mapping() {
     let snapshot2 = current_timestamp_ms();
     storage
         .snapshot_manager()
-        .create_snapshot(snapshot2, txn_id2)
+        .register_snapshot_with_lsn(snapshot2, txn_id2)
         .expect("Failed to create snapshot 2");
 
-    // Verify transaction mapping
+    // Verify transaction mapping. `get_timestamp_for_transaction` is gone;
+    // txn -> timestamp resolution now goes through `resolve_as_of`, which
+    // errors (rather than returning None) for an unknown transaction.
     let ts1 = storage
         .snapshot_manager()
-        .get_timestamp_for_transaction(txn_id1)
+        .resolve_as_of(&AsOfClause::Transaction(txn_id1))
         .expect("Failed to get timestamp");
-    assert_eq!(ts1, Some(snapshot1));
+    assert_eq!(ts1, snapshot1);
 
     let ts2 = storage
         .snapshot_manager()
-        .get_timestamp_for_transaction(txn_id2)
+        .resolve_as_of(&AsOfClause::Transaction(txn_id2))
         .expect("Failed to get timestamp");
-    assert_eq!(ts2, Some(snapshot2));
+    assert_eq!(ts2, snapshot2);
 }
 
 #[test]
@@ -301,23 +323,27 @@ fn test_07_scn_mapping() {
     let config = Config::in_memory();
     let storage = Arc::new(StorageEngine::open_in_memory(&config).expect("Failed to create storage"));
 
-    // Create snapshots with SCN
-    for scn in 3001..=3005 {
+    // SCNs are no longer supplied by the caller (`create_snapshot_with_scn` is
+    // gone) — the SnapshotManager allocates one per registered snapshot and
+    // hands it back on the returned metadata.
+    let mut registered = Vec::new();
+    for _ in 0..5 {
         let timestamp = current_timestamp_ms();
-        storage
+        let metadata = storage
             .snapshot_manager()
-            .create_snapshot_with_scn(timestamp, scn)
-            .expect("Failed to create snapshot with SCN");
+            .register_snapshot(timestamp)
+            .expect("Failed to register snapshot");
+        registered.push((metadata.scn, timestamp));
         thread::sleep(Duration::from_millis(5));
     }
 
     // Verify SCN mappings
-    for scn in 3001..=3005 {
+    for (scn, expected_ts) in registered {
         let ts = storage
             .snapshot_manager()
-            .get_timestamp_for_scn(scn)
+            .resolve_scn(scn)
             .expect("Failed to get timestamp for SCN");
-        assert!(ts.is_some(), "SCN {} should map to timestamp", scn);
+        assert_eq!(ts, expected_ts, "SCN {} should map to its snapshot timestamp", scn);
     }
 }
 
@@ -332,7 +358,7 @@ fn test_08_snapshot_gc_policy() {
         let snapshot = current_timestamp_ms();
         storage
             .snapshot_manager()
-            .create_snapshot(snapshot, 4000 + i)
+            .register_snapshot_with_lsn(snapshot, 4000 + i)
             .expect("Failed to create snapshot");
         snapshot_ids.push(snapshot);
         thread::sleep(Duration::from_millis(5));
@@ -360,7 +386,7 @@ async fn test_09_mv_scheduler_creation() {
 
     // Verify scheduler is created
     let stats = scheduler.get_stats();
-    assert_eq!(stats.queued_tasks, 0, "Should start with 0 queued tasks");
+    assert_eq!(stats.queue_size, 0, "Should start with 0 queued tasks");
     assert_eq!(stats.running_tasks, 0, "Should start with 0 running tasks");
 }
 
@@ -376,16 +402,15 @@ async fn test_10_mv_scheduler_priority_queue() {
         .expect("Failed to create table");
 
     // Create MV
-    let mv_catalog = MaterializedViewCatalog::new(storage.inner_db());
+    let mv_catalog = MaterializedViewCatalog::new(&storage);
     mv_catalog
-        .create_materialized_view(MaterializedViewMetadata {
-            name: "test_mv".to_string(),
-            query: "SELECT * FROM test_data".to_string(),
-            schema: create_test_schema(),
-            created_at: current_timestamp_ms(),
-            last_refresh_at: current_timestamp_ms(),
-            auto_refresh: false,
-        })
+        .create_view(mv_metadata(
+            "test_mv",
+            "SELECT * FROM test_data",
+            &["test_data"],
+            create_test_schema(),
+            false,
+        ))
         .expect("Failed to create MV");
 
     let scheduler_config = SchedulerConfig::default();
@@ -400,7 +425,7 @@ async fn test_10_mv_scheduler_priority_queue() {
         .expect("Failed to schedule high priority");
 
     let stats = scheduler.get_stats();
-    assert!(stats.queued_tasks > 0, "Should have queued tasks");
+    assert!(stats.queue_size > 0, "Should have queued tasks");
 }
 
 #[tokio::test]
@@ -443,7 +468,7 @@ async fn test_12_scheduler_cpu_monitoring() {
 
     let mut scheduler_config = SchedulerConfig::default();
     scheduler_config.max_cpu_percent = 75.0;
-    scheduler_config.max_concurrent_refreshes = 2;
+    scheduler_config.max_concurrent = 2;
 
     let scheduler = MVScheduler::new(scheduler_config, Arc::clone(&storage));
 
@@ -457,26 +482,34 @@ async fn test_13_mv_system_views() {
     let config = Config::in_memory();
     let storage = Arc::new(StorageEngine::open_in_memory(&config).expect("Failed to create storage"));
 
-    let mv_catalog = MaterializedViewCatalog::new(storage.inner_db());
+    let mv_catalog = MaterializedViewCatalog::new(&storage);
 
     // Create test MV
     mv_catalog
-        .create_materialized_view(MaterializedViewMetadata {
-            name: "system_view_test".to_string(),
-            query: "SELECT 1".to_string(),
-            schema: Schema { columns: vec![] },
-            created_at: current_timestamp_ms(),
-            last_refresh_at: current_timestamp_ms(),
-            auto_refresh: true,
-        })
+        .create_view(mv_metadata(
+            "system_view_test",
+            "SELECT 1",
+            &[],
+            Schema { columns: vec![] },
+            true,
+        ))
         .expect("Failed to create MV");
 
-    // Query system views
-    let system_views = MvSystemViews::new(storage.inner_db());
-    let mv_list = system_views.list_materialized_views().expect("Failed to list MVs");
+    // Query system views. `MvSystemViews::list_materialized_views` is gone;
+    // the enumerating system view is `pg_mv_auto_refresh_status`, which walks
+    // the MV catalog and reports one row per view.
+    let scheduler = Arc::new(MVScheduler::new(SchedulerConfig::default(), Arc::clone(&storage)));
+    let system_views = MvSystemViews::new(Arc::clone(&storage), scheduler);
+    let mv_list = system_views.pg_mv_auto_refresh_status().expect("Failed to list MVs");
 
     assert!(!mv_list.is_empty(), "Should have at least one MV");
-    assert!(mv_list.iter().any(|m| m.name == "system_view_test"));
+    assert!(mv_list.iter().any(|m| m.mv_name == "system_view_test"));
+    assert!(
+        mv_list
+            .iter()
+            .any(|m| m.mv_name == "system_view_test" && m.auto_refresh_enabled),
+        "auto_refresh should be reported as enabled"
+    );
 }
 
 // ============================================================================
@@ -494,15 +527,14 @@ fn test_14_branching_with_time_travel() {
         .create_table("versioned", create_test_schema())
         .expect("Failed to create table");
     storage
-        .catalog()
-        .insert("versioned", create_test_tuple(1, "main_v1", 100.0))
+        .insert_tuple("versioned", create_test_tuple(1, "main_v1", 100.0))
         .expect("Failed to insert");
 
     // Create snapshot
     let snapshot1 = current_timestamp_ms();
     storage
         .snapshot_manager()
-        .create_snapshot(snapshot1, 5001)
+        .register_snapshot_with_lsn(snapshot1, 5001)
         .expect("Failed to create snapshot");
 
     // Create branch
@@ -512,15 +544,14 @@ fn test_14_branching_with_time_travel() {
 
     // Update on main
     storage
-        .catalog()
-        .insert("versioned", create_test_tuple(1, "main_v2", 200.0))
+        .insert_tuple("versioned", create_test_tuple(1, "main_v2", 200.0))
         .expect("Failed to update");
 
     // Create another snapshot
     let snapshot2 = current_timestamp_ms();
     storage
         .snapshot_manager()
-        .create_snapshot(snapshot2, 5002)
+        .register_snapshot_with_lsn(snapshot2, 5002)
         .expect("Failed to create snapshot");
 
     // Verify branch and snapshot coexist
@@ -546,16 +577,15 @@ async fn test_15_mv_with_branching() {
         .expect("Failed to create table");
 
     // Create MV
-    let mv_catalog = MaterializedViewCatalog::new(storage.inner_db());
+    let mv_catalog = MaterializedViewCatalog::new(&storage);
     mv_catalog
-        .create_materialized_view(MaterializedViewMetadata {
-            name: "mv_on_main".to_string(),
-            query: "SELECT * FROM mv_branch_test".to_string(),
-            schema: create_test_schema(),
-            created_at: current_timestamp_ms(),
-            last_refresh_at: current_timestamp_ms(),
-            auto_refresh: false,
-        })
+        .create_view(mv_metadata(
+            "mv_on_main",
+            "SELECT * FROM mv_branch_test",
+            &["mv_branch_test"],
+            create_test_schema(),
+            false,
+        ))
         .expect("Failed to create MV");
 
     // Create branch
@@ -565,7 +595,7 @@ async fn test_15_mv_with_branching() {
 
     // Verify both exist
     let branches = storage.list_branches().expect("Failed to list branches");
-    let mvs = mv_catalog.list_all().expect("Failed to list MVs");
+    let mvs = mv_catalog.list_views().expect("Failed to list MVs");
 
     assert_eq!(branches.len(), 2);
     assert!(!mvs.is_empty());
@@ -584,15 +614,14 @@ async fn test_16_full_stack_integration() {
 
     // Insert data
     storage
-        .catalog()
-        .insert("full_stack", create_test_tuple(1, "test", 123.0))
+        .insert_tuple("full_stack", create_test_tuple(1, "test", 123.0))
         .expect("Failed to insert");
 
     // Create snapshot
     let snapshot = current_timestamp_ms();
     storage
         .snapshot_manager()
-        .create_snapshot(snapshot, 6001)
+        .register_snapshot_with_lsn(snapshot, 6001)
         .expect("Failed to create snapshot");
 
     // Create branch
@@ -601,16 +630,15 @@ async fn test_16_full_stack_integration() {
         .expect("Failed to create branch");
 
     // Create MV
-    let mv_catalog = MaterializedViewCatalog::new(storage.inner_db());
+    let mv_catalog = MaterializedViewCatalog::new(&storage);
     mv_catalog
-        .create_materialized_view(MaterializedViewMetadata {
-            name: "full_mv".to_string(),
-            query: "SELECT * FROM full_stack".to_string(),
-            schema: create_test_schema(),
-            created_at: current_timestamp_ms(),
-            last_refresh_at: current_timestamp_ms(),
-            auto_refresh: true,
-        })
+        .create_view(mv_metadata(
+            "full_mv",
+            "SELECT * FROM full_stack",
+            &["full_stack"],
+            create_test_schema(),
+            true,
+        ))
         .expect("Failed to create MV");
 
     // Verify everything exists together
@@ -619,7 +647,7 @@ async fn test_16_full_stack_integration() {
         .snapshot_manager()
         .list_snapshots()
         .expect("Failed to list snapshots");
-    let mvs = mv_catalog.list_all().expect("Failed to list MVs");
+    let mvs = mv_catalog.list_views().expect("Failed to list MVs");
 
     assert_eq!(branches.len(), 2, "Should have 2 branches");
     assert!(!snapshots.is_empty(), "Should have snapshots");
@@ -671,7 +699,7 @@ fn test_18_snapshot_creation_performance() {
         let timestamp = current_timestamp_ms() + i;
         storage
             .snapshot_manager()
-            .create_snapshot(timestamp, 7000 + i)
+            .register_snapshot_with_lsn(timestamp, 7000 + i)
             .expect("Failed to create snapshot");
     }
     let elapsed = start.elapsed();
@@ -697,17 +725,16 @@ async fn test_19_scheduler_task_throughput() {
         .create_table("throughput_test", create_test_schema())
         .expect("Failed to create table");
 
-    let mv_catalog = MaterializedViewCatalog::new(storage.inner_db());
+    let mv_catalog = MaterializedViewCatalog::new(&storage);
     for i in 0..5 {
         mv_catalog
-            .create_materialized_view(MaterializedViewMetadata {
-                name: format!("throughput_mv_{}", i),
-                query: "SELECT * FROM throughput_test".to_string(),
-                schema: create_test_schema(),
-                created_at: current_timestamp_ms(),
-                last_refresh_at: current_timestamp_ms(),
-                auto_refresh: false,
-            })
+            .create_view(mv_metadata(
+                &format!("throughput_mv_{}", i),
+                "SELECT * FROM throughput_test",
+                &["throughput_test"],
+                create_test_schema(),
+                false,
+            ))
             .expect("Failed to create MV");
     }
 

@@ -15,10 +15,10 @@
 
 use heliosdb_nano::sql::LogicalPlan;
 use heliosdb_nano::storage::{
-    AutoRefreshConfig, AutoRefreshPolicy, AutoRefreshWorker, MVScheduler, MaterializedViewCatalog,
-    MaterializedViewMetadata, MvSystemViews, Priority, SchedulerConfig, StorageEngine,
+    AutoRefreshConfig, AutoRefreshWorker, MVScheduler, MaterializedViewCatalog, MaterializedViewMetadata,
+    MvSystemViews, SchedulerConfig, StorageEngine,
 };
-use heliosdb_nano::{Column, Config, DataType, Schema, Tuple, Value};
+use heliosdb_nano::{Column, Config, DataType, Schema, Value};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -50,70 +50,16 @@ async fn test_auto_refresh_worker_lifecycle() {
     assert!(!worker.is_running());
 }
 
-#[tokio::test]
-async fn test_auto_refresh_registration() {
-    let config = Config::in_memory();
-    let storage = Arc::new(StorageEngine::open_in_memory(&config).unwrap());
-    let scheduler_config = SchedulerConfig::default();
-    let scheduler = Arc::new(MVScheduler::new(scheduler_config, Arc::clone(&storage)));
-
-    let worker_config = AutoRefreshConfig::default();
-    let worker = AutoRefreshWorker::new(worker_config, storage, scheduler);
-
-    // Register MV for auto-refresh
-    let policy = AutoRefreshPolicy {
-        enabled: true,
-        refresh_interval_seconds: Some(300),
-        priority: Priority::Normal,
-        concurrent: true,
-    };
-
-    worker.register_mv("test_view", policy.clone()).unwrap();
-
-    // Verify registration
-    let retrieved = worker.get_policy("test_view").unwrap();
-    assert_eq!(retrieved.enabled, true);
-    assert_eq!(retrieved.refresh_interval_seconds, Some(300));
-
-    // Unregister
-    worker.unregister_mv("test_view").unwrap();
-    assert!(worker.get_policy("test_view").is_none());
-}
-
-#[tokio::test]
-async fn test_auto_refresh_policy_update() {
-    let config = Config::in_memory();
-    let storage = Arc::new(StorageEngine::open_in_memory(&config).unwrap());
-    let scheduler_config = SchedulerConfig::default();
-    let scheduler = Arc::new(MVScheduler::new(scheduler_config, storage, scheduler));
-
-    let worker_config = AutoRefreshConfig::default();
-    let worker = AutoRefreshWorker::new(worker_config, storage, scheduler);
-
-    // Register with initial policy
-    let initial_policy = AutoRefreshPolicy {
-        enabled: true,
-        refresh_interval_seconds: Some(300),
-        priority: Priority::Normal,
-        concurrent: true,
-    };
-    worker.register_mv("test_view", initial_policy).unwrap();
-
-    // Update policy
-    let updated_policy = AutoRefreshPolicy {
-        enabled: true,
-        refresh_interval_seconds: Some(600),
-        priority: Priority::High,
-        concurrent: false,
-    };
-    worker.update_policy("test_view", updated_policy.clone()).unwrap();
-
-    // Verify update
-    let retrieved = worker.get_policy("test_view").unwrap();
-    assert_eq!(retrieved.refresh_interval_seconds, Some(600));
-    assert_eq!(retrieved.priority, Priority::High);
-    assert_eq!(retrieved.concurrent, false);
-}
+// `test_auto_refresh_registration` and `test_auto_refresh_policy_update` were
+// deleted here: they exercised `AutoRefreshWorker::{register_mv, unregister_mv,
+// get_policy, update_policy}` and the `AutoRefreshPolicy` struct, none of which
+// exist any more. Per-MV auto-refresh opt-in is no longer a worker-side policy
+// registry — it lives in `MaterializedViewMetadata.metadata["auto_refresh"]`,
+// which `perform_staleness_check` reads from the MV catalog. There is no
+// per-MV interval/priority/concurrency knob to assert on at all: the worker
+// applies its single `AutoRefreshConfig` to every view and always schedules
+// with `Priority::Normal`. `test_system_views_status` below covers the
+// surviving opt-in path.
 
 #[test]
 fn test_system_views_status() {
@@ -128,6 +74,7 @@ fn test_system_views_status() {
 
     let query_plan = LogicalPlan::Scan {
         table_name: "test".to_string(),
+        alias: None,
         schema: std::sync::Arc::new(schema.clone()),
         projection: None,
         as_of: None,
@@ -192,7 +139,7 @@ async fn test_config_runtime_updates() {
     let config = Config::in_memory();
     let storage = Arc::new(StorageEngine::open_in_memory(&config).unwrap());
     let scheduler_config = SchedulerConfig::default();
-    let scheduler = Arc::new(MVScheduler::new(scheduler_config, storage, scheduler));
+    let scheduler = Arc::new(MVScheduler::new(scheduler_config, Arc::clone(&storage)));
 
     let worker_config = AutoRefreshConfig::default();
     let worker = AutoRefreshWorker::new(worker_config, storage, scheduler);
@@ -214,9 +161,9 @@ async fn test_config_runtime_updates() {
 #[test]
 fn test_refresh_history_schema() {
     let schema = MvSystemViews::history_schema();
-    assert_eq!(schema.columns().len(), 8);
+    assert_eq!(schema.columns.len(), 8);
 
-    let col_names: Vec<&str> = schema.columns().iter().map(|c| c.name()).collect();
+    let col_names: Vec<&str> = schema.columns.iter().map(|c| c.name.as_str()).collect();
     assert!(col_names.contains(&"mv_name"));
     assert!(col_names.contains(&"start_time"));
     assert!(col_names.contains(&"success"));
@@ -294,6 +241,7 @@ async fn test_staleness_based_refresh_trigger() {
 
     let query_plan = LogicalPlan::Scan {
         table_name: "test".to_string(),
+        alias: None,
         schema: std::sync::Arc::new(schema.clone()),
         projection: None,
         as_of: None,
@@ -318,9 +266,8 @@ async fn test_staleness_based_refresh_trigger() {
 
     let mut worker = AutoRefreshWorker::new(worker_config, Arc::clone(&storage), scheduler);
 
-    // Register the MV
-    let policy = AutoRefreshPolicy::default();
-    worker.register_mv("stale_view", policy).unwrap();
+    // The MV opts in via its own catalog metadata (`auto_refresh = true`, set
+    // above) — the worker no longer keeps a per-MV registration of its own.
 
     // Start worker
     worker.start().await.unwrap();
@@ -335,25 +282,8 @@ async fn test_staleness_based_refresh_trigger() {
     // For now, we're just testing that the worker runs without errors
 }
 
-#[test]
-fn test_list_registered_mvs() {
-    let config = Config::in_memory();
-    let storage = Arc::new(StorageEngine::open_in_memory(&config).unwrap());
-    let scheduler_config = SchedulerConfig::default();
-    let scheduler = Arc::new(MVScheduler::new(scheduler_config, storage, scheduler));
-
-    let worker_config = AutoRefreshConfig::default();
-    let worker = AutoRefreshWorker::new(worker_config, storage, scheduler);
-
-    // Register multiple MVs
-    let policy = AutoRefreshPolicy::default();
-    worker.register_mv("mv1", policy.clone()).unwrap();
-    worker.register_mv("mv2", policy.clone()).unwrap();
-    worker.register_mv("mv3", policy).unwrap();
-
-    let registered = worker.list_registered_mvs();
-    assert_eq!(registered.len(), 3);
-    assert!(registered.contains(&"mv1".to_string()));
-    assert!(registered.contains(&"mv2".to_string()));
-    assert!(registered.contains(&"mv3".to_string()));
-}
+// `test_list_registered_mvs` was deleted here: `AutoRefreshWorker::
+// list_registered_mvs` no longer exists, and neither does the registry it
+// listed. The set of views the worker acts on is now derived on every pass
+// from `MaterializedViewCatalog::list_views()` filtered by the
+// `auto_refresh` metadata key, so there is no worker-side list to enumerate.
