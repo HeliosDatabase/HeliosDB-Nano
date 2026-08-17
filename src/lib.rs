@@ -20420,6 +20420,46 @@ impl EmbeddedDatabase {
         self.apply_rls_to_plan_recursive(plan)
     }
 
+    /// THE one place a SELECT policy becomes a plan predicate.
+    ///
+    /// Returns `Some(parsed predicate)` iff RLS applies to `table_name` for reads.
+    /// Both scan-leaf arms of [`apply_rls_to_plan_recursive`](Self::apply_rls_to_plan_recursive)
+    /// route through this, so a read policy has exactly ONE parse and ONE
+    /// meaning:
+    ///
+    /// > A read policy on table T attaches to T's scan leaf as a scan-level
+    /// > predicate (`FilteredScan.predicate`), which the executor evaluates
+    /// > against the full base-table row BEFORE any projection is applied.
+    ///
+    /// Before this existed the two arms each parsed the policy themselves and
+    /// attached it differently — `Scan` wrapped a `Filter` ABOVE the scan while
+    /// `FilteredScan` merged INTO the scan's predicate. Since the text-family
+    /// pipelines apply RLS *after* `ProjectionPruningRule` has pushed a
+    /// projection into a bare `Scan`, the `Filter` arm could reference a column
+    /// the scan no longer emitted, and the read failed with
+    /// `Column '<policy column>' not found in schema`. One rule with two
+    /// implementations; this is the single implementation.
+    ///
+    /// FAIL-CLOSED: a policy that will not parse propagates `Err` to the caller.
+    /// Never downgrade that to `None` (= "no policy applies"), which would serve
+    /// the unfiltered table. Pinned by `rls_parse_error_on_read_fails_closed` in
+    /// `tests/rls_read_parity_tests.rs`.
+    fn rls_read_predicate(
+        &self,
+        table_name: &str,
+        schema: &std::sync::Arc<Schema>,
+    ) -> Result<Option<sql::LogicalExpr>> {
+        if !self.tenant_manager.should_apply_rls(table_name, "SELECT") {
+            return Ok(None);
+        }
+        let Some((using_expr, _)) = self.tenant_manager.get_rls_conditions(table_name, "SELECT") else {
+            return Ok(None);
+        };
+        let tenant_context = self.tenant_manager.get_current_context();
+        let rls_evaluator = tenant::RLSExpressionEvaluator::new(schema.clone(), tenant_context);
+        Ok(Some(rls_evaluator.parse(&using_expr)?))
+    }
+
     /// Recursively apply RLS to all Scan operators in a plan
     fn apply_rls_to_plan_recursive(&self, plan: sql::LogicalPlan) -> Result<sql::LogicalPlan> {
         match plan {
@@ -20430,28 +20470,24 @@ impl EmbeddedDatabase {
                 projection,
                 as_of,
             } => {
-                // Check if RLS should be applied to this table
-                if self.tenant_manager.should_apply_rls(&table_name, "SELECT") {
-                    if let Some((using_expr, _)) = self.tenant_manager.get_rls_conditions(&table_name, "SELECT") {
-                        // Parse the RLS expression
-                        let tenant_context = self.tenant_manager.get_current_context();
-                        let rls_evaluator = tenant::RLSExpressionEvaluator::new(schema.clone(), tenant_context);
-                        let filter_expr = rls_evaluator.parse(&using_expr)?;
-
-                        // Create a Filter plan wrapping the Scan
-                        let scan_plan = sql::LogicalPlan::Scan {
-                            table_name,
-                            alias: alias.clone(),
-                            schema,
-                            projection,
-                            as_of,
-                        };
-
-                        return Ok(sql::LogicalPlan::Filter {
-                            input: Box::new(scan_plan),
-                            predicate: filter_expr,
-                        });
-                    }
+                // Emit a FilteredScan carrying the policy as the scan's own
+                // predicate rather than a Filter wrapped ABOVE the scan. The
+                // projection is PRESERVED: `FilteredScan` evaluates its
+                // predicate against the full base-table schema before rows are
+                // projected (`handle_filtered_scan`, and the index fast paths
+                // that re-filter with the full-width schema), so a policy on a
+                // column outside the projection resolves. `Scan::schema()` and
+                // `FilteredScan::schema()` are the same function, so nothing
+                // above the leaf sees a different arity or column set.
+                if let Some(rls_predicate) = self.rls_read_predicate(&table_name, &schema)? {
+                    return Ok(sql::LogicalPlan::FilteredScan {
+                        table_name,
+                        alias,
+                        schema,
+                        projection,
+                        predicate: Some(rls_predicate),
+                        as_of,
+                    });
                 }
 
                 // No RLS, return as-is
@@ -20538,34 +20574,29 @@ impl EmbeddedDatabase {
                 predicate,
                 as_of,
             } => {
-                // Check if RLS should be applied to this table
-                if self.tenant_manager.should_apply_rls(&table_name, "SELECT") {
-                    if let Some((using_expr, _)) = self.tenant_manager.get_rls_conditions(&table_name, "SELECT") {
-                        // Parse the RLS expression
-                        let tenant_context = self.tenant_manager.get_current_context();
-                        let rls_evaluator = tenant::RLSExpressionEvaluator::new(schema.clone(), tenant_context);
-                        let rls_predicate = rls_evaluator.parse(&using_expr)?;
+                // Same rule, same parse (see `rls_read_predicate`): the policy
+                // becomes part of this scan's own predicate. AND-merged with
+                // any predicate already pushed here by the optimizer.
+                if let Some(rls_predicate) = self.rls_read_predicate(&table_name, &schema)? {
+                    // Combine existing predicate with RLS predicate using AND
+                    let combined_predicate = if let Some(existing) = predicate {
+                        Some(sql::LogicalExpr::BinaryExpr {
+                            left: Box::new(existing),
+                            op: sql::BinaryOperator::And,
+                            right: Box::new(rls_predicate),
+                        })
+                    } else {
+                        Some(rls_predicate)
+                    };
 
-                        // Combine existing predicate with RLS predicate using AND
-                        let combined_predicate = if let Some(existing) = predicate {
-                            Some(sql::LogicalExpr::BinaryExpr {
-                                left: Box::new(existing),
-                                op: sql::BinaryOperator::And,
-                                right: Box::new(rls_predicate),
-                            })
-                        } else {
-                            Some(rls_predicate)
-                        };
-
-                        return Ok(sql::LogicalPlan::FilteredScan {
-                            table_name,
-                            alias,
-                            schema,
-                            projection,
-                            predicate: combined_predicate,
-                            as_of,
-                        });
-                    }
+                    return Ok(sql::LogicalPlan::FilteredScan {
+                        table_name,
+                        alias,
+                        schema,
+                        projection,
+                        predicate: combined_predicate,
+                        as_of,
+                    });
                 }
 
                 // No RLS, return as-is

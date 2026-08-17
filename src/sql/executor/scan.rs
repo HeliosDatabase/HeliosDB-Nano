@@ -2526,16 +2526,60 @@ pub(super) fn handle_filtered_scan(executor: &Executor, plan: &LogicalPlan) -> R
                     as_of_clause
                 );
 
-                // Resolve AS OF clause to snapshot timestamp
                 let snapshot_mgr = storage.snapshot_manager();
-                let snapshot_ts = snapshot_mgr.resolve_as_of(as_of_clause)?;
+
+                // `VERSIONS BETWEEN` names a RANGE, so `resolve_as_of` rejects
+                // it ("cannot be resolved to a single timestamp") and it needs
+                // the same dedicated branch `handle_scan` has. Any FilteredScan
+                // over a VERSIONS BETWEEN source reaches here — the RLS read
+                // rewrite (which attaches a policy to the scan leaf) and
+                // `StorageFilterPushdownRule` (which rewrites `Filter(Scan)`
+                // without inspecting `as_of`) both produce one. Without this
+                // arm those queries fail where the bare `Scan` succeeds, i.e.
+                // `FilteredScan` would not be a drop-in superset of `Scan`.
+                let versions_range = match as_of_clause {
+                    crate::sql::logical_plan::AsOfClause::VersionsBetween { start, end } => Some((
+                        snapshot_mgr.resolve_timestamp_for_range(start, true)?,
+                        snapshot_mgr.resolve_timestamp_for_range(end, false)?,
+                    )),
+                    _ => None,
+                };
 
                 // R4.3: pin the snapshot so the version GC cannot advance
-                // past it while this statement reads version history.
-                let _gc_pin = storage.pin_historical_snapshot(snapshot_ts)?;
+                // past it while this statement reads version history. For a
+                // range it is the LOW end that must not be collected.
+                let pin_ts = match versions_range {
+                    Some((start_ts, _)) => start_ts,
+                    None => snapshot_mgr.resolve_as_of(as_of_clause)?,
+                };
+                let _gc_pin = storage.pin_historical_snapshot(pin_ts)?;
 
-                // Scan at historical snapshot, then apply filtering
-                let base_tuples = storage.scan_table_at_snapshot(&actual_table_name, snapshot_ts)?;
+                // Scan at historical snapshot (or across the version range),
+                // then apply filtering.
+                let base_tuples = if let Some((start_ts, end_ts)) = versions_range {
+                    let versions = snapshot_mgr.scan_versions_between(&actual_table_name, start_ts, end_ts)?;
+                    let mut version_tuples = Vec::with_capacity(versions.len());
+                    for (row_id, timestamp, value_bytes) in versions {
+                        match bincode::deserialize::<crate::Tuple>(&value_bytes) {
+                            Ok(mut tuple) => {
+                                tuple.row_id = Some(row_id);
+                                version_tuples.push(tuple);
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to deserialize version at row_id={}, timestamp={}: {} (data len={})",
+                                    row_id,
+                                    timestamp,
+                                    e,
+                                    value_bytes.len()
+                                );
+                            }
+                        }
+                    }
+                    version_tuples
+                } else {
+                    storage.scan_table_at_snapshot(&actual_table_name, pin_ts)?
+                };
 
                 // Apply storage-level filtering
                 storage.predicate_pushdown().scan_with_pushdown(

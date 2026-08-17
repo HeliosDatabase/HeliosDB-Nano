@@ -5,6 +5,81 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+**One rule, two implementations — again.** A row-level-security read policy was attached to a
+scan leaf by two different mechanisms depending on which plan node the leaf happened to be, and
+the two disagreed about whether the policy is evaluated before or after the scan's projection.
+
+### Fixed
+
+- **On a table with an RLS policy, ordinary single-column projections failed with
+  `Column '<policy column>' not found in schema`.** With a policy `owner = 'alice'` on
+  `docs(id, owner, body)` and a tenant context active, these shapes **errored**:
+
+  | Broken | Worked |
+  |---|---|
+  | `SELECT id FROM docs` | `SELECT * FROM docs` |
+  | `SELECT body FROM docs` | `SELECT id, owner FROM docs` |
+  | `SELECT id FROM docs LIMIT 1` | `SELECT id FROM docs WHERE id > 0` |
+  | `SELECT id FROM docs LIMIT 1 OFFSET 1` | `SELECT id FROM docs ORDER BY id` |
+  | | `SELECT DISTINCT id FROM docs`, `COUNT(*)`, `SUM(id)` |
+
+  **It failed CLOSED** — an error raised before the first row was returned, never extra rows —
+  so this was an availability defect, not a disclosure. But it meant an RLS-enabled table
+  rejected the most ordinary read a client can issue, which is plausibly why this surface saw
+  so little real use.
+
+  *Cause — two mechanisms, and their order.* `ProjectionPruningRule` pushes a projection INTO a
+  bare `Scan` when a `Project{distinct:false}` sits **directly** above it, leaving the scan's
+  declared schema at full width. RLS injection then wrapped the scan in a `Filter` **above** it,
+  and the text-family pipelines apply RLS **after** the optimizer. So `SELECT id` reached
+  execution as `Project([id], Filter(owner='alice', Scan{projection:[0]}))`, the scan emitted
+  one-column rows, and the filter's `owner` reference had nothing to bind to. Each working shape
+  escapes for its own *structural* reason: `WHERE` interposes a `Filter`/`FilteredScan` so the
+  `Project`'s input is no longer a bare scan and pruning never fires; `ORDER BY` places the
+  `Sort` between the `Project` and the `Scan`; `DISTINCT` fails the rule's `distinct: false`
+  match; aggregates interpose an `Aggregate`; and `SELECT id, owner` does prune but keeps the
+  policy column inside the projection — which is exactly why the existing RLS read-parity suite,
+  whose workhorse read is `SELECT id, owner FROM orders`, never caught it.
+
+  *Fix:* the `Scan` arm of `apply_rls_to_plan_recursive` now emits a `FilteredScan` carrying the
+  policy as the scan's **own** predicate — preserving the projection — instead of wrapping a
+  `Filter` above the scan. `FilteredScan` evaluates its predicate against the full base-table row
+  before projection, so a policy on an unprojected column resolves. Both scan-leaf arms take
+  their policy from one new helper, `EmbeddedDatabase::rls_read_predicate`, so a read policy now
+  has exactly one parse and one meaning.
+  (`src/lib.rs`, `src/sql/executor/scan.rs`; new `tests/rls_projection_shapes_tests.rs`.)
+
+- **The PostgreSQL simple-query protocol disagreed with itself about the same statement.**
+  `query_with_columns_for_session` branches on whether the session has an open transaction:
+  in autocommit it delegates to the optimized text path, while inside `BEGIN` it plans without
+  the optimizer. So `SELECT id FROM docs` under a policy **errored in autocommit and returned
+  rows inside a transaction** — the same connection, the same SQL, a different answer either
+  side of `BEGIN`. Both branches are now correct, and a regression test pins them against each
+  other. (This widened the defect's scope beyond the embedded API: any psql/psycopg client
+  reading a policied table hit it.)
+
+- **`VERSIONS BETWEEN` failed on any scan carrying a storage-level predicate.**
+  `handle_filtered_scan` resolved its `AS OF` clause with `resolve_as_of`, which rejects
+  `VersionsBetween` outright ("cannot be resolved to a single timestamp"), while `handle_scan`
+  has a dedicated branch for it. Any `FilteredScan` over a `VERSIONS BETWEEN` source therefore
+  failed where the bare `Scan` succeeded — reachable before this release through
+  `StorageFilterPushdownRule`, which rewrites `Filter(Scan)` without inspecting `as_of`
+  (e.g. `SELECT * FROM t VERSIONS BETWEEN … WHERE id = 5`). Found while making the RLS rewrite
+  above behaviour-preserving: it is what makes `FilteredScan` a genuine drop-in superset of
+  `Scan`. (`src/sql/executor/scan.rs`.)
+
+### Notes
+
+- Fail-closed behaviour is unchanged and re-pinned: a policy that cannot be parsed still
+  propagates `Err` from the shared helper on every read family and every query shape. The new
+  suite asserts row counts **and contents** throughout — a fix that widened the projection to
+  keep the policy column addressable would return 3 rows where 2 are correct, and would pass any
+  test that only checked for `Ok`.
+- Still not applied inside CTE bodies, set operations, table functions or subquery expressions —
+  unchanged by this release, and tracked separately.
+
 ## [4.12.1] - 2026-08-16
 
 **Two broken copies of one rule.** HeliosDB Nano renders `Value`s into SQL text in two
