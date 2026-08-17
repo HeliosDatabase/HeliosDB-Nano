@@ -65,6 +65,11 @@ const ACK_DELAY_MS: u64 = 250;
 /// `ACK_DELAY_MS` so a slow-to-start ACK thread cannot make this flaky, while
 /// still being far above the sub-millisecond cost of a commit that did not
 /// wait at all.
+///
+/// That margin guards a slow ACK thread, which was never the real hazard. The
+/// one that actually bit was work *preceding* the measured window eating the
+/// delay — see the spawn site below, which is why the acker is started
+/// immediately before `COMMIT` rather than before `BEGIN`.
 const MIN_OBSERVED_WAIT_MS: u64 = 150;
 
 fn mock_standby(node_id: Uuid) -> StandbyInfo {
@@ -113,7 +118,22 @@ fn sync_mode_commit_waits_for_standby_ack() {
     let standby_id = Uuid::new_v4();
     ha_state().register_standby(mock_standby(standby_id));
 
+    db.execute("BEGIN").expect("begin");
+    db.execute("INSERT INTO sync_txn (id, v) VALUES (1, 10)")
+        .expect("staged insert");
+
     // Mock standby: acknowledges everything, but only after a delay.
+    //
+    // SPAWNED HERE, NOT EARLIER, AND THIS ORDERING IS LOAD-BEARING. The ACK
+    // delay must be measured from the start of the COMMIT window. Spawning
+    // before `BEGIN`/`INSERT` meant the delay ran concurrently with them, so on
+    // a loaded host — several cargo builds sharing this box is the normal case
+    // — those two statements could take longer than ACK_DELAY_MS, the standby
+    // was already marked caught up before COMMIT began, and COMMIT correctly
+    // returned immediately with nothing to wait for. The assertion then read
+    // that as "semi-sync did not wait" and failed. Observed 2026-08-16: COMMIT
+    // returned in 61ms against a 150ms floor, while the same test passed 3/3 in
+    // isolation and in the five preceding full-suite gates.
     let acker = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(ACK_DELAY_MS));
         ha_state().update_standby(standby_id, |standby| {
@@ -122,9 +142,6 @@ fn sync_mode_commit_waits_for_standby_ack() {
         });
     });
 
-    db.execute("BEGIN").expect("begin");
-    db.execute("INSERT INTO sync_txn (id, v) VALUES (1, 10)")
-        .expect("staged insert");
     let started = Instant::now();
     let commit = db.execute("COMMIT");
     let elapsed = started.elapsed();
