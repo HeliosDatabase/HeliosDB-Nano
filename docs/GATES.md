@@ -69,6 +69,44 @@ the change under test; all had been invisible because **the integration suite ha
 CI execution** (an open infrastructure gap — budget triage time for pre-existing rot on
 every first full run).
 
+### 3b. The empty-suite check — a green line that ran nothing
+
+A suite reporting `test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered
+out` is an **empty test binary**. It scrolls past as `ok`, contributes 0 to the totals, and
+is indistinguishable from a suite that does not exist. Grep every full-suite log for it:
+
+```bash
+awk '/^     Running/{s=$2} /^test result: ok\. 0 passed; 0 failed; 0 ignored/{print "EMPTY:", s}' full.log
+```
+
+**As of 2026-08-17, 49 of the files in `tests/` run zero tests under the default command.**
+Most are legitimately opt-in and expected: `code-graph` (16), `mcp-endpoint` (6),
+`graph-rag` (6), four more gated on `cfg(all(...))` combinations of those, plus
+`legacy-network` and `code-embed`. Note the compound gates — a naive grep for
+`#![cfg(feature = "x")]` misses `#![cfg(all(feature = "x", feature = "y"))]`, and misses
+feature names containing underscores.
+
+**The one that is not opt-in: `internal-tests`.** 15 files, ~202 `#[test]` functions —
+all time-travel/`AS OF`, encryption, materialized-view, branch-merge, protocol-integration
+and REPL-tenant coverage. `internal-tests = []` (Cargo.toml) is not a default feature and
+is enabled by no workflow and no command in this document's history, so those 202 tests
+have never run in any gate. **They also no longer compile**: `cargo build --features
+internal-tests --tests` fails with `E0063` missing-field errors in struct literals whose
+structs gained fields in 2026-02 and 2026-04. Six months of unobserved rot.
+
+```bash
+cargo test --features internal-tests --tests --no-fail-fast   # currently fails to build
+```
+
+**Capture:** found 2026-08-16 while gating the RLS projection fix. That change altered
+`handle_filtered_scan`'s `AS OF` handling, so a time-travel stage was added to the gate
+specifically to cover it. The stage reported five suites `ok` — while executing zero
+tests. Without the empty-suite check the change would have shipped with the coverage it
+was gated on being imaginary. Two further files (`explain_tests.rs`,
+`week6_visual_realtime_tests.rs`) turned out to be gated on features that were never
+declared in `Cargo.toml` at all — permanently unbuildable, each holding a single
+`assert!(true)` — and were deleted.
+
 ### 4. `cargo test --doc` — release CI parity
 Doc tests are a release-gate in CI; a broken example blocks the tag. Cheap; run with the
 full suite.
