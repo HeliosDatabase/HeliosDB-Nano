@@ -5,7 +5,7 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [4.13.1] - 2026-08-17
 
 **A documented surface that only worked if you happened to add a `WHERE`.** `RETURNING` is
 advertised for `DELETE` in the README and in the `heliosdb-nano-query` skill, but the bare form —
