@@ -152,6 +152,42 @@ item's scope, not optional cleanup.
 excludes (`SELECT *` works). Fails closed, so availability not security, but RLS-enabled tables
 reject ordinary projections, which is plausibly why this surface saw so little real use.
 
+**CORRECTION (2026-08-16) — the stated cause above is wrong, and it under-states the scope.**
+"The injected `Filter` references a column the projection excludes" is refuted by the `WHERE`
+case: `SELECT id FROM docs WHERE id > 0` projects exactly the same single column and **works**.
+The *user's* `Project` node always sits ABOVE the injected `Filter` and drops nothing the filter
+needs. The real defect needs **two** mechanisms plus their ordering:
+
+1. **`ProjectionPruningRule`** (`src/optimizer/rules.rs:494-691`) pushes a projection INTO a bare
+   `Scan` — but only when a `Project{distinct:false, distinct_on:None}` is its **direct** input,
+   and it leaves `Scan.schema` at full width while the scan emits pruned rows.
+2. **RLS injection** (`src/lib.rs`, `apply_rls_to_plan_recursive`) wrapped the scan in a `Filter`
+   **above** it, whereas its own `FilteredScan` arm merged the policy INTO the scan's predicate —
+   one rule, two implementations — and the text-family pipelines apply RLS **after** the optimizer.
+
+The bug fires exactly when (i) the plan contains `Project{distinct:false}` **directly** over
+`Scan`, (ii) the pruned column set excludes a policy column, and (iii) the entry point optimizes
+before applying RLS. Every escaping shape escapes structurally, not coincidentally: `WHERE`
+interposes a `Filter`/`FilteredScan` so the `Project`'s input is no longer a bare `Scan` and
+pruning never fires at all; `ORDER BY` puts the `Sort` between `Project` and `Scan`; `DISTINCT`
+fails the rule's `distinct: false` match; aggregates interpose an `Aggregate`; and
+`SELECT id, owner` *does* prune but keeps the policy column inside the projection — which is why
+`tests/rls_read_parity_tests.rs`, whose workhorse read is `SELECT id, owner FROM orders`, is green
+against a live bug. The params family never optimizes, so it could not exhibit this at all.
+
+**Scope was wider than "embedded API".** The PG **simple-query** protocol diverged *with itself*:
+`query_with_columns_for_session` delegates to the optimized text path in autocommit but plans
+without the optimizer inside `BEGIN`, so the same statement on the same connection errored before
+`BEGIN` and returned rows after it.
+
+**Fixed (Unreleased).** The `Scan` arm now emits `FilteredScan` with the projection preserved and
+the policy as the scan's own predicate — evaluated against the full base-table row before
+projection — with both scan-leaf arms taking their policy from one shared `rls_read_predicate`
+helper. Pinned by `tests/rls_projection_shapes_tests.rs` (shapes × both executor families ×
+autocommit/`BEGIN`, asserting row counts *and* contents). Closing this also required teaching
+`handle_filtered_scan` the `VERSIONS BETWEEN` branch `handle_scan` already had, so that
+`FilteredScan` is a genuine drop-in superset of `Scan`.
+
 **Fix shape:** move (or duplicate, verified identical) the `should_apply_rls` /
 `get_rls_conditions` / `WITH CHECK` / `USING` evaluation blocks from the dead `execute_internal`
 arms into the live generic INSERT/UPDATE/DELETE handling inside both
