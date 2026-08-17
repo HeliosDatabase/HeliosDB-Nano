@@ -731,11 +731,12 @@ fn rls_returning_does_not_leak() {
     // policy can keep the hidden one out of the result set.
     const UPD: &str = "UPDATE orders SET amount = 111 RETURNING id, owner";
     const UPD_PARAMS: &str = "UPDATE orders SET amount = $1 RETURNING id, owner";
-    // NB the `WHERE amount > 0` is load-bearing and matches every row: a bare
-    // `DELETE FROM t RETURNING cols` does not parse — sqlparser consumes
-    // `RETURNING` as a table alias and then rejects the column list. Filed
-    // separately; unrelated to RLS. Every passing RETURNING test in this repo
-    // has a WHERE clause, which is why the gap went unnoticed.
+    // The `WHERE amount > 0` matches every row, so it is equivalent to the bare
+    // form here. It dates from when a bare `DELETE FROM t RETURNING cols` did
+    // not parse at all (sqlparser consumed `RETURNING` as a table alias); that
+    // was unrelated to RLS and is fixed — see `Parser::rewrite_delete_returning`
+    // and `tests/delete_returning_tests.rs`. Kept as written so this suite keeps
+    // testing the RLS question and not the parser's.
     const DEL: &str = "DELETE FROM orders WHERE amount > 0 RETURNING id, owner";
     const HIDDEN_INTACT: &str = "SELECT id FROM orders WHERE id = 2 AND amount = 20";
 

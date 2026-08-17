@@ -5,6 +5,58 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+**A documented surface that only worked if you happened to add a `WHERE`.** `RETURNING` is
+advertised for `DELETE` in the README and in the `heliosdb-nano-query` skill, but the bare form —
+no `WHERE`, no alias — never parsed.
+
+### Fixed
+
+- **`DELETE FROM t RETURNING …` failed to parse** with
+  `Expected: end of statement, found: id at Line: 1, Column: 25`, the error column landing
+  immediately after `RETURNING `. Every projection shape was affected:
+
+  | Broken | Worked |
+  |---|---|
+  | `DELETE FROM t RETURNING id` | `DELETE FROM t AS x RETURNING id` |
+  | `DELETE FROM t RETURNING *` | `DELETE FROM t WHERE amount > 0 RETURNING id` |
+  | `DELETE FROM t RETURNING id, amount` | `DELETE FROM t WHERE TRUE RETURNING id` |
+  | `DELETE FROM public.t RETURNING id` | `UPDATE t SET amount = 1 RETURNING id` |
+  | | `INSERT INTO t VALUES (…) RETURNING id` |
+
+  **Who this hit:** anyone deleting a whole table and wanting the removed rows back — queue and
+  outbox drains (`DELETE FROM jobs RETURNING *`), "take everything" claim patterns, test-fixture
+  teardown that reports what it removed — plus every ORM and client that emits the bare form
+  (Drizzle's `.delete(table).returning()`, sqlx, node-postgres, psycopg). It failed **identically
+  through `db.query` and `db.query_params`**, and identically over the PostgreSQL and MySQL wire
+  protocols, because it failed at PARSE time, before either DML executor family was reached. It
+  failed **loudly** — a syntax error, never a wrong or partial delete — so this was a
+  reachability defect, not a correctness one. The workaround, for anyone who found it, was to add
+  a redundant `WHERE TRUE`.
+
+  *Cause.* sqlparser 0.53's `DELETE` grammar allows a **bare table alias**, and `RETURNING` is not
+  reserved in that position — so it was consumed AS THE ALIAS, and the projection list that
+  followed had nowhere to go. Each working shape escapes for the same structural reason: an
+  explicit `AS x` fills the alias slot, and any `WHERE` ends alias lookahead. `UPDATE` and
+  `INSERT` are immune because neither grammar has a bare-alias slot there — which is why every
+  passing `RETURNING` test in the repo either was an `UPDATE`/`INSERT` or carried a `WHERE`, and
+  why the gap went unnoticed.
+
+  *Fix:* a new `Parser::rewrite_delete_returning` inserts `WHERE TRUE` between the table
+  reference and `RETURNING`. It is chained into the same parse-failure fallback that already
+  carries the Stage-0 partitioning rewrites, so it keeps that path's **strictly-additive
+  guarantee**: it runs ONLY on SQL that fails to parse today, and a rewrite that still fails
+  reports the ORIGINAL diagnostic rather than a masked one. `WHERE TRUE` was chosen over filling
+  the alias slot because it is semantically neutral — every `DELETE` executor arm treats a
+  missing selection as "every row matches", and no `DELETE` path branches on
+  `selection.is_none()` — whereas an injected alias would show up in the AST. The rewrite parses
+  the statement head structurally rather than searching the text for the word `RETURNING`, so a
+  `RETURNING` inside a string literal, a comment or a dollar-quoted body can never be matched.
+  Schema-qualified (`public.t`) and quoted (`"my table"`) names, `RETURNING *`, explicit column
+  lists, mixed case, embedded newlines and a trailing `;` are all handled.
+  (`src/sql/parser.rs`; new `tests/delete_returning_tests.rs`.)
+
 ## [4.13.0] - 2026-08-17
 
 **One rule, two implementations — again.** A row-level-security read policy was attached to a

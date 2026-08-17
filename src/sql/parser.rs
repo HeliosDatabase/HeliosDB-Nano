@@ -342,16 +342,23 @@ impl Parser {
 
         // Attempt the normal parse first. Only if it fails do we apply the
         // Stage-0 partitioning rewrites (strip a parent `PARTITION BY …` clause,
-        // rewrite a child `PARTITION OF …` to an empty-column CREATE), so
-        // currently-passing SQL is byte-identically untouched — the
-        // strictly-additive guarantee: the rewrite fires ONLY on SQL that fails
-        // to parse today. A rewrite that still won't parse reports the ORIGINAL
-        // diagnostic, never a masked one.
+        // rewrite a child `PARTITION OF …` to an empty-column CREATE) or the
+        // `DELETE … RETURNING` alias-slot rewrite, so currently-passing SQL is
+        // byte-identically untouched — the strictly-additive guarantee: the
+        // rewrite fires ONLY on SQL that fails to parse today. A rewrite that
+        // still won't parse reports the ORIGINAL diagnostic, never a masked one.
+        //
+        // The candidates are disjoint by leading keyword (`CREATE TABLE` vs
+        // `DELETE`), so `or_else` chaining is order-independent; it is written
+        // this way so each rewrite keeps its own single responsibility and any
+        // future sibling only has to return `None` for what it does not own.
         let mut statements = match SqlParser::parse_sql(&self.dialect, &processed_sql) {
             Ok(statements) => statements,
             Err(orig_err) => {
                 let orig_msg = format!("Failed to parse SQL: {}", orig_err);
-                match Self::rewrite_partition_syntax(&processed_sql) {
+                let rewritten = Self::rewrite_partition_syntax(&processed_sql)
+                    .or_else(|| Self::rewrite_delete_returning(&processed_sql));
+                match rewritten {
                     Some(rewritten) => {
                         SqlParser::parse_sql(&self.dialect, &rewritten).map_err(|_| Error::sql_parse(orig_msg))?
                     }
@@ -2437,6 +2444,150 @@ impl Parser {
         }
     }
 
+    /// `DELETE … RETURNING` fallback (invoked by [`Parser::parse`] ONLY after
+    /// the normal parse fails, exactly like the sibling
+    /// [`Parser::rewrite_partition_syntax`]).
+    ///
+    /// **The defect.** sqlparser 0.53's DELETE grammar allows a BARE table
+    /// alias, and `RETURNING` is not reserved in that position — so
+    /// `DELETE FROM t RETURNING id` binds `RETURNING` as the alias and then
+    /// rejects the leftover column list with
+    /// `Expected: end of statement, found: id`, the error column landing
+    /// immediately after `RETURNING `. Anything that fills or ends the alias
+    /// slot parses today, which is what pins the mechanism:
+    /// `DELETE FROM t AS x RETURNING id` (slot filled) and
+    /// `DELETE FROM t WHERE TRUE RETURNING id` (`WHERE` ends alias lookahead)
+    /// both work, and `UPDATE … RETURNING` is immune because its grammar has no
+    /// bare-alias slot there. `RETURNING` is advertised for DELETE in the README
+    /// and the `heliosdb-nano-query` skill, so the documented surface was
+    /// reachable only with a redundant `WHERE`.
+    ///
+    /// **The rewrite.** Insert `WHERE TRUE` between the table reference and
+    /// `RETURNING`. That is semantically neutral for DELETE: both executor
+    /// families' `Delete` arms treat a missing selection as "every row matches"
+    /// (`} else { true }`), and no DELETE path branches on `selection.is_none()`
+    /// — the only two selection-keyed optimizations are
+    /// `EmbeddedDatabase::try_extract_pk_value`, which needs a
+    /// `pk_col = <literal>` equality and therefore declines for `None` and for
+    /// `TRUE` alike (both fall to the same `scan_table_branch_aware`), and the
+    /// text fast path `EmbeddedDatabase::prepare_fast_delete`, which declines on
+    /// any `RETURNING` before it ever looks at the predicate. Filling the alias
+    /// slot instead would also parse, but would plant a bogus alias in
+    /// `TableFactor::Table { alias }`; `WHERE TRUE` leaves the alias field
+    /// exactly as written.
+    ///
+    /// **Why it can never fire inside a string literal or comment.** It does not
+    /// search the statement for the word `RETURNING`. It parses the head
+    /// structurally — `DELETE`, `FROM`, one object name — and requires
+    /// `RETURNING` to be the VERY NEXT token, which by construction is outside
+    /// any literal, comment or dollar-quoted body (a literal starts with `'` or
+    /// `$`, a comment with `--` / `/*`, none of which pass the keyword test).
+    /// [`Parser::read_object_name`] is double-quote aware, so
+    /// `DELETE FROM "my table" RETURNING *` reads one name, and
+    /// [`Parser::is_plain_object_name`] then rejects any "name" that is really a
+    /// literal fragment, a comma-separated table list or a parenthesized
+    /// expression.
+    ///
+    /// Returns `None` — leaving the ORIGINAL diagnostic untouched — for
+    /// everything that is not exactly `DELETE FROM <object-name> RETURNING …`:
+    /// an existing alias (`… t AS x …`, `… t x …`), an existing `WHERE`, a
+    /// non-plain table reference, or a `RETURNING` that is not the next token.
+    /// A `DELETE` that fails to parse for an unrelated reason is therefore
+    /// reported unchanged.
+    ///
+    /// SCOPE: only the FIRST statement of the text is inspected. A multi-
+    /// statement string whose SECOND statement carries the bare
+    /// `DELETE … RETURNING` still fails, and still reports its original
+    /// diagnostic.
+    fn rewrite_delete_returning(sql: &str) -> Option<String> {
+        let after_delete = Self::strip_kw(sql, "DELETE")?;
+        let after_from = Self::strip_kw(after_delete, "FROM")?;
+        let (table, rest) = Self::read_object_name(after_from)?;
+        if !Self::is_plain_object_name(&table) {
+            return None;
+        }
+        if !Self::starts_kw(rest, "RETURNING") {
+            return None;
+        }
+        // Everything from `RETURNING` onward is carried through VERBATIM —
+        // including the projection list, a trailing `;` and anything after it.
+        Some(format!("DELETE FROM {table} WHERE TRUE {}", rest.trim_start()))
+    }
+
+    /// True when `name` is a plain, possibly schema-qualified object name: one
+    /// or more `.`-separated parts, each either a bare identifier (letter /
+    /// `_` / non-ASCII start, then alphanumerics / `_` / `$` / non-ASCII) or a
+    /// `"quoted identifier"` with `""` for an embedded quote.
+    ///
+    /// Deliberately strict, and the ONLY reason it exists: it is the guard that
+    /// keeps [`Parser::rewrite_delete_returning`] from mistaking the inside of a
+    /// string literal for a table reference. [`Parser::read_object_name`] stops
+    /// at whitespace outside DOUBLE quotes only, so on the (already
+    /// unparseable) input `DELETE FROM 'abc RETURNING def'` it would hand back
+    /// the fragment `'abc` and leave a `rest` that starts with the word
+    /// `RETURNING`. Rejecting `'abc` here makes "we never rewrite across a
+    /// literal boundary" a structural property rather than a lucky one.
+    ///
+    /// Byte-wise on purpose: `.` and `"` are ASCII, so in valid UTF-8 they can
+    /// never appear as a continuation byte, and every byte `>= 0x80` is part of
+    /// a multi-byte character and is accepted as an identifier byte.
+    #[allow(clippy::indexing_slicing)] // Every index is guarded by an `i < n` test on the same line or the loop head.
+    fn is_plain_object_name(name: &str) -> bool {
+        let bytes = name.as_bytes();
+        let n = bytes.len();
+        let mut i = 0usize;
+
+        loop {
+            // ---- one dot-separated part ----
+            if i >= n {
+                return false; // empty input, or a trailing `.`
+            }
+            if bytes[i] == b'"' {
+                i += 1;
+                loop {
+                    if i >= n {
+                        return false; // unterminated quoted identifier
+                    }
+                    if bytes[i] == b'"' {
+                        // A doubled "" is an embedded quote, not the end.
+                        if i + 1 < n && bytes[i + 1] == b'"' {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            } else {
+                // The start byte is checked against the stricter start set, and
+                // every byte in that set is also a continuation byte, so the
+                // loop below always consumes at least one byte.
+                let first = bytes[i];
+                if !(first.is_ascii_alphabetic() || first == b'_' || first >= 0x80) {
+                    return false;
+                }
+                while i < n {
+                    let c = bytes[i];
+                    if c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c >= 0x80 {
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+
+            // ---- separator ----
+            if i == n {
+                return true;
+            }
+            if bytes[i] != b'.' {
+                return false; // `t,u`, `t(`, `t'`, … — not a plain name
+            }
+            i += 1;
+        }
+    }
+
     /// Stage-0 partitioning: rewrite a child
     /// `CREATE TABLE [IF NOT EXISTS] [schema.]child PARTITION OF …` declaration
     /// into a plain empty-column `CREATE TABLE [IF NOT EXISTS] [schema.]child ()`
@@ -3935,6 +4086,266 @@ mod tests {
         fn missing_name_errors() {
             assert!(Parser::parse_alter_sequence("ALTER SEQUENCE").is_err());
             assert!(Parser::parse_alter_sequence("ALTER SEQUENCE IF EXISTS").is_err());
+        }
+    }
+
+    /// Unit-level coverage of the `DELETE … RETURNING` parse-failure fallback.
+    /// End-to-end row-level behaviour lives in `tests/delete_returning_tests.rs`;
+    /// what is pinned here is the *decision* — exactly which texts the rewrite
+    /// claims, and (more importantly) which it declines, since a decline is what
+    /// preserves the original diagnostic.
+    mod delete_returning_rewrite {
+        use super::*;
+
+        // ---- fires: the shapes the defect made unreachable ----
+
+        #[test]
+        fn bare_table() {
+            assert_eq!(
+                Parser::rewrite_delete_returning("DELETE FROM t RETURNING id").unwrap(),
+                "DELETE FROM t WHERE TRUE RETURNING id"
+            );
+        }
+
+        #[test]
+        fn star_and_column_lists_are_carried_verbatim() {
+            assert_eq!(
+                Parser::rewrite_delete_returning("DELETE FROM t RETURNING *").unwrap(),
+                "DELETE FROM t WHERE TRUE RETURNING *"
+            );
+            assert_eq!(
+                Parser::rewrite_delete_returning("DELETE FROM t RETURNING id, amount").unwrap(),
+                "DELETE FROM t WHERE TRUE RETURNING id, amount"
+            );
+        }
+
+        #[test]
+        fn schema_qualified_and_quoted_names() {
+            assert_eq!(
+                Parser::rewrite_delete_returning("DELETE FROM public.t RETURNING id").unwrap(),
+                "DELETE FROM public.t WHERE TRUE RETURNING id"
+            );
+            assert_eq!(
+                Parser::rewrite_delete_returning(r#"DELETE FROM "my table" RETURNING id"#).unwrap(),
+                r#"DELETE FROM "my table" WHERE TRUE RETURNING id"#
+            );
+            assert_eq!(
+                Parser::rewrite_delete_returning(r#"DELETE FROM "s"."my table" RETURNING *"#).unwrap(),
+                r#"DELETE FROM "s"."my table" WHERE TRUE RETURNING *"#
+            );
+            // A quoted identifier that IS the word: the name is read as one
+            // double-quoted token, so the following bare word is still the clause.
+            assert_eq!(
+                Parser::rewrite_delete_returning(r#"DELETE FROM "RETURNING" RETURNING id"#).unwrap(),
+                r#"DELETE FROM "RETURNING" WHERE TRUE RETURNING id"#
+            );
+        }
+
+        #[test]
+        fn mixed_case_whitespace_newlines_and_trailing_semicolon() {
+            assert_eq!(
+                Parser::rewrite_delete_returning("delete from t returning id").unwrap(),
+                "DELETE FROM t WHERE TRUE returning id"
+            );
+            assert_eq!(
+                Parser::rewrite_delete_returning("Delete From t Returning id;").unwrap(),
+                "DELETE FROM t WHERE TRUE Returning id;"
+            );
+            assert_eq!(
+                Parser::rewrite_delete_returning("  DELETE   FROM\n\tt\n RETURNING  id ;").unwrap(),
+                "DELETE FROM t WHERE TRUE RETURNING  id ;"
+            );
+        }
+
+        // ---- declines: everything that must keep its own diagnostic ----
+
+        #[test]
+        fn declines_when_the_alias_slot_is_already_filled() {
+            // These parse today; the rewrite must not claim them even if it were
+            // ever reached.
+            assert_eq!(
+                Parser::rewrite_delete_returning("DELETE FROM t AS x RETURNING id"),
+                None
+            );
+            assert_eq!(Parser::rewrite_delete_returning("DELETE FROM t x RETURNING id"), None);
+        }
+
+        #[test]
+        fn declines_when_a_where_clause_is_present() {
+            assert_eq!(
+                Parser::rewrite_delete_returning("DELETE FROM t WHERE amount > 0 RETURNING id"),
+                None
+            );
+            assert_eq!(
+                Parser::rewrite_delete_returning("DELETE FROM t WHERE TRUE RETURNING id"),
+                None
+            );
+        }
+
+        #[test]
+        fn declines_for_non_delete_and_malformed_delete() {
+            assert_eq!(
+                Parser::rewrite_delete_returning("UPDATE t SET a = 1 RETURNING id"),
+                None
+            );
+            assert_eq!(
+                Parser::rewrite_delete_returning("INSERT INTO t VALUES (1) RETURNING id"),
+                None
+            );
+            assert_eq!(Parser::rewrite_delete_returning("DELETE FROM t"), None);
+            assert_eq!(Parser::rewrite_delete_returning("DELETE FROM"), None);
+            assert_eq!(Parser::rewrite_delete_returning("DELETE t RETURNING id"), None);
+            assert_eq!(Parser::rewrite_delete_returning("DELETEFROM t RETURNING id"), None);
+            // A genuinely malformed tail is not this rewrite's business.
+            assert_eq!(Parser::rewrite_delete_returning("DELETE FROM t WHERE RETURNING"), None);
+        }
+
+        #[test]
+        fn never_matches_a_returning_inside_a_literal_or_comment() {
+            // The rewrite never SEARCHES for the word, so a literal that
+            // contains it cannot pull the clause across a quote boundary.
+            assert_eq!(
+                Parser::rewrite_delete_returning("DELETE FROM t WHERE note = 'RETURNING x'"),
+                None
+            );
+            // `read_object_name` stops at whitespace outside DOUBLE quotes, so
+            // it hands back the fragment `'abc` here — `is_plain_object_name`
+            // is what refuses to treat that as a table reference.
+            assert_eq!(
+                Parser::rewrite_delete_returning("DELETE FROM 'abc RETURNING def'"),
+                None
+            );
+            assert_eq!(
+                Parser::rewrite_delete_returning("DELETE FROM t -- RETURNING id\n"),
+                None
+            );
+            assert_eq!(
+                Parser::rewrite_delete_returning("DELETE FROM t /* RETURNING id */"),
+                None
+            );
+            assert_eq!(
+                Parser::rewrite_delete_returning("DELETE FROM t $q$ RETURNING id $q$"),
+                None
+            );
+        }
+
+        #[test]
+        fn declines_a_multi_table_delete_list() {
+            // `t,u` is one whitespace-delimited token but not a plain name.
+            assert_eq!(Parser::rewrite_delete_returning("DELETE FROM t,u RETURNING id"), None);
+        }
+
+        // ---- is_plain_object_name ----
+
+        #[test]
+        fn plain_object_names_accepted_and_everything_else_rejected() {
+            for ok in [
+                "t",
+                "_t",
+                "t1",
+                "t$1",
+                "public.t",
+                "a.b.c",
+                r#""t""#,
+                r#""my table""#,
+                r#""s"."my table""#,
+                r#"s."my table""#,
+                r#""a""b""#,
+                "café",
+            ] {
+                assert!(Parser::is_plain_object_name(ok), "{ok:?} should be a plain name");
+            }
+            for bad in [
+                "", "'abc", "abc'", "t,u", "t(", "t)", "1t", ".t", "t.", "t..u", "\"t", "t\"", "t-1", "t;", "$q$",
+            ] {
+                assert!(!Parser::is_plain_object_name(bad), "{bad:?} should be rejected");
+            }
+        }
+
+        // ---- integration with the fallback in `Parser::parse` ----
+
+        #[test]
+        fn parse_now_accepts_bare_delete_returning() {
+            let parser = Parser::new();
+            for sql in [
+                "DELETE FROM t RETURNING id",
+                "DELETE FROM t RETURNING *",
+                "DELETE FROM t RETURNING id, amount",
+                "DELETE FROM public.t RETURNING id",
+                r#"DELETE FROM "my table" RETURNING *"#,
+                "delete from t returning id;",
+                "DELETE\nFROM\n  t\nRETURNING id",
+            ] {
+                let statements = parser
+                    .parse(sql)
+                    .unwrap_or_else(|e| panic!("{sql:?} failed to parse: {e}"));
+                assert_eq!(statements.len(), 1, "{sql:?}");
+                let stmt = statements.into_iter().next().unwrap();
+                match stmt {
+                    Statement::Delete(delete) => {
+                        assert!(delete.returning.is_some(), "RETURNING was dropped for {sql:?}");
+                        assert!(
+                            delete.selection.is_some(),
+                            "the injected WHERE TRUE is missing for {sql:?}"
+                        );
+                    }
+                    other => panic!("{sql:?} parsed as {other:?}"),
+                }
+            }
+        }
+
+        #[test]
+        fn the_injected_predicate_is_the_constant_true_and_no_alias_is_planted() {
+            let parser = Parser::new();
+            let stmt = parser.parse_one("DELETE FROM t RETURNING id").unwrap();
+            let Statement::Delete(delete) = stmt else {
+                panic!("not a DELETE");
+            };
+            // `WHERE TRUE`, not `WHERE <something>` — a constant-true literal,
+            // which every DELETE arm folds into the same "match every row" that
+            // `selection: None` produces.
+            assert_eq!(
+                delete.selection,
+                Some(sqlparser::ast::Expr::Value(sqlparser::ast::Value::Boolean(true)))
+            );
+            // And the alias slot stays EMPTY — the reason `WHERE TRUE` was
+            // chosen over filling the alias.
+            let table = match &delete.from {
+                sqlparser::ast::FromTable::WithFromKeyword(t) | sqlparser::ast::FromTable::WithoutKeyword(t) => {
+                    t.first().unwrap()
+                }
+            };
+            match &table.relation {
+                sqlparser::ast::TableFactor::Table { alias, .. } => assert!(alias.is_none(), "{alias:?}"),
+                other => panic!("unexpected table factor {other:?}"),
+            }
+        }
+
+        /// The strictly-additive guarantee, both halves: a DELETE the rewrite
+        /// DECLINES and a DELETE it CLAIMS but whose rewrite still won't parse
+        /// must both surface sqlparser's verbatim complaint about the ORIGINAL
+        /// text — never a diagnostic whose offsets refer to the injected
+        /// `WHERE TRUE`.
+        #[test]
+        fn a_delete_that_still_fails_reports_the_original_diagnostic() {
+            let parser = Parser::new();
+            for sql in [
+                // Declined (a WHERE is present), malformed for its own reason.
+                "DELETE FROM t WHERE amount >",
+                // Claimed, rewritten, and STILL unparseable — the trailing FROM
+                // is rejected at a different offset in the rewritten text.
+                "DELETE FROM t RETURNING id FROM",
+            ] {
+                let direct = SqlParser::parse_sql(&PostgreSqlDialect {}, sql)
+                    .expect_err("fixture must be unparseable")
+                    .to_string();
+                let err = parser.parse(sql).unwrap_err().to_string();
+                assert!(
+                    err.contains(&direct),
+                    "diagnostic was masked for {sql:?}: got {err:?}, want it to contain {direct:?}"
+                );
+                assert!(!err.contains("TRUE"), "the injected predicate leaked into {err:?}");
+            }
         }
     }
 }

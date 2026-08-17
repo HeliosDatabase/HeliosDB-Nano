@@ -138,7 +138,7 @@ Look for: index usage, full-scan flags, rowcount estimates. If you see "SeqScan"
 - **`COUNT(col)` skips NULL rows; `COUNT(*)` does not.** Fast path is `COUNT(*)` only.
 - **`MIN/MAX` on empty set returns `NULL`**, not an error.
 - **Result cache** (128-entry LRU per connection) is invalidated on DML/DDL touching the involved tables. Repeated identical SELECTs are nearly free.
-- **`RETURNING` works for INSERT/UPDATE/DELETE** in both PG- and MySQL-wire paths. The Python sqlite3 SDK uses it transparently to populate `cursor.lastrowid`.
+- **`RETURNING` works for INSERT/UPDATE/DELETE** in both PG- and MySQL-wire paths, with or without a `WHERE` — `DELETE FROM t RETURNING *` drains a whole table and hands back every removed row. The Python sqlite3 SDK uses `RETURNING` transparently to populate `cursor.lastrowid`.
 - **ORDER BY ordinal positions** (e.g. `ORDER BY 2 DESC`) are valid SQL-92 and supported.
 - **Cross-process ON CONFLICT (path) DO UPDATE** has a known bug (FR `cross_process_on_conflict`): re-attaching to a populated DB from a different process can insert duplicates instead of updating. Single-process workflows are unaffected.
 
