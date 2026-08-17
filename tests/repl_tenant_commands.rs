@@ -17,7 +17,8 @@
 
 #![cfg(feature = "internal-tests")]
 
-use heliosdb_nano::repl::commands::MetaCommand;
+// `commands` is private; MetaCommand is publicly re-exported from `repl` (src/repl/mod.rs:16).
+use heliosdb_nano::repl::MetaCommand;
 
 // ============================================================================
 // Command Parsing Tests
@@ -41,7 +42,7 @@ fn test_parse_tenant_create_with_name_only() {
     assert!(cmd.is_some());
 
     match cmd.unwrap() {
-        MetaCommand::TenantCreate { name, plan } => {
+        MetaCommand::TenantCreate { name, plan, isolation: _ } => {
             assert_eq!(name, "mycompany");
             assert_eq!(plan, None);
         }
@@ -55,7 +56,7 @@ fn test_parse_tenant_create_with_plan() {
     assert!(cmd.is_some());
 
     match cmd.unwrap() {
-        MetaCommand::TenantCreate { name, plan } => {
+        MetaCommand::TenantCreate { name, plan, isolation: _ } => {
             assert_eq!(name, "mycompany");
             assert_eq!(plan, Some("pro".to_string()));
         }
@@ -72,7 +73,7 @@ fn test_parse_tenant_create_various_plans() {
         assert!(cmd.is_some());
 
         match cmd.unwrap() {
-            MetaCommand::TenantCreate { name, plan } => {
+            MetaCommand::TenantCreate { name, plan, isolation: _ } => {
                 assert_eq!(name, "test");
                 assert_eq!(plan, Some(plan_name.to_string()));
             }
@@ -241,7 +242,7 @@ fn test_tenant_command_with_whitespace() {
     assert!(cmd.is_some());
 
     match cmd.unwrap() {
-        MetaCommand::TenantCreate { name, plan } => {
+        MetaCommand::TenantCreate { name, plan, isolation: _ } => {
             assert_eq!(name, "mycompany");
             assert_eq!(plan, Some("pro".to_string()));
         }
@@ -268,7 +269,7 @@ fn test_tenant_name_with_special_characters() {
     assert!(cmd.is_some());
 
     match cmd.unwrap() {
-        MetaCommand::TenantCreate { name, plan } => {
+        MetaCommand::TenantCreate { name, plan, isolation: _ } => {
             assert_eq!(name, "my-company_123");
         }
         _ => panic!("Expected TenantCreate"),
@@ -302,6 +303,7 @@ fn test_custom_plan_names() {
             MetaCommand::TenantCreate {
                 name,
                 plan: parsed_plan,
+                isolation: _,
             } => {
                 assert_eq!(parsed_plan, Some(plan.to_string()));
             }

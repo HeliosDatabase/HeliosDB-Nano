@@ -23,7 +23,7 @@ fn test_merge_no_conflicts() {
     let engine = StorageEngine::open_in_memory(&config).unwrap();
 
     // Setup: main has key1, dev adds key2
-    engine.put(b"key1", b"value1_main").unwrap();
+    engine.put(&b"key1".to_vec(), b"value1_main").unwrap();
 
     // Create dev branch
     engine
@@ -43,8 +43,8 @@ fn test_merge_no_conflicts() {
     assert_eq!(result.merged_keys, 1); // Only key2 was merged
 
     // Verify main now has both keys
-    assert_eq!(engine.get(b"key1").unwrap(), Some(b"value1_main".to_vec()));
-    assert_eq!(engine.get(b"key2").unwrap(), Some(b"value2_dev".to_vec()));
+    assert_eq!(engine.get(&b"key1".to_vec()).unwrap(), Some(b"value1_main".to_vec()));
+    assert_eq!(engine.get(&b"key2".to_vec()).unwrap(), Some(b"value2_dev".to_vec()));
 }
 
 #[test]
@@ -53,7 +53,7 @@ fn test_merge_with_conflict_auto_strategy() {
     let engine = StorageEngine::open_in_memory(&config).unwrap();
 
     // Setup: both branches modify same key
-    engine.put(b"key1", b"original").unwrap();
+    engine.put(&b"key1".to_vec(), b"original").unwrap();
 
     // Create dev branch
     engine
@@ -66,7 +66,7 @@ fn test_merge_with_conflict_auto_strategy() {
     tx_dev.commit().unwrap();
 
     // Modify key1 in main
-    engine.put(b"key1", b"main_value").unwrap();
+    engine.put(&b"key1".to_vec(), b"main_value").unwrap();
 
     // Merge with Auto strategy (should prefer dev/source)
     let result = engine.merge_branch("dev", "main", MergeStrategy::Auto).unwrap();
@@ -75,7 +75,7 @@ fn test_merge_with_conflict_auto_strategy() {
     assert_eq!(result.conflicts.len(), 1); // Conflict detected but resolved
 
     // Auto strategy should have used dev's value
-    assert_eq!(engine.get(b"key1").unwrap(), Some(b"dev_value".to_vec()));
+    assert_eq!(engine.get(&b"key1".to_vec()).unwrap(), Some(b"dev_value".to_vec()));
 }
 
 #[test]
@@ -84,7 +84,7 @@ fn test_merge_with_conflict_manual_strategy() {
     let engine = StorageEngine::open_in_memory(&config).unwrap();
 
     // Setup: both branches modify same key
-    engine.put(b"key1", b"original").unwrap();
+    engine.put(&b"key1".to_vec(), b"original").unwrap();
 
     engine
         .create_branch("dev", Some("main"), BranchOptions::default())
@@ -96,7 +96,7 @@ fn test_merge_with_conflict_manual_strategy() {
     tx_dev.commit().unwrap();
 
     // Modify key1 in main
-    engine.put(b"key1", b"main_value").unwrap();
+    engine.put(&b"key1".to_vec(), b"main_value").unwrap();
 
     // Merge with Manual strategy (should fail on conflict)
     let result = engine.merge_branch("dev", "main", MergeStrategy::Manual).unwrap();
@@ -105,7 +105,7 @@ fn test_merge_with_conflict_manual_strategy() {
     assert_eq!(result.conflicts.len(), 1);
 
     // Main should be unchanged
-    assert_eq!(engine.get(b"key1").unwrap(), Some(b"main_value".to_vec()));
+    assert_eq!(engine.get(&b"key1".to_vec()).unwrap(), Some(b"main_value".to_vec()));
 }
 
 #[test]
@@ -114,7 +114,7 @@ fn test_merge_with_conflict_theirs_strategy() {
     let engine = StorageEngine::open_in_memory(&config).unwrap();
 
     // Setup: both branches modify same key
-    engine.put(b"key1", b"original").unwrap();
+    engine.put(&b"key1".to_vec(), b"original").unwrap();
 
     engine
         .create_branch("dev", Some("main"), BranchOptions::default())
@@ -126,7 +126,7 @@ fn test_merge_with_conflict_theirs_strategy() {
     tx_dev.commit().unwrap();
 
     // Modify key1 in main
-    engine.put(b"key1", b"main_value").unwrap();
+    engine.put(&b"key1".to_vec(), b"main_value").unwrap();
 
     // Merge with Theirs strategy (always prefer source/dev)
     let result = engine.merge_branch("dev", "main", MergeStrategy::Theirs).unwrap();
@@ -135,7 +135,7 @@ fn test_merge_with_conflict_theirs_strategy() {
     assert_eq!(result.merged_keys, 1);
 
     // Should use dev's value
-    assert_eq!(engine.get(b"key1").unwrap(), Some(b"dev_value".to_vec()));
+    assert_eq!(engine.get(&b"key1".to_vec()).unwrap(), Some(b"dev_value".to_vec()));
 }
 
 #[test]
@@ -144,7 +144,7 @@ fn test_merge_with_conflict_ours_strategy() {
     let engine = StorageEngine::open_in_memory(&config).unwrap();
 
     // Setup: both branches modify same key
-    engine.put(b"key1", b"original").unwrap();
+    engine.put(&b"key1".to_vec(), b"original").unwrap();
 
     engine
         .create_branch("dev", Some("main"), BranchOptions::default())
@@ -156,7 +156,7 @@ fn test_merge_with_conflict_ours_strategy() {
     tx_dev.commit().unwrap();
 
     // Modify key1 in main
-    engine.put(b"key1", b"main_value").unwrap();
+    engine.put(&b"key1".to_vec(), b"main_value").unwrap();
 
     // Merge with Ours strategy (always prefer target/main)
     let result = engine.merge_branch("dev", "main", MergeStrategy::Ours).unwrap();
@@ -164,7 +164,7 @@ fn test_merge_with_conflict_ours_strategy() {
     assert!(result.completed);
 
     // Should keep main's value
-    assert_eq!(engine.get(b"key1").unwrap(), Some(b"main_value".to_vec()));
+    assert_eq!(engine.get(&b"key1".to_vec()).unwrap(), Some(b"main_value".to_vec()));
 }
 
 #[test]
@@ -215,8 +215,8 @@ fn test_merge_with_deletions() {
     let engine = StorageEngine::open_in_memory(&config).unwrap();
 
     // Setup: main has key1 and key2
-    engine.put(b"key1", b"value1").unwrap();
-    engine.put(b"key2", b"value2").unwrap();
+    engine.put(&b"key1".to_vec(), b"value1").unwrap();
+    engine.put(&b"key2".to_vec(), b"value2").unwrap();
 
     engine
         .create_branch("dev", Some("main"), BranchOptions::default())
@@ -233,8 +233,8 @@ fn test_merge_with_deletions() {
     assert!(result.completed);
 
     // key1 should be deleted, key2 should remain
-    assert_eq!(engine.get(b"key1").unwrap(), None);
-    assert_eq!(engine.get(b"key2").unwrap(), Some(b"value2".to_vec()));
+    assert_eq!(engine.get(&b"key1".to_vec()).unwrap(), None);
+    assert_eq!(engine.get(&b"key2".to_vec()).unwrap(), Some(b"value2".to_vec()));
 }
 
 #[test]
@@ -284,7 +284,7 @@ fn test_merge_preserves_non_conflicting_changes() {
     let engine = StorageEngine::open_in_memory(&config).unwrap();
 
     // Setup: shared key and branch-specific keys
-    engine.put(b"shared", b"original").unwrap();
+    engine.put(&b"shared".to_vec(), b"original").unwrap();
 
     engine
         .create_branch("dev", Some("main"), BranchOptions::default())
@@ -297,8 +297,8 @@ fn test_merge_preserves_non_conflicting_changes() {
     tx_dev.commit().unwrap();
 
     // Main: modify shared + add main_key
-    engine.put(b"shared", b"main_value").unwrap();
-    engine.put(b"main_key", b"main_only").unwrap();
+    engine.put(&b"shared".to_vec(), b"main_value").unwrap();
+    engine.put(&b"main_key".to_vec(), b"main_only").unwrap();
 
     // Merge with Theirs strategy
     let result = engine.merge_branch("dev", "main", MergeStrategy::Theirs).unwrap();
@@ -306,9 +306,10 @@ fn test_merge_preserves_non_conflicting_changes() {
     assert!(result.completed);
 
     // Verify all keys present with correct values
-    assert_eq!(engine.get(b"shared").unwrap(), Some(b"dev_value".to_vec())); // Conflict resolved with dev's value
-    assert_eq!(engine.get(b"dev_key").unwrap(), Some(b"dev_only".to_vec())); // Dev's unique key merged
-    assert_eq!(engine.get(b"main_key").unwrap(), Some(b"main_only".to_vec())); // Main's unique key preserved
+    assert_eq!(engine.get(&b"shared".to_vec()).unwrap(), Some(b"dev_value".to_vec())); // Conflict resolved with dev's value
+    assert_eq!(engine.get(&b"dev_key".to_vec()).unwrap(), Some(b"dev_only".to_vec())); // Dev's unique key merged
+    assert_eq!(engine.get(&b"main_key".to_vec()).unwrap(), Some(b"main_only".to_vec()));
+    // Main's unique key preserved
 }
 
 #[test]
@@ -317,7 +318,7 @@ fn test_merge_same_change_no_conflict() {
     let engine = StorageEngine::open_in_memory(&config).unwrap();
 
     // Setup
-    engine.put(b"key1", b"original").unwrap();
+    engine.put(&b"key1".to_vec(), b"original").unwrap();
 
     engine
         .create_branch("dev", Some("main"), BranchOptions::default())
@@ -328,7 +329,7 @@ fn test_merge_same_change_no_conflict() {
     tx_dev.put(b"key1".to_vec(), b"same_value".to_vec()).unwrap();
     tx_dev.commit().unwrap();
 
-    engine.put(b"key1", b"same_value").unwrap();
+    engine.put(&b"key1".to_vec(), b"same_value").unwrap();
 
     // Merge should succeed with no conflicts (same change)
     let result = engine.merge_branch("dev", "main", MergeStrategy::Manual).unwrap();
@@ -343,7 +344,7 @@ fn test_merge_conflict_metadata() {
     let engine = StorageEngine::open_in_memory(&config).unwrap();
 
     // Setup conflict
-    engine.put(b"key1", b"base").unwrap();
+    engine.put(&b"key1".to_vec(), b"base").unwrap();
 
     engine
         .create_branch("dev", Some("main"), BranchOptions::default())
@@ -353,7 +354,7 @@ fn test_merge_conflict_metadata() {
     tx_dev.put(b"key1".to_vec(), b"dev_value".to_vec()).unwrap();
     tx_dev.commit().unwrap();
 
-    engine.put(b"key1", b"main_value").unwrap();
+    engine.put(&b"key1".to_vec(), b"main_value").unwrap();
 
     // Merge with Manual to inspect conflict metadata
     let result = engine.merge_branch("dev", "main", MergeStrategy::Manual).unwrap();

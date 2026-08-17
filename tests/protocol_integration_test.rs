@@ -9,14 +9,16 @@
 #![cfg(feature = "internal-tests")]
 
 use heliosdb_nano::protocols::{oracle::OracleServerConfig, ServerManager, ServerManagerConfig};
-use heliosdb_nano::{storage::StorageEngine, Config};
+use heliosdb_nano::{storage::StorageEngine, Config, EmbeddedDatabase};
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 
 #[tokio::test]
 async fn test_server_manager_creation() {
     let config = Config::in_memory();
-    let storage = Arc::new(StorageEngine::open_in_memory(&config).unwrap());
+    // ServerManager::new takes Arc<EmbeddedDatabase> (src/protocols/server_manager.rs:98);
+    // it used to take the raw StorageEngine.
+    let database = Arc::new(EmbeddedDatabase::with_config(config.clone()).unwrap());
 
     let oracle_config = OracleServerConfig {
         listen_addr: "127.0.0.1".to_string(),
@@ -25,7 +27,7 @@ async fn test_server_manager_creation() {
     };
 
     let server_config = ServerManagerConfig::oracle_only(oracle_config);
-    let manager = ServerManager::new(storage, server_config);
+    let manager = ServerManager::new(database, server_config);
 
     // Check health
     let health = manager.health_check();
@@ -62,7 +64,9 @@ async fn test_dual_protocol_config() {
 #[tokio::test]
 async fn test_server_startup_shutdown() {
     let config = Config::in_memory();
-    let storage = Arc::new(StorageEngine::open_in_memory(&config).unwrap());
+    // ServerManager::new takes Arc<EmbeddedDatabase> (src/protocols/server_manager.rs:98);
+    // it used to take the raw StorageEngine.
+    let database = Arc::new(EmbeddedDatabase::with_config(config.clone()).unwrap());
 
     let oracle_config = OracleServerConfig {
         listen_addr: "127.0.0.1".to_string(),
@@ -71,7 +75,7 @@ async fn test_server_startup_shutdown() {
     };
 
     let server_config = ServerManagerConfig::oracle_only(oracle_config);
-    let manager = ServerManager::new(storage, server_config);
+    let manager = ServerManager::new(database, server_config);
 
     // Start server in background
     let server_task = tokio::spawn(async move { manager.start().await });

@@ -12,12 +12,12 @@
 
 #![cfg(feature = "internal-tests")]
 
-use heliosdb_nano::{Column, Config, DataType, Database, Result, Schema, Value};
+use heliosdb_nano::{Column, Config, DataType, EmbeddedDatabase, Result, Schema, Value};
 
 #[test]
 fn test_create_materialized_view_basic() -> Result<()> {
     let config = Config::in_memory();
-    let mut db = Database::open_with_config(config)?;
+    let mut db = EmbeddedDatabase::with_config(config)?;
 
     // Create a base table
     db.execute("CREATE TABLE users (id INT, name TEXT, age INT)")?;
@@ -29,7 +29,7 @@ fn test_create_materialized_view_basic() -> Result<()> {
     db.execute("CREATE MATERIALIZED VIEW user_summary AS SELECT COUNT(*) as total FROM users")?;
 
     // Verify the view exists
-    let storage = db.storage();
+    let storage = &db.storage;
     let mv_catalog = storage.mv_catalog();
     assert!(mv_catalog.view_exists("user_summary")?);
 
@@ -46,7 +46,7 @@ fn test_create_materialized_view_basic() -> Result<()> {
 #[test]
 fn test_create_materialized_view_if_not_exists() -> Result<()> {
     let config = Config::in_memory();
-    let mut db = Database::open_with_config(config)?;
+    let mut db = EmbeddedDatabase::with_config(config)?;
 
     // Create a base table
     db.execute("CREATE TABLE products (id INT, name TEXT)")?;
@@ -67,13 +67,13 @@ fn test_create_materialized_view_if_not_exists() -> Result<()> {
 #[test]
 fn test_drop_materialized_view() -> Result<()> {
     let config = Config::in_memory();
-    let mut db = Database::open_with_config(config)?;
+    let mut db = EmbeddedDatabase::with_config(config)?;
 
     // Create base table and view
     db.execute("CREATE TABLE orders (id INT, total REAL)")?;
     db.execute("CREATE MATERIALIZED VIEW order_stats AS SELECT COUNT(*) FROM orders")?;
 
-    let storage = db.storage();
+    let storage = &db.storage;
     let mv_catalog = storage.mv_catalog();
     assert!(mv_catalog.view_exists("order_stats")?);
 
@@ -89,7 +89,7 @@ fn test_drop_materialized_view() -> Result<()> {
 #[test]
 fn test_drop_materialized_view_if_exists() -> Result<()> {
     let config = Config::in_memory();
-    let mut db = Database::open_with_config(config)?;
+    let mut db = EmbeddedDatabase::with_config(config)?;
 
     // Try to drop non-existent view without IF EXISTS - should fail
     let result = db.execute("DROP MATERIALIZED VIEW nonexistent");
@@ -104,14 +104,14 @@ fn test_drop_materialized_view_if_exists() -> Result<()> {
 #[test]
 fn test_refresh_materialized_view() -> Result<()> {
     let config = Config::in_memory();
-    let mut db = Database::open_with_config(config)?;
+    let mut db = EmbeddedDatabase::with_config(config)?;
 
     // Create base table and view
     db.execute("CREATE TABLE inventory (item TEXT, quantity INT)")?;
     db.execute("INSERT INTO inventory VALUES ('Widget', 100)")?;
     db.execute("CREATE MATERIALIZED VIEW inventory_summary AS SELECT COUNT(*) FROM inventory")?;
 
-    let storage = db.storage();
+    let storage = &db.storage;
     let mv_catalog = storage.mv_catalog();
 
     // Get initial metadata
@@ -134,7 +134,7 @@ fn test_refresh_materialized_view() -> Result<()> {
 #[test]
 fn test_materialized_view_with_aggregation() -> Result<()> {
     let config = Config::in_memory();
-    let mut db = Database::open_with_config(config)?;
+    let mut db = EmbeddedDatabase::with_config(config)?;
 
     // Create base table with sample data
     db.execute("CREATE TABLE sales (product TEXT, amount REAL)")?;
@@ -145,7 +145,7 @@ fn test_materialized_view_with_aggregation() -> Result<()> {
     // Create aggregated materialized view
     db.execute("CREATE MATERIALIZED VIEW sales_summary AS SELECT COUNT(*) as total FROM sales")?;
 
-    let storage = db.storage();
+    let storage = &db.storage;
     let mv_catalog = storage.mv_catalog();
 
     // Verify the view was populated
@@ -159,13 +159,13 @@ fn test_materialized_view_with_aggregation() -> Result<()> {
 #[test]
 fn test_materialized_view_staleness_tracking() -> Result<()> {
     let config = Config::in_memory();
-    let mut db = Database::open_with_config(config)?;
+    let mut db = EmbeddedDatabase::with_config(config)?;
 
     // Create base table and view
     db.execute("CREATE TABLE events (id INT, event_time TEXT)")?;
     db.execute("CREATE MATERIALIZED VIEW event_count AS SELECT COUNT(*) FROM events")?;
 
-    let storage = db.storage();
+    let storage = &db.storage;
     let mv_catalog = storage.mv_catalog();
 
     // View should not be stale (just created and populated)
@@ -184,7 +184,7 @@ fn test_materialized_view_staleness_tracking() -> Result<()> {
 #[test]
 fn test_list_materialized_views() -> Result<()> {
     let config = Config::in_memory();
-    let mut db = Database::open_with_config(config)?;
+    let mut db = EmbeddedDatabase::with_config(config)?;
 
     // Create multiple views
     db.execute("CREATE TABLE t1 (id INT)")?;
@@ -194,7 +194,7 @@ fn test_list_materialized_views() -> Result<()> {
     db.execute("CREATE MATERIALIZED VIEW view2 AS SELECT * FROM t2")?;
     db.execute("CREATE MATERIALIZED VIEW view3 AS SELECT COUNT(*) FROM t1")?;
 
-    let storage = db.storage();
+    let storage = &db.storage;
     let mv_catalog = storage.mv_catalog();
 
     // List all views
@@ -210,7 +210,7 @@ fn test_list_materialized_views() -> Result<()> {
 #[test]
 fn test_materialized_view_base_table_tracking() -> Result<()> {
     let config = Config::in_memory();
-    let mut db = Database::open_with_config(config)?;
+    let mut db = EmbeddedDatabase::with_config(config)?;
 
     // Create tables
     db.execute("CREATE TABLE customers (id INT, name TEXT)")?;
@@ -219,7 +219,7 @@ fn test_materialized_view_base_table_tracking() -> Result<()> {
     // Create a view that joins both tables
     db.execute("CREATE MATERIALIZED VIEW customer_orders AS SELECT COUNT(*) FROM customers")?;
 
-    let storage = db.storage();
+    let storage = &db.storage;
     let mv_catalog = storage.mv_catalog();
 
     // Verify base tables are tracked
@@ -233,7 +233,7 @@ fn test_materialized_view_base_table_tracking() -> Result<()> {
 #[test]
 fn test_materialized_view_data_storage() -> Result<()> {
     let config = Config::in_memory();
-    let mut db = Database::open_with_config(config)?;
+    let mut db = EmbeddedDatabase::with_config(config)?;
 
     // Create base table with data
     db.execute("CREATE TABLE items (id INT, name TEXT)")?;
@@ -243,7 +243,7 @@ fn test_materialized_view_data_storage() -> Result<()> {
     // Create materialized view
     db.execute("CREATE MATERIALIZED VIEW item_list AS SELECT COUNT(*) FROM items")?;
 
-    let storage = db.storage();
+    let storage = &db.storage;
     let mv_catalog = storage.mv_catalog();
 
     // Read the stored data
@@ -263,7 +263,7 @@ fn test_materialized_view_data_storage() -> Result<()> {
 #[test]
 fn test_concurrent_refresh_flag() -> Result<()> {
     let config = Config::in_memory();
-    let mut db = Database::open_with_config(config)?;
+    let mut db = EmbeddedDatabase::with_config(config)?;
 
     // Create base table and view
     db.execute("CREATE TABLE logs (id INT, message TEXT)")?;
@@ -272,7 +272,7 @@ fn test_concurrent_refresh_flag() -> Result<()> {
     // Test CONCURRENT refresh (currently same as regular refresh)
     db.execute("REFRESH MATERIALIZED VIEW CONCURRENTLY log_count")?;
 
-    let storage = db.storage();
+    let storage = &db.storage;
     let mv_catalog = storage.mv_catalog();
 
     // Should complete without error

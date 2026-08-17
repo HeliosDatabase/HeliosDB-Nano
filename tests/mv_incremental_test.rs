@@ -10,7 +10,9 @@
 #![cfg(feature = "internal-tests")]
 
 use heliosdb_nano::sql::LogicalPlan;
-use heliosdb_nano::storage::{DeltaTracker, IncrementalRefresher, MaterializedViewMetadata, RefreshStrategy};
+use heliosdb_nano::storage::{
+    IncDeltaTracker as DeltaTracker, IncrementalRefresher, MaterializedViewMetadata, RefreshStrategy,
+};
 use heliosdb_nano::{Column, Config, DataType, Result, Schema, StorageEngine, Tuple, Value};
 use std::sync::Arc;
 
@@ -21,12 +23,8 @@ fn test_delta_tracker_insert() -> Result<()> {
     let tracker = Arc::new(DeltaTracker::new(Arc::clone(&storage)));
 
     // Record some inserts
-    let tuple1 = Tuple {
-        values: vec![Value::Int4(1), Value::String("Alice".to_string())],
-    };
-    let tuple2 = Tuple {
-        values: vec![Value::Int4(2), Value::String("Bob".to_string())],
-    };
+    let tuple1 = Tuple::new(vec![Value::Int4(1), Value::String("Alice".to_string())]);
+    let tuple2 = Tuple::new(vec![Value::Int4(2), Value::String("Bob".to_string())]);
 
     tracker.record_insert("users", tuple1.clone(), 100);
     tracker.record_insert("users", tuple2.clone(), 150);
@@ -52,9 +50,7 @@ fn test_delta_tracker_delete() -> Result<()> {
     let storage = Arc::new(StorageEngine::open_in_memory(&config)?);
     let tracker = Arc::new(DeltaTracker::new(Arc::clone(&storage)));
 
-    let tuple = Tuple {
-        values: vec![Value::Int4(1), Value::String("Alice".to_string())],
-    };
+    let tuple = Tuple::new(vec![Value::Int4(1), Value::String("Alice".to_string())]);
 
     tracker.record_delete("users", tuple.clone(), 100);
 
@@ -77,12 +73,8 @@ fn test_delta_tracker_update() -> Result<()> {
     let storage = Arc::new(StorageEngine::open_in_memory(&config)?);
     let tracker = Arc::new(DeltaTracker::new(Arc::clone(&storage)));
 
-    let old_tuple = Tuple {
-        values: vec![Value::Int4(1), Value::String("Alice".to_string())],
-    };
-    let new_tuple = Tuple {
-        values: vec![Value::Int4(1), Value::String("Alicia".to_string())],
-    };
+    let old_tuple = Tuple::new(vec![Value::Int4(1), Value::String("Alice".to_string())]);
+    let new_tuple = Tuple::new(vec![Value::Int4(1), Value::String("Alicia".to_string())]);
 
     tracker.record_update("users", old_tuple.clone(), new_tuple.clone(), 100);
 
@@ -105,9 +97,7 @@ fn test_delta_tracker_multiple_tables() -> Result<()> {
     let storage = Arc::new(StorageEngine::open_in_memory(&config)?);
     let tracker = Arc::new(DeltaTracker::new(Arc::clone(&storage)));
 
-    let tuple = Tuple {
-        values: vec![Value::Int4(1)],
-    };
+    let tuple = Tuple::new(vec![Value::Int4(1)]);
 
     tracker.record_insert("users", tuple.clone(), 100);
     tracker.record_insert("orders", tuple.clone(), 150);
@@ -127,9 +117,7 @@ fn test_delta_tracker_clear() -> Result<()> {
     let storage = Arc::new(StorageEngine::open_in_memory(&config)?);
     let tracker = Arc::new(DeltaTracker::new(Arc::clone(&storage)));
 
-    let tuple = Tuple {
-        values: vec![Value::Int4(1)],
-    };
+    let tuple = Tuple::new(vec![Value::Int4(1)]);
 
     tracker.record_insert("users", tuple.clone(), 100);
     tracker.record_insert("users", tuple.clone(), 150);
@@ -180,15 +168,14 @@ fn test_cost_estimation_prefers_incremental() -> Result<()> {
 
     // Insert some rows
     for i in 0..100 {
-        let tuple = Tuple {
-            values: vec![Value::Int4(i), Value::String(format!("User{}", i))],
-        };
+        let tuple = Tuple::new(vec![Value::Int4(i), Value::String(format!("User{}", i))]);
         storage.insert_tuple("users", tuple)?;
     }
 
     // Create materialized view metadata
     let query_plan = LogicalPlan::Scan {
         table_name: "users".to_string(),
+        alias: None,
         schema: Arc::new(schema.clone()),
         projection: None,
         as_of: None,
@@ -223,9 +210,7 @@ fn test_cost_estimation_prefers_full() -> Result<()> {
     let tracker = Arc::new(DeltaTracker::new(Arc::clone(&storage)));
 
     // Record many deltas to make incremental expensive
-    let tuple = Tuple {
-        values: vec![Value::Int4(1)],
-    };
+    let tuple = Tuple::new(vec![Value::Int4(1)]);
     for i in 0..10000 {
         tracker.record_insert("users", tuple.clone(), i);
     }
@@ -240,15 +225,14 @@ fn test_cost_estimation_prefers_full() -> Result<()> {
 
     // Insert only a few rows
     for i in 0..10 {
-        let tuple = Tuple {
-            values: vec![Value::Int4(i)],
-        };
+        let tuple = Tuple::new(vec![Value::Int4(i)]);
         storage.insert_tuple("users", tuple)?;
     }
 
     // Create materialized view metadata
     let query_plan = LogicalPlan::Scan {
         table_name: "users".to_string(),
+        alias: None,
         schema: Arc::new(schema.clone()),
         projection: None,
         as_of: None,
@@ -288,6 +272,7 @@ fn test_can_refresh_incrementally() -> Result<()> {
     // Create a scan plan (supported for incremental refresh)
     let query_plan = LogicalPlan::Scan {
         table_name: "users".to_string(),
+        alias: None,
         schema: Arc::new(schema.clone()),
         projection: None,
         as_of: None,
@@ -327,9 +312,7 @@ fn test_delta_count() -> Result<()> {
     let storage = Arc::new(StorageEngine::open_in_memory(&config)?);
     let tracker = Arc::new(DeltaTracker::new(Arc::clone(&storage)));
 
-    let tuple = Tuple {
-        values: vec![Value::Int4(1)],
-    };
+    let tuple = Tuple::new(vec![Value::Int4(1)]);
 
     // Record deltas at different timestamps
     tracker.record_insert("users", tuple.clone(), 100);
@@ -362,6 +345,7 @@ fn test_incremental_refresh_not_supported_without_first_refresh() -> Result<()> 
 
     let query_plan = LogicalPlan::Scan {
         table_name: "users".to_string(),
+        alias: None,
         schema: Arc::new(schema.clone()),
         projection: None,
         as_of: None,
@@ -384,12 +368,8 @@ fn test_incremental_refresh_not_supported_without_first_refresh() -> Result<()> 
 
 #[test]
 fn test_delta_operations_equality() {
-    let tuple1 = Tuple {
-        values: vec![Value::Int4(1)],
-    };
-    let tuple2 = Tuple {
-        values: vec![Value::Int4(2)],
-    };
+    let tuple1 = Tuple::new(vec![Value::Int4(1)]);
+    let tuple2 = Tuple::new(vec![Value::Int4(2)]);
 
     let insert1 = heliosdb_nano::storage::DeltaOperation::Insert { tuple: tuple1.clone() };
     let insert2 = heliosdb_nano::storage::DeltaOperation::Insert { tuple: tuple1.clone() };

@@ -24,18 +24,12 @@ fn create_test_engine_with_snapshots() -> StorageEngine {
     // Create a simple test table
     let schema = Schema {
         columns: vec![
-            Column {
-                name: "id".to_string(),
-                data_type: DataType::Int4,
-                nullable: false,
-                primary_key: true,
-            },
-            Column {
-                name: "data".to_string(),
-                data_type: DataType::Text,
-                nullable: false,
-                primary_key: false,
-            },
+            // Constructor + builders, not a struct literal: a literal must name every
+            // field, which is why this file stopped compiling when `Column` gained
+            // `default_expr`, `unique`, `storage_mode`, `source_table` and
+            // `source_table_name`. `Column::new` defaults anything added later.
+            Column::new("id", DataType::Int4).not_null().primary_key(),
+            Column::new("data", DataType::Text).not_null(),
         ],
     };
 
@@ -46,10 +40,9 @@ fn create_test_engine_with_snapshots() -> StorageEngine {
 
     // Insert some data to create snapshots
     for i in 1..=5 {
-        let tuple = Tuple {
-            values: vec![Value::Int4(i), Value::String(format!("Data {}", i))],
-            row_id: None,
-        };
+        // Tuple::new sets row_id/branch_id; `branch_id` was added for copy-on-write
+        // branching and a struct literal has to name it.
+        let tuple = Tuple::new(vec![Value::Int4(i), Value::String(format!("Data {}", i))]);
         engine
             .insert_tuple_versioned("test_table", tuple)
             .expect(&format!("Failed to insert tuple {}", i));
@@ -317,6 +310,7 @@ fn test_time_travel_with_system_views() {
         schema: Arc::new(Schema { columns: vec![] }),
         projection: None,
         as_of: Some(AsOfClause::Transaction(txn_id)),
+        alias: None,
     };
 
     let mut executor = Executor::with_storage(&engine);
@@ -356,6 +350,7 @@ fn test_scn_based_time_travel() {
         schema: Arc::new(Schema { columns: vec![] }),
         projection: None,
         as_of: Some(AsOfClause::Scn(scn)),
+        alias: None,
     };
 
     let mut executor = Executor::with_storage(&engine);
