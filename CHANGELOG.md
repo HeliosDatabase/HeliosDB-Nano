@@ -5,7 +5,7 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [4.13.0] - 2026-08-17
 
 **One rule, two implementations — again.** A row-level-security read policy was attached to a
 scan leaf by two different mechanisms depending on which plan node the leaf happened to be, and
