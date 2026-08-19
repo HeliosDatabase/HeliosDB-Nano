@@ -162,12 +162,14 @@ OF TIMESTAMP '2026-06-01 09:00:00'` (needs time-travel ON — the agent profile
 guarantees it). Library API: `create_branch` / `switch_branch` / `drop_branch`
 / `list_branches`. REPL: `\branches`, `\use <branch>`, `\show branch`.
 
-> WARNING — MERGE is currently unreliable. `MERGE DATABASE BRANCH x INTO main`
-> exists, but its three-way conflict detection over-reports and can mis-detect
-> conflicts (branch keys no longer carry timestamps, so the merge-base lookup
-> reads the latest value instead of the historical base). If you merge, verify
-> the merged rows yourself afterwards (e.g. diff row counts and spot-check
-> changed rows against the source branch). A full fix is tracked (audit C11).
+> WARNING — MERGE DOES NOT WORK. `MERGE DATABASE BRANCH x INTO main` returns
+> `completed = true` with `conflicts = []` and `merged_keys = 0`, and leaves the
+> target unchanged. It raises no error. Measured 2026-08-19. An earlier version
+> of this warning called conflict detection "unreliable" and said to verify the
+> merged rows afterwards — that implied rows are merged; they are not. Risk is
+> silent data loss: merge, see success, discard the branch, lose the work. Never
+> propose MERGE; use fork-test-discard and re-run validated SQL on the target.
+> A fix is tracked (audit C11).
 > Until then, prefer fork-test-discard: apply validated changes to `main`
 > directly (re-run the tested SQL) instead of merging the branch.
 
