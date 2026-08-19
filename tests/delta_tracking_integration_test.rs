@@ -20,6 +20,32 @@ fn as_utc(t: SystemTime) -> DateTime<Utc> {
     DateTime::<Utc>::from(t)
 }
 
+/// Build a delta with an EXPLICIT timestamp and a unique `delta_id`.
+///
+/// The production helpers (`record_insert`/`record_update`/`record_delete`, which is how
+/// `src/storage/engine.rs` drives this tracker) allocate a `delta_id` themselves but always
+/// stamp `SystemTime::now()`. The two tests below need controlled timestamps to prove that
+/// `get_deltas_since` and `purge_deltas_before` filter by time at all.
+///
+/// `MvDelta::new()` is the only constructor that accepts a timestamp, and it leaves the
+/// deprecated `delta_id` at 0 — while `record_delta` keys storage on
+/// `delta:{table}:{delta_id:020}`. So every delta built that way collides on ONE key per
+/// table, and a test recording N deltas reads back 1. Assigning ids here works around that
+/// API gap; it is NOT part of what these tests verify. Filed separately as a footgun: the
+/// only timestamp-capable constructor is unusable for more than one delta per table.
+#[allow(deprecated)]
+fn timestamped_delta(
+    table: &str,
+    row_id: u64,
+    op: MvDeltaOperation,
+    ts: SystemTime,
+    delta_id: u64,
+) -> MvDelta {
+    let mut d = MvDelta::new(table.to_string(), row_id, op, ts, delta_id);
+    d.delta_id = delta_id;
+    d
+}
+
 #[test]
 fn test_delta_tracking_basic_insert() {
     let config = Config::in_memory();
@@ -73,16 +99,12 @@ fn test_delta_tracking_multiple_operations() {
         Value::Float8(19.99),
     ]);
 
+    // Recorded through the production helpers (record_insert/update/delete), which is
+    // how src/storage/engine.rs drives this tracker. They allocate a unique delta_id via
+    // next_delta_id(); building an MvDelta::new() by hand leaves delta_id at 0 and every
+    // delta then collides on one storage key per table. See the filed footgun.
     delta_tracker
-        .record_delta(MvDelta::new(
-            "products".to_string(),
-            1,
-            MvDeltaOperation::Insert {
-                tuple: insert_tuple.clone(),
-            },
-            now,
-            1,
-        ))
+        .record_insert("products", 1, insert_tuple.clone())
         .expect("Failed to record insert");
 
     // Update
@@ -93,27 +115,12 @@ fn test_delta_tracking_multiple_operations() {
     ]);
 
     delta_tracker
-        .record_delta(MvDelta::new(
-            "products".to_string(),
-            1,
-            MvDeltaOperation::Update {
-                old_tuple: insert_tuple.clone(),
-                new_tuple: updated_tuple.clone(),
-            },
-            now + Duration::from_secs(1),
-            2,
-        ))
+        .record_update("products", 1, insert_tuple.clone(), updated_tuple.clone())
         .expect("Failed to record update");
 
     // Delete
     delta_tracker
-        .record_delta(MvDelta::new(
-            "products".to_string(),
-            1,
-            MvDeltaOperation::Delete { tuple: updated_tuple },
-            now + Duration::from_secs(2),
-            3,
-        ))
+        .record_delete("products", 1, updated_tuple)
         .expect("Failed to record delete");
 
     // Query deltas
@@ -142,13 +149,7 @@ fn test_delta_tracking_multiple_tables() {
     for i in 1..=3 {
         let tuple = Tuple::new(vec![Value::Int4(i), Value::String(format!("User {}", i))]);
         delta_tracker
-            .record_delta(MvDelta::new(
-                "users".to_string(),
-                i as u64,
-                MvDeltaOperation::Insert { tuple },
-                now,
-                i as u64,
-            ))
+            .record_insert("users", i as u64, tuple)
             .expect("Failed to record user delta");
     }
 
@@ -156,13 +157,7 @@ fn test_delta_tracking_multiple_tables() {
     for i in 1..=2 {
         let tuple = Tuple::new(vec![Value::Int4(i), Value::Int4(i)]);
         delta_tracker
-            .record_delta(MvDelta::new(
-                "orders".to_string(),
-                i as u64,
-                MvDeltaOperation::Insert { tuple },
-                now,
-                (100 + i) as u64,
-            ))
+            .record_insert("orders", i as u64, tuple)
             .expect("Failed to record order delta");
     }
 
@@ -191,8 +186,8 @@ fn test_delta_tracking_time_range() {
     // Insert old delta
     let old_tuple = Tuple::new(vec![Value::Int4(1)]);
     delta_tracker
-        .record_delta(MvDelta::new(
-            "events".to_string(),
+        .record_delta(timestamped_delta(
+            "events",
             1,
             MvDeltaOperation::Insert { tuple: old_tuple },
             t0,
@@ -203,8 +198,8 @@ fn test_delta_tracking_time_range() {
     // Insert recent delta
     let recent_tuple = Tuple::new(vec![Value::Int4(2)]);
     delta_tracker
-        .record_delta(MvDelta::new(
-            "events".to_string(),
+        .record_delta(timestamped_delta(
+            "events",
             2,
             MvDeltaOperation::Insert { tuple: recent_tuple },
             t2,
@@ -244,8 +239,8 @@ fn test_delta_tracking_compaction() {
     for i in 1..=5 {
         let tuple = Tuple::new(vec![Value::Int4(i)]);
         delta_tracker
-            .record_delta(MvDelta::new(
-                "logs".to_string(),
+            .record_delta(timestamped_delta(
+                "logs",
                 i as u64,
                 MvDeltaOperation::Insert { tuple },
                 old_time,
@@ -258,8 +253,8 @@ fn test_delta_tracking_compaction() {
     for i in 6..=10 {
         let tuple = Tuple::new(vec![Value::Int4(i)]);
         delta_tracker
-            .record_delta(MvDelta::new(
-                "logs".to_string(),
+            .record_delta(timestamped_delta(
+                "logs",
                 i as u64,
                 MvDeltaOperation::Insert { tuple },
                 recent_time,
