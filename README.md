@@ -317,12 +317,23 @@ Branches can also fork from a past point in time:
 `CREATE BRANCH rewind FROM main AS OF TIMESTAMP '2026-06-01 09:00:00'`
 (requires time-travel, which the `agent` profile keeps enabled).
 
-> **Warning — `MERGE BRANCH` is currently unreliable.** `MERGE BRANCH x INTO
-> main` exists, but its three-way conflict detection over-reports and can
-> mis-detect conflicts (the merge-base lookup reads the latest value instead of
-> the historical base). If you do merge, verify the merged rows afterwards;
-> a full fix is tracked (audit C11). Until then, prefer fork-test-discard:
-> re-run the validated SQL on `main` instead of merging the branch.
+> **⚠️ Do not use `MERGE BRANCH`. It merges nothing and reports success.**
+> Measured 2026-08-19: `MERGE BRANCH dev INTO main` returns `completed = true`
+> with `conflicts = []` and **`merged_keys = 0`** — the target branch is
+> unchanged, and no error is raised. A previous version of this warning said
+> conflict detection "over-reports and can mis-detect", and advised verifying
+> the merged rows afterwards. That was wrong in the dangerous direction: it
+> implies rows are merged. **They are not.**
+>
+> The risk is silent data loss in the fork-test-discard workflow: run the merge,
+> see success with no conflicts, drop the branch — and the branch's work is gone,
+> never having reached `main`. Verify with `merged_keys` and by reading the rows
+> back before you discard anything.
+>
+> Use fork-test-discard as designed instead: re-run the validated SQL against
+> `main`. A fix is tracked (audit C11). This was invisible for months because the
+> merge test suite is gated behind a non-default feature and never ran — see
+> `docs/GATES.md` §3b.
 
 ## Time-Travel Queries
 

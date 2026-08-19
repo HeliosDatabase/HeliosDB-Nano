@@ -1,6 +1,6 @@
 ---
 name: heliosdb-nano-branches
-description: Database branching in HeliosDB-Nano — ephemeral fork-test-discard sandboxes. Create a branch from main (or any other branch, with an optional `AS OF` historical anchor), make isolated changes, validate, then discard. The primary pattern for agent sandboxes, migration rehearsals, A/B experiments, and short-lived "what if" workspaces. MERGE back exists but its conflict detection is currently unreliable — prefer discarding and re-applying validated SQL to main. Use this when the user says "branch", "fork the database", or wants to try a destructive change without affecting production data.
+description: Database branching in HeliosDB-Nano — ephemeral fork-test-discard sandboxes. Create a branch from main (or any other branch, with an optional `AS OF` historical anchor), make isolated changes, validate, then discard. The primary pattern for agent sandboxes, migration rehearsals, A/B experiments, and short-lived "what if" workspaces. MERGE back exists but DOES NOT WORK — it reports success and merges zero rows, so never propose it; discard and re-apply validated SQL to main instead. Use this when the user says "branch", "fork the database", or wants to try a destructive change without affecting production data.
 allowed-tools: Bash(heliosdb-nano *), Bash(psql *), Read
 ---
 
@@ -9,7 +9,7 @@ allowed-tools: Bash(heliosdb-nano *), Bash(psql *), Read
 Branches are ephemeral copy-on-write forks. The recommended lifecycle is
 **fork → test → discard**: create a branch, run the risky work there, validate,
 then `DROP` the branch and (if the change passed) re-apply the validated SQL to
-`main`. Treat `MERGE` as a last resort — see the warning below.
+`main`. `MERGE` does not work at all — see the warning below; never propose it.
 
 ## When to use
 - Give an LLM agent a sandboxed copy-on-write workspace (the primary use).
@@ -17,16 +17,36 @@ then `DROP` the branch and (if the change passed) re-apply the validated SQL to
 - A/B test a new schema or query plan.
 - Compare aggregates across "real" vs. "what if".
 
-## ⚠️ MERGE warning (known issue, fix tracked)
-`MERGE DATABASE BRANCH x INTO y` / `db.merge_branch(..)` currently has
-**unreliable three-way conflict detection**: branch keys no longer carry
-timestamps, so the merge-base lookup reads the *latest* value instead of the
-historical base (`src/storage/branch.rs` — audit C11). It can over-report
-conflicts and can also merge silently where a real conflict existed. If you
-merge anyway: verify the result afterwards (diff row counts, spot-check the
-rows the branch changed against both parents). The full fix is tracked; until
-it lands, prefer fork-test-discard and re-run validated SQL on the target
-branch instead of merging.
+## ⚠️ MERGE DOES NOT WORK — do not propose it
+
+`MERGE DATABASE BRANCH x INTO y` / `db.merge_branch(..)` **merges nothing and
+reports success.** Measured 2026-08-19 against
+`tests/branch_merge_conflict_tests.rs`:
+
+```
+main has key1; dev adds key2; merge dev -> main
+  result.completed    = true      <- claims success
+  result.conflicts    = []        <- claims no conflicts
+  result.merged_keys  = 0         <- merged NOTHING
+  main still lacks key2
+```
+
+Eleven of that suite's thirteen tests fail this way. The two that pass do so
+only because their expected outcome is "the target is unchanged" — which a
+no-op satisfies. Treat none of it as working.
+
+**An earlier version of this warning said conflict detection was "unreliable"
+and told you to verify the merged rows afterwards. That was wrong in the
+dangerous direction** — it implies rows are merged. The real risk is silent data
+loss: merge, see success with no conflicts, discard the branch, and the branch's
+work is gone without ever reaching the target.
+
+Never propose MERGE. Use fork-test-discard as designed: re-run the validated SQL
+against the target branch. A fix is tracked (audit C11; the merge-base lookup in
+`src/storage/branch.rs` reads the latest value instead of the historical base,
+which is a real defect but not the whole story). This stayed invisible for months
+because the merge suite is gated behind the non-default `internal-tests` feature
+and never ran — see `docs/GATES.md` §3b.
 
 ## Verbs
 
@@ -37,11 +57,11 @@ branch instead of merging.
 | switch | SQL / REPL | `USE BRANCH dev;` / `\use dev` |
 | current | REPL | `\show branch` |
 | list | SQL / REPL | `SELECT * FROM pg_database_branches();` / `\branches` |
-| merge ⚠️ | SQL | `MERGE DATABASE BRANCH dev INTO main;` — see MERGE warning above |
+| merge ❌ | SQL | `MERGE DATABASE BRANCH dev INTO main;` — **merges nothing, reports success**; see warning |
 | drop | SQL | `DROP DATABASE BRANCH dev;` |
 | library: create | Rust | `db.create_branch("dev")?` |
 | library: switch | Rust | `db.switch_branch("dev")?` |
-| library: merge ⚠️ | Rust | `db.merge_branch("dev")?` (merges source into current — see MERGE warning) |
+| library: merge ❌ | Rust | `db.merge_branch("dev")?` — **returns completed=true, merged_keys=0**; see warning |
 | library: drop | Rust | `db.drop_branch("dev")?` |
 | library: list | Rust | `db.list_branches()?` |
 
@@ -121,7 +141,7 @@ With `--features ha-ab-testing`, branches can be wired to traffic-split experime
 Branches can be marked for selective sync to specific remote replicas — useful for staging or jurisdiction-pinned data. See `docs/guides/ha_cluster_tutorial.md`.
 
 ## Pitfalls
-- **MERGE conflict detection is unreliable** (see the warning at the top). Verify results after any merge; prefer fork-test-discard.
+- **MERGE does not merge.** It returns `completed = true`, `conflicts = []`, `merged_keys = 0` and leaves the target unchanged (see the warning at the top). Do not propose it; use fork-test-discard and re-run the validated SQL.
 - **Branches are per-DB-instance**. Without `ha-tier2` / `ha-branch-replication`, a branch you create on one node is local to that node.
 - **Merge is "source into current"**. `db.merge_branch("dev")` merges `dev` into whatever branch you're currently on. Switch first, then merge.
 - **TRUNCATE on `main` does not touch branch overlays**, but TRUNCATE on a branch only clears that branch's writes; rows from the parent reappear. The ART-index branch guard handles this — see lib-tests `tests/branch_*.rs`.

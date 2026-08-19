@@ -46,34 +46,33 @@ SELECT current.id,
  WHERE past.balance IS DISTINCT FROM current.balance;
 ```
 
-### Recipe 3: "Undo a bad UPDATE" via branch + merge
+### Recipe 3: "Undo a bad UPDATE" — read the past straight into main
+
+No branch, and above all no `MERGE`. An earlier version of this recipe snapshotted
+into a branch and merged it back; `MERGE` reports success and merges **zero rows**
+(see the MERGE warning in `heliosdb-nano-branches`), so the holding table never
+reached `main` and the next step failed on a missing table — during an incident,
+which is the worst possible time to find out. `AS OF` reads history directly, so
+the branch was never buying anything here.
+
 ```sql
--- 1. Snapshot what the table looked like before the bad write
-CREATE DATABASE BRANCH undo FROM main
-  AS OF TIMESTAMP '2026-04-29 09:55:00';        -- 5 min before the bad UPDATE
-
-USE BRANCH undo;
-
--- 2. Copy the affected rows into a holding table
+-- 1. Copy the affected rows into a holding table, read as they were 5 minutes
+--    before the bad UPDATE
 CREATE TABLE accounts_restored AS
-SELECT * FROM accounts WHERE id IN (1,2,3);
+SELECT * FROM accounts AS OF TIMESTAMP '2026-04-29 09:55:00'
+ WHERE id IN (1,2,3);
 
--- 3. Merge the holding table back into main
---    ⚠️ MERGE conflict detection is currently unreliable (see the MERGE
---    warning in heliosdb-nano-branches) — verify accounts_restored after the
---    merge, or skip the merge: run the CREATE TABLE AS in step 2 with an
---    AS OF subquery directly on main instead.
-USE BRANCH main;
-MERGE DATABASE BRANCH undo INTO main;            -- brings accounts_restored over
+-- 2. Sanity-check BEFORE writing anything back
+SELECT r.id, a.balance AS balance_now, r.balance AS balance_then
+  FROM accounts_restored r JOIN accounts a ON a.id = r.id;
 
--- 4. Replace bad rows
+-- 3. Replace the bad rows
 UPDATE accounts a
    SET balance = r.balance
   FROM accounts_restored r
  WHERE a.id = r.id;
 
 DROP TABLE accounts_restored;
-DROP DATABASE BRANCH undo;
 ```
 
 ### Recipe 4: List available snapshots / show LSN

@@ -100,7 +100,7 @@ Source of truth: `src/main.rs`, `src/repl/commands.rs`, `src/lib.rs`, `src/mcp/t
 | `in_transaction()` | Check active txn | `heliosdb-nano-transactions` |
 | `create_branch(name)` | New branch | `heliosdb-nano-branches` |
 | `switch_branch(name)` | Activate branch | `heliosdb-nano-branches` |
-| `merge_branch(src)` | Merge source into current (⚠️ unreliable conflict detection — see skill) | `heliosdb-nano-branches` |
+| `merge_branch(src)` | ❌ **DOES NOT WORK** — returns completed=true, merged_keys=0, target unchanged | `heliosdb-nano-branches` |
 | `drop_branch(name)` | Delete branch | `heliosdb-nano-branches` |
 | `list_branches()` | Enumerate branches | `heliosdb-nano-branches` |
 | `dump_full(path)` | Full backup | `heliosdb-nano-backup` |
