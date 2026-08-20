@@ -5,6 +5,71 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **PRIMARY KEY / UNIQUE were not enforced on non-SQL inserts when
+  `storage.time_travel_enabled = false`** — duplicate primary keys were accepted
+  silently and written durably, with no error to the caller and nothing in the
+  log at any shipped level.
+
+  **Which profiles.** `fast` and `fast_ingest`, both of which set
+  `time_travel_enabled = false` (`src/config.rs`). `safe`, `balanced` and
+  `agent` set it to `true` and were never affected. Setting
+  `storage.time_travel_enabled = false` by hand, without a profile, had the same
+  effect.
+
+  **Which entry points.** Only callers that reach `StorageEngine::insert_tuple`
+  directly:
+
+  | Entry point | Source |
+  |---|---|
+  | REST `POST /rest/v1/<table>` | `src/api/handlers/data_handler.rs` |
+  | Dump RESTORE (CLI `restore`, `db.restore_from_dump`, `restore_tables`) | `src/embedded_db_dump.rs` |
+  | Protocol adapters | `src/protocols/adapters/executor.rs` |
+  | Materialized-view create/refresh (incl. incremental) | `src/storage/materialized_view.rs`, `src/storage/mv_incremental.rs` |
+  | FK-violation audit rows | `src/lib.rs` |
+
+  **SQL and wire clients were NOT affected.** Every `INSERT` statement — psql,
+  psycopg, sqlx, JDBC, the MySQL listener, the REPL, `db.execute`,
+  `db.execute_params` — goes through `insert_tuple_fast`, which has always
+  checked. A duplicate `INSERT INTO t VALUES (1, …)` was rejected under both
+  settings, which is why this never surfaced in wire-protocol testing.
+
+  **Consequence for backups: a restore could write duplicate primary keys.**
+  Restoring a dump into a `fast`/`fast_ingest` database applied rows through the
+  unchecked path, so a dump replayed onto a non-empty table (or replayed twice)
+  produced a table with repeated PK values that no subsequent `INSERT` could
+  have created. Such a table is inconsistent in a way reads expose unevenly: an
+  indexed lookup returns the one row the ART index registered, a full scan
+  returns them all.
+
+  *Cause.* `insert_tuple` has two arms and the arm is selected by
+  `time_travel_enabled`. The versioned arm checked; the non-versioned arm — the
+  one the fast profiles select — never called `check_unique_constraints` at all.
+  It did call `art_index_manager.on_insert`, whose duplicate-key rejection was
+  the only signal the row was bad, and that error was discarded at
+  `tracing::debug!` (off in every shipped configuration). So the row landed in
+  the heap, the index refused it, and nothing reported the divergence.
+
+  *Fix.* One rule, one implementation: a single private
+  `StorageEngine::check_insert_constraints` is now THE pre-insert PK/UNIQUE gate,
+  called by all three insert arms — the non-versioned arm of `insert_tuple`, the
+  versioned arm (`insert_tuple_versioned_with_schema`) and the SQL fast path
+  (`insert_tuple_fast`). Each arm checks exactly once, before anything is
+  written. The shared gate is tuple-backed, so the versioned arm no longer
+  allocates a per-row column map for its check (one `HashMap` less per insert on
+  the default profile); `time_travel_enabled = true` behaviour is otherwise
+  unchanged, and the SQL path is unchanged. A failed post-write index
+  maintenance call is now reported at `WARN` with the table, the row id and the
+  recovery action instead of `debug!` — it cannot become an error return,
+  because at that point the row is already durable and the caller would be told
+  a persisted write had failed. (`src/storage/engine.rs`; new
+  `tests/insert_tuple_constraint_parity_tests.rs` asserts the rule on every arm
+  under both settings, including that NULLs in a nullable UNIQUE column stay
+  distinct and that legitimate inserts are not over-rejected.)
+
 ## [4.13.1] - 2026-08-17
 
 **A documented surface that only worked if you happened to add a `WHERE`.** `RETURNING` is

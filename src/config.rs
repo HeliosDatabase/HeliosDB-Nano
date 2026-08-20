@@ -590,6 +590,15 @@ impl Default for StorageConfig {
 
 /// Named configuration profile (D3): a one-key bundle of durability /
 /// versioning settings. See [`Config::profile`] for precedence semantics.
+///
+/// What a profile trades is durability and history — never correctness.
+/// PRIMARY KEY, UNIQUE, FOREIGN KEY and CHECK are enforced identically under
+/// every profile. That invariant did not hold before the fix noted under
+/// "Unreleased" in `CHANGELOG.md`: `Fast` and `FastIngest` set
+/// `time_travel_enabled = false`, which selected a storage insert arm that
+/// skipped the PK/UNIQUE check, so non-SQL insert entry points (REST, dump
+/// RESTORE, protocol adapters, materialized-view refresh) could persist
+/// duplicate primary keys. Any new profile MUST keep enforcement invariant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProfileConfig {
