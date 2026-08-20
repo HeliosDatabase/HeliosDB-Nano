@@ -42,7 +42,11 @@ fn test_parse_tenant_create_with_name_only() {
     assert!(cmd.is_some());
 
     match cmd.unwrap() {
-        MetaCommand::TenantCreate { name, plan, isolation: _ } => {
+        MetaCommand::TenantCreate {
+            name,
+            plan,
+            isolation: _,
+        } => {
             assert_eq!(name, "mycompany");
             assert_eq!(plan, None);
         }
@@ -56,7 +60,11 @@ fn test_parse_tenant_create_with_plan() {
     assert!(cmd.is_some());
 
     match cmd.unwrap() {
-        MetaCommand::TenantCreate { name, plan, isolation: _ } => {
+        MetaCommand::TenantCreate {
+            name,
+            plan,
+            isolation: _,
+        } => {
             assert_eq!(name, "mycompany");
             assert_eq!(plan, Some("pro".to_string()));
         }
@@ -73,7 +81,11 @@ fn test_parse_tenant_create_various_plans() {
         assert!(cmd.is_some());
 
         match cmd.unwrap() {
-            MetaCommand::TenantCreate { name, plan, isolation: _ } => {
+            MetaCommand::TenantCreate {
+                name,
+                plan,
+                isolation: _,
+            } => {
                 assert_eq!(name, "test");
                 assert_eq!(plan, Some(plan_name.to_string()));
             }
@@ -242,7 +254,11 @@ fn test_tenant_command_with_whitespace() {
     assert!(cmd.is_some());
 
     match cmd.unwrap() {
-        MetaCommand::TenantCreate { name, plan, isolation: _ } => {
+        MetaCommand::TenantCreate {
+            name,
+            plan,
+            isolation: _,
+        } => {
             assert_eq!(name, "mycompany");
             assert_eq!(plan, Some("pro".to_string()));
         }
@@ -269,7 +285,11 @@ fn test_tenant_name_with_special_characters() {
     assert!(cmd.is_some());
 
     match cmd.unwrap() {
-        MetaCommand::TenantCreate { name, plan, isolation: _ } => {
+        MetaCommand::TenantCreate {
+            name,
+            plan,
+            isolation: _,
+        } => {
             assert_eq!(name, "my-company_123");
         }
         _ => panic!("Expected TenantCreate"),

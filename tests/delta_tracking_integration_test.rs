@@ -34,13 +34,7 @@ fn as_utc(t: SystemTime) -> DateTime<Utc> {
 /// API gap; it is NOT part of what these tests verify. Filed separately as a footgun: the
 /// only timestamp-capable constructor is unusable for more than one delta per table.
 #[allow(deprecated)]
-fn timestamped_delta(
-    table: &str,
-    row_id: u64,
-    op: MvDeltaOperation,
-    ts: SystemTime,
-    delta_id: u64,
-) -> MvDelta {
+fn timestamped_delta(table: &str, row_id: u64, op: MvDeltaOperation, ts: SystemTime, delta_id: u64) -> MvDelta {
     let mut d = MvDelta::new(table.to_string(), row_id, op, ts, delta_id);
     d.delta_id = delta_id;
     d
