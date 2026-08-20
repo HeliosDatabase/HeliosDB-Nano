@@ -3740,6 +3740,60 @@ impl StorageEngine {
         *ts
     }
 
+    /// THE pre-insert PK/UNIQUE gate. Every `insert_tuple*` arm calls this and
+    /// nothing else: the non-versioned arm of [`Self::insert_tuple`], the
+    /// versioned arm ([`Self::insert_tuple_versioned_with_schema`]) and the SQL
+    /// fast path ([`Self::insert_tuple_fast`]).
+    ///
+    /// One rule, one implementation. Until this existed the three arms carried
+    /// three separate decisions and the non-versioned arm — the arm selected by
+    /// `storage.time_travel_enabled = false`, i.e. by the shipped `fast` and
+    /// `fast_ingest` profiles — carried the decision "don't check". Every
+    /// non-SQL entry point that funnels into plain `insert_tuple` (REST
+    /// `POST /rest/v1/<table>`, dump RESTORE, the protocol adapters, MV refresh)
+    /// therefore persisted duplicate primary keys, silently and durably, under
+    /// those profiles. Adding a check must never again mean adding a fourth copy.
+    ///
+    /// Tuple-backed (`check_unique_constraints_tuple`) rather than the
+    /// `HashMap`-backed `check_unique_constraints`: every call site already has
+    /// the values in schema order, so no per-row column map is allocated. The
+    /// two are equivalent by construction — the map the HashMap variant used to
+    /// be handed was built by zipping `schema.columns` with `tuple.values`, and
+    /// `Schema::get_column_index` resolves names by the same exact-match rule
+    /// that `HashMap::get` did.
+    ///
+    /// MUST be called AFTER the SERIAL NULL-PK fill on arms that have one, so
+    /// the key checked is the key stored.
+    #[inline]
+    fn check_insert_constraints(&self, table_name: &str, schema: &crate::Schema, tuple: &Tuple) -> Result<()> {
+        self.art_index_manager
+            .check_unique_constraints_tuple(table_name, schema, tuple)
+            .map_err(|e| Error::constraint_violation(e.to_string()))
+    }
+
+    /// Report a post-write index-maintenance failure.
+    ///
+    /// This runs AFTER the row is durable, so it cannot be turned into an error
+    /// return: the caller would be told the insert failed while the row stays in
+    /// the heap forever — a torn insert, strictly worse than the divergence it
+    /// reports (and it would change `time_travel_enabled = true` behaviour, which
+    /// this path must preserve). What it must not be is invisible: it was
+    /// `tracing::debug!`, which is off in every shipped configuration, so a
+    /// dropped index write left an indexed lookup and a full scan disagreeing
+    /// about the same table with nothing in the log. WARN, with the row id and
+    /// the recovery action, is the correct level: it is not a user error, it is
+    /// an internal invariant breaking.
+    fn note_index_maintenance_failure(table_name: &str, row_id: u64, err: &dyn std::fmt::Display) {
+        tracing::warn!(
+            "ART index maintenance failed for table '{}' row {}: {} — the row is already durable, so an \
+             indexed lookup may now disagree with a full scan for this table. The ART is rebuilt from \
+             `data:` when the database is next opened; reopen to restore agreement.",
+            table_name,
+            row_id,
+            err
+        );
+    }
+
     /// Insert a tuple into a table
     ///
     /// Returns the row ID of the inserted tuple.
@@ -3747,6 +3801,10 @@ impl StorageEngine {
     /// This method automatically creates versioned snapshots for time-travel
     /// queries when time_travel_enabled is true (default). The versioning is
     /// transparent and requires zero configuration.
+    ///
+    /// Both arms enforce PRIMARY KEY / UNIQUE through the same shared gate
+    /// (`check_insert_constraints`) before anything is written — enforcement
+    /// never depends on `storage.time_travel_enabled`.
     pub fn insert_tuple(&self, table_name: &str, tuple: Tuple) -> Result<u64> {
         // Check if a non-main branch is active - use branch-aware insertion
         if self.is_branch_active() {
@@ -3767,6 +3825,13 @@ impl StorageEngine {
 
             // Get table schema
             let schema = catalog.get_table_schema(table_name)?;
+
+            // PK / UNIQUE gate — the SAME gate the versioned arm and the SQL
+            // fast path run, before anything is written. This arm used to skip
+            // it entirely, which made PK/UNIQUE enforcement depend on
+            // `storage.time_travel_enabled` (i.e. on the active profile) for
+            // every caller of plain `insert_tuple`.
+            self.check_insert_constraints(table_name, &schema, &tuple)?;
 
             // Check bulk load mode early - skip some operations if enabled
             let bulk_mode = self.is_bulk_load_mode();
@@ -3806,7 +3871,7 @@ impl StorageEngine {
                     }
                 }
                 if let Err(e) = self.art_index_manager.on_insert(table_name, row_id, &col_values) {
-                    tracing::debug!("ART index insert for table '{}': {}", table_name, e);
+                    Self::note_index_maintenance_failure(table_name, row_id, &e);
                 }
             }
 
@@ -10513,23 +10578,14 @@ impl StorageEngine {
 
         let logical_tuple = tuple.clone();
 
-        // PK / UNIQUE check before committing the write.  Mirror of the
-        // check in `insert_tuple_fast` (the SQL fast-path entry); without
-        // this, parameterised INSERTs (`db.execute_params`) and other
-        // callers routed here would silently insert duplicates that a
-        // cross-process `Catalog::rebuild_all_indexes()` had already
-        // registered in the ART. (FR `cross_process_on_conflict`.)
-        {
-            let mut col_values = std::collections::HashMap::with_capacity(schema.columns.len());
-            for (i, col) in schema.columns.iter().enumerate() {
-                if let Some(v) = tuple.values.get(i) {
-                    col_values.insert(col.name.clone(), v.clone());
-                }
-            }
-            if let Err(e) = self.art_index_manager.check_unique_constraints(table_name, &col_values) {
-                return Err(Error::constraint_violation(e.to_string()));
-            }
-        }
+        // PK / UNIQUE check before committing the write. Without this,
+        // parameterised INSERTs (`db.execute_params`) and other callers routed
+        // here would silently insert duplicates that a cross-process
+        // `Catalog::rebuild_all_indexes()` had already registered in the ART.
+        // (FR `cross_process_on_conflict`.) Runs exactly once per insert: this
+        // is the only constraint check on this arm, and it is the same check
+        // the non-versioned arm and `insert_tuple_fast` run.
+        self.check_insert_constraints(table_name, schema, &tuple)?;
 
         // Check bulk load mode early - skip some operations if enabled
         let bulk_mode = self.is_bulk_load_mode();
@@ -10586,7 +10642,7 @@ impl StorageEngine {
                 }
             }
             if let Err(e) = self.art_index_manager.on_insert(table_name, row_id, &col_values) {
-                tracing::debug!("ART index insert for table '{}': {}", table_name, e);
+                Self::note_index_maintenance_failure(table_name, row_id, &e);
             }
         }
 
@@ -10669,12 +10725,7 @@ impl StorageEngine {
         }
 
         // Check PK/UNIQUE constraints BEFORE writing data to prevent duplicates.
-        if let Err(e) = self
-            .art_index_manager
-            .check_unique_constraints_tuple(table_name, schema, &tuple)
-        {
-            return Err(Error::constraint_violation(e.to_string()));
-        }
+        self.check_insert_constraints(table_name, schema, &tuple)?;
 
         let uses_side_storage = schema_uses_column_storage(schema);
         let value = if uses_side_storage {
@@ -10765,7 +10816,7 @@ impl StorageEngine {
             .art_index_manager
             .on_insert_tuple(table_name, row_id, schema, &tuple)
         {
-            tracing::debug!("ART index insert for table '{}': {}", table_name, e);
+            Self::note_index_maintenance_failure(table_name, row_id, &e);
         }
 
         // R5.V1: maintain HNSW vector indexes (single atomic load when the

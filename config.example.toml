@@ -15,6 +15,10 @@
 # - "fast":     group_commit, time_travel OFF, durable_commit off — fastest
 #               writes; no AS OF time-travel queries, power loss can lose
 #               recent commits.
+# - "fast_ingest": async WAL, time_travel OFF, durable_commit off, Lz4 SSTs and
+#               a larger cache — opt-in bulk-load bundle for REGENERABLE data.
+#               Everything "fast" gives up, plus a crash can lose more than the
+#               last commit window (async WAL).
 # - "agent":    wal_sync_mode=group_commit, time_travel on — for AI-agent
 #               workloads: branchable sandboxes (CREATE DATABASE BRANCH —
 #               branching is always available; AS OF branch anchors need
@@ -24,6 +28,14 @@
 #               profile pins the agent feature bundle. See docs/llms.txt.
 # Precedence: a profile only fills in [storage] keys you do NOT set
 # explicitly below — explicit per-field values always win.
+# WHAT A PROFILE NEVER CHANGES: constraint enforcement. PRIMARY KEY, UNIQUE,
+# FOREIGN KEY and CHECK are enforced identically under every profile — what you
+# trade for speed is durability and history, never correctness. (Before the fix
+# noted in CHANGELOG "Unreleased", this was not true: with time_travel OFF —
+# i.e. under "fast" and "fast_ingest" — the storage engine's non-versioned
+# insert arm skipped the PK/UNIQUE check, so REST writes, dump RESTORE, the
+# protocol adapters and materialized-view refresh could persist duplicate
+# primary keys. SQL and wire clients were never affected.)
 # NOTE: none of the profiles force power-loss durable commits. If you need
 # commits to survive power loss (not just process crashes), also set
 # storage.durable_commit = true (available since v3.44.0; "safe" profile
@@ -63,6 +75,10 @@ compression = "Zstd"
 # Enable automatic time-travel versioning
 # When true, all insert/update operations create versioned snapshots
 # for time-travel queries (AS OF TIMESTAMP/TRANSACTION/SCN)
+# This flag selects which storage insert path runs, but it does NOT change what
+# is enforced: PRIMARY KEY / UNIQUE are checked before the write on every path
+# at either setting. (Setting it to false used to disable that check for the
+# non-SQL insert entry points — see CHANGELOG "Unreleased".)
 time_travel_enabled = true
 
 # W3.2: single-copy latest version. When true, a versioned main-branch INSERT
