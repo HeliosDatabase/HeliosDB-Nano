@@ -260,9 +260,10 @@ fn test_05_snapshot_creation_and_retrieval() {
 
     thread::sleep(Duration::from_millis(10));
 
-    // Insert version 2
+    // Insert a second row. `id` is the primary key, so this must be a distinct
+    // key: re-inserting id=1 is a PK violation, not an "update to v2".
     storage
-        .insert_tuple("history_test", create_test_tuple(1, "v2", 200.0))
+        .insert_tuple("history_test", create_test_tuple(2, "v2", 200.0))
         .expect("Failed to insert v2");
 
     let snapshot2 = current_timestamp_ms();
@@ -542,10 +543,12 @@ fn test_14_branching_with_time_travel() {
         .create_branch("versioned_dev", Some("main"), BranchOptions::default())
         .expect("Failed to create branch");
 
-    // Update on main
+    // Insert a second row on main. `id` is the primary key, so this is an
+    // insert of a distinct key, not an update of id=1 (which would be rejected
+    // as a PK violation).
     storage
-        .insert_tuple("versioned", create_test_tuple(1, "main_v2", 200.0))
-        .expect("Failed to update");
+        .insert_tuple("versioned", create_test_tuple(2, "main_v2", 200.0))
+        .expect("Failed to insert second row on main");
 
     // Create another snapshot
     let snapshot2 = current_timestamp_ms();
