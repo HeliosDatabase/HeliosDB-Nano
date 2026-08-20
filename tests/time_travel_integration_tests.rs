@@ -16,6 +16,14 @@ use std::sync::Arc;
 
 /// Helper to create a test storage engine with sample data
 fn create_test_engine_with_history() -> StorageEngine {
+    create_test_engine_with_history_inner(false)
+}
+
+/// As `create_test_engine_with_history`, but `space_last_insert` sleeps >1s
+/// before the third insert so that it lands in a strictly LATER wall-clock
+/// second than the first two. Only `test_as_of_timestamp` needs that; see the
+/// comment there for why.
+fn create_test_engine_with_history_inner(space_last_insert: bool) -> StorageEngine {
     let config = Config::in_memory();
     let engine = StorageEngine::open_in_memory(&config).expect("Failed to create storage engine");
 
@@ -53,6 +61,10 @@ fn create_test_engine_with_history() -> StorageEngine {
     engine
         .insert_tuple_versioned("orders", tuple2)
         .expect("Failed to insert tuple 2");
+
+    if space_last_insert {
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+    }
 
     // Insert version 3 - Add third order
     let tuple3 = Tuple::new(vec![
@@ -163,7 +175,18 @@ fn test_as_of_scn() {
 
 #[test]
 fn test_as_of_timestamp() {
-    let engine = create_test_engine_with_history();
+    // AS OF TIMESTAMP resolution is WHOLE-SECOND granular: `resolve_timestamp`
+    // parses the RFC3339 string with `DateTime::timestamp()` (seconds) and
+    // compares it against `SnapshotMetadata::wall_clock_unix_secs()` (also
+    // seconds). Among snapshots in the SAME second the tie is broken FORWARD,
+    // toward the newest one. So if all three inserts land in one second, asking
+    // for the second snapshot's timestamp resolves to the THIRD snapshot and
+    // returns 3 rows — the query would look broken but is behaving as designed.
+    //
+    // We therefore space the third insert into a later second. That makes this
+    // the one test that proves AS OF TIMESTAMP actually discriminates between
+    // points in time, rather than always resolving to "latest".
+    let engine = create_test_engine_with_history_inner(true);
     let snapshot_mgr = engine.snapshot_manager();
 
     // Get metadata for second snapshot
@@ -307,13 +330,16 @@ fn test_multiple_tables_time_travel() {
         )
         .expect("Failed to insert product");
 
-    // Query both tables at same snapshot
+    // Transaction IDs are GLOBAL, not per-table: the `users` insert is txn 1 and
+    // the `products` insert is txn 2. So the first snapshot at which BOTH tables
+    // are populated is txn 2 — `users` was already there at txn 1 and remains
+    // visible at txn 2.
     let plan_users = LogicalPlan::Scan {
         table_name: "users".to_string(),
         alias: None,
         schema: Arc::new(schema.clone()),
         projection: None,
-        as_of: Some(AsOfClause::Transaction(1)),
+        as_of: Some(AsOfClause::Transaction(2)),
     };
 
     let plan_products = LogicalPlan::Scan {
@@ -321,7 +347,7 @@ fn test_multiple_tables_time_travel() {
         alias: None,
         schema: Arc::new(schema.clone()),
         projection: None,
-        as_of: Some(AsOfClause::Transaction(1)),
+        as_of: Some(AsOfClause::Transaction(2)),
     };
 
     let mut executor = Executor::with_storage(&engine);
@@ -329,21 +355,44 @@ fn test_multiple_tables_time_travel() {
     let users = executor.execute(&plan_users).expect("Failed to query users");
     let products = executor.execute(&plan_products).expect("Failed to query products");
 
-    // Both should have data at transaction 1
+    // Both tables have data as of the global transaction 2
     assert_eq!(users.len(), 1);
     assert_eq!(products.len(), 1);
+
+    // Pin the global-transaction semantics explicitly: at txn 1 only the `users`
+    // insert had happened, so `products` must be EMPTY there. If transaction IDs
+    // were ever made per-table, txn 1 would name the `products` insert and this
+    // would return 1 row instead.
+    let plan_products_txn1 = LogicalPlan::Scan {
+        table_name: "products".to_string(),
+        alias: None,
+        schema: Arc::new(schema.clone()),
+        projection: None,
+        as_of: Some(AsOfClause::Transaction(1)),
+    };
+    let products_txn1 = executor
+        .execute(&plan_products_txn1)
+        .expect("Failed to query products at txn 1");
+    assert_eq!(
+        products_txn1.len(),
+        0,
+        "transaction IDs are global: txn 1 is the `users` insert, so `products` must be empty there"
+    );
 }
 
 #[test]
-fn test_snapshot_gc() {
-    use heliosdb_nano::storage::{GcConfig, SnapshotManager};
-
+fn test_snapshot_gc_retains_recent_snapshots() {
     let config = Config::in_memory();
     let engine = StorageEngine::open_in_memory(&config).expect("Failed to create storage engine");
 
+    // The engine-owned SnapshotManager is hardwired to `GcConfig::default()`:
+    // 3600 s minimum retention and a 1000-snapshot cap. There is no way to
+    // inject a different GcConfig through `StorageEngine`, so this test pins
+    // the retention side of that contract: freshly created snapshots are
+    // NOT collectable.
     let snapshot_mgr = engine.snapshot_manager();
 
-    // Create many snapshots
+    // Create many snapshots, all milliseconds old.
     for i in 1..=20 {
         snapshot_mgr
             .register_snapshot(i * 100)
@@ -355,9 +404,17 @@ fn test_snapshot_gc() {
     // Run GC
     let removed = snapshot_mgr.gc_old_snapshots().expect("Failed to run GC");
 
-    // Should have removed some snapshots (exact count depends on GC config)
-    assert!(removed > 0);
-    assert!(snapshot_mgr.snapshot_count() < 20);
+    // Nothing is eligible: every snapshot is far younger than the 3600 s
+    // minimum retention, and 20 is far below the 1000-snapshot cap.
+    assert_eq!(
+        removed, 0,
+        "snapshots younger than min_retention_seconds (3600) must not be collected"
+    );
+    assert_eq!(
+        snapshot_mgr.snapshot_count(),
+        20,
+        "GC must leave all 20 recent snapshots in place"
+    );
 }
 
 #[test]

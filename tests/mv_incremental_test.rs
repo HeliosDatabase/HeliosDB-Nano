@@ -9,7 +9,8 @@
 
 #![cfg(feature = "internal-tests")]
 
-use heliosdb_nano::sql::LogicalPlan;
+use chrono::Utc;
+use heliosdb_nano::sql::{LogicalExpr, LogicalPlan};
 use heliosdb_nano::storage::{
     IncDeltaTracker as DeltaTracker, IncrementalRefresher, MaterializedViewMetadata, RefreshStrategy,
 };
@@ -209,10 +210,18 @@ fn test_cost_estimation_prefers_full() -> Result<()> {
     let storage = Arc::new(StorageEngine::open_in_memory(&config)?);
     let tracker = Arc::new(DeltaTracker::new(Arc::clone(&storage)));
 
-    // Record many deltas to make incremental expensive
+    // `estimate_refresh_cost` counts only deltas with `timestamp > last_refresh`,
+    // and `mark_refreshed` always stamps `Utc::now()`. Delta timestamps and the
+    // MV's refresh anchor must therefore live in the SAME domain (Unix seconds):
+    // recording deltas at 0..10000 while the anchor sits at ~1.7e9 makes every
+    // delta invisible and the estimator reports an incremental cost of exactly
+    // zero. Anchor the deltas to "now" so they land AFTER the refresh.
+    let base = Utc::now().timestamp() as u64;
+
+    // Record more deltas than the base table has rows, so full refresh wins.
     let tuple = Tuple::new(vec![Value::Int4(1)]);
-    for i in 0..10000 {
-        tracker.record_insert("users", tuple.clone(), i);
+    for i in 1..=100 {
+        tracker.record_insert("users", tuple.clone(), base + i);
     }
 
     let refresher = IncrementalRefresher::new(Arc::clone(&storage), tracker);
@@ -269,13 +278,18 @@ fn test_can_refresh_incrementally() -> Result<()> {
 
     let schema = Schema::new(vec![Column::new("id", DataType::Int4)]);
 
-    // Create a scan plan (supported for incremental refresh)
-    let query_plan = LogicalPlan::Scan {
-        table_name: "users".to_string(),
-        alias: None,
-        schema: Arc::new(schema.clone()),
-        projection: None,
-        as_of: None,
+    // `can_refresh_incrementally` only accepts Aggregate / Filter / Project /
+    // Join plans; a bare Scan falls through to `_ => Ok(false)`. Build a
+    // Filter-over-Scan, which is a shape the function actually supports.
+    let query_plan = LogicalPlan::Filter {
+        input: Box::new(LogicalPlan::Scan {
+            table_name: "users".to_string(),
+            alias: None,
+            schema: Arc::new(schema.clone()),
+            projection: None,
+            as_of: None,
+        }),
+        predicate: LogicalExpr::Literal(Value::Boolean(true)),
     };
     let query_plan_bytes = bincode::serialize(&query_plan).unwrap();
 

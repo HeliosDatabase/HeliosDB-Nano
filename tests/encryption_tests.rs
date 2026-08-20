@@ -196,15 +196,70 @@ fn test_encrypted_table_operations() {
         "Table should exist"
     );
 
+    // `create_table` primes the in-memory schema cache, so a bare
+    // `get_table_schema` here would be served from a DashMap hit and would never
+    // touch the encrypted on-disk metadata at all — the assertion below would
+    // pass without a single byte being decrypted. Drop the cache entry first so
+    // this really is an encrypt -> persist -> decrypt round trip.
+    storage.invalidate_schema_cache("secrets");
+
     // Verify schema retrieval (decryption of metadata)
     let retrieved_schema = catalog
         .get_table_schema("secrets")
         .expect("Failed to get encrypted schema");
 
+    // Full-struct equality against a hand-built Schema is unattainable BY
+    // CONSTRUCTION: `create_table` persists columns exactly as given (here with
+    // `source_table_name: None`), while `get_table_schema` stamps the canonical
+    // table name onto every column on READ (B31 back-compat). So assert
+    // per-field, and pin that read-side asymmetry explicitly rather than
+    // papering over it.
     assert_eq!(
-        retrieved_schema, schema,
-        "Schema should match after encryption/decryption"
+        retrieved_schema.columns.len(),
+        schema.columns.len(),
+        "Column count should survive encryption/decryption"
     );
+
+    for (got, want) in retrieved_schema.columns.iter().zip(schema.columns.iter()) {
+        assert_eq!(got.name, want.name, "Column name should survive encryption/decryption");
+        assert_eq!(
+            got.data_type, want.data_type,
+            "Column type should survive encryption/decryption"
+        );
+        assert_eq!(
+            got.nullable, want.nullable,
+            "Nullability should survive encryption/decryption"
+        );
+        assert_eq!(
+            got.primary_key, want.primary_key,
+            "Primary-key flag should survive encryption/decryption"
+        );
+        assert_eq!(
+            got.unique, want.unique,
+            "UNIQUE flag should survive encryption/decryption"
+        );
+        assert_eq!(
+            got.default_expr, want.default_expr,
+            "Default expression should survive encryption/decryption"
+        );
+        assert_eq!(
+            got.storage_mode, want.storage_mode,
+            "Storage mode should survive encryption/decryption"
+        );
+
+        // Read-side normalization: `get_table_schema` stamps the actual table
+        // name onto every column, even though nothing wrote it.
+        assert_eq!(
+            got.source_table_name.as_deref(),
+            Some("secrets"),
+            "get_table_schema must stamp the canonical table name on read"
+        );
+        // ...but it does NOT touch the alias slot, which stays as persisted.
+        assert_eq!(
+            got.source_table, None,
+            "the alias slot must stay unset — only source_table_name is normalized on read"
+        );
+    }
 
     // Insert encrypted data
     let tuple = Tuple::new(vec![

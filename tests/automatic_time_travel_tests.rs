@@ -267,41 +267,17 @@ fn test_backward_compatibility() {
     assert_eq!(results.len(), 1);
 }
 
-#[test]
-fn test_force_versioning_when_disabled() {
-    // Test that insert_tuple_versioned() works even when auto-versioning is disabled
-    let mut config = Config::in_memory();
-    config.storage.time_travel_enabled = false;
-
-    let engine = StorageEngine::open_in_memory(&config).expect("Failed to create storage engine");
-
-    let catalog = engine.catalog();
-    catalog
-        .create_table("manual", create_simple_schema())
-        .expect("Failed to create table");
-
-    // Use insert_tuple() - should NOT version
-    let tuple1 = Tuple::new(vec![
-        Value::Int4(1),
-        Value::String("NoVersion".to_string()),
-        Value::Float8(100.0),
-    ]);
-    engine.insert_tuple("manual", tuple1).expect("Failed to insert");
-
-    assert_eq!(engine.snapshot_manager().snapshot_count(), 0);
-
-    // Use insert_tuple_versioned() - SHOULD version
-    let tuple2 = Tuple::new(vec![
-        Value::Int4(2),
-        Value::String("Versioned".to_string()),
-        Value::Float8(200.0),
-    ]);
-    engine
-        .insert_tuple_versioned("manual", tuple2)
-        .expect("Failed to insert versioned");
-
-    assert_eq!(engine.snapshot_manager().snapshot_count(), 1);
-}
+// NOTE: `test_force_versioning_when_disabled` was removed here. It asserted that
+// `insert_tuple_versioned()` could FORCE a snapshot while
+// `storage.time_travel_enabled = false`. That flag is now an absolute
+// kill-switch (engine.rs `insert_tuple_versioned_with_schema`: no version
+// timestamp is allocated when time-travel is off), so the test asserted
+// behaviour that was deliberately removed. The surviving semantics are covered,
+// un-gated, by tests/p0_1_tt_off_correctness.rs:
+//   - `tt_off_main_branch_context_does_not_force_versioned_insert` (TT-off
+//     `insert_tuple` writes no snapshot)
+//   - `tt_off_direct_versioned_insert_skips_snapshot_write` (TT-off *direct*
+//     `insert_tuple_versioned` writes no snapshot either, and the row still reads back)
 
 #[test]
 fn test_automatic_gc_integration() {
