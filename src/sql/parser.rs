@@ -340,6 +340,13 @@ impl Parser {
         // its own explicitly-listed columns, the pragmatic compatibility win.
         processed_sql = Self::preprocess_strip_inherits(&processed_sql);
 
+        // Move a TRAILING `CREATE MATERIALIZED VIEW … AS <query> WITH (opts)` clause
+        // to the pre-`AS` position sqlparser reads. Without this the documented
+        // spelling parses "successfully" with an EMPTY option list, because the
+        // trailing clause is swallowed as an MSSQL table hint on the last table in
+        // the query — which is how `WITH (auto_refresh = true)` came to mean nothing.
+        processed_sql = Self::preprocess_mv_with_options(&processed_sql);
+
         // Attempt the normal parse first. Only if it fails do we apply the
         // Stage-0 partitioning rewrites (strip a parent `PARTITION BY …` clause,
         // rewrite a child `PARTITION OF …` to an empty-column CREATE) or the
@@ -720,7 +727,15 @@ impl Parser {
     ///
     /// The caller still plans the inner query through the normal planner so
     /// the existing MV/DMV execution path stays authoritative.
-    pub fn parse_create_materialized_view_sql(sql: &str) -> Result<(String, String, bool)> {
+    ///
+    /// Returns `(view_name, query_sql, if_not_exists, options)`. The `WITH ( … )`
+    /// option list is accepted in BOTH documented positions and is stripped out of
+    /// `query_sql`/`view_name` so the caller can feed it to
+    /// `MaterializedViewParser::parse_mv_options`. This path used to discard options
+    /// entirely (the call site hard-coded `None`): a trailing clause was later
+    /// swallowed as an MSSQL table hint, and a pre-`AS` clause was glued onto the
+    /// view NAME.
+    pub fn parse_create_materialized_view_sql(sql: &str) -> Result<(String, String, bool, Option<String>)> {
         let cleaned = sql.trim().trim_end_matches(';').trim();
         let after_create = cleaned
             .get("CREATE MATERIALIZED VIEW".len()..)
@@ -737,8 +752,23 @@ impl Parser {
 
         let as_pos = Self::find_as_keyword(remaining)
             .ok_or_else(|| Error::query_execution("CREATE MATERIALIZED VIEW requires AS <query>"))?;
-        let raw_name = remaining[..as_pos].trim();
-        let query = remaining[as_pos + "AS".len()..].trim();
+        let mut raw_name = remaining[..as_pos].trim();
+        let mut query = remaining[as_pos + "AS".len()..].trim();
+
+        // Pre-`AS` (PostgreSQL-standard) form: `… v WITH ( … ) AS <query>`.
+        let mut options = None;
+        if let Some((name_only, opts)) = Self::split_trailing_with_options(raw_name) {
+            raw_name = name_only;
+            options = Some(opts);
+        }
+        // Trailing form (what the REPL help and the module docs teach):
+        // `… AS <query> WITH ( … )`.
+        if options.is_none() {
+            if let Some((query_only, opts)) = Self::split_trailing_with_options(query) {
+                query = query_only;
+                options = Some(opts);
+            }
+        }
 
         if raw_name.is_empty() {
             return Err(Error::query_execution("CREATE MATERIALIZED VIEW requires a view name"));
@@ -751,7 +781,197 @@ impl Parser {
             Self::normalize_simple_object_name(raw_name),
             query.to_string(),
             if_not_exists,
+            options,
         ))
+    }
+
+    /// Byte offsets of every whole-word, case-insensitive occurrence of the ASCII
+    /// `keyword` in `sql` that sits at paren depth 0 and outside quoted spans.
+    #[allow(clippy::indexing_slicing)] // Byte cursor bounded by `while i < n`; `keyword` is ASCII.
+    fn top_level_keyword_positions(sql: &str, keyword: &str) -> Vec<usize> {
+        let bytes = sql.as_bytes();
+        let kw = keyword.as_bytes();
+        let n = bytes.len();
+        let k = kw.len();
+        let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
+
+        let mut hits = Vec::new();
+        let mut depth = 0i32;
+        let mut i = 0usize;
+        while i < n {
+            let c = bytes[i];
+            if c == b'\'' || c == b'"' {
+                i = Self::skip_quoted_span(bytes, i);
+                continue;
+            }
+            if c == b'(' {
+                depth += 1;
+                i += 1;
+                continue;
+            }
+            if c == b')' {
+                depth -= 1;
+                i += 1;
+                continue;
+            }
+            if depth == 0
+                && i + k <= n
+                && bytes[i..i + k].eq_ignore_ascii_case(kw)
+                && (i == 0 || !is_ident(bytes[i - 1]))
+                && (i + k == n || !is_ident(bytes[i + k]))
+            {
+                hits.push(i);
+                i += k;
+                continue;
+            }
+            i += 1;
+        }
+        hits
+    }
+
+    /// Does `inner` (the text inside a `WITH ( … )`) read as an option list rather
+    /// than an MSSQL table hint? Every top-level comma-separated element must carry
+    /// a top-level `=`.
+    ///
+    /// This is the guard that keeps [`Self::find_trailing_with_options`] off genuinely
+    /// hinted migrated SQL: `… FROM t WITH (NOLOCK)` must stay exactly as it parses
+    /// today (sqlparser swallows it as a table hint), while
+    /// `… WITH (auto_refresh = true)` is recognised as the option list it is.
+    #[allow(clippy::indexing_slicing)] // Byte cursor bounded by `while i < n`.
+    fn with_options_are_assignments(inner: &str) -> bool {
+        let bytes = inner.as_bytes();
+        let n = bytes.len();
+        let mut depth = 0i32;
+        let mut i = 0usize;
+        let mut element_has_eq = false;
+        let mut element_nonempty = false;
+        while i < n {
+            let c = bytes[i];
+            if c == b'\'' || c == b'"' {
+                element_nonempty = true;
+                i = Self::skip_quoted_span(bytes, i);
+                continue;
+            }
+            match c {
+                b'(' => depth += 1,
+                b')' => depth -= 1,
+                b'=' if depth == 0 => element_has_eq = true,
+                b',' if depth == 0 => {
+                    if !element_nonempty || !element_has_eq {
+                        return false;
+                    }
+                    element_has_eq = false;
+                    element_nonempty = false;
+                    i += 1;
+                    continue;
+                }
+                _ => {}
+            }
+            if !c.is_ascii_whitespace() {
+                element_nonempty = true;
+            }
+            i += 1;
+        }
+        // The final (or only) element must also be a non-empty assignment.
+        element_nonempty && element_has_eq
+    }
+
+    /// Locate a *trailing* top-level `WITH ( … )` option list in `s`.
+    ///
+    /// Returns `(with_start, with_end, options_text)` where `with_start..with_end`
+    /// spans `WITH ( … )` exactly and `options_text` is the parenthesised content.
+    ///
+    /// Deliberately does NOT match: a CTE (`WITH name AS ( … )` — the keyword must be
+    /// followed immediately by `(`), a clause that is not the final token run of `s`
+    /// (only whitespace and one statement terminator may follow), an empty `WITH ()`,
+    /// or an MSSQL table hint (see [`Self::with_options_are_assignments`]).
+    #[allow(clippy::indexing_slicing)] // Offsets come from the ASCII-only scanners above.
+    fn find_trailing_with_options(s: &str) -> Option<(usize, usize, String)> {
+        let with_start = Self::top_level_keyword_positions(s, "WITH").last().copied()?;
+        let after_kw = with_start + "WITH".len();
+        let paren = s[after_kw..]
+            .find(|c: char| !c.is_whitespace())
+            .map(|off| after_kw + off)?;
+        if s.as_bytes().get(paren) != Some(&b'(') {
+            return None;
+        }
+        let close = Self::matching_paren_bytes(s.as_bytes(), paren)?;
+        if !s[close + 1..].trim().trim_end_matches(';').trim().is_empty() {
+            return None;
+        }
+        let inner = s[paren + 1..close].trim();
+        if inner.is_empty() || !Self::with_options_are_assignments(inner) {
+            return None;
+        }
+        Some((with_start, close + 1, inner.to_string()))
+    }
+
+    /// Split a trailing top-level `WITH ( … )` option list off `s`, returning the text
+    /// before it and the option text. See [`Self::find_trailing_with_options`].
+    #[allow(clippy::indexing_slicing)] // `with_start` is a valid byte offset into `s`.
+    fn split_trailing_with_options(s: &str) -> Option<(&str, String)> {
+        let (with_start, _with_end, options) = Self::find_trailing_with_options(s)?;
+        Some((s[..with_start].trim_end(), options))
+    }
+
+    /// Canonicalize the trailing-`WITH` spelling of `CREATE MATERIALIZED VIEW` into the
+    /// pre-`AS` PostgreSQL-standard spelling that sqlparser actually reads.
+    ///
+    /// `CREATE MATERIALIZED VIEW v AS SELECT … WITH (auto_refresh = true)` is the form
+    /// the REPL help, the `sql::phase3::materialized_views` module docs and the schema
+    /// skill all teach. sqlparser 0.53 only accepts the option list BEFORE `AS`
+    /// (`parse_create_view` → `parse_options(WITH)`); a trailing one is instead swallowed
+    /// by `parse_table_factor` as an MSSQL-style table hint — a branch that is NOT
+    /// dialect-gated. The statement therefore parsed cleanly with an EMPTY option list
+    /// and every documented option, `auto_refresh` included, was silently discarded.
+    ///
+    /// Rewriting to the canonical position (rather than harvesting
+    /// `TableFactor::with_hints` in the planner) keeps the option list out of the stored
+    /// query text and plan, and leaves genuine table hints alone.
+    #[allow(clippy::indexing_slicing)] // Offsets come from the ASCII-only scanners above.
+    pub fn preprocess_mv_with_options(sql: &str) -> String {
+        let trimmed = sql.trim_start();
+        if !crate::starts_with_icase(trimmed, "CREATE MATERIALIZED VIEW") {
+            return sql.to_string();
+        }
+        // `IF NOT EXISTS` never reaches sqlparser — it is pre-parsed in
+        // `EmbeddedDatabase::execute_in_transaction_inner` via
+        // `parse_create_materialized_view_sql`, which extracts the options itself.
+        // Rewriting here would only turn a handled statement into a parse error.
+        if Self::starts_kw(&trimmed["CREATE MATERIALIZED VIEW".len()..], "IF") {
+            return sql.to_string();
+        }
+
+        let Some(as_pos) = Self::top_level_keyword_positions(sql, "AS").first().copied() else {
+            return sql.to_string();
+        };
+        // A top-level `WITH` before the view's `AS` means the statement is already in
+        // canonical form (or in a shape this rewrite must not touch).
+        if Self::top_level_keyword_positions(sql, "WITH")
+            .iter()
+            .any(|&p| p < as_pos)
+        {
+            return sql.to_string();
+        }
+        let Some((with_start, with_end, options)) = Self::find_trailing_with_options(sql) else {
+            return sql.to_string();
+        };
+        if with_start < as_pos {
+            return sql.to_string();
+        }
+
+        let head = &sql[..as_pos];
+        let mut out = String::with_capacity(sql.len() + 8);
+        out.push_str(head);
+        if !head.ends_with(char::is_whitespace) {
+            out.push(' ');
+        }
+        out.push_str("WITH (");
+        out.push_str(&options);
+        out.push_str(") ");
+        out.push_str(sql[as_pos..with_start].trim_end());
+        out.push_str(&sql[with_end..]);
+        out
     }
 
     fn find_as_keyword(sql: &str) -> Option<usize> {
@@ -884,6 +1104,7 @@ impl Parser {
     /// - ALTER MATERIALIZED VIEW `<name>` SET (option = value, ...)
     ///
     /// Supported options:
+    /// - auto_refresh = true | false
     /// - staleness_threshold = `<seconds>`
     /// - max_cpu_percent = `<percent>`
     /// - refresh_strategy = 'manual' | 'auto' | 'incremental'
@@ -981,12 +1202,12 @@ impl Parser {
                         )));
                     }
                 }
-                "incremental_enabled" => {
+                "incremental_enabled" | "auto_refresh" => {
                     let lower = value.to_lowercase();
                     if !["true", "false"].contains(&lower.as_str()) {
                         return Err(Error::query_execution(format!(
-                            "incremental_enabled must be 'true' or 'false', got '{}'",
-                            value
+                            "{} must be 'true' or 'false', got '{}'",
+                            key, value
                         )));
                     }
                 }
@@ -3641,6 +3862,180 @@ mod tests {
         let parser = Parser::new();
         let result = parser.parse_one("SELECT FROM");
         assert!(result.is_err());
+    }
+
+    /// `preprocess_mv_with_options` — the trailing-`WITH` canonicalization that makes
+    /// the documented `CREATE MATERIALIZED VIEW … AS <query> WITH (auto_refresh = true)`
+    /// spelling actually reach the option list instead of being swallowed as an MSSQL
+    /// table hint.
+    #[allow(clippy::panic)]
+    mod mv_with_options {
+        use super::*;
+
+        /// Options reached the planner as a non-empty `CreateTableOptions`.
+        fn parsed_options(sql: &str) -> Vec<String> {
+            let parser = Parser::new();
+            match parser.parse_one(sql).expect("statement must parse") {
+                Statement::CreateView { options, .. } => match options {
+                    sqlparser::ast::CreateTableOptions::With(opts)
+                    | sqlparser::ast::CreateTableOptions::Options(opts) => opts
+                        .iter()
+                        .map(|o| match o {
+                            sqlparser::ast::SqlOption::KeyValue { key, value } => format!("{key}={value}"),
+                            other => format!("{other:?}"),
+                        })
+                        .collect(),
+                    sqlparser::ast::CreateTableOptions::None => vec![],
+                },
+                other => panic!("expected CreateView, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn trailing_with_is_moved_before_as() {
+            let out = Parser::preprocess_mv_with_options(
+                "CREATE MATERIALIZED VIEW mv_sum AS SELECT SUM(amount) AS total FROM base WITH (auto_refresh = true)",
+            );
+            assert_eq!(
+                out,
+                "CREATE MATERIALIZED VIEW mv_sum WITH (auto_refresh = true) AS SELECT SUM(amount) AS total FROM base"
+            );
+        }
+
+        #[test]
+        fn trailing_with_keeps_the_statement_terminator() {
+            let out = Parser::preprocess_mv_with_options(
+                "CREATE MATERIALIZED VIEW v AS SELECT a FROM t WITH (auto_refresh = true, max_cpu_percent = 15);",
+            );
+            assert_eq!(
+                out,
+                "CREATE MATERIALIZED VIEW v WITH (auto_refresh = true, max_cpu_percent = 15) AS SELECT a FROM t;"
+            );
+        }
+
+        /// Regression pin for the defect: WITHOUT the rewrite sqlparser reports an
+        /// EMPTY option list for the documented spelling. WITH it, the options arrive.
+        #[test]
+        fn trailing_with_options_reach_the_parser() {
+            assert_eq!(
+                parsed_options(
+                    "CREATE MATERIALIZED VIEW mv_sum AS SELECT SUM(amount) AS total FROM base WITH (auto_refresh = true)"
+                ),
+                vec!["auto_refresh=true".to_string()]
+            );
+        }
+
+        #[test]
+        fn pre_as_form_is_already_canonical_and_untouched() {
+            let sql = "CREATE MATERIALIZED VIEW v WITH (auto_refresh = true) AS SELECT a FROM t";
+            assert_eq!(Parser::preprocess_mv_with_options(sql), sql);
+            assert_eq!(parsed_options(sql), vec!["auto_refresh=true".to_string()]);
+        }
+
+        #[test]
+        fn does_not_fire_on_a_plain_select_with_a_cte() {
+            let sql = "WITH c AS (SELECT 1) SELECT * FROM c";
+            assert_eq!(Parser::preprocess_mv_with_options(sql), sql);
+        }
+
+        #[test]
+        fn does_not_fire_when_the_view_query_contains_a_cte() {
+            let sql = "CREATE MATERIALIZED VIEW v AS WITH c AS (SELECT a FROM t) SELECT * FROM c";
+            assert_eq!(Parser::preprocess_mv_with_options(sql), sql);
+        }
+
+        #[test]
+        fn does_not_fire_on_a_with_inside_a_string_literal() {
+            let sql = "CREATE MATERIALIZED VIEW v AS SELECT a FROM t WHERE note = 'WITH (auto_refresh = true)'";
+            assert_eq!(Parser::preprocess_mv_with_options(sql), sql);
+        }
+
+        /// A genuine MSSQL table hint has no `=`, so it must keep parsing exactly as
+        /// it does today rather than becoming an (invalid) option list.
+        #[test]
+        fn does_not_fire_on_a_table_hint() {
+            let sql = "CREATE MATERIALIZED VIEW v AS SELECT a FROM t WITH (NOLOCK)";
+            assert_eq!(Parser::preprocess_mv_with_options(sql), sql);
+            assert_eq!(parsed_options(sql), Vec::<String>::new());
+        }
+
+        #[test]
+        fn does_not_fire_on_non_mv_statements() {
+            let sql = "CREATE VIEW v AS SELECT a FROM t WITH (auto_refresh = true)";
+            assert_eq!(Parser::preprocess_mv_with_options(sql), sql);
+        }
+
+        #[test]
+        fn does_not_fire_on_if_not_exists_which_is_pre_parsed_elsewhere() {
+            let sql = "CREATE MATERIALIZED VIEW IF NOT EXISTS v AS SELECT a FROM t WITH (auto_refresh = true)";
+            assert_eq!(Parser::preprocess_mv_with_options(sql), sql);
+        }
+
+        // ---- parse_create_materialized_view_sql (the IF NOT EXISTS pre-parse) ----
+
+        #[test]
+        fn if_not_exists_extracts_trailing_options() {
+            let (name, query, if_not_exists, options) = Parser::parse_create_materialized_view_sql(
+                "CREATE MATERIALIZED VIEW IF NOT EXISTS mv_sum AS SELECT SUM(amount) FROM base WITH (auto_refresh = true)",
+            )
+            .expect("must parse");
+            assert_eq!(name, "mv_sum");
+            assert_eq!(query, "SELECT SUM(amount) FROM base");
+            assert!(if_not_exists);
+            assert_eq!(options.as_deref(), Some("auto_refresh = true"));
+        }
+
+        /// §1.3: a pre-`AS` option list used to be glued onto the view NAME.
+        #[test]
+        fn if_not_exists_extracts_pre_as_options_without_corrupting_the_name() {
+            let (name, query, if_not_exists, options) = Parser::parse_create_materialized_view_sql(
+                "CREATE MATERIALIZED VIEW IF NOT EXISTS mv_sum WITH (auto_refresh = true) AS SELECT SUM(amount) FROM base",
+            )
+            .expect("must parse");
+            assert_eq!(name, "mv_sum");
+            assert_eq!(query, "SELECT SUM(amount) FROM base");
+            assert!(if_not_exists);
+            assert_eq!(options.as_deref(), Some("auto_refresh = true"));
+        }
+
+        #[test]
+        fn if_not_exists_without_options_is_unchanged() {
+            let (name, query, if_not_exists, options) = Parser::parse_create_materialized_view_sql(
+                "CREATE MATERIALIZED VIEW IF NOT EXISTS v AS SELECT a FROM t",
+            )
+            .expect("must parse");
+            assert_eq!(name, "v");
+            assert_eq!(query, "SELECT a FROM t");
+            assert!(if_not_exists);
+            assert_eq!(options, None);
+        }
+
+        #[test]
+        fn if_not_exists_leaves_a_table_hint_in_the_query() {
+            let (_name, query, _ine, options) = Parser::parse_create_materialized_view_sql(
+                "CREATE MATERIALIZED VIEW IF NOT EXISTS v AS SELECT a FROM t WITH (NOLOCK)",
+            )
+            .expect("must parse");
+            assert_eq!(query, "SELECT a FROM t WITH (NOLOCK)");
+            assert_eq!(options, None);
+        }
+
+        // ---- ALTER MATERIALIZED VIEW option validation ----
+
+        #[test]
+        fn alter_validates_auto_refresh_as_boolean() {
+            let (name, opts) =
+                Parser::parse_alter_materialized_view_sql("ALTER MATERIALIZED VIEW v SET (auto_refresh = true)")
+                    .expect("must parse");
+            assert_eq!(name, "v");
+            assert_eq!(opts.get("auto_refresh").map(String::as_str), Some("true"));
+
+            assert!(
+                Parser::parse_alter_materialized_view_sql("ALTER MATERIALIZED VIEW v SET (auto_refresh = yes)")
+                    .is_err(),
+                "auto_refresh must reject a non-boolean value"
+            );
+        }
     }
 
     // Stage-0 PARTITION BY / PARTITION OF / ATTACH-DETACH pre-parse rewrites.
