@@ -647,6 +647,18 @@ pub struct EmbeddedDatabase {
     /// Fast DML invalidation gate; avoids taking the result-cache mutex when
     /// no query has populated it since the last invalidation.
     result_cache_nonempty: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// `StorageEngine::schema_generation` as of the last result-cache read.
+    ///
+    /// Every cache invalidation hook in this struct fires on mutations that go
+    /// THROUGH this handle. The materialized-view auto-refresh worker deliberately
+    /// does not (it must never hold an `Arc<EmbeddedDatabase>` — see the v4.7.0 Drop
+    /// notes on `start_auto_refresh`), so its rewrite of a view's data table is
+    /// invisible to them and a cached `SELECT … FROM <mv>` would serve pre-refresh
+    /// rows forever. The storage engine bumps `schema_generation` on every
+    /// catalog-existence change — including the create/rename/drop a view refresh
+    /// performs — so comparing it before serving cached rows closes the hole for ANY
+    /// out-of-handle catalog change, not just MV refresh.
+    seen_schema_generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Last result-cache entry served. Hot repeated SELECTs avoid touching the
     /// sharded LRU on every call; cleared by the same invalidation gate.
     hot_result_cache_entry: std::sync::Arc<parking_lot::RwLock<Option<(String, std::sync::Arc<Vec<Tuple>>)>>>,
@@ -780,9 +792,19 @@ impl Drop for EmbeddedDatabase {
             tracing::debug!("skipping index snapshot checkpoint: transaction still open at drop");
         }
 
-        // Signal the auto-refresh worker to stop (non-blocking)
-        if let Some(ref worker) = *self.auto_refresh_worker.read() {
-            worker.request_stop();
+        // Signal the auto-refresh worker to stop (non-blocking).
+        //
+        // LAST-OWNER GATE — do not remove. `Drop` runs for EVERY value of this struct,
+        // and `clone_for_trigger()` mints short-lived clones that share this `Arc` and
+        // drop mid-statement whenever a trigger or PL/pgSQL function executes. Without
+        // the gate, the first trigger to fire silently stops the auto-refresh worker
+        // (unnoticed historically only because auto-refresh never actually refreshed).
+        // `strong_count == 1` inside `drop(&mut self)` proves no other clone exists and
+        // none can be created — cloning requires a live `&self`.
+        if std::sync::Arc::strong_count(&self.auto_refresh_worker) == 1 {
+            if let Some(ref worker) = *self.auto_refresh_worker.read() {
+                worker.request_stop();
+            }
         }
 
         // Clear session transactions
@@ -2124,10 +2146,37 @@ impl EmbeddedDatabase {
         if self.tenant_manager.has_current_context() {
             return None;
         }
+        self.reconcile_result_cache_with_storage();
         self.hot_result_cache_entry
             .read()
             .as_ref()
             .and_then(|(hot_sql, rows)| (hot_sql == sql).then(|| std::sync::Arc::clone(rows)))
+    }
+
+    /// Drop cached query results if the storage catalog changed since the last cache
+    /// read — i.e. if something mutated it that did NOT go through this handle.
+    ///
+    /// This is the reader half of the materialized-view auto-refresh contract. The
+    /// refresh worker rewrites a view's data table directly against the
+    /// `StorageEngine` (it must not pin an `Arc<EmbeddedDatabase>`; see the v4.7.0
+    /// shutdown notes), so it cannot call `invalidate_result_cache`. Without this
+    /// check a reader that had cached `SELECT … FROM <mv>` would keep serving
+    /// pre-refresh rows indefinitely while `pg_matviews.last_refresh` advanced —
+    /// exactly the staleness lie auto-refresh is supposed to eliminate.
+    ///
+    /// Cost on the hot path is one `Acquire` load and a compare, paid only when a
+    /// cached read is actually attempted (which already takes an `RwLock` read or an
+    /// LRU lookup). `schema_generation` is bumped only by catalog-existence changes
+    /// (CREATE / ALTER / DROP / RENAME / branch switch / merge-to-main), never by
+    /// per-row DML, so this adds no invalidations to the write path.
+    #[inline]
+    fn reconcile_result_cache_with_storage(&self) {
+        let current = self.storage.schema_generation();
+        if self.seen_schema_generation.load(std::sync::atomic::Ordering::Acquire) != current {
+            self.seen_schema_generation
+                .store(current, std::sync::atomic::Ordering::Release);
+            self.invalidate_result_cache();
+        }
     }
 
     fn query_is_non_deterministic(sql: &str) -> bool {
@@ -3343,7 +3392,8 @@ impl EmbeddedDatabase {
             // sqlparser does not currently accept `CREATE MATERIALIZED VIEW
             // IF NOT EXISTS`; keep the existing MV/DMV execution path and
             // only pre-parse the outer DDL wrapper here.
-            let (view_name, query_sql, if_not_exists) = sql::Parser::parse_create_materialized_view_sql(sql)?;
+            let (view_name, query_sql, if_not_exists, options_str) =
+                sql::Parser::parse_create_materialized_view_sql(sql)?;
             let (statement, _) = self.parse_cached(&query_sql)?;
             let catalog = self.storage.catalog();
             let planner = sql::Planner::with_catalog(&catalog)
@@ -3351,7 +3401,14 @@ impl EmbeddedDatabase {
                 .with_current_schema(self.current_schema())
                 .with_search_path(self.current_search_path());
             let query_plan = planner.statement_to_plan(statement)?;
-            sql::phase3::MaterializedViewParser::parse_create_mv(view_name, query_plan, None, if_not_exists)?
+            // Pass the extracted `WITH ( … )` options through — this used to hard-code
+            // `None`, so `IF NOT EXISTS` silently dropped every option.
+            sql::phase3::MaterializedViewParser::parse_create_mv(
+                view_name,
+                query_plan,
+                options_str.as_deref(),
+                if_not_exists,
+            )?
         } else if sql::Parser::is_refresh_materialized_view(sql) {
             // Parse REFRESH MATERIALIZED VIEW statement
             let (view_name, concurrent, incremental) = sql::Parser::parse_refresh_materialized_view_sql(sql)?;
@@ -6168,6 +6225,21 @@ impl EmbeddedDatabase {
         }
     }
 
+    /// Derive the materialized-view refresh scheduler's runtime limits from the
+    /// `[materialized_views]` config section.
+    ///
+    /// Until the auto-refresh worker started owning `MVScheduler::run()`, nothing ever
+    /// spawned the consumer loop, so `SchedulerConfig::default()`'s hardcoded tick,
+    /// CPU ceiling and concurrency cap were inert. They are load-bearing now — how
+    /// quickly a stale view is picked up, and under what system load — so they are
+    /// read from config instead of being hardcoded here.
+    fn scheduler_config_from(config: &Config) -> storage::SchedulerConfig {
+        storage::SchedulerConfig::new()
+            .with_max_cpu_percent(f64::from(config.materialized_views.default_max_cpu_percent))
+            .with_check_interval(config.materialized_views.refresh_check_interval_secs)
+            .with_max_concurrent(config.materialized_views.max_concurrent_refreshes)
+    }
+
     /// Create a new embedded database
     ///
     /// # Arguments
@@ -6208,7 +6280,7 @@ impl EmbeddedDatabase {
             storage::StorageEngine::open(path.as_ref(), &config)?
         });
         let mv_scheduler = std::sync::Arc::new(storage::MVScheduler::new(
-            storage::SchedulerConfig::default(),
+            Self::scheduler_config_from(&config),
             std::sync::Arc::clone(&storage),
         ));
 
@@ -6240,6 +6312,12 @@ impl EmbeddedDatabase {
         // Weak only when a sequence function actually runs, so NOTHING is added
         // to the per-statement hot path.
         crate::sql::sequences::install_persistence(&storage);
+
+        // Seed the result-cache marker from storage rather than 0: reopening an
+        // existing database starts at whatever generation recovery left behind,
+        // and a read-only workload never calls `invalidate_result_cache`, so a
+        // 0 marker would make the first cached read discard a valid warm cache.
+        let initial_schema_generation = storage.schema_generation();
 
         Ok(Self {
             storage,
@@ -6278,6 +6356,7 @@ impl EmbeddedDatabase {
                     .with_site(lock_census::Site::ResultCache),
             ),
             result_cache_nonempty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            seen_schema_generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(initial_schema_generation)),
             hot_result_cache_entry: std::sync::Arc::new(parking_lot::RwLock::new(None)),
             last_fast_select_fingerprint: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             cache_admission: new_cache_admission(),
@@ -6322,7 +6401,7 @@ impl EmbeddedDatabase {
         let config = Config::in_memory();
         let storage = std::sync::Arc::new(storage::StorageEngine::open_in_memory(&config)?);
         let mv_scheduler = std::sync::Arc::new(storage::MVScheduler::new(
-            storage::SchedulerConfig::default(),
+            Self::scheduler_config_from(&config),
             std::sync::Arc::clone(&storage),
         ));
 
@@ -6343,6 +6422,9 @@ impl EmbeddedDatabase {
         // `nextval` lazy-load the real persisted CREATE SEQUENCE definition
         // (its increment/min/max/cycle) instead of a volatile default.
         crate::sql::sequences::install_persistence(&storage);
+
+        // See `new_with_config`: seed from storage, not 0.
+        let initial_schema_generation = storage.schema_generation();
 
         Ok(Self {
             storage,
@@ -6381,6 +6463,7 @@ impl EmbeddedDatabase {
                     .with_site(lock_census::Site::ResultCache),
             ),
             result_cache_nonempty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            seen_schema_generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(initial_schema_generation)),
             hot_result_cache_entry: std::sync::Arc::new(parking_lot::RwLock::new(None)),
             last_fast_select_fingerprint: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             cache_admission: new_cache_admission(),
@@ -6434,7 +6517,7 @@ impl EmbeddedDatabase {
             storage::StorageEngine::open(path, &config)?
         });
         let mv_scheduler = std::sync::Arc::new(storage::MVScheduler::new(
-            storage::SchedulerConfig::default(),
+            Self::scheduler_config_from(&config),
             std::sync::Arc::clone(&storage),
         ));
 
@@ -6483,6 +6566,9 @@ impl EmbeddedDatabase {
         // phase boundary — see `copy_phase_stats`).
         copy_phase_stats::set_enabled(config.performance.copy_phase_stats);
 
+        // See `new_with_config`: seed from storage, not 0.
+        let initial_schema_generation = storage.schema_generation();
+
         Ok(Self {
             storage,
             config,
@@ -6520,6 +6606,7 @@ impl EmbeddedDatabase {
                     .with_site(lock_census::Site::ResultCache),
             ),
             result_cache_nonempty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            seen_schema_generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(initial_schema_generation)),
             hot_result_cache_entry: std::sync::Arc::new(parking_lot::RwLock::new(None)),
             last_fast_select_fingerprint: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             cache_admission: new_cache_admission(),
@@ -9463,7 +9550,22 @@ impl EmbeddedDatabase {
     }
 
     /// Invalidate all cached query results (called on any DML operation)
+    ///
+    /// Advances `seen_schema_generation` first: once the cache is dropped it is
+    /// consistent with storage by definition, so a later
+    /// `reconcile_result_cache_with_storage` must not discard entries warmed
+    /// *after* this point. Without this, every DDL (which bumps the generation
+    /// and then invalidates through this handle) left the marker behind, and the
+    /// next cached read wiped a perfectly valid warm cache — making cache warmth
+    /// depend on which internal entry point a reader happened to take.
+    ///
+    /// This cannot mask an out-of-band mutation: the reconcile exists for writers
+    /// that never call this method (the MV auto-refresh worker). If such a write
+    /// races this store, the cache has just been cleared anyway, so the worst case
+    /// is one extra invalidation later — never a stale row.
     fn invalidate_result_cache(&self) {
+        self.seen_schema_generation
+            .store(self.storage.schema_generation(), std::sync::atomic::Ordering::Release);
         *self.hot_result_cache_entry.write() = None;
         if !self
             .result_cache_nonempty
@@ -18601,6 +18703,7 @@ impl EmbeddedDatabase {
             parse_cache: self.parse_cache.clone(),
             result_cache: self.result_cache.clone(),
             result_cache_nonempty: self.result_cache_nonempty.clone(),
+            seen_schema_generation: self.seen_schema_generation.clone(),
             hot_result_cache_entry: self.hot_result_cache_entry.clone(),
             last_fast_select_fingerprint: self.last_fast_select_fingerprint.clone(),
             cache_admission: self.cache_admission.clone(),
@@ -20648,6 +20751,17 @@ impl EmbeddedDatabase {
     /// }
     /// ```
     pub async fn start_auto_refresh(&self, config: Option<storage::AutoRefreshConfig>) -> Result<()> {
+        // Reject a second start rather than silently overwriting the stored worker.
+        // The overwritten worker's `command_tx` would drop, its `worker_loop`'s
+        // `command_rx.recv()` branch would go dead, and the loop would spin on its
+        // sleep branch forever — while a second consumer raced the first on the one
+        // shared refresh queue.
+        if self.is_auto_refresh_running() {
+            return Err(Error::storage(
+                "auto-refresh is already running; call stop_auto_refresh() first",
+            ));
+        }
+
         let worker_config = config.unwrap_or_else(|| {
             storage::AutoRefreshConfig::default()
                 .with_enabled(true)
@@ -21913,6 +22027,72 @@ mod tests {
         let (rows, columns) = db.query_with_columns(sql).unwrap();
         assert_eq!(columns, vec!["id".to_string(), "val".to_string()]);
         assert_eq!(rows.len(), 3);
+    }
+
+    /// A cache warmed *after* a DDL must survive the next cached read.
+    ///
+    /// `reconcile_result_cache_with_storage` compares storage's schema generation
+    /// against `seen_schema_generation`. DDL bumps the generation, so if the marker
+    /// only advanced on the reconcile path, the first cached read after any
+    /// CREATE/ALTER/DROP would wipe a perfectly valid warm cache — and which reads
+    /// paid that cost depended on which internal entry point they took.
+    #[test]
+    fn ddl_does_not_discard_a_result_cache_warmed_after_it() {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE gen_marker (id INT PRIMARY KEY, val INT)")
+            .unwrap();
+        db.execute("INSERT INTO gen_marker VALUES (1, 10)").unwrap();
+
+        // A later DDL bumps the generation again, after the table already exists.
+        db.execute("CREATE TABLE gen_marker_other (id INT PRIMARY KEY)")
+            .unwrap();
+
+        let sql = "SELECT id, val FROM gen_marker WHERE val IS NOT NULL";
+        // Two sightings: the admission filter only caches on the second.
+        db.query_with_columns(sql).unwrap();
+        db.query_with_columns(sql).unwrap();
+        assert!(
+            db.result_cache.contains(sql),
+            "precondition: the second sighting warms the result cache"
+        );
+
+        assert!(
+            db.try_cached_query_with_columns(sql).is_some(),
+            "a cache warmed after the DDL must not be discarded by the generation marker"
+        );
+        assert!(
+            db.result_cache.contains(sql),
+            "the reconcile must not have cleared the freshly warmed cache"
+        );
+    }
+
+    /// The other half of the contract: a mutation that bypasses this handle — the
+    /// materialized-view auto-refresh worker writes straight to the `StorageEngine`
+    /// and cannot call `invalidate_result_cache` — must still drop cached rows.
+    /// Guards against "fixing" the above by simply never reconciling.
+    #[test]
+    fn out_of_band_storage_mutation_still_invalidates_the_result_cache() {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE oob_marker (id INT PRIMARY KEY, val INT)")
+            .unwrap();
+        db.execute("INSERT INTO oob_marker VALUES (1, 10)").unwrap();
+
+        let sql = "SELECT id, val FROM oob_marker WHERE val IS NOT NULL";
+        db.query_with_columns(sql).unwrap();
+        db.query_with_columns(sql).unwrap();
+        assert!(
+            db.try_cached_query_with_columns(sql).is_some(),
+            "precondition: the query is cached and served from cache"
+        );
+
+        // Exactly what the refresh worker does: mutate through storage, bump the
+        // generation, never touch this handle's caches.
+        db.storage.bump_schema_generation();
+
+        assert!(
+            db.try_cached_query_with_columns(sql).is_none(),
+            "an out-of-band schema-generation bump must invalidate cached results"
+        );
     }
 
     #[test]

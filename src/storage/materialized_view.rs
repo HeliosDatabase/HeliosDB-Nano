@@ -300,6 +300,14 @@ impl<'a> MaterializedViewCatalog<'a> {
             self.storage.insert_tuple(&data_table, tuple)?;
         }
 
+        // Bump AFTER the rows are in place. Readers use `schema_generation` as the
+        // "something changed outside my handle" signal for their result caches
+        // (`EmbeddedDatabase::reconcile_result_cache_with_storage`); the create/drop
+        // above bump it BEFORE the rows land, so without this trailing bump a reader
+        // could reconcile against the mid-refresh generation, cache the half-written
+        // view, and never invalidate again.
+        self.storage.bump_schema_generation();
+
         tracing::info!(
             "Successfully stored {} rows for materialized view '{}'",
             row_count,
@@ -455,6 +463,11 @@ impl<'a> MaterializedViewCatalog<'a> {
                 tracing::debug!("Dropped backup table '{}'", backup_table);
             }
         }
+
+        // See the trailing bump in `store_view_data`: the LAST generation bump of a
+        // refresh must follow the row swap so out-of-handle readers reconcile against
+        // a generation that already reflects the new data.
+        self.storage.bump_schema_generation();
 
         tracing::info!(
             "Successfully stored {} rows for materialized view '{}' (CONCURRENT mode)",

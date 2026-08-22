@@ -175,6 +175,15 @@ pub struct AutoRefreshWorker {
     /// Worker task handle
     worker_handle: Option<JoinHandle<()>>,
 
+    /// Handle for the `MVScheduler::run()` consumer loop.
+    ///
+    /// The worker is the *producer* for the scheduler's refresh queue; without a
+    /// consumer, scheduled tasks are enqueued and never executed. The worker owns
+    /// the consumer so it starts exactly when a producer exists and stops with it.
+    /// `run()` never returns, so it is stopped by `abort()` — safe here because it
+    /// holds no lock across an await and in-flight refreshes are detached tasks.
+    scheduler_handle: Option<JoinHandle<()>>,
+
     /// Running state
     is_running: Arc<Mutex<bool>>,
 
@@ -199,6 +208,7 @@ impl AutoRefreshWorker {
             scheduler,
             command_tx: None,
             worker_handle: None,
+            scheduler_handle: None,
             is_running: Arc::new(Mutex::new(false)),
             active_refreshes: Arc::new(Mutex::new(0)),
             refresh_history: Arc::new(Mutex::new(VecDeque::with_capacity(MAX_HISTORY_ENTRIES))),
@@ -246,6 +256,21 @@ impl AutoRefreshWorker {
 
         self.worker_handle = Some(handle);
 
+        // Spawn the scheduler's consumer loop. `perform_staleness_check` only ever
+        // PUSHES onto `MVScheduler`'s queue; `MVScheduler::run()` is the sole consumer
+        // and nothing in the library used to spawn it, so every scheduled refresh sat
+        // in the queue forever.
+        let scheduler = Arc::clone(&self.scheduler);
+        self.scheduler_handle = Some(tokio::spawn(async move {
+            // `run()` loops forever, so it only returns on error — which would mean
+            // the consumer is gone and auto-refresh is silently inert again.
+            if let Err(e) = scheduler.run().await {
+                error!("MVScheduler consumer loop exited with error: {}", e);
+            } else {
+                warn!("MVScheduler consumer loop returned unexpectedly; auto-refresh is now inert");
+            }
+        }));
+
         info!("AutoRefreshWorker started successfully");
         Ok(())
     }
@@ -257,6 +282,13 @@ impl AutoRefreshWorker {
     pub fn request_stop(&self) {
         if let Some(tx) = &self.command_tx {
             let _ = tx.send(WorkerCommand::Stop);
+        }
+        // `JoinHandle::abort` takes `&self` and is non-blocking, so the consumer loop
+        // can be torn down from a `Drop` too. Leaving it running would pin
+        // `Arc<StorageEngine>` (open redb/file handles) and burn a CPU sample every
+        // `check_interval_secs` forever.
+        if let Some(handle) = &self.scheduler_handle {
+            handle.abort();
         }
         *self.is_running.lock() = false;
     }
@@ -284,6 +316,20 @@ impl AutoRefreshWorker {
                 Err(_) => {
                     warn!("Worker task did not stop within timeout, forcing shutdown");
                 }
+            }
+        }
+
+        // Tear down the scheduler consumer loop. `run()` has no shutdown signal and
+        // never returns, so abort is the only stop; it is safe because the loop holds
+        // no lock across an await point and in-flight refreshes are detached tasks
+        // that run to completion on their own.
+        if let Some(handle) = self.scheduler_handle.take() {
+            handle.abort();
+            if let Err(e) = handle.await {
+                if e.is_panic() {
+                    error!("MVScheduler consumer loop panicked: {}", e);
+                }
+                // JoinError::Cancelled is the expected outcome of abort().
             }
         }
 
@@ -555,6 +601,16 @@ impl AutoRefreshWorker {
                 *active_refreshes.lock() = 0;
             }
         });
+    }
+}
+
+impl Drop for AutoRefreshWorker {
+    /// Belt-and-braces teardown: a worker value that is replaced, forgotten, or
+    /// dropped without `stop()` must not orphan either background task. Both stops
+    /// are non-blocking and idempotent (`stop()` takes the handles, so a post-`stop()`
+    /// drop is a no-op).
+    fn drop(&mut self) {
+        self.request_stop();
     }
 }
 

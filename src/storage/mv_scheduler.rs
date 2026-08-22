@@ -275,10 +275,16 @@ pub struct MVScheduler {
     /// Storage engine reference
     storage: Arc<StorageEngine>,
 
-    /// Delta tracker for incremental refresh
+    /// Delta tracker for incremental refresh.
+    ///
+    /// NOT on the auto-refresh path: no DML path feeds `mv_incremental::DeltaTracker`
+    /// (see `perform_refresh`). Kept because `IncrementalRefresher` is public API.
     delta_tracker: Arc<DeltaTracker>,
 
-    /// Incremental refresher
+    /// Incremental refresher.
+    ///
+    /// NOT on the auto-refresh path — see the note on `delta_tracker` and the
+    /// `perform_refresh` doc comment.
     incremental_refresher: Arc<IncrementalRefresher>,
 
     /// Priority queue of pending refresh tasks
@@ -530,37 +536,57 @@ impl MVScheduler {
 
     /// Perform the actual refresh operation
     ///
-    /// Integrates with the incremental refresh system to choose the optimal
-    /// refresh strategy (full vs incremental) based on cost estimation.
+    /// Dispatches the SAME code path a user-issued
+    /// `REFRESH MATERIALIZED VIEW … CONCURRENTLY` takes
+    /// (`sql::executor::phase3::handle_refresh_materialized_view`): re-execute the
+    /// stored optimized query plan against current data and rewrite the view rows.
+    ///
+    /// Why not `IncrementalRefresher` (what this used to call): its deltas come from
+    /// `mv_incremental::DeltaTracker`, whose `record_insert` / `record_update` /
+    /// `record_delete` recorders **no DML path ever calls**. Every scheduled
+    /// "incremental refresh" therefore saw zero deltas, reported success, and reset
+    /// the staleness clock while the view's content stayed stale — a staleness lie.
+    /// The delta tracker DML actually feeds is `storage::mv_delta::DeltaTracker`,
+    /// which is what the SQL REFRESH path consults. `IncrementalRefresher` remains a
+    /// public API (see `tests/incremental_mv_integration_test.rs`); it is simply no
+    /// longer on the auto-refresh path.
     async fn perform_refresh(&self, mv_name: &str) -> Result<RefreshResult> {
-        use super::MaterializedViewCatalog;
+        let storage = Arc::clone(&self.storage);
+        let name = mv_name.to_string();
+        let start = std::time::Instant::now();
 
-        let catalog = MaterializedViewCatalog::new(&self.storage);
+        // The refresh is synchronous storage work end to end; keep it off the async
+        // runtime's worker threads (the previous body called a blocking refresher
+        // directly from this async fn).
+        let rows_affected = tokio::task::spawn_blocking(move || -> Result<u64> {
+            let plan = crate::sql::LogicalPlan::RefreshMaterializedView {
+                name: name.clone(),
+                // Zero-downtime atomic swap, as this module's docs promise. It also
+                // forces the handler's full-recompute branch (it disables incremental
+                // whenever `concurrent` is set), which is the only branch ever proven
+                // to change view content.
+                concurrent: true,
+                // Let the handler pick the strategy exactly like a manual REFRESH.
+                incremental: false,
+            };
+            // A FRESH executor with no inherited transaction — the same pattern the
+            // manual REFRESH and CREATE paths use so the re-materialization scans the
+            // whole current table (issue #2 / Quirk J).
+            let mut exec = crate::sql::Executor::with_storage(&storage);
+            exec.execute(&plan)?;
 
-        // Get MV metadata
-        let mut metadata = catalog.get_view(mv_name)?;
-
-        // Estimate refresh cost
-        let cost = self.incremental_refresher.estimate_refresh_cost(&metadata)?;
-
-        debug!(
-            "Refresh cost for '{}': incremental={:.2}s, full={:.2}s, strategy={:?}",
-            mv_name, cost.incremental_cost, cost.full_cost, cost.recommendation
-        );
-
-        // Perform refresh using the recommended strategy
-        let refresh_result = self.incremental_refresher.refresh_incremental(mv_name)?;
-
-        // Update metadata
-        let rows_affected = refresh_result.rows_inserted + refresh_result.rows_updated + refresh_result.rows_deleted;
-
-        metadata.mark_refreshed(rows_affected as u64);
-        catalog.update_view(&metadata)?;
+            // The handler already persisted metadata (row count + last_refresh); read
+            // it back rather than writing a second, racing update.
+            let catalog = super::MaterializedViewCatalog::new(&storage);
+            Ok(catalog.get_view(&name)?.row_count.unwrap_or(0))
+        })
+        .await
+        .map_err(|e| Error::storage(format!("MV refresh task join error: {e}")))??;
 
         Ok(RefreshResult {
-            strategy_used: format!("{:?}", refresh_result.strategy_used),
-            rows_affected: rows_affected as u64,
-            duration: refresh_result.duration,
+            strategy_used: "full(concurrent)".to_string(),
+            rows_affected,
+            duration: start.elapsed(),
         })
     }
 

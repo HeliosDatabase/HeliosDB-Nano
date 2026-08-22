@@ -384,25 +384,56 @@ fn handle_create_materialized_view(
         (*schema).clone(),
     );
 
-    // Process options (parse auto_refresh, etc.)
+    // Process WITH options.
+    //
+    // CONTRACT: the auto-refresh runtime gate reads `metadata.metadata["auto_refresh"]`
+    // (storage/mv_auto_refresh.rs `perform_staleness_check`), and so does the status view
+    // (storage/mv_system_views.rs). `metadata.refresh_strategy` is DISPLAY-ONLY — it is
+    // surfaced by `pg_matviews` and nothing gates on it. Writing only the strategy (what
+    // this loop used to do) meant `WITH (auto_refresh = true)` never enabled anything.
+    //
+    // Every option now lands in the metadata map so ALTER round-trips and system views
+    // stay honest; the ones with no consumer yet are recorded as such below.
+    use crate::sql::logical_plan::MaterializedViewOption as Opt;
     for option in options {
         match option {
-            crate::sql::logical_plan::MaterializedViewOption::AutoRefresh(enabled) => {
+            Opt::AutoRefresh(enabled) => {
+                // Stored explicitly (including "false") so the value round-trips rather
+                // than relying on the reader's `unwrap_or(false)` for absence.
+                metadata
+                    .metadata
+                    .insert("auto_refresh".to_string(), enabled.to_string());
                 if *enabled {
                     metadata.refresh_strategy = "auto".to_string();
                 }
             }
-            crate::sql::logical_plan::MaterializedViewOption::MaxCpuPercent(pct) => {
+            // Stored, but throttling is governed by the GLOBAL `AutoRefreshConfig` /
+            // `SchedulerConfig` CPU limits — there is no per-view CPU gate yet.
+            Opt::MaxCpuPercent(pct) => {
                 metadata.metadata.insert("max_cpu_percent".to_string(), pct.to_string());
             }
-            crate::sql::logical_plan::MaterializedViewOption::ThresholdDmlRate(rate) => {
+            // Stored; staleness scheduling is time-based, so no consumer yet.
+            Opt::ThresholdDmlRate(rate) => {
                 metadata
                     .metadata
                     .insert("threshold_dml_rate".to_string(), rate.to_string());
             }
-            _ => {
-                // Store other options as metadata
-                tracing::debug!("Storing MV option: {:?}", option);
+            Opt::ThresholdTableSize(v) => {
+                metadata.metadata.insert("threshold_table_size".to_string(), v.clone());
+            }
+            Opt::LazyUpdate(b) => {
+                metadata.metadata.insert("lazy_update".to_string(), b.to_string());
+            }
+            Opt::LazyCatchupWindow(v) => {
+                metadata.metadata.insert("lazy_catchup_window".to_string(), v.clone());
+            }
+            Opt::Distribution(v) => {
+                metadata.metadata.insert("distribution".to_string(), v.clone());
+            }
+            Opt::ReplicationFactor(rf) => {
+                metadata
+                    .metadata
+                    .insert("replication_factor".to_string(), rf.to_string());
             }
         }
     }
@@ -770,8 +801,25 @@ fn handle_alter_materialized_view(
                 "priority" => {
                     metadata.metadata.insert("priority".to_string(), value.clone());
                 }
+                // Explicit arm: this used to fall through to the `_` catch-all, which
+                // happened to write the right key but never touched `refresh_strategy`,
+                // so `pg_matviews` disagreed with the runtime gate.
+                "auto_refresh" => {
+                    let enabled = value.to_lowercase();
+                    metadata.metadata.insert("auto_refresh".to_string(), enabled.clone());
+                    if enabled == "true" {
+                        metadata.refresh_strategy = "auto".to_string();
+                    } else if metadata.refresh_strategy == "auto" {
+                        metadata.refresh_strategy = "manual".to_string();
+                    }
+                }
+                // The documented spelling. Keep the runtime gate in sync with it, so
+                // `SET (refresh_strategy = 'auto')` actually enables auto-refresh
+                // instead of only relabelling the view.
                 "refresh_strategy" => {
                     metadata.refresh_strategy = value.clone();
+                    let auto = value.eq_ignore_ascii_case("auto");
+                    metadata.metadata.insert("auto_refresh".to_string(), auto.to_string());
                 }
                 "incremental_enabled" => {
                     metadata.incremental_enabled = value.to_lowercase() == "true";
