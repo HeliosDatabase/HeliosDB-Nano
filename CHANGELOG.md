@@ -5,6 +5,124 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.15.0] - 2026-08-22
+
+### Fixed
+
+- **Materialized-view auto-refresh never refreshed anything.** A view created with the
+  documented `WITH (auto_refresh = true)` clause, with the auto-refresh worker started and
+  reporting itself running, kept serving its creation-time rows forever. There was no error,
+  no warning and no log line at any shipped level: the view simply stayed stale while
+  `pg_mv_staleness` and the auto-refresh status view reported normally.
+
+  **Who was affected.** Only callers of the library API `EmbeddedDatabase::start_auto_refresh`.
+  Nothing in the server, CLI, REPL, HTTP layer or config starts the worker — the config key
+  `[materialized_views] auto_refresh_default` is parsed and read by nothing — so no deployment
+  changes behaviour on upgrade unless its own code calls `start_auto_refresh`. **For those
+  callers auto-refresh goes from a no-op to genuinely running**: opted-in views will now be
+  recomputed on the configured interval, which costs CPU and I/O that this build never spent.
+  Review `[materialized_views]` (below) before upgrading.
+
+  Three independent, stacked defects, each sufficient on its own:
+
+  1. **The SQL opt-in never reached the flag the worker reads**, in all three spellings.
+     - `CREATE MATERIALIZED VIEW v AS <query> WITH (auto_refresh = true)` — the form the REPL
+       help, the `sql::phase3::materialized_views` module docs and the schema skill all teach —
+       parsed "successfully" with an EMPTY option list. sqlparser 0.53 only accepts a view's
+       option list *before* `AS`; a trailing one is swallowed by `parse_table_factor` as an
+       MSSQL-style table hint on the query's last table, and that branch is not dialect-gated.
+       Every option written this way was silently discarded. Fixed by canonicalizing the
+       trailing form to the pre-`AS` position before parsing
+       (`Parser::preprocess_mv_with_options`); genuine table hints (`WITH (NOLOCK)`, no `=`)
+       are left alone.
+     - `CREATE MATERIALIZED VIEW v WITH (auto_refresh = true) AS <query>` — the PostgreSQL
+       standard position — parsed correctly but the executor wrote only
+       `refresh_strategy = 'auto'`, a display-only field surfaced by `pg_matviews` that nothing
+       gates on. The runtime gate reads `metadata["auto_refresh"]`, which was never written.
+       Fixed: every parsed option is now persisted, and `auto_refresh` lands on the key the
+       worker reads.
+     - `CREATE MATERIALIZED VIEW IF NOT EXISTS …` takes its own pre-parse path, which
+       hard-coded "no options". A trailing clause was dropped and a pre-`AS` clause was glued
+       onto the view NAME. Both spellings now work on this path.
+     - `ALTER MATERIALIZED VIEW v SET (auto_refresh = …)` worked only by accident (an
+       unknown-key passthrough) and left `refresh_strategy` disagreeing with it, while the
+       documented `SET (refresh_strategy = 'auto')` set the label without enabling anything.
+       Both spellings are now explicit, validated (`auto_refresh` must be a boolean) and kept
+       in sync with each other.
+  2. **The refresh queue had no consumer.** `MVScheduler::run()` is the only code that pops the
+     queue, and nothing in the library or the binaries ever spawned it — scheduled refreshes
+     were enqueued and sat there. The auto-refresh worker now owns that task: it starts with
+     the worker and is aborted by `stop_auto_refresh()`, by `EmbeddedDatabase::drop`, and by
+     `AutoRefreshWorker`'s own `Drop`.
+  3. **The scheduled refresh could not have changed content even if it had run.** It called
+     `IncrementalRefresher::refresh_incremental`, whose deltas come from a tracker
+     (`mv_incremental::DeltaTracker`) that no DML path ever writes to. It would have "succeeded"
+     with zero deltas and reset the staleness clock over unchanged rows — a view reporting
+     itself fresh while serving stale data, which is worse than doing nothing. Scheduled
+     refreshes now dispatch the same code path a user-issued
+     `REFRESH MATERIALIZED VIEW … CONCURRENTLY` takes: re-execute the stored optimized plan and
+     atomically swap the view's rows, on the blocking pool rather than a runtime worker thread.
+     `IncrementalRefresher` is unchanged and still public; it is simply no longer on the
+     auto-refresh path.
+
+- **A background MV refresh did not invalidate the reader's result cache.** `EmbeddedDatabase`
+  invalidates its SQL-text-keyed result cache on every mutation that goes *through* the handle.
+  The refresh worker deliberately does not hold an `EmbeddedDatabase` (it must not — see the
+  4.7.0 shutdown note), so a reader that had cached `SELECT … FROM <mv>` would have kept serving
+  pre-refresh rows indefinitely. Cached results are now reconciled against
+  `StorageEngine::schema_generation`, which closes the hole for any out-of-handle catalog change,
+  not just MV refresh. Cost is one atomic load on a cached read, plus one load and one store per
+  cache invalidation (i.e. per mutating statement); neither is measurable on the perf gate.
+
+  Invalidating the cache also advances the reconciliation marker, and a new handle seeds it from
+  storage rather than from zero. Without both, a catalog change made *through* the handle — every
+  `CREATE`/`ALTER`/`DROP`/branch switch — would leave the marker behind and make the next cached
+  read discard a still-valid warm cache, so how long a cache survived would depend on which
+  internal read path a caller happened to take. Correctness never depended on this: the reconcile
+  can only over-invalidate, never serve a stale row.
+
+- **A trigger firing silently stopped the auto-refresh worker.** `clone_for_trigger()` mints
+  short-lived `EmbeddedDatabase` values that share the worker and drop mid-statement, and `Drop`
+  called `request_stop()` unconditionally — so the first trigger or PL/pgSQL function to run
+  killed auto-refresh. Only the last owner may stop it now
+  (`Arc::strong_count(&auto_refresh_worker) == 1`). Unnoticed until now because the feature had
+  never worked.
+
+- **A second `start_auto_refresh` silently orphaned the first worker**, whose dropped command
+  channel left its loop spinning on the sleep branch forever. It is now rejected with an error;
+  call `stop_auto_refresh()` first.
+
+### Changed
+
+- `[materialized_views]` now configures the MV refresh **scheduler**, not just the staleness
+  worker. `refresh_check_interval_secs` sets how often the scheduler drains its queue,
+  `default_max_cpu_percent` is the CPU ceiling above which it skips a batch, and
+  `max_concurrent_refreshes` caps concurrent refreshes. These were previously hardcoded
+  (`SchedulerConfig::default()`: 5 s / 70 % / 4) and inert, because the scheduler loop was never
+  started. **The CPU gate is now real for the first time** — it read a cached value that only
+  the never-spawned loop updated, so it was permanently `0.0` and could never trip.
+
+- Scheduler refresh logs report the view's resulting `row_count` rather than a delta count
+  (the delta count came from the unfed tracker and was always zero).
+
+### Known limitations
+
+- Auto-refresh can only be started from the embedded library API
+  (`EmbeddedDatabase::start_auto_refresh`). There is no CLI flag, config key, SQL statement or
+  HTTP endpoint that starts it; `[materialized_views] auto_refresh_default` is parsed and read
+  by nothing.
+- The per-view `WITH (max_cpu_percent = …)` option is stored but not enforced — throttling is
+  governed by the global `AutoRefreshConfig` / `[materialized_views]` limits. The same is true
+  of `threshold_table_size`, `threshold_dml_rate`, `lazy_update`, `lazy_catchup_window`,
+  `distribution` and `replication_factor`: they now persist (previously most were parsed and
+  thrown away) but have no consumer.
+- The `auto_refresh` flag has no SQL projection. `pg_matviews` is an empty PG-compat stub and
+  `pg_mv_staleness` does not expose the flag, so the opt-in cannot be read back over the wire.
+- Scheduled refreshes are always FULL recomputes on a time-based staleness trigger; there is no
+  change-detection gate, and `MVScheduler::on_base_table_change` still has no callers.
+- The worker-side `max_concurrent_refreshes` counter is reset unconditionally 5 s after
+  scheduling (pre-existing); the scheduler-side limit is the effective one.
+
 ## [4.14.0] - 2026-08-21
 
 ### Fixed
