@@ -102,6 +102,7 @@ impl BranchingParser {
     /// Parse branch options from WITH clause
     fn parse_branch_options(options_str: &str) -> Result<Vec<BranchOption>> {
         let mut options = Vec::new();
+        let options_str = Self::strip_option_parens(options_str);
 
         // Simple parsing - split by comma and parse key=value pairs
         for pair in options_str.split(',') {
@@ -166,9 +167,27 @@ impl BranchingParser {
         })
     }
 
+    /// Strip one layer of wrapping parentheses from a `WITH (...)` option list.
+    ///
+    /// The statement parsers hand these functions the raw text following `WITH`,
+    /// which includes the delimiters. Without this the first key parses as
+    /// `"(conflict_resolution"` and every option list is rejected as unknown —
+    /// so `WITH (...)` was unusable on **every** branch statement. Applied here,
+    /// in the option parsers themselves, rather than at each capture site: there
+    /// is more than one capture site and they drifted apart once already.
+    fn strip_option_parens(options_str: &str) -> &str {
+        let trimmed = options_str.trim();
+        trimmed
+            .strip_prefix('(')
+            .and_then(|s| s.strip_suffix(')'))
+            .unwrap_or(trimmed)
+            .trim()
+    }
+
     /// Parse merge options
     fn parse_merge_options(options_str: &str) -> Result<Vec<MergeOption>> {
         let mut options = Vec::new();
+        let options_str = Self::strip_option_parens(options_str);
 
         for pair in options_str.split(',') {
             let parts: Vec<&str> = pair.split('=').map(|s| s.trim()).collect();

@@ -18640,8 +18640,16 @@ impl EmbeddedDatabase {
     }
 
     /// Merge a branch into the current branch.
+    /// Merge `source` into the branch this handle is currently on (`main` if none).
+    ///
+    /// The emitted SQL must name the target: `MERGE BRANCH <src>` alone is a parse
+    /// error (`MERGE BRANCH requires INTO keyword`), so before this was fixed every
+    /// call returned that error and the MCP `branch_merge` tool — the only caller —
+    /// could never succeed. Callers that want an explicit target should switch
+    /// branches first, which is what that tool does.
     pub fn merge_branch(&self, source: &str) -> Result<u64> {
-        self.execute(&format!("MERGE BRANCH {source}"))
+        let target = self.storage.get_current_branch().unwrap_or_else(|| "main".to_string());
+        self.execute(&format!("MERGE BRANCH {source} INTO {target}"))
     }
 
     /// Drop a branch.
@@ -18650,8 +18658,14 @@ impl EmbeddedDatabase {
     }
 
     /// List all branches.
+    ///
+    /// Emits `SHOW BRANCHES`: there is no `LIST BRANCHES` in the grammar (see
+    /// `is_show_branches`), so the previous spelling was a parse error on every
+    /// call — the same defect as `merge_branch`'s missing `INTO`. Any helper here
+    /// that builds SQL by hand must be exercised by a test that actually runs it;
+    /// `branch_merge_surface_tests` now does that for this whole family.
     pub fn list_branches(&self) -> Result<Vec<Tuple>> {
-        self.query("LIST BRANCHES", &[])
+        self.query("SHOW BRANCHES", &[])
     }
 
     /// Return the query execution plan as a string.
