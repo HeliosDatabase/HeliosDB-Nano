@@ -138,15 +138,27 @@ fn test_merge_branch_sql() {
     let result = db.execute("MERGE DATABASE BRANCH dev INTO main");
     assert!(result.is_ok());
 
-    // Verify dev branch is marked as merged
+    // Verify dev branch is listed AND marked as merged.
+    //
+    // Two bugs met here. The product one: `pg_database_branches()` fed off
+    // `list_branches()`, which returns only `Active` branches, so a merged
+    // branch vanished from the catalog entirely and the `status` column could
+    // never read anything but "Active". The test one: this projects TWO columns
+    // and then read index 6 — the position of `status` in the full seven-column
+    // row, not in this projection — so it panicked on `None` rather than
+    // reporting the missing branch. `status` is index 1 here.
     let branches = db
         .query("SELECT branch_name, status FROM pg_database_branches()", &[])
         .unwrap();
     let dev_status = branches
         .iter()
         .find(|row| get_string(row, 0) == "dev")
-        .map(|row| get_string(row, 6)); // status column
-    assert!(dev_status.is_some());
+        .map(|row| get_string(row, 1));
+    let dev_status = dev_status.expect("a merged branch must remain visible in the catalog");
+    assert!(
+        dev_status.contains("Merged"),
+        "status must report the merge, not just presence; got {dev_status:?}"
+    );
 }
 
 #[test]

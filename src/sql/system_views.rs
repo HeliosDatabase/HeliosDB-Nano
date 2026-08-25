@@ -1465,7 +1465,7 @@ impl SystemViewRegistry {
     // === v2.0 Feature View Executors ===
 
     fn execute_pg_branches(&self, storage: &StorageEngine) -> Result<Vec<Tuple>> {
-        let branches = storage.list_branches()?;
+        let branches = storage.list_branches_for_catalog()?;
         let mut results = Vec::new();
 
         for branch in branches {

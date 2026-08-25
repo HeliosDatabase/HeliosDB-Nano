@@ -329,3 +329,78 @@ fn grandchildren_protect_their_own_parent_independently() {
     db.execute("DROP BRANCH g1").unwrap();
     db.execute("DROP BRANCH g0").expect("chain unwinds bottom-up");
 }
+
+// ---------------------------------------------------------------------------
+// Catalog visibility: a merged branch is history, not a deleted branch.
+//
+// `pg_database_branches()` fed off `list_branches()`, which filters to
+// `BranchState::Active`, so a merged branch disappeared from the catalog and the
+// view's `status` column could only ever read "Active". `handle_show_branches`
+// even carried a formatting arm for `Merged { into_branch, at_timestamp }` that
+// could never execute. Operational listings (version GC, branch resolution) stay
+// Active-only deliberately — see `list_branches_for_catalog`.
+// ---------------------------------------------------------------------------
+
+fn branch_rows(db: &EmbeddedDatabase, sql: &str) -> Vec<(String, String)> {
+    db.query(sql, &[])
+        .unwrap()
+        .iter()
+        .map(|r| {
+            let name = match r.get(0) {
+                Some(heliosdb_nano::Value::String(s)) => s.clone(),
+                other => format!("{other:?}"),
+            };
+            let all = format!("{:?}", r.values);
+            (name, all)
+        })
+        .collect()
+}
+
+#[test]
+fn a_merged_branch_stays_visible_in_the_catalog_with_its_state() {
+    let db = seeded();
+    db.execute("CREATE BRANCH tomerge AS OF NOW").unwrap();
+    db.execute("MERGE BRANCH tomerge INTO main").unwrap();
+
+    let rows = branch_rows(&db, "SELECT * FROM pg_database_branches()");
+    let found = rows.iter().find(|(n, _)| n == "tomerge");
+    let (_, all) = found.expect("a merged branch must remain in pg_database_branches()");
+    assert!(all.contains("Merged"), "its status must say Merged, got: {all}");
+}
+
+#[test]
+fn show_branches_agrees_with_pg_database_branches() {
+    let db = seeded();
+    db.execute("CREATE BRANCH shown AS OF NOW").unwrap();
+    db.execute("MERGE BRANCH shown INTO main").unwrap();
+
+    // Both catalog surfaces must report the same set — fixing only one would
+    // recreate the one-rule-two-implementations split that caused #72.
+    let view: Vec<String> = branch_rows(&db, "SELECT * FROM pg_database_branches()")
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    let show: Vec<String> = branch_rows(&db, "SHOW BRANCHES").into_iter().map(|(n, _)| n).collect();
+
+    assert!(view.contains(&"shown".to_string()), "view: {view:?}");
+    assert!(show.contains(&"shown".to_string()), "SHOW BRANCHES: {show:?}");
+    assert_eq!(view.len(), show.len(), "surfaces disagree: {view:?} vs {show:?}");
+}
+
+#[test]
+fn a_dropped_branch_is_not_history_and_stays_hidden() {
+    let db = seeded();
+    db.execute("CREATE BRANCH vanish AS OF NOW").unwrap();
+    db.execute("DROP BRANCH vanish").unwrap();
+
+    // A drop is a delete. Guards against fixing the merge case by simply
+    // removing the state filter altogether.
+    let names: Vec<String> = branch_rows(&db, "SELECT * FROM pg_database_branches()")
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    assert!(
+        !names.contains(&"vanish".to_string()),
+        "dropped branch must stay hidden: {names:?}"
+    );
+}

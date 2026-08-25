@@ -759,6 +759,38 @@ impl BranchManager {
         Ok(branches)
     }
 
+    /// List branches for catalog/history views: `Active` **and** `Merged`.
+    ///
+    /// `list_branches` returns only `Active` branches, which is what operational
+    /// callers want — version GC, branch resolution, "which branches can I use".
+    /// Do not widen that one: `version_gc` iterates it to decide what may be
+    /// collected, and including merged branches there would change retention.
+    ///
+    /// The catalog views are different: they project a state/status column, and
+    /// `handle_show_branches` even carries a formatting arm for
+    /// `Merged { into_branch, at_timestamp }` that could never run, because every
+    /// non-Active branch was filtered out upstream. A merged branch vanished from
+    /// `pg_database_branches()` entirely, so merge history was unreachable even
+    /// though `BranchState::Merged` is recorded faithfully in storage — the
+    /// status column could only ever read "Active".
+    ///
+    /// `Dropped` stays hidden here: a drop is a delete, not history.
+    pub fn list_branches_for_catalog(&self) -> Result<Vec<BranchMetadata>> {
+        let registry = self.registry.read();
+        let mut branches = Vec::new();
+
+        for name in registry.branches.values() {
+            match self.get_branch_by_name(name) {
+                Ok(metadata) if !matches!(metadata.state, BranchState::Dropped { .. }) => {
+                    branches.push(metadata);
+                }
+                _ => continue,
+            }
+        }
+
+        Ok(branches)
+    }
+
     /// Return true when any registered branch other than main exists.
     pub fn has_user_branches_registered(&self) -> bool {
         let registry = self.registry.read();

@@ -2892,7 +2892,7 @@ impl SystemViewRegistry {
     ///
     /// Returns information about all database branches
     fn execute_pg_database_branches(storage: &StorageEngine) -> Result<Vec<Tuple>> {
-        let branches = storage.list_branches()?;
+        let branches = storage.list_branches_for_catalog()?;
         let mut results = Vec::new();
 
         for branch in branches {
@@ -3006,7 +3006,7 @@ impl SystemViewRegistry {
     ///
     /// Returns detailed statistics for all database branches
     fn execute_pg_branch_stats(storage: &StorageEngine) -> Result<Vec<Tuple>> {
-        let branches = storage.list_branches()?;
+        let branches = storage.list_branches_for_catalog()?;
         let mut results = Vec::new();
 
         for branch in branches {

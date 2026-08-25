@@ -9115,6 +9115,20 @@ impl StorageEngine {
         mgr.list_branches()
     }
 
+    /// List branches for catalog/history views: `Active` and `Merged`.
+    ///
+    /// Distinct from `list_branches` (Active only), which operational callers
+    /// such as version GC depend on. See `BranchManager::list_branches_for_catalog`.
+    pub fn list_branches_for_catalog(&self) -> Result<Vec<BranchMetadata>> {
+        let manager_lock = self.get_or_init_branch_manager()?;
+        let manager = manager_lock.read();
+        let mgr = manager
+            .as_ref()
+            .ok_or_else(|| Error::storage("BranchManager not available in read lock"))?;
+
+        mgr.list_branches_for_catalog()
+    }
+
     /// Merge a source branch into a target branch
     ///
     /// Performs a merge by copying all branch-specific data from source to target.
