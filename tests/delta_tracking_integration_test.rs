@@ -20,24 +20,20 @@ fn as_utc(t: SystemTime) -> DateTime<Utc> {
     DateTime::<Utc>::from(t)
 }
 
-/// Build a delta with an EXPLICIT timestamp and a unique `delta_id`.
+/// Build a delta with an EXPLICIT timestamp.
 ///
 /// The production helpers (`record_insert`/`record_update`/`record_delete`, which is how
-/// `src/storage/engine.rs` drives this tracker) allocate a `delta_id` themselves but always
-/// stamp `SystemTime::now()`. The two tests below need controlled timestamps to prove that
-/// `get_deltas_since` and `purge_deltas_before` filter by time at all.
+/// `src/storage/engine.rs` drives this tracker) always stamp `SystemTime::now()`. The tests
+/// below need controlled timestamps to prove that `get_deltas_since` and
+/// `purge_deltas_before` filter by time at all.
 ///
-/// `MvDelta::new()` is the only constructor that accepts a timestamp, and it leaves the
-/// deprecated `delta_id` at 0 — while `record_delta` keys storage on
-/// `delta:{table}:{delta_id:020}`. So every delta built that way collides on ONE key per
-/// table, and a test recording N deltas reads back 1. Assigning ids here works around that
-/// API gap; it is NOT part of what these tests verify. Filed separately as a footgun: the
-/// only timestamp-capable constructor is unusable for more than one delta per table.
-#[allow(deprecated)]
-fn timestamped_delta(table: &str, row_id: u64, op: MvDeltaOperation, ts: SystemTime, delta_id: u64) -> MvDelta {
-    let mut d = MvDelta::new(table.to_string(), row_id, op, ts, delta_id);
-    d.delta_id = delta_id;
-    d
+/// This used to also hand-assign the deprecated `delta_id`, because `record_delta` keyed
+/// storage on it and `MvDelta::new` leaves it at 0 — so every delta built this way collided
+/// on one key per table and N recorded deltas read back as 1. `record_delta` now allocates
+/// the key id when it is unset, so the workaround is gone; `record_delta_allocates_a_key_id`
+/// pins that.
+fn timestamped_delta(table: &str, row_id: u64, op: MvDeltaOperation, ts: SystemTime, txn_id: u64) -> MvDelta {
+    MvDelta::new(table.to_string(), row_id, op, ts, txn_id)
 }
 
 #[test]
@@ -277,4 +273,62 @@ fn test_delta_tracking_compaction() {
         .get_deltas_since(&["logs".to_string()], since)
         .expect("Failed to get deltas");
     assert_eq!(after_compact.get("logs").expect("logs delta set").len(), 5);
+}
+
+/// #71: `record_delta` must allocate its own storage-key id.
+///
+/// `MvDelta::new` is the only constructor that takes a timestamp and it hardcodes
+/// the deprecated `delta_id` to 0, while `record_delta` keyed storage on
+/// `delta:{table}:{delta_id:020}`. Two such deltas for one table wrote the same
+/// key, so the second silently replaced the first — a caller recording N read
+/// back 1, with no error. The deprecated field is `#[serde(skip)]`, so it was not
+/// even persisted; it existed only to build the key.
+#[test]
+fn record_delta_allocates_a_key_id_so_deltas_do_not_collide() {
+    let config = Config::in_memory();
+    let engine = StorageEngine::open_in_memory(&config).unwrap();
+    let tracker = MvDeltaTracker::new(engine.db()).unwrap();
+
+    let base = SystemTime::now() - Duration::from_secs(60);
+    let cutoff = as_utc(base - Duration::from_secs(10));
+
+    // Five deltas for ONE table, all built the timestamp-capable way.
+    for row_id in 1..=5u64 {
+        let tuple = Tuple::new(vec![Value::Int4(row_id as i32)]);
+        tracker
+            .record_delta(timestamped_delta(
+                "collide",
+                row_id,
+                MvDeltaOperation::Insert { tuple },
+                base + Duration::from_secs(row_id),
+                row_id,
+            ))
+            .unwrap();
+    }
+
+    let sets = tracker.get_deltas_since(&["collide".to_string()], cutoff).unwrap();
+    let recorded = sets.get("collide").map(|s| s.deltas.len()).unwrap_or(0);
+    assert_eq!(recorded, 5, "all five deltas must survive; before the fix this was 1");
+
+    // Distinct rows, not five copies of the last one.
+    let rows: std::collections::HashSet<u64> = sets.get("collide").unwrap().deltas.iter().map(|d| d.row_id).collect();
+    assert_eq!(rows.len(), 5, "each delta must keep its own row_id: {rows:?}");
+}
+
+/// The id-allocating helpers must keep their existing numbering — the fix treats
+/// a caller-supplied id as authoritative and only allocates when it is unset.
+#[test]
+fn record_insert_still_controls_its_own_delta_numbering() {
+    let config = Config::in_memory();
+    let engine = StorageEngine::open_in_memory(&config).unwrap();
+    let tracker = MvDeltaTracker::new(engine.db()).unwrap();
+
+    let before = as_utc(SystemTime::now() - Duration::from_secs(60));
+    for row_id in 1..=3u64 {
+        let tuple = Tuple::new(vec![Value::Int4(row_id as i32)]);
+        tracker.record_insert("helpers", row_id, tuple).unwrap();
+    }
+
+    let sets = tracker.get_deltas_since(&["helpers".to_string()], before).unwrap();
+    assert_eq!(sets.get("helpers").map(|s| s.deltas.len()).unwrap_or(0), 3);
 }

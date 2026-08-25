@@ -316,10 +316,30 @@ impl DeltaTracker {
         *current
     }
 
-    /// Record a delta for a table change
+    /// Record a delta for a table change.
+    ///
+    /// Allocates the storage-key id when the caller has not set one. `delta_id`
+    /// is `#[deprecated]` *and* `#[serde(skip)]` — it is never persisted in the
+    /// value, it only builds the key — and `Delta::new`, the **only** constructor
+    /// that accepts a timestamp, hardcodes it to 0. So every delta built that way
+    /// keyed `delta:<table>:00000000000000000000` and silently overwrote the
+    /// previous one: a caller recording N timestamped deltas for a table read
+    /// back exactly one, with no error.
+    ///
+    /// 0 is a safe "unset" sentinel: `next_delta_id` pre-increments, so allocated
+    /// ids start at 1 and 0 is never issued. Callers that do pass an id
+    /// (`record_insert`/`record_update`/`record_delete`) keep their existing
+    /// numbering untouched.
     pub fn record_delta(&self, delta: Delta) -> Result<()> {
+        #[allow(deprecated)]
+        let delta_id = if delta.delta_id == 0 {
+            self.next_delta_id()
+        } else {
+            delta.delta_id
+        };
+
         // Store delta in RocksDB
-        let key = format!("delta:{}:{:020}", delta.table_name, delta.delta_id);
+        let key = format!("delta:{}:{:020}", delta.table_name, delta_id);
         let value =
             bincode::serialize(&delta).map_err(|e| Error::storage(format!("Failed to serialize delta: {}", e)))?;
 
@@ -328,7 +348,7 @@ impl DeltaTracker {
             .map_err(|e| Error::storage(format!("Failed to store delta: {}", e)))?;
 
         // Update last delta ID
-        self.save_last_delta_id(delta.delta_id)?;
+        self.save_last_delta_id(delta_id)?;
 
         Ok(())
     }
