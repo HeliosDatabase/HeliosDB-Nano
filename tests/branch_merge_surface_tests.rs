@@ -275,3 +275,57 @@ fn merge_carries_a_large_branch_diff() {
     assert_eq!(after.len(), 201, "every bulk row must land on main");
     assert!(after.contains(&100) && after.contains(&299), "range endpoints present");
 }
+
+// ---------------------------------------------------------------------------
+// Branch lifecycle: dropping a child must release its parent.
+//
+// `add_child_branch` had no mirror, so a dropped child stayed in its parent's
+// children list forever and `drop_branch`'s "has N child branch(es)" guard kept
+// firing. Any branch that had ever had a child became permanently undroppable —
+// branches accumulated with no way to remove them and no workaround.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn dropping_a_child_releases_the_parent_for_drop() {
+    let db = seeded();
+    db.execute("CREATE BRANCH parent AS OF NOW").unwrap();
+    db.execute("CREATE BRANCH child FROM parent AS OF NOW").unwrap();
+
+    db.execute("DROP BRANCH parent")
+        .expect_err("a parent with a live child must not be droppable");
+
+    db.execute("DROP BRANCH child").unwrap();
+
+    db.execute("DROP BRANCH parent")
+        .expect("once the child is gone the parent must be droppable");
+}
+
+#[test]
+fn dropping_one_of_several_children_still_guards_the_parent() {
+    let db = seeded();
+    db.execute("CREATE BRANCH p2 AS OF NOW").unwrap();
+    db.execute("CREATE BRANCH c1 FROM p2 AS OF NOW").unwrap();
+    db.execute("CREATE BRANCH c2 FROM p2 AS OF NOW").unwrap();
+
+    db.execute("DROP BRANCH c1").unwrap();
+    // One child remains: the guard must still fire. Guards against fixing the
+    // leak by clearing the whole list instead of removing one entry.
+    db.execute("DROP BRANCH p2")
+        .expect_err("a parent with one remaining child must still be protected");
+
+    db.execute("DROP BRANCH c2").unwrap();
+    db.execute("DROP BRANCH p2").expect("both children gone, parent drops");
+}
+
+#[test]
+fn grandchildren_protect_their_own_parent_independently() {
+    let db = seeded();
+    db.execute("CREATE BRANCH g0 AS OF NOW").unwrap();
+    db.execute("CREATE BRANCH g1 FROM g0 AS OF NOW").unwrap();
+    db.execute("CREATE BRANCH g2 FROM g1 AS OF NOW").unwrap();
+
+    db.execute("DROP BRANCH g1").expect_err("g1 still has g2 beneath it");
+    db.execute("DROP BRANCH g2").unwrap();
+    db.execute("DROP BRANCH g1").unwrap();
+    db.execute("DROP BRANCH g0").expect("chain unwinds bottom-up");
+}
