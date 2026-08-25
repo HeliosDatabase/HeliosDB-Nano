@@ -5,6 +5,38 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.18.0] - 2026-08-25
+
+### Fixed
+
+- **A branch that had ever had a child could never be dropped.** The parent's
+  children list was appended to on create and never pruned, so a dropped child
+  stayed in it forever and `DROP BRANCH` kept reporting *has N child branch(es)*:
+
+  ```sql
+  CREATE BRANCH parent; CREATE BRANCH child FROM parent;
+  DROP BRANCH parent;  -- correctly refused
+  DROP BRANCH child;   -- ok
+  DROP BRANCH parent;  -- STILL refused, permanently
+  ```
+
+  Nothing else writes that key, so there was no workaround: branches accumulated
+  with no way to remove them.
+
+- **Merged branches vanished from the catalog views.** `pg_database_branches()`,
+  `pg_branch_stats()`, `pg_branches()` and `SHOW BRANCHES` all fed off a listing
+  filtered to `Active`, so a merged branch disappeared and the `status` column
+  could only ever read "Active" — merge history was unreachable even though
+  `BranchState::Merged { into_branch, at_timestamp }` is stored faithfully.
+
+  These four catalog surfaces now report `Active` **and** `Merged`. `Dropped`
+  stays hidden: a drop is a delete, not history. Operational listings (version
+  GC, branch resolution, REST `/branches`, MCP) are deliberately unchanged and
+  remain `Active`-only — widening them would have altered GC retention.
+
+  **This changes row counts.** Anything counting rows from those four views will
+  now see merged branches included.
+
 ## [4.17.0] - 2026-08-25
 
 ### Changed
