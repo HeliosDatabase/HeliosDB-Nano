@@ -5,6 +5,67 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.16.0] - 2026-08-25
+
+### Fixed
+
+- **Row-constructor comparison returned a wrong answer when a NULL preceded a
+  decisive element.** `(NULL, 1) < (2, 3)` evaluated to TRUE; PostgreSQL returns
+  NULL. The evaluator noted the NULL pair and continued, letting a later pair
+  decide a comparison PostgreSQL leaves unknown.
+
+  **Who was affected.** Anyone using row-constructor (tuple) comparison — most
+  importantly the keyset-pagination predicate `WHERE (sort_key, id) < (?, ?)`.
+  A row whose sort key was NULL compared TRUE on its non-null `id` and appeared
+  in **every** keyset page. If you paginate over a nullable sort column, pages
+  produced by earlier versions may contain rows that should have been excluded.
+
+  PostgreSQL gives the two operator families opposite precedence, and only the
+  ordering family was wrong:
+
+  | | rule | `(NULL,1) op (2,3)` |
+  |---|---|---|
+  | `<` `<=` `>` `>=` | stop at the first unequal **or null** pair; a null there is unknown | **NULL** (was TRUE) |
+  | `=` `<>` | unequal if any members are non-null and unequal | FALSE (unchanged) |
+
+  `=` and `<>` were already correct and are now pinned by tests, so the two rules
+  cannot later be "simplified" into one.
+
+  Reported by the HeliosDB Lite team while evaluating Nano's row-constructor
+  support for adoption.
+
+- **`MERGE BRANCH ... WITH (conflict_resolution = ...)` no longer pretends to
+  work.** `StorageEngine::merge_branch` ignores the strategy argument and returns
+  a hard-coded empty conflict list: it never detects a conflict and never applies
+  a strategy, so `branch_wins` and `target_wins` both produced the same
+  last-writer-wins merge while reporting success. The option is now rejected with
+  an explicit *not implemented* error. `delete_branch_after` is honoured and
+  continues to work.
+
+  This is a **behaviour change**: the paren-less spelling
+  (`WITH conflict_resolution=branch_wins`) previously returned success. It was
+  silently doing nothing. Remove the option to merge with last-writer-wins
+  semantics, which is what you were already getting.
+
+### Changed
+
+- `branch_merge_conflict_tests` lost 9 of its 13 tests. They drove
+  `BranchTransaction` — an API with no production callers whose on-disk key
+  encoding the real merge implementation does not read — and six asserted
+  conflict detection that does not exist. Three covered mechanics the real merge
+  does support and were rewritten against SQL in `branch_merge_surface_tests`.
+
+### Known limitations
+
+- Branch merging is last-writer-wins. Conflicts are not detected and merge
+  strategies are not implemented.
+- A branch that has ever had a child cannot be dropped: the children index is not
+  decremented when the child is dropped.
+- Merged branches disappear from `pg_database_branches()`. `BranchState::Merged`
+  is recorded in storage but never projected, so merge history is unreachable.
+- Row-constructor predicates are evaluated as a post-scan filter, not an index
+  seek, so keyset pagination does not currently benefit from an index.
+
 ## [4.15.0] - 2026-08-22
 
 ### Fixed
