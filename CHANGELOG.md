@@ -5,6 +5,49 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.17.0] - 2026-08-25
+
+### Changed
+
+- **The "constant-time deep pagination" claim is withdrawn.** `README.md` and
+  `docs/PERFORMANCE.md` advertised `LIMIT … OFFSET` as *constant-time (~30 µs
+  regardless of offset)*, and `benches/external/README.md` claimed *~32 µs
+  regardless of offset depth — up to 334× faster than PostgreSQL 13 for
+  `OFFSET 99990`*, citing a page that is not in this repository. No committed
+  artifact anywhere held an offset or keyset measurement.
+
+  Measured (`perf/pagination_depth_curve.json`, N = 10 000, page 10, embedded
+  path, p50):
+
+  | shape | depth 0 | depth 9 000 | growth |
+  |---|---|---|---|
+  | keyset, `WHERE id > $1` (indexed) | 39 µs | **35 µs** | **0.9× flat** |
+  | `OFFSET`, no `ORDER BY` | 11 µs | 1 255 µs | 115× |
+  | `OFFSET` + `ORDER BY id` | 36 µs | 4 812 µs | 133× |
+  | `OFFSET` + `ORDER BY created_at DESC` | 5 361 µs | 8 880 µs | 1.7× (flat, ~5 ms) |
+  | keyset, row-constructor `(a, b)` | 5 282 µs | 5 867 µs | 1.1× (flat, ~5 ms) |
+
+  **`LIMIT … OFFSET` is linear in the offset.** The ~30 µs figure matches the
+  single-column *keyset* path, which is genuinely flat; the claim attributed
+  keyset's property to `OFFSET`.
+
+  No engine behaviour changed in this release — only what the project claims
+  about itself. If you chose deep `OFFSET` on the strength of the old wording,
+  switch to keyset on a single indexed column.
+
+### Known limitations
+
+- **Row-constructor keyset does not use an index seek.** `(a, b) < ($1, $2)` is
+  evaluated as a post-scan filter: flat in depth, but ~5 ms at 10 000 rows versus
+  ~35 µs for the single-column form. Planner-driven keyset pushdown onto
+  `scan_table_pk_range` is the fix and is not implemented. Prefer a single
+  indexed sort key.
+- `OFFSET` without `ORDER BY` skips cheaply *per row* (no decode or decrypt) but
+  still steps once per skipped row.
+- A `NULL` in a row-constructor comparison makes the comparison unknown
+  (PostgreSQL semantics, corrected in 4.16.0), so rows with a `NULL` sort key are
+  excluded from every keyset page. Use `NOT NULL` sort keys.
+
 ## [4.16.0] - 2026-08-25
 
 ### Fixed
