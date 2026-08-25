@@ -532,6 +532,14 @@ impl BranchManager {
             .put(&meta_key, &meta_value)
             .map_err(|e| Error::storage(format!("Failed to save updated metadata: {}", e)))?;
 
+        // Release this branch from its parent's children list. Without it the
+        // parent keeps a dead child id and can never be dropped itself — see
+        // `remove_child_branch`. Done after the metadata write (the point of no
+        // return) so the index cannot be pruned for a drop that then fails.
+        if let Some(parent_id) = metadata.parent_id {
+            self.remove_child_branch(parent_id, metadata.branch_id)?;
+        }
+
         // Remove from registry
         {
             let mut registry = self.registry.write();
@@ -778,6 +786,43 @@ impl BranchManager {
         };
 
         children.push(child_id);
+
+        let value = bincode::serialize(&children)
+            .map_err(|e| Error::storage(format!("Failed to serialize children: {}", e)))?;
+        self.db
+            .put(&key, &value)
+            .map_err(|e| Error::storage(format!("Failed to save children: {}", e)))
+    }
+
+    /// Remove a child branch from its parent's children list.
+    ///
+    /// The mirror of `add_child_branch`, which had none: the list only ever
+    /// grew. A dropped child stayed in its parent's list forever, so
+    /// `drop_branch`'s "has N child branch(es)" guard kept firing and any branch
+    /// that had EVER had a child became permanently undroppable — an unbounded
+    /// leak with no workaround, since nothing else writes this key.
+    ///
+    /// Writes the pruned list back rather than deleting the key when it empties:
+    /// `get_child_branches` treats a missing key and an empty list identically,
+    /// so this needs no delete primitive on the store handle.
+    fn remove_child_branch(&self, parent_id: BranchId, child_id: BranchId) -> Result<()> {
+        let key = encode_branch_children_key(parent_id);
+
+        let mut children: Vec<BranchId> = match self.db.get(&key) {
+            Ok(Some(data)) => bincode::deserialize(&data)
+                .map_err(|e| Error::storage(format!("Failed to deserialize children: {}", e)))?,
+            // No list at all: nothing to prune.
+            Ok(None) => return Ok(()),
+            Err(e) => return Err(Error::storage(format!("Failed to read children: {}", e))),
+        };
+
+        let before = children.len();
+        children.retain(|&id| id != child_id);
+        if children.len() == before {
+            // Not a child of this parent — leave the key untouched rather than
+            // rewriting it, so a bad call cannot churn unrelated state.
+            return Ok(());
+        }
 
         let value = bincode::serialize(&children)
             .map_err(|e| Error::storage(format!("Failed to serialize children: {}", e)))?;
