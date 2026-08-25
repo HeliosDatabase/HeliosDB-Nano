@@ -5,6 +5,23 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.18.1] - 2026-08-25
+
+### Fixed
+
+- **`MvDeltaTracker::record_delta` overwrote deltas instead of appending them.**
+  It keyed storage on the caller's `delta_id`, and `MvDelta::new` — the only
+  constructor that accepts a timestamp — hardcodes that field to `0`. Every delta
+  built that way wrote the same key, so the second silently replaced the first: a
+  caller recording N deltas for one table read back exactly one, with no error.
+  `record_delta` now allocates a key id when the field is unset.
+
+  **Not reachable from SQL or any shipped write path.** The engine records deltas
+  through `record_insert`/`record_update`/`record_delete`, which allocate ids
+  correctly and are unaffected — their numbering is unchanged. This only affected
+  embedded-library callers using `record_delta` directly, for whom it is a
+  straightforward fix with no migration.
+
 ## [4.18.0] - 2026-08-25
 
 ### Fixed
