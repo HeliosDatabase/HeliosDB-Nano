@@ -301,14 +301,25 @@ fn test_merge_with_conflict_resolution() {
     execute_ddl(&db, "CREATE DATABASE BRANCH branch1 FROM CURRENT AS OF NOW").unwrap();
     execute_ddl(&db, "CREATE DATABASE BRANCH branch2 FROM CURRENT AS OF NOW").unwrap();
 
-    // Merge with conflict resolution strategy (using simple key=value format)
-    execute_ddl(
+    // `conflict_resolution` is refused rather than honoured. This test used to
+    // assert the merge SUCCEEDED with the option, and passed — because the
+    // option was accepted, mapped to a MergeStrategy, and then discarded by
+    // `StorageEngine::merge_branch`, which takes `_strategy` (unused) and returns
+    // a hard-coded `conflicts: Vec::new()`. It only checked that branches still
+    // existed afterwards, so it never noticed the strategy did nothing.
+    // Merging is last-writer-wins; saying so out loud beats silently ignoring it.
+    let err = execute_ddl(
         &db,
         "MERGE DATABASE BRANCH branch1 INTO branch2 WITH conflict_resolution=branch_wins",
     )
-    .unwrap();
+    .expect_err("conflict_resolution must not be silently ignored");
+    assert!(
+        err.to_string().contains("not implemented"),
+        "expected an explicit unimplemented error, got: {err}"
+    );
 
-    // Verify merge completed by checking branches exist
+    // Without the option the merge still succeeds.
+    execute_ddl(&db, "MERGE DATABASE BRANCH branch1 INTO branch2").unwrap();
     let results = execute_sql(&db, "SELECT * FROM pg_database_branches()").unwrap();
     assert!(!results.is_empty(), "Should have branches after merge");
 }

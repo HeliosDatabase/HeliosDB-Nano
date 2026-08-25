@@ -49,19 +49,34 @@ fn merge_branch_into_main_moves_rows_that_a_select_can_see() {
     );
 }
 
-/// `WITH (...)` option lists were rejected on every branch statement because the
-/// parser handed the option parsers the text with its parentheses still attached,
-/// making the first key `\"(conflict_resolution\"`.
+/// `conflict_resolution` parses (the paren bug is fixed) but must NOT silently
+/// succeed: `StorageEngine::merge_branch` ignores the strategy and hard-codes
+/// `conflicts: Vec::new()`, so honouring the option is impossible today. Silent
+/// acceptance would tell a caller who asked for 'target_wins' that a
+/// last-writer-wins merge completed with 0 conflicts.
 #[test]
-fn merge_branch_accepts_a_with_option_list() {
+fn merge_branch_rejects_conflict_resolution_as_unimplemented() {
     let db = seeded();
     db.execute("CREATE BRANCH dev AS OF NOW").unwrap();
     db.execute("USE BRANCH dev").unwrap();
     db.execute("INSERT INTO t VALUES (2, 'dev_row')").unwrap();
     db.execute("USE BRANCH main").unwrap();
 
-    db.execute("MERGE BRANCH dev INTO main WITH (conflict_resolution = 'branch_wins')")
-        .expect("WITH (conflict_resolution = ...) must parse");
+    let err = db
+        .execute("MERGE BRANCH dev INTO main WITH (conflict_resolution = 'branch_wins')")
+        .expect_err("conflict_resolution must not be silently ignored");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("not implemented"),
+        "the error must say the option is unimplemented, not that the key is unknown: {msg}"
+    );
+    assert!(
+        !msg.contains("(conflict_resolution"),
+        "and it must not be the old paren parse error: {msg}"
+    );
+
+    // The plain merge still works — only the unhonourable option is refused.
+    db.execute("MERGE BRANCH dev INTO main").unwrap();
     assert_eq!(ids_on_current_branch(&db), vec![1, 2]);
 }
 
@@ -185,4 +200,78 @@ fn refresh_materialized_view_helper_emits_parseable_sql() {
     db.execute("CREATE MATERIALIZED VIEW mv AS SELECT id FROM t").unwrap();
     db.refresh_materialized_view("mv")
         .expect("refresh_materialized_view must not emit invalid SQL");
+}
+
+// ---------------------------------------------------------------------------
+// Ported from branch_merge_conflict_tests, which drove the dead
+// `BranchTransaction` API. These three asserted mechanics the real merge does
+// support, so they are rewritten against SQL rather than deleted. The six that
+// asserted conflict DETECTION or strategy semantics were deleted instead:
+// `StorageEngine::merge_branch` takes `_strategy` and hard-codes
+// `conflicts: Vec::new()`, so there is no behaviour there to test.
+// ---------------------------------------------------------------------------
+
+/// Was `test_merge_with_deletions`: a row deleted on the branch must be deleted
+/// on the target after the merge. The real implementation scans `bdel:` markers,
+/// so this is reachable — unlike the conflict tests.
+#[test]
+fn merge_carries_a_branch_deletion_to_the_target() {
+    let db = seeded();
+    db.execute("INSERT INTO t VALUES (2, 'second')").unwrap();
+    db.execute("CREATE BRANCH dev AS OF NOW").unwrap();
+    db.execute("USE BRANCH dev").unwrap();
+    db.execute("DELETE FROM t WHERE id = 1").unwrap();
+    assert_eq!(ids_on_current_branch(&db), vec![2], "branch sees its own delete");
+
+    db.execute("USE BRANCH main").unwrap();
+    assert_eq!(ids_on_current_branch(&db), vec![1, 2], "main isolated pre-merge");
+
+    db.execute("MERGE BRANCH dev INTO main").unwrap();
+    assert_eq!(
+        ids_on_current_branch(&db),
+        vec![2],
+        "the deletion must propagate: row 1 gone, row 2 kept"
+    );
+}
+
+/// Was `test_merge_preserves_non_conflicting_changes`: rows unique to each side
+/// both survive. The original also asserted a conflicting key resolved to the
+/// branch's value under MergeStrategy::Theirs; that assertion is dropped because
+/// strategy is ignored and merging is last-writer-wins.
+#[test]
+fn merge_preserves_rows_unique_to_each_branch() {
+    let db = seeded();
+    db.execute("CREATE BRANCH dev AS OF NOW").unwrap();
+    db.execute("USE BRANCH dev").unwrap();
+    db.execute("INSERT INTO t VALUES (2, 'dev_only')").unwrap();
+    db.execute("USE BRANCH main").unwrap();
+    db.execute("INSERT INTO t VALUES (3, 'main_only')").unwrap();
+
+    db.execute("MERGE BRANCH dev INTO main").unwrap();
+    assert_eq!(
+        ids_on_current_branch(&db),
+        vec![1, 2, 3],
+        "main's own row must survive the merge alongside the branch's"
+    );
+}
+
+/// Was `test_merge_large_dataset` (1000 rows). Scaled to 200: this is a
+/// correctness test, not a benchmark, and this host is resource-constrained.
+/// The timing assertion is dropped — a wall-clock bound in a correctness suite
+/// is a flake generator on a shared machine.
+#[test]
+fn merge_carries_a_large_branch_diff() {
+    let db = seeded();
+    db.execute("CREATE BRANCH bulk AS OF NOW").unwrap();
+    db.execute("USE BRANCH bulk").unwrap();
+    for i in 100..300 {
+        db.execute(&format!("INSERT INTO t VALUES ({i}, 'bulk_{i}')")).unwrap();
+    }
+    assert_eq!(ids_on_current_branch(&db).len(), 201, "1 seeded + 200 bulk");
+
+    db.execute("USE BRANCH main").unwrap();
+    db.execute("MERGE BRANCH bulk INTO main").unwrap();
+    let after = ids_on_current_branch(&db);
+    assert_eq!(after.len(), 201, "every bulk row must land on main");
+    assert!(after.contains(&100) && after.contains(&299), "range endpoints present");
 }
