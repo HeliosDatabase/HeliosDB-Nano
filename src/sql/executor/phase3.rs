@@ -1014,7 +1014,7 @@ fn handle_show_branches(executor: &Executor) -> Result<Box<dyn PhysicalOperator>
 
     if let Some(storage) = executor.storage() {
         // Get all branches
-        let branches = storage.list_branches()?;
+        let branches = storage.list_branches_for_catalog()?;
 
         tracing::debug!("Found {} branches", branches.len());
 
