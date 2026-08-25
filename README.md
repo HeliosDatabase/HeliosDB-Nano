@@ -257,15 +257,45 @@ ORDER BY score DESC LIMIT 10;
 
 Scope and honest limitations: see [docs/compatibility/fts.md](docs/compatibility/fts.md).
 
-## Pagination — Constant-Time at Depth
+## Pagination — Flat at Depth with Keyset
 
-Deep `LIMIT … OFFSET` runs in **~30 µs regardless of offset** — constant-time,
-where a stock row-store re-scans every skipped row (linear in the offset).
-Top-K over Sort, storage-level `OFFSET` skip, and keyset
-(`WHERE (col, id) < ($1, $2)`) are all native.
+**Keyset pagination on an indexed column is flat**: ~35 µs whether you are on
+page 1 or page 900. `LIMIT … OFFSET` is **not** — it is linear in the offset,
+because the skipped rows are still stepped over. Use keyset for deep lists.
+
+Measured on this repo (N = 10 000, page = 10, embedded path, p50; full curve and
+reproduction in [`perf/pagination_depth_curve.json`](perf/pagination_depth_curve.json),
+harness in `tests/pagination_depth_curve.rs`):
+
+| shape | depth 0 | depth 9 000 | growth |
+|---|---|---|---|
+| keyset, `WHERE id > $1` (indexed) | 39 µs | **35 µs** | **0.9× — flat** |
+| `OFFSET`, no `ORDER BY` | 11 µs | 1 255 µs | 115× |
+| `OFFSET` + `ORDER BY id` | 36 µs | 4 812 µs | 133× |
+| `OFFSET` + `ORDER BY created_at DESC, id DESC` | 5 361 µs | 8 880 µs | 1.7× (flat, but ~5 ms — dominated by sorting every row) |
+| keyset, row-constructor `(created_at, id)` | 5 282 µs | 5 867 µs | 1.1× (flat, but ~5 ms — see below) |
+
+Two caveats worth reading before you design around this:
+
+- **`OFFSET` is O(offset).** Skipping without `ORDER BY` is cheap *per row* (it
+  avoids decode and decrypt), but it is still a step per skipped row. Earlier
+  versions of this README described it as constant-time; that was wrong, and the
+  ~30 µs figure it quoted matches the *keyset* path, not `OFFSET`.
+- **Row-constructor keyset does not yet use an index seek.** `(a, b) < ($1, $2)`
+  is evaluated as a post-scan filter, so it is flat in depth but pays a full scan
+  (~5 ms at 10 000 rows versus ~35 µs for the single-column form). Planner-driven
+  keyset pushdown onto `scan_table_pk_range` is the fix and is not implemented.
+  Prefer a single indexed sort key until it is.
 
 ```sql
--- Traditional LIMIT / OFFSET — constant-time at any depth via storage-level skip
+-- Keyset on an indexed column — flat at any depth, the recommended shape
+SELECT id, created_at, subject
+  FROM leads
+ WHERE id < $1
+ ORDER BY id DESC
+ LIMIT 20;
+
+-- LIMIT / OFFSET — correct, but cost grows with the offset
 SELECT id, created_at, subject
   FROM leads
  ORDER BY created_at DESC, id DESC
@@ -289,9 +319,13 @@ SELECT l.id, l.subject, c.name AS company
 
 Pitfalls: the sort key must be unique (always tail with `id` or another unique
 column); avoid floating-point sort keys; do not mix `ASC`/`DESC` directions
-inside the tuple. See
-[pagination-performance.html](https://heliosdb.com/pagination-performance.html)
-for measured numbers and reproduction recipe.
+inside the tuple. A `NULL` in a row-constructor comparison makes the whole
+comparison unknown (PostgreSQL semantics), so rows with a `NULL` sort key are
+excluded from every page — use `NOT NULL` sort keys.
+
+Numbers above are reproduced by
+`cargo test --release --test pagination_depth_curve -- --ignored --nocapture`,
+which rewrites `perf/pagination_depth_curve.json`.
 
 ## Git-Like Branching — Fork-Test-Discard Sandboxes
 
@@ -404,7 +438,7 @@ All PostgreSQL types plus MySQL type aliases (automatically translated):
 - **COPY (PostgreSQL wire)**: `COPY … FROM STDIN` / `TO STDOUT` in text and CSV — works with `psql \copy` and high-throughput PG→Nano bulk migration
 - **JSONB**: `->`, `->>`, `@>`, `?` operators
 - **Full-text search**: `tsvector`, `tsquery`, `@@`, `ts_rank_cd`, `CREATE INDEX ... USING gin` (see [FTS scope](docs/compatibility/fts.md))
-- **Keyset pagination**: row-constructor comparison `WHERE (col, id) < ($1, $2)`; top-K sort; constant-time deep OFFSET
+- **Keyset pagination**: row-constructor comparison `WHERE (col, id) < ($1, $2)`; top-K sort. Keyset on a single indexed column is flat at any depth (~35 µs); `LIMIT … OFFSET` is linear in the offset, and row-constructor keyset is a post-scan filter, not an index seek (see [Pagination](#pagination--flat-at-depth-with-keyset))
 - **Foreign keys**: CASCADE, SET NULL, RESTRICT, deferred/audit/off validation modes, `NOT ENFORCED` constraints
 - **Triggers**: ⚠️ **not implemented** — `CREATE TRIGGER … EXECUTE FUNCTION f()` parses and registers, but no trigger body ever runs: nothing fires on INSERT/UPDATE/DELETE and there is no error or warning. SQLite/MySQL-style `BEGIN … END` bodies do not parse at all. The single exception that has an effect: `BEFORE INSERT … FOR EACH ROW EXECUTE FUNCTION f()` where `f`'s body is `NEW.<col> = <expr>` and/or `RETURN NULL` rewrites or skips the row being inserted. Do not use triggers for audit logs or derived-data maintenance — do that work in the application, in an explicit second statement in the same transaction, or in a `CREATE PROCEDURE` invoked with `CALL`. Procedures execute and bind their arguments in either language, provided you use `$`-sigil parameters, and now do so on every client path (through 4.11.0 this advice was inert over the PostgreSQL extended protocol and the REST layer — see the **Stored procedures** bullet above, which also covers the one remaining `BEGIN` limitation).
 - **Row-Level Security**: Per-tenant data isolation via policies
