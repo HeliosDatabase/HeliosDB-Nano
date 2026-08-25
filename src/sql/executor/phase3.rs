@@ -248,6 +248,27 @@ fn handle_merge_branch(
     tracing::info!("Executing MERGE BRANCH {} INTO {} WITH {:?}", source, target, options);
 
     if let Some(storage) = executor.storage() {
+        // `conflict_resolution` parses and maps to a MergeStrategy, and
+        // `StorageEngine::merge_branch` then ignores it: that function takes
+        // `_strategy` and returns a hard-coded `conflicts: Vec::new()`, so it
+        // never detects a conflict and never applies a strategy. Merging is
+        // last-writer-wins.
+        //
+        // Accepting the option would therefore be a silent no-op — the caller
+        // asks for 'target_wins', gets 'branch_wins', and is told the merge
+        // completed with 0 conflicts. Fail loudly instead until conflict
+        // detection exists. `delete_branch_after` IS honoured (below) and stays
+        // accepted.
+        if options
+            .iter()
+            .any(|o| matches!(o, crate::sql::logical_plan::MergeOption::ConflictResolution(_)))
+        {
+            return Err(Error::execution(
+                "MERGE BRANCH conflict_resolution is not implemented: merges are last-writer-wins \
+                 and conflicts are never detected. Remove the option to merge with those semantics.",
+            ));
+        }
+
         // Determine merge strategy from options
         let strategy = resolve_merge_strategy(options);
 

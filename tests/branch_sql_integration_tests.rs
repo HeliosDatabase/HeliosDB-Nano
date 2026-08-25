@@ -159,11 +159,27 @@ fn test_merge_with_conflict_resolution() {
     db.execute("CREATE DATABASE BRANCH staging FROM main AS OF NOW")
         .unwrap();
 
-    // Test different merge strategies
-    db.execute("MERGE DATABASE BRANCH dev INTO main WITH (conflict_resolution = 'branch_wins')")
-        .unwrap();
-    db.execute("MERGE DATABASE BRANCH staging INTO main WITH (conflict_resolution = 'target_wins')")
-        .unwrap();
+    // Merge strategies are NOT implemented. This test previously failed to parse
+    // (the option list kept its parentheses, so the key read as
+    // "(conflict_resolution"); fixing that briefly made it pass, which was worse —
+    // `StorageEngine::merge_branch` takes `_strategy` (unused) and hard-codes
+    // `conflicts: Vec::new()`, so 'branch_wins' and 'target_wins' would both have
+    // silently produced the same last-writer-wins merge. Both are now refused.
+    for strategy in ["branch_wins", "target_wins"] {
+        let err = db
+            .execute(&format!(
+                "MERGE DATABASE BRANCH dev INTO main WITH (conflict_resolution = '{strategy}')"
+            ))
+            .expect_err("conflict_resolution must not be silently ignored");
+        assert!(
+            err.to_string().contains("not implemented"),
+            "expected an explicit unimplemented error for {strategy}, got: {err}"
+        );
+    }
+
+    // Without the option both merges succeed.
+    db.execute("MERGE DATABASE BRANCH dev INTO main").unwrap();
+    db.execute("MERGE DATABASE BRANCH staging INTO main").unwrap();
 }
 
 #[test]

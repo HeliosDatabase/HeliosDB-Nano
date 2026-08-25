@@ -3485,9 +3485,27 @@ impl Evaluator {
             let r_val = self.evaluate(r_expr, tuple)?;
 
             if matches!(l_val, Value::Null) || matches!(r_val, Value::Null) {
-                // NULL makes the pair comparison unknown — propagate.
-                saw_null = true;
-                continue;
+                // PostgreSQL 9.24.5 treats the two families differently, and so
+                // must we — a uniform rule is wrong for one of them.
+                //
+                // Ordering ops: "the row elements are compared left-to-right,
+                // stopping as soon as an unequal or null pair of elements is
+                // found. If either of this pair is null, the result is unknown."
+                // So a NULL pair STOPS the walk. Continuing past it let a later
+                // decisive pair answer a comparison PostgreSQL leaves unknown:
+                // (NULL,1) < (2,3) returned TRUE here, where PostgreSQL says NULL.
+                //
+                // `=` / `<>`: rows are unequal if ANY corresponding members are
+                // non-null and unequal, so these must keep scanning for a
+                // decisive pair and only fall through to NULL if none exists —
+                // (NULL,1) = (2,3) is FALSE, not NULL. `saw_null` handles that.
+                match op {
+                    Op::Lt | Op::LtEq | Op::Gt | Op::GtEq => return Ok(Value::Null),
+                    _ => {
+                        saw_null = true;
+                        continue;
+                    }
+                }
             }
 
             let eq = self.compare_values(&l_val, &r_val, |c| c.is_eq())?;
