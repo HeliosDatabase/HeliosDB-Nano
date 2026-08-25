@@ -17,8 +17,9 @@ a wide margin, not a hair:
 - **Point operations** (PK lookup, INSERT/UPDATE/DELETE by key) — typically
   *orders of magnitude* faster (in-process, no network round-trip, ART index).
 - **DDL, subqueries, aggregates, UPSERT, set ops** — consistently far ahead.
-- **Deep pagination** — `LIMIT … OFFSET` is **constant-time** (~30 µs regardless
-  of offset), where a stock row-store re-scans every skipped row.
+- **Deep pagination** — **keyset** on an indexed column is flat (~35 µs at any
+  depth). `LIMIT … OFFSET` is *not* constant-time: it is linear in the offset
+  (115–133× from depth 0 to 9 000). See `perf/pagination_depth_curve.json`.
 - **Triple wire compatibility** (PostgreSQL + MySQL + REST) on one process, same
   data — no proxy, no second service.
 

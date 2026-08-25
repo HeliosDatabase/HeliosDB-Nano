@@ -65,10 +65,28 @@ python3 benches/external/pagination_bench.py --compare nano.json pg16.json
 
 ### Published results
 
-See `Website/site/pagination-performance.html` for an annotated version
-of the output. HeliosDB Nano 3.12.0 delivers constant-time pagination
-(~32 µs) regardless of offset depth — up to **334× faster** than
-PostgreSQL 13 for `OFFSET 99990` on a 100k-row table.
+**The previous claim here was wrong and has been withdrawn.** It stated that
+Nano 3.12.0 delivered "constant-time pagination (~32 µs) regardless of offset
+depth — up to 334× faster than PostgreSQL 13 for `OFFSET 99990`", and cited
+`Website/site/pagination-performance.html`, which is not in this repository and
+has no committed artifact behind it anywhere. Nothing substantiated either
+number.
+
+Measured instead (`perf/pagination_depth_curve.json`, harness
+`tests/pagination_depth_curve.rs`, N = 10 000, embedded path):
+
+- `LIMIT … OFFSET` is **linear in the offset** — 115× (no `ORDER BY`) to 133×
+  (`ORDER BY id`) from depth 0 to depth 9 000. It is not constant-time.
+- **Keyset on an indexed column is flat** — ~35 µs at every depth measured. The
+  "~30 µs" figure matches this shape, not `OFFSET`.
+- Row-constructor keyset `(a, b) < ($1, $2)` is flat in depth but runs as a
+  post-scan filter (~5 ms at 10 000 rows), because tuple predicates do not reach
+  an index seek.
+
+No PostgreSQL comparison is published here: the depth curve above is Nano-only,
+and the withdrawn 334× figure has no reproduction. Run `pagination_bench.py`
+against both engines if you need a cross-engine number, and commit the artifact
+alongside any claim made from it.
 
 ## Other scripts
 
