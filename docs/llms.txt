@@ -149,29 +149,33 @@ Branches are copy-on-write forks of the database — the primitive for letting a
 agent execute arbitrary SQL against real data with zero write-risk to `main`.
 The recommended lifecycle is fork-test-discard:
 
+`AS OF` is REQUIRED on CREATE — `AS OF NOW` forks current state. Omitting it
+errors with `CREATE BRANCH requires AS OF clause` (src/sql/parser.rs:3490).
+
 ```sql
-CREATE DATABASE BRANCH agent_run_42 FROM main;   -- instant copy-on-write fork
+CREATE DATABASE BRANCH agent_run_42 FROM main AS OF NOW;  -- copy-on-write fork
 USE BRANCH agent_run_42;
 -- … run migrations, destructive UPDATEs, experiments; validate with SELECTs …
 USE BRANCH main;
 DROP DATABASE BRANCH agent_run_42;               -- discard; main never touched
 ```
 
-Optionally anchor the fork in the past: `CREATE DATABASE BRANCH b FROM main AS
-OF TIMESTAMP '2026-06-01 09:00:00'` (needs time-travel ON — the agent profile
-guarantees it). Library API: `create_branch` / `switch_branch` / `drop_branch`
+Anchor the fork in the past instead: `CREATE DATABASE BRANCH b FROM main AS
+OF TIMESTAMP '2026-08-24 09:00:00'` (needs time-travel ON — the agent profile
+guarantees it; it is OFF under `fast` and `fast_ingest`). Library API: `create_branch` / `switch_branch` / `drop_branch`
 / `list_branches`. REPL: `\branches`, `\use <branch>`, `\show branch`.
 
-> WARNING — MERGE DOES NOT WORK. `MERGE DATABASE BRANCH x INTO main` returns
-> `completed = true` with `conflicts = []` and `merged_keys = 0`, and leaves the
-> target unchanged. It raises no error. Measured 2026-08-19. An earlier version
-> of this warning called conflict detection "unreliable" and said to verify the
-> merged rows afterwards — that implied rows are merged; they are not. Risk is
-> silent data loss: merge, see success, discard the branch, lose the work. Never
-> propose MERGE; use fork-test-discard and re-run validated SQL on the target.
-> A fix is tracked (audit C11).
-> Until then, prefer fork-test-discard: apply validated changes to `main`
-> directly (re-run the tested SQL) instead of merging the branch.
+> MERGE — moves rows, but has NO conflict detection. `MERGE BRANCH x INTO main`
+> does merge, and always did (pinned by tests/branch_merge_surface_tests.rs).
+> It is LAST-WRITER-WINS: if main and the branch changed the same row, one value
+> silently wins with no warning. `WITH (conflict_resolution = …)` errors as not
+> implemented; `WITH (delete_branch_after = true)` works.
+> Merge only when the target has not been written since the fork. An agent cannot
+> guarantee that, so for agent runs always fork-test-discard and re-run validated
+> SQL on the target instead of merging.
+> Earlier versions of this warning said MERGE "merges nothing and reports success"
+> — retracted in CHANGELOG [4.16.0]; that evidence came from BranchTransaction
+> tests with no production callers.
 
 ## Time travel
 
@@ -230,8 +234,9 @@ automatically after `git clone`; install globally with
 - heliosdb-nano-transactions — BEGIN/COMMIT/ROLLBACK, savepoints, RAII
   `db.begin_transaction()`, deadlock detection, bulk-load pattern.
 - heliosdb-nano-branches — fork-test-discard agent sandboxes: `CREATE
-  DATABASE BRANCH … FROM main [AS OF …]`, `USE BRANCH`, `DROP DATABASE
-  BRANCH`; merge exists but see the MERGE warning above.
+  DATABASE BRANCH … FROM main AS OF NOW` (AS OF required), `USE BRANCH`,
+  `SHOW BRANCHES`, `DROP DATABASE BRANCH`; merge works but is last-writer-wins
+  — see the MERGE note above.
 - heliosdb-nano-time-travel — `SELECT … AS OF TIMESTAMP '…'`, snapshot
   listing, bad-UPDATE recovery recipes. `\snapshots`.
 - heliosdb-nano-backup — `heliosdb-nano dump`/`restore`, zstd/gzip/brotli,

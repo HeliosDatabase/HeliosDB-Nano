@@ -334,8 +334,12 @@ destructive change (a migration, an experiment, an AI agent's writes) against
 real data, then discard the branch. `main` is never touched. This is the
 recommended pattern for giving every agent run its own sandbox.
 
+`CREATE BRANCH` **requires an `AS OF` clause** — use `AS OF NOW` to fork current
+state, or `AS OF TIMESTAMP '…'` to fork from the past. Without it the statement is
+rejected with `CREATE BRANCH requires AS OF clause` (`src/sql/parser.rs:3490`).
+
 ```sql
-CREATE BRANCH agent_run_42 FROM main;
+CREATE DATABASE BRANCH agent_run_42 FROM main AS OF NOW;
 USE BRANCH agent_run_42;
 
 -- Changes here are invisible to main
@@ -348,26 +352,25 @@ DROP BRANCH agent_run_42;                  -- discard; main never changed
 ```
 
 Branches can also fork from a past point in time:
-`CREATE BRANCH rewind FROM main AS OF TIMESTAMP '2026-06-01 09:00:00'`
+`CREATE DATABASE BRANCH rewind FROM main AS OF TIMESTAMP '2026-08-24 09:00:00'`
 (requires time-travel, which the `agent` profile keeps enabled).
 
-> **⚠️ Do not use `MERGE BRANCH`. It merges nothing and reports success.**
-> Measured 2026-08-19: `MERGE BRANCH dev INTO main` returns `completed = true`
-> with `conflicts = []` and **`merged_keys = 0`** — the target branch is
-> unchanged, and no error is raised. A previous version of this warning said
-> conflict detection "over-reports and can mis-detect", and advised verifying
-> the merged rows afterwards. That was wrong in the dangerous direction: it
-> implies rows are merged. **They are not.**
+> **⚠️ `MERGE BRANCH` moves rows, but does not detect conflicts.**
+> Merging is **last-writer-wins**: if `main` and the branch both changed the same
+> row, one value silently wins and you get no warning. Merge strategies are not
+> implemented — `WITH (conflict_resolution = …)` errors with *not implemented*.
+> `WITH (delete_branch_after = true)` is honoured and works.
 >
-> The risk is silent data loss in the fork-test-discard workflow: run the merge,
-> see success with no conflicts, drop the branch — and the branch's work is gone,
-> never having reached `main`. Verify with `merged_keys` and by reading the rows
-> back before you discard anything.
+> Merge is safe when the target has not been written since the fork. When you
+> cannot guarantee that — and an agent never can — use fork-test-discard as
+> designed: drop the branch and re-run the validated SQL against `main`.
 >
-> Use fork-test-discard as designed instead: re-run the validated SQL against
-> `main`. A fix is tracked (audit C11). This was invisible for months because the
-> merge test suite is gated behind a non-default feature and never ran — see
-> `docs/GATES.md` §3b.
+> **An earlier version of this warning said `MERGE BRANCH` "merges nothing and
+> reports success". That was wrong** and is retracted — see `CHANGELOG.md`
+> [4.16.0]. The evidence came from tests driving `BranchTransaction`, an API with
+> no production callers whose on-disk key encoding the real merge never reads.
+> Measured, the SQL path merges correctly and always did; it is pinned by
+> `tests/branch_merge_surface_tests.rs`.
 
 ## Time-Travel Queries
 
