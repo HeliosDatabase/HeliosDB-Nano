@@ -5,6 +5,52 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.19.0] - 2026-08-27
+
+### Fixed
+
+- **`CREATE TABLE … AS SELECT` created an empty, column-less table.** It returned
+  `Ok(1)` and copied nothing:
+
+  ```
+  source s: 3 rows
+  CREATE TABLE d  AS SELECT id, n FROM s             -> Ok(1),  d: 0 rows
+  CREATE TABLE d2 AS SELECT * FROM s                 -> Ok(1), d2: 0 rows
+  CREATE TABLE d3 AS SELECT id, n FROM s WHERE n>15  -> Ok(1), d3: 0 rows
+  SELECT id INTO t2 FROM s2                          -> Ok(1), t2 absent
+  ```
+
+  **If you used `CREATE TABLE backup AS SELECT * FROM t` as a safety copy before a
+  destructive change, that backup was empty and the statement reported success.**
+  Check any table you created this way. The planner never read the source query, so
+  no data was written anywhere — the rows were never copied, not copied-then-lost.
+
+  `SELECT … INTO newtable` was the same defect and is also fixed. Both now derive
+  columns from the query's static schema, so an empty source still produces a
+  correctly-shaped table, and a failed population drops the partial table instead of
+  leaving it behind.
+
+### Changed
+
+- **CTAS returns the inserted row count**, not `1`. Plain `CREATE TABLE` still
+  returns `1`.
+- **plpgsql `SELECT … INTO var` now assigns to the variable** (previously the
+  statement ran and its result was discarded). It therefore **errors if the target
+  variable was never declared**, where it used to appear to succeed. This is
+  PostgreSQL semantics, and it is required: without it, the SQL-level `SELECT … INTO`
+  fix would make a procedure body containing `SELECT COUNT(*) INTO cnt …` silently
+  create a table named `cnt`.
+
+### Known limitations
+
+- The explicit column-name form `CREATE TABLE t (a, b) AS SELECT …` is still a parse
+  error (a loud failure, not a silent one). A typed column list alongside a query —
+  which PostgreSQL also rejects — now errors explicitly.
+- CTAS tables are created with no primary key, no constraints and no indexes
+  (PostgreSQL parity). Add them afterwards with `ALTER TABLE` / `CREATE INDEX`.
+- Concurrent readers can observe a CTAS target mid-population; DDL is not
+  transactional here, the same as `INSERT … SELECT`.
+
 ## [4.18.1] - 2026-08-25
 
 ### Fixed
