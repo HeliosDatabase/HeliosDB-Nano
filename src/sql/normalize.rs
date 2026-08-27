@@ -112,6 +112,13 @@ pub(crate) fn normalize_select_literals(sql: &str) -> Option<(String, Vec<Value>
             let word = &sql[i..word_end];
 
             if depth == 0 {
+                // `SELECT … INTO t …` is CTAS, not a read: the planner turns it
+                // into `LogicalPlan::CreateTableAs`, which this path's
+                // SELECT-only executor cannot run. Bail to the raw route, which
+                // routes the plan to the CTAS executor instead.
+                if word.eq_ignore_ascii_case("into") {
+                    return None;
+                }
                 // Top-level clause keywords delimit the WHERE region.
                 if word.eq_ignore_ascii_case("where") {
                     in_where = true;

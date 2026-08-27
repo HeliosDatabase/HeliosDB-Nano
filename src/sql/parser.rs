@@ -347,6 +347,12 @@ impl Parser {
         // the query — which is how `WITH (auto_refresh = true)` came to mean nothing.
         processed_sql = Self::preprocess_mv_with_options(&processed_sql);
 
+        // Strip a trailing `WITH [NO] DATA` off `CREATE TABLE … AS <query>`:
+        // sqlparser 0.53 has no grammar for it, so the documented PostgreSQL
+        // spelling is a hard parse error otherwise. The planner recovers the
+        // intent from the ORIGINAL text (`extract_ctas_with_no_data`).
+        processed_sql = Self::preprocess_ctas_with_data(&processed_sql);
+
         // Attempt the normal parse first. Only if it fails do we apply the
         // Stage-0 partitioning rewrites (strip a parent `PARTITION BY …` clause,
         // rewrite a child `PARTITION OF …` to an empty-column CREATE) or the
@@ -972,6 +978,76 @@ impl Parser {
         out.push_str(sql[as_pos..with_start].trim_end());
         out.push_str(&sql[with_end..]);
         out
+    }
+
+    /// Strip a trailing `WITH [NO] DATA` clause off `CREATE TABLE … AS <query>`.
+    ///
+    /// sqlparser 0.53 has no `[NO] DATA` grammar, so the documented PostgreSQL
+    /// spelling does not parse at all today. Stripping it here — the
+    /// [`Self::preprocess_mv_with_options`] precedent — makes the statement
+    /// parse; the planner re-reads the intent from the ORIGINAL text via
+    /// [`Self::extract_ctas_with_no_data`], so the clause never has to survive
+    /// into an AST that cannot represent it. Non-CTAS SQL is returned unchanged.
+    #[allow(clippy::indexing_slicing)] // Offsets come from the quote-aware scanners below.
+    pub fn preprocess_ctas_with_data(sql: &str) -> String {
+        match Self::find_ctas_with_data(sql) {
+            Some((start, end, _)) => {
+                let mut out = sql[..start].trim_end().to_string();
+                out.push_str(&sql[end..]);
+                out
+            }
+            None => sql.to_string(),
+        }
+    }
+
+    /// Does `sql` spell `CREATE TABLE … AS <query> WITH NO DATA`?
+    ///
+    /// Read from the ORIGINAL statement text, after
+    /// [`Self::preprocess_ctas_with_data`] removed the clause the AST cannot
+    /// carry. `false` for `WITH DATA` and for a statement with no clause at all
+    /// — both mean "populate", the SQL-standard default.
+    pub(crate) fn extract_ctas_with_no_data(sql: &str) -> bool {
+        Self::find_ctas_with_data(sql).is_some_and(|(_, _, no_data)| no_data)
+    }
+
+    /// Locate a trailing top-level `WITH [NO] DATA` clause in a
+    /// `CREATE TABLE … AS <query>` statement, returning its byte range and
+    /// whether it said NO.
+    ///
+    /// Confident-or-`None`: the clause must sit at paren depth 0, outside
+    /// quoted spans, AFTER the CTAS `AS`, and be the LAST thing in the
+    /// statement. So a `WITH (…)` option list, an MSSQL table hint, a CTE
+    /// `WITH` in the query body, and every non-CTAS statement all yield `None`
+    /// and are left byte-identically alone. `CREATE MATERIALIZED VIEW … WITH NO
+    /// DATA` has no top-level `TABLE` keyword and is likewise untouched (it
+    /// keeps whatever behavior it has today).
+    fn find_ctas_with_data(sql: &str) -> Option<(usize, usize, bool)> {
+        // Cheap bail before any scanning: only a CREATE can carry this clause.
+        if !crate::starts_with_icase(sql.trim_start(), "CREATE") {
+            return None;
+        }
+        let table_pos = *Self::top_level_keyword_positions(sql, "TABLE").first()?;
+        let as_pos = Self::top_level_keyword_positions(sql, "AS")
+            .into_iter()
+            .find(|&p| p > table_pos)?;
+        // The LAST top-level WITH after the `AS`: a CTAS body may legitimately
+        // open with its own CTE `WITH`, which is not the clause we want.
+        let with_pos = Self::top_level_keyword_positions(sql, "WITH")
+            .into_iter()
+            .rfind(|&p| p > as_pos)?;
+
+        let after_with = sql.get(with_pos + "WITH".len()..)?;
+        let (after_no, no_data) = match Self::strip_kw(after_with, "NO") {
+            Some(rest) => (rest, true),
+            None => (after_with.trim_start(), false),
+        };
+        let rest = Self::strip_kw(after_no, "DATA")?;
+        // Anything other than an optional trailing `;` after DATA means this is
+        // not the clause (or not a shape we understand) — leave it alone.
+        if !rest.trim().trim_end_matches(';').trim().is_empty() {
+            return None;
+        }
+        Some((with_pos, sql.len() - rest.len(), no_data))
     }
 
     fn find_as_keyword(sql: &str) -> Option<usize> {

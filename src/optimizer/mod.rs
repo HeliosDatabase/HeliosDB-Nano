@@ -326,6 +326,27 @@ impl Optimizer {
                     returning,
                 }
             }
+            // CTAS - optimize the source sub-plan, exactly as InsertSelect
+            // above: the population runs through the InsertSelect executor, and
+            // an UNOPTIMIZED aggregate source undercounts at scale (issue #2 /
+            // Quirk J). Projection pruning keeps the outer `Project` (and hence
+            // the user's aliases), so the derived column names are unaffected.
+            LogicalPlan::CreateTableAs {
+                name,
+                column_names,
+                if_not_exists,
+                query,
+                with_data,
+            } => {
+                let optimized_query = self.optimize_recursive_inner(*query, depth)?;
+                LogicalPlan::CreateTableAs {
+                    name,
+                    column_names,
+                    if_not_exists,
+                    query: Box::new(optimized_query),
+                    with_data,
+                }
+            }
             // Leaf nodes - no recursion needed
             other => other,
         };

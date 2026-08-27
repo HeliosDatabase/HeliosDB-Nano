@@ -792,10 +792,154 @@ impl ProceduralParser {
             return Ok(None);
         }
 
+        // In a procedural body, `SELECT … INTO <var>[, …]` assigns into
+        // VARIABLES — it is NEVER CTAS (PostgreSQL parity). The SQL layer now
+        // treats a top-level `SELECT … INTO t` as `CREATE TABLE t AS …`, and
+        // body statements are handed to the engine VERBATIM through the
+        // `sql_executor` closure, so without this split a routine body like
+        // `SELECT COUNT(*) INTO cnt FROM …` would silently create a junk table
+        // named `cnt`. Splitting here also finally gives
+        // `ProceduralStatement::SelectInto` a producer — the runtime arm has
+        // always been implemented and never reachable.
+        if let Some((query, variables)) = Self::split_select_into(&sql) {
+            return Ok(Some(ProceduralStatement::SelectInto { query, variables }));
+        }
+
         Ok(Some(ProceduralStatement::Execute {
             sql,
             into_variables: Vec::new(),
         }))
+    }
+
+    /// Split a body statement of the form
+    /// `SELECT <items> INTO [STRICT] <var>[, …] <rest>` into the INTO-stripped
+    /// query text and the target variable names.
+    ///
+    /// Confident-or-`None`: the statement's leading keyword must be `SELECT`,
+    /// the `INTO` must sit at paren depth 0 outside quoted spans, and at least
+    /// one plain identifier must follow it. So `INSERT INTO t …`, a nested
+    /// `SELECT … FROM (SELECT … INTO …)`, `POSITION('x' IN s)` and an `INTO`
+    /// inside a string literal are all left to the plain `Execute` path. A
+    /// leading `WITH` is deliberately NOT accepted — `WITH … INSERT INTO t …`
+    /// also carries a depth-0 `INTO`, and a wrong split is far worse here than
+    /// a missed one.
+    ///
+    /// Record/composite INTO targets (`INTO rec` where `rec` is a ROWTYPE) are
+    /// out of scope: the runtime assigns column-by-column into scalar names.
+    #[allow(clippy::indexing_slicing)] // Byte cursor bounded by `while i < n`; slices are on ASCII boundaries.
+    fn split_select_into(sql: &str) -> Option<(String, Vec<String>)> {
+        let trimmed = sql.trim_start();
+        if !crate::starts_with_icase(trimmed, "SELECT") {
+            return None;
+        }
+        if trimmed
+            .as_bytes()
+            .get("SELECT".len())
+            .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_')
+        {
+            return None;
+        }
+
+        let bytes = sql.as_bytes();
+        let n = bytes.len();
+        let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
+
+        // Locate the first depth-0, unquoted, whole-word `INTO`.
+        let mut depth = 0i32;
+        let mut i = 0usize;
+        let into_start = loop {
+            if i >= n {
+                return None;
+            }
+            let c = bytes[i];
+            if c == b'\'' || c == b'"' {
+                let quote = c;
+                i += 1;
+                while i < n {
+                    if bytes[i] == quote {
+                        // A doubled quote is an embedded one — stay inside.
+                        if i + 1 < n && bytes[i + 1] == quote {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            if c == b'(' {
+                depth += 1;
+                i += 1;
+                continue;
+            }
+            if c == b')' {
+                depth -= 1;
+                i += 1;
+                continue;
+            }
+            if depth == 0
+                && i + 4 <= n
+                && bytes[i..i + 4].eq_ignore_ascii_case(b"INTO")
+                && (i == 0 || !is_ident(bytes[i - 1]))
+                && (i + 4 == n || !is_ident(bytes[i + 4]))
+            {
+                break i;
+            }
+            i += 1;
+        };
+
+        // `INTO STRICT v` (PL/pgSQL): the STRICT row-count check is not
+        // modelled, but the keyword must still be consumed so `STRICT` is not
+        // mistaken for the first target variable.
+        let mut rest = sql[into_start + 4..].trim_start();
+        if let Some(after_strict) = Self::strip_leading_word(rest, "STRICT") {
+            rest = after_strict;
+        }
+
+        let mut variables = Vec::new();
+        loop {
+            let name_len = rest.as_bytes().iter().take_while(|b| is_ident(**b)).count();
+            if name_len == 0 || rest.as_bytes().first().is_some_and(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            // A non-ASCII byte immediately after the name means this identifier
+            // is not one the scanner understands — bail rather than split it in
+            // the middle and emit a mangled query.
+            if rest.as_bytes().get(name_len).is_some_and(|b| !b.is_ascii()) {
+                return None;
+            }
+            variables.push(rest[..name_len].to_string());
+            rest = rest[name_len..].trim_start();
+            let Some(after_comma) = rest.strip_prefix(',') else {
+                break;
+            };
+            rest = after_comma.trim_start();
+        }
+
+        // Rebuild the query without the INTO clause, keeping the tail
+        // (`FROM …`, `WHERE …`) intact.
+        let mut query = sql[..into_start].trim_end().to_string();
+        if !rest.is_empty() {
+            query.push(' ');
+            query.push_str(rest);
+        }
+        Some((query, variables))
+    }
+
+    /// Strip a leading ASCII keyword (case-insensitive, right word boundary)
+    /// and return the remainder with leading whitespace trimmed.
+    #[allow(clippy::indexing_slicing)] // `starts_with_icase` proved the ASCII prefix.
+    fn strip_leading_word<'a>(s: &'a str, word: &str) -> Option<&'a str> {
+        if !crate::starts_with_icase(s, word) {
+            return None;
+        }
+        let rest = &s[word.len()..];
+        match rest.chars().next() {
+            Some(c) if c.is_alphanumeric() || c == '_' => None,
+            _ => Some(rest.trim_start()),
+        }
     }
 
     /// Parse exception handlers

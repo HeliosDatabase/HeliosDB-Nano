@@ -661,7 +661,7 @@ impl<'a> Planner<'a> {
     /// Convert a SQL statement to a logical plan
     pub fn statement_to_plan(&self, statement: Statement) -> Result<LogicalPlan> {
         match statement {
-            Statement::Query(query) => self.query_to_plan(*query),
+            Statement::Query(query) => self.top_level_query_to_plan(*query),
             Statement::Insert(insert) => {
                 // Extract fields from Insert struct for v0.53 API
                 let table_name = self.resolve_table_ref(&insert.table_name);
@@ -703,6 +703,20 @@ impl<'a> Planner<'a> {
                 // A bare CREATE under a non-`public` `search_path` targets the
                 // current schema (`cs.<table>`); a qualified name is exact.
                 let name = self.resolve_table_create(&create_table.name);
+                // CTAS branches FIRST. `create_table.columns` is EMPTY for
+                // `CREATE TABLE t AS SELECT …`, so the ordinary path below
+                // would build a zero-column table and drop `create_table.query`
+                // on the floor. The Stage-0 `PARTITION OF` empty-column path
+                // inside `create_table_to_plan` is unaffected — a partition
+                // child never carries a query.
+                if let Some(query) = create_table.query {
+                    return self.create_table_as_to_plan(
+                        name,
+                        &create_table.columns,
+                        create_table.if_not_exists,
+                        *query,
+                    );
+                }
                 let columns = create_table.columns;
                 let if_not_exists = create_table.if_not_exists;
                 let constraints = create_table.constraints;
@@ -1439,6 +1453,37 @@ impl<'a> Planner<'a> {
         };
         let anchor_plan = self.set_expr_to_plan((**left).clone())?;
         Ok(Some(anchor_plan.schema()))
+    }
+
+    /// Plan a TOP-LEVEL query, intercepting the `SELECT … INTO <table>`
+    /// spelling of CTAS on the way through.
+    ///
+    /// Deliberately NOT folded into [`Self::query_to_plan`]: that helper also
+    /// plans CTE bodies, view bodies, derived tables and scalar subqueries, and
+    /// PostgreSQL rejects `INTO` in every one of those positions. Hijacking it
+    /// there would turn a nested `INTO` into a stray `CREATE TABLE`.
+    fn top_level_query_to_plan(&self, mut query: Query) -> Result<LogicalPlan> {
+        // `SelectInto` also carries `temporary` / `unlogged` / `table`
+        // (`SELECT … INTO TEMP t`, `… INTO TABLE t`). Those modifiers are
+        // accepted and ignored, matching how the plain `CREATE TABLE` path
+        // already ignores TEMPORARY / UNLOGGED — deliberately consistent.
+        let into = match &mut *query.body {
+            SetExpr::Select(select) => select.into.take(),
+            _ => None,
+        };
+        let Some(into) = into else {
+            return self.query_to_plan(query);
+        };
+
+        let name = self.resolve_table_create(&into.name);
+        let query_plan = self.query_to_plan(query)?;
+        Ok(LogicalPlan::CreateTableAs {
+            name,
+            column_names: Vec::new(),
+            if_not_exists: false,
+            query: Box::new(query_plan),
+            with_data: true,
+        })
     }
 
     /// Convert a Query to a logical plan
@@ -4552,6 +4597,125 @@ impl<'a> Planner<'a> {
             if_not_exists,
             constraints,
         })
+    }
+
+    /// Convert `CREATE TABLE … AS <query>` (CTAS) to a plan.
+    fn create_table_as_to_plan(
+        &self,
+        name: String,
+        columns: &[SqlColumnDef],
+        if_not_exists: bool,
+        query: Query,
+    ) -> Result<LogicalPlan> {
+        // PostgreSQL's CTAS column list carries NAMES ONLY, and sqlparser's
+        // PostgreSqlDialect requires a type on every column def — so the
+        // name-only spelling `CREATE TABLE t (a, b) AS …` never parses and
+        // never reaches here. What CAN arrive is a TYPED list, which
+        // PostgreSQL itself rejects. Say so explicitly instead of silently
+        // discarding the list (the defect class this whole change fixes).
+        if !columns.is_empty() {
+            return Err(Error::query_execution(
+                "CREATE TABLE ... AS <query> does not accept column data types; \
+                 the column list may name columns only",
+            ));
+        }
+
+        // TEMPORARY / UNLOGGED / WITH (…) reach here already parsed and are
+        // accepted-and-ignored, exactly as the plain `CREATE TABLE` path
+        // ignores them — deliberately consistent, not an oversight.
+        let query_plan = self.query_to_plan(query)?;
+
+        // `WITH [NO] DATA` has no sqlparser 0.53 grammar, so
+        // `Parser::preprocess_ctas_with_data` strips the clause before parsing
+        // and the intent is re-read from the ORIGINAL statement text here (the
+        // `extract_partition_of` precedent). No original SQL threaded → the
+        // SQL-standard default, WITH DATA.
+        let with_data = !self
+            .original_sql
+            .as_deref()
+            .is_some_and(crate::sql::Parser::extract_ctas_with_no_data);
+
+        Ok(LogicalPlan::CreateTableAs {
+            name,
+            column_names: Vec::new(),
+            if_not_exists,
+            query: Box::new(query_plan),
+            with_data,
+        })
+    }
+
+    /// Derive the column list a CTAS target table is created with, from the
+    /// source query's STATIC schema.
+    ///
+    /// Never from the rows the query returns: `WITH NO DATA` and a `WHERE
+    /// false` source must still produce a correctly-shaped table, and tuple
+    /// inference structurally cannot do that (an empty result yields zero
+    /// columns — the exact bug being fixed). This is also why
+    /// `infer_schema_from_tuples` is NOT reused here: it is a self-described
+    /// HTTP-handler stopgap with generic `column_{idx}` names and lossy types,
+    /// and it stays private to that handler.
+    ///
+    /// `explicit`, when non-empty, renames the query's columns positionally.
+    pub(crate) fn ctas_target_columns(query_schema: &Schema, explicit: &[String]) -> Result<Vec<Column>> {
+        let arity = query_schema.columns.len();
+        if arity == 0 {
+            // Defensive: the planner always tops a SELECT with a Project, so a
+            // zero-column source should be unreachable. Erroring keeps the
+            // "never create a zero-column table" invariant enforced rather than
+            // assumed.
+            return Err(Error::query_execution(
+                "CREATE TABLE ... AS <query>: the query produces no columns",
+            ));
+        }
+        if !explicit.is_empty() && explicit.len() != arity {
+            return Err(Error::query_execution(if explicit.len() > arity {
+                "too many column names were specified"
+            } else {
+                "too few column names were specified"
+            }));
+        }
+
+        let mut columns: Vec<Column> = Vec::with_capacity(arity);
+        for (idx, source) in query_schema.columns.iter().enumerate() {
+            let name = match explicit.get(idx) {
+                Some(explicit_name) => explicit_name.clone(),
+                None => source.name.clone(),
+            };
+            // A CTAS target is a fresh standalone table: it inherits the
+            // query's names and types and NOTHING else. Provenance
+            // (`source_table*`) belongs to the tables the query read from;
+            // DEFAULT / UNIQUE / PRIMARY KEY would fabricate constraints
+            // PostgreSQL does not create for a CTAS. Mirrors the sanitising the
+            // plain CreateTable executor arm does when it builds its columns.
+            columns.push(Column {
+                name,
+                data_type: source.data_type.clone(),
+                nullable: source.nullable,
+                primary_key: false,
+                source_table: None,
+                source_table_name: None,
+                default_expr: None,
+                unique: false,
+                storage_mode: crate::types::ColumnStorageMode::Default,
+            });
+        }
+
+        // `Schema::new` does not validate and `get_column_index` returns the
+        // FIRST match, so a duplicate name would silently shadow: every read of
+        // the second column would answer with the first. Reject it, as
+        // PostgreSQL does. Compared exactly (not case-insensitively) because
+        // exact equality is precisely the condition under which the lookup
+        // shadows.
+        for (idx, column) in columns.iter().enumerate() {
+            if columns.iter().take(idx).any(|earlier| earlier.name == column.name) {
+                return Err(Error::query_execution(format!(
+                    "column \"{}\" specified more than once",
+                    column.name
+                )));
+            }
+        }
+
+        Ok(columns)
     }
 
     /// Stage-0 partitioning: build the `CreateTable` plan for a
