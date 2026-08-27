@@ -1046,16 +1046,49 @@ pub enum LogicalPlan {
     /// imply any ACL guarantee — real privilege enforcement is out of scope
     /// for this pass.
     ///
-    /// Deliberately declared as the LAST variant in this enum (not grouped
-    /// next to `CreateSchema` above): `LogicalPlan` derives
-    /// `Serialize`/`Deserialize` and is persisted via bincode for
-    /// materialized-view query plans (`storage/materialized_view.rs`,
-    /// `query_plan_bytes`), which encodes enum variants by positional
-    /// declaration index. Inserting a new variant in the middle would shift
-    /// every later variant's on-disk discriminant and break deserialization
-    /// of any materialized view persisted by an older binary; appending at
-    /// the end preserves every existing variant's index.
+    /// Deliberately APPENDED rather than grouped next to `CreateSchema` above:
+    /// `LogicalPlan` derives `Serialize`/`Deserialize` and is persisted via
+    /// bincode for materialized-view query plans
+    /// (`storage/materialized_view.rs`, `query_plan_bytes`), which encodes enum
+    /// variants by positional declaration index. Inserting a new variant in the
+    /// middle would shift every later variant's on-disk discriminant and break
+    /// deserialization of any materialized view persisted by an older binary;
+    /// appending at the end preserves every existing variant's index. Every
+    /// future variant must follow the same rule — `CreateTableAs` below was
+    /// appended after this one for exactly that reason.
     Noop,
+
+    /// `CREATE TABLE … AS <query>` (CTAS), and the top-level
+    /// `SELECT … INTO <table>` spelling of the same statement.
+    ///
+    /// A distinct variant rather than an optional `query` field on
+    /// [`LogicalPlan::CreateTable`]: an optional field would leave every
+    /// existing `CreateTable { .. }` consumer compiling while silently
+    /// discarding the query — the very defect this variant exists to fix,
+    /// moved one level down. A new variant instead fails LOUD: the exhaustive
+    /// matches (`schema()` here, the physical planner's DDL passthrough) stop
+    /// compiling until each has an answer, and every executor catch-all errors
+    /// rather than half-executing.
+    ///
+    /// Declared as the LAST variant for exactly the bincode reason documented
+    /// on `Noop` above — grouping it next to `CreateTable` would shift every
+    /// later variant's on-disk discriminant and break deserialization of any
+    /// materialized-view plan persisted by an older binary.
+    CreateTableAs {
+        /// Target table name, already resolved through the session `search_path`.
+        name: String,
+        /// Explicit column-name list (`CREATE TABLE t (a, b) AS …`). Empty means
+        /// "use the query's own output names".
+        column_names: Vec<String>,
+        /// `IF NOT EXISTS`: when the table already exists the WHOLE statement
+        /// no-ops, population included — PostgreSQL skips the statement, it
+        /// does not append to the existing table.
+        if_not_exists: bool,
+        /// The source query, already planned.
+        query: Box<LogicalPlan>,
+        /// `false` for `WITH NO DATA` — create the columns, insert nothing.
+        with_data: bool,
+    },
 }
 
 /// Function/Procedure parameter
@@ -1800,6 +1833,10 @@ impl LogicalPlan {
             Self::Update { .. } => "Update",
             Self::Delete { .. } => "Delete",
             Self::CreateTable { .. } => "CreateTable",
+            // This match has a `_ => "Other"` fallback, so the compiler does
+            // NOT force this arm — a missing one degrades every CTAS trace to
+            // "Other" silently.
+            Self::CreateTableAs { .. } => "CreateTableAs",
             Self::DropTable { .. } => "DropTable",
             Self::CreateIndex { .. } => "CreateIndex",
             Self::CreateSequence { .. } => "CreateSequence",
@@ -1899,6 +1936,10 @@ impl LogicalPlan {
                 Arc::new(Schema { columns: vec![] })
             }
             LogicalPlan::CreateTable { .. } => Arc::new(Schema { columns: vec![] }),
+            // CTAS is DDL: the statement itself produces a command tag, not a
+            // result set. The source query's schema — which becomes the new
+            // table's shape — is read from `query` at execution time.
+            LogicalPlan::CreateTableAs { .. } => Arc::new(Schema { columns: vec![] }),
             LogicalPlan::DropTable { .. } => Arc::new(Schema { columns: vec![] }),
             LogicalPlan::DropMulti { .. } => Arc::new(Schema { columns: vec![] }),
             LogicalPlan::Truncate { .. } => {

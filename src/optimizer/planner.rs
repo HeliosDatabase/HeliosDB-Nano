@@ -340,6 +340,7 @@ impl Planner {
             | LogicalPlan::Update { .. }
             | LogicalPlan::Delete { .. }
             | LogicalPlan::CreateTable { .. }
+            | LogicalPlan::CreateTableAs { .. }
             | LogicalPlan::DropTable { .. }
             | LogicalPlan::DropMulti { .. }
             | LogicalPlan::CreateIndex { .. }

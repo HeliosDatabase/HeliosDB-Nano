@@ -1281,6 +1281,10 @@ impl EmbeddedDatabase {
         matches!(
             plan,
             sql::LogicalPlan::CreateTable { .. }
+                // CTAS creates a table AND writes rows into it. This `matches!`
+                // is NOT compiler-forced — omitting the variant leaves stale
+                // plans and Describe metadata serving the pre-CREATE shape.
+                | sql::LogicalPlan::CreateTableAs { .. }
                 | sql::LogicalPlan::DropTable { .. }
                 // DROP SCHEMA CASCADE drops member tables; RESTRICT may still be
                 // a no-op, but invalidating on any DROP SCHEMA is safe + cheap.
@@ -1664,6 +1668,10 @@ impl EmbeddedDatabase {
                         | sql::LogicalPlan::InsertSelect { .. }
                         | sql::LogicalPlan::Update { .. }
                         | sql::LogicalPlan::Delete { .. }
+                        // CTAS is a WRITE that arrives through query-shaped
+                        // routes (`SELECT … INTO t`): it must be delegated to
+                        // the write executor, never to the read path.
+                        | sql::LogicalPlan::CreateTableAs { .. }
                 ) {
                     self.execute_plan_with_params(&stored_plan, &param_values, None)?.1
                 } else {
@@ -1740,6 +1748,10 @@ impl EmbeddedDatabase {
                     | sql::LogicalPlan::InsertSelect { .. }
                     | sql::LogicalPlan::Update { .. }
                     | sql::LogicalPlan::Delete { .. }
+                    // CTAS is a WRITE that arrives through query-shaped routes
+                    // (`SELECT … INTO t`): it must be delegated to the write
+                    // executor, never to the read path.
+                    | sql::LogicalPlan::CreateTableAs { .. }
             ) {
                 self.execute_plan_with_params(&stored_plan, &params, None)?.1
             } else {
@@ -3276,6 +3288,125 @@ impl EmbeddedDatabase {
         Ok(0)
     }
 
+    /// Execute `CREATE TABLE … AS <query>` — and the `SELECT … INTO <table>`
+    /// spelling, which plans to the same variant.
+    ///
+    /// Shared by BOTH live executor families so they cannot drift: the text
+    /// family (`execute_in_transaction_inner` — embedded `execute()`, the
+    /// PostgreSQL simple-query path, all MySQL wire) and the params family
+    /// (`execute_plan_with_params_inner` — Parse/Bind/Execute, which psycopg3 /
+    /// JDBC / Npgsql use for DDL by default).
+    ///
+    /// Returns the number of rows the population inserted — 0 for
+    /// `WITH NO DATA` and for an `IF NOT EXISTS` that found the table already
+    /// there. The `Ok(1)`-for-DDL convention stays with plain `CreateTable`.
+    fn execute_create_table_as(
+        &self,
+        name: &str,
+        column_names: &[String],
+        if_not_exists: bool,
+        query: &sql::LogicalPlan,
+        with_data: bool,
+        session_txn: Option<&storage::Transaction>,
+    ) -> Result<u64> {
+        let catalog = self.storage.catalog();
+
+        // PostgreSQL skips the WHOLE statement — population included — when
+        // IF NOT EXISTS finds the table. It never appends to the existing one.
+        // Returning here is also what makes the compensating drop below safe:
+        // past this point the table provably did not exist before us.
+        if if_not_exists && catalog.table_exists(name).unwrap_or(false) {
+            return Ok(0);
+        }
+
+        // Columns come from the source query's STATIC schema, so `WITH NO DATA`
+        // and a `WHERE false` source still create a correctly-shaped table.
+        let columns = sql::Planner::ctas_target_columns(&query.schema(), column_names)?;
+        // NOTE: deliberately NO `self.storage.log_create_table` call here.
+        // `Catalog::create_table` already WAL-logs the CREATE; the extra call
+        // the plain CreateTable arm makes is a documented pre-existing DUPLICATE
+        // (see `ddl_in_explicit_txn_is_not_double_logged`, which records that
+        // CREATE TABLE is logged twice per statement today) and must not be
+        // propagated onto a new code path.
+        catalog.create_table(name, Schema::new(columns))?;
+
+        if !with_data {
+            return Ok(0);
+        }
+
+        // Populate through the EXISTING InsertSelect implementation rather than
+        // a second copy loop: that arm already does source-side RLS, per-value
+        // casts to the target column types, CHECK and RLS-WITH-CHECK
+        // enforcement, and branch-aware inserts. A private copy here would
+        // start correct and then drift, which is how the two DML families
+        // diverged before.
+        //
+        // Optimize the source first, exactly as the materialized-view path does
+        // (`optimize_view_query`): materializing an UNOPTIMIZED aggregate source
+        // undercounts at scale (issue #2 / Quirk J).
+        let populated = self
+            .cold_optimizer()
+            .optimize_recursive(query.clone())
+            .and_then(|source| {
+                let insert = sql::LogicalPlan::InsertSelect {
+                    table_name: name.to_string(),
+                    columns: None,
+                    source: Box::new(source),
+                    returning: None,
+                };
+                self.execute_plan_with_params(&insert, &[], session_txn)
+                    .map(|(count, _returned)| count)
+            });
+
+        match populated {
+            Ok(count) => Ok(count),
+            Err(e) => {
+                // Compensating drop. DDL is non-transactional on this engine and
+                // the InsertSelect arms write rows STRAIGHT to storage, bypassing
+                // the transaction write set — so an autocommit rollback cannot
+                // remove a partial population. `drop_table` removes the metadata,
+                // every row written so far and the ART state in one funnel.
+                //
+                // RESIDUAL, documented not solved: a concurrent reader can observe
+                // the table empty or partially populated mid-statement — the same
+                // window plain `INSERT … SELECT` already has.
+                if let Err(drop_err) = catalog.drop_table(name) {
+                    tracing::warn!(
+                        table = %name,
+                        error = %drop_err,
+                        "CREATE TABLE AS: population failed and the compensating DROP also failed; \
+                         the half-built table is still present and must be dropped manually"
+                    );
+                }
+                // Always the ORIGINAL failure — the drop is cleanup, not the news.
+                Err(e)
+            }
+        }
+    }
+
+    /// If `plan` is a CTAS, execute it and hand back the empty result set every
+    /// READ surface must produce for it; `None` for every other plan.
+    ///
+    /// `SELECT … INTO t` legitimately arrives on the read entry points
+    /// (`query`, `query_with_columns` and their in-session variants): wire
+    /// routing is keyword-based, so a statement starting `SELECT` routes to a
+    /// query. It is a WRITE, so it must never be handed to the SELECT-only
+    /// physical executor (which answers "Operator not yet implemented") and its
+    /// empty row set must never be admitted to the result cache.
+    fn try_execute_create_table_as_plan(
+        &self,
+        plan: &sql::LogicalPlan,
+        session_txn: Option<&storage::Transaction>,
+    ) -> Option<Result<(Vec<Tuple>, Vec<String>)>> {
+        if !matches!(plan, sql::LogicalPlan::CreateTableAs { .. }) {
+            return None;
+        }
+        Some(
+            self.execute_plan_with_params(plan, &[], session_txn)
+                .map(|_| (Vec::new(), Vec::new())),
+        )
+    }
+
     fn execute_in_transaction_inner(
         &self,
         sql: &str,
@@ -3753,6 +3884,16 @@ impl EmbeddedDatabase {
 
                 Ok(1)
             }
+            // Sibling of the CreateTable arm above: the text family's CTAS
+            // entry point (embedded `execute()` / `execute_batch`, the psql
+            // simple-query path, all MySQL wire).
+            sql::LogicalPlan::CreateTableAs {
+                name,
+                column_names,
+                if_not_exists,
+                query,
+                with_data,
+            } => self.execute_create_table_as(name, column_names, *if_not_exists, query, *with_data, Some(txn)),
             sql::LogicalPlan::Insert {
                 table_name,
                 columns,
@@ -13986,6 +14127,10 @@ impl EmbeddedDatabase {
                     | sql::LogicalPlan::InsertSelect { .. }
                     | sql::LogicalPlan::Update { .. }
                     | sql::LogicalPlan::Delete { .. }
+                    // CTAS is a WRITE that arrives through query-shaped routes
+                    // (`SELECT … INTO t`): it must be delegated to the write
+                    // executor, never to the read path.
+                    | sql::LogicalPlan::CreateTableAs { .. }
             )
         {
             self.invalidate_result_cache();
@@ -14614,6 +14759,24 @@ impl EmbeddedDatabase {
                     count += 1;
                 }
                 Ok((count, returned_tuples))
+            }
+            // Sibling of the InsertSelect arm above: the params family's CTAS
+            // entry point. Before this arm existed CTAS reached the catch-all
+            // and errored on every extended-protocol client (psycopg3 / JDBC
+            // send DDL through Parse/Bind/Execute by default). It is also the
+            // arm the shared `execute_create_table_as` helper re-enters to
+            // populate, so the population goes through exactly one InsertSelect
+            // implementation.
+            sql::LogicalPlan::CreateTableAs {
+                name,
+                column_names,
+                if_not_exists,
+                query,
+                with_data,
+            } => {
+                let count =
+                    self.execute_create_table_as(name, column_names, *if_not_exists, query, *with_data, session_txn)?;
+                Ok((count, Vec::new()))
             }
             sql::LogicalPlan::Update {
                 table_name,
@@ -15428,6 +15591,16 @@ impl EmbeddedDatabase {
             tracing::debug!(phase = "parse", duration_us = 0_u64, "SQL parsed (cached)");
             tracing::debug!(phase = "plan", duration_us = 0_u64, "Logical plan created (cached)");
 
+            // `SELECT … INTO t` plans to CTAS, a WRITE. The cold path below
+            // never admits one to the plan cache, so this is belt-and-braces —
+            // but the alternative on a hit would be handing a DDL plan to the
+            // SELECT-only executor and caching its empty rows.
+            if let Some(result) = self.try_execute_create_table_as_plan(&arc_plan, None) {
+                let (rows, _columns) = result?;
+                self.log_slow_query(sql, start.elapsed(), rows.len() as u64);
+                return Ok(rows);
+            }
+
             // Fast path: no RLS context → execute directly from Arc (no deep clone)
             if self.tenant_manager.get_current_context().is_none() {
                 if let Some(result) = self.try_direct_projected_filtered_scan(&arc_plan) {
@@ -15534,6 +15707,16 @@ impl EmbeddedDatabase {
             duration_us = plan_start.elapsed().as_micros() as u64,
             "Logical plan created"
         );
+
+        // `SELECT … INTO t` (and a CTAS routed here) is a WRITE: run it on the
+        // write executor and return no rows. Placed BEFORE the optimize/cache
+        // steps below so the plan is never admitted to the plan cache and its
+        // empty result never reaches the result cache.
+        if let Some(result) = self.try_execute_create_table_as_plan(&plan, None) {
+            let (rows, _columns) = result?;
+            self.log_slow_query(sql, start.elapsed(), rows.len() as u64);
+            return Ok(rows);
+        }
 
         // 3. Optimize plan (predicate pushdown, constant folding, projection pruning)
         //
@@ -15831,6 +16014,13 @@ impl EmbeddedDatabase {
             if let Some(result) = self.try_handle_prepared_query_plan_with_columns(&arc_plan)? {
                 return Ok(result);
             }
+            // `SELECT … INTO t` plans to CTAS, a WRITE. The cold branch below
+            // never admits one to the plan cache, so this is belt-and-braces —
+            // but the alternative on a hit would be handing a DDL plan to the
+            // SELECT-only executor and caching its empty rows.
+            if let Some(result) = self.try_execute_create_table_as_plan(&arc_plan, None) {
+                return result;
+            }
             // R1.2 (ROADMAP_V5 §1.1 Residual, "wire simple-query SELECT never
             // calls apply_rls_to_plan"): give this branch the fast/slow split
             // `query()`'s plan-cache-hit branch already has. No context → the
@@ -15862,6 +16052,14 @@ impl EmbeddedDatabase {
 
         if let Some(result) = self.try_handle_prepared_query_plan_with_columns(&plan)? {
             return Ok(result);
+        }
+
+        // `SELECT … INTO t` (and a CTAS routed here) is a WRITE: run it on the
+        // write executor and return no rows/columns. Placed BEFORE the
+        // optimize/cache steps below so the plan is never admitted to the plan
+        // cache and its empty result never reaches the result cache.
+        if let Some(result) = self.try_execute_create_table_as_plan(&plan, None) {
+            return result;
         }
 
         // R-A5: reuse the process-shared stateless optimizer instead of
@@ -17022,6 +17220,16 @@ impl EmbeddedDatabase {
             .with_search_path(self.current_search_path());
         let plan = planner.statement_to_plan(statement)?;
 
+        // `SELECT … INTO t` inside an open session transaction is still a
+        // WRITE; hand it to the CTAS executor with this session's transaction
+        // attached rather than to the read path.
+        if let Some(result) = self.try_execute_create_table_as_plan(&plan, Some(&txn)) {
+            if let Ok((rows, _)) = &result {
+                self.log_slow_query(sql, start.elapsed(), rows.len() as u64);
+            }
+            return result;
+        }
+
         // R1.2 (Hole 5c): the wire simple-query path inside an open session
         // transaction built its own executor and skipped RLS entirely.
         let result = self.query_plan_with_params_with_columns(&plan, &[], Some(&txn));
@@ -17198,6 +17406,10 @@ impl EmbeddedDatabase {
                 | sql::LogicalPlan::InsertSelect { .. }
                 | sql::LogicalPlan::Update { .. }
                 | sql::LogicalPlan::Delete { .. }
+                // CTAS is a WRITE that arrives through query-shaped routes
+                // (`SELECT … INTO t`): it must be delegated to the write
+                // executor, never to the read path.
+                | sql::LogicalPlan::CreateTableAs { .. }
         ) {
             let (_count, returned) = self.execute_plan_with_params(&plan, params, Some(&txn))?;
             return Ok(returned);
@@ -17237,6 +17449,10 @@ impl EmbeddedDatabase {
                 | sql::LogicalPlan::InsertSelect { .. }
                 | sql::LogicalPlan::Update { .. }
                 | sql::LogicalPlan::Delete { .. }
+                // CTAS is a WRITE that arrives through query-shaped routes
+                // (`SELECT … INTO t`): it must be delegated to the write
+                // executor, never to the read path.
+                | sql::LogicalPlan::CreateTableAs { .. }
         ) {
             let columns = match &*plan {
                 sql::LogicalPlan::Insert {
@@ -17460,6 +17676,10 @@ impl EmbeddedDatabase {
                 | sql::LogicalPlan::InsertSelect { .. }
                 | sql::LogicalPlan::Update { .. }
                 | sql::LogicalPlan::Delete { .. }
+                // CTAS is a WRITE that arrives through query-shaped routes
+                // (`SELECT … INTO t`): it must be delegated to the write
+                // executor, never to the read path.
+                | sql::LogicalPlan::CreateTableAs { .. }
         ) {
             let (_count, returned) = self.execute_plan_with_params(&plan_arc, params, None)?;
             self.log_slow_query(sql, start.elapsed(), returned.len() as u64);
@@ -17623,6 +17843,10 @@ impl EmbeddedDatabase {
                 | sql::LogicalPlan::InsertSelect { .. }
                 | sql::LogicalPlan::Update { .. }
                 | sql::LogicalPlan::Delete { .. }
+                // CTAS is a WRITE that arrives through query-shaped routes
+                // (`SELECT … INTO t`): it must be delegated to the write
+                // executor, never to the read path.
+                | sql::LogicalPlan::CreateTableAs { .. }
         ) {
             let columns = match &plan {
                 sql::LogicalPlan::Insert {
