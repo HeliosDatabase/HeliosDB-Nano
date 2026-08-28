@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.20.0] - 2026-08-28
+
+Closes the five published "honest caveats" where PostgreSQL CE was ahead. Four were real —
+three of them **worse** than documented — and the fifth is refuted by a fresh measurement.
+Highest-severity item: `DROP ROLE x` was planned as `DROP TABLE x` and silently destroyed a
+same-named table.
+
+**Read before adopting:** trigger bodies still do not execute, and privileges are stored and
+introspectable but **not enforced** on any read or write path. Both are stated in full below.
+
 ### Triggers — partial parity. **Trigger bodies still do not execute.**
 
 Read the previous sentence again before adopting any of this. `CREATE TRIGGER`
