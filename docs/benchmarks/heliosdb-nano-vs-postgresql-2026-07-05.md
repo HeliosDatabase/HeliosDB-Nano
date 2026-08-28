@@ -1,5 +1,13 @@
 # HeliosDB-Nano vs PostgreSQL — Scalability & Performance (v4.0.0)
 
+> **Superseded for current figures — see
+> [`heliosdb-nano-vs-postgresql-2026-08-28.md`](heliosdb-nano-vs-postgresql-2026-08-28.md).**
+> This report measures **v4.0.0** and swept only the `simple` query protocol. COPY improved
+> further in v4.1.0/v4.2.0, and the 2026-08-28 run adds the `extended` and `prepared` protocols
+> that real drivers use — where Nano's lead is smaller (1.33×–1.57× extended, vs 1.68×–2.22×
+> simple). The 2026-08-28 run also records a **concurrency plateau at c=32→64** that this report
+> does not show. Retained for history; do not quote its numbers as current.
+
 **Date:** 2026-07-05
 **Engines:** PostgreSQL 18.4 vs HeliosDB-Nano **v4.0.0** (baseline reference: `3.60.9`)
 **Client:** `pgbench` (PostgreSQL 18.4 image), concurrency sweep c ∈ {1, 8, 16, 32, 64}.
@@ -58,7 +66,7 @@ Nano remains **~2.5× PostgreSQL** across the sweep — its protocol/connection 
 |  50,000 | 106 ms | ~1,250 ms |  **227 ms** | 5.5× faster |
 | 100,000 | 133 ms | ~2,550 ms |  **423 ms** | 6.0× faster |
 
-- **The COPY gap to PostgreSQL closed from ~20× to ~3×** (and at 10k rows, v4.0.0 is at parity / slightly faster). COPY now applies the whole load as one atomic batch through the fast insert-batch machinery instead of re-rendering each 500-row chunk to a ~25 KB SQL string and re-parsing it.
+- **The COPY gap to PostgreSQL closed from ~20× to ~3×** in v4.0.0 (and at 10k rows, v4.0.0 is at parity / slightly faster). It narrowed again in v4.1.0 once per-row version writes became one `vmeta:` range marker per batch, and v4.2.0 removed the row-at-a-time fallback for FK/CHECK tables. **Measured 2026-08-28 at v4.19.0: 100k rows 171 ms vs PostgreSQL 134 ms — a 1.28× gap, with Nano *faster* at 10k (50 ms vs 92 ms).** COPY now applies the whole load as one atomic batch through the fast insert-batch machinery instead of re-rendering each 500-row chunk to a ~25 KB SQL string and re-parsing it.
 - COPY is now **all-or-nothing atomic** (a constraint failure or crash mid-COPY leaves zero rows) and participates in an enclosing transaction (`BEGIN; COPY; ROLLBACK` no longer leaks rows).
 
 ## 4. `nextval`-bound INSERT and durable writes

@@ -2156,48 +2156,101 @@ impl SystemViewRegistry {
         // returning bogus rows. Now JOINs flow through the regular
         // operator pipeline; pg_user just needs to exist as a scannable
         // source with the standard shape.
+        // HC4: the shape comes from `sql::acl_views`, the SAME module that
+        // builds the rows for this registry AND for psql's `\du` on the wire,
+        // so the two catalog surfaces cannot drift apart again.
         self.register_view(SystemViewSchema {
             name: "pg_user".to_string(),
             schema: Schema {
-                columns: vec![
-                    sv_col("usename", DataType::Text),
-                    sv_col("usesysid", DataType::Int4),
-                    sv_col("usecreatedb", DataType::Boolean),
-                    sv_col("usesuper", DataType::Boolean),
-                    sv_col("userepl", DataType::Boolean),
-                    sv_col("usebypassrls", DataType::Boolean),
-                    sv_col("passwd", DataType::Text),
-                    sv_col("valuntil", DataType::Text),
-                    sv_col("useconfig", DataType::Text),
-                ],
+                columns: crate::sql::acl_views::pg_user_columns(),
             },
-            description: "Built-in PG-compat view over pg_authid (read-only stub)".to_string(),
+            description: "Login roles from the persisted role catalog (attributes are recorded, NOT enforced)"
+                .to_string(),
         });
 
         // pg_roles — PG's authoritative role list (different shape from
         // pg_user, includes rolinherit / rolreplication / rolconnlimit /
         // rolvaliduntil etc.). drizzle-kit queries this directly during
-        // introspection. Same two hard-coded roles.
+        // introspection.
+        //
+        // HC4: these rows used to be two FABRICATED all-privilege superusers.
+        // They are now the two virtual built-ins (kept for compatibility, and
+        // as meaningless as before) PLUS every persisted role with its REAL
+        // attribute bits. The bits describe what CREATE ROLE asked for; NOTHING
+        // enforces them.
         self.register_view(SystemViewSchema {
             name: "pg_roles".to_string(),
             schema: Schema {
-                columns: vec![
-                    sv_col("oid", DataType::Int4),
-                    sv_col("rolname", DataType::Text),
-                    sv_col("rolsuper", DataType::Boolean),
-                    sv_col("rolinherit", DataType::Boolean),
-                    sv_col("rolcreaterole", DataType::Boolean),
-                    sv_col("rolcreatedb", DataType::Boolean),
-                    sv_col("rolcanlogin", DataType::Boolean),
-                    sv_col("rolreplication", DataType::Boolean),
-                    sv_col("rolconnlimit", DataType::Int4),
-                    sv_col("rolpassword", DataType::Text),
-                    sv_col("rolvaliduntil", DataType::Text),
-                    sv_col("rolbypassrls", DataType::Boolean),
-                ],
+                columns: crate::sql::acl_views::pg_roles_columns(),
             },
-            description: "Built-in PG-compat view over pg_authid (read-only stub)".to_string(),
+            description: "Persisted role catalog (attributes are recorded, NOT enforced)".to_string(),
         });
+
+        // pg_authid — `pg_roles`'s twin. Previously it existed ONLY in the dead
+        // legacy registry (`sql/system_views.rs`), so `SELECT * FROM pg_authid`
+        // was an unknown relation on every live route while a test asserted it
+        // was "registered". Registering it here is what makes it reachable.
+        self.register_view(SystemViewSchema {
+            name: "pg_authid".to_string(),
+            schema: Schema {
+                columns: crate::sql::acl_views::pg_authid_columns(),
+            },
+            description: "Persisted role catalog; rolpassword is always masked (NOT enforced)".to_string(),
+        });
+
+        // ---- information_schema privilege / role views (HC4) ---------------
+        //
+        // `table_privileges` and `role_table_grants` are POPULATED from stored
+        // GRANT records. The remaining eight are registered shape-correct and
+        // EMPTY, deliberately and for stated reasons:
+        //   * column_privileges / role_column_grants — column-level grants are
+        //     rejected at plan time, so there are none to report;
+        //   * usage_privileges / role_usage_grants / role_routine_grants — no
+        //     sequence/routine grant surface in these views yet;
+        //   * applicable_roles / enabled_roles /
+        //     administrable_role_authorizations — role MEMBERSHIP is rejected
+        //     at plan time and there is no session identity, so an empty set is
+        //     the truthful answer.
+        // Registering them here also closes a route divergence: they answered
+        // (empty) on the PG wire and were UNKNOWN RELATIONS on the embedded /
+        // REPL / Python routes.
+        //
+        // *** A ROW IN table_privileges MEANS "SOMEBODY RAN GRANT". IT DOES NOT
+        // MEAN ACCESS IS RESTRICTED — nothing in this build enforces it. ***
+        for name in [
+            "information_schema.table_privileges",
+            "information_schema.role_table_grants",
+            "information_schema.column_privileges",
+            "information_schema.role_column_grants",
+            "information_schema.usage_privileges",
+            "information_schema.role_usage_grants",
+            "information_schema.role_routine_grants",
+        ] {
+            self.register_view(SystemViewSchema {
+                name: name.to_string(),
+                schema: Schema {
+                    columns: crate::sql::acl_views::table_privileges_columns(),
+                },
+                description: "SQL-standard privilege view over stored GRANTs (recorded, NOT enforced)".to_string(),
+            });
+        }
+        for name in [
+            "information_schema.applicable_roles",
+            "information_schema.enabled_roles",
+            "information_schema.administrable_role_authorizations",
+        ] {
+            self.register_view(SystemViewSchema {
+                name: name.to_string(),
+                schema: Schema {
+                    columns: vec![
+                        sv_col("grantee", DataType::Text),
+                        sv_col("role_name", DataType::Text),
+                        sv_col("is_grantable", DataType::Text),
+                    ],
+                },
+                description: "Role-membership view — always empty (HeliosDB has no role membership)".to_string(),
+            });
+        }
 
         // information_schema.table_constraints — drizzle reads this for
         // PK/UNIQUE/FK constraint info. 5-col PG-standard shape.
@@ -2286,6 +2339,117 @@ impl SystemViewRegistry {
                 ],
             },
             description: "SQL-standard table catalogue, sourced from storage::catalog::list_tables".to_string(),
+        });
+
+        // ---- HC3 (catalog unification): views migrated OFF the wire-only
+        // substring router in src/protocol/postgres/catalog.rs and onto the
+        // planner. Registering them here is what makes `return Ok(None)` in
+        // that router work: the PG wire (simple + extended) and the MySQL wire
+        // both fall through to `execute_query`, which plans a Scan over these
+        // entries. Every one of them was previously EITHER a fixed-shape wire
+        // copy that could not filter/project/JOIN, OR an outright error on the
+        // embedded/REPL/Python route. One implementation, five interfaces.
+
+        // information_schema.schemata — real schemas, not three hardcoded rows.
+        // Sourced from `all_schema_names`, the SAME enumeration pg_namespace
+        // uses, so the two views can never disagree about which schemas exist.
+        self.register_view(SystemViewSchema {
+            name: "information_schema.schemata".to_string(),
+            schema: Schema {
+                columns: vec![
+                    sv_col("catalog_name", DataType::Text),
+                    sv_col("schema_name", DataType::Text),
+                    sv_col("schema_owner", DataType::Text),
+                    sv_col("default_character_set_catalog", DataType::Text),
+                    sv_col("default_character_set_schema", DataType::Text),
+                    sv_col("default_character_set_name", DataType::Text),
+                    sv_col("sql_path", DataType::Text),
+                ],
+            },
+            description: "SQL-standard schema catalogue, sourced from storage::catalog::list_schemas".to_string(),
+        });
+
+        // information_schema.catalog_name — the SQL-standard one-row view
+        // naming the current catalog. SQLAlchemy-style optional probes read it;
+        // before HC3 it raised the unknown-view ERROR instead of degrading.
+        self.register_view(SystemViewSchema {
+            name: "information_schema.catalog_name".to_string(),
+            schema: Schema {
+                columns: vec![sv_col("catalog_name", DataType::Text)],
+            },
+            description: "SQL-standard one-row view naming the current catalogue".to_string(),
+        });
+
+        // information_schema.views — REAL rows. View bodies are persisted in
+        // `ViewCatalog` (src/storage/view_catalog.rs); the old wire stub's
+        // "Nano does not persist view definitions" comment was simply false.
+        self.register_view(SystemViewSchema {
+            name: "information_schema.views".to_string(),
+            schema: Schema {
+                columns: vec![
+                    sv_col("table_catalog", DataType::Text),
+                    sv_col("table_schema", DataType::Text),
+                    sv_col("table_name", DataType::Text),
+                    sv_col("view_definition", DataType::Text),
+                    sv_col("check_option", DataType::Text),
+                    sv_col("is_updatable", DataType::Text),
+                    sv_col("is_insertable_into", DataType::Text),
+                    sv_col("is_trigger_updatable", DataType::Text),
+                    sv_col("is_trigger_deletable", DataType::Text),
+                    sv_col("is_trigger_insertable_into", DataType::Text),
+                ],
+            },
+            description: "SQL-standard view catalogue, sourced from storage::ViewCatalog".to_string(),
+        });
+
+        // information_schema.check_constraints — REAL rows. `check_clause` is a
+        // direct read of the already-persisted `CheckConstraint.expression`
+        // (src/sql/constraints.rs) that
+        // `execute_information_schema_table_constraints` already loads.
+        self.register_view(SystemViewSchema {
+            name: "information_schema.check_constraints".to_string(),
+            schema: Schema {
+                columns: vec![
+                    sv_col("constraint_catalog", DataType::Text),
+                    sv_col("constraint_schema", DataType::Text),
+                    sv_col("constraint_name", DataType::Text),
+                    sv_col("check_clause", DataType::Text),
+                ],
+            },
+            description: "SQL-standard CHECK constraint catalogue, sourced from TableConstraints".to_string(),
+        });
+
+        // pg_views — the PG-native view catalogue. Same 4-column shape the
+        // deleted wire stub advertised, now with rows.
+        self.register_view(SystemViewSchema {
+            name: "pg_views".to_string(),
+            schema: Schema {
+                columns: vec![
+                    sv_col("schemaname", DataType::Text),
+                    sv_col("viewname", DataType::Text),
+                    sv_col("viewowner", DataType::Text),
+                    sv_col("definition", DataType::Text),
+                ],
+            },
+            description: "PG-compat view catalogue, sourced from storage::ViewCatalog".to_string(),
+        });
+
+        // pg_indexes — ported verbatim (behaviour-wise) from the wire-only
+        // `query_pg_indexes`: PK / UNIQUE / manual ART / HNSW vector indexes
+        // with a rendered `indexdef`. Embedded / REPL / Python used to ERROR on
+        // this view because it existed only on the wire.
+        self.register_view(SystemViewSchema {
+            name: "pg_indexes".to_string(),
+            schema: Schema {
+                columns: vec![
+                    sv_col("schemaname", DataType::Text),
+                    sv_col("tablename", DataType::Text),
+                    sv_col("indexname", DataType::Text),
+                    sv_col("tablespace", DataType::Text),
+                    sv_col("indexdef", DataType::Text),
+                ],
+            },
+            description: "PG-compat index catalogue (pkeys, unique keys, ART and HNSW indexes)".to_string(),
         });
 
         // ---- Empty-stub catalogue/view tables (KanttBan #22 v3.31.0 slice 5)
@@ -2419,7 +2583,8 @@ impl SystemViewRegistry {
                     sv_col("definition", DataType::Text),
                 ],
             },
-            description: "PG-compat matview view (empty — use pg_mv_staleness instead)".to_string(),
+            description: "PG-compat materialised-view catalogue, sourced from storage::MaterializedViewCatalog"
+                .to_string(),
         });
 
         self.register_view(SystemViewSchema {
@@ -2604,7 +2769,18 @@ const PG_CONSTRAINT_OID_BASE: i32 = 4000;
 /// Distinct OID base for sequence relations (pg_class relkind='S'). Kept clear
 /// of the table (1000) and index (5000) bases so sequence OIDs never collide.
 const PG_SEQ_OID_BASE: i32 = 6000;
+/// Distinct OID base for VIEW relations (pg_class relkind='v'). Kept clear of
+/// the table (1000), constraint (4000), index (5000) and sequence (6000) bases.
+/// Like its siblings this is a deterministic wire-protocol constant, not a
+/// tunable: clients JOIN `pg_class.oid` to `pg_attribute.attrelid`, so the two
+/// surfaces must derive the value the same way, every process, forever.
+const PG_VIEW_OID_BASE: i32 = 7000;
 const PG_PUBLIC_NAMESPACE_OID: i32 = 2200;
+
+/// The catalogue (database) name every introspection surface reports. One
+/// constant so `pg_database.datname`, `information_schema.catalog_name` and the
+/// `*_catalog` columns can never drift apart.
+const HELIOS_CATALOG_NAME: &str = "heliosdb";
 
 fn pg_table_oid(table_idx: usize) -> i32 {
     PG_TABLE_OID_BASE + table_idx as i32
@@ -2637,6 +2813,64 @@ fn pg_index_oid_by_name(indexes: &[(String, String, ArtIndexType, Vec<String>)],
 
 fn pg_sequence_oid(seq_idx: usize) -> i32 {
     PG_SEQ_OID_BASE + seq_idx as i32
+}
+
+fn pg_view_oid(view_idx: usize) -> i32 {
+    PG_VIEW_OID_BASE + view_idx as i32
+}
+
+/// Every schema name the catalogue surfaces: the three namespaces PostgreSQL
+/// always exposes, plus every user schema — whether implied by a
+/// `schema.table` storage key or DECLARED empty via `CREATE SCHEMA`
+/// (`list_schemas` unions the `meta:schema:` markers).
+///
+/// ONE implementation shared by `pg_namespace` and
+/// `information_schema.schemata`: before HC3 the wire served `schemata` from
+/// three hardcoded rows while `pg_namespace` enumerated the real set, so
+/// `CREATE SCHEMA app` was visible in one view and invisible in the other.
+/// A `list_schemas` failure propagates — an unreadable catalogue must not be
+/// reported as "this database has only the built-in schemas".
+fn all_schema_names(storage: &StorageEngine) -> Result<std::collections::BTreeSet<String>> {
+    use std::collections::BTreeSet;
+    let mut all: BTreeSet<String> = BTreeSet::new();
+    all.insert("pg_catalog".to_string());
+    all.insert("information_schema".to_string());
+    all.insert("public".to_string());
+    for s in storage.catalog().list_schemas()? {
+        all.insert(s);
+    }
+    Ok(all)
+}
+
+/// Every regular (non-materialised) view as `(schema, bare_name, metadata)`,
+/// sorted by stored key so `pg_class` / `pg_attribute` view OIDs are stable for
+/// a given catalogue state within a process.
+///
+/// Views are stored FLAT: `Planner::normalize_nontable_name` collapses
+/// `app.v` to the bare key `v` (unlike tables, whose key is `schema.table`).
+/// So the display schema comes from `ViewMetadata.creator_schema` — the
+/// session `search_path` captured at CREATE — and only falls back to a dotted
+/// key split (defensive) and then `public`. A pre-namespacing blob deserialises
+/// with `creator_schema = None` via `LegacyViewMetadata` and therefore reports
+/// `public`, which is exactly the schema it was created under.
+fn sorted_views(storage: &StorageEngine) -> Result<Vec<(String, String, crate::storage::ViewMetadata)>> {
+    let view_catalog = storage.view_catalog();
+    let mut names = view_catalog.list_views()?;
+    names.sort();
+    let mut out = Vec::with_capacity(names.len());
+    for name in names {
+        let metadata = view_catalog.get_view(&name)?;
+        let (schema_name, bare_name) = if name.contains('.') {
+            crate::sql::Planner::split_schema_key(&name)
+        } else {
+            (
+                metadata.creator_schema.clone().unwrap_or_else(|| "public".to_string()),
+                name.clone(),
+            )
+        };
+        out.push((schema_name, bare_name, metadata));
+    }
+    Ok(out)
 }
 
 /// Map a SERIAL/IDENTITY column's integer type to its synthetic
@@ -2790,9 +3024,33 @@ impl SystemViewRegistry {
             "pg_attribute" => Self::execute_pg_attribute(storage),
             "pg_type" => Self::execute_pg_type(storage),
             "pg_namespace" => Self::execute_pg_namespace(storage),
-            "pg_user" => Self::execute_pg_user(),
-            "pg_roles" => Self::execute_pg_roles(),
+            // HC4: role/privilege views are built by `sql::acl_views`, the
+            // single row-builder shared with the PG-wire surface. They report
+            // the persisted role/ACL catalog. They do NOT report enforcement —
+            // this build enforces no SQL privilege anywhere.
+            "pg_user" => crate::sql::acl_views::pg_user_rows(&storage.catalog()),
+            "pg_roles" => crate::sql::acl_views::pg_roles_rows(&storage.catalog()),
+            "pg_authid" => crate::sql::acl_views::pg_authid_rows(&storage.catalog()),
+            "information_schema.table_privileges" => crate::sql::acl_views::table_privileges_rows(&storage.catalog()),
+            "information_schema.role_table_grants" => crate::sql::acl_views::role_table_grants_rows(&storage.catalog()),
+            // Empty BY CONSTRUCTION, each for a reason stated at registration:
+            // column-level grants and role membership are both rejected at plan
+            // time, and there is no session identity to filter by.
+            "information_schema.column_privileges"
+            | "information_schema.role_column_grants"
+            | "information_schema.usage_privileges"
+            | "information_schema.role_usage_grants"
+            | "information_schema.role_routine_grants"
+            | "information_schema.applicable_roles"
+            | "information_schema.enabled_roles"
+            | "information_schema.administrable_role_authorizations" => Ok(vec![]),
             "information_schema.tables" => Self::execute_information_schema_tables(storage),
+            "information_schema.schemata" => Self::execute_information_schema_schemata(storage),
+            "information_schema.catalog_name" => Self::execute_information_schema_catalog_name(),
+            "information_schema.views" => Self::execute_information_schema_views(storage),
+            "information_schema.check_constraints" => Self::execute_information_schema_check_constraints(storage),
+            "pg_views" => Self::execute_pg_views(storage),
+            "pg_indexes" => Self::execute_pg_indexes(storage),
             "information_schema.sequences" => Self::execute_information_schema_sequences(storage),
             "information_schema.table_constraints" => Self::execute_information_schema_table_constraints(storage),
             "information_schema.key_column_usage" => Self::execute_information_schema_key_column_usage(storage),
@@ -2808,8 +3066,14 @@ impl SystemViewRegistry {
             // doesn't model these concepts.
             "pg_sequences" => Self::execute_pg_sequences(storage),
             "pg_attrdef" => Self::execute_pg_attrdef(storage),
-            "pg_proc" | "pg_description" | "pg_policies" | "pg_policy" | "pg_matviews" | "pg_inherits"
-            | "pg_publication" | "pg_statistic_ext" => Ok(vec![]),
+            "pg_matviews" => Self::execute_pg_matviews(storage),
+            // Still empty BY CONSTRUCTION: every one of these needs state that
+            // `execute(&StorageEngine)` cannot reach — FunctionRegistry and
+            // TenantManager hang off `EmbeddedDatabase`, not `StorageEngine`.
+            // Populating them requires widening this signature (named follow-up),
+            // NOT another wire-side fixed-shape copy.
+            "pg_proc" | "pg_description" | "pg_policies" | "pg_policy" | "pg_inherits" | "pg_publication"
+            | "pg_statistic_ext" => Ok(vec![]),
             "sqlite_master" => Self::execute_sqlite_master(storage),
             "pg_index" => Self::execute_pg_index(storage),
             "pg_constraint" => Self::execute_pg_constraint(storage),
@@ -3127,6 +3391,26 @@ impl SystemViewRegistry {
             }
         }
 
+        // Regular views (relkind='v'). Without these rows a client that
+        // enumerates relations through pg_class — psql `\d`, SQLAlchemy,
+        // drizzle — cannot see a single view. `sorted_views` fixes the
+        // enumeration order so the OIDs here match the `attrelid`s
+        // `execute_pg_attribute` emits for the same views.
+        for (idx, (view_schema, view_name, _metadata)) in sorted_views(storage)?.into_iter().enumerate() {
+            let oid = pg_view_oid(idx);
+            let nsp_oid = crate::sql::Planner::schema_name_to_oid(&view_schema);
+            results.push(Tuple::new(vec![
+                Value::Int4(oid),               // oid
+                Value::String(view_name),       // relname (bare)
+                Value::Int4(nsp_oid),           // relnamespace
+                Value::Int4(0),                 // reltype
+                Value::String("v".to_string()), // relkind (v = view)
+                Value::Int4(0),                 // relfilenode (a view has no storage)
+                Value::Boolean(false),          // relrowsecurity
+                Value::Null,                    // relpartbound
+            ]));
+        }
+
         Ok(results)
     }
 
@@ -3207,6 +3491,37 @@ impl SystemViewRegistry {
                     // Skip tables we can't read schema for
                     continue;
                 }
+            }
+        }
+
+        // Columns of regular views. `attrelid` uses the SAME `pg_view_oid(idx)`
+        // over the SAME `sorted_views` order that `execute_pg_class` uses, so
+        // `pg_class ⨝ pg_attribute ON oid = attrelid` resolves. Without these
+        // rows the relkind='v' entries above would describe a column-less
+        // relation and psql `\d v` / SQLAlchemy column reflection would break.
+        for (idx, (_view_schema, _view_name, metadata)) in sorted_views(storage)?.into_iter().enumerate() {
+            let view_oid = pg_view_oid(idx);
+            for (col_idx, column) in metadata.schema.columns.iter().enumerate() {
+                let type_oid = Self::get_type_oid(&column.data_type);
+                let ndims: i32 = match &column.data_type {
+                    DataType::Array(_) => 1,
+                    _ => 0,
+                };
+                results.push(Tuple::new(vec![
+                    Value::Int4(view_oid),              // attrelid
+                    Value::String(column.name.clone()), // attname
+                    Value::Int4(type_oid),              // atttypid
+                    Value::Int4(-1),                    // attlen
+                    Value::Boolean(!column.nullable),   // attnotnull
+                    Value::Int4((col_idx + 1) as i32),  // attnum
+                    Value::Int4(-1),                    // atttypmod
+                    Value::Boolean(false),              // attisdropped
+                    Value::Int4(ndims),                 // attndims
+                    Value::String(String::new()),       // attidentity (never for a view)
+                    Value::String(String::new()),       // attgenerated
+                    Value::Boolean(false),              // atthasdef
+                    Value::Int4(0),                     // attcollation
+                ]));
             }
         }
 
@@ -3416,28 +3731,10 @@ impl SystemViewRegistry {
         Ok(rows)
     }
 
-    /// pg_roles companion to pg_user — different shape (12 cols vs 9)
-    /// but same two synthetic roles. drizzle-kit's introspection
-    /// queries pg_roles directly during pull.
-    fn execute_pg_roles() -> Result<Vec<Tuple>> {
-        let role = |oid: i32, name: &str| {
-            Tuple::new(vec![
-                Value::Int4(oid),           // oid
-                Value::String(name.into()), // rolname
-                Value::Boolean(true),       // rolsuper
-                Value::Boolean(true),       // rolinherit
-                Value::Boolean(true),       // rolcreaterole
-                Value::Boolean(true),       // rolcreatedb
-                Value::Boolean(true),       // rolcanlogin
-                Value::Boolean(true),       // rolreplication
-                Value::Int4(-1),            // rolconnlimit
-                Value::Null,                // rolpassword
-                Value::Null,                // rolvaliduntil
-                Value::Boolean(true),       // rolbypassrls
-            ])
-        };
-        Ok(vec![role(10, "postgres"), role(11, "helios")])
-    }
+    // HC4: `execute_pg_roles` / `execute_pg_user` were two hard-coded
+    // all-privilege superusers. Both are gone — `pg_roles`, `pg_user` and
+    // `pg_authid` are now built by `sql::acl_views` from the persisted role
+    // catalog, through the SAME builders the PG-wire `\du` response uses.
 
     /// KanttBan #23 phase 2.8: information_schema.table_constraints —
     /// PK + UNIQUE per table. Mirrors the legacy
@@ -3679,12 +3976,252 @@ impl SystemViewRegistry {
             // `table_name` the bare table (split the `schema.table` key).
             let (table_schema, table_name) = crate::sql::Planner::split_schema_key(name);
             rows.push(Tuple::new(vec![
-                Value::String("heliosdb".into()),
+                Value::String(HELIOS_CATALOG_NAME.into()),
                 Value::String(table_schema),
                 Value::String(table_name),
                 Value::String("BASE TABLE".into()),
             ]));
         }
+        // PostgreSQL lists views here too, with table_type='VIEW'. Omitting
+        // them made every ORM that enumerates relations through this view miss
+        // every view in the database.
+        for (view_schema, view_name, _metadata) in sorted_views(storage)? {
+            rows.push(Tuple::new(vec![
+                Value::String(HELIOS_CATALOG_NAME.into()),
+                Value::String(view_schema),
+                Value::String(view_name),
+                Value::String("VIEW".into()),
+            ]));
+        }
+        Ok(rows)
+    }
+
+    /// HC3: `information_schema.schemata` — one row per REAL schema, from the
+    /// same `all_schema_names` enumeration `pg_namespace` uses. Replaces the
+    /// three hardcoded rows the wire router served (which never showed a
+    /// `CREATE SCHEMA` schema) and, before this, did not exist at all on the
+    /// embedded / REPL / Python route.
+    fn execute_information_schema_schemata(storage: &StorageEngine) -> Result<Vec<Tuple>> {
+        let mut rows = Vec::new();
+        for schema_name in all_schema_names(storage)? {
+            rows.push(Tuple::new(vec![
+                Value::String(HELIOS_CATALOG_NAME.into()), // catalog_name
+                Value::String(schema_name),                // schema_name
+                Value::String(HELIOS_CATALOG_NAME.into()), // schema_owner
+                Value::Null,                               // default_character_set_catalog
+                Value::Null,                               // default_character_set_schema
+                Value::Null,                               // default_character_set_name
+                Value::Null,                               // sql_path
+            ]));
+        }
+        Ok(rows)
+    }
+
+    /// HC3: `information_schema.catalog_name` — the SQL-standard one-row view
+    /// naming the current catalogue. It used to raise the unknown-view ERROR,
+    /// so SQLAlchemy-style optional probes raised instead of degrading.
+    fn execute_information_schema_catalog_name() -> Result<Vec<Tuple>> {
+        Ok(vec![Tuple::new(vec![Value::String(HELIOS_CATALOG_NAME.to_string())])])
+    }
+
+    /// HC3: `pg_views` — REAL rows from the persisted `ViewCatalog`. The
+    /// deleted wire stub returned zero rows behind a comment claiming Nano does
+    /// not persist view definitions; it always has (src/storage/view_catalog.rs).
+    fn execute_pg_views(storage: &StorageEngine) -> Result<Vec<Tuple>> {
+        let mut rows = Vec::new();
+        for (view_schema, view_name, metadata) in sorted_views(storage)? {
+            rows.push(Tuple::new(vec![
+                Value::String(view_schema),                // schemaname
+                Value::String(view_name),                  // viewname
+                Value::String(HELIOS_CATALOG_NAME.into()), // viewowner
+                Value::String(metadata.query_sql),         // definition
+            ]));
+        }
+        Ok(rows)
+    }
+
+    /// HC3: `information_schema.views` — the SQL-standard rendering of the same
+    /// `ViewCatalog` rows `pg_views` serves. Nano's views are read-only, so the
+    /// updatability columns are honestly 'NO' rather than optimistically 'YES'.
+    fn execute_information_schema_views(storage: &StorageEngine) -> Result<Vec<Tuple>> {
+        let mut rows = Vec::new();
+        for (view_schema, view_name, metadata) in sorted_views(storage)? {
+            rows.push(Tuple::new(vec![
+                Value::String(HELIOS_CATALOG_NAME.into()), // table_catalog
+                Value::String(view_schema),                // table_schema
+                Value::String(view_name),                  // table_name
+                Value::String(metadata.query_sql),         // view_definition
+                Value::String("NONE".into()),              // check_option
+                Value::String("NO".into()),                // is_updatable
+                Value::String("NO".into()),                // is_insertable_into
+                Value::String("NO".into()),                // is_trigger_updatable
+                Value::String("NO".into()),                // is_trigger_deletable
+                Value::String("NO".into()),                // is_trigger_insertable_into
+            ]));
+        }
+        Ok(rows)
+    }
+
+    /// HC3: `information_schema.check_constraints` — the clause of every
+    /// persisted `CheckConstraint`, from the very blob
+    /// `execute_information_schema_table_constraints` already loads to report
+    /// the constraint's EXISTENCE. Reporting the name but never the clause is
+    /// what made this view useless to migration tooling.
+    ///
+    /// `CheckConstraint.expression` is a serde_json `LogicalExpr` (src/lib.rs
+    /// CREATE TABLE arm), NOT SQL text, so it goes through the SAME
+    /// `default_expr_json_to_sql` renderer `column_default` / `pg_attrdef` use.
+    /// A blob that will not deserialise falls back to the raw stored string
+    /// rather than being dropped — a visible oddity beats a missing constraint.
+    fn execute_information_schema_check_constraints(storage: &StorageEngine) -> Result<Vec<Tuple>> {
+        let catalog = storage.catalog();
+        let mut rows = Vec::new();
+        for table_key in catalog.list_tables()? {
+            // A table with no constraints blob is normal, not an error — same
+            // tolerance `execute_information_schema_referential_constraints` uses.
+            let Ok(constraints) = catalog.load_table_constraints(&table_key) else {
+                continue;
+            };
+            let (constraint_schema, _bare_table) = crate::sql::Planner::split_schema_key(&table_key);
+            for check in &constraints.check_constraints {
+                let check_clause = crate::sql::logical_plan::default_expr_json_to_sql(&check.expression)
+                    .unwrap_or_else(|| check.expression.clone());
+                rows.push(Tuple::new(vec![
+                    Value::String(HELIOS_CATALOG_NAME.into()), // constraint_catalog
+                    Value::String(constraint_schema.clone()),  // constraint_schema
+                    Value::String(check.name.clone()),         // constraint_name
+                    Value::String(check_clause),               // check_clause
+                ]));
+            }
+        }
+        Ok(rows)
+    }
+
+    /// HC3: `pg_matviews` — REAL materialised-view rows, replacing the
+    /// `Ok(vec![])` arm. Sourced from `storage.mv_catalog()`, the same catalogue
+    /// `REFRESH MATERIALIZED VIEW` writes.
+    fn execute_pg_matviews(storage: &StorageEngine) -> Result<Vec<Tuple>> {
+        let mv_catalog = storage.mv_catalog();
+        let mut names = mv_catalog.list_views()?;
+        names.sort();
+        let mut rows = Vec::with_capacity(names.len());
+        for name in names {
+            let metadata = mv_catalog.get_view(&name)?;
+            let (schemaname, matviewname) = crate::sql::Planner::split_schema_key(&metadata.view_name);
+            rows.push(Tuple::new(vec![
+                Value::String(schemaname),                 // schemaname
+                Value::String(matviewname),                // matviewname
+                Value::String(HELIOS_CATALOG_NAME.into()), // matviewowner
+                Value::Null,                               // tablespace
+                Value::Boolean(false),                     // hasindexes
+                // A materialised view is POPULATED once it has been refreshed
+                // at least once (CREATE ... WITH NO DATA leaves last_refresh
+                // None). Same rule the legacy registry used.
+                Value::Boolean(metadata.last_refresh.is_some()), // ispopulated
+                Value::String(metadata.query_text.clone()),      // definition
+            ]));
+        }
+        Ok(rows)
+    }
+
+    /// HC3: `pg_indexes` — ported from the wire-only `query_pg_indexes` so the
+    /// embedded / REPL / Python routes stop erroring on it. Emits PRIMARY KEY
+    /// and UNIQUE indexes derived from the table schema, user-created (Manual)
+    /// ART indexes, and HNSW vector indexes with their opclass. ART indexes of
+    /// kind PrimaryKey / Unique / ForeignKey are skipped because the schema-
+    /// derived rows above already cover the first two and PostgreSQL has no
+    /// index row for a bare FK.
+    fn execute_pg_indexes(storage: &StorageEngine) -> Result<Vec<Tuple>> {
+        let catalog = storage.catalog();
+        let mut rows = Vec::new();
+
+        for table_key in catalog.list_tables()? {
+            let (schema_name, bare_table) = crate::sql::Planner::split_schema_key(&table_key);
+            let Ok(tschema) = catalog.get_table_schema(&table_key) else {
+                continue;
+            };
+            let pk_cols: Vec<String> = tschema
+                .columns
+                .iter()
+                .filter(|c| c.primary_key)
+                .map(|c| c.name.clone())
+                .collect();
+            if !pk_cols.is_empty() {
+                let index_name = format!("{bare_table}_pkey");
+                let indexdef = format!(
+                    "CREATE UNIQUE INDEX {} ON {}.{} USING btree ({})",
+                    index_name,
+                    schema_name,
+                    bare_table,
+                    pk_cols.join(", ")
+                );
+                rows.push(Tuple::new(vec![
+                    Value::String(schema_name.clone()),
+                    Value::String(bare_table.clone()),
+                    Value::String(index_name),
+                    Value::Null,
+                    Value::String(indexdef),
+                ]));
+            }
+            for col in &tschema.columns {
+                if col.unique && !col.primary_key {
+                    let index_name = format!("{}_{}_key", bare_table, col.name);
+                    let indexdef = format!(
+                        "CREATE UNIQUE INDEX {} ON {}.{} USING btree ({})",
+                        index_name, schema_name, bare_table, col.name
+                    );
+                    rows.push(Tuple::new(vec![
+                        Value::String(schema_name.clone()),
+                        Value::String(bare_table.clone()),
+                        Value::String(index_name),
+                        Value::Null,
+                        Value::String(indexdef),
+                    ]));
+                }
+            }
+        }
+
+        for (index_name, table_key, index_type, columns) in sorted_art_indexes(storage) {
+            if index_type != ArtIndexType::Manual {
+                continue;
+            }
+            let (schema_name, bare_table) = crate::sql::Planner::split_schema_key(&table_key);
+            let indexdef = format!(
+                "CREATE INDEX {} ON {}.{} USING btree ({})",
+                index_name,
+                schema_name,
+                bare_table,
+                columns.join(", ")
+            );
+            rows.push(Tuple::new(vec![
+                Value::String(schema_name),
+                Value::String(bare_table),
+                Value::String(index_name),
+                Value::Null,
+                Value::String(indexdef),
+            ]));
+        }
+
+        for metadata in storage.vector_indexes().list_all_metadata() {
+            let opclass = match metadata.distance_metric() {
+                crate::vector::DistanceMetric::Cosine => "vector_cosine_ops",
+                crate::vector::DistanceMetric::L2 => "vector_l2_ops",
+                crate::vector::DistanceMetric::InnerProduct => "vector_ip_ops",
+            };
+            let (schema_name, bare_table) = crate::sql::Planner::split_schema_key(&metadata.table_name);
+            let indexdef = format!(
+                "CREATE INDEX {} ON {}.{} USING hnsw ({} {})",
+                metadata.name, schema_name, bare_table, metadata.column_name, opclass
+            );
+            rows.push(Tuple::new(vec![
+                Value::String(schema_name),
+                Value::String(bare_table),
+                Value::String(metadata.name),
+                Value::Null,
+                Value::String(indexdef),
+            ]));
+        }
+
         Ok(rows)
     }
 
@@ -3698,60 +4235,24 @@ impl SystemViewRegistry {
     /// matcher), so there's no current-behaviour regression.
     fn execute_pg_database() -> Result<Vec<Tuple>> {
         Ok(vec![Tuple::new(vec![
-            Value::Int4(1),                   // oid
-            Value::String("heliosdb".into()), // datname
-            Value::Int4(10),                  // datdba
-            Value::Int4(6),                   // encoding = UTF8
-            Value::String("C.UTF-8".into()),  // datcollate
-            Value::String("C.UTF-8".into()),  // datctype
-            Value::Boolean(false),            // datistemplate
-            Value::Boolean(true),             // datallowconn
-            Value::Int4(-1),                  // datconnlimit
-            Value::Int4(1663),                // dattablespace = pg_default
+            Value::Int4(1),                            // oid
+            Value::String(HELIOS_CATALOG_NAME.into()), // datname
+            Value::Int4(10),                           // datdba
+            Value::Int4(6),                            // encoding = UTF8
+            Value::String("C.UTF-8".into()),           // datcollate
+            Value::String("C.UTF-8".into()),           // datctype
+            Value::Boolean(false),                     // datistemplate
+            Value::Boolean(true),                      // datallowconn
+            Value::Int4(-1),                           // datconnlimit
+            Value::Int4(1663),                         // dattablespace = pg_default
         ])])
     }
 
-    /// KanttBan #22 (v3.31.0): pg_user as a read-only stub. Mirrors
-    /// the two hard-coded roles the legacy substring router exposed
-    /// via query_pg_roles in `protocol/postgres/catalog.rs`.
-    /// usesysid is the value drivers JOIN to nspowner / relowner /
-    /// proowner; keep it stable at 10 (postgres) and 11 (helios) so
-    /// existing introspection sees the schemas / tables as owned by
-    /// the postgres super-user.
-    fn execute_pg_user() -> Result<Vec<Tuple>> {
-        let role = |name: &str, uid: i32| {
-            Tuple::new(vec![
-                Value::String(name.into()), // usename
-                Value::Int4(uid),           // usesysid
-                Value::Boolean(true),       // usecreatedb
-                Value::Boolean(true),       // usesuper
-                Value::Boolean(true),       // userepl
-                Value::Boolean(true),       // usebypassrls
-                Value::Null,                // passwd
-                Value::Null,                // valuntil
-                Value::Null,                // useconfig
-            ])
-        };
-        Ok(vec![role("postgres", 10), role("helios", 11)])
-    }
-
     fn execute_pg_namespace(storage: &StorageEngine) -> Result<Vec<Tuple>> {
-        use std::collections::BTreeSet;
-        // The namespaces PostgreSQL always exposes, plus every user schema —
-        // whether implied by a `schema.table` key or DECLARED empty via
-        // `CREATE SCHEMA` (`list_schemas` now unions the `meta:schema:` markers).
-        let mut all: BTreeSet<String> = BTreeSet::new();
-        all.insert("pg_catalog".to_string());
-        all.insert("information_schema".to_string());
-        all.insert("public".to_string());
-        if let Ok(catalog_schemas) = storage.catalog().list_schemas() {
-            for s in catalog_schemas {
-                all.insert(s);
-            }
-        }
-
+        // Schema enumeration lives in ONE place (`all_schema_names`); this view
+        // and `information_schema.schemata` are two renderings of it.
         let mut results = Vec::new();
-        for nspname in all {
+        for nspname in all_schema_names(storage)? {
             // Shared schema→oid map (also drives `pg_class.relnamespace`), so a
             // relation's relnamespace always matches its schema's oid here.
             let oid = crate::sql::Planner::schema_name_to_oid(&nspname);

@@ -9,8 +9,16 @@
 //! - CALL uses sqlparser: `CALL name(args)`
 //! - PL/pgSQL bodies are parsed by ProceduralParser and executed by ProceduralExecutor
 //! - SQL-language functions do parameter substitution ($1, $name) and execute as raw SQL
-//! - User-defined functions are NOT callable from SELECT expressions (no evaluator integration)
+//! - User-defined functions ARE callable from SELECT expressions as of the udf_bridge change
+//!   (`src/sql/udf_bridge.rs`); the full matrix lives in `tests/udf_invocation_tests.rs`
 //! - Procedure execution via CALL goes through lib.rs (clone_for_trigger + sql_executor closure)
+//!
+//! WARNING ABOUT THIS FILE'S STYLE: most tests below are written as
+//! `match result { Ok => assert…, Err => eprintln! }`, which provides NO regression
+//! protection — an `Err` prints and passes. Do not add more of them, and do not cite this
+//! file as evidence that something works. The two function-invocation tests that used to
+//! be written that way (`test_function_in_select_scalar`, `test_plpgsql_return_from_function`)
+//! now assert unconditionally.
 
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 mod plpgsql_hardening_tests {
@@ -253,27 +261,32 @@ mod plpgsql_hardening_tests {
 
     #[test]
     fn test_function_in_select_scalar() {
-        // NOTE: User-defined functions in SELECT are NOT wired up in the evaluator.
-        // This test documents that limitation.
+        // A `LANGUAGE sql` function IS callable from a SELECT now. Both halves of
+        // the rule are asserted unconditionally: the `$` sigil is MANDATORY, so the
+        // bare-`x` body fails as a column reference, and the `$1` body computes.
         let db = new_db();
-        let create = db.execute("CREATE FUNCTION plp_double(x INTEGER) RETURNS INTEGER LANGUAGE sql AS 'SELECT x * 2'");
-        match create {
-            Ok(_) => {
-                let result = db.query("SELECT plp_double(5)", &[]);
-                match result {
-                    Ok(rows) => {
-                        assert_eq!(rows.len(), 1);
-                        // Expected: 10
-                        assert_eq!(rows[0].get(0).unwrap(), &Value::Int4(10));
-                    }
-                    Err(e) => {
-                        // Expected: UDF in SELECT not supported
-                        eprintln!("[KNOWN LIMITATION] Function in SELECT not supported: {}", e);
-                    }
-                }
-            }
-            Err(e) => eprintln!("[NOT IMPLEMENTED] CREATE FUNCTION: {}", e),
-        }
+        db.execute("CREATE FUNCTION plp_double_bare(x INTEGER) RETURNS INTEGER LANGUAGE sql AS 'SELECT x * 2'")
+            .expect("CREATE FUNCTION must be accepted");
+        let err = db
+            .query("SELECT plp_double_bare(5)", &[])
+            .expect_err("a bare parameter name must not resolve — the `$` sigil is mandatory")
+            .to_string();
+        assert!(
+            !err.contains("Unknown scalar function"),
+            "the function itself RESOLVED; the failure must come from its body: {err}"
+        );
+
+        db.execute("CREATE FUNCTION plp_double(x INTEGER) RETURNS INTEGER LANGUAGE sql AS 'SELECT $1 * 2'")
+            .expect("CREATE FUNCTION must be accepted");
+        let rows = db
+            .query("SELECT plp_double(5)", &[])
+            .expect("the function must be callable");
+        assert_eq!(rows.len(), 1);
+        let value = rows[0].get(0).unwrap();
+        assert!(
+            matches!(value, Value::Int2(10) | Value::Int4(10) | Value::Int8(10)),
+            "expected 10, got {value:?}"
+        );
     }
 
     #[test]
@@ -491,31 +504,47 @@ mod plpgsql_hardening_tests {
 
     #[test]
     fn test_plpgsql_return_from_function() {
+        // `RETURN <expr>` in a PL/pgSQL body is evaluated as SQL after `$`
+        // interpolation (`ProceduralExecutor::evaluate_return_value`). It used to be
+        // handed to the evaluator as a string literal of its own SOURCE TEXT, because
+        // `ProceduralParser::parse_expression` never built an expression tree — so a
+        // callable `RETURN x * 10` would have returned the string "x * 10". Both the
+        // sigil rule and the computed result are asserted unconditionally.
         let db = new_db();
-        let create = db.execute(
-            "CREATE FUNCTION plp_ret_func(x INTEGER) RETURNS INTEGER LANGUAGE plpgsql AS $$\
+        db.execute(
+            "CREATE FUNCTION plp_ret_bare(x INTEGER) RETURNS INTEGER LANGUAGE plpgsql AS $$\
             BEGIN\n\
                 RETURN x * 10;\n\
             END;\n\
             $$",
+        )
+        .expect("CREATE FUNCTION must be accepted");
+        let err = db
+            .query("SELECT plp_ret_bare(5)", &[])
+            .expect_err("a bare parameter name in RETURN must not resolve")
+            .to_string();
+        assert!(
+            !err.contains("Unknown scalar function"),
+            "the function RESOLVED; the failure must come from its RETURN expression: {err}"
         );
-        match create {
-            Ok(_) => {
-                // Can't call UDF from SELECT, but verify it was created
-                // Try via CALL (won't work for functions, but tests the path)
-                let result = db.query("SELECT plp_ret_func(5)", &[]);
-                match result {
-                    Ok(rows) => {
-                        assert_eq!(rows.len(), 1);
-                        assert_eq!(rows[0].get(0).unwrap(), &Value::Int4(50));
-                    }
-                    Err(e) => {
-                        eprintln!("[KNOWN LIMITATION] PL/pgSQL function RETURN in SELECT: {}", e);
-                    }
-                }
-            }
-            Err(e) => eprintln!("[NOT IMPLEMENTED] PL/pgSQL function with RETURN: {}", e),
-        }
+
+        db.execute(
+            "CREATE FUNCTION plp_ret_func(x INTEGER) RETURNS INTEGER LANGUAGE plpgsql AS $$\
+            BEGIN\n\
+                RETURN $1 * 10;\n\
+            END;\n\
+            $$",
+        )
+        .expect("CREATE FUNCTION must be accepted");
+        let rows = db
+            .query("SELECT plp_ret_func(5)", &[])
+            .expect("the plpgsql function must be callable");
+        assert_eq!(rows.len(), 1);
+        let value = rows[0].get(0).unwrap();
+        assert!(
+            matches!(value, Value::Int2(50) | Value::Int4(50) | Value::Int8(50)),
+            "expected 50, got {value:?}"
+        );
     }
 
     // ========================================================================

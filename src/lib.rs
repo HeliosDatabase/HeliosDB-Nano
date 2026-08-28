@@ -574,9 +574,16 @@ pub struct EmbeddedDatabase {
     global_txn_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Tenant manager for multi-tenancy and RLS (optional)
     pub tenant_manager: std::sync::Arc<crate::tenant::TenantManager>,
-    /// Trigger registry: registration/lookup only. Trigger bodies are never executed
-    /// (`Planner::create_trigger_to_plan` always produces an empty body, and the DML
-    /// executor closures discard the row context) — see `tests/trigger_unimplemented_tests.rs`.
+    /// Trigger registry — THE LIVE ONE. This is the registry the DML paths and
+    /// `CREATE`/`DROP TRIGGER` use, and the one `load_persisted_triggers`
+    /// repopulates at open. (`StorageEngine::trigger_registry` is a separate,
+    /// executor-invisible instance that only WAL replay writes to.)
+    ///
+    /// Trigger BODIES are still never executed: `Planner::create_trigger_to_plan`
+    /// always produces an empty body, and the DML executor closures discard the
+    /// row context. The only mechanism with an observable effect is the
+    /// BEFORE-INSERT `NEW.<col> = <expr>` / `RETURN NULL` row rewrite applied by
+    /// `apply_before_insert_row_hook` — see `tests/trigger_row_mutation_tests.rs`.
     pub trigger_registry: std::sync::Arc<sql::TriggerRegistry>,
     /// Function registry for stored functions and procedures
     pub function_registry: std::sync::Arc<sql::FunctionRegistry>,
@@ -738,6 +745,20 @@ pub struct EmbeddedDatabase {
     /// lock. `OnceLock<Arc<_>>` clones cheaply (just an `Arc` bump) and avoids
     /// threading the field through the three constructors.
     cold_optimizer: std::sync::OnceLock<std::sync::Arc<optimizer::Optimizer>>,
+    /// The ONE strong reference to this database's UDF invocation bridge (the
+    /// process-global slot in `sql::udf_bridge` holds only a `Weak`). Set once,
+    /// at open, by `install_routine_runtime`.
+    ///
+    /// MUST be left EMPTY on `clone_for_trigger()` clones. The bridge's executor
+    /// closure captures such a clone, so a clone that carried the bridge would
+    /// close the cycle `Arc<UdfBridge>` -> handle -> `Arc<UdfBridge>`: the strong
+    /// count would never reach zero, this `Drop` and `StorageEngine`'s would
+    /// never run, and the data dir would stay locked. That exact Arc-leak has
+    /// shipped from this file before.
+    ///
+    /// Declared LAST so it drops last: the captured clone holds the final
+    /// `Arc<StorageEngine>`, and dropping it here is what lets the engine close.
+    udf_bridge: std::sync::OnceLock<std::sync::Arc<sql::udf_bridge::UdfBridge>>,
 }
 
 impl Drop for EmbeddedDatabase {
@@ -1112,9 +1133,10 @@ struct PendingFkCheck {
 /// `RLSExpressionEvaluator::parse` (src/tenant/expression.rs) re-tokenizes and
 /// re-parses the policy expression string through `sqlparser` on every call — it
 /// caches nothing — so building this inside a per-row loop would turn an
-/// O(1)-parses-per-statement cost into O(rows). The dead `execute_internal`
-/// UPDATE/DELETE arms do exactly that (`rls_evaluator.parse` inside
-/// `for tuple in tuples`); that is the mistake this type exists to prevent.
+/// O(1)-parses-per-statement cost into O(rows). NEVER construct one inside a
+/// row loop: a now-deleted duplicate DML path did exactly that
+/// (`rls_evaluator.parse` inside `for tuple in tuples`), and that is the
+/// mistake this type exists to prevent.
 ///
 /// The `USING`/`WITH CHECK` asymmetry is PostgreSQL's, not an oversight — see
 /// `docs/plans/ROADMAP_V5.md` §1.1 and `EmbeddedDatabase::build_rls_write_guard`.
@@ -1292,6 +1314,34 @@ impl EmbeddedDatabase {
                 | sql::LogicalPlan::CreateSequence { .. }
                 | sql::LogicalPlan::AlterSequence(_)
                 | sql::LogicalPlan::DropSequence { .. }
+                // HC4 role/ACL DDL. NOT because a grant changes any query
+                // PLAN — nothing is enforced, so it cannot. It is because this
+                // predicate also drives `invalidate_result_cache`, and these
+                // statements change the ROWS of `pg_roles` / `pg_user` /
+                // `pg_authid` / `information_schema.table_privileges` /
+                // `role_table_grants`. Without it a cached
+                // `SELECT * FROM pg_roles` would keep serving the pre-CREATE
+                // ROLE answer — the same staleness lie the MV reader-side
+                // reconciliation exists to prevent. Costs nothing on the hot
+                // path: role DDL is rare, and this is a discriminant match.
+                | sql::LogicalPlan::CreateRole { .. }
+                | sql::LogicalPlan::AlterRole { .. }
+                | sql::LogicalPlan::DropRole { .. }
+                | sql::LogicalPlan::GrantPrivileges { .. }
+                | sql::LogicalPlan::RevokePrivileges { .. }
+                // Routine DDL. Again NOT about plan shape: `udf_bridge` makes a
+                // user-defined function CALLABLE from the evaluator, and
+                // `query_is_non_deterministic` only knows the built-in volatile
+                // names — so a UDF-bearing `SELECT f()` is treated as
+                // deterministic and cached by SQL TEXT. Without these arms,
+                // `CREATE OR REPLACE FUNCTION f …` kept serving the old
+                // function's cached result, and `DROP FUNCTION f; SELECT f()`
+                // kept answering instead of erroring. Harmless while UDFs were
+                // uncallable; a stale-answer bug now that they are not.
+                | sql::LogicalPlan::CreateFunction { .. }
+                | sql::LogicalPlan::CreateProcedure { .. }
+                | sql::LogicalPlan::DropFunction { .. }
+                | sql::LogicalPlan::DropProcedure { .. }
                 | sql::LogicalPlan::AlterColumnStorage { .. }
                 | sql::LogicalPlan::AlterTableAddColumn { .. }
                 | sql::LogicalPlan::AlterTableDropColumn { .. }
@@ -3288,6 +3338,645 @@ impl EmbeddedDatabase {
         Ok(0)
     }
 
+    // ============ Routine DDL — ONE implementation, BOTH executor families ============
+    //
+    // `CREATE FUNCTION` / `CREATE PROCEDURE` / `DROP FUNCTION` / `DROP PROCEDURE`
+    // run through the four helpers below, called by the TEXT family
+    // (`execute_in_transaction_inner` — embedded `execute()`, the PostgreSQL
+    // simple-query path, all of the MySQL wire, the REPL) and by the PARAMS
+    // family (`execute_plan_with_params_inner` — Parse/Bind/Execute, which
+    // psycopg3 / JDBC / sqlx / Drizzle / node-postgres use for DDL by default).
+    // Same shared-helper precedent as `execute_call_plan` and
+    // `execute_create_table_as`.
+    //
+    // Before this, the params family had NO arm for any of the four. They fell to
+    // its catch-all, which builds a bare `sql::Executor`, and an `Executor` holds
+    // no `FunctionRegistry` handle — so its arms could only return a status
+    // message. Every extended-protocol client got a "created" for a routine that
+    // was never registered, never persisted and never callable, with
+    // `rows_affected = 1`. CREATE PROCEDURE was the user-visible half of that:
+    // procedures otherwise execute (`execute_call_plan`).
+
+    /// Durable-metadata key prefix for a function definition. Byte-identical to
+    /// the key `WalOperation::CreateFunction` replay writes
+    /// (`src/storage/engine.rs`), so the direct write below and replay are
+    /// idempotent with each other.
+    const FUNCTION_META_PREFIX: &'static str = "meta:function:";
+    /// Durable-metadata key prefix for a procedure definition. See
+    /// [`EmbeddedDatabase::FUNCTION_META_PREFIX`].
+    const PROCEDURE_META_PREFIX: &'static str = "meta:procedure:";
+
+    /// The one derivation of a routine's durable key, used by create, drop and
+    /// the open-time loader.
+    fn routine_meta_key(prefix: &str, name: &str) -> Vec<u8> {
+        format!("{}{}", prefix, name).into_bytes()
+    }
+
+    /// Wall-clock milliseconds for a routine's `created_at`. A pre-epoch clock
+    /// is not a recoverable condition and is not worth failing DDL over, so it
+    /// degrades to 0 — the behaviour these arms have always had.
+    fn routine_created_at_millis() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    /// Delete every durable definition under `prefix` whose name matches `name`
+    /// case-insensitively.
+    ///
+    /// `FunctionRegistry` keys routines by LOWERCASE name, but the durable key
+    /// carries the name exactly as written — and so does WAL replay. So
+    /// `CREATE FUNCTION Foo …` followed by `DROP FUNCTION foo` must not leave
+    /// `meta:function:Foo` on disk: the next open's loader would resurrect a
+    /// function the user dropped. Matching case-insensitively across the prefix
+    /// is what makes the drop agree with the registry's identity rule. DROP of a
+    /// routine is rare, so the scan is not on any hot path.
+    fn delete_routine_meta(&self, prefix: &str, name: &str) -> Result<()> {
+        for (suffix, _blob) in self.storage.meta_blobs_with_prefix(prefix) {
+            if suffix.eq_ignore_ascii_case(name) {
+                self.storage.delete(&Self::routine_meta_key(prefix, &suffix))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// `CREATE [OR REPLACE] FUNCTION` — register in the process registry, WAL-log
+    /// for replication, and write the durable definition so the function
+    /// survives a restart. Returns 0 (DDL affects no rows), matching the text
+    /// family's long-standing return value.
+    fn execute_create_function_plan(
+        &self,
+        name: &str,
+        or_replace: bool,
+        params: &[sql::logical_plan::FunctionParam],
+        return_type: &Option<DataType>,
+        body: &str,
+        language: &str,
+        volatility: &Option<String>,
+    ) -> Result<u64> {
+        let stored_func = sql::StoredFunction {
+            name: name.to_string(),
+            or_replace,
+            params: params.to_vec(),
+            return_type: return_type.clone(),
+            body: body.to_string(),
+            language: language.to_string(),
+            volatility: volatility.clone(),
+            created_at: Self::routine_created_at_millis(),
+        };
+
+        // Serialize BEFORE mutating anything, and LOUDLY: a failure here must not
+        // leave the registry holding a function that has no durable record (the
+        // old arm used `if let Ok(definition)`, which silently skipped both the
+        // WAL record and — had it existed — persistence).
+        let definition = bincode::serialize(&stored_func)
+            .map_err(|e| Error::internal(format!("Failed to serialize function '{}': {}", name, e)))?;
+
+        // The existence / OR REPLACE rule lives in the registry — one rule, one
+        // place. This is what produces `Function 'x' already exists`.
+        self.function_registry.register_function(stored_func)?;
+
+        // WAL, for replication and replay. Warn-only, exactly as this arm has
+        // always been: a standby missing the record is a replication problem,
+        // not a reason to fail the user's DDL.
+        if let Err(e) = self.storage.log_create_function(name, &definition) {
+            tracing::warn!("Failed to log CREATE FUNCTION to WAL: {}", e);
+        }
+
+        // DURABLE definition. WAL replay writes this same key with these same
+        // bytes, so the two are idempotent; writing it here is what makes a
+        // function survive a restart even once the WAL has been checkpointed
+        // away. LOUD on failure — swallowing it would reintroduce exactly the
+        // "registered, then silently gone after restart" behaviour this fixes.
+        self.storage
+            .put(&Self::routine_meta_key(Self::FUNCTION_META_PREFIX, name), &definition)?;
+        Ok(0)
+    }
+
+    /// `CREATE [OR REPLACE] PROCEDURE`. See
+    /// [`EmbeddedDatabase::execute_create_function_plan`] for the ordering
+    /// rationale — this is the same sequence over the procedure registry and the
+    /// `meta:procedure:` key.
+    fn execute_create_procedure_plan(
+        &self,
+        name: &str,
+        or_replace: bool,
+        params: &[sql::logical_plan::FunctionParam],
+        body: &str,
+        language: &str,
+    ) -> Result<u64> {
+        let stored_proc = sql::StoredProcedure {
+            name: name.to_string(),
+            or_replace,
+            params: params.to_vec(),
+            body: body.to_string(),
+            language: language.to_string(),
+            created_at: Self::routine_created_at_millis(),
+        };
+
+        let definition = bincode::serialize(&stored_proc)
+            .map_err(|e| Error::internal(format!("Failed to serialize procedure '{}': {}", name, e)))?;
+
+        self.function_registry.register_procedure(stored_proc)?;
+
+        if let Err(e) = self.storage.log_create_procedure(name, &definition) {
+            tracing::warn!("Failed to log CREATE PROCEDURE to WAL: {}", e);
+        }
+
+        self.storage
+            .put(&Self::routine_meta_key(Self::PROCEDURE_META_PREFIX, name), &definition)?;
+        Ok(0)
+    }
+
+    /// `DROP FUNCTION [IF EXISTS]`. The registry decides whether the name exists
+    /// (and therefore whether a missing name is an error); the durable record is
+    /// removed either way, so a stale key left by an interrupted create can
+    /// never resurrect the function.
+    fn execute_drop_function_plan(&self, name: &str, if_exists: bool) -> Result<u64> {
+        self.function_registry.drop_function(name, if_exists)?;
+        // Durable removal BEFORE the WAL record: if the process dies between the
+        // two, the definition is already gone from disk, which is what the caller
+        // was told. The reverse order could log the drop, die, and leave a
+        // definition for the next open's loader to reload.
+        self.delete_routine_meta(Self::FUNCTION_META_PREFIX, name)?;
+        if let Err(e) = self.storage.log_drop_function(name) {
+            tracing::warn!("Failed to log DROP FUNCTION to WAL: {}", e);
+        }
+        Ok(0)
+    }
+
+    /// `DROP PROCEDURE [IF EXISTS]`. See
+    /// [`EmbeddedDatabase::execute_drop_function_plan`].
+    fn execute_drop_procedure_plan(&self, name: &str, if_exists: bool) -> Result<u64> {
+        self.function_registry.drop_procedure(name, if_exists)?;
+        self.delete_routine_meta(Self::PROCEDURE_META_PREFIX, name)?;
+        if let Err(e) = self.storage.log_drop_procedure(name) {
+            tracing::warn!("Failed to log DROP PROCEDURE to WAL: {}", e);
+        }
+        Ok(0)
+    }
+
+    // ---- Trigger DDL, shared by BOTH executor families ----
+    //
+    // READ THIS BEFORE EXTENDING ANYTHING TRIGGER-SHAPED.
+    //
+    // Trigger BODIES ARE STILL NOT EXECUTED. `Planner::create_trigger_to_plan`
+    // hardcodes an empty `body`, so `TriggerRegistry::execute_triggers`' loop
+    // over `trigger_def.body` never iterates. Nothing here changes that; wiring
+    // real body execution is blocked on user-defined functions being callable
+    // and on the non-reentrant `current_transaction` mutex story documented at
+    // the params-family catch-all.
+    //
+    // What DOES have an effect is the BEFORE-row rewrite recipe
+    // (`TriggerRowMutation`): a textual resolution of the trigger function's
+    // `NEW.<col> = <expr>` / `RETURN NULL` body, applied to the NEW tuple by
+    // `apply_before_insert_row_hook`.
+    //
+    // These helpers exist because `CREATE TRIGGER` / `DROP TRIGGER` used to be
+    // handled ONLY in `execute_in_transaction_inner`. Sent over the PostgreSQL
+    // extended query protocol (psycopg with bound params, JDBC, sqlx, Drizzle,
+    // node-postgres, Alembic) the statement fell through
+    // `execute_plan_with_params_inner`'s catch-all into `Executor::execute` and
+    // came back as a HARD ERROR, `Operator not yet implemented: CreateTrigger`.
+    // Both families now call these; there is deliberately NO `CreateTrigger`
+    // arm in `src/sql/executor/` because the work needs `self` (registry +
+    // catalog + WAL) and a second implementation there is precisely the
+    // divergence this codebase keeps paying for.
+
+    /// `CREATE [OR REPLACE] TRIGGER`. Registers the definition, resolves and
+    /// registers the BEFORE-row rewrite recipe, persists BOTH so they survive a
+    /// restart, and WAL-logs the definition for replication.
+    ///
+    /// Touches only registry + catalog + WAL, and deliberately does NOT resolve
+    /// the global transaction, so the params family can call it directly
+    /// without re-entering the non-reentrant `current_transaction` mutex.
+    #[allow(clippy::too_many_arguments)]
+    fn execute_create_trigger_plan(
+        &self,
+        name: &str,
+        table_name: &str,
+        timing: &sql::logical_plan::TriggerTiming,
+        events: &[sql::logical_plan::TriggerEvent],
+        for_each: &sql::logical_plan::TriggerFor,
+        when_condition: &Option<Box<sql::LogicalExpr>>,
+        body: &[sql::LogicalPlan],
+        if_not_exists: bool,
+        referencing: &[sql::logical_plan::TransitionTable],
+        characteristics: &sql::TriggerCharacteristics,
+        trigger_type: &sql::TriggerType,
+        from_constraint: &Option<String>,
+        function_name: &Option<String>,
+    ) -> Result<u64> {
+        if let Ok(Some(_)) = self.trigger_registry.get_trigger(table_name, name) {
+            if if_not_exists {
+                return Ok(0);
+            }
+            let msg = format!("Trigger '{}' already exists on table '{}'", name, table_name);
+            return Err(Error::query_execution(msg));
+        }
+
+        let definition = sql::triggers::TriggerDefinition {
+            name: name.to_string(),
+            table_name: table_name.to_string(),
+            timing: timing.clone(),
+            events: events.to_vec(),
+            for_each: for_each.clone(),
+            when_condition: when_condition.clone(),
+            body: body.to_vec(),
+            enabled: true,
+            created_at: Self::routine_created_at_millis(),
+            referencing: referencing.to_vec(),
+            characteristics: characteristics.clone(),
+            trigger_type: trigger_type.clone(),
+            from_constraint: from_constraint.clone(),
+        };
+
+        self.trigger_registry.register_trigger(definition.clone())?;
+
+        // Durable definition. Warn-only: the trigger IS registered for this
+        // process, and failing the statement after the registry already accepted
+        // it would leave the two disagreeing. A lost record degrades to "the
+        // trigger disappears at the next restart", which the docs describe.
+        if let Err(e) = self.storage.catalog().save_trigger(&definition) {
+            tracing::warn!(
+                "CREATE TRIGGER '{}' on '{}': failed to persist definition ({}) — it will not survive a restart",
+                name,
+                table_name,
+                e
+            );
+        }
+
+        // Resolve the invoked function body into a BEFORE-row NEW mutation
+        // recipe (`NEW.col = expr; RETURN NEW|NULL`). Best effort: an
+        // unsupported body simply registers no recipe, so the trigger is
+        // accepted but performs no row rewrite.
+        if matches!(timing, sql::logical_plan::TriggerTiming::Before)
+            && matches!(for_each, sql::logical_plan::TriggerFor::Row)
+        {
+            if let Some(fname) = function_name {
+                if let Some(mutation) = self.build_trigger_row_mutation(fname, events) {
+                    // The recipe MUST be persisted rather than rebuilt at open:
+                    // it is derived from the trigger function's body, and the
+                    // function registry is repopulated from `meta:function:`
+                    // records that a database created by an older build does not
+                    // have. See `TriggerRowMutation`'s doc comment.
+                    let saved = self
+                        .storage
+                        .catalog()
+                        .save_trigger_row_mutation(table_name, name, &mutation);
+                    if let Err(e) = saved {
+                        tracing::warn!(
+                            "CREATE TRIGGER '{}' on '{}': failed to persist row-rewrite recipe ({}) — \
+                             the trigger will be inert after a restart",
+                            name,
+                            table_name,
+                            e
+                        );
+                    }
+                    self.trigger_registry.register_row_mutation(table_name, name, mutation);
+                }
+            }
+        }
+
+        // Log to WAL for replication.
+        if let Ok(serialized) = bincode::serialize(&definition) {
+            if let Err(e) = self.storage.log_create_trigger(name, table_name, &serialized) {
+                tracing::warn!("Failed to log CREATE TRIGGER to WAL: {}", e);
+            }
+        }
+
+        Ok(0)
+    }
+
+    /// `DROP TRIGGER [IF EXISTS] <name> ON <table>`. Removes the definition, the
+    /// rewrite recipe and both durable records, then WAL-logs the drop.
+    fn execute_drop_trigger_plan(&self, name: &str, table_name: &Option<String>, if_exists: bool) -> Result<u64> {
+        let Some(tbl) = table_name.as_ref() else {
+            return Err(Error::query_execution("DROP TRIGGER requires ON <table_name> clause"));
+        };
+
+        let dropped = self.trigger_registry.drop_trigger(tbl, name)?;
+        self.trigger_registry.drop_row_mutation(tbl, name);
+
+        if !dropped && !if_exists {
+            let msg = format!("Trigger '{}' does not exist on table '{}'", name, tbl);
+            return Err(Error::query_execution(msg));
+        }
+
+        // Durable removal happens even when the in-memory registry had nothing:
+        // a stale key left behind by an interrupted create must never resurrect
+        // a dropped trigger at the next open.
+        let catalog = self.storage.catalog();
+        if let Err(e) = catalog.delete_trigger(tbl, name) {
+            tracing::warn!(
+                "DROP TRIGGER '{}' on '{}': failed to delete definition: {}",
+                name,
+                tbl,
+                e
+            );
+        }
+        if let Err(e) = catalog.delete_trigger_row_mutation(tbl, name) {
+            tracing::warn!(
+                "DROP TRIGGER '{}' on '{}': failed to delete rewrite recipe: {}",
+                name,
+                tbl,
+                e
+            );
+        }
+
+        if let Err(e) = self.storage.log_drop_trigger(name, table_name.as_deref()) {
+            tracing::warn!("Failed to log DROP TRIGGER to WAL: {}", e);
+        }
+
+        Ok(0)
+    }
+
+    /// Apply the BEFORE-row rewrite recipe to a row that is about to be
+    /// inserted. `Ok(false)` means the trigger body did `RETURN NULL` and the
+    /// row must be SKIPPED (not written, not counted, not returned by
+    /// `RETURNING`).
+    ///
+    /// The single entry point for both executor families. Before this existed,
+    /// `apply_before_row_mutations` had exactly one call site, in the text
+    /// family's Insert arm, so a REST/JDBC/psycopg insert and a psql insert into
+    /// the same table produced DIFFERENT rows.
+    ///
+    /// PERF: callers must gate on `has_row_mutations(table)` ONCE PER STATEMENT
+    /// and hoist it out of the row loop. With no recipes registered anywhere the
+    /// registry answers that from a single atomic load without taking a lock.
+    fn apply_before_insert_row_hook(
+        &self,
+        table_name: &str,
+        event: &sql::logical_plan::TriggerEvent,
+        tuple: &mut Tuple,
+        schema: &std::sync::Arc<Schema>,
+    ) -> Result<bool> {
+        let registry = &self.trigger_registry;
+        registry.apply_before_row_mutations(table_name, event, tuple, schema.clone())
+    }
+
+    /// Deregister a dropped table's triggers from the LIVE in-memory registry.
+    ///
+    /// `DROP TABLE` routes through `Executor` from both families' catch-alls,
+    /// and `Executor` has no handle on the live registry — so the in-memory half
+    /// of the cleanup has to happen at this layer. Without it the trigger name
+    /// stayed taken for the life of the process, so re-creating the table and
+    /// its trigger failed with "already exists".
+    ///
+    /// The DURABLE half (`trigger:{table}:*` definitions and
+    /// `trigger_rowmut:{table}:*` recipes) is deliberately NOT done here: it
+    /// lives in `Catalog::drop_table`, the one funnel every table removal goes
+    /// through — including WAL replay and the partition cascade, neither of
+    /// which reaches this layer. Doing it here as well would be a second copy
+    /// of a rule that is already enforced one level down, and doing it ONLY
+    /// here is what let a replayed `CreateTrigger` resurrect a dropped table's
+    /// trigger at the next open.
+    ///
+    /// Best effort by design: the table is already gone by the time this runs,
+    /// and turning a successful `DROP TABLE` into an error because a cleanup
+    /// scan failed would be worse than the leak. Failures are warned, loudly and
+    /// by name.
+    fn on_table_dropped(&self, table_name: &str) {
+        if let Err(e) = self.trigger_registry.drop_table_triggers(table_name) {
+            tracing::warn!("DROP TABLE '{}': failed to deregister triggers: {}", table_name, e);
+        }
+    }
+
+    /// Every TABLE name a drop plan removes, in execution order.
+    ///
+    /// PostgreSQL's comma list (`DROP TABLE a, b`) is planned as
+    /// [`sql::LogicalPlan::DropMulti`], NOT `DropTable`, so a bare
+    /// `if let DropTable { .. } = plan` capture missed it entirely and left the
+    /// dropped tables' triggers registered — in memory AND, now that triggers
+    /// persist, in `trigger:{table}:{name}` / `trigger_rowmut:{table}:{name}`
+    /// forever. Non-table elements of a `DropMulti` (views, sequences, …) have
+    /// no triggers and are skipped. ONE helper, called from BOTH executor
+    /// families' catch-alls — do not re-inline the match.
+    fn dropped_table_names(plan: &sql::LogicalPlan) -> Vec<String> {
+        match plan {
+            sql::LogicalPlan::DropTable { name, .. } => vec![name.clone()],
+            sql::LogicalPlan::DropMulti { drops } => drops
+                .iter()
+                .filter_map(|drop| match drop {
+                    sql::LogicalPlan::DropTable { name, .. } => Some(name.clone()),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Repopulate the LIVE trigger registry from the catalog at open.
+    ///
+    /// Before this existed, `EmbeddedDatabase::trigger_registry` was a fresh
+    /// empty `TriggerRegistry` at every open and NOTHING repopulated it:
+    /// `StorageEngine::load_triggers` had zero callers and, when WAL replay
+    /// registered a trigger, it registered it into `StorageEngine`'s own
+    /// registry, which the executor never reads. Triggers therefore vanished at
+    /// every restart.
+    ///
+    /// Both halves are loaded: the definitions (`trigger:{table}:{name}`) and
+    /// the BEFORE-row rewrite recipes (`trigger_rowmut:{table}:{name}`).
+    ///
+    /// KNOWN RESIDUAL GAP, documented rather than hidden: WAL crash-replay
+    /// writes the DEFINITION back to the catalog but not the recipe sidecar, so
+    /// a trigger created after the last checkpoint and before a crash comes back
+    /// present-but-inert. That is strictly better than the previous behaviour
+    /// (gone entirely) and is called out in CHANGELOG.md.
+    fn load_persisted_triggers(&self) {
+        match self.storage.load_triggers_into(&self.trigger_registry) {
+            Ok(0) => return,
+            Ok(n) => tracing::debug!("restored {} persisted trigger definition(s)", n),
+            Err(e) => {
+                tracing::warn!("failed to restore persisted triggers: {}", e);
+                return;
+            }
+        }
+
+        match self.storage.catalog().load_all_trigger_row_mutations() {
+            Ok(mutations) => {
+                for (table_name, trigger_name, mutation) in mutations {
+                    // Only attach a recipe whose definition actually came back:
+                    // an orphan would be inert anyway (the gating in
+                    // `apply_before_row_mutations` refuses it) but would still
+                    // cost a scan on the write path.
+                    match self.trigger_registry.get_trigger(&table_name, &trigger_name) {
+                        Ok(Some(_)) => {
+                            let reg = &self.trigger_registry;
+                            reg.register_row_mutation(&table_name, &trigger_name, mutation);
+                        }
+                        Ok(None) => tracing::debug!(
+                            "persisted rewrite recipe for trigger '{}' on '{}' has no definition — skipped",
+                            trigger_name,
+                            table_name
+                        ),
+                        Err(e) => tracing::warn!("failed to look up trigger '{}': {}", trigger_name, e),
+                    }
+                }
+            }
+            Err(e) => tracing::warn!("failed to restore persisted trigger rewrite recipes: {}", e),
+        }
+    }
+
+    /// Open-time trigger installation. Chained after `install_routine_runtime`
+    /// at every construction site.
+    fn install_trigger_runtime(self) -> Result<Self> {
+        self.load_persisted_triggers();
+        Ok(self)
+    }
+
+    /// Plan a PostgreSQL-spelled `CREATE [OR REPLACE] PROCEDURE name(args)
+    /// LANGUAGE lang AS $$body$$`, or `Ok(None)` if `sql` is not that form.
+    ///
+    /// sqlparser 0.53 only understands the T-SQL spelling
+    /// (`CREATE PROCEDURE p AS BEGIN … END`), so the PostgreSQL form has to be
+    /// pre-parsed. That pre-parse lived INLINE in the text family's plan builder
+    /// and nowhere else, which meant the extended query protocol — psycopg3,
+    /// JDBC, sqlx, node-postgres, i.e. `parameterized_plan_cached` — could not
+    /// even PARSE a PostgreSQL `CREATE PROCEDURE`. Extracted here so both plan
+    /// builders run the one rule; adding a second copy in the params builder is
+    /// exactly the divergence this codebase keeps paying for.
+    fn try_plan_pg_create_procedure(sql: &str) -> Result<Option<sql::LogicalPlan>> {
+        // CHEAP GATE FIRST. `is_pg_create_procedure` upper-cases the WHOLE
+        // statement (an allocation per call), and this helper now runs inside
+        // `parameterized_plan_cached`, which is on the extended-protocol hot
+        // path. A byte-wise prefix test rejects every non-CREATE statement
+        // without allocating.
+        let trimmed = sql.trim_start();
+        if !starts_with_icase(trimmed, "CREATE") {
+            return Ok(None);
+        }
+        if !(sql::Parser::is_pg_create_procedure(trimmed) || sql::Parser::is_pg_create_or_replace_procedure(trimmed)) {
+            return Ok(None);
+        }
+        let (name, or_replace, params, language, body) = sql::Parser::parse_pg_create_procedure(trimmed)?;
+        let param_list: Vec<sql::logical_plan::FunctionParam> = params
+            .into_iter()
+            .map(|(pname, ptype)| sql::logical_plan::FunctionParam {
+                name: pname,
+                data_type: sql::Planner::parse_data_type_string(&ptype).unwrap_or(DataType::Text),
+                mode: sql::logical_plan::ParamMode::In,
+                default: None,
+            })
+            .collect();
+        Ok(Some(sql::LogicalPlan::CreateProcedure {
+            name,
+            or_replace,
+            params: param_list,
+            body,
+            language,
+        }))
+    }
+
+    /// Rebuild the in-memory `FunctionRegistry` from the durable
+    /// `meta:function:` / `meta:procedure:` records, and install the UDF bridge
+    /// so the evaluator can invoke what it finds.
+    ///
+    /// Called from every `EmbeddedDatabase` construction site, immediately after
+    /// the struct is built (the same spot `sequences::install_persistence` sits
+    /// in, one step later because it needs the finished handle). Before this the
+    /// registry was a fresh empty `HashMap` at every open and NOTHING read those
+    /// keys, so a registered function did not survive a restart on any route.
+    ///
+    /// Load failures are warned and skipped, never fatal: one unreadable routine
+    /// blob (a truncated write, a definition written by a future version) must
+    /// not stop the database from opening. The affected routine then reports
+    /// `does not exist` when called, which is loud at the point of use.
+    fn install_routine_runtime(self) -> Result<Self> {
+        for (name, blob) in self.storage.meta_blobs_with_prefix(Self::FUNCTION_META_PREFIX) {
+            match bincode::deserialize::<sql::StoredFunction>(&blob) {
+                Ok(func) => {
+                    if let Err(e) = self.function_registry.load_function(func) {
+                        tracing::warn!("failed to load persisted function '{}': {}", name, e);
+                    }
+                }
+                Err(e) => tracing::warn!("persisted function '{}' is unreadable and was skipped: {}", name, e),
+            }
+        }
+        for (name, blob) in self.storage.meta_blobs_with_prefix(Self::PROCEDURE_META_PREFIX) {
+            match bincode::deserialize::<sql::StoredProcedure>(&blob) {
+                Ok(proc) => {
+                    if let Err(e) = self.function_registry.load_procedure(proc) {
+                        tracing::warn!("failed to load persisted procedure '{}': {}", name, e);
+                    }
+                }
+                Err(e) => tracing::warn!("persisted procedure '{}' is unreadable and was skipped: {}", name, e),
+            }
+        }
+
+        // ---- UDF invocation bridge (see `crate::sql::udf_bridge`) ----
+        //
+        // CYCLE-CRITICAL. The executor closure captures a `clone_for_trigger()`
+        // handle, and `clone_for_trigger` gives its clone an EMPTY `udf_bridge`
+        // OnceLock. If the clone carried the bridge instead, the strong count of
+        // `Arc<UdfBridge>` could never reach zero (`Arc<UdfBridge>` -> handle ->
+        // `Arc<UdfBridge>`), `StorageEngine::Drop` would never run and the data
+        // dir would stay locked — the exact Arc-leak this repo already shipped
+        // once.
+        let handle = self.clone_for_trigger();
+        let max_call_depth = self.config.session.udf_max_call_depth;
+        let bridge = std::sync::Arc::new(sql::udf_bridge::UdfBridge {
+            registry: self.function_registry.clone(),
+            max_call_depth,
+            exec: Box::new(move |sql: &str| -> Result<Vec<Vec<Value>>> {
+                // DEADLOCK GATE — same hazard as `execute_call_plan`'s, but with
+                // a WIDER guard, deliberately.
+                //
+                // Running the body re-enters `query()` / `execute()`, and
+                // `current_transaction` is a NON-reentrant `parking_lot::Mutex`.
+                // `execute_call_plan` keys off `GLOBAL_TXN_LOCK_HELD`, which is
+                // set at exactly ONE site (`execute()`'s in-transaction branch).
+                // That is not enough here: a UDF is evaluated from READ paths too,
+                // and `query()`, `query_plan_with_params` and
+                // `query_plan_with_params_with_columns` each hold that same mutex
+                // across execution WITHOUT setting the marker. So gate on the
+                // condition all of those share — a global transaction being open
+                // at all. Every one of those sites takes the lock if and only if
+                // `global_txn_active` is true, so the false case is provably
+                // lock-free and safe to re-enter.
+                //
+                // NOT affected, because neither populates the global slot: a WIRE
+                // session transaction (`BEGIN` over PG/MySQL, which uses the
+                // per-session slot) and the embedded RAII `begin_transaction()`
+                // handle. A UDF works there, with the same body-runs-outside-the-
+                // caller's-transaction semantics `CALL` already ships
+                // (ROADMAP_V5 §2.11).
+                if handle.global_txn_active.load(std::sync::atomic::Ordering::Acquire)
+                    || GLOBAL_TXN_LOCK_HELD.with(|held| held.get())
+                {
+                    return Err(Error::query_execution(
+                        "Function was NOT executed: calling a user-defined function is not \
+                         supported inside an explicit transaction statement on this path. The \
+                         function body re-enters the executor, which would deadlock on the global \
+                         transaction lock. Issue the statement outside the transaction, or inline \
+                         the function body as ordinary SQL.",
+                    ));
+                }
+                let sql_trimmed = sql.trim();
+                if starts_with_icase(sql_trimmed, "SELECT") || starts_with_icase(sql_trimmed, "WITH") {
+                    let tuples = handle.query(sql, &[])?;
+                    Ok(tuples.iter().map(|t| t.values.clone()).collect())
+                } else {
+                    handle.execute(sql)?;
+                    Ok(vec![])
+                }
+            }),
+        });
+        // The database owns the only strong reference; the process-global slot
+        // keeps a `Weak`, so it never keeps this database alive.
+        if self.udf_bridge.set(std::sync::Arc::clone(&bridge)).is_err() {
+            // `install_routine_runtime` runs exactly once per open, on a
+            // freshly-built value, so this is unreachable — but it must never be
+            // a silent double-install.
+            return Err(Error::internal(
+                "UDF bridge was already installed on this database handle",
+            ));
+        }
+        sql::udf_bridge::install(&bridge);
+        Ok(self)
+    }
+
     /// Execute `CREATE TABLE … AS <query>` — and the `SELECT … INTO <table>`
     /// spelling, which plans to the same variant.
     ///
@@ -3593,25 +4282,11 @@ impl EmbeddedDatabase {
             }
         } else if let Some(plan) = Self::try_parse_alter_constraint_enforcement(sql)? {
             plan
-        } else if sql::Parser::is_pg_create_procedure(sql) || sql::Parser::is_pg_create_or_replace_procedure(sql) {
-            // Parse PostgreSQL-style CREATE [OR REPLACE] PROCEDURE statement
-            let (name, or_replace, params, language, body) = sql::Parser::parse_pg_create_procedure(sql)?;
-            let param_list: Vec<sql::logical_plan::FunctionParam> = params
-                .into_iter()
-                .map(|(pname, ptype)| sql::logical_plan::FunctionParam {
-                    name: pname,
-                    data_type: sql::Planner::parse_data_type_string(&ptype).unwrap_or(DataType::Text),
-                    mode: sql::logical_plan::ParamMode::In,
-                    default: None,
-                })
-                .collect();
-            sql::LogicalPlan::CreateProcedure {
-                name,
-                or_replace,
-                params: param_list,
-                body,
-                language,
-            }
+        } else if let Some(plan) = Self::try_plan_pg_create_procedure(sql)? {
+            // PostgreSQL-style CREATE [OR REPLACE] PROCEDURE. The rule now lives
+            // in a shared helper because `parameterized_plan_cached` (the PARAMS
+            // family / extended protocol) needs the identical pre-parse.
+            plan
         } else if let Some(plan) = Self::try_parse_ha_command(sql)? {
             // HA Switchover commands (ha-tier1 feature)
             plan
@@ -3941,6 +4616,17 @@ impl EmbeddedDatabase {
                 let trigger_event = sql::logical_plan::TriggerEvent::Insert;
                 let has_triggers = self.trigger_registry.has_triggers_for_table(table_name);
 
+                // BEFORE-row rewrite gate, hoisted out of the row loop exactly
+                // as the params family does it (`before_row_rewrite_schema`,
+                // ~lib.rs:13806). `has_row_mutations` answers from a single
+                // atomic load when no trigger anywhere defines a rewrite
+                // recipe, so the trigger-free INSERT path pays nothing.
+                let before_row_rewrite_schema = if self.trigger_registry.has_row_mutations(table_name) {
+                    Some(std::sync::Arc::new(schema.clone()))
+                } else {
+                    None
+                };
+
                 // Collect tuples for RETURNING clause
                 let mut returned_tuples: Vec<Tuple> = Vec::new();
                 let has_returning = returning.is_some();
@@ -4130,12 +4816,35 @@ impl EmbeddedDatabase {
 
                         let mut tuple = Tuple::new(final_values_vec.clone());
 
+                        // BEFORE-row NEW rewrite: after DEFAULT fill (so the
+                        // recipe sees the row the user's INSERT actually
+                        // produces) and BEFORE the CHECK / UNIQUE / FK / RLS
+                        // gates and the write. PostgreSQL runs BEFORE ROW
+                        // triggers BEFORE constraint checking, and the params
+                        // family already did (lib.rs ~13902); this arm used to
+                        // run the rewrite AFTER both gates, so the same INSERT
+                        // could persist a CHECK-violating row over psql while
+                        // being rejected over psycopg/JDBC/sqlx. Same shared
+                        // helper on both families, so they cannot drift.
+                        //
+                        // Every gate below therefore reads `tuple.values`, NOT
+                        // `final_values_vec` (which is the pre-rewrite row).
+                        //
+                        // `Ok(false)` is the trigger body's `RETURN NULL`: the
+                        // row is not written, not counted, and contributes no
+                        // RETURNING tuple.
+                        if let Some(schema_arc) = &before_row_rewrite_schema {
+                            if !self.apply_before_insert_row_hook(table_name, &trigger_event, &mut tuple, schema_arc)? {
+                                continue;
+                            }
+                        }
+
                         // Validate CHECK constraints
                         let table_constraints = catalog.load_table_constraints(table_name)?;
                         for check in &table_constraints.check_constraints {
                             // Parse and evaluate the CHECK expression
                             let check_result =
-                                self.evaluate_check_constraint(&check.expression, &schema, &final_values_vec)?;
+                                self.evaluate_check_constraint(&check.expression, &schema, &tuple.values)?;
 
                             if !check_result {
                                 return Err(Error::constraint_violation(format!(
@@ -4150,7 +4859,7 @@ impl EmbeddedDatabase {
                         {
                             let mut col_values_map = std::collections::HashMap::new();
                             for (i, col) in schema.columns.iter().enumerate() {
-                                if let Some(v) = final_values_vec.get(i) {
+                                if let Some(v) = tuple.values.get(i) {
                                     col_values_map.insert(col.name.clone(), v.clone());
                                 }
                             }
@@ -4169,10 +4878,14 @@ impl EmbeddedDatabase {
                                         // The conflict might be on PK or a UNIQUE key — extract which from the error.
                                         let err_msg = e.to_string();
 
-                                        // Build a map of insert column name -> proposed value for EXCLUDED resolution
+                                        // Build a map of insert column name -> proposed value for EXCLUDED resolution.
+                                        // Reads the POST-rewrite row (`tuple.values`): a BEFORE-row
+                                        // trigger rewrite is part of the row being proposed, so
+                                        // EXCLUDED must reflect it, and the conflict was detected
+                                        // against those same values above.
                                         let mut excluded_map = std::collections::HashMap::new();
                                         for (i, col) in schema.columns.iter().enumerate() {
-                                            if let Some(v) = final_values_vec.get(i) {
+                                            if let Some(v) = tuple.values.get(i) {
                                                 excluded_map.insert(col.name.to_lowercase(), v.clone());
                                             }
                                         }
@@ -4188,7 +4901,7 @@ impl EmbeddedDatabase {
                                             for (i, col) in schema.columns.iter().enumerate() {
                                                 if (col.unique || col.primary_key) && !col.primary_key {
                                                     // UNIQUE (non-PK) column — check if it caused the conflict
-                                                    if let Some(val) = final_values_vec.get(i) {
+                                                    if let Some(val) = tuple.values.get(i) {
                                                         if !matches!(val, Value::Null) {
                                                             // Scan table for existing row with this UNIQUE value
                                                             let scan_sql = format!(
@@ -4236,7 +4949,7 @@ impl EmbeddedDatabase {
                                                     .collect();
                                                 let pk_values: Vec<Value> = pk_cols
                                                     .iter()
-                                                    .filter_map(|(idx, _)| final_values_vec.get(*idx).cloned())
+                                                    .filter_map(|(idx, _)| tuple.values.get(*idx).cloned())
                                                     .collect();
                                                 if !pk_values.is_empty()
                                                     && !pk_values.iter().any(|v| matches!(v, Value::Null))
@@ -4464,6 +5177,7 @@ impl EmbeddedDatabase {
 
                         // Execute BEFORE INSERT triggers (skip if no triggers for this table)
                         if has_triggers {
+                            let schema_arc = std::sync::Arc::new(schema.clone());
                             let row_context = sql::triggers::TriggerRowContext::for_insert(tuple.clone());
                             let db_ref = self.clone_for_trigger();
                             let mut executor_fn =
@@ -4478,7 +5192,7 @@ impl EmbeddedDatabase {
                                 &sql::logical_plan::TriggerTiming::Before,
                                 &row_context,
                                 &mut trigger_context,
-                                Some(std::sync::Arc::new(schema.clone())),
+                                Some(schema_arc.clone()),
                                 &mut executor_fn,
                             )?;
 
@@ -4496,17 +5210,14 @@ impl EmbeddedDatabase {
                                 }
                             }
 
-                            // Apply BEFORE-row trigger-function NEW mutations
-                            // (`NEW.col = expr`) to the row before it is written.
-                            if !self.trigger_registry.apply_before_row_mutations(
-                                table_name,
-                                &trigger_event,
-                                &mut tuple,
-                                std::sync::Arc::new(schema.clone()),
-                            )? {
-                                // Trigger body did `RETURN NULL` — skip this row.
-                                continue;
-                            }
+                            // The BEFORE-row `NEW.col = expr` rewrite does NOT
+                            // run here. It ran above, before the CHECK and
+                            // UNIQUE gates, which is where PostgreSQL runs
+                            // BEFORE ROW triggers and where the params family
+                            // has always run it. Do not move it back down:
+                            // running it after the gates let a rewritten row
+                            // bypass a CHECK constraint on the text family
+                            // only.
                         }
 
                         // Transactional insert (branch-aware).
@@ -5708,29 +6419,10 @@ impl EmbeddedDatabase {
                 language,
                 volatility,
             } => {
-                // Store function in registry
-                let stored_func = sql::StoredFunction {
-                    name: name.clone(),
-                    or_replace: *or_replace,
-                    params: params.clone(),
-                    return_type: return_type.clone(),
-                    body: body.clone(),
-                    language: language.clone(),
-                    volatility: volatility.clone(),
-                    created_at: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis() as u64)
-                        .unwrap_or(0),
-                };
-                self.function_registry.register_function(stored_func.clone())?;
-
-                // Log to WAL for replication
-                if let Ok(definition) = bincode::serialize(&stored_func) {
-                    if let Err(e) = self.storage.log_create_function(name, &definition) {
-                        tracing::warn!("Failed to log CREATE FUNCTION to WAL: {}", e);
-                    }
-                }
-                Ok(0)
+                // TEXT family. One-line delegation to the helper the PARAMS
+                // family also calls — see the "Routine DDL" block above
+                // `execute_create_function_plan`.
+                self.execute_create_function_plan(name, *or_replace, params, return_type, body, language, volatility)
             }
             sql::LogicalPlan::CreateProcedure {
                 name,
@@ -5738,47 +6430,9 @@ impl EmbeddedDatabase {
                 params,
                 body,
                 language,
-            } => {
-                // Store procedure in registry
-                let stored_proc = sql::StoredProcedure {
-                    name: name.clone(),
-                    or_replace: *or_replace,
-                    params: params.clone(),
-                    body: body.clone(),
-                    language: language.clone(),
-                    created_at: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis() as u64)
-                        .unwrap_or(0),
-                };
-                self.function_registry.register_procedure(stored_proc.clone())?;
-
-                // Log to WAL for replication
-                if let Ok(definition) = bincode::serialize(&stored_proc) {
-                    if let Err(e) = self.storage.log_create_procedure(name, &definition) {
-                        tracing::warn!("Failed to log CREATE PROCEDURE to WAL: {}", e);
-                    }
-                }
-                Ok(0)
-            }
-            sql::LogicalPlan::DropFunction { name, if_exists } => {
-                self.function_registry.drop_function(name, *if_exists)?;
-
-                // Log to WAL for replication
-                if let Err(e) = self.storage.log_drop_function(name) {
-                    tracing::warn!("Failed to log DROP FUNCTION to WAL: {}", e);
-                }
-                Ok(0)
-            }
-            sql::LogicalPlan::DropProcedure { name, if_exists } => {
-                self.function_registry.drop_procedure(name, *if_exists)?;
-
-                // Log to WAL for replication
-                if let Err(e) = self.storage.log_drop_procedure(name) {
-                    tracing::warn!("Failed to log DROP PROCEDURE to WAL: {}", e);
-                }
-                Ok(0)
-            }
+            } => self.execute_create_procedure_plan(name, *or_replace, params, body, language),
+            sql::LogicalPlan::DropFunction { name, if_exists } => self.execute_drop_function_plan(name, *if_exists),
+            sql::LogicalPlan::DropProcedure { name, if_exists } => self.execute_drop_procedure_plan(name, *if_exists),
             sql::LogicalPlan::CreateTrigger {
                 name,
                 table_name,
@@ -5794,91 +6448,30 @@ impl EmbeddedDatabase {
                 from_constraint,
                 function_name,
             } => {
-                // Check if trigger already exists
-                if let Ok(Some(_)) = self.trigger_registry.get_trigger(table_name, name) {
-                    if *if_not_exists {
-                        return Ok(0);
-                    } else {
-                        return Err(Error::query_execution(format!(
-                            "Trigger '{}' already exists on table '{}'",
-                            name, table_name
-                        )));
-                    }
-                }
-
-                // Create trigger definition
-                let definition = sql::triggers::TriggerDefinition {
-                    name: name.clone(),
-                    table_name: table_name.clone(),
-                    timing: timing.clone(),
-                    events: events.clone(),
-                    for_each: for_each.clone(),
-                    when_condition: when_condition.clone(),
-                    body: body.clone(),
-                    enabled: true,
-                    created_at: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64,
-                    referencing: referencing.clone(),
-                    characteristics: characteristics.clone(),
-                    trigger_type: trigger_type.clone(),
-                    from_constraint: from_constraint.clone(),
-                };
-
-                // Register trigger
-                self.trigger_registry.register_trigger(definition.clone())?;
-
-                // Resolve the invoked function body into a BEFORE-row NEW
-                // mutation recipe (`NEW.col = expr; RETURN NEW|NULL`). Best
-                // effort: an unsupported body simply registers no mutation, so
-                // the trigger is accepted but performs no row rewrite.
-                if matches!(timing, sql::logical_plan::TriggerTiming::Before)
-                    && matches!(for_each, sql::logical_plan::TriggerFor::Row)
-                {
-                    if let Some(fname) = function_name {
-                        if let Some(mutation) = self.build_trigger_row_mutation(fname, events) {
-                            self.trigger_registry.register_row_mutation(table_name, name, mutation);
-                        }
-                    }
-                }
-
-                // Log to WAL for replication
-                if let Ok(serialized) = bincode::serialize(&definition) {
-                    if let Err(e) = self.storage.log_create_trigger(name, table_name, &serialized) {
-                        tracing::warn!("Failed to log CREATE TRIGGER to WAL: {}", e);
-                    }
-                }
-
-                Ok(0)
+                // TEXT family. One-line delegation to the helper the PARAMS
+                // family also calls — see the "Trigger DDL" block above
+                // `execute_create_trigger_plan`.
+                self.execute_create_trigger_plan(
+                    name,
+                    table_name,
+                    timing,
+                    events,
+                    for_each,
+                    when_condition,
+                    body,
+                    *if_not_exists,
+                    referencing,
+                    characteristics,
+                    trigger_type,
+                    from_constraint,
+                    function_name,
+                )
             }
             sql::LogicalPlan::DropTrigger {
                 name,
                 table_name,
                 if_exists,
-            } => {
-                // Drop trigger from registry - table_name is required
-                let tbl = table_name.as_ref().ok_or_else(|| {
-                    Error::query_execution("DROP TRIGGER requires ON <table_name> clause".to_string())
-                })?;
-
-                let dropped = self.trigger_registry.drop_trigger(tbl, name)?;
-                self.trigger_registry.drop_row_mutation(tbl, name);
-
-                if !dropped && !*if_exists {
-                    return Err(Error::query_execution(format!(
-                        "Trigger '{}' does not exist on table '{}'",
-                        name, tbl
-                    )));
-                }
-
-                // Log to WAL for replication
-                if let Err(e) = self.storage.log_drop_trigger(name, table_name.as_deref()) {
-                    tracing::warn!("Failed to log DROP TRIGGER to WAL: {}", e);
-                }
-
-                Ok(0)
-            }
+            } => self.execute_drop_trigger_plan(name, table_name, *if_exists),
             sql::LogicalPlan::Call { name, args } => {
                 // Text family. The implementation is shared with the params
                 // family's arm in `execute_plan_with_params_inner` — see
@@ -6361,7 +6954,17 @@ impl EmbeddedDatabase {
                 //
                 // The old `is_select` bookkeeping was dead (`let _ = is_select`)
                 // and is dropped with it.
-                Ok(self.query_plan_with_params(&plan, &[], Some(txn))?.len() as u64)
+                let count = self.query_plan_with_params(&plan, &[], Some(txn))?.len() as u64;
+                // DROP TABLE routes here (→ `Executor` → `ddl::handle_drop_table`),
+                // and `Executor` has no handle on the live trigger registry, so
+                // the trigger cleanup has to happen at this layer. The params
+                // family's catch-all does the same thing with the same helper.
+                // `dropped_table_names` also covers `DROP TABLE a, b`, which is
+                // planned as `DropMulti`.
+                for dropped in Self::dropped_table_names(&plan) {
+                    self.on_table_dropped(&dropped);
+                }
+                Ok(count)
             }
         }
     }
@@ -6460,7 +7063,12 @@ impl EmbeddedDatabase {
         // 0 marker would make the first cached read discard a valid warm cache.
         let initial_schema_generation = storage.schema_generation();
 
-        Ok(Self {
+        // Built, then FINISHED: `install_routine_runtime` rebuilds the routine
+        // registry from the durable `meta:function:` / `meta:procedure:` records
+        // and installs the UDF invocation bridge. It runs here, not beside
+        // `sequences::install_persistence` above, because it needs the finished
+        // handle (it captures a `clone_for_trigger()` of it).
+        Self {
             storage,
             config,
             current_transaction: std::sync::Arc::new(parking_lot::Mutex::new(None)),
@@ -6520,7 +7128,14 @@ impl EmbeddedDatabase {
             deferred_fk_checks: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
             constraints_all_deferred: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cold_optimizer: std::sync::OnceLock::new(),
-        })
+            udf_bridge: std::sync::OnceLock::new(),
+        }
+        .install_routine_runtime()?
+        // Trigger definitions and their BEFORE-row rewrite recipes are restored
+        // from the catalog here. Before this call existed, the LIVE trigger
+        // registry started empty at every open and nothing ever repopulated it,
+        // so triggers did not survive a restart at all.
+        .install_trigger_runtime()
     }
 
     /// Create an in-memory database
@@ -6567,7 +7182,12 @@ impl EmbeddedDatabase {
         // See `new_with_config`: seed from storage, not 0.
         let initial_schema_generation = storage.schema_generation();
 
-        Ok(Self {
+        // Built, then FINISHED: `install_routine_runtime` rebuilds the routine
+        // registry from the durable `meta:function:` / `meta:procedure:` records
+        // and installs the UDF invocation bridge. It runs here, not beside
+        // `sequences::install_persistence` above, because it needs the finished
+        // handle (it captures a `clone_for_trigger()` of it).
+        Self {
             storage,
             config,
             current_transaction: std::sync::Arc::new(parking_lot::Mutex::new(None)),
@@ -6627,7 +7247,14 @@ impl EmbeddedDatabase {
             deferred_fk_checks: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
             constraints_all_deferred: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cold_optimizer: std::sync::OnceLock::new(),
-        })
+            udf_bridge: std::sync::OnceLock::new(),
+        }
+        .install_routine_runtime()?
+        // Trigger definitions and their BEFORE-row rewrite recipes are restored
+        // from the catalog here. Before this call existed, the LIVE trigger
+        // registry started empty at every open and nothing ever repopulated it,
+        // so triggers did not survive a restart at all.
+        .install_trigger_runtime()
     }
 
     /// Create an in-memory database with custom configuration
@@ -6710,7 +7337,12 @@ impl EmbeddedDatabase {
         // See `new_with_config`: seed from storage, not 0.
         let initial_schema_generation = storage.schema_generation();
 
-        Ok(Self {
+        // Built, then FINISHED: `install_routine_runtime` rebuilds the routine
+        // registry from the durable `meta:function:` / `meta:procedure:` records
+        // and installs the UDF invocation bridge. It runs here, not beside
+        // `sequences::install_persistence` above, because it needs the finished
+        // handle (it captures a `clone_for_trigger()` of it).
+        Self {
             storage,
             config,
             current_transaction: std::sync::Arc::new(parking_lot::Mutex::new(None)),
@@ -6770,7 +7402,14 @@ impl EmbeddedDatabase {
             deferred_fk_checks: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
             constraints_all_deferred: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cold_optimizer: std::sync::OnceLock::new(),
-        })
+            udf_bridge: std::sync::OnceLock::new(),
+        }
+        .install_routine_runtime()?
+        // Trigger definitions and their BEFORE-row rewrite recipes are restored
+        // from the catalog here. Before this call existed, the LIVE trigger
+        // registry started empty at every open and nothing ever repopulated it,
+        // so triggers did not survive a restart at all.
+        .install_trigger_runtime()
     }
 
     /// Execute a SQL statement (POTENTIALLY UNSAFE - use execute_params for user input)
@@ -12601,6 +13240,20 @@ impl EmbeddedDatabase {
             }
         }
 
+        // PARAMS-FAMILY PARITY: the PostgreSQL `CREATE PROCEDURE … LANGUAGE …
+        // AS $$…$$` spelling is not sqlparser grammar, so without this the
+        // extended query protocol (psycopg3 / JDBC / sqlx / node-postgres) could
+        // not even PARSE it — the text family had the pre-parse and this builder
+        // did not. Same shared helper both families call; its own cheap
+        // `starts_with_icase("CREATE")` gate keeps this off the hot path.
+        if let Some(plan) = Self::try_plan_pg_create_procedure(sql)? {
+            let plan = std::sync::Arc::new(plan);
+            if !schema_active {
+                self.plan_cache.put(cache_key, std::sync::Arc::clone(&plan));
+            }
+            return Ok(plan);
+        }
+
         let (statement, _) = self.parse_cached(sql)?;
         let catalog = self.storage.catalog();
         let planner = sql::Planner::with_catalog(&catalog)
@@ -12631,1022 +13284,6 @@ impl EmbeddedDatabase {
         let epoch = self.plan_cache.epoch();
         let plan = self.parameterized_plan_cached(sql)?;
         Ok((plan, epoch))
-    }
-
-    /// Internal execute method without transaction management
-    ///
-    /// **DEAD CODE — do not copy from it, and do not treat it as a reference.**
-    /// It has zero callers (its only other mentions in the tree are comments).
-    /// Its four DML arms are also *wrong* relative to the live executors: the
-    /// UPDATE arm resolves RLS conditions and then discards the `WITH CHECK`
-    /// element outright (`if let Some((using_expr, _)) = &rls_condition`), none
-    /// of the arms implement PG's "no WITH CHECK → fall back to USING" rule, its
-    /// `InsertSelect` arm reads the source with no `apply_rls_to_plan`, and its
-    /// UPDATE/DELETE arms call `RLSExpressionEvaluator::parse` *inside* the
-    /// per-tuple loop (that parse is uncached — O(rows) full `sqlparser` reparses).
-    /// The live, correct implementations are `execute_in_transaction_inner` and
-    /// `execute_plan_with_params_inner`, which share `build_rls_write_guard` /
-    /// `rls_row_visible` / `enforce_rls_with_check` (ROADMAP_V5 §1.1). This
-    /// function should be deleted in its own commit, once each of its DDL /
-    /// savepoint / database arms has been confirmed to have a live counterpart.
-    fn execute_internal(&self, sql: &str) -> Result<u64> {
-        // 1. Record query for quota tracking (QPS enforcement)
-        if let Some(context) = self.tenant_manager.get_current_context() {
-            self.tenant_manager
-                .record_query(context.tenant_id)
-                .map_err(|e| Error::query_execution(format!("Quota exceeded: {}", e)))?;
-        }
-
-        // 2. Parse SQL (with cache)
-        let parse_start = std::time::Instant::now();
-        let (statement, parse_cached) = self.parse_cached(sql)?;
-        let parse_elapsed = parse_start.elapsed();
-        if parse_cached {
-            tracing::debug!(
-                phase = "parse",
-                duration_us = parse_elapsed.as_micros() as u64,
-                "SQL parsed (AST cached)"
-            );
-        } else {
-            tracing::debug!(
-                phase = "parse",
-                duration_us = parse_elapsed.as_micros() as u64,
-                "SQL parsed"
-            );
-        }
-
-        // 3. Create logical plan with catalog access
-        let plan_start = std::time::Instant::now();
-        let catalog = self.storage.catalog();
-        let planner = sql::Planner::with_catalog(&catalog)
-            .with_current_schema(self.current_schema())
-            .with_search_path(self.current_search_path());
-        let plan = planner.statement_to_plan(statement)?;
-        let plan_elapsed = plan_start.elapsed();
-        tracing::debug!(
-            phase = "plan",
-            duration_us = plan_elapsed.as_micros() as u64,
-            "Logical plan created"
-        );
-
-        // Invalidate SQL metadata caches on DDL operations that can alter schemas,
-        // constraints, indexes, triggers, or materialized-view shape.
-        if Self::plan_invalidates_sql_caches(&plan) {
-            self.invalidate_plan_cache();
-        }
-
-        // 3. Execute plan based on type
-        match &plan {
-            sql::LogicalPlan::CreateTable {
-                name,
-                columns,
-                if_not_exists,
-                ..
-            } => {
-                // Handle IF NOT EXISTS: silently succeed when table already exists
-                if *if_not_exists && self.storage.catalog().table_exists(name).unwrap_or(false) {
-                    return Ok(0);
-                }
-
-                // Convert ColumnDef to Column
-                let schema_columns: Vec<Column> = columns
-                    .iter()
-                    .map(|col_def| {
-                        Column {
-                            name: col_def.name.clone(),
-                            data_type: col_def.data_type.clone(),
-                            nullable: !col_def.not_null, // nullable is opposite of not_null
-                            primary_key: col_def.primary_key,
-                            source_table: None,
-                            source_table_name: None,
-                            default_expr: None,
-                            unique: false,
-                            storage_mode: col_def.storage_mode,
-                        }
-                    })
-                    .collect();
-
-                let schema = Schema::new(schema_columns);
-                let catalog = self.storage.catalog();
-
-                // Log to WAL for replication before creating (schema will be moved)
-                if let Err(e) = self.storage.log_create_table(name, &schema) {
-                    tracing::warn!("Failed to log CREATE TABLE to WAL: {}", e);
-                }
-
-                catalog.create_table(name, schema)?;
-                Ok(1) // 1 table created
-            }
-            sql::LogicalPlan::Insert {
-                table_name,
-                columns,
-                values,
-                returning,
-                on_conflict: _,
-            } => {
-                // Check for RLS enforcement (with_check_expr)
-                let rls_enforced = self.tenant_manager.should_apply_rls(table_name, "INSERT");
-                let rls_check = if rls_enforced {
-                    self.tenant_manager.get_rls_conditions(table_name, "INSERT")
-                } else {
-                    None
-                };
-
-                // Get table schema for column types
-                let catalog = self.storage.catalog();
-                let schema = catalog.get_table_schema(table_name)?;
-
-                // Create evaluator with schema for expression evaluation
-                // Use empty tuple for evaluation context since INSERT values are constants
-                let evaluator = sql::Evaluator::new(std::sync::Arc::new(Schema {
-                    columns: vec![], // Empty schema - INSERT values don't reference columns
-                }));
-                let empty_tuple = Tuple::new(vec![]);
-
-                let mut count = 0;
-                for value_row in values {
-                    // Evaluate each expression to get actual values
-                    // This handles literals, CAST expressions, and more
-                    let mut tuple_values: Vec<Value> = Vec::new();
-
-                    for (col_idx, expr) in value_row.iter().enumerate() {
-                        // Determine target column type for auto-casting
-                        let target_col_idx = if let Some(ref cols) = columns {
-                            // Explicit column list - find index
-                            let col_name = cols
-                                .get(col_idx)
-                                .ok_or_else(|| Error::internal("column index out of bounds"))?;
-                            schema
-                                .get_column_index(col_name)
-                                .ok_or_else(|| Error::query_execution(format!("Column '{}' not found", col_name)))?
-                        } else {
-                            // No column list - use position
-                            col_idx
-                        };
-
-                        let target_col = schema.get_column_at(target_col_idx).ok_or_else(|| {
-                            Error::query_execution(format!(
-                                "Too many values for INSERT: table has {} columns",
-                                schema.columns.len()
-                            ))
-                        })?;
-
-                        let target_type = &target_col.data_type;
-
-                        // Evaluate expression
-                        let mut value = evaluator.evaluate(expr, &empty_tuple)?;
-
-                        // Auto-cast if value type doesn't match column type
-                        let needs_cast = match (&value, target_type) {
-                            (Value::Null, _) => false, // NULL is compatible with any type
-                            (Value::Vector(_), DataType::Vector(_)) => true,
-                            (Value::String(_), DataType::Vector(_)) => true, // Always cast strings to vectors
-                            (Value::String(_), DataType::Json | DataType::Jsonb) => true, // Always cast strings to JSON
-                            (Value::Int4(_), DataType::Int4) => false,
-                            (Value::Int8(_), DataType::Int8) => false,
-                            (Value::Float4(_), DataType::Float4) => false,
-                            (Value::Float8(_), DataType::Float8) => false,
-                            (Value::String(_), DataType::Text | DataType::Varchar(_)) => false,
-                            (Value::Boolean(_), DataType::Boolean) => false,
-                            (Value::Json(_), DataType::Json | DataType::Jsonb) => false,
-                            _ => true, // Type mismatch - needs cast
-                        };
-
-                        if needs_cast {
-                            value = evaluator.cast_value(value, target_type)?;
-                        }
-
-                        tuple_values.push(value);
-                    }
-
-                    let tuple = Tuple::new(tuple_values);
-
-                    // Validate RLS with_check_expr if present
-                    if let Some((_, with_check)) = &rls_check {
-                        if let Some(ref with_check_expr) = with_check {
-                            // Evaluate RLS with_check expression to ensure inserted row satisfies policy
-                            let tenant_context = self.tenant_manager.get_current_context();
-                            let rls_evaluator = tenant::RLSExpressionEvaluator::new(
-                                std::sync::Arc::new(schema.clone()),
-                                tenant_context,
-                            );
-                            let expr = rls_evaluator.parse(with_check_expr)?;
-                            let satisfies_policy = rls_evaluator.evaluate(&expr, &tuple)?;
-
-                            if !satisfies_policy {
-                                return Err(Error::query_execution(format!(
-                                    "Row-Level Security policy violation: inserted row does not satisfy WITH CHECK expression"
-                                )));
-                            }
-                        }
-                    }
-
-                    self.storage
-                        .insert_tuple_branch_aware_with_schema(table_name, tuple, &schema)?;
-                    count += 1;
-                }
-                Ok(count)
-            }
-            sql::LogicalPlan::InsertSelect {
-                table_name,
-                columns,
-                source,
-                returning: _,
-            } => {
-                // Execute source SELECT plan to get rows
-                let mut executor =
-                    sql::Executor::with_storage(&self.storage).with_timeout(self.effective_statement_timeout_ms());
-                let source_rows = executor.execute(source)?;
-
-                // Check for RLS enforcement
-                let rls_enforced = self.tenant_manager.should_apply_rls(table_name, "INSERT");
-                let rls_check = if rls_enforced {
-                    self.tenant_manager.get_rls_conditions(table_name, "INSERT")
-                } else {
-                    None
-                };
-
-                let catalog = self.storage.catalog();
-                let schema = catalog.get_table_schema(table_name)?;
-                let evaluator = sql::Evaluator::new(std::sync::Arc::new(Schema { columns: vec![] }));
-                let empty_tuple = Tuple::new(vec![]);
-
-                let column_indices: Option<Vec<usize>> = columns.as_ref().map(|cols| {
-                    cols.iter()
-                        .filter_map(|col_name| schema.get_column_index(col_name))
-                        .collect()
-                });
-
-                let default_exprs: Vec<Option<sql::LogicalExpr>> = schema
-                    .columns
-                    .iter()
-                    .map(|col| {
-                        col.default_expr
-                            .as_ref()
-                            .and_then(|json| serde_json::from_str(json).ok())
-                    })
-                    .collect();
-
-                let mut count = 0u64;
-                for source_row in &source_rows {
-                    let mut tuple_values: Vec<Option<Value>> = vec![None; schema.columns.len()];
-
-                    for (val_idx, value) in source_row.values.iter().enumerate() {
-                        let target_col_idx = if let Some(ref indices) = column_indices {
-                            if val_idx >= indices.len() {
-                                return Err(Error::query_execution("More values than columns specified"));
-                            }
-                            *indices
-                                .get(val_idx)
-                                .ok_or_else(|| Error::internal("column index out of bounds"))?
-                        } else {
-                            val_idx
-                        };
-
-                        let target_col = schema.get_column_at(target_col_idx).ok_or_else(|| {
-                            Error::query_execution(format!(
-                                "Too many values for INSERT: table has {} columns",
-                                schema.columns.len()
-                            ))
-                        })?;
-
-                        let target_type = &target_col.data_type;
-                        let mut val = value.clone();
-
-                        let needs_cast = match (&val, target_type) {
-                            (Value::Null, _) => false,
-                            (Value::Vector(_), DataType::Vector(_)) => true,
-                            (Value::String(_), DataType::Vector(_)) => true,
-                            (Value::String(_), DataType::Json | DataType::Jsonb) => true,
-                            (Value::Int4(_), DataType::Int4) => false,
-                            (Value::Int8(_), DataType::Int8) => false,
-                            (Value::Float4(_), DataType::Float4) => false,
-                            (Value::Float8(_), DataType::Float8) => false,
-                            (Value::String(_), DataType::Text | DataType::Varchar(_)) => false,
-                            (Value::Boolean(_), DataType::Boolean) => false,
-                            (Value::Json(_), DataType::Json | DataType::Jsonb) => false,
-                            _ => true,
-                        };
-
-                        if needs_cast {
-                            val = evaluator.cast_value(val, target_type)?;
-                        }
-
-                        let tv = tuple_values
-                            .get_mut(target_col_idx)
-                            .ok_or_else(|| Error::internal("column index out of bounds"))?;
-                        *tv = Some(val);
-                    }
-
-                    let final_values: Result<Vec<Value>> = tuple_values
-                        .into_iter()
-                        .enumerate()
-                        .map(|(idx, opt_val)| {
-                            if let Some(val) = opt_val {
-                                Ok(val)
-                            } else {
-                                let col = schema
-                                    .get_column_at(idx)
-                                    .ok_or_else(|| Error::internal("column index out of bounds"))?;
-                                if let Some(ref default_expr) = default_exprs.get(idx).and_then(|d| d.as_ref()) {
-                                    let mut value = evaluator.evaluate(default_expr, &empty_tuple)?;
-                                    if value.data_type() != col.data_type {
-                                        value = evaluator.cast_value(value, &col.data_type)?;
-                                    }
-                                    Ok(value)
-                                } else if col.primary_key {
-                                    // PK column omitted from INSERT — fill with NULL so
-                                    // the SERIAL auto-fill logic replaces it with row_id.
-                                    Ok(Value::Null)
-                                } else if col.nullable {
-                                    Ok(Value::Null)
-                                } else {
-                                    Err(Error::query_execution(format!(
-                                        "Column '{}' does not have a default value and is not nullable",
-                                        col.name
-                                    )))
-                                }
-                            }
-                        })
-                        .collect();
-
-                    let tuple = Tuple::new(final_values?);
-
-                    // Validate RLS
-                    if let Some((_, with_check)) = &rls_check {
-                        if let Some(ref with_check_expr) = with_check {
-                            let tenant_context = self.tenant_manager.get_current_context();
-                            let rls_evaluator = tenant::RLSExpressionEvaluator::new(
-                                std::sync::Arc::new(schema.clone()),
-                                tenant_context,
-                            );
-                            let expr = rls_evaluator.parse(with_check_expr)?;
-                            let satisfies_policy = rls_evaluator.evaluate(&expr, &tuple)?;
-                            if !satisfies_policy {
-                                return Err(Error::query_execution(
-                                    "Row-Level Security policy violation: inserted row does not satisfy WITH CHECK expression"
-                                ));
-                            }
-                        }
-                    }
-
-                    self.storage
-                        .insert_tuple_branch_aware_with_schema(table_name, tuple, &schema)?;
-                    count += 1;
-                }
-                Ok(count)
-            }
-            sql::LogicalPlan::Update {
-                table_name,
-                assignments,
-                selection,
-                returning,
-            } => {
-                // Check for RLS enforcement
-                let rls_enforced = self.tenant_manager.should_apply_rls(table_name, "UPDATE");
-                let rls_condition = if rls_enforced {
-                    self.tenant_manager.get_rls_conditions(table_name, "UPDATE")
-                } else {
-                    None
-                };
-
-                // Scan table to get all tuples with their row IDs
-                let catalog = self.storage.catalog();
-                let schema = catalog.get_table_schema(table_name)?;
-                // Stamp source_table_name so qualified predicates resolve (B31).
-                let eval_schema = schema.clone().with_source_table_name(table_name);
-                let evaluator = sql::Evaluator::new(std::sync::Arc::new(eval_schema));
-
-                // Use branch-aware scan to get tuples (includes main + branch overrides - deleted)
-                let tuples = self.storage.scan_table_branch_aware(table_name)?;
-                let mut updates: Vec<(u64, Tuple)> = Vec::new();
-
-                for mut tuple in tuples {
-                    // Check if tuple matches WHERE clause (if provided)
-                    let where_matches = if let Some(predicate) = selection {
-                        let result = evaluator.evaluate(predicate, &tuple)?;
-                        match result {
-                            Value::Boolean(b) => b,
-                            _ => false,
-                        }
-                    } else {
-                        true // No WHERE clause means update all
-                    };
-
-                    // Check RLS policy (if enforced)
-                    let rls_matches = if let Some((using_expr, _)) = &rls_condition {
-                        // Evaluate RLS using expression to check if row can be updated
-                        let tenant_context = self.tenant_manager.get_current_context();
-                        let rls_evaluator =
-                            tenant::RLSExpressionEvaluator::new(std::sync::Arc::new(schema.clone()), tenant_context);
-                        let expr = rls_evaluator.parse(using_expr)?;
-                        rls_evaluator.evaluate(&expr, &tuple)?
-                    } else {
-                        true // No RLS policy = allow
-                    };
-
-                    if where_matches && rls_matches {
-                        // Apply updates — materialise any scalar
-                        // subqueries (including correlated ones) per
-                        // row before handing the expression to the
-                        // row-scoped evaluator.
-                        for (col_name, value_expr) in assignments {
-                            let bound = self.materialize_scalar_subqueries_for_row(
-                                value_expr,
-                                &tuple,
-                                &schema,
-                                table_name,
-                                &[],
-                            )?;
-                            let mut new_value = evaluator.evaluate(&bound, &tuple)?;
-                            // Find column index
-                            let col_index = evaluator
-                                .schema()
-                                .get_column_index(col_name)
-                                .ok_or_else(|| Error::query_execution(format!("Column '{}' not found", col_name)))?;
-                            // Auto-cast to target column type (B34).
-                            let target_col = schema
-                                .get_column_at(col_index)
-                                .ok_or_else(|| Error::query_execution(format!("Column '{}' not found", col_name)))?;
-                            let target_type = &target_col.data_type;
-                            let needs_cast = !matches!(&new_value, Value::Null)
-                                && !matches!(
-                                    (&new_value, target_type),
-                                    (Value::Vector(_), DataType::Vector(_))
-                                        | (Value::Int2(_), DataType::Int2)
-                                        | (Value::Int4(_), DataType::Int4)
-                                        | (Value::Int8(_), DataType::Int8)
-                                        | (Value::Float4(_), DataType::Float4)
-                                        | (Value::Float8(_), DataType::Float8)
-                                        | (Value::String(_), DataType::Text | DataType::Varchar(_))
-                                        | (Value::Boolean(_), DataType::Boolean)
-                                        | (Value::Json(_), DataType::Json | DataType::Jsonb)
-                                        | (Value::Timestamp(_), DataType::Timestamp | DataType::Timestamptz)
-                                        | (Value::Date(_), DataType::Date)
-                                );
-                            if needs_cast {
-                                new_value = evaluator.cast_value(new_value, target_type)?;
-                            }
-                            if let Some(slot) = tuple.values.get_mut(col_index) {
-                                *slot = new_value;
-                            }
-                        }
-
-                        // FK validation on UPDATE (Kanttban bug #6 fix)
-                        // — secondary path that bypassed the txn-bound
-                        // executor.
-                        let mut new_col_values = std::collections::HashMap::with_capacity(schema.columns.len());
-                        for (i, col) in schema.columns.iter().enumerate() {
-                            if let Some(v) = tuple.values.get(i) {
-                                new_col_values.insert(col.name.clone(), v.clone());
-                            }
-                        }
-                        self.check_fk_constraints_on_write(table_name, &new_col_values, None)?;
-
-                        let row_id = tuple.row_id.unwrap_or(0);
-                        updates.push((row_id, tuple));
-                    }
-                }
-
-                // Use branch-aware update which properly handles:
-                // - Main branch: direct key update
-                // - Other branches: write to branch-specific keys
-                let update_count = self.storage.update_tuples_branch_aware(table_name, updates)?;
-                Ok(update_count)
-            }
-            sql::LogicalPlan::Delete {
-                table_name,
-                selection,
-                returning,
-            } => {
-                // Check for RLS enforcement
-                let rls_enforced = self.tenant_manager.should_apply_rls(table_name, "DELETE");
-                let rls_condition = if rls_enforced {
-                    self.tenant_manager.get_rls_conditions(table_name, "DELETE")
-                } else {
-                    None
-                };
-
-                // Scan table to get all tuples
-                let catalog = self.storage.catalog();
-                let schema = catalog.get_table_schema(table_name)?;
-                // Stamp source_table_name so qualified predicates resolve (B31).
-                let eval_schema = schema.clone().with_source_table_name(table_name);
-                let evaluator = sql::Evaluator::new(std::sync::Arc::new(eval_schema));
-
-                // Use branch-aware scan to get tuples (includes main + branch overrides - deleted)
-                let tuples = self.storage.scan_table_branch_aware(table_name)?;
-                let mut row_ids_to_delete: Vec<u64> = Vec::new();
-                let mut deleted_tuples: Vec<(u64, Tuple)> = Vec::new();
-
-                for tuple in tuples {
-                    // Check if tuple matches WHERE clause (if provided)
-                    let where_matches = if let Some(predicate) = selection {
-                        let result = evaluator.evaluate(predicate, &tuple)?;
-                        match result {
-                            Value::Boolean(b) => b,
-                            _ => false,
-                        }
-                    } else {
-                        true // No WHERE clause means delete all
-                    };
-
-                    // Check RLS policy (if enforced)
-                    let rls_matches = if let Some((using_expr, _)) = &rls_condition {
-                        // Evaluate RLS using expression to check if row can be deleted
-                        let tenant_context = self.tenant_manager.get_current_context();
-                        let rls_evaluator =
-                            tenant::RLSExpressionEvaluator::new(std::sync::Arc::new(schema.clone()), tenant_context);
-                        let expr = rls_evaluator.parse(using_expr)?;
-                        rls_evaluator.evaluate(&expr, &tuple)?
-                    } else {
-                        true // No RLS policy = allow
-                    };
-
-                    if where_matches && rls_matches {
-                        if let Some(row_id) = tuple.row_id {
-                            row_ids_to_delete.push(row_id);
-                            deleted_tuples.push((row_id, tuple.clone()));
-                        }
-                    }
-                }
-
-                // Update ART indexes for deleted rows
-                for (row_id, tuple) in &deleted_tuples {
-                    let mut col_values = std::collections::HashMap::new();
-                    for (i, col) in schema.columns.iter().enumerate() {
-                        if let Some(v) = tuple.values.get(i) {
-                            col_values.insert(col.name.clone(), v.clone());
-                        }
-                    }
-                    if let Err(e) = self.storage.art_indexes().on_delete(table_name, *row_id, &col_values) {
-                        tracing::debug!("ART index delete for table '{}': {}", table_name, e);
-                    }
-                }
-
-                // Use branch-aware delete which properly handles:
-                // - Main branch: actual key deletion
-                // - Other branches: delete marker creation
-                let delete_count = self.storage.delete_tuples_branch_aware(table_name, row_ids_to_delete)?;
-                Ok(delete_count)
-            }
-            sql::LogicalPlan::DropTable { name, if_exists } => {
-                // Check if table exists
-                let catalog = self.storage.catalog();
-                let exists = catalog.table_exists(name)?;
-
-                if exists {
-                    // Check if any materialized views depend on this table
-                    let mv_catalog = self.storage.mv_catalog();
-                    if let Ok(mv_names) = mv_catalog.list_views() {
-                        let mut dependent_mvs = Vec::new();
-                        for mv_name in &mv_names {
-                            if let Ok(metadata) = mv_catalog.get_view(mv_name) {
-                                if metadata.base_tables.iter().any(|t| t == name) {
-                                    dependent_mvs.push(mv_name.clone());
-                                }
-                            }
-                        }
-                        if !dependent_mvs.is_empty() {
-                            tracing::warn!(
-                                "Dropping table '{}' which is used by materialized view(s): {}. Those views will be stale.",
-                                name,
-                                dependent_mvs.join(", ")
-                            );
-                        }
-                    }
-
-                    // Drop the table (schema, data, ART indexes, stats)
-                    catalog.drop_table(name)?;
-
-                    // Clean up triggers for this table
-                    if let Err(e) = self.trigger_registry.drop_table_triggers(name) {
-                        tracing::warn!("Failed to clean up triggers for dropped table '{}': {}", name, e);
-                    }
-
-                    // Clean up bloom filters and zone maps
-                    self.storage.predicate_pushdown().remove_table(name);
-
-                    // Invalidate all cached rows for this table
-                    self.storage.row_cache().invalidate_table(name);
-
-                    // Log to WAL for replication
-                    if let Err(e) = self.storage.log_drop_table(name) {
-                        tracing::warn!("Failed to log DROP TABLE to WAL: {}", e);
-                    }
-
-                    Ok(0) // 0 rows affected by DROP TABLE
-                } else if *if_exists {
-                    // IF EXISTS - no error if table doesn't exist
-                    Ok(0)
-                } else {
-                    // Table doesn't exist and IF NOT EXISTS wasn't specified
-                    Err(Error::query_execution(format!("Table '{}' does not exist", name)))
-                }
-            }
-            sql::LogicalPlan::Truncate { table_name } => {
-                // TRUNCATE removes all rows from a table
-                // Implementation: Delete all keys with the table prefix
-
-                // Initialize trigger context for cascading detection
-                let mut trigger_context = sql::TriggerContext::new();
-                let trigger_event = sql::logical_plan::TriggerEvent::Truncate;
-
-                // TRUNCATE triggers are FOR EACH STATEMENT only - no OLD/NEW rows
-                let row_context = sql::triggers::TriggerRowContext {
-                    old_tuple: None,
-                    new_tuple: None,
-                    transition_tables: None,
-                };
-
-                // Execute BEFORE TRUNCATE triggers
-                let db_ref = self.clone_for_trigger();
-                let mut executor_fn =
-                    |stmt: &sql::LogicalPlan, _ctx: &sql::triggers::TriggerRowContext| -> Result<()> {
-                        db_ref.execute_plan_internal(stmt)?;
-                        Ok(())
-                    };
-
-                let action = self.trigger_registry.execute_triggers(
-                    table_name,
-                    &trigger_event,
-                    &sql::logical_plan::TriggerTiming::Before,
-                    &row_context,
-                    &mut trigger_context,
-                    None, // No schema needed for statement-level TRUNCATE triggers
-                    &mut executor_fn,
-                )?;
-
-                // Handle trigger action
-                match action {
-                    sql::triggers::TriggerAction::Abort(msg) => {
-                        return Err(Error::query_execution(format!("TRUNCATE aborted by trigger: {}", msg)));
-                    }
-                    sql::triggers::TriggerAction::Skip => {
-                        // INSTEAD OF trigger - skip the truncate
-                        return Ok(0);
-                    }
-                    sql::triggers::TriggerAction::Continue => {
-                        // Continue with truncate
-                    }
-                }
-
-                let prefix = format!("data:{}:", table_name);
-                let prefix_bytes = prefix.as_bytes();
-                let mut keys_to_delete = Vec::new();
-
-                // Collect all keys for this table
-                let iter = self.storage.db.iterator(rocksdb::IteratorMode::Start);
-                for item in iter {
-                    let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
-
-                    if !key.starts_with(prefix_bytes) {
-                        if !key.is_empty() && key.first() > prefix_bytes.first() {
-                            break;
-                        }
-                        continue;
-                    }
-
-                    keys_to_delete.push(key.to_vec());
-                }
-
-                // Item #2: materialize COPY marker-covered rows' insert versions
-                // before removing their `data:`, so AS-OF reads predating this
-                // TRUNCATE still resolve them (matches the per-row baseline,
-                // which leaves `v:` intact across TRUNCATE). No-op without markers.
-                self.storage.materialize_copy_markers_for_table(table_name)?;
-
-                // Delete all collected keys
-                for key in &keys_to_delete {
-                    self.storage.delete(key)?;
-                }
-
-                // R3.3: purge columnar sidecars (col:/colz:/colzm:/colp:/colpm:)
-                // with the rows — otherwise batch-driven columnar reads and the
-                // presence sidecar would resurrect truncated rows. No-op prefix
-                // seeks for tables without columnar columns.
-                storage::ColumnarStore::purge_table_sidecars(&self.storage.db(), table_name)?;
-
-                // Invalidate all cached rows for this table
-                self.storage.row_cache().invalidate_table(table_name);
-
-                // Clear ART index entries for this table so that stale PK/UNIQUE
-                // values do not block re-insertion of the same values.
-                // Skip clearing if user-created branches exist (exclude the
-                // auto-created "main" branch). Branch data uses separate key
-                // prefixes and does not share the ART index, but as a safety
-                // measure we skip clearing when user branches exist.
-                let has_user_branches = self
-                    .storage
-                    .list_branches()
-                    .map(|b| b.iter().any(|br| br.name != "main"))
-                    .unwrap_or(false);
-                if !has_user_branches {
-                    self.storage.art_indexes().clear_table_indexes(table_name);
-                }
-
-                // Execute AFTER TRUNCATE triggers
-                let action = self.trigger_registry.execute_triggers(
-                    table_name,
-                    &trigger_event,
-                    &sql::logical_plan::TriggerTiming::After,
-                    &row_context,
-                    &mut trigger_context,
-                    None, // No schema needed for statement-level TRUNCATE triggers
-                    &mut executor_fn,
-                )?;
-
-                // Handle AFTER trigger action
-                if let sql::triggers::TriggerAction::Abort(msg) = action {
-                    return Err(Error::query_execution(format!(
-                        "TRUNCATE failed in AFTER trigger: {}",
-                        msg
-                    )));
-                }
-
-                // Log to WAL for replication
-                if let Err(e) = self.storage.log_truncate(table_name) {
-                    tracing::warn!("Failed to log TRUNCATE to WAL: {}", e);
-                }
-
-                // DDL-like contract (PostgreSQL parity): TRUNCATE reports no
-                // affected-row count — its command tag is bare "TRUNCATE TABLE".
-                // (Returned keys_to_delete.len() until 2026-07-16; nothing
-                // consumed it, and truncate_hardening_tests pins 0.)
-                tracing::debug!(
-                    table = table_name.as_str(),
-                    rows = keys_to_delete.len() as u64,
-                    "TRUNCATE removed rows"
-                );
-                Ok(0)
-            }
-            sql::LogicalPlan::AlterColumnStorage {
-                table_name,
-                column_name,
-                storage_mode,
-            } => {
-                // ALTER TABLE t ALTER COLUMN c SET STORAGE mode
-                // Migrates existing data to the new storage format online
-
-                let catalog = self.storage.catalog();
-                let mut schema = catalog.get_table_schema(table_name)?;
-
-                // Find column index
-                let col_idx = schema
-                    .columns
-                    .iter()
-                    .position(|c| c.name == *column_name)
-                    .ok_or_else(|| {
-                        Error::query_execution(format!("Column '{}' not found in table '{}'", column_name, table_name))
-                    })?;
-
-                let col_ref = schema
-                    .get_column_at(col_idx)
-                    .ok_or_else(|| Error::internal("column index out of bounds"))?;
-                let old_mode = col_ref.storage_mode;
-                if old_mode == *storage_mode {
-                    // No change needed
-                    return Ok(0);
-                }
-
-                // Migrate existing data online
-                let column = col_ref.clone();
-                let rows_migrated =
-                    self.storage
-                        .migrate_column_storage(table_name, col_idx, &column, old_mode, *storage_mode)?;
-
-                // Update schema with new storage mode
-                schema
-                    .get_column_at_mut(col_idx)
-                    .ok_or_else(|| Error::internal("column index out of bounds"))?
-                    .storage_mode = *storage_mode;
-                catalog.update_table_schema(table_name, &schema)?;
-
-                // Log to WAL for replication
-                if let Err(e) = self
-                    .storage
-                    .log_alter_column_storage(table_name, column_name, storage_mode)
-                {
-                    tracing::warn!("Failed to log ALTER COLUMN STORAGE to WAL: {}", e);
-                }
-
-                tracing::info!(
-                    "Altered {}.{} storage from {:?} to {:?}, migrated {} rows",
-                    table_name,
-                    column_name,
-                    old_mode,
-                    storage_mode,
-                    rows_migrated
-                );
-
-                Ok(rows_migrated as u64)
-            }
-            sql::LogicalPlan::AlterTableAddColumn {
-                table_name,
-                column_def,
-                if_not_exists,
-            } => {
-                let catalog = self.storage.catalog();
-                let mut schema = catalog.get_table_schema(table_name)?;
-
-                if schema.columns.iter().any(|c| c.name == column_def.name) {
-                    if *if_not_exists {
-                        return Ok(0);
-                    }
-                    return Err(Error::query_execution(format!(
-                        "Column '{}' already exists in table '{}'",
-                        column_def.name, table_name
-                    )));
-                }
-
-                let new_column = Column {
-                    name: column_def.name.clone(),
-                    data_type: column_def.data_type.clone(),
-                    nullable: !column_def.not_null,
-                    primary_key: column_def.primary_key,
-                    source_table: None,
-                    source_table_name: Some(table_name.clone()),
-                    default_expr: Self::serialize_default_expr(&column_def.default),
-                    unique: column_def.unique,
-                    storage_mode: column_def.storage_mode,
-                };
-
-                schema.columns.push(new_column);
-                catalog.update_table_schema(table_name, &schema)?;
-
-                let rows_updated = self.storage.add_column_to_rows(table_name, &column_def.default)?;
-                Ok(rows_updated as u64)
-            }
-            sql::LogicalPlan::AlterTableDropColumn {
-                table_name,
-                column_name,
-                if_exists,
-                cascade,
-            } => {
-                let catalog = self.storage.catalog();
-                let mut schema = catalog.get_table_schema(table_name)?;
-
-                let col_idx = schema.columns.iter().position(|c| c.name == *column_name);
-
-                match col_idx {
-                    Some(idx) => {
-                        if schema.get_column_at(idx).is_some_and(|c| c.primary_key) && !cascade {
-                            return Err(Error::query_execution(format!(
-                                "Cannot drop primary key column '{}' without CASCADE",
-                                column_name
-                            )));
-                        }
-
-                        let was_columnar = schema
-                            .get_column_at(idx)
-                            .is_some_and(|c| c.storage_mode == ColumnStorageMode::Columnar);
-                        schema.columns.remove(idx);
-                        catalog.update_table_schema(table_name, &schema)?;
-                        let rows_updated = self.storage.drop_column_from_rows(table_name, idx)?;
-                        self.cleanup_columnar_after_drop_column(table_name, column_name, was_columnar, &schema)?;
-                        Ok(rows_updated as u64)
-                    }
-                    None => {
-                        if *if_exists {
-                            Ok(0)
-                        } else {
-                            Err(Error::query_execution(format!(
-                                "Column '{}' does not exist in table '{}'",
-                                column_name, table_name
-                            )))
-                        }
-                    }
-                }
-            }
-            sql::LogicalPlan::AlterTableRenameColumn {
-                table_name,
-                old_column_name,
-                new_column_name,
-            } => {
-                let catalog = self.storage.catalog();
-                let mut schema = catalog.get_table_schema(table_name)?;
-
-                if schema.columns.iter().any(|c| c.name == *new_column_name) {
-                    return Err(Error::query_execution(format!(
-                        "Column '{}' already exists in table '{}'",
-                        new_column_name, table_name
-                    )));
-                }
-
-                let col_idx = schema
-                    .columns
-                    .iter()
-                    .position(|c| c.name == *old_column_name)
-                    .ok_or_else(|| {
-                        Error::query_execution(format!(
-                            "Column '{}' does not exist in table '{}'",
-                            old_column_name, table_name
-                        ))
-                    })?;
-
-                schema
-                    .get_column_at_mut(col_idx)
-                    .ok_or_else(|| Error::internal("column index out of bounds"))?
-                    .name = new_column_name.clone();
-                catalog.update_table_schema(table_name, &schema)?;
-                Ok(0)
-            }
-            sql::LogicalPlan::AlterTableAlterColumnNullability {
-                table_name,
-                column_name,
-                nullable,
-            } => self.alter_table_set_column_nullability(table_name, column_name, *nullable),
-            sql::LogicalPlan::AlterTableRename {
-                table_name,
-                new_table_name,
-            } => {
-                let catalog = self.storage.catalog();
-
-                if catalog.get_table_schema(new_table_name).is_ok() {
-                    return Err(Error::query_execution(format!(
-                        "Table '{}' already exists",
-                        new_table_name
-                    )));
-                }
-
-                self.storage.rename_table(table_name, new_table_name)?;
-                Ok(0)
-            }
-            sql::LogicalPlan::AlterTableMulti { operations } => {
-                let mut total_rows = 0u64;
-                for sub_plan in operations {
-                    total_rows += self.execute_alter_table_op(sub_plan)?;
-                }
-                Ok(total_rows)
-            }
-            sql::LogicalPlan::Savepoint { ref name } => {
-                let txn = self.current_transaction.lock();
-                let (write_set_snapshot, art_undo_len) = match txn.as_ref() {
-                    Some(t) => (t.savepoint_snapshot(), self.art_undo_len_for(t)),
-                    None => {
-                        return Err(Error::query_execution(
-                            "SAVEPOINT can only be used within a transaction",
-                        ))
-                    }
-                };
-                drop(txn);
-                let savepoint = SavepointState {
-                    name: name.clone(),
-                    write_set_snapshot,
-                    art_undo_len,
-                };
-                self.savepoints.write().push(savepoint);
-                Ok(0)
-            }
-            sql::LogicalPlan::ReleaseSavepoint { ref name } => {
-                let mut savepoints = self.savepoints.write();
-                if let Some(pos) = savepoints.iter().rposition(|s| &s.name == name) {
-                    savepoints.truncate(pos);
-                    Ok(0)
-                } else {
-                    Err(Error::query_execution(format!("Savepoint '{}' does not exist", name)))
-                }
-            }
-            sql::LogicalPlan::RollbackToSavepoint { ref name } => {
-                let savepoints = self.savepoints.read();
-                if let Some(pos) = savepoints.iter().rposition(|s| &s.name == name) {
-                    let restore = savepoints
-                        .get(pos)
-                        .map(|s| (s.write_set_snapshot.clone(), s.art_undo_len));
-                    drop(savepoints);
-
-                    if let Some((snapshot, art_undo_len)) = restore {
-                        let txn = self.current_transaction.lock();
-                        if let Some(t) = txn.as_ref() {
-                            t.rollback_to_savepoint(&snapshot);
-                            self.rollback_art_undo_to(t, art_undo_len);
-                        }
-                        drop(txn);
-                    }
-
-                    let mut savepoints = self.savepoints.write();
-                    savepoints.truncate(pos + 1);
-                    Ok(0)
-                } else {
-                    Err(Error::query_execution(format!("Savepoint '{}' does not exist", name)))
-                }
-            }
-            sql::LogicalPlan::CreateDatabase { name, if_not_exists } => {
-                let (count, _) = self.handle_create_database(name, *if_not_exists)?;
-                Ok(count)
-            }
-            sql::LogicalPlan::DropDatabase { name, if_exists } => {
-                let (count, _) = self.handle_drop_database(name, *if_exists)?;
-                Ok(count)
-            }
-            _ => {
-                // For query plans, use executor
-                let mut executor =
-                    sql::Executor::with_storage(&self.storage).with_timeout(self.effective_statement_timeout_ms());
-                let results = executor.execute(&plan)?;
-                Ok(results.len() as u64)
-            }
-        }
     }
 
     /// Execute a SQL statement with parameters (SAFE - prevents SQL injection)
@@ -14146,9 +13783,9 @@ impl EmbeddedDatabase {
     ) -> Result<(u64, Vec<Tuple>)> {
         // Invalidate SQL metadata caches on DDL that reaches the executor
         // through the parameterized / extended-protocol funnel. This is the
-        // THIRD DDL route: the non-parameterized paths gate at
-        // `execute_internal` and `execute_in_transaction_inner`, but DDL run
-        // via Parse/Bind/Execute (`execute_params[_for_session] ->
+        // SECOND of the two DDL routes: the non-parameterized (text) path gates
+        // at `execute_in_transaction_inner`, but DDL run via
+        // Parse/Bind/Execute (`execute_params[_for_session] ->
         // execute_params_inner -> execute_plan_with_params`) lands in the
         // catch-all `_` arm below, which hands CreateView/DropView/AlterTable/
         // materialized-view + branch ops to the `Executor` without ever
@@ -14158,7 +13795,8 @@ impl EmbeddedDatabase {
         // feeds BOTH Execute-side plan pinning (R5.W2) and W2.3 Describe
         // metadata, keyed by SQL text — keeps serving the pre-redefine plan
         // (stale RowDescription / OIDs, the 3.58.3 regression class the
-        // OID-parity contract protects). Idempotent with the two other sites
+        // OID-parity contract protects). Idempotent with the other
+        // `plan_invalidates_sql_caches` gate in `execute_in_transaction_inner`
         // (invalidate-before-execute); a cheap enum-discriminant match on the
         // parameterized DML/DDL funnel (point-read SELECTs bypass this funnel
         // via query_params_inner -> query_plan_with_params, so the hot read
@@ -14237,6 +13875,23 @@ impl EmbeddedDatabase {
                         _txn_guard = Some(self.current_transaction.lock());
                         _txn_guard.as_ref().and_then(|guard| guard.as_ref())
                     }
+                };
+
+                // BEFORE INSERT FOR EACH ROW row-rewrite parity with the text
+                // family (ROADMAP_V5 HC1). Hoisted OUT of the row loop: it is a
+                // per-statement question, and with no trigger anywhere defining
+                // a rewrite recipe `has_row_mutations` answers from a single
+                // atomic load without touching a lock, so the trigger-free
+                // INSERT path — which the perf gate measures — pays nothing.
+                //
+                // Until this existed, a REST/JDBC/psycopg-with-params insert and
+                // a psql simple-query insert into the SAME table produced
+                // DIFFERENT rows, and `INSERT … RETURNING` skipped the rewrite
+                // on every interface because it routes through this arm.
+                let before_row_rewrite_schema = if self.trigger_registry.has_row_mutations(table_name) {
+                    Some(std::sync::Arc::new(schema.clone()))
+                } else {
+                    None
                 };
 
                 let has_returning = returning.is_some();
@@ -14318,7 +13973,28 @@ impl EmbeddedDatabase {
                     // row_id.
                     Self::apply_defaults_and_check_not_null(&mut tuple_values, &schema, &user_provided)?;
 
-                    let tuple = Tuple::new(tuple_values);
+                    let mut tuple = Tuple::new(tuple_values);
+
+                    // BEFORE-row NEW rewrite: after DEFAULT fill (so the recipe
+                    // sees the row the user's INSERT actually produces) and
+                    // BEFORE the CHECK / UNIQUE / FK / RLS gates and the write,
+                    // matching the text family's ordering. Same shared helper,
+                    // so the two families cannot drift.
+                    //
+                    // `Ok(false)` is the trigger body's `RETURN NULL`: the row
+                    // is not written, not counted, and contributes no RETURNING
+                    // tuple.
+                    if let Some(schema_arc) = &before_row_rewrite_schema {
+                        if !self.apply_before_insert_row_hook(
+                            table_name,
+                            &sql::logical_plan::TriggerEvent::Insert,
+                            &mut tuple,
+                            schema_arc,
+                        )? {
+                            continue;
+                        }
+                    }
+
                     self.validate_check_constraints(&table_constraints, &schema, &tuple.values)?;
 
                     // Pre-check PK / UNIQUE constraints so a parameterised
@@ -15302,6 +14978,115 @@ impl EmbeddedDatabase {
                 let count = self.execute_call_plan(name, args, params)?;
                 Ok((count, Vec::new()))
             }
+            // ---- Routine DDL, params family ----
+            //
+            // These four arms did not exist. `CREATE FUNCTION` / `CREATE
+            // PROCEDURE` / `DROP FUNCTION` / `DROP PROCEDURE` fell to the
+            // catch-all below, which builds a bare `sql::Executor` — and an
+            // `Executor` has no `FunctionRegistry` handle, so its arms could only
+            // return a status message. The statement reported success with
+            // `rows_affected = 1` and registered NOTHING. The PostgreSQL extended
+            // query protocol routes every non-SELECT statement here, so psycopg3
+            // / JDBC / sqlx / Drizzle / node-postgres — and every embedded
+            // `execute_params` caller — got a fake "created". That also silently
+            // broke CREATE PROCEDURE for those clients, which is a real
+            // regression: procedures otherwise execute.
+            //
+            // Same helpers as the text family, so the two cannot drift. The field
+            // is destructured as `fn_params` because `params` is already bound in
+            // this function to the statement's BOUND VALUES.
+            sql::LogicalPlan::CreateFunction {
+                name,
+                or_replace,
+                params: fn_params,
+                return_type,
+                body,
+                language,
+                volatility,
+            } => {
+                self.execute_create_function_plan(
+                    name,
+                    *or_replace,
+                    fn_params,
+                    return_type,
+                    body,
+                    language,
+                    volatility,
+                )?;
+                Ok((0, Vec::new()))
+            }
+            sql::LogicalPlan::CreateProcedure {
+                name,
+                or_replace,
+                params: fn_params,
+                body,
+                language,
+            } => {
+                self.execute_create_procedure_plan(name, *or_replace, fn_params, body, language)?;
+                Ok((0, Vec::new()))
+            }
+            sql::LogicalPlan::DropFunction { name, if_exists } => {
+                self.execute_drop_function_plan(name, *if_exists)?;
+                Ok((0, Vec::new()))
+            }
+            sql::LogicalPlan::DropProcedure { name, if_exists } => {
+                self.execute_drop_procedure_plan(name, *if_exists)?;
+                Ok((0, Vec::new()))
+            }
+            // ---- Trigger DDL, params family ----
+            //
+            // These two arms did not exist. `CREATE TRIGGER` fell to the
+            // catch-all below, which hands the plan to a bare `sql::Executor`
+            // whose `plan_to_operator` has no CreateTrigger arm — so every
+            // extended-query client (psycopg with bound params, JDBC, sqlx,
+            // Drizzle, node-postgres, Alembic) and every REST/BaaS caller got a
+            // HARD ERROR: `Operator not yet implemented: CreateTrigger { … }`.
+            // Same helpers as the text family, so the two cannot drift.
+            //
+            // These touch registry + catalog + WAL only and MUST NOT be routed
+            // through `execute_in_transaction_no_fast_path`: doing so would
+            // resolve the global transaction from this funnel, which the
+            // catch-all below documents at length as a re-entrancy hazard.
+            sql::LogicalPlan::CreateTrigger {
+                name,
+                table_name,
+                timing,
+                events,
+                for_each,
+                when_condition,
+                body,
+                if_not_exists,
+                referencing,
+                characteristics,
+                trigger_type,
+                from_constraint,
+                function_name,
+            } => {
+                self.execute_create_trigger_plan(
+                    name,
+                    table_name,
+                    timing,
+                    events,
+                    for_each,
+                    when_condition,
+                    body,
+                    *if_not_exists,
+                    referencing,
+                    characteristics,
+                    trigger_type,
+                    from_constraint,
+                    function_name,
+                )?;
+                Ok((0, Vec::new()))
+            }
+            sql::LogicalPlan::DropTrigger {
+                name,
+                table_name,
+                if_exists,
+            } => {
+                self.execute_drop_trigger_plan(name, table_name, *if_exists)?;
+                Ok((0, Vec::new()))
+            }
             _ => {
                 // For query plans and other operations, use executor with parameters.
                 //
@@ -15325,11 +15110,23 @@ impl EmbeddedDatabase {
                 // Insert/Update/Delete arms above, which already lock
                 // unconditionally). So this arm shares the RLS rule via
                 // `rls_filtered_plan` and leaves its executor construction alone.
+                //
+                // Captured BEFORE `plan` is shadowed by the RLS-filtered copy:
+                // DROP TABLE reaches the `Executor` from here, and the `Executor`
+                // has no handle on the live trigger registry, so the trigger
+                // deregistration has to happen at this layer. Same helper as the
+                // text family's catch-all.
+                // `dropped_table_names` also covers `DROP TABLE a, b`, which is
+                // planned as `DropMulti`, not `DropTable`.
+                let dropped_tables = Self::dropped_table_names(plan);
                 let plan = self.rls_filtered_plan(plan)?;
                 let mut executor = sql::Executor::with_storage(&self.storage)
                     .with_timeout(self.effective_statement_timeout_ms())
                     .with_parameters(params.to_vec());
                 let results = executor.execute(&plan)?;
+                for table in dropped_tables {
+                    self.on_table_dropped(&table);
+                }
                 Ok((results.len() as u64, Vec::new()))
             }
         }
@@ -18907,6 +18704,16 @@ impl EmbeddedDatabase {
         self.execute(&format!("REFRESH MATERIALIZED VIEW {name}"))
     }
 
+    /// Whether this handle owns the UDF invocation bridge.
+    ///
+    /// `true` for every database opened through the public constructors; `false`
+    /// for a `clone_for_trigger()` handle, which must NOT own it (see the
+    /// `udf_bridge` field docs — a clone that carried it would form an Arc cycle
+    /// and keep the data dir locked forever).
+    pub fn has_udf_bridge(&self) -> bool {
+        self.udf_bridge.get().is_some()
+    }
+
     /// Clone database reference for trigger execution
     ///
     /// This creates a lightweight clone that shares the same storage and registries
@@ -18963,6 +18770,16 @@ impl EmbeddedDatabase {
             fk_validation_source: self.fk_validation_source.clone(),
             deferred_fk_checks: self.deferred_fk_checks.clone(),
             cold_optimizer: self.cold_optimizer.clone(),
+            // DELIBERATELY EMPTY — do not "fix" this to `self.udf_bridge.clone()`.
+            // The UDF bridge's executor closure captures a clone minted right
+            // here; if that clone carried the bridge, `Arc<UdfBridge>` would
+            // reference a handle that references the same `Arc<UdfBridge>`, the
+            // strong count could never reach zero, and `StorageEngine::Drop`
+            // would never run — leaving the data dir locked after the database
+            // was dropped. This file has shipped that Arc-leak once already.
+            // Nothing needs the field on a clone: resolution goes through the
+            // process-global list in `sql::udf_bridge`, not through this handle.
+            udf_bridge: std::sync::OnceLock::new(),
         }
     }
 

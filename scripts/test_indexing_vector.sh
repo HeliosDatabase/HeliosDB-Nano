@@ -49,6 +49,39 @@ EOF
     return 1
 }
 
+# Inverse of run_test: PASSES only when the output contains the expected error
+# text. `run_test` cannot express this — its second guard is `grep -qvE`, which
+# succeeds whenever ANY line lacks the pattern, so on multi-line REPL output an
+# erroring statement would still be scored a pass. Use this for statements whose
+# whole point is that they must be refused.
+expect_error() {
+    local test_name="$1"
+    local test_num="$2"
+    local expected="$3"
+    local sql="$4"
+
+    rm -f "${TEST_DB}"*
+    echo -n "[$test_num] $test_name ... "
+
+    output=$(timeout 10 "$BINARY" repl << EOF 2>&1
+$sql
+\q
+EOF
+)
+
+    if echo "$output" | grep -qF "$expected"; then
+        echo -e "${GREEN}✓${NC}"
+        ((PASSED++))
+        return 0
+    fi
+
+    echo -e "${RED}✗${NC}"
+    echo "  Expected error containing: $expected"
+    echo "  Output: $(echo "$output" | tail -2)"
+    ((FAILED++))
+    return 1
+}
+
 # ===================================================================
 # CREATE INDEX - BASIC
 # ===================================================================
@@ -158,18 +191,28 @@ SELECT COUNT(*) FROM multi_vec;"
 echo ""
 
 # ===================================================================
-# DROP INDEX
+# DROP INDEX — NOT SUPPORTED (expected to fail loudly)
+#
+# Both statements below are EXPECTED to error with
+# "DROP INDEX is not supported yet", and `expect_error` PASSES only when that
+# text is present — so if DROP INDEX ever silently succeeds again, these fail.
+# Do not "fix" them by removing the error: through 4.19.0 DROP INDEX was planned
+# as DROP TABLE, so `DROP INDEX idx_drop` dropped a TABLE named `idx_drop` if one
+# existed, and `DROP INDEX IF EXISTS x` did it silently.
+# Wiring a real LogicalPlan::DropIndex is roadmap §2.1.
 # ===================================================================
-echo -e "${YELLOW}═══ DROP INDEX ═══${NC}"
+echo -e "${YELLOW}═══ DROP INDEX (expected: unsupported) ═══${NC}"
 echo ""
 
-run_test "DROP INDEX" "5.1" \
+expect_error "DROP INDEX must be refused, not silently run as DROP TABLE" "5.1" \
+    "DROP INDEX is not supported yet" \
     "CREATE TABLE drop_idx_test (id INT);
 CREATE INDEX idx_drop ON drop_idx_test(id);
 DROP INDEX idx_drop;
 CREATE TABLE test (id INT);"
 
-run_test "DROP INDEX IF EXISTS" "5.2" \
+expect_error "DROP INDEX IF EXISTS must also be refused, not silently ignored" "5.2" \
+    "DROP INDEX is not supported yet" \
     "DROP INDEX IF EXISTS nonexistent;
 CREATE TABLE test (id INT);"
 

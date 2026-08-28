@@ -128,6 +128,128 @@ const SEQ_DEF_FORMAT_VERSION: u8 = 1;
 const SEQ_STATE_MAGIC: &[u8; 4] = b"HSQS";
 const SEQ_STATE_FORMAT_VERSION: u8 = 1;
 
+/// On-disk tags for the role / ACL catalog records (same frame shape).
+const ROLE_MAGIC: &[u8; 4] = b"HROL";
+const ROLE_FORMAT_VERSION: u8 = 1;
+const ACL_MAGIC: &[u8; 4] = b"HACL";
+const ACL_FORMAT_VERSION: u8 = 1;
+
+/// On-disk tag for the BEFORE-row trigger rewrite recipe sidecar
+/// (`trigger_rowmut:{table}:{trigger}`). Framed for the same reason as the role
+/// and ACL records: `TriggerRowMutation` embeds `Vec<TriggerEvent>` and
+/// `Vec<(String, LogicalExpr)>`, both bincode-POSITIONAL, so a mid-enum
+/// insertion in `LogicalExpr` would otherwise decode as garbage — or, worse,
+/// silently as a different expression — instead of being rejected. The frame
+/// turns that into a loud, skippable "not in a recognised format".
+const TRIGGER_ROWMUT_MAGIC: &[u8; 4] = b"HTRM";
+const TRIGGER_ROWMUT_FORMAT_VERSION: u8 = 1;
+
+/// PostgreSQL's `FirstNormalObjectId`. The first OID handed to a
+/// user-created role; everything below it is reserved for built-ins.
+///
+/// A protocol-convention constant, NOT a tunable: drivers and psql compare
+/// role OIDs against PostgreSQL's own reserved range, so changing it would
+/// break compatibility rather than tune anything.
+pub const FIRST_ROLE_OID: u32 = 16_384;
+
+/// OID of the virtual built-in role `postgres`. Virtual = synthesized by the
+/// catalog-view builders, never persisted, not creatable and not droppable.
+/// Kept at PostgreSQL's bootstrap-superuser OID so existing introspection
+/// (which JOINs `pg_namespace.nspowner` / `pg_class.relowner` = 10) keeps
+/// resolving an owner name.
+pub const BUILTIN_POSTGRES_ROLE_OID: u32 = 10;
+
+/// OID of the virtual built-in role `helios`. See `BUILTIN_POSTGRES_ROLE_OID`.
+pub const BUILTIN_HELIOS_ROLE_OID: u32 = 11;
+
+/// The three role names HeliosDB reserves: the two virtual built-ins plus the
+/// SQL-standard `PUBLIC` pseudo-role. None can be created, altered or dropped;
+/// `public` IS accepted as a GRANT/REVOKE grantee.
+pub const RESERVED_ROLE_NAMES: [&str; 3] = ["postgres", "helios", "public"];
+
+/// True if `name` is one of the reserved role names (case-insensitive —
+/// unquoted identifiers are already lowercased by the planner, this also
+/// catches a quoted `"Postgres"`).
+pub fn is_reserved_role_name(name: &str) -> bool {
+    RESERVED_ROLE_NAMES.iter().any(|r| name.eq_ignore_ascii_case(r))
+}
+
+/// A persisted SQL role (`CREATE ROLE` / `CREATE USER`).
+///
+/// *** NOT A SECURITY BOUNDARY. *** No code path consults these attribute
+/// bits to authorise anything: `rolsuper`, `rolbypassrls` and friends are
+/// recorded so `pg_roles` / `pg_authid` can report what was asked for, and
+/// nothing else reads them. `password` is likewise stored verbatim and is
+/// NOT wired into wire authentication (`AuthManager` still knows only the
+/// `--password` users); it is never emitted by any catalog view.
+///
+/// FIELD DISCIPLINE: this struct is bincode-encoded, which is positional.
+/// New fields must be APPENDED at the end (and old records re-read only by a
+/// binary that bumps `ROLE_FORMAT_VERSION`), never inserted in the middle.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RoleRecord {
+    /// Stable identity, allocated from `meta:role_oid_next` at `FIRST_ROLE_OID`.
+    pub oid: u32,
+    /// Role name as normalised by the planner (unquoted names are lowercased).
+    pub name: String,
+    pub rolsuper: bool,
+    pub rolinherit: bool,
+    pub rolcreaterole: bool,
+    pub rolcreatedb: bool,
+    pub rolcanlogin: bool,
+    pub rolreplication: bool,
+    pub rolbypassrls: bool,
+    /// `-1` means unlimited (PostgreSQL convention).
+    pub rolconnlimit: i64,
+    /// Verbatim `VALID UNTIL` text, or `None`.
+    pub rolvaliduntil: Option<String>,
+    /// Verbatim password as written. NEVER rendered by a catalog view.
+    pub password: Option<String>,
+}
+
+impl RoleRecord {
+    /// A role with PostgreSQL's `CREATE ROLE` defaults: no attributes except
+    /// `INHERIT`, no login, unlimited connections.
+    pub fn new_default(oid: u32, name: &str) -> Self {
+        Self {
+            oid,
+            name: name.to_string(),
+            rolsuper: false,
+            rolinherit: true,
+            rolcreaterole: false,
+            rolcreatedb: false,
+            rolcanlogin: false,
+            rolreplication: false,
+            rolbypassrls: false,
+            rolconnlimit: -1,
+            rolvaliduntil: None,
+            password: None,
+        }
+    }
+}
+
+/// One grantee's privilege set on one object, as recorded by `GRANT` /
+/// `REVOKE`.
+///
+/// *** STORED, INTROSPECTABLE, NOT ENFORCED. *** No DML choke point reads
+/// this. A row here means "somebody ran GRANT", never "access is restricted".
+///
+/// FIELD DISCIPLINE: bincode-positional, append-only — see `RoleRecord`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AclRecord {
+    /// `"table"` or `"sequence"` (the only object kinds this slice accepts).
+    pub object_type: String,
+    /// Resolved storage key of the object (`schema.table` when non-`public`).
+    pub object_name: String,
+    /// Role name, or the literal `public` pseudo-role.
+    pub grantee: String,
+    /// Who issued the GRANT. Always `helios` until session identity lands —
+    /// the authenticated wire username does not reach SQL yet.
+    pub grantor: String,
+    /// `(privilege, is_grantable)`, sorted by privilege name.
+    pub privileges: Vec<(String, bool)>,
+}
+
 fn vector_distance_metric(options: &[crate::sql::logical_plan::IndexOption]) -> crate::vector::DistanceMetric {
     use crate::sql::logical_plan::IndexOption;
     use crate::vector::DistanceMetric;
@@ -394,6 +516,34 @@ impl<'a> Catalog<'a> {
         // early-return with `?`; bumping here means even those error paths
         // leave no stale `Table` entry for the dropped table.
         self.storage.bump_schema_generation();
+
+        // A dropped table's TRIGGER records die with it — both the
+        // `trigger:{table}:*` definitions and the `trigger_rowmut:{table}:*`
+        // rewrite recipes.
+        //
+        // This belongs HERE, in the one funnel every table removal goes
+        // through, and not only one layer up in
+        // `EmbeddedDatabase::on_table_dropped` (which the two executor
+        // families' catch-alls call). Two paths reach a table drop WITHOUT
+        // passing through that layer:
+        //   * WAL REPLAY (`StorageEngine::apply_wal_operation`'s
+        //     `WalOperation::DropTable` arm) calls this directly. The replayed
+        //     `WalOperation::CreateTrigger` earlier in the same log RE-WRITES
+        //     the `trigger:{table}:` record, so a table dropped after its
+        //     trigger was created came back at the next open with the trigger
+        //     attached — and then applied that trigger to a NEW table created
+        //     under the same name. That is a data-correctness bug, not a leak.
+        //   * The Stage-0 partition cascade (`drop_table_and_partition_children`)
+        //     recurses through this funnel for CHILD tables, whose names never
+        //     appear in the drop plan the upper layer inspects.
+        //
+        // Best effort by design, exactly like the ART-index teardown above: the
+        // table is already gone by this point, and turning a successful
+        // DROP TABLE into an error because a cleanup scan failed would be worse
+        // than the leak. Failures are warned, loudly and by name.
+        if let Err(e) = self.delete_table_triggers(table_name) {
+            tracing::warn!("DROP TABLE '{}': failed to delete trigger records: {}", table_name, e);
+        }
 
         // Delete all data rows using prefix seek (jumps directly to table's key range)
         // Key format: data:{table_name}:{row_id}
@@ -1864,6 +2014,288 @@ impl<'a> Catalog<'a> {
         self.storage.put(&key, &value)
     }
 
+    // -------------------------------------------------------------------
+    // SQL ROLES + ACL RECORDS (HC4 storage slice).
+    //
+    // *** NO PRIVILEGE IS ENFORCED ANYWHERE IN THIS BUILD. ***
+    //
+    // These records exist so that `CREATE/ALTER/DROP ROLE` and
+    // `GRANT`/`REVOKE` stop being silent no-ops and so the catalog views
+    // (`pg_roles` / `pg_user` / `pg_authid` /
+    // `information_schema.table_privileges` / `role_table_grants`) report
+    // what was actually asked for instead of two fabricated all-privilege
+    // superusers and permanently-empty grant views. NOTHING reads an
+    // `AclRecord` to decide whether a statement is allowed — there is no
+    // check at any DML choke point. Treat this as an introspection catalog,
+    // never as a security boundary.
+    //
+    // Storage follows the existing `meta:`-prefix pattern exactly
+    // (`register_schema`, `save_sequence`, `register_enum_type`,
+    // `save_trigger`):
+    //   meta:role:<name>                        -> RoleRecord
+    //   meta:acl:<objtype>:<objname>:<grantee>   -> AclRecord
+    //   meta:role_oid_next                       -> u32 LE, next free OID
+    //
+    // Prefix-scan safety: `meta:role_oid_next` is NOT inside the
+    // `meta:role:` scan — the two diverge at byte 10 (':' 0x3A vs '_' 0x5F)
+    // and ':' sorts first, so the forward scan hits every `meta:role:` key
+    // before the counter and breaks on it. Same reasoning the
+    // `meta:sequence:` / `meta:seqstate:` split relies on.
+    // -------------------------------------------------------------------
+
+    fn role_key(name: &str) -> Vec<u8> {
+        format!("meta:role:{}", name).into_bytes()
+    }
+
+    fn role_oid_counter_key() -> Vec<u8> {
+        b"meta:role_oid_next".to_vec()
+    }
+
+    fn acl_key(object_type: &str, object_name: &str, grantee: &str) -> Vec<u8> {
+        format!("meta:acl:{}:{}:{}", object_type, object_name, grantee).into_bytes()
+    }
+
+    /// Frame a record: magic + version byte + bincode body, so a future
+    /// format bump is *detectable* rather than silently misread.
+    fn encode_tagged<T: Serialize>(magic: &[u8; 4], version: u8, value: &T, what: &str) -> Result<Vec<u8>> {
+        let body = bincode::serialize(value)
+            .map_err(|e| Error::storage(format!("Failed to serialize {what} catalog record: {e}")))?;
+        let mut out = Vec::with_capacity(magic.len() + 1 + body.len());
+        out.extend_from_slice(magic);
+        out.push(version);
+        out.extend_from_slice(&body);
+        Ok(out)
+    }
+
+    /// Decode a framed record. Deliberately LOUD: an undecodable or
+    /// future-version role/ACL record is an error, not a skipped row.
+    /// Silently dropping it would under-report the catalog — exactly the
+    /// "views lie about privileges" failure this slice exists to remove.
+    fn decode_tagged<T: for<'de> Deserialize<'de>>(
+        magic: &[u8; 4],
+        version: u8,
+        bytes: &[u8],
+        what: &str,
+    ) -> Result<T> {
+        if bytes.len() <= magic.len() || !bytes.starts_with(magic) {
+            return Err(Error::storage(format!(
+                "{what} catalog record is not in a recognised format ({} bytes)",
+                bytes.len()
+            )));
+        }
+        let found = bytes[magic.len()];
+        if found != version {
+            return Err(Error::storage(format!(
+                "{what} catalog record has on-disk format version {found}, this binary supports v{version}"
+            )));
+        }
+        // In-bounds by the length check above (`bytes.len() > magic.len()`).
+        let body = &bytes[magic.len() + 1..];
+        bincode::deserialize(body).map_err(|e| Error::storage(format!("Failed to decode {what} catalog record: {e}")))
+    }
+
+    /// Allocate the next role OID and persist the bumped counter. OIDs are
+    /// never reused (a dropped role's OID stays retired), so a role keeps a
+    /// stable identity for the lifetime of the data directory.
+    pub fn allocate_role_oid(&self) -> Result<u32> {
+        let key = Self::role_oid_counter_key();
+        let next = match self.storage.get(&key)? {
+            Some(bytes) => {
+                if bytes.len() != 4 {
+                    return Err(Error::storage(format!(
+                        "role OID counter (meta:role_oid_next) is corrupt: {} bytes, expected 4",
+                        bytes.len()
+                    )));
+                }
+                u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+            }
+            None => FIRST_ROLE_OID,
+        };
+        let after = next
+            .checked_add(1)
+            .ok_or_else(|| Error::storage("role OID space exhausted (u32 overflow)"))?;
+        self.storage.put(&key, &after.to_le_bytes())?;
+        Ok(next)
+    }
+
+    /// Persist a role record, overwriting any existing entry with the same
+    /// name. Existence/duplicate semantics belong to the caller (the
+    /// executor's CREATE/ALTER ROLE arms).
+    pub fn save_role(&self, role: &RoleRecord) -> Result<()> {
+        let key = Self::role_key(&role.name);
+        let value = Self::encode_tagged(ROLE_MAGIC, ROLE_FORMAT_VERSION, role, "role")?;
+        self.storage.put(&key, &value)?;
+        // Catalog-visibility change: drop cached `SELECT … FROM pg_roles`
+        // style results so the next read reflects this role.
+        self.storage.bump_schema_generation();
+        Ok(())
+    }
+
+    /// Look up one persisted role by name.
+    pub fn get_role(&self, name: &str) -> Result<Option<RoleRecord>> {
+        match self.storage.get(&Self::role_key(name))? {
+            Some(bytes) => Ok(Some(Self::decode_tagged(
+                ROLE_MAGIC,
+                ROLE_FORMAT_VERSION,
+                &bytes,
+                "role",
+            )?)),
+            None => Ok(None),
+        }
+    }
+
+    /// True if a role with this name is persisted. Built-in virtual roles
+    /// (`postgres`, `helios`, `public`) are NOT persisted and report false
+    /// here — see `is_reserved_role_name`.
+    pub fn role_exists(&self, name: &str) -> Result<bool> {
+        Ok(self.storage.get(&Self::role_key(name))?.is_some())
+    }
+
+    /// Remove a role record. No-op when absent (the executor pre-checks so it
+    /// can honour `IF EXISTS` and emit the PostgreSQL error text otherwise).
+    pub fn delete_role(&self, name: &str) -> Result<()> {
+        self.storage.delete(&Self::role_key(name))?;
+        self.storage.bump_schema_generation();
+        Ok(())
+    }
+
+    /// Every persisted role, sorted by name.
+    ///
+    /// Reads through [`StorageEngine::meta_blobs_with_prefix`], NOT off a raw
+    /// RocksDB iterator: `save_role` writes through `StorageEngine::put`, which
+    /// ENCRYPTS when a key manager is configured, so on a TDE data dir a raw
+    /// iterator hands back ciphertext and `decode_tagged` rejects every record.
+    /// `get_role` already reads through `get`; this keeps ONE on-disk read
+    /// discipline for the `meta:role:` namespace. The `meta:role:` prefix does
+    /// not match the `meta:role_oid_next` counter (they diverge at byte 10), so
+    /// the counter is not scanned.
+    pub fn list_roles(&self) -> Result<Vec<RoleRecord>> {
+        let mut roles = Vec::new();
+        for (_suffix, value) in self.storage.meta_blobs_with_prefix("meta:role:") {
+            roles.push(Self::decode_tagged(ROLE_MAGIC, ROLE_FORMAT_VERSION, &value, "role")?);
+        }
+        roles.sort_by(|a: &RoleRecord, b: &RoleRecord| a.name.cmp(&b.name));
+        Ok(roles)
+    }
+
+    /// Read one ACL record (the full privilege set held by `grantee` on one
+    /// object).
+    pub fn get_acl(&self, object_type: &str, object_name: &str, grantee: &str) -> Result<Option<AclRecord>> {
+        match self.storage.get(&Self::acl_key(object_type, object_name, grantee))? {
+            Some(bytes) => Ok(Some(Self::decode_tagged(ACL_MAGIC, ACL_FORMAT_VERSION, &bytes, "ACL")?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Every persisted ACL record, sorted by (object_type, object_name,
+    /// grantee) — the order the privilege views render in.
+    ///
+    /// Reads through [`StorageEngine::meta_blobs_with_prefix`] for the same
+    /// reason as [`Catalog::list_roles`]: `grant_privileges` writes through
+    /// `StorageEngine::put`, which encrypts on a TDE data dir, and `get_acl`
+    /// already reads through `get`. Two readers of one key namespace must not
+    /// disagree about the on-disk format.
+    pub fn list_acls(&self) -> Result<Vec<AclRecord>> {
+        let mut acls = Vec::new();
+        for (_suffix, value) in self.storage.meta_blobs_with_prefix("meta:acl:") {
+            acls.push(Self::decode_tagged(ACL_MAGIC, ACL_FORMAT_VERSION, &value, "ACL")?);
+        }
+        acls.sort_by(|a: &AclRecord, b: &AclRecord| {
+            (&a.object_type, &a.object_name, &a.grantee).cmp(&(&b.object_type, &b.object_name, &b.grantee))
+        });
+        Ok(acls)
+    }
+
+    /// Every ACL record naming `grantee`. Used by DROP ROLE's dependency
+    /// check and by MySQL `SHOW GRANTS`.
+    pub fn list_acls_for_grantee(&self, grantee: &str) -> Result<Vec<AclRecord>> {
+        Ok(self
+            .list_acls()?
+            .into_iter()
+            .filter(|acl| acl.grantee == grantee)
+            .collect())
+    }
+
+    /// GRANT: merge `privileges` into the record for
+    /// (object_type, object_name, grantee), creating it when absent. An
+    /// already-held privilege has its grantable flag OR-ed with `grantable`
+    /// (PostgreSQL: re-granting WITH GRANT OPTION upgrades, never downgrades).
+    ///
+    /// STORES ONLY. Nothing consults the result to authorise a statement.
+    pub fn grant_privileges(
+        &self,
+        object_type: &str,
+        object_name: &str,
+        grantee: &str,
+        grantor: &str,
+        privileges: &[String],
+        grantable: bool,
+    ) -> Result<()> {
+        let mut record = self
+            .get_acl(object_type, object_name, grantee)?
+            .unwrap_or_else(|| AclRecord {
+                object_type: object_type.to_string(),
+                object_name: object_name.to_string(),
+                grantee: grantee.to_string(),
+                grantor: grantor.to_string(),
+                privileges: Vec::new(),
+            });
+        for privilege in privileges {
+            match record.privileges.iter_mut().find(|(p, _)| p == privilege) {
+                Some(existing) => existing.1 = existing.1 || grantable,
+                None => record.privileges.push((privilege.clone(), grantable)),
+            }
+        }
+        record.privileges.sort_by(|a, b| a.0.cmp(&b.0));
+        let key = Self::acl_key(object_type, object_name, grantee);
+        let value = Self::encode_tagged(ACL_MAGIC, ACL_FORMAT_VERSION, &record, "ACL")?;
+        self.storage.put(&key, &value)?;
+        self.storage.bump_schema_generation();
+        Ok(())
+    }
+
+    /// REVOKE: remove `privileges` from the record, deleting the record once
+    /// it holds nothing. Revoking something that was never granted succeeds
+    /// silently — PostgreSQL emits a warning and succeeds too.
+    ///
+    /// `REVOKE GRANT OPTION FOR …` is deliberately not modelled: sqlparser
+    /// 0.53 cannot parse that spelling at all, so it fails LOUD at the parse
+    /// stage rather than being half-implemented here.
+    pub fn revoke_privileges(
+        &self,
+        object_type: &str,
+        object_name: &str,
+        grantee: &str,
+        privileges: &[String],
+    ) -> Result<()> {
+        let mut record = match self.get_acl(object_type, object_name, grantee)? {
+            Some(record) => record,
+            None => return Ok(()),
+        };
+        record.privileges.retain(|(p, _)| !privileges.iter().any(|r| r == p));
+        let key = Self::acl_key(object_type, object_name, grantee);
+        if record.privileges.is_empty() {
+            self.storage.delete(&key)?;
+        } else {
+            let value = Self::encode_tagged(ACL_MAGIC, ACL_FORMAT_VERSION, &record, "ACL")?;
+            self.storage.put(&key, &value)?;
+        }
+        self.storage.bump_schema_generation();
+        Ok(())
+    }
+
+    /// Drop every ACL record naming `grantee`. Not used by DROP ROLE (which
+    /// refuses while grants exist, PostgreSQL-style); provided so a future
+    /// `DROP OWNED BY` / `DROP ROLE … CASCADE` has one implementation to call.
+    pub fn delete_acls_for_grantee(&self, grantee: &str) -> Result<()> {
+        for acl in self.list_acls_for_grantee(grantee)? {
+            self.storage
+                .delete(&Self::acl_key(&acl.object_type, &acl.object_name, &acl.grantee))?;
+        }
+        self.storage.bump_schema_generation();
+        Ok(())
+    }
+
     /// Build counter key for table row IDs
     fn table_counter_key(table_name: &str) -> Vec<u8> {
         format!("counter:{}", table_name).into_bytes()
@@ -2020,41 +2452,50 @@ impl<'a> Catalog<'a> {
         self.storage.delete(&key)
     }
 
-    /// Load all triggers from persistent storage
+    /// Load all triggers from persistent storage.
+    ///
+    /// Values are fetched through [`StorageEngine::meta_blobs_with_prefix`],
+    /// i.e. through `StorageEngine::get`, NOT off a raw RocksDB iterator: on a
+    /// TDE data dir the raw iterator hands back ciphertext (`save_trigger`
+    /// writes through `put`, which encrypts), so the previous raw-iterator read
+    /// could only ever have produced a deserialize error on an encrypted
+    /// database. It had no callers, so nothing noticed.
+    ///
+    /// An unreadable entry is warned about and SKIPPED rather than failing the
+    /// whole load: the caller is the open-time loader, and one corrupt trigger
+    /// record must degrade to "that trigger is missing", never to "the database
+    /// will not open".
+    ///
+    /// The `trigger:` prefix does NOT collide with the `trigger_rowmut:`
+    /// sidecar namespace — they diverge at byte 7 (`:` 0x3A vs `_` 0x5F).
     pub fn load_all_triggers(&self) -> Result<Vec<crate::sql::TriggerDefinition>> {
-        let prefix = b"trigger:";
         let mut triggers = Vec::new();
-
-        // Seek to the `trigger:` prefix instead of scanning from keyspace start.
-        let mut read_opts = rocksdb::ReadOptions::default();
-        read_opts.set_total_order_seek(true);
-        let iter = self.storage.db.iterator_opt(
-            rocksdb::IteratorMode::From(prefix.as_slice(), rocksdb::Direction::Forward),
-            read_opts,
-        );
-        for item in iter {
-            let (key, value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
-
-            if !key.starts_with(prefix) {
-                break;
+        for (suffix, value) in self.storage.meta_blobs_with_prefix("trigger:") {
+            match bincode::deserialize::<crate::sql::TriggerDefinition>(&value) {
+                Ok(definition) => triggers.push(definition),
+                Err(e) => tracing::warn!("persisted trigger 'trigger:{}' is unreadable, skipped: {}", suffix, e),
             }
-
-            // Deserialize trigger definition
-            let definition: crate::sql::TriggerDefinition = bincode::deserialize(&value)
-                .map_err(|e| Error::storage(format!("Failed to deserialize trigger: {}", e)))?;
-            triggers.push(definition);
         }
-
         Ok(triggers)
     }
 
-    /// Delete all triggers for a table (called when table is dropped)
+    /// Delete all triggers for a table (called when table is dropped).
+    ///
+    /// Removes BOTH the `trigger:{table}:*` definitions and the
+    /// `trigger_rowmut:{table}:*` rewrite recipes — the two are always written
+    /// and deleted together.
     pub fn delete_table_triggers(&self, table_name: &str) -> Result<usize> {
-        let prefix = format!("trigger:{}:", table_name);
+        let count = self.delete_keys_with_prefix(&format!("trigger:{}:", table_name))?;
+        self.delete_keys_with_prefix(&format!("trigger_rowmut:{}:", table_name))?;
+        Ok(count)
+    }
+
+    /// Delete every key under `prefix`, returning how many were removed.
+    fn delete_keys_with_prefix(&self, prefix: &str) -> Result<usize> {
         let prefix_bytes = prefix.as_bytes();
         let mut keys_to_delete = Vec::new();
 
-        // Seek to the `trigger:{table}:` prefix instead of scanning from start.
+        // Seek to the prefix instead of scanning from the keyspace start.
         let mut read_opts = rocksdb::ReadOptions::default();
         read_opts.set_total_order_seek(true);
         let iter = self.storage.db.iterator_opt(
@@ -2076,6 +2517,79 @@ impl<'a> Catalog<'a> {
         }
 
         Ok(count)
+    }
+
+    // === BEFORE-row rewrite recipe (`TriggerRowMutation`) persistence ===
+    //
+    // A SEPARATE, purely ADDITIVE key namespace, deliberately not a field on
+    // `TriggerDefinition`. That struct is bincode-POSITIONAL and is stored both
+    // in `trigger:{table}:{name}` and inside `WalOperation::CreateTrigger`, and
+    // is replicated to standbys as a `SchemaChange` — adding a field to it
+    // would break replay of every record an older build wrote. Do not
+    // "simplify" this by folding the recipe into the definition.
+
+    /// Build the rewrite-recipe key: `trigger_rowmut:{table}:{trigger}`.
+    fn trigger_row_mutation_key(table_name: &str, trigger_name: &str) -> Vec<u8> {
+        format!("trigger_rowmut:{}:{}", table_name, trigger_name).into_bytes()
+    }
+
+    /// Persist a trigger's BEFORE-row rewrite recipe.
+    pub fn save_trigger_row_mutation(
+        &self,
+        table_name: &str,
+        trigger_name: &str,
+        mutation: &crate::sql::triggers::TriggerRowMutation,
+    ) -> Result<()> {
+        let key = Self::trigger_row_mutation_key(table_name, trigger_name);
+        let value = Self::encode_tagged(
+            TRIGGER_ROWMUT_MAGIC,
+            TRIGGER_ROWMUT_FORMAT_VERSION,
+            mutation,
+            "trigger row mutation",
+        )?;
+        self.storage.put(&key, &value)
+    }
+
+    /// Remove a trigger's BEFORE-row rewrite recipe.
+    pub fn delete_trigger_row_mutation(&self, table_name: &str, trigger_name: &str) -> Result<()> {
+        let key = Self::trigger_row_mutation_key(table_name, trigger_name);
+        self.storage.delete(&key)
+    }
+
+    /// Every persisted rewrite recipe, as `(table_name, trigger_name, recipe)`.
+    ///
+    /// Unreadable entries are warned about and skipped, for the same reason
+    /// [`Catalog::load_all_triggers`] skips them.
+    pub fn load_all_trigger_row_mutations(
+        &self,
+    ) -> Result<Vec<(String, String, crate::sql::triggers::TriggerRowMutation)>> {
+        let mut out = Vec::new();
+        for (suffix, value) in self.storage.meta_blobs_with_prefix("trigger_rowmut:") {
+            // `suffix` is `{table}:{trigger}`. Split from the RIGHT: trigger
+            // names are bare identifiers, while a table name may be schema
+            // qualified (`s.t`).
+            let Some((table_name, trigger_name)) = suffix.rsplit_once(':') else {
+                tracing::warn!(
+                    "malformed trigger row-mutation key 'trigger_rowmut:{}' — skipped",
+                    suffix
+                );
+                continue;
+            };
+            match Self::decode_tagged::<crate::sql::triggers::TriggerRowMutation>(
+                TRIGGER_ROWMUT_MAGIC,
+                TRIGGER_ROWMUT_FORMAT_VERSION,
+                &value,
+                "trigger row mutation",
+            ) {
+                Ok(mutation) => out.push((table_name.to_string(), trigger_name.to_string(), mutation)),
+                Err(e) => tracing::warn!(
+                    "persisted trigger row mutation 'trigger_rowmut:{}' is unreadable and was skipped: {}",
+                    suffix,
+                    e
+                ),
+            }
+        }
+        Ok(out)
     }
 
     // === Constraint Persistence Methods ===

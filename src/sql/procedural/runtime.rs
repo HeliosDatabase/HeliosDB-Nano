@@ -246,6 +246,55 @@ impl ProceduralExecutor {
         Ok(())
     }
 
+    /// Evaluate the value of a `RETURN <expr>` statement.
+    ///
+    /// `ProceduralParser::parse_expression` does NOT build an expression tree —
+    /// it captures the expression's RAW SOURCE TEXT and wraps it in
+    /// `LogicalExpr::Literal(Value::String(text))` (its own comment says "A full
+    /// implementation would parse this into LogicalExpr"). Handing that literal
+    /// to `Evaluator::evaluate` therefore returned the TEXT of the expression as
+    /// the routine's return value — so `RETURN x * 10` produced the string
+    /// `"x * 10"`, not a number. That was invisible while user functions were
+    /// uncallable; it became a wrong-answer factory the moment the evaluator
+    /// gained a UDF call path, so the text is now EVALUATED.
+    ///
+    /// Evaluation reuses the two mechanisms the rest of a body already uses and
+    /// adds no third rule: the text goes through `ExecutionContext::interpolate`
+    /// (the shared `$`-sigil scanner — `$name` from the variable scope, `$N`
+    /// from the call's arguments) and is then evaluated by the engine as
+    /// `SELECT <text>`. The `$` sigil stays mandatory, exactly as it is for body
+    /// statements, so a bare identifier reaches the planner as a column
+    /// reference and errors loudly rather than silently resolving.
+    ///
+    /// An expression that is not the parser's text literal (no producer today,
+    /// but the AST permits it) is evaluated directly, preserving the old path.
+    fn evaluate_return_value(expr: &crate::sql::LogicalExpr, ctx: &mut ExecutionContext<'_>) -> Result<Value> {
+        let text = match expr {
+            crate::sql::LogicalExpr::Literal(Value::String(text)) => text.trim().to_string(),
+            other => return ctx.evaluator.evaluate(other, &crate::Tuple::new(vec![])),
+        };
+        if text.is_empty() {
+            return Ok(Value::Null);
+        }
+        // Borrow ends before `sql_executor` is borrowed mutably below.
+        let sql = format!("SELECT {}", ctx.interpolate(&text));
+        let results = (ctx.sql_executor)(&sql).map_err(|e| {
+            Error::query_execution(format!(
+                "RETURN could not evaluate `{}`: {}. A routine body evaluates its RETURN \
+                 expression as SQL, and the `$` sigil is mandatory — reference a parameter or \
+                 declared variable as `$name` or `$1`.",
+                text, e
+            ))
+        })?;
+        // No rows -> NULL, matching `execute_sql_function`'s empty-result rule
+        // and PostgreSQL's `SELECT (SELECT … WHERE false)`.
+        Ok(results
+            .first()
+            .and_then(|row| row.first())
+            .cloned()
+            .unwrap_or(Value::Null))
+    }
+
     /// Execute a single statement
     #[allow(clippy::indexing_slicing)]
     // SAFETY: All indexing is guarded by `.is_empty()` and `.len()` checks within each match arm
@@ -461,10 +510,9 @@ impl ProceduralExecutor {
             }
 
             ProceduralStatement::Return { value } => {
-                ctx.return_value = if let Some(expr) = value {
-                    Some(ctx.evaluator.evaluate(expr, &crate::Tuple::new(vec![]))?)
-                } else {
-                    None
+                ctx.return_value = match value {
+                    Some(expr) => Some(Self::evaluate_return_value(expr, ctx)?),
+                    None => None,
                 };
                 ctx.returned = true;
             }

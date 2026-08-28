@@ -1,6 +1,6 @@
 //! Trigger Registration / DML-hook Demo
 //!
-//! ⚠️ TRIGGERS ARE NOT IMPLEMENTED IN HELIOSDB NANO. This example demonstrates the
+//! ⚠️ TRIGGER BODIES ARE NOT EXECUTED IN HELIOSDB NANO. This example demonstrates the
 //! trigger *hooks* the DML paths call into — registration, per-table lookup, and the
 //! cascade-depth guard. It does NOT demonstrate a trigger body running, because no
 //! trigger body ever runs: `TriggerDefinition.body` is always empty (the planner
@@ -8,8 +8,10 @@
 //! NEW/OLD row context. INSERT/UPDATE/DELETE below take the trigger-aware slow path
 //! and invoke the hooks, and the hooks do nothing observable.
 //!
-//! See the `heliosdb-nano-schema` skill ("Triggers — NOT IMPLEMENTED") before using
-//! triggers for anything.
+//! See the `heliosdb-nano-schema` skill (Recipe 5) before using triggers for anything.
+//! The one mechanism with a real effect — a `BEFORE INSERT … FOR EACH ROW` body of the
+//! form `NEW.<col> = <expr>` / `RETURN NULL` — is covered by
+//! `tests/trigger_row_mutation_tests.rs`.
 
 use heliosdb_nano::{sql, EmbeddedDatabase, Result};
 
@@ -173,7 +175,7 @@ fn main() -> Result<()> {
     println!("  ✗ NEW/OLD resolution during DML — the executor discards the row context");
     println!("  ✗ Any observable effect of a trigger on INSERT/UPDATE/DELETE");
     println!();
-    println!("Regression coverage for this behaviour: tests/trigger_unimplemented_tests.rs");
+    println!("Regression coverage for this behaviour: tests/trigger_row_mutation_tests.rs");
 
     Ok(())
 }

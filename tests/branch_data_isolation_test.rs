@@ -639,8 +639,9 @@ fn test_multiple_branches_no_cross_contamination_in_memory() {
 // Out of scope (documented, NOT ART-poisoning): the parameterized
 // `INSERT ... ON CONFLICT DO UPDATE` path calls `update_tuple_fast`, which
 // writes the row to the MAIN `data:` key even on a branch — a deeper
-// data-isolation issue, not an ART-index one; and the dead `execute_internal`
-// DELETE arm (verified zero callers).
+// data-isolation issue, not an ART-index one. (A third, callerless duplicate
+// DML path also had an ungated DELETE arm; it has since been deleted outright
+// rather than gated.)
 // ============================================================================
 
 // Extract the first (integer) projected column of each result row as i64.

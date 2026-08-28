@@ -356,6 +356,30 @@ password_hash_algorithm = "argon2"
 # Users file path (for file-based authentication)
 # users_file = "/etc/heliosdb/users.json"
 
+# ----------------------------------------------------------------------------
+# SQL ROLES AND GRANTS: STORED AND INTROSPECTABLE, **NOT ENFORCED**
+# ----------------------------------------------------------------------------
+# HeliosDB Nano persists CREATE/ALTER/DROP ROLE and GRANT/REVOKE so that
+# pg_roles, pg_user, pg_authid, information_schema.table_privileges /
+# role_table_grants and MySQL SHOW GRANTS report what was actually requested.
+#
+# NO PRIVILEGE IS CHECKED ANYWHERE. There is no permission check on any read
+# or write path. A GRANT confers nothing; a REVOKE removes nothing. Do not
+# treat a row in a privilege view as an access control. Enforcement is a
+# tracked follow-up (ROADMAP_V5).
+#
+# legacy_acl_noop restores the pre-4.20 leniency for deployments whose scripts
+# depended on it:
+#   false (default) - GRANT/REVOKE naming a role or table that does not exist
+#                     raise an error, and `SET ROLE <name>` over the PostgreSQL
+#                     wire raises 0A000 feature_not_supported.
+#   true            - unknown grantees/objects are skipped and the statement
+#                     succeeds; `SET ROLE` returns the old silent "SET" ack.
+#                     (That old ack was a FALSE claim that the session had
+#                     dropped privileges — enable this only to unblock an
+#                     existing script.)
+# legacy_acl_noop = false
+
 # ============================================================================
 # COMPRESSION CONFIGURATION (v2.1)
 # ============================================================================
@@ -384,17 +408,30 @@ min_size_bytes = 1024
 # MATERIALIZED VIEW CONFIGURATION (v2.1)
 # ============================================================================
 [materialized_views]
-# Enable auto-refresh by default for new materialized views
+# NOTE: automatic refresh only runs when the embedded library API
+# `EmbeddedDatabase::start_auto_refresh()` is called. There is no CLI flag, SQL
+# statement or HTTP endpoint that starts it, and the settings below do nothing
+# until it is running. Opt a view in with
+# `CREATE MATERIALIZED VIEW … WITH (auto_refresh = true)` (either before or after
+# the query) or `ALTER MATERIALIZED VIEW … SET (auto_refresh = true)`.
+
+# RESERVED — parsed but not yet wired to anything. Setting it true does NOT opt
+# new materialized views into auto-refresh; use the WITH clause above.
 auto_refresh_default = false
 
-# Default maximum CPU percentage for refresh operations
-# Prevents refresh from consuming all CPU resources
+# CPU ceiling for refresh work. The refresh scheduler skips a batch, and the
+# staleness worker skips a check, while smoothed system CPU is above this.
+# Set it high if refreshes must keep up on a busy host — at 15 on a loaded
+# machine, opted-in views may never refresh.
 default_max_cpu_percent = 15
 
-# Interval to check if views need refresh (seconds)
+# How often the staleness worker scans for stale views AND how often the
+# scheduler drains its refresh queue (seconds). Effectively the upper bound on
+# how long a stale view waits.
 refresh_check_interval_secs = 60
 
-# Maximum concurrent refresh operations
+# Maximum concurrent refresh operations. Each one is a FULL recompute of the
+# view's query with an atomic row swap.
 max_concurrent_refreshes = 2
 
 # ============================================================================
@@ -488,6 +525,16 @@ max_sessions_per_user = 10
 # How often to clean up inactive sessions (seconds)
 # Default: 300 (5 minutes)
 cleanup_interval_secs = 300
+
+# Maximum nested user-defined-function invocations on one thread.
+# A CREATE FUNCTION body re-enters the parser, planner and executor, so a
+# self-recursive function (`f()` whose body calls `f()`) would recurse until the
+# thread's stack is exhausted — a process abort, not a SQL error. When this
+# depth is reached the call fails loudly with a message naming this setting.
+# Raise it for legitimately deep function nesting; lower it to fail faster on
+# runaway recursion. Must be at least 1.
+# Default: 32
+udf_max_call_depth = 32
 
 # ============================================================================
 # LOCK CONFIGURATION (v3.1.0 - Multi-User ACID)

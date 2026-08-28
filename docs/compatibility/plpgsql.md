@@ -47,41 +47,86 @@ ERROR:  PL/pgSQL control flow (`<KEYWORD>`) inside DO blocks is not yet
 Everything above concerns anonymous `DO` blocks. Named routines are a separate surface
 with separate — and more severe — limits.
 
-### `CREATE FUNCTION`: registers, but nothing can call it
+### `CREATE FUNCTION`: scalar calls work, under the `$`-sigil rule
 
-All three forms are accepted and the function is stored in the registry:
+The function is registered, **persisted** (`meta:function:<name>`, reloaded into the
+registry at every open, so it survives a restart) and callable in scalar position:
 
 ```sql
-CREATE FUNCTION dbl(x INTEGER) RETURNS INTEGER AS $$ BEGIN RETURN x * 2; END $$ LANGUAGE plpgsql;  -- OK
-CREATE FUNCTION dbl(x INTEGER) RETURNS INTEGER AS $$ SELECT x * 2 $$ LANGUAGE sql;                 -- OK
-CREATE FUNCTION dbl(x INTEGER) RETURNS INTEGER RETURN x * 2;                                       -- OK
+CREATE FUNCTION dbl(x INTEGER) RETURNS INTEGER AS $$ SELECT $1 * 2 $$ LANGUAGE sql;
+
+SELECT dbl(21);                            -- 42
+SELECT public.dbl(21);                     -- 42
+SELECT id, dbl(id) FROM t;                 -- per row
+SELECT id FROM t WHERE dbl(id) = 2;        -- filters
+-- and identically through bound parameters:
+SELECT dbl($1);                            -- 42 with $1 = 21
 ```
 
-The body is **never interpreted**, because it is never reached: there is no invocation
-route.
+**The `$` sigil is mandatory**, exactly as it is for procedure bodies: `$1` / `$name`.
+A bare parameter name is a column reference and fails with
+`Column 'x' not found in schema`. That is deliberate — a variable must never silently
+shadow a column — and it applies to `LANGUAGE sql` and `LANGUAGE plpgsql` alike.
+
+Both DML executor families register and invoke: `db.execute()` (psql simple query, the
+whole MySQL wire, the REPL) and `db.execute_params()` (the PostgreSQL **extended**
+protocol — psycopg server-side bind, JDBC, sqlx, Drizzle, node-postgres). Before this,
+the params family had no `CreateFunction` arm at all: the statement reported success with
+one row affected and registered nothing.
+
+Recursion is bounded by `[session] udf_max_call_depth` in `config.toml` (default 32); a
+self-recursive body fails with an explicit depth-limit error instead of exhausting the
+thread stack. On the **embedded API and the REPL**, calling a function inside an explicit
+`BEGIN` is refused with an error — the body re-enters the executor and would deadlock on
+the global (non-reentrant) transaction lock. A wire `BEGIN` is a per-session transaction
+and is unaffected; as with `CALL`, the body does not join the caller's transaction.
+
+#### PL/pgSQL function bodies
+
+Supported: a `DECLARE` section without initialisers, SQL statements,
+`SELECT … INTO <var>`, nested `BEGIN … END` blocks, and `RETURN <expr>` (the expression is
+`$`-interpolated and then evaluated as SQL).
 
 ```sql
-SELECT dbl(21);                            -- ERROR: Unknown scalar function: dbl
-SELECT public.dbl(21);                     -- ERROR: Unknown scalar function: public.dbl
-SELECT id, dbl(id) FROM t;                 -- ERROR: Unknown scalar function: dbl
-SELECT id FROM t WHERE dbl(id) = 2;        -- ERROR: Unknown scalar function: dbl
-SELECT * FROM dbl(21);                     -- ERROR: Table 'dbl' does not exist
-CALL dbl(21);                              -- ERROR: Procedure 'dbl' does not exist
+CREATE FUNCTION post_count(uid INTEGER) RETURNS INTEGER AS $$
+DECLARE cnt INTEGER;
+BEGIN
+    SELECT COUNT(*) INTO cnt FROM posts WHERE author_id = $uid;
+    RETURN $cnt;
+END;
+$$ LANGUAGE plpgsql;
+```
+
+**REFUSED with an explicit error inside a function body**: `IF` / `CASE` / `LOOP` /
+`WHILE` / `FOR`, `:=` assignment, `DECLARE v INT := …`, `RAISE`, `EXIT` / `CONTINUE`,
+cursors, `EXECUTE` of dynamic SQL, `RETURN NEXT` / `RETURN QUERY` and `EXCEPTION`
+handlers. The reason is specific and worth knowing:
+`ProceduralParser::parse_expression` does not build an expression tree — it captures the
+expression's raw *source text*. An `IF <cond> THEN` would therefore evaluate to a string,
+never to `true`, and would silently take the ELSE branch. Refusing is strictly better than
+that wrong answer. (`CREATE PROCEDURE` bodies are deliberately NOT gated, so nothing that
+ships today breaks; the parser is the real fix — ROADMAP_V5 §2.9.)
+
+#### Still not implemented
+
+```sql
+SELECT * FROM dbl(21);                     -- ERROR: Table 'dbl' does not exist (no set-returning functions)
+CALL dbl(21);                              -- ERROR: Procedure 'dbl' does not exist (separate namespaces)
 PERFORM dbl(21);                           -- ERROR: SQL parse error (PERFORM is not a statement)
+SELECT reporting.dbl(21);                  -- ERROR: Unknown scalar function (only `public.` qualifies)
 ```
 
-Same on the embedded API and over the PostgreSQL wire, and same through bound
-parameters (`SELECT dbl($1)` → `Unknown scalar function: dbl`). The cause is structural:
-the expression evaluator holds no reference to the function registry and falls through to
-`Unknown scalar function` (`src/sql/evaluator.rs:1154`), and
-`FunctionRegistry::execute_function` (`src/sql/functions.rs:190`) has exactly one call
-site in the crate, inside `#[cfg(test)] mod tests` (`src/sql/functions.rs:603`).
-`SELECT * FROM f()` is blocked separately by a fixed table-function whitelist of
-`generate_series | unnest` (`src/sql/planner.rs:2078`).
+`SELECT * FROM f()` is blocked by the fixed table-function whitelist
+`generate_series | unnest` (`Planner::is_table_function`), and `RETURNS TABLE(...)`'s
+column list is still discarded at plan time — lifting either needs a return-signature slot
+on `StoredFunction`, which is a bincode-positional WAL/`meta:` payload. There is also no
+overload resolution: the registry keys on the lowercase name alone, so
+`f(int)` and `f(text)` collide with `Function 'f' already exists`.
 
-A registered function is also invisible: `information_schema.routines`,
-`information_schema.parameters` and `pg_proc` return zero rows with it registered (see
-[`information_schema` compatibility](information_schema.md)).
+A registered function is still invisible to introspection: `information_schema.routines`,
+`information_schema.parameters` and `pg_proc` return zero rows (see
+[`information_schema` compatibility](information_schema.md)), and
+`POST /rest/v1/rpc/<fn>` is still HTTP 501.
 
 ### `CREATE PROCEDURE`: works, with one rule
 

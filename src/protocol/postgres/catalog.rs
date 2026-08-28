@@ -5,7 +5,6 @@
 //! Many PostgreSQL clients query these system tables during connection
 //! and for introspection.
 
-use crate::storage::{ArtIndexType, VectorIndexType};
 use crate::{Column, DataType, EmbeddedDatabase, Result, Schema, Tuple, Value};
 use std::sync::Arc;
 
@@ -109,61 +108,66 @@ impl PgCatalog {
         // with F4 (its only consumer was a degenerate empty-result branch that
         // now falls through to the planner).
         let has_information_schema_ref = matchable.contains("information_schema.");
-        // KanttBan #22/#23 (v3.31.x) migrated several information_schema
-        // views to the planner-backed SystemViewRegistry by returning
-        // Ok(None) here. That delegation is required for drizzle-kit,
-        // which JOINs `table_constraints ⨝ key_column_usage ⨝
-        // constraint_column_usage` (and `columns`) in one statement —
-        // the substring router can only serve a single view, so a JOIN
-        // must fall through to the planner. But a *single-view* SELECT
-        // (no JOIN) is still served directly here so the legacy
-        // interception contract (and the direct `handle_query` callers /
-        // tests) keeps working. Detect a catalog JOIN and only then
-        // defer to the planner.
-        // Defer to the planner for JOINs and aggregates/GROUP BY — the
-        // substring router can only serve a single view and can't run
-        // the planner's aggregate operator. Plain single-view SELECTs
-        // are still intercepted here (legacy contract + direct callers).
-        let needs_planner =
-            query_lower.contains(" join ") || query_lower.contains("count(") || query_lower.contains(" group by ");
+        // HC3 (catalog unification): every information_schema view listed below
+        // is served by the planner-backed SystemViewRegistry
+        // (src/sql/phase3/system_views.rs). `return Ok(None)` defers to the
+        // planner on ALL three routes that reach this function — the PG simple
+        // query path, the PG extended/Parse path (handler_extended.rs derives
+        // RowDescription from the planner instead), and the MySQL wire (which
+        // calls `execute_query` on Ok(None)) — so ONE implementation now answers
+        // every interface instead of a wire-only fixed-shape copy plus a
+        // divergent registry copy.
+        //
+        // This deletes a whole class of bug rather than instances of it: the
+        // substring router could not filter, project or JOIN, so
+        // `… FROM information_schema.columns WHERE table_schema = 'public'` —
+        // the most common ORM introspection query in existence — tested a column
+        // the wire shape did not have, compared it against NULL and dropped
+        // EVERY row; written without spaces around `=` it instead silently
+        // dropped `table_schema` from the projection and returned a narrower row
+        // than RowDescription had promised. The planner does real filtering,
+        // projection, JOINs and aggregates, so all of that simply goes away.
+        //
+        // NEVER add an interception branch back here. This handler runs on RAW,
+        // UNPARSED text and has already caused two silent-write-loss incidents
+        // (commits 0c27a30, 4ec06fa / tasks #34, #38); REMOVING interception is
+        // the only safe direction. If a wire test fails, fix the registry.
         let result = if has_information_schema_ref {
-            if needs_planner
-                && (query_lower.contains("information_schema.columns")
-                    || query_lower.contains("information_schema.tables")
-                    || query_lower.contains("information_schema.key_column_usage")
-                    || query_lower.contains("information_schema.table_constraints")
-                    || query_lower.contains("information_schema.referential_constraints")
-                    || query_lower.contains("information_schema.constraint_column_usage"))
+            if query_lower.contains("information_schema.columns")
+                || query_lower.contains("information_schema.tables")
+                || query_lower.contains("information_schema.key_column_usage")
+                || query_lower.contains("information_schema.table_constraints")
+                || query_lower.contains("information_schema.referential_constraints")
+                || query_lower.contains("information_schema.constraint_column_usage")
+                || query_lower.contains("information_schema.sequences")
+                || query_lower.contains("information_schema.schemata")
+                || query_lower.contains("information_schema.catalog_name")
+                || query_lower.contains("information_schema.check_constraints")
+                || query_lower.contains("information_schema.views")
+                // HC4 privilege/role views. `table_privileges` and
+                // `role_table_grants` are now POPULATED from the persisted ACL
+                // catalog, and the other eight are registered shape-correct and
+                // empty — all ten in the phase-3 registry, so the embedded /
+                // REPL / Python routes stop reporting them as unknown
+                // relations. Deferring here means the planner (which can
+                // filter, project and JOIN) answers them on the wire too.
+                //
+                // A ROW IN THESE VIEWS MEANS "SOMEBODY RAN GRANT". It does not
+                // mean access is restricted: this build enforces no privilege.
+                || query_lower.contains("information_schema.table_privileges")
+                || query_lower.contains("information_schema.role_table_grants")
+                || query_lower.contains("information_schema.column_privileges")
+                || query_lower.contains("information_schema.role_column_grants")
+                || query_lower.contains("information_schema.usage_privileges")
+                || query_lower.contains("information_schema.role_usage_grants")
+                || query_lower.contains("information_schema.role_routine_grants")
+                || query_lower.contains("information_schema.applicable_roles")
+                || query_lower.contains("information_schema.enabled_roles")
+                || query_lower.contains("information_schema.administrable_role_authorizations")
             {
-                // JOIN / aggregate across registry-backed views: defer to the planner.
                 return Ok(None);
-            } else if query_lower.contains("information_schema.sequences") {
-                // The real sequence catalog is served by the planner-backed
-                // SystemViewRegistry (execute_information_schema_sequences).
-                // Defer so it returns live rows instead of the empty placeholder
-                // stub — sequence discovery is a migration-tooling requirement.
-                return Ok(None);
-            } else if query_lower.contains("information_schema.columns") {
-                Some(self.query_information_schema_columns(&query_lower)?)
-            } else if query_lower.contains("information_schema.tables") {
-                Some(self.query_information_schema_tables(&query_lower)?)
-            } else if query_lower.contains("information_schema.key_column_usage") {
-                Some(self.query_information_schema_key_column_usage()?)
-            } else if query_lower.contains("information_schema.table_constraints") {
-                Some(self.query_information_schema_table_constraints()?)
-            } else if query_lower.contains("information_schema.referential_constraints") {
-                Some(self.query_information_schema_referential_constraints()?)
-            } else if query_lower.contains("information_schema.constraint_column_usage") {
-                // Empty placeholder shape (Nano doesn't surface this view's rows).
-                Self::known_empty_information_schema_view("constraint_column_usage")
             } else if query_lower.contains("information_schema.routines") {
                 Some(Self::query_information_schema_routines())
-            } else if query_lower.contains("information_schema.check_constraints") {
-                Some(Self::query_information_schema_check_constraints())
-            } else if query_lower.contains("information_schema.views") {
-                Some(Self::query_information_schema_views())
-            } else if query_lower.contains("information_schema.schemata") {
-                Some(self.query_information_schema_schemata()?)
             } else if let Some(name) = Self::information_schema_view_name(&query_lower) {
                 if let Some(empty) = Self::known_empty_information_schema_view(&name) {
                     Some(empty)
@@ -176,13 +180,19 @@ impl PgCatalog {
                     // docs/compatibility/information_schema.md.
                     return Err(crate::Error::QueryExecution(format!(
                         "information_schema.{name} is not a recognised view; \
-                         HeliosDB Nano populates tables (base tables only, not views), \
-                         columns, schemata, key_column_usage, table_constraints and \
-                         referential_constraints. These resolve but are ALWAYS EMPTY: \
-                         views, view_table_usage, view_column_usage, check_constraints, \
-                         constraint_column_usage, routines, parameters, triggers, \
-                         sequences, domains, character_sets, collations, *_privileges, \
-                         role_*. Please file an issue if this view is needed."
+                         HeliosDB Nano populates catalog_name, tables (base tables AND \
+                         views), columns, schemata, views, key_column_usage, \
+                         table_constraints, constraint_column_usage, \
+                         referential_constraints, check_constraints, sequences, \
+                         table_privileges and role_table_grants — the last two report \
+                         STORED grants; HeliosDB does NOT enforce SQL privileges. \
+                         These resolve but are ALWAYS EMPTY: view_table_usage, \
+                         view_column_usage, routines, parameters, triggers, domains, \
+                         character_sets, collations, column_privileges, \
+                         usage_privileges, role_column_grants, role_usage_grants, \
+                         role_routine_grants, applicable_roles, enabled_roles, \
+                         administrable_role_authorizations. \
+                         Please file an issue if this view is needed."
                     )));
                 }
             } else {
@@ -241,23 +251,20 @@ impl PgCatalog {
                 ]),
                 vec![],
             ))
-        } else if Self::contains_word(&matchable, "pg_indexes") {
-            // pg_indexes (the user-facing view) — not in the registry
-            // yet. Leave as fixed-shape until migrated.
-            Some(self.query_pg_indexes()?)
         } else if Self::contains_word(&matchable, "pg_tables") {
-            // Same — leave until migrated to registry. `contains_word` still
-            // matches inside `pg_catalog.pg_tables` (the `.` is a boundary).
+            // Leave until migrated to registry. `contains_word` still matches
+            // inside `pg_catalog.pg_tables` (the `.` is a boundary).
             Some(self.query_pg_tables()?)
-        } else if Self::contains_word(&matchable, "pg_views") {
-            Some(self.query_pg_views()?)
         } else if Self::contains_word(&matchable, "pg_settings") {
             Some(self.query_pg_settings()?)
         } else {
             // KanttBan #22 (v3.31.0): pg_namespace / pg_class / pg_attribute /
             // pg_index / pg_constraint / pg_user / pg_roles previously had
-            // fixed-shape branches here. They now flow through the regular
-            // planner via the SystemViewRegistry (see src/sql/planner.rs
+            // fixed-shape branches here; HC3 added pg_views and pg_indexes to
+            // that list (pg_indexes was the LIVE implementation and is ported
+            // verbatim into the registry, which also un-errors it on the
+            // embedded / REPL / Python routes). They now flow through the
+            // regular planner via the SystemViewRegistry (see src/sql/planner.rs
             // dealias_schema + table_factor_to_plan; src/sql/executor/scan.rs
             // handle_scan). Returning None signals the caller to fall through
             // to the planner; the planner handles SELECT projection, column
@@ -524,174 +531,6 @@ impl PgCatalog {
             return matches!(val, Value::Boolean(false));
         }
         false
-    }
-
-    /// Query information_schema.tables - returns real table metadata from the catalog
-    fn query_information_schema_tables(&self, query_lower: &str) -> Result<(Schema, Vec<Tuple>)> {
-        let schema = Schema::new(vec![
-            Column::new("table_catalog", DataType::Text),
-            Column::new("table_schema", DataType::Text),
-            Column::new("table_name", DataType::Text),
-            Column::new("table_type", DataType::Text),
-        ]);
-
-        let db = match &self.database {
-            Some(db) => db,
-            None => return Ok((schema, vec![])),
-        };
-
-        // Get real table list from storage catalog
-        let catalog = db.storage.catalog();
-        let table_names = catalog.list_tables()?;
-
-        // Extract LIKE filter if present (e.g., "table_name LIKE 'tenant_xyz__%'")
-        let like_filter = Self::extract_like_filter(query_lower, "table_name");
-
-        let mut rows = Vec::new();
-        for name in &table_names {
-            // Apply LIKE filter if present
-            if let Some(ref pattern) = like_filter {
-                if !Self::sql_like_match(name, pattern) {
-                    continue;
-                }
-            }
-
-            rows.push(Tuple::new(vec![
-                Value::String("heliosdb".to_string()),
-                Value::String("public".to_string()),
-                Value::String(name.clone()),
-                Value::String("BASE TABLE".to_string()),
-            ]));
-        }
-
-        Ok((schema, rows))
-    }
-
-    /// Query information_schema.columns - returns real column metadata from the catalog
-    fn query_information_schema_columns(&self, query_lower: &str) -> Result<(Schema, Vec<Tuple>)> {
-        let schema = Schema::new(vec![
-            Column::new("table_name", DataType::Text),
-            Column::new("column_name", DataType::Text),
-            Column::new("data_type", DataType::Text),
-            Column::new("is_nullable", DataType::Text),
-            Column::new("ordinal_position", DataType::Int4),
-            Column::new("is_pk", DataType::Boolean),
-            // column_default rendered back to SQL text (pg_dump / ORM readback).
-            Column::new("column_default", DataType::Text),
-        ]);
-
-        let db = match &self.database {
-            Some(db) => db,
-            None => return Ok((schema, vec![])),
-        };
-
-        // Extract table_name filter (e.g., "WHERE table_name = 'my_table'")
-        let table_filter = Self::extract_eq_filter(query_lower, "table_name");
-        // Also honor a column_name equality filter so a query like
-        // `WHERE table_name='t' AND column_name='id'` returns exactly that
-        // column, not every column of the table (avoids a client `fetchone()`
-        // reading an unrelated column's default).
-        let column_filter = Self::extract_eq_filter(query_lower, "column_name");
-
-        let catalog = db.storage.catalog();
-
-        let tables_to_query: Vec<String> = if let Some(ref filter_name) = table_filter {
-            // Query specific table
-            if catalog.table_exists(filter_name)? {
-                vec![filter_name.clone()]
-            } else {
-                vec![]
-            }
-        } else {
-            // Query all tables
-            catalog.list_tables()?
-        };
-
-        let mut rows = Vec::new();
-        for table_name in &tables_to_query {
-            if let Ok(table_schema) = catalog.get_table_schema(table_name) {
-                for (i, col) in table_schema.columns.iter().enumerate() {
-                    if let Some(ref want) = column_filter {
-                        if !col.name.eq_ignore_ascii_case(want) {
-                            continue;
-                        }
-                    }
-                    rows.push(Tuple::new(vec![
-                        Value::String(table_name.clone()),
-                        Value::String(col.name.clone()),
-                        Value::String(col.data_type.to_string()),
-                        Value::String(if col.nullable {
-                            "YES".to_string()
-                        } else {
-                            "NO".to_string()
-                        }),
-                        Value::Int4((i + 1) as i32),
-                        Value::Boolean(col.primary_key),
-                        col.default_expr
-                            .as_ref()
-                            .map(|d| {
-                                Value::String(
-                                    crate::sql::logical_plan::default_expr_json_to_sql(d).unwrap_or_else(|| d.clone()),
-                                )
-                            })
-                            .unwrap_or(Value::Null),
-                    ]));
-                }
-            }
-        }
-
-        Ok((schema, rows))
-    }
-
-    /// Extract a LIKE filter value from a query
-    /// E.g., "table_name LIKE 'tenant_xyz__%'" -> Some("tenant_xyz__%")
-    fn extract_like_filter(query: &str, column: &str) -> Option<String> {
-        let pattern = format!("{} like '", column);
-        if let Some(start) = query.find(&pattern) {
-            let after = &query[start + pattern.len()..];
-            if let Some(end) = after.find('\'') {
-                return Some(after[..end].to_string());
-            }
-        }
-        None
-    }
-
-    /// Extract an equality filter value from a query
-    /// E.g., "table_name = 'my_table'" -> Some("my_table")
-    fn extract_eq_filter(query: &str, column: &str) -> Option<String> {
-        // Match `<column> = 'value'` tolerant of optional whitespace around `=`
-        // (`col='x'`, `col = 'x'`, `col ='x'`, `col= 'x'`) and a table-qualified
-        // reference (`c.table_name = 'x'`). Real clients (psycopg, ORMs) emit the
-        // no-space form, so the old `"{col} = '"` literal silently matched nothing
-        // and the filter was dropped — returning every table's columns instead of
-        // the requested one (a2h v3.60.3 report: information_schema.columns
-        // readback returned a different table's default).
-        let bytes = query.as_bytes();
-        let mut from = 0;
-        while let Some(rel) = query[from..].find(column) {
-            let start = from + rel;
-            from = start + column.len();
-            // Token boundary before `column`: the previous char must not be part
-            // of an identifier, so searching for `table_name` does not match the
-            // tail of `referenced_table_name`.
-            if start > 0 {
-                let prev = bytes[start - 1];
-                if prev.is_ascii_alphanumeric() || prev == b'_' {
-                    continue;
-                }
-            }
-            // After the column: optional ws, `=`, optional ws, then `'value'`.
-            let Some(after) = query[from..].trim_start().strip_prefix('=') else {
-                continue;
-            };
-            let Some(after) = after.trim_start().strip_prefix('\'') else {
-                continue;
-            };
-            if let Some(end) = after.find('\'') {
-                return Some(after[..end].to_string());
-            }
-        }
-        None
     }
 
     /// Apply column projection based on the SELECT clause
@@ -1203,36 +1042,17 @@ impl PgCatalog {
         // ---- \du / \dg (list roles) --------------------------------------------
         // psql sends a SELECT of 11 columns from pg_catalog.pg_roles.
         // Mirror its exact shape so psql's client-side formatter accepts it.
+        //
+        // HC4: these rows used to be two hardcoded all-privilege superusers, so
+        // `\du` reported a privilege posture nobody had configured. Shape and
+        // rows now come from `sql::acl_views` — the SAME builders the phase-3
+        // registry uses for `pg_roles` / `pg_user` / `pg_authid` — so `\du` and
+        // `SELECT * FROM pg_roles` can never disagree. The two virtual built-ins
+        // are still listed (compatibility), followed by every persisted role
+        // with its REAL attribute bits. Those bits are RECORDED, NOT ENFORCED.
         if q.contains("pg_catalog.pg_roles") && q.contains("rolname") && q.contains("rolsuper") {
-            let schema = Schema::new(vec![
-                Column::new("rolname", DataType::Text),
-                Column::new("rolsuper", DataType::Boolean),
-                Column::new("rolinherit", DataType::Boolean),
-                Column::new("rolcreaterole", DataType::Boolean),
-                Column::new("rolcreatedb", DataType::Boolean),
-                Column::new("rolcanlogin", DataType::Boolean),
-                Column::new("rolconnlimit", DataType::Int4),
-                Column::new("rolvaliduntil", DataType::Text),
-                Column::new("memberof", DataType::Text),
-                Column::new("rolreplication", DataType::Boolean),
-                Column::new("rolbypassrls", DataType::Boolean),
-            ]);
-            let role = |name: &str| {
-                Tuple::new(vec![
-                    Value::String(name.into()),
-                    Value::Boolean(true),       // rolsuper
-                    Value::Boolean(true),       // rolinherit
-                    Value::Boolean(true),       // rolcreaterole
-                    Value::Boolean(true),       // rolcreatedb
-                    Value::Boolean(true),       // rolcanlogin
-                    Value::Int4(-1),            // rolconnlimit (unlimited)
-                    Value::Null,                // rolvaliduntil
-                    Value::String("{}".into()), // memberof
-                    Value::Boolean(true),       // rolreplication
-                    Value::Boolean(true),       // rolbypassrls
-                ])
-            };
-            let rows = vec![role("postgres"), role("helios")];
+            let schema = Schema::new(crate::sql::acl_views::psql_du_columns());
+            let rows = crate::sql::acl_views::psql_du_rows(&catalog)?;
             return Ok(Some((schema, rows)));
         }
 
@@ -1861,108 +1681,6 @@ impl PgCatalog {
         Ok((schema, rows))
     }
 
-    /// Query pg_indexes (view) — 5 columns (schemaname, tablename, indexname, tablespace, indexdef).
-    fn query_pg_indexes(&self) -> Result<(Schema, Vec<Tuple>)> {
-        let schema = Schema::new(vec![
-            Column::new("schemaname", DataType::Text),
-            Column::new("tablename", DataType::Text),
-            Column::new("indexname", DataType::Text),
-            Column::new("tablespace", DataType::Text),
-            Column::new("indexdef", DataType::Text),
-        ]);
-        let db = match &self.database {
-            Some(db) => db,
-            None => return Ok((schema, vec![])),
-        };
-        let catalog = db.storage.catalog();
-        let tables = catalog.list_tables()?;
-        let mut rows = Vec::new();
-        for name in &tables {
-            if let Ok(tschema) = catalog.get_table_schema(name) {
-                let pk_cols: Vec<String> = tschema
-                    .columns
-                    .iter()
-                    .filter(|c| c.primary_key)
-                    .map(|c| c.name.clone())
-                    .collect();
-                if !pk_cols.is_empty() {
-                    let idx_name = format!("{}_pkey", name);
-                    let def = format!(
-                        "CREATE UNIQUE INDEX {} ON public.{} USING btree ({})",
-                        idx_name,
-                        name,
-                        pk_cols.join(", ")
-                    );
-                    rows.push(Tuple::new(vec![
-                        Value::String("public".into()),
-                        Value::String(name.clone()),
-                        Value::String(idx_name),
-                        Value::Null,
-                        Value::String(def),
-                    ]));
-                }
-                for col in &tschema.columns {
-                    if col.unique && !col.primary_key {
-                        let idx_name = format!("{}_{}_key", name, col.name);
-                        let def = format!(
-                            "CREATE UNIQUE INDEX {} ON public.{} USING btree ({})",
-                            idx_name, name, col.name
-                        );
-                        rows.push(Tuple::new(vec![
-                            Value::String("public".into()),
-                            Value::String(name.clone()),
-                            Value::String(idx_name),
-                            Value::Null,
-                            Value::String(def),
-                        ]));
-                    }
-                }
-            }
-        }
-        for (index_name, table_name, index_type, columns) in db.storage.art_indexes().list_indexes() {
-            if index_type != ArtIndexType::Manual {
-                continue;
-            }
-            let def = format!(
-                "CREATE INDEX {} ON public.{} USING btree ({})",
-                index_name,
-                table_name,
-                columns.join(", ")
-            );
-            rows.push(Tuple::new(vec![
-                Value::String("public".into()),
-                Value::String(table_name),
-                Value::String(index_name),
-                Value::Null,
-                Value::String(def),
-            ]));
-        }
-        for metadata in db.storage.vector_indexes().list_all_metadata() {
-            let opclass = match metadata.distance_metric() {
-                crate::vector::DistanceMetric::Cosine => "vector_cosine_ops",
-                crate::vector::DistanceMetric::L2 => "vector_l2_ops",
-                crate::vector::DistanceMetric::InnerProduct => "vector_ip_ops",
-            };
-            let using = match &metadata.index_type {
-                VectorIndexType::Standard(_) => "hnsw",
-                VectorIndexType::Quantized(_) => "hnsw",
-                VectorIndexType::Persistent(_) => "hnsw",
-            };
-            let def = format!(
-                "CREATE INDEX {} ON public.{} USING {} ({} {})",
-                metadata.name, metadata.table_name, using, metadata.column_name, opclass
-            );
-            rows.push(Tuple::new(vec![
-                Value::String("public".into()),
-                Value::String(metadata.table_name),
-                Value::String(metadata.name),
-                Value::Null,
-                Value::String(def),
-            ]));
-        }
-        Ok((schema, rows))
-    }
-
     /// Query pg_tables (view) — 5 cols (schemaname, tablename, tableowner, tablespace, hasindexes).
     fn query_pg_tables(&self) -> Result<(Schema, Vec<Tuple>)> {
         let schema = Schema::new(vec![
@@ -1990,17 +1708,6 @@ impl PgCatalog {
             })
             .collect();
         Ok((schema, rows))
-    }
-
-    /// Query pg_views (view) — always empty; Nano does not persist view definitions.
-    fn query_pg_views(&self) -> Result<(Schema, Vec<Tuple>)> {
-        let schema = Schema::new(vec![
-            Column::new("schemaname", DataType::Text),
-            Column::new("viewname", DataType::Text),
-            Column::new("viewowner", DataType::Text),
-            Column::new("definition", DataType::Text),
-        ]);
-        Ok((schema, vec![]))
     }
 
     /// Query pg_constraint — primary key + unique constraints per table.
@@ -2054,222 +1761,13 @@ impl PgCatalog {
         Ok((schema, rows))
     }
 
-    /// Query pg_roles / pg_user — single admin role.
-    fn query_pg_roles(&self) -> Result<(Schema, Vec<Tuple>)> {
-        let schema = Schema::new(vec![
-            Column::new("oid", DataType::Int4),
-            Column::new("rolname", DataType::Text),
-            Column::new("rolsuper", DataType::Boolean),
-            Column::new("rolcanlogin", DataType::Boolean),
-        ]);
-        let rows = vec![
-            Tuple::new(vec![
-                Value::Int4(10),
-                Value::String("postgres".into()),
-                Value::Boolean(true),
-                Value::Boolean(true),
-            ]),
-            Tuple::new(vec![
-                Value::Int4(11),
-                Value::String("helios".into()),
-                Value::Boolean(true),
-                Value::Boolean(true),
-            ]),
-        ];
-        Ok((schema, rows))
-    }
-
-    /// information_schema.schemata
-    fn query_information_schema_schemata(&self) -> Result<(Schema, Vec<Tuple>)> {
-        let schema = Schema::new(vec![
-            Column::new("catalog_name", DataType::Text),
-            Column::new("schema_name", DataType::Text),
-            Column::new("schema_owner", DataType::Text),
-        ]);
-        let rows = vec![
-            Tuple::new(vec![
-                Value::String("heliosdb".into()),
-                Value::String("public".into()),
-                Value::String("heliosdb".into()),
-            ]),
-            Tuple::new(vec![
-                Value::String("heliosdb".into()),
-                Value::String("information_schema".into()),
-                Value::String("heliosdb".into()),
-            ]),
-            Tuple::new(vec![
-                Value::String("heliosdb".into()),
-                Value::String("pg_catalog".into()),
-                Value::String("heliosdb".into()),
-            ]),
-        ];
-        Ok((schema, rows))
-    }
-
-    /// information_schema.key_column_usage — PK / unique columns.
-    fn query_information_schema_key_column_usage(&self) -> Result<(Schema, Vec<Tuple>)> {
-        let schema = Schema::new(vec![
-            Column::new("constraint_catalog", DataType::Text),
-            Column::new("constraint_schema", DataType::Text),
-            Column::new("constraint_name", DataType::Text),
-            Column::new("table_name", DataType::Text),
-            Column::new("column_name", DataType::Text),
-            Column::new("ordinal_position", DataType::Int4),
-        ]);
-        let db = match &self.database {
-            Some(db) => db,
-            None => return Ok((schema, vec![])),
-        };
-        let catalog = db.storage.catalog();
-        let mut rows = Vec::new();
-        for name in catalog.list_tables()? {
-            let mut emitted = std::collections::HashSet::new();
-            if let Ok(tschema) = catalog.get_table_schema(&name) {
-                let mut pos = 1;
-                for col in &tschema.columns {
-                    if col.primary_key {
-                        emitted.insert((format!("{}_pkey", name), col.name.clone()));
-                        rows.push(Tuple::new(vec![
-                            Value::String("heliosdb".into()),
-                            Value::String("public".into()),
-                            Value::String(format!("{}_pkey", name)),
-                            Value::String(name.clone()),
-                            Value::String(col.name.clone()),
-                            Value::Int4(pos),
-                        ]));
-                        pos += 1;
-                    } else if col.unique {
-                        emitted.insert((format!("{}_{}_key", name, col.name), col.name.clone()));
-                        rows.push(Tuple::new(vec![
-                            Value::String("heliosdb".into()),
-                            Value::String("public".into()),
-                            Value::String(format!("{}_{}_key", name, col.name)),
-                            Value::String(name.clone()),
-                            Value::String(col.name.clone()),
-                            Value::Int4(1),
-                        ]));
-                    }
-                }
-            }
-            if let Ok(constraints) = catalog.load_table_constraints(&name) {
-                for unique in constraints.unique_constraints {
-                    for (idx, col) in unique.columns.iter().enumerate() {
-                        if emitted.insert((unique.name.clone(), col.clone())) {
-                            rows.push(Tuple::new(vec![
-                                Value::String("heliosdb".into()),
-                                Value::String("public".into()),
-                                Value::String(unique.name.clone()),
-                                Value::String(name.clone()),
-                                Value::String(col.clone()),
-                                Value::Int4((idx + 1) as i32),
-                            ]));
-                        }
-                    }
-                }
-                for fk in constraints.foreign_keys {
-                    for (idx, col) in fk.columns.iter().enumerate() {
-                        if emitted.insert((fk.name.clone(), col.clone())) {
-                            rows.push(Tuple::new(vec![
-                                Value::String("heliosdb".into()),
-                                Value::String("public".into()),
-                                Value::String(fk.name.clone()),
-                                Value::String(name.clone()),
-                                Value::String(col.clone()),
-                                Value::Int4((idx + 1) as i32),
-                            ]));
-                        }
-                    }
-                }
-            }
-        }
-        Ok((schema, rows))
-    }
-
-    /// information_schema.table_constraints — PK, UNIQUE, CHECK, and FK per table.
-    fn query_information_schema_table_constraints(&self) -> Result<(Schema, Vec<Tuple>)> {
-        let schema = Schema::new(vec![
-            Column::new("constraint_catalog", DataType::Text),
-            Column::new("constraint_schema", DataType::Text),
-            Column::new("constraint_name", DataType::Text),
-            Column::new("table_name", DataType::Text),
-            Column::new("constraint_type", DataType::Text),
-        ]);
-        let db = match &self.database {
-            Some(db) => db,
-            None => return Ok((schema, vec![])),
-        };
-        let catalog = db.storage.catalog();
-        let mut rows = Vec::new();
-        for name in catalog.list_tables()? {
-            let mut emitted = std::collections::HashSet::new();
-            if let Ok(tschema) = catalog.get_table_schema(&name) {
-                if tschema.columns.iter().any(|c| c.primary_key) {
-                    let constraint_name = format!("{}_pkey", name);
-                    emitted.insert(constraint_name.clone());
-                    rows.push(Tuple::new(vec![
-                        Value::String("heliosdb".into()),
-                        Value::String("public".into()),
-                        Value::String(constraint_name),
-                        Value::String(name.clone()),
-                        Value::String("PRIMARY KEY".into()),
-                    ]));
-                }
-                for col in &tschema.columns {
-                    if col.unique && !col.primary_key {
-                        let constraint_name = format!("{}_{}_key", name, col.name);
-                        emitted.insert(constraint_name.clone());
-                        rows.push(Tuple::new(vec![
-                            Value::String("heliosdb".into()),
-                            Value::String("public".into()),
-                            Value::String(constraint_name),
-                            Value::String(name.clone()),
-                            Value::String("UNIQUE".into()),
-                        ]));
-                    }
-                }
-            }
-            if let Ok(constraints) = catalog.load_table_constraints(&name) {
-                for unique in constraints.unique_constraints {
-                    if emitted.insert(unique.name.clone()) {
-                        rows.push(Tuple::new(vec![
-                            Value::String("heliosdb".into()),
-                            Value::String("public".into()),
-                            Value::String(unique.name),
-                            Value::String(name.clone()),
-                            Value::String(if unique.is_primary_key {
-                                "PRIMARY KEY".into()
-                            } else {
-                                "UNIQUE".into()
-                            }),
-                        ]));
-                    }
-                }
-                for fk in constraints.foreign_keys {
-                    if emitted.insert(fk.name.clone()) {
-                        rows.push(Tuple::new(vec![
-                            Value::String("heliosdb".into()),
-                            Value::String("public".into()),
-                            Value::String(fk.name),
-                            Value::String(name.clone()),
-                            Value::String("FOREIGN KEY".into()),
-                        ]));
-                    }
-                }
-                for check in constraints.check_constraints {
-                    if emitted.insert(check.name.clone()) {
-                        rows.push(Tuple::new(vec![
-                            Value::String("heliosdb".into()),
-                            Value::String("public".into()),
-                            Value::String(check.name),
-                            Value::String(name.clone()),
-                            Value::String("CHECK".into()),
-                        ]));
-                    }
-                }
-            }
-        }
-        Ok((schema, rows))
-    }
+    // HC4: `query_pg_roles` (two hardcoded all-privilege superusers) is gone.
+    // `pg_roles` / `pg_user` / `pg_authid` have no branch in this substring
+    // router at all — they fall through to the planner and are answered by the
+    // phase-3 registry from `sql::acl_views`, which reads the persisted role
+    // catalog. The only role rows still built on this file's side are psql's
+    // `\du` / `\dg` meta-command response, and those come from the same
+    // `acl_views` builders (see `try_psql_metacommand`).
 
     /// Extract the view name from an `information_schema.<view>` reference.
     /// Returns the lowercase name on the first match, or `None` if the
@@ -2344,24 +1842,13 @@ impl PgCatalog {
                 ("collation_schema", DataType::Text),
                 ("collation_name", DataType::Text),
             ],
-            "table_privileges" | "column_privileges" | "usage_privileges" => &[
-                ("grantor", DataType::Text),
-                ("grantee", DataType::Text),
-                ("table_catalog", DataType::Text),
-                ("table_schema", DataType::Text),
-                ("table_name", DataType::Text),
-                ("privilege_type", DataType::Text),
-                ("is_grantable", DataType::Text),
-            ],
-            "role_table_grants" | "role_column_grants" | "role_usage_grants" | "role_routine_grants" => &[
-                ("grantor", DataType::Text),
-                ("grantee", DataType::Text),
-                ("table_catalog", DataType::Text),
-                ("table_schema", DataType::Text),
-                ("table_name", DataType::Text),
-                ("privilege_type", DataType::Text),
-                ("is_grantable", DataType::Text),
-            ],
+            // HC4: table_privileges / column_privileges / usage_privileges /
+            // role_*_grants / applicable_roles / enabled_roles /
+            // administrable_role_authorizations are NOT listed here any more.
+            // All ten are registered in the phase-3 registry (two populated
+            // from the stored ACL catalog, eight shape-correct empty) and the
+            // caller defers them to the planner, so one implementation answers
+            // every route. Do not re-add a wire-side copy.
             "constraint_column_usage" | "constraint_table_usage" => &[
                 ("table_catalog", DataType::Text),
                 ("table_schema", DataType::Text),
@@ -2378,11 +1865,6 @@ impl PgCatalog {
                 ("table_catalog", DataType::Text),
                 ("table_schema", DataType::Text),
                 ("table_name", DataType::Text),
-            ],
-            "applicable_roles" | "enabled_roles" | "administrable_role_authorizations" => &[
-                ("grantee", DataType::Text),
-                ("role_name", DataType::Text),
-                ("is_grantable", DataType::Text),
             ],
             "element_types" => &[
                 ("object_catalog", DataType::Text),
@@ -2421,78 +1903,6 @@ impl PgCatalog {
             Column::new("security_type", DataType::Text),
         ]);
         (schema, vec![])
-    }
-
-    /// information_schema.check_constraints — SQL-standard schema, zero
-    /// rows. Nano stores CHECK constraints internally but does not yet
-    /// surface them through this view.
-    fn query_information_schema_check_constraints() -> (Schema, Vec<Tuple>) {
-        let schema = Schema::new(vec![
-            Column::new("constraint_catalog", DataType::Text),
-            Column::new("constraint_schema", DataType::Text),
-            Column::new("constraint_name", DataType::Text),
-            Column::new("check_clause", DataType::Text),
-        ]);
-        (schema, vec![])
-    }
-
-    /// information_schema.views — SQL-standard schema, zero rows. Nano
-    /// does not persist VIEW definitions, mirroring `pg_views`.
-    fn query_information_schema_views() -> (Schema, Vec<Tuple>) {
-        let schema = Schema::new(vec![
-            Column::new("table_catalog", DataType::Text),
-            Column::new("table_schema", DataType::Text),
-            Column::new("table_name", DataType::Text),
-            Column::new("view_definition", DataType::Text),
-            Column::new("check_option", DataType::Text),
-            Column::new("is_updatable", DataType::Text),
-            Column::new("is_insertable_into", DataType::Text),
-        ]);
-        (schema, vec![])
-    }
-
-    /// information_schema.referential_constraints — one row per FK
-    /// constraint. Reads from the per-table `TableConstraints` blob via
-    /// the storage catalog, so cross-schema and self-referential FKs
-    /// surface correctly.
-    fn query_information_schema_referential_constraints(&self) -> Result<(Schema, Vec<Tuple>)> {
-        let schema = Schema::new(vec![
-            Column::new("constraint_catalog", DataType::Text),
-            Column::new("constraint_schema", DataType::Text),
-            Column::new("constraint_name", DataType::Text),
-            Column::new("unique_constraint_catalog", DataType::Text),
-            Column::new("unique_constraint_schema", DataType::Text),
-            Column::new("unique_constraint_name", DataType::Text),
-            Column::new("match_option", DataType::Text),
-            Column::new("update_rule", DataType::Text),
-            Column::new("delete_rule", DataType::Text),
-        ]);
-        let db = match &self.database {
-            Some(db) => db,
-            None => return Ok((schema, vec![])),
-        };
-        let catalog = db.storage.catalog();
-        let mut rows = Vec::new();
-        for table in catalog.list_tables()? {
-            let constraints = match catalog.load_table_constraints(&table) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            for fk in &constraints.foreign_keys {
-                rows.push(Tuple::new(vec![
-                    Value::String("heliosdb".into()),
-                    Value::String("public".into()),
-                    Value::String(fk.name.clone()),
-                    Value::String("heliosdb".into()),
-                    Value::String("public".into()),
-                    Value::String(format!("{}_pkey", fk.references_table)),
-                    Value::String("NONE".into()),
-                    Value::String(fk.on_update.to_string()),
-                    Value::String(fk.on_delete.to_string()),
-                ]));
-            }
-        }
-        Ok((schema, rows))
     }
 
     /// Bug 5 — validate a StartupMessage `database` parameter. Thin
@@ -2567,21 +1977,38 @@ mod tests {
         assert!(result.unwrap().is_some());
     }
 
+    /// HC3: every registry-backed catalog view DEFERS to the planner
+    /// (`Ok(None)`), including a plain single-view SELECT. The fixed-shape wire
+    /// copies are deleted: they could not filter, project or JOIN, which is why
+    /// `WHERE table_schema = 'public'` — the query every ORM opens with — used
+    /// to return zero rows on `columns`. Pin the deferral so nobody
+    /// "helpfully" re-adds an interception branch when a wire test fails.
     #[test]
-    fn test_handle_query_information_schema_tables() {
-        // A plain single-view SELECT against information_schema.tables is
-        // intercepted directly so the legacy contract (and the direct
-        // `handle_query` callers / introspection tests) keeps working.
-        // JOINs and aggregates still fall through to the planner — see
-        // `group_by_information_schema_tables_falls_through_to_planner`.
+    fn hc3_registry_backed_catalog_views_defer_to_planner() {
         let catalog = PgCatalog::new();
-        let result = catalog
-            .handle_query("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'")
-            .unwrap();
-        assert!(
-            result.is_some(),
-            "plain information_schema.tables SELECT is intercepted; got {result:?}"
-        );
+        for q in &[
+            "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'",
+            "SELECT column_name FROM information_schema.columns WHERE table_name = 'my_notes'",
+            "SELECT table_schema, table_name, column_name, data_type, is_nullable, column_default \
+             FROM information_schema.columns WHERE table_schema = 'public'",
+            "SELECT * FROM information_schema.schemata",
+            "SELECT * FROM information_schema.catalog_name",
+            "SELECT * FROM information_schema.views",
+            "SELECT * FROM information_schema.check_constraints",
+            "SELECT * FROM information_schema.key_column_usage",
+            "SELECT * FROM information_schema.table_constraints",
+            "SELECT * FROM information_schema.referential_constraints",
+            "SELECT * FROM information_schema.constraint_column_usage",
+            "SELECT * FROM information_schema.sequences",
+            "SELECT * FROM pg_views",
+            "SELECT * FROM pg_indexes",
+        ] {
+            let result = catalog.handle_query(q).unwrap();
+            assert!(
+                result.is_none(),
+                "`{q}` must DEFER to the planner-backed SystemViewRegistry (Ok(None)); got {result:?}"
+            );
+        }
     }
 
     // -------------------------------------------------------------------
@@ -2759,16 +2186,21 @@ mod tests {
         assert!(result.is_some(), "qualified pg_catalog.pg_type must still be served");
     }
 
-    /// A real `information_schema.columns` SELECT is still intercepted.
+    /// A real `information_schema.columns` SELECT is answered — by the planner
+    /// after HC3, not by this router. The task-#38 contract that matters here is
+    /// that it neither ERRORS nor gets hijacked: `Ok(None)` is the "the real
+    /// engine handles this" signal, and the engine has the view registered.
+    /// Row-level behaviour is asserted in tests/catalog_introspection_tests.rs
+    /// and the wire tests.
     #[test]
-    fn task38_real_information_schema_columns_still_intercepted() {
+    fn task38_real_information_schema_columns_reaches_the_engine() {
         let catalog = PgCatalog::new();
         let result = catalog
             .handle_query("SELECT column_name FROM information_schema.columns WHERE table_name = 'my_notes'")
-            .unwrap();
+            .expect("a real information_schema.columns SELECT must never error here");
         assert!(
-            result.is_some(),
-            "real information_schema.columns SELECT must still be served"
+            result.is_none(),
+            "real information_schema.columns SELECT must reach the planner, got {result:?}"
         );
     }
 
@@ -2856,19 +2288,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "v3.31.1 phase 2: information_schema.columns migrated to the registry; this test asserts the old contract. Replace with a planner-level test."]
-    fn test_handle_query_information_schema_columns() {
-        let catalog = PgCatalog::new();
-        let result = catalog
-            .handle_query("SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'test'");
-        assert!(result.is_ok());
-        // project_columns reduces to only the requested columns (column_name, data_type)
-        let (schema, rows) = result.unwrap().unwrap();
-        assert_eq!(schema.columns.len(), 2);
-        assert_eq!(rows.len(), 0);
-    }
-
-    #[test]
     fn test_like_match() {
         assert!(PgCatalog::sql_like_match("tenant_abc__users", "tenant_abc__%"));
         assert!(PgCatalog::sql_like_match("tenant_abc__orders", "tenant_abc__%"));
@@ -2879,60 +2298,6 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_like_filter() {
-        let query = "select table_name from information_schema.tables where table_name like 'tenant_abc__%'";
-        assert_eq!(
-            PgCatalog::extract_like_filter(query, "table_name"),
-            Some("tenant_abc__%".to_string())
-        );
-
-        let query = "select table_name from information_schema.tables where table_schema = 'public'";
-        assert_eq!(PgCatalog::extract_like_filter(query, "table_name"), None);
-    }
-
-    #[test]
-    fn test_extract_eq_filter() {
-        let query = "select column_name from information_schema.columns c where table_name = 'my_table'";
-        assert_eq!(
-            PgCatalog::extract_eq_filter(query, "table_name"),
-            Some("my_table".to_string())
-        );
-        // No-space form, as emitted by psycopg / ORMs (the a2h v3.60.3 bug).
-        assert_eq!(
-            PgCatalog::extract_eq_filter("... where table_name='harden_t' and column_name='id'", "table_name"),
-            Some("harden_t".to_string())
-        );
-        assert_eq!(
-            PgCatalog::extract_eq_filter("... where table_name='harden_t' and column_name='id'", "column_name"),
-            Some("id".to_string())
-        );
-        // Asymmetric spacing.
-        assert_eq!(
-            PgCatalog::extract_eq_filter("where table_name ='t'", "table_name"),
-            Some("t".to_string())
-        );
-        assert_eq!(
-            PgCatalog::extract_eq_filter("where table_name= 't'", "table_name"),
-            Some("t".to_string())
-        );
-        // Table-qualified reference.
-        assert_eq!(
-            PgCatalog::extract_eq_filter("where c.table_name='t'", "table_name"),
-            Some("t".to_string())
-        );
-        // Token boundary: must NOT match the tail of a longer identifier, and
-        // must skip a SELECT-list mention to find the WHERE predicate.
-        assert_eq!(
-            PgCatalog::extract_eq_filter("where referenced_table_name='other'", "table_name"),
-            None
-        );
-        assert_eq!(
-            PgCatalog::extract_eq_filter("select column_name from t where column_name='id'", "column_name"),
-            Some("id".to_string())
-        );
-    }
-
-    #[test]
     fn test_information_schema_columns_filter_distinguishes_tables() {
         // Regression for the a2h v3.60.3 report. With multiple tables each having
         // a `nextval` default, `information_schema.columns` read back the WRONG
@@ -2940,7 +2305,11 @@ mod tests {
         // spaces around `=`, as psycopg emits) was dropped, the handler returned
         // every table's columns, and a client `fetchone()` got the first table's
         // first defaulted column. The stored defaults were always correct.
-        use std::sync::Arc;
+        // HC3: the hand-rolled `extract_eq_filter` this used to exercise is gone
+        // along with the whole wire-side copy of the view; the planner now
+        // evaluates the predicate. The USER-VISIBLE contract is unchanged and is
+        // what this test pins — asserted through the engine, which is exactly
+        // where the wire now routes it.
         let db = crate::EmbeddedDatabase::new_in_memory().unwrap();
         db.execute("CREATE SEQUENCE actor_actor_id_seq").unwrap();
         db.execute("CREATE TABLE actor (actor_id INT DEFAULT nextval('actor_actor_id_seq'), first_name TEXT)")
@@ -2948,10 +2317,9 @@ mod tests {
         db.execute("CREATE SEQUENCE harden_seq").unwrap();
         db.execute("CREATE TABLE harden_t (id INT DEFAULT nextval('harden_seq'), v TEXT)")
             .unwrap();
-        let catalog = PgCatalog::with_database(Arc::new(db));
 
         let default_of = |sql: &str| -> String {
-            let (_, rows) = catalog.handle_query(sql).unwrap().unwrap();
+            let (rows, _cols) = db.query_with_columns(sql).unwrap();
             assert_eq!(
                 rows.len(),
                 1,

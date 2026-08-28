@@ -351,6 +351,11 @@ impl Planner {
             | LogicalPlan::DropEnumType { .. }
             | LogicalPlan::CreateSchema { .. }
             | LogicalPlan::DropSchema { .. }
+            | LogicalPlan::DropRole { .. }
+            | LogicalPlan::CreateRole { .. }
+            | LogicalPlan::AlterRole { .. }
+            | LogicalPlan::GrantPrivileges { .. }
+            | LogicalPlan::RevokePrivileges { .. }
             | LogicalPlan::Noop
             | LogicalPlan::CreateExtension { .. }
             | LogicalPlan::DropExtension { .. }

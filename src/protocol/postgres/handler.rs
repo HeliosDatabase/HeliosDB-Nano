@@ -244,14 +244,7 @@ where
                         continue;
                     }
 
-                    let wait_for_sync = Self::message_requires_sync_after_error(&msg);
-                    if let Err(e) = self.handle_message(msg).await {
-                        tracing::error!("Error handling message: {}", e);
-                        self.send_error_for_query(&e, wait_for_sync).await?;
-                        if wait_for_sync {
-                            self.awaiting_sync_after_error = true;
-                        }
-                    }
+                    self.dispatch_message(msg).await?;
                 }
                 Ok(None) => {
                     // Connection closed gracefully
@@ -265,6 +258,31 @@ where
             }
         }
 
+        Ok(())
+    }
+
+    /// Dispatch ONE frontend message and render any failure the way the client
+    /// actually receives it: an `ErrorResponse` carrying the mapped SQLSTATE,
+    /// followed (simple query) by `ReadyForQuery`.
+    ///
+    /// This is the connection loop's body, extracted so the loop and the
+    /// in-crate wire tests share ONE definition of "what the client sees".
+    /// `handle_message` alone is NOT that contract: only the row-returning and
+    /// `SET` arms of [`Self::handle_single_query`] answer their own errors
+    /// inline — a failing DDL/DML statement deliberately PROPAGATES so a
+    /// multi-statement simple query aborts on the first failure (PostgreSQL
+    /// implicit-transaction semantics), and the wire error is rendered here.
+    /// A test that called `handle_message` and unwrapped would pin a layer no
+    /// PostgreSQL client ever talks to.
+    pub(super) async fn dispatch_message(&mut self, msg: FrontendMessage) -> Result<()> {
+        let wait_for_sync = Self::message_requires_sync_after_error(&msg);
+        if let Err(e) = self.handle_message(msg).await {
+            tracing::error!("Error handling message: {}", e);
+            self.send_error_for_query(&e, wait_for_sync).await?;
+            if wait_for_sync {
+                self.awaiting_sync_after_error = true;
+            }
+        }
         Ok(())
     }
 
@@ -737,6 +755,32 @@ where
                     return Ok(());
                 }
                 Ok(None) => {}
+            }
+            // HC4: `SET ROLE <x>` / `SET SESSION AUTHORIZATION <x>` used to fall
+            // through to the generic `CommandComplete("SET")` below and be
+            // acked with ZERO effect. A client — or a pooler, or a hardening
+            // check — that believed it had dropped to a restricted role kept
+            // full access. That is a false security claim, so it now errors.
+            //
+            // `SET ROLE NONE` / `SET SESSION AUTHORIZATION DEFAULT` keep the ack:
+            // "go back to the default identity" is genuinely satisfied when
+            // there is only one identity.
+            if let Some(target) = Self::parse_set_role_target(trimmed) {
+                if !target.is_reset && !self.database.storage.config().authentication.legacy_acl_noop {
+                    self.send_error(
+                        "ERROR",
+                        crate::network::protocol::sqlstate::FEATURE_NOT_SUPPORTED,
+                        &format!(
+                            "{} is not supported: HeliosDB stores roles and grants but does not enforce \
+                             privileges or switch session identity",
+                            target.statement
+                        ),
+                        None,
+                        None,
+                    )
+                    .await?;
+                    return Ok(());
+                }
             }
             if EmbeddedDatabase::is_search_path_statement(trimmed) {
                 // `SET search_path` is a per-session schema selector: store it on
@@ -2140,6 +2184,22 @@ where
             "ALTER TABLE".to_string()
         } else if starts_with_icase(trimmed, "ALTER INDEX") {
             "ALTER INDEX".to_string()
+        // HC4: PostgreSQL replies with the statement name for role/ACL DDL.
+        // These previously fell through to `OK 0`, which made a stored GRANT
+        // look identical to the old discard-everything no-op on the wire.
+        // `CREATE/ALTER/DROP USER` are rewritten to ROLE before execution, but
+        // PostgreSQL still tags them `CREATE ROLE` / `ALTER ROLE` / `DROP ROLE`,
+        // so the same tag is correct for both spellings.
+        } else if starts_with_icase(trimmed, "CREATE ROLE") || starts_with_icase(trimmed, "CREATE USER") {
+            "CREATE ROLE".to_string()
+        } else if starts_with_icase(trimmed, "ALTER ROLE") || starts_with_icase(trimmed, "ALTER USER") {
+            "ALTER ROLE".to_string()
+        } else if starts_with_icase(trimmed, "DROP ROLE") || starts_with_icase(trimmed, "DROP USER") {
+            "DROP ROLE".to_string()
+        } else if starts_with_icase(trimmed, "GRANT") {
+            "GRANT".to_string()
+        } else if starts_with_icase(trimmed, "REVOKE") {
+            "REVOKE".to_string()
         } else {
             format!("OK {}", affected)
         }
@@ -2177,6 +2237,64 @@ where
             _ => String::new(),
         };
         (col, val)
+    }
+
+    /// HC4: classify `SET [SESSION|LOCAL] ROLE …` and
+    /// `SET SESSION AUTHORIZATION …`, which the generic `SET` handler below
+    /// used to swallow and acknowledge with zero effect.
+    ///
+    /// Returns `None` for anything else — including a GUC whose name merely
+    /// starts with `role` (`SET role_cache = on`), which the word-boundary
+    /// check rejects.
+    ///
+    /// `pub(super)` so `handler_extended` can ask the SAME question and delegate
+    /// to `handle_single_query`: the guard, the wording and the
+    /// `[authentication] legacy_acl_noop` escape must not be duplicated for the
+    /// extended protocol.
+    pub(super) fn parse_set_role_target(trimmed: &str) -> Option<SetRoleTarget> {
+        let rest = trimmed.trim_end_matches(';').trim();
+        if !starts_with_icase(rest, "SET ") {
+            return None;
+        }
+        // "SET ".len() == 4 (ASCII).
+        let mut tail = rest.get(4..)?.trim_start();
+        if starts_with_icase(tail, "SESSION ") {
+            // "SESSION ".len() == 8.
+            let after = tail.get(8..)?.trim_start();
+            if starts_with_icase(after, "AUTHORIZATION") {
+                let target = after.get("AUTHORIZATION".len()..)?;
+                if !target.is_empty() && !target.starts_with([' ', '\t', '\n', '\r', '=']) {
+                    return None;
+                }
+                return Some(SetRoleTarget {
+                    statement: "SET SESSION AUTHORIZATION",
+                    is_reset: Self::is_role_reset_target(target),
+                });
+            }
+            tail = after;
+        } else if starts_with_icase(tail, "LOCAL ") {
+            // "LOCAL ".len() == 6.
+            tail = tail.get(6..)?.trim_start();
+        }
+        if starts_with_icase(tail, "ROLE") {
+            let target = tail.get(4..)?;
+            // Word boundary: `SET role_cache = on` must NOT match.
+            if !target.is_empty() && !target.starts_with([' ', '\t', '\n', '\r', '=']) {
+                return None;
+            }
+            return Some(SetRoleTarget {
+                statement: "SET ROLE",
+                is_reset: Self::is_role_reset_target(target),
+            });
+        }
+        None
+    }
+
+    /// `NONE` / `DEFAULT` (and an empty tail) mean "return to the default
+    /// identity", which is genuinely a no-op here — there is only one identity.
+    fn is_role_reset_target(target: &str) -> bool {
+        let target = target.trim().trim_start_matches('=').trim();
+        target.is_empty() || target.eq_ignore_ascii_case("NONE") || target.eq_ignore_ascii_case("DEFAULT")
     }
 
     /// Item 5: classify a `DISCARD …` statement, returning the canonical
@@ -3064,7 +3182,18 @@ fn sqlstate_for_query_execution_message(message: &str) -> &'static str {
     let lower = message.to_ascii_lowercase();
     let not_found = lower.contains("not found") || lower.contains("does not exist") || lower.contains("doesn't exist");
 
-    if lower.contains("function") && (not_found || lower.contains("unknown")) {
+    // HC4 role/ACL mappings, checked BEFORE the table/relation rules: the role
+    // errors deliberately avoid the words "table"/"relation" so they cannot be
+    // mis-mapped, but ordering makes that independent of message wording.
+    if lower.contains("cannot be dropped because some objects depend") {
+        sqlstate::DEPENDENT_OBJECTS_STILL_EXIST // 2BP01
+    } else if lower.contains("role") && (lower.contains("is reserved") || lower.contains("built-in role")) {
+        sqlstate::INSUFFICIENT_PRIVILEGE // 42501
+    } else if lower.contains("role") && lower.contains("already exists") {
+        sqlstate::DUPLICATE_OBJECT // 42710
+    } else if lower.contains("role") && not_found {
+        sqlstate::UNDEFINED_OBJECT // 42704
+    } else if lower.contains("function") && (not_found || lower.contains("unknown")) {
         sqlstate::UNDEFINED_FUNCTION // 42883
     } else if lower.contains("column") && (not_found || lower.contains("unknown")) {
         sqlstate::UNDEFINED_COLUMN // 42703
@@ -3075,6 +3204,20 @@ fn sqlstate_for_query_execution_message(message: &str) -> &'static str {
     } else {
         sqlstate::INTERNAL_ERROR // XX000
     }
+}
+
+/// A recognised `SET ROLE` / `SET SESSION AUTHORIZATION` statement.
+///
+/// Exists because acknowledging those with `CommandComplete("SET")` and doing
+/// nothing — the pre-4.20 behaviour — told a client it had dropped to a
+/// restricted identity when it had not. HeliosDB has no session identity to
+/// switch to and enforces no privileges, so the honest answer is an error.
+pub(super) struct SetRoleTarget {
+    /// Canonical statement name, for the error message.
+    statement: &'static str,
+    /// `NONE` / `DEFAULT`: "return to the default identity", which IS a
+    /// genuine no-op here and keeps the plain `SET` acknowledgement.
+    is_reset: bool,
 }
 
 /// Detail/hint fields for the ErrorResponse, keyed on the mapped SQLSTATE.

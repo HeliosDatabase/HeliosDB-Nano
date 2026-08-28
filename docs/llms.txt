@@ -215,10 +215,28 @@ automatically after `git clone`; install globally with
   `psql -h 127.0.0.1 -p 5432`, `mysql -h 127.0.0.1 -P 3306`.
 - heliosdb-nano-schema — DDL: tables, constraints, B-tree + HNSW indexes,
   views, materialized views; introspection. `\d`, `\dt`,
-  `\dS`, `\dmv`, `CREATE INDEX … USING hnsw`. Also documents why triggers
-  are unimplemented (`CREATE TRIGGER` registers but never fires) and why
-  user-defined functions are unusable (`CREATE FUNCTION` registers, but
-  every call route errors `Unknown scalar function`). Stored procedures
+  `\dS`, `\dmv`, `CREATE INDEX … USING hnsw`. Also documents why trigger
+  BODIES still never execute (`CREATE TRIGGER` registers and persists, but
+  no body runs on any route — no audit rows, no cascades; `AFTER`,
+  `FOR EACH STATEMENT`, `INSTEAD OF` and `OLD` do nothing, and there is no
+  trigger introspection). The one exception with a real effect is a
+  `BEFORE INSERT … FOR EACH ROW` body of the form `NEW.<col> = <expr>` /
+  `RETURN NULL`, which rewrites or drops the inserted row; since 4.20.0 it
+  behaves identically on every interface (including the PG extended
+  protocol, REST and `INSERT … RETURNING`), honours `WHEN`, and survives a
+  restart.
+  User-defined SCALAR functions ARE callable: `CREATE FUNCTION dbl(x INT)
+  RETURNS INT AS $$ SELECT $1 * 2 $$ LANGUAGE sql` + `SELECT dbl(21)`,
+  in a select list / `WHERE` / with a `public.` qualifier / with bound
+  parameters, on both DML families and both wires, and they survive a
+  restart. Same `$`-sigil rule as procedures; depth-bounded by
+  `[session] udf_max_call_depth` (default 32). Still absent: `SELECT *
+  FROM f()` (set-returning), overloading, `CALL f()` for a function,
+  non-`public` qualifiers, `pg_proc` / `information_schema.routines`
+  population, and `/rest/v1/rpc/<fn>` (HTTP 501). PL/pgSQL FUNCTION
+  bodies support DECLARE + SQL + `SELECT … INTO` + `RETURN`; `IF`,
+  `CASE`, loops and `:=` inside a function body are refused with an
+  explicit error rather than silently mis-branching. Stored procedures
   DO work: `CREATE PROCEDURE p(a INT) LANGUAGE sql AS $$… $a …$$` +
   `CALL p(1)` — either language (sql or plpgsql), params need the `$`
   sigil (`$a` or `$1`); a bare name is a column reference. `CALL` runs

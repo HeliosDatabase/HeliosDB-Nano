@@ -11,6 +11,7 @@ use super::logical_plan::{
 use crate::{Error, Result, Schema, Tuple, Value};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, RwLock};
 
 /// Maximum cascading depth for trigger execution (PostgreSQL compatible)
@@ -325,9 +326,22 @@ impl Default for TriggerContext {
 /// A BEFORE-row trigger-function effect for the common
 /// `NEW.<col> = <expr>; … RETURN NEW|NULL;` pattern. Resolved from the
 /// invoked function's body at CREATE TRIGGER time and applied to the NEW
-/// tuple before the row is written. Held in memory (session-scoped); not
-/// part of the persisted `TriggerDefinition`.
-#[derive(Debug, Clone)]
+/// tuple before the row is written.
+///
+/// PERSISTED, but deliberately NOT as part of `TriggerDefinition`. The
+/// definition struct is bincode-POSITIONAL, lives in the `trigger:{table}:{name}`
+/// catalog keys AND in `WalOperation::CreateTrigger`, and is replicated to
+/// standbys — adding a field to it would break replay of every record written
+/// by an older build. This recipe therefore gets its own additive sidecar key
+/// namespace, `trigger_rowmut:{table}:{name}` (see
+/// `Catalog::save_trigger_row_mutation`).
+///
+/// It has to be persisted rather than rebuilt at open, because the recipe is
+/// derived from the trigger FUNCTION's body and the function registry is
+/// rebuilt from `meta:function:` records that a plain `CREATE FUNCTION …
+/// RETURNS TRIGGER` may not have (and, historically, never had) — the compiled
+/// recipe is the only thing guaranteed to survive.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TriggerRowMutation {
     /// Events the owning trigger fires on (INSERT / UPDATE).
     pub events: Vec<TriggerEvent>,
@@ -342,8 +356,18 @@ pub struct TriggerRegistry {
     /// In-memory trigger storage keyed by (table_name, trigger_name)
     triggers: Arc<RwLock<HashMap<(String, String), TriggerDefinition>>>,
     /// BEFORE-row NEW-mutation recipes keyed by (table_name, trigger_name).
-    /// Session-scoped; rebuilt on CREATE TRIGGER.
+    /// Loaded from the catalog at open and updated by CREATE/DROP TRIGGER.
     row_mutations: Arc<RwLock<HashMap<(String, String), TriggerRowMutation>>>,
+    /// `row_mutations.len()`, mirrored into an atomic.
+    ///
+    /// PERF (write path): `has_row_mutations` / `apply_before_row_mutations`
+    /// sit on the DML INSERT path of BOTH executor families. When no trigger
+    /// anywhere defines a row-rewrite recipe — the overwhelmingly common case —
+    /// this lets them answer with a single relaxed-ish atomic load and never
+    /// touch the `RwLock` at all, so a trigger-free database pays no lock
+    /// traffic for the feature. Always written under the `row_mutations` write
+    /// guard, so it can never disagree with the map.
+    row_mutation_count: Arc<AtomicUsize>,
     /// Storage key prefix for triggers
     storage_prefix: &'static str,
 }
@@ -354,6 +378,7 @@ impl TriggerRegistry {
         Self {
             triggers: Arc::new(RwLock::new(HashMap::new())),
             row_mutations: Arc::new(RwLock::new(HashMap::new())),
+            row_mutation_count: Arc::new(AtomicUsize::new(0)),
             storage_prefix: "trigger:",
         }
     }
@@ -362,6 +387,7 @@ impl TriggerRegistry {
     pub fn register_row_mutation(&self, table_name: &str, trigger_name: &str, mutation: TriggerRowMutation) {
         if let Ok(mut guard) = self.row_mutations.write() {
             guard.insert((table_name.to_string(), trigger_name.to_string()), mutation);
+            self.row_mutation_count.store(guard.len(), AtomicOrdering::Release);
         }
     }
 
@@ -369,15 +395,34 @@ impl TriggerRegistry {
     pub fn drop_row_mutation(&self, table_name: &str, trigger_name: &str) {
         if let Ok(mut guard) = self.row_mutations.write() {
             guard.remove(&(table_name.to_string(), trigger_name.to_string()));
+            self.row_mutation_count.store(guard.len(), AtomicOrdering::Release);
         }
     }
 
     /// Whether any BEFORE-row mutation recipe is registered for `table_name`.
+    ///
+    /// Hoist this OUT of per-row loops: it is a per-statement gate, not a
+    /// per-row one.
     pub fn has_row_mutations(&self, table_name: &str) -> bool {
+        if self.row_mutation_count.load(AtomicOrdering::Acquire) == 0 {
+            return false;
+        }
         self.row_mutations
             .read()
             .map(|g| g.keys().any(|(tbl, _)| tbl == table_name))
             .unwrap_or(false)
+    }
+
+    /// Evaluate `expr` against the pending NEW row.
+    ///
+    /// ONE evaluator construction shared by the `WHEN` predicate and by every
+    /// `NEW.<col> = <rhs>` right-hand side, so the two can never resolve
+    /// `NEW.` differently.
+    fn eval_against_new_row(expr: &LogicalExpr, new_tuple: &Tuple, schema: &Arc<Schema>) -> Result<Value> {
+        let ctx = TriggerRowContext::for_insert(new_tuple.clone());
+        let evaluator = Evaluator::with_trigger_row_context(schema.clone(), Vec::new(), ctx, schema.clone());
+        let empty = Tuple::new(Vec::new());
+        evaluator.evaluate(expr, &empty)
     }
 
     /// Apply BEFORE-row trigger-function mutations (`NEW.col = expr`) to
@@ -385,6 +430,20 @@ impl TriggerRegistry {
     /// did `RETURN NULL` (the row should be skipped). Unknown target columns
     /// and non-evaluable expressions are skipped rather than erroring, so an
     /// unsupported body never breaks the DML.
+    ///
+    /// Gating (this is the whole of what "the trigger fired" means today —
+    /// real body execution is NOT implemented):
+    /// * a recipe whose owning `TriggerDefinition` is `enabled == false` is
+    ///   skipped;
+    /// * a recipe whose owning definition carries a `WHEN` predicate is skipped
+    ///   unless that predicate evaluates to `TRUE` against the NEW row. FALSE
+    ///   and NULL mean "not fired" (PostgreSQL semantics). An UNEVALUABLE
+    ///   predicate also means "not fired" and is logged at debug rather than
+    ///   raised: this mechanism is a best-effort approximation of a trigger
+    ///   body, and an INSERT that succeeds today must not start failing because
+    ///   the approximation cannot understand a predicate.
+    /// * recipes fire in trigger-NAME order, as PostgreSQL does for triggers of
+    ///   the same timing on the same table.
     pub fn apply_before_row_mutations(
         &self,
         table_name: &str,
@@ -392,7 +451,12 @@ impl TriggerRegistry {
         new_tuple: &mut Tuple,
         schema: Arc<Schema>,
     ) -> Result<bool> {
-        let applicable: Vec<TriggerRowMutation> = match self.row_mutations.read() {
+        // Free when no recipe exists anywhere: one atomic load, no lock.
+        if self.row_mutation_count.load(AtomicOrdering::Acquire) == 0 {
+            return Ok(true);
+        }
+
+        let mut applicable: Vec<(String, TriggerRowMutation)> = match self.row_mutations.read() {
             Ok(guard) => guard
                 .iter()
                 // Match by event kind, ignoring `Update`'s column-list payload
@@ -403,12 +467,50 @@ impl TriggerRegistry {
                             .iter()
                             .any(|e| std::mem::discriminant(e) == std::mem::discriminant(event))
                 })
-                .map(|(_, m)| m.clone())
+                .map(|((_, trigger), m)| (trigger.clone(), m.clone()))
+                .collect(),
+            Err(_) => return Ok(true),
+        };
+        if applicable.is_empty() {
+            return Ok(true);
+        }
+        applicable.sort_by(|a, b| a.0.cmp(&b.0));
+
+        // `enabled` and `WHEN` live on the DEFINITION, not on the recipe —
+        // resolved here so the two can never disagree.
+        let gates: HashMap<String, (bool, Option<Box<LogicalExpr>>)> = match self.triggers.read() {
+            Ok(guard) => guard
+                .iter()
+                .filter(|((tbl, _), _)| tbl == table_name)
+                .map(|((_, trigger), def)| (trigger.clone(), (def.enabled, def.when_condition.clone())))
                 .collect(),
             Err(_) => return Ok(true),
         };
 
-        for m in &applicable {
+        for (trigger_name, m) in &applicable {
+            // A recipe whose definition is gone does not fire. (The two are
+            // dropped together; this is defence in depth, not an expected path.)
+            let Some((enabled, when)) = gates.get(trigger_name) else {
+                continue;
+            };
+            if !*enabled {
+                continue;
+            }
+            if let Some(cond) = when {
+                match Self::eval_against_new_row(cond, new_tuple, &schema) {
+                    Ok(Value::Boolean(true)) => {}
+                    Ok(_) => continue,
+                    Err(e) => {
+                        tracing::debug!(
+                            "trigger '{}' on '{}': WHEN clause could not be evaluated ({}) — treated as not fired",
+                            trigger_name,
+                            table_name,
+                            e
+                        );
+                        continue;
+                    }
+                }
+            }
             if m.returns_null {
                 return Ok(false);
             }
@@ -418,10 +520,7 @@ impl TriggerRegistry {
                 };
                 // Evaluate the RHS against the current NEW row (so later
                 // assignments can see earlier ones).
-                let ctx = TriggerRowContext::for_insert(new_tuple.clone());
-                let evaluator = Evaluator::with_trigger_row_context(schema.clone(), Vec::new(), ctx, schema.clone());
-                let empty = Tuple::new(Vec::new());
-                match evaluator.evaluate(expr, &empty) {
+                match Self::eval_against_new_row(expr, new_tuple, &schema) {
                     Ok(value) => {
                         if idx < new_tuple.values.len() {
                             new_tuple.values[idx] = value;
@@ -684,6 +783,17 @@ impl TriggerRegistry {
         let count = keys_to_remove.len();
         for key in keys_to_remove {
             triggers.remove(&key);
+        }
+        drop(triggers);
+
+        // The BEFORE-row rewrite recipes are keyed identically and MUST go with
+        // the definitions. Leaving them behind would keep rewriting rows of a
+        // table whose triggers no longer exist — and `apply_before_row_mutations`
+        // now refuses to fire a recipe whose definition is gone, so an orphan
+        // would be permanently inert dead weight in the hot-path scan.
+        if let Ok(mut mutations) = self.row_mutations.write() {
+            mutations.retain(|key, _| key.0 != table_name);
+            self.row_mutation_count.store(mutations.len(), AtomicOrdering::Release);
         }
 
         Ok(count)
@@ -1288,6 +1398,7 @@ impl Default for DeferredTriggerTracker {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 mod tests {
     use super::*;
     use crate::sql::BinaryOperator;
@@ -1754,5 +1865,307 @@ mod tests {
         let result_dec = row_context.evaluate_when_condition(&when_expr_dec, schema);
         assert!(result_dec.is_ok());
         assert!(!result_dec.unwrap()); // NEW.price (150) < OLD.price (100) is false
+    }
+
+    // =======================================================================
+    // apply_before_row_mutations — the ONE trigger mechanism that has an
+    // observable effect today. Trigger BODIES are still never executed; these
+    // tests pin the gating (`enabled`, `WHEN`) and the firing ORDER of the
+    // `NEW.<col> = <expr>` / `RETURN NULL` rewrite, all of which the pre-4.20
+    // implementation ignored outright.
+    // =======================================================================
+
+    /// `mut_t(id INT, tag TEXT)`.
+    fn mutation_test_schema() -> Arc<Schema> {
+        use crate::{Column, DataType};
+        Arc::new(Schema::new(vec![
+            Column {
+                name: "id".to_string(),
+                data_type: DataType::Int4,
+                nullable: false,
+                primary_key: true,
+                source_table: None,
+                source_table_name: None,
+                default_expr: None,
+                unique: false,
+                storage_mode: crate::ColumnStorageMode::Default,
+            },
+            Column {
+                name: "tag".to_string(),
+                data_type: DataType::Text,
+                nullable: true,
+                primary_key: false,
+                source_table: None,
+                source_table_name: None,
+                default_expr: None,
+                unique: false,
+                storage_mode: crate::ColumnStorageMode::Default,
+            },
+        ]))
+    }
+
+    /// Register a BEFORE INSERT FOR EACH ROW trigger named `name` on `mut_t`
+    /// whose recipe sets `tag = <literal>`.
+    fn register_tag_setter(
+        registry: &TriggerRegistry,
+        name: &str,
+        literal: &str,
+        when: Option<Box<LogicalExpr>>,
+        enabled: bool,
+    ) {
+        let mut def = TriggerDefinition::new(
+            name.to_string(),
+            "mut_t".to_string(),
+            TriggerTiming::Before,
+            vec![TriggerEvent::Insert],
+            TriggerFor::Row,
+            when,
+            vec![],
+            vec![],
+        );
+        def.enabled = enabled;
+        registry.register_trigger(def).expect("register");
+        registry.register_row_mutation(
+            "mut_t",
+            name,
+            TriggerRowMutation {
+                events: vec![TriggerEvent::Insert],
+                assignments: vec![(
+                    "tag".to_string(),
+                    LogicalExpr::Literal(Value::String(literal.to_string())),
+                )],
+                returns_null: false,
+            },
+        );
+    }
+
+    fn tag_of(tuple: &Tuple) -> String {
+        match tuple.values.get(1) {
+            Some(Value::String(s)) => s.clone(),
+            other => panic!("expected a text tag, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_row_mutation_is_skipped_when_trigger_is_disabled() {
+        let registry = TriggerRegistry::new();
+        let schema = mutation_test_schema();
+        register_tag_setter(&registry, "t_disabled", "rewritten", None, false);
+
+        let mut tuple = Tuple::new(vec![Value::Int4(1), Value::String("original".to_string())]);
+        let kept = registry
+            .apply_before_row_mutations("mut_t", &TriggerEvent::Insert, &mut tuple, schema)
+            .expect("apply");
+
+        assert!(kept, "a disabled trigger must not suppress the row");
+        assert_eq!(
+            tag_of(&tuple),
+            "original",
+            "a disabled trigger's recipe must not rewrite the row"
+        );
+    }
+
+    #[test]
+    fn test_row_mutations_fire_in_trigger_name_order() {
+        let registry = TriggerRegistry::new();
+        let schema = mutation_test_schema();
+        // Registered out of order on purpose; PostgreSQL fires alphabetically,
+        // so `z_last` must win regardless of insertion order or hash order.
+        register_tag_setter(&registry, "z_last", "from-z", None, true);
+        register_tag_setter(&registry, "a_first", "from-a", None, true);
+
+        let mut tuple = Tuple::new(vec![Value::Int4(1), Value::String("original".to_string())]);
+        let kept = registry
+            .apply_before_row_mutations("mut_t", &TriggerEvent::Insert, &mut tuple, schema)
+            .expect("apply");
+
+        assert!(kept);
+        assert_eq!(tag_of(&tuple), "from-z", "the alphabetically last trigger writes last");
+    }
+
+    #[test]
+    fn test_row_mutation_when_condition_gates_firing() {
+        let schema = mutation_test_schema();
+        // WHEN (NEW.id > 10)
+        let when = || {
+            Some(Box::new(LogicalExpr::BinaryExpr {
+                left: Box::new(LogicalExpr::NewRow {
+                    column: "id".to_string(),
+                }),
+                op: BinaryOperator::Gt,
+                right: Box::new(LogicalExpr::Literal(Value::Int4(10))),
+            }))
+        };
+
+        // Row satisfying WHEN is rewritten.
+        let registry = TriggerRegistry::new();
+        register_tag_setter(&registry, "t_when", "rewritten", when(), true);
+        let mut hit = Tuple::new(vec![Value::Int4(42), Value::String("original".to_string())]);
+        assert!(registry
+            .apply_before_row_mutations("mut_t", &TriggerEvent::Insert, &mut hit, schema.clone())
+            .expect("apply"));
+        assert_eq!(tag_of(&hit), "rewritten", "WHEN true must fire");
+
+        // Row failing WHEN is untouched.
+        let mut miss = Tuple::new(vec![Value::Int4(1), Value::String("original".to_string())]);
+        assert!(registry
+            .apply_before_row_mutations("mut_t", &TriggerEvent::Insert, &mut miss, schema.clone())
+            .expect("apply"));
+        assert_eq!(tag_of(&miss), "original", "WHEN false must not fire");
+
+        // WHEN over a NULL column is NULL, which is not TRUE — not fired.
+        let mut null_row = Tuple::new(vec![Value::Null, Value::String("original".to_string())]);
+        assert!(registry
+            .apply_before_row_mutations("mut_t", &TriggerEvent::Insert, &mut null_row, schema)
+            .expect("apply"));
+        assert_eq!(tag_of(&null_row), "original", "WHEN NULL must not fire");
+    }
+
+    #[test]
+    fn test_when_condition_gates_return_null_suppression() {
+        let registry = TriggerRegistry::new();
+        let schema = mutation_test_schema();
+        let mut def = TriggerDefinition::new(
+            "t_skip".to_string(),
+            "mut_t".to_string(),
+            TriggerTiming::Before,
+            vec![TriggerEvent::Insert],
+            TriggerFor::Row,
+            Some(Box::new(LogicalExpr::BinaryExpr {
+                left: Box::new(LogicalExpr::NewRow {
+                    column: "id".to_string(),
+                }),
+                op: BinaryOperator::Gt,
+                right: Box::new(LogicalExpr::Literal(Value::Int4(10))),
+            })),
+            vec![],
+            vec![],
+        );
+        def.enabled = true;
+        registry.register_trigger(def).expect("register");
+        registry.register_row_mutation(
+            "mut_t",
+            "t_skip",
+            TriggerRowMutation {
+                events: vec![TriggerEvent::Insert],
+                assignments: vec![],
+                returns_null: true,
+            },
+        );
+
+        let mut suppressed = Tuple::new(vec![Value::Int4(42), Value::String("a".to_string())]);
+        assert!(
+            !registry
+                .apply_before_row_mutations("mut_t", &TriggerEvent::Insert, &mut suppressed, schema.clone())
+                .expect("apply"),
+            "RETURN NULL under a satisfied WHEN suppresses the row"
+        );
+
+        let mut kept = Tuple::new(vec![Value::Int4(1), Value::String("a".to_string())]);
+        assert!(
+            registry
+                .apply_before_row_mutations("mut_t", &TriggerEvent::Insert, &mut kept, schema)
+                .expect("apply"),
+            "RETURN NULL under an unsatisfied WHEN must NOT suppress the row"
+        );
+    }
+
+    #[test]
+    fn test_row_mutation_unknown_column_and_bad_rhs_are_skipped_without_error() {
+        let registry = TriggerRegistry::new();
+        let schema = mutation_test_schema();
+        let def = TriggerDefinition::new(
+            "t_bad".to_string(),
+            "mut_t".to_string(),
+            TriggerTiming::Before,
+            vec![TriggerEvent::Insert],
+            TriggerFor::Row,
+            None,
+            vec![],
+            vec![],
+        );
+        registry.register_trigger(def).expect("register");
+        registry.register_row_mutation(
+            "mut_t",
+            "t_bad",
+            TriggerRowMutation {
+                events: vec![TriggerEvent::Insert],
+                assignments: vec![
+                    // Column that does not exist on the table.
+                    ("nope".to_string(), LogicalExpr::Literal(Value::String("x".to_string()))),
+                    // RHS referencing a column that does not exist.
+                    (
+                        "tag".to_string(),
+                        LogicalExpr::NewRow {
+                            column: "also_nope".to_string(),
+                        },
+                    ),
+                ],
+                returns_null: false,
+            },
+        );
+
+        let mut tuple = Tuple::new(vec![Value::Int4(1), Value::String("original".to_string())]);
+        let kept = registry
+            .apply_before_row_mutations("mut_t", &TriggerEvent::Insert, &mut tuple, schema)
+            .expect("an unsupported recipe must never fail the DML");
+        assert!(kept);
+        assert_eq!(tag_of(&tuple), "original", "nothing applied, nothing corrupted");
+    }
+
+    #[test]
+    fn test_drop_table_triggers_purges_row_mutations() {
+        let registry = TriggerRegistry::new();
+        let schema = mutation_test_schema();
+        register_tag_setter(&registry, "t_gone", "rewritten", None, true);
+        assert!(registry.has_row_mutations("mut_t"));
+
+        registry.drop_table_triggers("mut_t").expect("drop");
+
+        assert!(
+            !registry.has_row_mutations("mut_t"),
+            "DROP TABLE must take the rewrite recipe with the definition"
+        );
+        let mut tuple = Tuple::new(vec![Value::Int4(1), Value::String("original".to_string())]);
+        assert!(registry
+            .apply_before_row_mutations("mut_t", &TriggerEvent::Insert, &mut tuple, schema)
+            .expect("apply"));
+        assert_eq!(tag_of(&tuple), "original");
+    }
+
+    #[test]
+    fn test_has_row_mutations_is_false_on_an_empty_registry() {
+        let registry = TriggerRegistry::new();
+        assert!(!registry.has_row_mutations("anything"));
+        let schema = mutation_test_schema();
+        let mut tuple = Tuple::new(vec![Value::Int4(1), Value::String("original".to_string())]);
+        assert!(registry
+            .apply_before_row_mutations("mut_t", &TriggerEvent::Insert, &mut tuple, schema)
+            .expect("apply"));
+        assert_eq!(tag_of(&tuple), "original");
+    }
+
+    #[test]
+    fn test_trigger_row_mutation_round_trips_through_bincode() {
+        // The recipe is persisted under `trigger_rowmut:{table}:{name}` so a
+        // trigger keeps rewriting rows after a restart. If this stops
+        // round-tripping, restart durability is silently gone.
+        let mutation = TriggerRowMutation {
+            events: vec![
+                TriggerEvent::Insert,
+                TriggerEvent::Update(Some(vec!["tag".to_string()])),
+            ],
+            assignments: vec![(
+                "tag".to_string(),
+                LogicalExpr::Literal(Value::String("set-by-trigger".to_string())),
+            )],
+            returns_null: false,
+        };
+        let bytes = bincode::serialize(&mutation).expect("serialize");
+        let back: TriggerRowMutation = bincode::deserialize(&bytes).expect("deserialize");
+        assert_eq!(back.events.len(), 2);
+        assert_eq!(back.assignments.len(), 1);
+        assert_eq!(back.assignments[0].0, "tag");
+        assert!(!back.returns_null);
     }
 }

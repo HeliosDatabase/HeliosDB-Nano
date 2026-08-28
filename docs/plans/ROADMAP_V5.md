@@ -69,6 +69,16 @@ only, not on writes") undersells this. There *is* write-enforcement code — `Lo
 **`execute_internal` has zero callers anywhere in the crate** (`grep -rn "execute_internal("`
 matches only its own definition). It is dead code.
 
+> **RESOLVED (v4.19.x).** `execute_internal` and its 1,016 lines have been **deleted** from
+> `src/lib.rs`. Every reference to it below is historical narrative describing the state at the
+> time of the audit — do not grep for it, it no longer exists. Its RLS write-enforcement logic was
+> not salvaged verbatim (it was wrong: it dropped `WITH CHECK`, skipped `apply_rls_to_plan` on
+> `InsertSelect`, and re-parsed policies per row); §1.1 was closed instead by the shared
+> `build_rls_write_guard` / `rls_row_visible` / `enforce_rls_with_check` helpers called from both
+> live families. One side effect worth tracking: `PredicatePushdownManager::remove_table`
+> (`src/storage/predicate_pushdown.rs`) now has **zero callers** — the live `DROP TABLE` paths
+> never purged bloom filters / zone maps for a dropped table; only the dead path did.
+
 The two DML paths every real client actually hits never check RLS at all:
 - `execute_in_transaction_inner` (`src/lib.rs:2951`–~5836; PostgreSQL simple-query, all MySQL
   wire, the REPL, the embedded `execute()` API — the "text family") — zero occurrences of
@@ -463,7 +473,27 @@ additionally require `cargo test --features ha-tier1 --test ha_integration`.
 
 ### 2.1 `DROP INDEX` falls through to `LogicalPlan::DropTable`
 
-**Status:** open. **Effort: small.**
+**Status:** DATA-LOSS HALF FIXED in 4.20.0; the feature itself is still open.
+**Effort to finish: small.**
+
+**What landed.** The `_ => LogicalPlan::DropTable` catch-all described below is
+GONE. `src/sql/planner.rs`'s `Statement::Drop` handler is now exhaustive over
+`sqlparser::ast::ObjectType` (Table, View, Index, Schema, Database, Role,
+Sequence, Stage, Type), so a parser upgrade that adds an object kind is a
+compile error rather than a silent table deletion. `DROP INDEX` (and
+`DROP STAGE`) error loudly and name themselves; `IF EXISTS` does not silence
+them, because the index is not dropped either way. Regression coverage:
+`drop_index_never_plans_as_drop_table` (planner unit test) and
+`drop_index_does_not_drop_a_same_named_table` /
+`drop_index_if_exists_does_not_drop_a_same_named_table` /
+`drop_index_comma_list_does_not_drop_tables` in `tests/roles_acl_tests.rs`,
+all of which assert the same-named TABLE survives.
+
+**What is still open** is the fix shape at the bottom of this section: there is
+still no `LogicalPlan::DropIndex`, so the working `Catalog::drop_index_definition`
+/ `ArtManager::drop_index` / `WalOperation::DropIndex` machinery remains
+disconnected from the parser. The paragraphs below describe the pre-4.20.0
+behaviour and are kept for context.
 
 **Verified**, and worse in the worst case than "wrong error." `src/sql/planner.rs`, the
 `Statement::Drop` handler's `to_plan` closure (`~730`–`769`): explicit arms exist for `View`,
@@ -484,10 +514,12 @@ the base name on both), and `DROP INDEX` silently drops that table's data instea
 `Catalog::drop_index_definition` / `ArtManager::drop_index` / WAL-log path (all still functional,
 just disconnected from the parser). Gate: new DDL test, `information_schema_completion`.
 
-### 2.2 Triggers are not implemented at all
+### 2.2 Trigger bodies are not executed
 
-**Status:** documented as unimplemented in v4.10.1 (`e0a3d31`). **Effort to actually implement:
-large**, and not currently scheduled.
+**Status:** documented as unimplemented in v4.10.1 (`e0a3d31`); the SUBSET below shipped in
+4.20.0 (extended-protocol DDL, cross-family row-rewrite parity, restart persistence,
+`WHEN`/enabled, `DROP TABLE` cleanup). **Trigger BODY execution is still not implemented**;
+effort to finish it: large, still not scheduled.
 
 **CORRECTION (2026-08-07).** This section previously read "Triggers do not survive a restart" and
 proposed wiring `load_triggers()` at startup as a small fix. That framing was wrong in a way that
@@ -495,7 +527,8 @@ would have wasted the work: it treats persistence as the defect, which presumes 
 *run*. They do not. Wiring `load_triggers()` would restore **registration** only, and would make
 triggers look more correct while still executing nothing. Do not do it as a standalone fix.
 
-**Measured** (`tests/trigger_unimplemented_tests.rs`, 21 unconditional tests):
+**Measured** (was `tests/trigger_unimplemented_tests.rs`, 21 unconditional tests; now
+`tests/trigger_row_mutation_tests.rs`):
 `CREATE TRIGGER … EXECUTE FUNCTION f()` parses, registers, and returns Ok for every timing
 (`BEFORE`/`AFTER`/`INSTEAD OF`), every event, row- and statement-level, with or without `WHEN` —
 and **no trigger body ever executes**, with no error, warning, or log line. Two independent,
@@ -508,8 +541,8 @@ body existed. The SQLite/MySQL `BEGIN … END` form does not parse at all.
 Sole working mechanism: `BEFORE INSERT … FOR EACH ROW` whose function body contains literal
 `NEW.<col> = <expr>` and/or `RETURN NULL` rewrites or skips the inserted row — a text scan
 (`parse_trigger_assignments`), not execution. INSERT-only; no `OLD`; no side effects.
-Also measured: `DROP TABLE` does **not** deregister triggers (the name stays burned for the
-process), and `CALL` on a `CREATE PROCEDURE` *does* execute the body.
+Also measured: `DROP TABLE` did **not** deregister triggers (the name stayed burned for the
+process — fixed in 4.20.0), and `CALL` on a `CREATE PROCEDURE` *does* execute the body.
 
 **QUALIFICATION (2026-08-07), second pass.** This entry ended "`CALL` on a `CREATE PROCEDURE`
 *does* execute — that is the alternative to recommend", and v4.10.1 shipped that advice verbatim.
@@ -521,16 +554,54 @@ parameters, got 0`), and the body must reference parameters with a **`$` sigil**
 (`$p_id`) or positionally (`$1`) — a bare parameter name fails `Column 'n' not found in schema`
 in *either* language. **Rule 1 no longer applies** (§2.9 fix shape (b) landed): both languages now
 bind through one shared scanner, so only the `$`-sigil rule remains. Within that rule arguments
-bind correctly and a procedure is a genuine escape hatch. `CREATE FUNCTION` is not an alternative
-at all; nothing can call it. See §2.9.
+bind correctly and a procedure is a genuine escape hatch. `CREATE FUNCTION` used to be no
+alternative at all — nothing could call it — but as of 4.20.0 scalar calls work under the same
+`$`-sigil rule (§2.9); a FUNCTION still cannot perform side effects for you, and `CALL f()` does
+not exist. See §2.9.
 
-**If this is ever scheduled**, the work is: populate the body in the planner, thread
-`TriggerRowContext` through the DML executor closures (both families — see §1.1's lesson), fix the
-lock asymmetry noted in the closed trigger-deadlock item (`execute()` holds `current_transaction`
-while the Insert/Update/Delete arms re-acquire it, non-reentrant `parking_lot::Mutex`), add
-`pg_trigger`/`information_schema.triggers`/`relhastriggers`, and only then wire `load_triggers()`.
-Rewrite `tests/trigger_unimplemented_tests.rs` rather than relaxing it — it is designed to go red
-on purpose the day triggers start working.
+**PARTIAL FIX LANDED (4.20.0) — the SUBSET, not body execution.** Body execution is still
+NOT implemented and is still blocked on §2.9 (user functions) and on the re-entrancy lock story.
+What shipped, all of it "machinery existed, add the caller":
+
+1. `CREATE TRIGGER` / `DROP TRIGGER` now have arms in `execute_plan_with_params_inner`, calling the
+   same `execute_create_trigger_plan` / `execute_drop_trigger_plan` helpers the text family's arms
+   were reduced to. This entry (and v4.10.1's changelog) both missed that over the PG **extended**
+   protocol `CREATE TRIGGER` was not "succeeding and never firing" — it was a HARD ERROR,
+   `Operator not yet implemented: CreateTrigger { … }`, because there is no `CreateTrigger` arm in
+   `src/sql/executor/`. There deliberately still is not one: the work needs `self`.
+2. The BEFORE-INSERT row rewrite now runs on BOTH families through one
+   `apply_before_insert_row_hook`. It previously had exactly ONE call site (text family, Insert
+   arm), so REST/JDBC/psycopg inserts and `psql` inserts into the same table produced different
+   rows, and `INSERT … RETURNING` skipped it on every interface.
+3. Persistence: `CREATE TRIGGER` writes `trigger:{table}:{name}` and a NEW additive sidecar
+   `trigger_rowmut:{table}:{name}` (the compiled recipe — it cannot be rebuilt at open because it
+   is derived from the function body); `EmbeddedDatabase::load_persisted_triggers` repopulates the
+   LIVE registry at open via `StorageEngine::load_triggers_into`. Note the correction to this
+   section's own history: wiring the loader turned out to be correct AS PART OF the subset, because
+   the subset also makes a capability real; it is still wrong as a standalone "fix".
+   `Catalog::load_all_triggers` also had a TDE bug (raw-iterator reads return ciphertext) that only
+   its zero callers hid.
+4. `apply_before_row_mutations` honours `enabled` and `when_condition` (it ignored both, so a
+   `WHEN`-qualified trigger rewrote every row) and fires in trigger-name order.
+5. `DROP TABLE` deregisters via a new `EmbeddedDatabase::on_table_dropped` called from BOTH
+   families' catch-alls (the only previous `drop_table_triggers` caller was inside the dead
+   `execute_internal`).
+
+`tests/trigger_unimplemented_tests.rs` went red exactly as designed and was deleted; it is replaced
+by `tests/trigger_row_mutation_tests.rs`.
+
+**STILL OPEN — real body execution.** Blocked on §2.9 (a trigger body has nothing to run until
+user functions are invocable in this shape) and on the lock redesign. The work is: populate the
+body in `Planner::create_trigger_to_plan` (still `let body = vec![]`), thread `TriggerRowContext`
+through the DML executor closures (both families — see §1.1's lesson), fix the lock asymmetry noted
+in the closed trigger-deadlock item (`execute()` holds `current_transaction` while the
+Insert/Update/Delete arms re-acquire it, non-reentrant `parking_lot::Mutex`), route the DML sites
+through the still-dead `execute_row_triggers` so `FOR EACH STATEMENT` and `INSTEAD OF` have any
+path at all, extend the row rewrite's successor to `BEFORE UPDATE`/`DELETE` and `OLD`, call the
+uncalled `DeferredTriggerTracker`, expose `ALTER TABLE … ENABLE/DISABLE TRIGGER` for the now-honoured
+`enabled` flag, add `pg_trigger` / `information_schema.triggers` / `relhastriggers`, and make WAL
+crash-replay restore the rewrite-recipe sidecar (today it restores the definition only, so a
+post-checkpoint trigger comes back inert).
 
 ### 2.3 Five process-wide globals are not session-keyed
 
@@ -776,10 +847,55 @@ test binary from any other working directory, since §2.7 makes `wal_dir` CWD-re
 
 ### 2.9 User-defined functions are registered but callable by nothing — **found 2026-08-07**
 
-**Status:** open for FUNCTIONS, documented (not fixed). **Effort to make functions callable:
-medium** — the executor already exists and passes its own unit test; what is missing is the wiring.
-Not currently scheduled. **Fix shape (b) — `LANGUAGE plpgsql` procedure argument binding — is DONE**
-(see the procedure sub-entry below); everything else in this section stands.
+**Status: SCALAR INVOCATION FIXED.** `src/sql/udf_bridge.rs` gives the session-less `Evaluator`
+a process-scoped handle to a `FunctionRegistry` plus a re-entrant SQL executor (the same
+`install`/`resolve` pattern `sql::sequences` uses for `nextval`), consulted from the TERMINAL arm
+of scalar dispatch — after every built-in has missed, so the read hot path is untouched. The
+already-complete interpreter `FunctionRegistry::execute_function` finally has a production caller.
+Alongside it: the params family gained real `CreateFunction` / `CreateProcedure` / `DropFunction` /
+`DropProcedure` arms (they used to fall to the catch-all and fake success), the four `sql::Executor`
+stubs became loud errors, the PostgreSQL `CREATE PROCEDURE … LANGUAGE … AS $$…$$` pre-parse is now
+shared by both plan builders instead of living only in the text family, and routine definitions are
+persisted to `meta:function:` / `meta:procedure:` and reloaded at open. Recursion is bounded by the
+new `[session] udf_max_call_depth` (default 32). Coverage:
+`tests/udf_invocation_tests.rs` (replaces the deleted `tests/function_unimplemented_tests.rs`).
+
+**STILL OPEN in this section**, each pinned by a hard assertion in
+`tests/udf_remaining_gaps_tests.rs`:
+
+* **Set-returning functions.** `Planner::is_table_function` is still the fixed
+  `generate_series | unnest` whitelist and `RETURNS TABLE(...)`'s column list is still discarded.
+  Lifting either needs a return-signature slot on `StoredFunction`, which is a bincode-POSITIONAL
+  payload in the WAL and in `meta:` values and is replayed by HA standbys — so it needs payload
+  versioning, not a new field.
+* **Overload resolution.** The registry keys on the lowercase name alone; `f(int)` and `f(text)`
+  collide with `already exists`.
+* **`CALL f()` for a function**, and non-`public.` schema qualification.
+* **Catalog visibility.** `pg_proc`, `information_schema.routines` / `.parameters` are still
+  empty — that belongs to the introspection item (HC3), which this change unblocks by giving a
+  registry handle a home.
+* **`POST /rest/v1/rpc/<fn>`** is still a hard HTTP 501 stub.
+* **THE PROCEDURAL EXPRESSION PARSER IS A STUB — new finding, wider than functions.**
+  `ProceduralParser::parse_expression` (`src/sql/procedural/parser.rs`) does not build an
+  expression tree; it captures the expression's RAW SOURCE TEXT and returns
+  `LogicalExpr::Literal(Value::String(text))` (its own comment says "A full implementation would
+  parse this into LogicalExpr"). Every construct whose semantics depend on EVALUATING that
+  expression therefore misbehaves silently in a PL/pgSQL body: `IF <cond> THEN` yields a
+  non-boolean string, so the condition is always false and the ELSE branch always runs; `WHILE`
+  never loops; `x := <expr>` assigns the literal text of the expression. Two mitigations landed
+  with the UDF work: `RETURN <expr>` is now `$`-interpolated and evaluated as SQL (it used to
+  return the expression's own text as the value), and a PL/pgSQL FUNCTION body containing any of
+  those constructs is REFUSED with an error naming the construct rather than executed.
+  **PROCEDURE bodies are deliberately NOT gated** — gating them would newly break bodies users run
+  today — so a `CREATE PROCEDURE` with an `IF` still silently takes the ELSE branch. Fixing the
+  parser is the real remedy and is not scheduled.
+* **Result cache.** `volatility` is stored and still unread, and a `SELECT` containing a UDF is
+  admitted to the result cache like any other query. DML through any handle clears the cache, so
+  the stale window is bounded by "no write happened", but a genuinely volatile UDF (one that
+  depends on time or on another process's writes) can serve a cached value. Not redesigned here.
+
+**Fix shape (b) — `LANGUAGE plpgsql` procedure argument binding — was DONE earlier**
+(see the procedure sub-entry below).
 
 This is the same class of defect as §2.2 and was found by checking v4.10.1's own remediation advice.
 That release told users to replace triggers with "a `CREATE PROCEDURE` invoked with `CALL`
@@ -898,9 +1014,10 @@ runtime function catalog through this view".
      registry. Cheap, independent of (a)–(c), and worth doing even if the rest is deferred — today a
      registered routine is undiscoverable.
 
-**Gate:** rewrite `tests/function_unimplemented_tests.rs` rather than relaxing it — like
-`trigger_unimplemented_tests.rs`, it is designed to go red on purpose the day functions start
-working. Also update `README.md`, `AGENTS.md`, `docs/llms.txt`,
+**Gate:** rewrite `tests/function_unimplemented_tests.rs` rather than relaxing it — like the
+former `trigger_unimplemented_tests.rs` (which went red and was replaced by
+`tests/trigger_row_mutation_tests.rs` in 4.20.0, exactly as designed), it is designed to go red on
+purpose the day functions start working. Also update `README.md`, `AGENTS.md`, `docs/llms.txt`,
 `docs/compatibility/plpgsql.md`, `docs/compatibility/information_schema.md`, and the
 `heliosdb-nano-schema` (Recipe 6) / `heliosdb-nano-migrate` skills, all of which now document this
 as unimplemented.
@@ -960,9 +1077,11 @@ introduced to prevent, reintroduced one layer down.
   c. **`routines` / `parameters` / `pg_proc`** — same item as §2.9(d); the registry has the data.
   d. **`character_sets` / `collations`** — constant single-row content, effectively free.
   e. **`catalog_name`** — a single-row view returning the current database name.
-  f. **The four privilege views** — the largest, and arguably should stay empty until `CREATE ROLE`
-     is supported at all (it currently returns "Statement not yet supported: CreateRole" while
-     `GRANT` returns Ok, which is its own inconsistency worth resolving first).
+  f. **The four privilege views** — DONE, see §2.13. `CREATE ROLE` is real DDL now and
+     `GRANT`/`REVOKE` persist an ACL record, so `table_privileges` and `role_table_grants` are
+     populated; `column_privileges` and `role_column_grants` stay empty because column-level
+     grants are rejected at plan time. **These views report STORED grants — no privilege is
+     enforced anywhere.**
 
 **Gate:** `tests/information_schema_completion.rs` pins the current state deliberately —
 `always_empty_views_stay_empty_even_with_the_objects_they_describe_present` will go red on purpose
@@ -1136,6 +1255,72 @@ entry points — it fails if a fork is reintroduced), and
 over every variant). Every assertion is unconditional. `tests/procedure_interpolation_tests.rs`,
 `tests/postgres_extended_protocol_tests.rs` and `tests/drizzle_compat_tests.rs` cover the
 unchanged int/text/null renderings and pass without modification.
+
+---
+
+### 2.13 SQL roles and grants are stored but NOT enforced — **storage slice landed; enforcement and identity open**
+
+**Status:** the *storage* slice is done. What is open is everything that would make a privilege
+mean something. **Effort: large**, and security-sensitive — do not take it in a hurry.
+
+**What landed.** `CREATE/ALTER/DROP ROLE` (and the `CREATE/ALTER/DROP USER` spellings, via a
+pre-parse rewrite — sqlparser 0.53 cannot parse `USER` at all) are real DDL persisted under
+`meta:role:<name>`. `GRANT`/`REVOKE` persist an `AclRecord` under
+`meta:acl:<objtype>:<obj>:<grantee>` instead of planning to `LogicalPlan::Noop` and vanishing
+while reporting success. `pg_roles` / `pg_user` / `pg_authid` and
+`information_schema.table_privileges` / `role_table_grants` report that catalog through ONE
+row-builder module (`src/sql/acl_views.rs`) consumed by BOTH catalog surfaces. The PG wire stopped
+acknowledging `SET ROLE <x>` with a silent `SET`, and MySQL `SHOW GRANTS` stopped fabricating
+`GRANT ALL PRIVILEGES ON *.* … WITH GRANT OPTION`. One new tunable:
+`[authentication] legacy_acl_noop` (default `false`) restores the old leniency.
+
+**What is NOT true and must not be implied anywhere:** no privilege is checked at any read or
+write path. A stored grant confers nothing; a revoke removes nothing.
+
+**Follow-ups, roughly in dependency order:**
+
+  a. **Enforcement.** Add the check to BOTH DML executor families
+     (`execute_in_transaction_inner` and `execute_plan_with_params_inner`) via one shared helper,
+     ideally at the same choke points `build_rls_write_guard` / `apply_rls_to_plan` already hook so
+     the two rules cannot drift. Violations raise `42501 insufficient_privilege`. It MUST have a
+     "no roles configured → one branch, allocate nothing" fast exit, mirroring
+     `build_rls_write_guard`'s early return, or it will show up in the perf gate. This is a
+     BREAKING change for any deployment that has run a `GRANT` since the storage slice landed, so
+     it needs its own opt-in.
+  b. **Session identity.** The authenticated wire username never reaches SQL: `current_user` /
+     `session_user` return the hardcoded literal `"heliosdb"` (`src/sql/evaluator.rs`) and
+     `current_setting('current_user')` returns a *different* hardcoded literal `"postgres"`.
+     Propagate the startup username into a per-session identity, make those three agree, then
+     implement `SET ROLE` / `SET SESSION AUTHORIZATION` for real (they currently raise `0A000`).
+     Until this exists, `information_schema.role_table_grants` cannot be identity-filtered and
+     mirrors `table_privileges`, and every ACL row records the constant grantor `helios`.
+  c. **`CREATE ROLE … PASSWORD` → wire authentication.** The password is stored verbatim in the
+     catalog and never emitted by a view, but `AuthManager` still knows only the two `--password`
+     users from `src/main.rs`, and `[authentication] users_file` is still read by nothing. Hash
+     into a SCRAM verifier and load the role catalog into the password store.
+  d. **Role membership.** `CREATE ROLE … IN ROLE/ROLE/ADMIN`, `ALTER ROLE … ADD/DROP MEMBER` and
+     `GRANT <role> TO <role>` all error today (loudly, on purpose). Implementing them is what
+     would populate `applicable_roles` / `enabled_roles` /
+     `administrable_role_authorizations`, which are registered and empty.
+  e. **Column-level and schema-level grants.** `GRANT SELECT (col) …`, `GRANT … ON SCHEMA …` and
+     `GRANT … ON ALL TABLES IN SCHEMA …` error today; they are what would populate
+     `column_privileges` / `role_column_grants` / `usage_privileges`.
+  f. **`ALTER ROLE … RENAME TO` and per-role `SET`/`RESET`** — both error; there is no per-role
+     GUC store.
+  g. **Dump/restore.** `heliosdb-nano dump` / `restore` operate on TABLES only — they do not carry
+     any `meta:` record, so roles and ACLs (like sequences, enum types and triggers before them)
+     do not survive a dump/restore round trip. They DO survive a restart on the same data
+     directory (`tests/roles_acl_tests.rs::persistence_restart`). Fixing this is one change for
+     all `meta:` prefixes, not a role-specific one — do it once, for all of them.
+  h. **Unify the three identity systems** instead of adding a fourth: `TenantContext.user_id` /
+     `roles` (`src/tenant/mod.rs`, what RLS actually keys off) and the BaaS JWT user store
+     (`src/api/supabase/auth.rs`) should both map onto the SQL role catalog.
+
+**Gate:** `tests/roles_acl_tests.rs` (both executor families on every case, the negative matrix,
+restart persistence, the `legacy_acl_noop` tunable, and an MV round-trip guarding the appended
+bincode discriminants), `src/protocol/postgres/wire_tests.rs` (the `\du` interceptor, command
+tags, `SET ROLE` 0A000, role SQLSTATEs), the `mysql_show_grants_lines` unit tests in
+`src/sql/acl_views.rs`, and `tests/information_schema_completion.rs::privilege_views_reflect_a_stored_grant`.
 
 ---
 

@@ -1,13 +1,13 @@
 ---
 name: heliosdb-nano-schema
-description: Define and inspect schema in HeliosDB-Nano. Covers CREATE/ALTER/DROP TABLE with PK/FK/UNIQUE/CHECK/DEFAULT constraints, regular and HNSW vector indexes, views, materialized views, stored procedures, and introspection through Postgres (`pg_class`, `information_schema`), SQLite (`sqlite_master`, `PRAGMA table_info`), and Nano-specific (`\d`, `\dt`, `\dS`, `\dmv`) surfaces. Also documents why `CREATE TRIGGER` succeeds but triggers never fire, why a `CREATE FUNCTION` registers but nothing can call it, and the one rule that makes `CREATE PROCEDURE` + `CALL` actually work — read this before proposing a trigger or a user-defined function. Use this when the user asks "create a table", "add an index", "describe", "what columns does X have", or anything about triggers, functions, or stored procedures.
+description: Define and inspect schema in HeliosDB-Nano. Covers CREATE/ALTER/DROP TABLE with PK/FK/UNIQUE/CHECK/DEFAULT constraints, regular and HNSW vector indexes, views, materialized views, stored procedures, and introspection through Postgres (`pg_class`, `information_schema`), SQLite (`sqlite_master`, `PRAGMA table_info`), and Nano-specific (`\d`, `\dt`, `\dS`, `\dmv`) surfaces. Also documents why `CREATE TRIGGER` succeeds but trigger bodies never run, what user-defined functions can and cannot do (scalar calls work, under the `$`-sigil rule), and the one rule that makes `CREATE PROCEDURE` + `CALL` actually work — read this before proposing a trigger or a user-defined function. Use this when the user asks "create a table", "add an index", "describe", "what columns does X have", or anything about triggers, functions, or stored procedures.
 allowed-tools: Bash(heliosdb-nano *), Bash(psql *), Read
 ---
 
 # Schema (DDL & Introspection)
 
 ## When to use
-Any DDL operation: `CREATE`, `ALTER`, `DROP` against tables/indexes/views/functions; or asking the database what schema exists. Also read this before answering any trigger, function, or stored-procedure question — triggers are **not implemented** (Recipe 5) and user-defined functions are **registered but not callable by anything** (Recipe 6). `CREATE TRIGGER` and `CREATE FUNCTION` returning `OK` does not mean either one works. Stored procedures *do* work, under the one rule in Recipe 6.
+Any DDL operation: `CREATE`, `ALTER`, `DROP` against tables/indexes/views/functions; or asking the database what schema exists. Also read this before answering any trigger, function, or stored-procedure question — triggers are **not implemented** (Recipe 5) and user-defined functions are **callable only in scalar position, and only with `$`-sigil parameters** (Recipe 6). `CREATE TRIGGER` returning `OK` does not mean it works; `CREATE FUNCTION` does work for scalar calls but NOT for `SELECT * FROM f()`, overloading, `CALL f()` or catalog introspection. Stored procedures *do* work, under the same `$`-sigil rule.
 
 ## Verbs
 
@@ -18,11 +18,11 @@ Any DDL operation: `CREATE`, `ALTER`, `DROP` against tables/indexes/views/functi
 | drop table | SQL | `DROP TABLE [IF EXISTS] t` |
 | create index | SQL | `CREATE INDEX idx_t_c ON t(c)` |
 | create vector index | SQL | `CREATE INDEX vidx ON t USING HNSW (embedding) WITH (dim = 384, metric = 'cosine')` |
-| drop index | SQL | `DROP INDEX idx_t_c` |
+| drop index | — | ❌ **not supported** — `DROP INDEX` errors (`DROP INDEX is not supported yet`). Through 4.19.0 it was planned as `DROP TABLE` and could destroy a table sharing the index's name. Drop the table, or leave the index in place |
 | create view | SQL | `CREATE VIEW v AS SELECT …` |
 | create materialized view | SQL | `CREATE MATERIALIZED VIEW mv AS SELECT … WITH (auto_refresh = true)` |
-| create trigger | SQL | ⚠️ **registered but never fires** — see "Triggers — not implemented" below before writing any `CREATE TRIGGER` |
-| create function | SQL | ⚠️ **registers, but nothing can call it** — `SELECT f(1)` errors `Unknown scalar function: f`. See Recipe 6 before writing any `CREATE FUNCTION` |
+| create trigger | SQL | ⚠️ **registered, persisted, but the BODY never runs** — see "Triggers" below before writing any `CREATE TRIGGER` |
+| create function | SQL | ✅ scalar calls work — `CREATE FUNCTION f(x INT) RETURNS INT AS $$ SELECT $1 * 2 $$ LANGUAGE sql` + `SELECT f(1)`. The `$` sigil is MANDATORY (a bare `x` is a column ref). No `SELECT * FROM f()`, no overloading, no `pg_proc` row. See Recipe 6 |
 | create procedure | SQL | ✅ works — `CREATE PROCEDURE p(a INT) LANGUAGE sql AS $$…$a…$$` + `CALL p(1)`. Either language (sql or plpgsql); params need the `$` sigil. See Recipe 6 |
 | list tables | REPL / SQL | `\dt` / `SELECT * FROM pg_tables` |
 | describe table | REPL / SQL | `\d t` / `PRAGMA table_info(t)` / `SELECT * FROM information_schema.columns WHERE table_name='t'` |
@@ -84,7 +84,27 @@ CREATE MATERIALIZED VIEW user_stats AS
      GROUP BY user_id
 WITH (auto_refresh = true, max_cpu_percent = 15);
 ```
-Inspect with `\dmv` (REPL) or `SELECT * FROM pg_matviews`.
+The `WITH (...)` clause is accepted in either position — after the query as above, or in the
+PostgreSQL-standard spot between the view name and `AS` — and works with `IF NOT EXISTS`. You
+can also flip it later: `ALTER MATERIALIZED VIEW user_stats SET (auto_refresh = true)`.
+
+**`auto_refresh = true` only records the opt-in; it does not start anything.** The refresh loop
+is driven by the embedded library API `EmbeddedDatabase::start_auto_refresh(config)` — there is
+no CLI flag, SQL statement, HTTP endpoint or config key that starts it (`[materialized_views]
+auto_refresh_default` is reserved and wired to nothing). Without that call, an opted-in view
+behaves exactly like a manual one: it only changes on `REFRESH MATERIALIZED VIEW`. Do not tell a
+user that `WITH (auto_refresh = true)` alone will keep a view current.
+
+Once the worker is running, opted-in views are FULL-recomputed on a time-based staleness
+schedule tuned by `[materialized_views]` (`refresh_check_interval_secs`,
+`default_max_cpu_percent`, `max_concurrent_refreshes`). The per-view `max_cpu_percent` above is
+stored but NOT enforced — the global limit governs. (Before the fix in 4.15.0, auto-refresh
+never refreshed at all, in any spelling.)
+
+Inspect with `\dmv` (REPL), `SELECT * FROM pg_matviews` (one row per materialised view, with its
+`definition`; `ispopulated` is false until the first refresh), or `SELECT * FROM
+pg_mv_staleness()`. No view projects the `auto_refresh` flag, so the opt-in cannot be read back
+over the wire.
 
 ### Recipe 5: Triggers — NOT IMPLEMENTED (read this instead of writing one)
 
@@ -100,7 +120,9 @@ language, on every client path — with one rule: the body must reference parame
 the two things to know before recommending it: through 4.11.0 `CALL` was a **silent no-op**
 over the PostgreSQL extended protocol and the REST layer (fixed), and `CALL` inside an
 explicit `BEGIN` on the embedded API / REPL is refused with an error.
-Note that `CREATE FUNCTION` is *not* an option: nothing can call a user-defined function.
+A user-defined FUNCTION is a *partial* alternative: `SELECT f(x)` works in scalar position
+(under the `$`-sigil rule), but it cannot perform a side effect for you the way a procedure
+body can, and `CALL f()` does not exist. See Recipe 6.
 
 What each form actually does today:
 
@@ -123,12 +145,14 @@ CREATE TRIGGER posts_audit AFTER UPDATE ON posts
 FOR EACH ROW EXECUTE FUNCTION audit_posts();             -- OK, registered
 
 UPDATE posts SET title = 'x' WHERE id = 1;               -- OK
-SELECT COUNT(*) FROM audit_log;                          -- 0  ← never fired
+SELECT COUNT(*) FROM audit_log;                          -- 0  ← body never ran
 ```
 
 This holds for every timing (`BEFORE` / `AFTER` / `INSTEAD OF`), every event, both
 `FOR EACH ROW` and `FOR EACH STATEMENT`, and with or without a `WHEN (…)` clause —
-all of them parse and register, none of them execute.
+all of them parse and register, none of them execute. It is true on EVERY interface:
+embedded `execute()`/`execute_params()`, the PostgreSQL simple and extended query
+protocols, the MySQL wire, the REPL and REST.
 
 **The one exception that does have an effect.** A `BEFORE INSERT … FOR EACH ROW
 EXECUTE FUNCTION f()` whose function body contains literal `NEW.<col> = <expr>`
@@ -149,79 +173,120 @@ This is a text scan of the function body, not execution: **INSERT only** (not
 `BEFORE UPDATE` / `BEFORE DELETE`, which register the recipe but never apply it), no
 `OLD`, and no side effects — an `INSERT`/`UPDATE`/`RAISE` inside the body is ignored.
 
-**`DROP TABLE` does not cascade to triggers.** The registration outlives the table,
-so re-creating the table and its trigger fails with
-`Trigger 'x' already exists on table 't'` — the name stays burned for the lifetime of
-the process. `DROP TRIGGER x ON t` before dropping the table, or use a fresh name.
+Since **4.20.0** this exception is uniform and durable:
+
+- it applies identically on BOTH DML executor families, so a REST / JDBC / sqlx /
+  psycopg-with-bound-params insert and a `psql` simple-query insert into the same table
+  finally produce the SAME row, and `INSERT … RETURNING` (which always routes through the
+  params family) reflects the rewrite. Through 4.19.0 it applied on the text family only.
+- `CREATE TRIGGER` / `DROP TRIGGER` sent over the PostgreSQL **extended** query protocol
+  used to fail outright with `Operator not yet implemented: CreateTrigger { … }`; they now
+  succeed. A migration tool that previously caught that error will now see the statement
+  pass — and create a trigger whose body does not run.
+- the trigger's `WHEN (…)` clause and its enabled flag are honoured (before 4.20.0 the
+  rewrite hit every row regardless of the predicate). `WHEN` false, NULL, or unevaluable
+  all mean "not fired". Multiple recipes on one table fire in trigger-name order.
+- it survives a restart (both the definition and the compiled recipe are persisted).
+  Caveat: a trigger created after the last checkpoint and lost to a crash comes back
+  definition-only, i.e. inert — `DROP TRIGGER` and re-create it.
+
+**`DROP TABLE` deregisters the table's triggers (since 4.20.0).** In-memory
+registrations and the persisted records both go. Before 4.20.0 the registration outlived
+the table, so re-creating the table and its trigger failed with
+`Trigger 'x' already exists on table 't'` and the name stayed burned for the lifetime of
+the process.
 
 **No trigger introspection exists either**: there is no `pg_trigger` view,
-`information_schema.triggers` is always empty by design, `pg_class.relhastriggers` is
-hardcoded `false`, and no REPL meta-command lists triggers. On a disk-backed database a
-registered trigger survives exactly one restart (WAL replay restores it, then the WAL is
-truncated and nothing reloads it from the catalog), so registration is not durable either.
+`information_schema.triggers` is always empty by design, psql's `\d` reports
+`relhastriggers = false` (the column does not exist on `pg_class` on any other
+route), and no REPL meta-command lists triggers. There is also no
+`ALTER TABLE … ENABLE/DISABLE TRIGGER` surface, so the enabled flag the rewrite now
+honours is only reachable from the library API.
 
-### Recipe 6: User-defined functions — NOT CALLABLE (read this instead of writing one)
+Registration IS durable since 4.20.0. (Documentation correction: releases through 4.19.0
+claimed a registered trigger "survives exactly one restart". It survived none — WAL replay
+registered it into a registry the SQL executor never reads.)
 
-**Do not propose a `CREATE FUNCTION` as a solution.** Every `CREATE FUNCTION` form is
-accepted and the function is registered — and then **nothing in the database can call
-it.** There is no working invocation route: not a `SELECT` list, not a `WHERE` clause,
-not `FROM`, not `CALL`, not a bound-parameter query. All of them error.
+### Recipe 6: User-defined functions — scalar calls work, under the `$`-sigil rule
 
-All three registration forms succeed:
+**A `CREATE FUNCTION` is a usable solution for SCALAR logic**, on every client path, and
+the definition survives a restart. It is NOT usable as a set-returning function, is not
+overloadable, and is invisible to catalog introspection — the exact boundaries are below.
+
+```sql
+CREATE FUNCTION dbl(x INTEGER) RETURNS INTEGER
+    AS $$ SELECT $1 * 2 $$ LANGUAGE sql;
+
+SELECT dbl(21);                            -- 42
+SELECT public.dbl(21);                     -- 42
+SELECT id, dbl(id) FROM posts;             -- evaluated per row
+SELECT id FROM posts WHERE dbl(id) = 2;    -- filters
+-- identical through bound parameters:
+execute_params("SELECT dbl($1)", [21])     -- 42
+```
+
+**THE `$` SIGIL IS MANDATORY** — the single rule that catches everyone. Reference a
+parameter as `$1` or `$name`. A bare `x` is a COLUMN reference and fails with
+`Column 'x' not found in schema`. This is deliberate (a variable must never silently
+shadow a column) and it applies to `LANGUAGE sql` and `LANGUAGE plpgsql` alike. So the
+PostgreSQL-idiomatic `AS $$ SELECT x * 2 $$` does NOT work; write `$$ SELECT $1 * 2 $$`.
+
+PL/pgSQL function bodies support a `DECLARE` section (no `:=` initialisers), SQL
+statements, `SELECT … INTO <var>`, nested blocks, and `RETURN <expr>`:
 
 ```sql
 CREATE FUNCTION post_count(uid INTEGER) RETURNS INTEGER AS $$
-DECLARE
-    cnt INTEGER;
+DECLARE cnt INTEGER;
 BEGIN
-    SELECT COUNT(*) INTO cnt FROM posts WHERE author_id = uid;
-    RETURN cnt;
+    SELECT COUNT(*) INTO cnt FROM posts WHERE author_id = $uid;   -- $uid, not uid
+    RETURN $cnt;                                                  -- $cnt, not cnt
 END;
-$$ LANGUAGE plpgsql;                                              -- OK, registered
+$$ LANGUAGE plpgsql;
 
-CREATE FUNCTION dbl(x INTEGER) RETURNS INTEGER
-    AS $$ SELECT x * 2 $$ LANGUAGE sql;                           -- OK, registered
-
-CREATE FUNCTION dbl2(x INTEGER) RETURNS INTEGER RETURN x * 2;     -- OK, registered
+SELECT post_count(7);                      -- 2
 ```
 
-Every way to call one:
+**Control flow inside a FUNCTION body is REFUSED, loudly.** `IF` / `CASE` / `LOOP` /
+`WHILE` / `FOR`, `:=` assignment, `DECLARE v INT := …`, `RAISE`, `EXIT` / `CONTINUE`,
+cursors, dynamic `EXECUTE`, `RETURN NEXT` / `RETURN QUERY` and `EXCEPTION` handlers all
+produce an error naming the construct. The reason: the procedural expression parser
+stores an expression's raw TEXT instead of parsing it, so an `IF` condition would never be
+true and the ELSE branch would always run. An error beats that wrong answer. Express the
+branch in SQL instead — `RETURN (SELECT CASE WHEN $1 > 0 THEN 1 ELSE 2 END)`.
+(PROCEDURE bodies are not gated, so an `IF` in a procedure still silently mis-branches.)
+
+**Recursion** is bounded by `[session] udf_max_call_depth` in `config.toml` (default 32);
+a self-recursive body fails with an explicit depth-limit error.
+
+**One transaction limitation.** On the **embedded API and the REPL**, calling a function
+inside an explicit `BEGIN` is refused with an error — the body re-enters the executor and
+would deadlock on the global, non-reentrant transaction lock. A `BEGIN` over the PG or
+MySQL wire is a per-session transaction and is unaffected. As with `CALL`, the body does
+not join the caller's transaction.
+
+**What still does NOT work:**
 
 ```sql
-SELECT post_count(7);                      -- ERROR: Unknown scalar function: post_count
-SELECT dbl(21);                            -- ERROR: Unknown scalar function: dbl
-SELECT public.dbl(21);                     -- ERROR: Unknown scalar function: public.dbl
-SELECT id, dbl(id) FROM posts;             -- ERROR: Unknown scalar function: dbl
-SELECT id FROM posts WHERE dbl(id) = 2;    -- ERROR: Unknown scalar function: dbl
 SELECT * FROM dbl(21);                     -- ERROR: Table 'dbl' does not exist
+                                           --   (no set-returning functions; RETURNS TABLE(...)
+                                           --    parses but its column list is discarded)
 CALL dbl(21);                              -- ERROR: Procedure 'dbl' does not exist
+                                           --   (functions and procedures are separate namespaces)
 PERFORM dbl(21);                           -- ERROR: SQL parse error (PERFORM is not a statement)
+SELECT reporting.dbl(21);                  -- ERROR: Unknown scalar function (only `public.` qualifies)
+
+CREATE FUNCTION f(a INT) …;                -- OK
+CREATE FUNCTION f(a TEXT, b TEXT) …;       -- ERROR: Function 'f' already exists (no overloading —
+                                           --   the registry keys on the name alone)
+
+CREATE FUNCTION g(x INT) RETURNS INT RETURN x * 2;   -- registers, but the stored body is the
+                                                     -- literal text `RETURN x * 2`, which is not
+                                                     -- SQL: calling it errors. Use the AS $$…$$ form.
 ```
 
-This is identical on the embedded API and over the PostgreSQL wire, and identical
-through the bound-parameter path — `execute_params("SELECT dbl($1)", …)` also returns
-`Unknown scalar function: dbl`.
-
-**Why.** The expression evaluator has no link to the function registry at all: its
-scalar-function match ends in `_ => Err("Unknown scalar function: {}")`
-(`src/sql/evaluator.rs:1154`), so no expression on any path can resolve a user
-function. `FunctionRegistry::execute_function` (`src/sql/functions.rs:190`) has exactly
-one call site in `src/`, and it is inside `#[cfg(test)] mod tests`
-(`src/sql/functions.rs:603`) — the executor works in its unit test and is never reached
-in production. `SELECT * FROM f()` is blocked separately: table-valued functions are a
-fixed whitelist, `matches!(name, "generate_series" | "unnest")`
-(`src/sql/planner.rs:2078`).
-
-**No introspection either.** `information_schema.routines`, `information_schema.parameters`
-and `pg_proc` are structurally present on the wire path and return zero rows *with a
-function registered* — `query_information_schema_routines` returns `(schema, vec![])` by
-construction (`src/protocol/postgres/catalog.rs:2398`). On the embedded path
-`information_schema.routines` does not resolve at all and `pg_proc` returns no rows. A
-registered function is invisible to every catalog client and every ORM probe.
-
-**Use instead:** inline the expression (`SELECT id * 2 FROM posts`), a view
-(`CREATE VIEW post_dbl AS SELECT id, id * 2 AS dbl FROM posts`), a column the
-application maintains, or move the logic into application code.
+**No introspection.** `information_schema.routines`, `information_schema.parameters` and
+`pg_proc` still return zero rows with a function registered, so a function is invisible to
+ORM probes and catalog clients. `POST /rest/v1/rpc/<fn>` is still HTTP 501.
 
 #### Procedures DO work — in either language, with `$`-sigil parameters
 
@@ -354,7 +419,9 @@ PRAGMA table_info(posts);
 ### Recipe 8: Drop with safety
 ```sql
 DROP TABLE IF EXISTS posts CASCADE;        -- cascade through FKs
-DROP INDEX IF EXISTS idx_posts_author;
+-- DROP INDEX is NOT supported: it errors, and `IF EXISTS` does not silence it.
+-- (Through 4.19.0 it was planned as DROP TABLE — `DROP INDEX IF EXISTS posts`
+--  silently dropped the TABLE `posts`. Never issue it against older builds.)
 DROP VIEW IF EXISTS user_stats;
 DROP TRIGGER IF EXISTS posts_audit ON posts;   -- works; `ON <table>` is mandatory
 ```
@@ -364,10 +431,10 @@ DROP TRIGGER IF EXISTS posts_audit ON posts;   -- works; `ON <table>` is mandato
 - **FK violations inside a single transaction** were fixed in v3.22.1 — older versions could see phantom violations during cascading deletes.
 - **`PRAGMA foreign_keys = ON;` is a no-op-with-ack** — Nano enforces FKs by default; the PRAGMA exists only for sqlite3 source compatibility.
 - **HNSW indexes require explicit `dim`** in `WITH (...)`. Mismatched embedding dimensions will fail at insert time, not at index creation.
-- **Triggers never fire at all** — row-level *and* statement-level, every timing, every event. `CREATE TRIGGER` returning `OK` only means it was registered. See Recipe 5; never rely on a trigger for correctness.
-- **User-defined functions are not callable by anything** — `CREATE FUNCTION` returning `OK` only means it was registered. `SELECT f(x)` errors `Unknown scalar function: f`, in a `SELECT` list, a `WHERE` clause, a `FROM` clause, via `CALL`, and via bound parameters, on both the embedded API and the wire. There is no `PERFORM`. See Recipe 6.
+- **Trigger BODIES never execute** — row-level *and* statement-level, every timing, every event, every interface. `CREATE TRIGGER` returning `OK` only means it was registered and persisted. The sole exception is the `BEFORE INSERT … FOR EACH ROW` `NEW.<col> = <expr>` / `RETURN NULL` row rewrite. See Recipe 5; never rely on a trigger body for correctness.
+- **User-defined functions are SCALAR-only, and the `$` sigil is mandatory** — `SELECT f(x)` works in a `SELECT` list, a `WHERE` clause and through bound parameters, on the embedded API and both wires, and survives a restart. But `SELECT * FROM f()` fails as a missing table, `CALL f()` fails (`Procedure 'f' does not exist`), there is no `PERFORM`, no overloading, no non-`public` qualifier, and `pg_proc` / `information_schema.routines` stay empty. A body that writes `x` instead of `$1` fails with a column error. PL/pgSQL `IF`/loops/`:=` inside a FUNCTION body are refused with an explicit error. See Recipe 6.
 - **Procedures work in either language, but the `$` sigil is mandatory** — a *bare* parameter name fails with `Column 'n' not found in schema` in both `LANGUAGE sql` and `LANGUAGE plpgsql`, deliberately, so a variable can never shadow a column. (plpgsql binding is new; through 4.10.2 a plpgsql body substituted nothing at all.) An argument a body never mentions is silently discarded, and a `$`-token inside a string literal, comment or `$tag$…$tag$` block is data, not a placeholder. `CALL` now runs the body on every client path and reports 0 rows affected — through 4.11.0 it was a silent no-op (returning 1 row affected, and "succeeding" for a missing procedure) over the PG extended protocol and the REST layer. On the embedded API / REPL only, `CALL` inside an explicit `BEGIN` is refused with an error. See Recipe 6.
-- **`information_schema.routines`, `information_schema.parameters` and `pg_proc` are always empty** — they return zero rows even with a function registered, so no ORM or catalog client can discover a user-defined routine.
+- **`information_schema.routines`, `information_schema.parameters` and `pg_proc` never report a user-defined routine** — so no ORM or catalog client can discover one. `pg_proc` is registered everywhere and returns zero rows. `routines` and `parameters` return zero rows over the PostgreSQL and MySQL wires, but on the embedded API / REPL / Python binding they are *unknown relations* and raise an error — they are not registered in the phase-3 view registry.
 - **Materialized view auto-refresh** competes for CPU with foreground queries. Tune `max_cpu_percent`.
 
 ## See also

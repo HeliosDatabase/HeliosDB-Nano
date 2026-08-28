@@ -215,7 +215,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
             || super::handler::starts_with_icase(trimmed_query, "START TRANSACTION ")
             || trimmed_query.eq_ignore_ascii_case("COMMIT")
             || trimmed_query.eq_ignore_ascii_case("ROLLBACK");
-        if is_transaction_control {
+        // HC4 parity. `SET ROLE <x>` / `SET SESSION AUTHORIZATION <x>` are
+        // classified and refused (0A000, with the explanatory text) — and the
+        // `NONE` / `DEFAULT` spellings are still acked — inside
+        // `handle_single_query`. Every client that binds parameters server-side
+        // (psycopg3, JDBC, sqlx, node-postgres) reaches Execute, never the
+        // simple path, so without this delegation they got
+        // `XX000 Statement not yet supported: SetRole { … }` for the dangerous
+        // spelling, an outright error for `SET ROLE NONE`, and no effect at all
+        // from `[authentication] legacy_acl_noop`. Delegate rather than growing
+        // a second copy of the rule.
+        let is_set_role = Self::parse_set_role_target(trimmed_query).is_some();
+        if is_transaction_control || is_set_role {
             let previous_suppress_ready = self.suppress_ready_for_query;
             self.suppress_ready_for_query = true;
             let result = self.handle_single_query(&statement.query).await;

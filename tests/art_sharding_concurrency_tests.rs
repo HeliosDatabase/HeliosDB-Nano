@@ -186,8 +186,9 @@ fn mutual_fk_inserts_across_tables_do_not_deadlock() {
 /// (c) Concurrent index create/drop (takes the global registry WRITE lock)
 /// while readers run point lookups and a writer inserts into the DDL'd
 /// table. Create/drop is driven through the ART manager API directly (the
-/// embedded SQL layer does not support `DROP INDEX` yet — it parses as
-/// `DROP TABLE`), which is exactly the registry path R2.2 re-locked.
+/// embedded SQL layer does not support `DROP INDEX` yet — it now errors
+/// loudly; it used to parse as `DROP TABLE`), which is exactly the registry
+/// path R2.2 re-locked.
 #[test]
 fn concurrent_index_create_drop_during_reads() {
     let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());

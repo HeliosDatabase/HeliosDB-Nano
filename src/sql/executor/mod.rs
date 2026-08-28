@@ -39,6 +39,15 @@ pub use window::WindowOperator;
 
 type IntRangeBounds = (Option<(i64, bool)>, Option<(i64, bool)>);
 
+/// The grantor recorded on every stored ACL row.
+///
+/// Constant until session identity lands: the authenticated wire username
+/// never reaches SQL today (`current_user` / `session_user` are hardcoded
+/// literals — see the ROADMAP_V5 session-identity follow-up), so deriving a
+/// per-statement grantor would be fabrication. `helios` matches the built-in
+/// role the catalog already reports as owning everything.
+const ACL_DEFAULT_GRANTOR: &str = "helios";
+
 /// Create a schema for COUNT(*) fast path results (single Int8 column).
 fn count_star_schema() -> Arc<Schema> {
     Arc::new(Schema {
@@ -2069,6 +2078,32 @@ impl<'a> Executor<'a> {
         ))
     }
 
+    /// True when `table_name` is served by the planner-backed
+    /// [`SystemViewRegistry`](crate::sql::phase3::SystemViewRegistry)
+    /// (`information_schema.*`, `pg_class`, `pg_indexes`, …) rather than by a
+    /// physical table in storage.
+    ///
+    /// Every storage-metadata aggregate fast path in this file keys on the
+    /// scan's table name and then asks STORAGE for the answer
+    /// (`count_table_rows`, `aggregate_columnar_columns`,
+    /// `try_aggregate_row_columns`, the PK-cardinality probes). A registry
+    /// view has no physical table, and storage reports "no rows" for an
+    /// unknown table instead of erroring — so `SELECT count(*) FROM
+    /// information_schema.tables` answered `0` and `SELECT table_schema,
+    /// count(*) FROM information_schema.columns GROUP BY table_schema`
+    /// answered nothing at all, on every route. That is exactly the
+    /// "introspecting clients see less schema than exists" defect: an ORM or
+    /// migration tool asking how many tables exist was told none did.
+    ///
+    /// Declining here makes those plans fall through to the generic
+    /// `AggregateOperator`, which consumes the rows `scan::handle_scan`
+    /// materialises from the registry — the same rows a plain `SELECT *`
+    /// returns. This is the ONE place that rule lives; do not re-derive it
+    /// per fast path.
+    fn is_registry_backed_system_view(table_name: &str) -> bool {
+        crate::sql::phase3::SystemViewRegistry::shared().is_system_view(table_name)
+    }
+
     fn fast_path_storage_table_name(&self, table_name: &str) -> Result<String> {
         let Some(storage) = self.storage else {
             return Ok(table_name.to_string());
@@ -2612,6 +2647,32 @@ impl<'a> Executor<'a> {
     }
 
     fn columnar_aggregate_input<'b>(
+        input: &'b LogicalPlan,
+    ) -> Option<(
+        &'b str,
+        &'b Schema,
+        Option<&'b crate::sql::LogicalExpr>,
+        Option<&'b crate::sql::logical_plan::AsOfClause>,
+    )> {
+        let resolved = Self::columnar_aggregate_scan_target(input);
+        // A registry-backed system view has no physical table, so every caller
+        // of this function (`try_count_pk_cardinality`,
+        // `try_count_star_pk_cardinality`, `try_columnar_aggregate`,
+        // `try_rowstore_aggregate`) would ask storage about a name it has
+        // never heard of and be told "no rows" rather than erroring. Decline
+        // once, here, so all four fall through to the generic aggregate
+        // operator over the registry-materialised rows.
+        if resolved.is_some_and(|(table_name, _, _, _)| Self::is_registry_backed_system_view(table_name)) {
+            return None;
+        }
+        resolved
+    }
+
+    /// Structural half of [`Self::columnar_aggregate_input`]: recognise the
+    /// scan shapes a storage-metadata aggregate can be pushed into. Callers
+    /// must go through `columnar_aggregate_input`, which additionally rejects
+    /// relations that storage cannot answer for.
+    fn columnar_aggregate_scan_target<'b>(
         input: &'b LogicalPlan,
     ) -> Option<(
         &'b str,
@@ -3432,8 +3493,18 @@ impl<'a> Executor<'a> {
                                 }
                                 _ => None,
                             };
+                            // The storage row-counter answers for PHYSICAL
+                            // tables only. A registry-backed system view has
+                            // none, and `count_table_rows` reports 0 for an
+                            // unknown table rather than erroring — which is
+                            // how `SELECT count(*) FROM
+                            // information_schema.tables` told every ORM the
+                            // database had no tables. Fall through to the
+                            // generic aggregate over the registry rows.
                             if let Some(table_name) = scan_table {
-                                if self.get_cte(table_name).is_none() {
+                                if self.get_cte(table_name).is_none()
+                                    && !Self::is_registry_backed_system_view(table_name)
+                                {
                                     if let Some(storage) = self.storage {
                                         let count_table_name = self.fast_path_storage_table_name(table_name)?;
                                         let count = storage.count_table_rows(&count_table_name)?;
@@ -3835,6 +3906,213 @@ impl<'a> Executor<'a> {
                     .with_timeout(self.timeout_ctx()),
                 ))
             }
+            // ---------------------------------------------------------------
+            // Role / ACL DDL. ONE implementation, reached by BOTH DML executor
+            // families: the text family (`execute_in_transaction_inner`'s
+            // catch-all → `query_plan_with_params` → `Executor::execute`) and
+            // the params family (`execute_plan_with_params_inner`'s catch-all →
+            // `Executor::execute`). Nothing family-specific may be added here.
+            //
+            // *** THESE ARMS WRITE AND READ A CATALOG. THEY ENFORCE NOTHING. ***
+            // No privilege is checked at any DML choke point in this build.
+            // ---------------------------------------------------------------
+            LogicalPlan::CreateRole {
+                name,
+                if_not_exists,
+                login,
+                superuser,
+                createdb,
+                createrole,
+                inherit,
+                replication,
+                bypassrls,
+                conn_limit,
+                valid_until,
+                password,
+            } => {
+                let catalog = self.acl_catalog("CREATE ROLE")?;
+                if crate::storage::is_reserved_role_name(name) {
+                    return Err(Error::query_execution(format!(
+                        "role \"{name}\" is reserved and cannot be created"
+                    )));
+                }
+                if catalog.role_exists(name)? {
+                    if *if_not_exists {
+                        return self.empty_ddl_result();
+                    }
+                    return Err(Error::query_execution(format!("role \"{name}\" already exists")));
+                }
+                let oid = catalog.allocate_role_oid()?;
+                let record = crate::storage::RoleRecord {
+                    oid,
+                    name: name.clone(),
+                    rolsuper: *superuser,
+                    rolinherit: *inherit,
+                    rolcreaterole: *createrole,
+                    rolcreatedb: *createdb,
+                    rolcanlogin: *login,
+                    rolreplication: *replication,
+                    rolbypassrls: *bypassrls,
+                    rolconnlimit: conn_limit.unwrap_or(-1),
+                    rolvaliduntil: valid_until.clone(),
+                    password: password.clone(),
+                };
+                catalog.save_role(&record)?;
+                self.empty_ddl_result()
+            }
+            LogicalPlan::AlterRole {
+                name,
+                set_login,
+                set_superuser,
+                set_createdb,
+                set_createrole,
+                set_inherit,
+                set_replication,
+                set_bypassrls,
+                set_conn_limit,
+                set_valid_until,
+                set_password,
+            } => {
+                let catalog = self.acl_catalog("ALTER ROLE")?;
+                if crate::storage::is_reserved_role_name(name) {
+                    return Err(Error::query_execution(format!("cannot alter built-in role \"{name}\"")));
+                }
+                let mut record = catalog
+                    .get_role(name)?
+                    .ok_or_else(|| Error::query_execution(format!("role \"{name}\" does not exist")))?;
+                if let Some(v) = set_login {
+                    record.rolcanlogin = *v;
+                }
+                if let Some(v) = set_superuser {
+                    record.rolsuper = *v;
+                }
+                if let Some(v) = set_createdb {
+                    record.rolcreatedb = *v;
+                }
+                if let Some(v) = set_createrole {
+                    record.rolcreaterole = *v;
+                }
+                if let Some(v) = set_inherit {
+                    record.rolinherit = *v;
+                }
+                if let Some(v) = set_replication {
+                    record.rolreplication = *v;
+                }
+                if let Some(v) = set_bypassrls {
+                    record.rolbypassrls = *v;
+                }
+                if let Some(v) = set_conn_limit {
+                    record.rolconnlimit = v.unwrap_or(-1);
+                }
+                if let Some(v) = set_valid_until {
+                    record.rolvaliduntil = v.clone();
+                }
+                if let Some(v) = set_password {
+                    record.password = v.clone();
+                }
+                catalog.save_role(&record)?;
+                self.empty_ddl_result()
+            }
+            LogicalPlan::DropRole { name, if_exists } => {
+                // DATA-LOSS FIX (companion to the planner's `ObjectType::Role`
+                // arm). `DROP ROLE x` used to be planned as `DROP TABLE x` and
+                // silently dropped a same-named table. It lands here, where it
+                // can NEVER touch a relation.
+                //
+                // The "does not exist" message deliberately avoids the words
+                // "table"/"relation" so the PG wire's message-shape SQLSTATE
+                // classifier maps it to 42704 undefined_object, not 42P01.
+                let catalog = self.acl_catalog("DROP ROLE")?;
+                if crate::storage::is_reserved_role_name(name) {
+                    return Err(Error::query_execution(format!("cannot drop built-in role \"{name}\"")));
+                }
+                if !catalog.role_exists(name)? {
+                    if *if_exists {
+                        return self.empty_ddl_result();
+                    }
+                    return Err(Error::query_execution(format!("role \"{name}\" does not exist")));
+                }
+                // PostgreSQL parity: a role holding grants cannot be dropped.
+                // This is a REFERENTIAL check on the ACL catalog, not a
+                // privilege check — it stops the catalog from keeping grant
+                // rows that name a role nobody can see any more.
+                if !catalog.list_acls_for_grantee(name)?.is_empty() {
+                    return Err(Error::query_execution(format!(
+                        "role \"{name}\" cannot be dropped because some objects depend on it \
+                         (revoke its privileges first)"
+                    )));
+                }
+                catalog.delete_role(name)?;
+                self.empty_ddl_result()
+            }
+            LogicalPlan::GrantPrivileges {
+                privileges,
+                all_privileges,
+                object_type,
+                objects,
+                grantees,
+                with_grant_option,
+            } => {
+                let catalog = self.acl_catalog("GRANT")?;
+                let privileges = Self::resolve_acl_privileges(privileges, *all_privileges, object_type)?;
+                let lenient = Self::legacy_acl_noop(self.storage);
+                for grantee in grantees {
+                    if !Self::acl_grantee_exists(&catalog, grantee)? {
+                        if lenient {
+                            continue;
+                        }
+                        return Err(Error::query_execution(format!("role \"{grantee}\" does not exist")));
+                    }
+                    for object in objects {
+                        if !Self::acl_object_exists(&catalog, object_type, object)? {
+                            if lenient {
+                                continue;
+                            }
+                            return Err(Self::acl_missing_object_error(object_type, object));
+                        }
+                        catalog.grant_privileges(
+                            object_type,
+                            object,
+                            grantee,
+                            ACL_DEFAULT_GRANTOR,
+                            &privileges,
+                            *with_grant_option,
+                        )?;
+                    }
+                }
+                self.empty_ddl_result()
+            }
+            LogicalPlan::RevokePrivileges {
+                privileges,
+                all_privileges,
+                object_type,
+                objects,
+                grantees,
+            } => {
+                let catalog = self.acl_catalog("REVOKE")?;
+                let privileges = Self::resolve_acl_privileges(privileges, *all_privileges, object_type)?;
+                let lenient = Self::legacy_acl_noop(self.storage);
+                for grantee in grantees {
+                    if !Self::acl_grantee_exists(&catalog, grantee)? {
+                        if lenient {
+                            continue;
+                        }
+                        return Err(Error::query_execution(format!("role \"{grantee}\" does not exist")));
+                    }
+                    for object in objects {
+                        if !Self::acl_object_exists(&catalog, object_type, object)? {
+                            if lenient {
+                                continue;
+                            }
+                            return Err(Self::acl_missing_object_error(object_type, object));
+                        }
+                        // Revoking a privilege that was never granted succeeds
+                        // silently (PostgreSQL warns and succeeds).
+                        catalog.revoke_privileges(object_type, object, grantee, &privileges)?;
+                    }
+                }
+                self.empty_ddl_result()
+            }
             LogicalPlan::CreateEnumType { name, labels } => {
                 // KanttBan #20 (v3.31.0). Persist the enum labels in
                 // the catalog. CREATE TABLE statements that reference
@@ -3950,10 +4228,12 @@ impl<'a> Executor<'a> {
                 ))
             }
             LogicalPlan::Noop => {
-                // Priority #4 of the pgrust-corpus diagnosis: GRANT/REVOKE
-                // (and any other statement the planner maps to Noop) parse
-                // and succeed with zero effect — same empty-result shape as
-                // CreateSchema above.
+                // Any statement the planner maps to Noop parses and succeeds
+                // with zero effect — same empty-result shape as CreateSchema
+                // above. GRANT/REVOKE NO LONGER LAND HERE: they plan to
+                // `GrantPrivileges` / `RevokePrivileges` and persist an ACL
+                // record instead of vanishing while reporting success. (That
+                // record is introspectable only; nothing enforces it.)
                 Ok(Box::new(
                     ScanOperator::new(
                         String::new(),
@@ -4195,31 +4475,40 @@ impl<'a> Executor<'a> {
                 Ok(Box::new(DualScanOperator::new()))
             }
             // Procedural SQL statements
-            LogicalPlan::CreateFunction { name, .. } => {
-                // Return a status message
-                let msg = format!("Function '{}' created", name);
-                Ok(Box::new(StatusMessageOperator::new(msg)))
-            }
-            LogicalPlan::CreateProcedure { name, .. } => {
-                let msg = format!("Procedure '{}' created", name);
-                Ok(Box::new(StatusMessageOperator::new(msg)))
-            }
-            LogicalPlan::DropFunction { name, if_exists } => {
-                let msg = if *if_exists {
-                    format!("Function '{}' dropped (if exists)", name)
-                } else {
-                    format!("Function '{}' dropped", name)
-                };
-                Ok(Box::new(StatusMessageOperator::new(msg)))
-            }
-            LogicalPlan::DropProcedure { name, if_exists } => {
-                let msg = if *if_exists {
-                    format!("Procedure '{}' dropped (if exists)", name)
-                } else {
-                    format!("Procedure '{}' dropped", name)
-                };
-                Ok(Box::new(StatusMessageOperator::new(msg)))
-            }
+            // An `Executor` holds no `FunctionRegistry` handle, so it cannot create or
+            // drop a routine — only `EmbeddedDatabase`'s four shared helpers
+            // (`execute_create_function_plan` and friends) can, and BOTH DML executor
+            // families now dispatch these four plans there before reaching this operator
+            // builder. Anything still landing here must FAIL.
+            //
+            // These four used to return `StatusMessageOperator::new("Function 'x'
+            // created")` — a success that registered nothing, persisted nothing and
+            // counted its own status line as one affected row. That was the whole of
+            // CREATE FUNCTION / CREATE PROCEDURE for the params family, i.e. for every
+            // extended-protocol client (psycopg server-side bind, JDBC, sqlx, Drizzle,
+            // node-postgres). A loud error cannot be mistaken for the routine existing.
+            // Same shape and same rationale as the `Call` arm directly below — see the
+            // v4.12.0 precedent.
+            LogicalPlan::CreateFunction { name, .. } => Err(Error::query_execution(format!(
+                "Function '{}' was NOT created: this execution path cannot register functions. \
+                 Issue CREATE FUNCTION through execute() or execute_params() (it is DDL, not a query).",
+                name
+            ))),
+            LogicalPlan::CreateProcedure { name, .. } => Err(Error::query_execution(format!(
+                "Procedure '{}' was NOT created: this execution path cannot register procedures. \
+                 Issue CREATE PROCEDURE through execute() or execute_params() (it is DDL, not a query).",
+                name
+            ))),
+            LogicalPlan::DropFunction { name, .. } => Err(Error::query_execution(format!(
+                "Function '{}' was NOT dropped: this execution path cannot drop functions. \
+                 Issue DROP FUNCTION through execute() or execute_params() (it is DDL, not a query).",
+                name
+            ))),
+            LogicalPlan::DropProcedure { name, .. } => Err(Error::query_execution(format!(
+                "Procedure '{}' was NOT dropped: this execution path cannot drop procedures. \
+                 Issue DROP PROCEDURE through execute() or execute_params() (it is DDL, not a query).",
+                name
+            ))),
             LogicalPlan::Call { name, .. } => {
                 // An `Executor` holds no `FunctionRegistry` handle, so it cannot run a
                 // procedure body — only `EmbeddedDatabase::execute_call_plan` can, and both
@@ -4357,6 +4646,102 @@ impl<'a> Executor<'a> {
             owned_by_table,
             owned_by_column,
         })
+    }
+
+    // -------------------------------------------------------------------
+    // Role / ACL execution helpers.
+    //
+    // *** READ THIS BEFORE REUSING ANYTHING BELOW. *** These helpers write and
+    // read a catalog of roles and grants. They do NOT authorise anything, and
+    // no caller of theirs does either: this build performs ZERO privilege
+    // checks at any DML choke point. The value of the catalog is that
+    // introspection stops lying (GRANT no longer vanishes while reporting
+    // success, pg_roles no longer invents two all-privilege superusers) — not
+    // that access is restricted.
+    // -------------------------------------------------------------------
+
+    /// Storage handle for the role/ACL catalog, or a loud error naming the
+    /// statement that needs it.
+    fn acl_catalog(&self, statement: &str) -> Result<crate::storage::Catalog<'a>> {
+        let storage = self
+            .storage
+            .ok_or_else(|| Error::query_execution(format!("{statement} requires storage context")))?;
+        Ok(storage.catalog())
+    }
+
+    /// `[authentication] legacy_acl_noop` — the documented compatibility
+    /// escape for deployments whose scripts relied on GRANT/REVOKE succeeding
+    /// against roles and tables that do not exist. When true, an unknown
+    /// grantee or object is skipped instead of erroring; grants whose grantee
+    /// AND object both exist are still stored. It does NOT re-enable the old
+    /// "store nothing" behaviour, and it changes no enforcement (there is
+    /// none, either way).
+    fn legacy_acl_noop(storage: Option<&StorageEngine>) -> bool {
+        storage.is_some_and(|s| s.config().authentication.legacy_acl_noop)
+    }
+
+    /// A DDL-shaped empty result (zero columns, zero rows) — the same shape
+    /// `DROP SEQUENCE` / `CREATE SCHEMA` return.
+    fn empty_ddl_result(&self) -> Result<Box<dyn PhysicalOperator>> {
+        Ok(Box::new(
+            ScanOperator::new(
+                String::new(),
+                Arc::new(crate::Schema { columns: vec![] }),
+                None,
+                vec![],
+                vec![],
+            )
+            .with_timeout(self.timeout_ctx()),
+        ))
+    }
+
+    /// Expand `GRANT/REVOKE ALL` for the object type, or validate an explicit
+    /// list. The "what does ALL mean" rule lives in exactly one place
+    /// (`sql::acl_views::all_privileges_for`) so the executor and the views
+    /// can never disagree about it.
+    fn resolve_acl_privileges(privileges: &[String], all_privileges: bool, object_type: &str) -> Result<Vec<String>> {
+        if !all_privileges {
+            if privileges.is_empty() {
+                return Err(Error::query_execution("GRANT/REVOKE requires at least one privilege"));
+            }
+            return Ok(privileges.to_vec());
+        }
+        let all = crate::sql::acl_views::all_privileges_for(object_type).ok_or_else(|| {
+            Error::query_execution(format!(
+                "GRANT/REVOKE ALL PRIVILEGES is not defined for object type '{object_type}'"
+            ))
+        })?;
+        Ok(all.iter().map(|p| (*p).to_string()).collect())
+    }
+
+    /// True if `grantee` names something a grant can be recorded against: the
+    /// `public` pseudo-role, a virtual built-in, or a persisted role.
+    fn acl_grantee_exists(catalog: &crate::storage::Catalog<'_>, grantee: &str) -> Result<bool> {
+        if crate::storage::is_reserved_role_name(grantee) {
+            return Ok(true);
+        }
+        catalog.role_exists(grantee)
+    }
+
+    /// True if the GRANT target exists in the catalog.
+    fn acl_object_exists(catalog: &crate::storage::Catalog<'_>, object_type: &str, object: &str) -> Result<bool> {
+        match object_type {
+            "table" => catalog.table_exists(object),
+            "sequence" => catalog.sequence_exists(object),
+            other => Err(Error::query_execution(format!(
+                "GRANT/REVOKE on object type '{other}' is not supported (tables and sequences only)"
+            ))),
+        }
+    }
+
+    /// The missing-object error for a GRANT/REVOKE target. Table wording is
+    /// deliberately the engine's standard `Table 'x' does not exist` so the PG
+    /// wire's message-shape classifier maps it to 42P01 undefined_table.
+    fn acl_missing_object_error(object_type: &str, object: &str) -> Error {
+        match object_type {
+            "sequence" => Error::query_execution(format!("sequence \"{object}\" does not exist")),
+            _ => Error::query_execution(format!("Table '{object}' does not exist")),
+        }
     }
 
     /// Get timeout context (for submodules)
