@@ -756,8 +756,23 @@ impl<'a> Planner<'a> {
                 // for an embedded DB. A DROP TABLE target resolves through the
                 // session `search_path` (bare → `cs.t` when it exists); other
                 // object kinds keep the plain namespace-collapse.
-                let to_plan = |name: &sqlparser::ast::ObjectName| -> LogicalPlan {
-                    match object_type {
+                //
+                // DATA-LOSS CLASS FIX (roadmap §2.1 / the DROP ROLE landmine).
+                // This match used to end in `_ => LogicalPlan::DropTable { … }`,
+                // so EVERY object kind without an explicit arm was executed as a
+                // DROP TABLE against a relation with the same name. `DROP ROLE
+                // analyst` destroyed a table called `analyst`; `DROP INDEX users`
+                // destroyed the `users` TABLE; `DROP INDEX IF EXISTS x` dropped
+                // table `x` and reported success. The catch-all is GONE on
+                // purpose: this match is exhaustive over `sqlparser::ast::
+                // ObjectType` (Table, View, Index, Schema, Database, Role,
+                // Sequence, Stage, Type — sqlparser 0.53 `ast/mod.rs:5879`), so a
+                // sqlparser upgrade that adds a variant is a COMPILE ERROR here
+                // instead of a silent table deletion. DO NOT reintroduce a `_`
+                // arm; add the variant explicitly, and if it is unimplemented
+                // make it a loud error that names itself.
+                let to_plan = |name: &sqlparser::ast::ObjectName| -> Result<LogicalPlan> {
+                    Ok(match object_type {
                         sqlparser::ast::ObjectType::View => LogicalPlan::DropView {
                             name: Self::normalize_nontable_name(name),
                             if_exists,
@@ -778,20 +793,65 @@ impl<'a> Planner<'a> {
                             name: Self::normalize_nontable_name(name),
                             if_exists,
                         },
-                        // Default to DROP TABLE for backwards compatibility.
-                        _ => LogicalPlan::DropTable {
-                            name: self.resolve_table_ref(name),
+                        // DATA-LOSS FIX. `DROP ROLE analyst` parses as
+                        // `ObjectType::Role`, which used to fall through the
+                        // now-deleted `_ =>` fallback and be executed as
+                        // `DROP TABLE analyst` — silently destroying a table
+                        // that happened to share the role's name, with no
+                        // error. Roles are persisted (`meta:role:<name>`); the
+                        // executor's `DropRole` arm removes the catalog record
+                        // and can never reach a relation. This arm MUST stay
+                        // ahead of any future fallback.
+                        sqlparser::ast::ObjectType::Role => LogicalPlan::DropRole {
+                            name: Self::normalize_nontable_name(name),
                             if_exists,
                         },
-                    }
+                        // DATA-LOSS FIX, same class as DROP ROLE. There is no
+                        // `LogicalPlan::DropIndex`: the drop machinery exists
+                        // (`Catalog::drop_index_definition`, `ArtManager::
+                        // drop_index`, `WalOperation::DropIndex` replay) but is
+                        // not wired to the parser (roadmap §2.1). Until it is,
+                        // this MUST error loudly rather than resolve a table
+                        // reference. `IF EXISTS` deliberately does NOT silence
+                        // it — the index is not dropped either way, and a quiet
+                        // "success" here is exactly the silent-no-op failure
+                        // mode this repo keeps shipping.
+                        sqlparser::ast::ObjectType::Index => {
+                            return Err(Error::query_execution(format!(
+                                "DROP INDEX is not supported yet (index '{}'); it is NOT executed as DROP TABLE. \
+                                 Indexes are dropped implicitly with their table.",
+                                Self::normalize_nontable_name(name)
+                            )))
+                        }
+                        // Snowflake-only object kind; there is no stage concept
+                        // in HeliosDB. Never a relation.
+                        sqlparser::ast::ObjectType::Stage => {
+                            return Err(Error::query_execution(format!(
+                                "DROP STAGE is not supported (stage '{}'); HeliosDB has no stage objects.",
+                                Self::normalize_nontable_name(name)
+                            )))
+                        }
+                        // Handled by the early return above; kept explicit so
+                        // the match stays exhaustive without a catch-all.
+                        sqlparser::ast::ObjectType::Schema => {
+                            return Err(Error::internal(
+                                "DROP SCHEMA must be planned by the DropSchema early return",
+                            ))
+                        }
+                    })
                 };
 
                 if names.len() == 1 {
-                    Ok(to_plan(&names[0]))
+                    let only = names
+                        .first()
+                        .ok_or_else(|| Error::query_execution("DROP requires a name"))?;
+                    to_plan(only)
                 } else {
-                    Ok(LogicalPlan::DropMulti {
-                        drops: names.iter().map(&to_plan).collect(),
-                    })
+                    let mut drops = Vec::with_capacity(names.len());
+                    for name in &names {
+                        drops.push(to_plan(name)?);
+                    }
+                    Ok(LogicalPlan::DropMulti { drops })
                 }
             }
             Statement::Truncate { table_names, .. } => {
@@ -1299,24 +1359,357 @@ impl<'a> Planner<'a> {
                     ))),
                 }
             }
-            // Priority #4 of the pgrust-corpus diagnosis:
+            // `CREATE ROLE <name> [WITH] <options…>`. Also the destination of
+            // the parser's `CREATE USER` → `CREATE ROLE … LOGIN` rewrite
+            // (sqlparser 0.53 has no CREATE USER grammar at all).
+            //
+            // *** THE RESULTING CATALOG RECORD ENFORCES NOTHING. *** The
+            // attribute bits are persisted so `pg_roles` / `pg_authid` report
+            // what was asked for instead of two fabricated superusers; no code
+            // path reads them to authorise a statement.
+            Statement::CreateRole {
+                names,
+                if_not_exists,
+                login,
+                inherit,
+                bypassrls,
+                password,
+                superuser,
+                create_db,
+                create_role,
+                replication,
+                connection_limit,
+                valid_until,
+                in_role,
+                in_group,
+                role,
+                user,
+                admin,
+                authorization_owner,
+            } => {
+                // PostgreSQL's CREATE ROLE takes exactly one name; sqlparser
+                // models it as a Vec. Reject >1 loudly rather than silently
+                // creating only the first.
+                if names.len() != 1 {
+                    return Err(Error::query_execution(
+                        "CREATE ROLE supports exactly one role name per statement",
+                    ));
+                }
+                if !in_role.is_empty() || !in_group.is_empty() || !role.is_empty() || !user.is_empty() {
+                    return Err(Error::query_execution(
+                        "CREATE ROLE … IN ROLE / IN GROUP / ROLE / USER membership is not supported yet \
+                         (HeliosDB has no role membership graph); create the roles separately",
+                    ));
+                }
+                if !admin.is_empty() {
+                    return Err(Error::query_execution(
+                        "CREATE ROLE … ADMIN is not supported yet (HeliosDB has no role membership graph)",
+                    ));
+                }
+                if authorization_owner.is_some() {
+                    return Err(Error::query_execution(
+                        "CREATE ROLE … AUTHORIZATION is a SQL Server form and is not supported",
+                    ));
+                }
+                let name = Self::normalize_nontable_name(
+                    names
+                        .first()
+                        .ok_or_else(|| Error::query_execution("CREATE ROLE requires a role name"))?,
+                );
+                Ok(LogicalPlan::CreateRole {
+                    name,
+                    if_not_exists,
+                    // PostgreSQL defaults: NOLOGIN, INHERIT, everything else off.
+                    login: login.unwrap_or(false),
+                    superuser: superuser.unwrap_or(false),
+                    createdb: create_db.unwrap_or(false),
+                    createrole: create_role.unwrap_or(false),
+                    inherit: inherit.unwrap_or(true),
+                    replication: replication.unwrap_or(false),
+                    bypassrls: bypassrls.unwrap_or(false),
+                    conn_limit: connection_limit
+                        .as_ref()
+                        .map(|expr| Self::role_int_option(expr, "CONNECTION LIMIT"))
+                        .transpose()?,
+                    valid_until: valid_until
+                        .as_ref()
+                        .map(|expr| Self::role_text_option(expr, "VALID UNTIL"))
+                        .transpose()?,
+                    password: Self::role_password_option(password.as_ref())?,
+                })
+            }
+            // `ALTER ROLE <name> WITH <options…>`. RENAME TO / SET / RESET /
+            // ADD MEMBER / DROP MEMBER error loudly — they are NOT silently
+            // dropped, because an accepted-and-ignored ALTER is exactly the
+            // misrepresentation this slice removes.
+            Statement::AlterRole { name, operation } => {
+                use sqlparser::ast::{AlterRoleOperation, RoleOption};
+                let role_name = Self::normalize_ident(&name);
+                let options = match operation {
+                    AlterRoleOperation::WithOptions { options } => options,
+                    AlterRoleOperation::RenameRole { .. } => {
+                        return Err(Error::query_execution("ALTER ROLE … RENAME TO is not supported yet"));
+                    }
+                    AlterRoleOperation::Set { .. } | AlterRoleOperation::Reset { .. } => {
+                        return Err(Error::query_execution(
+                            "ALTER ROLE … SET/RESET of configuration parameters is not supported \
+                             (HeliosDB has no per-role GUC store)",
+                        ));
+                    }
+                    AlterRoleOperation::AddMember { .. } | AlterRoleOperation::DropMember { .. } => {
+                        return Err(Error::query_execution(
+                            "ALTER ROLE … ADD/DROP MEMBER is not supported yet \
+                             (HeliosDB has no role membership graph)",
+                        ));
+                    }
+                };
+                if options.is_empty() {
+                    return Err(Error::query_execution(
+                        "ALTER ROLE requires at least one option (e.g. ALTER ROLE r WITH LOGIN)",
+                    ));
+                }
+                let mut set_login = None;
+                let mut set_superuser = None;
+                let mut set_createdb = None;
+                let mut set_createrole = None;
+                let mut set_inherit = None;
+                let mut set_replication = None;
+                let mut set_bypassrls = None;
+                let mut set_conn_limit = None;
+                let mut set_valid_until = None;
+                let mut set_password = None;
+                for option in &options {
+                    match option {
+                        RoleOption::Login(v) => set_login = Some(*v),
+                        RoleOption::SuperUser(v) => set_superuser = Some(*v),
+                        RoleOption::CreateDB(v) => set_createdb = Some(*v),
+                        RoleOption::CreateRole(v) => set_createrole = Some(*v),
+                        RoleOption::Inherit(v) => set_inherit = Some(*v),
+                        RoleOption::Replication(v) => set_replication = Some(*v),
+                        RoleOption::BypassRLS(v) => set_bypassrls = Some(*v),
+                        RoleOption::ConnectionLimit(expr) => {
+                            set_conn_limit = Some(Some(Self::role_int_option(expr, "CONNECTION LIMIT")?));
+                        }
+                        RoleOption::ValidUntil(expr) => {
+                            set_valid_until = Some(Some(Self::role_text_option(expr, "VALID UNTIL")?));
+                        }
+                        RoleOption::Password(password) => {
+                            set_password = Some(Self::role_password_option(Some(password))?);
+                        }
+                    }
+                }
+                Ok(LogicalPlan::AlterRole {
+                    name: role_name,
+                    set_login,
+                    set_superuser,
+                    set_createdb,
+                    set_createrole,
+                    set_inherit,
+                    set_replication,
+                    set_bypassrls,
+                    set_conn_limit,
+                    set_valid_until,
+                    set_password,
+                })
+            }
             // `GRANT privileges ON objects TO grantees` /
-            // `REVOKE privileges ON objects FROM grantees`. HeliosDB has no
-            // SQL-level roles/permissions/ACL module to hang real
-            // enforcement off of (checked src/**/role*, permission*, rbac*,
-            // auth* — only HTTP/OAuth/replication-role/MCP auth exist,
-            // nothing privilege-shaped at the SQL layer), so — following
-            // the exact CREATE SCHEMA "single flat namespace" precedent
-            // above — these are accepted as a parse-and-accept no-op rather
-            // than erroring "Statement not yet supported". This is
-            // deliberately NOT real privilege enforcement; see
-            // `LogicalPlan::Noop`'s doc comment.
-            Statement::Grant { .. } | Statement::Revoke { .. } => Ok(LogicalPlan::Noop),
+            // `REVOKE privileges ON objects FROM grantees`.
+            //
+            // These used to map to `LogicalPlan::Noop` — parsed, executed as a
+            // no-op, and reported to the client as success. A client could not
+            // tell a stored grant from a discarded one, which is a
+            // security-relevant misrepresentation, not merely a missing
+            // feature. They now build real plans that PERSIST an ACL record.
+            //
+            // *** STILL NOT ENFORCEMENT. *** Nothing reads those records at any
+            // DML choke point; a GRANT confers no access and a REVOKE removes
+            // none. What changed is that introspection
+            // (`information_schema.table_privileges`, `role_table_grants`,
+            // MySQL `SHOW GRANTS`) now reports the truth about what was asked
+            // for. Enforcement is a named ROADMAP_V5 follow-up.
+            Statement::Grant {
+                privileges,
+                objects,
+                grantees,
+                with_grant_option,
+                ..
+            } => {
+                let (object_type, objects) = self.grant_objects_to_names(&objects)?;
+                let (privileges, all_privileges) = Self::grant_privileges_to_names(&privileges, &object_type)?;
+                Ok(LogicalPlan::GrantPrivileges {
+                    privileges,
+                    all_privileges,
+                    object_type,
+                    objects,
+                    grantees: grantees.iter().map(Self::normalize_ident).collect(),
+                    with_grant_option,
+                })
+            }
+            Statement::Revoke {
+                privileges,
+                objects,
+                grantees,
+                ..
+            } => {
+                let (object_type, objects) = self.grant_objects_to_names(&objects)?;
+                let (privileges, all_privileges) = Self::grant_privileges_to_names(&privileges, &object_type)?;
+                Ok(LogicalPlan::RevokePrivileges {
+                    privileges,
+                    all_privileges,
+                    object_type,
+                    objects,
+                    grantees: grantees.iter().map(Self::normalize_ident).collect(),
+                })
+            }
             _ => Err(Error::query_execution(format!(
                 "Statement not yet supported: {:?}",
                 statement
             ))),
         }
+    }
+
+    // -------------------------------------------------------------------
+    // CREATE/ALTER ROLE + GRANT/REVOKE plan helpers.
+    //
+    // Every one of these fails LOUD on a shape it cannot model. None of them
+    // may silently drop a clause: an accepted-and-ignored role option or
+    // grantee is precisely the misrepresentation this slice exists to remove.
+    // And to be explicit, since these names read like access control:
+    // *** NOTHING DOWNSTREAM ENFORCES A PRIVILEGE. ***
+    // -------------------------------------------------------------------
+
+    /// `CONNECTION LIMIT <n>` — an integer literal, nothing else.
+    fn role_int_option(expr: &sqlparser::ast::Expr, clause: &str) -> Result<i64> {
+        match expr {
+            sqlparser::ast::Expr::Value(sqlparser::ast::Value::Number(n, _)) => n
+                .parse::<i64>()
+                .map_err(|_| Error::query_execution(format!("{clause} must be an integer, got '{n}'"))),
+            other => Err(Error::query_execution(format!(
+                "{clause} must be an integer literal, got: {other}"
+            ))),
+        }
+    }
+
+    /// `VALID UNTIL '<timestamp>'` — a string literal, stored verbatim.
+    fn role_text_option(expr: &sqlparser::ast::Expr, clause: &str) -> Result<String> {
+        match expr {
+            sqlparser::ast::Expr::Value(sqlparser::ast::Value::SingleQuotedString(s)) => Ok(s.clone()),
+            other => Err(Error::query_execution(format!(
+                "{clause} must be a quoted string literal, got: {other}"
+            ))),
+        }
+    }
+
+    /// `PASSWORD '<literal>'` → `Some(literal)`; `PASSWORD NULL` and an
+    /// omitted clause → `None`.
+    ///
+    /// The literal is stored verbatim and is NEVER emitted by a catalog view
+    /// (`pg_roles.rolpassword` renders `********`). It is also NOT wired into
+    /// wire authentication — `AuthManager` still knows only the `--password`
+    /// users — so `CREATE ROLE … PASSWORD` does not create a connectable
+    /// account. That is a documented follow-up, not a silent gap.
+    fn role_password_option(password: Option<&sqlparser::ast::Password>) -> Result<Option<String>> {
+        match password {
+            None | Some(sqlparser::ast::Password::NullPassword) => Ok(None),
+            Some(sqlparser::ast::Password::Password(expr)) => Self::role_text_option(expr, "PASSWORD").map(Some),
+        }
+    }
+
+    /// Map a parsed `GRANT … ON <objects>` target list to
+    /// `(object_type, resolved names)`.
+    ///
+    /// Tables resolve through the session `search_path` (same choke point as
+    /// DML/DROP) so a grant records the same storage key the data lives under.
+    /// Every other target shape errors — schema-level, ALL TABLES IN SCHEMA and
+    /// the warehouse/Snowflake forms are not modelled, and pretending
+    /// otherwise would store a record that describes nothing.
+    fn grant_objects_to_names(&self, objects: &sqlparser::ast::GrantObjects) -> Result<(String, Vec<String>)> {
+        use sqlparser::ast::GrantObjects;
+        match objects {
+            GrantObjects::Tables(names) => Ok((
+                "table".to_string(),
+                names.iter().map(|n| self.resolve_table_ref(n)).collect(),
+            )),
+            GrantObjects::Sequences(names) => Ok((
+                "sequence".to_string(),
+                names.iter().map(Self::normalize_nontable_name).collect(),
+            )),
+            GrantObjects::Schemas(_) => Err(Error::query_execution(
+                "GRANT/REVOKE ON SCHEMA is not supported yet (tables and sequences only)",
+            )),
+            GrantObjects::AllTablesInSchema { .. } => Err(Error::query_execution(
+                "GRANT/REVOKE ON ALL TABLES IN SCHEMA is not supported yet \
+                 (name each table explicitly; tables and sequences only)",
+            )),
+            GrantObjects::AllSequencesInSchema { .. } => Err(Error::query_execution(
+                "GRANT/REVOKE ON ALL SEQUENCES IN SCHEMA is not supported yet \
+                 (name each sequence explicitly; tables and sequences only)",
+            )),
+        }
+    }
+
+    /// Map a parsed privilege list to `(uppercase names, all_privileges)`.
+    ///
+    /// `GRANT ALL` returns `(vec![], true)` — the expansion happens at
+    /// execution, where the object type is known, so the "what does ALL mean"
+    /// rule lives in exactly one place (`sql::acl_views::all_privileges_for`).
+    /// Column-scoped privileges (`GRANT SELECT (col) …`) and privileges that
+    /// do not apply to the target object type error rather than being stored
+    /// as something they are not.
+    fn grant_privileges_to_names(
+        privileges: &sqlparser::ast::Privileges,
+        object_type: &str,
+    ) -> Result<(Vec<String>, bool)> {
+        use sqlparser::ast::{Action, Privileges};
+        let actions = match privileges {
+            Privileges::All { .. } => return Ok((Vec::new(), true)),
+            Privileges::Actions(actions) => actions,
+        };
+        if actions.is_empty() {
+            return Err(Error::query_execution("GRANT/REVOKE requires at least one privilege"));
+        }
+        let mut names = Vec::with_capacity(actions.len());
+        for action in actions {
+            // Column-scoped grants are a separate catalog
+            // (`information_schema.column_privileges`) that this slice leaves
+            // empty; storing a column grant as a table grant would over-report.
+            let columns = match action {
+                Action::Select { columns }
+                | Action::Insert { columns }
+                | Action::Update { columns }
+                | Action::References { columns } => columns.as_ref(),
+                _ => None,
+            };
+            if columns.is_some() {
+                return Err(Error::query_execution(
+                    "column-level privileges (GRANT <priv> (column) …) are not supported yet",
+                ));
+            }
+            let name = match action {
+                Action::Select { .. } => "SELECT",
+                Action::Insert { .. } => "INSERT",
+                Action::Update { .. } => "UPDATE",
+                Action::Delete => "DELETE",
+                Action::Truncate => "TRUNCATE",
+                Action::References { .. } => "REFERENCES",
+                Action::Trigger => "TRIGGER",
+                Action::Usage => "USAGE",
+                Action::Connect | Action::Create | Action::Execute | Action::Temporary => {
+                    return Err(Error::query_execution(format!(
+                        "privilege {action} is not supported yet \
+                         (tables: SELECT/INSERT/UPDATE/DELETE/TRUNCATE/REFERENCES/TRIGGER; \
+                         sequences: USAGE/SELECT/UPDATE)"
+                    )));
+                }
+            };
+            if !crate::sql::acl_views::is_valid_privilege(object_type, name) {
+                return Err(Error::query_execution(format!(
+                    "privilege {name} is not valid for a {object_type}"
+                )));
+            }
+            names.push(name.to_string());
+        }
+        Ok((names, false))
     }
 
     /// Convert CREATE FUNCTION to plan
@@ -6216,6 +6609,88 @@ mod tests {
             LogicalPlan::CreateView { name, .. } => assert_eq!(name, "v1"),
             other => panic!("expected CreateView, got {other:?}"),
         }
+    }
+
+    /// DATA-LOSS REGRESSION (plan level). `DROP ROLE x` used to fall through the
+    /// DROP planner's `_ => DropTable` fallback and was executed as
+    /// `DROP TABLE x`, silently destroying a table that shared the role's name.
+    /// The plan for a role drop must NEVER be a table drop.
+    #[test]
+    fn drop_role_never_plans_as_drop_table() {
+        let parser = Parser::new();
+        let plan = |sql: &str| Planner::new().statement_to_plan(parser.parse_one(sql).expect("parse"));
+
+        match plan("DROP ROLE analyst").expect("drop role plan") {
+            LogicalPlan::DropRole { name, if_exists } => {
+                assert_eq!(name, "analyst");
+                assert!(!if_exists, "no IF EXISTS was written");
+            }
+            other => panic!("DROP ROLE must plan as DropRole, got {other:?}"),
+        }
+
+        match plan("DROP ROLE IF EXISTS analyst").expect("drop role if exists plan") {
+            LogicalPlan::DropRole { name, if_exists } => {
+                assert_eq!(name, "analyst");
+                assert!(if_exists, "IF EXISTS must survive planning");
+            }
+            other => panic!("DROP ROLE IF EXISTS must plan as DropRole, got {other:?}"),
+        }
+
+        // The comma list composes through DropMulti — every element must be a
+        // role drop, not a table drop.
+        match plan("DROP ROLE analyst, auditor").expect("drop role multi plan") {
+            LogicalPlan::DropMulti { drops } => {
+                assert_eq!(drops.len(), 2);
+                for drop in &drops {
+                    assert!(
+                        matches!(drop, LogicalPlan::DropRole { .. }),
+                        "every DROP ROLE element must be DropRole, got {drop:?}"
+                    );
+                }
+            }
+            other => panic!("expected DropMulti, got {other:?}"),
+        }
+
+        // The `_ => DropTable` fallback has been REMOVED (the match is now
+        // exhaustive over `ObjectType`); an explicit `DROP TABLE` must of
+        // course still plan as a table drop.
+        match plan("DROP TABLE analyst").expect("drop table plan") {
+            LogicalPlan::DropTable { name, .. } => assert_eq!(name, "analyst"),
+            other => panic!("expected DropTable, got {other:?}"),
+        }
+    }
+
+    /// DATA-LOSS REGRESSION (plan level), same class as `DROP ROLE`. Every
+    /// `ObjectType` that is not a relation must be planned WITHOUT reaching
+    /// `LogicalPlan::DropTable`. `DROP INDEX users` used to fall through the
+    /// old `_ => DropTable` fallback and destroy the `users` table.
+    #[test]
+    fn drop_index_never_plans_as_drop_table() {
+        let parser = Parser::new();
+        let plan = |sql: &str| Planner::new().statement_to_plan(parser.parse_one(sql).expect("parse"));
+
+        for sql in [
+            "DROP INDEX users",
+            "DROP INDEX IF EXISTS users",
+            "DROP INDEX users, orders",
+        ] {
+            match plan(sql) {
+                Ok(other) => panic!("{sql} must not produce a plan, got {other:?}"),
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("DROP INDEX"),
+                        "{sql} must fail with an error naming DROP INDEX, got: {msg}"
+                    );
+                }
+            }
+        }
+
+        // `IF EXISTS` must NOT turn the unsupported drop into a silent success.
+        assert!(
+            plan("DROP INDEX IF EXISTS users").is_err(),
+            "DROP INDEX IF EXISTS must not be a silent no-op"
+        );
     }
 
     #[test]

@@ -1751,12 +1751,28 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
         }
 
         if upper.contains("GRANTS") {
-            // SHOW GRANTS — return minimal ALL PRIVILEGES grant.
+            // HC4: this used to fabricate
+            // `GRANT ALL PRIVILEGES ON *.* TO '<user>'@'%' WITH GRANT OPTION`
+            // for whoever was connected — an affirmative FALSE statement about
+            // privileges that an operator or an automated hardening check would
+            // have believed. It now reports the STORED ACL catalog: the
+            // `GRANT USAGE ON *.*` baseline plus one line per recorded grant
+            // for this user and for the `public` pseudo-role.
+            //
+            // Still not an enforcement claim — HeliosDB checks no privilege on
+            // any path. These lines describe what GRANT recorded, nothing more.
             let user = self.username.clone().unwrap_or_else(|| "root".to_string());
-            let line = format!("GRANT ALL PRIVILEGES ON *.* TO '{}'@'%' WITH GRANT OPTION", user);
-            return self
-                .show_single_column(&format!("Grants for {}@%", user), &[&line])
-                .await;
+            // Scope the catalog borrow so it ends before the `&mut self` send.
+            let lines = {
+                let catalog = self.database.storage.catalog();
+                let mut acls = catalog.list_acls_for_grantee(&user)?;
+                if user != "public" {
+                    acls.extend(catalog.list_acls_for_grantee("public")?);
+                }
+                crate::sql::acl_views::mysql_show_grants_lines(&user, &acls)
+            };
+            let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+            return self.show_single_column(&format!("Grants for {}@%", user), &refs).await;
         }
 
         if upper.contains("MASTER STATUS")

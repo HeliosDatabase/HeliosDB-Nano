@@ -53,14 +53,59 @@ Nothing here changes existing behavior — they are additive compatibility fixes
 See the `CHANGELOG.md` `[3.58.1]` entry for the full list.
 
 > **Scope note on the trigger row (read before relying on it).** That row is the
-> *only* trigger behaviour HeliosDB Nano has. Triggers as a feature are **not
-> implemented**: `CREATE TRIGGER` parses and registers, but no trigger body is ever
-> executed and nothing fires on INSERT/UPDATE/DELETE — silently, with no error.
-> The exception above is narrow: `BEFORE INSERT … FOR EACH ROW EXECUTE FUNCTION f()`
-> where `f`'s body contains literal `NEW.<col> = <expr>` assignments and/or
-> `RETURN NULL` rewrites or skips the row being inserted. It does not extend to
+> *only* trigger behaviour HeliosDB Nano has. **Trigger BODIES are still not
+> executed**: `CREATE TRIGGER` parses, registers and (since 4.20.0) persists, but no
+> trigger body is ever run and nothing fires on INSERT/UPDATE/DELETE — silently, with
+> no error. The exception above is narrow: `BEFORE INSERT … FOR EACH ROW EXECUTE
+> FUNCTION f()` where `f`'s body contains literal `NEW.<col> = <expr>` assignments
+> and/or `RETURN NULL` rewrites or skips the row being inserted. It does not extend to
 > `BEFORE UPDATE`/`BEFORE DELETE`, to `AFTER` timings, or to side effects such as
 > `INSERT INTO audit_log …` inside the body.
+>
+> **What 4.20.0 changed about that exception:** it now applies identically on both DML
+> executor families, so it takes effect over the PostgreSQL *extended* query protocol
+> (psycopg with bound params, JDBC, sqlx, Drizzle, node-postgres), over REST, and in
+> `INSERT … RETURNING` — through 4.19.0 it applied only on the text family, so a REST
+> insert and a `psql` insert into the same table produced different rows. It honours
+> the trigger's `WHEN` clause and enabled flag, and it survives a restart.
+> `CREATE TRIGGER`/`DROP TRIGGER` also stopped hard-erroring `Operator not yet
+> implemented: CreateTrigger` over the extended protocol — **a migration that used to
+> fail there will now succeed, creating a trigger whose body does not run.**
+
+## Breaking changes in 4.20.0 — read before upgrading
+
+No storage-format change and no data migration. These are **statement-level**
+behaviour changes: things that used to be accepted silently now fail loudly, and
+two catalog views changed shape. Full detail in `CHANGELOG.md`.
+
+| Statement | ≤ 4.19.0 | 4.20.0 | What to do |
+|---|---|---|---|
+| `DROP INDEX x` / `DROP INDEX IF EXISTS x` | planned as `DROP TABLE x` — **dropped the TABLE `x`** if one existed, otherwise "table does not exist" (or, with `IF EXISTS`, silent success) | errors: *DROP INDEX is not supported yet* | Remove the statement. **Audit your data** if you ever ran it against a name that was also a table |
+| `DROP ROLE x` / `DROP ROLE IF EXISTS x` | same fallback — **dropped the TABLE `x`** | real role DDL; can never reach a relation | Nothing, but audit as above |
+| `SET ROLE <x>`, `SET SESSION AUTHORIZATION <x>` | acknowledged with **zero effect** — a session that thought it had dropped privileges had not | `0A000 feature_not_supported` (simple query AND extended protocol) | Remove it, or set `[authentication] legacy_acl_noop = true` to restore the ack. `SET ROLE NONE` / `… AUTHORIZATION DEFAULT` are still acked |
+| `GRANT` / `REVOKE` naming a role or table that does not exist | silent success, storing nothing | ERROR | Create the role/table first, or set `legacy_acl_noop = true` |
+| `SELECT * FROM information_schema.columns` over the PG wire | 7 columns, including the non-standard `is_pk` | 17 columns (matches the embedded route); **`is_pk` is gone with no replacement** | Select columns by name, not by position. For `is_pk`, join `information_schema.key_column_usage` against `table_constraints` where `constraint_type = 'PRIMARY KEY'` — it was a Nano invention that PostgreSQL never had |
+| `SELECT * FROM information_schema.tables` | base tables only | base tables **and** views (`table_type = 'VIEW'`) | Filter on `table_type` if you only want base tables; row counts change |
+| `CREATE FUNCTION f …` then `SELECT f(x)` | `Unknown scalar function: f` | the function runs | If you caught that error as a feature probe, the probe now succeeds |
+
+New optional config keys (both defaulted; an existing `config.toml` keeps
+parsing unchanged):
+
+```toml
+[authentication]
+# Restore the pre-4.20 silent acceptance of GRANT/REVOKE on unknown names and
+# of SET ROLE / SET SESSION AUTHORIZATION. Default: false.
+legacy_acl_noop = false
+
+[session]
+# Recursion ceiling for user-defined function invocation. Default: 32.
+udf_max_call_depth = 32
+```
+
+> **Roles and grants are stored and introspectable; privileges are NOT
+> enforced.** 4.20.0 makes the catalog tell the truth about what was granted.
+> It does not add a permission check to any read or write path. Do not treat a
+> successful `GRANT` as a security control.
 
 ## Wire-protocol notes
 

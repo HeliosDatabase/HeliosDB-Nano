@@ -82,11 +82,32 @@ fn pg_indexes_lists_manual_and_vector_indexes() {
     )
     .unwrap();
 
-    let catalog = PgCatalog::with_database(db);
-    let (_schema, rows) = catalog
-        .handle_query("SELECT * FROM pg_indexes")
-        .unwrap()
-        .expect("catalog should intercept pg_indexes");
+    // HC3: `pg_indexes` moved OFF the wire-only substring router and INTO the
+    // planner-backed SystemViewRegistry, so `handle_query` now defers
+    // (`Ok(None)`) and the same rows arrive through the engine — which is also
+    // what finally makes this view reachable from the embedded / REPL / Python
+    // routes, where it used to error with "does not exist".
+    let catalog = PgCatalog::with_database(Arc::clone(&db));
+    assert!(
+        catalog
+            .handle_query("SELECT * FROM pg_indexes")
+            .expect("pg_indexes must not error at the wire")
+            .is_none(),
+        "pg_indexes must DEFER to the SystemViewRegistry"
+    );
+    let (rows, cols) = db
+        .query_with_columns("SELECT * FROM pg_indexes")
+        .expect("pg_indexes must be served by the planner");
+    assert_eq!(
+        cols,
+        vec![
+            "schemaname".to_string(),
+            "tablename".to_string(),
+            "indexname".to_string(),
+            "tablespace".to_string(),
+            "indexdef".to_string(),
+        ]
+    );
 
     let mut saw_manual = false;
     let mut saw_vector = false;
@@ -180,28 +201,99 @@ fn pg_wire_catalog_single_view_reflection_exposes_foreign_key_rows() {
     )
     .unwrap();
 
-    let catalog = PgCatalog::with_database(db);
-    let (_schema, kcu_rows) = catalog
-        .handle_query("SELECT * FROM information_schema.key_column_usage")
-        .unwrap()
-        .expect("catalog should intercept single-view key_column_usage");
+    // HC3: single-view `information_schema` reflection moved OFF the PG-wire
+    // substring interceptor and INTO the planner-backed SystemViewRegistry —
+    // the same move `pg_indexes_lists_manual_and_vector_indexes` above pins.
+    //
+    // The subject of this test has always been "a reflecting client can see
+    // the foreign key", never "the interceptor is what produced the rows", so
+    // it now pins BOTH halves of the new contract:
+    //   1. the wire DEFERS (`Ok(None)`) — no raw-text interception is left for
+    //      a query mentioning these views to be hijacked by; and
+    //   2. the FK rows still come back, through the engine route that PG wire,
+    //      MySQL wire, embedded, REPL and Python now all share.
+    // Restoring interception to satisfy (2) would fail (1) — which is the
+    // point.
+    let catalog = PgCatalog::with_database(Arc::clone(&db));
+    for view in [
+        "information_schema.key_column_usage",
+        "information_schema.table_constraints",
+    ] {
+        let sql = format!("SELECT * FROM {view}");
+        assert!(
+            catalog
+                .handle_query(&sql)
+                .unwrap_or_else(|e| panic!("{view} must not error at the wire: {e}"))
+                .is_none(),
+            "{view} must DEFER to the SystemViewRegistry, not be intercepted on raw wire text"
+        );
+    }
+
+    // Column NAMES are asserted too (the interceptor-era test only indexed
+    // positionally): a shape drift that silently shifted `column_name` into
+    // another slot would now be caught instead of misread.
+    let (kcu_rows, kcu_cols) = db
+        .query_with_columns("SELECT * FROM information_schema.key_column_usage")
+        .expect("key_column_usage must be served by the planner");
+    assert_eq!(
+        kcu_cols,
+        vec![
+            "constraint_catalog".to_string(),
+            "constraint_schema".to_string(),
+            "constraint_name".to_string(),
+            "table_name".to_string(),
+            "column_name".to_string(),
+            "ordinal_position".to_string(),
+        ]
+    );
     assert!(
         kcu_rows.iter().any(|row| {
             as_text(&row.values[2]) == "a4_wire_child_parent_fk"
                 && as_text(&row.values[3]) == "a4_wire_child"
                 && as_text(&row.values[4]) == "parent_id"
+                && as_i32(&row.values[5]) == 1
         }),
-        "pg-wire key_column_usage did not expose the FK row: {kcu_rows:?}"
+        "key_column_usage did not expose the FK row: {kcu_rows:?}"
     );
 
-    let (_schema, tc_rows) = catalog
-        .handle_query("SELECT * FROM information_schema.table_constraints")
-        .unwrap()
-        .expect("catalog should intercept single-view table_constraints");
+    let (tc_rows, tc_cols) = db
+        .query_with_columns("SELECT * FROM information_schema.table_constraints")
+        .expect("table_constraints must be served by the planner");
+    assert_eq!(
+        tc_cols,
+        vec![
+            "constraint_catalog".to_string(),
+            "constraint_schema".to_string(),
+            "constraint_name".to_string(),
+            "table_name".to_string(),
+            "constraint_type".to_string(),
+        ]
+    );
     assert!(
         tc_rows.iter().any(|row| {
             as_text(&row.values[2]) == "a4_wire_child_parent_fk" && as_text(&row.values[4]) == "FOREIGN KEY"
         }),
-        "pg-wire table_constraints did not expose the FK row: {tc_rows:?}"
+        "table_constraints did not expose the FK row: {tc_rows:?}"
     );
+
+    // The capability the substring router never had, and the reason deferring
+    // is an upgrade rather than a downgrade: a real WHERE clause. The child
+    // table also carries `a4_wire_child_pkey`, so an unfiltered (or
+    // wrongly-filtered) result would not be exactly one row.
+    let filtered = db
+        .query(
+            "SELECT constraint_name, table_name, column_name \
+             FROM information_schema.key_column_usage \
+             WHERE constraint_name = 'a4_wire_child_parent_fk'",
+            &[],
+        )
+        .expect("key_column_usage must support WHERE through the planner");
+    assert_eq!(
+        filtered.len(),
+        1,
+        "WHERE constraint_name must select exactly the FK row: {filtered:?}"
+    );
+    assert_eq!(as_text(&filtered[0].values[0]), "a4_wire_child_parent_fk");
+    assert_eq!(as_text(&filtered[0].values[1]), "a4_wire_child");
+    assert_eq!(as_text(&filtered[0].values[2]), "parent_id");
 }

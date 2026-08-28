@@ -136,6 +136,16 @@ deterministically fast.
   joins, subqueries, CTEs, window functions, aggregates, the extended protocol)
   run against embedded Nano and a real PostgreSQL 18.4 over `tokio-postgres`,
   same schema and row counts, timed the same way.
+- **Asymmetry you must know before quoting these numbers.** The workload is
+  identical; the *deployment* is not. Nano runs **embedded and in-memory**
+  (`EmbeddedDatabase::new_in_memory()`, `durable_commit = false` by default) while
+  PostgreSQL runs as a **separate server over TCP, on disk, with
+  `synchronous_commit = on`**. The margins here therefore include
+  in-process-vs-network and non-durable-vs-fsync effects on top of engine speed,
+  which is most of why the DDL/DML ratios are so large. For a like-for-like
+  wire-to-wire comparison — Nano also as a TCP server, `pgbench` against both —
+  see [`heliosdb-nano-vs-postgresql-2026-08-28.md`](heliosdb-nano-vs-postgresql-2026-08-28.md),
+  where the margins are a far more modest 1.3×–2.8×.
 - **How to reproduce.** Start PostgreSQL 18.4 (e.g. a `postgres:18` container on
   `:25433`, user `bench`/`benchpass`, db `benchdb`) and run:
 

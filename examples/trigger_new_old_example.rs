@@ -2,7 +2,7 @@
 //
 // ⚠️ This is a LIBRARY-LEVEL example. It drives `Evaluator::with_trigger_row_context`
 // directly, which works. It is NOT reachable from SQL triggers: trigger bodies never
-// execute (see `tests/trigger_unimplemented_tests.rs` and the `heliosdb-nano-schema`
+// execute (see `tests/trigger_row_mutation_tests.rs` and the `heliosdb-nano-schema`
 // skill), so `NEW.col` / `OLD.col` written inside a `CREATE TRIGGER` function body is
 // never evaluated by this or any other code path during DML.
 

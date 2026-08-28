@@ -1101,6 +1101,27 @@ pub struct AuthenticationConfig {
     pub password_hash_algorithm: PasswordHashAlgorithm,
     /// Users file path (for file-based auth)
     pub users_file: Option<PathBuf>,
+    /// Compatibility escape for the pre-4.20 `GRANT`/`REVOKE` behaviour.
+    ///
+    /// **HeliosDB does not enforce SQL privileges either way.** Roles and
+    /// grants are persisted and introspectable (`pg_roles`, `pg_authid`,
+    /// `information_schema.table_privileges`, MySQL `SHOW GRANTS`); no
+    /// privilege is checked at any read or write path. This flag only decides
+    /// how *strict* the statements are about names.
+    ///
+    /// * `false` (default): `GRANT`/`REVOKE` naming a role or table that does
+    ///   not exist raise an error, and `SET ROLE <x>` over the PostgreSQL wire
+    ///   raises `0A000 feature_not_supported` instead of silently acking — on
+    ///   the simple query path AND the extended (Parse/Bind/Execute) path, which
+    ///   is what psycopg3 / JDBC / sqlx / node-postgres use.
+    /// * `true`: unknown grantees/objects are skipped and the statement
+    ///   succeeds (grants whose grantee AND object exist are still stored),
+    ///   and `SET ROLE` goes back to the silent `SET` acknowledgement.
+    ///
+    /// Set it to `true` only to unblock a pre-existing script or restore that
+    /// depended on the old always-succeed behaviour. The old `SET ROLE` ack in
+    /// particular was a false claim that the session had dropped privileges.
+    pub legacy_acl_noop: bool,
 }
 
 impl Default for AuthenticationConfig {
@@ -1112,6 +1133,10 @@ impl Default for AuthenticationConfig {
             jwt_expiration_secs: 86400, // 24 hours
             password_hash_algorithm: PasswordHashAlgorithm::Argon2,
             users_file: None,
+            // Strict by default: a GRANT that names a nonexistent role is a
+            // bug in the caller, and a silently-acked SET ROLE is a false
+            // security claim. Opt back in only for compatibility.
+            legacy_acl_noop: false,
         }
     }
 }
@@ -1291,6 +1316,16 @@ pub struct SessionConfig {
     pub max_sessions_per_user: u32,
     /// Session cleanup interval in seconds (default: 300 = 5 minutes)
     pub cleanup_interval_secs: u64,
+    /// Maximum nested user-defined-function invocations on one thread
+    /// (default: 32).
+    ///
+    /// A UDF body re-enters the parser/planner/executor, so a self-recursive
+    /// function would otherwise recurse until the thread's stack is exhausted —
+    /// an abort, not an error. When the limit is reached the call fails loudly
+    /// with a message naming this setting. Raise it if a legitimately deep
+    /// nesting of functions is needed; lower it to fail faster on runaway
+    /// recursion. Must be at least 1 (0 would make every UDF call fail).
+    pub udf_max_call_depth: u32,
 }
 
 impl Default for SessionConfig {
@@ -1299,6 +1334,7 @@ impl Default for SessionConfig {
             timeout_secs: 3600,
             max_sessions_per_user: 10,
             cleanup_interval_secs: 300,
+            udf_max_call_depth: 32,
         }
     }
 }
@@ -1315,6 +1351,11 @@ impl SessionConfig {
         if self.cleanup_interval_secs < 1 {
             return Err(crate::Error::config(
                 "session.cleanup_interval_secs must be at least 1 second",
+            ));
+        }
+        if self.udf_max_call_depth < 1 {
+            return Err(crate::Error::config(
+                "session.udf_max_call_depth must be at least 1 (0 would refuse every function call)",
             ));
         }
         Ok(())

@@ -121,9 +121,10 @@ Source of truth: `src/main.rs`, `src/repl/commands.rs`, `src/lib.rs`, `src/mcp/t
 
 | Statement | Skill |
 |-----------|-------|
-| `CREATE / ALTER / DROP TABLE / INDEX / VIEW / MATERIALIZED VIEW` | `heliosdb-nano-schema` |
-| `CREATE / DROP TRIGGER` (registers, but **triggers never fire** — see the skill) | `heliosdb-nano-schema` |
-| `CREATE / DROP FUNCTION` (registers, but **nothing can call it** — see the skill) | `heliosdb-nano-schema` |
+| `CREATE / ALTER / DROP TABLE`, `CREATE INDEX`, `CREATE / DROP VIEW / MATERIALIZED VIEW` | `heliosdb-nano-schema` |
+| `DROP INDEX` (**not supported** — errors; through 4.19.0 it was planned as `DROP TABLE`) | `heliosdb-nano-schema` |
+| `CREATE / DROP TRIGGER` (registers + persists, but **trigger bodies never run** — see the skill) | `heliosdb-nano-schema` |
+| `CREATE / DROP FUNCTION` (scalar calls work; `$`-sigil params mandatory, no set-returning/overloading — see the skill) | `heliosdb-nano-schema` |
 | `CREATE PROCEDURE` / `CALL` (works — either language, params need a `$` sigil) | `heliosdb-nano-schema` |
 | `INSERT [OR REPLACE/IGNORE] / … ON CONFLICT … / … RETURNING` | `heliosdb-nano-query` |
 | `UPDATE … RETURNING` / `DELETE … RETURNING` / `MERGE` | `heliosdb-nano-query` |

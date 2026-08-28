@@ -5,6 +5,240 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Triggers — partial parity. **Trigger bodies still do not execute.**
+
+Read the previous sentence again before adopting any of this. `CREATE TRIGGER`
+still does not give you audit rows, derived-column maintenance, cascades, or any
+other side effect, on any interface. What changed is that the ONE trigger
+capability that has ever had an observable effect now behaves the same on every
+client path, survives a restart, and respects the trigger's own `WHEN` clause.
+
+**Fixed — `CREATE TRIGGER` / `DROP TRIGGER` over the PostgreSQL extended query
+protocol.** They were a hard error, `Operator not yet implemented:
+CreateTrigger { … }`, for every client that binds parameters server-side:
+psycopg (bound params), JDBC, sqlx, Drizzle, node-postgres, Alembic, and the
+REST/BaaS layer. Only the simple-query path, the MySQL wire, the REPL and the
+embedded `execute()` ever worked. Both statements now run through one shared
+implementation called by both executor families.
+
+  *Behaviour change to be aware of:* a migration tool that previously CAUGHT
+  that error will now see the statement SUCCEED. It creates a trigger whose body
+  will not run. If your migration relied on the failure, it will no longer fail.
+
+**Fixed — the BEFORE-INSERT row rewrite now applies on both executor families.**
+The single mechanism with a real effect is `BEFORE INSERT … FOR EACH ROW EXECUTE
+FUNCTION f()` where `f`'s body is top-level `NEW.<col> = <expr>` and/or
+`RETURN NULL`: it rewrites, or drops, the row being inserted. It used to be
+applied at exactly ONE call site, in the text executor family. Consequences that
+are now gone:
+
+  - a REST/JDBC/psycopg insert and a `psql` insert into the SAME table produced
+    DIFFERENT rows;
+  - `INSERT … RETURNING` skipped the rewrite on EVERY interface, including the
+    embedded API, because `RETURNING` always routes through the params family.
+
+  `RETURN NULL` now suppresses the row on both families: the row is not written,
+  not counted in the affected-row total, and produces no `RETURNING` tuple.
+
+**Fixed — triggers now survive a restart.** They previously survived ZERO
+restarts. `StorageEngine::load_triggers()` had no callers, `CREATE TRIGGER` never
+wrote to the catalog, and WAL crash-replay registered into a registry the SQL
+executor does not read. Both the definition (`trigger:{table}:{name}`) and the
+compiled rewrite recipe (a new, purely additive `trigger_rowmut:{table}:{name}`
+sidecar) are now persisted, and the live registry is repopulated at open.
+
+  *Residual gap, stated rather than hidden:* WAL crash-replay restores the
+  DEFINITION but not the recipe sidecar. A trigger created after the last
+  checkpoint and before a crash comes back present but inert — `DROP TRIGGER` and
+  re-create it. A standby likewise only picks up replicated triggers at its next
+  restart.
+
+  `Catalog::load_all_triggers` also read values straight off the RocksDB
+  iterator, which returns CIPHERTEXT on a TDE data directory; it now reads
+  through `StorageEngine::get`. An unreadable record is logged and skipped rather
+  than blocking the database from opening.
+
+**Fixed — the rewrite honours `WHEN` and the `enabled` flag.** It previously
+ignored both, so `BEFORE INSERT … WHEN (NEW.id > 10) …` rewrote every row
+regardless of the predicate. `WHEN` is now evaluated against the NEW row and the
+recipe fires only when it is TRUE; FALSE, NULL and an unevaluable predicate all
+mean "not fired" (PostgreSQL semantics). Multiple recipes on one table now fire
+in trigger-NAME order, as PostgreSQL does, instead of hash order.
+
+**Fixed — `DROP TABLE` deregisters the table's triggers.** It used to leave them
+behind, so the trigger name was unusable for the lifetime of the process and
+re-creating the table plus its trigger failed with `already exists`. Both the
+in-memory registrations and the persisted records are now removed.
+
+**Still not implemented (unchanged):** trigger body execution of any kind;
+`AFTER` triggers; `FOR EACH STATEMENT`; `INSTEAD OF`; the row rewrite on
+`BEFORE UPDATE` / `BEFORE DELETE`; `OLD`; deferred/CONSTRAINT triggers; and
+trigger introspection (`pg_trigger` does not exist,
+`information_schema.triggers` is empty, and psql's `\d` reports
+`relhastriggers = false` — the column does not exist on `pg_class` on any
+other route). There is still no SQL surface for `ALTER TABLE … ENABLE/DISABLE
+TRIGGER`, so the now-honoured `enabled` flag is only reachable from the library.
+Use a `CREATE PROCEDURE` invoked with `CALL`, or a second statement in the same
+transaction, wherever you would reach for a trigger body.
+
+**Tests:** `tests/trigger_unimplemented_tests.rs` was a deliberately
+red-on-purpose pin suite; it is deleted and replaced by
+`tests/trigger_row_mutation_tests.rs`, which exercises the DDL matrix, the
+rewrite, `RETURN NULL`, `WHEN`, restart durability and `DROP TABLE` cleanup
+through BOTH `execute()` and `execute_params()`, and still pins — unconditionally
+— that side-effecting bodies, `AFTER` triggers and statement-level triggers do
+nothing.
+
+### `DROP` no longer falls through to `DROP TABLE`. **Data-loss fix.**
+
+**Fixed — `DROP ROLE x` and `DROP INDEX x` were executed as `DROP TABLE x`.**
+The planner's `Statement::Drop` handler ended in
+`_ => LogicalPlan::DropTable { … }`, so every object kind without an explicit
+arm resolved a *table* reference with the object's name and dropped it:
+
+```sql
+CREATE TABLE analyst (…);        -- a real table
+DROP ROLE analyst;               -- silently DROPPED THE TABLE, reported success
+DROP INDEX IF EXISTS analyst;    -- likewise, and with no error at all
+```
+
+**If you ever ran `DROP ROLE` or `DROP INDEX` against a name that also existed
+as a table, that table was deleted.** Check your data. The `IF EXISTS` spellings
+were the worst case: they dropped the table and returned success.
+
+The catch-all is removed. The match is now exhaustive over sqlparser's
+`ObjectType`, so a future parser upgrade that adds an object kind is a compile
+error rather than a silent table deletion.
+
+  **Behaviour change / breaking.** `DROP INDEX` (with or without `IF EXISTS`)
+  now returns an error naming itself: *DROP INDEX is not supported yet*. It
+  previously "succeeded" while dropping either nothing or the wrong object.
+  `IF EXISTS` deliberately does NOT silence it — HeliosDB cannot drop an index
+  from SQL at all, so reporting success would be a lie. Indexes are still
+  removed with their table. Scripts containing `DROP INDEX IF EXISTS …` will
+  now fail loudly; remove the statement.
+
+### Roles and privileges
+
+> **Roles and grants are STORED and introspectable. Privileges are NOT
+> enforced.** No read or write path checks a permission. A row in
+> `information_schema.table_privileges` means "somebody ran `GRANT`", not
+> "access is restricted". Do not treat any of this as a security control.
+
+**Added — `CREATE ROLE` / `ALTER ROLE` / `DROP ROLE` are real DDL** (and the
+`CREATE USER` / `ALTER USER` / `DROP USER` spellings), persisted to the catalog
+under `meta:role:<name>` with a stable OID. `GRANT` / `REVOKE` persist an ACL
+record instead of parsing and discarding it. Both executor families — `execute()`
+and `execute_params()`, i.e. simple query AND the extended protocol every real
+driver uses — go through one shared implementation.
+
+**Fixed — `pg_roles` / `pg_user` / `pg_authid` invented two all-privilege
+superusers.** They now report the real persisted roles with their real attribute
+bits, plus the two virtual built-ins. A stored password is never rendered on any
+view (`rolpassword` is always `********`). `information_schema.table_privileges`
+and `role_table_grants` report the stored ACL records, and resolve on **every**
+route — embedded, REPL, Python binding, PostgreSQL wire and MySQL wire — where
+they previously resolved (empty) on the PG wire only. MySQL `SHOW GRANTS` reads
+the same catalog instead of fabricating an `ALL PRIVILEGES` line.
+
+  **Behaviour change / breaking — `GRANT` / `REVOKE` on an unknown name is now
+  an ERROR.** Naming a role or a table that does not exist used to succeed
+  silently (having stored nothing). Set `[authentication] legacy_acl_noop = true`
+  to restore the old leniency (unknown names skipped, statement succeeds).
+
+  **Behaviour change / breaking — `SET ROLE <x>` and
+  `SET SESSION AUTHORIZATION <x>` now fail with `0A000 feature_not_supported`**
+  instead of being acknowledged with zero effect. A client, pooler or hardening
+  check that believed it had dropped to a restricted role kept full access; that
+  is a false security claim. `SET ROLE NONE` and
+  `SET SESSION AUTHORIZATION DEFAULT` are still acked — returning to the only
+  identity there is, is genuinely satisfied. This applies on the simple query
+  path AND the extended protocol. `legacy_acl_noop = true` restores the silent
+  ack on both.
+
+**Still not implemented:** privilege enforcement of any kind; role membership
+(`GRANT role TO role`) and column-level grants (both rejected at plan time);
+session identity (`current_user` is a literal); `DROP OWNED BY`;
+`DROP ROLE … CASCADE` (a role holding grants must have them revoked first).
+
+### User-defined functions are callable
+
+**Fixed — `CREATE FUNCTION` registered a function that nothing could call.**
+`SELECT f(x)` answered `Unknown scalar function: f` on every interface while a
+complete interpreter sat unreachable. Scalar calls now work — in a `SELECT`
+list, in a `WHERE` clause, through bound parameters, on the embedded API, the
+REPL and both wires — and the definition survives a restart (`meta:function:` /
+`meta:procedure:` records, reloaded at open). `CREATE`/`DROP FUNCTION` and
+`CREATE`/`DROP PROCEDURE` run through shared helpers called by both executor
+families, so the extended protocol is no longer a hard error.
+
+**The `$` sigil is mandatory.** A body must reference parameters as `$1` or
+`$paramname`; a bare parameter name is parsed as a column reference and fails
+with a column error. This is deliberate — a variable must never silently shadow
+a column.
+
+**Not supported:** set-returning functions (`SELECT * FROM f()`), overloading,
+`CALL f()` on a FUNCTION, non-`public` qualifiers, and routine introspection
+(`pg_proc`, `information_schema.routines` / `parameters` stay empty). PL/pgSQL
+control flow inside a FUNCTION body is refused with an explicit error rather
+than being half-evaluated. Recursion depth is bounded by the new
+`[session] udf_max_call_depth` config key.
+
+  **Behaviour change to be aware of:** the four `sql::Executor` routine-DDL
+  stubs used to return a fabricated `Function 'x' created` status without
+  creating anything. They now error loudly if reached. Any code that relied on
+  that fake success will now see a failure.
+
+  **Behaviour change:** `CREATE/DROP FUNCTION` and `CREATE/DROP PROCEDURE` now
+  invalidate the SQL result cache. They previously did not, which — now that
+  UDFs are callable — meant `CREATE OR REPLACE FUNCTION f …` kept serving the
+  old function's cached result and `DROP FUNCTION f; SELECT f()` kept answering
+  instead of erroring.
+
+### Catalog introspection unified
+
+**Fixed — the PostgreSQL wire and the embedded/REPL/Python routes were served by
+two different implementations and disagreed.** Twelve wire-only
+`information_schema` / `pg_*` implementations are deleted; there is now ONE
+registry (`src/sql/phase3/system_views.rs`) behind all five interfaces. Most
+visibly, the wire's `information_schema.columns` had no `table_schema` column,
+so `WHERE table_schema = 'public'` returned zero rows there while working
+embedded.
+
+Now returning real rows on every route: `information_schema.views`,
+`check_constraints`, `constraint_column_usage`, `catalog_name`, `pg_views`,
+`pg_indexes` and `pg_matviews` (the last three were reachable only over the PG
+wire, or empty everywhere while a working implementation sat unreachable).
+`information_schema.tables` now also lists views with `table_type = 'VIEW'`, and
+`schemata` enumerates real schemas instead of three hardcoded rows.
+
+  **Behaviour change — result SHAPES changed.** `information_schema.columns`
+  went from 7 columns to 17 over the PG wire. `information_schema.tables` emits
+  additional `VIEW` rows. Anything that selected `*` from these views and
+  indexed the result positionally, or that counted rows from `tables`, must be
+  rechecked.
+
+  **Still PG-wire only:** `routines`, `parameters`, `triggers`, `domains`,
+  `character_sets`, `collations`, `view_table_usage` and `view_column_usage` are
+  answered by the PostgreSQL **and MySQL** wire interceptor (the MySQL handler
+  routes `information_schema` through the same code) with the correct column
+  list and zero rows; on the embedded API, the REPL and the Python binding they
+  raise an unknown-relation error. See
+  `docs/compatibility/information_schema.md`.
+
+### New configuration keys
+
+Both are optional and defaulted, so an existing `config.toml` keeps parsing
+unchanged.
+
+- `[authentication] legacy_acl_noop` (default `false`) — restores the pre-4.20
+  silent acceptance of `GRANT`/`REVOKE` on unknown names and of
+  `SET ROLE` / `SET SESSION AUTHORIZATION`.
+- `[session] udf_max_call_depth` — recursion ceiling for user-defined function
+  invocation.
+
 ## [4.19.0] - 2026-08-27
 
 ### Fixed
@@ -860,6 +1094,16 @@ fired. Check that data.
     database a registered trigger survives exactly one restart (WAL replay
     restores it, then the WAL is truncated and nothing reloads it from the
     catalog), so registration is not durable either.
+
+    **CORRECTION (4.20.0):** the "survives exactly one restart" sentence above
+    was WRONG. WAL replay registered the replayed trigger into
+    `StorageEngine::trigger_registry`, which the SQL executor never reads — the
+    executor uses `EmbeddedDatabase::trigger_registry`, which was a brand-new
+    empty registry at every open. A trigger therefore survived ZERO restarts, not
+    one. This entry also omitted that `CREATE TRIGGER` sent over the PostgreSQL
+    *extended* query protocol did not "succeed and never fire": it returned a hard
+    error, `Operator not yet implemented: CreateTrigger { … }`. Both are fixed in
+    4.20.0 — see that entry.
 - **What to use instead:** do the work in your application, in an explicit
   second statement inside the same transaction, or in a `CREATE PROCEDURE`
   invoked with `CALL` (procedures do execute).
@@ -874,7 +1118,8 @@ fired. Check that data.
   all). They are replaced by `tests/trigger_unimplemented_tests.rs`, which
   asserts unconditionally what ships today — including that a registered
   trigger leaves the audit table empty — so the day triggers start working, the
-  suite goes red on purpose.
+  suite goes red on purpose. (That suite was retired in 4.20.0 and replaced by
+  `tests/trigger_row_mutation_tests.rs`, exactly as designed.)
 
 ## [4.10.0] - 2026-08-03
 

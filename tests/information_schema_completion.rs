@@ -132,36 +132,69 @@ fn referential_constraints_view_exposes_real_fk_metadata() {
 }
 
 #[test]
-fn check_constraints_view_returns_zero_rows() {
+fn check_constraints_view_defers_and_returns_real_clauses() {
+    // HC3: the wire's zero-row stub is deleted; `handle_query` DEFERS
+    // (`Ok(None)`) and the planner-backed SystemViewRegistry serves rows read
+    // from the persisted `CheckConstraint` blob. Pin BOTH halves — the
+    // deferral direction and the fact that a real CHECK now shows up.
     let (cat, db) = catalog_with_db();
-    db.execute("CREATE TABLE t (a INT)").expect("create");
-    let (schema, rows) = cat
-        .handle_query("SELECT * FROM information_schema.check_constraints")
-        .expect("query")
-        .expect("intercepted");
-    // SQL-standard columns:
-    let names: Vec<_> = schema.columns.iter().map(|c| c.name.as_str()).collect();
+    db.execute("CREATE TABLE t (a INT, CONSTRAINT t_a_positive CHECK (a > 0))")
+        .expect("create");
+
+    assert!(
+        cat.handle_query("SELECT * FROM information_schema.check_constraints")
+            .expect("must not error")
+            .is_none(),
+        "check_constraints must DEFER to the SystemViewRegistry, not re-intercept"
+    );
+
+    let (rows, cols) = db
+        .query_with_columns("SELECT * FROM information_schema.check_constraints")
+        .expect("query");
     for required in &[
         "constraint_catalog",
         "constraint_schema",
         "constraint_name",
         "check_clause",
     ] {
-        assert!(names.contains(required), "missing {required}");
+        assert!(cols.iter().any(|c| c == required), "missing {required}; got {cols:?}");
     }
-    // We don't yet expose check constraints through this view; empty is OK.
-    assert_eq!(rows.len(), 0);
+    let name_idx = cols.iter().position(|c| c == "constraint_name").unwrap();
+    let clause_idx = cols.iter().position(|c| c == "check_clause").unwrap();
+    let row = rows
+        .iter()
+        .find(|r| s(&r.values[name_idx]) == "t_a_positive")
+        .expect("the named CHECK must be listed");
+    let clause = s(&row.values[clause_idx]);
+    assert!(
+        clause.contains('a') && clause.contains('>'),
+        "check_clause must be the SQL predicate, got {clause}"
+    );
 }
 
 #[test]
-fn views_view_is_recognised_and_empty() {
-    let (cat, _db) = catalog_with_db();
-    let (schema, rows) = cat
-        .handle_query("SELECT * FROM information_schema.views")
-        .expect("query")
-        .expect("intercepted");
-    assert!(schema.columns.iter().any(|c| c.name == "view_definition"));
-    assert_eq!(rows.len(), 0);
+fn views_view_defers_and_returns_real_view_definitions() {
+    let (cat, db) = catalog_with_db();
+    db.execute("CREATE TABLE vt (a INT)").expect("create table");
+    db.execute("CREATE VIEW vv AS SELECT a FROM vt").expect("create view");
+
+    assert!(
+        cat.handle_query("SELECT * FROM information_schema.views")
+            .expect("must not error")
+            .is_none(),
+        "information_schema.views must DEFER to the SystemViewRegistry"
+    );
+
+    let (rows, cols) = db
+        .query_with_columns("SELECT * FROM information_schema.views")
+        .expect("query");
+    assert!(cols.iter().any(|c| c == "view_definition"));
+    assert_eq!(rows.len(), 1, "one view was created");
+    let def_idx = cols.iter().position(|c| c == "view_definition").unwrap();
+    assert!(
+        s(&rows[0].values[def_idx]).contains("vt"),
+        "view_definition must be the stored body"
+    );
 }
 
 #[test]
@@ -169,22 +202,39 @@ fn whitelist_views_return_empty_without_error() {
     // These are SQL-standard view names that Nano legitimately doesn't populate
     // but ORM probes still hit. They must be recognised (return empty), not error.
     let (cat, _db) = catalog_with_db();
-    for view in &[
-        "triggers",
-        "parameters",
-        "domains",
-        "character_sets",
-        "collations",
-        "table_privileges",
-        "column_privileges",
-        "role_table_grants",
-    ] {
+    for view in &["triggers", "parameters", "domains", "character_sets", "collations"] {
         let q = format!("SELECT * FROM information_schema.{view}");
         let result = cat.handle_query(&q);
         assert!(result.is_ok(), "{view}: should not error, got {result:?}");
         assert!(
             result.unwrap().is_some(),
             "{view}: should be recognised and intercepted"
+        );
+    }
+
+    // HC4: the ten privilege/role views left the wire whitelist. All ten are
+    // registered in the planner-backed SystemViewRegistry — two POPULATED from
+    // the stored ACL catalog, eight shape-correct empty — so the wire must
+    // DEFER them (Ok(None)). Pinning the direction stops a wire-side fixed
+    // shape from being reintroduced and diverging from the registry.
+    for view in &[
+        "table_privileges",
+        "role_table_grants",
+        "column_privileges",
+        "role_column_grants",
+        "usage_privileges",
+        "role_usage_grants",
+        "role_routine_grants",
+        "applicable_roles",
+        "enabled_roles",
+        "administrable_role_authorizations",
+    ] {
+        let q = format!("SELECT * FROM information_schema.{view}");
+        let result = cat.handle_query(&q);
+        assert!(result.is_ok(), "{view}: should not error, got {result:?}");
+        assert!(
+            result.unwrap().is_none(),
+            "{view}: must DEFER to the SystemViewRegistry, not answer from a wire-side shape"
         );
     }
 
@@ -284,6 +334,9 @@ fn catalog_with_populated_schema() -> (PgCatalog, Arc<EmbeddedDatabase>) {
     (cat, db)
 }
 
+/// Row count for a view the WIRE still serves from its own fixed shape
+/// (whitelist stubs + routines). Views that HC3 migrated to the planner return
+/// `Ok(None)` here by design and must be counted with `planner_row_count`.
 fn row_count(cat: &PgCatalog, view: &str) -> usize {
     let q = format!("SELECT * FROM information_schema.{view}");
     cat.handle_query(&q)
@@ -293,15 +346,27 @@ fn row_count(cat: &PgCatalog, view: &str) -> usize {
         .len()
 }
 
+/// Row count through the planner-backed SystemViewRegistry — the single
+/// implementation every route now lands on for the migrated views.
+fn planner_row_count(db: &EmbeddedDatabase, view: &str) -> usize {
+    let q = format!("SELECT * FROM information_schema.{view}");
+    db.query_with_columns(&q)
+        .unwrap_or_else(|e| panic!("{view}: should be served by the planner, got Err({e})"))
+        .0
+        .len()
+}
+
 #[test]
 fn always_empty_views_stay_empty_even_with_the_objects_they_describe_present() {
+    // What is STILL empty after HC3, with the objects they describe present.
+    // `views`, `check_constraints` and `constraint_column_usage` left this list
+    // because they now return real rows (see `populated_views_do_return_rows`).
+    // `view_table_usage` / `view_column_usage` remain wire whitelist stubs — a
+    // named follow-up, not an accident.
     let (cat, _db) = catalog_with_populated_schema();
     for view in &[
-        "views",
         "view_table_usage",
         "view_column_usage",
-        "check_constraints",
-        "constraint_column_usage",
         "routines",
         "parameters",
         "character_sets",
@@ -317,92 +382,150 @@ fn always_empty_views_stay_empty_even_with_the_objects_they_describe_present() {
 
 #[test]
 fn populated_views_do_return_rows() {
-    // The other half of the contract: these six are documented "Populated", so a
+    // The other half of the contract: these are documented "Populated", so a
     // regression that emptied them must fail here rather than quietly matching
-    // the always-empty expectation above.
-    let (cat, _db) = catalog_with_populated_schema();
+    // the always-empty expectation above. HC3 added views, check_constraints,
+    // catalog_name and constraint_column_usage to the list.
+    let (_cat, db) = catalog_with_populated_schema();
     for view in &[
         "tables",
         "columns",
         "schemata",
+        "catalog_name",
         "key_column_usage",
         "table_constraints",
         "referential_constraints",
+        "constraint_column_usage",
+        "views",
+        "check_constraints",
     ] {
         assert!(
-            row_count(&cat, view) > 0,
+            planner_row_count(&db, view) > 0,
             "information_schema.{view} is documented as populated, but returned no rows"
         );
     }
 }
 
 #[test]
-fn tables_view_lists_base_tables_but_not_views() {
-    // PostgreSQL lists views here with table_type = 'VIEW'. Nano does not, so a
-    // client enumerating relations through this view will miss every view.
-    let (cat, _db) = catalog_with_populated_schema();
-    let (schema, rows) = cat
-        .handle_query("SELECT * FROM information_schema.tables")
-        .unwrap()
-        .expect("tables must be intercepted");
-    let name_idx = schema
-        .columns
-        .iter()
-        .position(|c| c.name == "table_name")
-        .expect("table_name column");
-    let names: Vec<String> = rows.iter().map(|r| s(&r.values[name_idx])).collect();
-    assert!(names.iter().any(|n| n == "is_parent"), "base tables listed: {names:?}");
-    assert!(
-        !names.iter().any(|n| n == "is_v"),
-        "views are NOT listed in information_schema.tables; got {names:?}"
+fn tables_view_lists_base_tables_and_views() {
+    // PostgreSQL lists views here with table_type = 'VIEW'; HC3 makes Nano do
+    // the same, so a client enumerating relations no longer misses every view.
+    let (_cat, db) = catalog_with_populated_schema();
+    let (rows, cols) = db
+        .query_with_columns("SELECT * FROM information_schema.tables")
+        .expect("tables must be served by the planner");
+    let name_idx = cols.iter().position(|c| c == "table_name").expect("table_name column");
+    let type_idx = cols.iter().position(|c| c == "table_type").expect("table_type column");
+
+    let type_of = |want: &str| -> Option<String> {
+        rows.iter()
+            .find(|r| s(&r.values[name_idx]) == want)
+            .map(|r| s(&r.values[type_idx]))
+    };
+    assert_eq!(
+        type_of("is_parent").as_deref(),
+        Some("BASE TABLE"),
+        "base tables must still be listed"
+    );
+    assert_eq!(
+        type_of("is_v").as_deref(),
+        Some("VIEW"),
+        "views must be listed with table_type='VIEW'"
     );
 }
 
 #[test]
-fn privilege_views_stay_empty_after_a_grant() {
-    let (cat, db) = catalog_with_populated_schema();
-    // GRANT is accepted (CREATE ROLE is not supported at all), and changes nothing here.
-    let _ = db.execute("GRANT SELECT ON is_parent TO app_user");
-    for view in &[
-        "table_privileges",
-        "column_privileges",
-        "role_table_grants",
-        "role_column_grants",
-    ] {
+fn privilege_views_reflect_a_stored_grant() {
+    // HC4 INVERSION. This test used to assert that a GRANT changed nothing —
+    // which was accurate, and was the bug: GRANT parsed, "succeeded" and
+    // vanished. Roles and grants are now PERSISTED, so table_privileges and
+    // role_table_grants report them.
+    //
+    // Reporting is all that changed. HeliosDB still enforces NO privilege on
+    // any read or write path; these rows document intent, not access control.
+    let (_cat, db) = catalog_with_populated_schema();
+    db.execute("CREATE ROLE app_user").expect("CREATE ROLE must work now");
+    db.execute("GRANT SELECT ON is_parent TO app_user")
+        .expect("GRANT must be stored, not discarded");
+
+    for view in &["table_privileges", "role_table_grants"] {
+        let q = format!("SELECT grantee, table_name, privilege_type, is_grantable FROM information_schema.{view}");
+        let (rows, cols) = db
+            .query_with_columns(&q)
+            .unwrap_or_else(|e| panic!("{view}: should be served by the planner, got Err({e})"));
+        assert_eq!(rows.len(), 1, "information_schema.{view} must report the grant");
         assert_eq!(
-            row_count(&cat, view),
+            cols,
+            vec![
+                "grantee".to_string(),
+                "table_name".to_string(),
+                "privilege_type".to_string(),
+                "is_grantable".to_string()
+            ]
+        );
+        assert_eq!(s(&rows[0].values[0]), "app_user");
+        assert_eq!(s(&rows[0].values[1]), "is_parent");
+        assert_eq!(s(&rows[0].values[2]), "SELECT");
+        assert_eq!(
+            s(&rows[0].values[3]),
+            "NO",
+            "no WITH GRANT OPTION was given, so is_grantable must be NO"
+        );
+    }
+
+    // Column-level grants are rejected at plan time, so these stay empty —
+    // and must still be reachable (not "unknown relation") on this route.
+    for view in &["column_privileges", "role_column_grants"] {
+        assert_eq!(
+            planner_row_count(&db, view),
             0,
-            "information_schema.{view} does not reflect grants; it returned rows"
+            "information_schema.{view} must stay empty (no column-level grants exist)"
         );
     }
 }
 
 #[test]
-fn catalog_name_is_not_implemented_at_all() {
-    // Documented as "Not implemented": it raises the unknown-view error rather
-    // than returning an empty result, exactly like a typo does.
-    let (cat, _db) = catalog_with_db();
-    let real = cat.handle_query("SELECT * FROM information_schema.catalog_name");
+fn catalog_name_is_a_one_row_view_and_a_typo_still_errors() {
+    // HC3: `catalog_name` used to raise the unknown-view error, so SQLAlchemy's
+    // optional probes raised instead of degrading. It is now a registered
+    // one-row view — while a genuine typo must STILL error loudly.
+    let (cat, db) = catalog_with_db();
+    assert!(
+        cat.handle_query("SELECT * FROM information_schema.catalog_name")
+            .expect("catalog_name must not error")
+            .is_none(),
+        "catalog_name must DEFER to the SystemViewRegistry"
+    );
+    let (rows, cols) = db
+        .query_with_columns("SELECT * FROM information_schema.catalog_name")
+        .expect("catalog_name must be served by the planner");
+    assert_eq!(rows.len(), 1, "catalog_name is a one-row view");
+    assert_eq!(cols, vec!["catalog_name".to_string()]);
+    assert_eq!(s(&rows[0].values[0]), "heliosdb");
+
     let typo = cat.handle_query("SELECT * FROM information_schema.does_not_exist");
-    assert!(real.is_err(), "catalog_name should error, got {real:?}");
     assert!(typo.is_err(), "an unknown view should error, got {typo:?}");
 }
 
 #[test]
 fn unknown_view_error_lists_the_always_empty_views_honestly() {
-    // The error text is the most-read description of this surface. It used to
-    // claim routines/check_constraints/views were implemented; they are not.
+    // The error text is the most-read description of this surface, so it must
+    // track reality: after HC3, views/check_constraints/sequences are populated
+    // and must NOT be listed as always-empty; routines/parameters still are.
     let (cat, _db) = catalog_with_db();
     let err = cat
         .handle_query("SELECT * FROM information_schema.does_not_exist")
         .expect_err("unknown view must error")
         .to_string();
     assert!(err.contains("ALWAYS EMPTY"), "error should flag the empty views: {err}");
-    for empty in &["views", "check_constraints", "routines"] {
-        let tail = err.split("ALWAYS EMPTY").nth(1).unwrap_or("");
+    let tail = err.split("ALWAYS EMPTY").nth(1).unwrap_or("").to_string();
+    for empty in &["routines", "parameters", "view_table_usage"] {
+        assert!(tail.contains(empty), "`{empty}` must be listed as always-empty: {err}");
+    }
+    for populated in &["check_constraints", "sequences"] {
         assert!(
-            tail.contains(empty),
-            "`{empty}` must be listed as always-empty, not as populated: {err}"
+            !tail.contains(populated),
+            "`{populated}` is populated now and must NOT be in the always-empty list: {err}"
         );
     }
 }

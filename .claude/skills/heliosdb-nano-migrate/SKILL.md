@@ -148,7 +148,7 @@ Acceptance bar: row counts identical, numeric aggregates within ≤ 0.01 % drift
 - **`PRAGMA foreign_keys = OFF;` is a no-op-with-ack.** FKs are always enforced. If your old app relied on toggling this off mid-migration, restructure the migration as `BEGIN; … COMMIT;` (see `heliosdb-nano-transactions`).
 - **Per-`Connection` subprocess** in Python embedded mode means high request rates create many processes. For threaded servers prefer `mode='daemon'`.
 - **Cross-process `INSERT … ON CONFLICT (path) DO UPDATE`** has a known regression. Single-process workflows are unaffected.
-- **Custom SQLite functions / collations** registered via `register_function` / `create_function` aren't supported, **and there is no in-database replacement.** `CREATE FUNCTION` registers but nothing can call the result (`SELECT f(x)` → `Unknown scalar function: f`), so move that logic into the app, inline the expression, or wrap it in a view. See `heliosdb-nano-schema` Recipe 6.
+- **Custom SQLite functions / collations** registered via `register_function` / `create_function` aren't supported, but there IS a partial in-database replacement: `CREATE FUNCTION … LANGUAGE sql` is callable in scalar position (`SELECT f(x)`, `WHERE f(x) = …`) provided the body references parameters with the `$` sigil (`$1` or `$paramname`) — a bare parameter name is parsed as a column reference. Not covered: `SELECT * FROM f()` (set-returning), overloading, `CALL f()`, and `pg_proc` / `information_schema.routines` introspection (both stay empty). Custom **collations** have no replacement at all. See `heliosdb-nano-schema` Recipe 6 for the exact boundaries.
 - **MySQL `ENGINE=InnoDB` and `CHARSET=…` clauses are accepted but ignored.** The storage engine is fixed; charset is UTF-8.
 
 ## See also

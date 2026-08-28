@@ -1038,13 +1038,17 @@ pub enum LogicalPlan {
 
     /// Parse-and-accept no-op for statements HeliosDB deliberately does not
     /// enforce/implement yet, following the exact `CreateSchema` precedent
-    /// elsewhere in this enum. Currently used for `GRANT`/`REVOKE`
-    /// (priority #4 of the pgrust-corpus diagnosis): there is no SQL-level
-    /// roles/permissions/ACL module in HeliosDB to hang real enforcement
-    /// off of, so these parse and succeed with zero effect rather than
-    /// erroring "Statement not yet supported". This intentionally does NOT
-    /// imply any ACL guarantee — real privilege enforcement is out of scope
-    /// for this pass.
+    /// elsewhere in this enum.
+    ///
+    /// NO LONGER USED BY `GRANT`/`REVOKE`. They used to plan to this variant
+    /// and vanish while reporting success — a security-relevant
+    /// misrepresentation, since a client could not tell a stored grant from a
+    /// discarded one. They now plan to [`LogicalPlan::GrantPrivileges`] /
+    /// [`LogicalPlan::RevokePrivileges`], which persist an ACL record. That
+    /// record is INTROSPECTABLE ONLY: no DML choke point reads it, so no
+    /// privilege is enforced either way. The variant itself is KEPT (it is
+    /// still reachable for other accept-as-no-op statements, and removing it
+    /// would shift every later variant's on-disk bincode discriminant).
     ///
     /// Deliberately APPENDED rather than grouped next to `CreateSchema` above:
     /// `LogicalPlan` derives `Serialize`/`Deserialize` and is persisted via
@@ -1089,6 +1093,167 @@ pub enum LogicalPlan {
         /// `false` for `WITH NO DATA` — create the columns, insert nothing.
         with_data: bool,
     },
+
+    /// `DROP ROLE [IF EXISTS] <name>` (and the `DROP ROLE a, b` comma list,
+    /// which the planner composes into [`LogicalPlan::DropMulti`]).
+    ///
+    /// EXISTS TO CLOSE A DATA-LOSS PATH. Before this variant, the DROP
+    /// planner's `_ => LogicalPlan::DropTable` fallback (`sql/planner.rs`)
+    /// swallowed `ObjectType::Role`, so `DROP ROLE analyst` was planned and
+    /// executed as `DROP TABLE analyst` — silently destroying a table that
+    /// merely shared a name with the role the user meant to remove. The
+    /// explicit arm exists so that statement can never reach a table again.
+    ///
+    /// Roles ARE persisted now (`meta:role:<name>`, see
+    /// [`LogicalPlan::CreateRole`]), so the executor arm removes the real
+    /// catalog record: it rejects the reserved built-ins, refuses a role that
+    /// still holds grants (PostgreSQL semantics), errors loudly on an unknown
+    /// name without `IF EXISTS`, and is a genuine no-op with it. It never
+    /// touches any table, and it never claims a role was dropped when none was.
+    ///
+    /// (An earlier revision of this comment said "HeliosDB has NO SQL-level
+    /// role catalog yet"; that stopped being true when the roles workstream
+    /// landed in the same release. Privileges are still NOT ENFORCED anywhere —
+    /// that part has not changed.)
+    ///
+    /// APPENDED after every pre-existing variant, for the bincode reason
+    /// documented on [`LogicalPlan::Noop`] and repeated on `CreateTableAs`
+    /// above: `LogicalPlan` is persisted by bincode for materialized-view query
+    /// plans (`storage/materialized_view.rs`, `query_plan_bytes`), which encodes
+    /// enum variants by POSITIONAL declaration index. Inserting a variant
+    /// anywhere but the end shifts every later variant's on-disk discriminant
+    /// and corrupts every materialized-view plan written by an older binary.
+    ///
+    /// This is no longer the final variant — `CreateRole`, `AlterRole`,
+    /// `GrantPrivileges` and `RevokePrivileges` were appended after it in the
+    /// same release. Any future variant must be appended after the LAST one
+    /// below, not here.
+    DropRole {
+        /// Role name, namespace-collapsed exactly like other non-table objects.
+        name: String,
+        /// `IF EXISTS`: absent role is not an error.
+        if_exists: bool,
+    },
+
+    /// `CREATE ROLE <name> [WITH] <options…>` (and the `CREATE USER` spelling,
+    /// which the parser rewrites to `CREATE ROLE … LOGIN`).
+    ///
+    /// *** STORES A CATALOG RECORD; ENFORCES NOTHING. *** The attribute bits
+    /// below are persisted so `pg_roles` / `pg_authid` / `pg_user` report what
+    /// the user actually asked for instead of two fabricated all-privilege
+    /// superusers. No code path consults `superuser`, `bypassrls` or any other
+    /// bit to authorise a statement, and `password` is NOT wired into wire
+    /// authentication.
+    ///
+    /// APPEND-ONLY: declared after [`LogicalPlan::DropRole`] for the bincode
+    /// reason documented on [`LogicalPlan::Noop`] — `LogicalPlan` is persisted
+    /// positionally for materialized-view plans, so any future variant must go
+    /// after the last one, never in the middle.
+    CreateRole {
+        /// Role name (planner-normalised).
+        name: String,
+        /// `IF NOT EXISTS`: an existing role is not an error.
+        if_not_exists: bool,
+        /// `LOGIN` / `NOLOGIN` (PostgreSQL default: NOLOGIN).
+        login: bool,
+        /// `SUPERUSER` / `NOSUPERUSER`. Recorded only.
+        superuser: bool,
+        /// `CREATEDB` / `NOCREATEDB`. Recorded only.
+        createdb: bool,
+        /// `CREATEROLE` / `NOCREATEROLE`. Recorded only.
+        createrole: bool,
+        /// `INHERIT` / `NOINHERIT` (PostgreSQL default: INHERIT).
+        inherit: bool,
+        /// `REPLICATION` / `NOREPLICATION`. Recorded only.
+        replication: bool,
+        /// `BYPASSRLS` / `NOBYPASSRLS`. Recorded only — HeliosDB RLS keys off
+        /// `TenantContext`, not off SQL roles, so this bit changes nothing.
+        bypassrls: bool,
+        /// `CONNECTION LIMIT n` (`None` → unlimited / `-1`). Recorded only.
+        conn_limit: Option<i64>,
+        /// `VALID UNTIL '…'`, stored verbatim. Recorded only.
+        valid_until: Option<String>,
+        /// `PASSWORD '…'`, stored verbatim; `None` for `PASSWORD NULL` or an
+        /// omitted clause. NEVER emitted by a catalog view.
+        password: Option<String>,
+    },
+
+    /// `ALTER ROLE <name> WITH <options…>`. Every field is
+    /// `Option<…>`: `None` means "the statement did not mention this
+    /// attribute", so an ALTER only touches what it names.
+    ///
+    /// *** RECORDS ATTRIBUTES; ENFORCES NOTHING *** — see
+    /// [`LogicalPlan::CreateRole`].
+    ///
+    /// APPEND-ONLY — see [`LogicalPlan::Noop`].
+    AlterRole {
+        /// Role name (planner-normalised).
+        name: String,
+        set_login: Option<bool>,
+        set_superuser: Option<bool>,
+        set_createdb: Option<bool>,
+        set_createrole: Option<bool>,
+        set_inherit: Option<bool>,
+        set_replication: Option<bool>,
+        set_bypassrls: Option<bool>,
+        /// Outer `None` = clause absent; inner `None` = unlimited.
+        set_conn_limit: Option<Option<i64>>,
+        /// Outer `None` = clause absent; inner `None` = `VALID UNTIL NULL`.
+        set_valid_until: Option<Option<String>>,
+        /// Outer `None` = clause absent; inner `None` = `PASSWORD NULL`.
+        set_password: Option<Option<String>>,
+    },
+
+    /// `GRANT <privileges> ON <objects> TO <grantees> [WITH GRANT OPTION]`.
+    ///
+    /// *** THIS WRITES AN ACL RECORD. IT DOES NOT ENFORCE ONE. *** Before this
+    /// variant, GRANT planned to [`LogicalPlan::Noop`] and vanished while
+    /// reporting success. It now persists what was granted so the privilege
+    /// views can report it — but no DML choke point reads those records, so a
+    /// GRANT still confers nothing and a REVOKE still removes nothing at
+    /// execution time. Enforcement is a named follow-up (ROADMAP_V5).
+    ///
+    /// APPEND-ONLY — see [`LogicalPlan::Noop`].
+    GrantPrivileges {
+        /// Uppercase privilege names (`SELECT`, `INSERT`, …). Empty when
+        /// `all_privileges` is set.
+        privileges: Vec<String>,
+        /// `GRANT ALL [PRIVILEGES]` — expanded per object type at execution.
+        all_privileges: bool,
+        /// `"table"` or `"sequence"`.
+        object_type: String,
+        /// Resolved object names (tables go through `search_path`).
+        objects: Vec<String>,
+        /// Role names; the literal `public` is the PUBLIC pseudo-role.
+        grantees: Vec<String>,
+        /// `WITH GRANT OPTION`.
+        with_grant_option: bool,
+    },
+
+    /// `REVOKE <privileges> ON <objects> FROM <grantees>`.
+    ///
+    /// *** REMOVES A CATALOG RECORD, NOT AN ACCESS RIGHT *** — see
+    /// [`LogicalPlan::GrantPrivileges`].
+    ///
+    /// No `grant_option_for` field: sqlparser 0.53 has no
+    /// `REVOKE GRANT OPTION FOR …` grammar (its privilege-keyword list has no
+    /// `GRANT`), so that spelling fails LOUD at parse time with 42601 and can
+    /// never reach here. A field that could only ever be `false` would be
+    /// exactly the "machinery nothing calls" this codebase keeps shipping.
+    ///
+    /// APPEND-ONLY — see [`LogicalPlan::Noop`].
+    RevokePrivileges {
+        /// Uppercase privilege names. Empty when `all_privileges` is set.
+        privileges: Vec<String>,
+        /// `REVOKE ALL [PRIVILEGES]`.
+        all_privileges: bool,
+        /// `"table"` or `"sequence"`.
+        object_type: String,
+        /// Resolved object names.
+        objects: Vec<String>,
+        /// Role names; `public` is the PUBLIC pseudo-role.
+        grantees: Vec<String>,
+    },
 }
 
 /// Function/Procedure parameter
@@ -1113,6 +1278,17 @@ pub enum ParamMode {
 }
 
 /// Logical expression
+///
+/// # APPEND-ONLY — this enum is PERSISTED
+///
+/// `LogicalExpr` is bincode-encoded by POSITION, and it reaches disk through
+/// more than one namespace: materialized-view `query_plan_bytes`, the persisted
+/// `TriggerDefinition.body: Vec<LogicalPlan>`, and the BEFORE-row rewrite
+/// sidecar `trigger_rowmut:{table}:{trigger}` (`TriggerRowMutation` carries
+/// `Vec<(String, LogicalExpr)>`). Inserting or reordering a variant silently
+/// re-interprets every record an older binary wrote — a wrong expression, not a
+/// decode error. New variants MUST be APPENDED at the end of this enum. Same
+/// rule as `LogicalPlan` (see the note on `LogicalPlan::Noop`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum LogicalExpr {
     /// Column reference
@@ -1366,8 +1542,102 @@ impl LogicalExpr {
                 };
                 format!("{}{}", op_str, expr.to_default_sql())
             }
+            // HC3: CHECK clauses are stored the same way column defaults are —
+            // a serde_json `LogicalExpr` — and are read back through this same
+            // renderer for `information_schema.check_constraints.check_clause`.
+            // Almost every real CHECK is a binary/`IS NULL`/`BETWEEN`/`IN`
+            // predicate, so without these arms readback produced Rust `Debug`
+            // output (`BinaryExpr { left: Column { … } … }`) rather than SQL —
+            // a wrong answer dressed as a right one. Parenthesised so nesting
+            // and operator precedence survive the round trip.
+            LogicalExpr::BinaryExpr { left, op, right } => {
+                format!(
+                    "({} {} {})",
+                    left.to_default_sql(),
+                    binary_operator_sql(*op),
+                    right.to_default_sql()
+                )
+            }
+            LogicalExpr::IsNull { expr, is_null } => {
+                format!(
+                    "({} IS {}NULL)",
+                    expr.to_default_sql(),
+                    if *is_null { "" } else { "NOT " }
+                )
+            }
+            LogicalExpr::Between {
+                expr,
+                low,
+                high,
+                negated,
+            } => {
+                format!(
+                    "({} {}BETWEEN {} AND {})",
+                    expr.to_default_sql(),
+                    if *negated { "NOT " } else { "" },
+                    low.to_default_sql(),
+                    high.to_default_sql()
+                )
+            }
+            LogicalExpr::InList { expr, list, negated } => {
+                let rendered: Vec<String> = list.iter().map(|item| item.to_default_sql()).collect();
+                format!(
+                    "({} {}IN ({}))",
+                    expr.to_default_sql(),
+                    if *negated { "NOT " } else { "" },
+                    rendered.join(", ")
+                )
+            }
             other => format!("{other:?}"),
         }
+    }
+}
+
+/// PostgreSQL source text for a [`BinaryOperator`], for catalog readback
+/// (`information_schema.check_constraints.check_clause`,
+/// `information_schema.columns.column_default`, `pg_attrdef.adsrc`).
+/// Exhaustive on purpose: a new operator must be given its spelling here rather
+/// than silently rendering as debug output inside an otherwise-valid clause.
+fn binary_operator_sql(op: BinaryOperator) -> &'static str {
+    match op {
+        BinaryOperator::Plus => "+",
+        BinaryOperator::Minus => "-",
+        BinaryOperator::Multiply => "*",
+        BinaryOperator::Divide => "/",
+        BinaryOperator::Modulo => "%",
+        BinaryOperator::Eq => "=",
+        BinaryOperator::NotEq => "<>",
+        BinaryOperator::IsDistinctFrom => "IS DISTINCT FROM",
+        BinaryOperator::IsNotDistinctFrom => "IS NOT DISTINCT FROM",
+        BinaryOperator::Lt => "<",
+        BinaryOperator::LtEq => "<=",
+        BinaryOperator::Gt => ">",
+        BinaryOperator::GtEq => ">=",
+        BinaryOperator::And => "AND",
+        BinaryOperator::Or => "OR",
+        BinaryOperator::Like => "LIKE",
+        BinaryOperator::NotLike => "NOT LIKE",
+        BinaryOperator::ILike => "ILIKE",
+        BinaryOperator::NotILike => "NOT ILIKE",
+        BinaryOperator::RegexMatch => "~",
+        BinaryOperator::RegexIMatch => "~*",
+        BinaryOperator::NotRegexMatch => "!~",
+        BinaryOperator::NotRegexIMatch => "!~*",
+        BinaryOperator::SimilarTo => "SIMILAR TO",
+        BinaryOperator::NotSimilarTo => "NOT SIMILAR TO",
+        BinaryOperator::VectorL2Distance => "<->",
+        BinaryOperator::VectorCosineDistance => "<=>",
+        BinaryOperator::VectorInnerProduct => "<#>",
+        BinaryOperator::JsonGet => "->",
+        BinaryOperator::JsonGetText => "->>",
+        BinaryOperator::JsonContains => "@>",
+        BinaryOperator::JsonContainedBy => "<@",
+        BinaryOperator::JsonExists => "?",
+        BinaryOperator::JsonExistsAny => "?|",
+        BinaryOperator::JsonExistsAll => "?&",
+        BinaryOperator::ArrayConcat => "||",
+        BinaryOperator::StringConcat => "||",
+        BinaryOperator::TsMatch => "@@",
     }
 }
 
@@ -1842,6 +2112,11 @@ impl LogicalPlan {
             Self::CreateSequence { .. } => "CreateSequence",
             Self::AlterSequence(_) => "AlterSequence",
             Self::DropSequence { .. } => "DropSequence",
+            Self::DropRole { .. } => "DropRole",
+            Self::CreateRole { .. } => "CreateRole",
+            Self::AlterRole { .. } => "AlterRole",
+            Self::GrantPrivileges { .. } => "GrantPrivileges",
+            Self::RevokePrivileges { .. } => "RevokePrivileges",
             Self::CreateExtension { .. } => "CreateExtension",
             Self::CreateDatabase { .. } => "CreateDatabase",
             Self::DropDatabase { .. } => "DropDatabase",
@@ -2264,6 +2539,14 @@ impl LogicalPlan {
             | LogicalPlan::DropEnumType { .. }
             | LogicalPlan::CreateSchema { .. }
             | LogicalPlan::DropSchema { .. }
+            | LogicalPlan::DropRole { .. }
+            // Role / ACL DDL: no output rows. `GRANT`/`REVOKE` write a catalog
+            // record and report a command tag; they never return a result set,
+            // and — deliberately — they never enforce anything.
+            | LogicalPlan::CreateRole { .. }
+            | LogicalPlan::AlterRole { .. }
+            | LogicalPlan::GrantPrivileges { .. }
+            | LogicalPlan::RevokePrivileges { .. }
             | LogicalPlan::Noop => {
                 // KanttBan #20 (v3.31.0): DDL — no output rows.
                 Arc::new(Schema { columns: vec![] })

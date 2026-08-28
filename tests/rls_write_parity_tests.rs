@@ -308,8 +308,9 @@ fn rls_update_using_silently_filters() {
 
 /// Two halves of the same policy: (a) the session's OWN row updates fine, and
 /// (b) an assignment that would move that row out of the policy's reach is an
-/// ERROR via `WITH CHECK` — the case the dead `execute_internal` UPDATE arm never
+/// ERROR via `WITH CHECK` — the case a now-deleted duplicate UPDATE path never
 /// checked at all (it destructured `(using_expr, _)` and dropped the check).
+/// Both live families must enforce it; that is what this test pins.
 #[test]
 fn rls_update_using_allows_own_row_then_with_check_errors_on_bad_assignment() {
     fn setup(db: &EmbeddedDatabase) -> TenantId {

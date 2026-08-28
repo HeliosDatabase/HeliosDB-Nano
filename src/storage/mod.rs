@@ -187,6 +187,12 @@ pub use lockfree::{
 // Per-column storage optimization exports
 pub use catalog::PersistedIndexDefinition;
 pub use catalog::{PersistedSeqState, PersistedSequence, DEFAULT_SEQUENCE_CACHE};
+// Role / ACL catalog (HC4 storage slice). STORED AND INTROSPECTABLE ONLY —
+// nothing in the engine enforces a privilege; see `AclRecord`'s doc comment.
+pub use catalog::{
+    is_reserved_role_name, AclRecord, RoleRecord, BUILTIN_HELIOS_ROLE_OID, BUILTIN_POSTGRES_ROLE_OID, FIRST_ROLE_OID,
+    RESERVED_ROLE_NAMES,
+};
 pub use columnar::{BatchPresence, ColumnBatch, ColumnarStats, ColumnarStore, BATCH_SIZE};
 pub use compression::{
     ColumnCompressionMetadata, CompressionCodec, CompressionConfig, CompressionManager, CompressionStats,

@@ -1151,7 +1151,32 @@ impl Evaluator {
                 Ok(Value::String(format_pg_type_oid(oid)))
             }
 
-            _ => Err(Error::query_execution(format!("Unknown scalar function: {}", fun))),
+            // ================= TERMINAL ARM — USER-DEFINED FUNCTIONS =================
+            //
+            // PERF CONTRACT: this is reached ONLY after every built-in arm above
+            // has failed to match, so a built-in call pays nothing for the
+            // lookup below — no mutex, no `Weak::upgrade`, no registry read.
+            // Do NOT hoist any part of this ahead of the built-in dispatch;
+            // `evaluate_scalar_function` is the hottest expression path in the
+            // engine and `benches/public/ci_perf_smoke.sh` gates it.
+            //
+            // `arg_values` is already evaluated above, so NULL arguments pass
+            // straight through to the routine (PostgreSQL's non-STRICT
+            // behaviour — `volatility`/`STRICT` are stored but not yet honoured).
+            _ => {
+                // Registry keys are bare lowercase names with no schema and no
+                // signature (`FunctionRegistry::register_function`). Accept the
+                // `public.` qualification because that is the schema every UDF
+                // is created in; any OTHER qualifier keeps erroring rather than
+                // silently resolving to a different schema's name.
+                let base = fun_dispatch.strip_prefix("public.").unwrap_or(fun_dispatch);
+                if !base.contains('.') {
+                    if let Some(bridge) = crate::sql::udf_bridge::resolve(base) {
+                        return crate::sql::udf_bridge::call_scalar(&bridge, base, &arg_values);
+                    }
+                }
+                Err(Error::query_execution(format!("Unknown scalar function: {}", fun)))
+            }
         }
     }
 

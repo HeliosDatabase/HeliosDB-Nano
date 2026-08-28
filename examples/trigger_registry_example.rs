@@ -6,7 +6,12 @@
 //! ⚠️ Registration is not execution. Everything below (register / lookup / enable /
 //! disable / drop / persist) works, but HeliosDB Nano never executes a trigger body:
 //! a registered trigger has no observable effect on INSERT/UPDATE/DELETE. See
-//! `tests/trigger_unimplemented_tests.rs` and the `heliosdb-nano-schema` skill.
+//! `tests/trigger_row_mutation_tests.rs` and the `heliosdb-nano-schema` skill.
+//!
+//! NOTE: `db.storage.trigger_registry()` below is `StorageEngine`'s OWN registry, which
+//! the SQL executor does NOT consult. The live one the DML path reads is
+//! `db.trigger_registry`; that is the one `CREATE TRIGGER` writes and the one repopulated
+//! from the catalog at open.
 
 use heliosdb_nano::{
     sql::{

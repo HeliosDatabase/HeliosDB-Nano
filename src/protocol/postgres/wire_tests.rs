@@ -871,8 +871,8 @@ async fn view_redefine_invalidates_describe_schema() {
 /// redefining DDL run over the EXTENDED protocol (Parse/Bind/Execute) — the
 /// route psycopg3 / JDBC / Npgsql use by default (e.g. Alembic migrations).
 /// That route lands in `execute_plan_with_params_inner`'s catch-all executor
-/// arm, which the first two `plan_invalidates_sql_caches` gates
-/// (`execute_internal`, `execute_in_transaction_inner`) never cover — so the
+/// arm, which the text-family `plan_invalidates_sql_caches` gate in
+/// `execute_in_transaction_inner` never covers — so the
 /// `CREATE OR REPLACE VIEW` executed here left the shared `"\0params\0<sql>"`
 /// plan cache un-cleared and its epoch un-bumped, and the second Parse of the
 /// SAME `SELECT * FROM vv` text Described the STALE single-column plan. Unlike
@@ -1680,4 +1680,827 @@ async fn test_wire_update_with_pg_tables_in_literal_actually_executes() {
         Some("see pg_tables"),
         "the UPDATE must have genuinely written the new note value"
     );
+}
+
+// ---------------------------------------------------------------------------
+// HC3 — catalog introspection over the WIRE.
+//
+// The repo's documented gotcha is that embedded tests never execute
+// `src/protocol/postgres/catalog.rs`, so a catalog view could pass every
+// embedded test and still be empty (or mis-shaped) for the only clients that
+// matter here: psql, psycopg, JDBC, sqlx, drizzle-kit, Prisma. These tests
+// drive the real PG wire — simple query AND the extended Parse/Describe/Bind/
+// Execute path — and are the acceptance criterion for HC3; the embedded suite
+// (tests/catalog_introspection_tests.rs) is the regression floor beneath them.
+// ---------------------------------------------------------------------------
+
+/// Decode the RowDescription column names from a backend byte stream.
+/// Field layout after the NUL-terminated name: table_oid i32, col_attnum i16,
+/// type_oid i32, type_len i16, type_mod i32, format i16 = 18 fixed bytes.
+fn row_description_names(bytes: &[u8]) -> Vec<String> {
+    for (ty, payload) in parse_messages(bytes) {
+        if ty != b'T' {
+            continue;
+        }
+        let n = i16::from_be_bytes([payload[0], payload[1]]) as usize;
+        let mut pos = 2usize;
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            let end = payload[pos..]
+                .iter()
+                .position(|&b| b == 0)
+                .map(|i| pos + i)
+                .expect("RowDescription field name must be NUL-terminated");
+            out.push(String::from_utf8_lossy(&payload[pos..end]).to_string());
+            pos = end + 1 + 18;
+        }
+        return out;
+    }
+    Vec::new()
+}
+
+/// Column index by name in a RowDescription, panicking with the full list.
+fn rd_index(names: &[String], want: &str) -> usize {
+    names
+        .iter()
+        .position(|n| n == want)
+        .unwrap_or_else(|| panic!("column `{want}` missing from RowDescription; got {names:?}"))
+}
+
+/// Text of a DataRow cell, `None` for SQL NULL.
+fn cell(row: &[Option<Vec<u8>>], idx: usize) -> Option<String> {
+    row.get(idx)
+        .and_then(|v| v.as_ref())
+        .map(|b| String::from_utf8_lossy(b).to_string())
+}
+
+/// THE regression this whole change exists for. The single most common ORM
+/// introspection query in existence — Prisma / Drizzle / Rails / SQLAlchemy all
+/// send some variant of it — used to come back from the PG wire with ZERO ROWS,
+/// because the wire's fixed 7-column `information_schema.columns` shape had no
+/// `table_schema` at all: `row_value` returned NULL for it and `lit_eq_value`
+/// dropped every row. Written WITHOUT spaces around `=` it instead hit the
+/// "unknown predicate, keep the row" branch and then `project_columns` silently
+/// DROPPED `table_schema` from the projection, so the client got 5 columns where
+/// it asked for 6 — a different shape than RowDescription implied.
+///
+/// Both spellings must now return rows AND exactly the six requested columns.
+#[tokio::test]
+async fn wire_orm_columns_introspection_returns_six_columns_and_rows() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+    handler
+        .handle_single_query("CREATE TABLE wire_orm (id INT PRIMARY KEY, name TEXT)")
+        .await
+        .expect("create table");
+    let _ = drain(&mut client).await;
+
+    for sql in [
+        "SELECT table_schema, table_name, column_name, data_type, is_nullable, column_default \
+         FROM information_schema.columns WHERE table_schema = 'public'",
+        "SELECT table_schema, table_name, column_name, data_type, is_nullable, column_default \
+         FROM information_schema.columns WHERE table_schema='public'",
+    ] {
+        handler.handle_single_query(sql).await.expect("introspection query");
+        let out = drain(&mut client).await;
+        let names = row_description_names(&out);
+        assert_eq!(
+            names,
+            vec![
+                "table_schema".to_string(),
+                "table_name".to_string(),
+                "column_name".to_string(),
+                "data_type".to_string(),
+                "is_nullable".to_string(),
+                "column_default".to_string(),
+            ],
+            "RowDescription must be exactly the six requested columns for `{sql}`"
+        );
+
+        let rows = data_rows(&out);
+        assert!(
+            !rows.is_empty(),
+            "the ORM introspection query must return rows over the wire for `{sql}` (this returned ZERO before HC3)"
+        );
+        for row in &rows {
+            assert_eq!(
+                row.len(),
+                6,
+                "every DataRow must carry the six columns RowDescription promised"
+            );
+            assert_eq!(
+                cell(row, 0).as_deref(),
+                Some("public"),
+                "WHERE table_schema = 'public' must actually filter"
+            );
+        }
+        assert!(
+            rows.iter().any(|r| cell(r, 1).as_deref() == Some("wire_orm")),
+            "the user table's columns must be present for `{sql}`"
+        );
+    }
+}
+
+/// Schema namespacing over the wire: the deleted wire copy HARDCODED
+/// `table_schema = 'public'` and emitted the raw `app.t` storage key as
+/// `table_name`, so a table in another schema was reported twice-wrong. The
+/// registry splits the key correctly and now answers the wire too.
+#[tokio::test]
+async fn wire_information_schema_reports_the_real_schema() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(Arc::clone(&db));
+    for stmt in ["CREATE SCHEMA wapp", "CREATE TABLE wapp.t (c INT)"] {
+        handler.handle_single_query(stmt).await.expect("setup");
+        let _ = drain(&mut client).await;
+    }
+
+    handler
+        .handle_single_query("SELECT table_schema, table_name FROM information_schema.tables")
+        .await
+        .expect("tables");
+    let out = drain(&mut client).await;
+    let rows = data_rows(&out);
+    assert!(
+        rows.iter()
+            .any(|r| cell(r, 0).as_deref() == Some("wapp") && cell(r, 1).as_deref() == Some("t")),
+        "a table in schema `wapp` must report table_schema='wapp', table_name='t' over the wire; got {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|r| cell(r, 1).as_deref() == Some("wapp.t")),
+        "table_name must never be the raw `schema.table` storage key"
+    );
+
+    // information_schema.schemata must enumerate the real schema list, not the
+    // three hardcoded rows the wire copy returned.
+    handler
+        .handle_single_query("SELECT schema_name FROM information_schema.schemata")
+        .await
+        .expect("schemata");
+    let schemata = data_rows(&drain(&mut client).await);
+    assert!(
+        schemata.iter().any(|r| cell(r, 0).as_deref() == Some("wapp")),
+        "information_schema.schemata must list a CREATE SCHEMA schema; got {schemata:?}"
+    );
+
+    // The embedded route must agree exactly — the divergence is what HC3 removes.
+    // NOTE: `Value`'s Display quotes strings, so unwrap the raw text explicitly
+    // rather than comparing `'wapp'` against the wire's `wapp`.
+    let raw = |v: &crate::Value| -> String {
+        match v {
+            crate::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        }
+    };
+    let (embedded, cols) = db
+        .query_with_columns("SELECT table_schema, table_name FROM information_schema.tables")
+        .expect("embedded tables");
+    assert_eq!(cols, vec!["table_schema".to_string(), "table_name".to_string()]);
+    let embedded_pairs: Vec<(String, String)> = embedded
+        .iter()
+        .map(|r| (raw(&r.values[0]), raw(&r.values[1])))
+        .collect();
+    let wire_pairs: Vec<(String, String)> = rows
+        .iter()
+        .map(|r| (cell(r, 0).unwrap_or_default(), cell(r, 1).unwrap_or_default()))
+        .collect();
+    assert_eq!(
+        wire_pairs, embedded_pairs,
+        "the wire and embedded routes must return identical information_schema.tables rows"
+    );
+}
+
+/// Extended-query family (psycopg / JDBC / sqlx / node-postgres all use it):
+/// Describe derives RowDescription at PARSE time — before HC3 from the wire's
+/// fixed shape, now from the planner. Describe and Execute MUST agree, or
+/// SQLAlchemy's psycopg dialect raises. Guards handler_extended.rs:68 / :304.
+#[tokio::test]
+async fn wire_extended_describe_matches_execute_for_catalog_views() {
+    use super::messages::DescribeTarget;
+
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+    for stmt in [
+        "CREATE TABLE wext (id INT PRIMARY KEY, name TEXT)",
+        "CREATE VIEW wext_v AS SELECT id FROM wext",
+    ] {
+        handler.handle_single_query(stmt).await.expect("setup");
+        let _ = drain(&mut client).await;
+    }
+
+    for (idx, sql) in [
+        "SELECT table_name, column_name FROM information_schema.columns WHERE table_schema = 'public'",
+        "SELECT schemaname, viewname, definition FROM pg_views",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let stmt_name = format!("hc3s{idx}");
+        let portal = format!("hc3p{idx}");
+
+        handler
+            .handle_parse_extended(stmt_name.clone(), (*sql).to_string(), vec![])
+            .await
+            .expect("parse");
+        handler
+            .handle_describe_extended(DescribeTarget::Statement, stmt_name.clone())
+            .await
+            .expect("describe");
+        let describe_names = row_description_names(&drain(&mut client).await);
+        assert!(
+            !describe_names.is_empty(),
+            "Describe must produce a RowDescription for `{sql}`"
+        );
+
+        handler
+            .handle_bind_extended(portal.clone(), stmt_name, vec![], vec![], vec![])
+            .await
+            .expect("bind");
+        handler.handle_execute_extended(portal, 0).await.expect("execute");
+        let out = drain(&mut client).await;
+        let rows = data_rows(&out);
+        assert!(!rows.is_empty(), "Execute must return rows for `{sql}`");
+        for row in &rows {
+            assert_eq!(
+                row.len(),
+                describe_names.len(),
+                "Describe promised {} columns but Execute sent {} for `{sql}`",
+                describe_names.len(),
+                row.len()
+            );
+        }
+    }
+}
+
+/// Views are visible over the wire on every surface at once.
+#[tokio::test]
+async fn wire_views_are_visible_in_pg_views_and_pg_class() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+    for stmt in [
+        "CREATE TABLE wv_base (id INT PRIMARY KEY, n INT)",
+        "CREATE VIEW wv AS SELECT id, n FROM wv_base",
+    ] {
+        handler.handle_single_query(stmt).await.expect("setup");
+        let _ = drain(&mut client).await;
+    }
+
+    handler
+        .handle_single_query("SELECT viewname, definition FROM pg_views")
+        .await
+        .expect("pg_views");
+    let out = drain(&mut client).await;
+    let names = row_description_names(&out);
+    assert_eq!(names, vec!["viewname".to_string(), "definition".to_string()]);
+    let rows = data_rows(&out);
+    assert_eq!(rows.len(), 1, "one view exists; got {rows:?}");
+    assert_eq!(cell(&rows[0], 0).as_deref(), Some("wv"));
+    assert!(
+        cell(&rows[0], 1).unwrap_or_default().contains("wv_base"),
+        "pg_views.definition must be the stored body over the wire"
+    );
+
+    handler
+        .handle_single_query("SELECT relname FROM pg_class WHERE relkind = 'v'")
+        .await
+        .expect("pg_class");
+    let cls = data_rows(&drain(&mut client).await);
+    assert!(
+        cls.iter().any(|r| cell(r, 0).as_deref() == Some("wv")),
+        "pg_class must expose the view with relkind='v' over the wire; got {cls:?}"
+    );
+}
+
+/// `pg_indexes` moved from the wire router into the registry; it must still
+/// answer over the wire (this is the "port, don't drop" check).
+#[tokio::test]
+async fn wire_pg_indexes_still_answers_after_the_migration() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+    for stmt in [
+        "CREATE TABLE wpi (id INT PRIMARY KEY, email TEXT)",
+        "CREATE INDEX wpi_email_idx ON wpi(email)",
+    ] {
+        handler.handle_single_query(stmt).await.expect("setup");
+        let _ = drain(&mut client).await;
+    }
+
+    handler
+        .handle_single_query("SELECT indexname, indexdef FROM pg_indexes")
+        .await
+        .expect("pg_indexes");
+    let out = drain(&mut client).await;
+    assert_eq!(
+        row_description_names(&out),
+        vec!["indexname".to_string(), "indexdef".to_string()]
+    );
+    let rows = data_rows(&out);
+    assert!(
+        rows.iter().any(|r| cell(r, 0).as_deref() == Some("wpi_email_idx")),
+        "the manual index must still be listed over the wire; got {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|r| cell(r, 0).as_deref() == Some("wpi_pkey")),
+        "the primary-key index must still be listed over the wire; got {rows:?}"
+    );
+}
+
+/// Aggregates, GROUP BY and the drizzle-kit triple JOIN must keep working after
+/// the deferral — they are the reason the deferral pattern existed at all.
+#[tokio::test]
+async fn wire_catalog_aggregates_and_joins_still_work() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+    handler
+        .handle_single_query("CREATE TABLE wagg (id INT PRIMARY KEY, name TEXT)")
+        .await
+        .expect("setup");
+    let _ = drain(&mut client).await;
+
+    handler
+        .handle_single_query("SELECT count(*) FROM information_schema.tables")
+        .await
+        .expect("count");
+    let count = first_data_row_text(&drain(&mut client).await).expect("count value");
+    assert!(
+        count.parse::<i64>().map(|n| n > 0).unwrap_or(false),
+        "count(*) over information_schema.tables must be a positive integer, got {count:?}"
+    );
+
+    handler
+        .handle_single_query("SELECT table_schema, count(*) FROM information_schema.columns GROUP BY table_schema")
+        .await
+        .expect("group by");
+    let grouped = data_rows(&drain(&mut client).await);
+    assert!(
+        !grouped.is_empty(),
+        "GROUP BY over information_schema.columns must return rows"
+    );
+
+    // drizzle-kit's introspection shape: three catalog views in one statement.
+    // This shape ALREADY deferred to the planner before HC3 (the old
+    // `needs_planner` check fired on " join "), so a failure here is a planner
+    // gap, not an HC3 regression — but it must not start failing because of
+    // this change either, which is exactly what the pin is for.
+    handler
+        .handle_single_query(
+            "SELECT tc.constraint_name FROM information_schema.table_constraints tc \
+             JOIN information_schema.key_column_usage kcu ON kcu.constraint_name = tc.constraint_name \
+             JOIN information_schema.constraint_column_usage ccu ON ccu.constraint_name = tc.constraint_name",
+        )
+        .await
+        .expect("drizzle triple join must plan and execute");
+    let joined = data_rows(&drain(&mut client).await);
+    assert!(
+        !joined.is_empty(),
+        "the drizzle-kit triple JOIN must return the table's PK constraint; got {joined:?}"
+    );
+}
+
+/// NULL edge over the wire: a NOT NULL column with a DEFAULT and a nullable
+/// column with none must render 'NO'/'YES' and a real SQL NULL (-1 length),
+/// not an empty string.
+#[tokio::test]
+async fn wire_information_schema_columns_null_and_default_rendering() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+    handler
+        .handle_single_query("CREATE TABLE wnull (a INT NOT NULL DEFAULT 7, b TEXT)")
+        .await
+        .expect("setup");
+    let _ = drain(&mut client).await;
+
+    handler
+        .handle_single_query(
+            "SELECT column_name, is_nullable, column_default FROM information_schema.columns \
+             WHERE table_name = 'wnull'",
+        )
+        .await
+        .expect("columns");
+    let out = drain(&mut client).await;
+    let names = row_description_names(&out);
+    let name_idx = rd_index(&names, "column_name");
+    let null_idx = rd_index(&names, "is_nullable");
+    let def_idx = rd_index(&names, "column_default");
+
+    let rows = data_rows(&out);
+    assert_eq!(rows.len(), 2, "two columns on wnull; got {rows:?}");
+
+    let a = rows
+        .iter()
+        .find(|r| cell(r, name_idx).as_deref() == Some("a"))
+        .expect("column a");
+    assert_eq!(cell(a, null_idx).as_deref(), Some("NO"));
+    assert!(
+        cell(a, def_idx).unwrap_or_default().contains('7'),
+        "a's default must read back as 7 over the wire"
+    );
+
+    let b = rows
+        .iter()
+        .find(|r| cell(r, name_idx).as_deref() == Some("b"))
+        .expect("column b");
+    assert_eq!(cell(b, null_idx).as_deref(), Some("YES"));
+    assert_eq!(
+        cell(b, def_idx),
+        None,
+        "a column with no default must be a real wire NULL, not an empty string"
+    );
+}
+
+/// Task #38 boundary regression, re-pinned after the branch deletions: user
+/// tables whose names merely CONTAIN a catalog marker must never be shadowed by
+/// the catalog router. `pg_views_backup` and `app_pg_indexes` are the exact
+/// shapes the word-boundary matcher exists for, and both markers just lost
+/// their dispatch branches — the marker list keeps them, so the boundary check
+/// is still the only thing standing between a user table and interception.
+#[tokio::test]
+async fn wire_user_tables_named_after_catalog_views_are_not_shadowed() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+    for stmt in [
+        "CREATE TABLE pg_views_backup (id INT PRIMARY KEY, note TEXT)",
+        "CREATE TABLE app_pg_indexes (id INT PRIMARY KEY, note TEXT)",
+        "INSERT INTO pg_views_backup VALUES (1, 'mine')",
+        "INSERT INTO app_pg_indexes VALUES (1, 'also mine')",
+    ] {
+        handler.handle_single_query(stmt).await.expect("setup");
+        let _ = drain(&mut client).await;
+    }
+
+    for (table, expected) in [("pg_views_backup", "mine"), ("app_pg_indexes", "also mine")] {
+        handler
+            .handle_single_query(&format!("SELECT note FROM {table} WHERE id = 1"))
+            .await
+            .expect("user table read");
+        assert_eq!(
+            first_data_row_text(&drain(&mut client).await).as_deref(),
+            Some(expected),
+            "`{table}` is a USER table and must never be shadowed by the catalog router"
+        );
+    }
+}
+
+/// CHECK clauses reach the wire as SQL, not as the internal encoding.
+#[tokio::test]
+async fn wire_check_constraints_expose_the_clause() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+    handler
+        .handle_single_query("CREATE TABLE wck (qty INT, CONSTRAINT wck_qty_pos CHECK (qty > 0))")
+        .await
+        .expect("setup");
+    let _ = drain(&mut client).await;
+
+    handler
+        .handle_single_query("SELECT constraint_name, check_clause FROM information_schema.check_constraints")
+        .await
+        .expect("check_constraints");
+    let out = drain(&mut client).await;
+    let rows = data_rows(&out);
+    let row = rows
+        .iter()
+        .find(|r| cell(r, 0).as_deref() == Some("wck_qty_pos"))
+        .unwrap_or_else(|| panic!("the CHECK must be listed over the wire; got {rows:?}"));
+    let clause = cell(row, 1).unwrap_or_default();
+    assert!(
+        clause.contains("qty") && clause.contains('>'),
+        "check_clause must be the SQL predicate over the wire, got {clause:?}"
+    );
+    assert!(
+        !clause.contains("BinaryExpr"),
+        "check_clause must not leak the internal expression encoding, got {clause:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// HC4 — roles / grants over the wire.
+//
+// These cover the paths the embedded suite CANNOT reach: the catalog
+// interceptor's psql `\du` response, the command tags, and the SET intercept.
+//
+// None of this is enforcement. HeliosDB stores and reports roles and grants;
+// it checks no privilege anywhere.
+// ---------------------------------------------------------------------------
+
+/// SQLSTATE codes carried by every ErrorResponse in a byte stream.
+/// ErrorResponse payload is a sequence of (field-type byte, NUL-terminated
+/// string); field `C` is the SQLSTATE.
+fn sqlstates(bytes: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    for (ty, payload) in parse_messages(bytes) {
+        if ty != b'E' {
+            continue;
+        }
+        let mut pos = 0;
+        while pos < payload.len() && payload[pos] != 0 {
+            let field = payload[pos];
+            pos += 1;
+            let start = pos;
+            while pos < payload.len() && payload[pos] != 0 {
+                pos += 1;
+            }
+            if field == b'C' {
+                out.push(String::from_utf8_lossy(&payload[start..pos]).to_string());
+            }
+            pos += 1;
+        }
+    }
+    out
+}
+
+/// psql's `\du` response is served by the catalog interceptor. It used to be
+/// two hardcoded all-privilege superusers; it must now reflect the persisted
+/// role catalog, with the created role's REAL bits.
+#[tokio::test]
+async fn wire_du_reflects_a_created_role() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+    handler
+        .handle_single_query("CREATE ROLE reporter NOLOGIN")
+        .await
+        .expect("CREATE ROLE over the wire");
+    let _ = drain(&mut client).await;
+
+    // The 11-column shape psql sends for \du.
+    handler
+        .handle_single_query(
+            "SELECT r.rolname, r.rolsuper, r.rolinherit, r.rolcreaterole, r.rolcreatedb, \
+             r.rolcanlogin, r.rolconnlimit, r.rolvaliduntil FROM pg_catalog.pg_roles r ORDER BY 1",
+        )
+        .await
+        .expect("\\du query");
+    let out = drain(&mut client).await;
+    let rows = data_rows(&out);
+    let row = rows
+        .iter()
+        .find(|r| cell(r, 0).as_deref() == Some("reporter"))
+        .unwrap_or_else(|| panic!("\\du must list the created role; got {rows:?}"));
+    // The wire renders booleans as PostgreSQL does: `t` / `f`.
+    assert_eq!(
+        cell(row, 1).as_deref(),
+        Some("f"),
+        "a created role is NOT a superuser — \\du used to claim it was"
+    );
+    assert_eq!(cell(row, 5).as_deref(), Some("f"), "NOLOGIN must be reported");
+    // The built-ins are still listed for compatibility.
+    assert!(
+        rows.iter().any(|r| cell(r, 0).as_deref() == Some("postgres")),
+        "the virtual built-in must remain listed"
+    );
+}
+
+/// A GRANT issued over the wire is stored, and `table_privileges` reports it —
+/// through the planner, since the substring router now defers these views.
+#[tokio::test]
+async fn wire_grant_is_stored_and_visible_in_table_privileges() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+    for setup in [
+        "CREATE TABLE orders (id INT PRIMARY KEY)",
+        "CREATE ROLE app",
+        "GRANT SELECT ON orders TO app",
+    ] {
+        handler
+            .handle_single_query(setup)
+            .await
+            .unwrap_or_else(|e| panic!("{setup}: {e}"));
+        let out = drain(&mut client).await;
+        assert!(
+            sqlstates(&out).is_empty(),
+            "{setup} must not error over the wire: {:?}",
+            sqlstates(&out)
+        );
+    }
+
+    handler
+        .handle_single_query("SELECT grantee, table_name, privilege_type FROM information_schema.table_privileges")
+        .await
+        .expect("table_privileges");
+    let rows = data_rows(&drain(&mut client).await);
+    assert_eq!(
+        rows.len(),
+        1,
+        "the stored grant must be visible over the wire: {rows:?}"
+    );
+    assert_eq!(cell(&rows[0], 0).as_deref(), Some("app"));
+    assert_eq!(cell(&rows[0], 1).as_deref(), Some("orders"));
+    assert_eq!(cell(&rows[0], 2).as_deref(), Some("SELECT"));
+}
+
+/// Command tags: PostgreSQL parity. `GRANT` used to report `OK 0`, which made a
+/// stored grant indistinguishable from the old discard-everything no-op.
+#[tokio::test]
+async fn wire_role_ddl_command_tags() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+    handler
+        .handle_single_query("CREATE TABLE orders (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    let _ = drain(&mut client).await;
+
+    for (sql, tag) in [
+        ("CREATE ROLE app", "CREATE ROLE"),
+        ("ALTER ROLE app WITH LOGIN", "ALTER ROLE"),
+        ("GRANT SELECT ON orders TO app", "GRANT"),
+        ("REVOKE SELECT ON orders FROM app", "REVOKE"),
+        ("DROP ROLE app", "DROP ROLE"),
+        ("CREATE USER u LOGIN", "CREATE ROLE"),
+        ("DROP USER u", "DROP ROLE"),
+    ] {
+        handler
+            .handle_single_query(sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let out = drain(&mut client).await;
+        assert!(sqlstates(&out).is_empty(), "{sql} errored: {:?}", sqlstates(&out));
+        assert!(
+            command_tags(&out).iter().any(|t| t == tag),
+            "{sql} must report the `{tag}` tag, got {:?}",
+            command_tags(&out)
+        );
+    }
+}
+
+/// `SET ROLE <x>` used to be acked with `SET` and zero effect — telling a
+/// client it had dropped to a restricted identity when it had not. It now
+/// errors 0A000. `SET ROLE NONE` stays a genuine no-op ack.
+#[tokio::test]
+async fn wire_set_role_errors_but_set_role_none_still_acks() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+
+    for sql in ["SET ROLE readonly_user", "SET SESSION AUTHORIZATION readonly_user"] {
+        handler
+            .handle_single_query(sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let out = drain(&mut client).await;
+        assert_eq!(
+            sqlstates(&out),
+            vec!["0A000".to_string()],
+            "{sql} must raise feature_not_supported, not a silent SET ack"
+        );
+        assert!(
+            !command_tags(&out).iter().any(|t| t == "SET"),
+            "{sql} must NOT be acknowledged as a successful SET"
+        );
+    }
+
+    for sql in ["SET ROLE NONE", "SET SESSION AUTHORIZATION DEFAULT"] {
+        handler
+            .handle_single_query(sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let out = drain(&mut client).await;
+        assert!(
+            sqlstates(&out).is_empty(),
+            "{sql} must not error: {:?}",
+            sqlstates(&out)
+        );
+        assert!(
+            command_tags(&out).iter().any(|t| t == "SET"),
+            "{sql} is a genuine no-op and must still ack"
+        );
+    }
+
+    // A GUC whose name merely starts with `role` must keep the generic ack.
+    handler.handle_single_query("SET role_cache = on").await.unwrap();
+    let out = drain(&mut client).await;
+    assert!(
+        command_tags(&out).iter().any(|t| t == "SET"),
+        "an unrelated GUC must not be mistaken for SET ROLE"
+    );
+}
+
+/// SQLSTATE mapping for the role errors: 42710 duplicate_object,
+/// 42704 undefined_object, 2BP01 dependent_objects_still_exist.
+///
+/// Driven through `dispatch_message` — the connection run loop's own body —
+/// NOT through `handle_single_query` directly: a failing DDL statement
+/// deliberately propagates out of the per-statement handler (so a
+/// multi-statement simple query aborts on the first failure), and the
+/// ErrorResponse a client actually receives is rendered one level up. Calling
+/// the inner handler and unwrapping would assert a contract no driver sees.
+#[tokio::test]
+async fn wire_role_error_sqlstates() {
+    use super::messages::FrontendMessage;
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+    for setup in [
+        "CREATE TABLE orders (id INT PRIMARY KEY)",
+        "CREATE ROLE app",
+        "GRANT SELECT ON orders TO app",
+    ] {
+        handler
+            .dispatch_message(FrontendMessage::Query { query: setup.into() })
+            .await
+            .unwrap_or_else(|e| panic!("{setup}: {e}"));
+        let out = drain(&mut client).await;
+        assert!(
+            sqlstates(&out).is_empty(),
+            "{setup} must succeed over the wire, got {:?}",
+            sqlstates(&out)
+        );
+    }
+
+    for (sql, code) in [
+        ("CREATE ROLE app", "42710"),
+        ("DROP ROLE ghost", "42704"),
+        ("ALTER ROLE ghost WITH LOGIN", "42704"),
+        ("DROP ROLE app", "2BP01"),
+    ] {
+        handler
+            .dispatch_message(FrontendMessage::Query { query: sql.into() })
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let out = drain(&mut client).await;
+        assert_eq!(
+            sqlstates(&out),
+            vec![code.to_string()],
+            "{sql} must map to SQLSTATE {code}"
+        );
+        // A rejected statement must NOT also be acknowledged as done: an
+        // `ErrorResponse` beside a `CREATE ROLE` / `DROP ROLE` CommandComplete
+        // is exactly the "silently succeeded" shape this slice exists to
+        // remove.
+        assert!(
+            command_tags(&out).is_empty(),
+            "{sql} was rejected and must not also be acked, got {:?}",
+            command_tags(&out)
+        );
+        // ... and the connection must stay usable: the simple-query error path
+        // owes the client a ReadyForQuery, or every subsequent statement in
+        // this loop would hang a real driver.
+        assert!(
+            parse_messages(&out).iter().any(|(ty, _)| *ty == b'Z'),
+            "{sql} must be followed by ReadyForQuery"
+        );
+    }
+}
+
+/// HC3 deleted the PG wire's fixed-shape `information_schema` implementations,
+/// so foreign-key reflection now travels the planner route on every interface.
+/// `tests/markon_a4_reflection.rs` pins the engine half of that contract; this
+/// pins the PG-WIRE half, which is where drizzle-kit / Prisma / Alembic
+/// actually read it from. It also exercises the capability the deleted
+/// substring router never had — a real WHERE clause — so "we deferred to the
+/// planner" cannot quietly become "we returned everything" or "we returned
+/// nothing".
+#[tokio::test]
+async fn wire_information_schema_exposes_foreign_key_reflection() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+    for stmt in [
+        "CREATE TABLE wfk_parent (id INT PRIMARY KEY)",
+        "CREATE TABLE wfk_child (id INT PRIMARY KEY, parent_id INT, \
+         CONSTRAINT wfk_child_parent_fk FOREIGN KEY(parent_id) REFERENCES wfk_parent(id))",
+    ] {
+        handler.handle_single_query(stmt).await.expect("setup");
+        let _ = drain(&mut client).await;
+    }
+
+    handler
+        .handle_single_query(
+            "SELECT constraint_name, table_name, column_name FROM information_schema.key_column_usage \
+             WHERE constraint_name = 'wfk_child_parent_fk'",
+        )
+        .await
+        .expect("key_column_usage over the wire");
+    let out = drain(&mut client).await;
+    assert_eq!(
+        row_description_names(&out),
+        vec![
+            "constraint_name".to_string(),
+            "table_name".to_string(),
+            "column_name".to_string(),
+        ]
+    );
+    let rows = data_rows(&out);
+    // `wfk_child` also carries `wfk_child_pkey`, so an unfiltered or
+    // wrongly-filtered answer cannot be exactly one row.
+    assert_eq!(
+        rows.len(),
+        1,
+        "the WHERE clause must be honoured over the wire; got {rows:?}"
+    );
+    let fk = rows.first().expect("the FK key_column_usage row");
+    assert_eq!(cell(fk, 0).as_deref(), Some("wfk_child_parent_fk"));
+    assert_eq!(cell(fk, 1).as_deref(), Some("wfk_child"));
+    assert_eq!(cell(fk, 2).as_deref(), Some("parent_id"));
+
+    handler
+        .handle_single_query(
+            "SELECT constraint_type FROM information_schema.table_constraints \
+             WHERE constraint_name = 'wfk_child_parent_fk'",
+        )
+        .await
+        .expect("table_constraints over the wire");
+    let tc = data_rows(&drain(&mut client).await);
+    assert_eq!(
+        tc.len(),
+        1,
+        "table_constraints must expose exactly the FK constraint; got {tc:?}"
+    );
+    assert_eq!(tc.first().and_then(|r| cell(r, 0)).as_deref(), Some("FOREIGN KEY"));
 }

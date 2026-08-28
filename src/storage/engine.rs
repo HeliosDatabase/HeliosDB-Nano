@@ -8535,25 +8535,45 @@ impl StorageEngine {
         &self.trigger_registry
     }
 
-    /// Load all triggers from persistent storage on startup
+    /// Load all triggers from persistent storage on startup, into
+    /// `StorageEngine`'s own registry.
+    ///
+    /// NOTE for anyone wiring trigger startup: the registry the SQL executor
+    /// actually consults is `EmbeddedDatabase::trigger_registry`, NOT this one.
+    /// The open-time loader therefore calls
+    /// [`StorageEngine::load_triggers_into`] with that registry — see
+    /// `EmbeddedDatabase::load_persisted_triggers`.
     pub fn load_triggers(&self) -> Result<()> {
+        self.load_triggers_into(&self.trigger_registry).map(|_| ())
+    }
+
+    /// Load every persisted trigger definition into `registry`, returning how
+    /// many were registered.
+    ///
+    /// One implementation, two possible targets — the caller decides which
+    /// registry is being populated. Registration failures are warned about and
+    /// skipped: a single bad definition must never stop a database from
+    /// opening.
+    pub fn load_triggers_into(&self, registry: &Arc<crate::sql::TriggerRegistry>) -> Result<usize> {
         let catalog = self.catalog();
         let triggers = catalog.load_all_triggers()?;
 
         info!("Loading {} triggers from persistent storage", triggers.len());
 
+        let mut loaded = 0usize;
         for trigger in triggers {
-            if let Err(e) = self.trigger_registry.register_trigger(trigger.clone()) {
+            if let Err(e) = registry.register_trigger(trigger.clone()) {
                 warn!(
                     "Failed to load trigger '{}' on table '{}': {}",
                     trigger.name, trigger.table_name, e
                 );
             } else {
+                loaded += 1;
                 debug!("Loaded trigger '{}' on table '{}'", trigger.name, trigger.table_name);
             }
         }
 
-        Ok(())
+        Ok(loaded)
     }
 
     /// Get a reference to the vector index manager
@@ -9008,6 +9028,41 @@ impl StorageEngine {
                 break;
             }
             out.push(String::from_utf8_lossy(key.get(prefix_bytes.len()..).unwrap_or_default()).to_string());
+        }
+        out
+    }
+
+    /// Every metadata blob stored under `prefix`, as `(key suffix, value)`.
+    ///
+    /// Values are fetched through [`StorageEngine::get`] rather than read off
+    /// the raw RocksDB iterator, because on a TDE data dir the raw iterator
+    /// hands back CIPHERTEXT — `get` is the one place decryption happens. A key
+    /// that disappears between the scan and the fetch is skipped, and a read
+    /// error is warned and skipped rather than aborting the whole scan: this
+    /// started life as the open-time routine loader's reader, which must degrade
+    /// to "that one record is missing", never to "the database will not open".
+    /// Callers that need a hard failure decode the returned bytes themselves and
+    /// propagate — `Catalog::list_roles` / `list_acls` do exactly that.
+    ///
+    /// THIS IS THE ONE READ DISCIPLINE for prefix-scanned metadata. Do not add a
+    /// second reader over `self.db.iterator_opt` that touches VALUES; it will be
+    /// correct on a plaintext data dir and broken on every encrypted one.
+    ///
+    /// Callers: rebuilding the `FunctionRegistry` from the durable
+    /// `meta:function:` / `meta:procedure:` records that
+    /// `EmbeddedDatabase::execute_create_function_plan` and WAL replay
+    /// (`WalOperation::CreateFunction`) both write; `Catalog::load_all_triggers`;
+    /// `Catalog::load_all_trigger_row_mutations`; `Catalog::list_roles`;
+    /// `Catalog::list_acls`.
+    pub fn meta_blobs_with_prefix(&self, prefix: &str) -> Vec<(String, Vec<u8>)> {
+        let mut out = Vec::new();
+        for suffix in self.keys_with_prefix_suffixes(prefix) {
+            let key = format!("{}{}", prefix, suffix).into_bytes();
+            match self.get(&key) {
+                Ok(Some(value)) => out.push((suffix, value)),
+                Ok(None) => {}
+                Err(e) => warn!("failed to read metadata key '{}{}': {}", prefix, suffix, e),
+            }
         }
         out
     }
@@ -10045,6 +10100,22 @@ impl StorageEngine {
                 // Check if table exists before dropping
                 if catalog.get_table_schema(&table).is_err() {
                     debug!("Table {} doesn't exist, skipping drop", table);
+                    // The DROP is already durable, but a `CreateTrigger` entry
+                    // EARLIER in this same log has just re-written this table's
+                    // `trigger:{table}:` record (that arm re-saves it
+                    // unconditionally). `Catalog::drop_table` — which owns the
+                    // trigger purge — is not going to run on this path, so purge
+                    // here or the trigger comes back at every open and then
+                    // fires on a NEW table created under the same name.
+                    // Reachable whenever the replayed window contains the
+                    // CREATE TRIGGER and the DROP TABLE but not the original
+                    // CREATE TABLE.
+                    if let Err(e) = catalog.delete_table_triggers(&table) {
+                        warn!(
+                            "Replayed drop table '{}': failed to delete trigger records: {}",
+                            table, e
+                        );
+                    }
                     return Ok(());
                 }
 
@@ -10417,19 +10488,6 @@ impl StorageEngine {
                 }
             }
 
-            WalOperation::DropTable { table } => {
-                // Can't batch schema operations, apply immediately
-                let catalog = Catalog::new(self);
-                if catalog.get_table_schema(table).is_err() {
-                    debug!("Table {} doesn't exist, skipping drop", table);
-                    return Ok(false);
-                }
-
-                catalog.drop_table(table)?;
-                debug!("Replayed drop table: {}", table);
-                Ok(false) // Don't count as batch operation
-            }
-
             WalOperation::RenameTable { old_table, new_table } => {
                 // Can't batch schema operations, apply immediately (see the
                 // apply_wal_operation arm for the skip semantics).
@@ -10444,7 +10502,14 @@ impl StorageEngine {
             }
 
             // DDL operations - can't batch, apply via apply_wal_operation
-            WalOperation::Truncate { .. }
+            //
+            // `DropTable` is in this list rather than getting its own arm: it
+            // used to be a byte-for-byte copy of `apply_wal_operation`'s arm,
+            // and the copy silently missed the trigger-record purge that arm
+            // grew. Both replay drivers must remove a dropped table's triggers
+            // identically, so there is now exactly ONE implementation.
+            WalOperation::DropTable { .. }
+            | WalOperation::Truncate { .. }
             | WalOperation::AlterColumnStorage { .. }
             | WalOperation::CreateIndex { .. }
             | WalOperation::DropIndex { .. }

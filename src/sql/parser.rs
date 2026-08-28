@@ -285,6 +285,14 @@ impl Parser {
         // other rewrite so downstream stages see canonical PostgreSQL syntax.
         let sql_compat = crate::sql::sqlite_compat::translate(&sql_no_comments)?;
 
+        // HC4: `CREATE/ALTER/DROP USER` → `CREATE/ALTER/DROP ROLE`. sqlparser
+        // 0.53 has no USER grammar in its CREATE/ALTER/DROP dispatch at all, so
+        // the standard PostgreSQL spelling died at the parse stage
+        // ("Expected: an object type after CREATE, found: USER") before the
+        // planner ever saw it. PostgreSQL defines CREATE USER as CREATE ROLE …
+        // LOGIN, which is exactly what this produces.
+        let sql_compat = Self::preprocess_user_to_role(sql_compat);
+
         // Preprocess to remove time-travel syntax for parsing
         let mut processed_sql = self.preprocess_time_travel_sql(&sql_compat);
 
@@ -565,6 +573,80 @@ impl Parser {
     pub fn is_create_tablespace_statement(sql: &str) -> bool {
         let trimmed = sql.trim();
         crate::starts_with_icase(trimmed, "CREATE TABLESPACE")
+    }
+
+    /// True if `keyword` appears in `text` as a WHOLE identifier token.
+    ///
+    /// Word boundaries matter here: a plain `contains("LOGIN")` would also fire
+    /// on `NOLOGIN`, which would make `CREATE USER u NOLOGIN` silently keep its
+    /// NOLOGIN *and* skip the LOGIN default — the right outcome by accident,
+    /// but for `CREATE USER u LOGIN` it is the difference between correct and
+    /// double-specified.
+    fn contains_keyword_icase(text: &str, keyword: &str) -> bool {
+        text.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .any(|word| word.eq_ignore_ascii_case(keyword))
+    }
+
+    /// HC4 pre-parse rewrite: `CREATE|ALTER|DROP USER …` → `… ROLE …`.
+    ///
+    /// sqlparser 0.53 cannot parse ANY of the `USER` spellings (its
+    /// CREATE/ALTER/DROP dispatch has no `USER` branch), so they failed at the
+    /// parse stage with a syntax error before the planner could report
+    /// anything useful. PostgreSQL itself defines `CREATE USER` as
+    /// `CREATE ROLE … LOGIN`, so `CREATE USER` additionally appends `LOGIN`
+    /// when the statement mentions neither `LOGIN` nor `NOLOGIN`; `ALTER`/`DROP
+    /// USER` are pure synonyms and get no added option.
+    ///
+    /// Head-anchored and whole-keyword: only a statement that BEGINS with one
+    /// of these three heads is touched, so no other SQL — including a query
+    /// against a table called `user_roles` — can be rewritten. The command tag
+    /// reported on the wire stays `CREATE ROLE` / `ALTER ROLE` / `DROP ROLE`,
+    /// which is what PostgreSQL sends for the USER spelling too.
+    ///
+    /// Known edge: a role literally named `"login"` suppresses the appended
+    /// `LOGIN` default (the name is one of the tokens scanned). Spell the
+    /// option explicitly in that case.
+    ///
+    /// Takes and returns the owned `String` so the overwhelmingly common case
+    /// (SQL that is not a USER statement) costs three prefix compares and ZERO
+    /// allocations — this runs on every statement that reaches the parser.
+    fn preprocess_user_to_role(sql: String) -> String {
+        match Self::rewrite_user_to_role(&sql) {
+            Some(rewritten) => rewritten,
+            None => sql,
+        }
+    }
+
+    /// The rewrite itself. `None` means "not a USER statement, leave it alone".
+    fn rewrite_user_to_role(sql: &str) -> Option<String> {
+        let leading_len = sql.len() - sql.trim_start().len();
+        let (leading, rest) = sql.split_at(leading_len);
+        for (head, add_login_default) in [("CREATE USER", true), ("ALTER USER", false), ("DROP USER", false)] {
+            if !crate::starts_with_icase(rest, head) {
+                continue;
+            }
+            let tail = rest.get(head.len()..)?;
+            // Whole-keyword boundary: `CREATE USERS …` must not be rewritten.
+            if !tail.is_empty() && !tail.starts_with(|c: char| c.is_whitespace()) {
+                continue;
+            }
+            let verb = head.split_whitespace().next()?;
+            let rewritten = format!("{leading}{verb} ROLE{tail}");
+            if !add_login_default
+                || Self::contains_keyword_icase(tail, "LOGIN")
+                || Self::contains_keyword_icase(tail, "NOLOGIN")
+            {
+                return Some(rewritten);
+            }
+            // Append the LOGIN default INSIDE the statement — before a trailing
+            // semicolon, never after it.
+            let body = rewritten.trim_end();
+            return Some(match body.strip_suffix(';') {
+                Some(without_semicolon) => format!("{} LOGIN;", without_semicolon.trim_end()),
+                None => format!("{body} LOGIN"),
+            });
+        }
+        None
     }
 
     /// Round-2 pgrust-corpus compat (~464 corpus statements): standard

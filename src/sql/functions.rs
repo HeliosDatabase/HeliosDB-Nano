@@ -6,7 +6,7 @@
 use super::evaluator::Evaluator;
 use super::interpolate::{interpolate_sql_placeholders, value_to_sql_literal, Placeholder};
 use super::logical_plan::{FunctionParam, ParamMode};
-use super::procedural::{ExecutionContext, ProceduralExecutor, ProceduralParser};
+use super::procedural::{ExecutionContext, ProceduralBlock, ProceduralExecutor, ProceduralParser, ProceduralStatement};
 use crate::{DataType, Error, Result, Value};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -84,6 +84,35 @@ impl FunctionRegistry {
         }
 
         functions.insert(name, func);
+        Ok(())
+    }
+
+    /// Load a function definition read back from durable storage.
+    ///
+    /// Deliberately NOT `register_function`: loading is not user DDL. The
+    /// open-time loader replays whatever `meta:function:<name>` records survived
+    /// the last shutdown, and every one of them was already accepted once — so
+    /// the `or_replace` "already exists" gate must not fire (it would make the
+    /// SECOND record for a name fail on a re-open, or make a reload after a
+    /// partial load error out). Same key derivation as `register_function`:
+    /// lowercase name, no signature (no overloading — see the module docs).
+    pub fn load_function(&self, func: StoredFunction) -> Result<()> {
+        let mut functions = self
+            .functions
+            .write()
+            .map_err(|e| Error::internal(format!("Failed to acquire function lock: {}", e)))?;
+        functions.insert(func.name.to_lowercase(), func);
+        Ok(())
+    }
+
+    /// Load a procedure definition read back from durable storage. See
+    /// [`FunctionRegistry::load_function`].
+    pub fn load_procedure(&self, proc: StoredProcedure) -> Result<()> {
+        let mut procedures = self
+            .procedures
+            .write()
+            .map_err(|e| Error::internal(format!("Failed to acquire procedure lock: {}", e)))?;
+        procedures.insert(proc.name.to_lowercase(), proc);
         Ok(())
     }
 
@@ -260,6 +289,123 @@ impl FunctionRegistry {
         }
     }
 
+    /// Refuse a PL/pgSQL FUNCTION body that contains a construct this engine
+    /// cannot evaluate, instead of running it and returning a wrong answer.
+    ///
+    /// WHY THIS EXISTS (verified at HEAD, and it contradicts the folklore that
+    /// "both languages are fully implemented"):
+    /// `ProceduralParser::parse_expression` (src/sql/procedural/parser.rs) does
+    /// NOT build an expression tree. It captures the RAW SOURCE TEXT of the
+    /// expression and returns `LogicalExpr::Literal(Value::String(text))` — its
+    /// own comment says "A full implementation would parse this into
+    /// LogicalExpr". Every construct whose semantics depend on *evaluating* that
+    /// expression therefore misbehaves SILENTLY:
+    ///
+    /// * `IF <cond> THEN` — `evaluate` yields `Value::String("<cond text>")`,
+    ///   which is not `Boolean(true)`, so the condition is ALWAYS false and the
+    ///   ELSE branch always runs.
+    /// * `WHILE <cond> LOOP` — same: the loop body never runs.
+    /// * `x := <expr>` — assigns the literal TEXT of `<expr>` to `x`.
+    /// * `DECLARE v INT := <expr>` — same, for the initial value.
+    ///
+    /// Those are wrong answers, not errors, and this repo has shipped that class
+    /// of bug before. So the FUNCTION path (which is what UDF invocation newly
+    /// reaches) accepts only the constructs that are genuinely implemented —
+    /// SQL statements, `SELECT … INTO`, `RETURN`, `NULL` and nested blocks, all
+    /// of which route through the `$`-sigil interpolator rather than the
+    /// expression parser — and names anything else in a loud error.
+    ///
+    /// PROCEDURES ARE DELIBERATELY NOT GATED. `execute_plpgsql_procedure` ships
+    /// today and this gate is not applied to it: adding it there would newly
+    /// break bodies that users already run. The underlying parser defect is
+    /// filed (ROADMAP_V5 §2.9) and is the real fix; this gate only stops the
+    /// NEW path from manufacturing wrong answers.
+    fn reject_unevaluable_constructs(func_name: &str, block: &ProceduralBlock) -> Result<()> {
+        let refuse = |construct: &str| -> Error {
+            Error::query_execution(format!(
+                "Function '{}' was NOT executed: its PL/pgSQL body uses {}, which HeliosDB Nano \
+                 cannot evaluate — the procedural expression parser captures expression text \
+                 instead of parsing it, so the construct would silently produce a wrong result. \
+                 Supported in a PL/pgSQL function body today: SQL statements, `SELECT … INTO <var>`, \
+                 `RETURN <expr>` and nested BEGIN/END blocks, with parameters and variables \
+                 referenced through the mandatory `$` sigil (`$name` / `$1`). Rewrite the function \
+                 with LANGUAGE sql, or express the logic in SQL (e.g. CASE inside the RETURN \
+                 expression).",
+                func_name, construct
+            ))
+        };
+
+        for decl in &block.declarations {
+            if decl.default.is_some() {
+                return Err(refuse(&format!("a DECLARE default value (`{} … := …`)", decl.name)));
+            }
+        }
+
+        Self::reject_unevaluable_statements(&refuse, &block.statements)?;
+
+        if !block.exception_handlers.is_empty() {
+            return Err(refuse("an EXCEPTION handler"));
+        }
+        Ok(())
+    }
+
+    /// Statement-level half of [`FunctionRegistry::reject_unevaluable_constructs`].
+    ///
+    /// Written as an EXHAUSTIVE allow-list on purpose: there is NO catch-all
+    /// `_` arm, so a `ProceduralStatement` variant added later is a compile
+    /// error here rather than being silently admitted as evaluable. Admitting a
+    /// construct that is not really implemented is exactly the failure mode this
+    /// gate exists to prevent. Do not add a `_ =>` arm.
+    fn reject_unevaluable_statements(refuse: &dyn Fn(&str) -> Error, statements: &[ProceduralStatement]) -> Result<()> {
+        for stmt in statements {
+            match stmt {
+                // These three are the interpolator-backed paths: the body SQL is
+                // rendered through `crate::sql::interpolate` and handed to the
+                // executor verbatim, so no expression evaluation is involved.
+                ProceduralStatement::Execute { .. }
+                | ProceduralStatement::SelectInto { .. }
+                | ProceduralStatement::Null => {}
+                // `RETURN` is evaluated as SQL — see
+                // `ProceduralExecutor::evaluate_return_value`.
+                ProceduralStatement::Return { .. } => {}
+                ProceduralStatement::Block(inner) => {
+                    for decl in &inner.declarations {
+                        if decl.default.is_some() {
+                            return Err(refuse(&format!("a DECLARE default value (`{} … := …`)", decl.name)));
+                        }
+                    }
+                    Self::reject_unevaluable_statements(refuse, &inner.statements)?;
+                    if !inner.exception_handlers.is_empty() {
+                        return Err(refuse("an EXCEPTION handler"));
+                    }
+                }
+                ProceduralStatement::Assignment { .. } => return Err(refuse("a `:=` assignment")),
+                ProceduralStatement::If { .. } => return Err(refuse("an IF statement")),
+                ProceduralStatement::Case { .. } | ProceduralStatement::SimpleCase { .. } => {
+                    return Err(refuse("a CASE statement"))
+                }
+                ProceduralStatement::Loop { .. } => return Err(refuse("a LOOP")),
+                ProceduralStatement::While { .. } => return Err(refuse("a WHILE loop")),
+                ProceduralStatement::ForNumeric { .. } | ProceduralStatement::ForQuery { .. } => {
+                    return Err(refuse("a FOR loop"))
+                }
+                ProceduralStatement::Exit { .. } => return Err(refuse("an EXIT statement")),
+                ProceduralStatement::Continue { .. } => return Err(refuse("a CONTINUE statement")),
+                ProceduralStatement::ReturnNext { .. } | ProceduralStatement::ReturnQuery { .. } => {
+                    return Err(refuse("RETURN NEXT / RETURN QUERY (set-returning functions)"))
+                }
+                ProceduralStatement::Raise { .. } => return Err(refuse("a RAISE statement")),
+                ProceduralStatement::ExecuteDynamic { .. } => return Err(refuse("EXECUTE of dynamic SQL")),
+                ProceduralStatement::Print { .. } => return Err(refuse("a PRINT statement")),
+                ProceduralStatement::OpenCursor { .. }
+                | ProceduralStatement::FetchCursor { .. }
+                | ProceduralStatement::CloseCursor { .. } => return Err(refuse("a cursor operation")),
+                ProceduralStatement::Call { .. } => return Err(refuse("a CALL statement")),
+            }
+        }
+        Ok(())
+    }
+
     /// Execute a PL/pgSQL function
     // SAFETY: args[i] guarded by i < args.len() check.
     #[allow(clippy::indexing_slicing)]
@@ -274,6 +420,12 @@ impl FunctionRegistry {
         let block = parser
             .parse_block()
             .map_err(|e| Error::query_execution(format!("Failed to parse function body: {}", e)))?;
+
+        // LOUD GATE — see `reject_unevaluable_constructs`. A PL/pgSQL body whose
+        // control flow or assignments depend on the procedural EXPRESSION parser
+        // cannot be executed correctly today, and running it anyway silently
+        // produces a wrong answer. Refuse instead.
+        Self::reject_unevaluable_constructs(&func.name, &block)?;
 
         // Create execution context
         let schema = Arc::new(crate::Schema { columns: vec![] });
