@@ -473,8 +473,38 @@ additionally require `cargo test --features ha-tier1 --test ha_integration`.
 
 ### 2.1 `DROP INDEX` falls through to `LogicalPlan::DropTable`
 
-**Status:** DATA-LOSS HALF FIXED in 4.20.0; the feature itself is still open.
-**Effort to finish: small.**
+**Status:** ✅ DONE. Data-loss half fixed in 4.20.0; the feature itself landed in
+4.21.0.
+
+**What landed in 4.21.0.** `LogicalPlan::DropIndex { name, if_exists }` (APPENDED
+after `RevokePrivileges`, the then-last variant — `LogicalPlan` is positionally
+bincode-encoded and persisted), planned from the `ObjectType::Index` arm and
+executed by `ddl::handle_drop_index` off the SHARED `plan_to_operator`, so both
+executor families get it from one arm. It dispatches on the persisted
+`index_type` through the SHARED `storage::index_family` classifier — the same
+one `handle_create_index` routes on and `rebuild_vector_indexes` filters on, so
+the mapping exists once (art/btree/hash → `ArtManager::drop_index`;
+hnsw/hnsw_pq/persistent_hnsw → `VectorIndexManager::drop_index`; gin/gist →
+DDL-only, nothing to unbuild; anything else errors by name). Dropping a vector
+index also removes its `vecsnap:`/`vecsnapv:` checkpoint records and
+`hnsw_snapshots/` graph dump. It deletes the `meta:index:` record (the durability
+step — indexes rebuild from those records at open), gives
+`StorageEngine::log_drop_index` its first caller, and adds `DropIndex` — and
+`DropMulti`, the comma-list wrapper that had never been in the list, so
+`DROP TABLE a, b` invalidated nothing while `DROP TABLE a` did — to
+`plan_invalidates_sql_caches`. The `WalOperation::DropIndex` replay arm now also
+clears the in-memory ART/vector registration so a long-lived standby converges,
+under the same constraint-index guard the SQL path uses (a replayed name that
+matches a PK/UNIQUE/FK index is warned about, never dropped).
+A PK/UNIQUE/FK backing index is REFUSED (2BP01) — those names are reachable
+(`<table>_pkey`, and a UNIQUE column registers a backing index named after the
+column). `IF EXISTS` silences a missing index again, reversing the 4.20.0 rule,
+which was correct only while nothing was dropped. MySQL's `DROP INDEX i ON t`
+is accepted via a parse-failure fallback rewrite. Coverage:
+`tests/drop_index_tests.rs`.
+
+**Blocked on, and shipped with, the TDE prerequisite** (see 2.1b below): the
+drop reads index definitions, and that read was broken on encrypted data dirs.
 
 **What landed.** The `_ => LogicalPlan::DropTable` catch-all described below is
 GONE. `src/sql/planner.rs`'s `Statement::Drop` handler is now exhaustive over
@@ -513,6 +543,38 @@ the base name on both), and `DROP INDEX` silently drops that table's data instea
 **Fix shape:** add `LogicalPlan::DropIndex { name, if_exists }`, wire it to the existing
 `Catalog::drop_index_definition` / `ArtManager::drop_index` / WAL-log path (all still functional,
 just disconnected from the parser). Gate: new DDL test, `information_schema_completion`.
+*(This is what shipped in 4.21.0.)*
+
+### 2.1b On an encrypted (TDE) data dir, every secondary index vanished at restart
+
+**Status:** ✅ FIXED in 4.21.0. Pre-existing; found while implementing 2.1, which
+depends on the same read.
+
+`Catalog::save_index_definition` writes `meta:index:<name>` through
+`StorageEngine::put`, which ENCRYPTS when a key manager is configured.
+`Catalog::list_index_definitions` read the record VALUES off a raw
+`self.storage.db.iterator_opt`, which returns CIPHERTEXT —
+`StorageEngine::get` is the one place decryption happens. Because index-record
+decoding is deliberately per-record resilient (an undecodable record is `warn!`ed
+and SKIPPED so one bad record cannot abort the whole rebuild), NOTHING FAILED.
+
+`Catalog::rebuild_all_indexes` is the only thing that re-registers user secondary
+indexes at open, and it reads that list, so on an encrypted database it saw ZERO
+definitions: every `CREATE INDEX` index disappeared at every restart, permanently,
+with correct query results and full table scans. This is the exact defect fixed
+for `list_roles` / `list_acls` in 4.20.0, in a second location.
+
+Fixed by routing both `list_index_definitions` and — same shape, same
+consequence — `list_sequences` through `StorageEngine::meta_blobs_with_prefix`.
+Regression test: `secondary_indexes_survive_reopen_on_an_encrypted_database`
+(`tests/drop_index_tests.rs`).
+
+**Still open, same class:** `Catalog::get_referencing_foreign_keys`
+(`src/storage/catalog.rs`) reads `table_constraints:` VALUES off a raw iterator
+and `bincode::deserialize(...)?` them. Those records are written through the same
+encrypting `put`, so on an encrypted data dir this fails LOUDLY rather than
+silently — but it is on the DELETE hot path and it is cached, so switching it to
+`meta_blobs_with_prefix` needs its own perf gate. Filed separately; see §2.1b-2.
 
 ### 2.2 Trigger bodies are not executed
 

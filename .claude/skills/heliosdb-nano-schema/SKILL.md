@@ -18,7 +18,7 @@ Any DDL operation: `CREATE`, `ALTER`, `DROP` against tables/indexes/views/functi
 | drop table | SQL | `DROP TABLE [IF EXISTS] t` |
 | create index | SQL | `CREATE INDEX idx_t_c ON t(c)` |
 | create vector index | SQL | `CREATE INDEX vidx ON t USING HNSW (embedding) WITH (dim = 384, metric = 'cosine')` |
-| drop index | — | ❌ **not supported** — `DROP INDEX` errors (`DROP INDEX is not supported yet`). Through 4.19.0 it was planned as `DROP TABLE` and could destroy a table sharing the index's name. Drop the table, or leave the index in place |
+| drop index | SQL | `DROP INDEX [IF EXISTS] idx_t_c` (4.21.0+; MySQL's `DROP INDEX i ON t` also accepted). A PK/UNIQUE/FK backing index is **refused**. Through 4.19.0 the statement was planned as `DROP TABLE` and could destroy a table sharing the index's name; 4.20.0 made it a loud error |
 | create view | SQL | `CREATE VIEW v AS SELECT …` |
 | create materialized view | SQL | `CREATE MATERIALIZED VIEW mv AS SELECT … WITH (auto_refresh = true)` |
 | create trigger | SQL | ⚠️ **registered, persisted, but the BODY never runs** — see "Triggers" below before writing any `CREATE TRIGGER` |
@@ -419,9 +419,11 @@ PRAGMA table_info(posts);
 ### Recipe 8: Drop with safety
 ```sql
 DROP TABLE IF EXISTS posts CASCADE;        -- cascade through FKs
--- DROP INDEX is NOT supported: it errors, and `IF EXISTS` does not silence it.
--- (Through 4.19.0 it was planned as DROP TABLE — `DROP INDEX IF EXISTS posts`
---  silently dropped the TABLE `posts`. Never issue it against older builds.)
+DROP INDEX IF EXISTS idx_posts_status;      -- 4.21.0+; never touches a same-named TABLE
+-- A PRIMARY KEY / UNIQUE / FOREIGN KEY backing index is refused (2BP01) — drop the
+-- constraint instead. Note a UNIQUE column `email` backs an index named `email`.
+-- (Through 4.19.0 DROP INDEX was planned as DROP TABLE — `DROP INDEX IF EXISTS posts`
+--  silently dropped the TABLE `posts`. Never issue it against pre-4.20 builds.)
 DROP VIEW IF EXISTS user_stats;
 DROP TRIGGER IF EXISTS posts_audit ON posts;   -- works; `ON <table>` is mandatory
 ```

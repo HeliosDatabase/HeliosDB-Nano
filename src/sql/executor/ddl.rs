@@ -180,8 +180,15 @@ fn encoded_index_options(options: &[crate::sql::logical_plan::IndexOption]) -> V
     bincode::serialize(options).unwrap_or_default()
 }
 
-/// Handle CREATE INDEX logical plan node
+/// Handle CREATE INDEX logical plan node.
+///
+/// The `USING <type>` spelling is routed through the SHARED
+/// [`crate::storage::index_family`] classifier — the same one
+/// [`handle_drop_index`] and `Catalog::rebuild_vector_indexes` use — so the
+/// set of index types this build understands is defined in exactly one place.
 pub(super) fn handle_create_index(executor: &Executor, plan: &LogicalPlan) -> Result<Box<dyn PhysicalOperator>> {
+    use crate::storage::{index_family, IndexFamily};
+
     if let LogicalPlan::CreateIndex {
         name,
         table_name,
@@ -192,7 +199,8 @@ pub(super) fn handle_create_index(executor: &Executor, plan: &LogicalPlan) -> Re
     } = plan
     {
         if let Some(storage) = executor.storage() {
-            if matches!(index_type.as_deref(), None | Some("art" | "btree" | "hash")) {
+            let family = index_family(index_type.as_deref());
+            if family == Some(IndexFamily::Art) {
                 if let Some(backfilled) =
                     create_art_secondary_index(storage, name, table_name, column_name, *if_not_exists)?
                 {
@@ -213,7 +221,7 @@ pub(super) fn handle_create_index(executor: &Executor, plan: &LogicalPlan) -> Re
                     }
                 }
             } else if let Some(idx_type) = index_type {
-                if idx_type == "gin" || idx_type == "gist" {
+                if family == Some(IndexFamily::DdlOnly) {
                     // Postgres FTS/GIN/GiST index.
                     //
                     // Accepted for syntactic compatibility (Django, Rails,
@@ -246,7 +254,7 @@ pub(super) fn handle_create_index(executor: &Executor, plan: &LogicalPlan) -> Re
                     ) {
                         tracing::warn!("Failed to log CREATE INDEX to WAL: {}", e);
                     }
-                } else if idx_type == "hnsw" {
+                } else if family == Some(IndexFamily::Vector) {
                     // Check if index already exists
                     let vector_indexes = storage.vector_indexes();
                     if vector_indexes.index_exists(name) {
@@ -470,28 +478,48 @@ pub(super) fn handle_create_index(executor: &Executor, plan: &LogicalPlan) -> Re
                                 column_name,
                                 backfilled
                             );
-                            persist_index_definition(
-                                storage,
-                                name,
-                                table_name,
-                                column_name,
-                                index_type.as_deref(),
-                                options,
-                            )?;
+                            // The tag records what was BUILT, not what the user
+                            // typed. It used to echo `index_type` back, which was
+                            // only ever "hnsw" because the branch guard compared
+                            // against that literal; now that the guard is the
+                            // shared family classifier, an alternative spelling
+                            // reaching here must still persist the canonical tag
+                            // for a standard in-memory HNSW — otherwise the open
+                            // path would try to reopen a persistent backend that
+                            // was never created.
+                            persist_index_definition(storage, name, table_name, column_name, Some("hnsw"), options)?;
 
                             // Log to WAL for replication
                             let encoded_options = encoded_index_options(options);
-                            if let Err(e) = storage.log_create_index(
-                                name,
-                                table_name,
-                                column_name,
-                                index_type.as_deref(),
-                                &encoded_options,
-                            ) {
+                            if let Err(e) =
+                                storage.log_create_index(name, table_name, column_name, Some("hnsw"), &encoded_options)
+                            {
                                 tracing::warn!("Failed to log CREATE INDEX to WAL: {}", e);
                             }
                         }
                     }
+                } else {
+                    // An access method this build has no implementation for
+                    // (`USING brin`, `USING spgist`, `USING ivfflat`, …).
+                    //
+                    // PRE-EXISTING BEHAVIOUR, deliberately unchanged here: the
+                    // statement reports success and builds nothing. That IS a
+                    // silent success and it is filed as such — but making it an
+                    // error is a user-visible change to CREATE INDEX, not part
+                    // of the DROP INDEX slice, and it would start failing
+                    // migrations that this build has accepted since v3.x. The
+                    // one thing this arm now does is SAY SO, by name, instead of
+                    // falling off the end of an if/else chain invisibly.
+                    tracing::warn!(
+                        "CREATE INDEX {} ON {} ({}) USING {}: this build has no '{}' access method — \
+                         the statement is accepted for compatibility and NO index is built \
+                         (queries fall back to a scan). Use art/btree/hash, gin/gist or hnsw.",
+                        name,
+                        table_name,
+                        column_name,
+                        idx_type,
+                        idx_type
+                    );
                 }
             }
         }
@@ -501,6 +529,227 @@ pub(super) fn handle_create_index(executor: &Executor, plan: &LogicalPlan) -> Re
     } else {
         Err(Error::query_execution("Expected CreateIndex plan node"))
     }
+}
+
+/// The constraint an ART index backs, as `(user-facing noun, owning table)` —
+/// `None` for a plain secondary index created by `CREATE INDEX`.
+fn constraint_index_kind(storage: &crate::storage::StorageEngine, index_name: &str) -> Option<(&'static str, String)> {
+    use crate::storage::art_index::ArtIndexType;
+
+    let (kind, table) = storage.art_indexes().index_kind_and_table(index_name)?;
+    let noun = match kind {
+        ArtIndexType::PrimaryKey => "PRIMARY KEY",
+        ArtIndexType::Unique => "UNIQUE",
+        ArtIndexType::ForeignKey => "FOREIGN KEY",
+        ArtIndexType::Manual => return None,
+    };
+    Some((noun, table))
+}
+
+/// Handle DROP INDEX logical plan node — the mirror of `handle_create_index`,
+/// and the caller that `Catalog::drop_index_definition`, `ArtManager::
+/// drop_index`, `VectorIndexManager::drop_index` and
+/// `StorageEngine::log_drop_index` had been waiting for since they were
+/// written. Reached from the SHARED `plan_to_operator`, so `db.execute()` and
+/// `db.execute_params()` (i.e. the PostgreSQL EXTENDED protocol, i.e. every
+/// real driver) get identical behaviour from ONE arm.
+///
+/// The drop dispatches on the PERSISTED definition's `index_type` through the
+/// SHARED [`crate::storage::index_family`] classifier — the same function
+/// `handle_create_index` routes on and `Catalog::rebuild_vector_indexes` filters
+/// on — so it undoes exactly the branch of `handle_create_index` that created
+/// it:
+///   * [`IndexFamily::Art`] (`art` / `btree` / `hash` / absent)
+///        → `ArtManager::drop_index`
+///   * [`IndexFamily::Vector`] (`hnsw` / `hnsw_pq` / `persistent_hnsw`)
+///        → `VectorIndexManager::drop_index`
+///   * [`IndexFamily::DdlOnly`] (`gin` / `gist`)
+///        → nothing to drop; those never had a backing index (see the CREATE
+///          branch's comment).
+/// An unclassifiable tag errors by name rather than pretending to have dropped
+/// it.
+///
+/// The classifier is shared for a reason this function got wrong on its first
+/// draft: it enumerated the tags itself and MISSED `persistent_hnsw`, the tag
+/// `CREATE INDEX … USING hnsw … WITH (persistent = true)` persists. Such an
+/// index was reopened at every start by `rebuild_vector_indexes` and could never
+/// be dropped, with an error that blamed the user's catalog for being corrupt.
+///
+/// Removing the `meta:index:` definition is what makes the drop DURABLE:
+/// `Catalog::rebuild_all_indexes` re-registers every user secondary index from
+/// those records at open, so an index whose definition survived would simply
+/// come back on the next restart.
+///
+/// [`IndexFamily::Art`]: crate::storage::IndexFamily::Art
+/// [`IndexFamily::Vector`]: crate::storage::IndexFamily::Vector
+/// [`IndexFamily::DdlOnly`]: crate::storage::IndexFamily::DdlOnly
+pub(super) fn handle_drop_index(executor: &Executor, name: &str, if_exists: bool) -> Result<Box<dyn PhysicalOperator>> {
+    use crate::storage::{index_family, IndexFamily};
+
+    let Some(storage) = executor.storage() else {
+        return Err(Error::query_execution("No storage engine available"));
+    };
+
+    // Mirrors `create_art_secondary_index`: index state lives on main, so a
+    // branch session must not be able to mutate it. CREATE refuses; DROP has to
+    // refuse for the stronger reason — it would delete main's durable
+    // definition from inside a branch that is supposed to be discardable.
+    if storage.is_branch_active() {
+        return Err(Error::query_execution("DROP INDEX must run on the main branch"));
+    }
+
+    // *** SAFETY GATE — checked BEFORE anything is removed. ***
+    //
+    // A PRIMARY KEY / UNIQUE / FOREIGN KEY constraint is ENFORCED through its
+    // backing ART index. Dropping one would not report anything: inserts would
+    // simply stop being checked and duplicates would start landing silently.
+    // That is the worst outcome this statement has, so it is guarded twice.
+    //
+    // The structural guarantee is that constraint indexes are unreachable here
+    // at all: they are registered by `create_pk_index` / `create_unique_index`
+    // / `create_fk_index` under generated names, and ONLY `handle_create_index`
+    // ever calls `persist_index_definition` — so no constraint index has a
+    // `meta:index:` record, and the lookup below would return `None` for one.
+    // But that is a property of today's CALLERS, not of the data model, and it
+    // would be silently voided by any future code path that persisted a
+    // definition for a constraint index. So the live ART registry is also
+    // consulted directly and by name. If both an explicit CREATE INDEX
+    // definition and a constraint registration somehow shared a name, this
+    // refuses — the safe direction.
+    //
+    // Message shape is PostgreSQL's ("cannot drop index … because constraint …
+    // requires it") so the PG wire classifier maps it to 2BP01
+    // dependent_objects_still_exist rather than XX000.
+    if let Some((kind, owner)) = constraint_index_kind(storage, name) {
+        return Err(Error::query_execution(format!(
+            "cannot drop index \"{name}\" because constraint {kind} on \"{owner}\" requires it; \
+             drop the constraint instead"
+        )));
+    }
+
+    let catalog = storage.catalog();
+    let definition = match catalog.get_index_definition(name)? {
+        Some(definition) => Some(definition),
+        // Record present but undecodable (a future on-disk format, or
+        // corruption). `rebuild_all_indexes` skips such a record, so no index is
+        // registered for it — but the record itself would otherwise be
+        // undeletable forever. Fall through with an unknown type, which lands on
+        // the ART arm and warns; the definition delete below is the point.
+        None if catalog.index_definition_exists(name)? => {
+            tracing::warn!(
+                "DROP INDEX '{}': the catalog record exists but is not decodable by this build; \
+                 removing the record",
+                name
+            );
+            None
+        }
+        None => {
+            // IF EXISTS now genuinely silences this. In v4.20.0 it deliberately
+            // did NOT: nothing was dropped either way, so reporting success
+            // would have been a silent no-op. A real drop exists now, so
+            // PostgreSQL semantics apply — an absent index means the
+            // post-condition already holds.
+            if if_exists {
+                return Ok(empty_ddl_result(executor));
+            }
+            // Deliberately says "index", never "table"/"relation", so the PG
+            // wire's message-shape classifier maps it to 42704
+            // undefined_object rather than 42P01 undefined_table.
+            return Err(Error::query_execution(format!("index \"{name}\" does not exist")));
+        }
+    };
+
+    // Dispatch on the recorded type. `None` is the pre-v3.37.2 legacy shape and
+    // means the ART family, exactly as `rebuild_all_indexes` reads it — which is
+    // not restated here, it is `index_family`'s single definition.
+    let recorded_type = definition.as_ref().and_then(|d| d.index_type.as_deref());
+    match index_family(recorded_type) {
+        Some(IndexFamily::Art) => {
+            let art_manager = storage.art_indexes();
+            if let Err(e) = art_manager.drop_index(name) {
+                // A definition with no live registration is a REAL state, not a
+                // swallowed error: `rebuild_all_indexes` warns and continues
+                // when a manual index fails to register at open, leaving exactly
+                // this shape. The user's intent — the index is gone — is still
+                // fully achieved by deleting the definition below, so the drop
+                // proceeds. Every OTHER error propagates.
+                if matches!(e, crate::storage::art_index::ArtIndexError::IndexNotFound(_)) {
+                    tracing::warn!(
+                        "DROP INDEX '{}': no live ART registration (the index was not rebuilt at open); \
+                         removing the catalog definition anyway",
+                        name
+                    );
+                } else {
+                    return Err(Error::query_execution(format!(
+                        "Failed to drop ART index '{}': {}",
+                        name, e
+                    )));
+                }
+            }
+        }
+        Some(IndexFamily::Vector) => {
+            let vector_indexes = storage.vector_indexes();
+            // Checked rather than string-matched on the error: `index_exists`
+            // answers the same question precisely, and the same
+            // definition-without-registration state is possible here too.
+            //
+            // `persistent_hnsw` lands here too (it is `IndexFamily::Vector`):
+            // `VectorIndexManager::drop_index` matches on the live
+            // `IndexStorage` and calls `drop_storage()` for a persistent index,
+            // which deletes only that index's `prefix(index_id)` keyspace.
+            if vector_indexes.index_exists(name) {
+                vector_indexes.drop_index(name)?;
+            } else {
+                tracing::warn!(
+                    "DROP INDEX '{}': no live HNSW index registered; removing the catalog definition anyway",
+                    name
+                );
+            }
+            // The graph dump + sidecar written by the last checkpoint outlive
+            // the index otherwise: later checkpoints only write keys for LIVE
+            // indexes, so a drop/recreate cycle accumulated dead `vecsnap:`
+            // blobs and `.hnsw.graph` / `.hnsw.data` files forever. Best effort
+            // and after the drop, never a reason to fail it.
+            storage.remove_vector_index_snapshot(name);
+        }
+        Some(IndexFamily::DdlOnly) => {
+            // DDL-only by construction — `handle_create_index` persists the
+            // definition and builds NOTHING (the `@@` operator scans). So there
+            // is no backing structure to remove and this is not a silent skip:
+            // deleting the definition is the entire drop.
+            tracing::info!(
+                "DROP INDEX '{}': gin/gist indexes are DDL-only in this build; \
+                 removing the catalog definition (there is no backing index)",
+                name
+            );
+        }
+        None => {
+            // `index_family` could not classify the tag. Only
+            // `handle_create_index` and the `WalOperation::CreateIndex` replay
+            // of what it logged write these records, so an unclassifiable tag
+            // means a downgrade (a newer binary wrote an index type this one has
+            // never heard of) or a corrupt record — name it, do not guess which
+            // structure to remove and do not report a drop that did not happen.
+            let other = recorded_type.unwrap_or("<none>");
+            return Err(Error::query_execution(format!(
+                "Cannot drop index \"{name}\": unsupported persisted index type '{other}'. \
+                 This build knows art, btree, hash, gin, gist, hnsw, hnsw_pq and persistent_hnsw."
+            )));
+        }
+    }
+
+    // Durability: this is the step that makes the drop survive a restart.
+    catalog.drop_index_definition(name)?;
+
+    // Replication / recovery. Same warn-and-continue posture as
+    // `handle_create_index`'s `log_create_index`: the local drop has already
+    // been made durable above, so a WAL append failure must not resurrect it.
+    if let Err(e) = storage.log_drop_index(name) {
+        tracing::warn!("Failed to log DROP INDEX to WAL: {}", e);
+    }
+
+    tracing::info!("Dropped index '{}'", name);
+    Ok(empty_ddl_result(executor))
 }
 
 /// Handle DROP TABLE logical plan node.

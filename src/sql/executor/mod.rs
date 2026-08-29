@@ -4299,6 +4299,13 @@ impl<'a> Executor<'a> {
                 ))
             }
             LogicalPlan::DropTable { name, if_exists } => ddl::handle_drop_table(self, name, *if_exists),
+            // DROP INDEX. Placed in the SHARED `plan_to_operator` (exactly like
+            // DROP TABLE and DROP ROLE) so that `db.execute()` and
+            // `db.execute_params()` — the latter being what the PostgreSQL
+            // extended protocol, and therefore every real driver, uses — reach
+            // ONE implementation. It resolves the name in the `meta:index:`
+            // namespace only and can never touch a relation.
+            LogicalPlan::DropIndex { name, if_exists } => ddl::handle_drop_index(self, name, *if_exists),
             LogicalPlan::DropMulti { drops } => {
                 // Execute each drop in sequence. DDL side effects happen during
                 // physical planning (as for the other Drop nodes here), so this

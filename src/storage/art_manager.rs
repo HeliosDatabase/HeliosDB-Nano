@@ -2155,6 +2155,20 @@ impl ArtIndexManager {
         let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
         indexes.contains_key(name)
     }
+
+    /// The registered kind and owning table of the index called `name`, or
+    /// `None` if no index by that name is registered.
+    ///
+    /// Exists so `DROP INDEX` can REFUSE to touch a `PrimaryKey` / `Unique` /
+    /// `ForeignKey` index — dropping one would silently remove constraint
+    /// enforcement while every affected INSERT kept reporting success — and can
+    /// name the owning table in the refusal the way PostgreSQL does. The
+    /// alternative, `list_indexes()`, allocates the whole registry and is
+    /// O(indexes); this is a single map probe under the same read lock.
+    pub fn index_kind_and_table(&self, name: &str) -> Option<(ArtIndexType, String)> {
+        let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
+        indexes.get(name).map(|entry| (entry.index_type, entry.table.clone()))
+    }
 }
 
 #[cfg(test)]
