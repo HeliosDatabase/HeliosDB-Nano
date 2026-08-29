@@ -2439,6 +2439,193 @@ async fn wire_role_error_sqlstates() {
     }
 }
 
+/// `DROP INDEX` over the PG WIRE: the command tag and the error SQLSTATEs.
+///
+/// Worth pinning separately from the engine tests because the wire is where
+/// drivers read both, and because through 4.19.0 this statement DROPPED A TABLE
+/// while reporting `OK 0`. The three shapes are:
+///   * success                    → `DROP INDEX` tag, no SQLSTATE;
+///   * missing index              → 42704 undefined_object (NOT 42P01 — the
+///     message must never be classified as being about a relation);
+///   * PK/UNIQUE backing index    → 2BP01 dependent_objects_still_exist.
+///
+/// Driven through `dispatch_message` for the same reason
+/// `wire_role_error_sqlstates` is: the ErrorResponse a client receives is
+/// rendered one level above `handle_single_query`.
+#[tokio::test]
+async fn wire_drop_index_tag_and_error_sqlstates() {
+    use super::messages::FrontendMessage;
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+
+    for setup in [
+        "CREATE TABLE docs (id INT PRIMARY KEY, status TEXT)",
+        "INSERT INTO docs (id, status) VALUES (1, 'open')",
+        "CREATE INDEX docs_status_idx ON docs (status)",
+    ] {
+        handler
+            .dispatch_message(FrontendMessage::Query { query: setup.into() })
+            .await
+            .unwrap_or_else(|e| panic!("{setup}: {e}"));
+        let out = drain(&mut client).await;
+        assert!(
+            sqlstates(&out).is_empty(),
+            "{setup} must succeed over the wire, got {:?}",
+            sqlstates(&out)
+        );
+    }
+
+    // Success: PostgreSQL's tag, not `OK 0`.
+    handler
+        .dispatch_message(FrontendMessage::Query {
+            query: "DROP INDEX docs_status_idx".into(),
+        })
+        .await
+        .unwrap();
+    let out = drain(&mut client).await;
+    assert!(
+        sqlstates(&out).is_empty(),
+        "DROP INDEX must succeed over the wire, got {:?}",
+        sqlstates(&out)
+    );
+    assert!(
+        command_tags(&out).iter().any(|t| t == "DROP INDEX"),
+        "DROP INDEX must report the `DROP INDEX` tag, got {:?}",
+        command_tags(&out)
+    );
+
+    // IF EXISTS on the now-missing index is a genuine no-op success.
+    handler
+        .dispatch_message(FrontendMessage::Query {
+            query: "DROP INDEX IF EXISTS docs_status_idx".into(),
+        })
+        .await
+        .unwrap();
+    let out = drain(&mut client).await;
+    assert!(
+        sqlstates(&out).is_empty(),
+        "DROP INDEX IF EXISTS on a missing index must not error, got {:?}",
+        sqlstates(&out)
+    );
+
+    for (sql, code) in [
+        // The index is gone, and `docs` is a TABLE — this must be 42704
+        // undefined_object, never 42P01 undefined_table.
+        ("DROP INDEX docs_status_idx", "42704"),
+        ("DROP INDEX docs", "42704"),
+        // The PRIMARY KEY's backing index is refused, not dropped.
+        ("DROP INDEX docs_pkey", "2BP01"),
+    ] {
+        handler
+            .dispatch_message(FrontendMessage::Query { query: sql.into() })
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let out = drain(&mut client).await;
+        assert_eq!(
+            sqlstates(&out),
+            vec![code.to_string()],
+            "{sql} must map to SQLSTATE {code}"
+        );
+        assert!(
+            command_tags(&out).is_empty(),
+            "{sql} was rejected and must not also be acked, got {:?}",
+            command_tags(&out)
+        );
+    }
+
+    // The TABLE that shares a name with a failed `DROP INDEX` is untouched.
+    handler
+        .dispatch_message(FrontendMessage::Query {
+            query: "SELECT id FROM docs".into(),
+        })
+        .await
+        .unwrap();
+    let out = drain(&mut client).await;
+    assert!(
+        sqlstates(&out).is_empty(),
+        "*** DATA LOSS *** `DROP INDEX docs` destroyed the TABLE docs: {:?}",
+        sqlstates(&out)
+    );
+}
+
+/// The SUBSTRING-HIJACK boundary for the DROP INDEX SQLSTATE arms — Task #38's
+/// question asked of a different classifier.
+///
+/// The first draft of `sqlstate_for_query_execution_message`'s index arms tested
+/// a bare `lower.contains("index")` and sat AHEAD of the table/relation rules,
+/// so every error about a TABLE whose name merely contains "index" was
+/// reclassified: `Table 'app_pg_indexes' does not exist` became 42704
+/// undefined_object instead of 42P01 undefined_table, and `already exists`
+/// became 42710 instead of 42P07. psycopg/Django raise `UndefinedTable` on
+/// 42P01, and Rails/sqlx migrations use 42P07 for idempotency, so this is a
+/// driver-facing contract, not cosmetics.
+///
+/// `app_pg_indexes` is the same table name Task #38 used for the catalog-router
+/// boundary (`wire_user_tables_named_after_catalog_views_are_not_shadowed`) —
+/// deliberately, because it is the shape that keeps catching this repo out.
+#[tokio::test]
+async fn wire_index_named_table_still_maps_to_undefined_table() {
+    use super::messages::FrontendMessage;
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+
+    // Missing table whose name ends in "index"/"indexes" → 42P01, never 42704.
+    for sql in ["SELECT * FROM app_pg_indexes", "SELECT * FROM search_index"] {
+        handler
+            .dispatch_message(FrontendMessage::Query { query: sql.into() })
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let out = drain(&mut client).await;
+        assert_eq!(
+            sqlstates(&out),
+            vec!["42P01".to_string()],
+            "{sql} names a missing TABLE — 42P01 undefined_table, not the index class"
+        );
+    }
+
+    // ... and the duplicate-table half: 42P07, never 42710 duplicate_object.
+    handler
+        .dispatch_message(FrontendMessage::Query {
+            query: "CREATE TABLE app_pg_indexes (id INT PRIMARY KEY)".into(),
+        })
+        .await
+        .unwrap();
+    let out = drain(&mut client).await;
+    assert!(
+        sqlstates(&out).is_empty(),
+        "setup CREATE TABLE must succeed, got {:?}",
+        sqlstates(&out)
+    );
+
+    handler
+        .dispatch_message(FrontendMessage::Query {
+            query: "CREATE TABLE app_pg_indexes (id INT PRIMARY KEY)".into(),
+        })
+        .await
+        .unwrap();
+    let out = drain(&mut client).await;
+    assert_eq!(
+        sqlstates(&out),
+        vec!["42P07".to_string()],
+        "a duplicate TABLE whose name contains \"index\" must be 42P07 duplicate_table"
+    );
+
+    // The genuine index error still classifies as an index error, so the fix
+    // is an anchor and not a blanket disable.
+    handler
+        .dispatch_message(FrontendMessage::Query {
+            query: "DROP INDEX app_pg_indexes".into(),
+        })
+        .await
+        .unwrap();
+    let out = drain(&mut client).await;
+    assert_eq!(
+        sqlstates(&out),
+        vec!["42704".to_string()],
+        "`DROP INDEX <name>` on a missing index is still 42704 undefined_object"
+    );
+}
+
 /// HC3 deleted the PG wire's fixed-shape `information_schema` implementations,
 /// so foreign-key reflection now travels the planner route on every interface.
 /// `tests/markon_a4_reflection.rs` pins the engine half of that contract; this

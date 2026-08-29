@@ -18,7 +18,10 @@
 //!    tests is "the TABLE is still there". The fallback has since been removed
 //!    entirely — the planner's `ObjectType` match is exhaustive — so the same
 //!    assertions are made here for `DROP INDEX`, which was the second live
-//!    instance of the identical class (roadmap §2.1).
+//!    instance of the identical class (roadmap §2.1). `DROP INDEX` became a
+//!    real drop in 4.21.0; the guard kept here is the data-loss one (the
+//!    same-named TABLE survives). Its full behaviour matrix lives in
+//!    `tests/drop_index_tests.rs`.
 //!
 //! 2. **The storage slice**: `CREATE/ALTER/DROP ROLE` as real DDL, `GRANT` /
 //!    `REVOKE` storing ACL records instead of vanishing, and the catalog views
@@ -313,10 +316,16 @@ fn qualified_drop_role_does_not_drop_a_table() {
 
 /// `DROP INDEX x` used to hit the exact same `_ => LogicalPlan::DropTable`
 /// fallback as `DROP ROLE x` and destroy a TABLE called `x`. The fallback is
-/// gone: the planner's `ObjectType` match is now exhaustive, so `DROP INDEX`
-/// errors loudly instead of resolving a table reference.
+/// gone: the planner's `ObjectType` match is exhaustive, and from 4.21.0
+/// `DROP INDEX` is a real drop that resolves names only in the `meta:index:`
+/// namespace, so it can never reach a relation.
 ///
-/// The load-bearing assertion is identical to the role one: the TABLE survives.
+/// The load-bearing assertion is identical to the role one and does not change
+/// with the implementation: the TABLE survives. There is no index called
+/// `analyst`, so the statement must ERROR — naming the index, never the table.
+///
+/// The full DROP INDEX behaviour matrix lives in `tests/drop_index_tests.rs`;
+/// what is kept here is the data-loss guard.
 #[test]
 fn drop_index_does_not_drop_a_same_named_table() {
     for params in [false, true] {
@@ -332,40 +341,45 @@ fn drop_index_does_not_drop_a_same_named_table() {
         );
         assert_eq!(first_name(&db), Some(Value::String("keep me".to_string())));
 
-        let err = result.expect_err("DROP INDEX is not implemented and must not silently succeed");
+        let err = result.expect_err("no index named `analyst` exists, so the drop must error");
         let message = err.to_string();
         assert!(
-            message.to_uppercase().contains("DROP INDEX"),
-            "error must name DROP INDEX (params = {params}): {message}"
+            message.contains("analyst"),
+            "error must name the index (params = {params}): {message}"
+        );
+        assert!(
+            message.to_lowercase().contains("index"),
+            "error must be about an INDEX, not a table (params = {params}): {message}"
         );
     }
 }
 
-/// The silent spelling. `DROP INDEX IF EXISTS analyst` used to drop the table
-/// and report success with no error at all. `IF EXISTS` must not resurrect the
-/// no-op: nothing can drop an index, so claiming success would be a lie.
+/// The silent spelling. `DROP INDEX IF EXISTS analyst` used to drop the TABLE
+/// and report success with no error at all. It is now a genuine no-op — which
+/// is the *correct* meaning of `IF EXISTS` now that a real drop exists (in
+/// 4.20.0 it deliberately still errored, because nothing was dropped either way
+/// and a quiet success would have been a lie). The table must be untouched.
 #[test]
 fn drop_index_if_exists_does_not_drop_a_same_named_table() {
     for params in [false, true] {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         setup_analyst_table(&db);
 
-        let result = run(&db, "DROP INDEX IF EXISTS analyst", params);
+        run(&db, "DROP INDEX IF EXISTS analyst", params)
+            .unwrap_or_else(|e| panic!("IF EXISTS on a missing index must be a no-op (params = {params}): {e}"));
 
         assert_eq!(
             analyst_rows(&db),
             1,
-            "DROP INDEX IF EXISTS must not delete the table `analyst` (params = {params})"
+            "*** DATA LOSS *** DROP INDEX IF EXISTS deleted the table `analyst` (params = {params})"
         );
-        assert!(
-            result.is_err(),
-            "DROP INDEX IF EXISTS must not report success for an index it cannot drop (params = {params})"
-        );
+        assert_eq!(first_name(&db), Some(Value::String("keep me".to_string())));
     }
 }
 
 /// The comma list composes through `DropMulti`; no element may fall back to a
-/// table drop.
+/// table drop. Neither name is an index, so the statement errors — and both
+/// TABLES must survive.
 #[test]
 fn drop_index_comma_list_does_not_drop_tables() {
     for params in [false, true] {
@@ -375,7 +389,10 @@ fn drop_index_comma_list_does_not_drop_tables() {
         db.execute("INSERT INTO auditor VALUES (7)").unwrap();
 
         let result = run(&db, "DROP INDEX analyst, auditor", params);
-        assert!(result.is_err(), "DROP INDEX comma list must error (params = {params})");
+        assert!(
+            result.is_err(),
+            "neither name is an index, so the comma list must error (params = {params})"
+        );
 
         assert_eq!(analyst_rows(&db), 1, "table `analyst` must survive (params = {params})");
         assert_eq!(
@@ -1060,6 +1077,11 @@ fn roles_and_grants_are_readable_on_an_encrypted_database() {
 /// live materialized view: the four variants added by this slice must all sort
 /// AFTER `Noop`, `CreateTableAs` and `DropRole`, and after each other in
 /// declaration order.
+///
+/// EXTEND THIS ARRAY WITH EVERY NEW `LogicalPlan` VARIANT. It is the repo's
+/// only mechanical check that an append was an append; a variant left out of it
+/// is a variant whose position nothing verifies. `DropIndex` (v4.21.0) is the
+/// most recent addition.
 #[test]
 fn new_plan_variants_were_appended_not_inserted() {
     use heliosdb_nano::sql::LogicalPlan;
@@ -1125,6 +1147,16 @@ fn new_plan_variants_were_appended_not_inserted() {
         grantees: vec!["r".to_string()],
     };
 
+    // Appended by the v4.21.0 DROP INDEX slice, AFTER `RevokePrivileges` — the
+    // variant that was last when this guard was written. Listed here because a
+    // guard that is not extended with the variant it was written to protect
+    // guards nothing: without this row, nothing asserts that `DropIndex` was
+    // appended rather than inserted.
+    let drop_index = LogicalPlan::DropIndex {
+        name: "i".to_string(),
+        if_exists: false,
+    };
+
     let ordered = [
         ("Noop", discriminant(&noop)),
         ("CreateTableAs", discriminant(&ctas)),
@@ -1133,6 +1165,7 @@ fn new_plan_variants_were_appended_not_inserted() {
         ("AlterRole", discriminant(&alter_role)),
         ("GrantPrivileges", discriminant(&grant)),
         ("RevokePrivileges", discriminant(&revoke)),
+        ("DropIndex", discriminant(&drop_index)),
     ];
     for pair in ordered.windows(2) {
         let (before_name, before) = pair[0];

@@ -806,23 +806,26 @@ impl<'a> Planner<'a> {
                             name: Self::normalize_nontable_name(name),
                             if_exists,
                         },
-                        // DATA-LOSS FIX, same class as DROP ROLE. There is no
-                        // `LogicalPlan::DropIndex`: the drop machinery exists
-                        // (`Catalog::drop_index_definition`, `ArtManager::
-                        // drop_index`, `WalOperation::DropIndex` replay) but is
-                        // not wired to the parser (roadmap §2.1). Until it is,
-                        // this MUST error loudly rather than resolve a table
-                        // reference. `IF EXISTS` deliberately does NOT silence
-                        // it — the index is not dropped either way, and a quiet
-                        // "success" here is exactly the silent-no-op failure
-                        // mode this repo keeps shipping.
-                        sqlparser::ast::ObjectType::Index => {
-                            return Err(Error::query_execution(format!(
-                                "DROP INDEX is not supported yet (index '{}'); it is NOT executed as DROP TABLE. \
-                                 Indexes are dropped implicitly with their table.",
-                                Self::normalize_nontable_name(name)
-                            )))
-                        }
+                        // DATA-LOSS FIX, same class as DROP ROLE. `DROP INDEX x`
+                        // used to fall through the now-deleted `_ => DropTable`
+                        // catch-all and destroy a TABLE named `x`. v4.20.0 made
+                        // it a loud error; v4.21.0 makes it a real drop. It
+                        // lands in `ddl::handle_drop_index`, which resolves the
+                        // name in the `meta:index:` namespace ONLY and can never
+                        // reach a relation. This arm MUST stay ahead of any
+                        // future fallback.
+                        //
+                        // Note the deliberate reversal of the v4.20.0 rule that
+                        // `IF EXISTS` did NOT silence the missing-index error.
+                        // That was correct while nothing was ever dropped — a
+                        // quiet "success" would have been a silent no-op. Now
+                        // that a real drop exists, `IF EXISTS` means what
+                        // PostgreSQL says it means: absent index → no-op
+                        // success, and without it → 42704 undefined_object.
+                        sqlparser::ast::ObjectType::Index => LogicalPlan::DropIndex {
+                            name: Self::normalize_nontable_name(name),
+                            if_exists,
+                        },
                         // Snowflake-only object kind; there is no stage concept
                         // in HeliosDB. Never a relation.
                         sqlparser::ast::ObjectType::Stage => {
@@ -6663,34 +6666,43 @@ mod tests {
     /// DATA-LOSS REGRESSION (plan level), same class as `DROP ROLE`. Every
     /// `ObjectType` that is not a relation must be planned WITHOUT reaching
     /// `LogicalPlan::DropTable`. `DROP INDEX users` used to fall through the
-    /// old `_ => DropTable` fallback and destroy the `users` table.
+    /// old `_ => DropTable` fallback and destroy the `users` table; in 4.20.0
+    /// it errored; from 4.21.0 it plans as `LogicalPlan::DropIndex`, which
+    /// resolves only in the `meta:index:` namespace and can never reach a
+    /// relation. The load-bearing assertion is unchanged: NOT `DropTable`.
     #[test]
     fn drop_index_never_plans_as_drop_table() {
         let parser = Parser::new();
         let plan = |sql: &str| Planner::new().statement_to_plan(parser.parse_one(sql).expect("parse"));
 
-        for sql in [
-            "DROP INDEX users",
-            "DROP INDEX IF EXISTS users",
-            "DROP INDEX users, orders",
-        ] {
-            match plan(sql) {
-                Ok(other) => panic!("{sql} must not produce a plan, got {other:?}"),
-                Err(e) => {
-                    let msg = e.to_string();
+        match plan("DROP INDEX users").expect("DROP INDEX must plan") {
+            LogicalPlan::DropIndex { name, if_exists } => {
+                assert_eq!(name, "users");
+                assert!(!if_exists);
+            }
+            other => panic!("DROP INDEX must plan as DropIndex, got {other:?}"),
+        }
+
+        match plan("DROP INDEX IF EXISTS users").expect("DROP INDEX IF EXISTS must plan") {
+            LogicalPlan::DropIndex { name, if_exists } => {
+                assert_eq!(name, "users");
+                assert!(if_exists, "IF EXISTS must reach the executor as if_exists = true");
+            }
+            other => panic!("DROP INDEX IF EXISTS must plan as DropIndex, got {other:?}"),
+        }
+
+        match plan("DROP INDEX users, orders").expect("comma list must plan") {
+            LogicalPlan::DropMulti { drops } => {
+                assert_eq!(drops.len(), 2);
+                for drop in &drops {
                     assert!(
-                        msg.contains("DROP INDEX"),
-                        "{sql} must fail with an error naming DROP INDEX, got: {msg}"
+                        matches!(drop, LogicalPlan::DropIndex { .. }),
+                        "every DROP INDEX element must be DropIndex, got {drop:?}"
                     );
                 }
             }
+            other => panic!("DROP INDEX comma list must plan as DropMulti, got {other:?}"),
         }
-
-        // `IF EXISTS` must NOT turn the unsupported drop into a silent success.
-        assert!(
-            plan("DROP INDEX IF EXISTS users").is_err(),
-            "DROP INDEX IF EXISTS must not be a silent no-op"
-        );
     }
 
     #[test]

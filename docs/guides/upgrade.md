@@ -80,7 +80,7 @@ two catalog views changed shape. Full detail in `CHANGELOG.md`.
 
 | Statement | ≤ 4.19.0 | 4.20.0 | What to do |
 |---|---|---|---|
-| `DROP INDEX x` / `DROP INDEX IF EXISTS x` | planned as `DROP TABLE x` — **dropped the TABLE `x`** if one existed, otherwise "table does not exist" (or, with `IF EXISTS`, silent success) | errors: *DROP INDEX is not supported yet* | Remove the statement. **Audit your data** if you ever ran it against a name that was also a table |
+| `DROP INDEX x` / `DROP INDEX IF EXISTS x` | planned as `DROP TABLE x` — **dropped the TABLE `x`** if one existed, otherwise "table does not exist" (or, with `IF EXISTS`, silent success) | 4.20.0: errors, *DROP INDEX is not supported yet*. **4.21.0: really drops the index** (a same-named table is never touched; a PK/UNIQUE/FK backing index is refused; `IF EXISTS` silences a missing index again) | **Audit your data** if you ever ran it against a name that was also a table. From 4.21.0 the statement can be used normally |
 | `DROP ROLE x` / `DROP ROLE IF EXISTS x` | same fallback — **dropped the TABLE `x`** | real role DDL; can never reach a relation | Nothing, but audit as above |
 | `SET ROLE <x>`, `SET SESSION AUTHORIZATION <x>` | acknowledged with **zero effect** — a session that thought it had dropped privileges had not | `0A000 feature_not_supported` (simple query AND extended protocol) | Remove it, or set `[authentication] legacy_acl_noop = true` to restore the ack. `SET ROLE NONE` / `… AUTHORIZATION DEFAULT` are still acked |
 | `GRANT` / `REVOKE` naming a role or table that does not exist | silent success, storing nothing | ERROR | Create the role/table first, or set `legacy_acl_noop = true` |

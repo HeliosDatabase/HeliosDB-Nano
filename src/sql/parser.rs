@@ -370,15 +370,17 @@ impl Parser {
         // still won't parse reports the ORIGINAL diagnostic, never a masked one.
         //
         // The candidates are disjoint by leading keyword (`CREATE TABLE` vs
-        // `DELETE`), so `or_else` chaining is order-independent; it is written
-        // this way so each rewrite keeps its own single responsibility and any
-        // future sibling only has to return `None` for what it does not own.
+        // `DELETE` vs `DROP INDEX`), so `or_else` chaining is order-independent;
+        // it is written this way so each rewrite keeps its own single
+        // responsibility and any future sibling only has to return `None` for
+        // what it does not own.
         let mut statements = match SqlParser::parse_sql(&self.dialect, &processed_sql) {
             Ok(statements) => statements,
             Err(orig_err) => {
                 let orig_msg = format!("Failed to parse SQL: {}", orig_err);
                 let rewritten = Self::rewrite_partition_syntax(&processed_sql)
-                    .or_else(|| Self::rewrite_delete_returning(&processed_sql));
+                    .or_else(|| Self::rewrite_delete_returning(&processed_sql))
+                    .or_else(|| Self::rewrite_drop_index_on(&processed_sql));
                 match rewritten {
                     Some(rewritten) => {
                         SqlParser::parse_sql(&self.dialect, &rewritten).map_err(|_| Error::sql_parse(orig_msg))?
@@ -2891,6 +2893,68 @@ impl Parser {
         // Everything from `RETURNING` onward is carried through VERBATIM —
         // including the projection list, a trailing `;` and anything after it.
         Some(format!("DELETE FROM {table} WHERE TRUE {}", rest.trim_start()))
+    }
+
+    /// MySQL spelling `DROP INDEX [IF EXISTS] <index> ON <table>` → the
+    /// PostgreSQL spelling `DROP INDEX [IF EXISTS] <index>`.
+    ///
+    /// sqlparser 0.53's `parse_drop` reads `DROP INDEX <name>` and stops; the
+    /// trailing `ON <table>` then fails the statement-delimiter check with
+    /// "Expected: end of statement, found: ON". So the MySQL wire — where this
+    /// is the ONLY legal spelling — could not drop an index at all.
+    ///
+    /// The table qualifier is dropped, not ignored-by-accident: HeliosDB's index
+    /// namespace is GLOBAL (`meta:index:<name>`, and `create_manual_index`
+    /// rejects a duplicate name outright), so unlike MySQL — where index names
+    /// are scoped per table — a name here identifies exactly one index and the
+    /// qualifier cannot disambiguate anything. What it CANNOT currently do is
+    /// reject `DROP INDEX i ON wrong_table`; that divergence is recorded in the
+    /// CHANGELOG rather than hidden.
+    ///
+    /// Runs only from the parse-failure fallback, so SQL that parses today is
+    /// byte-identically untouched. A trailing MySQL `ALGORITHM=` / `LOCK=`
+    /// option is NOT accepted — it returns `None` and the original parse
+    /// diagnostic stands, rather than silently discarding a clause the caller
+    /// asked for.
+    fn rewrite_drop_index_on(sql: &str) -> Option<String> {
+        // `read_object_name` stops at whitespace, so a trailing `;` would be
+        // read as part of the table token and fail `is_plain_object_name`.
+        // Strip exactly one statement terminator up front; anything left after
+        // the table name (including a SECOND statement) then makes the tail
+        // non-empty and the rewrite declines.
+        let sql = sql.trim_end();
+        let sql = sql.strip_suffix(';').unwrap_or(sql);
+
+        let after_drop = Self::strip_kw(sql, "DROP")?;
+        let after_index = Self::strip_kw(after_drop, "INDEX")?;
+
+        let (if_exists, rest) = match Self::strip_kw(after_index, "IF") {
+            Some(after_if) => (true, Self::strip_kw(after_if, "EXISTS")?),
+            None => (false, after_index),
+        };
+
+        let (index, rest) = Self::read_object_name(rest)?;
+        if !Self::is_plain_object_name(&index) {
+            return None;
+        }
+
+        let rest = Self::strip_kw(rest, "ON")?;
+        let (table, tail) = Self::read_object_name(rest)?;
+        if !Self::is_plain_object_name(&table) {
+            return None;
+        }
+
+        // Only a bare statement is rewritten. A trailing MySQL `ALGORITHM=` /
+        // `LOCK=` clause, or a second statement, lands here and declines.
+        if !tail.trim().is_empty() {
+            return None;
+        }
+
+        Some(if if_exists {
+            format!("DROP INDEX IF EXISTS {index}")
+        } else {
+            format!("DROP INDEX {index}")
+        })
     }
 
     /// True when `name` is a plain, possibly schema-qualified object name: one

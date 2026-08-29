@@ -7,6 +7,93 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — **on an encrypted (TDE) data directory, every `CREATE INDEX` index silently disappeared at every restart**
+
+**Read this if you run HeliosDB Nano with `[encryption] enabled = true`.** This is a
+pre-existing defect, present in every release that supported both TDE and user-created
+secondary indexes. It was found while implementing `DROP INDEX`.
+
+`Catalog::save_index_definition` writes the `meta:index:<name>` record through
+`StorageEngine::put`, which **encrypts** when a key manager is configured.
+`Catalog::list_index_definitions` read those record VALUES straight off a raw RocksDB
+iterator, which returns **ciphertext** — `StorageEngine::get` is the one place decryption
+happens. Because index-record decoding is deliberately per-record resilient (an undecodable
+record is `warn!`ed and SKIPPED so one bad record cannot abort the rebuild of every other
+index), nothing failed and nothing errored.
+
+The consequence was total and silent. `Catalog::rebuild_all_indexes` is the ONLY thing that
+re-registers user secondary indexes when a process attaches to a data directory, and it reads
+that list. On an encrypted database it saw **zero** index definitions, so:
+
+* every index created with `CREATE INDEX` vanished from the moment the process restarted;
+* it never came back — each subsequent restart re-read the same ciphertext;
+* **query results stayed correct.** Affected queries silently fell back to full table scans.
+  There was no error, no failed statement, and nothing above `warn!` in the log.
+
+Unencrypted data directories were never affected.
+
+The fix routes the read through `StorageEngine::meta_blobs_with_prefix`, the single
+decrypting prefix-read discipline already used for `list_roles` / `list_acls`. Regression test:
+`secondary_indexes_survive_reopen_on_an_encrypted_database` in `tests/drop_index_tests.rs`.
+
+**No action needed beyond upgrading** — index definitions were persisted correctly the whole
+time; only reading them back was broken, so your indexes are rebuilt on the first start after
+the upgrade.
+
+**The identical defect in `Catalog::list_sequences` is fixed in the same change.** Sequence
+definitions are written through the same encrypting `put` and were read off the same kind of
+raw iterator with the same per-record resilience, so on an encrypted data directory every
+`CREATE SEQUENCE` definition silently disappeared at restart too — taking `nextval`, `SERIAL`
+defaults, and the `pg_sequences` / `information_schema.sequences` views with it.
+
+### Added — real `DROP INDEX` (roadmap §2.1, second half)
+
+Through 4.19.0, `DROP INDEX x` fell through the planner's `_ => LogicalPlan::DropTable`
+catch-all and **destroyed a TABLE named `x`**. 4.20.0 removed the catch-all and made the
+statement a loud error. It is now implemented.
+
+* `DROP INDEX [IF EXISTS] <name> [, …]` drops ART (`art`/`btree`/`hash`), HNSW in every
+  flavour (`hnsw`/`hnsw_pq`/`persistent_hnsw`, i.e. including
+  `WITH (persistent = true)`) and DDL-only `gin`/`gist` indexes, dispatching on the persisted
+  definition so each undoes exactly the `CREATE INDEX` branch that made it. `CREATE INDEX`,
+  `DROP INDEX` and the open-time index rebuild all classify the index type through **one**
+  shared function (`storage::index_family`), so a new index type cannot be taught to one of
+  them and forgotten by the others.
+* It removes the `meta:index:` catalog record, which is what makes the drop **durable** —
+  indexes are rebuilt from those records at every open, so a drop that left the record behind
+  would quietly undo itself at the next restart.
+* Reached from the shared `plan_to_operator`, so `db.execute()` and `db.execute_params()`
+  (the PostgreSQL **extended** protocol — psycopg, JDBC, sqlx, node-postgres, and the
+  REST/BaaS layer) behave identically.
+* It gives `StorageEngine::log_drop_index` its first caller, so the drop is replicated; the
+  `WalOperation::DropIndex` replay arm now also clears the in-memory ART / vector
+  registration, which a long-lived **standby** needs in order to converge.
+* Cached plans and cached results are invalidated, so a dropped index cannot keep being used
+  by a warm plan cache. This also closes a **pre-existing** gap for every comma-list drop:
+  `DROP TABLE a, b` / `DROP VIEW a, b` plan as one `DropMulti` node, which was absent from the
+  invalidation list — so the multi-target spelling invalidated nothing while the single-target
+  spelling of the same statement invalidated correctly.
+
+**Behaviour worth knowing:**
+
+* **A PRIMARY KEY / UNIQUE / FOREIGN KEY backing index cannot be dropped.** It is refused with
+  PostgreSQL's wording (`cannot drop index "…" because constraint … requires it`, SQLSTATE
+  2BP01). This matters because those names are reachable: a `UNIQUE` column `email` registers
+  a backing index literally called `email`, and a primary key registers `<table>_pkey`.
+  Dropping one would have silently removed constraint enforcement.
+* **`IF EXISTS` now silences a missing index.** In 4.20.0 it deliberately did not — nothing
+  was dropped either way, so a quiet success would have been a silent no-op. Now that a real
+  drop exists, PostgreSQL semantics apply. Without `IF EXISTS`, a missing index is
+  `index "x" does not exist`, SQLSTATE 42704 undefined_object (previously XX000).
+* **A same-named TABLE is never touched**, in either direction — pinned by tests.
+* **The MySQL spelling `DROP INDEX <i> ON <t>` is accepted.** sqlparser rejects the trailing
+  `ON`, so the MySQL wire previously could not drop an index at all. HeliosDB's index
+  namespace is global (one index per name), so the table qualifier cannot disambiguate
+  anything and is not used for the lookup — meaning, unlike MySQL, `DROP INDEX i ON
+  wrong_table` is **not** rejected. A trailing `ALGORITHM=` / `LOCK=` clause is refused rather
+  than silently discarded.
+* The PostgreSQL wire now reports the `DROP INDEX` command tag instead of `OK 0`.
+
 ## [4.20.0] - 2026-08-28
 
 Closes the five published "honest caveats" where PostgreSQL CE was ahead. Four were real —

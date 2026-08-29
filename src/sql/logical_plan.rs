@@ -1254,6 +1254,37 @@ pub enum LogicalPlan {
         /// Role names; `public` is the PUBLIC pseudo-role.
         grantees: Vec<String>,
     },
+
+    /// `DROP INDEX [IF EXISTS] <name> [, …]`.
+    ///
+    /// The mirror of [`LogicalPlan::CreateIndex`], and the second half of
+    /// roadmap §2.1. Before v4.21.0 every piece of the drop existed with NO
+    /// CALLER — `Catalog::drop_index_definition`, `ArtManager::drop_index`,
+    /// `VectorIndexManager::drop_index`, `StorageEngine::log_drop_index` and
+    /// the `WalOperation::DropIndex` replay arm — while the statement itself
+    /// fell through the planner's now-deleted `_ => DropTable` catch-all and
+    /// DESTROYED a same-named table. v4.20.0 made that a loud error; this
+    /// variant is the real implementation.
+    ///
+    /// There is no `on_table` field: HeliosDB's index namespace is GLOBAL
+    /// (`meta:index:<name>`, one record per name), so — unlike MySQL, where
+    /// index names are scoped per table — a name identifies exactly one index
+    /// and a table qualifier cannot disambiguate anything. The MySQL spelling
+    /// `DROP INDEX <i> ON <t>` is accepted by a parser rewrite that strips the
+    /// qualifier; see `Parser::rewrite_drop_index_on`.
+    ///
+    /// APPEND-ONLY — see [`LogicalPlan::Noop`]. Declared after
+    /// [`LogicalPlan::RevokePrivileges`], which was the last variant when this
+    /// was added. `LogicalPlan` is POSITIONALLY bincode-encoded and PERSISTED
+    /// (materialized-view plans, trigger definitions), so a new variant may
+    /// only ever be appended here — never inserted, never reordered.
+    DropIndex {
+        /// Index name, normalized the same way every other non-table object
+        /// name is (`normalize_nontable_name`).
+        name: String,
+        /// `IF EXISTS` — a missing index is then a genuine no-op success.
+        if_exists: bool,
+    },
 }
 
 /// Function/Procedure parameter
@@ -2117,6 +2148,7 @@ impl LogicalPlan {
             Self::AlterRole { .. } => "AlterRole",
             Self::GrantPrivileges { .. } => "GrantPrivileges",
             Self::RevokePrivileges { .. } => "RevokePrivileges",
+            Self::DropIndex { .. } => "DropIndex",
             Self::CreateExtension { .. } => "CreateExtension",
             Self::CreateDatabase { .. } => "CreateDatabase",
             Self::DropDatabase { .. } => "DropDatabase",
@@ -2547,6 +2579,8 @@ impl LogicalPlan {
             | LogicalPlan::AlterRole { .. }
             | LogicalPlan::GrantPrivileges { .. }
             | LogicalPlan::RevokePrivileges { .. }
+            // DROP INDEX returns no rows, exactly like DROP TABLE.
+            | LogicalPlan::DropIndex { .. }
             | LogicalPlan::Noop => {
                 // KanttBan #20 (v3.31.0): DDL — no output rows.
                 Arc::new(Schema { columns: vec![] })

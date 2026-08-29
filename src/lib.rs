@@ -1308,6 +1308,17 @@ impl EmbeddedDatabase {
                 // plans and Describe metadata serving the pre-CREATE shape.
                 | sql::LogicalPlan::CreateTableAs { .. }
                 | sql::LogicalPlan::DropTable { .. }
+                // The COMMA-LIST form of every drop — `DROP TABLE a, b`,
+                // `DROP INDEX a, b`, `DROP VIEW a, b` — plans as ONE `DropMulti`
+                // wrapping the individual drop nodes (planner.rs), and this
+                // predicate only ever sees the OUTER plan. Without this arm a
+                // multi-target drop invalidated nothing at all while the
+                // single-target spelling of the same statement invalidated
+                // correctly: `DROP TABLE a` cleared the caches, `DROP TABLE a, b`
+                // did not, and a warm `SELECT * FROM pg_indexes` (or any cached
+                // plan naming a dropped index) kept serving the pre-drop answer.
+                // Discriminant match on a rare DDL path, so it costs nothing.
+                | sql::LogicalPlan::DropMulti { .. }
                 // DROP SCHEMA CASCADE drops member tables; RESTRICT may still be
                 // a no-op, but invalidating on any DROP SCHEMA is safe + cheap.
                 | sql::LogicalPlan::DropSchema { .. }
@@ -1354,6 +1365,13 @@ impl EmbeddedDatabase {
                 | sql::LogicalPlan::AlterTableDropConstraint { .. }
                 | sql::LogicalPlan::AlterTableMulti { .. }
                 | sql::LogicalPlan::CreateIndex { .. }
+                // DROP INDEX must invalidate for the same reason CREATE INDEX
+                // does, and more urgently: a CACHED PLAN may contain an index
+                // point-lookup / range-scan operator naming an index that no
+                // longer exists, and a cached RESULT may have been produced by
+                // one. Omitting this leaves the drop looking like a no-op for
+                // exactly as long as the caches stay warm.
+                | sql::LogicalPlan::DropIndex { .. }
                 | sql::LogicalPlan::CreateTrigger { .. }
                 | sql::LogicalPlan::DropTrigger { .. }
                 | sql::LogicalPlan::Truncate { .. }

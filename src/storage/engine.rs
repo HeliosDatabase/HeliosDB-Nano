@@ -8947,6 +8947,76 @@ impl StorageEngine {
         Ok(report)
     }
 
+    /// Remove the durable snapshot artefacts belonging to ONE vector index: the
+    /// `vecsnap:` sidecar blob, its `vecsnapv:` marker, and the `hnsw_rs` graph
+    /// dump files under `{data_dir}/hnsw_snapshots/`.
+    ///
+    /// Called by every path that removes a vector index (`DROP INDEX` and its
+    /// WAL replay). Without it the artefacts are immortal: a checkpoint only
+    /// ever WRITES keys for indexes that are still live, so a repeated
+    /// drop/recreate cycle accumulated dead blobs and dump files with nothing
+    /// to ever collect them.
+    ///
+    /// Correctness does not depend on this — `VectorIndexManager::drop_index`
+    /// calls `note_mutation()`, whose hook durably deletes every `vecsnapv:`
+    /// marker, so a stale sidecar can never be handed to the rebuild. This is
+    /// purely the space leak, and it is therefore BEST EFFORT: every failure is
+    /// warned by name and none of them can fail the drop that is already done.
+    pub(crate) fn remove_vector_index_snapshot(&self, index_name: &str) {
+        use super::index_snapshot as snap;
+
+        // The dump basename is read back OUT of the sidecar rather than
+        // re-derived: `graph_dump_basename` is lossy (every non-alphanumeric
+        // collapses to `_`), so re-deriving it from the index name could delete
+        // a different index's dump files.
+        if let Some(dir) = self.hnsw_snapshot_dir() {
+            match self.get(&snap::vec_snapshot_key(index_name)) {
+                Ok(Some(blob)) => match bincode::deserialize::<snap::VectorGraphSidecar>(&blob) {
+                    Ok(sidecar) if sidecar.index_name == index_name => {
+                        for suffix in [".hnsw.graph", ".hnsw.data"] {
+                            let path = dir.join(format!("{}{}", sidecar.basename, suffix));
+                            match std::fs::remove_file(&path) {
+                                Ok(()) => {}
+                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                                Err(e) => warn!(
+                                    "dropping vector index '{}': could not remove graph dump {:?}: {}",
+                                    index_name, path, e
+                                ),
+                            }
+                        }
+                    }
+                    Ok(sidecar) => warn!(
+                        "dropping vector index '{}': its sidecar names index '{}' — \
+                         leaving the graph dump alone",
+                        index_name, sidecar.index_name
+                    ),
+                    Err(e) => warn!(
+                        "dropping vector index '{}': sidecar is undecodable ({}) — \
+                         the graph dump files are left behind",
+                        index_name, e
+                    ),
+                },
+                Ok(None) => {}
+                Err(e) => warn!("dropping vector index '{}': sidecar read failed: {}", index_name, e),
+            }
+        }
+
+        // Raw deletes: these keys are outside the `meta:` namespace, so going
+        // through `StorageEngine::delete` would append a WAL `Delete` record
+        // against a bogus table name for a checkpoint artefact.
+        for key in [
+            snap::vec_snapshot_key(index_name),
+            snap::vec_snapshot_marker_key(index_name),
+        ] {
+            if let Err(e) = self.db.delete(&key) {
+                warn!(
+                    "dropping vector index '{}': could not remove snapshot record: {}",
+                    index_name, e
+                );
+            }
+        }
+    }
+
     /// Read every valid ART table snapshot (marker present + versions match).
     /// Called once at the START of `rebuild_all_indexes`, before index
     /// registration consumes the markers.
@@ -10226,7 +10296,66 @@ impl StorageEngine {
 
             WalOperation::DropIndex { name } => {
                 info!("Replayed drop index: name={}", name);
+
+                // Removing the durable definition is what makes the drop stick:
+                // `Catalog::rebuild_all_indexes` re-registers every user
+                // secondary index FROM these records, so a definition that
+                // survived replay would resurrect the index at the next open.
                 Catalog::new(self).drop_index_definition(&name)?;
+
+                // The definition delete alone is NOT sufficient for convergence
+                // on a live process. Two of the three replay paths run against
+                // an engine that already has in-memory index state:
+                //   * crash recovery replays into a freshly opened engine, and
+                //     `rebuild_all_indexes` runs AFTER replay — so nothing is
+                //     registered yet and these calls are no-ops;
+                //   * a STANDBY applies this record into a long-lived process
+                //     whose ART / vector managers were populated at ITS open.
+                //     Without the calls below the standby keeps serving from an
+                //     index the primary has dropped, and — worse — a later
+                //     CREATE INDEX with the same name fails
+                //     `IndexAlreadyExists` and the standby silently diverges.
+                // So the in-memory structures are cleared here too. A missing
+                // registration is the normal case (crash recovery) and is
+                // therefore not an error; anything else is logged rather than
+                // aborting recovery, which must never fail to open a database
+                // over an index that is being removed anyway.
+                //
+                // SAME SAFETY GATE AS `ddl::handle_drop_index`, and here for the
+                // same reason it is there twice: a PRIMARY KEY / UNIQUE /
+                // FOREIGN KEY constraint is ENFORCED through its backing ART
+                // index, and deregistering one does not report anything — writes
+                // simply stop being checked. That `log_drop_index`'s only caller
+                // refuses constraint indexes is a property of TODAY'S CALLERS,
+                // not of the record: a standby (or a re-replay from an older LSN
+                // after a base-backup restore) can apply a name that has since
+                // become a constraint index on THIS node. Structural beats
+                // caller-dependent, so the live registry is probed by name.
+                use super::art_index::ArtIndexType;
+                match self.art_indexes().index_kind_and_table(&name).map(|(kind, _)| kind) {
+                    Some(ArtIndexType::Manual) => {
+                        if let Err(e) = self.art_indexes().drop_index(&name) {
+                            warn!("Replay drop index '{}': ART drop failed: {}", name, e);
+                        }
+                    }
+                    Some(kind) => warn!(
+                        "Replay drop index '{}': the live ART index of that name backs a {:?} \
+                         constraint — NOT dropping it (a replayed DROP INDEX must never disable \
+                         constraint enforcement); the catalog definition was still removed",
+                        name, kind
+                    ),
+                    // No live ART registration: the normal crash-recovery case
+                    // (`rebuild_all_indexes` has not run yet), and nothing to do.
+                    None => {}
+                }
+                if self.vector_indexes().index_exists(&name) {
+                    if let Err(e) = self.vector_indexes().drop_index(&name) {
+                        warn!("Replay drop index '{}': vector drop failed: {}", name, e);
+                    }
+                }
+                // Same artefact cleanup the SQL path does; harmless when the
+                // index was never a vector index (both keys simply do not exist).
+                self.remove_vector_index_snapshot(&name);
                 Ok(())
             }
 

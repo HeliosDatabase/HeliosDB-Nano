@@ -122,7 +122,7 @@ Source of truth: `src/main.rs`, `src/repl/commands.rs`, `src/lib.rs`, `src/mcp/t
 | Statement | Skill |
 |-----------|-------|
 | `CREATE / ALTER / DROP TABLE`, `CREATE INDEX`, `CREATE / DROP VIEW / MATERIALIZED VIEW` | `heliosdb-nano-schema` |
-| `DROP INDEX` (**not supported** — errors; through 4.19.0 it was planned as `DROP TABLE`) | `heliosdb-nano-schema` |
+| `DROP INDEX` (supported from 4.21.0; a PK/UNIQUE/FK backing index is refused. Through 4.19.0 it was planned as `DROP TABLE`; 4.20.0 errored) | `heliosdb-nano-schema` |
 | `CREATE / DROP TRIGGER` (registers + persists, but **trigger bodies never run** — see the skill) | `heliosdb-nano-schema` |
 | `CREATE / DROP FUNCTION` (scalar calls work; `$`-sigil params mandatory, no set-returning/overloading — see the skill) | `heliosdb-nano-schema` |
 | `CREATE PROCEDURE` / `CALL` (works — either language, params need a `$` sigil) | `heliosdb-nano-schema` |

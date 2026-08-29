@@ -23,6 +23,66 @@ pub struct PersistedIndexDefinition {
     pub options: Vec<crate::sql::logical_plan::IndexOption>,
 }
 
+/// Which physical structure owns an index — the ONE mapping from an index-type
+/// tag to the manager that builds, rebuilds and drops it.
+///
+/// See [`index_family`] for why this exists as a shared classifier rather than
+/// as a `matches!` repeated at each site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexFamily {
+    /// `ArtIndexManager` — the in-memory adaptive radix tree behind every
+    /// ordinary secondary index (`art`, and the `btree` / `hash` spellings the
+    /// planner passes through from `USING`).
+    Art,
+    /// `VectorIndexManager` — HNSW in every flavour (in-memory, PQ-quantized,
+    /// RocksDB-backed persistent).
+    Vector,
+    /// Accepted for syntax compatibility and DELIBERATELY builds nothing
+    /// (`gin` / `gist`: the `@@` operator scans). The catalog record IS the
+    /// whole index, so creating and dropping one is a pure catalog operation.
+    DdlOnly,
+}
+
+/// Classify an index-type tag into the structure that owns it. `None` is the
+/// pre-v3.37.2 legacy record shape and means [`IndexFamily::Art`]; an unknown
+/// tag returns `None` so the caller can fail by name instead of guessing.
+///
+/// # Why this is shared
+///
+/// The mapping had drifted into three independent copies — `handle_create_index`
+/// (which branch builds the index), `Catalog::rebuild_vector_indexes` (which
+/// records to reopen at open) and `ddl::handle_drop_index` (which manager to
+/// call). `CREATE INDEX … USING hnsw … WITH (persistent = true)` persists
+/// `persistent_hnsw`, which the create and rebuild copies knew about and the
+/// drop copy did not — making such an index permanently UNDROPPABLE with an
+/// error that told the user their catalog was corrupt. One classifier means a
+/// future index type cannot be added to one site and forgotten at another.
+///
+/// # The accepted tags
+///
+/// Every literal here is a tag some caller actually writes. Verified against
+/// every `persist_index_definition` call site (`sql/executor/ddl.rs`: `art`,
+/// `gin`/`gist`, `hnsw`, `hnsw_pq`, `persistent_hnsw`) plus WAL replay
+/// (`WalOperation::CreateIndex`, which round-trips whatever CREATE logged) and
+/// the legacy untagged shape. `btree` / `hash` are never PERSISTED (the ART
+/// branch normalizes them to `art`) but ARE accepted spellings of `USING`, so
+/// they belong here too — this function classifies both the requested spelling
+/// and the persisted tag, and the two vocabularies overlap.
+///
+/// `persistent_pq_hnsw` / `persistent_hnsw_pq` are deliberately absent: they are
+/// DISPLAY spellings only (`EmbeddedDatabase::get_vector_store`,
+/// `embedded_db_dump`), never written to a `meta:index:` record — a persistent
+/// index with PQ enabled is persisted as `persistent_hnsw`. If that ever
+/// changes, add them HERE and both sites follow.
+pub fn index_family(tag: Option<&str>) -> Option<IndexFamily> {
+    match tag {
+        None | Some("art") | Some("btree") | Some("hash") => Some(IndexFamily::Art),
+        Some("gin") | Some("gist") => Some(IndexFamily::DdlOnly),
+        Some("hnsw") | Some("hnsw_pq") | Some("persistent_hnsw") => Some(IndexFamily::Vector),
+        Some(_) => None,
+    }
+}
+
 /// On-disk format tag for a persisted index definition: a 4-byte magic plus a
 /// single version byte, written ahead of the bincode body. The tag lets a
 /// future format change be *detected* (and skipped/migrated) rather than
@@ -775,24 +835,60 @@ impl<'a> Catalog<'a> {
         self.storage.delete(&key)
     }
 
+    /// Fetch ONE persisted `CREATE INDEX` definition by name.
+    ///
+    /// `Ok(None)` means "no such user-created index" — which is exactly the
+    /// question `DROP INDEX` has to answer, and the reason this is a point `get`
+    /// rather than a filter over [`Catalog::list_index_definitions`]: the drop
+    /// must not become O(number of indexes), and it must not depend on the sort
+    /// the list performs.
+    ///
+    /// Decoding uses the same [`Catalog::decode_persisted_index_definition`]
+    /// every other reader uses, so all on-disk formats are understood
+    /// identically — one rule, one implementation. Reads through
+    /// [`StorageEngine::get`], so it is correct on an encrypted data directory.
+    ///
+    /// A record that EXISTS but cannot be decoded returns `Ok(None)`, matching
+    /// the rebuild path's per-record resilience. `drop_index_definition` deletes
+    /// by key regardless of decodability, so such a record is still removable.
+    pub fn get_index_definition(&self, index_name: &str) -> Result<Option<PersistedIndexDefinition>> {
+        let key = Self::index_metadata_key(index_name);
+        match self.storage.get(&key)? {
+            Some(bytes) => Ok(Self::decode_persisted_index_definition(index_name, &bytes)),
+            None => Ok(None),
+        }
+    }
+
+    /// True when a `meta:index:<name>` record exists, whether or not its body
+    /// decodes. Distinguishes "no such index" from "unreadable index record",
+    /// which `get_index_definition` deliberately collapses.
+    pub fn index_definition_exists(&self, index_name: &str) -> Result<bool> {
+        let key = Self::index_metadata_key(index_name);
+        Ok(self.storage.get(&key)?.is_some())
+    }
+
     /// List persisted CREATE INDEX definitions.
+    ///
+    /// TDE CORRECTNESS (v4.21.0). This used to read record VALUES straight off
+    /// `self.storage.db.iterator_opt`. `save_index_definition` writes through
+    /// [`StorageEngine::put`], which ENCRYPTS when a key manager is configured —
+    /// so on an encrypted data directory the raw iterator handed back
+    /// CIPHERTEXT. Combined with the per-record resilience below (an undecodable
+    /// record is warned and SKIPPED, never surfaced as an error), the effect was
+    /// silent and total: `rebuild_all_indexes` is the only thing that
+    /// re-registers user secondary indexes at open, so on a TDE database EVERY
+    /// `CREATE INDEX` index disappeared at EVERY restart. Queries stayed
+    /// correct — they just full-scanned forever, with nothing above `warn!` to
+    /// say so.
+    ///
+    /// The fix is the same one applied to `list_roles` / `list_acls`: read
+    /// through [`StorageEngine::meta_blobs_with_prefix`], which fetches values
+    /// via `get` — the one place decryption happens. Do not "optimize" this back
+    /// into a raw iterator.
     pub fn list_index_definitions(&self) -> Result<Vec<(String, PersistedIndexDefinition)>> {
-        let prefix = b"meta:index:";
         let mut indexes = Vec::new();
-        let mut read_opts = rocksdb::ReadOptions::default();
-        read_opts.set_total_order_seek(true);
-        let iter = self.storage.db.iterator_opt(
-            rocksdb::IteratorMode::From(prefix, rocksdb::Direction::Forward),
-            read_opts,
-        );
 
-        for item in iter {
-            let (key, value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
-            if !key.starts_with(prefix) {
-                break;
-            }
-            let index_name = String::from_utf8_lossy(key.get(prefix.len()..).unwrap_or_default()).to_string();
-
+        for (index_name, value) in self.storage.meta_blobs_with_prefix("meta:index:") {
             // Per-record resilience: a single undecodable record must NOT abort
             // the whole rebuild (that would silently un-index every *other*
             // index on the database — the failure mode behind the upgrade bug).
@@ -1107,10 +1203,10 @@ impl<'a> Catalog<'a> {
     ) -> Result<()> {
         let dump_dir = self.storage.hnsw_snapshot_dir();
         for (index_name, definition) in indexes {
-            if !matches!(
-                definition.index_type.as_deref(),
-                Some("hnsw" | "persistent_hnsw" | "hnsw_pq")
-            ) {
+            // Shared classifier, not a local tag list: this used to be a
+            // `matches!` copy of the same mapping `handle_create_index` and
+            // `handle_drop_index` each kept privately, and they drifted.
+            if index_family(definition.index_type.as_deref()) != Some(IndexFamily::Vector) {
                 continue;
             }
 
@@ -1937,25 +2033,21 @@ impl<'a> Catalog<'a> {
     /// single undecodable record is skipped (with a `warn!`), never aborting
     /// the whole load. Used by startup warm-load and by the pg_sequences /
     /// information_schema.sequences / pg_class introspection views.
+    ///
+    /// TDE CORRECTNESS (v4.21.0): reads through
+    /// [`StorageEngine::meta_blobs_with_prefix`] for exactly the reason
+    /// [`Catalog::list_index_definitions`] does. `save_sequence` writes through
+    /// the encrypting `put`, and this reader is per-record resilient, so the
+    /// raw-iterator version made every sequence definition silently VANISH on
+    /// an encrypted data directory — taking `nextval`, `SERIAL` defaults and the
+    /// `pg_sequences` / `information_schema.sequences` views with it. Same
+    /// defect class, same fix. `meta:seqstate:` is not a prefix of
+    /// `meta:sequence:` (they diverge at byte 7), so the state records stay out
+    /// of this scan.
     pub fn list_sequences(&self) -> Result<Vec<PersistedSequence>> {
-        let prefix = b"meta:sequence:";
         let mut sequences = Vec::new();
-        let mut read_opts = rocksdb::ReadOptions::default();
-        read_opts.set_total_order_seek(true);
-        let iter = self.storage.db.iterator_opt(
-            rocksdb::IteratorMode::From(prefix, rocksdb::Direction::Forward),
-            read_opts,
-        );
 
-        for item in iter {
-            let (key, value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
-            // `meta:seqstate:` is NOT a prefix of `meta:sequence:` (they
-            // diverge at byte 7), so breaking on the first non-matching key
-            // keeps the state records out of this scan.
-            if !key.starts_with(prefix) {
-                break;
-            }
-            let name = String::from_utf8_lossy(key.get(prefix.len()..).unwrap_or_default()).to_string();
+        for (name, value) in self.storage.meta_blobs_with_prefix("meta:sequence:") {
             if let Some(def) = Self::decode_persisted_sequence(&name, &value) {
                 sequences.push(def);
             }
@@ -2827,6 +2919,58 @@ impl TriggerPersistence for Catalog<'_> {
 mod tests {
     use super::*;
     use crate::{Column, Config, DataType};
+
+    /// Every tag any writer persists into a `meta:index:` record must be
+    /// classifiable, and must classify into the family whose manager actually
+    /// owns that structure.
+    ///
+    /// `persistent_hnsw` is the reason this test exists: `handle_drop_index`
+    /// shipped its first draft with a hand-written tag list that omitted it, so
+    /// `CREATE INDEX … USING hnsw … WITH (persistent = true)` produced an index
+    /// that `rebuild_vector_indexes` reopened at every start and NOTHING could
+    /// drop — reported as "unsupported persisted index type", i.e. the engine
+    /// telling the user their own catalog was corrupt.
+    ///
+    /// If you add an index type, add its tag to `index_family` and to this
+    /// list. The literals below are the exact strings passed to
+    /// `persist_index_definition` in `sql/executor/ddl.rs`.
+    #[test]
+    fn every_persisted_index_tag_is_classified() {
+        for (tag, expected) in [
+            // Legacy pre-v3.37.2 records carry no tag at all.
+            (None, IndexFamily::Art),
+            (Some("art"), IndexFamily::Art),
+            // Accepted `USING` spellings, normalized to `art` when persisted.
+            (Some("btree"), IndexFamily::Art),
+            (Some("hash"), IndexFamily::Art),
+            (Some("gin"), IndexFamily::DdlOnly),
+            (Some("gist"), IndexFamily::DdlOnly),
+            (Some("hnsw"), IndexFamily::Vector),
+            (Some("hnsw_pq"), IndexFamily::Vector),
+            (Some("persistent_hnsw"), IndexFamily::Vector),
+        ] {
+            assert_eq!(
+                index_family(tag),
+                Some(expected),
+                "index tag {tag:?} must classify as {expected:?} — an unclassified tag makes \
+                 every index of that type UNDROPPABLE"
+            );
+        }
+    }
+
+    /// An unknown tag is `None`, never a guess. `handle_drop_index` turns that
+    /// into a named error rather than removing the wrong structure and
+    /// reporting a drop that did not happen.
+    #[test]
+    fn an_unknown_index_tag_is_not_guessed() {
+        for tag in ["brin", "spgist", "ivfflat", "", "HNSW"] {
+            assert_eq!(
+                index_family(Some(tag)),
+                None,
+                "'{tag}' is not an index type this build implements and must not be classified"
+            );
+        }
+    }
 
     #[test]
     fn test_create_table() {

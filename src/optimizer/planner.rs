@@ -344,6 +344,7 @@ impl Planner {
             | LogicalPlan::DropTable { .. }
             | LogicalPlan::DropMulti { .. }
             | LogicalPlan::CreateIndex { .. }
+            | LogicalPlan::DropIndex { .. }
             | LogicalPlan::CreateSequence { .. }
             | LogicalPlan::AlterSequence(_)
             | LogicalPlan::DropSequence { .. }

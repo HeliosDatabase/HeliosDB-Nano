@@ -2178,6 +2178,11 @@ where
             "DROP TABLE".to_string()
         } else if starts_with_icase(trimmed, "CREATE INDEX") {
             "CREATE INDEX".to_string()
+        } else if starts_with_icase(trimmed, "DROP INDEX") {
+            // PostgreSQL replies "DROP INDEX". Before v4.21.0 this fell through
+            // to `OK 0`, which is what a client saw for a statement that at the
+            // time did not drop anything at all.
+            "DROP INDEX".to_string()
         } else if starts_with_icase(trimmed, "ALTER TABLE") {
             // PostgreSQL replies "ALTER TABLE" (no row count) for every ALTER
             // TABLE form, including the Stage-0 ATTACH/DETACH PARTITION no-op.
@@ -3171,11 +3176,63 @@ pub(crate) fn sqlstate_for_error(error: &Error) -> &'static str {
     }
 }
 
+/// Does this message name an INDEX as its subject?
+///
+/// SHAPE, not a bare substring. Every index error this engine emits QUOTES the
+/// index name immediately after the noun:
+///
+/// * `index "i" does not exist`              — `ddl::handle_drop_index`
+/// * `Index 'i' not found` / `does not exist` — `VectorIndexManager`
+/// * `Index 'i' already exists`               — CREATE INDEX, HNSW branch
+/// * `ART index 'i' already exists`           — `create_art_secondary_index`
+/// * `Failed to drop ART index 'i': …`        — `ddl::handle_drop_index`
+///
+/// so the noun must be followed by a space and a quote. A bare
+/// `lower.contains("index")` matched the index NAME inside somebody else's
+/// object name instead, and — sitting ahead of the table/relation rules — it
+/// hijacked every relation error about a table whose name merely CONTAINS
+/// "index": `Table 'search_index' does not exist` became 42704 undefined_object
+/// instead of 42P01 undefined_table, and `Table 'pg_indexes' already exists`
+/// became 42710 instead of 42P07. Drivers and migration tools branch on exactly
+/// 42P01/42P07 (psycopg/Django `UndefinedTable`, Rails/sqlx idempotent
+/// migrations), so that silently changed a driver-facing contract.
+///
+/// That is the marker-substring class this repo has now fixed three times: the
+/// `is_catalog_query` marker-list audit, the v4.6.1
+/// `version()`/`current_database()`/`current_user` statement hijack (0c27a30),
+/// and this. Anchor on the shape the emitter actually produces.
+///
+/// The table/relation exclusion is deliberate belt-and-braces: it makes the
+/// classification independent of ARM ORDER as well as of the substring, so
+/// moving these arms could not silently reintroduce the hijack either.
+fn message_names_an_index(lower: &str) -> bool {
+    (lower.contains("index \"") || lower.contains("index '")) && !lower.contains("table") && !lower.contains("relation")
+}
+
 /// Classify a `QueryExecution` message into a SQLSTATE.
 ///
 /// Order matters: function and column shapes are checked before table
 /// shapes because messages like `Column 'c' not found in table 't'`
 /// mention both.
+///
+/// # Known bare-substring arms (audited, NOT fixed here)
+///
+/// The index arms below were reworked to match a message SHAPE
+/// ([`message_names_an_index`]). The `role` / `function` / `column` arms above
+/// them are still bare `contains` tests carrying the SAME hazard, and are
+/// PRE-EXISTING — they are recorded here rather than silently left:
+///
+/// * `contains("role")` — `Table 'roles' does not exist` → 42704 instead of
+///   42P01; `Column 'role' not found in table 't'` → 42704 instead of 42703.
+///   Every emitter writes `role "x" …` (`executor/mod.rs` CREATE/ALTER/DROP
+///   ROLE, GRANT/REVOKE), so `contains("role \"")` would anchor it.
+/// * `contains("function")` — `Table 'functions' does not exist` → 42883.
+/// * `contains("column")` — `Table 'columns' does not exist` → 42703.
+///
+/// Each needs its own emitter audit (an unquoted variant would fall through to
+/// XX000, a WORSE answer for a driver than today's wrong-but-specific code) plus
+/// wire tests, so they are deliberately out of this change's scope rather than
+/// fixed blind. See the DROP INDEX review notes.
 fn sqlstate_for_query_execution_message(message: &str) -> &'static str {
     use crate::network::protocol::sqlstate;
 
@@ -3185,7 +3242,12 @@ fn sqlstate_for_query_execution_message(message: &str) -> &'static str {
     // HC4 role/ACL mappings, checked BEFORE the table/relation rules: the role
     // errors deliberately avoid the words "table"/"relation" so they cannot be
     // mis-mapped, but ordering makes that independent of message wording.
-    if lower.contains("cannot be dropped because some objects depend") {
+    if lower.contains("cannot be dropped because some objects depend")
+        // `DROP INDEX` on a PK/UNIQUE/FK backing index, worded the way
+        // PostgreSQL words it ("cannot drop index … because constraint …
+        // requires it"). Same class, same SQLSTATE.
+        || lower.contains("because constraint")
+    {
         sqlstate::DEPENDENT_OBJECTS_STILL_EXIST // 2BP01
     } else if lower.contains("role") && (lower.contains("is reserved") || lower.contains("built-in role")) {
         sqlstate::INSUFFICIENT_PRIVILEGE // 42501
@@ -3197,6 +3259,18 @@ fn sqlstate_for_query_execution_message(message: &str) -> &'static str {
         sqlstate::UNDEFINED_FUNCTION // 42883
     } else if lower.contains("column") && (not_found || lower.contains("unknown")) {
         sqlstate::UNDEFINED_COLUMN // 42703
+    } else if message_names_an_index(&lower) && lower.contains("already exists") {
+        // `ART index 'x' already exists` (`create_art_secondary_index`),
+        // `Index 'x' already exists` (the HNSW branch of CREATE INDEX).
+        sqlstate::DUPLICATE_OBJECT // 42710
+    } else if message_names_an_index(&lower) && not_found {
+        // `index "i" does not exist` (`ddl::handle_drop_index`), and
+        // `VectorIndexManager`'s `Index 'x' not found`. These two arms sit
+        // BEFORE the table/relation rules so an index error can never be
+        // reported as 42P01 undefined_table, and AFTER the function/column
+        // rules because a message naming both is better classified by the
+        // column it names.
+        sqlstate::UNDEFINED_OBJECT // 42704
     } else if (lower.contains("table") || lower.contains("relation")) && lower.contains("already exists") {
         sqlstate::DUPLICATE_TABLE // 42P07
     } else if (lower.contains("table") || lower.contains("relation")) && not_found {

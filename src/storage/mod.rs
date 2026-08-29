@@ -186,6 +186,9 @@ pub use lockfree::{
 
 // Per-column storage optimization exports
 pub use catalog::PersistedIndexDefinition;
+// The ONE index-type → owning-structure classifier, shared by CREATE INDEX,
+// DROP INDEX and the open-time rebuild so the mapping cannot drift again.
+pub use catalog::{index_family, IndexFamily};
 pub use catalog::{PersistedSeqState, PersistedSequence, DEFAULT_SEQUENCE_CACHE};
 // Role / ACL catalog (HC4 storage slice). STORED AND INTROSPECTABLE ONLY —
 // nothing in the engine enforces a privilege; see `AclRecord`'s doc comment.
