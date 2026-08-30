@@ -453,7 +453,7 @@ All PostgreSQL types plus MySQL type aliases (automatically translated):
 - **Backup/Restore**: Compressed dumps (zstd/gzip/brotli)
 - **Import/Export**: CSV, JSON, JSONL, Parquet, Arrow, SQL
 - **Audit logging**: Tamper-proof trail (SHA-256 checksums)
-- **Encryption**: AES-256-GCM TDE, FIPS 140-3 mode
+- **Encryption**: AES-256-GCM at rest, FIPS 140-3 mode — see [what is and isn't encrypted](#encryption-at-rest) before relying on it
 - **Unix domain socket listeners** for both PostgreSQL (`--pg-socket-dir /tmp`) and MySQL (`--mysql-socket /tmp/heliosdb.sock`) — PHP `mysqli` / WordPress embedded-mode and libpq defaults work out of the box
 
 ## Architecture
@@ -467,6 +467,40 @@ All PostgreSQL types plus MySQL type aliases (automatically translated):
 | Wire protocols | PostgreSQL v3, MySQL v10 |
 | HTTP server | Axum |
 | Encryption | AES-256-GCM, AWS-LC FIPS |
+
+## Encryption at rest
+
+Set `[encryption] enabled = true` (off by default) and supply a key via
+`[encryption.key_source]`. Values are sealed with AES-256-GCM.
+
+**Encrypted.** Every row image written through any SQL, wire-protocol or library route — the
+live row, its MVCC version history, row-id counters, the logical WAL entries that carry those
+rows, branch row overlays, materialized-view delta records, the catalog (table schemas, index
+definitions, sequences, roles and ACLs) and durable index snapshots. This holds on every write
+route: autocommit, batch/`COPY`, explicit and session transactions, WAL replay, `RENAME TABLE`
+and `MERGE BRANCH`.
+
+**Not encrypted — read this before relying on it:**
+
+| Not sealed | Why it matters |
+|---|---|
+| **RocksDB keys** | Table names, column names, row ids, timestamps and branch ids are visible on disk. Only *values* are sealed |
+| **Column sidecars for non-default `STORAGE` modes** (`col:`, `colz:`, `colp:`, `dict:`, `cas:`) | For a column declared `STORAGE COLUMNAR`, `DICTIONARY` or `CONTENT_ADDRESSED`, the row holds only a reference and the payload lives in a sidecar in the clear. With `time_travel` on (the default) the sealed version copy still holds the value; with time travel **off** there is no sealed copy anywhere |
+| **HNSW graph snapshots** under `<data_dir>/hnsw_snapshots/` | Plain files outside RocksDB containing raw vectors |
+| **Backup dumps** (`[dump]`, `--dump-on-shutdown`, `--dump-schedule`) | Written unencrypted; protect the dump directory separately |
+| **Data written before enabling encryption** | Existing values are read as-is and never rewritten. Enabling encryption seals *new* writes; it does not retroactively seal an existing database |
+| **The replication link** | Rows are shipped to standbys in the clear. Encryption at rest says nothing about the wire — use TLS |
+
+**Wrong-key protection.** A sentinel is sealed at first open and verified strictly on every
+subsequent open, so a wrong or rotated key is refused up front rather than silently yielding
+unreadable rows. Opening an encrypted directory with encryption *disabled* is refused for the
+same reason. A pre-existing database without a sentinel gains one only after the configured key
+is shown to open data that is already there — an ambiguous database is refused rather than
+stamped with a key that might be wrong.
+
+**Key rotation is not implemented.** AES-256-GCM here uses a random 96-bit nonce under a single
+static key; NIST SP 800-38D caps random-nonce GCM at 2^32 invocations per key. High-volume
+deployments should track write volume against that bound.
 
 ## High Availability
 

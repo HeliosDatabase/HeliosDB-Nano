@@ -148,14 +148,67 @@ snapshot_schema_evolution = "null_pad"
 # ENCRYPTION CONFIGURATION
 # ============================================================================
 [encryption]
-# Enable encryption at rest
+# Enable encryption at rest (AES-256-GCM on stored VALUES).
+#
+# Sealed: row images, MVCC version history, row-id counters, logical-WAL
+# entries, branch row overlays, materialized-view deltas, the catalog and
+# durable index snapshots — on every write route.
+#
+# NOT sealed: RocksDB KEYS (table/column names, row ids and timestamps stay
+# visible); the column sidecars used by non-default `STORAGE` modes
+# (COLUMNAR / DICTIONARY / CONTENT_ADDRESSED), whose payloads live outside the
+# row; HNSW graph snapshot files under <data_dir>/hnsw_snapshots/; backup dumps
+# written by [dump]; and the replication link, which ships rows in the clear
+# (use TLS). See the "Encryption at rest" section of the README.
+#
+# Enabling this on an EXISTING database seals new writes only; data already on
+# disk is read as-is and is never rewritten.
+#
+# Once enabled, the key is checked at every open against a sealed sentinel: a
+# wrong or rotated key is refused rather than silently returning unreadable
+# rows, and an encrypted directory cannot be opened with encryption disabled.
+# Key ROTATION is not implemented — see the note on the GCM nonce budget below.
 enabled = false
 
 # Encryption algorithm (currently only AES-256-GCM supported)
 algorithm = "Aes256Gcm"
 
-# Key rotation interval in days
+# Key rotation interval in days.
+#
+# NOT IMPLEMENTED IN THIS BUILD. The value is parsed and then read by nothing:
+# no timer, no re-key, no dual-key read path. Re-keying today means dumping the
+# database and restoring it under a new key. Left in place because removing it
+# would break existing config files.
+#
+# NONCE BUDGET, which is the reason rotation matters. AES-256-GCM is used here
+# with a random 96-bit nonce under one static key. NIST SP 800-38D §8.3 caps
+# random-nonce GCM at 2^32 invocations per key before the collision probability
+# stops being negligible. Every sealed value costs one invocation, so a
+# write-heavy deployment should track its cumulative write count against that
+# bound and re-key (dump/restore) before approaching it.
 rotation_interval_days = 90
+
+# ---------------------------------------------------------------------------
+# PER-KEY INVOCATION LIMIT — read this before running encryption at rest on a
+# high-write workload.
+#
+# Every encrypted value gets a fresh, fully RANDOM 96-bit nonce under one static
+# key. NIST SP 800-38D section 8.3 caps random-nonce AES-GCM at 2^32 (~4.3
+# billion) invocations per key: past that the birthday bound makes a nonce
+# COLLISION likely, and a GCM nonce collision leaks the XOR of the two
+# plaintexts and compromises the authentication subkey.
+#
+# Count invocations, not rows. Roughly, per row: 1 for the row image (its MVCC
+# version twin reuses the same sealed bytes), +1 for an UPDATE's preserved
+# pre-image, +1 per logical-WAL entry (storage.wal_enabled, on by default), and
+# 1 per row-counter flush (every 64 inserts). A database sustaining 10,000 row
+# writes per second reaches 2^32 in roughly five days.
+#
+# There is no automatic rotation to fall back on (see rotation_interval_days
+# above), so on a workload of that size plan a periodic dump-and-restore under a
+# fresh key, or keep encryption at rest scoped to a database that stays well
+# under the limit.
+# ---------------------------------------------------------------------------
 
 # Key source configuration
 # Option 1: Environment variable

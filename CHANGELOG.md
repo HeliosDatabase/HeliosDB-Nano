@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.21.0] - 2026-08-30
+
+### SECURITY — encryption at rest now covers row data. **Upgrade if you use `[encryption] enabled = true`.**
+
+**Through 4.20.0, enabling encryption did not encrypt the rows written by SQL.** Encryption was
+applied per code path rather than at the storage boundary: `StorageEngine::put` sealed values,
+but the transaction commit batch, the default single-row autocommit `INSERT`, the batch/`COPY`
+path, every MVCC version copy, branch row overlays and materialized-view delta records all wrote
+straight to RocksDB with no key manager in scope. A row inserted through ordinary SQL was stored
+in the clear, and because materialized-view deltas carry full tuples, a `DELETE` left a complete
+plaintext image of the removed row behind. The affected data is whatever was written on an
+encryption-enabled database by an affected version.
+
+**What to do.** Upgrading seals *new* writes; it does not retroactively seal data already on
+disk. To encrypt an existing database fully, dump and restore it under 4.21.0. To check exposure,
+inspect the data directory for known plaintext values.
+
+Encryption now happens at one boundary (`src/storage/tde.rs`) — `crypto::encrypt` and
+`crypto::decrypt` have no call sites outside it, so the answer to "is this value sealed?" no
+longer depends on which function wrote it. Sealed: row images, MVCC version history, row-id
+counters, logical-WAL entries, branch overlays, materialized-view deltas, the catalog and durable
+index snapshots, on every write route. **Still not sealed, deliberately and now documented:**
+RocksDB *keys* (table and column names, row ids, timestamps); the column sidecars used by
+non-default `STORAGE` modes; HNSW graph snapshot files; backup dumps; and the replication link.
+See the README's "Encryption at rest" for the full table.
+
+**Reads are tolerant, which is what makes the upgrade safe.** A stored value may be ciphertext or
+plaintext and nothing on disk distinguishes them, so every read attempts decryption and falls back
+to the raw bytes only on an AEAD authentication failure. A false accept would require forging a
+GCM tag (2^-128). Existing databases therefore keep reading correctly while new writes are sealed.
+
+**Wrong-key protection, which tolerant reads would otherwise have removed.** A sentinel is sealed
+at `meta:tde:keycheck` and verified at every open with a strict decrypt: a wrong or rotated key is
+now refused up front instead of silently serving unreadable bytes, and an encrypted directory
+cannot be opened with encryption disabled. A pre-existing database gains a sentinel only after the
+configured key is shown to open data already present — an ambiguous database is refused rather
+than stamped with a key that may be wrong.
+
+**Not implemented:** key rotation. AES-256-GCM here uses a random 96-bit nonce under one static
+key; NIST SP 800-38D caps that at 2^32 invocations per key, and every sealed value costs one.
+`[encryption] rotation_interval_days` remains inert and is documented as such.
+
 ### Fixed — **on an encrypted (TDE) data directory, every `CREATE INDEX` index silently disappeared at every restart**
 
 **Read this if you run HeliosDB Nano with `[encryption] enabled = true`.** This is a

@@ -3411,7 +3411,7 @@ impl EmbeddedDatabase {
     /// is what makes the drop agree with the registry's identity rule. DROP of a
     /// routine is rare, so the scan is not on any hot path.
     fn delete_routine_meta(&self, prefix: &str, name: &str) -> Result<()> {
-        for (suffix, _blob) in self.storage.meta_blobs_with_prefix(prefix) {
+        for (suffix, _blob) in self.storage.meta_blobs_with_prefix(prefix)? {
             if suffix.eq_ignore_ascii_case(name) {
                 self.storage.delete(&Self::routine_meta_key(prefix, &suffix))?;
             }
@@ -3902,7 +3902,7 @@ impl EmbeddedDatabase {
     /// not stop the database from opening. The affected routine then reports
     /// `does not exist` when called, which is loud at the point of use.
     fn install_routine_runtime(self) -> Result<Self> {
-        for (name, blob) in self.storage.meta_blobs_with_prefix(Self::FUNCTION_META_PREFIX) {
+        for (name, blob) in self.storage.meta_blobs_with_prefix(Self::FUNCTION_META_PREFIX)? {
             match bincode::deserialize::<sql::StoredFunction>(&blob) {
                 Ok(func) => {
                     if let Err(e) = self.function_registry.load_function(func) {
@@ -3912,7 +3912,7 @@ impl EmbeddedDatabase {
                 Err(e) => tracing::warn!("persisted function '{}' is unreadable and was skipped: {}", name, e),
             }
         }
-        for (name, blob) in self.storage.meta_blobs_with_prefix(Self::PROCEDURE_META_PREFIX) {
+        for (name, blob) in self.storage.meta_blobs_with_prefix(Self::PROCEDURE_META_PREFIX)? {
             match bincode::deserialize::<sql::StoredProcedure>(&blob) {
                 Ok(proc) => {
                     if let Err(e) = self.function_registry.load_procedure(proc) {
@@ -16165,6 +16165,9 @@ impl EmbeddedDatabase {
             self.lock_manager.clone(),
             self.dirty_tracker.clone(),
         )?;
+        // The commit batch writes `data:`/`v:`/`counter:` straight to RocksDB,
+        // so it seals them itself (see `Transaction::key_manager`).
+        txn.set_key_manager(self.storage.key_manager_arc());
         // P0#1: session transactions must honor time_travel_enabled too
         // (new_with_session defaults versioning on).
         txn.set_versioning_enabled(self.storage.time_travel_enabled());
@@ -16433,6 +16436,9 @@ impl EmbeddedDatabase {
                 self.lock_manager.clone(),
                 self.dirty_tracker.clone(),
             )?;
+            // The commit batch writes `data:`/`v:`/`counter:` straight to
+            // RocksDB, so it seals them itself (see `Transaction::key_manager`).
+            txn.set_key_manager(self.storage.key_manager_arc());
             // P0#1: session transactions must honor time_travel_enabled too.
             txn.set_versioning_enabled(self.storage.time_travel_enabled());
             txn.set_rocksdb_wal_enabled(!self.storage.config().storage.memory_only);

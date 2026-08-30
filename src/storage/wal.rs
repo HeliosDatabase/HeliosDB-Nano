@@ -3,6 +3,8 @@
 //! Provides durability guarantees through write-ahead logging.
 //! Uses RocksDB's WriteBatch for atomic operations and built-in WAL support.
 
+use super::tde;
+use crate::crypto::KeyManager;
 use crate::{Error, Result};
 use parking_lot::Mutex;
 use rocksdb::{WriteBatch, WriteOptions, DB};
@@ -185,6 +187,45 @@ impl WalEntry {
     }
 }
 
+// ==================== `wal:entries:` value codec ====================
+//
+// An `Insert`/`Update` operation carries the row tuple itself, so a WAL entry
+// is a second full image of a row, living in the same RocksDB store as the
+// `data:` key it describes. Its stored form therefore follows the same rule
+// every other row keyspace does (`src/storage/tde.rs`), keyed on the storage
+// key rather than on which function wrote it.
+//
+// These two functions are the ONLY place `wal:entries:` bytes cross the
+// storage boundary in either direction: every `append*` path seals through
+// `stored_entry_bytes`, and every reader — crash replay, integrity
+// verification, truncation, retention cleanup, metrics — opens through
+// `decode_entry`. Free functions rather than methods because the group-commit
+// thread builds its batch off the `WriteAheadLog`.
+//
+// The HA/CDC broadcast path is deliberately untouched: `broadcast_after_append`
+// and `broadcast_after_batch` are handed the in-memory `&WalOperation`, not the
+// stored bytes, so a standby receives exactly what it received before and seals
+// what it applies under its OWN key on its own write path. What one node has on
+// disk is not what another node should have on disk.
+
+/// Seal a WAL entry into the bytes stored at `wal:entries:{lsn}`.
+///
+/// `Vec` in, `Vec` out: with encryption disabled `tde::seal_owned` hands back
+/// the serialized buffer UNMOVED, so the default configuration pays one
+/// `Option` check and no copy.
+fn stored_entry_bytes(key_manager: Option<&KeyManager>, entry: &WalEntry) -> Result<Vec<u8>> {
+    tde::seal_owned(key_manager, entry.serialize()?)
+}
+
+/// Open the bytes stored at `wal:entries:{lsn}` back into an entry.
+///
+/// Goes through the same tolerant rule as every other stored value, so a WAL
+/// written before this keyspace was sealed still replays: an entry that is not
+/// ciphertext under the configured key is deserialized as it stands.
+fn decode_entry(key_manager: Option<&KeyManager>, storage_key: &[u8], raw: &[u8]) -> Result<WalEntry> {
+    WalEntry::deserialize(&tde::open_ref(key_manager, storage_key, raw)?)
+}
+
 /// WAL synchronization mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WalSyncMode {
@@ -322,14 +363,36 @@ pub struct WriteAheadLog {
     commit_thread: Option<Arc<Mutex<Option<JoinHandle<()>>>>>,
     /// Batch timeout for group commit (default: 10ms)
     batch_timeout: Duration,
+    /// The storage boundary's key manager, or `None` when encryption is
+    /// disabled. `wal:entries:` values are row images and are sealed with it;
+    /// see the value codec above.
+    key_manager: Option<Arc<KeyManager>>,
 }
 
 impl WriteAheadLog {
+    /// Open or create a WAL with no encryption key.
+    ///
+    /// Thin wrapper over [`WriteAheadLog::open_with_key_manager`]; every caller
+    /// that has a key manager must use that one instead, so that the WAL agrees
+    /// with the rest of the storage boundary about the stored form.
+    pub fn open(db: Arc<DB>, sync_mode: WalSyncMode) -> Result<Self> {
+        Self::open_with_key_manager(db, sync_mode, None)
+    }
+
     /// Open or create a WAL
     ///
     /// The WAL uses RocksDB's built-in WAL functionality. This implementation
     /// adds logical WAL entries on top of RocksDB's physical WAL.
-    pub fn open(db: Arc<DB>, sync_mode: WalSyncMode) -> Result<Self> {
+    ///
+    /// `key_manager` is taken at construction rather than through a later
+    /// setter because the group-commit thread is spawned here and captures it:
+    /// a key installed after the spawn would leave that thread writing in a
+    /// different form from every other append path.
+    pub fn open_with_key_manager(
+        db: Arc<DB>,
+        sync_mode: WalSyncMode,
+        key_manager: Option<Arc<KeyManager>>,
+    ) -> Result<Self> {
         // Configure write options based on sync mode
         let mut write_opts = WriteOptions::default();
         match sync_mode {
@@ -371,6 +434,7 @@ impl WriteAheadLog {
             commit_queue: commit_queue.clone(),
             commit_thread: commit_thread.clone(),
             batch_timeout,
+            key_manager,
         };
 
         // Start group commit thread if in GroupCommit mode
@@ -379,10 +443,11 @@ impl WriteAheadLog {
                 let db_clone = Arc::clone(&db);
                 let current_lsn_clone = Arc::clone(&wal.current_lsn);
                 let batch_timeout = wal.batch_timeout;
+                let key_manager_clone = wal.key_manager.clone();
 
                 let handle = thread::spawn(move || {
                     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        Self::group_commit_loop(db_clone, queue, current_lsn_clone, batch_timeout);
+                        Self::group_commit_loop(db_clone, queue, current_lsn_clone, batch_timeout, key_manager_clone);
                     })) {
                         Ok(()) => {}
                         Err(panic_info) => {
@@ -453,8 +518,8 @@ impl WriteAheadLog {
         let lsn = self.next_lsn();
         let entry = WalEntry::new(lsn, operation);
 
-        // Serialize the entry
-        let data = entry.serialize()?;
+        // Serialize and seal the entry (see the value codec above).
+        let data = stored_entry_bytes(self.key_manager.as_deref(), &entry)?;
 
         // Create a batch for atomic write
         let mut batch = WriteBatch::default();
@@ -524,7 +589,7 @@ impl WriteAheadLog {
     pub fn append_nosync(&self, operation: WalOperation) -> Result<u64> {
         let lsn = self.next_lsn();
         let entry = WalEntry::new(lsn, operation);
-        let data = entry.serialize()?;
+        let data = stored_entry_bytes(self.key_manager.as_deref(), &entry)?;
 
         let mut batch = WriteBatch::default();
         let key = format!("wal:entries:{:020}", lsn);
@@ -587,7 +652,7 @@ impl WriteAheadLog {
         for operation in operations {
             let lsn = self.next_lsn();
             let entry = WalEntry::new(lsn, operation);
-            let data = entry.serialize()?;
+            let data = stored_entry_bytes(self.key_manager.as_deref(), &entry)?;
             let key = format!("wal:entries:{:020}", lsn);
             batch.put(key.as_bytes(), &data);
             highest_lsn = lsn;
@@ -730,7 +795,7 @@ impl WriteAheadLog {
             // keep the good prefix instead of aborting the entire recovery
             // (which the old `?` did, discarding every recovered entry over one
             // bad tail record).
-            match WalEntry::deserialize(&value) {
+            match decode_entry(self.key_manager.as_deref(), &key, &value) {
                 Ok(entry) => {
                     debug!("Replaying WAL entry with LSN {}", entry.lsn);
                     entries.push(entry);
@@ -771,7 +836,7 @@ impl WriteAheadLog {
             }
 
             // Parse LSN from entry
-            let entry = WalEntry::deserialize(&value)?;
+            let entry = decode_entry(self.key_manager.as_deref(), &key, &value)?;
             if entry.lsn <= up_to_lsn {
                 batch.delete(&key);
                 deleted_count += 1;
@@ -838,6 +903,7 @@ impl WriteAheadLog {
         queue: Arc<Mutex<VecDeque<PendingWrite>>>,
         _current_lsn: Arc<AtomicU64>,
         batch_timeout: Duration,
+        key_manager: Option<Arc<KeyManager>>,
     ) {
         info!("Group commit thread started (batch timeout: {:?})", batch_timeout);
 
@@ -868,8 +934,10 @@ impl WriteAheadLog {
                 let lsn = write.entry.lsn;
                 last_lsn = last_lsn.max(lsn);
 
-                // Serialize entry
-                match write.entry.serialize() {
+                // Serialize and seal the entry — the same codec every other
+                // append path uses, so a group-committed entry lands in the
+                // same stored form as a directly appended one.
+                match stored_entry_bytes(key_manager.as_deref(), &write.entry) {
                     Ok(data) => {
                         let key = format!("wal:entries:{:020}", lsn);
                         batch.put(key.as_bytes(), &data);
@@ -943,7 +1011,7 @@ impl WriteAheadLog {
                     entry_count += 1;
 
                     // Try to deserialize
-                    match WalEntry::deserialize(&value) {
+                    match decode_entry(self.key_manager.as_deref(), &key, &value) {
                         Ok(entry) => {
                             // Check for duplicate LSN
                             if let Some(count) = lsn_map.get_mut(&entry.lsn) {
@@ -1039,7 +1107,7 @@ impl WriteAheadLog {
                         break;
                     }
 
-                    match WalEntry::deserialize(&value) {
+                    match decode_entry(self.key_manager.as_deref(), &key, &value) {
                         Ok(entry) => {
                             if entry.lsn < from_lsn {
                                 stats.operations_skipped += 1;
@@ -1151,7 +1219,7 @@ impl WriteAheadLog {
 
                     total_entries += 1;
 
-                    match WalEntry::deserialize(&value) {
+                    match decode_entry(self.key_manager.as_deref(), &key, &value) {
                         Ok(entry) => {
                             if stats.oldest_lsn == 0 {
                                 stats.oldest_lsn = entry.lsn;
@@ -1233,7 +1301,7 @@ impl WriteAheadLog {
                     metrics.entry_count += 1;
                     metrics.size_bytes += key.len() as u64 + value.len() as u64;
 
-                    if let Ok(entry) = WalEntry::deserialize(&value) {
+                    if let Ok(entry) = decode_entry(self.key_manager.as_deref(), &key, &value) {
                         if metrics.oldest_lsn == 0 {
                             metrics.oldest_lsn = entry.lsn;
                             metrics.oldest_timestamp = entry.timestamp;

@@ -31,6 +31,7 @@
 
 #![allow(deprecated)]
 
+use crate::crypto::KeyManager;
 use crate::{Error, Result, Tuple};
 use chrono::{DateTime, Utc};
 use rocksdb::DB;
@@ -266,17 +267,43 @@ pub struct DeltaTracker {
     db: Arc<DB>,
     /// Current delta sequence number
     current_delta_id: parking_lot::RwLock<u64>,
+    /// TDE key manager, mirroring `StorageEngine::key_manager`.
+    ///
+    /// This type writes `delta:` records straight to the `Arc<DB>` it holds, so
+    /// `StorageEngine::put` is never on its path and the storage boundary's rule
+    /// has to be applied here. A `Delta` carries whole `Tuple`s — including the
+    /// contents of a row a `DELETE` has just removed — so `delta:` is one of the
+    /// keyspaces `storage::tde::is_row_value_key` seals.
+    ///
+    /// `None` (the default configuration) makes every use a single `Option`
+    /// check with no allocation and no copy.
+    key_manager: Option<Arc<KeyManager>>,
 }
 
 impl DeltaTracker {
-    /// Create a new delta tracker
+    /// Create a new delta tracker with no key manager.
+    ///
+    /// Delegates to [`DeltaTracker::new_with_key_manager`]; both engine
+    /// constructors use that one, so this is the shape a caller outside the
+    /// engine gets.
     pub fn new(db: Arc<DB>) -> Result<Self> {
+        Self::new_with_key_manager(db, None)
+    }
+
+    /// Create a delta tracker that seals its records under `key_manager`.
+    ///
+    /// The key is taken at construction rather than through a setter so that a
+    /// tracker can never be published to the engine in a state where it would
+    /// write `delta:` records in a different form from the one its own readers
+    /// expect.
+    pub fn new_with_key_manager(db: Arc<DB>, key_manager: Option<Arc<KeyManager>>) -> Result<Self> {
         // Load the last delta ID from storage
         let last_delta_id = Self::load_last_delta_id(&db)?;
 
         Ok(Self {
             db,
             current_delta_id: parking_lot::RwLock::new(last_delta_id),
+            key_manager,
         })
     }
 
@@ -343,8 +370,14 @@ impl DeltaTracker {
         let value =
             bincode::serialize(&delta).map_err(|e| Error::storage(format!("Failed to serialize delta: {}", e)))?;
 
+        // THE STORAGE BOUNDARY for this keyspace. A `Delta` is a full row image
+        // (see the `delta:` entry in `storage::tde::is_row_value_key`), so it is
+        // sealed by the same key-driven rule as `data:` — and `Cow::Borrowed`,
+        // i.e. byte-for-byte the call below made before, when encryption is off.
+        let stored = super::tde::seal_row_value(self.key_manager.as_deref(), key.as_bytes(), &value)?;
+
         self.db
-            .put(key.as_bytes(), &value)
+            .put(key.as_bytes(), stored.as_ref())
             .map_err(|e| Error::storage(format!("Failed to store delta: {}", e)))?;
 
         // Update last delta ID
@@ -402,8 +435,9 @@ impl DeltaTracker {
                     break;
                 }
 
-                // Deserialize delta
-                let delta: Delta = bincode::deserialize(&value)
+                // Decode through the same rule `record_delta` seals with.
+                let stored = super::tde::open_ref(self.key_manager.as_deref(), &key, &value)?;
+                let delta: Delta = bincode::deserialize(&stored)
                     .map_err(|e| Error::storage(format!("Failed to deserialize delta: {}", e)))?;
 
                 // Filter by timestamp
@@ -442,8 +476,9 @@ impl DeltaTracker {
                     break;
                 }
 
-                // Deserialize delta to check timestamp
-                let delta: Delta = bincode::deserialize(&value)
+                // Decode through the same rule `record_delta` seals with.
+                let stored = super::tde::open_ref(self.key_manager.as_deref(), &key, &value)?;
+                let delta: Delta = bincode::deserialize(&stored)
                     .map_err(|e| Error::storage(format!("Failed to deserialize delta: {}", e)))?;
 
                 let since_system_time: SystemTime = since.into();
@@ -477,8 +512,9 @@ impl DeltaTracker {
                 break;
             }
 
-            // Deserialize delta to check timestamp
-            let delta: Delta = bincode::deserialize(&value)
+            // Decode through the same rule `record_delta` seals with.
+            let stored = super::tde::open_ref(self.key_manager.as_deref(), &key, &value)?;
+            let delta: Delta = bincode::deserialize(&stored)
                 .map_err(|e| Error::storage(format!("Failed to deserialize delta: {}", e)))?;
 
             let before_system_time: SystemTime = before.into();
@@ -583,5 +619,46 @@ mod tests {
             .expect("Failed to count");
 
         assert_eq!(count, 2);
+    }
+
+    /// A `Delta` carries the whole row, including the row a DELETE removed, so
+    /// `delta:` is a sealed keyspace. Asserted on the STORED bytes, because a
+    /// record-then-read-back round trip passes whether or not anything was
+    /// sealed.
+    #[test]
+    fn delta_records_are_sealed_on_disk_and_still_read_back() {
+        let config = Config::in_memory();
+        let engine = StorageEngine::open_in_memory(&config).expect("Failed to open storage");
+        let km = Arc::new(crate::crypto::KeyManager::generate_random());
+        let tracker = DeltaTracker::new_with_key_manager(Arc::clone(&engine.db), Some(Arc::clone(&km)))
+            .expect("Failed to create tracker");
+
+        const SECRET: &str = "QZX-MV-DELTA-DELETED-ROW-5501";
+        let tuple = Tuple::new(vec![Value::Int4(1), Value::String(SECRET.to_string())]);
+        tracker.record_delete("users", 1, tuple.clone()).expect("record delete");
+
+        // The deleted row's contents must not be on disk in the clear.
+        let stored = engine
+            .db
+            .get(b"delta:users:00000000000000000001")
+            .expect("get")
+            .expect("the delta record must exist");
+        assert!(
+            !stored.windows(SECRET.len()).any(|w| w == SECRET.as_bytes()),
+            "*** ROW DATA IN THE CLEAR *** the deleted row's contents were found verbatim in the \
+             stored `delta:` record"
+        );
+
+        // …and the tracker still reads its own records.
+        let deltas = tracker
+            .get_deltas_since(&["users".to_string()], Utc::now() - chrono::Duration::seconds(60))
+            .expect("read back");
+        let set = deltas.get("users").expect("a delta set for the table");
+        assert_eq!(set.len(), 1);
+        let recorded = set.deltas.first().expect("one delta");
+        assert!(
+            matches!(&recorded.operation, DeltaOperation::Delete { tuple: t } if t == &tuple),
+            "the sealed record must decode back to the row it was written from"
+        );
     }
 }

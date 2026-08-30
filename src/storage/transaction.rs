@@ -8,8 +8,10 @@
 use super::conflict::WriteConflictRegistry;
 use super::dirty_tracker::DirtyTracker;
 use super::lock_manager::{LockGuard, LockManager, LockType};
+use super::tde;
 use super::time_travel::SnapshotManager;
 use super::{Key, Snapshot, SnapshotId, WalOperation, WriteAheadLog};
+use crate::crypto::KeyManager;
 use crate::session::{IsolationLevel, SessionId};
 use crate::{Error, Result, Tuple};
 use dashmap::{DashMap, DashSet};
@@ -182,6 +184,18 @@ pub struct Transaction {
     /// snapshot via `scan_table_at_snapshot`), so the version GC never
     /// reclaims a version an open transaction may still read.
     gc_pin_id: Option<u64>,
+    /// TDE key manager, mirroring `StorageEngine::key_manager`.
+    ///
+    /// This type holds a raw `Arc<DB>` and applies its commit `WriteBatch`
+    /// itself, so `StorageEngine::put` — historically the only place that
+    /// encrypted — is never on this path. Without this field the on-disk form
+    /// of a row would depend on WHICH code route wrote it. Reads have the
+    /// matching obligation: `read_at_version`'s raw `db.get` fallbacks decode
+    /// through the same rule.
+    ///
+    /// `None` (the default configuration) makes every use a single `Option`
+    /// check with no allocation and no copy.
+    key_manager: Option<Arc<KeyManager>>,
 }
 
 impl Drop for Transaction {
@@ -251,7 +265,28 @@ impl Transaction {
             conflict_registry: None,
             conflict_validation: false,
             gc_pin_id: None,
+            key_manager: None,
         })
+    }
+
+    /// Attach the engine's TDE key manager so the commit batch seals the row
+    /// values it writes (see the `key_manager` field docs).
+    ///
+    /// MUST be called for every transaction built against an encryption-enabled
+    /// engine. A transaction without it writes row data in the clear, which is
+    /// exactly the per-write-route encryption this field exists to remove; the
+    /// five construction sites in the crate (`StorageEngine::begin_transaction`,
+    /// `begin_autocommit_transaction`, the two `new_with_session` sites in
+    /// `lib.rs`, and `BranchTransaction::new`) all call it.
+    pub fn set_key_manager(&mut self, key_manager: Option<Arc<KeyManager>>) {
+        self.key_manager = key_manager;
+    }
+
+    /// Decode a value read straight from RocksDB by this transaction, applying
+    /// the same tolerant rule the engine uses. `Cow::Borrowed`/unmoved bytes
+    /// when encryption is off.
+    pub(crate) fn decode_stored(&self, storage_key: &[u8], raw: Vec<u8>) -> Result<Vec<u8>> {
+        tde::open_owned(self.key_manager.as_deref(), storage_key, raw)
     }
 
     /// Enable/disable MVCC version-history emission at commit (see field docs).
@@ -371,6 +406,7 @@ impl Transaction {
             conflict_registry: None,
             conflict_validation: false,
             gc_pin_id: None,
+            key_manager: None,
         })
     }
 
@@ -441,11 +477,14 @@ impl Transaction {
         // Fast path: check prefix without UTF-8 conversion
         const DATA_PREFIX: &[u8] = b"data:";
         if !key.starts_with(DATA_PREFIX) {
-            // Not a versioned data key, fallback to simple read
-            return self
-                .db
-                .get(key)
-                .map_err(|e| Error::storage(format!("Transaction get failed: {}", e)));
+            // Not a versioned data key, fallback to simple read.
+            //
+            // Every raw `db.get` in this function decodes through the shared
+            // rule. This path reaches `counter:` and `meta:` keys, which
+            // `put_internal` has always sealed, so before this it could hand a
+            // caller ciphertext where it expected a value; it now also reaches
+            // `data:` rows this transaction's own commit batch sealed.
+            return self.read_raw_decoded(key);
         }
 
         // Parse key with minimal allocations
@@ -459,10 +498,7 @@ impl Transaction {
             Some(pos) => pos,
             None => {
                 // Invalid format, fallback to simple read
-                return self
-                    .db
-                    .get(key)
-                    .map_err(|e| Error::storage(format!("Transaction get failed: {}", e)));
+                return self.read_raw_decoded(key);
             }
         };
 
@@ -474,10 +510,7 @@ impl Transaction {
             Ok(id) => id,
             Err(_) => {
                 // Invalid row ID format, fallback to simple read
-                return self
-                    .db
-                    .get(key)
-                    .map_err(|e| Error::storage(format!("Transaction get failed: {}", e)));
+                return self.read_raw_decoded(key);
             }
         };
 
@@ -486,15 +519,27 @@ impl Transaction {
         // read the current committed `data:` value directly (mirrors the commit
         // write-gate and the engine's scan_table_at_snapshot gate).
         if !self.versioning_enabled {
-            return self
-                .db
-                .get(key)
-                .map_err(|e| Error::storage(format!("Transaction get failed: {}", e)));
+            return self.read_raw_decoded(key);
         }
 
         // Use snapshot manager to read the versioned value
-        // This implements the core MVCC logic: find the latest version <= snapshot_ts
+        // This implements the core MVCC logic: find the latest version <= snapshot_ts.
+        // `read_at_snapshot` decodes with the same rule before returning, so
+        // this arm needs no decode of its own.
         self.snapshot_manager.read_at_snapshot(table_name, row_id, snapshot_ts)
+    }
+
+    /// Read a key straight from RocksDB and decode it through the shared
+    /// storage-boundary rule.
+    ///
+    /// Zero cost when encryption is disabled: one `Option` check, and the
+    /// fetched `Vec<u8>` is returned unmoved.
+    fn read_raw_decoded(&self, key: &Key) -> Result<Option<Vec<u8>>> {
+        let raw = self
+            .db
+            .get(key)
+            .map_err(|e| Error::storage(format!("Transaction get failed: {}", e)))?;
+        tde::open_opt(self.key_manager.as_deref(), key, raw)
     }
 
     /// Write a value
@@ -788,8 +833,9 @@ impl Transaction {
                 if write_set_has_entries && self.write_set.contains_key(key) {
                     continue;
                 }
-                Self::put_versioned_batch(
+                if let Err(e) = Self::put_versioned_batch(
                     &mut batch,
+                    self.key_manager.as_deref(),
                     key,
                     val,
                     self.versioning_enabled,
@@ -799,7 +845,16 @@ impl Transaction {
                     &commit_ts_bytes,
                     &mut version_key_buf,
                     &mut version_index_key_buf,
-                );
+                ) {
+                    // Sealing a row value can fail only if AES-GCM itself
+                    // fails. It must abort the commit, never fall back to
+                    // writing the row in the clear — but it must NOT `?` out
+                    // past the in-flight bookkeeping (see the counter loop
+                    // below for the same hazard). The `insert_log` read guard
+                    // is released by this return; `abort_partial_commit`
+                    // touches only the registry, the lock set and the state.
+                    return Err(self.abort_partial_commit(inflight, commit_ts, e));
+                }
             }
         }
 
@@ -851,8 +906,9 @@ impl Transaction {
             }
             match value {
                 Some(val) => {
-                    Self::put_versioned_batch(
+                    if let Err(e) = Self::put_versioned_batch(
                         &mut batch,
+                        self.key_manager.as_deref(),
                         key,
                         val,
                         self.versioning_enabled,
@@ -862,7 +918,10 @@ impl Transaction {
                         &commit_ts_bytes,
                         &mut version_key_buf,
                         &mut version_index_key_buf,
-                    );
+                    ) {
+                        // See the insert_log loop: abort, never write in the clear.
+                        return Err(self.abort_partial_commit(inflight, commit_ts, e));
+                    }
                 }
                 None => {
                     batch.delete(key);
@@ -877,23 +936,24 @@ impl Transaction {
 
         for (table_name, row_id) in self.row_counter_stages.read().iter() {
             let key = format!("counter:{}", table_name);
+            // Must NOT early-return with `?` in this loop: an announced
+            // in-flight commit that never reaches `end_commit` would stall the
+            // snapshot barrier forever — hence `abort_partial_commit`.
             let value = match bincode::serialize(row_id) {
                 Ok(value) => value,
                 Err(e) => {
-                    // Must NOT early-return with `?` here: an announced
-                    // in-flight commit that never reaches `end_commit` would
-                    // stall the snapshot barrier forever.
-                    if inflight {
-                        if let Some(registry) = &self.conflict_registry {
-                            registry.end_commit(commit_ts);
-                        }
-                    }
-                    self.acquired_locks.write().clear();
-                    self.state.store(TransactionState::Aborted.to_u8(), Ordering::Release);
-                    return Err(Error::storage(format!("Failed to serialize counter: {}", e)));
+                    let e = Error::storage(format!("Failed to serialize counter: {}", e));
+                    return Err(self.abort_partial_commit(inflight, commit_ts, e));
                 }
             };
-            batch.put(key.as_bytes(), value);
+            // `counter:` is a sealed keyspace (`put_internal` seals it on every
+            // other route), so this batch seals it too rather than making the
+            // on-disk form depend on which route flushed the counter.
+            let stored = match tde::seal(self.key_manager.as_deref(), &value) {
+                Ok(stored) => stored,
+                Err(e) => return Err(self.abort_partial_commit(inflight, commit_ts, e)),
+            };
+            batch.put(key.as_bytes(), stored.as_ref());
         }
 
         // P0 (ROADMAP_V5.md §1.8): explicit and session transactions appended
@@ -1221,8 +1281,45 @@ impl Transaction {
         Some(text[..pos].to_string())
     }
 
+    /// Abort a commit that has already announced itself in flight.
+    ///
+    /// The batch-building loops in `commit_with_timestamp` must NOT `?` out:
+    /// an announced in-flight commit that never reaches `end_commit` would
+    /// stall the snapshot barrier forever. Every early exit from those loops
+    /// goes through here so there is one copy of that unwind, not one per
+    /// failure kind. Returns the error so call sites read `return
+    /// Err(self.abort_partial_commit(..))`.
+    ///
+    /// Deliberately does not touch `insert_log` / `write_set` /
+    /// `row_counter_stages`: the callers hold guards on them.
+    fn abort_partial_commit(&self, inflight: bool, commit_ts: u64, err: Error) -> Error {
+        if inflight {
+            if let Some(registry) = &self.conflict_registry {
+                registry.end_commit(commit_ts);
+            }
+        }
+        self.acquired_locks.write().clear();
+        self.state.store(TransactionState::Aborted.to_u8(), Ordering::Release);
+        err
+    }
+
+    /// Stage one staged write into the commit batch: the `data:` row and, when
+    /// versioning is on, its `v:`/`v_idx:` history.
+    ///
+    /// THIS IS THE STORAGE BOUNDARY for every explicit transaction, every
+    /// session transaction, the params/extended-protocol DML family and every
+    /// autocommit statement that falls through to an implicit transaction. The
+    /// value is sealed HERE — once — and the same sealed bytes are used for the
+    /// `data:` row and its `v:` twin, because they are the same plaintext and
+    /// storing one ciphertext twice reveals nothing a reader of the two keys
+    /// did not already know.
+    ///
+    /// `key_manager` is `None` on the default configuration, in which case
+    /// `seal_row_value` returns the caller's slice borrowed and `batch.put` is
+    /// byte-for-byte the call this function made before it could fail at all.
     fn put_versioned_batch(
         batch: &mut rocksdb::WriteBatch,
+        key_manager: Option<&KeyManager>,
         key: &[u8],
         val: &[u8],
         versioning_enabled: bool,
@@ -1232,15 +1329,20 @@ impl Transaction {
         commit_ts_bytes: &[u8; 8],
         version_key_buf: &mut Vec<u8>,
         version_index_key_buf: &mut Vec<u8>,
-    ) {
-        batch.put(key, val);
+    ) -> Result<()> {
+        // Key-driven, not route-driven: `seal_row_value` seals `data:` (and the
+        // `v:` twin below) and leaves `bdata:`, `col:`/`colz:`/`colp:` and
+        // `meta:` staged writes verbatim, because those keyspaces are read raw
+        // by modules that own no key manager. See `storage::tde`.
+        let stored = tde::seal_row_value(key_manager, key, val)?;
+        batch.put(key, stored.as_ref());
         // W3.2: `data:` bytes for the buffered commit path (explicit txns and
         // autocommit-implicit txns). Class is the ambient scope — `other` for a
         // multi-statement txn whose writes land at COMMIT, decoupled from the
         // staging statement (documented in `W3_2_DESIGN.md`).
         if crate::write_volume::enabled() {
             crate::write_volume::add_row();
-            crate::write_volume::add(crate::write_volume::Category::Data, (key.len() + val.len()) as u64);
+            crate::write_volume::add(crate::write_volume::Category::Data, (key.len() + stored.len()) as u64);
         }
 
         // Create version history (value + reverse-ts index) for AS OF /
@@ -1252,7 +1354,7 @@ impl Transaction {
             Self::put_version_index_batch(
                 batch,
                 key,
-                val,
+                stored.as_ref(),
                 elide,
                 commit_ts_text,
                 reverse_ts_text,
@@ -1261,8 +1363,13 @@ impl Transaction {
                 version_index_key_buf,
             );
         }
+        Ok(())
     }
 
+    /// `val` is the STORED form of the row value (already sealed by
+    /// `put_versioned_batch` when encryption is on), because the `v:` twin must
+    /// hold exactly what `data:` holds — the version chain and the live row are
+    /// read through the same tolerant decode.
     fn put_version_index_batch(
         batch: &mut rocksdb::WriteBatch,
         key: &[u8],

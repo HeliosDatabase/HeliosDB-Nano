@@ -22,6 +22,7 @@ mod mvcc;
 mod prefix_decode;
 pub mod statistics;
 mod stats;
+mod tde;
 pub mod time_travel;
 mod transaction;
 mod vector_index;

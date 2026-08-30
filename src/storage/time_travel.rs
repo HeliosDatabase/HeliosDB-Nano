@@ -24,12 +24,15 @@
 //! - Transaction mapping: `txn_map:{txn_id}`
 //! - SCN mapping: `scn_map:{scn}`
 
+use super::tde;
+use crate::crypto::KeyManager;
 use crate::{Error, Result};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use lru::LruCache;
 use parking_lot::{Mutex, RwLock};
 use rocksdb::{WriteBatch, WriteOptions, DB};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -256,6 +259,18 @@ pub struct SnapshotManager {
     /// materialize-before-overwrite seek on the mutation hot path: `false` ⇒ one
     /// relaxed atomic load and skip, because no flagged row can exist.
     maybe_elided_rows: AtomicBool,
+    /// TDE key manager, mirroring `StorageEngine::key_manager`.
+    ///
+    /// This type writes `data:` and `v:` values straight to the shared
+    /// `Arc<DB>` — including the DEFAULT autocommit INSERT's only `data:`
+    /// write (`write_data_version_and_register_snapshot`) — so it must apply
+    /// the same storage-boundary rule the engine's `put` applies. Reads have
+    /// the matching obligation: `read_at_snapshot`, `read_at_snapshot_linear`
+    /// and `scan_versions_between` decode before returning.
+    ///
+    /// `None` (the default configuration) makes every use a single `Option`
+    /// check with no allocation and no copy.
+    key_manager: Option<Arc<KeyManager>>,
 }
 
 /// Snapshot cache configuration
@@ -321,6 +336,7 @@ impl SnapshotManager {
             copy_markers: crate::storage::copy_marker::CopyMarkers::new(),
             elide_latest_version: AtomicBool::new(false),
             maybe_elided_rows: AtomicBool::new(false),
+            key_manager: None,
         }
     }
 
@@ -355,6 +371,7 @@ impl SnapshotManager {
             copy_markers: crate::storage::copy_marker::CopyMarkers::new(),
             elide_latest_version: AtomicBool::new(false),
             maybe_elided_rows: AtomicBool::new(false),
+            key_manager: None,
         }
     }
 
@@ -380,7 +397,37 @@ impl SnapshotManager {
             copy_markers: crate::storage::copy_marker::CopyMarkers::new(),
             elide_latest_version: AtomicBool::new(false),
             maybe_elided_rows: AtomicBool::new(false),
+            key_manager: None,
         }
+    }
+
+    /// Attach the engine's TDE key manager so the version chain and the fast
+    /// autocommit `data:` write are sealed by the same rule `StorageEngine::put`
+    /// applies (see the `key_manager` field docs).
+    ///
+    /// Called at engine construction BEFORE the manager is wrapped in an `Arc`
+    /// and published, which is why it can take `&mut self` and why no
+    /// synchronization is needed for the field afterwards.
+    ///
+    /// MUST be called for every manager built against an encryption-enabled
+    /// engine. Without it the MVCC version chain is a plaintext copy of every
+    /// row on a database whose live rows are ciphertext.
+    pub fn set_key_manager(&mut self, key_manager: Option<Arc<KeyManager>>) {
+        self.key_manager = key_manager;
+    }
+
+    /// Seal a `data:`/`v:` value for storage. `Cow::Borrowed` — no allocation,
+    /// no copy — when encryption is disabled.
+    #[inline]
+    fn seal_stored<'a>(&self, value: &'a [u8]) -> Result<Cow<'a, [u8]>> {
+        tde::seal(self.key_manager.as_deref(), value)
+    }
+
+    /// Decode a `data:`/`v:` value this manager read straight from RocksDB.
+    /// The bytes are returned unmoved when encryption is disabled.
+    #[inline]
+    fn decode_stored_opt(&self, storage_key: &[u8], raw: Option<Vec<u8>>) -> Result<Option<Vec<u8>>> {
+        tde::open_opt(self.key_manager.as_deref(), storage_key, raw)
     }
 
     /// W3.2: wire the `storage.elide_latest_version` knob at open (called from
@@ -823,8 +870,11 @@ impl SnapshotManager {
             }
         }
 
-        // Return the best version found
-        Ok(best_version.map(|(_, value)| value))
+        // Return the best version found, decoded like every other version read.
+        // The scan above keeps only the value, so the exact key is gone by here;
+        // the placeholder keeps the real `v:` prefix because the decode rule and
+        // the plaintext-passthrough diagnostic are both keyed on the keyspace.
+        self.decode_stored_opt(b"v:<version value>", best_version.map(|(_, value)| value))
     }
 
     /// Read a versioned value at a specific snapshot (optimized with reverse index and cache)
@@ -852,8 +902,15 @@ impl SnapshotManager {
             None
         };
 
-        // Cache miss - perform database lookup
-        let result = self.read_at_snapshot_uncached(table_name, row_id, snapshot_ts)?;
+        // Cache miss - perform database lookup. `read_at_snapshot_uncached`
+        // returns the STORED bytes (`v:` or the `data:` fallback), so decode
+        // here — once, at the single point every version read funnels through —
+        // and the cache then holds plaintext, exactly as it did before values
+        // were sealed. Callers (`Transaction::get`,
+        // `StorageEngine::scan_table_at_snapshot`) bincode-deserialize the
+        // result and must never see ciphertext.
+        let stored = self.read_at_snapshot_uncached(table_name, row_id, snapshot_ts)?;
+        let result = self.decode_stored_opt(b"v:<version value>", stored)?;
 
         // Store in cache if enabled (stamped with the pre-lookup generation)
         if let Some(gen) = cache_gen {
@@ -983,10 +1040,13 @@ impl SnapshotManager {
     /// Also creates a reverse timestamp index entry for efficient lookups.
     /// Invalidates cache entries for this row.
     pub fn write_version(&self, table_name: &str, row_id: u64, timestamp: u64, value: &[u8]) -> Result<()> {
-        // Write the actual versioned data
+        // Write the actual versioned data. `v:` holds a copy of the row image,
+        // so it is sealed exactly like the `data:` row it mirrors — a plaintext
+        // version chain beside a ciphertext row would defeat the whole point.
         let key = format!("v:{}:{}:{}", table_name, row_id, timestamp);
+        let stored = self.seal_stored(value)?;
         self.db
-            .put(key.as_bytes(), value)
+            .put(key.as_bytes(), stored.as_ref())
             .map_err(|e| Error::storage(format!("Failed to write version: {}", e)))?;
 
         // Create reverse timestamp index entry
@@ -1030,6 +1090,9 @@ impl SnapshotManager {
             row_id,
             timestamp,
             value,
+            // Nothing else in this batch holds the sealed form of `value`, so
+            // the funnel seals it.
+            None,
             &metadata,
             allow_elide,
         )?;
@@ -1059,13 +1122,37 @@ impl SnapshotManager {
     ) -> Result<SnapshotMetadata> {
         let (metadata, txn_id, scn) = self.allocate_snapshot_metadata(timestamp, lsn);
         let mut batch = WriteBatch::default();
-        batch.put(data_key, data_value);
+        // THE DEFAULT AUTOCOMMIT INSERT'S ONLY `data:` WRITE. `insert_tuple_fast`
+        // skips `StorageEngine::put` on this arm, so if this put is not sealed
+        // the row never is.
+        let stored_data = self.seal_stored(data_value)?;
+        batch.put(data_key, stored_data.as_ref());
+
+        // ONE cipher invocation per row on this path, not two. The caller gates
+        // this route on `!uses_side_storage`, which is exactly the case in which
+        // the `v:` twin carries the same row image as `data:` — so the sealed
+        // bytes are reused rather than the identical plaintext being encrypted a
+        // second time. Storing the same ciphertext under both keys is the choice
+        // `Transaction::put_versioned_batch` already makes for the same pair, and
+        // it discloses nothing: a reader who can see both keys can see they are
+        // equal either way, and it is one plaintext with one nonce, never a nonce
+        // reused across two different plaintexts.
+        //
+        // The comparison runs ONLY when a key is configured, so the default
+        // encryption-disabled path pays nothing for it: with no key manager this
+        // is a single `Option` check and `sealed_version` is `None`, leaving the
+        // funnel below to do exactly what it did before.
+        let sealed_version: Option<&[u8]> = match &self.key_manager {
+            Some(_) if data_value == version_value => Some(stored_data.as_ref()),
+            _ => None,
+        };
         self.append_version_snapshot_to_batch(
             &mut batch,
             table_name,
             row_id,
             timestamp,
             version_value,
+            sealed_version,
             &metadata,
             allow_elide,
         )?;
@@ -1190,6 +1277,13 @@ impl SnapshotManager {
             .get(data_key.as_bytes())
             .map_err(|e| Error::storage(format!("marker materialize data read failed: {}", e)))?;
         if let Some(old_value) = old_value {
+            // `old_value` is the STORED `data:` image, copied verbatim into
+            // `v:`. It is deliberately NOT sealed again: on an encrypted
+            // database it is already ciphertext (re-sealing would double-encrypt
+            // and the read would return a ciphertext blob as if it were a row),
+            // and on a legacy plaintext row the tolerant decode handles it. The
+            // property being preserved is "the `v:` twin holds exactly what
+            // `data:` held", which a verbatim copy gives for free.
             let mut batch = WriteBatch::default();
             let version_key = format!("v:{}:{}:{}", table_name, row_id, marker_ts);
             batch.put(version_key.as_bytes(), &old_value);
@@ -1241,6 +1335,9 @@ impl SnapshotManager {
             .get(data_key.as_bytes())
             .map_err(|e| Error::storage(format!("elided version materialize data read failed: {}", e)))?;
         if let Some(old_value) = old_value {
+            // Verbatim copy of the stored `data:` image — see
+            // `materialize_copy_marker_row_durable_inner` for why it must not be
+            // sealed again.
             let mut batch = WriteBatch::default();
             let version_key = format!("v:{}:{}:{}", table_name, row_id, event_ts);
             batch.put(version_key.as_bytes(), &old_value);
@@ -1270,6 +1367,8 @@ impl SnapshotManager {
             .get(data_key.as_bytes())
             .map_err(|e| Error::storage(format!("elided version backfill data read failed: {}", e)))?;
         if let Some(old_value) = old_value {
+            // Verbatim copy of the stored `data:` image (see
+            // `materialize_copy_marker_row_durable_inner`).
             let version_key = format!("v:{}:{}:{}", table_name, row_id, event_ts);
             batch.put(version_key.as_bytes(), &old_value);
             batch.put(&index_key, encode_version_index_value(event_ts, false));
@@ -1305,6 +1404,8 @@ impl SnapshotManager {
             .get(data_key.as_bytes())
             .map_err(|e| Error::storage(format!("marker backfill data read failed: {}", e)))?;
         if let Some(old_value) = old_value {
+            // Verbatim copy of the stored `data:` image (see
+            // `materialize_copy_marker_row_durable_inner`).
             let version_key = format!("v:{}:{}:{}", table_name, row_id, marker_ts);
             batch.put(version_key.as_bytes(), &old_value);
             let reverse_ts = u64::MAX - marker_ts;
@@ -1314,6 +1415,14 @@ impl SnapshotManager {
         Ok(())
     }
 
+    /// Append the `v:` copy, its `v_idx:` event and the optional `snapshot:`
+    /// metadata for one version into `batch`.
+    ///
+    /// `value` is the version's PLAINTEXT row image. `sealed_value` is that same
+    /// plaintext ALREADY sealed, for the one caller that has just sealed it for
+    /// the `data:` key in this same batch — passing it avoids a second cipher
+    /// invocation over identical bytes. `None` means "seal it here", and every
+    /// caller that has no sealed copy to hand passes `None`.
     fn append_version_snapshot_to_batch(
         &self,
         batch: &mut WriteBatch,
@@ -1321,6 +1430,7 @@ impl SnapshotManager {
         row_id: u64,
         timestamp: u64,
         value: &[u8],
+        sealed_value: Option<&[u8]>,
         metadata: &SnapshotMetadata,
         allow_elide: bool,
     ) -> Result<()> {
@@ -1349,9 +1459,17 @@ impl SnapshotManager {
             (index_key.len() + 8) as u64
         } else {
             let version_key = format!("v:{}:{}:{}", table_name, row_id, timestamp);
-            batch.put(version_key.as_bytes(), value);
+            // `value` arrives as PLAINTEXT from every caller; this funnel is the
+            // boundary for the `v:` copy, so it seals here — unless the caller
+            // already sealed this exact plaintext for the `data:` key in this
+            // same batch and handed the result down (see `sealed_value`).
+            let stored: Cow<'_, [u8]> = match sealed_value {
+                Some(sealed) => Cow::Borrowed(sealed),
+                None => self.seal_stored(value)?,
+            };
+            batch.put(version_key.as_bytes(), stored.as_ref());
             batch.put(index_key.as_bytes(), encode_version_index_value(timestamp, false));
-            (version_key.len() + value.len() + index_key.len() + 8) as u64
+            (version_key.len() + stored.len() + index_key.len() + 8) as u64
         };
 
         // W3.2: version-chain bytes for the autocommit INSERT path (fast single
@@ -1712,7 +1830,11 @@ impl SnapshotManager {
                     if let (Ok(row_id), Ok(ts)) = (p2.parse::<u64>(), p3.parse::<u64>()) {
                         // Check if timestamp is within range
                         if ts >= start_ts && ts <= end_ts {
-                            versions.push((row_id, ts, value.to_vec()));
+                            // VERSIONS BETWEEN hands these straight to
+                            // `bincode::deserialize` in the executor, so decode
+                            // here — this is a `v:` value like any other.
+                            let decoded = tde::open_owned(self.key_manager.as_deref(), &key, value.to_vec())?;
+                            versions.push((row_id, ts, decoded));
                         }
                     }
                 }

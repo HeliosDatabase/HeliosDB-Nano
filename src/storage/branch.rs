@@ -325,12 +325,28 @@ pub struct BranchManager {
 
     /// Pending GC queue (branch_id -> drop_timestamp)
     pending_gc: Arc<RwLock<HashMap<BranchId, u64>>>,
+
+    /// The storage boundary's key manager, or `None` when encryption is
+    /// disabled. Set by the engine right after construction; see
+    /// [`BranchManager::set_key_manager`].
+    key_manager: Option<Arc<crate::crypto::KeyManager>>,
 }
 
 impl BranchManager {
     /// Create new branch manager with default GC configuration
     pub fn new(db: Arc<DB>, timestamp: Arc<RwLock<u64>>) -> Result<Self> {
         Self::with_gc_config(db, timestamp, BranchGcConfig::default())
+    }
+
+    /// Give this manager the engine's key manager.
+    ///
+    /// It builds writes against the same `Arc<DB>` the engine does, so it must
+    /// apply the same rule: a value read out of one key and written under
+    /// another is decoded for the source key and sealed for the destination
+    /// key. Called before the manager is published, so no reader can observe it
+    /// unset.
+    pub fn set_key_manager(&mut self, key_manager: Option<Arc<crate::crypto::KeyManager>>) {
+        self.key_manager = key_manager;
     }
 
     /// Create new branch manager with custom GC configuration
@@ -347,6 +363,7 @@ impl BranchManager {
             timestamp,
             gc_config,
             pending_gc: Arc::new(RwLock::new(pending_gc)),
+            key_manager: None,
         })
     }
 
@@ -1179,16 +1196,25 @@ impl BranchManager {
 
     /// Copy a key from source branch to target branch
     fn copy_key_to_branch(&self, source_id: BranchId, target_id: BranchId, key: &str, timestamp: u64) -> Result<()> {
-        // Get value from source
+        // Get value from source. `get_latest_key_value` has already decoded it,
+        // so `data` here is the in-memory value, not the stored bytes.
         let value = self.get_latest_key_value(source_id, key)?;
 
         // Encode target key
         let target_key = encode_branch_data_key(target_id, key, timestamp);
 
         if let Some((data, _ts)) = value {
-            // Write to target
+            // Seal for the key it is LANDING under, rather than copying the
+            // source's stored bytes across. Both keys are in the `bdata:`
+            // keyspace, which this rule seals, so the transform is
+            // form-preserving; it is written this way because the correct form
+            // of a stored value is a property of its key, and because the
+            // tolerant open on the read side is what lets a source value written
+            // by an earlier build be copied correctly. Zero cost with encryption
+            // disabled.
+            let stored = super::tde::seal_row_value(self.key_manager.as_deref(), &target_key, &data)?;
             self.db
-                .put(&target_key, &data)
+                .put(&target_key, stored.as_ref())
                 .map_err(|e| Error::storage(format!("Failed to copy key: {}", e)))?;
         } else {
             // Tombstone (deleted key)
@@ -1210,7 +1236,16 @@ impl BranchManager {
         let branch_key = encode_branch_data_key(branch_id, key, snapshot);
 
         match self.db.get(&branch_key) {
-            Ok(Some(data)) => Ok(Some((data, snapshot))),
+            // Decoded through the shared rule, like every other read of a
+            // stored value. It matters here beyond readability: the merge
+            // conflict detector COMPARES the values this returns against each
+            // other, and two AES-GCM frames of the same plaintext differ (fresh
+            // nonce per seal), so comparing stored bytes would report a conflict
+            // between two identical rows.
+            Ok(Some(data)) => Ok(Some((
+                super::tde::open_owned(self.key_manager.as_deref(), &branch_key, data)?,
+                snapshot,
+            ))),
             Ok(None) => Ok(None),
             Err(e) => Err(Error::storage(format!("Failed to read key: {}", e))),
         }
@@ -1230,9 +1265,12 @@ impl BranchManager {
         // Since we no longer store timestamps in the key, we just return the value directly
         let mut iter = self.db.prefix_iterator(&prefix);
         if let Some(item) = iter.next() {
-            let (_k, v) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
-            // Return the first (and only) match for this key
-            return Ok(Some((v.to_vec(), 0))); // Return 0 as default timestamp since it's not stored
+            let (k, v) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+            // Return the first (and only) match for this key, decoded through
+            // the shared rule (see `get_key_at_snapshot` for why the comparison
+            // callers require the decoded form).
+            let decoded = super::tde::open_owned(self.key_manager.as_deref(), &k, v.to_vec())?;
+            return Ok(Some((decoded, 0))); // Return 0 as default timestamp since it's not stored
         }
 
         Ok(None)
@@ -1295,8 +1333,13 @@ impl BranchTransaction {
         parent_chain: Vec<(BranchId, SnapshotId)>,
         snapshot_id: SnapshotId,
         snapshot_manager: Arc<super::time_travel::SnapshotManager>,
+        key_manager: Option<Arc<crate::crypto::KeyManager>>,
     ) -> Result<Self> {
-        let tx = Transaction::new(Arc::clone(&db), snapshot_id, snapshot_manager)?;
+        let mut tx = Transaction::new(Arc::clone(&db), snapshot_id, snapshot_manager)?;
+        // The parent-chain fallback in `get` below reads MAIN-branch `data:`
+        // keys, which the storage boundary now seals. Carry the engine's key
+        // manager so those reads decode by the same rule.
+        tx.set_key_manager(key_manager);
 
         Ok(Self {
             tx,
@@ -1337,7 +1380,10 @@ impl BranchTransaction {
                 .get(&parent_key)
                 .map_err(|e| Error::storage(format!("Parent read failed: {}", e)))?
             {
-                return Ok(Some(value));
+                // For `parent_id == 1` this is a main-branch `data:` row, i.e.
+                // a sealed keyspace read raw. Decode through the transaction's
+                // copy of the shared rule.
+                return Ok(Some(self.tx.decode_stored(&parent_key, value)?));
             }
         }
 
