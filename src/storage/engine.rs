@@ -25,11 +25,12 @@ use super::{
     BranchId, BranchManager, BranchMetadata, BranchOptions, BranchTransaction, Catalog, DatabaseStats, Key,
     SnapshotManager, Transaction, VectorIndexManager,
 };
-use crate::crypto::{self, KeyManager};
+use crate::crypto::KeyManager;
 use crate::ColumnStorageMode;
 use crate::{Config, Error, Result, Tuple, Value};
 use parking_lot::RwLock;
 use rocksdb::{BlockBasedOptions, Cache, IteratorMode, Options, ReadOptions, WriteBatch, WriteOptions, DB};
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -2165,8 +2166,24 @@ impl StorageEngine {
             None
         };
 
-        // Initialize snapshot manager
-        let snapshot_manager = Arc::new(SnapshotManager::new(Arc::clone(&db)));
+        // Check the configured key against this database BEFORE anything reads
+        // a stored value, and install the sentinel on a database that has none
+        // yet. `KeyManager::from_source` only proves a key could be LOADED; this
+        // is what proves it is the key this data was sealed with. Deliberately
+        // ahead of snapshot recovery, WAL replay and catalog load — all of which
+        // read stored values — so a key mismatch is one error at open rather
+        // than an unbounded number of unreadable values afterwards.
+        super::tde::verify_or_install_key_check(&db, key_manager.as_deref(), read_only)?;
+
+        // Initialize snapshot manager. It builds its own `WriteBatch`es against
+        // the same `Arc<DB>`, so it needs the same key manager the engine uses —
+        // otherwise the version chain and the fast autocommit `data:` write
+        // would disagree with `put`/`put_internal` about the on-disk form.
+        let snapshot_manager = {
+            let mut sm = SnapshotManager::new(Arc::clone(&db));
+            sm.set_key_manager(key_manager.clone());
+            Arc::new(sm)
+        };
 
         // Recover existing snapshots
         if let Err(e) = snapshot_manager.recover_snapshots() {
@@ -2191,7 +2208,10 @@ impl StorageEngine {
         // Initialize branch manager
         debug!("Initializing BranchManager");
         let branch_manager = match BranchManager::new(Arc::clone(&db), Arc::clone(&timestamp)) {
-            Ok(manager) => {
+            Ok(mut manager) => {
+                // It writes branch rows against the same `Arc<DB>`, including
+                // copies between keys, so it applies the same rule.
+                manager.set_key_manager(key_manager.clone());
                 info!("BranchManager initialized successfully");
                 Arc::new(RwLock::new(Some(Arc::new(manager))))
             }
@@ -2213,7 +2233,10 @@ impl StorageEngine {
                 crate::config::WalSyncModeConfig::Async => WalSyncMode::Async,
                 crate::config::WalSyncModeConfig::GroupCommit => WalSyncMode::GroupCommit,
             };
-            match WriteAheadLog::open(Arc::clone(&db), sync_mode) {
+            // The WAL writes `wal:entries:` straight to RocksDB, bypassing
+            // `StorageEngine::put`, and those entries carry row tuples — so it
+            // carries the engine's key manager and seals them itself.
+            match WriteAheadLog::open_with_key_manager(Arc::clone(&db), sync_mode, key_manager.clone()) {
                 Ok(wal) => {
                     info!("WAL initialized successfully");
                     Some(Arc::new(RwLock::new(wal)))
@@ -2235,7 +2258,13 @@ impl StorageEngine {
         let statistics_cache = Arc::new(crate::storage::StatisticsCache::with_config(100, 30)?);
 
         // Initialize delta tracker for incremental materialized views
-        let mv_delta_tracker = Arc::new(super::MvDeltaTracker::new(Arc::clone(&db))?);
+        // It writes `delta:` records — full row images, including the contents
+        // of rows a DELETE removed — straight to this `Arc<DB>`, so it carries
+        // the key manager and applies the boundary rule itself.
+        let mv_delta_tracker = Arc::new(super::MvDeltaTracker::new_with_key_manager(
+            Arc::clone(&db),
+            key_manager.clone(),
+        )?);
         debug!("Delta tracker initialized for incremental MV refresh");
 
         // Initialize trigger registry
@@ -2434,8 +2463,19 @@ impl StorageEngine {
             None
         };
 
-        // Initialize snapshot manager
-        let snapshot_manager = Arc::new(SnapshotManager::new_non_durable(Arc::clone(&db)));
+        // Same key check as the on-disk `open`. This store is always freshly
+        // created, so in practice it is the "install a sentinel" arm — but the
+        // rule is the rule, and running it here keeps one implementation rather
+        // than two.
+        super::tde::verify_or_install_key_check(&db, key_manager.as_deref(), false)?;
+
+        // Initialize snapshot manager (see the on-disk StorageEngine::open for
+        // why it carries the engine's key manager).
+        let snapshot_manager = {
+            let mut sm = SnapshotManager::new_non_durable(Arc::clone(&db));
+            sm.set_key_manager(key_manager.clone());
+            Arc::new(sm)
+        };
         // W3.2: wire the single-copy-latest-version knob (memory-only: no durable
         // sentinel, but the in-process materialize gate is still armed).
         snapshot_manager.configure_elision(config.storage.elide_latest_version);
@@ -2445,7 +2485,9 @@ impl StorageEngine {
         // Initialize branch manager
         debug!("Initializing BranchManager for in-memory storage");
         let branch_manager = match BranchManager::new(Arc::clone(&db), Arc::clone(&timestamp)) {
-            Ok(manager) => {
+            Ok(mut manager) => {
+                // Same reason as the on-disk open.
+                manager.set_key_manager(key_manager.clone());
                 info!("BranchManager initialized successfully for in-memory storage");
                 Arc::new(RwLock::new(Some(Arc::new(manager))))
             }
@@ -2461,7 +2503,8 @@ impl StorageEngine {
         // Initialize WAL if enabled (typically disabled for in-memory testing)
         let wal = if config.storage.wal_enabled {
             let sync_mode = WalSyncMode::Async; // Use async for in-memory
-            match WriteAheadLog::open(Arc::clone(&db), sync_mode) {
+                                                // Carries the key manager for the same reason the on-disk open does.
+            match WriteAheadLog::open_with_key_manager(Arc::clone(&db), sync_mode, key_manager.clone()) {
                 Ok(wal) => {
                     debug!("WAL initialized for in-memory storage");
                     Some(Arc::new(RwLock::new(wal)))
@@ -2482,7 +2525,11 @@ impl StorageEngine {
         let statistics_cache = Arc::new(crate::storage::StatisticsCache::with_config(100, 30)?);
 
         // Initialize delta tracker for incremental materialized views
-        let mv_delta_tracker = Arc::new(super::MvDeltaTracker::new(Arc::clone(&db))?);
+        // Carries the key manager for the same reason the on-disk open does.
+        let mv_delta_tracker = Arc::new(super::MvDeltaTracker::new_with_key_manager(
+            Arc::clone(&db),
+            key_manager.clone(),
+        )?);
         debug!("Delta tracker initialized for in-memory incremental MV refresh");
 
         // Initialize trigger registry
@@ -2878,14 +2925,30 @@ impl StorageEngine {
 
             match data {
                 Some(value) => {
-                    // Encrypt if needed
-                    let to_write = if let Some(ref km) = key_manager {
-                        crypto::encrypt(km.key(), value).unwrap_or_else(|_| value.to_vec())
-                    } else {
-                        value.to_vec()
+                    // Seal through the shared storage-boundary rule. This used
+                    // to be `crypto::encrypt(...).unwrap_or_else(|_| value.to_vec())`,
+                    // i.e. a failed encryption silently stored the row in the
+                    // clear: a security control failing OPEN. A failure here is
+                    // now treated exactly like a failed `db.put` below — the
+                    // write is abandoned and logged at ERROR — because this
+                    // callback runs on the ingestion commit worker and has no
+                    // caller to return a `Result` to. It must never downgrade to
+                    // a weaker on-disk guarantee than the one that was asked for.
+                    let to_write = match super::tde::seal(key_manager.as_deref(), value) {
+                        Ok(sealed) => sealed,
+                        Err(e) => {
+                            tracing::error!(
+                                "Lock-free apply callback REFUSED to write {}:{} unencrypted after an encryption \
+                                 failure - {}",
+                                table,
+                                row_id,
+                                e
+                            );
+                            return;
+                        }
                     };
 
-                    if let Err(e) = db.put(key_bytes, &to_write) {
+                    if let Err(e) = db.put(key_bytes, to_write.as_ref()) {
                         tracing::error!("Lock-free apply callback failed for {}:{} - {}", table, row_id, e);
                     }
                 }
@@ -3119,12 +3182,10 @@ impl StorageEngine {
             key_buf.push(':');
             key_buf.push_str(&row_id.to_string());
 
-            // Encrypt if needed (usually disabled for bulk load)
-            let to_write = if let Some(ref km) = self.key_manager {
-                crypto::encrypt(km.key(), &data)?
-            } else {
-                data
-            };
+            // `data:` is a sealed keyspace; route through the one rule rather
+            // than repeating it here. `seal_owned` hands the input `Vec` back
+            // unmoved when encryption is off, so the bulk path pays no copy.
+            let to_write = super::tde::seal_owned(self.key_manager.as_deref(), data)?;
 
             total_bytes += to_write.len();
             batch.put(key_buf.as_bytes(), &to_write);
@@ -3243,14 +3304,11 @@ impl StorageEngine {
             .get(key)
             .map_err(|e| Error::storage(format!("Get failed: {}", e)))?;
 
-        // Decrypt if encryption is enabled
-        match (encrypted_data, &self.key_manager) {
-            (Some(data), Some(km)) => {
-                let decrypted = crypto::decrypt(km.key(), &data)?;
-                Ok(Some(decrypted))
-            }
-            (Some(data), None) => Ok(Some(data)),
-            (None, _) => Ok(None),
+        // Decrypt if encryption is enabled (tolerating an already-plaintext
+        // stored value — see `decode_stored`).
+        match encrypted_data {
+            Some(data) => Ok(Some(self.decode_stored(key, data)?)),
+            None => Ok(None),
         }
     }
 
@@ -3277,25 +3335,19 @@ impl StorageEngine {
             }
         }
 
-        // Encrypt if encryption is enabled, otherwise write directly (no copy)
-        if let Some(km) = &self.key_manager {
-            let data = crypto::encrypt(km.key(), value)?;
-            if let Some(opts) = &self.memory_write_options {
-                self.db
-                    .put_opt(key, data, opts)
-                    .map_err(|e| Error::storage(format!("Put failed: {}", e)))
-            } else {
-                self.db
-                    .put(key, data)
-                    .map_err(|e| Error::storage(format!("Put failed: {}", e)))
-            }
-        } else if let Some(opts) = &self.memory_write_options {
+        // This entry point seals EVERY key it is handed — deliberately broader
+        // than `tde::is_row_value_key`, because it is how `meta:` catalog blobs
+        // are sealed — so it takes `tde::seal`, not `seal_row_value`. With
+        // encryption off `seal` borrows the caller's slice and the `put` below
+        // is byte-for-byte the call this function made before.
+        let stored = super::tde::seal(self.key_manager.as_deref(), value)?;
+        if let Some(opts) = &self.memory_write_options {
             self.db
-                .put_opt(key, value, opts)
+                .put_opt(key, stored.as_ref(), opts)
                 .map_err(|e| Error::storage(format!("Put failed: {}", e)))
         } else {
             self.db
-                .put(key, value)
+                .put(key, stored.as_ref())
                 .map_err(|e| Error::storage(format!("Put failed: {}", e)))
         }
     }
@@ -3471,18 +3523,16 @@ impl StorageEngine {
     /// Internal put: encrypt and store without WAL logging
     /// Use this for internal metadata like counters, version history, etc.
     fn put_internal(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        let data = if let Some(km) = &self.key_manager {
-            crypto::encrypt(km.key(), value)?
-        } else {
-            value.to_vec()
-        };
+        // Seals every key it is handed, like `put` — see the note there for why
+        // this takes `tde::seal` rather than `seal_row_value`.
+        let stored = super::tde::seal(self.key_manager.as_deref(), value)?;
         if let Some(opts) = &self.memory_write_options {
             self.db
-                .put_opt(key, data, opts)
+                .put_opt(key, stored.as_ref(), opts)
                 .map_err(|e| Error::storage(format!("Internal put failed: {}", e)))
         } else {
             self.db
-                .put(key, data)
+                .put(key, stored.as_ref())
                 .map_err(|e| Error::storage(format!("Internal put failed: {}", e)))
         }
     }
@@ -3495,29 +3545,106 @@ impl StorageEngine {
             .get(key)
             .map_err(|e| Error::storage(format!("Internal get failed: {}", e)))?;
 
-        match (encrypted_data, &self.key_manager) {
-            (Some(data), Some(km)) => {
-                let decrypted = crypto::decrypt(km.key(), &data)?;
-                Ok(Some(decrypted))
-            }
-            (Some(data), None) => Ok(Some(data)),
-            (None, _) => Ok(None),
+        match encrypted_data {
+            Some(data) => Ok(Some(self.decode_stored(key, data)?)),
+            None => Ok(None),
         }
     }
 
-    /// Decrypt a raw value if encryption is enabled
-    fn decrypt_value(&self, value: &[u8]) -> Result<Vec<u8>> {
-        if let Some(km) = &self.key_manager {
-            crypto::decrypt(km.key(), value)
-        } else {
-            Ok(value.to_vec())
-        }
+    /// Decode a raw value read straight off a RocksDB iterator, for a caller
+    /// that has the value's storage KEY in hand.
+    ///
+    /// The key is required rather than optional: the decode rule and its
+    /// plaintext-passthrough diagnostic are both keyed on the keyspace, so a
+    /// caller that already knows the key must pass it instead of going through
+    /// `decode_stored_anon`.
+    fn decrypt_value(&self, storage_key: &[u8], value: &[u8]) -> Result<Vec<u8>> {
+        Ok(self.decode_stored_ref(storage_key, value)?.into_owned())
+    }
+
+    // ==================== Stored-value codec ====================
+    //
+    // Every read of a stored value in this engine, and every write that builds
+    // its own `WriteBatch` instead of going through `put`/`put_internal`, goes
+    // through the entry points below. They are thin delegations to
+    // `storage::tde`, which holds the ONE rule — see that module for the
+    // tolerance requirement, the AEAD safety argument, the cost this buys, and
+    // the list of keyspaces that are sealed (and the ones that deliberately
+    // are not).
+    //
+    // The rule lives there rather than here because `Transaction` and
+    // `SnapshotManager` build batches against the same `Arc<DB>` and must give
+    // the same answer as the engine does. Keeping it on `StorageEngine` is what
+    // made encryption a per-write-route property in the first place.
+    //
+    // ZERO COST WHEN ENCRYPTION IS OFF (the default configuration): with no key
+    // manager each of these is a single `Option` check — the same check the code
+    // they replaced already performed — and the input is handed back unmoved.
+    // No allocation, no copy, no extra branch in any row loop.
+
+    /// Seal a value the caller has already decided must be sealed.
+    /// `Cow::Borrowed` when encryption is off.
+    #[inline]
+    fn seal_stored<'a>(&self, value: &'a [u8]) -> Result<Cow<'a, [u8]>> {
+        super::tde::seal(self.key_manager.as_deref(), value)
+    }
+
+    /// How many values in one of the storage boundary's sealed keyspaces
+    /// (`data:` / `v:` / `counter:` / `wal:entries:` / `bdata:` / `delta:`)
+    /// have been read as plaintext on an encryption-enabled database in this
+    /// process. `0` on a database with encryption disabled, and on a uniformly
+    /// encrypted one.
+    ///
+    /// See `storage::tde::plaintext_passthrough_count` for the exact scope: the
+    /// keyspaces stored verbatim by design are not counted, and neither are keys
+    /// sealed only by `put`/`put_internal`.
+    pub fn plaintext_passthrough_count() -> u64 {
+        super::tde::plaintext_passthrough_count()
+    }
+
+    /// Borrowed decode: returns `Cow::Borrowed(raw)` when the bytes are used
+    /// as they are, so the encryption-disabled path allocates nothing.
+    #[inline]
+    fn decode_stored_ref<'a>(&self, storage_key: &[u8], raw: &'a [u8]) -> Result<Cow<'a, [u8]>> {
+        super::tde::open_ref(self.key_manager.as_deref(), storage_key, raw)
+    }
+
+    /// Borrowed decode for the row-store column helpers, which are handed a
+    /// `data:` row image without its storage key (their callers iterate a
+    /// `data:{table}:` prefix and keep only the value).
+    ///
+    /// Identical rule; the WARN names the namespace instead of a key. The
+    /// placeholder MUST keep its real `data:` prefix: both the decode rule and
+    /// the plaintext-passthrough diagnostic are keyed on the keyspace, so a
+    /// placeholder that did not look like the keyspace it stands for would be
+    /// silently excluded from the count.
+    #[inline]
+    fn decode_stored_anon<'a>(&self, raw: &'a [u8]) -> Result<Cow<'a, [u8]>> {
+        self.decode_stored_ref(b"data:<row-store value>", raw)
+    }
+
+    /// Owned decode: consumes `raw` and returns it UNMOVED when the bytes are
+    /// used as they are, so the passthrough costs no copy.
+    #[inline]
+    fn decode_stored(&self, storage_key: &[u8], raw: Vec<u8>) -> Result<Vec<u8>> {
+        super::tde::open_owned(self.key_manager.as_deref(), storage_key, raw)
+    }
+
+    /// The engine's key manager, for the batch builders that live in
+    /// `transaction.rs` / `time_travel.rs` / `branch.rs` and must apply the
+    /// same rule to the batches they build against this engine's `Arc<DB>`.
+    pub(crate) fn key_manager_arc(&self) -> Option<Arc<KeyManager>> {
+        self.key_manager.clone()
     }
 
     /// Begin a transaction
     pub fn begin_transaction(&self) -> Result<Transaction> {
         let snapshot_id = self.next_timestamp();
         let mut txn = Transaction::new(Arc::clone(&self.db), snapshot_id, Arc::clone(&self.snapshot_manager))?;
+        // The commit batch writes `data:`/`v:`/`counter:` straight to RocksDB,
+        // bypassing `StorageEngine::put`, so it must carry the key manager and
+        // seal them itself.
+        txn.set_key_manager(self.key_manager.clone());
         // P0#1: emit MVCC version-history at commit only when time-travel is on.
         txn.set_versioning_enabled(self.config.storage.time_travel_enabled);
         txn.set_rocksdb_wal_enabled(!self.config.storage.memory_only);
@@ -3549,6 +3676,8 @@ impl StorageEngine {
     pub fn begin_autocommit_transaction(&self) -> Result<Transaction> {
         let snapshot_id = self.next_timestamp();
         let mut txn = Transaction::new(Arc::clone(&self.db), snapshot_id, Arc::clone(&self.snapshot_manager))?;
+        // See `begin_transaction`: the commit batch seals its own row values.
+        txn.set_key_manager(self.key_manager.clone());
         txn.set_versioning_enabled(self.config.storage.time_travel_enabled);
         txn.set_rocksdb_wal_enabled(!self.config.storage.memory_only);
         txn.set_sync_commit(self.statement_durability_required());
@@ -4101,13 +4230,8 @@ impl StorageEngine {
                 break;
             }
 
-            let decrypted;
-            let row_bytes = if let Some(km) = &self.key_manager {
-                decrypted = crypto::decrypt(km.key(), raw_value.as_ref())?;
-                decrypted.as_slice()
-            } else {
-                raw_value.as_ref()
-            };
+            let stored = self.decode_stored_ref(&key, raw_value.as_ref())?;
+            let row_bytes: &[u8] = &stored;
 
             let mut matched = true;
             for filter in filters {
@@ -4317,13 +4441,8 @@ impl StorageEngine {
                 break;
             }
 
-            let decrypted;
-            let row_bytes = if let Some(km) = &self.key_manager {
-                decrypted = crypto::decrypt(km.key(), raw_value.as_ref())?;
-                decrypted.as_slice()
-            } else {
-                raw_value.as_ref()
-            };
+            let stored = self.decode_stored_ref(&key, raw_value.as_ref())?;
+            let row_bytes: &[u8] = &stored;
 
             let Some(matches) =
                 crate::storage::prefix_decode::tuple_string_column_eq(row_bytes, filter.column_index, filter.value)
@@ -4516,22 +4635,13 @@ impl StorageEngine {
             }
 
             if !default_requested.is_empty() {
-                if let Some(km) = &self.key_manager {
-                    let decrypted = crypto::decrypt(km.key(), raw_value.as_ref())?;
-                    crate::storage::prefix_decode::decode_tuple_column_values_into(
-                        &decrypted,
-                        &default_requested,
-                        schema.columns.len(),
-                        &mut default_values,
-                    )
-                } else {
-                    crate::storage::prefix_decode::decode_tuple_column_values_into(
-                        raw_value.as_ref(),
-                        &default_requested,
-                        schema.columns.len(),
-                        &mut default_values,
-                    )
-                }
+                let stored = self.decode_stored_ref(&key, raw_value.as_ref())?;
+                crate::storage::prefix_decode::decode_tuple_column_values_into(
+                    &stored,
+                    &default_requested,
+                    schema.columns.len(),
+                    &mut default_values,
+                )
                 .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
             } else {
                 default_values.clear();
@@ -4599,13 +4709,8 @@ impl StorageEngine {
                 break;
             }
 
-            let decrypted;
-            let row_bytes = if let Some(km) = &self.key_manager {
-                decrypted = crypto::decrypt(km.key(), raw_value.as_ref())?;
-                decrypted.as_slice()
-            } else {
-                raw_value.as_ref()
-            };
+            let stored = self.decode_stored_ref(&key, raw_value.as_ref())?;
+            let row_bytes: &[u8] = &stored;
 
             let mut matched = true;
             for filter in filters {
@@ -4709,12 +4814,8 @@ impl StorageEngine {
                 break;
             }
 
-            let sort_value = if let Some(km) = &self.key_manager {
-                let decrypted = crypto::decrypt(km.key(), &raw_value)?;
-                crate::storage::prefix_decode::decode_tuple_numeric_column_value(&decrypted, sort_column)
-            } else {
-                crate::storage::prefix_decode::decode_tuple_numeric_column_value(&raw_value, sort_column)
-            };
+            let stored = self.decode_stored_ref(&key, &raw_value)?;
+            let sort_value = crate::storage::prefix_decode::decode_tuple_numeric_column_value(&stored, sort_column);
             let Some(crate::storage::prefix_decode::DecodedNumericValue::Int(sort_key)) = sort_value else {
                 return Ok(None);
             };
@@ -6279,14 +6380,10 @@ impl StorageEngine {
                     let mut shard_small: Vec<(Option<String>, CountSumIntState)> = Vec::new();
                     let mut shard_hash: Option<HashMap<Option<String>, CountSumIntState>> = None;
                     for item in iter {
-                        let (_, raw_value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
-                        let decrypted;
-                        let bytes: &[u8] = if let Some(km) = &self.key_manager {
-                            decrypted = crypto::decrypt(km.key(), &raw_value)?;
-                            &decrypted
-                        } else {
-                            &raw_value
-                        };
+                        let (row_key, raw_value) =
+                            item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+                        let stored = self.decode_stored_ref(&row_key, &raw_value)?;
+                        let bytes: &[u8] = &stored;
                         let Some((group_key, sum_value)) =
                             crate::storage::prefix_decode::decode_tuple_text_and_int_columns(
                                 bytes,
@@ -6332,38 +6429,19 @@ impl StorageEngine {
                     break;
                 }
 
-                if let Some(km) = &self.key_manager {
-                    let decrypted = crypto::decrypt(km.key(), &raw_value)?;
-                    let Some((group_key, sum_value)) = crate::storage::prefix_decode::decode_tuple_text_and_int_columns(
-                        &decrypted,
-                        group_column,
-                        sum_column,
-                    ) else {
-                        return Ok(None);
-                    };
-                    update_text_count_sum_group(
-                        group_key,
-                        sum_value,
-                        &mut small_groups,
-                        &mut hash_groups,
-                        LINEAR_GROUP_LIMIT,
-                    )?;
-                } else {
-                    let Some((group_key, sum_value)) = crate::storage::prefix_decode::decode_tuple_text_and_int_columns(
-                        &raw_value,
-                        group_column,
-                        sum_column,
-                    ) else {
-                        return Ok(None);
-                    };
-                    update_text_count_sum_group(
-                        group_key,
-                        sum_value,
-                        &mut small_groups,
-                        &mut hash_groups,
-                        LINEAR_GROUP_LIMIT,
-                    )?;
-                }
+                let stored = self.decode_stored_ref(&key, &raw_value)?;
+                let Some((group_key, sum_value)) =
+                    crate::storage::prefix_decode::decode_tuple_text_and_int_columns(&stored, group_column, sum_column)
+                else {
+                    return Ok(None);
+                };
+                update_text_count_sum_group(
+                    group_key,
+                    sum_value,
+                    &mut small_groups,
+                    &mut hash_groups,
+                    LINEAR_GROUP_LIMIT,
+                )?;
             }
         }
 
@@ -6498,21 +6576,14 @@ impl StorageEngine {
                         plan.iter().copied().map(PrimitiveRowAggregateState::new).collect();
                     let mut values = Vec::with_capacity(requested.len());
                     for item in iter {
-                        let (_, raw_value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
-                        let decoded = if let Some(km) = &self.key_manager {
-                            let decrypted = crypto::decrypt(km.key(), &raw_value)?;
-                            crate::storage::prefix_decode::decode_tuple_numeric_column_values_into(
-                                &decrypted,
-                                &requested,
-                                &mut values,
-                            )
-                        } else {
-                            crate::storage::prefix_decode::decode_tuple_numeric_column_values_into(
-                                &raw_value,
-                                &requested,
-                                &mut values,
-                            )
-                        };
+                        let (row_key, raw_value) =
+                            item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+                        let stored = self.decode_stored_ref(&row_key, &raw_value)?;
+                        let decoded = crate::storage::prefix_decode::decode_tuple_numeric_column_values_into(
+                            &stored,
+                            &requested,
+                            &mut values,
+                        );
                         if decoded.is_none() {
                             return Ok(None);
                         }
@@ -6545,20 +6616,12 @@ impl StorageEngine {
                     break;
                 }
 
-                let decoded = if let Some(km) = &self.key_manager {
-                    let decrypted = crypto::decrypt(km.key(), &raw_value)?;
-                    crate::storage::prefix_decode::decode_tuple_numeric_column_values_into(
-                        &decrypted,
-                        &requested,
-                        &mut values,
-                    )
-                } else {
-                    crate::storage::prefix_decode::decode_tuple_numeric_column_values_into(
-                        &raw_value,
-                        &requested,
-                        &mut values,
-                    )
-                };
+                let stored = self.decode_stored_ref(&key, &raw_value)?;
+                let decoded = crate::storage::prefix_decode::decode_tuple_numeric_column_values_into(
+                    &stored,
+                    &requested,
+                    &mut values,
+                );
                 if decoded.is_none() {
                     return Ok(None);
                 }
@@ -6612,21 +6675,13 @@ impl StorageEngine {
                 let mut avg_count = 0_u64;
                 let mut values = Vec::with_capacity(requested.len());
                 for item in iter {
-                    let (_, raw_value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
-                    let decoded = if let Some(km) = &self.key_manager {
-                        let decrypted = crypto::decrypt(km.key(), &raw_value)?;
-                        crate::storage::prefix_decode::decode_tuple_numeric_column_values_into(
-                            &decrypted,
-                            requested,
-                            &mut values,
-                        )
-                    } else {
-                        crate::storage::prefix_decode::decode_tuple_numeric_column_values_into(
-                            &raw_value,
-                            requested,
-                            &mut values,
-                        )
-                    };
+                    let (row_key, raw_value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+                    let stored = self.decode_stored_ref(&row_key, &raw_value)?;
+                    let decoded = crate::storage::prefix_decode::decode_tuple_numeric_column_values_into(
+                        &stored,
+                        requested,
+                        &mut values,
+                    );
                     if decoded.is_none() {
                         return Ok(None);
                     }
@@ -6682,20 +6737,12 @@ impl StorageEngine {
                     break;
                 }
 
-                let decoded = if let Some(km) = &self.key_manager {
-                    let decrypted = crypto::decrypt(km.key(), &raw_value)?;
-                    crate::storage::prefix_decode::decode_tuple_numeric_column_values_into(
-                        &decrypted,
-                        requested,
-                        &mut values,
-                    )
-                } else {
-                    crate::storage::prefix_decode::decode_tuple_numeric_column_values_into(
-                        &raw_value,
-                        requested,
-                        &mut values,
-                    )
-                };
+                let stored = self.decode_stored_ref(&key, &raw_value)?;
+                let decoded = crate::storage::prefix_decode::decode_tuple_numeric_column_values_into(
+                    &stored,
+                    requested,
+                    &mut values,
+                );
                 if decoded.is_none() {
                     return Ok(None);
                 }
@@ -7042,13 +7089,9 @@ impl StorageEngine {
     }
 
     fn decode_rowstore_columns(&self, raw_value: &[u8], columns: &[usize], total_cols: usize) -> Result<Tuple> {
-        let tuple = if let Some(km) = &self.key_manager {
-            let decrypted = crypto::decrypt(km.key(), raw_value)?;
-            crate::storage::prefix_decode::decode_tuple_columns(&decrypted, columns, total_cols)
-        } else {
-            crate::storage::prefix_decode::decode_tuple_columns(raw_value, columns, total_cols)
-        }
-        .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
+        let stored = self.decode_stored_anon(raw_value)?;
+        let tuple = crate::storage::prefix_decode::decode_tuple_columns(&stored, columns, total_cols)
+            .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
         Ok(tuple)
     }
 
@@ -7058,13 +7101,9 @@ impl StorageEngine {
         columns: &[usize],
         total_cols: usize,
     ) -> Result<Vec<Value>> {
-        let values = if let Some(km) = &self.key_manager {
-            let decrypted = crypto::decrypt(km.key(), raw_value)?;
-            crate::storage::prefix_decode::decode_tuple_column_values(&decrypted, columns, total_cols)
-        } else {
-            crate::storage::prefix_decode::decode_tuple_column_values(raw_value, columns, total_cols)
-        }
-        .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
+        let stored = self.decode_stored_anon(raw_value)?;
+        let values = crate::storage::prefix_decode::decode_tuple_column_values(&stored, columns, total_cols)
+            .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
         Ok(values)
     }
 
@@ -7075,13 +7114,9 @@ impl StorageEngine {
         total_cols: usize,
         out: &mut Vec<Value>,
     ) -> Result<()> {
-        if let Some(km) = &self.key_manager {
-            let decrypted = crypto::decrypt(km.key(), raw_value)?;
-            crate::storage::prefix_decode::decode_tuple_column_values_into(&decrypted, columns, total_cols, out)
-        } else {
-            crate::storage::prefix_decode::decode_tuple_column_values_into(raw_value, columns, total_cols, out)
-        }
-        .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))
+        let stored = self.decode_stored_anon(raw_value)?;
+        crate::storage::prefix_decode::decode_tuple_column_values_into(&stored, columns, total_cols, out)
+            .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))
     }
 
     /// W3.5 Stage 1: shape a decoded BASE-TABLE tuple to the current catalog
@@ -7156,31 +7191,15 @@ impl StorageEngine {
             {
                 // Deserialize tuple (decrypt first if encryption is enabled). With a
                 // decode hint, materialize only the columns the executor will read.
-                let mut tuple: Tuple = if let Some(km) = &self.key_manager {
-                    let decrypted = crypto::decrypt(km.key(), &raw_value)?;
-                    match decode_hint {
-                        RowDecodeHint::Prefix(k) => {
-                            crate::storage::prefix_decode::decode_tuple_prefix(&decrypted, k, schema.columns.len())
-                        }
-                        RowDecodeHint::Columns(columns) => crate::storage::prefix_decode::decode_tuple_columns(
-                            &decrypted,
-                            columns,
-                            schema.columns.len(),
-                        ),
-                        RowDecodeHint::Full => bincode::deserialize(&decrypted),
+                let stored = self.decode_stored_ref(key, raw_value)?;
+                let mut tuple: Tuple = match decode_hint {
+                    RowDecodeHint::Prefix(k) => {
+                        crate::storage::prefix_decode::decode_tuple_prefix(&stored, k, schema.columns.len())
                     }
-                } else {
-                    match decode_hint {
-                        RowDecodeHint::Prefix(k) => {
-                            crate::storage::prefix_decode::decode_tuple_prefix(&raw_value, k, schema.columns.len())
-                        }
-                        RowDecodeHint::Columns(columns) => crate::storage::prefix_decode::decode_tuple_columns(
-                            &raw_value,
-                            columns,
-                            schema.columns.len(),
-                        ),
-                        RowDecodeHint::Full => bincode::deserialize(&raw_value),
+                    RowDecodeHint::Columns(columns) => {
+                        crate::storage::prefix_decode::decode_tuple_columns(&stored, columns, schema.columns.len())
                     }
+                    RowDecodeHint::Full => bincode::deserialize(&stored),
                 }
                 .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
 
@@ -7440,13 +7459,9 @@ impl StorageEngine {
                 skipped += 1;
                 continue;
             }
-            let mut tuple: Tuple = if let Some(km) = &self.key_manager {
-                let decrypted = crypto::decrypt(km.key(), &raw_value)?;
-                bincode::deserialize(&decrypted)
-            } else {
-                bincode::deserialize(&raw_value)
-            }
-            .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
+            let stored = self.decode_stored_ref(&key, &raw_value)?;
+            let mut tuple: Tuple = bincode::deserialize(&stored)
+                .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
             if let Some(rid) = Self::parse_row_id_after_prefix(&key, prefix_bytes.len()) {
                 tuple.row_id = Some(rid);
             }
@@ -7555,13 +7570,9 @@ impl StorageEngine {
             }
             let (key, raw_value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
             if key.starts_with(prefix_bytes) {
-                let mut tuple: Tuple = if let Some(km) = &self.key_manager {
-                    let decrypted = crypto::decrypt(km.key(), &raw_value)?;
-                    bincode::deserialize(&decrypted)
-                } else {
-                    bincode::deserialize(&raw_value)
-                }
-                .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
+                let stored = self.decode_stored_ref(&key, &raw_value)?;
+                let mut tuple: Tuple = bincode::deserialize(&stored)
+                    .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
                 if let Some(rid) = Self::parse_row_id_after_prefix(&key, prefix_bytes.len()) {
                     tuple.row_id = Some(rid);
                 }
@@ -8022,13 +8033,9 @@ impl StorageEngine {
                 .ok_or_else(|| Error::storage("Row disappeared during migration"))?;
 
             // Deserialize (decrypt first if needed)
-            let mut tuple: Tuple = if let Some(km) = &self.key_manager {
-                let decrypted = crypto::decrypt(km.key(), &raw_value)?;
-                bincode::deserialize(&decrypted)
-            } else {
-                bincode::deserialize(&raw_value)
-            }
-            .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
+            let stored = self.decode_stored_ref(&key, &raw_value)?;
+            let mut tuple: Tuple = bincode::deserialize(&stored)
+                .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
 
             if col_idx >= tuple.values.len() {
                 continue;
@@ -8109,15 +8116,11 @@ impl StorageEngine {
             let new_value =
                 bincode::serialize(&tuple).map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
 
-            // Encrypt if needed
-            let final_value = if let Some(km) = &self.key_manager {
-                crypto::encrypt(km.key(), &new_value)?
-            } else {
-                new_value
-            };
+            // Through the one rule, keyed on the key this row is landing under.
+            let final_value = super::tde::seal_row_value(self.key_manager.as_deref(), &key, &new_value)?;
 
             self.db
-                .put(&key, &final_value)
+                .put(&key, final_value.as_ref())
                 .map_err(|e| Error::storage(format!("Failed to write migrated row: {}", e)))?;
 
             migrated += 1;
@@ -8227,26 +8230,19 @@ impl StorageEngine {
                 .ok_or_else(|| Error::storage("Row disappeared during update"))?;
 
             // Deserialize (decrypt first if needed)
-            let mut tuple: Tuple = if let Some(km) = &self.key_manager {
-                let decrypted = crypto::decrypt(km.key(), &raw_value)?;
-                bincode::deserialize(&decrypted)
-            } else {
-                bincode::deserialize(&raw_value)
-            }
-            .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
+            let stored = self.decode_stored_ref(&key, &raw_value)?;
+            let mut tuple: Tuple = bincode::deserialize(&stored)
+                .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
 
             // Append the new column value
             tuple.values.push(default_value.clone());
 
-            // Serialize and encrypt if needed
+            // Serialize, then seal through the one rule, keyed on the key this
+            // row is landing under.
             let new_value =
                 bincode::serialize(&tuple).map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
 
-            let final_value = if let Some(km) = &self.key_manager {
-                crypto::encrypt(km.key(), &new_value)?
-            } else {
-                new_value
-            };
+            let final_value = super::tde::seal_row_value(self.key_manager.as_deref(), &key, &new_value)?;
 
             // W3.2: preserve this row's elided/COPY-marker insert version in its
             // own durable write BEFORE the overwrite below (the materialize reads
@@ -8261,7 +8257,7 @@ impl StorageEngine {
             }
 
             self.db
-                .put(&key, &final_value)
+                .put(&key, final_value.as_ref())
                 .map_err(|e| Error::storage(format!("Failed to write updated row: {}", e)))?;
 
             updated += 1;
@@ -8331,27 +8327,20 @@ impl StorageEngine {
                 .ok_or_else(|| Error::storage("Row disappeared during update"))?;
 
             // Deserialize (decrypt first if needed)
-            let mut tuple: Tuple = if let Some(km) = &self.key_manager {
-                let decrypted = crypto::decrypt(km.key(), &raw_value)?;
-                bincode::deserialize(&decrypted)
-            } else {
-                bincode::deserialize(&raw_value)
-            }
-            .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
+            let stored = self.decode_stored_ref(&key, &raw_value)?;
+            let mut tuple: Tuple = bincode::deserialize(&stored)
+                .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
 
             // Remove the column value if it exists
             if col_idx < tuple.values.len() {
                 tuple.values.remove(col_idx);
 
-                // Serialize and encrypt if needed
+                // Serialize, then seal through the one rule, keyed on the key
+                // this row is landing under.
                 let new_value = bincode::serialize(&tuple)
                     .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
 
-                let final_value = if let Some(km) = &self.key_manager {
-                    crypto::encrypt(km.key(), &new_value)?
-                } else {
-                    new_value
-                };
+                let final_value = super::tde::seal_row_value(self.key_manager.as_deref(), &key, &new_value)?;
 
                 // W3.2: materialize this row's elided/COPY-marker insert version
                 // BEFORE the in-place narrowing overwrite (only rows actually
@@ -8365,7 +8354,7 @@ impl StorageEngine {
                 }
 
                 self.db
-                    .put(&key, &final_value)
+                    .put(&key, final_value.as_ref())
                     .map_err(|e| Error::storage(format!("Failed to write updated row: {}", e)))?;
 
                 updated += 1;
@@ -9107,16 +9096,28 @@ impl StorageEngine {
     /// Values are fetched through [`StorageEngine::get`] rather than read off
     /// the raw RocksDB iterator, because on a TDE data dir the raw iterator
     /// hands back CIPHERTEXT — `get` is the one place decryption happens. A key
-    /// that disappears between the scan and the fetch is skipped, and a read
-    /// error is warned and skipped rather than aborting the whole scan: this
-    /// started life as the open-time routine loader's reader, which must degrade
-    /// to "that one record is missing", never to "the database will not open".
-    /// Callers that need a hard failure decode the returned bytes themselves and
-    /// propagate — `Catalog::list_roles` / `list_acls` do exactly that.
+    /// that disappears between the scan and the fetch is still skipped (an
+    /// absent key is not an error).
     ///
     /// THIS IS THE ONE READ DISCIPLINE for prefix-scanned metadata. Do not add a
     /// second reader over `self.db.iterator_opt` that touches VALUES; it will be
     /// correct on a plaintext data dir and broken on every encrypted one.
+    ///
+    /// A FAILED READ PROPAGATES; it is not warned and dropped. It used to be:
+    /// the downgrade existed so that a value which would not decrypt could not
+    /// stop the open-time loaders, and it is exactly the silent-skip behaviour
+    /// that let an entire metadata namespace vanish at open with nothing above
+    /// WARN to say so. Now that `get` accepts an already-plaintext stored value
+    /// (see the stored-value decode helpers), the undecryptable case does not
+    /// arise here, so the only `Err` left is a genuine RocksDB read failure —
+    /// which must never be swallowed.
+    ///
+    /// Per-RECORD resilience still belongs to the callers, and several of them
+    /// keep it: `Catalog::load_all_triggers` and the routine loader warn-and-skip
+    /// one undecodable blob so a single bad record cannot stop the database
+    /// opening, while `Catalog::list_roles` / `list_acls` decode strictly and
+    /// propagate. Whether one record is readable is a different question from
+    /// whether the STORE is readable, which is what this answers.
     ///
     /// Callers: rebuilding the `FunctionRegistry` from the durable
     /// `meta:function:` / `meta:procedure:` records that
@@ -9124,17 +9125,18 @@ impl StorageEngine {
     /// (`WalOperation::CreateFunction`) both write; `Catalog::load_all_triggers`;
     /// `Catalog::load_all_trigger_row_mutations`; `Catalog::list_roles`;
     /// `Catalog::list_acls`.
-    pub fn meta_blobs_with_prefix(&self, prefix: &str) -> Vec<(String, Vec<u8>)> {
+    pub fn meta_blobs_with_prefix(&self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>> {
         let mut out = Vec::new();
         for suffix in self.keys_with_prefix_suffixes(prefix) {
             let key = format!("{}{}", prefix, suffix).into_bytes();
-            match self.get(&key) {
-                Ok(Some(value)) => out.push((suffix, value)),
-                Ok(None) => {}
-                Err(e) => warn!("failed to read metadata key '{}{}': {}", prefix, suffix, e),
+            let value = self
+                .get(&key)
+                .map_err(|e| Error::storage(format!("failed to read metadata key '{}{}': {}", prefix, suffix, e)))?;
+            if let Some(value) = value {
+                out.push((suffix, value));
             }
         }
-        out
+        Ok(out)
     }
 
     /// Get database statistics
@@ -9380,8 +9382,23 @@ impl StorageEngine {
                         format!("bdata:{}:{}:{}", target_id, table_name, row_id)
                     };
 
+                    // The stored form of a value is a property of the key it
+                    // lands under, so a row moving between keys is decoded for
+                    // the key it came FROM and sealed for the key it is going TO
+                    // — never copied across as bytes. `bdata:` and `data:` are
+                    // both sealed keyspaces, so on this path the transform is
+                    // form-preserving; it is written this way because the
+                    // decision belongs to the destination key, and because the
+                    // tolerant open is what lets a source value written by an
+                    // earlier build be promoted correctly. Both directions go
+                    // through the one rule in `tde`, and both are a no-op with
+                    // encryption disabled.
+                    let plain = super::tde::open_ref(self.key_manager.as_deref(), &key, &value)?;
+                    let stored =
+                        super::tde::seal_row_value(self.key_manager.as_deref(), target_key.as_bytes(), plain.as_ref())?;
+
                     self.db
-                        .put(target_key.as_bytes(), &value)
+                        .put(target_key.as_bytes(), stored.as_ref())
                         .map_err(|e| Error::storage(format!("Failed to merge data: {}", e)))?;
                     // The row cache is keyed (table, row_id) with NO branch
                     // dimension; the merged write changes the row's value, so
@@ -9497,6 +9514,7 @@ impl StorageEngine {
             parent_chain,
             snapshot_id,
             Arc::clone(&self.snapshot_manager),
+            self.key_manager.clone(),
         )
     }
 
@@ -10551,14 +10569,12 @@ impl StorageEngine {
                     return Ok(false);
                 }
 
-                // Encrypt if needed
-                let data = if let Some(km) = &self.key_manager {
-                    crypto::encrypt(km.key(), tuple)?
-                } else {
-                    tuple.clone()
-                };
+                // Keyed on the key being replayed, so a replayed write lands in
+                // exactly the form the live write would have produced for that
+                // same key.
+                let data = super::tde::seal_row_value(self.key_manager.as_deref(), key, tuple)?;
 
-                batch.put(key, &data);
+                batch.put(key, data.as_ref());
                 debug!("Batched insert: table={}, key_len={}", table, key.len());
                 Ok(true)
             }
@@ -10571,14 +10587,10 @@ impl StorageEngine {
                     return Ok(false);
                 }
 
-                // Encrypt if needed
-                let data = if let Some(km) = &self.key_manager {
-                    crypto::encrypt(km.key(), tuple)?
-                } else {
-                    tuple.clone()
-                };
+                // Keyed on the key being replayed, like the Insert arm above.
+                let data = super::tde::seal_row_value(self.key_manager.as_deref(), key, tuple)?;
 
-                batch.put(key, &data);
+                batch.put(key, data.as_ref());
                 debug!("Batched update: table={}, key_len={}", table, key.len());
                 Ok(true)
             }
@@ -10691,11 +10703,15 @@ impl StorageEngine {
                     counter.store(*new_value, std::sync::atomic::Ordering::SeqCst);
                 }
 
-                // Persist the counter
+                // Persist the counter, sealed like every other `counter:` write
+                // (`put_internal`, the fast batch, the transaction commit batch)
+                // — a replayed counter must land in the same on-disk form as a
+                // live one.
                 let key = format!("counter:{}", table_name).into_bytes();
                 let value = bincode::serialize(new_value)
                     .map_err(|e| Error::storage(format!("Failed to serialize counter: {}", e)))?;
-                batch.put(&key, &value);
+                let stored = self.seal_stored(&value)?;
+                batch.put(&key, stored.as_ref());
 
                 Ok(false) // Don't count as regular batch operation
             }
@@ -11222,7 +11238,11 @@ impl StorageEngine {
                 key_buf.clear();
                 key_buf.extend_from_slice(data_prefix.as_bytes());
                 key_buf.extend_from_slice(row_id_str.as_bytes());
-                batch.put(&key_buf, &value);
+                // Seal at the batch builder, not at the call site: this is one
+                // of the three `data:` writes in this function and they must all
+                // land in the same on-disk form as `StorageEngine::put`.
+                let stored = self.seal_stored(&value)?;
+                batch.put(&key_buf, stored.as_ref());
                 // W3.2: `data:` bytes. The version chain here is a SINGLE
                 // `vmeta:` marker (recorded below), not per-row `v:`/`v_idx:` —
                 // this is the copy-marker elision W3.2 generalizes.
@@ -11230,7 +11250,7 @@ impl StorageEngine {
                     crate::write_volume::add_row();
                     crate::write_volume::add(
                         crate::write_volume::Category::Data,
-                        (key_buf.len() + value.len()) as u64,
+                        (key_buf.len() + stored.len()) as u64,
                     );
                 }
 
@@ -11271,12 +11291,13 @@ impl StorageEngine {
                 key_buf.clear();
                 key_buf.extend_from_slice(data_prefix.as_bytes());
                 key_buf.extend_from_slice(row_id_str.as_bytes());
-                batch.put(&key_buf, &value);
+                let stored = self.seal_stored(&value)?;
+                batch.put(&key_buf, stored.as_ref());
                 if wv {
                     crate::write_volume::add_row();
                     crate::write_volume::add(
                         crate::write_volume::Category::Data,
-                        (key_buf.len() + value.len()) as u64,
+                        (key_buf.len() + stored.len()) as u64,
                     );
                 }
 
@@ -11284,7 +11305,12 @@ impl StorageEngine {
                 version_key_buf.extend_from_slice(version_prefix.as_bytes());
                 version_key_buf.extend_from_slice(row_id_str.as_bytes());
                 version_key_buf.extend_from_slice(version_suffix.as_bytes());
-                batch.put(&version_key_buf, &logical_value);
+                // The `v:` twin holds the LOGICAL row image (never a
+                // `ColumnarRef` placeholder), so it is sealed from
+                // `logical_value` rather than reusing `stored` — on the
+                // columnar arm the two are genuinely different plaintexts.
+                let stored_version = self.seal_stored(&logical_value)?;
+                batch.put(&version_key_buf, stored_version.as_ref());
 
                 version_index_key_buf.clear();
                 version_index_key_buf.extend_from_slice(version_index_prefix.as_bytes());
@@ -11301,7 +11327,7 @@ impl StorageEngine {
                 if wv {
                     crate::write_volume::add(
                         crate::write_volume::Category::Version,
-                        (version_key_buf.len() + logical_value.len() + version_index_key_buf.len() + 8) as u64,
+                        (version_key_buf.len() + stored_version.len() + version_index_key_buf.len() + 8) as u64,
                     );
                 }
 
@@ -11316,12 +11342,13 @@ impl StorageEngine {
                 key_buf.clear();
                 key_buf.extend_from_slice(data_prefix.as_bytes());
                 key_buf.extend_from_slice(row_id_str.as_bytes());
-                batch.put(&key_buf, &value);
+                let stored = self.seal_stored(&value)?;
+                batch.put(&key_buf, stored.as_ref());
                 if wv {
                     crate::write_volume::add_row();
                     crate::write_volume::add(
                         crate::write_volume::Category::Data,
-                        (key_buf.len() + value.len()) as u64,
+                        (key_buf.len() + stored.len()) as u64,
                     );
                 }
 
@@ -11334,7 +11361,10 @@ impl StorageEngine {
             let counter_key = format!("counter:{}", table_name);
             let counter_value = bincode::serialize(&final_row_id)
                 .map_err(|e| Error::storage(format!("Failed to serialize counter: {}", e)))?;
-            batch.put(counter_key.as_bytes(), counter_value);
+            // `counter:` is sealed by `put_internal` on every other route; this
+            // batch must agree with it rather than differ by write route.
+            let stored_counter = self.seal_stored(&counter_value)?;
+            batch.put(counter_key.as_bytes(), stored_counter.as_ref());
         }
 
         // R3.3: append the grouped columnar writes to the same WriteBatch.
@@ -12119,7 +12149,7 @@ impl StorageEngine {
 
             if key.starts_with(prefix) {
                 // Decrypt value if encryption is enabled
-                let value = self.decrypt_value(&raw_value)?;
+                let value = self.decrypt_value(&key, &raw_value)?;
 
                 let table_name = String::from_utf8_lossy(key.get(prefix.len()..).unwrap_or_default()).to_string();
                 let count: u64 = bincode::deserialize(&value)
@@ -12320,6 +12350,161 @@ impl StorageEngine {
 mod tests {
     use super::*;
     use crate::{Column, DataType, Schema, Value};
+
+    // ---- TDE read tolerance -------------------------------------------------
+    //
+    // An encryption-enabled database can legitimately hold a MIXTURE of
+    // ciphertext and plaintext under the same key prefixes, and nothing on
+    // disk distinguishes them, so every read must handle BOTH. These tests
+    // pin that behaviour on the exact routes a real database takes.
+
+    /// Open an in-memory engine with TDE on, keyed from a per-test env var so
+    /// tests never fight over one variable.
+    fn encrypted_test_engine(env_var: &str, key_hex: &str) -> StorageEngine {
+        std::env::set_var(env_var, key_hex);
+        let mut config = Config::in_memory();
+        config.encryption.enabled = true;
+        config.encryption.key_source = crate::KeySource::Environment(env_var.to_string());
+        let engine = StorageEngine::open_in_memory(&config).expect("open encrypted in-memory engine");
+        assert!(engine.is_encrypted(), "test engine must have a key manager");
+        engine
+    }
+
+    fn int_pk_schema() -> Schema {
+        Schema {
+            columns: vec![Column {
+                name: "id".to_string(),
+                data_type: DataType::Int4,
+                nullable: false,
+                primary_key: true,
+                source_table: None,
+                source_table_name: None,
+                default_expr: None,
+                unique: false,
+                storage_mode: crate::ColumnStorageMode::Default,
+            }],
+        }
+    }
+
+    /// `get` must return BOTH a value written through the encrypting `put` and
+    /// a value that was written raw. Before the tolerant decode the raw value
+    /// failed with `Encryption("Decryption failed: aead::Error")`.
+    #[test]
+    fn get_tolerates_a_plaintext_stored_value() {
+        let engine = encrypted_test_engine("TEST_TDE_TOLERANCE_GET_KEY", &"11".repeat(32));
+        // The counter is process-global and monotonic, so only "it advanced"
+        // is race-free to assert under a parallel test runner.
+        //
+        // These use `data:` keys rather than `meta:` ones because the
+        // passthrough counter is scoped to `tde::is_row_value_key` — the
+        // keyspaces the storage boundary itself seals. Tolerance applies to
+        // every key either way (`get` decodes the same for all of them, as the
+        // three round-trips below assert); it is only the DIAGNOSTIC that is
+        // scoped.
+        let before = StorageEngine::plaintext_passthrough_count();
+
+        engine.put(&b"data:tolerance:1".to_vec(), b"through-put").expect("put");
+        assert_eq!(
+            engine.get(&b"data:tolerance:1".to_vec()).expect("get ciphertext"),
+            Some(b"through-put".to_vec()),
+            "a value written through the encrypting put must still round-trip"
+        );
+
+        // Written raw, bypassing every encrypting route — the shape legacy
+        // rows already on disk have.
+        engine.db.put(b"data:tolerance:2", b"written-raw").expect("raw put");
+        assert_eq!(
+            engine.get(&b"data:tolerance:2".to_vec()).expect("get plaintext"),
+            Some(b"written-raw".to_vec()),
+            "an already-plaintext stored value must be readable, not an aead error"
+        );
+
+        // A buffer long enough to BE a frame but not authentic still falls
+        // through as bytes rather than erroring (2^-128 to do otherwise).
+        let long_plaintext = vec![7u8; 512];
+        engine.db.put(b"data:tolerance:3", &long_plaintext).expect("raw put");
+        assert_eq!(
+            engine.get(&b"data:tolerance:3".to_vec()).expect("get long plaintext"),
+            Some(long_plaintext)
+        );
+
+        // The same tolerance still applies OUTSIDE the counted keyspaces — this
+        // is the half the gate must not have broken.
+        engine.db.put(b"meta:tolerance:pt", b"written-raw").expect("raw put");
+        assert_eq!(
+            engine.get(&b"meta:tolerance:pt".to_vec()).expect("get plaintext"),
+            Some(b"written-raw".to_vec()),
+            "tolerance is not limited to the counted keyspaces"
+        );
+
+        assert!(
+            StorageEngine::plaintext_passthrough_count() > before,
+            "a plaintext passthrough must be counted so it stays diagnosable"
+        );
+    }
+
+    /// The scan decoder is the route that broke: `CREATE INDEX` backfills via
+    /// `scan_table_with_schema`, so one plaintext row used to fail the whole
+    /// scan. Both rows must come back.
+    #[test]
+    fn scan_reads_mixed_ciphertext_and_plaintext_rows() {
+        let engine = encrypted_test_engine("TEST_TDE_TOLERANCE_SCAN_KEY", &"22".repeat(32));
+        let schema = int_pk_schema();
+        engine
+            .catalog()
+            .create_table("mix", schema.clone())
+            .expect("create mix");
+
+        // (a) through the encrypting library route
+        engine
+            .insert_tuple("mix", Tuple::new(vec![Value::Int4(1)]))
+            .expect("insert encrypted row");
+
+        // (b) raw, exactly as the non-encrypting write routes leave it
+        let plain = bincode::serialize(&Tuple::new(vec![Value::Int4(2)])).expect("serialize tuple");
+        engine.db.put(b"data:mix:9999", &plain).expect("raw put");
+
+        let rows = engine
+            .scan_table_with_schema("mix", &schema)
+            .expect("scan must tolerate a mixed keyspace");
+        let mut ids: Vec<i32> = rows
+            .iter()
+            .filter_map(|t| match t.values.first() {
+                Some(Value::Int4(v)) => Some(*v),
+                _ => None,
+            })
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![1, 2],
+            "both the ciphertext row and the plaintext row must decode"
+        );
+    }
+
+    /// With encryption OFF (the default configuration) the decode helpers are
+    /// a pure passthrough: whatever bytes are on disk come back verbatim, with
+    /// no cipher involved on either side.
+    #[test]
+    fn decode_is_a_passthrough_when_encryption_is_disabled() {
+        let engine = StorageEngine::open_in_memory(&Config::in_memory()).expect("open plain in-memory");
+        assert!(!engine.is_encrypted());
+
+        engine.put(&b"meta:plain:put".to_vec(), b"value").expect("put");
+        assert_eq!(
+            engine.get(&b"meta:plain:put".to_vec()).expect("get"),
+            Some(b"value".to_vec())
+        );
+
+        // Bytes that happen to LOOK like an AES-GCM frame must not be
+        // reinterpreted when there is no key manager.
+        let framelike = vec![0u8; 128];
+        engine.db.put(b"meta:plain:raw", &framelike).expect("raw put");
+        assert_eq!(
+            engine.get(&b"meta:plain:raw".to_vec()).expect("get raw"),
+            Some(framelike)
+        );
+    }
 
     #[test]
     fn coerce_pk_value_int_to_numeric() {
@@ -13404,7 +13589,7 @@ impl StorageEngine {
             }
 
             if let Some(row_id) = Self::parse_row_id_after_prefix(&key, main_prefix_bytes.len()) {
-                let value = self.decrypt_value(&raw_value)?;
+                let value = self.decrypt_value(&key, &raw_value)?;
 
                 let mut tuple: Tuple = bincode::deserialize(&value)
                     .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
@@ -13456,7 +13641,7 @@ impl StorageEngine {
                 }
 
                 if let Some(row_id) = Self::parse_row_id_after_prefix(&key, branch_prefix_bytes.len()) {
-                    let value = self.decrypt_value(&raw_value)?;
+                    let value = self.decrypt_value(&key, &raw_value)?;
 
                     let mut tuple: Tuple = bincode::deserialize(&value)
                         .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;

@@ -888,7 +888,7 @@ impl<'a> Catalog<'a> {
     pub fn list_index_definitions(&self) -> Result<Vec<(String, PersistedIndexDefinition)>> {
         let mut indexes = Vec::new();
 
-        for (index_name, value) in self.storage.meta_blobs_with_prefix("meta:index:") {
+        for (index_name, value) in self.storage.meta_blobs_with_prefix("meta:index:")? {
             // Per-record resilience: a single undecodable record must NOT abort
             // the whole rebuild (that would silently un-index every *other*
             // index on the database — the failure mode behind the upgrade bug).
@@ -1486,9 +1486,31 @@ impl<'a> Catalog<'a> {
             bincode::serialize(&schema).map_err(|e| Error::storage(format!("Failed to serialize schema: {}", e)))?;
         let new_counter_key = Self::table_counter_key(new_name);
 
+        // The two values this batch SYNTHESIZES — the schema blob and the row
+        // counter — are in-memory plaintext (`schema_bytes` was just serialized
+        // above; `counter_value` came back from `storage.get`, which DECODES).
+        // Every other writer of `meta:table:{t}` and `counter:{t}` stores them
+        // sealed: `create_table` / `update_table_schema` write the schema through
+        // `StorageEngine::put`, and the counter goes through `put_internal`
+        // (`flush_row_counter`), the transaction commit batch and the fast batch.
+        // This batch must agree with them, because the stored form of a value is
+        // a property of the KEY it lands under, not of which function wrote it.
+        //
+        // Sealing here — rather than copying the old keys' stored bytes across,
+        // the way the per-row loop below correctly does — is what makes both keys
+        // come out in the canonical form whichever form the source had, and it is
+        // the only option for the counter's `None` arm above, which synthesizes a
+        // fresh `0u64` with no old key to copy from.
+        //
+        // `tde::seal` is the same one rule every other writer uses, and it is
+        // `Cow::Borrowed` — no allocation, no copy — when encryption is off.
+        let key_manager = self.storage.key_manager_arc();
+        let stored_schema = super::tde::seal(key_manager.as_deref(), &schema_bytes)?;
+        let stored_counter = super::tde::seal(key_manager.as_deref(), &counter_value)?;
+
         let mut batch = rocksdb::WriteBatch::default();
-        batch.put(&new_metadata_key, &schema_bytes);
-        batch.put(&new_counter_key, &counter_value);
+        batch.put(&new_metadata_key, stored_schema.as_ref());
+        batch.put(&new_counter_key, stored_counter.as_ref());
 
         let old_data_prefix = format!("data:{}:", old_name);
         let old_prefix_bytes = old_data_prefix.as_bytes();
@@ -2047,7 +2069,7 @@ impl<'a> Catalog<'a> {
     pub fn list_sequences(&self) -> Result<Vec<PersistedSequence>> {
         let mut sequences = Vec::new();
 
-        for (name, value) in self.storage.meta_blobs_with_prefix("meta:sequence:") {
+        for (name, value) in self.storage.meta_blobs_with_prefix("meta:sequence:")? {
             if let Some(def) = Self::decode_persisted_sequence(&name, &value) {
                 sequences.push(def);
             }
@@ -2263,7 +2285,7 @@ impl<'a> Catalog<'a> {
     /// the counter is not scanned.
     pub fn list_roles(&self) -> Result<Vec<RoleRecord>> {
         let mut roles = Vec::new();
-        for (_suffix, value) in self.storage.meta_blobs_with_prefix("meta:role:") {
+        for (_suffix, value) in self.storage.meta_blobs_with_prefix("meta:role:")? {
             roles.push(Self::decode_tagged(ROLE_MAGIC, ROLE_FORMAT_VERSION, &value, "role")?);
         }
         roles.sort_by(|a: &RoleRecord, b: &RoleRecord| a.name.cmp(&b.name));
@@ -2289,7 +2311,7 @@ impl<'a> Catalog<'a> {
     /// disagree about the on-disk format.
     pub fn list_acls(&self) -> Result<Vec<AclRecord>> {
         let mut acls = Vec::new();
-        for (_suffix, value) in self.storage.meta_blobs_with_prefix("meta:acl:") {
+        for (_suffix, value) in self.storage.meta_blobs_with_prefix("meta:acl:")? {
             acls.push(Self::decode_tagged(ACL_MAGIC, ACL_FORMAT_VERSION, &value, "ACL")?);
         }
         acls.sort_by(|a: &AclRecord, b: &AclRecord| {
@@ -2562,7 +2584,7 @@ impl<'a> Catalog<'a> {
     /// sidecar namespace — they diverge at byte 7 (`:` 0x3A vs `_` 0x5F).
     pub fn load_all_triggers(&self) -> Result<Vec<crate::sql::TriggerDefinition>> {
         let mut triggers = Vec::new();
-        for (suffix, value) in self.storage.meta_blobs_with_prefix("trigger:") {
+        for (suffix, value) in self.storage.meta_blobs_with_prefix("trigger:")? {
             match bincode::deserialize::<crate::sql::TriggerDefinition>(&value) {
                 Ok(definition) => triggers.push(definition),
                 Err(e) => tracing::warn!("persisted trigger 'trigger:{}' is unreadable, skipped: {}", suffix, e),
@@ -2656,7 +2678,7 @@ impl<'a> Catalog<'a> {
         &self,
     ) -> Result<Vec<(String, String, crate::sql::triggers::TriggerRowMutation)>> {
         let mut out = Vec::new();
-        for (suffix, value) in self.storage.meta_blobs_with_prefix("trigger_rowmut:") {
+        for (suffix, value) in self.storage.meta_blobs_with_prefix("trigger_rowmut:")? {
             // `suffix` is `{table}:{trigger}`. Split from the RIGHT: trigger
             // names are bare identifiers, while a table name may be schema
             // qualified (`s.t`).
@@ -2793,30 +2815,21 @@ impl<'a> Catalog<'a> {
         }
 
         let mut result = Vec::new();
-        let prefix = b"table_constraints:";
 
-        // Seek directly to the `table_constraints:` prefix instead of iterating
-        // from the start of the keyspace. With `IteratorMode::Start` this walked
-        // every `data:` row key (which sort before `table_constraints:`), making
-        // every reverse-FK lookup -- and therefore every DELETE -- O(table rows).
-        // `total_order_seek` is required because the DB uses a 5-byte prefix extractor.
-        let mut read_opts = rocksdb::ReadOptions::default();
-        read_opts.set_total_order_seek(true);
-        let iter = self.storage.db.iterator_opt(
-            rocksdb::IteratorMode::From(prefix, rocksdb::Direction::Forward),
-            read_opts,
-        );
-        for item in iter {
-            let (key, value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
-
-            if !key.starts_with(prefix) {
-                // We seeked to `table_constraints:`; the first key that no longer
-                // shares the prefix means the whole group has been read.
-                break;
-            }
-
-            let constraints: crate::sql::TableConstraints = bincode::deserialize(&value)
-                .map_err(|e| Error::storage(format!("Failed to deserialize constraints: {}", e)))?;
+        // Read through `meta_blobs_with_prefix`, which fetches each value with
+        // `StorageEngine::get` — the one place a stored value is decoded. This
+        // keyspace is written by `save_table_constraints` through
+        // `self.storage.put`, which seals whatever key it is handed, so a raw
+        // iterator over the VALUES here reads ciphertext on an encrypted data
+        // directory and this lookup runs on every reverse-FK check, i.e. every
+        // DELETE. That read discipline (engine.rs) also replaces the old manual
+        // prefix seek: it does the `total_order_seek` this keyspace needs,
+        // instead of the `IteratorMode::Start` walk over every `data:` row key
+        // that made the lookup O(table rows).
+        for (table_name, value) in self.storage.meta_blobs_with_prefix("table_constraints:")? {
+            let constraints: crate::sql::TableConstraints = bincode::deserialize(&value).map_err(|e| {
+                Error::storage(format!("Failed to deserialize constraints for '{}': {}", table_name, e))
+            })?;
 
             for fk in constraints.foreign_keys {
                 if fk.references_table == referenced_table {
