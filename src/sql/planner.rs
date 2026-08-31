@@ -5262,10 +5262,20 @@ impl<'a> Planner<'a> {
             // DEFAULT / UNIQUE / PRIMARY KEY would fabricate constraints
             // PostgreSQL does not create for a CTAS. Mirrors the sanitising the
             // plain CreateTable executor arm does when it builds its columns.
+            //
+            // NOT NULL is the same class and is therefore NOT inherited either
+            // (`nullable: true`, not `source.nullable`). PostgreSQL creates a
+            // CTAS target with no NOT NULL constraints. Inheriting it was
+            // harmless only while nothing enforced NOT NULL on this path; once
+            // INSERT … SELECT enforces it, a query whose static schema says
+            // NOT NULL but whose rows are NULL — the ordinary
+            // `CREATE TABLE t2 AS SELECT a.id, b.val FROM a LEFT JOIN b …`,
+            // where the outer join produces NULLs for a column declared NOT
+            // NULL in `b` — would be rejected outright.
             columns.push(Column {
                 name,
                 data_type: source.data_type.clone(),
-                nullable: source.nullable,
+                nullable: true,
                 primary_key: false,
                 source_table: None,
                 source_table_name: None,
