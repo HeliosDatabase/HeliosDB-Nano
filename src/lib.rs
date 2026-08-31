@@ -1077,6 +1077,61 @@ impl CompiledCheckConstraints {
     }
 }
 
+/// Per-statement state for `INSERT … SELECT` row assembly and validation,
+/// built ONCE by [`EmbeddedDatabase::prepare_insert_select_gate`] and consumed
+/// per source row by [`EmbeddedDatabase::build_insert_select_row`].
+///
+/// ONE gate, called from BOTH executor families' `InsertSelect` arms (tasks
+/// #101/#102/#84). Before it existed the two arms were independent
+/// implementations of the same rule and had decayed apart: the params family —
+/// the PG EXTENDED protocol (psycopg3 / JDBC / sqlx / node-postgres) and every
+/// REST/BaaS write — placed column-list values POSITIONALLY (so
+/// `INSERT INTO t (b, a) SELECT x, y` stored `x` in `a`) and enforced CHECK and
+/// nothing else: no NOT NULL, no FOREIGN KEY, no table-level UNIQUE, no DEFAULT
+/// fill. Do not re-inline either half; extend the gate.
+///
+/// **The gate NEVER WRITES.** It returns a validated `Tuple` and each arm keeps
+/// its own existing `insert_tuple_branch_aware_with_schema` call. Making
+/// `INSERT … SELECT` write through the caller's transaction is task #100 and is
+/// deliberately NOT part of this type.
+///
+/// PERF: everything a row loop would otherwise redo — schema-derived indices,
+/// parsed DEFAULT expressions, parsed+bound CHECK expressions, resolved UNIQUE
+/// column positions, the "are there any FKs / rewrite recipes at all" questions
+/// — is resolved here, once. The text family previously called
+/// `load_table_constraints` (a catalog read + deserialize) and re-parsed every
+/// CHECK expression PER ROW on what is a bulk path.
+struct InsertSelectGate<'a> {
+    /// Target table schema; owned by the calling arm for the whole statement.
+    schema: &'a Schema,
+    /// Target column index for each source-row position, resolved from the
+    /// INSERT column list by `resolve_insert_column_indices` (which ERRORS on
+    /// an unknown column name). `None` for a positional `INSERT INTO t SELECT`.
+    column_indices: Option<Vec<usize>>,
+    /// Parsed DEFAULT expression per column position, parsed once.
+    default_exprs: Vec<Option<sql::LogicalExpr>>,
+    /// CHECK constraints parsed and column-bound once (see
+    /// [`CompiledCheckConstraints`] — identical semantics to the per-row
+    /// `validate_check_constraints`, only hoisted).
+    checks: CompiledCheckConstraints,
+    /// Table-level UNIQUE constraints as `(name, column names, column
+    /// positions)`. A constraint naming a column the table does not have is
+    /// dropped here, which is exactly what the per-row name lookup's
+    /// `unwrap_or(Value::Null)` + "any NULL → skip" did.
+    unique_checks: Vec<(String, Vec<String>, Vec<usize>)>,
+    /// Whether the table has any enforceable FOREIGN KEY at all, so the
+    /// FK-free bulk path never builds a column map or re-reads the catalog.
+    has_foreign_keys: bool,
+    /// Schema handle for the BEFORE-row rewrite hook; `None` when the table has
+    /// no rewrite recipe (the common case — answered from one atomic load).
+    rewrite_schema: Option<std::sync::Arc<Schema>>,
+    /// Empty-schema evaluator for per-value casts and DEFAULT evaluation —
+    /// the same one both arms built inline.
+    evaluator: sql::Evaluator,
+    /// Reusable empty tuple for DEFAULT expression evaluation.
+    empty_tuple: Tuple,
+}
+
 struct FastSelectSpec {
     table_name: String,
     pk_col: String,
@@ -3879,6 +3934,330 @@ impl EmbeddedDatabase {
         Ok(Some(indices))
     }
 
+    /// Build the per-statement [`InsertSelectGate`] for an `INSERT … SELECT`
+    /// into `table_name`. Called ONCE per statement by both executor families,
+    /// OUTSIDE the row loop.
+    ///
+    /// Everything expensive that does not vary per row lives here: the catalog
+    /// constraint read, the CHECK parse+bind, the DEFAULT-expression parse, the
+    /// UNIQUE column-position resolution, the column-list resolution and the
+    /// "does this table have a BEFORE-row rewrite recipe" question. The text
+    /// family used to pay `load_table_constraints` and a full CHECK parse PER
+    /// ROW on what is the engine's bulk-insert path.
+    fn prepare_insert_select_gate<'a>(
+        &self,
+        table_name: &str,
+        schema: &'a Schema,
+        columns: Option<&Vec<String>>,
+    ) -> Result<InsertSelectGate<'a>> {
+        let catalog = self.storage.catalog();
+        let constraints = catalog.load_table_constraints(table_name)?;
+        let checks = self.compile_check_constraints(&constraints, schema)?;
+        let column_indices = Self::resolve_insert_column_indices(schema, columns, table_name)?;
+
+        let default_exprs: Vec<Option<sql::LogicalExpr>> = schema
+            .columns
+            .iter()
+            .map(|col| {
+                col.default_expr
+                    .as_ref()
+                    .and_then(|json| serde_json::from_str::<sql::LogicalExpr>(json).ok())
+            })
+            .collect();
+
+        let mut unique_checks: Vec<(String, Vec<String>, Vec<usize>)> =
+            Vec::with_capacity(constraints.unique_constraints.len());
+        for uc in &constraints.unique_constraints {
+            // ONLY the primary key. The probe below is `pk_index_contains`,
+            // which resolves the table's PRIMARY KEY index and answers about
+            // that index alone — so handing it a NON-PK unique constraint's
+            // values asks the wrong index and reports a duplicate whenever
+            // those values happen to exist as a PRIMARY KEY. On
+            // `(name TEXT PRIMARY KEY, alias TEXT UNIQUE)`, inserting
+            // `alias = 'x'` while a ROW NAMED 'x' exists raised a phantom
+            // 23505. That false positive is pre-existing on the text family;
+            // this change would have newly exposed the extended protocol and
+            // REST to it, so it is filtered here rather than carried forward.
+            //
+            // Non-PK single-column UNIQUE is still enforced — by the ART unique
+            // index at the storage layer, on every write path. Table-level
+            // COMPOSITE UNIQUE is enforced by nothing at all, because
+            // `Catalog::create_table` builds ART indexes only for PRIMARY KEY
+            // and column-level UNIQUE; that gap is pinned by a test and filed.
+            if !uc.is_primary_key {
+                continue;
+            }
+            let mut positions = Vec::with_capacity(uc.columns.len());
+            let mut resolvable = true;
+            for col_name in &uc.columns {
+                match schema.columns.iter().position(|c| &c.name == col_name) {
+                    Some(idx) => positions.push(idx),
+                    None => {
+                        // A constraint naming a column this table does not have
+                        // can never be probed — the per-row lookup it replaces
+                        // produced `Value::Null` for it and then skipped the
+                        // whole constraint on the "any NULL" rule.
+                        resolvable = false;
+                        break;
+                    }
+                }
+            }
+            if resolvable {
+                unique_checks.push((uc.name.clone(), uc.columns.clone(), positions));
+            }
+        }
+
+        let has_foreign_keys = !constraints.foreign_keys.is_empty();
+
+        // Hoisted exactly as the single-row INSERT arms hoist it: with no
+        // rewrite recipe registered anywhere, `has_row_mutations` answers from
+        // one atomic load without taking a lock, so the trigger-free bulk path
+        // — which the perf gate measures — pays nothing.
+        let rewrite_schema = if self.trigger_registry.has_row_mutations(table_name) {
+            Some(std::sync::Arc::new(schema.clone()))
+        } else {
+            None
+        };
+
+        Ok(InsertSelectGate {
+            schema,
+            column_indices,
+            default_exprs,
+            checks,
+            unique_checks,
+            has_foreign_keys,
+            rewrite_schema,
+            evaluator: sql::Evaluator::new(std::sync::Arc::new(Schema { columns: vec![] })),
+            empty_tuple: Tuple::new(vec![]),
+        })
+    }
+
+    /// Assemble and validate ONE `INSERT … SELECT` source row against the
+    /// target table. `Ok(None)` means the BEFORE-row rewrite recipe said
+    /// `RETURN NULL`: the row must be skipped — not written, not counted, not
+    /// returned by `RETURNING`.
+    ///
+    /// **Never writes.** The caller performs its own insert. Turning these rows
+    /// into transaction-staged writes is task #100 and is deliberately not done
+    /// here (see [`InsertSelectGate`]).
+    ///
+    /// Order, matching PostgreSQL and the single-row INSERT arms that
+    /// v4.20.0/v4.21.0 established:
+    ///
+    /// 1. place each source value at ITS NAMED target column (#101) and cast it
+    ///    to that column's type, enforcing NOT NULL on the values the source
+    ///    actually supplied;
+    /// 2. fill unlisted columns from their DEFAULT, leave an omitted PK NULL for
+    ///    the storage layer's SERIAL/IDENTITY fill, and REJECT an omitted
+    ///    non-nullable column with no default;
+    /// 3. the BEFORE-row rewrite hook (#84) — BEFORE the constraint gates;
+    /// 4. NOT NULL again over the rewritten row, then FOREIGN KEY, CHECK and
+    ///    table-level UNIQUE (#102).
+    ///
+    /// RLS `WITH CHECK` deliberately stays at each arm's own call site: the text
+    /// family fires its BEFORE-trigger block between this gate and the write,
+    /// and PostgreSQL evaluates `WITH CHECK` after BEFORE triggers. It is
+    /// already one shared helper (`enforce_rls_with_check`), so that is a call
+    /// order, not a second copy of the rule.
+    fn build_insert_select_row(
+        &self,
+        table_name: &str,
+        gate: &InsertSelectGate<'_>,
+        source_row: &Tuple,
+        active_txn: Option<&storage::Transaction>,
+    ) -> Result<Option<Tuple>> {
+        let schema = gate.schema;
+        let column_count = schema.columns.len();
+
+        // Pre-sized so every value lands at its TARGET column index. The params
+        // family used to `Vec::new()` + `push`, using the target index only to
+        // pick a cast type — silently storing `INSERT INTO t (b, a) SELECT x, y`
+        // as `(x, y)` positionally (#101).
+        let mut slots: Vec<Option<Value>> = vec![None; column_count];
+
+        for (val_idx, value) in source_row.values.iter().enumerate() {
+            let target_col_idx = match &gate.column_indices {
+                Some(indices) => {
+                    if val_idx >= indices.len() {
+                        return Err(Error::query_execution("More values than columns specified"));
+                    }
+                    *indices
+                        .get(val_idx)
+                        .ok_or_else(|| Error::internal("column index out of bounds"))?
+                }
+                None => val_idx,
+            };
+
+            let target_col = schema.get_column_at(target_col_idx).ok_or_else(|| {
+                Error::query_execution(format!(
+                    "Too many values for INSERT: table has {} columns",
+                    column_count
+                ))
+            })?;
+
+            let target_type = &target_col.data_type;
+            let mut val = value.clone();
+
+            let needs_cast = match (&val, target_type) {
+                (Value::Null, _) => false,
+                (Value::Vector(_), DataType::Vector(_)) => true,
+                (Value::String(_), DataType::Vector(_)) => true,
+                (Value::String(_), DataType::Json | DataType::Jsonb) => true,
+                (Value::Int4(_), DataType::Int4) => false,
+                (Value::Int8(_), DataType::Int8) => false,
+                (Value::Float4(_), DataType::Float4) => false,
+                (Value::Float8(_), DataType::Float8) => false,
+                (Value::String(_), DataType::Text | DataType::Varchar(_)) => false,
+                (Value::Boolean(_), DataType::Boolean) => false,
+                (Value::Json(_), DataType::Json | DataType::Jsonb) => false,
+                _ => true,
+            };
+
+            if needs_cast {
+                val = gate.evaluator.cast_value(val, target_type)?;
+            }
+
+            // NOT NULL on a value the source actually supplied.
+            //
+            // Primary keys are exempt, matching the post-rewrite pass below and
+            // the single-row INSERT arm: a NULL in a SERIAL/IDENTITY primary key
+            // is the signal for the storage layer to auto-fill it. Without this
+            // exemption the two passes inside this one function contradict each
+            // other — a source-supplied NULL PK would be rejected here while an
+            // omitted one is accepted 70 lines down.
+            if matches!(val, Value::Null) && !target_col.nullable && !target_col.primary_key {
+                return Err(Error::constraint_violation(format!(
+                    "NOT NULL constraint violated: cannot insert NULL into column '{}'",
+                    target_col.name
+                )));
+            }
+
+            let slot = slots
+                .get_mut(target_col_idx)
+                .ok_or_else(|| Error::internal("column index out of bounds"))?;
+            *slot = Some(val);
+        }
+
+        // DEFAULT fill for every column the source did not supply.
+        let mut values: Vec<Value> = Vec::with_capacity(column_count);
+        for (idx, opt_val) in slots.into_iter().enumerate() {
+            match opt_val {
+                Some(val) => values.push(val),
+                None => {
+                    let col = schema
+                        .get_column_at(idx)
+                        .ok_or_else(|| Error::internal("column index out of bounds"))?;
+                    if let Some(default_expr) = gate.default_exprs.get(idx).and_then(|d| d.as_ref()) {
+                        let mut value = gate.evaluator.evaluate(default_expr, &gate.empty_tuple)?;
+                        if value.data_type() != col.data_type {
+                            value = gate.evaluator.cast_value(value, &col.data_type)?;
+                        }
+                        values.push(value);
+                    } else if col.primary_key {
+                        // PK omitted from the INSERT — NULL so the storage
+                        // layer's SERIAL auto-fill replaces it with the row_id.
+                        values.push(Value::Null);
+                    } else if col.nullable {
+                        values.push(Value::Null);
+                    } else {
+                        return Err(Error::query_execution(format!(
+                            "Column '{}' does not have a default value and is not nullable",
+                            col.name
+                        )));
+                    }
+                }
+            }
+        }
+
+        let mut tuple = Tuple::new(values);
+
+        // #84: the BEFORE-row rewrite recipe, which neither arm applied. Placed
+        // BEFORE the constraint gates — PostgreSQL's order, and the position the
+        // single-row INSERT arms use on both families.
+        if let Some(schema_arc) = &gate.rewrite_schema {
+            if !self.apply_before_insert_row_hook(
+                table_name,
+                &sql::logical_plan::TriggerEvent::Insert,
+                &mut tuple,
+                schema_arc,
+            )? {
+                return Ok(None);
+            }
+        }
+
+        // NOT NULL over the row as it will actually be stored, so a rewrite (or
+        // a DEFAULT expression evaluating to NULL) cannot smuggle a NULL into a
+        // NOT NULL column. Primary keys are exempt: an omitted PK is NULL by
+        // design above and the storage layer fills it.
+        for (idx, col) in schema.columns.iter().enumerate() {
+            if col.nullable || col.primary_key {
+                continue;
+            }
+            if matches!(tuple.values.get(idx), Some(Value::Null)) {
+                return Err(Error::constraint_violation(format!(
+                    "NOT NULL constraint violated: cannot insert NULL into column '{}'",
+                    col.name
+                )));
+            }
+        }
+
+        // FOREIGN KEY through the shared, type-aware validator the single-row
+        // INSERT arms use: it coerces the probe to the parent column's type,
+        // queues DEFERRABLE checks for the commit-time
+        // `validate_deferred_fk_checks`, and audits. `active_txn` gives
+        // read-your-own-writes parity with the sibling arms.
+        if gate.has_foreign_keys {
+            let mut fk_col_values = std::collections::HashMap::with_capacity(column_count);
+            for (i, col) in schema.columns.iter().enumerate() {
+                if let Some(v) = tuple.values.get(i) {
+                    fk_col_values.insert(col.name.clone(), v.clone());
+                }
+            }
+            self.check_fk_constraints_on_write(table_name, &fk_col_values, active_txn)?;
+        }
+
+        // CHECK — same evaluate() and same result→bool mapping as the per-row
+        // `validate_check_constraints`, only parsed and bound once.
+        if !gate.checks.is_empty() {
+            gate.checks.validate(&tuple)?;
+        }
+
+        // PRIMARY KEY duplicate probe. `gate.unique_checks` holds ONLY the
+        // primary-key constraint — see the filter in `prepare_insert_select_gate`
+        // for why feeding this probe any other unique constraint produces a
+        // phantom 23505. Non-PK single-column UNIQUE is enforced below this
+        // layer, by the ART unique index on the actual insert; table-level
+        // COMPOSITE UNIQUE is enforced nowhere (filed, pinned by a test).
+        //
+        // A NULL in any constrained column makes the constraint trivially
+        // satisfied (PG).
+        for (uc_name, uc_columns, positions) in &gate.unique_checks {
+            let mut uc_values: Vec<Value> = Vec::with_capacity(positions.len());
+            let mut any_null = false;
+            for idx in positions {
+                let v = tuple.values.get(*idx).cloned().unwrap_or(Value::Null);
+                if matches!(v, Value::Null) {
+                    any_null = true;
+                    break;
+                }
+                uc_values.push(v);
+            }
+            if any_null {
+                continue;
+            }
+            let key = crate::storage::ArtIndexManager::encode_key(&uc_values);
+            if self.storage.art_indexes().pk_index_contains(table_name, &key) == Some(true) {
+                return Err(Error::constraint_violation(format!(
+                    "UNIQUE constraint '{}' violated: duplicate value for columns ({})",
+                    uc_name,
+                    uc_columns.join(", ")
+                )));
+            }
+        }
+
+        Ok(Some(tuple))
+    }
+
     fn dropped_table_names(plan: &sql::LogicalPlan) -> Vec<String> {
         match plan {
             sql::LogicalPlan::DropTable { name, .. } => vec![name.clone()],
@@ -5564,27 +5943,20 @@ impl EmbeddedDatabase {
 
                 let catalog = self.storage.catalog();
                 let schema = catalog.get_table_schema(table_name)?;
-                let evaluator = sql::Evaluator::new(std::sync::Arc::new(Schema { columns: vec![] }));
-                let empty_tuple = Tuple::new(vec![]);
 
                 // RLS WITH CHECK on the TARGET table, resolved once per statement
                 // (see `RlsWriteGuard`); `None` on the free no-context path.
                 let rls_guard_insert = self.build_rls_write_guard(table_name, "INSERT", &schema)?;
 
-                // Build column index mapping for INSERT with explicit column list
-                let column_indices: Option<Vec<usize>> =
-                    Self::resolve_insert_column_indices(&schema, columns.as_ref(), table_name)?;
-
-                // Pre-parse default expressions for columns
-                let default_exprs: Vec<Option<sql::LogicalExpr>> = schema
-                    .columns
-                    .iter()
-                    .map(|col| {
-                        col.default_expr
-                            .as_ref()
-                            .and_then(|json| serde_json::from_str(json).ok())
-                    })
-                    .collect();
+                // ONE shared row-assembly + validation gate, built once per
+                // statement and shared with the params family's InsertSelect arm
+                // (#101/#102/#84). It resolves the column list (erroring on an
+                // unknown name), pre-parses DEFAULTs, parses and binds CHECK
+                // expressions, resolves UNIQUE column positions and answers the
+                // has-FKs / has-rewrite-recipe questions ONCE — this arm used to
+                // call `load_table_constraints` and re-parse every CHECK PER ROW
+                // on the engine's bulk-insert path.
+                let gate = self.prepare_insert_select_gate(table_name, &schema, columns.as_ref())?;
 
                 // Initialize trigger context
                 let mut trigger_context = sql::TriggerContext::new();
@@ -5607,175 +5979,19 @@ impl EmbeddedDatabase {
 
                 let mut count = 0u64;
                 for source_row in &source_rows {
-                    // Initialize tuple values for ALL columns (use None as placeholder)
-                    let mut tuple_values: Vec<Option<Value>> = vec![None; schema.columns.len()];
-
-                    // Fill in provided values from the source row
-                    for (val_idx, value) in source_row.values.iter().enumerate() {
-                        let target_col_idx = if let Some(ref indices) = column_indices {
-                            if val_idx >= indices.len() {
-                                return Err(Error::query_execution("More values than columns specified"));
-                            }
-                            *indices
-                                .get(val_idx)
-                                .ok_or_else(|| Error::internal("column index out of bounds"))?
-                        } else {
-                            val_idx
-                        };
-
-                        let target_col = schema.get_column_at(target_col_idx).ok_or_else(|| {
-                            Error::query_execution(format!(
-                                "Too many values for INSERT: table has {} columns",
-                                schema.columns.len()
-                            ))
-                        })?;
-
-                        let target_type = &target_col.data_type;
-                        let mut val = value.clone();
-
-                        // Auto-cast if needed
-                        let needs_cast = match (&val, target_type) {
-                            (Value::Null, _) => false,
-                            (Value::Vector(_), DataType::Vector(_)) => true,
-                            (Value::String(_), DataType::Vector(_)) => true,
-                            (Value::String(_), DataType::Json | DataType::Jsonb) => true,
-                            (Value::Int4(_), DataType::Int4) => false,
-                            (Value::Int8(_), DataType::Int8) => false,
-                            (Value::Float4(_), DataType::Float4) => false,
-                            (Value::Float8(_), DataType::Float8) => false,
-                            (Value::String(_), DataType::Text | DataType::Varchar(_)) => false,
-                            (Value::Boolean(_), DataType::Boolean) => false,
-                            (Value::Json(_), DataType::Json | DataType::Jsonb) => false,
-                            _ => true,
-                        };
-
-                        if needs_cast {
-                            val = evaluator.cast_value(val, target_type)?;
-                        }
-
-                        // Enforce NOT NULL constraint
-                        if let Some(target_col_ref) = schema.get_column_at(target_col_idx) {
-                            if matches!(val, Value::Null) && !target_col_ref.nullable {
-                                return Err(Error::constraint_violation(format!(
-                                    "NOT NULL constraint violated: cannot insert NULL into column '{}'",
-                                    target_col_ref.name
-                                )));
-                            }
-                        }
-
-                        let tv = tuple_values
-                            .get_mut(target_col_idx)
-                            .ok_or_else(|| Error::internal("column index out of bounds"))?;
-                        *tv = Some(val);
-                    }
-
-                    // Fill in missing columns with defaults or NULL
-                    let final_values: Result<Vec<Value>> = tuple_values
-                        .into_iter()
-                        .enumerate()
-                        .map(|(idx, opt_val)| {
-                            if let Some(val) = opt_val {
-                                Ok(val)
-                            } else {
-                                let col = schema
-                                    .get_column_at(idx)
-                                    .ok_or_else(|| Error::internal("column index out of bounds"))?;
-                                if let Some(ref default_expr) = default_exprs.get(idx).and_then(|d| d.as_ref()) {
-                                    let mut value = evaluator.evaluate(default_expr, &empty_tuple)?;
-                                    if value.data_type() != col.data_type {
-                                        value = evaluator.cast_value(value, &col.data_type)?;
-                                    }
-                                    Ok(value)
-                                } else if col.primary_key {
-                                    // PK column omitted from INSERT — fill with NULL so
-                                    // the SERIAL auto-fill logic replaces it with row_id.
-                                    Ok(Value::Null)
-                                } else if col.nullable {
-                                    Ok(Value::Null)
-                                } else {
-                                    Err(Error::query_execution(format!(
-                                        "Column '{}' does not have a default value and is not nullable",
-                                        col.name
-                                    )))
-                                }
-                            }
-                        })
-                        .collect();
-
-                    let final_values_vec = final_values?;
-                    let tuple = Tuple::new(final_values_vec.clone());
-
-                    // Validate foreign key constraints.
+                    // ONE shared gate, identical to the one the params family's
+                    // InsertSelect arm calls (`InsertSelectGate`): place every
+                    // source value at its NAMED target column, fill DEFAULTs,
+                    // apply the BEFORE-row rewrite recipe (#84), then enforce
+                    // NOT NULL, FOREIGN KEY, CHECK and table-level UNIQUE. The
+                    // per-row `load_table_constraints` + CHECK re-parse this
+                    // block used to do is now hoisted into the gate.
                     //
-                    // I-FK increment 0 — the cross-type FK "twin". This
-                    // INSERT..SELECT arm used to run its OWN inline
-                    // FK-membership probe: it built an ART key from the RAW
-                    // child values and called `pk_index_contains` UNCOERCED.
-                    // `encode_key` is type-width-sensitive, so a cross-type FK
-                    // (int child -> int8 parent, int -> NUMERIC parent, ...)
-                    // encoded a width-mismatched key that could never match the
-                    // parent's PK/UNIQUE index -> a PHANTOM 23503 on rows that
-                    // DO satisfy the FK. It also honored only `Immediate` FKs,
-                    // silently skipping deferred ones. Delete-and-delegate to
-                    // the shared, type-aware validator the direct-INSERT sibling
-                    // already uses (`check_fk_constraints_on_write`, see the
-                    // Insert arm ~lib.rs:3770): it coerces the probe to the
-                    // parent column type (`coerce_fk_probe_values`), queues
-                    // deferred checks for the commit-time
-                    // `validate_deferred_fk_checks`, and audits — while still
-                    // raising 23503 for a genuinely absent parent. Pass the
-                    // active `txn` for read-your-own-writes parity with the
-                    // sibling.
-                    let table_constraints = catalog.load_table_constraints(table_name)?;
-                    let mut fk_col_values = std::collections::HashMap::with_capacity(schema.columns.len());
-                    for (i, col) in schema.columns.iter().enumerate() {
-                        if let Some(v) = final_values_vec.get(i) {
-                            fk_col_values.insert(col.name.clone(), v.clone());
-                        }
-                    }
-                    self.check_fk_constraints_on_write(table_name, &fk_col_values, Some(txn))?;
-
-                    // Validate CHECK constraints
-                    for check in &table_constraints.check_constraints {
-                        let check_result =
-                            self.evaluate_check_constraint(&check.expression, &schema, &final_values_vec)?;
-
-                        if !check_result {
-                            return Err(Error::constraint_violation(format!(
-                                "new row violates CHECK constraint '{}' on table '{}'",
-                                check.name, check.table_name
-                            )));
-                        }
-                    }
-
-                    // Validate UNIQUE constraints
-                    if !table_constraints.unique_constraints.is_empty() {
-                        for uc in &table_constraints.unique_constraints {
-                            let uc_values: Vec<Value> = uc
-                                .columns
-                                .iter()
-                                .map(|col_name| {
-                                    schema
-                                        .columns
-                                        .iter()
-                                        .position(|c| &c.name == col_name)
-                                        .and_then(|idx| final_values_vec.get(idx).cloned())
-                                        .unwrap_or(Value::Null)
-                                })
-                                .collect();
-                            if uc_values.iter().any(|v| matches!(v, Value::Null)) {
-                                continue;
-                            }
-                            let key = crate::storage::ArtIndexManager::encode_key(&uc_values);
-                            if self.storage.art_indexes().pk_index_contains(table_name, &key) == Some(true) {
-                                return Err(Error::constraint_violation(format!(
-                                    "UNIQUE constraint '{}' violated: duplicate value for columns ({})",
-                                    uc.name,
-                                    uc.columns.join(", ")
-                                )));
-                            }
-                        }
-                    }
+                    // `None` is the rewrite recipe's `RETURN NULL`: the row is
+                    // skipped — not written, not counted, no RETURNING tuple.
+                    let Some(tuple) = self.build_insert_select_row(table_name, &gate, source_row, Some(txn))? else {
+                        continue;
+                    };
 
                     // Execute BEFORE INSERT triggers
                     if has_triggers {
@@ -5824,7 +6040,7 @@ impl EmbeddedDatabase {
                     if self.storage.get_current_branch_id().is_none() {
                         let mut col_values = std::collections::HashMap::new();
                         for (i, col) in schema.columns.iter().enumerate() {
-                            if let Some(v) = final_values_vec.get(i) {
+                            if let Some(v) = tuple.values.get(i) {
                                 col_values.insert(col.name.clone(), v.clone());
                             }
                         }
@@ -14536,65 +14752,64 @@ impl EmbeddedDatabase {
 
                 let catalog = self.storage.catalog();
                 let schema = catalog.get_table_schema(table_name)?;
-                let table_constraints = catalog.load_table_constraints(table_name)?;
-                let evaluator = sql::Evaluator::new(std::sync::Arc::new(Schema { columns: vec![] }));
 
                 // RLS WITH CHECK on the TARGET table, once per statement.
                 let rls_guard_insert = self.build_rls_write_guard(table_name, "INSERT", &schema)?;
 
-                let column_indices: Option<Vec<usize>> =
-                    Self::resolve_insert_column_indices(&schema, columns.as_ref(), table_name)?;
+                // THE SAME gate the text family's InsertSelect arm builds
+                // (`InsertSelectGate`). Until it existed this arm assembled rows
+                // POSITIONALLY — `INSERT INTO t (b, a) SELECT x, y` stored `x` in
+                // `a` (#101) — and enforced CHECK and nothing else: no NOT NULL,
+                // no FOREIGN KEY, no table-level UNIQUE, no DEFAULT fill (#102).
+                // Every extended-protocol driver (psycopg3 / JDBC / sqlx /
+                // node-postgres) and every REST/BaaS write lands here, so those
+                // were silent corruption on the family real clients use.
+                let gate = self.prepare_insert_select_gate(table_name, &schema, columns.as_ref())?;
+
+                // Read-only handle on the active transaction, for the FK probe's
+                // read-your-own-writes parity with the text family (which passes
+                // its `txn`). NOT transaction participation: the rows below still
+                // go straight to storage, which is task #100.
+                //
+                // Only touched when a global transaction is actually open, and
+                // NEVER when this thread already holds that mutex across
+                // statement execution (`execute()`'s in-transaction branch, from
+                // which a trigger/UDF body can re-enter here):
+                // `parking_lot::Mutex` is not reentrant, and the unconditional
+                // lock in the Insert/Update/Delete arms above is a documented
+                // latent re-entrancy — see the catch-all arm's note. This arm
+                // must not add a third.
+                // Also gated on the gate ACTUALLY having foreign keys: the guard's
+                // sole consumer is the FK probe's read-your-own-writes lookup. At
+                // HEAD this arm held the mutex for zero time; holding it across an
+                // entire bulk row loop when the table has no FKs would serialise
+                // unrelated sessions for the duration of the statement, for no
+                // benefit.
+                let can_read_global_txn = gate.has_foreign_keys
+                    && self.global_txn_active.load(std::sync::atomic::Ordering::Acquire)
+                    && !GLOBAL_TXN_LOCK_HELD.with(|held| held.get());
+                let mut _txn_guard = None;
+                let active_txn: Option<&storage::Transaction> = match session_txn {
+                    Some(txn) => Some(txn),
+                    None if can_read_global_txn => {
+                        _txn_guard = Some(self.current_transaction.lock());
+                        _txn_guard.as_ref().and_then(|guard| guard.as_ref())
+                    }
+                    None => None,
+                };
 
                 let has_returning = returning.is_some();
                 let mut returned_tuples: Vec<Tuple> = Vec::new();
                 let mut count = 0u64;
 
                 for source_row in &source_rows {
-                    let mut tuple_values: Vec<Value> = Vec::new();
+                    // `None` is the BEFORE-row rewrite recipe's `RETURN NULL`:
+                    // the row is skipped — not written, not counted, and it
+                    // contributes no RETURNING tuple.
+                    let Some(tuple) = self.build_insert_select_row(table_name, &gate, source_row, active_txn)? else {
+                        continue;
+                    };
 
-                    for (val_idx, value) in source_row.values.iter().enumerate() {
-                        let target_col_idx = if let Some(ref indices) = column_indices {
-                            *indices
-                                .get(val_idx)
-                                .ok_or_else(|| Error::internal("column index out of bounds"))?
-                        } else {
-                            val_idx
-                        };
-
-                        let target_col = schema.get_column_at(target_col_idx).ok_or_else(|| {
-                            Error::query_execution(format!(
-                                "Too many values for INSERT: table has {} columns",
-                                schema.columns.len()
-                            ))
-                        })?;
-
-                        let target_type = &target_col.data_type;
-                        let mut val = value.clone();
-
-                        let needs_cast = match (&val, target_type) {
-                            (Value::Null, _) => false,
-                            (Value::Vector(_), DataType::Vector(_)) => true,
-                            (Value::String(_), DataType::Vector(_)) => true,
-                            (Value::String(_), DataType::Json | DataType::Jsonb) => true,
-                            (Value::Int4(_), DataType::Int4) => false,
-                            (Value::Int8(_), DataType::Int8) => false,
-                            (Value::Float4(_), DataType::Float4) => false,
-                            (Value::Float8(_), DataType::Float8) => false,
-                            (Value::String(_), DataType::Text | DataType::Varchar(_)) => false,
-                            (Value::Boolean(_), DataType::Boolean) => false,
-                            (Value::Json(_), DataType::Json | DataType::Jsonb) => false,
-                            _ => true,
-                        };
-
-                        if needs_cast {
-                            val = evaluator.cast_value(val, target_type)?;
-                        }
-
-                        tuple_values.push(val);
-                    }
-
-                    let tuple = Tuple::new(tuple_values);
-                    self.validate_check_constraints(&table_constraints, &schema, &tuple.values)?;
                     // RLS WITH CHECK on the row about to be persisted. An INSERT
                     // violation is an error that aborts the statement, so it runs
                     // BEFORE the RETURNING projection — no point projecting a row
