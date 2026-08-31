@@ -461,6 +461,27 @@ impl WriteConflictRegistry {
     /// its recorded timestamp is newer than `snapshot_ts` (when `validate`),
     /// otherwise record `commit_ts`. On conflict, partial records made by
     /// this call are rolled back before returning.
+    ///
+    /// # This is WRITE-WRITE validation only — it is not SSI (task #103)
+    ///
+    /// The only input is `write_set`. There is no read set here or anywhere
+    /// else in the engine (`grep -r read_set src/storage/` finds nothing), and
+    /// no dangerous-structure detection. Consequences, stated so nobody has to
+    /// re-derive them from the signature:
+    ///
+    /// * `IsolationLevel::Serializable` and `IsolationLevel::RepeatableRead`
+    ///   both arrive here with `validate = true` and are therefore
+    ///   BYTE-IDENTICAL. Both are SNAPSHOT ISOLATION.
+    /// * WRITE SKEW is permitted under both: two transactions that read
+    ///   overlapping rows but WRITE DISJOINT ones have disjoint write sets, so
+    ///   nothing here can see the dependency, and both commit.
+    ///
+    /// `EmbeddedDatabase::enforce_serializable_policy` reports that to a client
+    /// that asked for `SERIALIZABLE` (wire `WARNING`, or an error under
+    /// `storage.serializable_policy = "error"`). Implementing real SSI means
+    /// tracking read sets through BOTH executor families plus a new conflict
+    /// class — a dedicated milestone. Until it lands, do not add a caller that
+    /// treats a successful return as serializability.
     pub fn validate_and_record(
         &self,
         write_set: &DashMap<Key, Option<Vec<u8>>>,

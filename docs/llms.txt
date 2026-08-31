@@ -108,6 +108,16 @@ Full recipes: `.claude/skills/heliosdb-nano-mcp/SKILL.md`.
   RETURNING`, CTEs, window functions, set ops, `EXPLAIN [ANALYZE]`.
 - Transactions: `BEGIN/COMMIT/ROLLBACK`, nested `SAVEPOINT … RELEASE/ROLLBACK
   TO`. Bulk-load: wrap tens of thousands of INSERTs in one transaction.
+  Isolation is SNAPSHOT ISOLATION: `READ COMMITTED` re-snapshots per statement,
+  `REPEATABLE READ` once per transaction with first-committer-wins (40001).
+  `SERIALIZABLE` is accepted but served as snapshot isolation — no read-set
+  tracking, no SSI, so it is identical to `REPEATABLE READ` and does NOT prevent
+  write skew; it raises a wire WARNING, and `[storage] serializable_policy =
+  "error"` refuses it instead.
+- DDL is NOT transactional: `BEGIN; DROP TABLE t; ROLLBACK;` destroys `t`
+  permanently, and a `CREATE TABLE` inside a rolled-back transaction survives.
+  Only the DML in the block is undone. Run schema changes outside an explicit
+  transaction; take a dump or a branch before a destructive migration.
 - Introspection: `information_schema.*`, `pg_class`, `sqlite_master`,
   `PRAGMA table_info(t)`, REPL `\d [table]` / `\dt`.
 - JSONB operators `->`, `->>`, `@>`, `?`; FTS via `to_tsvector @@ to_tsquery`
@@ -250,7 +260,9 @@ automatically after `git clone`; install globally with
   RETURNING), UPDATE/DELETE RETURNING, parameter styles, CTEs, window
   functions, EXPLAIN [ANALYZE], result cache.
 - heliosdb-nano-transactions — BEGIN/COMMIT/ROLLBACK, savepoints, RAII
-  `db.begin_transaction()`, deadlock detection, bulk-load pattern.
+  `db.begin_transaction()`, deadlock detection, bulk-load pattern; isolation
+  levels and the two PostgreSQL-parity gaps (SERIALIZABLE = snapshot isolation,
+  DDL is not transactional).
 - heliosdb-nano-branches — fork-test-discard agent sandboxes: `CREATE
   DATABASE BRANCH … FROM main AS OF NOW` (AS OF required), `USE BRANCH`,
   `SHOW BRANCHES`, `DROP DATABASE BRANCH`; merge works but is last-writer-wins

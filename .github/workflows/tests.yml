@@ -1,0 +1,172 @@
+name: Tests
+
+# The integration suite had ZERO automated execution before this workflow.
+# `release.yml` runs only `--lib` + `--doc`, and only on a `v*` tag; `perf-gate.yml`
+# runs the perf smoke. So ~5,200 integration tests existed, passed, and were only
+# ever run by a human on a workstation.
+#
+# WHY IT WAS NEVER ADDED — the blocker is physical, not political. `cargo test
+# --tests` builds every file in tests/ as its own target (272 files, no [[test]]
+# entries in Cargo.toml), and those debug binaries total ~67 GiB. A GitHub-hosted
+# standard runner has ~14 GB of usable disk, so a single-job full run CANNOT fit.
+#
+# Two things make it tractable:
+#   * CARGO_PROFILE_TEST_DEBUG=0 — measured 74% of each test binary is DWARF, so
+#     dropping debug info takes the set from ~67 GiB to ~21 GiB. Set in the CI env
+#     only, so local debugging ergonomics are unchanged.
+#   * sharding the full run, so no single job holds the whole set.
+#
+# HONEST SCOPE. This would NOT have caught the defects found in the 2026-08
+# campaign: their regression suites shipped WITH the fixes, and CI cannot catch a
+# defect nobody wrote a test for. What it buys is that those ~5,200 tests can no
+# longer rot unobserved, which is what actually happened to the `internal-tests`
+# feature (see the compile-only job below).
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # 74% of a debug test binary is DWARF. Without this the full matrix does not fit
+  # on a runner. Do NOT move this into Cargo.toml — local `cargo test` should keep
+  # its debug info.
+  CARGO_PROFILE_TEST_DEBUG: 0
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Tier 1 — blocking on every PR. A curated subset covering the defect CLASSES
+  # this project has actually shipped: encryption at rest, index durability across
+  # restart, branch isolation and merge, MV refresh, FK validation, catalog
+  # introspection, the fast-path/params executor split, savepoints, and roles.
+  # ---------------------------------------------------------------------------
+  integration-smoke:
+    name: integration smoke (blocking)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: tests
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+          df -h /
+      - name: Unit tests
+        run: cargo test --locked --lib
+      - name: Integration smoke
+        run: |
+          set -o pipefail
+          cargo test --locked --no-fail-fast \
+            --test encryption_at_rest_tests \
+            --test drop_index_tests \
+            --test pk_predicate_coercion_tests \
+            --test create_index_generated_name_tests \
+            --test json_operator_unknown_literal \
+            --test pg_typeof \
+            --test branch_merge_surface_tests \
+            --test branch_data_isolation_test \
+            --test mv_auto_refresh_e2e \
+            --test fast_path_eligibility_tests \
+            --test parameterized_query_tests \
+            --test roles_acl_tests \
+            --test rls_write_parity_tests \
+            --test create_table_as_tests \
+            --test insert_select_tests \
+            --test catalog_introspection_tests \
+            2>&1 | tee smoke.log
+      # docs/GATES.md §3b: a suite reporting "ok. 0 passed; 0 failed; 0 ignored"
+      # RAN NOTHING. Treat it as a FAILURE, not a pass — this is exactly how the
+      # `internal-tests` rot went unnoticed for months.
+      - name: No empty suites
+        run: |
+          if awk '/^     Running/{s=$2}
+                  /^test result: ok\. 0 passed; 0 failed; 0 ignored/{print "EMPTY:", s; f=1}
+                  END{exit f}' smoke.log; then
+            echo "no empty suites"
+          else
+            echo "::error::a named suite executed zero tests — see EMPTY: lines above"
+            exit 1
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Tier 2 — the WHOLE integration suite, sharded. Nightly + on release tags +
+  # manual. Not blocking a PR (too slow), but blocking a release.
+  #
+  # --no-fail-fast is mandatory: docs/GATES.md §3 records a run that died partway
+  # through the alphabet, so suites j..z had never executed at all. Without it you
+  # get a prefix, not a result.
+  # ---------------------------------------------------------------------------
+  integration-full:
+    name: integration full (shard ${{ matrix.shard }}/6)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: tests-shard-${{ matrix.shard }}
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+          df -h /
+      - name: Run shard
+        run: |
+          set -o pipefail
+          args=$(ls tests/*.rs | sort | awk -v s=${{ matrix.shard }} \
+                 'NR % 6 == s { n=$0; sub(/^tests\//,"",n); sub(/\.rs$/,"",n); printf "--test %s ", n }')
+          if [ -z "$args" ]; then echo "::error::shard produced no targets"; exit 1; fi
+          echo "shard ${{ matrix.shard }} targets: $(echo $args | wc -w | awk '{print $1/2}')"
+          # The two documented pre-existing flakes on constrained runners.
+          # docs/GATES.md forbids adding NEW skips — these two and no others.
+          cargo test --locked --no-fail-fast $args -- \
+            --skip ha_tests::streaming_tests --skip lock_management 2>&1 | tee shard.log
+      - name: No empty suites
+        run: |
+          if awk '/^     Running/{s=$2}
+                  /^test result: ok\. 0 passed; 0 failed; 0 ignored/{print "EMPTY:", s; f=1}
+                  END{exit f}' shard.log; then
+            echo "no empty suites"
+          else
+            echo "::error::a suite in this shard executed zero tests"
+            exit 1
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Tier 3 — compile the feature-gated suites. BUILD ONLY, ~2 minutes.
+  #
+  # `internal-tests` gates 15 files / ~206 tests covering time travel, encryption,
+  # materialized views, branch merge and protocol integration. It is not a default
+  # feature, no gate has ever built it, and it silently stopped COMPILING — six
+  # months of rot discovered by hand. A compile step closes that class forever.
+  # ---------------------------------------------------------------------------
+  feature-gated-compile:
+    name: feature-gated suites compile
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: tests-featgate
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android
+      - name: internal-tests must compile
+        run: cargo build --locked --features internal-tests --tests

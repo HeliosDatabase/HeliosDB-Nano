@@ -208,13 +208,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
         // machine from the simple-query path. Letting extended Execute send
         // BEGIN/COMMIT/ROLLBACK straight to the engine leaves the handler's
         // TransactionStatus out of sync with the embedded transaction.
+        //
+        // ONE classifier, shared with the simple-query arms and the engine's
+        // session entry points (`super::handler::classify_transaction_control`).
+        // `ROLLBACK TO [SAVEPOINT] n` is deliberately NOT intercepted — it is a
+        // partial rollback owned by the executor's savepoint stack, and routing
+        // it here would turn it into a full rollback.
         let trimmed_query = statement.query.trim();
-        let is_transaction_control = trimmed_query.eq_ignore_ascii_case("BEGIN")
-            || super::handler::starts_with_icase(trimmed_query, "BEGIN ")
-            || trimmed_query.eq_ignore_ascii_case("START TRANSACTION")
-            || super::handler::starts_with_icase(trimmed_query, "START TRANSACTION ")
-            || trimmed_query.eq_ignore_ascii_case("COMMIT")
-            || trimmed_query.eq_ignore_ascii_case("ROLLBACK");
+        let is_transaction_control = super::handler::classify_transaction_control(trimmed_query)
+            .is_some_and(super::handler::TxnControl::is_boundary);
         // HC4 parity. `SET ROLE <x>` / `SET SESSION AUTHORIZATION <x>` are
         // classified and refused (0A000, with the explanatory text) — and the
         // `NONE` / `DEFAULT` spellings are still acked — inside

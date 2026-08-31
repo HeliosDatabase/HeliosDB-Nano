@@ -322,7 +322,27 @@ pub struct StorageConfig {
     ///
     /// Controls the visibility of concurrent transaction changes.
     /// Default: ReadCommitted (standard PostgreSQL default)
+    ///
+    /// NOTE: `SERIALIZABLE` is served as SNAPSHOT ISOLATION — see
+    /// [`TransactionIsolation::Serializable`] and
+    /// [`StorageConfig::serializable_policy`].
     pub transaction_isolation: TransactionIsolation,
+    /// Task #103: what to do when a client asks for `SERIALIZABLE`.
+    ///
+    /// HeliosDB-Nano implements SNAPSHOT ISOLATION with first-committer-wins
+    /// write-write conflict detection. It does NOT implement SSI: there is no
+    /// read-set tracking anywhere in the engine, so `SERIALIZABLE` and
+    /// `REPEATABLE READ` are the same level and **write skew is not
+    /// prevented**. This knob decides how loudly that is said:
+    ///
+    /// * `"warn"` (default) — run the transaction as snapshot isolation and
+    ///   tell the client: a `WARNING` on the PostgreSQL wire plus a server-log
+    ///   `WARN` line naming write skew.
+    /// * `"error"` — refuse `BEGIN … ISOLATION LEVEL SERIALIZABLE` outright,
+    ///   for deployments that need the real guarantee or nothing.
+    ///
+    /// Default: `Warn`.
+    pub serializable_policy: SerializablePolicy,
     /// Slow query log threshold in milliseconds (None to disable)
     ///
     /// Queries exceeding this threshold are logged at WARN level with their
@@ -566,8 +586,11 @@ impl Default for StorageConfig {
             query_timeout_ms: None,      // Unlimited by default
             statement_timeout_ms: None,  // Unlimited by default
             transaction_isolation: TransactionIsolation::ReadCommitted, // PostgreSQL default
+            // #103: warn (never silently accept) that SERIALIZABLE is served
+            // as snapshot isolation. `"error"` refuses it instead.
+            serializable_policy: SerializablePolicy::Warn,
             slow_query_threshold_ms: Some(1000), // 1 second default
-            logical_wal_per_statement: false, // rely on RocksDB WAL at commit (see field docs)
+            logical_wal_per_statement: false,    // rely on RocksDB WAL at commit (see field docs)
             durable_commit: false,
             // W3.5 Stage 1 on by default: turn the pre-ALTER-snapshot arity
             // error into isolation-preserving NULL-padded rows. `"strict"`
@@ -766,7 +789,9 @@ pub enum CompressionType {
 /// Transaction isolation level
 ///
 /// Controls how transactions see concurrent changes from other transactions.
-/// HeliosDB-Lite implements snapshot isolation by default.
+/// HeliosDB-Nano implements SNAPSHOT ISOLATION. Read the per-variant docs
+/// before choosing: `RepeatableRead` and `Serializable` are the SAME level
+/// here, and `Serializable` is **not** serializable (task #103).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum TransactionIsolation {
@@ -780,16 +805,81 @@ pub enum TransactionIsolation {
     /// Transactions only see committed changes from other transactions.
     /// Each statement sees a fresh snapshot at statement start.
     ReadCommitted,
-    /// Repeatable Read
+    /// Repeatable Read — i.e. SNAPSHOT ISOLATION.
     ///
-    /// Transactions see a consistent snapshot from transaction start.
-    /// No dirty reads, non-repeatable reads, or phantom reads.
+    /// The transaction reads one consistent snapshot taken at BEGIN, so no
+    /// dirty reads and no non-repeatable reads. Concurrent writers to the same
+    /// row are resolved first-committer-wins: the loser aborts with a
+    /// `40001 serialization_failure`.
+    ///
+    /// WRITE SKEW is permitted — two transactions may each read a set the
+    /// other is about to change, and both commit.
     RepeatableRead,
-    /// Serializable (strictest)
+    /// Serializable — **accepted as a name, served as SNAPSHOT ISOLATION**.
     ///
-    /// Transactions execute as if they run serially.
-    /// Prevents all anomalies but may cause serialization failures.
+    /// Task #103: HeliosDB-Nano has no read-set tracking and no
+    /// dangerous-structure detection (no SSI), so this level is byte-identical
+    /// to [`TransactionIsolation::RepeatableRead`] — same snapshot, same
+    /// first-committer-wins write-write validation, and the same WRITE SKEW
+    /// exposure. The classic anomaly it does NOT prevent:
+    ///
+    /// ```text
+    /// -- both transactions read the same rows, each then writes a DIFFERENT one
+    /// T1: BEGIN; SELECT count(*) FROM doctors WHERE on_call;  -- 2
+    /// T2: BEGIN; SELECT count(*) FROM doctors WHERE on_call;  -- 2
+    /// T1: UPDATE doctors SET on_call=false WHERE name='alice'; COMMIT;
+    /// T2: UPDATE doctors SET on_call=false WHERE name='bob';   COMMIT;
+    /// -- PostgreSQL SERIALIZABLE: one transaction aborts (40001).
+    /// -- HeliosDB-Nano: BOTH commit; nobody is left on call.
+    /// ```
+    ///
+    /// Requesting this level raises a wire `WARNING` — or an error — according
+    /// to [`SerializablePolicy`] (`storage.serializable_policy`).
     Serializable,
+}
+
+/// Task #103: how a request for `SERIALIZABLE` isolation is answered.
+///
+/// `SERIALIZABLE` is served as snapshot isolation (see
+/// [`TransactionIsolation::Serializable`]). Rather than silently accept a level
+/// it does not implement, the engine either says so or refuses. There is
+/// deliberately NO "silent" variant: the point of the knob is that a client
+/// asking for serializability is never left believing it got it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SerializablePolicy {
+    /// Default. Run the transaction (as snapshot isolation) and warn: a
+    /// PostgreSQL `WARNING` notice on the wire naming write skew, plus a
+    /// server-log `WARN` line.
+    Warn,
+    /// Refuse `BEGIN … ISOLATION LEVEL SERIALIZABLE` with an error, for
+    /// deployments that need the real guarantee or nothing.
+    Error,
+}
+
+impl<'de> Deserialize<'de> for SerializablePolicy {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Hand-rolled (not derived), like `SnapshotSchemaEvolution`: a typo in
+        // a knob whose whole job is honesty must fail config parse loudly
+        // rather than fall back to a default the operator did not choose.
+        let raw = String::deserialize(deserializer)?;
+        match raw.as_str() {
+            "warn" => Ok(SerializablePolicy::Warn),
+            "error" => Ok(SerializablePolicy::Error),
+            "silent" | "accept" | "off" => Err(serde::de::Error::custom(
+                "storage.serializable_policy has no silent-accept value: SERIALIZABLE is served as \
+                 snapshot isolation and does not prevent write skew, so the request is always \
+                 reported. Use \"warn\" (the default) or \"error\"",
+            )),
+            other => Err(serde::de::Error::custom(format!(
+                "invalid storage.serializable_policy '{}': expected \"warn\" or \"error\"",
+                other
+            ))),
+        }
+    }
 }
 
 /// Encryption configuration
@@ -1760,6 +1850,36 @@ mod tests {
         config.validate().expect("config.example.toml must validate");
         // The example documents the safe profile semantics explicitly.
         assert_eq!(config.storage.wal_sync_mode, WalSyncModeConfig::Sync);
+    }
+
+    // ------------------------------------------------------------------
+    // #103: SERIALIZABLE honesty knob
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_serializable_policy_defaults_to_warn() {
+        // The default must never be "accept silently": a client asking for a
+        // level the engine does not implement has to be told.
+        assert_eq!(StorageConfig::default().serializable_policy, SerializablePolicy::Warn);
+    }
+
+    #[test]
+    fn test_serializable_policy_parses_error_and_rejects_silence() {
+        let config = Config::from_toml_str("[storage]\nserializable_policy = \"error\"\n").expect("parse");
+        assert_eq!(config.storage.serializable_policy, SerializablePolicy::Error);
+
+        let config = Config::from_toml_str("[storage]\nserializable_policy = \"warn\"\n").expect("parse");
+        assert_eq!(config.storage.serializable_policy, SerializablePolicy::Warn);
+
+        // No silent-accept value exists, and asking for one says why.
+        let err = Config::from_toml_str("[storage]\nserializable_policy = \"silent\"\n")
+            .expect_err("silent must be rejected");
+        assert!(err.to_string().contains("silent-accept"), "{}", err);
+
+        // A typo fails config parse instead of falling back to a default.
+        let err =
+            Config::from_toml_str("[storage]\nserializable_policy = \"warm\"\n").expect_err("typo must be rejected");
+        assert!(err.to_string().contains("serializable_policy"), "{}", err);
     }
 
     #[test]

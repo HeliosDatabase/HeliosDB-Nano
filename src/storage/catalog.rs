@@ -83,6 +83,116 @@ pub fn index_family(tag: Option<&str>) -> Option<IndexFamily> {
     }
 }
 
+/// Remove the PHYSICAL structures behind ONE index, dispatching on its persisted
+/// type through [`index_family`]. Does NOT touch the `meta:index:` definition —
+/// deleting that is the caller's job, because the two callers differ on what to
+/// do when this fails.
+///
+/// # Why this is shared
+///
+/// Two statements have to undo `handle_create_index`: `DROP INDEX` (one index by
+/// name) and `DROP TABLE` (every index the table owns). Before this function
+/// existed only the first had an implementation, so `DROP TABLE` leaked the
+/// whole HNSW graph, its `vecsnap:` blob, its `.hnsw.graph` / `.hnsw.data` dump
+/// files and its persistent-HNSW keyspace — and left the `meta:index:` record
+/// behind for `rebuild_all_indexes` / `rebuild_vector_indexes` to resurrect at
+/// the next open. Writing the second copy at the DROP TABLE site is exactly the
+/// drift [`index_family`]'s own doc comment records having already happened once
+/// (the `persistent_hnsw` tag known to two of three copies). One body, two
+/// callers.
+///
+/// `recorded_type` is the definition's `index_type` tag; `None` is both "legacy
+/// untagged record" and "record present but undecodable", and lands on the ART
+/// arm, which is safe — the ART drop is a name lookup that reports
+/// `IndexNotFound` rather than guessing.
+///
+/// Errors: an unclassifiable tag. Nothing else — a definition with no live
+/// registration is a REAL state (a manual index that failed to register at open,
+/// or a DDL-only `gin`/`gist` that never had a structure), so it warns and
+/// reports success. The one thing this must never do is report a teardown that
+/// did not happen.
+pub(crate) fn teardown_index_structures(
+    storage: &StorageEngine,
+    index_name: &str,
+    recorded_type: Option<&str>,
+) -> Result<()> {
+    match index_family(recorded_type) {
+        Some(IndexFamily::Art) => {
+            let art_manager = storage.art_indexes();
+            if let Err(e) = art_manager.drop_index(index_name) {
+                // A definition with no live registration is a REAL state, not a
+                // swallowed error: `rebuild_all_indexes` warns and continues when
+                // a manual index fails to register at open, leaving exactly this
+                // shape. The user's intent — the index is gone — is still fully
+                // achieved by deleting the definition, so the drop proceeds.
+                // Every OTHER error propagates.
+                if matches!(e, super::art_index::ArtIndexError::IndexNotFound(_)) {
+                    tracing::warn!(
+                        "dropping index '{}': no live ART registration (the index was not rebuilt at open); \
+                         removing the catalog definition anyway",
+                        index_name
+                    );
+                } else {
+                    return Err(Error::query_execution(format!(
+                        "Failed to drop ART index '{}': {}",
+                        index_name, e
+                    )));
+                }
+            }
+        }
+        Some(IndexFamily::Vector) => {
+            let vector_indexes = storage.vector_indexes();
+            // Checked rather than string-matched on the error: `index_exists`
+            // answers the same question precisely, and the same
+            // definition-without-registration state is possible here too.
+            //
+            // `persistent_hnsw` lands here too (it is `IndexFamily::Vector`):
+            // `VectorIndexManager::drop_index` matches on the live `IndexStorage`
+            // and calls `drop_storage()` for a persistent index, which deletes
+            // only that index's `prefix(index_id)` keyspace.
+            if vector_indexes.index_exists(index_name) {
+                vector_indexes.drop_index(index_name)?;
+            } else {
+                tracing::warn!(
+                    "dropping index '{}': no live HNSW index registered; removing the catalog definition anyway",
+                    index_name
+                );
+            }
+            // The graph dump + sidecar written by the last checkpoint outlive the
+            // index otherwise: later checkpoints only write keys for LIVE
+            // indexes, so a drop/recreate cycle accumulated dead `vecsnap:` blobs
+            // and `.hnsw.graph` / `.hnsw.data` files forever. Best effort and
+            // after the drop, never a reason to fail it.
+            storage.remove_vector_index_snapshot(index_name);
+        }
+        Some(IndexFamily::DdlOnly) => {
+            // DDL-only by construction — `handle_create_index` persists the
+            // definition and builds NOTHING (the `@@` operator scans). So there
+            // is no backing structure to remove and this is not a silent skip:
+            // deleting the definition is the entire drop.
+            tracing::info!(
+                "dropping index '{}': gin/gist indexes are DDL-only in this build; \
+                 removing the catalog definition (there is no backing index)",
+                index_name
+            );
+        }
+        None => {
+            // `index_family` could not classify the tag. Only
+            // `handle_create_index` and the `WalOperation::CreateIndex` replay of
+            // what it logged write these records, so an unclassifiable tag means
+            // a downgrade (a newer binary wrote an index type this one has never
+            // heard of) or a corrupt record — name it, do not guess which
+            // structure to remove and do not report a drop that did not happen.
+            let other = recorded_type.unwrap_or("<none>");
+            return Err(Error::query_execution(format!(
+                "Cannot drop index \"{index_name}\": unsupported persisted index type '{other}'. \
+                 This build knows art, btree, hash, gin, gist, hnsw, hnsw_pq and persistent_hnsw."
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// On-disk format tag for a persisted index definition: a 4-byte magic plus a
 /// single version byte, written ahead of the bincode body. The tag lets a
 /// future format change be *detected* (and skipped/migrated) rather than
@@ -543,6 +653,35 @@ impl<'a> Catalog<'a> {
 
         // Log DropTable to WAL first (for replication to standbys)
         self.storage.log_drop_table(table_name)?;
+
+        // #90: a dropped table's user-created INDEXES die with it — the live ART
+        // or HNSW structure, the durable vector artefacts (`vecsnap:` blob,
+        // `vecsnapv:` marker, `hnsw_snapshots/*.hnsw.graph|.data`, persistent-HNSW
+        // keyspace) AND the `meta:index:<name>` definition.
+        //
+        // Without the definition delete this is not merely a leak. The record is
+        // what `rebuild_all_indexes` / `rebuild_vector_indexes` replay at every
+        // open, so an orphan RESURRECTS: re-create a table under the dropped
+        // name and the old index comes back attached to it — and, because the
+        // batch below deletes `counter:{table}`, the new table's row ids restart
+        // at 1 and COLLIDE with the dead graph's entries, so a kNN query returns
+        // the dropped table's vectors ranked against the new table's rows. The
+        // name also stays squatted: `CREATE INDEX <name> ON other_table` fails
+        // and `DROP INDEX <name>` succeeds against a table that no longer exists.
+        //
+        // Ordered BEFORE the `drop_table_indexes` sweep below on purpose: that
+        // sweep removes every ART registration for the table, so running it first
+        // would make the shared teardown's ART arm report `IndexNotFound` and warn
+        // for EVERY ordinary index on every DROP TABLE — training operators to
+        // ignore exactly the warnings this item is about.
+        //
+        // Best effort with a named warn!, identical posture and for the identical
+        // reason as the ART teardown below and the trigger teardown further down:
+        // the table is already going away, and turning a successful DROP TABLE
+        // into an error because a cleanup scan failed is worse than the leak.
+        if let Err(e) = self.drop_table_index_definitions(table_name) {
+            tracing::warn!("DROP TABLE '{}': failed to scan index definitions: {}", table_name, e);
+        }
 
         // Drop all ART indexes for this table
         let art_manager = self.storage.art_indexes();
@@ -1568,6 +1707,21 @@ impl<'a> Catalog<'a> {
         if let Err(e) = art_manager.rename_table_indexes(old_name, new_name) {
             tracing::warn!(
                 "Failed to rename ART indexes from '{}' to '{}': {}",
+                old_name,
+                new_name,
+                e
+            );
+        }
+
+        // #85: carry the table's TRIGGER records to the new name. Both the
+        // `trigger:{table}:*` definitions and the `trigger_rowmut:{table}:*`
+        // recipes are keyed by table name, so leaving them behind strands them
+        // under a name that no longer exists AND lets a later
+        // `CREATE TABLE <old_name>` inherit them at the next open. Best effort,
+        // same posture as the ART rename above.
+        if let Err(e) = self.move_table_triggers(old_name, new_name) {
+            tracing::warn!(
+                "RENAME TABLE '{}' -> '{}': failed to move trigger records: {}",
                 old_name,
                 new_name,
                 e
@@ -2604,6 +2758,208 @@ impl<'a> Catalog<'a> {
         Ok(count)
     }
 
+    /// Tear down every user-created index that belongs to `table_name` — the
+    /// physical structure via [`teardown_index_structures`] AND the durable
+    /// `meta:index:<name>` definition. Returns how many definitions were removed.
+    ///
+    /// Called from [`Catalog::drop_table`], the one funnel every table removal
+    /// goes through — see the comment at that call site for why this cannot live
+    /// one layer up in `EmbeddedDatabase::on_table_dropped`.
+    ///
+    /// Reads through [`Catalog::list_index_definitions`] and NOT a raw RocksDB
+    /// iterator: `save_index_definition` writes through `StorageEngine::put`,
+    /// which ENCRYPTS when a key manager is configured, so a raw iterator would
+    /// hand back ciphertext and this teardown would silently do nothing on every
+    /// encrypted data directory (the v4.21.0 TDE fix — do not "optimize" it back).
+    ///
+    /// `table_name` is matched with `==`, the same comparison
+    /// `rebuild_all_indexes` uses to decide which definitions belong to a table.
+    /// One rule: if that ever becomes case-insensitive it must change in both
+    /// places together, or an index would be rebuilt for a table whose drop had
+    /// not removed it.
+    ///
+    /// UNDECODABLE records are deliberately left alone. `list_index_definitions`
+    /// skips them (by design: one bad record must not abort the rebuild of every
+    /// other index), and a record that cannot be decoded carries no `table_name`
+    /// — so there is no way to tell whether it belonged to THIS table, and
+    /// deleting it would be a guess that can destroy another table's index. Such
+    /// a record is not undeletable: `DROP INDEX <name>` removes it by name
+    /// (`sql::executor::ddl::handle_drop_index`'s undecodable arm).
+    ///
+    /// Live vector-index registrations created by the LIBRARY `create_vector_store`
+    /// API are also deliberately untouched: they have no `meta:index:` record and
+    /// are not indexes ON a table (their `table_name` is the store's own name),
+    /// so sweeping `VectorIndexManager::indexes_on_table` here would silently
+    /// destroy a user's vector store the moment a table happened to share its
+    /// name. `delete_vector_store` owns those.
+    ///
+    /// WAL: emits NO per-index `log_drop_index` record. `DROP TABLE` is already
+    /// logged once (`log_drop_table`) and its replay arm re-enters
+    /// `Catalog::drop_table`, so a standby runs this same teardown. Per-index
+    /// records would double-log and could race the replayed
+    /// `WalOperation::CreateIndex` — the hazard the trigger teardown documents.
+    fn drop_table_index_definitions(&self, table_name: &str) -> Result<usize> {
+        let mut removed = 0usize;
+        for (index_name, definition) in self.list_index_definitions()? {
+            if definition.table_name != table_name {
+                continue;
+            }
+
+            // Per-index best effort: a structure that refuses to come down must
+            // not stop the REMAINING indexes of the same table from being torn
+            // down, and must not stop the definition delete below — leaving the
+            // definition is what makes the index come back at the next open.
+            if let Err(e) = teardown_index_structures(self.storage, &index_name, definition.index_type.as_deref()) {
+                tracing::warn!(
+                    "DROP TABLE '{}': index '{}' could not be torn down ({}); \
+                     removing its catalog definition anyway",
+                    table_name,
+                    index_name,
+                    e
+                );
+            }
+
+            if let Err(e) = self.drop_index_definition(&index_name) {
+                tracing::warn!(
+                    "DROP TABLE '{}': failed to delete the catalog definition for index '{}' ({}); \
+                     it will be re-registered at the next open",
+                    table_name,
+                    index_name,
+                    e
+                );
+                continue;
+            }
+            removed += 1;
+        }
+        Ok(removed)
+    }
+
+    /// Carry a renamed table's TRIGGER records across to the new name — both the
+    /// `trigger:{table}:*` definitions and the `trigger_rowmut:{table}:*` rewrite
+    /// recipes. Returns how many definitions moved.
+    ///
+    /// Called from `Catalog::rename_table_inner`, the one funnel every rename
+    /// goes through (`ALTER TABLE … RENAME TO`, `ALTER TABLE … SET SCHEMA`, the MV
+    /// refresh swap and WAL replay), for the same reason the drop-side teardown
+    /// lives in `Catalog::drop_table`. (`ALTER TABLE … RENAME TO` is text-family
+    /// only today — `Executor::plan_to_operator` has no `AlterTableRename` arm —
+    /// but the funnel placement means the params family is covered for free the
+    /// moment that arm exists.)
+    ///
+    /// Both registries are keyed by TABLE NAME, so without this the records are
+    /// stranded under a name that no longer exists: the trigger stops firing, and
+    /// — the sharp edge — a later `CREATE TABLE <old_name>` INHERITS them, because
+    /// `load_all_triggers` / `load_all_trigger_row_mutations` repopulate the live
+    /// registry from these keys at every open with no table-existence filter.
+    /// That is the same resurrection class `delete_table_triggers` closes for
+    /// DROP TABLE.
+    ///
+    /// The definition payload carries its own `table_name` field, so it is
+    /// REWRITTEN, not merely re-keyed — `load_all_triggers` registers by the
+    /// field, not by the key. `TriggerRowMutation` has no such field, so its
+    /// value moves verbatim.
+    ///
+    /// Best effort per record: an unreadable definition is warned about and left
+    /// in place rather than failing the rename (matching `load_all_triggers`'s
+    /// per-record resilience), because a rename that half-succeeded is worse than
+    /// a stranded record the user can drop by name.
+    ///
+    /// SCOPE: this moves the DURABLE half only. The live in-memory registry the
+    /// executor consults is `EmbeddedDatabase::trigger_registry`, which the
+    /// storage layer has no handle on, so within the renaming process the trigger
+    /// still fires under the old key until the next open. Deregistering/
+    /// re-registering it needs a `TriggerRegistry` rename plus a caller at the
+    /// `EmbeddedDatabase` layer.
+    pub fn move_table_triggers(&self, old_name: &str, new_name: &str) -> Result<usize> {
+        let mut moved = 0usize;
+
+        let definition_prefix = format!("trigger:{}:", old_name);
+        for (trigger_name, value) in self.storage.meta_blobs_with_prefix(&definition_prefix)? {
+            let mut definition: crate::sql::TriggerDefinition = match bincode::deserialize(&value) {
+                Ok(definition) => definition,
+                Err(e) => {
+                    tracing::warn!(
+                        "RENAME TABLE '{}' -> '{}': trigger record '{}{}' is unreadable ({}); \
+                         left under the old name",
+                        old_name,
+                        new_name,
+                        definition_prefix,
+                        trigger_name,
+                        e
+                    );
+                    continue;
+                }
+            };
+            definition.table_name = new_name.to_string();
+            if let Err(e) = self.save_trigger(&definition) {
+                tracing::warn!(
+                    "RENAME TABLE '{}' -> '{}': failed to write trigger '{}' under the new name ({}); \
+                     left under the old name",
+                    old_name,
+                    new_name,
+                    trigger_name,
+                    e
+                );
+                continue;
+            }
+            // Delete by the SCANNED key suffix, not by `definition.name`: if the
+            // two ever disagreed, deleting by the field would leave the old key
+            // behind — the exact orphan this function exists to remove.
+            if let Err(e) = self
+                .storage
+                .delete(&Self::trigger_metadata_key(old_name, &trigger_name))
+            {
+                tracing::warn!(
+                    "RENAME TABLE '{}' -> '{}': trigger '{}' was copied to the new name but the old \
+                     record could not be deleted ({})",
+                    old_name,
+                    new_name,
+                    trigger_name,
+                    e
+                );
+                continue;
+            }
+            moved += 1;
+        }
+
+        // `trigger_rowmut:` does NOT collide with the `trigger:` scan above —
+        // the two prefixes diverge at byte 7 (`_` 0x5F vs `:` 0x3A).
+        let recipe_prefix = format!("trigger_rowmut:{}:", old_name);
+        for (trigger_name, value) in self.storage.meta_blobs_with_prefix(&recipe_prefix)? {
+            // The value is the tagged `TriggerRowMutation` blob and carries no
+            // table name, so it moves verbatim — no decode, no re-encode. It came
+            // back from `get` (decrypted) and goes out through `put` (sealed), so
+            // it lands in the canonical stored form on an encrypted data dir.
+            let new_key = Self::trigger_row_mutation_key(new_name, &trigger_name);
+            if let Err(e) = self.storage.put(&new_key, &value) {
+                tracing::warn!(
+                    "RENAME TABLE '{}' -> '{}': failed to write the row-rewrite recipe for trigger \
+                     '{}' under the new name ({}); left under the old name",
+                    old_name,
+                    new_name,
+                    trigger_name,
+                    e
+                );
+                continue;
+            }
+            if let Err(e) = self
+                .storage
+                .delete(&Self::trigger_row_mutation_key(old_name, &trigger_name))
+            {
+                tracing::warn!(
+                    "RENAME TABLE '{}' -> '{}': the row-rewrite recipe for trigger '{}' was copied to \
+                     the new name but the old record could not be deleted ({})",
+                    old_name,
+                    new_name,
+                    trigger_name,
+                    e
+                );
+            }
+        }
+
+        Ok(moved)
+    }
+
     /// Delete every key under `prefix`, returning how many were removed.
     fn delete_keys_with_prefix(&self, prefix: &str) -> Result<usize> {
         let prefix_bytes = prefix.as_bytes();
@@ -3217,6 +3573,204 @@ mod tests {
         assert!(
             !names.contains(&"corrupt_idx"),
             "corrupt record should be skipped, not surfaced: {names:?}"
+        );
+    }
+
+    /// #90, at the catalog layer: `drop_table` deletes the dropped table's
+    /// `meta:index:` records and NOTHING else's. The `table_name` filter is the
+    /// whole safety property — an over-broad match would silently un-index a
+    /// surviving table.
+    #[test]
+    fn drop_table_removes_only_its_own_index_definitions() {
+        let config = Config::in_memory();
+        let storage = StorageEngine::open_in_memory(&config).expect("open in-memory");
+        let catalog = Catalog::new(&storage);
+
+        let schema = || {
+            Schema::new(vec![
+                Column::new("id", DataType::Int4),
+                Column::new("c", DataType::Text),
+            ])
+        };
+        catalog.create_table("gone", schema()).expect("create gone");
+        catalog.create_table("keep", schema()).expect("create keep");
+        // A table whose name is a PREFIX-adjacent neighbour: the filter is `==`,
+        // not `starts_with`, and this pins that.
+        catalog.create_table("gone2", schema()).expect("create gone2");
+
+        for (index, table) in [("gone_idx", "gone"), ("keep_idx", "keep"), ("gone2_idx", "gone2")] {
+            catalog
+                .save_index_definition(
+                    index,
+                    &PersistedIndexDefinition {
+                        table_name: table.to_string(),
+                        column_name: "c".to_string(),
+                        index_type: Some("art".to_string()),
+                        options: Vec::new(),
+                    },
+                )
+                .expect("save definition");
+        }
+
+        catalog.drop_table("gone").expect("drop table");
+
+        let defs = catalog.list_index_definitions().expect("list");
+        let names: Vec<&str> = defs.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(
+            !names.contains(&"gone_idx"),
+            "the dropped table's index definition survived: {names:?}"
+        );
+        assert!(
+            names.contains(&"keep_idx"),
+            "DROP TABLE deleted an unrelated table's index definition: {names:?}"
+        );
+        assert!(
+            names.contains(&"gone2_idx"),
+            "DROP TABLE matched a table name by prefix instead of equality: {names:?}"
+        );
+    }
+
+    /// An UNDECODABLE `meta:index:` record carries no `table_name`, so there is no
+    /// way to tell whether it belonged to the dropped table. It is deliberately
+    /// LEFT ALONE — deleting it would be a guess that can destroy a surviving
+    /// table's index — and it must not make the drop fail. It stays removable by
+    /// name through `DROP INDEX`, whose undecodable arm handles exactly this.
+    #[test]
+    fn drop_table_leaves_an_undecodable_index_record_alone_and_still_succeeds() {
+        let config = Config::in_memory();
+        let storage = StorageEngine::open_in_memory(&config).expect("open in-memory");
+        let catalog = Catalog::new(&storage);
+
+        catalog
+            .create_table("gone", Schema::new(vec![Column::new("id", DataType::Int4)]))
+            .expect("create table");
+        storage
+            .put(&b"meta:index:corrupt_idx".to_vec(), &[0xde, 0xad, 0xbe, 0xef, 0x01])
+            .expect("put corrupt record");
+
+        catalog
+            .drop_table("gone")
+            .expect("an undecodable index record must not fail the drop");
+
+        assert!(
+            storage
+                .get(&b"meta:index:corrupt_idx".to_vec())
+                .expect("read back")
+                .is_some(),
+            "an undecodable record was deleted on a guess about which table owned it"
+        );
+    }
+
+    /// The common case: a table with no user-created indexes drops exactly as it
+    /// did before, and the new scan reports zero.
+    #[test]
+    fn drop_table_with_no_index_definitions_is_a_no_op_scan() {
+        let config = Config::in_memory();
+        let storage = StorageEngine::open_in_memory(&config).expect("open in-memory");
+        let catalog = Catalog::new(&storage);
+
+        catalog
+            .create_table("plain", Schema::new(vec![Column::new("id", DataType::Int4)]))
+            .expect("create table");
+        assert_eq!(
+            catalog.drop_table_index_definitions("plain").expect("scan"),
+            0,
+            "a table with no indexes reported a teardown"
+        );
+        catalog.drop_table("plain").expect("drop table");
+        assert!(!catalog.table_exists("plain").expect("exists"));
+    }
+
+    /// #85, at the catalog layer: `rename_table` carries the `trigger:{t}:*`
+    /// definitions and the `trigger_rowmut:{t}:*` recipes to the new name, and
+    /// rewrites the definition's own `table_name` field — the open-time loader
+    /// registers by that field, not by the key.
+    #[test]
+    fn rename_table_moves_trigger_records_to_the_new_name() {
+        use crate::sql::logical_plan::{TriggerEvent, TriggerFor, TriggerTiming};
+        use crate::sql::triggers::TriggerRowMutation;
+
+        let config = Config::in_memory();
+        let storage = StorageEngine::open_in_memory(&config).expect("open in-memory");
+        let catalog = Catalog::new(&storage);
+
+        catalog
+            .create_table("ren_a", Schema::new(vec![Column::new("id", DataType::Int4)]))
+            .expect("create ren_a");
+        catalog
+            .create_table("other", Schema::new(vec![Column::new("id", DataType::Int4)]))
+            .expect("create other");
+
+        let definition = |name: &str, table: &str| {
+            TriggerDefinition::new(
+                name.to_string(),
+                table.to_string(),
+                TriggerTiming::Before,
+                vec![TriggerEvent::Insert],
+                TriggerFor::Row,
+                None,
+                Vec::new(),
+                Vec::new(),
+            )
+        };
+        catalog.save_trigger(&definition("trg", "ren_a")).expect("save trigger");
+        catalog
+            .save_trigger(&definition("other_trg", "other"))
+            .expect("save other trigger");
+
+        catalog
+            .save_trigger_row_mutation(
+                "ren_a",
+                "trg",
+                &TriggerRowMutation {
+                    events: vec![TriggerEvent::Insert],
+                    assignments: Vec::new(),
+                    returns_null: true,
+                },
+            )
+            .expect("save recipe");
+
+        catalog.rename_table("ren_a", "ren_b").expect("rename");
+
+        let mut tables: Vec<String> = catalog
+            .load_all_triggers()
+            .expect("load triggers")
+            .into_iter()
+            .map(|t| t.table_name)
+            .collect();
+        tables.sort();
+        assert_eq!(
+            tables,
+            vec!["other".to_string(), "ren_b".to_string()],
+            "the trigger definition did not follow the rename (or an unrelated one moved)"
+        );
+
+        let recipes: Vec<String> = catalog
+            .load_all_trigger_row_mutations()
+            .expect("load recipes")
+            .into_iter()
+            .map(|(table, _trigger, _recipe)| table)
+            .collect();
+        assert_eq!(
+            recipes,
+            vec!["ren_b".to_string()],
+            "the rewrite recipe did not follow the rename"
+        );
+
+        // The old keys are gone, not merely shadowed.
+        assert!(
+            storage
+                .get(&b"trigger:ren_a:trg".to_vec())
+                .expect("read back")
+                .is_none(),
+            "the trigger definition was copied but the old record was left behind"
+        );
+        assert!(
+            storage
+                .get(&b"trigger_rowmut:ren_a:trg".to_vec())
+                .expect("read back")
+                .is_none(),
+            "the rewrite recipe was copied but the old record was left behind"
         );
     }
 }

@@ -28,6 +28,286 @@ pub(super) fn starts_with_cte(s: &str) -> bool {
             .get(4)
             .map_or(true, |c| !c.is_ascii_alphanumeric() && *c != b'_')
 }
+
+/// What a recognised transaction-control statement asks for.
+///
+/// See [`classify_transaction_control`] for why this is a shared type rather
+/// than a fourth `bool`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TxnControl {
+    /// `BEGIN [WORK | TRANSACTION] [ … ]` / `START TRANSACTION [ … ]`.
+    /// The trailing text (isolation level, access mode) is parsed by the
+    /// caller — this only answers "is this a BEGIN?".
+    Begin,
+    /// `COMMIT [WORK | TRANSACTION] [AND [NO] CHAIN]` and its synonym
+    /// `END [WORK | TRANSACTION] [AND [NO] CHAIN]`.
+    Commit {
+        /// `AND CHAIN`: commit, then immediately start a new transaction with
+        /// the same characteristics.
+        chain: bool,
+    },
+    /// `ROLLBACK [WORK | TRANSACTION] [AND [NO] CHAIN]` and its synonym
+    /// `ABORT [WORK | TRANSACTION] [AND [NO] CHAIN]`.
+    Rollback {
+        /// `AND CHAIN`: roll back, then immediately start a new transaction.
+        chain: bool,
+    },
+    /// `ROLLBACK [WORK | TRANSACTION] TO [SAVEPOINT] <name>`.
+    ///
+    /// Recognised so it can never be mistaken for a plain `ROLLBACK` — it is
+    /// NOT a transaction boundary. Every caller deliberately routes it to the
+    /// ordinary executor, which owns the savepoint stack
+    /// (`LogicalPlan::RollbackToSavepoint`).
+    RollbackToSavepoint,
+}
+
+impl TxnControl {
+    /// True for the three statements that open or close a transaction, i.e.
+    /// everything a caller must intercept before the SQL executor sees it.
+    ///
+    /// `ROLLBACK TO SAVEPOINT` is deliberately excluded: intercepting it would
+    /// turn a partial rollback into a full one.
+    #[inline]
+    pub(crate) fn is_boundary(self) -> bool {
+        !matches!(self, TxnControl::RollbackToSavepoint)
+    }
+}
+
+/// Classify a transaction-control statement — the ONE implementation.
+///
+/// # Why this exists
+///
+/// Four independent copies of this rule used to live in the tree
+/// (`EmbeddedDatabase::is_transaction_control`,
+/// `EmbeddedDatabase::handle_transaction_control_for_session`, the simple-query
+/// arms of `PgConnectionHandler::handle_single_query`, and the extended-Execute
+/// guard in `handler_extended.rs`). All four prefix-matched
+/// `BEGIN`/`START TRANSACTION` but used an EXACT `eq_ignore_ascii_case` for
+/// `COMMIT` and `ROLLBACK`, so every ordinary PostgreSQL spelling missed:
+///
+/// * `END` — sqlparser 0.53 maps it to `Statement::Commit`, and PostgreSQL
+///   documents it as a synonym for `COMMIT`. **`END;` did not commit.**
+/// * `COMMIT WORK` / `COMMIT TRANSACTION` / `ROLLBACK WORK` /
+///   `ROLLBACK TRANSACTION` — the SQL-standard spellings.
+/// * `ABORT` — PostgreSQL's synonym for `ROLLBACK`.
+///
+/// A miss fell through to the SQL executor, which has no `Commit` operator, so
+/// the user got `Operator not yet implemented: Commit` — a loud but
+/// internal-looking error from a statement whose whole job is the transaction
+/// boundary. That is the one place a database cannot be approximate.
+///
+/// # What it accepts
+///
+/// ```text
+/// BEGIN   [ WORK | TRANSACTION ] [ … ]
+/// START   TRANSACTION [ … ]
+/// COMMIT  [ WORK | TRANSACTION ] [ AND [ NO ] CHAIN ]
+/// END     [ WORK | TRANSACTION ] [ AND [ NO ] CHAIN ]
+/// ROLLBACK[ WORK | TRANSACTION ] [ AND [ NO ] CHAIN ]
+/// ABORT   [ WORK | TRANSACTION ] [ AND [ NO ] CHAIN ]
+/// ROLLBACK[ WORK | TRANSACTION ] TO [ SAVEPOINT ] <name>
+/// ```
+///
+/// Anything else returns `None` and is left to the executor. In particular
+/// `COMMIT PREPARED 'gid'` / `ROLLBACK PREPARED 'gid'` (two-phase commit, which
+/// this engine does not implement) are NOT classified: silently treating them
+/// as a local COMMIT would be the worst possible answer.
+///
+/// Tokens are split on ASCII whitespace **and `;`**, which preserves the
+/// pre-existing behaviour of the callers' `trim_end_matches(';')` — including
+/// the historical quirk that `BEGIN; …` classifies as `BEGIN`.
+pub(crate) fn classify_transaction_control(sql: &str) -> Option<TxnControl> {
+    let mut words = sql
+        .split(|c: char| c.is_ascii_whitespace() || c == ';')
+        .filter(|w| !w.is_empty());
+    let first = words.next()?;
+
+    // BEGIN / START TRANSACTION keep the historical "first word wins"
+    // behaviour: everything after them is an isolation-level / access-mode
+    // clause that each caller parses for itself.
+    if first.eq_ignore_ascii_case("BEGIN") {
+        return Some(TxnControl::Begin);
+    }
+    if first.eq_ignore_ascii_case("START") {
+        return match words.next() {
+            Some(w) if w.eq_ignore_ascii_case("TRANSACTION") => Some(TxnControl::Begin),
+            _ => None,
+        };
+    }
+
+    let is_rollback = if first.eq_ignore_ascii_case("COMMIT") || first.eq_ignore_ascii_case("END") {
+        false
+    } else if first.eq_ignore_ascii_case("ROLLBACK") || first.eq_ignore_ascii_case("ABORT") {
+        true
+    } else {
+        return None;
+    };
+
+    let finish = |chain: bool| {
+        Some(if is_rollback {
+            TxnControl::Rollback { chain }
+        } else {
+            TxnControl::Commit { chain }
+        })
+    };
+
+    // Optional noise word: [ WORK | TRANSACTION ].
+    let mut next = words.next();
+    if let Some(w) = next {
+        if w.eq_ignore_ascii_case("WORK") || w.eq_ignore_ascii_case("TRANSACTION") {
+            next = words.next();
+        }
+    }
+
+    match next {
+        // Bare `COMMIT` / `END TRANSACTION` / `ROLLBACK WORK` / `ABORT`.
+        None => finish(false),
+        // `ROLLBACK [WORK|TRANSACTION] TO [SAVEPOINT] <name>` — a savepoint
+        // operation. `COMMIT TO …` is not SQL, so this arm is rollback-only.
+        Some(w) if is_rollback && w.eq_ignore_ascii_case("TO") => {
+            let name = match words.next() {
+                Some(n) if n.eq_ignore_ascii_case("SAVEPOINT") => words.next(),
+                other => other,
+            };
+            // A missing name, or trailing junk (e.g. a quoted identifier that
+            // contains a space), is not something this classifier should be
+            // guessing at — hand it to the executor's real parser.
+            if name.is_none() || words.next().is_some() {
+                return None;
+            }
+            Some(TxnControl::RollbackToSavepoint)
+        }
+        // `AND [ NO ] CHAIN`.
+        Some(w) if w.eq_ignore_ascii_case("AND") => {
+            let mut chain = true;
+            let mut tail = words.next()?;
+            if tail.eq_ignore_ascii_case("NO") {
+                chain = false;
+                tail = words.next()?;
+            }
+            if !tail.eq_ignore_ascii_case("CHAIN") || words.next().is_some() {
+                return None;
+            }
+            finish(chain)
+        }
+        // `COMMIT PREPARED 'gid'`, `ROLLBACK PREPARED 'gid'`, or anything else
+        // we do not understand: deliberately unclassified.
+        Some(_) => None,
+    }
+}
+
+#[cfg(test)]
+mod txn_control_classifier_tests {
+    //! Task #104. These pin the CLASSIFICATION; the wire behaviour it produces
+    //! is pinned in `wire_tests.rs`
+    //! (`wire_standard_transaction_control_spellings_reach_the_boundary`,
+    //! `wire_commit_and_chain_opens_the_next_transaction`,
+    //! `wire_rollback_to_savepoint_does_not_end_the_transaction`).
+    use super::{classify_transaction_control as classify, TxnControl};
+
+    const COMMIT: TxnControl = TxnControl::Commit { chain: false };
+    const ROLLBACK: TxnControl = TxnControl::Rollback { chain: false };
+
+    #[test]
+    fn the_spellings_that_used_to_miss_now_classify() {
+        // Every one of these fell through to the SQL executor before the
+        // collapse, producing `Operator not yet implemented: Commit`.
+        for sql in [
+            "END",
+            "end;",
+            "END WORK",
+            "END TRANSACTION",
+            "COMMIT WORK",
+            "COMMIT TRANSACTION",
+        ] {
+            assert_eq!(classify(sql), Some(COMMIT), "`{sql}` must classify as COMMIT");
+        }
+        for sql in [
+            "ABORT",
+            "abort;",
+            "ABORT WORK",
+            "ROLLBACK WORK",
+            "ROLLBACK TRANSACTION",
+            "ROLLBACK TRANSACTION AND NO CHAIN",
+        ] {
+            assert_eq!(classify(sql), Some(ROLLBACK), "`{sql}` must classify as ROLLBACK");
+        }
+    }
+
+    #[test]
+    fn the_canonical_spellings_are_unchanged() {
+        assert_eq!(classify("COMMIT"), Some(COMMIT));
+        assert_eq!(classify("  commit ; "), Some(COMMIT));
+        assert_eq!(classify("ROLLBACK"), Some(ROLLBACK));
+        assert_eq!(classify("BEGIN"), Some(TxnControl::Begin));
+        assert_eq!(classify("BEGIN;"), Some(TxnControl::Begin));
+        assert_eq!(
+            classify("begin transaction isolation level serializable"),
+            Some(TxnControl::Begin)
+        );
+        assert_eq!(classify("START TRANSACTION"), Some(TxnControl::Begin));
+        assert_eq!(classify("START TRANSACTION READ ONLY"), Some(TxnControl::Begin));
+        // Historical quirk of the four `trim_end_matches(';')` copies, kept so
+        // the collapse is behaviour-preserving.
+        assert_eq!(classify("BEGIN; INSERT INTO t VALUES (1)"), Some(TxnControl::Begin));
+    }
+
+    #[test]
+    fn and_chain_is_carried_not_swallowed() {
+        assert_eq!(classify("COMMIT AND CHAIN"), Some(TxnControl::Commit { chain: true }));
+        assert_eq!(
+            classify("COMMIT WORK AND CHAIN"),
+            Some(TxnControl::Commit { chain: true })
+        );
+        assert_eq!(classify("COMMIT AND NO CHAIN"), Some(COMMIT));
+        assert_eq!(
+            classify("ROLLBACK AND CHAIN"),
+            Some(TxnControl::Rollback { chain: true })
+        );
+        assert_eq!(classify("ROLLBACK AND NO CHAIN"), Some(ROLLBACK));
+    }
+
+    #[test]
+    fn rollback_to_savepoint_is_recognised_but_is_not_a_boundary() {
+        for sql in [
+            "ROLLBACK TO sp1",
+            "ROLLBACK TO SAVEPOINT sp1",
+            "rollback work to savepoint sp1;",
+            "ROLLBACK TRANSACTION TO SAVEPOINT sp1",
+        ] {
+            assert_eq!(
+                classify(sql),
+                Some(TxnControl::RollbackToSavepoint),
+                "`{sql}` must classify as a savepoint rollback"
+            );
+            assert!(
+                !classify(sql).expect("classified").is_boundary(),
+                "`{sql}` must NOT be a boundary: intercepting it turns a partial rollback into a full one"
+            );
+        }
+    }
+
+    #[test]
+    fn statements_we_do_not_implement_are_left_to_the_executor() {
+        // Two-phase commit: silently treating these as a local COMMIT/ROLLBACK
+        // would be the worst possible answer.
+        assert_eq!(classify("COMMIT PREPARED 'gid'"), None);
+        assert_eq!(classify("ROLLBACK PREPARED 'gid'"), None);
+        assert_eq!(classify("PREPARE TRANSACTION 'gid'"), None);
+        // Not transaction control at all.
+        assert_eq!(classify("SELECT 1"), None);
+        assert_eq!(classify(""), None);
+        assert_eq!(classify("   "), None);
+        assert_eq!(classify("SAVEPOINT sp1"), None);
+        assert_eq!(classify("RELEASE SAVEPOINT sp1"), None);
+        assert_eq!(classify("START"), None);
+        assert_eq!(classify("ROLLBACK TO"), None);
+        // Word-boundary: a name that merely starts with a keyword is not one.
+        assert_eq!(classify("BEGINNER_REPORT"), None);
+        assert_eq!(classify("COMMITTED"), None);
+    }
+}
+
 use super::auth::{AuthManager, AuthMethod, ScramAuthState};
 use super::catalog::PgCatalog;
 use super::messages::{AuthenticationMessage, BackendMessage, FieldDescription, FrontendMessage, TransactionStatus};
@@ -659,13 +939,13 @@ where
             return self.handle_copy(copy_stmt).await;
         }
 
-        // Handle transaction commands (case-insensitive without allocation)
+        // Handle transaction commands. ONE classifier ([`classify_transaction_control`])
+        // is shared with the extended-Execute guard and with the engine's two
+        // session entry points, so `END` / `ABORT` / `COMMIT WORK` /
+        // `ROLLBACK TRANSACTION` cannot be understood here and missed there.
         let trimmed = query.trim();
-        if trimmed.eq_ignore_ascii_case("BEGIN")
-            || starts_with_icase(trimmed, "BEGIN ")
-            || trimmed.eq_ignore_ascii_case("START TRANSACTION")
-            || starts_with_icase(trimmed, "START TRANSACTION ")
-        {
+        let txn_control = classify_transaction_control(trimmed);
+        if txn_control == Some(TxnControl::Begin) {
             // Parse isolation level if specified
             // Supported: BEGIN [TRANSACTION] [ISOLATION LEVEL {READ UNCOMMITTED | READ COMMITTED | REPEATABLE READ | SERIALIZABLE}]
             let isolation_level = Self::parse_isolation_level(trimmed);
@@ -694,6 +974,7 @@ where
                     tracing::debug!("Transaction starting with isolation level: {}", level);
                 }
                 self.database.begin_transaction_for_session(self.session_id)?;
+                self.emit_pending_session_notices().await?;
                 self.transaction_status = TransactionStatus::InTransaction;
             }
             self.send_command_complete("BEGIN").await?;
@@ -941,12 +1222,17 @@ where
                 self.send_ready_for_query().await?;
                 return Ok(());
             }
-        } else if trimmed.eq_ignore_ascii_case("COMMIT") {
-            // Handle commit even if no transaction active (PostgreSQL warns but succeeds)
+        } else if let Some(TxnControl::Commit { chain }) = txn_control {
+            // `COMMIT`, and its synonym `END`, in every spelling the shared
+            // classifier accepts. Handle commit even if no transaction is
+            // active (PostgreSQL warns but succeeds).
+            let mut closed_a_transaction = false;
             if self.transaction_status == TransactionStatus::InTransaction {
                 self.database.commit_transaction_for_session(self.session_id)?;
+                closed_a_transaction = true;
             } else if self.transaction_status == TransactionStatus::Failed {
                 self.rollback_failed_transaction_for_recovery()?;
+                self.transaction_status = TransactionStatus::Idle;
                 self.send_command_complete("ROLLBACK").await?;
                 self.send_ready_for_query().await?;
                 return Ok(());
@@ -958,12 +1244,25 @@ where
                 })
                 .await?;
             }
-            self.transaction_status = TransactionStatus::Idle;
+            // `AND CHAIN` must open the next transaction immediately, or the
+            // statements that follow would silently autocommit — the exact
+            // atomicity hole this item exists to close. Like PostgreSQL, chain
+            // only when a live transaction was actually closed.
+            self.transaction_status = if chain && closed_a_transaction {
+                self.database.begin_transaction_for_session(self.session_id)?;
+                self.emit_pending_session_notices().await?;
+                TransactionStatus::InTransaction
+            } else {
+                TransactionStatus::Idle
+            };
+            // PostgreSQL reports `END` with the COMMIT tag.
             self.send_command_complete("COMMIT").await?;
             self.send_ready_for_query().await?;
             return Ok(());
-        } else if trimmed.eq_ignore_ascii_case("ROLLBACK") {
-            // Handle rollback even if no transaction active (PostgreSQL warns but succeeds)
+        } else if let Some(TxnControl::Rollback { chain }) = txn_control {
+            // `ROLLBACK`, and its synonym `ABORT`. Handle rollback even if no
+            // transaction is active (PostgreSQL warns but succeeds).
+            let mut closed_a_transaction = false;
             if matches!(
                 self.transaction_status,
                 TransactionStatus::InTransaction | TransactionStatus::Failed
@@ -971,6 +1270,7 @@ where
                 if self.database.session_in_transaction(self.session_id) {
                     self.database.rollback_transaction_for_session(self.session_id)?;
                 }
+                closed_a_transaction = true;
             } else {
                 self.send_message(BackendMessage::NoticeResponse {
                     severity: "WARNING".to_string(),
@@ -979,7 +1279,14 @@ where
                 })
                 .await?;
             }
-            self.transaction_status = TransactionStatus::Idle;
+            self.transaction_status = if chain && closed_a_transaction {
+                self.database.begin_transaction_for_session(self.session_id)?;
+                self.emit_pending_session_notices().await?;
+                TransactionStatus::InTransaction
+            } else {
+                TransactionStatus::Idle
+            };
+            // PostgreSQL reports `ABORT` with the ROLLBACK tag.
             self.send_command_complete("ROLLBACK").await?;
             self.send_ready_for_query().await?;
             return Ok(());
@@ -2007,6 +2314,27 @@ where
     }
 
     /// Send command complete
+    /// Drain any notices the engine queued for this session and emit them to the
+    /// client as `NoticeResponse`.
+    ///
+    /// The engine cannot write to the wire, so anything it needs to tell the
+    /// client is queued on the session and drained here. Today the only producer
+    /// is the SERIALIZABLE policy: a client that asks for a level we serve as
+    /// snapshot isolation is told so, naming write skew, rather than being left
+    /// to believe it got serializability. Without this drain the warning reaches
+    /// only the server log — i.e. everyone except the person who asked.
+    pub(super) async fn emit_pending_session_notices(&mut self) -> Result<()> {
+        for notice in self.database.take_session_notices(self.session_id) {
+            self.send_message(BackendMessage::NoticeResponse {
+                severity: notice.severity,
+                code: notice.code,
+                message: notice.message,
+            })
+            .await?;
+        }
+        Ok(())
+    }
+
     pub(super) async fn send_command_complete(&mut self, tag: &str) -> Result<()> {
         self.send_message(BackendMessage::CommandComplete { tag: tag.to_string() })
             .await
@@ -3134,12 +3462,31 @@ pub(crate) fn sqlstate_for_error(error: &Error) -> &'static str {
             // table name embedded in the message could otherwise contain one of
             // the keywords below. Raised by `EmbeddedDatabase::enforce_rls_with_check`
             // ("new row violates row-level security policy for table …").
+            //
+            // FOREIGN KEY is tested BEFORE unique, and BOTH are anchored on the
+            // phrase their emitters actually write, because the FK message is
+            // the only one here that interpolates USER DATA:
+            //   `Foreign key constraint '<name>' violated: row references
+            //    non-existent <table>(<cols>) = (<the offending values>)`
+            // (src/lib.rs `check_fk_constraints_on_write`, the deferred COMMIT
+            // check, and src/sql/constraints.rs). With the old bare
+            // `contains("duplicate") || contains("unique")` arm sitting FIRST,
+            // `INSERT INTO child VALUES (1, 'unique')` against a missing parent
+            // reported 23505 unique_violation — so an ON CONFLICT retry loop
+            // keyed on 23505 would retry forever against a dangling FK, and a
+            // referenced table merely NAMED `unique_codes` did the same. The
+            // unique emitters interpolate only a DDL identifier:
+            // `Duplicate key value violates UNIQUE|PRIMARY KEY constraint "<n>"`
+            // (storage/art_manager.rs, src/lib.rs). `foreign key violation` is
+            // the second FK shape: `ArtIndexError::ForeignKeyViolation` Displays
+            // as `Foreign key violation: …` (src/storage/art_index.rs) and
+            // several sites wrap it with `constraint_violation(e.to_string())`.
             if lower.contains("row-level security") {
                 sqlstate::INSUFFICIENT_PRIVILEGE // 42501
-            } else if lower.contains("duplicate") || lower.contains("unique") {
-                sqlstate::UNIQUE_VIOLATION // 23505
-            } else if lower.contains("foreign key") {
+            } else if lower.contains("foreign key constraint") || lower.contains("foreign key violation") {
                 sqlstate::FOREIGN_KEY_VIOLATION // 23503
+            } else if lower.contains("duplicate key") || lower.contains("unique constraint") {
+                sqlstate::UNIQUE_VIOLATION // 23505
             } else if lower.contains("check") {
                 sqlstate::CHECK_VIOLATION // 23514
             } else {
@@ -3209,30 +3556,124 @@ fn message_names_an_index(lower: &str) -> bool {
     (lower.contains("index \"") || lower.contains("index '")) && !lower.contains("table") && !lower.contains("relation")
 }
 
+/// Does this message name a ROLE as its subject?
+///
+/// SHAPE, not a bare substring — same rule as [`message_names_an_index`], and
+/// the same reason. All nine PG-reachable role emitters live in
+/// `src/sql/executor/mod.rs` and every one of them DOUBLE-quotes the name:
+///
+/// ```text
+/// role "r" is reserved and cannot be created        CREATE ROLE   :4049
+/// role "r" already exists                           CREATE ROLE   :4056
+/// cannot alter built-in role "r"                    ALTER ROLE    :4091
+/// role "r" does not exist                           ALTER ROLE    :4095
+/// cannot drop built-in role "r"                     DROP ROLE     :4140
+/// role "r" does not exist                           DROP ROLE     :4146
+/// role "r" cannot be dropped because some objects…  DROP ROLE     :4154  (2BP01 arm, first)
+/// role "r" does not exist                           GRANT         :4177
+/// role "r" does not exist                           REVOKE        :4213
+/// ```
+///
+/// There is NO unquoted variant, so anchoring cannot demote any of them to
+/// `XX000` — the degradation that would be strictly worse for a driver than the
+/// wrong-but-specific code this replaces. (`src/main.rs`'s
+/// `Unknown replication role: '…'` is CLI argument validation and
+/// `src/replication/role_manager.rs` raises `Error::Replication`; neither ever
+/// reaches this mapper.) The single-quote spelling is accepted too so a future
+/// emitter following the `Table 'x'` house style is still classified.
+///
+/// The bug being fixed: a bare `lower.contains("role")` matched the role NOUN
+/// inside somebody else's OBJECT NAME. `roles` / `user_roles` are ordinary table
+/// names (Rails, Django and Supabase schemas all ship them), so
+/// `Table 'roles' does not exist` returned 42704 undefined_object instead of
+/// 42P01 undefined_table; and because these arms precede the column arm,
+/// `Column 'user_role' not found` returned 42704 instead of 42703. Shipped live
+/// in v4.20.0.
+///
+/// The table/relation exclusion is the same belt-and-braces as the index helper
+/// (no role emitter mentions either word), making the classification independent
+/// of arm order. Documented edge: a role literally NAMED `table` would trip the
+/// exclusion. Pathological, and preferable to the hijack.
+fn message_names_a_role(lower: &str) -> bool {
+    (lower.contains("role \"") || lower.contains("role '")) && !lower.contains("table") && !lower.contains("relation")
+}
+
+/// Does this message name a FUNCTION as its subject?
+///
+/// Emitter audit (8 sites), and note the **deliberate absence of a
+/// table/relation exclusion**:
+///
+/// ```text
+/// Function 'f' already exists                src/sql/functions.rs:81
+/// Function 'f' does not exist                src/sql/functions.rs:165, :228
+/// Table function 'f' not supported           src/sql/planner.rs:2927      (no token → XX000, unchanged)
+/// Function 'f' not supported in RLS …        src/tenant/expression.rs:571 (no token → XX000, unchanged)
+/// Unknown scalar function: f                 src/sql/evaluator.rs:1194    ← UNQUOTED
+/// Unknown window function: f                 src/sql/planner.rs:3833      ← UNQUOTED
+/// Unknown table function: f                  src/sql/executor/scan.rs:3012← UNQUOTED, and says "table"
+/// ```
+///
+/// The `function: ` alternative exists for the three UNQUOTED emitters — the
+/// first of which, `Unknown scalar function`, is the single most common function
+/// error a driver will ever see. Without it they would fall through to `XX000`.
+/// And `Unknown table function: f` is exactly why this helper must NOT copy the
+/// index helper's `!contains("table")` guard: that guard would demote a genuine
+/// 42883 to `XX000`.
+///
+/// Ordering still defeats the hijack: `Table 'functions' does not exist`
+/// contains `functions'`, not `function '` / `function "` / `function: `.
+fn message_names_a_function(lower: &str) -> bool {
+    lower.contains("function '") || lower.contains("function \"") || lower.contains("function: ")
+}
+
+/// Does this message name a COLUMN as its subject?
+///
+/// All 25 emitters single-quote the name — `Column 'c' not found`,
+/// `Column 'c' not found in table 't'`, `Column 'c' does not exist in table 't'`,
+/// `Column 'c' already exists in table 't'`, `ON CONFLICT DO UPDATE: column 'c'
+/// not found` (src/lib.rs, src/sql/evaluator.rs, src/sql/type_inference.rs,
+/// src/sql/executor/{ddl,aggregate}.rs, src/storage/{catalog,mv_incremental}.rs,
+/// src/tenant/expression.rs). The only unquoted "column" texts are the
+/// `Column index N out of bounds …` family and `Columnar scan requested
+/// non-columnar column x.y`, which carry no not-found/unknown/already-exists
+/// token and so are unreachable by these arms — before and after.
+/// `src/storage/catalog.rs:1230`'s unquoted "column x.y not found" is a
+/// `tracing::warn!`, never an `Error`.
+///
+/// **No table/relation exclusion**, and that is deliberate: column errors
+/// legitimately name their table. What defeats the hijack is the required SPACE
+/// before the quote plus arm order — `Table 'columns' does not exist` contains
+/// `columns'`, and `Table 'column' does not exist` contains `column'`; neither
+/// is `column '`.
+fn message_names_a_column(lower: &str) -> bool {
+    lower.contains("column '") || lower.contains("column \"")
+}
+
 /// Classify a `QueryExecution` message into a SQLSTATE.
 ///
 /// Order matters: function and column shapes are checked before table
 /// shapes because messages like `Column 'c' not found in table 't'`
 /// mention both.
 ///
-/// # Known bare-substring arms (audited, NOT fixed here)
+/// Every object-noun arm below now anchors on the SHAPE its emitters actually
+/// produce ([`message_names_a_role`], [`message_names_a_function`],
+/// [`message_names_a_column`], [`message_names_an_index`]) rather than on a bare
+/// `contains(<noun>)`, and each helper carries its own emitter audit. That
+/// audit is the load-bearing part: an emitter missed by an anchor degrades from
+/// a wrong-but-specific code to `XX000 internal_error`, which is WORSE for a
+/// driver (poolers and HA proxies treat XX000 as a server fault).
 ///
-/// The index arms below were reworked to match a message SHAPE
-/// ([`message_names_an_index`]). The `role` / `function` / `column` arms above
-/// them are still bare `contains` tests carrying the SAME hazard, and are
-/// PRE-EXISTING — they are recorded here rather than silently left:
+/// # Known gaps (recorded, deliberately NOT fixed here)
 ///
-/// * `contains("role")` — `Table 'roles' does not exist` → 42704 instead of
-///   42P01; `Column 'role' not found in table 't'` → 42704 instead of 42703.
-///   Every emitter writes `role "x" …` (`executor/mod.rs` CREATE/ALTER/DROP
-///   ROLE, GRANT/REVOKE), so `contains("role \"")` would anchor it.
-/// * `contains("function")` — `Table 'functions' does not exist` → 42883.
-/// * `contains("column")` — `Table 'columns' does not exist` → 42703.
-///
-/// Each needs its own emitter audit (an unquoted variant would fall through to
-/// XX000, a WORSE answer for a driver than today's wrong-but-specific code) plus
-/// wire tests, so they are deliberately out of this change's scope rather than
-/// fixed blind. See the DROP INDEX review notes.
+/// * `sequence "s" does not exist` (`Executor::acl_missing_object_error`,
+///   src/sql/executor/mod.rs) matches no arm and returns XX000. Separate noun,
+///   separate audit.
+/// * `NOT NULL constraint violated: …` / `PRIMARY KEY constraint 'c' violated:
+///   NULL value` report 23000 rather than 23502; `sqlstate::NOT_NULL_VIOLATION`
+///   exists with no caller. (They route through the `ConstraintViolation` arm of
+///   [`sqlstate_for_error`], not this function.)
+/// * `Division by zero` matches no arm here and returns XX000;
+///   `sqlstate::DIVISION_BY_ZERO` (22012) exists with no caller.
 fn sqlstate_for_query_execution_message(message: &str) -> &'static str {
     use crate::network::protocol::sqlstate;
 
@@ -3249,15 +3690,26 @@ fn sqlstate_for_query_execution_message(message: &str) -> &'static str {
         || lower.contains("because constraint")
     {
         sqlstate::DEPENDENT_OBJECTS_STILL_EXIST // 2BP01
-    } else if lower.contains("role") && (lower.contains("is reserved") || lower.contains("built-in role")) {
+    } else if message_names_a_role(&lower) && (lower.contains("is reserved") || lower.contains("built-in role")) {
         sqlstate::INSUFFICIENT_PRIVILEGE // 42501
-    } else if lower.contains("role") && lower.contains("already exists") {
+    } else if message_names_a_role(&lower) && lower.contains("already exists") {
         sqlstate::DUPLICATE_OBJECT // 42710
-    } else if lower.contains("role") && not_found {
+    } else if message_names_a_role(&lower) && not_found {
         sqlstate::UNDEFINED_OBJECT // 42704
-    } else if lower.contains("function") && (not_found || lower.contains("unknown")) {
+    } else if message_names_a_function(&lower) && lower.contains("already exists") {
+        // `Function 'f' already exists` (src/sql/functions.rs:81) used to fall
+        // through to XX000: it names no table, so neither the table arm nor any
+        // other matched it.
+        sqlstate::DUPLICATE_FUNCTION // 42723
+    } else if message_names_a_function(&lower) && (not_found || lower.contains("unknown")) {
         sqlstate::UNDEFINED_FUNCTION // 42883
-    } else if lower.contains("column") && (not_found || lower.contains("unknown")) {
+    } else if message_names_a_column(&lower) && lower.contains("already exists") {
+        // `Column 'c' already exists in table 't'` (ALTER TABLE ADD/RENAME
+        // COLUMN, src/lib.rs) used to reach the `(table||relation) && already
+        // exists` arm below and report 42P07 duplicate_TABLE for a duplicate
+        // COLUMN. Must stay ahead of that arm.
+        sqlstate::DUPLICATE_COLUMN // 42701
+    } else if message_names_a_column(&lower) && (not_found || lower.contains("unknown")) {
         sqlstate::UNDEFINED_COLUMN // 42703
     } else if message_names_an_index(&lower) && lower.contains("already exists") {
         // `ART index 'x' already exists` (`create_art_secondary_index`),
@@ -3860,5 +4312,125 @@ mod sqlstate_mapping_unit_tests {
             "42P01",
             "a passed-through error must keep its own SQLSTATE mapping; got {err}"
         );
+    }
+
+    /// Task #89 — the EXACT emitter strings, verbatim from their raise sites.
+    ///
+    /// This is the drift tripwire for the anchors: `message_names_a_role` /
+    /// `_a_function` / `_a_column` are only correct as long as these are the
+    /// shapes the engine writes. An emitter reworded past its anchor degrades
+    /// to `XX000 internal_error`, which is WORSE for a driver than the
+    /// wrong-but-specific code the anchors replaced — so the strings, not just
+    /// the SQL, are what is pinned. (The SQL routes are pinned over the wire in
+    /// `wire_tests.rs`; per task #86 these unit tests are the complement, not a
+    /// substitute.)
+    #[test]
+    fn every_audited_emitter_shape_keeps_its_sqlstate() {
+        let cases: &[(&str, &str)] = &[
+            // --- role: src/sql/executor/mod.rs, all DOUBLE-quoted ---
+            ("role \"app\" is reserved and cannot be created", "42501"),
+            ("cannot alter built-in role \"postgres\"", "42501"),
+            ("cannot drop built-in role \"postgres\"", "42501"),
+            ("role \"app\" already exists", "42710"),
+            ("role \"ghost\" does not exist", "42704"),
+            (
+                "role \"app\" cannot be dropped because some objects depend on it (revoke its privileges first)",
+                "2BP01",
+            ),
+            // --- function: quoted and UNQUOTED ---
+            ("Function 'f' does not exist", "42883"),
+            ("Function 'f' already exists", "42723"),
+            ("Unknown scalar function: no_such_fn", "42883"),
+            ("Unknown window function: NO_SUCH_WIN", "42883"),
+            // Contains the word "table" — the reason the function anchor must
+            // NOT copy the index helper's table/relation exclusion.
+            ("Unknown table function: no_such_tf", "42883"),
+            // --- column ---
+            ("Column 'c' not found", "42703"),
+            ("Column 'c' not found in table 't'", "42703"),
+            ("Column 'c' does not exist in table 't'", "42703"),
+            ("ON CONFLICT DO UPDATE: column 'c' not found", "42703"),
+            ("Column 'c' already exists in table 't'", "42701"),
+            // --- index (v4.21.0 anchors, unchanged) ---
+            ("index \"ix\" does not exist", "42704"),
+            ("Index 'ix' already exists", "42710"),
+            ("ART index 'ix' already exists", "42710"),
+            // --- table/relation ---
+            ("Table 't' does not exist", "42P01"),
+            ("Table 't' already exists", "42P07"),
+            ("relation \"t\" does not exist", "42P01"),
+            // --- THE HIJACKS: ordinary object names carrying another noun ---
+            ("Table 'roles' does not exist", "42P01"),
+            ("Table 'user_roles' does not exist", "42P01"),
+            ("Table 'roles' already exists", "42P07"),
+            ("Table 'functions' does not exist", "42P01"),
+            ("Table 'columns' does not exist", "42P01"),
+            ("Table 'column' does not exist", "42P01"),
+            ("Table 'search_index' does not exist", "42P01"),
+            ("Column 'user_role' not found", "42703"),
+            ("Column 'role' not found in table 't'", "42703"),
+        ];
+        for (message, expected) in cases {
+            let err = Error::query_execution(*message);
+            assert_eq!(
+                sqlstate_for_error(&err),
+                *expected,
+                "`{message}` must map to {expected}"
+            );
+        }
+    }
+
+    /// Task #89 companion, on the `ConstraintViolation` side: the FK message is
+    /// the only one here that interpolates USER DATA (the offending parent
+    /// values), so the unique arm's old bare `contains("unique")` — checked
+    /// FIRST — reported 23505 for a dangling foreign key whose value happened to
+    /// be the word `unique`. An ON CONFLICT retry loop keyed on 23505 retries
+    /// that forever. Both directions are pinned so the fix is an anchor, not a
+    /// reordering that merely moves the bug.
+    #[test]
+    fn fk_and_unique_violations_are_anchored_not_substring_matched() {
+        let cases: &[(&str, &str)] = &[
+            (
+                "Foreign key constraint 'fk_child_code' violated: row references non-existent parent(code) = (unique)",
+                "23503",
+            ),
+            (
+                "Foreign key constraint 'fk_c' violated: referenced row in table 'unique_codes' does not exist",
+                "23503",
+            ),
+            (
+                "Deferred foreign key constraint 'fk_c' violated at COMMIT: parent row is missing",
+                "23503",
+            ),
+            (
+                "Foreign key constraint 'fk_c' violated: cannot delete row from 'p' - referenced by 'c'",
+                "23503",
+            ),
+            // `ArtIndexError::ForeignKeyViolation` Displays with this wording.
+            ("Foreign key violation: parent key not present", "23503"),
+            // ... and genuine unique violations, including on names containing
+            // "foreign key".
+            ("Duplicate key value violates UNIQUE constraint \"u_ix\"", "23505"),
+            (
+                "Duplicate key value violates PRIMARY KEY constraint \"foreign_key_registry_pkey\"",
+                "23505",
+            ),
+            (
+                "UNIQUE constraint 'u' violated: duplicate value for columns (a, b)",
+                "23505",
+            ),
+            ("Duplicate key: 7", "23505"),
+            // Untouched neighbours.
+            ("new row violates CHECK constraint 'c' on table 't'", "23514"),
+            ("new row violates row-level security policy for table \"t\"", "42501"),
+        ];
+        for (message, expected) in cases {
+            let err = Error::constraint_violation(*message);
+            assert_eq!(
+                sqlstate_for_error(&err),
+                *expected,
+                "`{message}` must map to {expected}"
+            );
+        }
     }
 }

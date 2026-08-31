@@ -24,9 +24,10 @@
 //!    scan. The predicate was never evaluated. `UPDATE 0`, no error.
 //!
 //! The planner's read path was never broken for the reported UUID case: it
-//! already coerced the probe (`coerce_index_lookup_value`,
-//! `src/sql/executor/scan.rs`) and, crucially, falls back to a scan when it
-//! cannot. The read FAST path was, though — `try_fast_select` turns an index
+//! already coerced the probe (then `coerce_index_lookup_value` in
+//! `src/sql/executor/scan.rs`, since collapsed into the shared rule — see the
+//! item #99 section at the bottom of this file) and, crucially, falls back to a
+//! scan when it cannot. The read FAST path was, though — `try_fast_select` turns an index
 //! miss straight into `Ok(vec![])` with no scan, and its own literal typing
 //! (`fast_string_literal_value`) accepted only RFC-3339 timestamps. So
 //! `SELECT * FROM t WHERE ts_pk = '2024-01-15 10:30:00'` returned zero rows.
@@ -345,8 +346,9 @@ fn gh15_timestamp_pk_update_matches_select() {
 /// BYTEA PK. `Value::Bytes` encodes as its raw bytes, which the text spelling
 /// `'\x0102'` is not. This is deliberately NOT asserted as a silent-write-loss
 /// case, because it is not one: `Evaluator::compare_values` has no Bytes↔String
-/// arm (nor even a Bytes↔Bytes arm), so `coerce_index_lookup_value` on the READ
-/// path declines the same probe. BYTEA equality is a pre-existing, separate gap
+/// arm (nor even a Bytes↔Bytes arm), so the READ path declines the same probe —
+/// literally so since item #99, which pointed the read path at the very same
+/// `coerce_literal_to_column_type`. BYTEA equality is a pre-existing, separate gap
 /// on BOTH paths — see the follow-ups.
 ///
 /// What GH#15 owes this type is only that the write path does not *invent* a
@@ -547,4 +549,288 @@ fn params_family_uuid_pk_update_and_delete() {
         .unwrap();
     assert_eq!(affected, 0, "params family: absent UUID must affect 0 rows");
     assert_eq!(all_meta(&db), vec!["seed".to_string()]);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Item #99 — the READ path now shares the same one rule
+//
+// GH#15 (above) fixed the WRITE probe by routing it through
+// `coerce_literal_to_column_type` (src/sql/executor/mod.rs). The READ probe in
+// src/sql/executor/scan.rs kept a private near-clone, `coerce_index_lookup_value`
+// plus four helpers — the same rule, written twice, with nothing keeping the two
+// in step. A drift between the read probe and the write probe is EXACTLY the
+// divergence that produced the write loss narrated at the top of this file, so
+// the clone was deleted and scan.rs's four call sites now call the canonical
+// function.
+//
+// The tests below are the no-regression evidence for that collapse. They assert
+// the READ side: the same lookups, through both executor families, still return
+// the same rows. The per-`DataType` answer itself is pinned as a unit test next
+// to the function (`probe_coercion_tests` in src/sql/executor/mod.rs), so an
+// edit to the rule fails there before it can reach here.
+//
+// The one behavioural delta the collapse introduces is on NUMERIC: the canonical
+// rule coerces an INTEGER literal to `Numeric("6")` (the write path needs it —
+// `get_row_by_pk` has no scan to fall back to), whereas the deleted clone
+// declined. That is a NARROWING on the read side, because the ART key for a
+// NUMERIC column is the raw decimal string, so `6` and a stored `6.00` are
+// different keys for the same number. `try_index_lookup_for_scan` and
+// `try_index_in_list_for_scan` therefore decline the fast path when a NUMERIC
+// probe MISSES and fall back to the filtered scan, which compares numerically.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Read-path no-regression matrix. For every PK type whose ART encoding differs
+/// from a literal's `Value::String` form, a SELECT by the literal AND by a bound
+/// parameter must still return exactly the seeded row — on BOTH executor
+/// families (`query` → the text family, `query_params` → the extended-protocol
+/// family every real driver uses).
+///
+/// This is the "AFTER column is identical to the BEFORE column" test: nothing
+/// here is new behaviour, and that is the point.
+#[test]
+fn read_path_probe_matrix_survives_the_collapse() {
+    let uuid_key = uuid::Uuid::new_v4();
+    // (column DDL, literal as written in SQL, bound-parameter form)
+    let cases: Vec<(&str, String, Value)> = vec![
+        ("SMALLINT", "7".to_string(), Value::Int2(7)),
+        ("INT", "7".to_string(), Value::Int4(7)),
+        ("BIGINT", "7".to_string(), Value::Int8(7)),
+        ("DOUBLE PRECISION", "2.5".to_string(), Value::Float8(2.5)),
+        ("TEXT", "'abc'".to_string(), Value::String("abc".to_string())),
+        ("VARCHAR(16)", "'abc'".to_string(), Value::String("abc".to_string())),
+        ("UUID", format!("'{uuid_key}'"), Value::Uuid(uuid_key)),
+        (
+            "DATE",
+            "'2024-01-15'".to_string(),
+            Value::String("2024-01-15".to_string()),
+        ),
+        (
+            "TIMESTAMP",
+            "'2024-01-15 10:30:00'".to_string(),
+            Value::String("2024-01-15 10:30:00".to_string()),
+        ),
+    ];
+
+    for (ddl_type, literal, param) in cases {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute(&format!(
+            "CREATE TABLE probe (id {ddl_type} PRIMARY KEY, note TEXT NOT NULL)"
+        ))
+        .unwrap_or_else(|e| panic!("{ddl_type}: CREATE TABLE failed: {e}"));
+        db.execute(&format!("INSERT INTO probe VALUES ({literal}, 'seed')"))
+            .unwrap_or_else(|e| panic!("{ddl_type}: INSERT failed: {e}"));
+
+        // Text family, literal predicate.
+        let rows = db
+            .query(&format!("SELECT note FROM probe WHERE id = {literal}"), &[])
+            .unwrap_or_else(|e| panic!("{ddl_type}: SELECT by literal errored: {e}"));
+        assert_eq!(
+            texts(&rows, 0),
+            vec!["seed".to_string()],
+            "{ddl_type}: SELECT by the literal {literal} lost the row after the coercion collapse"
+        );
+
+        // Params family, bound parameter.
+        let rows = db
+            .query_params("SELECT note FROM probe WHERE id = $1", &[param.clone()])
+            .unwrap_or_else(|e| panic!("{ddl_type}: SELECT by bound param errored: {e}"));
+        assert_eq!(
+            texts(&rows, 0),
+            vec!["seed".to_string()],
+            "{ddl_type}: SELECT by a bound parameter lost the row after the coercion collapse"
+        );
+
+        // A genuine non-match must still be 0 rows, not a manufactured row.
+        let absent = match ddl_type {
+            "TEXT" | "VARCHAR(16)" => "'zzz'".to_string(),
+            "UUID" => format!("'{}'", uuid::Uuid::new_v4()),
+            "DATE" => "'2029-12-31'".to_string(),
+            "TIMESTAMP" => "'2029-12-31 00:00:00'".to_string(),
+            _ => "31".to_string(),
+        };
+        let rows = db
+            .query(&format!("SELECT note FROM probe WHERE id = {absent}"), &[])
+            .unwrap_or_else(|e| panic!("{ddl_type}: SELECT for an absent key errored: {e}"));
+        assert!(
+            rows.is_empty(),
+            "{ddl_type}: an absent key {absent} returned {} row(s)",
+            rows.len()
+        );
+    }
+}
+
+/// The NUMERIC narrowing guard — the test a naive collapse fails.
+///
+/// The canonical rule turns the integer literal `6` into the probe key `"6"`,
+/// but a row inserted as `6.00` is keyed `"6.00"`: same number, different bytes.
+/// The probe misses, and if that miss were reported as "no such row" the SELECT
+/// would silently lose a row the predicate matches. `try_index_lookup_for_scan`
+/// declines the fast path instead and lets the filtered scan compare numerically.
+#[test]
+fn numeric_pk_integer_literal_read_survives_a_scaled_key() {
+    let db = EmbeddedDatabase::new_in_memory().unwrap();
+    db.execute("CREATE TABLE prices (id NUMERIC PRIMARY KEY, note TEXT NOT NULL)")
+        .unwrap();
+    db.execute("INSERT INTO prices VALUES (6.00, 'six')").unwrap();
+    db.execute("INSERT INTO prices VALUES (7, 'seven')").unwrap();
+
+    let rows = db.query("SELECT note FROM prices WHERE id = 6", &[]).unwrap();
+    assert_eq!(
+        texts(&rows, 0),
+        vec!["six".to_string()],
+        "NUMERIC PK: `= 6` must find the row stored as 6.00 — the ART key is the \
+         decimal STRING, so the probe misses and must fall back to a scan"
+    );
+
+    // The unscaled row still resolves (probe hit; nothing changed for it).
+    let rows = db.query("SELECT note FROM prices WHERE id = 7", &[]).unwrap();
+    assert_eq!(texts(&rows, 0), vec!["seven".to_string()]);
+
+    // Genuine absence is still 0 rows — the fallback must not manufacture any.
+    let rows = db.query("SELECT note FROM prices WHERE id = 999", &[]).unwrap();
+    assert!(
+        rows.is_empty(),
+        "NUMERIC PK: an absent key returned {} row(s)",
+        rows.len()
+    );
+
+    // The GH#15 write-path win must not be given back. Asserted on the
+    // canonically-keyed row (`7`): the write path is a `get_row_by_pk` with no
+    // scan to fall back to, so a SCALED key (`6.00` probed as `6`) is a known,
+    // separately filed limitation of the NUMERIC ART encoding — not something
+    // this item claims to fix, and not something it may silently regress.
+    let affected = db
+        .execute("UPDATE prices SET note = 'has, comma' WHERE id = 7")
+        .unwrap();
+    assert_eq!(affected, 1, "NUMERIC PK UPDATE by integer literal regressed");
+    assert_eq!(
+        select_matches(&db, "prices", "id = 7").unwrap(),
+        1,
+        "the updated NUMERIC row must still be readable by the same predicate"
+    );
+    let affected = db.execute("DELETE FROM prices WHERE id = 7").unwrap();
+    assert_eq!(affected, 1, "NUMERIC PK DELETE by integer literal regressed");
+    assert_eq!(row_count(&db, "prices"), 1);
+}
+
+/// An INT PK miss must NOT pay the NUMERIC fallback: it stays a point lookup and
+/// still reports nothing. (The fallback is keyed on `Value::Numeric`, which the
+/// canonical rule produces only for a NUMERIC column, so no other type can reach
+/// it. This pins the answer, which is what a user observes.)
+#[test]
+fn int_pk_miss_is_still_a_plain_zero_row_answer() {
+    let db = EmbeddedDatabase::new_in_memory().unwrap();
+    db.execute("CREATE TABLE nums (id INT PRIMARY KEY, note TEXT NOT NULL)")
+        .unwrap();
+    db.execute("INSERT INTO nums VALUES (1, 'seed')").unwrap();
+
+    assert_eq!(select_matches(&db, "nums", "id = 99").unwrap(), 0);
+    assert_eq!(select_matches(&db, "nums", "id = 1").unwrap(), 1);
+}
+
+/// IN-list pushdown (`indexed_in_list_lookup`) is the third scan.rs call site
+/// that moved onto the canonical rule. Every element must resolve or the WHOLE
+/// pushdown declines, because a partial probe set drops matching rows.
+#[test]
+fn in_list_pushdown_still_returns_the_right_rows() {
+    // Coercible elements on an INT PK: probes, and both rows come back.
+    let db = EmbeddedDatabase::new_in_memory().unwrap();
+    db.execute("CREATE TABLE nums (id INT PRIMARY KEY, note TEXT NOT NULL)")
+        .unwrap();
+    db.execute("INSERT INTO nums VALUES (1, 'a')").unwrap();
+    db.execute("INSERT INTO nums VALUES (2, 'b')").unwrap();
+    db.execute("INSERT INTO nums VALUES (3, 'c')").unwrap();
+    let mut got = texts(&db.query("SELECT note FROM nums WHERE id IN (1, 2)", &[]).unwrap(), 0);
+    got.sort();
+    assert_eq!(got, vec!["a".to_string(), "b".to_string()]);
+
+    // A UUID PK with quoted literals: the coercion is load-bearing here (36 text
+    // bytes vs a 16-byte key) and both rows must come back.
+    let db = EmbeddedDatabase::new_in_memory().unwrap();
+    db.execute("CREATE TABLE docs2 (id UUID PRIMARY KEY, note TEXT NOT NULL)")
+        .unwrap();
+    let u1 = uuid::Uuid::new_v4();
+    let u2 = uuid::Uuid::new_v4();
+    let u3 = uuid::Uuid::new_v4();
+    db.execute(&format!("INSERT INTO docs2 VALUES ('{u1}', 'one')"))
+        .unwrap();
+    db.execute(&format!("INSERT INTO docs2 VALUES ('{u2}', 'two')"))
+        .unwrap();
+    db.execute(&format!("INSERT INTO docs2 VALUES ('{u3}', 'three')"))
+        .unwrap();
+
+    let mut got = texts(
+        &db.query(&format!("SELECT note FROM docs2 WHERE id IN ('{u1}', '{u2}')"), &[])
+            .unwrap(),
+        0,
+    );
+    got.sort();
+    assert_eq!(got, vec!["one".to_string(), "two".to_string()]);
+
+    // One uncoercible element declines the whole pushdown. Whatever the scan
+    // then does with `'not-a-uuid'`, it must never return a WRONG row set:
+    // either the two real rows, or a loud error. Silently answering with a
+    // different set is the failure this asserts against.
+    match db.query(
+        &format!("SELECT note FROM docs2 WHERE id IN ('{u1}', '{u2}', 'not-a-uuid')"),
+        &[],
+    ) {
+        Ok(rows) => {
+            let mut got = texts(&rows, 0);
+            got.sort();
+            assert_eq!(
+                got,
+                vec!["one".to_string(), "two".to_string()],
+                "an uncoercible IN element changed which real rows matched"
+            );
+        }
+        Err(_) => { /* rejecting the invalid UUID literal outright is also correct */ }
+    }
+}
+
+/// Index RANGE scans are the fourth scan.rs call site. `range_scannable_type`
+/// admits only the order-preserving encodings (never NUMERIC), so the range path
+/// cannot reach the one arm that changed — pin that it returns the same rows.
+#[test]
+fn index_range_scan_is_unaffected_by_the_collapse() {
+    let db = EmbeddedDatabase::new_in_memory().unwrap();
+    db.execute("CREATE TABLE scores (id INT PRIMARY KEY, n INT NOT NULL, label TEXT NOT NULL)")
+        .unwrap();
+    db.execute("CREATE INDEX scores_n_idx ON scores (n)").unwrap();
+    db.execute("CREATE INDEX scores_label_idx ON scores (label)").unwrap();
+    for (id, n, label) in [(1, 1, "alpha"), (2, 5, "mike"), (3, 10, "zulu"), (4, 20, "delta")] {
+        db.execute(&format!("INSERT INTO scores VALUES ({id}, {n}, '{label}')"))
+            .unwrap();
+    }
+
+    let mut got = texts(
+        &db.query("SELECT label FROM scores WHERE n BETWEEN 5 AND 10", &[])
+            .unwrap(),
+        0,
+    );
+    got.sort();
+    assert_eq!(got, vec!["mike".to_string(), "zulu".to_string()]);
+
+    let mut got = texts(&db.query("SELECT label FROM scores WHERE n > 5", &[]).unwrap(), 0);
+    got.sort();
+    assert_eq!(got, vec!["delta".to_string(), "zulu".to_string()]);
+
+    let mut got = texts(
+        &db.query("SELECT label FROM scores WHERE label >= 'm'", &[]).unwrap(),
+        0,
+    );
+    got.sort();
+    assert_eq!(got, vec!["mike".to_string(), "zulu".to_string()]);
+
+    // Same through the extended-protocol family.
+    let mut got = texts(
+        &db.query_params(
+            "SELECT label FROM scores WHERE n BETWEEN $1 AND $2",
+            &[Value::Int4(5), Value::Int4(10)],
+        )
+        .unwrap(),
+        0,
+    );
+    got.sort();
+    assert_eq!(got, vec!["mike".to_string(), "zulu".to_string()]);
 }

@@ -365,6 +365,28 @@ pub(super) fn try_index_point_lookup_for_scan(
 
     let key = crate::storage::ArtIndexManager::encode_key_from_values(std::iter::once(&lookup_value));
     let row_ids = storage.art_indexes().index_get_all(&index_name, &key);
+    // A NUMERIC probe that MISSES is declined, not reported as "no such row".
+    //
+    // A probe HIT is always safe: `filter_tuples_with_evaluator` below
+    // re-evaluates the real predicate against every fetched row, so an
+    // over-eager coercion can only ever narrow the fetch set, never widen the
+    // answer. A MISS is the one case the coercion cannot vouch for, and NUMERIC
+    // is the one type where a miss does not imply absence: the ART key for a
+    // NUMERIC column is the raw decimal-string bytes
+    // (`ArtIndexManager::encode_value_into`) and `parse_numeric_text` preserves
+    // scale, so the literal `6` encodes as "6" while a row stored as `6.00`
+    // encodes as "6.00" — different keys for the same number. Falling back to
+    // the filtered scan compares numerically and finds it. (The real repair is
+    // a scale-normalised NUMERIC key encoding; that is an on-disk format change
+    // and is filed separately. This is the containment.)
+    //
+    // `Value::Numeric` is produced by `coerce_literal_to_column_type` for
+    // `DataType::Numeric` and for no other declared type, so this test is
+    // exactly "the probed column is NUMERIC" without threading the column type
+    // down. Cost: one discriminant compare, and only on the miss path.
+    if row_ids.is_empty() && matches!(lookup_value, Value::Numeric(_)) {
+        return Ok(None);
+    }
     let mut tuples = Vec::with_capacity(row_ids.len());
     for row_id in row_ids {
         if let Some(tuple) = storage.get_row_by_id(table_name, row_id, schema.as_ref())? {
@@ -434,7 +456,7 @@ pub(super) fn indexed_in_list_lookup(
                 // Every element must resolve to a concrete indexed value, else
                 // the probe set is incomplete and would drop matching rows.
                 let raw = lookup_bound_value(item, parameters)?;
-                values.push(coerce_index_lookup_value(raw, &column.data_type)?);
+                values.push(super::coerce_literal_to_column_type(raw, &column.data_type)?);
             }
             Some((index_name, values))
         }
@@ -497,7 +519,16 @@ pub(super) fn try_index_in_list_for_scan(
     let mut row_ids = Vec::new();
     for value in &lookup_values {
         let key = crate::storage::ArtIndexManager::encode_key_from_values(std::iter::once(value));
-        for row_id in storage.art_indexes().index_get_all(&index_name, &key) {
+        let probed = storage.art_indexes().index_get_all(&index_name, &key);
+        // Same NUMERIC miss rule as `try_index_lookup_for_scan` (see the long
+        // note there). Here it is per ELEMENT: one element whose rows the key
+        // probe cannot find would silently drop them from the union, turning
+        // `IN (6, 7)` into `IN (7)`. So a NUMERIC element that misses declines
+        // the whole pushdown.
+        if probed.is_empty() && matches!(value, Value::Numeric(_)) {
+            return Ok(None);
+        }
+        for row_id in probed {
             if seen.insert(row_id) {
                 row_ids.push(row_id);
             }
@@ -703,7 +734,7 @@ pub(super) fn indexed_range_lookup(
         let mut encoded_uppers: Vec<(Vec<u8>, bool, String)> = Vec::new();
         let mut ok = true;
         for (raw, inclusive) in &raw_bounds.lowers {
-            match coerce_index_lookup_value(raw.clone(), &column.data_type) {
+            match super::coerce_literal_to_column_type(raw.clone(), &column.data_type) {
                 Some(v) if !matches!(v, Value::Null) => {
                     let key = crate::storage::ArtIndexManager::encode_key_from_values(std::iter::once(&v));
                     encoded_lowers.push((key, *inclusive, format!("{v}")));
@@ -716,7 +747,7 @@ pub(super) fn indexed_range_lookup(
         }
         if ok {
             for (raw, inclusive) in &raw_bounds.uppers {
-                match coerce_index_lookup_value(raw.clone(), &column.data_type) {
+                match super::coerce_literal_to_column_type(raw.clone(), &column.data_type) {
                     Some(v) if !matches!(v, Value::Null) => {
                         let key = crate::storage::ArtIndexManager::encode_key_from_values(std::iter::once(&v));
                         encoded_uppers.push((key, *inclusive, format!("{v}")));
@@ -989,7 +1020,13 @@ fn equality_lookup_from_sides(
     let column = schema.columns.get(column_idx)?;
     let index_name = storage.art_indexes().find_column_index(table_name, &column.name)?;
     let raw_value = lookup_bound_value(value_expr, parameters)?;
-    let lookup_value = coerce_index_lookup_value(raw_value, &column.data_type)?;
+    // `None` = this literal has no valid encoding for this column, so any probe
+    // key built from it is a guaranteed miss. Declining here makes
+    // `indexed_equality_lookup` return `None`, and `try_index_lookup_for_scan`
+    // then returns `Ok(None)` so an ordinary filtered scan is planned. It must
+    // never be turned into an empty row set — see the doc block on
+    // `coerce_literal_to_column_type`.
+    let lookup_value = super::coerce_literal_to_column_type(raw_value, &column.data_type)?;
     Some((index_name, lookup_value))
 }
 
@@ -1000,128 +1037,6 @@ fn lookup_bound_value(expr: &LogicalExpr, parameters: &[Value]) -> Option<Value>
         LogicalExpr::Cast { expr, .. } => lookup_bound_value(expr, parameters),
         _ => None,
     }
-}
-
-fn coerce_index_lookup_value(value: Value, data_type: &DataType) -> Option<Value> {
-    use crate::{DataType, Value};
-
-    if matches!(value, Value::Null) {
-        return Some(Value::Null);
-    }
-
-    match data_type {
-        DataType::Int2 => value_to_i64(&value)
-            .and_then(|value| i16::try_from(value).ok())
-            .map(Value::Int2),
-        DataType::Int4 => value_to_i64(&value)
-            .and_then(|value| i32::try_from(value).ok())
-            .map(Value::Int4),
-        DataType::Int8 => value_to_i64(&value).map(Value::Int8),
-        DataType::Float4 => value_to_f64(&value).map(|value| Value::Float4(value as f32)),
-        DataType::Float8 => value_to_f64(&value).map(Value::Float8),
-        DataType::Text | DataType::Varchar(_) | DataType::Char(_) => match value {
-            Value::String(_) => Some(value),
-            _ => None,
-        },
-        DataType::Boolean => match value {
-            Value::Boolean(_) => Some(value),
-            Value::String(s) => Some(Value::Boolean(matches!(
-                s.as_str(),
-                "1" | "true" | "TRUE" | "t" | "yes"
-            ))),
-            _ => None,
-        },
-        DataType::Uuid => match value {
-            Value::Uuid(_) => Some(value),
-            Value::String(s) => uuid::Uuid::parse_str(&s).ok().map(Value::Uuid),
-            // Binary-format wire parameter with no declared OID arrives as raw
-            // bytes; a 16-byte payload is the UUID itself. Without this arm the
-            // probe is skipped and the query silently degrades to a full scan.
-            Value::Bytes(b) => uuid::Uuid::from_slice(&b).ok().map(Value::Uuid),
-            _ => None,
-        },
-        DataType::Date => match value {
-            Value::Date(_) => Some(value),
-            Value::Timestamp(ts) => Some(Value::Date(ts.date_naive())),
-            Value::String(s) => parse_date_for_index(&s).map(Value::Date),
-            _ => None,
-        },
-        DataType::Timestamp | DataType::Timestamptz => match value {
-            Value::Timestamp(_) => Some(value),
-            Value::Date(date) => date
-                .and_hms_opt(0, 0, 0)
-                .map(|ts| Value::Timestamp(chrono::DateTime::from_naive_utc_and_offset(ts, chrono::Utc))),
-            Value::String(s) => parse_timestamp_for_index(&s).map(Value::Timestamp),
-            _ => None,
-        },
-        DataType::Time => match value {
-            Value::Time(_) => Some(value),
-            Value::String(s) => chrono::NaiveTime::parse_from_str(&s, "%H:%M:%S%.f")
-                .ok()
-                .map(Value::Time),
-            _ => None,
-        },
-        DataType::Bytea => matches!(value, Value::Bytes(_)).then_some(value),
-        DataType::Interval => matches!(value, Value::Interval(_)).then_some(value),
-        DataType::Numeric => {
-            if matches!(value, Value::Numeric(_)) {
-                Some(value)
-            } else if let Value::String(s) = value {
-                // Quoted numeric literal (incl. NaN/±Infinity) used as an index
-                // probe key: coerce to the canonical Numeric string so the ART
-                // key (raw decimal-string bytes) matches the stored value.
-                crate::sql::numeric_special::parse_numeric_text(&s).map(Value::Numeric)
-            } else {
-                None
-            }
-        }
-        DataType::Json | DataType::Jsonb => matches!(value, Value::Json(_)).then_some(value),
-        DataType::Vector(_) => matches!(value, Value::Vector(_)).then_some(value),
-        DataType::Array(_) => matches!(value, Value::Array(_)).then_some(value),
-    }
-}
-
-fn value_to_i64(value: &Value) -> Option<i64> {
-    match value {
-        Value::Int2(value) => Some(i64::from(*value)),
-        Value::Int4(value) => Some(i64::from(*value)),
-        Value::Int8(value) => Some(*value),
-        Value::String(value) => value.parse::<i64>().ok(),
-        _ => None,
-    }
-}
-
-fn value_to_f64(value: &Value) -> Option<f64> {
-    match value {
-        Value::Int2(value) => Some(f64::from(*value)),
-        Value::Int4(value) => Some(f64::from(*value)),
-        Value::Int8(value) => Some(*value as f64),
-        Value::Float4(value) => Some(f64::from(*value)),
-        Value::Float8(value) => Some(*value),
-        Value::String(value) => value.parse::<f64>().ok(),
-        _ => None,
-    }
-}
-
-fn parse_timestamp_for_index(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
-    if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(value) {
-        return Some(ts.with_timezone(&chrono::Utc));
-    }
-    if let Ok(ts) = chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f") {
-        return Some(chrono::DateTime::from_naive_utc_and_offset(ts, chrono::Utc));
-    }
-    if let Ok(date) = chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d") {
-        return date
-            .and_hms_opt(0, 0, 0)
-            .map(|ts| chrono::DateTime::from_naive_utc_and_offset(ts, chrono::Utc));
-    }
-    None
-}
-
-fn parse_date_for_index(value: &str) -> Option<chrono::NaiveDate> {
-    chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d")
-        .ok()
-        .or_else(|| parse_timestamp_for_index(value).map(|ts| ts.date_naive()))
 }
 
 pub(super) fn schema_with_source(schema: &Schema, source_name: &str, table_name: &str) -> Schema {

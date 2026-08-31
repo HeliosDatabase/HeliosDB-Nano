@@ -132,6 +132,42 @@ impl PhysicalOperator for DualScanOperator {
 /// below are a subset of the cross-type comparisons
 /// `Evaluator::compare_values` already performs, so an over-eager coercion can
 /// never widen what a statement matches.
+///
+/// # Every caller, read path and write path
+///
+/// There is no second copy of this rule. Both the probe a statement *writes*
+/// through and the probe it *reads* through resolve here, because a drift
+/// between them is precisely the divergence that produced the GH#15 write loss
+/// (`UPDATE … WHERE id = '<uuid>'` reporting `UPDATE 0` while the identical
+/// `SELECT` returned the row).
+///
+/// * `src/lib.rs` `fast_string_literal_value` — text-family fast SELECT
+/// * `src/lib.rs` `fast_parse_pk_probe_value` — text-family fast PK probe
+/// * `src/lib.rs` `try_extract_pk_value` — text-family UPDATE/DELETE point lookup
+/// * `src/sql/executor/mod.rs` `pk_in_list_value` — `pk IN (…)` pushdown
+/// * `src/storage/engine.rs` `coerce_pk_value` — `get_row_by_pk`
+/// * `src/sql/executor/scan.rs` — the READ path: `equality_lookup_from_sides`,
+///   `indexed_in_list_lookup` and the `try_index_range_scan` bounds. These used
+///   to run a private near-clone (`coerce_index_lookup_value`); it was deleted
+///   and pointed here. `src/sql/executor/explain.rs` reaches the same rule
+///   through those functions, purely to label the plan.
+///
+/// A change here changes all of them. That is the point — the
+/// `#[cfg(test)] mod probe_coercion_tests` matrix below pins the answer for
+/// every `DataType`, so an edit that was only meant for one caller fails a test
+/// instead of silently splitting the rule in two again.
+///
+/// # The one deliberate difference from the deleted scan.rs clone
+///
+/// `Numeric` here also accepts `Int2/Int4/Int8` (→ `Value::Numeric("6")`); the
+/// scan.rs clone declined them. `get_row_by_pk` has no scan to fall back to, so
+/// without that arm `UPDATE`/`DELETE` by a DECIMAL PK matched 0 rows. On the
+/// read side the same arm is a *narrowing* — `WHERE numeric_pk = 6` now builds
+/// the key `"6"`, which misses a row stored as `6.00` — so `try_index_lookup_for_scan`
+/// and `try_index_in_list_for_scan` decline the fast path on a NUMERIC probe
+/// MISS and fall back to the filtered scan. `None` therefore still means the
+/// same thing on both sides ("do not probe"); it is a NUMERIC *miss*, not
+/// `None`, that the read path treats specially.
 pub(crate) fn coerce_literal_to_column_type(v: crate::Value, col_type: &crate::DataType) -> Option<crate::Value> {
     use crate::{DataType, Value};
 
@@ -262,6 +298,226 @@ fn probe_parse_date(value: &str) -> Option<chrono::NaiveDate> {
     chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d")
         .ok()
         .or_else(|| probe_parse_timestamp(value).map(|ts| ts.date_naive()))
+}
+
+/// Drift tripwire for [`coerce_literal_to_column_type`].
+///
+/// `src/sql/executor/scan.rs` used to carry a private near-clone of this rule
+/// (`coerce_index_lookup_value` + four helpers) for the READ path, while the
+/// canonical copy served the WRITE path. They agreed when the clone was made,
+/// nothing kept them agreeing, and a read/write divergence in exactly this
+/// function is what produced the GH#15 silent write loss. The clone is gone; the
+/// expectation table below is the pre-collapse scan.rs answer, so a future edit
+/// intended for one caller fails here instead of silently splitting the rule.
+///
+/// The single deliberate difference — `Numeric` from an integer literal — is
+/// marked inline.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod probe_coercion_tests {
+    use super::coerce_literal_to_column_type;
+    use crate::{DataType, Value};
+
+    fn ts(text: &str) -> chrono::DateTime<chrono::Utc> {
+        let naive = chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S").expect("test timestamp");
+        chrono::DateTime::from_naive_utc_and_offset(naive, chrono::Utc)
+    }
+
+    fn date(text: &str) -> chrono::NaiveDate {
+        chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d").expect("test date")
+    }
+
+    fn sample_uuid() -> uuid::Uuid {
+        uuid::Uuid::parse_str("11111111-2222-3333-4444-555555555555").expect("test uuid")
+    }
+
+    /// One row per (literal, declared type) pair the probe paths can see, with
+    /// the exact `Option<Value>` both the read and the write path must produce.
+    #[test]
+    fn probe_coercion_matrix_is_the_one_rule() {
+        let uu = sample_uuid();
+        let cases: Vec<(Value, DataType, Option<Value>)> = vec![
+            // NULL passes through for every type — the caller's predicate
+            // re-evaluation produces the NULL/false that SQL requires.
+            (Value::Null, DataType::Int4, Some(Value::Null)),
+            (Value::Null, DataType::Uuid, Some(Value::Null)),
+            // Booleans
+            (Value::Boolean(true), DataType::Boolean, Some(Value::Boolean(true))),
+            (
+                Value::String("true".to_string()),
+                DataType::Boolean,
+                Some(Value::Boolean(true)),
+            ),
+            (
+                Value::String("nope".to_string()),
+                DataType::Boolean,
+                Some(Value::Boolean(false)),
+            ),
+            (Value::Int4(1), DataType::Boolean, None),
+            // Integers, including width narrowing and its overflow refusal.
+            (Value::Int4(7), DataType::Int8, Some(Value::Int8(7))),
+            (Value::String("7".to_string()), DataType::Int4, Some(Value::Int4(7))),
+            (Value::Int8(7), DataType::Int2, Some(Value::Int2(7))),
+            (Value::Int8(70_000), DataType::Int2, None),
+            (Value::String("abc".to_string()), DataType::Int4, None),
+            (Value::Float8(1.5), DataType::Int4, None),
+            // Floats
+            (Value::Int4(2), DataType::Float8, Some(Value::Float8(2.0))),
+            (
+                Value::String("2.5".to_string()),
+                DataType::Float4,
+                Some(Value::Float4(2.5)),
+            ),
+            (Value::String("x".to_string()), DataType::Float8, None),
+            // Text family: only a real string is a valid key.
+            (
+                Value::String("hi".to_string()),
+                DataType::Text,
+                Some(Value::String("hi".to_string())),
+            ),
+            (
+                Value::String("hi".to_string()),
+                DataType::Varchar(Some(10)),
+                Some(Value::String("hi".to_string())),
+            ),
+            (
+                Value::String("hi".to_string()),
+                DataType::Char(2),
+                Some(Value::String("hi".to_string())),
+            ),
+            (Value::Int4(5), DataType::Text, None),
+            // UUID — the GH#15 literal shape, plus the binary-parameter shape.
+            (
+                Value::String("11111111-2222-3333-4444-555555555555".to_string()),
+                DataType::Uuid,
+                Some(Value::Uuid(uu)),
+            ),
+            (Value::Uuid(uu), DataType::Uuid, Some(Value::Uuid(uu))),
+            (
+                Value::Bytes(uu.as_bytes().to_vec()),
+                DataType::Uuid,
+                Some(Value::Uuid(uu)),
+            ),
+            (Value::String("not-a-uuid".to_string()), DataType::Uuid, None),
+            // DATE / TIMESTAMP: the spellings a client actually writes.
+            (
+                Value::String("2024-01-15".to_string()),
+                DataType::Date,
+                Some(Value::Date(date("2024-01-15"))),
+            ),
+            (
+                Value::Timestamp(ts("2024-01-15 10:30:00")),
+                DataType::Date,
+                Some(Value::Date(date("2024-01-15"))),
+            ),
+            (
+                Value::String("2024-01-15 10:30:00".to_string()),
+                DataType::Timestamp,
+                Some(Value::Timestamp(ts("2024-01-15 10:30:00"))),
+            ),
+            (
+                Value::String("2024-01-15T10:30:00+00:00".to_string()),
+                DataType::Timestamptz,
+                Some(Value::Timestamp(ts("2024-01-15 10:30:00"))),
+            ),
+            (
+                Value::Date(date("2024-01-15")),
+                DataType::Timestamp,
+                Some(Value::Timestamp(ts("2024-01-15 00:00:00"))),
+            ),
+            (Value::String("15/01/2024".to_string()), DataType::Date, None),
+            // TIME
+            (
+                Value::String("10:30:00".to_string()),
+                DataType::Time,
+                Some(Value::Time(
+                    chrono::NaiveTime::parse_from_str("10:30:00", "%H:%M:%S").expect("test time"),
+                )),
+            ),
+            (Value::String("10:30".to_string()), DataType::Time, None),
+            // NUMERIC. `Value::Numeric` and a quoted literal are the pre-collapse
+            // answers. The integer rows are THE ONE DELIBERATE CHANGE: scan.rs's
+            // clone returned `None` here (decline → scan); the canonical rule
+            // coerces, because `get_row_by_pk` has no scan to fall back to.
+            // `try_index_lookup_for_scan` compensates on the read side by
+            // declining the fast path when a NUMERIC probe MISSES.
+            (
+                Value::Numeric("6.00".to_string()),
+                DataType::Numeric,
+                Some(Value::Numeric("6.00".to_string())),
+            ),
+            (
+                Value::String("5.50".to_string()),
+                DataType::Numeric,
+                Some(Value::Numeric("5.50".to_string())),
+            ),
+            // ↓ deliberate change vs the deleted clone (was None)
+            (Value::Int4(6), DataType::Numeric, Some(Value::Numeric("6".to_string()))),
+            (Value::Int8(6), DataType::Numeric, Some(Value::Numeric("6".to_string()))),
+            (Value::Int2(6), DataType::Numeric, Some(Value::Numeric("6".to_string()))),
+            (Value::String("abc".to_string()), DataType::Numeric, None),
+            // BYTEA: the text spelling is NOT the same key, and the evaluator has
+            // no Bytes↔String comparison, so decline rather than invent a match.
+            (
+                Value::Bytes(vec![1, 2]),
+                DataType::Bytea,
+                Some(Value::Bytes(vec![1, 2])),
+            ),
+            (Value::String("\\x0102".to_string()), DataType::Bytea, None),
+            // INTERVAL / JSON / VECTOR / ARRAY: native value only.
+            (Value::Interval(5), DataType::Interval, Some(Value::Interval(5))),
+            (Value::Int4(5), DataType::Interval, None),
+            (
+                Value::Json("{\"a\":1}".to_string()),
+                DataType::Json,
+                Some(Value::Json("{\"a\":1}".to_string())),
+            ),
+            (
+                Value::Json("{\"a\":1}".to_string()),
+                DataType::Jsonb,
+                Some(Value::Json("{\"a\":1}".to_string())),
+            ),
+            (Value::String("{\"a\":1}".to_string()), DataType::Jsonb, None),
+            (
+                Value::Vector(vec![1.0, 2.0]),
+                DataType::Vector(2),
+                Some(Value::Vector(vec![1.0, 2.0])),
+            ),
+            (Value::String("[1,2]".to_string()), DataType::Vector(2), None),
+            (
+                Value::Array(vec![Value::Int4(1)]),
+                DataType::Array(Box::new(DataType::Int4)),
+                Some(Value::Array(vec![Value::Int4(1)])),
+            ),
+            (
+                Value::String("{1}".to_string()),
+                DataType::Array(Box::new(DataType::Int4)),
+                None,
+            ),
+        ];
+
+        for (input, col_type, expected) in cases {
+            let actual = coerce_literal_to_column_type(input.clone(), &col_type);
+            assert_eq!(
+                actual, expected,
+                "coerce_literal_to_column_type({input:?}, {col_type:?}) drifted: got {actual:?}, expected {expected:?}"
+            );
+        }
+    }
+
+    /// `None` is "decline the probe", never "no such row". Pinned as a sentence
+    /// so the contract survives a refactor that only reads the code.
+    #[test]
+    fn uncoercible_literal_declines_rather_than_returning_a_wrong_key() {
+        assert_eq!(
+            coerce_literal_to_column_type(Value::String("not-a-uuid".to_string()), &DataType::Uuid),
+            None
+        );
+        assert_eq!(
+            coerce_literal_to_column_type(Value::String("9999999999999999999999".to_string()), &DataType::Int4),
+            None
+        );
+    }
 }
 
 /// StatusMessage operator for DDL operations
