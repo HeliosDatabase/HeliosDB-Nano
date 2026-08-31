@@ -484,6 +484,136 @@ impl<'a> Planner<'a> {
         }
     }
 
+    /// PostgreSQL's `NAMEDATALEN - 1`. A generated index name is truncated to
+    /// this before the uniquifying suffix is appended, exactly as
+    /// `ChooseRelationName` does, so a long table/column pair cannot produce a
+    /// name PostgreSQL itself would have shortened.
+    const MAX_GENERATED_INDEX_NAME_LEN: usize = 63;
+
+    /// How many numeric variants (`…_idx1` … `…_idxN`) to try before giving up
+    /// loudly. PostgreSQL loops unbounded; a bound here keeps a pathological
+    /// catalog from spinning the planner, and exhausting it is reported as an
+    /// error telling the user to name the index — never a silent fallback to a
+    /// name that is already in use.
+    const MAX_GENERATED_INDEX_NAME_ATTEMPTS: u32 = 10_000;
+
+    /// GH#16 — the PostgreSQL-compatible name for an index the user did not
+    /// name: `{table}_{col}_idx`, or `{table}_{col1}_{col2}_idx` for a
+    /// multi-column index, uniquified with `1`, `2`, … when that base name is
+    /// already taken (PostgreSQL's `ChooseRelationName`/`ChooseIndexName`).
+    ///
+    /// Called from the ONE `Statement::CreateIndex` planner arm, so every
+    /// access method — ART/btree/hash, vector/HNSW, gin/gist — gets a name the
+    /// same way, and the name is an ordinary `LogicalPlan::CreateIndex.name`
+    /// from there on: registered, PERSISTED by `persist_index_definition`,
+    /// WAL-logged, visible in `pg_indexes`, and droppable by `DROP INDEX`.
+    ///
+    /// The `_idx` suffix also keeps generated names out of `art_manager`'s
+    /// constraint namespace (`{table}_pkey`, `{table}_{cols}_key`,
+    /// `{table}_{cols}_fkey`), whose members `DROP INDEX` refuses to drop.
+    /// That separation is not left to the suffix convention alone:
+    /// [`Self::index_name_taken`] consults the live ART registry by name, so a
+    /// candidate that somehow WAS a constraint index is skipped.
+    fn generated_index_name(&self, table_key: &str, columns: &[sqlparser::ast::OrderByExpr]) -> Result<String> {
+        // Index names are a FLAT namespace in this engine
+        // (`normalize_nontable_name` collapses any qualifier), so the generated
+        // name is built from the BARE table name even when the table lives in a
+        // non-`public` schema: `b.t(x)` yields `t_x_idx`, and an unnamed index
+        // on `a.t(x)` then uniquifies to `t_x_idx1` rather than colliding.
+        let (_schema, bare_table) = Self::split_schema_key(table_key);
+        let max_len = Self::MAX_GENERATED_INDEX_NAME_LEN;
+        let attempts = Self::MAX_GENERATED_INDEX_NAME_ATTEMPTS;
+
+        let mut stem = bare_table;
+        for column in columns {
+            stem.push('_');
+            stem.push_str(&Self::index_name_column_label(&column.expr));
+        }
+        stem.push_str("_idx");
+        let base = Self::truncate_identifier(&stem, max_len);
+
+        if !self.index_name_taken(&base) {
+            return Ok(base);
+        }
+
+        for attempt in 1..=attempts {
+            let suffix = attempt.to_string();
+            let head = Self::truncate_identifier(&base, max_len.saturating_sub(suffix.len()));
+            let candidate = format!("{head}{suffix}");
+            if !self.index_name_taken(&candidate) {
+                return Ok(candidate);
+            }
+        }
+
+        Err(Error::query_execution(format!(
+            "Could not generate a unique name for the index on \"{table_key}\": \"{base}\" and \
+             {attempts} numbered variants are all in use — name the index explicitly"
+        )))
+    }
+
+    /// The name component a single indexed column contributes to a generated
+    /// index name. A plain (or qualified) column reference contributes the bare
+    /// column name; anything else contributes PostgreSQL's `expr` placeholder.
+    /// Only the LEADING column has to be a real column for the statement to be
+    /// accepted, so this must not fail on the trailing ones.
+    fn index_name_column_label(expr: &sqlparser::ast::Expr) -> String {
+        match expr {
+            sqlparser::ast::Expr::Identifier(ident) => Self::normalize_ident(ident),
+            sqlparser::ast::Expr::CompoundIdentifier(parts) => parts
+                .last()
+                .map(Self::normalize_ident)
+                .unwrap_or_else(|| "expr".to_string()),
+            _ => "expr".to_string(),
+        }
+    }
+
+    /// Truncate an identifier to at most `max_bytes`, never splitting a UTF-8
+    /// character (a quoted identifier may be non-ASCII).
+    fn truncate_identifier(name: &str, max_bytes: usize) -> String {
+        if name.len() <= max_bytes {
+            return name.to_string();
+        }
+        let mut end = max_bytes;
+        while end > 0 && !name.is_char_boundary(end) {
+            end -= 1;
+        }
+        name[..end].to_string()
+    }
+
+    /// Is `name` already claimed by something a generated index name must not
+    /// collide with?
+    ///
+    /// All four sources are consulted because they are four different places an
+    /// index name can live and no single one is authoritative:
+    ///   * the persisted `meta:index:` definitions (what `DROP INDEX` and
+    ///     `rebuild_all_indexes` dispatch on),
+    ///   * the live ART registry — which also holds the CONSTRAINT indexes
+    ///     (`{table}_pkey` / `_key` / `_fkey`) that have no persisted
+    ///     definition and that `DROP INDEX` deliberately refuses to drop,
+    ///   * the live vector/HNSW registry,
+    ///   * table names, because PostgreSQL puts indexes and tables in the same
+    ///     relation namespace.
+    ///
+    /// Without a catalog (the no-storage planner used by unit tests) nothing is
+    /// claimed. That cannot silently clobber anything: `handle_create_index`
+    /// independently refuses a duplicate name in every family.
+    fn index_name_taken(&self, name: &str) -> bool {
+        let Some(catalog) = self.catalog else {
+            return false;
+        };
+        if catalog.index_definition_exists(name).unwrap_or(false) {
+            return true;
+        }
+        let storage = catalog.storage();
+        if storage.art_indexes().index_exists(name) {
+            return true;
+        }
+        if storage.vector_indexes().index_exists(name) {
+            return true;
+        }
+        catalog.table_exists(name).unwrap_or(false)
+    }
+
     /// The stable namespace OID for a schema name — the single authoritative
     /// schema→oid map shared by the `pg_namespace` and `pg_class.relnamespace`
     /// catalog surfaces so a relation's `relnamespace` always matches its
@@ -920,15 +1050,7 @@ impl<'a> Planner<'a> {
                 self.delete_to_plan(table, delete_stmt.selection.clone(), returning)
             }
             Statement::CreateIndex(create_index) => {
-                // Extract index name (non-table object → plain collapse).
-                let index_name = Self::normalize_nontable_name(
-                    create_index
-                        .name
-                        .as_ref()
-                        .ok_or_else(|| Error::query_execution("Index name is required"))?,
-                );
-
-                // Extract table name (the index NAME above stays a plain
+                // Extract table name (the index NAME below stays a plain
                 // namespace-collapse; only the TARGET table is schema-resolved).
                 let table = self.resolve_table_ref(&create_index.table_name);
 
@@ -956,14 +1078,6 @@ impl<'a> Planner<'a> {
                         "Multi-column vector indexes are not supported (HNSW/IVF require a single VECTOR column)",
                     ));
                 }
-                if create_index.columns.len() > 1 {
-                    tracing::debug!(
-                        "Composite index {:?} on {:?}({} cols): only the leading column is indexed",
-                        index_name,
-                        table,
-                        create_index.columns.len()
-                    );
-                }
 
                 let first_col = create_index
                     .columns
@@ -973,6 +1087,55 @@ impl<'a> Planner<'a> {
                     Expr::Identifier(ident) => Self::normalize_ident(ident),
                     _ => return Err(Error::query_execution("Column name expected in CREATE INDEX")),
                 };
+
+                // GH#16: the index name is OPTIONAL in PostgreSQL — `CREATE
+                // INDEX ON items USING hnsw (embedding vector_cosine_ops)` is
+                // pgvector's README spelling and the first statement a vector
+                // -store onboarding runs. This used to be a hard
+                // "Index name is required" error.
+                //
+                // Generated here, ONCE, for every access method: the name lands
+                // in `LogicalPlan::CreateIndex.name` and is therefore the SAME
+                // string the ART branch, the vector/HNSW branch and the
+                // gin/gist DDL-only branch of `executor::ddl::handle_create_index`
+                // register AND persist (`persist_index_definition`) — so a
+                // generated name is droppable by `DROP INDEX` exactly like an
+                // explicit one, and survives a restart through
+                // `Catalog::rebuild_all_indexes`. Both executor families
+                // (`db.execute()` and `db.execute_params()` / the PG extended
+                // protocol) reach this one planner arm.
+                let index_name = match create_index.name.as_ref() {
+                    // Explicit name (non-table object → plain collapse).
+                    Some(name) => Self::normalize_nontable_name(name),
+                    None => {
+                        // PostgreSQL refuses this combination outright
+                        // ("IF NOT EXISTS requires that you name the index"):
+                        // the clause asks "is the index called X already
+                        // there?", and with no X there is nothing to ask about
+                        // — a generated name is unique BY CONSTRUCTION, so
+                        // IF NOT EXISTS could never suppress anything and would
+                        // be a silently-ignored clause. Say so instead.
+                        //
+                        // Defence in depth: sqlparser 0.53's
+                        // `parse_create_index` already requires a name once it
+                        // has consumed IF NOT EXISTS, so this normally fails at
+                        // parse time. This arm keeps the answer correct (and
+                        // correctly worded) if that ever changes.
+                        if create_index.if_not_exists {
+                            return Err(Error::query_execution("IF NOT EXISTS requires that you name the index"));
+                        }
+                        self.generated_index_name(&table, &create_index.columns)?
+                    }
+                };
+
+                if create_index.columns.len() > 1 {
+                    tracing::debug!(
+                        "Composite index {:?} on {:?}({} cols): only the leading column is indexed",
+                        index_name,
+                        table,
+                        create_index.columns.len()
+                    );
+                }
 
                 // Parse WITH options from SQL
                 let options = self.parse_index_options(&create_index.with)?;
@@ -4665,7 +4828,24 @@ impl<'a> Planner<'a> {
             SqlBinaryOp::QuestionAnd => Ok(BinaryOperator::JsonExistsAll),
             // PostgreSQL vector operators
             SqlBinaryOp::Spaceship => Ok(BinaryOperator::VectorCosineDistance),
-            SqlBinaryOp::HashArrow => Ok(BinaryOperator::VectorInnerProduct),
+            // `#>` is PostgreSQL's JSON *path-extraction* operator, not a vector
+            // operator — sqlparser's `HashArrow` renders as `#>` (operator.rs:294).
+            // It was mapped to VectorInnerProduct, so `jsonb_col #> '{a,b}'`
+            // silently computed an inner product instead of extracting a path: a
+            // wrong answer rather than an error. pgvector's inner product is
+            // spelled `<#>` and is handled by the custom-operator arm below, so
+            // nothing vector-related depends on this mapping.
+            //
+            // `#>` / `#>>` are not implemented. They error loudly here rather
+            // than resolving to an unrelated operator; implementing them needs
+            // JsonPathGet/JsonPathGetText variants (APPENDED — BinaryOperator is
+            // reachable from the bincode-persisted LogicalExpr) plus evaluator
+            // arms. Tracked as a follow-up.
+            SqlBinaryOp::HashArrow | SqlBinaryOp::HashLongArrow => Err(Error::query_execution(
+                "JSON path operators `#>` and `#>>` are not supported yet. \
+                 Use `->`/`->>` to step one level at a time (chain them for a path), \
+                 or the `jsonb_extract_path`/`jsonb_extract_path_text` functions.",
+            )),
             // String concatenation operator: ||
             SqlBinaryOp::StringConcat => Ok(BinaryOperator::StringConcat),
             // Postgres FTS match operator: tsvector @@ tsquery

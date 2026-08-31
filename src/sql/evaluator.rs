@@ -1151,6 +1151,22 @@ impl Evaluator {
                 Ok(Value::String(format_pg_type_oid(oid)))
             }
 
+            // pg_typeof(any) -> regtype: the PostgreSQL type NAME of the
+            // argument. `regtype` is surfaced as text in Nano (same as the
+            // `::regtype` cast), so this returns a `Value::String`.
+            "pg_typeof" => {
+                let [arg_expr] = args else {
+                    return Err(Error::query_execution(format!(
+                        "pg_typeof() takes exactly one argument, got {}",
+                        args.len()
+                    )));
+                };
+                let value = arg_values
+                    .first()
+                    .ok_or_else(|| Error::query_execution("pg_typeof(): argument produced no value"))?;
+                Ok(Value::String(self.pg_typeof_name(arg_expr, value)?))
+            }
+
             // ================= TERMINAL ARM — USER-DEFINED FUNCTIONS =================
             //
             // PERF CONTRACT: this is reached ONLY after every built-in arm above
@@ -1177,6 +1193,58 @@ impl Evaluator {
                 }
                 Err(Error::query_execution(format!("Unknown scalar function: {}", fun)))
             }
+        }
+    }
+
+    /// PostgreSQL type name reported by `pg_typeof(expr)`.
+    ///
+    /// Resolution order: the expression's DECLARED type when the expression
+    /// shape carries one (see [`Evaluator::static_type_of`]), otherwise the
+    /// runtime value's type.
+    ///
+    /// # Known limitation
+    ///
+    /// Nano's planner does not annotate expressions with a resolved result
+    /// type, so there is no general "declared type of this expression" to read
+    /// at scalar-dispatch time. Column references, `CAST`/`::` expressions and
+    /// literals are answered exactly; every other shape (arithmetic, function
+    /// results, CASE, subqueries, parameters) falls back to the runtime value,
+    /// which cannot separate declared types that share one representation —
+    /// `varchar(n)`/`char(n)` report `text`, `json` reports `jsonb`, and
+    /// `timestamptz` reports `timestamp without time zone`. NULL is handled
+    /// correctly for the shapes above (`pg_typeof(uuid_col)` is `uuid` even
+    /// when the row's value is NULL, and bare `pg_typeof(NULL)` is `text`,
+    /// matching PostgreSQL's `unknown` -> `text` resolution). Closing the
+    /// remaining gap requires planner-side type annotation on `LogicalExpr`,
+    /// which is out of scope here and filed as a follow-up.
+    fn pg_typeof_name(&self, expr: &LogicalExpr, value: &Value) -> Result<String> {
+        if let Some(data_type) = self.static_type_of(expr) {
+            return Ok(pg_type_name_of_datatype(&data_type));
+        }
+        pg_type_name_of_value(value).ok_or_else(|| {
+            Error::query_execution(
+                "pg_typeof(): the argument is an internal storage placeholder with no SQL type; \
+                 the expression carries no declared type either",
+            )
+        })
+    }
+
+    /// Declared [`DataType`] of `expr` when the expression shape carries one.
+    ///
+    /// Returns `None` for every shape whose type is only knowable from the
+    /// planner; callers must then fall back to the runtime value.
+    fn static_type_of(&self, expr: &LogicalExpr) -> Option<DataType> {
+        match expr {
+            // An explicit cast states the type outright.
+            LogicalExpr::Cast { data_type, .. } => Some(data_type.clone()),
+            // A column reference resolves against the evaluator's schema, so a
+            // NULL row value still reports the DECLARED type (PostgreSQL's rule).
+            LogicalExpr::Column { table, name } => {
+                let index = self.schema.get_qualified_column_index(table.as_deref(), name)?;
+                self.schema.columns.get(index).map(|c| c.data_type.clone())
+            }
+            LogicalExpr::BoundColumn { index, .. } => self.schema.columns.get(*index).map(|c| c.data_type.clone()),
+            _ => None,
         }
     }
 
@@ -5092,25 +5160,13 @@ impl Evaluator {
     /// Extracts field from JSON object
     /// If as_text is true, returns text value (->>), otherwise returns JSON (->)
     fn json_get_op(&self, json_val: &Value, key_val: &Value, as_text: bool) -> Result<Value> {
-        let json_str = match json_val {
-            Value::Json(j) => j,
-            // Lenient: allow `->`/`->>` directly on a TEXT column holding JSON.
-            // Many schemas store JSON-in-TEXT (no native JSON type) and expect
-            // `col->>'k'` to work without an explicit `::json` cast. The
-            // `serde_json::from_str` below validates it. See HELIOSDB_GAPS A2.
-            Value::String(s) => s,
-            Value::Null => return Ok(Value::Null),
-            _ => {
-                return Err(Error::query_execution(format!(
-                    "Left operand of -> must be JSON, got {:?}",
-                    json_val
-                )))
-            }
+        let op = if as_text { "->>" } else { "->" };
+        // Left operand: native JSON, or an untyped/TEXT operand parsed as JSON
+        // (see `json_operand` for the unknown-literal rule). NULL -> NULL.
+        let json = match json_operand(json_val, op, "left")? {
+            Some(j) => j,
+            None => return Ok(Value::Null),
         };
-
-        // Parse JSON string to serde_json::Value
-        let json: serde_json::Value =
-            serde_json::from_str(json_str).map_err(|e| Error::query_execution(format!("Invalid JSON: {}", e)))?;
 
         let key = match key_val {
             Value::String(s) => s.as_str(),
@@ -5143,10 +5199,11 @@ impl Evaluator {
                     "Integer index can only be used with JSON arrays",
                 ));
             }
-            _ => {
+            Value::Null => return Ok(Value::Null),
+            other => {
                 return Err(Error::query_execution(format!(
-                    "Right operand of -> must be string or integer, got {:?}",
-                    key_val
+                    "operator {op} needs a text key or an integer index on its right side, but got {}",
+                    describe_operand(other)
                 )))
             }
         };
@@ -5172,36 +5229,34 @@ impl Evaluator {
         }
     }
 
-    /// JSON contains operator: @>
-    /// Checks if left JSON contains right JSON
+    /// JSON contains operator: `@>` (and `<@`, which the dispatch swaps the
+    /// operands of).
+    ///
+    /// `@>`/`<@` are overloaded in PostgreSQL: `jsonb @> jsonb` AND
+    /// `anyarray @> anyarray`. The two never alias here because a SQL array is
+    /// `Value::Array` while a JSON document is `Value::Json` (or an untyped
+    /// `Value::String` literal) — so the array arm below is taken only when
+    /// BOTH operands are real SQL arrays, and everything else is resolved as
+    /// JSON.
     fn json_contains_op(&self, left: &Value, right: &Value) -> Result<Value> {
-        let left_json_str = match left {
-            Value::Json(j) => j,
-            Value::Null => return Ok(Value::Boolean(false)),
-            _ => {
-                return Err(Error::query_execution(format!(
-                    "JSON contains operator requires JSON operands, got {:?}",
-                    left
-                )))
-            }
-        };
+        // --- anyarray @> anyarray -------------------------------------------
+        // Every element of the right array must appear in the left array.
+        if let (Value::Array(l_elems), Value::Array(r_elems)) = (left, right) {
+            let contained = r_elems.iter().all(|r| l_elems.iter().any(|l| self.values_equal(l, r)));
+            return Ok(Value::Boolean(contained));
+        }
 
-        let right_json_str = match right {
-            Value::Json(j) => j,
-            Value::Null => return Ok(Value::Boolean(true)), // NULL is contained in any JSON
-            _ => {
-                return Err(Error::query_execution(format!(
-                    "JSON contains operator requires JSON operands, got {:?}",
-                    right
-                )))
-            }
+        // --- jsonb @> jsonb --------------------------------------------------
+        // NULL semantics are preserved from the original implementation:
+        // a NULL left side contains nothing, and NULL is contained in anything.
+        let left_json = match json_operand(left, "@>", "left")? {
+            Some(j) => j,
+            None => return Ok(Value::Boolean(false)),
         };
-
-        // Parse JSON strings to serde_json::Value
-        let left_json: serde_json::Value =
-            serde_json::from_str(left_json_str).map_err(|e| Error::query_execution(format!("Invalid JSON: {}", e)))?;
-        let right_json: serde_json::Value =
-            serde_json::from_str(right_json_str).map_err(|e| Error::query_execution(format!("Invalid JSON: {}", e)))?;
+        let right_json = match json_operand(right, "@>", "right")? {
+            Some(j) => j,
+            None => return Ok(Value::Boolean(true)),
+        };
 
         Ok(Value::Boolean(json_contains(&left_json, &right_json)))
     }
@@ -5209,27 +5264,30 @@ impl Evaluator {
     /// JSON exists operator: ? or ?|
     /// Checks if key(s) exist in JSON object
     fn json_exists_op(&self, json_val: &Value, key_val: &Value, any: bool) -> Result<Value> {
-        let json_str = match json_val {
-            Value::Json(j) => j,
-            Value::Null => return Ok(Value::Boolean(false)),
-            _ => {
-                return Err(Error::query_execution(format!(
-                    "JSON exists operator requires JSON operand, got {:?}",
-                    json_val
-                )))
-            }
+        let op = if any { "?|" } else { "?" };
+        let json = match json_operand(json_val, op, "left")? {
+            Some(j) => j,
+            None => return Ok(Value::Boolean(false)),
         };
-
-        // Parse JSON string to serde_json::Value
-        let json: serde_json::Value =
-            serde_json::from_str(json_str).map_err(|e| Error::query_execution(format!("Invalid JSON: {}", e)))?;
 
         let obj = match json.as_object() {
             Some(o) => o,
             None => return Ok(Value::Boolean(false)),
         };
 
-        match key_val {
+        // `?` takes a single text key; `?|` takes text[]. An untyped literal on
+        // the right of `?|` arrives as the PostgreSQL array text form
+        // (`'{a,b}'`) — resolve it the same way `= ANY($1)` does rather than
+        // rejecting it.
+        let key_val = match (any, key_val) {
+            (true, Value::String(s)) => match Self::parse_pg_text_array(s) {
+                Some(elems) => std::borrow::Cow::Owned(Value::Array(elems)),
+                None => std::borrow::Cow::Borrowed(key_val),
+            },
+            _ => std::borrow::Cow::Borrowed(key_val),
+        };
+
+        match &*key_val {
             Value::String(key) => Ok(Value::Boolean(obj.contains_key(key.as_str()))),
             Value::Array(keys) => {
                 // For ?| (any), return true if any key exists
@@ -5249,9 +5307,11 @@ impl Evaluator {
                 // If any==false and we get here, all keys matched
                 Ok(Value::Boolean(!any))
             }
-            _ => Err(Error::query_execution(format!(
-                "JSON exists operator requires string or array, got {:?}",
-                key_val
+            Value::Null => Ok(Value::Null),
+            other => Err(Error::query_execution(format!(
+                "operator {op} needs a text key{} on its right side, but got {}",
+                if any { " or a text array" } else { "" },
+                describe_operand(other)
             ))),
         }
     }
@@ -5259,32 +5319,30 @@ impl Evaluator {
     /// JSON exists all operator: ?&
     /// Checks if all keys exist in JSON object
     fn json_exists_all_op(&self, json_val: &Value, keys_val: &Value) -> Result<Value> {
-        let json_str = match json_val {
-            Value::Json(j) => j,
-            Value::Null => return Ok(Value::Boolean(false)),
-            _ => {
-                return Err(Error::query_execution(format!(
-                    "JSON exists operator requires JSON operand, got {:?}",
-                    json_val
-                )))
-            }
+        let json = match json_operand(json_val, "?&", "left")? {
+            Some(j) => j,
+            None => return Ok(Value::Boolean(false)),
         };
-
-        // Parse JSON string to serde_json::Value
-        let json: serde_json::Value =
-            serde_json::from_str(json_str).map_err(|e| Error::query_execution(format!("Invalid JSON: {}", e)))?;
 
         let obj = match json.as_object() {
             Some(o) => o,
             None => return Ok(Value::Boolean(false)),
         };
 
-        let keys = match keys_val {
-            Value::Array(k) => k,
-            _ => {
+        // Same unknown-literal resolution as `?|`: `'{a,b}'` with no cast is
+        // the PostgreSQL text[] literal form, not an opaque string.
+        let parsed_text_array = match keys_val {
+            Value::String(s) => Self::parse_pg_text_array(s),
+            _ => None,
+        };
+        let keys: &Vec<Value> = match (keys_val, &parsed_text_array) {
+            (_, Some(elems)) => elems,
+            (Value::Array(k), _) => k,
+            (Value::Null, _) => return Ok(Value::Null),
+            (other, _) => {
                 return Err(Error::query_execution(format!(
-                    "?& operator requires array operand, got {:?}",
-                    keys_val
+                    "operator ?& needs a text array on its right side, but got {}",
+                    describe_operand(other)
                 )))
             }
         };
@@ -7777,6 +7835,149 @@ fn jsonb_delete_recursive_impl(current: &mut serde_json::Value, path: &[String],
     Ok(())
 }
 
+/// Describe an operand in user-facing terms for operator type errors.
+///
+/// Never renders the Rust `{:?}` form of a `Value` — an error a user reads
+/// should name a SQL type, not `String("{\"k\": 1}")`.
+fn describe_operand(value: &Value) -> String {
+    match value {
+        Value::Null => "NULL".to_string(),
+        other => match pg_type_name_of_value(other) {
+            Some(name) => format!("a value of type {name}"),
+            None => "an internal storage placeholder".to_string(),
+        },
+    }
+}
+
+/// Resolve one operand of a PostgreSQL JSON operator to parsed JSON.
+///
+/// PostgreSQL types a bare, uncast string literal as `unknown` and then
+/// resolves it against the operator's signature, so in `payload @> '{"a":1}'`
+/// the literal becomes `jsonb`. Nano's evaluator only ever sees a runtime
+/// [`Value`], so the equivalent rule is applied here: a `Value::Json` is used
+/// as-is, and a `Value::String` — an uncast literal, a bound text parameter,
+/// or a TEXT column that holds JSON — is parsed as JSON. Any other type is a
+/// real error.
+///
+/// Returns `Ok(None)` for SQL NULL so each operator can apply its own NULL
+/// rule (they differ: `@>` treats a NULL right side as contained, `?` treats a
+/// NULL left side as false).
+///
+/// `op` is the SQL spelling (`@>`, `->`, `?|`, …) and `side` is `"left"` or
+/// `"right"`; both appear verbatim in the error text.
+fn json_operand(value: &Value, op: &str, side: &str) -> Result<Option<serde_json::Value>> {
+    let text: &str = match value {
+        Value::Json(j) => j.as_str(),
+        Value::String(s) => s.as_str(),
+        Value::Null => return Ok(None),
+        other => {
+            return Err(Error::query_execution(format!(
+                "operator {op} needs a JSON value on its {side} side, but got {}; \
+                 add an explicit cast such as `expr::jsonb`",
+                describe_operand(other)
+            )))
+        }
+    };
+
+    serde_json::from_str(text).map(Some).map_err(|e| {
+        Error::query_execution(format!(
+            "operator {op}: the {side} operand is not valid JSON ({e}). \
+             An uncast text literal is read as JSON here, so it must be well-formed \
+             (for example '{{\"key\": \"value\"}}'); cast with `::text` if you meant plain text",
+        ))
+    })
+}
+
+/// PostgreSQL type name for a declared [`DataType`] — what `pg_typeof` and
+/// `format_type` render (`integer`, not `INT4`).
+///
+/// The same spellings appear in `format_pg_type_oid` above, which renders them
+/// from an OID instead of a `DataType`. They are not merged because the
+/// `DataType -> OID` direction lives in `src/protocol/postgres/catalog.rs`
+/// (`datatype_to_oid`); routing through it would pull the protocol layer into
+/// expression evaluation. Consolidating all three into one table is filed as a
+/// follow-up.
+pub(crate) fn pg_type_name_of_datatype(data_type: &DataType) -> String {
+    match data_type {
+        DataType::Boolean => "boolean".to_string(),
+        DataType::Int2 => "smallint".to_string(),
+        DataType::Int4 => "integer".to_string(),
+        DataType::Int8 => "bigint".to_string(),
+        DataType::Float4 => "real".to_string(),
+        DataType::Float8 => "double precision".to_string(),
+        DataType::Numeric => "numeric".to_string(),
+        DataType::Varchar(_) => "character varying".to_string(),
+        DataType::Text => "text".to_string(),
+        DataType::Char(_) => "character".to_string(),
+        DataType::Bytea => "bytea".to_string(),
+        DataType::Date => "date".to_string(),
+        DataType::Time => "time without time zone".to_string(),
+        DataType::Timestamp => "timestamp without time zone".to_string(),
+        DataType::Timestamptz => "timestamp with time zone".to_string(),
+        DataType::Interval => "interval".to_string(),
+        DataType::Uuid => "uuid".to_string(),
+        DataType::Json => "json".to_string(),
+        DataType::Jsonb => "jsonb".to_string(),
+        DataType::Array(inner) => format!("{}[]", pg_type_name_of_datatype(inner)),
+        // pgvector spells the type simply `vector`; the dimension is a typmod.
+        DataType::Vector(_) => "vector".to_string(),
+    }
+}
+
+/// PostgreSQL type name inferred from a runtime [`Value`].
+///
+/// This is the fallback used by `pg_typeof` when the expression's declared
+/// type is not recoverable (see `Evaluator::pg_typeof_name`). It is necessarily
+/// approximate, because several declared types share one runtime
+/// representation:
+///
+/// * `Value::String` backs `text`, `varchar(n)` and `char(n)` → reported as `text`
+/// * `Value::Json` backs both `json` and `jsonb` → reported as `jsonb`
+/// * `Value::Timestamp` backs `timestamp` and `timestamptz` → reported as
+///   `timestamp without time zone`
+/// * `Value::Null` carries no type at all → reported as `text`, which matches
+///   PostgreSQL's `SELECT pg_typeof(NULL)` (an `unknown` literal resolves to
+///   `text`). A NULL *column* value does NOT come through here: the declared
+///   type wins.
+///
+/// The internal storage placeholders (`DictRef`, `CasRef`, `ColumnarRef`) are
+/// encodings, not SQL types, and carry no type of their own — they yield
+/// `None` so callers can refuse rather than invent a name. They cannot occur
+/// for an ordinary column reference, whose declared type is resolved first.
+pub(crate) fn pg_type_name_of_value(value: &Value) -> Option<String> {
+    let name = match value {
+        Value::Null => "text".to_string(),
+        Value::Boolean(_) => "boolean".to_string(),
+        Value::Int2(_) => "smallint".to_string(),
+        Value::Int4(_) => "integer".to_string(),
+        Value::Int8(_) => "bigint".to_string(),
+        Value::Float4(_) => "real".to_string(),
+        Value::Float8(_) => "double precision".to_string(),
+        Value::Numeric(_) => "numeric".to_string(),
+        Value::String(_) => "text".to_string(),
+        Value::Bytes(_) => "bytea".to_string(),
+        Value::Uuid(_) => "uuid".to_string(),
+        Value::Timestamp(_) => "timestamp without time zone".to_string(),
+        Value::Date(_) => "date".to_string(),
+        Value::Time(_) => "time without time zone".to_string(),
+        Value::Interval(_) => "interval".to_string(),
+        Value::Json(_) => "jsonb".to_string(),
+        Value::Array(elems) => {
+            // Element type from the first non-NULL element; an empty or
+            // all-NULL array has no inferable element type, so use text[].
+            let elem = elems
+                .iter()
+                .find(|v| !matches!(v, Value::Null))
+                .and_then(pg_type_name_of_value)
+                .unwrap_or_else(|| "text".to_string());
+            format!("{elem}[]")
+        }
+        Value::Vector(_) => "vector".to_string(),
+        Value::DictRef { .. } | Value::CasRef { .. } | Value::ColumnarRef => return None,
+    };
+    Some(name)
+}
+
 /// Check if left JSON contains right JSON (recursive containment check)
 fn json_contains(left: &serde_json::Value, right: &serde_json::Value) -> bool {
     use serde_json::Value as JV;
@@ -7803,7 +8004,7 @@ fn json_contains(left: &serde_json::Value, right: &serde_json::Value) -> bool {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use crate::sql::BinaryOperator;
@@ -8124,5 +8325,258 @@ mod tests {
         assert!(evaluator
             .cast_value(Value::String("2026-06-28 05:52:42".to_string()), &DataType::Timestamp)
             .is_ok());
+    }
+
+    // =====================================================================
+    // GH#17 — JSON operators accept an uncast (unknown-typed) string literal
+    //
+    // `@>` / `<@` / `->` / `->>` are covered end-to-end in
+    // tests/json_operator_unknown_literal.rs. The three key-existence
+    // operators (`?`, `?|`, `?&`) cannot be reached through SQL today —
+    // `sqlite_compat::rewrite_question_placeholders` rewrites every bare `?`
+    // into `$N` before the parser sees it — so their operator semantics are
+    // asserted here, directly against the evaluator.
+    // =====================================================================
+
+    fn json_evaluator() -> Evaluator {
+        Evaluator::new(test_schema())
+    }
+
+    fn expect_bool(v: Value) -> bool {
+        match v {
+            Value::Boolean(b) => b,
+            other => panic!("expected a boolean, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn json_contains_accepts_uncast_string_operands() {
+        let ev = json_evaluator();
+        let doc = Value::Json(r#"{"user_id":"alice","kind":"login"}"#.to_string());
+        let literal = Value::String(r#"{"user_id":"alice"}"#.to_string());
+
+        // The GH#17 shape: jsonb @> <uncast literal>.
+        assert!(expect_bool(
+            ev.evaluate_binary_op(&doc, &BinaryOperator::JsonContains, &literal)
+                .unwrap()
+        ));
+        // <@ is the same code path with operands swapped.
+        assert!(expect_bool(
+            ev.evaluate_binary_op(&literal, &BinaryOperator::JsonContainedBy, &doc)
+                .unwrap()
+        ));
+        // Both operands uncast.
+        let both = ev
+            .evaluate_binary_op(
+                &Value::String(r#"{"a":1,"b":2}"#.to_string()),
+                &BinaryOperator::JsonContains,
+                &Value::String(r#"{"a":1}"#.to_string()),
+            )
+            .unwrap();
+        assert!(expect_bool(both));
+    }
+
+    #[test]
+    fn json_contains_keeps_array_containment_separate() {
+        let ev = json_evaluator();
+        let left = Value::Array(vec![Value::Int4(1), Value::Int4(2), Value::Int4(3)]);
+        let right = Value::Array(vec![Value::Int4(2)]);
+        assert!(expect_bool(
+            ev.evaluate_binary_op(&left, &BinaryOperator::JsonContains, &right)
+                .unwrap()
+        ));
+        let missing = Value::Array(vec![Value::Int4(9)]);
+        assert!(!expect_bool(
+            ev.evaluate_binary_op(&left, &BinaryOperator::JsonContains, &missing)
+                .unwrap()
+        ));
+        assert!(expect_bool(
+            ev.evaluate_binary_op(&right, &BinaryOperator::JsonContainedBy, &left)
+                .unwrap()
+        ));
+    }
+
+    #[test]
+    fn json_exists_operators_accept_uncast_json_operand() {
+        let ev = json_evaluator();
+        // Left operand is an uncast TEXT value holding JSON, which every one of
+        // these rejected before GH#17.
+        let doc = Value::String(r#"{"a":1,"b":2}"#.to_string());
+
+        // `?`
+        assert!(expect_bool(
+            ev.evaluate_binary_op(&doc, &BinaryOperator::JsonExists, &Value::String("a".to_string()))
+                .unwrap()
+        ));
+        assert!(!expect_bool(
+            ev.evaluate_binary_op(&doc, &BinaryOperator::JsonExists, &Value::String("z".to_string()))
+                .unwrap()
+        ));
+
+        // `?|` — any key present.
+        let any_keys = Value::Array(vec![Value::String("z".to_string()), Value::String("b".to_string())]);
+        assert!(expect_bool(
+            ev.evaluate_binary_op(&doc, &BinaryOperator::JsonExistsAny, &any_keys)
+                .unwrap()
+        ));
+        // `?|` also accepts the uncast PostgreSQL text[] literal form.
+        assert!(expect_bool(
+            ev.evaluate_binary_op(
+                &doc,
+                &BinaryOperator::JsonExistsAny,
+                &Value::String("{z,b}".to_string())
+            )
+            .unwrap()
+        ));
+
+        // `?&` — all keys present.
+        let all_keys = Value::Array(vec![Value::String("a".to_string()), Value::String("b".to_string())]);
+        assert!(expect_bool(
+            ev.evaluate_binary_op(&doc, &BinaryOperator::JsonExistsAll, &all_keys)
+                .unwrap()
+        ));
+        assert!(!expect_bool(
+            ev.evaluate_binary_op(
+                &doc,
+                &BinaryOperator::JsonExistsAll,
+                &Value::Array(vec![Value::String("a".to_string()), Value::String("z".to_string())])
+            )
+            .unwrap()
+        ));
+        assert!(expect_bool(
+            ev.evaluate_binary_op(
+                &doc,
+                &BinaryOperator::JsonExistsAll,
+                &Value::String("{a,b}".to_string())
+            )
+            .unwrap()
+        ));
+    }
+
+    #[test]
+    fn json_operator_errors_are_user_facing() {
+        let ev = json_evaluator();
+        let doc = Value::Json(r#"{"a":1}"#.to_string());
+
+        for (op, operand) in [
+            (BinaryOperator::JsonContains, Value::Int4(42)),
+            (BinaryOperator::JsonExists, Value::Boolean(true)),
+        ] {
+            let err = ev
+                .evaluate_binary_op(&doc, &op, &operand)
+                .expect_err("a non-JSON operand must be rejected")
+                .to_string();
+            assert!(!err.contains("Int4("), "leaked Debug form: {err}");
+            assert!(!err.contains("Boolean("), "leaked Debug form: {err}");
+            assert!(err.contains("operator"), "should name the operator: {err}");
+        }
+
+        // Malformed JSON text names the real problem.
+        let err = ev
+            .evaluate_binary_op(
+                &doc,
+                &BinaryOperator::JsonContains,
+                &Value::String("not json".to_string()),
+            )
+            .expect_err("malformed JSON must be rejected")
+            .to_string();
+        assert!(!err.contains("String(\""), "leaked Debug form: {err}");
+        assert!(err.contains("not valid JSON"), "should say what is wrong: {err}");
+    }
+
+    // =====================================================================
+    // GH#18 — pg_typeof()
+    // =====================================================================
+
+    #[test]
+    fn pg_typeof_datatype_names_match_postgresql() {
+        assert_eq!(pg_type_name_of_datatype(&DataType::Int4), "integer");
+        assert_eq!(pg_type_name_of_datatype(&DataType::Int8), "bigint");
+        assert_eq!(pg_type_name_of_datatype(&DataType::Int2), "smallint");
+        assert_eq!(pg_type_name_of_datatype(&DataType::Text), "text");
+        assert_eq!(
+            pg_type_name_of_datatype(&DataType::Varchar(Some(10))),
+            "character varying"
+        );
+        assert_eq!(pg_type_name_of_datatype(&DataType::Uuid), "uuid");
+        assert_eq!(pg_type_name_of_datatype(&DataType::Jsonb), "jsonb");
+        assert_eq!(pg_type_name_of_datatype(&DataType::Json), "json");
+        assert_eq!(
+            pg_type_name_of_datatype(&DataType::Timestamp),
+            "timestamp without time zone"
+        );
+        assert_eq!(
+            pg_type_name_of_datatype(&DataType::Timestamptz),
+            "timestamp with time zone"
+        );
+        assert_eq!(pg_type_name_of_datatype(&DataType::Float8), "double precision");
+        assert_eq!(
+            pg_type_name_of_datatype(&DataType::Array(Box::new(DataType::Int4))),
+            "integer[]"
+        );
+        assert_eq!(pg_type_name_of_datatype(&DataType::Vector(3)), "vector");
+    }
+
+    #[test]
+    fn pg_typeof_value_fallback_names() {
+        assert_eq!(pg_type_name_of_value(&Value::Int4(1)).as_deref(), Some("integer"));
+        assert_eq!(
+            pg_type_name_of_value(&Value::String("x".to_string())).as_deref(),
+            Some("text")
+        );
+        // A bare NULL is `unknown` in PostgreSQL and resolves to text.
+        assert_eq!(pg_type_name_of_value(&Value::Null).as_deref(), Some("text"));
+        assert_eq!(
+            pg_type_name_of_value(&Value::Json("{}".to_string())).as_deref(),
+            Some("jsonb")
+        );
+        assert_eq!(
+            pg_type_name_of_value(&Value::Array(vec![Value::Int8(1)])).as_deref(),
+            Some("bigint[]")
+        );
+        // Internal storage placeholders have no SQL type at all.
+        assert_eq!(pg_type_name_of_value(&Value::ColumnarRef), None);
+    }
+
+    #[test]
+    fn pg_typeof_prefers_the_declared_column_type_over_the_value() {
+        // test_schema() is (id INT4 NOT NULL, age INT4, name TEXT).
+        let ev = json_evaluator();
+        let tuple = Tuple::new(vec![Value::Int4(1), Value::Null, Value::Null]);
+
+        // Declared type wins even when the row value is NULL — PostgreSQL's rule.
+        let expr = LogicalExpr::Column {
+            table: None,
+            name: "name".to_string(),
+        };
+        assert_eq!(ev.pg_typeof_name(&expr, &Value::Null).unwrap(), "text");
+
+        let bound = ev.bind(LogicalExpr::Column {
+            table: None,
+            name: "age".to_string(),
+        });
+        assert!(
+            matches!(bound, LogicalExpr::BoundColumn { .. }),
+            "bind() should have resolved the column"
+        );
+        assert_eq!(ev.pg_typeof_name(&bound, &Value::Null).unwrap(), "integer");
+
+        // An explicit cast states the type outright.
+        let cast = LogicalExpr::Cast {
+            expr: Box::new(LogicalExpr::Literal(Value::Null)),
+            data_type: DataType::Uuid,
+        };
+        assert_eq!(ev.pg_typeof_name(&cast, &Value::Null).unwrap(), "uuid");
+
+        // A shape with no declared type falls back to the runtime value.
+        let literal = LogicalExpr::Literal(Value::Int8(7));
+        assert_eq!(ev.pg_typeof_name(&literal, &Value::Int8(7)).unwrap(), "bigint");
+
+        // Bare NULL literal -> text (PostgreSQL's unknown -> text resolution).
+        let null_literal = LogicalExpr::Literal(Value::Null);
+        assert_eq!(ev.pg_typeof_name(&null_literal, &Value::Null).unwrap(), "text");
+
+        // Keep `tuple` meaningful: the same column evaluates to NULL.
+        assert_eq!(ev.evaluate(&expr, &tuple).unwrap(), Value::Null);
     }
 }

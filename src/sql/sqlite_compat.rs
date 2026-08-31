@@ -161,8 +161,32 @@ pub fn rewrite_question_placeholders(sql: &str) -> Result<String> {
             continue;
         }
 
-        // ? positional placeholder
+        // ? positional placeholder.
+        //
+        // `?|` and `?&` are PostgreSQL's jsonb key-existence operators, never
+        // placeholders — a `$N` cannot be followed by `|`/`&` in any valid
+        // statement. Rewriting them produced `$1|` / `$1&`, so those operators
+        // could never reach the parser at all. This translate() runs on EVERY
+        // statement, not only SQLite-dialect ones, so the rewrite has to leave
+        // them alone.
+        //
+        // The bare `?` key-existence operator stays ambiguous with a positional
+        // placeholder and is still rewritten: that ambiguity is real in
+        // PostgreSQL too, and SQLite placeholder compatibility is this
+        // function's whole purpose.
+        //
+        // Workaround for the single-key form: `col ?| ARRAY['key']`, which is
+        // exempted above and means the same thing. (PostgreSQL's own escape
+        // hatch, `jsonb_exists(col, 'key')`, is NOT implemented here — do not
+        // recommend it until it is.)
         if c == b'?' {
+            let next = bytes.get(i + 1).copied();
+            if next == Some(b'|') || next == Some(b'&') {
+                out.push('?');
+                out.push(next.unwrap_or(b'?') as char);
+                i += 2;
+                continue;
+            }
             saw_question = true;
             out.push('$');
             out.push_str(&next_idx.to_string());

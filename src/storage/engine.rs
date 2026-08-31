@@ -7919,35 +7919,26 @@ impl StorageEngine {
     /// encoding matches what was stored at INSERT time.  For example, the SQL
     /// parser produces `Int4(1)` for the literal `1`, but if the column is
     /// `BIGSERIAL` (Int8) the stored ART key uses 8 bytes.  Without coercion
-    /// the 4-byte key will never match the 8-byte one.
+    /// the 4-byte key will never match the 8-byte one; the same holds for a
+    /// quoted UUID (`Value::String`, 36 UTF-8 bytes) against a `Value::Uuid`
+    /// key (16 raw bytes), for a `'YYYY-MM-DD HH:MM:SS'` literal against a
+    /// TIMESTAMP key (RFC 3339 text), and for an integer literal against a
+    /// NUMERIC key (decimal-string text).
+    ///
+    /// GH#15: this used to carry its own hand-rolled arms covering only the
+    /// integer and integer→NUMERIC cases, so every other type silently probed
+    /// with the wrong encoding.  It now delegates to THE one coercion rule,
+    /// `crate::sql::executor::coerce_literal_to_column_type`, which the
+    /// UPDATE/DELETE point lookup and the `IN`-list count pushdown also use.
+    ///
+    /// This entry point stays infallible because its callers
+    /// ([`Self::get_row_by_pk`] and friends) have no scan to fall back to: a
+    /// value the rule cannot type is passed through unchanged, which probes
+    /// with the original encoding and misses — the same outcome as before.
+    /// Callers that CAN fall back (the UPDATE/DELETE arms in `src/lib.rs`) call
+    /// the fallible rule directly and take a scan instead of reporting 0 rows.
     fn coerce_pk_value(value: &crate::Value, target: &crate::DataType) -> crate::Value {
-        use crate::{DataType, Value};
-        match (value, target) {
-            // Widen small ints to Int8
-            (Value::Int2(v), DataType::Int8) => Value::Int8(i64::from(*v)),
-            (Value::Int4(v), DataType::Int8) => Value::Int8(i64::from(*v)),
-            // Widen Int2 to Int4
-            (Value::Int2(v), DataType::Int4) => Value::Int4(i32::from(*v)),
-            // Narrow (lossless for values that fit)
-            (Value::Int8(v), DataType::Int4) => Value::Int4(*v as i32),
-            (Value::Int8(v), DataType::Int2) => Value::Int2(*v as i16),
-            (Value::Int4(v), DataType::Int2) => Value::Int2(*v as i16),
-            // String→Int coercion: MySQL sends WHERE ID = '1' via $wpdb->prepare(%s)
-            (Value::String(s), DataType::Int8) => s.parse::<i64>().map(Value::Int8).unwrap_or_else(|_| value.clone()),
-            (Value::String(s), DataType::Int4) => s.parse::<i32>().map(Value::Int4).unwrap_or_else(|_| value.clone()),
-            (Value::String(s), DataType::Int2) => s.parse::<i16>().map(Value::Int2).unwrap_or_else(|_| value.clone()),
-            // Integer literal against a NUMERIC/DECIMAL PK column. The SQL parser
-            // yields Int4(6) for the literal `6`, but an INSERT cast the same
-            // value to Numeric("6") (see Evaluator::cast_value), so the stored
-            // ART key is the UTF-8 string "6", not the 4-byte int encoding.
-            // Without this, UPDATE/DELETE by a DECIMAL PK silently match 0 rows
-            // while SELECT (which type-coerces during predicate eval) matches 1.
-            (Value::Int2(v), DataType::Numeric) => Value::Numeric(format!("{}", v)),
-            (Value::Int4(v), DataType::Numeric) => Value::Numeric(format!("{}", v)),
-            (Value::Int8(v), DataType::Numeric) => Value::Numeric(format!("{}", v)),
-            // Already correct type — return as-is
-            _ => value.clone(),
-        }
+        crate::sql::executor::coerce_literal_to_column_type(value.clone(), target).unwrap_or_else(|| value.clone())
     }
 
     /// Scan table with storage-level predicate pushdown filtering

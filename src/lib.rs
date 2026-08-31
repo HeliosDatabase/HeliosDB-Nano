@@ -5800,10 +5800,21 @@ impl EmbeddedDatabase {
                 // fetch only the matching row instead of scanning the entire table.
                 // Skip optimization on non-main branches: branch-inherited rows are stored
                 // under the main prefix (data:) but PK lookup uses branch prefix (bdata:).
+                //
+                // GH#15: `try_extract_pk_value` returns `Some` only when the literal was
+                // coerced to the PK column's exact type, so the probe key is byte-identical
+                // to the one INSERT stored and a miss really does mean "no such row"
+                // (`None => vec![]` below). Anything it cannot type — including a literal
+                // that is not representable in the column's type — comes back `None` and
+                // takes the scan branch, where the predicate is evaluated per row exactly
+                // as SELECT does it.
                 let on_branch = self.storage.get_current_branch().is_some();
                 let tuples = if !on_branch {
                     if let Some(pk_value) = Self::try_extract_pk_value(selection.as_ref(), &schema) {
-                        match self.storage.get_row_by_pk(table_name, &pk_value)? {
+                        match self
+                            .storage
+                            .get_row_by_typed_pk_with_schema(table_name, &pk_value, &schema)?
+                        {
                             Some(tuple) => vec![tuple],
                             None => vec![],
                         }
@@ -6179,10 +6190,19 @@ impl EmbeddedDatabase {
                 // Skip optimization on non-main branches: branch-inherited rows are stored
                 // under the main prefix (data:) but PK lookup uses branch prefix (bdata:),
                 // so inherited rows would not be found.
+                //
+                // GH#15: identical shape to the UPDATE arm above, and identical contract —
+                // `try_extract_pk_value` yields a probe key already coerced to the PK
+                // column's type, so `None => vec![]` only ever means "genuinely absent";
+                // an uncoercible literal declines the point lookup and falls back to the
+                // scan branch. `DELETE … RETURNING` by PK reaches exactly this code.
                 let on_branch = self.storage.get_current_branch().is_some();
                 let tuples = if !on_branch {
                     if let Some(pk_value) = Self::try_extract_pk_value(selection.as_ref(), &schema_arc) {
-                        match self.storage.get_row_by_pk(table_name, &pk_value)? {
+                        match self
+                            .storage
+                            .get_row_by_typed_pk_with_schema(table_name, &pk_value, &schema_arc)?
+                        {
                             Some(tuple) => vec![tuple],
                             None => vec![],
                         }
@@ -11544,11 +11564,9 @@ impl EmbeddedDatabase {
 
         // Parse PK value. The literal must consume the whole token — trailing
         // text (e.g. `WHERE id = 5 LIMIT 1`) means the fast parser didn't
-        // understand the full clause and must fall back to the planner.
-        let (pk_value, pk_rest) = Self::fast_parse_one_value(pk_val_str, &spec.pk_data_type)?;
-        if !pk_rest.trim().is_empty() {
-            return None;
-        }
+        // understand the full clause and must fall back to the planner. So does
+        // a literal with no valid key for the PK column's type (GH#15).
+        let pk_value = Self::fast_parse_pk_probe_value(pk_val_str, &spec.pk_data_type)?;
 
         // Look up the existing row by PK (needed for both literal and expression SET)
         let existing_row =
@@ -11747,11 +11765,9 @@ impl EmbeddedDatabase {
         };
 
         // The PK literal must consume the whole token — trailing text means
-        // an unparsed construct; fall back to the planner.
-        let (pk_value, pk_rest) = Self::fast_parse_one_value(pk_val_str, &spec.pk_data_type)?;
-        if !pk_rest.trim().is_empty() {
-            return None;
-        }
+        // an unparsed construct; fall back to the planner. So does a literal
+        // with no valid key for the PK column's type (GH#15).
+        let pk_value = Self::fast_parse_pk_probe_value(pk_val_str, &spec.pk_data_type)?;
         let pk_key = crate::storage::art_manager::ArtIndexManager::encode_key(std::slice::from_ref(&pk_value));
         let (row_id, existing_row) = if spec.pk_only_delete && !require_tuple {
             match self.storage.art_indexes().pk_index_lookup(&spec.table_name, &pk_key) {
@@ -12028,10 +12044,8 @@ impl EmbeddedDatabase {
                     Ok(spec) => spec,
                     Err(e) => return Some(Err(e)),
                 };
-                if let Some((pk_value, pk_rest)) = Self::fast_parse_one_value(pk_val_str, &spec.pk_data_type) {
-                    if pk_rest.trim().is_empty() {
-                        return Some(Ok((spec, pk_value)));
-                    }
+                if let Some(pk_value) = Self::fast_parse_pk_probe_value(pk_val_str, &spec.pk_data_type) {
+                    return Some(Ok((spec, pk_value)));
                 }
             }
         }
@@ -12063,12 +12077,10 @@ impl EmbeddedDatabase {
             Err(e) => return Some(Err(e)),
         };
 
-        // Parse PK value; trailing text after the literal means an unparsed
+        // Parse PK value; trailing text after the literal, or a literal with no
+        // valid key for the PK column's type (GH#15), means an unparsed
         // construct — fall back to the planner.
-        let (pk_value, pk_rest) = Self::fast_parse_one_value(pk_val_str, &spec.pk_data_type)?;
-        if !pk_rest.trim().is_empty() {
-            return None;
-        }
+        let pk_value = Self::fast_parse_pk_probe_value(pk_val_str, &spec.pk_data_type)?;
 
         Some(Ok((spec, pk_value)))
     }
@@ -12640,12 +12652,10 @@ impl EmbeddedDatabase {
         }
 
         // The literal must consume the whole token — trailing text means an
-        // unparsed construct; fall back to the planner.
-        let (value, rest) = Self::fast_parse_one_value(token, target_type)?;
-        if !rest.trim().is_empty() {
-            return None;
-        }
-        Some(Ok(value))
+        // unparsed construct; fall back to the planner. Both callers use the
+        // result as a PK probe key, so a literal the coercion rule declines
+        // must fall back too rather than probe with unusable bytes (GH#15).
+        Some(Ok(Self::fast_parse_pk_probe_value(token, target_type)?))
     }
 
     fn strip_fast_postgres_type_cast(token: &str) -> &str {
@@ -13098,20 +13108,48 @@ impl EmbeddedDatabase {
         None
     }
 
+    /// Type a quoted SQL literal for a column of type `target_type`.
+    ///
+    /// GH#15: this used to carry its own three-arm coercion (UUID / DATE /
+    /// RFC-3339-only TIMESTAMP) that disagreed with the shared rule — so
+    /// `'2024-01-15 10:30:00'` against a TIMESTAMP column stayed a
+    /// `Value::String`, which both encodes to a different ART key than the
+    /// stored `Value::Timestamp` AND, on a fast UPDATE's SET value, wrote a
+    /// String into a TIMESTAMP column. It now delegates to
+    /// `sql::executor::coerce_literal_to_column_type`.
+    ///
+    /// Deliberately still infallible: it feeds INSERT and SET values too, where
+    /// a literal the rule declines (BYTEA/JSON/array text spellings) is cast
+    /// downstream by `fast_cast_value`. PK **probe** keys must not use this —
+    /// they go through [`Self::fast_parse_pk_probe_value`], which fails closed
+    /// to the planner instead of probing with an unusable key.
     fn fast_string_literal_value(result: String, target_type: &DataType) -> Value {
-        match target_type {
-            DataType::Uuid => uuid::Uuid::parse_str(&result)
-                .map(Value::Uuid)
-                .unwrap_or(Value::String(result)),
-            DataType::Date => result
-                .parse::<chrono::NaiveDate>()
-                .map(Value::Date)
-                .unwrap_or(Value::String(result)),
-            DataType::Timestamp => chrono::DateTime::parse_from_rfc3339(&result)
-                .map(|t| Value::Timestamp(t.to_utc()))
-                .unwrap_or(Value::String(result)),
-            _ => Value::String(result),
+        // Overwhelmingly the common case, and the rule is a no-op for it: keep
+        // it allocation-free on the literal-parsing hot path.
+        if matches!(target_type, DataType::Text | DataType::Varchar(_) | DataType::Char(_)) {
+            return Value::String(result);
         }
+        let fallback = result.clone();
+        sql::executor::coerce_literal_to_column_type(Value::String(result), target_type)
+            .unwrap_or(Value::String(fallback))
+    }
+
+    /// Parse one literal token as an ART **probe key** for a PK column of type
+    /// `pk_type`, requiring the literal to consume the whole token.
+    ///
+    /// `None` means "fall back to the planner", for either of two reasons that
+    /// are equally fatal to a probe: trailing text means the fast parser did not
+    /// understand the whole clause, and a literal the shared coercion rule
+    /// declines has no valid key for that column at all. Probing anyway encodes
+    /// the wrong bytes — and every fast path here turns the resulting index miss
+    /// straight into an EMPTY RESULT (`Ok(None)` → `Ok(vec![])` /
+    /// `Some(Ok(0))`), which is the read-path twin of GH#15.
+    fn fast_parse_pk_probe_value(token: &str, pk_type: &DataType) -> Option<Value> {
+        let (value, rest) = Self::fast_parse_one_value(token, pk_type)?;
+        if !rest.trim().is_empty() {
+            return None;
+        }
+        sql::executor::coerce_literal_to_column_type(value, pk_type)
     }
 
     /// Largest SQL text (bytes) the parse cache will key on. COPY renders each
@@ -20556,8 +20594,21 @@ impl EmbeddedDatabase {
         }
     }
 
-    /// Extract PK value from a simple WHERE clause like `pk_col = literal` or `literal = pk_col`.
-    /// Returns None if the predicate is not a simple PK equality or no PK column exists.
+    /// Extract the PK point-lookup probe key from a simple WHERE clause like
+    /// `pk_col = literal` or `literal = pk_col`.
+    ///
+    /// `None` means "do NOT take the point lookup" — the caller must scan and
+    /// evaluate the predicate per row. It is returned when the predicate is not
+    /// a simple PK equality, when there is no sole PK column, and (GH#15) when
+    /// the literal has no valid ART encoding for the PK column's type.
+    ///
+    /// `Some(value)` is always already coerced to the PK column's type, because
+    /// the ART key encoding is byte-exact per `Value` variant: the parser hands
+    /// us `Value::String("<uuid>")` (36 UTF-8 bytes) for a quoted literal while
+    /// INSERT stored `Value::Uuid` (16 raw bytes), so an uncoerced probe can
+    /// never match. That miss used to be reported as "no such row", which is
+    /// how `UPDATE … WHERE id = '<uuid>'` silently became `UPDATE 0` while
+    /// `SELECT` with the same predicate returned the row.
     fn try_extract_pk_value(selection: Option<&sql::LogicalExpr>, schema: &Schema) -> Option<Value> {
         let predicate = selection?;
         // BUG F: this single-value `get_row_by_pk` optimization (used by the
@@ -20573,7 +20624,7 @@ impl EmbeddedDatabase {
         }
         let pk_col = schema.columns.iter().find(|c| c.primary_key)?;
 
-        if let sql::LogicalExpr::BinaryExpr {
+        let literal = if let sql::LogicalExpr::BinaryExpr {
             left,
             op: sql::BinaryOperator::Eq,
             right,
@@ -20581,16 +20632,23 @@ impl EmbeddedDatabase {
         {
             match (left.as_ref(), right.as_ref()) {
                 (sql::LogicalExpr::Column { name, .. }, sql::LogicalExpr::Literal(val)) if name == &pk_col.name => {
-                    Some(val.clone())
+                    val.clone()
                 }
                 (sql::LogicalExpr::Literal(val), sql::LogicalExpr::Column { name, .. }) if name == &pk_col.name => {
-                    Some(val.clone())
+                    val.clone()
                 }
-                _ => None,
+                _ => return None,
             }
         } else {
-            None
-        }
+            return None;
+        };
+
+        // GH#15: THE one coercion rule, shared with the read path's index probe
+        // and with the `IN`-list count pushdown. `None` = this literal cannot be
+        // encoded as a key for this column, so the point lookup would be a
+        // guaranteed miss; declining sends the caller to a scan, which is the
+        // only thing that keeps UPDATE/DELETE matching exactly what SELECT does.
+        sql::executor::coerce_literal_to_column_type(literal, &pk_col.data_type)
     }
 
     /// Apply RLS policies to a query plan by injecting Filter operators
