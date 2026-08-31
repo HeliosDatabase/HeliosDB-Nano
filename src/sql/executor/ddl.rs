@@ -186,6 +186,19 @@ fn encoded_index_options(options: &[crate::sql::logical_plan::IndexOption]) -> V
 /// [`crate::storage::index_family`] classifier — the same one
 /// [`handle_drop_index`] and `Catalog::rebuild_vector_indexes` use — so the
 /// set of index types this build understands is defined in exactly one place.
+///
+/// GH#16: `name` is NOT always something the user typed. PostgreSQL makes the
+/// index name optional (`CREATE INDEX ON items USING hnsw (embedding
+/// vector_cosine_ops)` — pgvector's README spelling), and the planner derives
+/// `{table}_{cols}_idx` for those, uniquified against the persisted
+/// definitions, the live ART registry (which owns the `_pkey` / `_key` /
+/// `_fkey` CONSTRAINT namespace), the live vector registry and the table names.
+/// It arrives here as an ordinary name and MUST be treated as one by every
+/// branch below — in particular every branch that builds something must also
+/// `persist_index_definition`, because that record is what `DROP INDEX`
+/// dispatches on and what `Catalog::rebuild_all_indexes` restores at open. A
+/// generated name that were registered but not persisted would be an index the
+/// user could neither drop nor keep across a restart.
 pub(super) fn handle_create_index(executor: &Executor, plan: &LogicalPlan) -> Result<Box<dyn PhysicalOperator>> {
     use crate::storage::{index_family, IndexFamily};
 

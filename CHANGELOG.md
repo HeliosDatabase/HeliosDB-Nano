@@ -7,6 +7,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.22.0] - 2026-08-31
+
+Four externally-reported issues, filed against 4.21.0 by a user evaluating Nano as a vector
+store. One of them is a silent write-loss bug that has shipped for many releases.
+
+### Fixed — **`UPDATE ... WHERE <pk> = '<literal>'` could report `UPDATE 0` and change nothing** (#15)
+
+`UPDATE mem_test SET payload='...' WHERE id='<uuid>'` returned `UPDATE 0` and modified nothing,
+while `SELECT` with the identical predicate returned the row. Reproduced on a live server.
+
+The literal-UPDATE fast path bails when the SET clause contains a comma — so a two-key JSON value
+diverts the statement into the planner arm, which built the primary-key index probe from the
+parser's `Value::String` with **no coercion to the column's declared type**. A `UUID` encodes into
+the index as 16 raw bytes and a `String` as 36 UTF-8 bytes, so the probe could never match; the
+miss returned "no such row" with no fallback, and the predicate was never evaluated. `SELECT`
+survived only because the read path already had the coercion.
+
+Fixed as a class, not an instance:
+
+- The coercion rule now covers **every** `DataType` whose index encoding differs from its string
+  form — UUID, DATE, TIME, TIMESTAMP, TIMESTAMPTZ, BYTEA, BOOLEAN, FLOAT4/8, NUMERIC, INTERVAL,
+  JSON/JSONB, ARRAY, VECTOR — derived by reading the index encoder and matched exhaustively with
+  no wildcard arm, so a future type is a compile error rather than a silent miss.
+- **`DELETE ... WHERE <pk> = ...` had the identical defect** and is fixed by the same change.
+- A literal that cannot be represented in the column's type now **declines the index and scans**
+  instead of asserting the row is absent. A correctly-coerced probe that misses still means
+  absent, so `WHERE id = <nonexistent>` remains a point lookup and does not become a table scan.
+- **The read fast path had the mirror defect**: `SELECT ... WHERE ts_pk = '2024-01-15 10:30:00'`
+  returned zero rows on a row that exists, because its own copy of the coercion accepted only
+  RFC 3339. Fixing only the write side would have inverted the divergence.
+- Four copies of this coercion rule existed; there are now two.
+
+### Fixed — `CREATE INDEX` without a name (#16)
+
+`CREATE INDEX ON t USING hnsw (v vector_cosine_ops)` — the form in pgvector's own README — failed
+with "Index name is required". Names are now generated as PostgreSQL does (`{table}_{col}_idx`,
+uniquified on collision, truncated at 63 bytes), for both the ART and vector branches, and a
+generated name is droppable and cannot collide with a constraint index.
+
+### Fixed — JSON operators reject uncast literals (#17)
+
+`payload @> '{"user_id":"alice"}'` required an explicit `::jsonb`. PostgreSQL resolves an untyped
+literal against the operator signature; Nano now does the same, across **five** operators —
+`@>`, `<@`, `?`, `?|`, `?&` — not only the reported one. The error text no longer leaks the
+internal Rust representation.
+
+Two related defects found and fixed alongside:
+
+- **`?|` and `?&` could never reach the parser at all.** The SQLite-compat placeholder rewrite
+  runs on every statement and turned any bare `?` into `$N`, producing `$1|`. Those two spellings
+  are now exempt (a `$N` can never be followed by `|` or `&`). Bare `?` remains a placeholder by
+  design — use `col ?| ARRAY['key']` for the single-key form.
+- **`#>` was silently mis-planned as the vector inner-product operator**, so `jsonb_col #> '{a,b}'`
+  computed an inner product instead of extracting a path. pgvector's operator is `<#>` and was
+  handled separately, so the mapping was simply wrong. `#>` / `#>>` now error explicitly; they are
+  tracked as unimplemented rather than silently answering wrongly.
+
+### Added — `pg_typeof()` (#18)
+
+Returns the PostgreSQL type name of an expression. Introspection tooling and ORMs verifying column
+types reach for it early, and its absence made diagnosing the JSON typing issue above harder.
+
+
 ## [4.21.0] - 2026-08-30
 
 ### SECURITY — encryption at rest now covers row data. **Upgrade if you use `[encryption] enabled = true`.**

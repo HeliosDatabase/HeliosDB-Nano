@@ -103,39 +103,165 @@ impl PhysicalOperator for DualScanOperator {
     }
 }
 
-/// Coerce a SQL literal Value to a column's declared type when
-/// the obvious cross-type case calls for it.  Currently handles
-/// String→UUID/Date/Timestamp; everything else passes through.
+/// THE one rule for turning a SQL literal into an ART index probe key for a
+/// column of declared type `col_type`.
 ///
-/// Necessary because the planner emits `Value::String(...)` for
-/// any quoted literal regardless of the comparison column's type,
-/// and the ART index lookup encodes types byte-exactly.  Without
-/// this coercion `WHERE id = '<uuid>'` against a UUID PK misses
-/// every row.
-pub(crate) fn coerce_literal_to_column_type(v: crate::Value, col_type: &crate::DataType) -> crate::Value {
+/// Necessary because the planner emits `Value::String(...)` for any quoted
+/// literal regardless of the comparison column's type, while
+/// `ArtIndexManager::encode_value_into` (`src/storage/art_manager.rs`)
+/// encodes each `Value` variant byte-exactly: a `Value::Uuid` is 16 raw bytes
+/// but the same UUID as `Value::String` is 36 UTF-8 bytes, a `Value::Timestamp`
+/// is its RFC 3339 rendering but `'2024-01-15 10:30:00'` is not, and so on.
+/// Without this coercion `WHERE id = '<uuid>'` against a UUID PK misses every
+/// row.
+///
+/// # `None` means "do not probe the index" — it never means "no such row"
+///
+/// GH#15: an uncoercible literal (`WHERE uuid_pk = 'not-a-uuid'`,
+/// `WHERE int_pk = 'abc'`, an out-of-range integer for the column's width) has
+/// **no** valid encoding for this column, so any probe key built from it is a
+/// guaranteed miss. Callers that use the result as a point lookup MUST treat
+/// `None` as "fall back to a full scan + predicate evaluation", not as "the row
+/// is absent". Callers that use it as a pushdown MUST decline the pushdown.
+/// Turning `None` into an empty row set is exactly the defect that made
+/// `UPDATE … WHERE id = '<uuid>'` report `UPDATE 0` while `SELECT` with the
+/// same predicate returned the row.
+///
+/// Conversely `Some(v)` is only ever a *pre-filter*: every point-lookup caller
+/// re-evaluates the real predicate against the fetched row, and the coercions
+/// below are a subset of the cross-type comparisons
+/// `Evaluator::compare_values` already performs, so an over-eager coercion can
+/// never widen what a statement matches.
+pub(crate) fn coerce_literal_to_column_type(v: crate::Value, col_type: &crate::DataType) -> Option<crate::Value> {
     use crate::{DataType, Value};
-    match (&v, col_type) {
-        (Value::String(s), DataType::Uuid) => match uuid::Uuid::parse_str(s) {
-            Ok(u) => Value::Uuid(u),
-            Err(_) => v,
-        },
-        (Value::String(s), DataType::Date) => match s.parse::<chrono::NaiveDate>() {
-            Ok(d) => Value::Date(d),
-            Err(_) => v,
-        },
-        (Value::String(s), DataType::Timestamp) => match chrono::DateTime::parse_from_rfc3339(s) {
-            Ok(t) => Value::Timestamp(t.to_utc()),
-            Err(_) => v,
-        },
-        // A quoted numeric literal (`WHERE numcol = 'NaN'` / `= '5.5'`) reaches
-        // the comparison as Value::String; coerce it to the column's Numeric
-        // type so it can match — including the special NaN/±Infinity tokens.
-        (Value::String(s), DataType::Numeric) => match crate::sql::numeric_special::parse_numeric_text(s) {
-            Some(canon) => Value::Numeric(canon),
-            None => v,
-        },
-        _ => v,
+
+    // NULL never equals anything (SQL three-valued logic); pass it through so
+    // the caller's predicate re-evaluation produces the NULL/false it should.
+    if matches!(v, Value::Null) {
+        return Some(Value::Null);
     }
+
+    match col_type {
+        DataType::Boolean => match v {
+            Value::Boolean(_) => Some(v),
+            // Same truthiness set as `Evaluator::compare_values`' Boolean↔String arm.
+            Value::String(ref s) => Some(Value::Boolean(matches!(
+                s.as_str(),
+                "1" | "true" | "TRUE" | "t" | "yes"
+            ))),
+            _ => None,
+        },
+        DataType::Int2 => probe_value_to_i64(&v)
+            .and_then(|raw| i16::try_from(raw).ok())
+            .map(Value::Int2),
+        DataType::Int4 => probe_value_to_i64(&v)
+            .and_then(|raw| i32::try_from(raw).ok())
+            .map(Value::Int4),
+        DataType::Int8 => probe_value_to_i64(&v).map(Value::Int8),
+        DataType::Float4 => probe_value_to_f64(&v).map(|raw| Value::Float4(raw as f32)),
+        DataType::Float8 => probe_value_to_f64(&v).map(Value::Float8),
+        // A NUMERIC column stores its value as a decimal *string*, so the ART
+        // key is the UTF-8 of that string: the integer literal `6` must become
+        // Numeric("6") (INSERT cast it the same way) and a quoted literal
+        // (`= 'NaN'` / `= '5.5'`) must be canonicalised the same way too.
+        DataType::Numeric => match v {
+            Value::Numeric(_) => Some(v),
+            Value::Int2(ref n) => Some(Value::Numeric(n.to_string())),
+            Value::Int4(ref n) => Some(Value::Numeric(n.to_string())),
+            Value::Int8(ref n) => Some(Value::Numeric(n.to_string())),
+            Value::String(ref s) => crate::sql::numeric_special::parse_numeric_text(s).map(Value::Numeric),
+            _ => None,
+        },
+        DataType::Text | DataType::Varchar(_) | DataType::Char(_) => match v {
+            Value::String(_) => Some(v),
+            _ => None,
+        },
+        DataType::Uuid => match v {
+            Value::Uuid(_) => Some(v),
+            Value::String(ref s) => uuid::Uuid::parse_str(s).ok().map(Value::Uuid),
+            // Binary-format wire parameter with no declared OID arrives as raw
+            // bytes; a 16-byte payload is the UUID itself.
+            Value::Bytes(ref b) => uuid::Uuid::from_slice(b).ok().map(Value::Uuid),
+            _ => None,
+        },
+        DataType::Date => match v {
+            Value::Date(_) => Some(v),
+            Value::Timestamp(ref ts) => Some(Value::Date(ts.date_naive())),
+            Value::String(ref s) => probe_parse_date(s).map(Value::Date),
+            _ => None,
+        },
+        DataType::Timestamp | DataType::Timestamptz => match v {
+            Value::Timestamp(_) => Some(v),
+            Value::Date(ref d) => d
+                .and_hms_opt(0, 0, 0)
+                .map(|ts| Value::Timestamp(chrono::DateTime::from_naive_utc_and_offset(ts, chrono::Utc))),
+            Value::String(ref s) => probe_parse_timestamp(s).map(Value::Timestamp),
+            _ => None,
+        },
+        DataType::Time => match v {
+            Value::Time(_) => Some(v),
+            Value::String(ref s) => chrono::NaiveTime::parse_from_str(s, "%H:%M:%S%.f")
+                .ok()
+                .map(Value::Time),
+            _ => None,
+        },
+        // BYTEA keys are raw bytes; the text spelling `'\x0102'` is NOT the
+        // same key and `Evaluator::compare_values` has no Bytes↔String arm, so
+        // declining here (→ scan) keeps the write path bug-for-bug identical to
+        // the read path instead of inventing a match the predicate would reject.
+        DataType::Bytea => matches!(v, Value::Bytes(_)).then_some(v),
+        DataType::Interval => matches!(v, Value::Interval(_)).then_some(v),
+        DataType::Json | DataType::Jsonb => matches!(v, Value::Json(_)).then_some(v),
+        DataType::Vector(_) => matches!(v, Value::Vector(_)).then_some(v),
+        DataType::Array(_) => matches!(v, Value::Array(_)).then_some(v),
+    }
+}
+
+fn probe_value_to_i64(value: &crate::Value) -> Option<i64> {
+    use crate::Value;
+    match value {
+        Value::Int2(v) => Some(i64::from(*v)),
+        Value::Int4(v) => Some(i64::from(*v)),
+        Value::Int8(v) => Some(*v),
+        Value::String(v) => v.parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
+fn probe_value_to_f64(value: &crate::Value) -> Option<f64> {
+    use crate::Value;
+    match value {
+        Value::Int2(v) => Some(f64::from(*v)),
+        Value::Int4(v) => Some(f64::from(*v)),
+        Value::Int8(v) => Some(*v as f64),
+        Value::Float4(v) => Some(f64::from(*v)),
+        Value::Float8(v) => Some(*v),
+        Value::String(v) => v.parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+/// Accepts the same timestamp spellings as `Evaluator::parse_timestamp_string`,
+/// so a literal the predicate can compare is also a literal we can probe with.
+fn probe_parse_timestamp(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(value) {
+        return Some(ts.with_timezone(&chrono::Utc));
+    }
+    if let Ok(ts) = chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f") {
+        return Some(chrono::DateTime::from_naive_utc_and_offset(ts, chrono::Utc));
+    }
+    if let Ok(date) = chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d") {
+        return date
+            .and_hms_opt(0, 0, 0)
+            .map(|ts| chrono::DateTime::from_naive_utc_and_offset(ts, chrono::Utc));
+    }
+    None
+}
+
+fn probe_parse_date(value: &str) -> Option<chrono::NaiveDate> {
+    chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d")
+        .ok()
+        .or_else(|| probe_parse_timestamp(value).map(|ts| ts.date_naive()))
 }
 
 /// StatusMessage operator for DDL operations
@@ -2356,9 +2482,12 @@ impl<'a> Executor<'a> {
         Ok(Some(count))
     }
 
+    /// Build the ART probe key for one `IN (…)` element, or `None` if this
+    /// element has no valid encoding for the PK column — in which case
+    /// [`Self::count_single_pk_in_list`] declines the pushdown entirely and the
+    /// count falls back to scan + predicate evaluation.
     fn pk_in_list_value(&self, expr: &crate::sql::LogicalExpr, pk_type: &crate::DataType) -> Option<crate::Value> {
         use crate::sql::LogicalExpr;
-        use crate::{DataType, Value};
 
         let value = match expr {
             LogicalExpr::Literal(value) => value.clone(),
@@ -2366,25 +2495,9 @@ impl<'a> Executor<'a> {
             _ => return None,
         };
 
-        if matches!(value, Value::Null) {
-            return Some(Value::Null);
-        }
-
-        match pk_type {
-            DataType::Int2 => {
-                let raw = Self::value_to_i64_for_pk_range(&value, pk_type)?;
-                i16::try_from(raw).ok().map(Value::Int2)
-            }
-            DataType::Int4 => {
-                let raw = Self::value_to_i64_for_pk_range(&value, pk_type)?;
-                i32::try_from(raw).ok().map(Value::Int4)
-            }
-            DataType::Int8 => {
-                let raw = Self::value_to_i64_for_pk_range(&value, pk_type)?;
-                Some(Value::Int8(raw))
-            }
-            _ => Some(self::coerce_literal_to_column_type(value, pk_type)),
-        }
+        // One rule for every type, shared with the UPDATE/DELETE PK point
+        // lookup and with `StorageEngine::coerce_pk_value` (GH#15).
+        self::coerce_literal_to_column_type(value, pk_type)
     }
 
     /// R2.3 item 2: apply HAVING as a post-filter over the (small) output of
