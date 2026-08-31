@@ -531,6 +531,14 @@ fn coerce_binary_types(left: DataType, right: DataType, op: &BinaryOperator) -> 
             // ->> returns text
             Ok(DataType::Text)
         }
+        BinaryOperator::JsonPathGet => {
+            // #> returns JSON (mirrors ->)
+            Ok(DataType::Jsonb)
+        }
+        BinaryOperator::JsonPathGetText => {
+            // #>> returns text (mirrors ->>)
+            Ok(DataType::Text)
+        }
         BinaryOperator::JsonContains |
         BinaryOperator::JsonContainedBy |
         BinaryOperator::JsonExists |

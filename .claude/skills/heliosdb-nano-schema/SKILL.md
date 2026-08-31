@@ -429,6 +429,7 @@ DROP TRIGGER IF EXISTS posts_audit ON posts;   -- works; `ON <table>` is mandato
 ```
 
 ## Pitfalls
+- **DDL is NOT transactional — `ROLLBACK` does not undo it.** `BEGIN; DROP TABLE orders; ROLLBACK;` destroys `orders` and its rows permanently; a `CREATE TABLE` inside a rolled-back transaction survives; only the ordinary DML in the block is undone, so a mixed block ends up half-applied. Every DDL statement writes the catalog directly instead of staging into the transaction's write set. Run schema changes outside an explicit transaction, and take a dump (`heliosdb-nano dump`) or a branch before a destructive migration — that is the only undo available. See `heliosdb-nano-transactions`.
 - **`INTEGER PRIMARY KEY AUTOINCREMENT` (SQLite-ism) is accepted** — translated to `BIGSERIAL` internally. Use freely in drop-in scenarios.
 - **FK violations inside a single transaction** were fixed in v3.22.1 — older versions could see phantom violations during cascading deletes.
 - **`PRAGMA foreign_keys = ON;` is a no-op-with-ack** — Nano enforces FKs by default; the PRAGMA exists only for sqlite3 source compatibility.

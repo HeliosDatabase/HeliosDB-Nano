@@ -323,7 +323,9 @@ pub mod config;
 mod embedded_db_dump;
 
 // Re-exports
-pub use config::{Config, KeySource, ProfileConfig, SnapshotSchemaEvolution, ZkeEncryptionConfig, ZkeMode};
+pub use config::{
+    Config, KeySource, ProfileConfig, SerializablePolicy, SnapshotSchemaEvolution, ZkeEncryptionConfig, ZkeMode,
+};
 pub use crypto::{
     NonceTracker, TimestampValidator, ZeroKnowledgeSession, ZkeConfig, ZkeDerivedKeys, ZkeKeyDerivation,
     ZkeRequestContext,
@@ -556,6 +558,35 @@ pub(crate) fn session_search_path_tls() -> Vec<String> {
     SESSION_SEARCH_PATH.with(|c| c.borrow().clone())
 }
 
+/// A PostgreSQL-style notice the engine raised for a session, waiting to be
+/// written to that session's connection.
+///
+/// #103: the engine layer cannot write wire bytes, but it is the only layer
+/// that knows the truth (e.g. that a requested `SERIALIZABLE` transaction is
+/// being served as snapshot isolation). It queues the notice here; the wire
+/// handler drains it with [`EmbeddedDatabase::take_session_notices`] and emits
+/// one `NoticeResponse` per entry. The fields map 1:1 onto that message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionNotice {
+    /// PostgreSQL severity, e.g. `"WARNING"`.
+    pub severity: String,
+    /// SQLSTATE, e.g. `"01000"` (`warning`).
+    pub code: String,
+    /// Primary message text.
+    pub message: String,
+}
+
+/// #103: the ONE place the SERIALIZABLE-is-snapshot-isolation truth is worded.
+///
+/// Shared by the wire `WARNING`, the server log line and the refusal error, so
+/// a user, an operator reading logs and a driver catching the error all see the
+/// same sentence — and it names the specific anomaly, because "not fully
+/// serializable" is not actionable. Each caller appends its own policy hint.
+pub(crate) const SERIALIZABLE_IS_SNAPSHOT_ISOLATION: &str =
+    "SERIALIZABLE is served as SNAPSHOT ISOLATION: HeliosDB-Nano performs no read-set validation \
+     (no SSI), so this transaction behaves exactly like REPEATABLE READ and WRITE SKEW is NOT \
+     prevented — two transactions may each read rows the other then modifies, and both commit.";
+
 pub struct EmbeddedDatabase {
     /// Storage engine (public for REPL access)
     pub storage: std::sync::Arc<storage::StorageEngine>,
@@ -725,6 +756,16 @@ pub struct EmbeddedDatabase {
     /// shard lock (~128 on a 32-core host, ~1-2us) and sits on the per-statement
     /// fast-path gates; this atomic keeps those gates to one load.
     session_txn_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// #103: per-session queue of PostgreSQL notices the engine raised while
+    /// serving a statement, for a wire handler to flush to the client.
+    ///
+    /// Only populated for sessions that actually raise one (today: a
+    /// `SERIALIZABLE` request served as snapshot isolation), and drained by
+    /// [`EmbeddedDatabase::take_session_notices`]. Entries are dropped with the
+    /// session in `destroy_session`, and each session's queue is capped at
+    /// [`Self::MAX_PENDING_SESSION_NOTICES`] so an undrained queue can never
+    /// grow without bound.
+    session_notices: std::sync::Arc<dashmap::DashMap<crate::session::SessionId, Vec<SessionNotice>>>,
     /// Session-level FK validation mode used by embedded and protocol paths.
     fk_validation_mode: std::sync::Arc<parking_lot::RwLock<FkValidationMode>>,
     /// Source trusted for FK validation hints. Engine remains default.
@@ -831,6 +872,11 @@ impl Drop for EmbeddedDatabase {
         // Clear session transactions
         self.session_transactions.clear();
         self.session_txn_count.store(0, std::sync::atomic::Ordering::Release);
+        // #103: `session_notices` is deliberately NOT cleared here. `Drop` runs
+        // for every `clone_for_trigger()` clone too, and those clones share the
+        // Arc; clearing would discard live sessions' undelivered notices
+        // mid-statement. The map is freed with the last owner, and
+        // `destroy_session` removes a session's queue at disconnect.
 
         // Clear prepared statements
         self.prepared_statements.write().clear();
@@ -2274,30 +2320,55 @@ impl EmbeddedDatabase {
         .any(|needle| Self::contains_ascii_case_insensitive(sql, needle))
     }
 
-    /// Check if a SQL statement is a transaction control statement (zero-allocation)
+    /// Check if a SQL statement is a transaction control statement.
+    ///
+    /// Delegates to the ONE shared classifier
+    /// (`protocol::postgres::handler::classify_transaction_control`),
+    /// which is also what the PG simple-query arms, the PG extended-Execute
+    /// guard and `handle_transaction_control_for_session` use. There
+    /// used to be four hand-rolled copies of this rule and all four missed
+    /// `END`, `ABORT`, `COMMIT WORK` and `ROLLBACK TRANSACTION` — so `END;` did
+    /// not commit, and `ROLLBACK WORK;` did not roll back.
+    ///
+    /// `ROLLBACK TO [SAVEPOINT] n` is classified but is NOT a boundary, so it
+    /// still falls through to the executor's savepoint stack
+    /// (`LogicalPlan::RollbackToSavepoint`) exactly as before.
     fn is_transaction_control(sql: &str) -> bool {
-        let trimmed = sql.trim().trim_end_matches(';').trim();
-        starts_with_icase(trimmed, "BEGIN")
-            || starts_with_icase(trimmed, "START TRANSACTION")
-            || trimmed.eq_ignore_ascii_case("COMMIT")
-            || trimmed.eq_ignore_ascii_case("ROLLBACK")
+        crate::protocol::postgres::handler::classify_transaction_control(sql)
+            .is_some_and(crate::protocol::postgres::handler::TxnControl::is_boundary)
     }
 
-    /// Handle transaction control statements (BEGIN, COMMIT, ROLLBACK)
+    /// Handle transaction control statements (BEGIN, COMMIT/END, ROLLBACK/ABORT)
+    /// on the global (embedded / REPL) transaction slot.
     fn handle_transaction_control(&self, sql: &str) -> Result<u64> {
-        let trimmed = sql.trim().trim_end_matches(';').trim();
+        use crate::protocol::postgres::handler::{classify_transaction_control, TxnControl};
 
-        if starts_with_icase(trimmed, "BEGIN") || starts_with_icase(trimmed, "START TRANSACTION") {
-            self.begin_transaction_internal()?;
-            Ok(0)
-        } else if trimmed.eq_ignore_ascii_case("COMMIT") {
-            self.commit_internal()?;
-            Ok(0)
-        } else if trimmed.eq_ignore_ascii_case("ROLLBACK") {
-            self.rollback_internal()?;
-            Ok(0)
-        } else {
-            Err(Error::query_execution("Unknown transaction control statement"))
+        match classify_transaction_control(sql) {
+            Some(TxnControl::Begin) => {
+                self.begin_transaction_internal()?;
+                Ok(0)
+            }
+            Some(TxnControl::Commit { chain }) => {
+                self.commit_internal()?;
+                // `AND CHAIN` opens the next transaction immediately; without
+                // this the following statements would silently autocommit.
+                if chain {
+                    self.begin_transaction_internal()?;
+                }
+                Ok(0)
+            }
+            Some(TxnControl::Rollback { chain }) => {
+                self.rollback_internal()?;
+                if chain {
+                    self.begin_transaction_internal()?;
+                }
+                Ok(0)
+            }
+            // Not reachable through `is_transaction_control` (which excludes
+            // non-boundaries), but a direct caller must not get a silent no-op.
+            Some(TxnControl::RollbackToSavepoint) | None => {
+                Err(Error::query_execution("Unknown transaction control statement"))
+            }
         }
     }
 
@@ -3771,6 +3842,43 @@ impl EmbeddedDatabase {
     /// forever. Non-table elements of a `DropMulti` (views, sequences, …) have
     /// no triggers and are skipped. ONE helper, called from BOTH executor
     /// families' catch-alls — do not re-inline the match.
+    /// Resolve an INSERT column list to schema indices, erroring on a name the
+    /// table does not have.
+    ///
+    /// The three arms that build this list all used
+    /// `filter_map(schema.get_column_index)`, which SILENTLY DROPS an unknown
+    /// name. That is a wrong-answer factory in two directions: the value
+    /// intended for the unknown column lands in whatever position the shortened
+    /// index list puts it, and when the arity then mismatches the user gets
+    /// "More values than columns specified" — a message that names neither the
+    /// column nor the real problem, and which no SQLSTATE anchor can classify
+    /// (it reported XX000 internal_error rather than 42703).
+    ///
+    /// ONE helper, called from every INSERT arm in BOTH executor families. Do
+    /// not re-inline the `filter_map` — the single-row params arm already
+    /// errored correctly here while the other three did not, which is precisely
+    /// the divergence this repo keeps paying for.
+    fn resolve_insert_column_indices(
+        schema: &Schema,
+        columns: Option<&Vec<String>>,
+        table_name: &str,
+    ) -> Result<Option<Vec<usize>>> {
+        let Some(cols) = columns else { return Ok(None) };
+        let mut indices = Vec::with_capacity(cols.len());
+        for col_name in cols {
+            match schema.get_column_index(col_name) {
+                Some(idx) => indices.push(idx),
+                None => {
+                    return Err(Error::query_execution(format!(
+                        "Column '{}' not found in table '{}'",
+                        col_name, table_name
+                    )))
+                }
+            }
+        }
+        Ok(Some(indices))
+    }
+
     fn dropped_table_names(plan: &sql::LogicalPlan) -> Vec<String> {
         match plan {
             sql::LogicalPlan::DropTable { name, .. } => vec![name.clone()],
@@ -4661,11 +4769,8 @@ impl EmbeddedDatabase {
                     .collect();
 
                 // Build column index mapping for INSERT with explicit column list
-                let column_indices: Option<Vec<usize>> = columns.as_ref().map(|cols| {
-                    cols.iter()
-                        .filter_map(|col_name| schema.get_column_index(col_name))
-                        .collect()
-                });
+                let column_indices: Option<Vec<usize>> =
+                    Self::resolve_insert_column_indices(&schema, columns.as_ref(), table_name)?;
 
                 // R3.3: columnar side-data is staged grouped by (column,
                 // batch) AFTER the row loop — one staged read-modify-write
@@ -5467,11 +5572,8 @@ impl EmbeddedDatabase {
                 let rls_guard_insert = self.build_rls_write_guard(table_name, "INSERT", &schema)?;
 
                 // Build column index mapping for INSERT with explicit column list
-                let column_indices: Option<Vec<usize>> = columns.as_ref().map(|cols| {
-                    cols.iter()
-                        .filter_map(|col_name| schema.get_column_index(col_name))
-                        .collect()
-                });
+                let column_indices: Option<Vec<usize>> =
+                    Self::resolve_insert_column_indices(&schema, columns.as_ref(), table_name)?;
 
                 // Pre-parse default expressions for columns
                 let default_exprs: Vec<Option<sql::LogicalExpr>> = schema
@@ -7161,6 +7263,7 @@ impl EmbeddedDatabase {
             art_undo_log: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
             session_art_undo: std::sync::Arc::new(dashmap::DashMap::new()),
             session_txn_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            session_notices: std::sync::Arc::new(dashmap::DashMap::new()),
             fk_validation_mode: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationMode::Enforced)),
             fk_validation_source: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationSource::Engine)),
             deferred_fk_checks: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
@@ -7280,6 +7383,7 @@ impl EmbeddedDatabase {
             art_undo_log: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
             session_art_undo: std::sync::Arc::new(dashmap::DashMap::new()),
             session_txn_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            session_notices: std::sync::Arc::new(dashmap::DashMap::new()),
             fk_validation_mode: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationMode::Enforced)),
             fk_validation_source: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationSource::Engine)),
             deferred_fk_checks: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
@@ -7435,6 +7539,7 @@ impl EmbeddedDatabase {
             art_undo_log: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
             session_art_undo: std::sync::Arc::new(dashmap::DashMap::new()),
             session_txn_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            session_notices: std::sync::Arc::new(dashmap::DashMap::new()),
             fk_validation_mode: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationMode::Enforced)),
             fk_validation_source: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationSource::Engine)),
             deferred_fk_checks: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
@@ -8584,8 +8689,25 @@ impl EmbeddedDatabase {
         // W3.2: COPY class scope for the batch write below.
         let _wv = write_volume::stmt_scope(write_volume::StmtClass::Copy);
         // Fall back for every shape the fast batch path does not preserve.
+        //
+        // #87: the session-transaction term is `session_txns_block_fast_inserts`
+        // (= an open session transaction AND time-travel OFF), NOT the raw
+        // process-wide `any_session_txns()` it used to be. The correctness
+        // property being guarded is snapshot isolation for OTHER sessions: a
+        // fast batch write that skipped MVCC version keys would become visible
+        // inside an older snapshot. With time-travel ON that cannot happen —
+        // `insert_prepared_tuples_fast_batch` writes the `v:`/`vmeta:` gate and
+        // raises the per-table committed-write watermark BEFORE the rows land,
+        // and says so in its own contract (storage/engine.rs: "This batch path
+        // … is NOT blocked while a session transaction is open (its callers only
+        // bail on `session_txns_block_fast_inserts`…)"). COPY was the one caller
+        // that did not match that contract, so a single unrelated idle
+        // transaction anywhere in the process demoted every concurrent COPY to
+        // the ~10x-slower render-to-SQL path. With time-travel OFF there is no
+        // version gate, so the process-wide bail still applies — narrowing it
+        // there WOULD be a correctness bug.
         if self.in_transaction()
-            || self.any_session_txns()
+            || self.session_txns_block_fast_inserts()
             || !self.savepoints.read().is_empty()
             || self.tenant_manager.get_current_context().is_some()
             || self.storage.get_current_branch_id().is_some()
@@ -14420,11 +14542,8 @@ impl EmbeddedDatabase {
                 // RLS WITH CHECK on the TARGET table, once per statement.
                 let rls_guard_insert = self.build_rls_write_guard(table_name, "INSERT", &schema)?;
 
-                let column_indices: Option<Vec<usize>> = columns.as_ref().map(|cols| {
-                    cols.iter()
-                        .filter_map(|col_name| schema.get_column_index(col_name))
-                        .collect()
-                });
+                let column_indices: Option<Vec<usize>> =
+                    Self::resolve_insert_column_indices(&schema, columns.as_ref(), table_name)?;
 
                 let has_returning = returning.is_some();
                 let mut returned_tuples: Vec<Tuple> = Vec::new();
@@ -15690,8 +15809,36 @@ impl EmbeddedDatabase {
         }
         // Only the autocommit read path. In a transaction the query may need to
         // see the txn's own writes / RLS rewrites; leave those to the raw path.
+        //
+        // #87 (second, previously unfiled instance): the CALLER's transaction
+        // state is what matters here, and `in_transaction()` already covers it.
+        // The process-wide `any_session_txns()` term that used to sit here made
+        // ONE idle session in a transaction disable plan normalization for every
+        // OTHER session's reads — a silent, unlogged slowdown in any
+        // connection-pooled deployment.
+        //
+        // Narrowing it is safe because this gate is a heuristic, not a
+        // correctness property — established, not assumed:
+        //   * The calling session is provably not in a transaction. The only
+        //     wire entry point is `query_with_columns_for_session`, which
+        //     delegates to `query_with_columns` ONLY when
+        //     `!self.session_transactions.contains_key(&session_id)`; a session
+        //     WITH a transaction plans and executes against that transaction and
+        //     never reaches here. The embedded `query()`/`query_with_columns()`
+        //     entry points have no session at all, and their global-slot
+        //     transaction is exactly what `in_transaction()` tests.
+        //   * Another session's transaction cannot change what this read sees.
+        //     Both the normalized and the raw path build the SAME
+        //     non-transactional `sql::Executor::with_storage(&self.storage)`
+        //     over the same storage; uncommitted rows live in that other
+        //     transaction's write-set buffer, not in RocksDB, so they are
+        //     invisible to both. If the term were load-bearing, the raw path
+        //     sitting immediately below — which has no such gate — would be
+        //     equally wrong.
+        //   * Nothing is cached here that could go stale: the normalized path
+        //     deliberately does not populate the result cache (see below), and
+        //     the plan cache is invalidated on DDL for every path alike.
         if self.in_transaction()
-            || self.any_session_txns()
             || self.tenant_manager.get_current_context().is_some()
             || self.storage.get_current_branch_id().is_some()
         {
@@ -16170,7 +16317,88 @@ impl EmbeddedDatabase {
             }
         }
         self.finish_session_art_undo(session_id, true);
+        // #103: a disconnected session's undelivered notices have nowhere to go.
+        self.session_notices.remove(&session_id);
         self.session_manager.destroy_session(session_id)
+    }
+
+    /// #103: cap on notices buffered for one session, so a wire handler that
+    /// never drains cannot grow the queue without bound. Overflow drops the
+    /// OLDEST entry (the newest statement's diagnostic is the useful one).
+    const MAX_PENDING_SESSION_NOTICES: usize = 16;
+
+    /// Queue a PostgreSQL notice for `session_id`'s connection to emit.
+    ///
+    /// #103. The engine cannot write wire bytes, so it records the notice here
+    /// and the protocol handler flushes it with [`Self::take_session_notices`]
+    /// after the statement completes.
+    pub(crate) fn push_session_notice(&self, session_id: crate::session::SessionId, notice: SessionNotice) {
+        let mut entry = self.session_notices.entry(session_id).or_default();
+        let queue: &mut Vec<SessionNotice> = entry.value_mut();
+        if queue.len() >= Self::MAX_PENDING_SESSION_NOTICES {
+            queue.remove(0);
+        }
+        queue.push(notice);
+    }
+
+    /// Drain the notices queued for `session_id` (empty when there are none).
+    ///
+    /// #103. A wire handler calls this after each statement and emits one
+    /// `NoticeResponse` per entry, in order. Draining is destructive: a notice
+    /// is delivered at most once.
+    pub fn take_session_notices(&self, session_id: crate::session::SessionId) -> Vec<SessionNotice> {
+        self.session_notices
+            .remove(&session_id)
+            .map(|(_, notices)| notices)
+            .unwrap_or_default()
+    }
+
+    /// #103: answer a `SERIALIZABLE` request honestly.
+    ///
+    /// `SERIALIZABLE` is served as SNAPSHOT ISOLATION — `validate_and_record`
+    /// (src/storage/conflict.rs) sees only the WRITE set and there is no read
+    /// set anywhere in the engine, so `Serializable` and `RepeatableRead` are
+    /// byte-identical and neither prevents write skew. Rather than accept the
+    /// level silently, `storage.serializable_policy` either warns (default:
+    /// wire `WARNING` + server log) or refuses.
+    ///
+    /// Called from [`Self::begin_transaction_for_session`], which is the ONE
+    /// funnel every wire BEGIN reaches — simple query (`handler.rs`) and
+    /// extended protocol (`handle_transaction_control_for_session`) alike.
+    fn enforce_serializable_policy(
+        &self,
+        session_id: crate::session::SessionId,
+        isolation: crate::session::IsolationLevel,
+    ) -> Result<()> {
+        if isolation != crate::session::IsolationLevel::Serializable {
+            return Ok(());
+        }
+        match self.storage.config().storage.serializable_policy {
+            crate::config::SerializablePolicy::Error => Err(Error::transaction(format!(
+                "cannot start a SERIALIZABLE transaction: {} \
+                 (storage.serializable_policy = \"error\"; set it to \"warn\" to run the \
+                 transaction as snapshot isolation instead)",
+                SERIALIZABLE_IS_SNAPSHOT_ISOLATION
+            ))),
+            crate::config::SerializablePolicy::Warn => {
+                let message = format!(
+                    "{} Set storage.serializable_policy = \"error\" to reject this level instead \
+                     of downgrading it.",
+                    SERIALIZABLE_IS_SNAPSHOT_ISOLATION
+                );
+                tracing::warn!(session_id = session_id.0, "{}", message);
+                self.push_session_notice(
+                    session_id,
+                    SessionNotice {
+                        severity: "WARNING".to_string(),
+                        // 01000 `warning` — PostgreSQL's generic warning class.
+                        code: "01000".to_string(),
+                        message,
+                    },
+                );
+                Ok(())
+            }
+        }
     }
 
     /// Begin an explicit transaction for a specific session
@@ -16184,7 +16412,12 @@ impl EmbeddedDatabase {
     ///
     /// # Errors
     ///
-    /// Returns an error if the session already has an active transaction.
+    /// Returns an error if the session already has an active transaction, or
+    /// if the session asked for `SERIALIZABLE` and
+    /// `storage.serializable_policy = "error"` (#103 — `SERIALIZABLE` is served
+    /// as snapshot isolation and does not prevent write skew; under the default
+    /// `"warn"` policy the transaction runs and a `WARNING` notice is queued for
+    /// the wire instead).
     pub fn begin_transaction_for_session(&self, session_id: crate::session::SessionId) -> Result<()> {
         let session_lock = self.session_manager.get_session(session_id)?;
         let mut session = session_lock.write();
@@ -16192,6 +16425,11 @@ impl EmbeddedDatabase {
         if session.active_txn.is_some() {
             return Err(Error::transaction("Session already has an active transaction"));
         }
+
+        // #103: never let a SERIALIZABLE request through silently. Runs BEFORE
+        // any state is mutated, so the "error" policy leaves the session
+        // exactly as it was (no half-started transaction).
+        self.enforce_serializable_policy(session_id, session.isolation_level)?;
 
         // Create a real storage transaction with a FRESH snapshot
         let mut txn = storage::Transaction::new_with_session(
@@ -16230,6 +16468,14 @@ impl EmbeddedDatabase {
         // R0.2: record commits always; validate (first-committer-wins) for
         // RepeatableRead/Serializable. ReadCommitted keeps PostgreSQL's
         // blind-write semantics.
+        //
+        // #103: this is WRITE-set validation only — `validate_and_record`
+        // (src/storage/conflict.rs) never sees a read set, and none is tracked
+        // anywhere in the engine. That makes RepeatableRead and Serializable
+        // the SAME level (snapshot isolation, write skew permitted); the
+        // difference is only that a Serializable request is reported to the
+        // client by `enforce_serializable_policy` above. Real SSI is an
+        // unshipped milestone — do not read this line as one.
         txn.set_conflict_registry(
             self.storage.conflict_registry(),
             session.isolation_level != crate::session::IsolationLevel::ReadCommitted,
@@ -16932,29 +17178,56 @@ impl EmbeddedDatabase {
     /// Handle BEGIN / COMMIT / ROLLBACK for a wire session with PostgreSQL's
     /// lenient semantics: BEGIN inside a transaction and COMMIT/ROLLBACK
     /// outside one succeed (the handler emits the WARNING notice).
+    ///
+    /// Statement recognition is the ONE shared classifier
+    /// (`protocol::postgres::handler::classify_transaction_control`) — see
+    /// `EmbeddedDatabase::is_transaction_control`, which gates every caller of
+    /// this method — so `END`, `ABORT`, `COMMIT WORK` and `ROLLBACK
+    /// TRANSACTION` reach the same code path as their canonical spellings.
     pub fn handle_transaction_control_for_session(
         &self,
         session_id: crate::session::SessionId,
         sql: &str,
     ) -> Result<u64> {
-        let trimmed = sql.trim().trim_end_matches(';').trim();
-        if starts_with_icase(trimmed, "BEGIN") || starts_with_icase(trimmed, "START TRANSACTION") {
-            if !self.session_transactions.contains_key(&session_id) {
-                self.begin_transaction_for_session(session_id)?;
+        use crate::protocol::postgres::handler::{classify_transaction_control, TxnControl};
+
+        match classify_transaction_control(sql) {
+            Some(TxnControl::Begin) => {
+                if !self.session_transactions.contains_key(&session_id) {
+                    self.begin_transaction_for_session(session_id)?;
+                }
+                Ok(0)
             }
-            Ok(0)
-        } else if trimmed.eq_ignore_ascii_case("COMMIT") {
-            if self.session_transactions.contains_key(&session_id) {
-                self.commit_transaction_for_session(session_id)?;
+            Some(TxnControl::Commit { chain }) => {
+                let had_txn = self.session_transactions.contains_key(&session_id);
+                if had_txn {
+                    self.commit_transaction_for_session(session_id)?;
+                }
+                // `AND CHAIN` must open the next transaction immediately, or
+                // everything after it silently autocommits. Like PostgreSQL,
+                // only chain when a live transaction was actually closed.
+                if chain && had_txn {
+                    self.begin_transaction_for_session(session_id)?;
+                }
+                Ok(0)
             }
-            Ok(0)
-        } else if trimmed.eq_ignore_ascii_case("ROLLBACK") {
-            if self.session_transactions.contains_key(&session_id) {
-                self.rollback_transaction_for_session(session_id)?;
+            Some(TxnControl::Rollback { chain }) => {
+                let had_txn = self.session_transactions.contains_key(&session_id);
+                if had_txn {
+                    self.rollback_transaction_for_session(session_id)?;
+                }
+                if chain && had_txn {
+                    self.begin_transaction_for_session(session_id)?;
+                }
+                Ok(0)
             }
-            Ok(0)
-        } else {
-            Err(Error::query_execution("Unknown transaction control statement"))
+            // `ROLLBACK TO [SAVEPOINT] n` is a partial rollback owned by the
+            // executor's savepoint stack; `is_transaction_control` excludes it
+            // so it never arrives here. A direct caller gets an error rather
+            // than a silent full rollback.
+            Some(TxnControl::RollbackToSavepoint) | None => {
+                Err(Error::query_execution("Unknown transaction control statement"))
+            }
         }
     }
 
@@ -18828,6 +19101,7 @@ impl EmbeddedDatabase {
             art_undo_log: self.art_undo_log.clone(),
             session_art_undo: self.session_art_undo.clone(),
             session_txn_count: self.session_txn_count.clone(),
+            session_notices: self.session_notices.clone(),
             fk_validation_mode: self.fk_validation_mode.clone(),
             fk_validation_source: self.fk_validation_source.clone(),
             deferred_fk_checks: self.deferred_fk_checks.clone(),
@@ -22816,6 +23090,110 @@ mod tests {
     }
 
     // ========================================================================
+    // #103: SERIALIZABLE is served as snapshot isolation — say so, or refuse
+    // ========================================================================
+
+    #[test]
+    fn test_serializable_request_queues_a_wire_warning_by_default() {
+        use crate::session::IsolationLevel;
+
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        let session = db.create_session("s103_warn", IsolationLevel::Serializable).unwrap();
+        assert!(db.take_session_notices(session).is_empty(), "quiet before BEGIN");
+
+        db.begin_transaction_for_session(session)
+            .expect("the default policy runs the transaction, as snapshot isolation");
+
+        let notices = db.take_session_notices(session);
+        assert_eq!(notices.len(), 1, "one notice per SERIALIZABLE BEGIN");
+        assert_eq!(notices[0].severity, "WARNING");
+        assert_eq!(notices[0].code, "01000", "PostgreSQL generic `warning` class");
+        assert!(
+            notices[0].message.contains("WRITE SKEW"),
+            "the warning must name the anomaly that is NOT prevented — \
+             'not fully serializable' is not actionable: {}",
+            notices[0].message
+        );
+        assert!(
+            notices[0].message.contains("SNAPSHOT ISOLATION"),
+            "the warning must say what the client actually got instead: {}",
+            notices[0].message
+        );
+
+        // Draining is destructive: a notice is delivered at most once.
+        assert!(db.take_session_notices(session).is_empty());
+
+        db.rollback_transaction_for_session(session).unwrap();
+        db.destroy_session(session).unwrap();
+    }
+
+    #[test]
+    fn test_non_serializable_levels_queue_no_notice() {
+        use crate::session::IsolationLevel;
+
+        // REPEATABLE READ is the level SERIALIZABLE is downgraded to, so asking
+        // for it honestly must stay quiet — otherwise the warning is noise
+        // instead of a signal.
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        for level in [IsolationLevel::ReadCommitted, IsolationLevel::RepeatableRead] {
+            let session = db.create_session("s103_quiet", level).unwrap();
+            db.begin_transaction_for_session(session).unwrap();
+            assert!(db.take_session_notices(session).is_empty(), "{level:?} must not warn");
+            db.rollback_transaction_for_session(session).unwrap();
+            db.destroy_session(session).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_serializable_policy_error_refuses_the_transaction() {
+        use crate::session::IsolationLevel;
+
+        let mut config = Config::in_memory();
+        config.storage.serializable_policy = SerializablePolicy::Error;
+        let db = EmbeddedDatabase::with_config(config).unwrap();
+
+        let session = db.create_session("s103_error", IsolationLevel::Serializable).unwrap();
+        let err = db
+            .begin_transaction_for_session(session)
+            .expect_err("serializable_policy = \"error\" must refuse, not downgrade");
+        let message = err.to_string();
+        assert!(message.contains("WRITE SKEW"), "refusal must say why: {message}");
+        // Refusal happens before any state changes: no half-started transaction.
+        assert!(!db.session_in_transaction(session), "refused BEGIN must not open one");
+        // And a refusal is not also a warning.
+        assert!(db.take_session_notices(session).is_empty());
+
+        // The session is still usable at a level the engine does implement.
+        db.set_session_isolation(session, IsolationLevel::RepeatableRead)
+            .expect("changing isolation level outside a transaction is allowed");
+        db.begin_transaction_for_session(session)
+            .expect("REPEATABLE READ is the level SERIALIZABLE was silently being served as");
+        db.rollback_transaction_for_session(session).unwrap();
+        db.destroy_session(session).unwrap();
+    }
+
+    #[test]
+    fn test_session_notices_are_capped_and_dropped_with_the_session() {
+        use crate::session::IsolationLevel;
+
+        let cap = EmbeddedDatabase::MAX_PENDING_SESSION_NOTICES;
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        let session = db.create_session("s103_cap", IsolationLevel::Serializable).unwrap();
+
+        // An undrained queue must not grow without bound.
+        for _ in 0..(cap + 8) {
+            db.begin_transaction_for_session(session).unwrap();
+            db.rollback_transaction_for_session(session).unwrap();
+        }
+        assert_eq!(db.take_session_notices(session).len(), cap, "queue must be capped");
+
+        // Disconnecting drops whatever was never delivered.
+        db.begin_transaction_for_session(session).unwrap();
+        db.destroy_session(session).unwrap();
+        assert!(db.take_session_notices(session).is_empty());
+    }
+
+    // ========================================================================
     // Transaction Edge Cases
     // ========================================================================
 
@@ -22889,33 +23267,64 @@ mod tests {
         assert_eq!(rows.len(), 1, "DDL + DML in committed transaction should persist");
     }
 
+    /// #105: DDL IS NOT TRANSACTIONAL — `ROLLBACK` does not undo it.
+    ///
+    /// This test pins the REAL behaviour. It replaces a test that asserted
+    /// `rows.is_empty() || rows.len() == 1` inside an `if let Ok(...)` — true
+    /// for every possible outcome, and silently passing when the query errored.
+    /// A test that cannot fail is worse than no test: it is what let this
+    /// limitation read as "covered".
+    ///
+    /// Why it behaves this way: the `CreateTable` arm of
+    /// `execute_in_transaction_inner` holds the transaction but calls
+    /// `catalog.create_table(...)` directly, and `Catalog::drop_table` issues
+    /// its own `db.write(batch)` — neither goes through the transaction's write
+    /// set. Making DDL transactional means routing every catalog write in BOTH
+    /// executor families through the write set; that is a milestone, not a
+    /// patch. Until it ships, this test is the contract. If someone makes DDL
+    /// transactional, this test SHOULD fail — invert it then, do not delete it.
     #[test]
-    fn test_ddl_in_transaction_rollback() {
-        // CREATE TABLE inside transaction, then rollback.
-        // Note: DDL rollback is a known limitation in many databases.
+    fn test_ddl_in_transaction_rollback_is_not_undone() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
+        // ---- CREATE TABLE auto-commits; the DML in the same block does not.
         db.execute("BEGIN").unwrap();
         db.execute("CREATE TABLE ddl_rb (id INT, val TEXT)").unwrap();
         db.execute("INSERT INTO ddl_rb VALUES (1, 'hello')").unwrap();
         db.execute("ROLLBACK").unwrap();
 
-        // In most databases, DDL is auto-committed so CREATE TABLE persists
-        // even after ROLLBACK. Document current behavior.
-        let query_result = db.query("SELECT * FROM ddl_rb", &[]);
-        // The table may or may not exist after rollback depending on implementation.
-        // If the table exists, the INSERT data should have been rolled back.
-        // But current implementation may keep the INSERT too since DDL is auto-committed
-        // and the INSERT was in the same auto-commit scope.
-        if let Ok(rows) = query_result {
-            // Table survived rollback (DDL auto-commit behavior)
-            assert!(
-                rows.is_empty() || rows.len() == 1,
-                "DDL rollback behavior: table exists with {} rows",
+        let after_rollback = db.query("SELECT * FROM ddl_rb", &[]);
+        let rows = after_rollback.expect(
+            "DDL is not transactional: CREATE TABLE auto-commits, so the table must still exist \
+             after ROLLBACK (if this now errors, DDL became transactional — update the docs too)",
+        );
+        assert_eq!(
+            rows.len(),
+            0,
+            "the INSERT is ordinary DML and IS rolled back by ROLLBACK, even though the \
+             CREATE TABLE in the same block is not"
+        );
+
+        // ---- DROP TABLE inside a transaction is permanent. This is the
+        //      user-facing harm: `BEGIN; DROP TABLE orders; ROLLBACK;` destroys
+        //      the table and its rows with no way back.
+        db.execute("CREATE TABLE ddl_drop (id INT)").unwrap();
+        db.execute("INSERT INTO ddl_drop VALUES (1)").unwrap();
+        assert_eq!(db.query("SELECT * FROM ddl_drop", &[]).unwrap().len(), 1);
+
+        db.execute("BEGIN").unwrap();
+        db.execute("DROP TABLE ddl_drop").unwrap();
+        db.execute("ROLLBACK").unwrap();
+
+        match db.query("SELECT * FROM ddl_drop", &[]) {
+            Err(_) => {} // documented behaviour: the table is gone for good
+            Ok(rows) => panic!(
+                "ROLLBACK appears to have undone DROP TABLE ({} rows readable). DDL became \
+                 transactional — invert this assertion and correct README.md, docs/ and the \
+                 heliosdb-nano-transactions skill, which all state that it is not.",
                 rows.len()
-            );
+            ),
         }
-        // If query_result is Err, table was successfully rolled back (ideal behavior)
     }
 
     #[test]

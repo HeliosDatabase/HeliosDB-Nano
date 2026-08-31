@@ -104,12 +104,27 @@ query_timeout_ms = 0
 # Currently not implemented, reserved for future use
 statement_timeout_ms = 0
 
-# Transaction isolation level:
+# Transaction isolation level. HeliosDB-Nano implements SNAPSHOT ISOLATION:
 # - "READ_UNCOMMITTED": Not fully supported, maps to READ_COMMITTED
-# - "READ_COMMITTED": Standard PostgreSQL default
-# - "REPEATABLE_READ": Consistent snapshot from transaction start
-# - "SERIALIZABLE": Strictest isolation, may cause serialization failures
+# - "READ_COMMITTED": Standard PostgreSQL default; fresh snapshot per statement
+# - "REPEATABLE_READ": One snapshot per transaction, first-committer-wins on
+#                      write-write conflicts (loser gets 40001)
+# - "SERIALIZABLE":    ACCEPTED AS A NAME, SERVED AS SNAPSHOT ISOLATION. There
+#                      is no read-set tracking (no SSI), so this is identical to
+#                      REPEATABLE_READ and it does NOT prevent WRITE SKEW: two
+#                      transactions can each read the rows the other is about to
+#                      change and both commit. See serializable_policy below.
 transaction_isolation = "READ_COMMITTED"
+
+# What to do when a client asks for SERIALIZABLE (task #103):
+# - "warn"  (default) run it as snapshot isolation and say so — a PostgreSQL
+#                     WARNING on the wire naming write skew, plus a server-log
+#                     WARN line.
+# - "error"           refuse `BEGIN ... ISOLATION LEVEL SERIALIZABLE`, for
+#                     deployments that need the real guarantee or nothing.
+# There is no silent-accept value: a client asking for serializability is never
+# left believing it got it. Real SSI is a separate, unshipped milestone.
+serializable_policy = "warn"
 
 # Slow query log threshold in milliseconds.
 # Queries exceeding this threshold are logged at WARN level with their SQL

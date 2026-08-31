@@ -2620,72 +2620,47 @@ impl Evaluator {
         self.func_locate(&swapped)
     }
 
-    /// jsonb_extract_path(json, path_elements...)
-    /// Extract JSON sub-object at the specified path
-    fn jsonb_extract_path(&self, args: &[Value]) -> Result<Value> {
+    /// Shared body of `jsonb_extract_path` / `json_extract_path` and their
+    /// `_text` variants: resolve the first argument to a JSON document and walk
+    /// the remaining arguments as a path.
+    ///
+    /// `Ok(None)` means "no such path" (→ SQL NULL), never an error. The walk
+    /// itself is [`json_path_extract`], which the `#>` / `#>>` operators use
+    /// too — one traversal, one set of semantics, so the function form and the
+    /// operator form cannot drift apart.
+    fn jsonb_extract_path_value(&self, args: &[Value]) -> Result<Option<serde_json::Value>> {
         let (first, rest) = args
             .split_first()
             .ok_or_else(|| Error::query_execution("jsonb_extract_path requires at least one argument"))?;
 
         let json_str = match first {
             Value::Json(j) => j,
-            Value::Null => return Ok(Value::Null),
+            Value::Null => return Ok(None),
             _ => return Err(Error::query_execution("First argument must be JSON")),
         };
 
         // Parse the JSON string
-        let mut current: serde_json::Value =
+        let root: serde_json::Value =
             serde_json::from_str(json_str).map_err(|e| Error::query_execution(format!("Invalid JSON: {}", e)))?;
 
-        // Navigate through the path
-        for path_elem in rest {
-            match path_elem {
-                Value::String(key) => {
-                    current = match current.get(key) {
-                        Some(v) => v.clone(),
-                        None => return Ok(Value::Null),
-                    };
-                }
-                Value::Int4(idx) => {
-                    if let Some(arr) = current.as_array() {
-                        let index = if *idx < 0 {
-                            (arr.len() as i32 + idx) as usize
-                        } else {
-                            *idx as usize
-                        };
-                        current = match arr.get(index) {
-                            Some(v) => v.clone(),
-                            None => return Ok(Value::Null),
-                        };
-                    } else {
-                        return Ok(Value::Null);
-                    }
-                }
-                _ => return Err(Error::query_execution("Path elements must be strings or integers")),
-            }
-        }
+        json_path_extract(root, rest)
+    }
 
-        Ok(Value::Json(current.to_string()))
+    /// jsonb_extract_path(json, path_elements...)
+    /// Extract JSON sub-object at the specified path
+    fn jsonb_extract_path(&self, args: &[Value]) -> Result<Value> {
+        match self.jsonb_extract_path_value(args)? {
+            Some(found) => Ok(Value::Json(found.to_string())),
+            None => Ok(Value::Null),
+        }
     }
 
     /// jsonb_extract_path_text(json, path_elements...)
     /// Extract JSON sub-object at the specified path as text
     fn jsonb_extract_path_text(&self, args: &[Value]) -> Result<Value> {
-        let result = self.jsonb_extract_path(args)?;
-        match result {
-            Value::Json(j) => {
-                // Parse the JSON string to check if it's a string value
-                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&j) {
-                    match parsed {
-                        serde_json::Value::String(s) => Ok(Value::String(s)),
-                        _ => Ok(Value::String(j)),
-                    }
-                } else {
-                    Ok(Value::String(j))
-                }
-            }
-            Value::Null => Ok(Value::Null),
-            _ => Ok(Value::String(result.to_string())),
+        match self.jsonb_extract_path_value(args)? {
+            Some(found) => Ok(json_value_as_text(&found)),
+            None => Ok(Value::Null),
         }
     }
 
@@ -3454,6 +3429,8 @@ impl Evaluator {
             BinaryOperator::JsonExists => self.json_exists_op(left, right, false),
             BinaryOperator::JsonExistsAny => self.json_exists_op(left, right, true),
             BinaryOperator::JsonExistsAll => self.json_exists_all_op(left, right),
+            BinaryOperator::JsonPathGet => self.json_path_get_op(left, right, false),
+            BinaryOperator::JsonPathGetText => self.json_path_get_op(left, right, true),
 
             // Array operators
             BinaryOperator::ArrayConcat => self.array_concat_op(left, right),
@@ -5226,6 +5203,54 @@ impl Evaluator {
             }
         } else {
             Err(Error::query_execution("String key can only be used with JSON objects"))
+        }
+    }
+
+    /// JSON path extraction operators: `#>` (JSON result) and `#>>` (text
+    /// result). PostgreSQL's signature is `jsonb #> text[] → jsonb` /
+    /// `jsonb #>> text[] → text`.
+    ///
+    /// The traversal itself is [`json_path_extract`] — the same one
+    /// `jsonb_extract_path` uses — so `data #> '{a,b}'` and
+    /// `jsonb_extract_path(data,'a','b')` are the same query by construction,
+    /// not by coincidence.
+    ///
+    /// A path that does not exist yields SQL NULL, matching PostgreSQL; it is
+    /// not an error.
+    fn json_path_get_op(&self, json_val: &Value, path_val: &Value, as_text: bool) -> Result<Value> {
+        let op = if as_text { "#>>" } else { "#>" };
+        // Left operand: native JSON, or an untyped/TEXT operand parsed as JSON
+        // (see `json_operand` for the unknown-literal rule). NULL -> NULL.
+        let root = match json_operand(json_val, op, "left")? {
+            Some(j) => j,
+            None => return Ok(Value::Null),
+        };
+
+        // Right operand is text[]. An uncast literal `'{a,b}'` arrives as a
+        // `Value::String` holding the PostgreSQL array text form — resolve it
+        // the same way `?|`, `?&` and `= ANY($1)` do rather than rejecting it.
+        // `ARRAY['a','b']` and a bound text[] parameter arrive as
+        // `Value::Array` and need no conversion.
+        let parsed_text_array = match path_val {
+            Value::String(s) => Self::parse_pg_text_array(s),
+            _ => None,
+        };
+        let path: &[Value] = match (path_val, &parsed_text_array) {
+            (_, Some(elems)) => elems.as_slice(),
+            (Value::Array(elems), _) => elems.as_slice(),
+            (Value::Null, _) => return Ok(Value::Null),
+            (other, _) => {
+                return Err(Error::query_execution(format!(
+                    "operator {op} needs a text array on its right side, but got {}",
+                    describe_operand(other)
+                )))
+            }
+        };
+
+        match json_path_extract(root, path)? {
+            Some(found) if as_text => Ok(json_value_as_text(&found)),
+            Some(found) => Ok(Value::Json(found.to_string())),
+            None => Ok(Value::Null),
         }
     }
 
@@ -7886,6 +7911,93 @@ fn json_operand(value: &Value, op: &str, side: &str) -> Result<Option<serde_json
              (for example '{{\"key\": \"value\"}}'); cast with `::text` if you meant plain text",
         ))
     })
+}
+
+/// Render an extracted JSON value the way every `…_text` JSON surface does
+/// (`->>`, `#>>`, `jsonb_extract_path_text`): a JSON *string* yields its
+/// unquoted contents, and everything else yields its JSON text. The
+/// unwrap-the-string difference is the entire point of the text-returning
+/// variants, so it lives in exactly one place.
+fn json_value_as_text(value: &serde_json::Value) -> Value {
+    match value {
+        serde_json::Value::String(s) => Value::String(s.clone()),
+        other => Value::String(other.to_string()),
+    }
+}
+
+/// Resolve one array subscript, honouring PostgreSQL's negative-from-the-end
+/// convention. Returns `None` when the node is not an array or the subscript
+/// is out of range — both are "no such path", i.e. SQL NULL.
+fn json_array_element(node: &serde_json::Value, idx: i64) -> Option<serde_json::Value> {
+    let arr = node.as_array()?;
+    let resolved: i64 = if idx < 0 {
+        // `-1` is the last element. An index further from the end than the
+        // array is long stays out of range rather than wrapping.
+        (arr.len() as i64).checked_add(idx).filter(|i| *i >= 0)?
+    } else {
+        idx
+    };
+    arr.get(resolved as usize).cloned()
+}
+
+/// THE one JSON path traversal.
+///
+/// Used by `jsonb_extract_path` / `json_extract_path` (and their `_text`
+/// variants) through `Evaluator::jsonb_extract_path_value`, and by the `#>` /
+/// `#>>` operators through `Evaluator::json_path_get_op`. The operators
+/// delegate here rather than carrying their own copy, because a second
+/// traversal is a second set of semantics waiting to diverge.
+///
+/// Path element rules, matching PostgreSQL:
+///
+/// * A **text** element addresses an object key. When the current node is an
+///   *array* instead, the element is re-read as a decimal subscript — `#>`
+///   takes `text[]`, so `'{items,0}'` presents the index as the STRING `"0"`
+///   and would otherwise miss every array element. Object lookup is tried
+///   first, so a document with a literal `"0"` key still resolves by key.
+/// * An **integer** element (the function form, where callers can pass a real
+///   `Value::Int*`) addresses an array subscript directly.
+/// * A **NULL** element makes the whole extraction NULL — `jsonb_extract_path`
+///   is STRICT in PostgreSQL and a NULL member of a `text[]` path behaves the
+///   same way.
+///
+/// `Ok(None)` is "path absent" → SQL NULL, never an error; PostgreSQL does not
+/// raise for a path that does not exist. `Err` is reserved for a path element
+/// that is not a text key or an integer subscript at all.
+fn json_path_extract(root: serde_json::Value, path: &[Value]) -> Result<Option<serde_json::Value>> {
+    let mut current = root;
+    for elem in path {
+        let next = match elem {
+            Value::String(key) => {
+                if let Some(obj) = current.as_object() {
+                    obj.get(key.as_str()).cloned()
+                } else if current.is_array() {
+                    match key.parse::<i64>() {
+                        Ok(idx) => json_array_element(&current, idx),
+                        // A non-numeric key against an array is simply absent.
+                        Err(_) => None,
+                    }
+                } else {
+                    None
+                }
+            }
+            Value::Int2(idx) => json_array_element(&current, i64::from(*idx)),
+            Value::Int4(idx) => json_array_element(&current, i64::from(*idx)),
+            Value::Int8(idx) => json_array_element(&current, *idx),
+            Value::Null => return Ok(None),
+            other => {
+                return Err(Error::query_execution(format!(
+                    "a JSON path element must be a text key or an integer subscript, but got {}",
+                    describe_operand(other)
+                )))
+            }
+        };
+        match next {
+            Some(found) => current = found,
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(current))
 }
 
 /// PostgreSQL type name for a declared [`DataType`] — what `pg_typeof` and

@@ -4828,24 +4828,23 @@ impl<'a> Planner<'a> {
             SqlBinaryOp::QuestionAnd => Ok(BinaryOperator::JsonExistsAll),
             // PostgreSQL vector operators
             SqlBinaryOp::Spaceship => Ok(BinaryOperator::VectorCosineDistance),
-            // `#>` is PostgreSQL's JSON *path-extraction* operator, not a vector
-            // operator — sqlparser's `HashArrow` renders as `#>` (operator.rs:294).
-            // It was mapped to VectorInnerProduct, so `jsonb_col #> '{a,b}'`
-            // silently computed an inner product instead of extracting a path: a
-            // wrong answer rather than an error. pgvector's inner product is
-            // spelled `<#>` and is handled by the custom-operator arm below, so
-            // nothing vector-related depends on this mapping.
+            // PostgreSQL JSON *path-extraction* operators: `jsonb #> text[]`
+            // and `jsonb #>> text[]`. sqlparser renders `HashArrow` as `#>` and
+            // `HashLongArrow` as `#>>`.
             //
-            // `#>` / `#>>` are not implemented. They error loudly here rather
-            // than resolving to an unrelated operator; implementing them needs
-            // JsonPathGet/JsonPathGetText variants (APPENDED — BinaryOperator is
-            // reachable from the bincode-persisted LogicalExpr) plus evaluator
-            // arms. Tracked as a follow-up.
-            SqlBinaryOp::HashArrow | SqlBinaryOp::HashLongArrow => Err(Error::query_execution(
-                "JSON path operators `#>` and `#>>` are not supported yet. \
-                 Use `->`/`->>` to step one level at a time (chain them for a path), \
-                 or the `jsonb_extract_path`/`jsonb_extract_path_text` functions.",
-            )),
+            // History, because it is the reason this arm is commented at all:
+            // `HashArrow` used to be mapped to `VectorInnerProduct`, so
+            // `jsonb_col #> '{a,b}'` silently computed a vector inner product
+            // instead of extracting a path — a wrong answer (a number where a
+            // JSON value belongs), not an error. pgvector's inner product is
+            // spelled `<#>` and is handled by the custom-operator arm below, so
+            // nothing vector-related ever depended on that mapping. v4.21.0
+            // replaced it with a loud error; these two variants replace the
+            // error with the real thing. `JsonPathGet` / `JsonPathGetText` are
+            // APPENDED at the end of `BinaryOperator` — it is reachable from the
+            // bincode-persisted `LogicalExpr`.
+            SqlBinaryOp::HashArrow => Ok(BinaryOperator::JsonPathGet),
+            SqlBinaryOp::HashLongArrow => Ok(BinaryOperator::JsonPathGetText),
             // String concatenation operator: ||
             SqlBinaryOp::StringConcat => Ok(BinaryOperator::StringConcat),
             // Postgres FTS match operator: tsvector @@ tsquery

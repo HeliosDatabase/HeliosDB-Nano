@@ -190,6 +190,10 @@ pub use catalog::PersistedIndexDefinition;
 // The ONE index-type → owning-structure classifier, shared by CREATE INDEX,
 // DROP INDEX and the open-time rebuild so the mapping cannot drift again.
 pub use catalog::{index_family, IndexFamily};
+// The ONE physical-teardown body behind that classifier, shared by DROP INDEX
+// (`sql::executor::ddl::handle_drop_index`) and DROP TABLE
+// (`Catalog::drop_table_index_definitions`).
+pub(crate) use catalog::teardown_index_structures;
 pub use catalog::{PersistedSeqState, PersistedSequence, DEFAULT_SEQUENCE_CACHE};
 // Role / ACL catalog (HC4 storage slice). STORED AND INTROSPECTABLE ONLY —
 // nothing in the engine enforces a privilege; see `AclRecord`'s doc comment.

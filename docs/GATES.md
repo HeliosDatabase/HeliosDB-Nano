@@ -30,6 +30,42 @@ flock /home/gpc/HDB/sprint/coordination/build.lock \
   ephemeral probe (`TcpListener::bind("127.0.0.1:0")`) + a negotiation timeout.
 - Exact-PID kills only, never pattern-match `pkill` (other live heliosdb processes).
 
+## CI coverage (as of v4.22.0)
+
+`.github/workflows/tests.yml` closes the gap this document previously recorded as
+"the integration suite has zero CI execution". Three tiers:
+
+| Job | Trigger | Blocking | What it runs |
+|---|---|---|---|
+| `integration-smoke` | every PR + push to main | yes | `--lib` plus 16 curated integration targets covering the defect classes this project has actually shipped |
+| `integration-full` | nightly, `v*` tags, manual | yes for a tag | the whole `tests/` suite, sharded 6 ways |
+| `feature-gated-compile` | every PR | yes | `cargo build --features internal-tests --tests` — compile only |
+
+**Why it was not done sooner, and what makes it possible.** `cargo test --tests`
+builds every file in `tests/` as its own target (272 files; there are no `[[test]]`
+entries in `Cargo.toml`), and the debug binaries total ~67 GiB. A GitHub-hosted
+standard runner has ~14 GB of usable disk, so a single-job full run cannot
+physically fit. `CARGO_PROFILE_TEST_DEBUG=0` is set in the workflow env only —
+measured, ~74% of each test binary is DWARF — which takes the set to ~21 GiB, and
+the full run is sharded on top of that. Local `cargo test` keeps its debug info.
+
+**Cost.** The repository is public, so GitHub-hosted standard runners are free with
+unlimited minutes. The cost of this workflow is wall-clock and maintenance, not
+spend.
+
+**What it does and does not buy — read this before relying on it.** It does NOT
+mean CI would have caught the defects found in the 2026-08 campaign: the regression
+suites for the encryption hole, the vanishing indexes and the MERGE BRANCH no-op
+were new files shipped *with* their fixes, and no CI can catch a defect nobody wrote
+a test for. What it buys is that the ~5,200 tests which now exist can no longer rot
+unobserved — which is precisely what happened to the `internal-tests` feature, whose
+15 files stopped compiling for months with nothing to notice.
+
+**The empty-suite check is a hard failure.** Every tier greps its own log for
+`test result: ok. 0 passed; 0 failed; 0 ignored` and fails the job. §3b explains
+why: a suite that ran nothing reports success, and that is how the `internal-tests`
+rot stayed invisible.
+
 ## The gates
 
 ### 1. `cargo test --lib` — the cheapest signal

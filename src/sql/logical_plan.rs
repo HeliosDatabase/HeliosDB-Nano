@@ -1661,6 +1661,8 @@ fn binary_operator_sql(op: BinaryOperator) -> &'static str {
         BinaryOperator::VectorInnerProduct => "<#>",
         BinaryOperator::JsonGet => "->",
         BinaryOperator::JsonGetText => "->>",
+        BinaryOperator::JsonPathGet => "#>",
+        BinaryOperator::JsonPathGetText => "#>>",
         BinaryOperator::JsonContains => "@>",
         BinaryOperator::JsonContainedBy => "<@",
         BinaryOperator::JsonExists => "?",
@@ -1850,6 +1852,23 @@ pub enum BinaryOperator {
     // Full-text search operators
     /// Text-search match: tsvector @@ tsquery → boolean
     TsMatch,
+
+    // ── APPEND-ONLY BOUNDARY ────────────────────────────────────────────────
+    // `BinaryOperator` is reached from `LogicalExpr::BinaryExpr`, which is
+    // bincode-encoded POSITIONALLY and PERSISTED (materialized-view query
+    // plans, view definitions, column defaults, the trigger row-mutation
+    // sidecar). bincode writes an enum as its *discriminant index*, so
+    // inserting a variant anywhere above this line renumbers every later
+    // variant and silently reinterprets already-stored plans — an `@>` written
+    // yesterday would decode as an unrelated operator today. New variants go
+    // BELOW, never in the middle, no matter how much better they would read
+    // next to their thematic neighbours.
+    /// Extract JSON sub-object at a path: `#>` → jsonb.
+    /// APPENDED after `TsMatch` (was the last variant at v4.22.0).
+    JsonPathGet,
+    /// Extract JSON sub-object at a path as text: `#>>` → text.
+    /// APPENDED after `JsonPathGet`; same append-only rule.
+    JsonPathGetText,
 }
 
 /// Unary operator
@@ -2700,5 +2719,126 @@ mod tests {
         };
 
         assert_eq!(plan.schema().columns.len(), 1);
+    }
+}
+
+/// Wire-format tripwire for [`BinaryOperator`].
+///
+/// `BinaryOperator` is reached from [`LogicalExpr::BinaryExpr`], which is
+/// bincode-encoded and PERSISTED — materialized-view query plans
+/// (`src/sql/executor/phase3.rs`), view definitions, column defaults, the
+/// trigger row-mutation sidecar. bincode writes a fieldless enum as its
+/// *declaration index*, so inserting a variant anywhere but the end renumbers
+/// every later one and makes already-stored plans decode as a DIFFERENT
+/// operator. There is no version tag on those bytes and no error when it
+/// happens: an `@>` written yesterday would simply start meaning something
+/// else.
+///
+/// The list below is the recorded on-disk order. Growing it at the END is the
+/// only legal edit. Reordering, removing, or inserting into the middle fails
+/// this test — which is the entire point.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+mod binary_operator_wire_format_tests {
+    use super::{binary_operator_sql, BinaryOperator};
+
+    /// Declaration order as persisted. APPEND ONLY.
+    const DECLARED_ORDER: [BinaryOperator; 40] = [
+        BinaryOperator::Plus,
+        BinaryOperator::Minus,
+        BinaryOperator::Multiply,
+        BinaryOperator::Divide,
+        BinaryOperator::Modulo,
+        BinaryOperator::Eq,
+        BinaryOperator::NotEq,
+        BinaryOperator::IsDistinctFrom,
+        BinaryOperator::IsNotDistinctFrom,
+        BinaryOperator::Lt,
+        BinaryOperator::LtEq,
+        BinaryOperator::Gt,
+        BinaryOperator::GtEq,
+        BinaryOperator::And,
+        BinaryOperator::Or,
+        BinaryOperator::Like,
+        BinaryOperator::NotLike,
+        BinaryOperator::ILike,
+        BinaryOperator::NotILike,
+        BinaryOperator::RegexMatch,
+        BinaryOperator::RegexIMatch,
+        BinaryOperator::NotRegexMatch,
+        BinaryOperator::NotRegexIMatch,
+        BinaryOperator::SimilarTo,
+        BinaryOperator::NotSimilarTo,
+        BinaryOperator::VectorL2Distance,
+        BinaryOperator::VectorCosineDistance,
+        BinaryOperator::VectorInnerProduct,
+        BinaryOperator::JsonGet,
+        BinaryOperator::JsonGetText,
+        BinaryOperator::JsonContains,
+        BinaryOperator::JsonContainedBy,
+        BinaryOperator::JsonExists,
+        BinaryOperator::JsonExistsAny,
+        BinaryOperator::JsonExistsAll,
+        BinaryOperator::ArrayConcat,
+        BinaryOperator::StringConcat,
+        BinaryOperator::TsMatch,
+        // ── appended in v4.23 (item #98) ──
+        BinaryOperator::JsonPathGet,
+        BinaryOperator::JsonPathGetText,
+    ];
+
+    /// bincode 1.3's default configuration (`with_fixint_encoding`) writes a
+    /// fieldless enum's variant as a fixed-width little-endian `u32`; see
+    /// `serialize_unit_variant` in bincode's serializer. That is the byte the
+    /// persisted plans carry.
+    fn persisted_variant_index(op: BinaryOperator) -> u32 {
+        let bytes = bincode::serialize(&op).expect("BinaryOperator derives Serialize");
+        assert_eq!(
+            bytes.len(),
+            4,
+            "bincode changed its fieldless-enum encoding for {op:?}; every persisted \
+             LogicalExpr on disk is written with the old one"
+        );
+        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+    }
+
+    #[test]
+    fn binary_operator_discriminants_are_append_only() {
+        for (position, op) in DECLARED_ORDER.into_iter().enumerate() {
+            assert_eq!(
+                persisted_variant_index(op) as usize,
+                position,
+                "{op:?} moved to discriminant {} but every already-persisted plan was \
+                 written with {position}. A BinaryOperator variant was inserted or \
+                 removed in the middle of the enum — append instead.",
+                persisted_variant_index(op)
+            );
+        }
+    }
+
+    #[test]
+    fn every_binary_operator_round_trips_through_bincode() {
+        for op in DECLARED_ORDER {
+            let bytes = bincode::serialize(&op).unwrap();
+            let decoded: BinaryOperator = bincode::deserialize(&bytes).unwrap();
+            assert_eq!(decoded, op, "bincode round-trip lost {op:?}");
+        }
+    }
+
+    /// `binary_operator_sql` is what view / default readback emits, so a
+    /// missing spelling is a silently wrong `CREATE VIEW` body.
+    #[test]
+    fn every_binary_operator_has_a_sql_spelling() {
+        for op in DECLARED_ORDER {
+            assert!(
+                !binary_operator_sql(op).is_empty(),
+                "{op:?} renders as the empty string"
+            );
+        }
+        assert_eq!(binary_operator_sql(BinaryOperator::JsonPathGet), "#>");
+        assert_eq!(binary_operator_sql(BinaryOperator::JsonPathGetText), "#>>");
+        // The v4.21.0 mishap in reverse: `#>` must never render as the vector
+        // inner product's spelling, and `<#>` must stay with the vector op.
+        assert_eq!(binary_operator_sql(BinaryOperator::VectorInnerProduct), "<#>");
     }
 }

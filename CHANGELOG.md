@@ -7,6 +7,125 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.23.0] - 2026-08-31
+
+Ten backlog items, most of them found by an ACID audit rather than reported. Several are
+silent wrong answers on the wire; two are transaction-boundary bugs.
+
+### Fixed — SQLSTATE could depend on the CONTENT of your data
+
+`sqlstate_for_error` classified constraint violations by substring, and the unique-violation
+arm was tested BEFORE the foreign-key arm. Because the foreign-key message interpolates the
+offending row's values, `INSERT INTO child VALUES (1, 'unique')` against a missing parent
+reported **23505 unique_violation instead of 23503 foreign_key_violation** — the error code
+depended on what the user's data happened to contain. Both arms now anchor on structural
+phrases, foreign key first.
+
+### Fixed — ordinary table names misclassified by the SQLSTATE classifier
+
+Three bare-substring arms (added in 4.20.0) mapped `Table 'roles' does not exist` to 42704
+instead of 42P01, `Table 'functions'` to 42883, `Table 'columns'` to 42703, and — because
+the role arms preceded the column arm — `Column 'role' not found` to 42704. Every arm now
+anchors on the shape its emitters actually produce.
+
+The anchors are backed by a full emitter audit, which is the part that made them correct:
+`role` has 9 emitters, all double-quoted, so excluding table/relation messages is safe;
+`function` has 8, of which **3 are unquoted** (`Unknown scalar function: …`), so its anchor
+needs that alternative and must NOT exclude "table" — `Unknown table function` contains it.
+
+Also: `Column 'c' already exists` now maps to 42701 (was 42P07, duplicate *table*), and
+`Function 'f' already exists` to 42723 (was XX000).
+
+### Fixed — `END;` did not commit, `ROLLBACK WORK;` did not roll back
+
+Four independent copies of the transaction-control classifier all prefix-matched
+`BEGIN`/`START TRANSACTION` but used exact matching for `COMMIT`/`ROLLBACK`. sqlparser maps
+`END` to `Statement::Commit`, and `COMMIT WORK` / `ROLLBACK WORK` / `ROLLBACK TRANSACTION`
+are ordinary PostgreSQL spellings — all reached the wrong executor. Replaced by ONE
+classifier accepting `END`, `ABORT`, `COMMIT`/`ROLLBACK [WORK|TRANSACTION] [AND [NO] CHAIN]`
+and `ROLLBACK TO [SAVEPOINT] n`.
+
+Two hazards the collapse exposed and closed: `ROLLBACK TO SAVEPOINT` is a distinct
+non-boundary variant (treating it as a plain ROLLBACK silently converts a partial rollback
+into a full one), and `AND CHAIN` genuinely chains (accepting the spelling without
+re-opening would leave every following statement autocommitting).
+
+### Fixed — an unknown column in an INSERT column list was silently dropped
+
+`INSERT INTO t (no_such_col) VALUES (1)` dropped the unknown name, shifting every later
+value, and then failed with "More values than columns specified" — a message naming neither
+the column nor the problem, classified as XX000. All three sites (text VALUES, text SELECT,
+params SELECT) now share one resolver that errors with the column name and 42703.
+
+### Changed — `SERIALIZABLE` now tells you what it actually is
+
+There is no read-set tracking in the engine, so `SERIALIZABLE` and `REPEATABLE READ` are
+byte-identical and both are snapshot isolation: **write skew is not prevented**. Requesting
+it now emits a PostgreSQL WARNING on the wire naming the anomaly, and the new
+`[storage] serializable_policy = "warn" | "error"` can refuse it outright for deployments
+that need the guarantee or nothing. There is deliberately no silent-accept setting. Real SSI
+remains unimplemented and is not claimed anywhere.
+
+### Changed — DDL is documented as non-transactional, and the test now says so
+
+`BEGIN; DROP TABLE t; ROLLBACK;` destroys the table permanently. The only guarding test
+asserted `rows.is_empty() || rows.len() == 1` — a tautology that could never fail. Replaced
+with a test that pins the real behaviour, and documented in the README and the transactions
+skill. Making DDL transactional is tracked separately.
+
+### Fixed — DROP TABLE leaked vector indexes and index definitions
+
+`Catalog::drop_table` dropped ART indexes only, leaving vector-index registrations and
+`meta:index:` definitions behind. Orphaned definitions do worse than warn at every open: a
+later `CREATE TABLE` with the same name **inherits them**, which for a vector index means
+silently wrong kNN results. Teardown now runs from the one catalog funnel, so WAL replay and
+the partition cascade get it too.
+
+### Fixed — RENAME TABLE stranded trigger records
+
+Trigger definitions and row-mutation recipes were not re-keyed, so triggers stopped firing
+and the records were orphaned under a name that no longer existed. (The DROP half was
+already handled.)
+
+### Fixed — one open transaction anywhere slowed down every other session
+
+`COPY` demoted to a ~10× slower fallback, and — previously unfiled — plan normalization was
+disabled for **all** sessions' reads, whenever any unrelated session held an open
+transaction, because the gate consulted a process-wide counter. Both now consult the
+caller's own transaction state. Measured effect on the vs-PostgreSQL benchmark: indexed
+point-reads improved from 14,606 to 16,063 TPS (simple) and 9,729 to 11,350 (extended).
+
+### Added — `#>` and `#>>` JSON path operators
+
+Implemented, delegating to the existing `jsonb_extract_path` traversal so the function and
+operator forms cannot diverge. (In 4.22.0 `#>` was corrected from silently computing a
+vector inner product to erroring.) The traversal also gained the array-index-as-text case
+(`'{items,0}'`) the old loop returned NULL for.
+
+### Internal — the last duplicate of the PK-literal coercion rule is gone
+
+`scan.rs`'s private copy is removed; all six call sites now share one function. A drift
+between the read probe and the write probe is exactly what caused the 4.22.0 write-loss bug.
+Pinned by a ~45-row coercion matrix and a bincode discriminant test asserting every
+`BinaryOperator` variant's on-disk index equals its declaration position.
+
+### Added — CI finally runs the integration suite
+
+`.github/workflows/tests.yml`: a blocking 16-target smoke on every PR, the full suite sharded
+six ways nightly and on release tags, and a compile-only job for the `internal-tests` feature
+(15 files that silently stopped compiling for months). Every tier fails on an empty suite —
+`ok. 0 passed` is treated as failure, not success.
+
+This was never a cost question: the repository is public, so runners are free. It was a
+physical one — `cargo test --tests` builds 272 targets totalling ~67 GiB of debug binaries
+against a runner's ~14 GB disk. `CARGO_PROFILE_TEST_DEBUG=0` (CI env only; ~74% of each
+binary is DWARF) plus sharding makes it fit.
+
+**Honest scope:** this would NOT have caught the defects found in the 4.20–4.22 campaign —
+their regression suites shipped WITH the fixes, and no CI catches a defect nobody wrote a
+test for. What it buys is that the ~5,200 tests which now exist can no longer rot unobserved.
+
+
 ## [4.22.0] - 2026-08-31
 
 Four externally-reported issues, filed against 4.21.0 by a user evaluating Nano as a vector

@@ -2691,3 +2691,637 @@ async fn wire_information_schema_exposes_foreign_key_reflection() {
     );
     assert_eq!(tc.first().and_then(|r| cell(r, 0)).as_deref(), Some("FOREIGN KEY"));
 }
+
+// ---------------------------------------------------------------------------
+// Task #89 / #86 — driver-facing error SQLSTATEs for NON-ROW-RETURNING
+// statements, and the object-noun anchors that produce them.
+//
+// Everything below is driven through `dispatch_message` — the connection run
+// loop's own body — for the reason spelled out on `wire_role_error_sqlstates`:
+// a failing DDL/DML statement deliberately propagates out of
+// `handle_single_query`, and the ErrorResponse a client actually receives is
+// rendered one level up. Each case asserts the full three-part contract:
+//
+//   1. the SQLSTATE the driver branches on,
+//   2. that a REJECTED statement is NOT also acknowledged with a CommandComplete
+//      (the "silently succeeded" shape), and
+//   3. that a ReadyForQuery follows, so the connection stays usable.
+// ---------------------------------------------------------------------------
+
+/// Transaction-status byte carried by each `ReadyForQuery`:
+/// `I` idle, `T` inside a transaction block, `E` failed transaction.
+fn ready_for_query_statuses(bytes: &[u8]) -> Vec<u8> {
+    parse_messages(bytes)
+        .into_iter()
+        .filter(|(ty, _)| *ty == b'Z')
+        .filter_map(|(_, payload)| payload.first().copied())
+        .collect()
+}
+
+/// Send one simple query through the run-loop body and return the raw reply.
+/// Boxed rather than a plain `async fn`, and that is load-bearing.
+///
+/// `dispatch_message`'s future is ~65 KB (clippy's `large_futures` lint flags it).
+/// An `async fn`'s state is inlined into its CALLER's future, so a test issuing a
+/// dozen statements accumulates a dozen copies and blows the 2 MB test-thread
+/// stack — observed as `fatal runtime error: stack overflow` aborting the WHOLE
+/// lib test binary with SIGABRT, which takes ~2,300 unrelated tests down with it
+/// and reports no result at all. Boxing makes each await cost one pointer.
+fn wire_query<'a>(
+    handler: &'a mut PgConnectionHandler<DuplexStream>,
+    client: &'a mut DuplexStream,
+    sql: &'a str,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<u8>> + 'a>> {
+    use super::messages::FrontendMessage;
+    Box::pin(async move {
+        handler
+            .dispatch_message(FrontendMessage::Query { query: sql.into() })
+            .await
+            .unwrap_or_else(|e| panic!("dispatch `{sql}`: {e}"));
+        drain(client).await
+    })
+}
+
+/// Setup statement that must not produce an ErrorResponse.
+fn wire_setup<'a>(
+    handler: &'a mut PgConnectionHandler<DuplexStream>,
+    client: &'a mut DuplexStream,
+    sql: &'a str,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>> {
+    Box::pin(async move {
+        let out = wire_query(handler, client, sql).await;
+        assert!(
+            sqlstates(&out).is_empty(),
+            "setup `{sql}` must succeed over the wire, got {:?}",
+            sqlstates(&out)
+        );
+    })
+}
+
+/// A statement that must be rejected with exactly `code`, with no command tag
+/// and with a trailing ReadyForQuery.
+fn assert_wire_sqlstate<'a>(
+    handler: &'a mut PgConnectionHandler<DuplexStream>,
+    client: &'a mut DuplexStream,
+    sql: &'a str,
+    code: &'a str,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>> {
+    Box::pin(async move {
+        let out = wire_query(handler, client, sql).await;
+        assert_eq!(
+            sqlstates(&out),
+            vec![code.to_string()],
+            "`{sql}` must map to SQLSTATE {code}"
+        );
+        assert!(
+            command_tags(&out).is_empty(),
+            "`{sql}` was rejected and must not also be acked, got {:?}",
+            command_tags(&out)
+        );
+        assert!(
+            parse_messages(&out).iter().any(|(ty, _)| *ty == b'Z'),
+            "`{sql}` must be followed by ReadyForQuery"
+        );
+    })
+}
+
+/// #89, the role arms. `roles` / `user_roles` are ordinary table names — Rails,
+/// Django and Supabase schemas all ship them — and through v4.21.0 the bare
+/// `lower.contains("role")` arms (shipped live in v4.20.0) reclassified every
+/// error about them: `Table 'roles' does not exist` returned 42704
+/// undefined_object instead of 42P01 undefined_table, and `already exists`
+/// returned 42710 instead of 42P07.
+///
+/// The second half is the point: a GENUINE role error must still be classified
+/// as one, so the fix is an anchor and not a blanket disable.
+#[tokio::test]
+async fn wire_role_named_table_still_maps_to_undefined_table() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+
+    for sql in ["SELECT * FROM roles", "SELECT * FROM user_roles"] {
+        assert_wire_sqlstate(&mut handler, &mut client, sql, "42P01").await;
+    }
+
+    wire_setup(
+        &mut handler,
+        &mut client,
+        "CREATE TABLE user_roles (id INT PRIMARY KEY, label TEXT)",
+    )
+    .await;
+    assert_wire_sqlstate(
+        &mut handler,
+        &mut client,
+        "CREATE TABLE user_roles (id INT PRIMARY KEY, label TEXT)",
+        "42P07",
+    )
+    .await;
+
+    // The anchor half: every role emitter writes `role "<name>"`, so real role
+    // errors keep their codes.
+    assert_wire_sqlstate(&mut handler, &mut client, "DROP ROLE nosuchrole", "42704").await;
+    assert_wire_sqlstate(&mut handler, &mut client, "ALTER ROLE nosuchrole WITH LOGIN", "42704").await;
+    // `postgres` is reserved (`storage::RESERVED_ROLE_NAMES`) → 42501.
+    assert_wire_sqlstate(&mut handler, &mut client, "CREATE ROLE postgres", "42501").await;
+}
+
+/// #89, the ORDERING half of the role bug. The role arms sit ahead of the
+/// column arm, so a message that mentions BOTH — `Column 'user_role' not found`
+/// — used to be classified as an undefined ROLE (42704) instead of an undefined
+/// COLUMN (42703). psycopg/Django raise `UndefinedColumn` on 42703.
+#[tokio::test]
+async fn wire_column_whose_name_contains_role_maps_to_undefined_column() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+
+    // A row is required: projection expressions are evaluated per row, so an
+    // empty table returns zero rows instead of the column error.
+    wire_setup(
+        &mut handler,
+        &mut client,
+        "CREATE TABLE role_probe (id INT PRIMARY KEY, label TEXT)",
+    )
+    .await;
+    wire_setup(&mut handler, &mut client, "INSERT INTO role_probe VALUES (1, 'x')").await;
+
+    assert_wire_sqlstate(&mut handler, &mut client, "SELECT user_role FROM role_probe", "42703").await;
+    assert_wire_sqlstate(&mut handler, &mut client, "SELECT nosuchcol FROM role_probe", "42703").await;
+}
+
+/// #89, the function and column arms. `functions` and `columns` are ordinary
+/// table names; `Table 'functions' does not exist` used to return 42883
+/// undefined_function and `Table 'columns' does not exist` 42703
+/// undefined_column, because both arms were bare `contains` tests sitting ahead
+/// of the table rules.
+#[tokio::test]
+async fn wire_function_and_column_named_tables_still_map_to_undefined_table() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+
+    for sql in ["SELECT * FROM functions", "SELECT * FROM columns"] {
+        assert_wire_sqlstate(&mut handler, &mut client, sql, "42P01").await;
+    }
+
+    wire_setup(&mut handler, &mut client, "CREATE TABLE columns (id INT PRIMARY KEY)").await;
+    assert_wire_sqlstate(
+        &mut handler,
+        &mut client,
+        "CREATE TABLE columns (id INT PRIMARY KEY)",
+        "42P07",
+    )
+    .await;
+}
+
+/// #89, the anchor's hardest requirement: the UNQUOTED function emitters.
+///
+/// `Unknown scalar function: f` (src/sql/evaluator.rs) and
+/// `Unknown window function: F` (src/sql/planner.rs) do not quote the name, so
+/// an anchor built only from `function '` / `function "` would have demoted the
+/// single most common function error a driver ever sees from 42883 to
+/// `XX000 internal_error` — strictly WORSE than the wrong-but-specific code the
+/// audit set out to fix. That degradation is what the `function: ` alternative
+/// exists for, and this is its regression test.
+#[tokio::test]
+async fn wire_unquoted_unknown_function_shapes_map_to_undefined_function() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+
+    wire_setup(&mut handler, &mut client, "CREATE TABLE fn_probe (id INT PRIMARY KEY)").await;
+    wire_setup(&mut handler, &mut client, "INSERT INTO fn_probe VALUES (1)").await;
+
+    // `Unknown scalar function: no_such_scalar_fn`
+    assert_wire_sqlstate(
+        &mut handler,
+        &mut client,
+        "SELECT no_such_scalar_fn(id) FROM fn_probe",
+        "42883",
+    )
+    .await;
+    // `Unknown window function: NO_SUCH_WINDOW_FN`
+    assert_wire_sqlstate(
+        &mut handler,
+        &mut client,
+        "SELECT no_such_window_fn() OVER () FROM fn_probe",
+        "42883",
+    )
+    .await;
+}
+
+/// #89 bonus arms, both same-class and both previously wrong:
+///
+/// * `Column 'c' already exists in table 't'` reached the
+///   `(table||relation) && already exists` arm and reported 42P07
+///   duplicate_TABLE for a duplicate COLUMN. PostgreSQL uses 42701.
+/// * `Function 'f' already exists` matched nothing and reported
+///   `XX000 internal_error`. PostgreSQL uses 42723.
+#[tokio::test]
+async fn wire_duplicate_column_and_duplicate_function_sqlstates() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+
+    wire_setup(&mut handler, &mut client, "CREATE TABLE dup_col (id INT PRIMARY KEY)").await;
+    assert_wire_sqlstate(
+        &mut handler,
+        &mut client,
+        "ALTER TABLE dup_col ADD COLUMN id INT",
+        "42701",
+    )
+    .await;
+
+    wire_setup(
+        &mut handler,
+        &mut client,
+        "CREATE FUNCTION dup_fn() RETURNS INTEGER LANGUAGE sql AS $$SELECT 1$$",
+    )
+    .await;
+    assert_wire_sqlstate(
+        &mut handler,
+        &mut client,
+        "CREATE FUNCTION dup_fn() RETURNS INTEGER LANGUAGE sql AS $$SELECT 1$$",
+        "42723",
+    )
+    .await;
+}
+
+/// #86 P0 — the missing cell. 23503 foreign_key_violation had NO coverage of
+/// any kind (no wire test, no unit test), and it is the code an ORM branches on
+/// to distinguish "your parent row is missing" from "retry this upsert".
+///
+/// Also the substring-hijack boundary: the FK message interpolates the OFFENDING
+/// PARENT VALUES, so with the classifier's `contains("unique")` arm sitting
+/// ahead of the `foreign key` arm, inserting the literal text `unique` against a
+/// missing parent reported 23505 unique_violation — and an ON CONFLICT retry
+/// loop keyed on 23505 would retry forever. The reverse direction is asserted
+/// too, so the fix is an anchor and not a reordering that merely moves the bug.
+#[tokio::test]
+async fn wire_fk_violation_is_23503_and_is_not_hijacked_by_unique() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+
+    for stmt in [
+        "CREATE TABLE fk_parent (id INT PRIMARY KEY)",
+        "CREATE TABLE fk_child (id INT PRIMARY KEY, pid INT REFERENCES fk_parent(id) ON DELETE RESTRICT)",
+        "INSERT INTO fk_parent VALUES (1)",
+        "INSERT INTO fk_child VALUES (10, 1)",
+    ] {
+        wire_setup(&mut handler, &mut client, stmt).await;
+    }
+
+    // INSERT, UPDATE and the ON DELETE RESTRICT parent delete are three
+    // different emitters; all three are 23503.
+    assert_wire_sqlstate(
+        &mut handler,
+        &mut client,
+        "INSERT INTO fk_child VALUES (11, 999)",
+        "23503",
+    )
+    .await;
+    assert_wire_sqlstate(
+        &mut handler,
+        &mut client,
+        "UPDATE fk_child SET pid = 998 WHERE id = 10",
+        "23503",
+    )
+    .await;
+    assert_wire_sqlstate(&mut handler, &mut client, "DELETE FROM fk_parent WHERE id = 1", "23503").await;
+
+    // The hijack: the offending value is the literal text `unique`.
+    for stmt in [
+        "CREATE TABLE unique_codes (code TEXT PRIMARY KEY)",
+        "CREATE TABLE code_child (id INT PRIMARY KEY, code TEXT REFERENCES unique_codes(code))",
+    ] {
+        wire_setup(&mut handler, &mut client, stmt).await;
+    }
+    assert_wire_sqlstate(
+        &mut handler,
+        &mut client,
+        "INSERT INTO code_child VALUES (1, 'unique')",
+        "23503",
+    )
+    .await;
+
+    // ... and the other direction: a GENUINE unique violation on a table whose
+    // name contains "foreign" must still be 23505.
+    wire_setup(
+        &mut handler,
+        &mut client,
+        "CREATE TABLE foreign_key_registry (id INT PRIMARY KEY)",
+    )
+    .await;
+    wire_setup(&mut handler, &mut client, "INSERT INTO foreign_key_registry VALUES (1)").await;
+    assert_wire_sqlstate(
+        &mut handler,
+        &mut client,
+        "INSERT INTO foreign_key_registry VALUES (1)",
+        "23505",
+    )
+    .await;
+}
+
+/// #86 P1 — 42P01 and 42703 were covered only through SELECT. These are the
+/// non-row-returning routes: different planner paths, same codes.
+#[tokio::test]
+async fn wire_dml_against_missing_table_and_column_sqlstates() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+
+    for sql in [
+        "INSERT INTO ghost_table VALUES (1)",
+        "UPDATE ghost_table SET x = 1",
+        "DELETE FROM ghost_table",
+    ] {
+        assert_wire_sqlstate(&mut handler, &mut client, sql, "42P01").await;
+    }
+
+    wire_setup(&mut handler, &mut client, "CREATE TABLE dml_probe (id INT PRIMARY KEY)").await;
+    assert_wire_sqlstate(
+        &mut handler,
+        &mut client,
+        "INSERT INTO dml_probe (no_such_col) VALUES (1)",
+        "42703",
+    )
+    .await;
+}
+
+/// #86 P0 — the EXTENDED protocol, which had ZERO error-SQLSTATE coverage even
+/// though it is the family every real driver uses (psycopg3, JDBC, sqlx,
+/// node-postgres, Drizzle) and the one the REST/BaaS layer writes through.
+///
+/// Asserts the three things the simple-query path cannot tell you:
+///   * the code matches the simple-query path for the same violation,
+///   * NO ReadyForQuery is emitted before the client's Sync (sending it early
+///     wedges drivers), and
+///   * after Sync the connection is usable again.
+#[tokio::test]
+async fn wire_extended_protocol_dml_error_sqlstates() {
+    use super::messages::FrontendMessage;
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+
+    wire_setup(&mut handler, &mut client, "CREATE TABLE ext_uniq (id INT PRIMARY KEY)").await;
+    wire_setup(&mut handler, &mut client, "INSERT INTO ext_uniq VALUES (1)").await;
+
+    handler
+        .dispatch_message(FrontendMessage::Parse {
+            statement_name: "s_dup".into(),
+            query: "INSERT INTO ext_uniq VALUES ($1)".into(),
+            param_types: vec![23],
+        })
+        .await
+        .expect("parse");
+    handler
+        .dispatch_message(FrontendMessage::Bind {
+            portal_name: "p_dup".into(),
+            statement_name: "s_dup".into(),
+            param_formats: vec![0],
+            params: vec![Some(b"1".to_vec())],
+            result_formats: vec![],
+        })
+        .await
+        .expect("bind");
+    let _ = drain(&mut client).await;
+
+    handler
+        .dispatch_message(FrontendMessage::Execute {
+            portal_name: "p_dup".into(),
+            max_rows: 0,
+        })
+        .await
+        .expect("execute");
+    let out = drain(&mut client).await;
+    assert_eq!(
+        sqlstates(&out),
+        vec!["23505".to_string()],
+        "the extended path must report the same 23505 the simple path does"
+    );
+    assert!(
+        command_tags(&out).is_empty(),
+        "a rejected Execute must not also be acked, got {:?}",
+        command_tags(&out)
+    );
+    assert!(
+        ready_for_query_statuses(&out).is_empty(),
+        "extended-protocol errors must defer ReadyForQuery until Sync"
+    );
+
+    handler.dispatch_message(FrontendMessage::Sync).await.expect("sync");
+    let out = drain(&mut client).await;
+    assert!(
+        !ready_for_query_statuses(&out).is_empty(),
+        "Sync must release the deferred ReadyForQuery"
+    );
+
+    // The connection is still usable.
+    let out = wire_query(&mut handler, &mut client, "SELECT id FROM ext_uniq").await;
+    assert!(
+        sqlstates(&out).is_empty(),
+        "the connection must survive the extended-protocol error, got {:?}",
+        sqlstates(&out)
+    );
+    assert_eq!(data_rows(&out).len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Task #104 — ONE transaction-control classifier.
+//
+// All four copies prefix-matched BEGIN/START TRANSACTION but used an EXACT
+// `eq_ignore_ascii_case` for COMMIT and ROLLBACK, so `END`, `ABORT`,
+// `COMMIT WORK`, `COMMIT TRANSACTION`, `ROLLBACK WORK` and
+// `ROLLBACK TRANSACTION` all fell through to the SQL executor — which has no
+// `Commit` operator. **`END;` did not commit.**
+// ---------------------------------------------------------------------------
+
+/// `END` commits, `ROLLBACK WORK` / `ABORT` roll back, and every spelling
+/// reports the tag PostgreSQL reports (`COMMIT` for END, `ROLLBACK` for ABORT)
+/// and leaves the connection idle.
+#[tokio::test]
+async fn wire_standard_transaction_control_spellings_reach_the_boundary() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+
+    wire_setup(&mut handler, &mut client, "CREATE TABLE txnctl (id INT PRIMARY KEY)").await;
+
+    // END must COMMIT.
+    wire_setup(&mut handler, &mut client, "BEGIN").await;
+    wire_setup(&mut handler, &mut client, "INSERT INTO txnctl VALUES (1)").await;
+    let out = wire_query(&mut handler, &mut client, "END").await;
+    assert!(
+        sqlstates(&out).is_empty(),
+        "`END` must not error (it used to reach `Operator not yet implemented: Commit`), got {:?}",
+        sqlstates(&out)
+    );
+    assert_eq!(
+        command_tags(&out),
+        vec!["COMMIT".to_string()],
+        "PostgreSQL reports END with the COMMIT tag"
+    );
+    assert_eq!(
+        ready_for_query_statuses(&out),
+        vec![b'I'],
+        "`END` must leave the connection idle, not inside a transaction"
+    );
+    let out = wire_query(&mut handler, &mut client, "SELECT id FROM txnctl").await;
+    assert_eq!(data_rows(&out).len(), 1, "*** `END;` did not commit ***");
+
+    // ROLLBACK WORK must roll back.
+    wire_setup(&mut handler, &mut client, "BEGIN").await;
+    wire_setup(&mut handler, &mut client, "INSERT INTO txnctl VALUES (2)").await;
+    let out = wire_query(&mut handler, &mut client, "ROLLBACK WORK").await;
+    assert!(sqlstates(&out).is_empty(), "`ROLLBACK WORK` must not error");
+    assert_eq!(command_tags(&out), vec!["ROLLBACK".to_string()]);
+    let out = wire_query(&mut handler, &mut client, "SELECT id FROM txnctl").await;
+    assert_eq!(data_rows(&out).len(), 1, "*** `ROLLBACK WORK;` did not roll back ***");
+
+    // ABORT is PostgreSQL's synonym for ROLLBACK.
+    wire_setup(&mut handler, &mut client, "BEGIN").await;
+    wire_setup(&mut handler, &mut client, "INSERT INTO txnctl VALUES (3)").await;
+    let out = wire_query(&mut handler, &mut client, "ABORT").await;
+    assert!(sqlstates(&out).is_empty(), "`ABORT` must not error");
+    assert_eq!(command_tags(&out), vec!["ROLLBACK".to_string()]);
+    let out = wire_query(&mut handler, &mut client, "SELECT id FROM txnctl").await;
+    assert_eq!(data_rows(&out).len(), 1, "`ABORT` must roll back");
+
+    // COMMIT TRANSACTION.
+    wire_setup(&mut handler, &mut client, "BEGIN").await;
+    wire_setup(&mut handler, &mut client, "INSERT INTO txnctl VALUES (4)").await;
+    let out = wire_query(&mut handler, &mut client, "COMMIT TRANSACTION").await;
+    assert!(sqlstates(&out).is_empty(), "`COMMIT TRANSACTION` must not error");
+    assert_eq!(command_tags(&out), vec!["COMMIT".to_string()]);
+    let out = wire_query(&mut handler, &mut client, "SELECT id FROM txnctl").await;
+    assert_eq!(data_rows(&out).len(), 2, "`COMMIT TRANSACTION` must commit");
+
+    // `AND NO CHAIN` is the default behaviour, spelled out.
+    wire_setup(&mut handler, &mut client, "BEGIN").await;
+    wire_setup(&mut handler, &mut client, "INSERT INTO txnctl VALUES (5)").await;
+    let out = wire_query(&mut handler, &mut client, "COMMIT WORK AND NO CHAIN").await;
+    assert!(sqlstates(&out).is_empty(), "`COMMIT WORK AND NO CHAIN` must not error");
+    assert_eq!(ready_for_query_statuses(&out), vec![b'I']);
+    let out = wire_query(&mut handler, &mut client, "SELECT id FROM txnctl").await;
+    assert_eq!(data_rows(&out).len(), 3);
+}
+
+/// `COMMIT AND CHAIN` must open the NEXT transaction immediately. Accepting the
+/// spelling and then not chaining would leave every following statement
+/// autocommitting — an atomicity hole dressed as success.
+#[tokio::test]
+async fn wire_commit_and_chain_opens_the_next_transaction() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+
+    wire_setup(&mut handler, &mut client, "CREATE TABLE chained (id INT PRIMARY KEY)").await;
+    wire_setup(&mut handler, &mut client, "BEGIN").await;
+    wire_setup(&mut handler, &mut client, "INSERT INTO chained VALUES (1)").await;
+
+    let out = wire_query(&mut handler, &mut client, "COMMIT AND CHAIN").await;
+    assert!(sqlstates(&out).is_empty(), "`COMMIT AND CHAIN` must not error");
+    assert_eq!(
+        ready_for_query_statuses(&out),
+        vec![b'T'],
+        "`AND CHAIN` must leave the connection INSIDE the next transaction"
+    );
+
+    // Proof it is a real transaction: this write is discarded by ROLLBACK.
+    wire_setup(&mut handler, &mut client, "INSERT INTO chained VALUES (2)").await;
+    wire_setup(&mut handler, &mut client, "ROLLBACK").await;
+    let out = wire_query(&mut handler, &mut client, "SELECT id FROM chained").await;
+    assert_eq!(
+        data_rows(&out).len(),
+        1,
+        "the chained transaction's write must be rolled back, so only the committed row survives"
+    );
+}
+
+/// `ROLLBACK TO [SAVEPOINT] n` is NOT a transaction boundary and must never be
+/// intercepted by the transaction-control classifier — doing so would silently
+/// turn a partial rollback into a full one. This pins the CLASSIFICATION, not
+/// the savepoint engine (that contract lives in
+/// `tests/savepoint_rollback_regression_tests.rs`): after `ROLLBACK TO
+/// SAVEPOINT` the connection must STILL be inside the transaction, and the
+/// pre-savepoint work must survive the COMMIT.
+#[tokio::test]
+async fn wire_rollback_to_savepoint_does_not_end_the_transaction() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+
+    wire_setup(&mut handler, &mut client, "CREATE TABLE sp_probe (id INT PRIMARY KEY)").await;
+    wire_setup(&mut handler, &mut client, "BEGIN").await;
+    wire_setup(&mut handler, &mut client, "INSERT INTO sp_probe VALUES (1)").await;
+    wire_setup(&mut handler, &mut client, "SAVEPOINT sp1").await;
+
+    let out = wire_query(&mut handler, &mut client, "ROLLBACK TO SAVEPOINT sp1").await;
+    assert!(
+        sqlstates(&out).is_empty(),
+        "`ROLLBACK TO SAVEPOINT` must not error, got {:?}",
+        sqlstates(&out)
+    );
+    assert_eq!(
+        ready_for_query_statuses(&out),
+        vec![b'T'],
+        "`ROLLBACK TO SAVEPOINT` must leave the transaction OPEN"
+    );
+
+    wire_setup(&mut handler, &mut client, "COMMIT").await;
+    let out = wire_query(&mut handler, &mut client, "SELECT id FROM sp_probe").await;
+    assert_eq!(
+        data_rows(&out).len(),
+        1,
+        "work done before the savepoint must survive the COMMIT"
+    );
+}
+
+/// The extended protocol reaches the SAME classifier: a driver that prepares
+/// `END` (psycopg3, JDBC and sqlx all send Parse/Bind/Execute for statements
+/// they cache) must commit, not receive an executor error.
+#[tokio::test]
+async fn wire_extended_execute_of_end_commits() {
+    use super::messages::FrontendMessage;
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+
+    wire_setup(&mut handler, &mut client, "CREATE TABLE ext_txn (id INT PRIMARY KEY)").await;
+    wire_setup(&mut handler, &mut client, "BEGIN").await;
+    wire_setup(&mut handler, &mut client, "INSERT INTO ext_txn VALUES (1)").await;
+
+    handler
+        .dispatch_message(FrontendMessage::Parse {
+            statement_name: "s_end".into(),
+            query: "END".into(),
+            param_types: vec![],
+        })
+        .await
+        .expect("parse END");
+    handler
+        .dispatch_message(FrontendMessage::Bind {
+            portal_name: "p_end".into(),
+            statement_name: "s_end".into(),
+            param_formats: vec![],
+            params: vec![],
+            result_formats: vec![],
+        })
+        .await
+        .expect("bind END");
+    let _ = drain(&mut client).await;
+    handler
+        .dispatch_message(FrontendMessage::Execute {
+            portal_name: "p_end".into(),
+            max_rows: 0,
+        })
+        .await
+        .expect("execute END");
+    let out = drain(&mut client).await;
+    assert!(
+        sqlstates(&out).is_empty(),
+        "extended `END` must not error, got {:?}",
+        sqlstates(&out)
+    );
+
+    handler.dispatch_message(FrontendMessage::Sync).await.expect("sync");
+    let _ = drain(&mut client).await;
+
+    let out = wire_query(&mut handler, &mut client, "SELECT id FROM ext_txn").await;
+    assert_eq!(
+        data_rows(&out).len(),
+        1,
+        "*** extended-protocol `END` did not commit ***"
+    );
+}
