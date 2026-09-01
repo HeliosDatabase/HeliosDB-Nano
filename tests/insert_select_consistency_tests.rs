@@ -698,47 +698,14 @@ fn pinned_gap_100_insert_select_rows_survive_rollback() {
     );
 }
 
-/// PINS the composite-UNIQUE hole: `Catalog::create_table` only builds ART indexes for
-/// PRIMARY KEY and COLUMN-level UNIQUE (`src/storage/catalog.rs`), so a TABLE-level
-/// `UNIQUE (a, b)` has no index to probe and nothing enforces it — on any write path, on
-/// either family. The shared INSERT … SELECT gate carries the pre-existing probe forward
-/// unchanged rather than inventing a second enforcement mechanism.
-///
-/// WHEN composite UNIQUE indexes land THIS TEST MUST FAIL. Replace it with the rejection
-/// assertion (both families, table unchanged) rather than relaxing it.
-#[test]
-fn pinned_gap_composite_unique_is_enforced_on_neither_family() {
-    fn setup(db: &EmbeddedDatabase) {
-        db.execute("CREATE TABLE cu_dst (id INT PRIMARY KEY, a INT, b INT, UNIQUE (a, b))")
-            .unwrap();
-        db.execute("INSERT INTO cu_dst (id, a, b) VALUES (1, 7, 8)").unwrap();
-        db.execute("CREATE TABLE cu_src (id INT, a INT, b INT)").unwrap();
-        db.execute("INSERT INTO cu_src (id, a, b) VALUES (2, 7, 8)").unwrap();
-    }
-
-    let db = mem_db();
-    setup(&db);
-    db.execute("INSERT INTO cu_dst (id, a, b) SELECT id, a, b FROM cu_src")
-        .expect("text family: composite UNIQUE is not enforced today");
-    let text_rows = rows_in(&db, "cu_dst");
-
-    let db2 = mem_db();
-    setup(&db2);
-    db2.execute_params("INSERT INTO cu_dst (id, a, b) SELECT id, a, b FROM cu_src", &[])
-        .expect("params family: composite UNIQUE is not enforced today");
-    let params_rows = rows_in(&db2, "cu_dst");
-
-    assert_eq!(
-        params_rows, text_rows,
-        "the two families must agree even about a gap: text left {text_rows} row(s), params {params_rows}"
-    );
-    assert_eq!(
-        text_rows, 2,
-        "KNOWN GAP: a table-level UNIQUE (a, b) has no ART index, so the duplicate is \
-         accepted. If this now reports 1, composite UNIQUE is enforced — replace this test \
-         with the rejection assertion rather than deleting it."
-    );
-}
+// #107 CLOSED. This slot held `pinned_gap_composite_unique_is_enforced_on_neither_family`,
+// which asserted that a duplicate under a table-level `UNIQUE (a, b)` WAS accepted, with
+// instructions to replace it with the rejection assertion once composite UNIQUE landed
+// rather than relax or delete it. Composite UNIQUE now has an ART index
+// (`Catalog::register_composite_unique_indexes`), so the pin is replaced as directed —
+// the INSERT … SELECT rejection assertion lives in `tests/composite_unique_tests.rs`
+// (`insert_select_also_rejects_a_composite_duplicate_on_both_families`), next to the
+// rest of the composite-UNIQUE coverage.
 
 // ===========================================================================
 // Regressions the shared gate itself introduced, caught in adversarial review
