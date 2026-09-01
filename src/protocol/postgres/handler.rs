@@ -700,14 +700,41 @@ where
                         return Err(Error::protocol("Expected password message"));
                     }
                 }
+                AuthMethod::Md5 => {
+                    // PostgreSQL MD5 authentication (AuthenticationMD5Password).
+                    // Send a random 4-byte salt challenge, then verify the
+                    // client's md5 response against the stored shadow. Fail
+                    // closed: a wrong or absent password is rejected. The match
+                    // is exhaustive over all four AuthMethod variants — there is
+                    // deliberately no catch-all, so a new method cannot silently
+                    // fall through to an authenticated state.
+                    let salt: [u8; 4] = rand::random();
+                    self.send_message(BackendMessage::Authentication(AuthenticationMessage::Md5Password {
+                        salt,
+                    }))
+                    .await?;
+                    self.flush().await?; // Client must read challenge before responding
+
+                    // Wait for password message
+                    if let Some(FrontendMessage::PasswordMessage { password }) = self.read_message().await? {
+                        let username = self
+                            .username
+                            .as_ref()
+                            .ok_or_else(|| Error::authentication("No username provided"))?;
+
+                        if self.auth_manager.verify_md5_response(username, &password, &salt)? {
+                            self.authenticated = true;
+                            self.send_auth_ok().await?;
+                        } else {
+                            return Err(Error::authentication("Invalid password"));
+                        }
+                    } else {
+                        return Err(Error::protocol("Expected password message"));
+                    }
+                }
                 AuthMethod::ScramSha256 => {
                     // Initiate SCRAM-SHA-256 authentication
                     self.handle_scram_authentication().await?;
-                }
-                _ => {
-                    // Other auth methods not yet implemented
-                    self.authenticated = true;
-                    self.send_auth_ok().await?;
                 }
             }
 
@@ -1631,16 +1658,32 @@ where
             .get_credentials(username)
             .ok_or_else(|| Error::authentication("User not found"))?;
 
-        // Create SCRAM state
-        let mut scram_state = ScramAuthState::new(username.to_string());
+        // Create SCRAM state FROM THE STORED CREDENTIAL's salt and iteration
+        // count (GH#20). `ScramAuthState::new` generates a fresh random salt per
+        // connection; the server then advertised that random salt in `s=`, the
+        // client derived its proof from it, and the server checked the result
+        // against a `stored_key` derived from a COMPLETELY DIFFERENT salt chosen
+        // at `add_user` time. The HMAC/XOR recovery therefore produced garbage
+        // and the comparison failed for every password including the correct
+        // one — `--auth scram-sha-256` could not authenticate anybody.
+        let mut scram_state =
+            ScramAuthState::with_credentials(username.to_string(), credentials.salt.clone(), credentials.iterations);
         scram_state.set_client_nonce(client_nonce.to_string());
 
-        // Build client-first-message-bare for auth message.
-        // BUG-003 (Perf-73): MUST match exactly what the client sent (empty
-        // `n=` per the Postgres SCRAM profile + RFC 5802) — the SCRAM proof
-        // verification hashes this string. Reconstructing with the startup
-        // user breaks the proof and yields "Invalid password".
-        let client_first_bare = format!("n=,r={}", client_nonce);
+        // Client-first-message-bare: take the bytes the client ACTUALLY sent
+        // rather than reconstructing them.
+        //
+        // The SCRAM proof hashes this string, so it must be byte-identical to
+        // the client's own copy. Reconstructing as `n=,r={nonce}` happens to be
+        // right for libpq (the Postgres SCRAM profile leaves `n=` empty), but it
+        // silently corrupts the AuthMessage for any client that sends a non-empty
+        // `n=` or a mandatory-extension field, which RFC 5802 permits. The bare
+        // portion is simply everything after the GS2 header, i.e. after the
+        // second comma — so slice it out instead of guessing.
+        let client_first_bare = match super::auth::scram_client_first_bare(&client_first) {
+            Some(bare) => bare.to_string(),
+            None => format!("n=,r={}", client_nonce),
+        };
         scram_state.set_client_first_message_bare(client_first_bare);
 
         // Generate server-first-message
@@ -1711,6 +1754,16 @@ where
             },
         ))
         .await?;
+
+        // AuthenticationOk — REQUIRED, and it was missing (GH#20, second half).
+        // Per the PostgreSQL protocol, AuthenticationSASLFinal is followed by
+        // AuthenticationOk; libpq stays in CONNECTION_AWAITING_RESPONSE until it
+        // arrives and rejects any non-'R' message. Without this the next byte
+        // this handler sends is ParameterStatus ('S'), so even a perfectly
+        // verified proof ended in
+        // "expected authentication request from server, but received S".
+        // The three other authenticating arms all send it; SCRAM did not.
+        self.send_auth_ok().await?;
 
         // Authentication successful
         self.authenticated = true;
@@ -4432,5 +4485,354 @@ mod sqlstate_mapping_unit_tests {
                 "`{message}` must map to {expected}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod md5_auth_wire_tests {
+    //! End-to-end MD5 handshake tests driven through the real
+    //! `handle_startup` path over an in-memory duplex stream. These verify
+    //! the P0 fix: `--auth md5` now performs a genuine
+    //! AuthenticationMD5Password challenge/response and fails closed on a
+    //! wrong or absent password.
+    use super::*;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+
+    /// Build a handler wired to a caller-supplied `AuthManager`, starting
+    /// unauthenticated so the startup auth handshake actually runs.
+    fn test_handler_with_auth(
+        db: Arc<EmbeddedDatabase>,
+        auth: AuthManager,
+    ) -> (PgConnectionHandler<DuplexStream>, DuplexStream) {
+        let (stream, client) = tokio::io::duplex(4096);
+        (
+            PgConnectionHandler {
+                stream,
+                session_id: db
+                    .create_wire_session("pg_wire_test")
+                    .expect("wire session creation is infallible"),
+                database: db.clone(),
+                auth_manager: Arc::new(auth),
+                catalog: PgCatalog::with_database(db),
+                prepared_statements: PreparedStatementManager::new(),
+                authenticated: false,
+                transaction_status: TransactionStatus::Idle,
+                buffer: BytesMut::with_capacity(8192),
+                username: None,
+                scram_state: None,
+                write_buf: BytesMut::with_capacity(4096),
+                suppress_ready_for_query: false,
+                awaiting_sync_after_error: false,
+            },
+            client,
+        )
+    }
+
+    /// Encode a minimal PostgreSQL v3 StartupMessage with just `user=<user>`.
+    fn build_startup(user: &str) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&196_608_i32.to_be_bytes()); // protocol 3.0
+        body.extend_from_slice(b"user\0");
+        body.extend_from_slice(user.as_bytes());
+        body.push(0); // terminate the user value
+        body.push(0); // final parameter-list terminator
+        let total = (body.len() + 4) as i32;
+        let mut msg = total.to_be_bytes().to_vec();
+        msg.extend_from_slice(&body);
+        msg
+    }
+
+    /// Encode a frontend PasswordMessage (`'p'`) carrying `response`.
+    fn build_password_message(response: &str) -> Vec<u8> {
+        let mut msg = vec![b'p'];
+        let len = (4 + response.len() + 1) as i32;
+        msg.extend_from_slice(&len.to_be_bytes());
+        msg.extend_from_slice(response.as_bytes());
+        msg.push(0);
+        msg
+    }
+
+    /// Compute the libpq MD5 client response for the given credentials + salt.
+    fn client_md5_response(password: &str, username: &str, salt: &[u8; 4]) -> String {
+        let shadow_body = format!(
+            "{:x}",
+            md5::compute([password.as_bytes(), username.as_bytes()].concat())
+        );
+        format!(
+            "md5{:x}",
+            md5::compute([shadow_body.as_bytes(), salt.as_slice()].concat())
+        )
+    }
+
+    /// Read the 13-byte AuthenticationMD5Password challenge and return its salt.
+    async fn read_md5_challenge(client: &mut DuplexStream) -> [u8; 4] {
+        let mut chal = [0u8; 13];
+        client.read_exact(&mut chal).await.expect("read md5 challenge");
+        assert_eq!(chal[0], b'R', "expected Authentication message type 'R'");
+        // int32 length (12) at [1..5], int32 auth type (5 = MD5) at [5..9].
+        assert_eq!(i32::from_be_bytes([chal[5], chal[6], chal[7], chal[8]]), 5);
+        [chal[9], chal[10], chal[11], chal[12]]
+    }
+
+    #[tokio::test]
+    async fn md5_handshake_correct_password_authenticates() {
+        let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+        let mut auth = AuthManager::new(AuthMethod::Md5);
+        auth.add_user("postgres".to_string(), "s3cret".to_string());
+        let (mut handler, mut client) = test_handler_with_auth(Arc::clone(&db), auth);
+
+        let client_task = tokio::spawn(async move {
+            client
+                .write_all(&build_startup("postgres"))
+                .await
+                .expect("write startup");
+            let salt = read_md5_challenge(&mut client).await;
+            let resp = client_md5_response("s3cret", "postgres", &salt);
+            client
+                .write_all(&build_password_message(&resp))
+                .await
+                .expect("write password");
+            // Return `client` so our end of the pipe stays OPEN (parked in the
+            // JoinHandle) until we join below — dropping it here would close the
+            // read side and make the server's post-auth writes fail BrokenPipe.
+            // We don't drain the trailing AuthOk/ParameterStatus/ReadyForQuery
+            // burst (~420 bytes); it fits inside the 4096-byte duplex buffer, so
+            // the server's writes complete without a reader.
+            client
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), handler.handle_startup())
+            .await
+            .expect("startup did not hang")
+            .expect("md5 handshake succeeds");
+        assert!(handler.authenticated, "correct password must authenticate");
+        let _client = client_task.await.expect("client task");
+    }
+
+    #[tokio::test]
+    async fn md5_handshake_wrong_password_rejected() {
+        let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+        let mut auth = AuthManager::new(AuthMethod::Md5);
+        auth.add_user("postgres".to_string(), "s3cret".to_string());
+        let (mut handler, mut client) = test_handler_with_auth(Arc::clone(&db), auth);
+
+        let client_task = tokio::spawn(async move {
+            client
+                .write_all(&build_startup("postgres"))
+                .await
+                .expect("write startup");
+            let salt = read_md5_challenge(&mut client).await;
+            // Response for the WRONG password.
+            let resp = client_md5_response("not-the-password", "postgres", &salt);
+            client
+                .write_all(&build_password_message(&resp))
+                .await
+                .expect("write password");
+            // Keep our end open until join (same rationale as the positive
+            // test); the rejection path writes nothing after the challenge, but
+            // returning `client` avoids a drop-order footgun if an ErrorResponse
+            // write is ever added before the Err return.
+            client
+        });
+
+        let result = tokio::time::timeout(Duration::from_secs(5), handler.handle_startup())
+            .await
+            .expect("startup did not hang");
+        assert!(result.is_err(), "wrong password must be rejected");
+        assert!(!handler.authenticated, "failed auth must leave authenticated=false");
+        let _client = client_task.await.expect("client task");
+    }
+
+    // =======================================================================
+    // SCRAM-SHA-256 over the real handler (GH#20)
+    // =======================================================================
+
+    /// Encode a SASLInitialResponse ('p' with mechanism name + length-prefixed body).
+    fn build_sasl_initial(mechanism: &str, body: &str) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(mechanism.as_bytes());
+        payload.push(0);
+        payload.extend_from_slice(&(body.len() as i32).to_be_bytes());
+        payload.extend_from_slice(body.as_bytes());
+        let mut msg = vec![b'p'];
+        msg.extend_from_slice(&((payload.len() + 4) as i32).to_be_bytes());
+        msg.extend_from_slice(&payload);
+        msg
+    }
+
+    /// Encode a SASLResponse ('p' carrying the raw client-final-message).
+    fn build_sasl_response(body: &str) -> Vec<u8> {
+        let mut msg = vec![b'p'];
+        msg.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
+        msg.extend_from_slice(body.as_bytes());
+        msg
+    }
+
+    /// Read one Authentication ('R') message: returns (auth_type, payload).
+    async fn read_auth_message(client: &mut DuplexStream) -> (i32, Vec<u8>) {
+        let mut head = [0u8; 9];
+        client.read_exact(&mut head).await.expect("read auth header");
+        assert_eq!(head[0], b'R', "expected Authentication message type 'R'");
+        let len = i32::from_be_bytes([head[1], head[2], head[3], head[4]]) as usize;
+        let auth_type = i32::from_be_bytes([head[5], head[6], head[7], head[8]]);
+        let remaining = len.saturating_sub(8);
+        let mut payload = vec![0u8; remaining];
+        if remaining > 0 {
+            client.read_exact(&mut payload).await.expect("read auth payload");
+        }
+        (auth_type, payload)
+    }
+
+    /// Drive a full SCRAM exchange as a real client would. Returns whether the
+    /// server reached AuthenticationOk (auth type 0) after SASLFinal.
+    async fn scram_client_exchange(client: &mut DuplexStream, username: &str, password: &str) -> bool {
+        use super::super::auth::{scram_hi, scram_hmac_sha256};
+
+        client.write_all(&build_startup(username)).await.expect("startup");
+
+        // AuthenticationSASL (10): mechanism list.
+        let (ty, _mechs) = read_auth_message(client).await;
+        assert_eq!(ty, 10, "expected AuthenticationSASL");
+
+        let client_nonce = "rOprNGfwEbeRWgbNEkqO";
+        let client_first_bare = format!("n=,r={client_nonce}");
+        let client_first = format!("n,,{client_first_bare}");
+        client
+            .write_all(&build_sasl_initial("SCRAM-SHA-256", &client_first))
+            .await
+            .expect("sasl initial");
+
+        // AuthenticationSASLContinue (11): server-first-message.
+        let (ty, payload) = read_auth_message(client).await;
+        assert_eq!(ty, 11, "expected AuthenticationSASLContinue");
+        let server_first = String::from_utf8(payload).expect("server-first utf8");
+
+        // Parse r=, s=, i= exactly as libpq does.
+        let mut combined_nonce = String::new();
+        let mut salt_b64 = String::new();
+        let mut iterations: u32 = 0;
+        for part in server_first.split(',') {
+            if let Some(v) = part.strip_prefix("r=") {
+                combined_nonce = v.to_string();
+            } else if let Some(v) = part.strip_prefix("s=") {
+                salt_b64 = v.to_string();
+            } else if let Some(v) = part.strip_prefix("i=") {
+                iterations = v.parse().unwrap_or(0);
+            }
+        }
+        let salt = super::super::auth::base64_decode(&salt_b64).expect("decode salt");
+
+        // Derive the proof from the salt/iterations THE SERVER ADVERTISED. If the
+        // server invented a random salt (GH#20) this proof cannot match its stored
+        // key and the exchange fails for every password.
+        let salted = scram_hi(password, &salt, iterations);
+        let client_key = scram_hmac_sha256(&salted, b"Client Key");
+        let stored_key = {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(&client_key);
+            h.finalize().to_vec()
+        };
+        let client_final_without_proof = format!("c=biws,r={combined_nonce}");
+        let auth_message = format!("{client_first_bare},{server_first},{client_final_without_proof}");
+        let client_signature = scram_hmac_sha256(&stored_key, auth_message.as_bytes());
+        let proof: Vec<u8> = client_key
+            .iter()
+            .zip(client_signature.iter())
+            .map(|(a, b)| a ^ b)
+            .collect();
+        let proof_b64 = super::super::auth::base64_encode(&proof).expect("encode proof");
+        let client_final = format!("{client_final_without_proof},p={proof_b64}");
+        client
+            .write_all(&build_sasl_response(&client_final))
+            .await
+            .expect("sasl response");
+
+        // AuthenticationSASLFinal (12) then — REQUIRED — AuthenticationOk (0).
+        let (ty, _) = read_auth_message(client).await;
+        assert_eq!(ty, 12, "expected AuthenticationSASLFinal");
+        let (ty, _) = read_auth_message(client).await;
+        ty == 0
+    }
+
+    fn scram_auth_manager(username: &str, password: &str) -> AuthManager {
+        use super::super::password_store::{InMemoryPasswordStore, SharedPasswordStore};
+        // Provision through SharedPasswordStore's inherent `add_user` (the one on
+        // InMemoryPasswordStore is a `PasswordStore` trait method). This is the same
+        // route `main.rs` uses for `--auth scram-sha-256 --password`, so the credential
+        // under test is built exactly as a real deployment builds it — including its
+        // own randomly chosen salt, which is the whole point of GH#20.
+        let store = SharedPasswordStore::new(InMemoryPasswordStore::new());
+        store.add_user(username, password).expect("add user");
+        AuthManager::with_password_store(AuthMethod::ScramSha256, store)
+    }
+
+    /// GH#20's regression test, at the WIRE level. The module-level round-trip in
+    /// `tests/auth_wire_matrix_tests.rs` proves the SCRAM math agrees with a stored
+    /// credential; this proves the HANDLER actually feeds it that credential's salt
+    /// rather than a per-connection random one. Reverting handler.rs to
+    /// `ScramAuthState::new` fails this and only this.
+    #[tokio::test]
+    async fn scram_handshake_correct_password_authenticates() {
+        let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+        let auth = scram_auth_manager("postgres", "S3cretTestPw_ExampleOnly");
+        let (mut handler, mut client) = test_handler_with_auth(Arc::clone(&db), auth);
+
+        let client_task = tokio::spawn(async move {
+            let ok = scram_client_exchange(&mut client, "postgres", "S3cretTestPw_ExampleOnly").await;
+            (client, ok)
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), handler.handle_startup())
+            .await
+            .expect("startup did not hang")
+            .expect("SCRAM handshake with the CORRECT password must succeed");
+        assert!(handler.authenticated, "correct password must authenticate under SCRAM");
+
+        let (_client, saw_auth_ok) = client_task.await.expect("client task");
+        assert!(
+            saw_auth_ok,
+            "AuthenticationOk must follow AuthenticationSASLFinal — without it libpq reports \
+             \"expected authentication request from server, but received S\" even though the \
+             proof verified"
+        );
+    }
+
+    #[tokio::test]
+    async fn scram_handshake_wrong_password_rejected() {
+        let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+        let auth = scram_auth_manager("postgres", "S3cretTestPw_ExampleOnly");
+        let (mut handler, mut client) = test_handler_with_auth(Arc::clone(&db), auth);
+
+        let client_task = tokio::spawn(async move {
+            client.write_all(&build_startup("postgres")).await.expect("startup");
+            let _ = read_auth_message(&mut client).await; // SASL
+            let client_first = "n,,n=,r=rOprNGfwEbeRWgbNEkqO";
+            client
+                .write_all(&build_sasl_initial("SCRAM-SHA-256", client_first))
+                .await
+                .expect("sasl initial");
+            let (_, payload) = read_auth_message(&mut client).await; // SASLContinue
+            let server_first = String::from_utf8(payload).expect("utf8");
+            let combined = server_first
+                .split(',')
+                .find_map(|p| p.strip_prefix("r="))
+                .unwrap_or_default()
+                .to_string();
+            // A structurally valid but WRONG proof.
+            let client_final = format!("c=biws,r={combined},p={}", "A".repeat(43));
+            let _ = client.write_all(&build_sasl_response(&client_final)).await;
+            client
+        });
+
+        let result = tokio::time::timeout(Duration::from_secs(5), handler.handle_startup())
+            .await
+            .expect("startup did not hang");
+        assert!(result.is_err(), "a wrong SCRAM proof must be rejected");
+        assert!(!handler.authenticated, "failed SCRAM must leave authenticated=false");
+        let _client = client_task.await.expect("client task");
     }
 }

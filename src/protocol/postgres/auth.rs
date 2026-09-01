@@ -50,6 +50,27 @@ use super::password_store::{InMemoryPasswordStore, SharedPasswordStore};
 /// when the GS2 header was *missing* — but libpq, asyncpg, and every
 /// other compliant client always sends the header, so the parser was
 /// broken for every real client.
+/// The client-first-message-BARE portion of a SCRAM client-first-message: every
+/// byte after the GS2 header (i.e. after the second comma), returned as a slice
+/// of the original so it is byte-identical to what the client sent.
+///
+/// The SCRAM proof hashes this string on both sides, so it must not be
+/// reconstructed. `format!("n=,r={nonce}")` is correct only for clients that
+/// send an empty `n=`; RFC 5802 permits a non-empty username field and
+/// extension fields, and either would silently break the AuthMessage and
+/// surface as "Invalid password". Returns `None` if the GS2 header is malformed
+/// (no second comma), leaving the caller to decide the fallback.
+pub fn scram_client_first_bare(msg: &str) -> Option<&str> {
+    let mut iter = msg.splitn(3, ',');
+    iter.next()?; // gs2-cbind-flag
+    iter.next()?; // authzid
+    let bare = iter.next()?;
+    if bare.is_empty() {
+        return None;
+    }
+    Some(bare)
+}
+
 pub fn parse_scram_client_first(msg: &str) -> Result<(String, String)> {
     // GS2 header: at least 2 commas before the bare body.
     let mut iter = msg.splitn(3, ',');
@@ -166,8 +187,18 @@ impl AuthManager {
             }
         }
 
-        // Legacy storage for non-SCRAM methods
-        let password_hash = Self::hash_password(&password);
+        // Legacy storage for non-SCRAM methods. For MD5, store the PostgreSQL
+        // shadow (`md5` + hex(md5(password || username)), the pg_authid
+        // .rolpassword format); for the remaining methods keep the SHA-256
+        // hash used by clear-text verification.
+        let password_hash = if self.method == AuthMethod::Md5 {
+            format!(
+                "md5{:x}",
+                md5::compute([password.as_bytes(), username.as_bytes()].concat())
+            )
+        } else {
+            Self::hash_password(&password)
+        };
         self.users.insert(
             username.clone(),
             UserCredentials {
@@ -212,21 +243,37 @@ impl AuthManager {
         }
     }
 
-    /// Verify MD5 password
-    pub fn verify_md5(&self, username: &str, password: &str, salt: &[u8; 4]) -> Result<bool> {
-        if let Some(user) = self.users.get(username) {
-            // PostgreSQL MD5 format: md5(md5(password + username) + salt)
-            let inner = format!("{}{}", password, username);
-            let inner_hash = format!("{:x}", md5::compute(inner.as_bytes()));
-
-            let mut outer_input = inner_hash.as_bytes().to_vec();
-            outer_input.extend_from_slice(salt);
-            let outer_hash = format!("md5{:x}", md5::compute(&outer_input));
-
-            Ok(outer_hash == user.password_hash)
-        } else {
-            Ok(false)
-        }
+    /// Verify a PostgreSQL MD5 password response (AuthenticationMD5Password).
+    ///
+    /// The per-user shadow is stored as `md5` + hex(md5(password || username))
+    /// (pg_authid.rolpassword format). Given the 4-byte challenge `salt` the
+    /// server sent, a correct client returns
+    /// `md5` + hex(md5(ascii(shadow_body) || salt)), where `shadow_body` is the
+    /// 32 hex characters of the shadow *without* the `md5` prefix. We recompute
+    /// that expected string from the stored shadow and compare it, in
+    /// constant time, to what the client sent. Returns `Ok(false)` (never an
+    /// error) for an unknown user or a malformed stored shadow, so the caller
+    /// fails closed uniformly.
+    pub fn verify_md5_response(&self, username: &str, client_response: &str, salt: &[u8; 4]) -> Result<bool> {
+        // Fixed dummy shadow body used to equalize the MD5 work on the
+        // unknown-user / malformed-shadow paths (mirrors verify_cleartext's
+        // dummy hashing above), so an unauthenticated peer cannot use response
+        // latency to enumerate valid usernames. `is_real` gates the result so a
+        // dummy path never authenticates even if its hash were reproduced.
+        const DUMMY_BODY: &[u8; 32] = b"00000000000000000000000000000000";
+        let (body, is_real): (&[u8], bool) = match self.users.get(username) {
+            // Stored shadow must be `md5<32 hex>`; strip the prefix to the body.
+            Some(user) => match user.password_hash.strip_prefix("md5") {
+                Some(b) => (b.as_bytes(), true),
+                None => (DUMMY_BODY, false),
+            },
+            None => (DUMMY_BODY, false),
+        };
+        let expected = format!("md5{:x}", md5::compute([body, salt.as_slice()].concat()));
+        // Length-checked, constant-time comparison (accumulate XOR of every
+        // byte; no early return on the first mismatch).
+        let matches = constant_time_compare(expected.as_bytes(), client_response.as_bytes());
+        Ok(is_real && matches)
     }
 
     /// Hash password using SHA-256
@@ -243,6 +290,13 @@ impl AuthManager {
         self
     }
 }
+
+/// Iteration count used when a credential does not carry its own.
+///
+/// 4096 is the SCRAM-SHA-256 minimum recommended by RFC 5802 and the value
+/// PostgreSQL itself defaults to, so a credential registered elsewhere with the
+/// default interoperates. Kept in sync with `scram_hi`'s fallback below.
+pub const DEFAULT_SCRAM_ITERATIONS: u32 = 4096;
 
 /// SCRAM-SHA-256 authentication state
 ///
@@ -261,7 +315,36 @@ pub struct ScramAuthState {
 
 impl ScramAuthState {
     /// Create new SCRAM authentication state
+    /// Fresh state with a RANDOM salt and the default iteration count.
+    ///
+    /// **Not usable for verifying a stored password.** A SCRAM proof can only be
+    /// checked against the salt and iteration count the stored key was DERIVED
+    /// from; a random salt makes the comparison fail for every password,
+    /// including the correct one. Use [`ScramAuthState::with_credentials`] on any
+    /// path that verifies a real user — the wire handler does.
+    ///
+    /// Retained (and still public) because it is a legitimate way to build state
+    /// for tests and for registering a brand-new credential, and because it is
+    /// re-exported from `protocol::postgres`, so changing its signature would be
+    /// a breaking change for embedders.
     pub fn new(username: String) -> Self {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let salt: Vec<u8> = (0..16).map(|_| rng.gen::<u8>()).collect();
+        Self::with_credentials(username, salt, DEFAULT_SCRAM_ITERATIONS)
+    }
+
+    /// State that advertises the salt and iteration count a stored credential was
+    /// actually derived from.
+    ///
+    /// This is what makes SCRAM verification possible at all. The server sends
+    /// `s=<salt>,i=<iterations>` in server-first-message, and the client derives
+    /// its proof from them; if they are not the ones behind the stored key, the
+    /// server's HMAC/XOR recovery yields garbage and the comparison fails
+    /// unconditionally — no password can authenticate. That was GH#20: the wire
+    /// handler built state with [`ScramAuthState::new`], whose salt is freshly
+    /// random per connection and unrelated to the stored credential.
+    pub fn with_credentials(username: String, salt: Vec<u8>, iterations: u32) -> Self {
         use rand::Rng;
         let mut rng = rand::thread_rng();
 
@@ -269,14 +352,16 @@ impl ScramAuthState {
             .map(|_| rng.sample(rand::distributions::Alphanumeric) as char)
             .collect();
 
-        let salt: Vec<u8> = (0..16).map(|_| rng.gen::<u8>()).collect();
-
         Self {
             username,
             client_nonce: String::new(),
             server_nonce,
             salt,
-            iteration_count: 4096,
+            iteration_count: if iterations == 0 {
+                DEFAULT_SCRAM_ITERATIONS
+            } else {
+                iterations
+            },
             client_first_message_bare: String::new(),
             server_first_message: String::new(),
         }
@@ -479,14 +564,14 @@ pub fn prepare_scram_credentials(password: &str, salt: &[u8], iterations: u32) -
 }
 
 /// Base64 encode
-fn base64_encode(data: &[u8]) -> std::result::Result<String, Box<dyn std::error::Error>> {
+pub(crate) fn base64_encode(data: &[u8]) -> std::result::Result<String, Box<dyn std::error::Error>> {
     use base64::Engine;
     let encoded = base64::engine::general_purpose::STANDARD.encode(data);
     Ok(encoded)
 }
 
 /// Base64 decode
-fn base64_decode(data: &str) -> std::result::Result<Vec<u8>, Box<dyn std::error::Error>> {
+pub(crate) fn base64_decode(data: &str) -> std::result::Result<Vec<u8>, Box<dyn std::error::Error>> {
     use base64::Engine;
     let decoded = base64::engine::general_purpose::STANDARD.decode(data)?;
     Ok(decoded)
@@ -511,6 +596,56 @@ mod tests {
         let hash1 = AuthManager::hash_password("password123");
         let hash2 = AuthManager::hash_password("password123");
         assert_eq!(hash1, hash2);
+    }
+
+    /// Build the libpq client MD5 response for the given credentials + salt,
+    /// exactly as a real client computes it:
+    /// `md5` + hex(md5( ascii(hex(md5(password || username))) || salt )).
+    fn client_md5_response(password: &str, username: &str, salt: &[u8; 4]) -> String {
+        let shadow_body = format!(
+            "{:x}",
+            md5::compute([password.as_bytes(), username.as_bytes()].concat())
+        );
+        format!(
+            "md5{:x}",
+            md5::compute([shadow_body.as_bytes(), salt.as_slice()].concat())
+        )
+    }
+
+    #[test]
+    fn test_md5_add_user_stores_pg_shadow() {
+        let mut auth = AuthManager::new(AuthMethod::Md5);
+        auth.add_user("postgres".to_string(), "s3cret".to_string());
+        let stored = &auth.users.get("postgres").unwrap().password_hash;
+        let expected = format!(
+            "md5{:x}",
+            md5::compute([b"s3cret".as_slice(), b"postgres".as_slice()].concat())
+        );
+        assert_eq!(stored, &expected);
+        assert!(stored.starts_with("md5"));
+        assert_eq!(stored.len(), 3 + 32);
+    }
+
+    #[test]
+    fn test_verify_md5_response_accepts_and_rejects() {
+        let mut auth = AuthManager::new(AuthMethod::Md5);
+        auth.add_user("postgres".to_string(), "s3cret".to_string());
+        let salt: [u8; 4] = [0x01, 0x02, 0x03, 0x04];
+
+        // Correct password + correct salt authenticates.
+        let good = client_md5_response("s3cret", "postgres", &salt);
+        assert!(auth.verify_md5_response("postgres", &good, &salt).unwrap());
+
+        // Wrong password is rejected.
+        let wrong_pw = client_md5_response("wrong", "postgres", &salt);
+        assert!(!auth.verify_md5_response("postgres", &wrong_pw, &salt).unwrap());
+
+        // Right response but wrong salt is rejected.
+        let other_salt: [u8; 4] = [0x09, 0x08, 0x07, 0x06];
+        assert!(!auth.verify_md5_response("postgres", &good, &other_salt).unwrap());
+
+        // Unknown user is rejected (fail closed, no error).
+        assert!(!auth.verify_md5_response("nobody", &good, &salt).unwrap());
     }
 
     #[test]

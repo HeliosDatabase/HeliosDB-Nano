@@ -674,10 +674,23 @@ async fn start_server(
     }
 
     // Create PostgreSQL server with appropriate auth configuration
-    let pg_server = if matches!(
-        auth_method,
-        AuthMethod::CleartextPassword | AuthMethod::Md5 | AuthMethod::ScramSha256
-    ) {
+    let pg_server = if auth_method == AuthMethod::Md5 {
+        // MD5 uses the legacy `AuthManager` users map, which stores the
+        // PostgreSQL md5 shadow — NOT the SCRAM password store, which cannot
+        // serve an md5 challenge. With a --password, seed the default users
+        // (their shadows are computed by `add_user` under AuthMethod::Md5);
+        // without one, fall back to PgServer::new, which provisions md5-shadow
+        // default users. Both paths are fail-closed: the correct password is
+        // always required.
+        if let Some(ref pwd) = password {
+            let mut mgr = AuthManager::new(AuthMethod::Md5);
+            mgr.add_user("postgres".to_string(), pwd.clone());
+            mgr.add_user("helios".to_string(), pwd.clone());
+            PgServer::with_auth_manager(pg_config, Arc::clone(&db), mgr)?
+        } else {
+            PgServer::new(pg_config, Arc::clone(&db))?
+        }
+    } else if matches!(auth_method, AuthMethod::CleartextPassword | AuthMethod::ScramSha256) {
         if let Some(ref pwd) = password {
             // Create password store with default users
             let mut store = InMemoryPasswordStore::new();
