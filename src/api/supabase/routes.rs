@@ -32,7 +32,9 @@ impl Default for SupabaseRouter {
             project_ref: "local".to_string(),
             anon_key: None,
             service_role_key: None,
-            jwt_secret: "your-super-secret-jwt-key".to_string(),
+            // Random per process, never a constant — see the note in
+            // `supabase::auth::AuthConfig::default`.
+            jwt_secret: crate::config::generate_jwt_secret(),
             enable_rest: true,
             enable_auth: true,
             enable_storage: true,

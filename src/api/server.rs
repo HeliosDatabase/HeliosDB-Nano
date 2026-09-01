@@ -178,6 +178,21 @@ impl ApiServer {
         self
     }
 
+    /// Build the application router with all routes and middleware, for a caller
+    /// that already owns its listener.
+    ///
+    /// `serve()` binds its own socket. The `heliosdb-nano start` command cannot use
+    /// that: it binds the HTTP port up front so a bind failure is reported before
+    /// the database opens (see `run_http_listener`). It therefore needs the router
+    /// on its own, which is why this is public.
+    ///
+    /// Until v4.27.0 nothing outside this file called `build_router` at all, so the
+    /// whole REST / Auth / Realtime / Swagger surface existed only as a library API
+    /// while the README advertised it as a built-in feature of the server.
+    pub fn into_router(self) -> Router {
+        self.build_router()
+    }
+
     /// Build the application router with all routes and middleware
     fn build_router(&self) -> Router {
         // Create CORS layer
@@ -402,8 +417,17 @@ impl ApiServer {
 }
 
 /// Health check endpoint
-async fn health_check() -> (StatusCode, &'static str) {
-    (StatusCode::OK, "OK")
+async fn health_check() -> axum::Json<serde_json::Value> {
+    // `{"status":"ok"}`, NOT the plain string "OK".
+    //
+    // This is the response the `heliosdb-nano start` listener has always given on
+    // /health and what monitoring is written against. When v4.27.0 mounted this
+    // router on that listener, this handler took over the path — and returning
+    // plain text here silently changed /health's content type and body for every
+    // deployment. `daemon_http_listener_serves_health` caught it by failing to
+    // decode the response as JSON; keep the shapes identical so the two can never
+    // drift apart again.
+    axum::Json(serde_json::json!({ "status": "ok" }))
 }
 
 /// Version information endpoint
@@ -461,9 +485,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_health_check() {
-        let (status, body) = health_check().await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body, "OK");
+        // `{"status":"ok"}`, not the bare string "OK" this asserted until v4.27.0.
+        // Once this router was mounted on the `start` listener, this handler began
+        // serving the /health path that has always answered with that JSON object,
+        // so the plain-text form was a silent content-type and body change for
+        // every deployment's monitoring.
+        let json = health_check().await.0;
+        assert_eq!(json["status"], "ok");
     }
 
     #[tokio::test]

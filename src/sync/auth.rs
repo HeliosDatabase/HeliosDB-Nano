@@ -129,8 +129,9 @@ impl JwtManager {
 
     /// Create a JWT manager from an environment variable or config
     pub fn from_env_or_default() -> Self {
-        let secret = std::env::var("HELIOSDB_JWT_SECRET")
-            .unwrap_or_else(|_| "default-secret-change-in-production".to_string());
+        // Random per process when unset, never a constant: a shipped default
+        // signing key is a forgeable-token hazard, not a convenience.
+        let secret = std::env::var("HELIOSDB_JWT_SECRET").unwrap_or_else(|_| crate::config::generate_jwt_secret());
         Self::new(secret.as_bytes())
     }
 
