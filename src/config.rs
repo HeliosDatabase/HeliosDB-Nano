@@ -193,15 +193,82 @@ impl Config {
     pub fn from_toml_str(content: &str) -> crate::Result<Self> {
         let mut config: Config =
             toml::from_str(content).map_err(|e| crate::Error::config(format!("Failed to parse config: {}", e)))?;
+
+        // Re-parse as a raw TOML document. Two consumers: the profile-precedence
+        // check below, and the unknown-section warning. Hoisted out of the
+        // `if let Some(profile)` so the warning runs for every config file, not
+        // only profile-bearing ones.
+        let raw: toml::Value =
+            toml::from_str(content).map_err(|e| crate::Error::config(format!("Failed to parse config: {}", e)))?;
+
+        Self::warn_unknown_sections(&raw);
+
         if let Some(profile) = config.profile {
-            // Re-parse as a raw TOML document to learn which [storage] keys
-            // the file set explicitly — after serde deserialization a default
-            // is indistinguishable from an explicit value.
-            let raw: toml::Value =
-                toml::from_str(content).map_err(|e| crate::Error::config(format!("Failed to parse config: {}", e)))?;
+            // Which [storage] keys the file set EXPLICITLY — after serde
+            // deserialization a default is indistinguishable from an explicit value.
             config.apply_profile_defaults(profile, |key| raw.get("storage").and_then(|s| s.get(key)).is_some());
         }
         Ok(config)
+    }
+
+    /// Warn about top-level sections this build does not recognise.
+    ///
+    /// serde ignores unknown fields by default and nothing here sets
+    /// `deny_unknown_fields`, so a misspelled or obsolete section is silently
+    /// discarded. That is how a user came to run a database they believed was
+    /// authenticated: they wrote `[auth] method = "md5"`, the real section is
+    /// `[authentication]`, and NOTHING said otherwise — while `[storage]` from the
+    /// same file applied correctly, making the file look honoured.
+    ///
+    /// Warn rather than hard-fail: rejecting outright would stop existing configs
+    /// from booting over a stray key, and a config that refuses to start is its own
+    /// outage. A warning that names the likely intended section is enough to make
+    /// the failure visible, which was the entire problem.
+    ///
+    /// NOTE this catches TOP-LEVEL sections only. An unknown KEY inside a known
+    /// section (`[authentication] passwrod = ...`) is still silent; closing that
+    /// needs per-section allowlists or `serde_ignored`, and is tracked separately.
+    fn warn_unknown_sections(raw: &toml::Value) {
+        const KNOWN: &[&str] = &[
+            "profile",
+            "storage",
+            "encryption",
+            "server",
+            "performance",
+            "audit",
+            "optimizer",
+            "authentication",
+            "compression",
+            "materialized_views",
+            "vector",
+            "sync",
+            "session",
+            "locks",
+            "dump",
+            "resource_quotas",
+            "api",
+        ];
+
+        let Some(table) = raw.as_table() else { return };
+        for key in table.keys() {
+            if KNOWN.contains(&key.as_str()) {
+                continue;
+            }
+            // Cheap nearest-match: prefix relation in either direction covers the
+            // realistic confusions (auth/authentication, vec/vector, perf/performance).
+            let suggestion = KNOWN
+                .iter()
+                .find(|k| k.starts_with(key.as_str()) || key.as_str().starts_with(*k));
+            match suggestion {
+                Some(k) => tracing::warn!(
+                    "config: unknown section [{key}] is IGNORED — did you mean [{k}]? \
+                     Settings under [{key}] have no effect."
+                ),
+                None => {
+                    tracing::warn!("config: unknown section [{key}] is IGNORED — settings under it have no effect.")
+                }
+            }
+        }
     }
 
     /// Default configuration with a named profile bundle applied.
