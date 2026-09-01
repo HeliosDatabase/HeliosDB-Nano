@@ -128,8 +128,12 @@ pub struct AuthConfig {
 impl Default for AuthConfig {
     fn default() -> Self {
         Self {
-            jwt_secret: std::env::var("JWT_SECRET")
-                .unwrap_or_else(|_| "heliosdb-jwt-secret-change-in-production".to_string()),
+            // NEVER a constant. A published signing key lets anyone mint a valid
+            // session — the same shape as the `--auth md5` fail-open fixed in
+            // v4.26.0. Unset means a fresh random key for this process: tokens do
+            // not survive a restart, which is a visible failure rather than a
+            // silent forgery.
+            jwt_secret: std::env::var("JWT_SECRET").unwrap_or_else(|_| crate::config::generate_jwt_secret()),
             token_expiry: 3600, // 1 hour
             refresh_token_expiry: 604800, // 7 days
             site_url: "http://localhost:3000".to_string(),

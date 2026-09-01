@@ -388,6 +388,20 @@ SELECT * FROM products AS OF TRANSACTION 12345;
 
 Self-hosted Supabase/Firebase alternative — Auth, REST, Realtime, RLS in the same binary:
 
+> **Set `[api] jwt_secret` before you rely on sessions.** When it is unset the server
+> generates a fresh 256-bit key at every start and logs a warning: tokens issued by the
+> previous process stop verifying after a restart. There is deliberately no built-in default
+> key — a shipped signing secret would let anyone mint a valid session.
+>
+> ```toml
+> [api]
+> jwt_secret = "…64 hex chars from a password manager…"
+> ```
+>
+> These endpoints are served on the HTTP listener (`--http-port`, default 8080). They were
+> **not mounted at all before v4.27.0** — the router existed only as a library API, so every
+> path below returned 404 on the released binary.
+
 ```bash
 # Sign up
 curl -X POST http://localhost:8080/auth/v1/signup \

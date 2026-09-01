@@ -203,6 +203,12 @@ impl Config {
 
         Self::warn_unknown_sections(&raw);
 
+        // `#[serde(skip)]` gives this `false` after deserialization regardless, so
+        // derive it from the raw document: only it can say whether the operator
+        // actually wrote `[api] jwt_secret`. A generated secret is otherwise
+        // indistinguishable from a configured one.
+        config.api.jwt_secret_is_ephemeral = raw.get("api").and_then(|api| api.get("jwt_secret")).is_none();
+
         if let Some(profile) = config.profile {
             // Which [storage] keys the file set EXPLICITLY — after serde
             // deserialization a default is indistinguishable from an explicit value.
@@ -1727,8 +1733,23 @@ impl ResourceQuotaConfig {
 pub struct ApiConfig {
     /// JWT secret used to sign and verify authentication tokens.
     ///
-    /// If not set, a random 64-byte hex string is generated at startup.
+    /// If not set, a random 256-bit hex string is generated at startup and
+    /// [`ApiConfig::jwt_secret_is_ephemeral`] is true.
     pub jwt_secret: String,
+    /// True when `jwt_secret` was GENERATED rather than configured.
+    ///
+    /// Not deserialized from the file — it is derived in
+    /// [`Config::from_toml_str`] by asking the raw TOML document whether
+    /// `[api] jwt_secret` was actually present, because after deserialization a
+    /// generated value is indistinguishable from a configured one.
+    ///
+    /// The server warns when this is true: an ephemeral key means every token it
+    /// issues stops verifying at restart. The alternative — a constant fallback
+    /// secret — is not on the table, because a published signing key lets anyone
+    /// mint a valid session (the same shape as the `--auth md5` fail-open fixed
+    /// in v4.26.0).
+    #[serde(skip)]
+    pub jwt_secret_is_ephemeral: bool,
     /// Anonymous API key that grants unauthenticated read access.
     pub anon_key: Option<String>,
     /// Service-role API key that grants full admin access (bypasses RLS).
@@ -1771,6 +1792,8 @@ impl Default for ApiConfig {
     fn default() -> Self {
         Self {
             jwt_secret: generate_random_secret(),
+            // Default() means nobody configured one.
+            jwt_secret_is_ephemeral: true,
             anon_key: None,
             service_role_key: None,
             oauth_providers: Vec::new(),
@@ -1778,16 +1801,29 @@ impl Default for ApiConfig {
     }
 }
 
-/// Generate a random 64-character hex string for use as a JWT secret.
-fn generate_random_secret() -> String {
-    use std::collections::hash_map::RandomState;
-    use std::hash::{BuildHasher, Hasher};
+/// Generate a random 64-character hex string (256 bits) for use as a JWT secret.
+///
+/// This value SIGNS AUTHENTICATION TOKENS once the HTTP API is mounted, so it is
+/// generated from the OS entropy source via `rand::thread_rng` (a CSPRNG).
+///
+/// The previous implementation derived it from two `RandomState` hashers and then
+/// wrote them out TWICE — `{h1}{h2}{h1}{h2}`. That is 128 bits of entropy formatted
+/// to look like 256, from a source seeded for HashDoS resistance rather than for
+/// key generation. It signed nothing at the time, because the API router was never
+/// mounted; it does now, so it has to be a real key.
+pub fn generate_jwt_secret() -> String {
+    generate_random_secret()
+}
 
-    // Use two independent random hashers to get 128 bits of randomness
-    let s = RandomState::new();
-    let h1 = s.build_hasher().finish();
-    let h2 = RandomState::new().build_hasher().finish();
-    format!("{h1:016x}{h2:016x}{h1:016x}{h2:016x}")
+fn generate_random_secret() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    bytes.iter().fold(String::with_capacity(64), |mut acc, b| {
+        use std::fmt::Write;
+        let _ = write!(acc, "{b:02x}");
+        acc
+    })
 }
 
 #[cfg(test)]

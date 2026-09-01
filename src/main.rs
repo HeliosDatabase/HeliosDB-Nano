@@ -595,6 +595,12 @@ async fn start_server(
     println!("      {durability_line}");
     info!("{durability_line}");
 
+    // Taken before `db_config` is MOVED into the database below. The HTTP
+    // listener needs `[api]` (the JWT signing key above all) and would otherwise
+    // have no access to it — which is part of why `[api]` was a dead config
+    // section: nothing downstream of this point could read it.
+    let api_config = db_config.api.clone();
+
     // Open database (in-memory mode avoids disk I/O for all operations)
     let db = if memory_mode {
         println!("[2/4] Initializing in-memory database...");
@@ -793,12 +799,17 @@ async fn start_server(
             .map_err(|e| Error::config(format!("Invalid HTTP address: {e}")))?;
         match tokio::net::TcpListener::bind(http_addr).await {
             Ok(listener) => {
-                info!("HTTP endpoint at http://{} (/health)", http_addr);
+                info!(
+                    "HTTP endpoint at http://{http_addr} (/health, /version, /docs, /rest/v1, /auth/v1, /realtime/v1)"
+                );
                 let http_db = Arc::clone(&db);
                 let mcp_token = ha_config.mcp_token.clone();
                 let allow_remote_mcp = ha_config.allow_remote_mcp;
+                let http_api_config = api_config.clone();
                 Some(tokio::spawn(async move {
-                    if let Err(e) = run_http_listener(listener, http_db, mcp_token, allow_remote_mcp).await {
+                    if let Err(e) =
+                        run_http_listener(listener, http_db, mcp_token, allow_remote_mcp, http_api_config).await
+                    {
                         tracing::error!("HTTP server accept loop exited: {e}");
                     }
                 }))
@@ -1798,6 +1809,7 @@ async fn run_http_listener(
     db: std::sync::Arc<EmbeddedDatabase>,
     mcp_token: Option<String>,
     allow_remote_mcp: bool,
+    api_config: heliosdb_nano::config::ApiConfig,
 ) -> std::io::Result<()> {
     use axum::{routing::get, Json, Router};
 
@@ -1805,7 +1817,48 @@ async fn run_http_listener(
         Json(serde_json::json!({ "status": "ok" }))
     }
 
-    let app = Router::new().route("/", get(health)).route("/health", get(health));
+    // The BaaS layer the README advertises as built in: PostgREST-style
+    // `/rest/v1/*`, `/auth/v1/*`, `/realtime/v1/websocket`, Swagger `/docs` +
+    // `/openapi.json`, and `/version`.
+    //
+    // Through v4.26.0 this listener served `/` and `/health` and NOTHING else —
+    // every one of those documented endpoints returned 404 on the shipped binary,
+    // because `ApiServer`'s router was only ever reachable as a library API.
+    //
+    // The JWT signing key comes from `[api] jwt_secret`, which defaults to a
+    // freshly generated 256-bit CSPRNG value per start. There is deliberately NO
+    // constant fallback anywhere on this path: a guessable signing key lets
+    // anyone mint a valid session, which is the same shape as the `--auth md5`
+    // fail-open fixed in v4.26.0. A random per-start key means tokens do not
+    // survive a restart unless an operator configures one — that is the correct
+    // trade, and it is logged below so the behaviour is never a surprise.
+    let local_addr = listener.local_addr()?;
+    let auth_bridge = std::sync::Arc::new(heliosdb_nano::api::auth_bridge::AuthBridge::new(
+        std::sync::Arc::clone(&db),
+        &api_config.jwt_secret,
+    ));
+    // `bootstrap` creates `_auth_users` / `_auth_refresh_tokens`. It is
+    // idempotent (CREATE TABLE IF NOT EXISTS) and, until now, was called by
+    // nothing but its own unit tests — so the first real signup failed with
+    // "Table '_auth_users' does not exist". Mounting the auth routes without
+    // this just moves the failure from 404 to 500.
+    if let Err(e) = auth_bridge.bootstrap() {
+        tracing::error!(
+            "auth schema bootstrap failed: {e}; /auth/v1/* endpoints will return errors until this is resolved"
+        );
+    }
+    if api_config.jwt_secret_is_ephemeral {
+        tracing::warn!(
+            "[api] jwt_secret is not configured; generated an ephemeral one for this process. \
+             Auth tokens issued now become invalid on restart. Set [api] jwt_secret to persist them."
+        );
+    }
+
+    let app = heliosdb_nano::api::ApiServer::new(local_addr, std::sync::Arc::clone(&db))
+        .with_auth_bridge(auth_bridge)
+        .into_router()
+        // `ApiServer` already serves `/health`; only `/` is additional.
+        .route("/", get(health));
 
     #[cfg(feature = "mcp-endpoint")]
     let app = {
@@ -1857,7 +1910,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let handle = tokio::spawn(async move {
-            let _ = run_http_listener(listener, db, None, false).await;
+            let _ = run_http_listener(listener, db, None, false, heliosdb_nano::config::ApiConfig::default()).await;
         });
 
         let body: Value = reqwest::get(format!("http://{addr}/health"))
@@ -1878,7 +1931,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let handle = tokio::spawn(async move {
-            let _ = run_http_listener(listener, db, None, false).await;
+            let _ = run_http_listener(listener, db, None, false, heliosdb_nano::config::ApiConfig::default()).await;
         });
 
         let resp: Value = reqwest::Client::new()
@@ -1908,7 +1961,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let addr = format!("127.0.0.1:{port}");
         let handle = tokio::spawn(async move {
-            let _ = run_http_listener(listener, db, None, false).await;
+            let _ = run_http_listener(listener, db, None, false, heliosdb_nano::config::ApiConfig::default()).await;
         });
 
         let health: Value = reqwest::get(format!("http://{addr}/health"))
@@ -1933,7 +1986,14 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let addr = format!("127.0.0.1:{port}");
         let handle = tokio::spawn(async move {
-            let _ = run_http_listener(listener, db, Some("td8-secret".to_string()), false).await;
+            let _ = run_http_listener(
+                listener,
+                db,
+                Some("td8-secret".to_string()),
+                false,
+                heliosdb_nano::config::ApiConfig::default(),
+            )
+            .await;
         });
 
         let client = reqwest::Client::new();
