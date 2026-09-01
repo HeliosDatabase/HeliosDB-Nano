@@ -35,7 +35,13 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  CARGO_TERM_COLOR: always
+  # NEVER, not `always`. Every tier below parses cargo's own output with awk to prove the
+  # suites actually ran, and `always` wraps the `     Running tests/x.rs` line in ANSI SGR
+  # escapes so the `/^     Running/` anchor never matches. The first run of this workflow
+  # reported `EMPTY:` with a BLANK suite name for that reason — the check could tell that
+  # something ran zero tests but not what. Machine-readable output beats coloured output in
+  # a job whose entire purpose is machine-reading the output.
+  CARGO_TERM_COLOR: never
   # 74% of a debug test binary is DWARF. Without this the full matrix does not fit
   # on a runner. Do NOT move this into Cargo.toml — local `cargo test` should keep
   # its debug info.
@@ -137,16 +143,31 @@ jobs:
           # docs/GATES.md forbids adding NEW skips — these two and no others.
           cargo test --locked --no-fail-fast $args -- \
             --skip ha_tests::streaming_tests --skip lock_management 2>&1 | tee shard.log
-      - name: No empty suites
+      - name: No unexpected empty suites
         run: |
-          if awk '/^     Running/{s=$2}
-                  /^test result: ok\. 0 passed; 0 failed; 0 ignored/{print "EMPTY:", s; f=1}
-                  END{exit f}' shard.log; then
-            echo "no empty suites"
-          else
-            echo "::error::a suite in this shard executed zero tests"
+          # This tier runs EVERY tests/*.rs, which includes the ~49 targets that are empty
+          # by design without their cargo feature (code-graph / mcp-endpoint / graph-rag /
+          # internal-tests). Failing on those is what red-lit all six shards on the first
+          # run. Consult the checked-in allowlist and fail only on a suite that is NOT
+          # listed — a real suite going empty is still a hard failure, which is the signal
+          # docs/GATES.md §3b actually wants.
+          grep -vE '^\s*(#|$)' .github/expected-empty-suites.txt | sort -u > /tmp/expected-empty
+          awk '/^     Running/{s=$2}
+               /^test result: ok\. 0 passed; 0 failed; 0 ignored/{print s}' shard.log \
+            | sed 's|^tests/||; s|\.rs$||' | sort -u > /tmp/actual-empty
+          # A blank name here means the parse broke (see CARGO_TERM_COLOR above), not that a
+          # suite is fine — treat it as a failure rather than silently passing.
+          if grep -qE '^\s*$' /tmp/actual-empty; then
+            echo "::error::empty-suite parse produced a blank target name — cargo output format changed"
             exit 1
           fi
+          unexpected=$(comm -23 /tmp/actual-empty /tmp/expected-empty)
+          if [ -n "$unexpected" ]; then
+            echo "::error::these suites executed zero tests and are not in .github/expected-empty-suites.txt:"
+            echo "$unexpected" | sed 's/^/  /'
+            exit 1
+          fi
+          echo "no unexpected empty suites ($(wc -l < /tmp/actual-empty) expected-empty in this shard)"
 
   # ---------------------------------------------------------------------------
   # Tier 3 — compile the feature-gated suites. BUILD ONLY, ~2 minutes.

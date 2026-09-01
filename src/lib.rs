@@ -5018,6 +5018,13 @@ impl EmbeddedDatabase {
                         }
                     }
                     catalog.save_table_constraints(name, &table_constraints)?;
+                    // A composite `UNIQUE (a, b)` needs an ART index to be
+                    // enforced by anything, and `Catalog::create_table` cannot
+                    // create it: it only sees `Schema`, and a table-level
+                    // constraint lives here in `TableConstraints`. Same helper
+                    // `rebuild_all_indexes` calls at open, so create-time and
+                    // reopen-time agree.
+                    catalog.register_composite_unique_indexes(name, &table_constraints);
                 }
 
                 // Also add column-level UNIQUE and PRIMARY KEY constraints
@@ -7181,6 +7188,20 @@ impl EmbeddedDatabase {
                 constraints
                     .check_constraints
                     .retain(|c| !c.name.eq_ignore_ascii_case(constraint_name));
+                // Keep the removed UNIQUE constraints: their ART index has to go
+                // too. The index — not the constraint record — is what the write
+                // path probes, so leaving it registered means DROP CONSTRAINT
+                // reports success while the constraint keeps rejecting rows.
+                // This arm never dropped it (it reimplements the removal inline
+                // rather than calling `Catalog::drop_constraint`, whose
+                // index-dropping half consequently had no caller from SQL), so a
+                // dropped UNIQUE went on being enforced forever.
+                let removed_uniques: Vec<sql::UniqueConstraint> = constraints
+                    .unique_constraints
+                    .iter()
+                    .filter(|c| c.name.eq_ignore_ascii_case(constraint_name))
+                    .cloned()
+                    .collect();
                 constraints
                     .unique_constraints
                     .retain(|c| !c.name.eq_ignore_ascii_case(constraint_name));
@@ -7200,6 +7221,7 @@ impl EmbeddedDatabase {
                     )));
                 }
                 catalog.save_table_constraints(table_name, &constraints)?;
+                catalog.drop_unique_constraint_indexes(table_name, &removed_uniques);
                 Ok(0)
             }
             sql::LogicalPlan::AlterTableMulti { operations } => {

@@ -1,0 +1,68 @@
+# Integration-test targets that legitimately execute ZERO tests under the default
+# `cargo test --tests` command, because their contents are behind a non-default
+# cargo feature (`code-graph`, `mcp-endpoint`, `graph-rag`, `internal-tests`).
+#
+# WHY THIS FILE EXISTS. `docs/GATES.md` §3b makes "a suite reporting
+# `ok. 0 passed; 0 failed; 0 ignored` ran nothing" a gate FAILURE. That rule is right for a
+# suite that is SUPPOSED to run — it is how a silently-emptied suite gets caught — but the
+# targets below are opt-ins that are empty BY DESIGN without their feature. The first
+# `integration full` run failed all six shards on exactly these, so the check now consults
+# this allowlist and fails only on a suite that is not listed.
+#
+# Generated from a full local run:
+#   awk '/^     Running/{s=$2} /^test result: ok\. 0 passed; 0 failed; 0 ignored/{print s}' full.log
+#
+# MAINTENANCE. Removing a name makes the gate strict for that suite again. Adding one
+# suppresses a real signal — only do so with the feature gate that justifies it. Note the
+# `internal-tests` entries (branch_*, time_travel_*, encryption_tests, materialized_view_tests,
+# protocol_integration_test, repl_tenant_commands, …) DO run in the `feature-gated-compile`
+# tier and in the local `--features internal-tests` gate; they are empty only by default.
+automatic_time_travel_tests
+branch_as_of_tests
+branch_merge_conflict_tests
+branch_sql_integration_tests
+code_graph_ast_index
+code_graph_body_vec
+code_graph_extractor_registry
+code_graph_grammar_registry
+code_graph_list_languages
+code_graph_local_embedder
+code_graph_mvp
+code_graph_namespacing
+code_graph_on_branch
+code_graph_parallel_index
+code_graph_parallel_index_bench
+code_graph_phase2
+code_graph_rename_apply
+code_graph_semantic_hash_ddl
+code_graph_sql
+code_graph_temporal
+delta_tracking_integration_test
+encryption_tests
+graph_rag_docling
+graph_rag_ingest
+graph_rag_linker
+graph_rag_linker_vector
+graph_rag_phase3
+materialized_view_tests
+mcp_auth
+mcp_auto_register
+mcp_axum_routes
+mcp_conformance
+mcp_endpoint_phase4
+mcp_followups
+mcp_introspection
+mcp_new_tools
+mcp_progress
+mcp_progress_http
+mv_auto_refresh_integration_test
+mv_incremental_test
+network_protocol_test
+phase3_comprehensive_integration
+protocol_integration_test
+repl_tenant_commands
+semantic_merkle
+time_travel_integration_tests
+time_travel_optimization_tests
+time_travel_system_views_tests
+with_context

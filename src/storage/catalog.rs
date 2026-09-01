@@ -554,6 +554,99 @@ impl<'a> Catalog<'a> {
         Ok(())
     }
 
+    /// Register the ART unique indexes for a table's MULTI-COLUMN (composite)
+    /// table-level `UNIQUE (a, b)` constraints.
+    ///
+    /// Why this exists: `create_table` above derives unique indexes from
+    /// `schema.columns` — i.e. from the COLUMN-level `unique` flag only. A
+    /// table-level constraint lives in `TableConstraints`, which `create_table`
+    /// never sees, so a composite `UNIQUE (a, b)` had no index. With no index
+    /// there was nothing to probe, and the constraint was enforced by NOTHING on
+    /// any write path, on either executor family — a silently accepted duplicate.
+    ///
+    /// Everything below the creation call was already composite-capable and is
+    /// unchanged: `insert_row_indexes` resolves `entry.columns` at any arity, and
+    /// `check_unique_constraints_tuple` encodes the multi-value key and skips the
+    /// constraint when any column is NULL (PostgreSQL semantics). Only the
+    /// creation call was missing.
+    ///
+    /// SINGLE-column table-level `UNIQUE (a)` is deliberately skipped: it is
+    /// already enforced today (verified end to end), because that shape also sets
+    /// the column-level flag `create_table` reads. Creating a second index for it
+    /// would double-register the same rule under a different name and change the
+    /// error text of a case that already works.
+    ///
+    /// Idempotent: `IndexAlreadyExists` is the expected outcome when
+    /// `rebuild_all_indexes` runs in a process that already executed the
+    /// `CREATE TABLE`, and is logged at debug like the sibling PK/FK loops.
+    pub fn register_composite_unique_indexes(&self, table_name: &str, constraints: &crate::sql::TableConstraints) {
+        let art_manager = self.storage.art_indexes();
+        for uc in &constraints.unique_constraints {
+            if uc.is_primary_key || uc.columns.len() < 2 {
+                continue;
+            }
+            match art_manager.create_unique_index(table_name, &uc.columns, Some(&uc.name)) {
+                Ok(_) => tracing::debug!(
+                    "Registered composite UNIQUE ART index '{}' on {}({})",
+                    uc.name,
+                    table_name,
+                    uc.columns.join(", ")
+                ),
+                Err(super::art_index::ArtIndexError::IndexAlreadyExists(_)) => {
+                    tracing::debug!("Composite UNIQUE index '{}' already registered", uc.name);
+                }
+                Err(e) => tracing::warn!(
+                    "Failed to register composite UNIQUE index '{}' on {}({}): {} — \
+                     the constraint will NOT be enforced until it is registered",
+                    uc.name,
+                    table_name,
+                    uc.columns.join(", "),
+                    e
+                ),
+            }
+        }
+    }
+
+    /// Drop the ART unique index backing each of `removed` (unique constraints that have
+    /// just been removed from a table's persisted constraint set).
+    ///
+    /// TWO candidate names, because unique indexes are not all named the same way:
+    /// `create_unique_index` uses the name it is GIVEN, and callers pass different things —
+    /// `create_table`'s column-level loop passes the COLUMN name, while
+    /// `register_composite_unique_indexes` passes the CONSTRAINT name. The
+    /// `unique_{table}_{name}` form is the original guess and matches neither; it is tried
+    /// last so that any index which does carry it is still cleaned up.
+    ///
+    /// Leaving the index behind is not cosmetic: the index, not the constraint record, is
+    /// what the write path probes, so a stale one keeps rejecting rows for a constraint the
+    /// user has already dropped.
+    pub fn drop_unique_constraint_indexes(&self, table_name: &str, removed: &[crate::sql::UniqueConstraint]) {
+        let art_manager = self.storage.art_indexes();
+        for uc in removed {
+            let mut candidates: Vec<String> = vec![uc.name.clone()];
+            if uc.columns.len() == 1 {
+                // Column-level UNIQUE registers under the bare column name.
+                candidates.push(uc.columns[0].clone());
+            }
+            candidates.push(format!("unique_{}_{}", table_name, uc.name));
+
+            let mut dropped = false;
+            for candidate in candidates {
+                if art_manager.drop_index(&candidate).is_ok() {
+                    dropped = true;
+                    tracing::debug!("Dropped UNIQUE ART index '{}' for constraint '{}'", candidate, uc.name);
+                }
+            }
+            if !dropped {
+                tracing::debug!(
+                    "No UNIQUE ART index found for dropped constraint '{}' on '{}'",
+                    uc.name,
+                    table_name
+                );
+            }
+        }
+    }
+
     /// Check if a table exists
     pub fn table_exists(&self, table_name: &str) -> Result<bool> {
         let key = Self::table_metadata_key(table_name);
@@ -1123,8 +1216,16 @@ impl<'a> Catalog<'a> {
                 }
             }
 
-            // (Re)register FK indexes from persisted constraints.
+            // (Re)register FK indexes from persisted constraints — and, from the
+            // same load, the composite UNIQUE indexes. Both are constraint-derived
+            // rather than schema-derived, so neither is covered by the
+            // `schema.columns` loops above. Registering here (before the snapshot
+            // load / row replay below) is what makes a composite UNIQUE survive a
+            // restart AND get backfilled with the table's existing rows; register
+            // it after the replay and the tree would be empty, so duplicates
+            // against pre-restart rows would be accepted.
             if let Ok(constraints) = self.load_table_constraints(&table_name) {
+                self.register_composite_unique_indexes(&table_name, &constraints);
                 for fk in &constraints.foreign_keys {
                     if let Err(e) = art_manager.create_fk_index(
                         &fk.table_name,
@@ -3249,12 +3350,11 @@ impl<'a> Catalog<'a> {
                 }
             }
 
-            // Drop UNIQUE ART index if constraint was a unique constraint
+            // Drop the UNIQUE ART index through the same helper the SQL
+            // `ALTER TABLE ... DROP CONSTRAINT` executor uses, so the two agree
+            // about which index names back a unique constraint.
             if let Some(unique) = unique_to_drop {
-                let unique_index_name = format!("unique_{}_{}", table_name, unique.name);
-                if let Err(e) = art_manager.drop_index(&unique_index_name) {
-                    tracing::warn!("Failed to drop UNIQUE ART index '{}': {}", unique_index_name, e);
-                }
+                self.drop_unique_constraint_indexes(table_name, std::slice::from_ref(&unique));
             }
 
             Ok(true)
