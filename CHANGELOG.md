@@ -7,6 +7,131 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.28.0] - 2026-09-02
+
+### Changed — **BREAKING**: a NULL into a plain `INT PRIMARY KEY` is now rejected, as in PostgreSQL
+
+Through 4.27.0, `INSERT INTO t (id, v) VALUES (NULL, 'x')` — and `INSERT INTO t (v) VALUES ('x')`
+— on `t (id INT PRIMARY KEY, v TEXT)` **succeeded** and silently invented a primary key from the
+row id. PostgreSQL raises `null value in column "id" violates not-null constraint` for both. Nano
+now does too, on every insert shape and both executor families.
+
+**`SERIAL` / `BIGSERIAL` / `IDENTITY` primary keys are unaffected** and still auto-fill when omitted
+or explicitly NULL. The planner already marks those columns nullable precisely so the storage
+layer can fill them; the defect was a `primary_key` exemption in the NOT NULL checks that could
+only ever fire for a plain non-nullable key, where it was wrong.
+
+**If you relied on the old behaviour**, declare the column `SERIAL` (or `GENERATED … AS IDENTITY`)
+— that is the shape that means "generate it for me".
+
+Also in this release: two HNSW backfill tests asserted exact nearest-neighbour *rank* on an
+approximate, randomised index — one between two vectors ~0.006 apart, the other an exact-copy
+probe at `k=1` over 3-dimensional synthetic vectors — and each flaked a release gate while
+passing against the identical binary elsewhere in the same run. Both now assert what their names
+claim, that the backfilled row is *reachable*, which still fails if backfill breaks.
+
+## [4.27.0] - 2026-09-01
+
+### Added — the built-in BaaS HTTP layer is now actually served (**behaviour change on port 8080**)
+
+The README's opening line advertises a "built-in BaaS layer (Auth, REST API, Realtime)" and
+prints a working `curl -X POST …/auth/v1/signup`. On every released binary those endpoints
+returned **404**: the `start` command's HTTP listener served `/` and `/health` and nothing else,
+and the REST / Auth / Realtime / Swagger router existed only as a library API that nothing
+mounted. It is mounted now. `/version`, `/docs`, `/openapi.json`, `/rest/v1/*`, `/auth/v1/*` and
+`/realtime/v1/websocket` respond; the README's signup example returns a real session.
+
+**Review your exposure before upgrading.** Port 8080 (`--http-port`) previously exposed
+effectively only a health check. It now exposes a REST API, authentication endpoints, a realtime
+websocket and Swagger UI.
+
+Four defects had to be fixed to deliver this, each sufficient on its own to keep it dead: the
+router was never mounted; the auth bridge was never constructed (every `/auth/v1/*` call would
+have returned 503); its schema bootstrap was never called (the first signup would have failed on
+a missing `_auth_users`); and **four hardcoded fallback JWT secrets** sat behind the path.
+
+### Security — no shipped JWT signing key
+
+All four hardcoded fallback secrets are gone. The signing key comes from `[api] jwt_secret`; when
+unset the server generates a fresh 256-bit key per start and **warns that tokens will not survive
+a restart**. Set it before relying on sessions. The previous generator produced 128 bits from a
+hash seed written out twice to look like 256 — inert while nothing signed tokens, unacceptable
+now that something does.
+
+### Fixed — `/health` kept its JSON shape
+
+Mounting the router would have silently changed `/health` from `{"status":"ok"}` to the plain
+string `OK`, breaking any monitor parsing it. Caught by the gate; both handlers now return the
+JSON object.
+
+## [4.26.0] - 2026-09-01
+
+### Security — **`--auth md5` authenticated everyone; `--auth scram-sha-256` authenticated no one** (GH#19, GH#20)
+
+Affects 4.23.0 through 4.25.0. **If you ran `--auth md5` on a non-loopback interface, treat the
+database as having been open for the lifetime of that deployment.**
+
+`--auth md5` accepted a client with the correct password, a wrong password, or **no password at
+all**. `AuthMethod::Md5` had no arm in the wire handler's auth dispatch and fell into a catch-all
+that set `authenticated = true` without ever sending a challenge — which is why an empty
+`PGPASSWORD` connected without even a prompt. The startup banner printed `Authentication: MD5`,
+confirming a control that did not exist. md5 is now genuinely implemented (salted challenge,
+constant-time compare, uniform work on the unknown-user path), and the catch-all is **deleted**:
+the match is exhaustive, so a future auth method is a compile error rather than another silent
+accept-everyone.
+
+`--auth scram-sha-256` rejected every password including the correct one. The handler advertised
+a fresh random salt per connection instead of the salt the stored key was derived from, so no
+proof could ever verify; it also never sent `AuthenticationOk` after `SASLFinal`, and rebuilt
+`client-first-message-bare` rather than using the client's bytes. All three fixed. `scram-sha-256`
+is the mode to use.
+
+### Fixed — unknown config sections are no longer silent
+
+`[auth]` in `config.toml` was parsed, discarded and never mentioned — the real section is
+`[authentication]`. Unknown top-level sections now warn and suggest the intended name.
+
+## [4.25.0] - 2026-09-01
+
+### Fixed — table-level composite `UNIQUE (a, b)` was enforced by nothing (#107)
+
+Accepted by the parser, persisted, reported by the catalog views — and enforced on no write path.
+A duplicate pair simply succeeded. Only the index-creation call was missing; everything below it
+was already composite-capable. The index is now created at `CREATE TABLE` and re-registered and
+backfilled at open, so it survives a restart.
+
+### Fixed — `ALTER TABLE … DROP CONSTRAINT` never stopped a UNIQUE constraint enforcing
+
+The executor removed the constraint record but never dropped the index the write path actually
+probes, so a dropped UNIQUE went on rejecting rows forever.
+
+### Fixed — the integration-test CI added in 4.23.0 was red on main
+
+Two bugs in the workflow itself: coloured cargo output defeated the suite-name parser, and the
+empty-suite rule fired on the ~49 feature-gated targets that are empty by design.
+
+## [4.24.0] - 2026-08-31
+
+### Fixed — `INSERT … SELECT` over the PostgreSQL extended protocol wrote to the wrong columns (#101)
+
+On the executor family used by psycopg3 (server-side bind), JDBC, sqlx, Drizzle, node-postgres and
+every REST write, `INSERT INTO t (b, a) SELECT x, y FROM s` stored `x` in the **first** column,
+ignoring the column list. With type-compatible columns there was no error — the values were
+simply swapped. Silent data corruption.
+
+### Fixed — the same path enforced almost no constraints (#102)
+
+No NOT NULL, no FOREIGN KEY, no UNIQUE, no DEFAULT fill. `INSERT INTO child SELECT …` created
+orphan rows past a foreign key. Both executor families now share one row-assembly and validation
+gate. An unknown column name in an INSERT column list now errors instead of being silently dropped
+and shifting every later value.
+
+### Fixed — `BEFORE INSERT … FOR EACH ROW` rewrites did not apply to `INSERT … SELECT` (#84)
+
+Known remaining gap, pinned by a test: `INSERT … SELECT` rows are not rolled back by a surrounding
+`ROLLBACK` (#100).
+
+
 ## [4.23.0] - 2026-08-31
 
 Ten backlog items, most of them found by an ACID audit rather than reported. Several are

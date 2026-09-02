@@ -770,20 +770,17 @@ fn a_non_pk_unique_value_colliding_with_a_primary_key_is_accepted_on_both_famili
 }
 
 /// A source-supplied NULL primary key must behave the same in `INSERT … SELECT` as in a
-/// single-row `INSERT`. This codebase auto-fills it from the row id — verified on the
-/// single-row arm of BOTH families before this test was written — and the gate's
-/// post-rewrite NOT NULL pass already exempted primary keys for the OMITTED form. Its
-/// per-value pass did not, so `INSERT … SELECT` alone rejected what every other insert
-/// shape accepted. The two passes inside one function contradicted each other.
+/// single-row `INSERT` — and as of #108 BOTH reject it for a plain `INT PRIMARY KEY`,
+/// matching PostgreSQL.
+///
+/// This test previously asserted the OPPOSITE: that the NULL was auto-filled from the row
+/// id, because that was the convention every insert shape shared. It was written to pin the
+/// shapes AGREEING, and they still do — the agreed answer changed from accept to reject.
 ///
 /// `INT PRIMARY KEY` is deliberate, not `SERIAL`: the planner sets `not_null = false` for
-/// SERIAL/IDENTITY columns (`sql_column_def_to_column_def`, `src/sql/planner.rs`), so a
-/// SERIAL PK never reaches the NOT NULL pass at all and would make this test vacuous.
-///
-/// NOTE this auto-fill diverges from PostgreSQL, which rejects an explicit NULL into a
-/// plain `INT PRIMARY KEY`. That divergence is pre-existing and codebase-wide — the
-/// single-row arms do it too — so it is filed separately rather than changed here, where
-/// the goal is that the statement shapes AGREE.
+/// SERIAL/IDENTITY (`sql_column_def_to_column_def`), so a SERIAL PK is nullable and is still
+/// auto-filled. That distinction is the whole fix — `nullable` already separated the two
+/// cases, so the old `&& !primary_key` exemptions could only ever misfire on plain PKs.
 #[test]
 fn a_source_supplied_null_primary_key_matches_the_single_row_arm_on_both_families() {
     fn setup(db: &EmbeddedDatabase) {
@@ -826,23 +823,53 @@ fn a_source_supplied_null_primary_key_matches_the_single_row_arm_on_both_familie
     );
     assert_eq!(params_rows, text_rows, "DIVERGENCE in rows left behind");
 
-    // Whatever the shared convention is, assert what it currently IS so a change to it
-    // surfaces here rather than silently.
+    // #108: the agreed answer is REJECT for a plain (non-nullable) INT PRIMARY KEY.
     assert!(
-        single_row_accepts,
-        "reference behaviour changed: single-row INSERT now rejects a NULL primary key. \
-         Update this test AND the gate together — they must stay in agreement."
+        !single_row_accepts,
+        "a NULL into a plain INT PRIMARY KEY must be rejected, as PostgreSQL does (#108)"
     );
-    assert_eq!(text_rows, 1, "the row must be stored");
-    assert_eq!(
-        column(&db, "SELECT label FROM spk_dst"),
-        vec![text("alpha")],
-        "the non-PK column must survive intact"
-    );
-    assert!(
-        !matches!(column(&db, "SELECT id FROM spk_dst").first(), Some(Value::Null) | None),
-        "the primary key must have been filled, not left NULL"
-    );
+    assert_eq!(text_rows, 0, "the rejected row must not be stored");
+}
+
+/// SERIAL primary keys are the case the NOT NULL check must NOT catch, on every shape.
+/// The planner marks them nullable so an omitted or explicitly-NULL value becomes the NULL
+/// the storage layer replaces with the row id. If #108 had been implemented by consulting
+/// `primary_key` rather than `nullable`, this is what would have broken.
+#[test]
+fn a_serial_primary_key_is_still_auto_filled_on_both_families() {
+    fn setup(db: &EmbeddedDatabase) {
+        db.execute("CREATE TABLE ser_dst (id SERIAL PRIMARY KEY, label TEXT)")
+            .unwrap();
+        db.execute("CREATE TABLE ser_src (label TEXT)").unwrap();
+        db.execute("INSERT INTO ser_src (label) VALUES ('alpha')").unwrap();
+    }
+
+    for (label, params) in [("text", false), ("params", true)] {
+        let db = mem_db();
+        setup(&db);
+        let sql = "INSERT INTO ser_dst (id, label) SELECT NULL, label FROM ser_src";
+        let r = if params {
+            db.execute_params(sql, &[])
+        } else {
+            db.execute(sql)
+        };
+        r.unwrap_or_else(|e| panic!("{label}: a NULL SERIAL primary key must be auto-filled: {e}"));
+        assert_eq!(rows_in(&db, "ser_dst"), 1, "{label}: the row must be stored");
+        assert!(
+            !matches!(column(&db, "SELECT id FROM ser_dst").first(), Some(Value::Null) | None),
+            "{label}: the SERIAL primary key must have been filled, not left NULL"
+        );
+
+        // Omitting it entirely must work too.
+        let sql2 = "INSERT INTO ser_dst (label) SELECT label FROM ser_src";
+        let r2 = if params {
+            db.execute_params(sql2, &[])
+        } else {
+            db.execute(sql2)
+        };
+        r2.unwrap_or_else(|e| panic!("{label}: an OMITTED SERIAL primary key must be auto-filled: {e}"));
+        assert_eq!(rows_in(&db, "ser_dst"), 2, "{label}: both rows must be stored");
+    }
 }
 
 /// A NULL into a NOT NULL column that is NOT the primary key is still rejected. Pins the
