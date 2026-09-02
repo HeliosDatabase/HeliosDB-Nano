@@ -4119,13 +4119,15 @@ impl EmbeddedDatabase {
 
             // NOT NULL on a value the source actually supplied.
             //
-            // Primary keys are exempt, matching the post-rewrite pass below and
-            // the single-row INSERT arm: a NULL in a SERIAL/IDENTITY primary key
-            // is the signal for the storage layer to auto-fill it. Without this
-            // exemption the two passes inside this one function contradict each
-            // other — a source-supplied NULL PK would be rejected here while an
-            // omitted one is accepted 70 lines down.
-            if matches!(val, Value::Null) && !target_col.nullable && !target_col.primary_key {
+            // NO primary-key exemption. `nullable` ALREADY distinguishes the two
+            // cases: the planner sets `not_null = false` for SERIAL/IDENTITY
+            // (`sql_column_def_to_column_def`), so a `SERIAL PRIMARY KEY` column
+            // is nullable=true and never reaches this check, while a plain
+            // `INT PRIMARY KEY` is nullable=false and must reject NULL exactly as
+            // PostgreSQL does. The old `&& !primary_key` clause could therefore
+            // only ever fire for the plain-PK case, where it was wrong — it
+            // silently invented a primary key from the row id (#108).
+            if matches!(val, Value::Null) && !target_col.nullable {
                 return Err(Error::constraint_violation(format!(
                     "NOT NULL constraint violated: cannot insert NULL into column '{}'",
                     target_col.name
@@ -4153,11 +4155,14 @@ impl EmbeddedDatabase {
                             value = gate.evaluator.cast_value(value, &col.data_type)?;
                         }
                         values.push(value);
-                    } else if col.primary_key {
-                        // PK omitted from the INSERT — NULL so the storage
-                        // layer's SERIAL auto-fill replaces it with the row_id.
-                        values.push(Value::Null);
                     } else if col.nullable {
+                        // Covers SERIAL/IDENTITY primary keys, which the planner
+                        // marks nullable precisely so an omitted value becomes the
+                        // NULL that the storage layer's auto-fill replaces with the
+                        // row id. A plain non-nullable `INT PRIMARY KEY` falls
+                        // through to the error below, as PostgreSQL does (#108) —
+                        // it previously had its own arm here and was auto-filled.
+
                         values.push(Value::Null);
                     } else {
                         return Err(Error::query_execution(format!(
@@ -4190,7 +4195,10 @@ impl EmbeddedDatabase {
         // NOT NULL column. Primary keys are exempt: an omitted PK is NULL by
         // design above and the storage layer fills it.
         for (idx, col) in schema.columns.iter().enumerate() {
-            if col.nullable || col.primary_key {
+            // No primary-key exemption: `nullable` already exempts SERIAL/IDENTITY
+            // (the planner marks them nullable), and a plain INT PRIMARY KEY must
+            // reject NULL as PostgreSQL does (#108).
+            if col.nullable {
                 continue;
             }
             if matches!(tuple.values.get(idx), Some(Value::Null)) {
@@ -5289,11 +5297,12 @@ impl EmbeddedDatabase {
                                             value = evaluator.cast_value(value, &col.data_type)?;
                                         }
                                         Ok(value)
-                                    } else if col.primary_key {
-                                        // PK column omitted from INSERT — fill with NULL so
-                                        // the SERIAL auto-fill logic replaces it with row_id.
-                                        Ok(Value::Null)
                                     } else if col.nullable {
+                                        // SERIAL/IDENTITY PKs are nullable by design, so this
+                                        // arm still yields the NULL the storage layer auto-fills.
+                                        // A plain non-nullable INT PRIMARY KEY now falls through
+                                        // to the error below, matching PostgreSQL (#108).
+
                                         Ok(Value::Null)
                                     } else {
                                         Err(Error::query_execution(format!(
@@ -5313,7 +5322,8 @@ impl EmbeddedDatabase {
                         // PK columns are left for SERIAL/IDENTITY auto-fill
                         // to populate in the storage layer.
                         for (idx, col) in schema.columns.iter().enumerate() {
-                            if !col.nullable && !col.primary_key {
+                            // `nullable` already exempts SERIAL/IDENTITY (#108).
+                            if !col.nullable {
                                 if matches!(final_values_vec.get(idx), Some(Value::Null)) {
                                     return Err(Error::constraint_violation(format!(
                                         "NOT NULL constraint violated: cannot insert NULL into column '{}'",
@@ -9635,7 +9645,8 @@ impl EmbeddedDatabase {
 
     fn check_not_null_for_materialized_insert(tuple_values: &[Value], schema: &Schema) -> Result<()> {
         for (idx, col) in schema.columns.iter().enumerate() {
-            if col.nullable || col.primary_key {
+            // `nullable` already exempts SERIAL/IDENTITY (#108).
+            if col.nullable {
                 continue;
             }
             if matches!(tuple_values.get(idx), Some(Value::Null)) {
@@ -20845,7 +20856,8 @@ impl EmbeddedDatabase {
             // After potential default application, enforce NOT NULL.
             // Primary-key columns skip this check because SERIAL /
             // IDENTITY auto-fill runs in the storage layer later.
-            if !col.nullable && !col.primary_key {
+            // `nullable` already exempts SERIAL/IDENTITY (#108).
+            if !col.nullable {
                 if matches!(slot, Value::Null) {
                     return Err(Error::constraint_violation(format!(
                         "NOT NULL constraint violated: cannot insert NULL into column '{}'",
