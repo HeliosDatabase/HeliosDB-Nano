@@ -667,36 +667,11 @@ fn ctas_failed_population_still_leaves_no_table() {
 // KNOWN GAPS — pinned, not fixed. Read before "fixing" a failure here.
 // ===========================================================================
 
-/// PINS TASK #100: `INSERT … SELECT` writes rows STRAIGHT to storage
-/// (`insert_tuple_branch_aware_with_schema`, which takes no transaction), so they survive
-/// the enclosing `ROLLBACK`. That is WRONG and it is filed as #100; it is deliberately NOT
-/// fixed by the #101/#102/#84 change, which alters row assembly and validation only and
-/// leaves transaction participation exactly as it was.
-///
-/// WHEN #100 LANDS THIS TEST MUST FAIL. Do not relax it — REPLACE it with the inverse
-/// assertion (`rows_in(&db, "pin_dst") == 0` after ROLLBACK, and the rows visible before
-/// COMMIT only to the writing session), on BOTH executor families.
-#[test]
-fn pinned_gap_100_insert_select_rows_survive_rollback() {
-    let db = mem_db();
-    db.execute("CREATE TABLE pin_src (id INT, name TEXT)").unwrap();
-    db.execute("INSERT INTO pin_src (id, name) VALUES (1, 'Alice')")
-        .unwrap();
-    db.execute("CREATE TABLE pin_dst (id INT, name TEXT)").unwrap();
-
-    db.execute("BEGIN").expect("BEGIN");
-    db.execute("INSERT INTO pin_dst (id, name) SELECT id, name FROM pin_src")
-        .expect("INSERT … SELECT inside the transaction");
-    db.execute("ROLLBACK").expect("ROLLBACK");
-
-    assert_eq!(
-        rows_in(&db, "pin_dst"),
-        1,
-        "KNOWN GAP #100: INSERT … SELECT writes around the transaction, so the row survives \
-         ROLLBACK. If this now reports 0, #100 has been fixed — replace this test with the \
-         inverse assertion rather than deleting it."
-    );
-}
+// #100 CLOSED. This slot held `pinned_gap_100_insert_select_rows_survive_rollback`, which
+// asserted that INSERT … SELECT rows SURVIVED a ROLLBACK, with instructions to replace it once
+// the rows joined the transaction. They do now (v4.29.0): both arms stage validated rows through
+// the transactional multi-row insert primitive. The rollback/commit/atomicity coverage lives in
+// `tests/insert_select_txn_tests.rs`.
 
 // #107 CLOSED. This slot held `pinned_gap_composite_unique_is_enforced_on_neither_family`,
 // which asserted that a duplicate under a table-level `UNIQUE (a, b)` WAS accepted, with

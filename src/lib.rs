@@ -4032,6 +4032,63 @@ impl EmbeddedDatabase {
         })
     }
 
+    /// Stage one chunk of already-validated `INSERT … SELECT` rows INTO `txn`
+    /// (#100); returns the assigned row ids in order.
+    ///
+    /// ONE implementation for both executor families — a third copy-and-drift
+    /// of the staging sequence is exactly what produced #101/#102. Delegates to
+    /// `insert_validated_tuples_in_transaction_ids`, the primitive the multi-row
+    /// `INSERT … VALUES` path uses: grouped columnar staging, per-row
+    /// `txn.put_insert_fast` with an ART `RemoveInserted` undo entry, and
+    /// `stage_row_counter_in_transaction` (without which `counter:{table}` is
+    /// never persisted and a restart hands out already-used row ids that
+    /// OVERWRITE live rows).
+    ///
+    /// HNSW indexes are maintained here per row WITH an undo entry, mirroring
+    /// the single-row text arm; the multi-row primitive does not do it and the
+    /// params single-row arm omits it — do not copy that omission.
+    fn stage_insert_select_chunk_in_transaction(
+        &self,
+        table_name: &str,
+        chunk: Vec<Tuple>,
+        schema: &Schema,
+        txn: &storage::Transaction,
+    ) -> Result<Vec<u64>> {
+        if chunk.is_empty() {
+            return Ok(Vec::new());
+        }
+        let vector_gate = self.vector_dml_gate(table_name);
+        let snapshot: Vec<Tuple> = if vector_gate { chunk.clone() } else { Vec::new() };
+        let ids = self.insert_validated_tuples_in_transaction_ids(table_name, chunk, schema, txn)?;
+        if vector_gate {
+            for (row_id, tuple) in ids.iter().zip(snapshot.iter()) {
+                let vops = self
+                    .storage
+                    .vector_indexes()
+                    .on_row_insert(table_name, *row_id, schema, tuple);
+                self.push_vector_undo(txn, vops);
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Whether an `INSERT … SELECT` that holds a transaction should STAGE its
+    /// rows into it (#100). Mirrors the guards the multi-row `INSERT … VALUES`
+    /// transactional fast path applies to itself: a tenant context or a branch
+    /// falls back to the streaming engine path, keeping branch `bv:` version
+    /// keys and tenant routing exactly as today.
+    /// The TEXT arm additionally requires `skip_fast_paths` (a real, not
+    /// implicit-autocommit, transaction); the params arm's `active_txn` is
+    /// only ever a session or explicit global transaction, because its
+    /// autocommit entry passes `None` and CTAS population passes `None`.
+    fn insert_select_should_stage(&self) -> bool {
+        self.tenant_manager.get_current_context().is_none() && self.storage.get_current_branch_id().is_none()
+    }
+
+    fn insert_select_txn_batch_rows(&self) -> usize {
+        self.config.performance.insert_select_txn_batch_rows
+    }
+
     /// Assemble and validate ONE `INSERT … SELECT` source row against the
     /// target table. `Ok(None)` means the BEFORE-row rewrite recipe said
     /// `RETURN NULL`: the row must be skipped — not written, not counted, not
@@ -4556,7 +4613,13 @@ impl EmbeddedDatabase {
                     source: Box::new(source),
                     returning: None,
                 };
-                self.execute_plan_with_params(&insert, &[], session_txn)
+                // #100 deliberately passes NO transaction here: CTAS population
+                // stays on the streaming engine path so the compensating DROP
+                // below remains correct. DDL is non-transactional on this
+                // engine (recorded in the ACID audit); staging rows into a
+                // session txn while the CREATE is not staged would let them
+                // commit later against a table the compensating drop removed.
+                self.execute_plan_with_params(&insert, &[], None)
                     .map(|(count, _returned)| count)
             });
 
@@ -5954,8 +6017,11 @@ impl EmbeddedDatabase {
                 };
 
                 // Execute the source SELECT plan to get rows
-                let mut executor =
-                    sql::Executor::with_storage(&self.storage).with_timeout(self.effective_statement_timeout_ms());
+                let mut executor = sql::Executor::with_storage(&self.storage)
+                        .with_timeout(self.effective_statement_timeout_ms())
+                        // #100: the source SELECT must see rows this transaction staged
+                        // earlier (a chained INSERT … SELECT via a staging table).
+                        .with_transaction(txn);
                 let source_rows = executor.execute(source_plan)?;
 
                 let catalog = self.storage.catalog();
@@ -5993,6 +6059,23 @@ impl EmbeddedDatabase {
                 } else {
                     None
                 };
+
+                // #100: inside a REAL transaction, STAGE rows into it (chunked)
+                // instead of writing straight to storage around it.
+                //
+                // `skip_fast_paths` is the discriminator this arm already has:
+                // `true` only for `Transaction::execute()` / session transactions;
+                // `false` for autocommit, whose `txn` is the IMPLICIT transaction
+                // `begin_autocommit_transaction` builds — one with no logical WAL,
+                // which the single-row arm compensates for with per-row
+                // `log_data_insert` gated on this same flag. Staging under it would
+                // silently drop those ops for HA standbys, so autocommit keeps the
+                // streaming engine path unchanged; explicit transactions get their
+                // logical WAL at COMMIT via `collect_logical_wal_ops`.
+                let staging = skip_fast_paths && self.insert_select_should_stage();
+                let batch_rows = self.insert_select_txn_batch_rows();
+                let mut pending: Vec<Tuple> = Vec::new();
+                let mut pending_returning: Vec<Tuple> = Vec::new();
 
                 let mut count = 0u64;
                 for source_row in &source_rows {
@@ -6046,34 +6129,62 @@ impl EmbeddedDatabase {
                     // for the same reason as the plain INSERT arm.
                     Self::enforce_rls_with_check(rls_guard_insert.as_ref(), &tuple)?;
 
-                    // Insert the tuple
-                    let row_id =
-                        self.storage
-                            .insert_tuple_branch_aware_with_schema(table_name, tuple.clone(), &schema)?;
-
-                    // Update ART index (main only; a branch INSERT..SELECT row
-                    // lands in `bdata:` via `insert_tuple_branch_aware_with_schema`
-                    // above and must not touch the shared ART; W2.0).
-                    if self.storage.get_current_branch_id().is_none() {
-                        let mut col_values = std::collections::HashMap::new();
-                        for (i, col) in schema.columns.iter().enumerate() {
-                            if let Some(v) = tuple.values.get(i) {
-                                col_values.insert(col.name.clone(), v.clone());
+                    if staging {
+                        // #100: staged — written by the txn's WriteBatch at COMMIT,
+                        // dropped by ROLLBACK, undone in ART and HNSW. RETURNING is
+                        // projected at flush time once the row id is known.
+                        pending.push(tuple.clone());
+                        if has_returning {
+                            pending_returning.push(tuple.clone());
+                        }
+                        if batch_rows != 0 && pending.len() >= batch_rows {
+                            let ids = self.stage_insert_select_chunk_in_transaction(
+                                table_name,
+                                std::mem::take(&mut pending),
+                                &schema,
+                                txn,
+                            )?;
+                            count += ids.len() as u64;
+                            for (mut t, id) in pending_returning.drain(..).zip(ids) {
+                                t.row_id = Some(id);
+                                if let Some(p) = Self::project_returning_columns(&t, &schema, returning) {
+                                    returned_tuples.push(p);
+                                }
                             }
                         }
-                        if let Err(e) = self.storage.art_indexes().on_insert(table_name, row_id, &col_values) {
-                            tracing::debug!("ART index insert for '{}': {}", table_name, e);
+                    } else {
+                        // Autocommit / branch / tenant: the streaming engine path,
+                        // unchanged.
+                        let row_id =
+                            self.storage
+                                .insert_tuple_branch_aware_with_schema(table_name, tuple.clone(), &schema)?;
+
+                        // Update ART index (main only; a branch INSERT..SELECT row
+                        // lands in `bdata:` via `insert_tuple_branch_aware_with_schema`
+                        // above and must not touch the shared ART; W2.0).
+                        if self.storage.get_current_branch_id().is_none() {
+                            let mut col_values = std::collections::HashMap::new();
+                            for (i, col) in schema.columns.iter().enumerate() {
+                                if let Some(v) = tuple.values.get(i) {
+                                    col_values.insert(col.name.clone(), v.clone());
+                                }
+                            }
+                            if let Err(e) = self.storage.art_indexes().on_insert(table_name, row_id, &col_values) {
+                                tracing::debug!("ART index insert for '{}': {}", table_name, e);
+                            }
                         }
-                    }
 
-                    count += 1;
+                        count += 1;
 
-                    // Collect tuple for RETURNING clause
-                    if has_returning {
-                        let mut returned_tuple = tuple.clone();
-                        returned_tuple.row_id = Some(row_id);
-                        if let Some(projected) = Self::project_returning_columns(&returned_tuple, &schema, returning) {
-                            returned_tuples.push(projected);
+                        // Collect tuple for RETURNING clause
+                        if has_returning {
+                            let mut returned_tuple = tuple.clone();
+                            returned_tuple.row_id = Some(row_id);
+                            if let Some(projected) =
+                                Self::project_returning_columns(&returned_tuple, &schema, returning)
+                            {
+                                returned_tuples.push(projected);
+                            }
                         }
                     }
 
@@ -6100,6 +6211,17 @@ impl EmbeddedDatabase {
                                 "INSERT aborted by AFTER trigger: {}",
                                 msg
                             )));
+                        }
+                    }
+                }
+                // #100: flush the final (or only) chunk.
+                if staging && !pending.is_empty() {
+                    let ids = self.stage_insert_select_chunk_in_transaction(table_name, pending, &schema, txn)?;
+                    count += ids.len() as u64;
+                    for (mut t, id) in pending_returning.into_iter().zip(ids) {
+                        t.row_id = Some(id);
+                        if let Some(p) = Self::project_returning_columns(&t, &schema, returning) {
+                            returned_tuples.push(p);
                         }
                     }
                 }
@@ -11484,19 +11606,21 @@ impl EmbeddedDatabase {
         Some(key)
     }
 
-    fn insert_validated_tuples_in_transaction(
+    fn insert_validated_tuples_in_transaction_ids(
         &self,
         table_name: &str,
         tuples: Vec<Tuple>,
         schema: &Schema,
         txn: &storage::Transaction,
-    ) -> Result<u64> {
+    ) -> Result<Vec<u64>> {
         if tuples.len() == 1 {
             let tuple = tuples
                 .into_iter()
                 .next()
                 .ok_or_else(|| Error::internal("missing insert tuple"))?;
-            return self.insert_validated_tuple_in_transaction(table_name, tuple, schema, txn);
+            return Ok(vec![
+                self.insert_validated_tuple_in_transaction_id(table_name, tuple, schema, txn)?
+            ]);
         }
 
         let prepared = self.prepare_fast_insert_batch(table_name, tuples, schema)?;
@@ -11512,18 +11636,30 @@ impl EmbeddedDatabase {
                 .stage_columnar_rows_grouped_in_transaction(table_name, &row_refs, schema, txn, true)?;
         }
 
-        let mut inserted = 0_u64;
-        let mut final_row_id = None;
+        let mut ids = Vec::with_capacity(prepared.len());
         for (row_id, tuple) in prepared {
             self.insert_prepared_tuple_in_transaction(table_name, row_id, tuple, schema, txn, true, false)?;
-            final_row_id = Some(row_id);
-            inserted += 1;
+            ids.push(row_id);
         }
+        if let Some(row_id) = ids.last() {
+            self.storage
+                .stage_row_counter_in_transaction(table_name, *row_id, txn)?;
+        }
+        Ok(ids)
+    }
 
-        if let Some(row_id) = final_row_id {
-            self.storage.stage_row_counter_in_transaction(table_name, row_id, txn)?;
-        }
-        Ok(inserted)
+    /// Count-returning wrapper kept for the existing multi-row `INSERT … VALUES`
+    /// callers; `insert_validated_tuples_in_transaction_ids` is the primitive.
+    fn insert_validated_tuples_in_transaction(
+        &self,
+        table_name: &str,
+        tuples: Vec<Tuple>,
+        schema: &Schema,
+        txn: &storage::Transaction,
+    ) -> Result<u64> {
+        Ok(self
+            .insert_validated_tuples_in_transaction_ids(table_name, tuples, schema, txn)?
+            .len() as u64)
     }
 
     fn prepare_fast_insert_batch(
@@ -11547,10 +11683,23 @@ impl EmbeddedDatabase {
         schema: &Schema,
         txn: &storage::Transaction,
     ) -> Result<u64> {
+        self.insert_validated_tuple_in_transaction_id(table_name, tuple, schema, txn)?;
+        Ok(1)
+    }
+
+    /// Same as `insert_validated_tuple_in_transaction`, returning the assigned
+    /// row id instead of the count (#100 needs it for HNSW undo bookkeeping).
+    fn insert_validated_tuple_in_transaction_id(
+        &self,
+        table_name: &str,
+        tuple: Tuple,
+        schema: &Schema,
+        txn: &storage::Transaction,
+    ) -> Result<u64> {
         let (row_id, tuple) = self.prepare_tuple_for_transaction_insert(table_name, tuple, schema);
         self.insert_prepared_tuple_in_transaction(table_name, row_id, tuple, schema, txn, false, true)?;
         self.storage.stage_row_counter_in_transaction(table_name, row_id, txn)?;
-        Ok(1)
+        Ok(row_id)
     }
 
     fn prepare_tuple_for_transaction_insert(
@@ -14779,9 +14928,6 @@ impl EmbeddedDatabase {
                 };
 
                 // Execute source SELECT plan
-                let mut executor =
-                    sql::Executor::with_storage(&self.storage).with_timeout(self.effective_statement_timeout_ms());
-                let source_rows = executor.execute(source_plan)?;
 
                 let catalog = self.storage.catalog();
                 let schema = catalog.get_table_schema(table_name)?;
@@ -14818,8 +14964,10 @@ impl EmbeddedDatabase {
                 // entire bulk row loop when the table has no FKs would serialise
                 // unrelated sessions for the duration of the statement, for no
                 // benefit.
-                let can_read_global_txn = gate.has_foreign_keys
-                    && self.global_txn_active.load(std::sync::atomic::Ordering::Acquire)
+                // #100: the transaction is now needed for the WRITE (staging), not
+                // only for the FK probe, so it is taken whenever one is open — the
+                // same unconditional hold the Insert/Update/Delete arms use.
+                let can_read_global_txn = self.global_txn_active.load(std::sync::atomic::Ordering::Acquire)
                     && !GLOBAL_TXN_LOCK_HELD.with(|held| held.get());
                 let mut _txn_guard = None;
                 let active_txn: Option<&storage::Transaction> = match session_txn {
@@ -14830,6 +14978,20 @@ impl EmbeddedDatabase {
                     }
                     None => None,
                 };
+
+                // Source SELECT built AFTER the transaction is resolved so it
+                // can see rows staged earlier in the same transaction (#100).
+                let mut executor =
+                    sql::Executor::with_storage(&self.storage).with_timeout(self.effective_statement_timeout_ms());
+                if let Some(t) = active_txn {
+                    executor = executor.with_transaction(t);
+                }
+                let source_rows = executor.execute(source_plan)?;
+
+                let staging = active_txn.is_some() && self.insert_select_should_stage();
+                let batch_rows = self.insert_select_txn_batch_rows();
+                let mut pending: Vec<Tuple> = Vec::new();
+                let mut pending_returning: Vec<Tuple> = Vec::new();
 
                 let has_returning = returning.is_some();
                 let mut returned_tuples: Vec<Tuple> = Vec::new();
@@ -14848,6 +15010,29 @@ impl EmbeddedDatabase {
                     // BEFORE the RETURNING projection — no point projecting a row
                     // we are about to reject.
                     Self::enforce_rls_with_check(rls_guard_insert.as_ref(), &tuple)?;
+                    if let (true, Some(txn)) = (staging, active_txn) {
+                        // #100: staged into the transaction (see the text arm).
+                        pending.push(tuple.clone());
+                        if has_returning {
+                            pending_returning.push(tuple);
+                        }
+                        if batch_rows != 0 && pending.len() >= batch_rows {
+                            let ids = self.stage_insert_select_chunk_in_transaction(
+                                table_name,
+                                std::mem::take(&mut pending),
+                                &schema,
+                                txn,
+                            )?;
+                            count += ids.len() as u64;
+                            for (mut t, id) in pending_returning.drain(..).zip(ids) {
+                                t.row_id = Some(id);
+                                if let Some(p) = Self::project_returning_columns(&t, &schema, returning) {
+                                    returned_tuples.push(p);
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     if has_returning {
                         if let Some(projected) = Self::project_returning_columns(&tuple, &schema, returning) {
                             returned_tuples.push(projected);
@@ -14856,6 +15041,16 @@ impl EmbeddedDatabase {
                     self.storage
                         .insert_tuple_branch_aware_with_schema(table_name, tuple, &schema)?;
                     count += 1;
+                }
+                if let (true, Some(txn), false) = (staging, active_txn, pending.is_empty()) {
+                    let ids = self.stage_insert_select_chunk_in_transaction(table_name, pending, &schema, txn)?;
+                    count += ids.len() as u64;
+                    for (mut t, id) in pending_returning.into_iter().zip(ids) {
+                        t.row_id = Some(id);
+                        if let Some(p) = Self::project_returning_columns(&t, &schema, returning) {
+                            returned_tuples.push(p);
+                        }
+                    }
                 }
                 Ok((count, returned_tuples))
             }

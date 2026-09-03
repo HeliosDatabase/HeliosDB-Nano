@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.29.0] - 2026-09-02
+
+### Fixed — **`INSERT … SELECT` now participates in the enclosing transaction** (#100)
+
+Through 4.28.0, `BEGIN; INSERT INTO t SELECT …; ROLLBACK;` **left the rows** — on psql, MySQL, the
+REPL, the embedded API and every extended-protocol driver. Both executor arms wrote each row
+straight to storage with a call that takes no transaction, while holding a live transaction and
+using it for the foreign-key probe a few lines earlier. Found by the ACID audit; never reported.
+
+Inside a real transaction the rows are now staged through the same transactional path a
+multi-row `INSERT … VALUES` uses: written at COMMIT, removed by ROLLBACK, undone in the ART and
+HNSW indexes, with the row-id counter staged so a restart cannot hand out already-used ids. A
+failure on row N inside a transaction now removes rows 1..N-1. A chained
+`INSERT INTO stage SELECT …; INSERT INTO final SELECT … FROM stage` in one transaction sees the
+staged rows.
+
+**Scope, stated exactly.** Autocommit is unchanged: it runs through an implicit transaction that
+carries no logical WAL, so staging under it would silently drop replication ops for HA standbys.
+Consequently a mid-statement failure under *autocommit* still leaves the earlier rows — a
+pre-existing, secondary audit finding, now filed. `CREATE TABLE … AS` population also stays on the
+engine path so its compensating drop remains correct; DDL is non-transactional on this engine. A
+tenant context or a branch falls back to the engine path, as the multi-row fast path already does.
+
+New knob `[performance] insert_select_txn_batch_rows` (default 1000; `0` = one chunk) bounds the
+transient per-chunk buffer.
+
+**Breaking** only for anyone who relied on `INSERT … SELECT` rows surviving a `ROLLBACK`. That
+was never a feature.
+
 ## [4.28.0] - 2026-09-02
 
 ### Changed — **BREAKING**: a NULL into a plain `INT PRIMARY KEY` is now rejected, as in PostgreSQL

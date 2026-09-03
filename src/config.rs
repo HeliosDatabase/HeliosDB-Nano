@@ -1184,6 +1184,19 @@ pub struct PerformanceConfig {
     /// when off — one relaxed atomic load per phase boundary. Off by default:
     /// diagnostic only.
     pub copy_phase_stats: bool,
+    /// Rows staged per chunk when `INSERT … SELECT` runs INSIDE a transaction
+    /// (#100). Validated rows are collected in chunks of this size and handed
+    /// to the transactional multi-row insert path, so `ROLLBACK` removes them
+    /// and a failure on row N removes rows 1..N-1. Bounds the transient
+    /// per-chunk buffer; the transaction's write set still holds every row
+    /// until COMMIT, exactly as for a multi-row `INSERT … VALUES`.
+    /// `0` = a single chunk. Default 1000.
+    #[serde(default = "default_insert_select_txn_batch_rows")]
+    pub insert_select_txn_batch_rows: usize,
+}
+
+fn default_insert_select_txn_batch_rows() -> usize {
+    1000
 }
 
 impl Default for PerformanceConfig {
@@ -1196,6 +1209,7 @@ impl Default for PerformanceConfig {
             lock_census: false,
             write_volume_stats: false,
             copy_phase_stats: false,
+            insert_select_txn_batch_rows: default_insert_select_txn_batch_rows(),
         }
     }
 }
