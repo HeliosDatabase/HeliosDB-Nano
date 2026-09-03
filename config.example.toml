@@ -301,6 +301,11 @@ simd_enabled = true
 # Enable parallel query execution
 parallel_query = true
 
+# INSERT … SELECT inside a transaction stages its rows through the transactional
+# insert path in chunks of this many rows (so ROLLBACK removes them). Bounds the
+# transient per-chunk buffer; 0 = a single chunk. Default 1000.
+insert_select_txn_batch_rows = 1000
+
 # Read-hot-path lock-contention census (diagnostic; W3.1 plateau attribution).
 # When enabled, per-query acquisitions of the plan/parse/result cache shard
 # mutexes, the ART index registry, and the prepared-statement fast-select
