@@ -3506,48 +3506,71 @@ impl Parser {
     /// This allows SQLite DECIMAL syntax to work with PostgreSQL parser.
     /// Both types represent arbitrary-precision numbers in HeliosDB.
     pub fn preprocess_decimal_to_numeric(sql: &str) -> String {
-        let mut result = String::new();
-        let chars: Vec<(usize, char)> = sql.char_indices().collect();
-        let mut char_idx = 0;
-
-        // SAFETY: All indexing below is guarded by `while char_idx < chars.len()` and
-        // `char_idx + 7 <= chars.len()` / `char_idx + 7 >= chars.len()` checks, plus
-        // `char_idx == 0` guard before `char_idx - 1` access. Bounds are structurally guaranteed.
-        #[allow(clippy::indexing_slicing)]
-        while char_idx < chars.len() {
-            let (byte_pos, _) = chars[char_idx];
-
-            // Check for DECIMAL keyword (case-insensitive)
-            // Only check if we have at least 7 characters remaining
-            if char_idx + 7 <= chars.len() {
-                let slice = &sql[byte_pos..];
-                if slice.to_uppercase().starts_with("DECIMAL") {
-                    // Make sure it's a word boundary (not part of another identifier)
-                    let is_word_start = char_idx == 0 || {
-                        let (_, prev_char) = chars[char_idx - 1];
-                        !prev_char.is_alphanumeric() && prev_char != '_'
-                    };
-
-                    let is_word_end = char_idx + 7 >= chars.len() || {
-                        let (_, next_char) = chars[char_idx + 7];
-                        !next_char.is_alphanumeric() && next_char != '_'
-                    };
-
-                    if is_word_start && is_word_end {
-                        // Replace DECIMAL with NUMERIC
-                        result.push_str("NUMERIC");
-                        char_idx += 7;
-                        continue;
+        // LINEAR. The previous implementation called `slice.to_uppercase()` on
+        // the ENTIRE remaining statement at EVERY character position — O(n^2)
+        // with a full allocation per step. A 500-row `INSERT ... VALUES` of
+        // VECTOR(384) literals is ~1.45 MB of SQL, so that was ~10^12 bytes of
+        // work: the "60 s per statement" in the PGConf.Brasil 2026 capture, on
+        // a path every statement pays before it is even parsed.
+        //
+        // Fast exit: no `decimal` substring at all (case-insensitive) — true for
+        // essentially every INSERT — costs one scan and zero allocation.
+        let bytes = sql.as_bytes();
+        if !bytes.windows(7).any(|w| w.eq_ignore_ascii_case(b"DECIMAL")) {
+            return sql.to_string();
+        }
+        let mut result = String::with_capacity(sql.len());
+        let n = bytes.len();
+        let mut i = 0;
+        // Quote-aware: never rewrite inside '...' (with '' escapes) or "...".
+        while i < n {
+            let b = bytes[i];
+            if b == b'\'' {
+                let start = i;
+                i += 1;
+                while i < n {
+                    if bytes[i] == b'\'' {
+                        if i + 1 < n && bytes[i + 1] == b'\'' {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
                     }
+                    i += 1;
+                }
+                result.push_str(&sql[start..i]);
+                continue;
+            }
+            if b == b'"' {
+                let start = i;
+                i += 1;
+                while i < n && bytes[i] != b'"' {
+                    i += 1;
+                }
+                i = (i + 1).min(n);
+                result.push_str(&sql[start..i]);
+                continue;
+            }
+            if i + 7 <= n && bytes[i..i + 7].eq_ignore_ascii_case(b"DECIMAL") {
+                let word_start = i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+                let word_end = i + 7 >= n || !(bytes[i + 7].is_ascii_alphanumeric() || bytes[i + 7] == b'_');
+                if word_start && word_end {
+                    result.push_str("NUMERIC");
+                    i += 7;
+                    continue;
                 }
             }
-
-            // Copy character as-is
-            let (_, c) = chars[char_idx];
-            result.push(c);
-            char_idx += 1;
+            let ch_len = match b {
+                0..=0x7F => 1,
+                0xC0..=0xDF => 2,
+                0xE0..=0xEF => 3,
+                _ => 4,
+            }
+            .min(n - i);
+            result.push_str(&sql[i..i + ch_len]);
+            i += ch_len;
         }
-
         result
     }
 
@@ -3633,39 +3656,42 @@ impl Parser {
             None
         };
 
-        // Find AS OF clause (required)
-        let as_of_pos = upper_remaining
-            .find("AS OF")
-            .ok_or_else(|| Error::query_execution("CREATE BRANCH requires AS OF clause"))?;
-
-        let after_as_of = remaining[as_of_pos + 5..].trim_start();
-
-        // Find end of AS OF clause (WITH, WHERE, GROUP, ORDER, LIMIT, UNION, ;, or end)
-        let as_of_end_keywords = ["WITH", "WHERE", "GROUP", "ORDER", "LIMIT", "UNION", ";"];
-        let as_of_end = as_of_end_keywords
-            .iter()
-            .filter_map(|&kw| {
-                if let Some(pos) = after_as_of.to_uppercase().find(kw) {
-                    if pos == 0
-                        || after_as_of
-                            .chars()
-                            .nth(pos.saturating_sub(1))
-                            .map(|c| c.is_whitespace())
-                            .unwrap_or(true)
-                    {
-                        return Some(pos);
-                    }
+        // AS OF is OPTIONAL and defaults to NOW. The documented grammar
+        // (`CREATE DATABASE BRANCH x FROM main;`) and this function's own
+        // docstring both omit it; through v4.29.0 that form was rejected with
+        // "CREATE BRANCH requires AS OF clause". A PRESENT but empty clause is
+        // still an error.
+        let as_of_clause = match upper_remaining.find("AS OF") {
+            None => "NOW".to_string(),
+            Some(as_of_pos) => {
+                let after_as_of = remaining[as_of_pos + 5..].trim_start();
+                // Find end of AS OF clause (WITH, WHERE, GROUP, ORDER, LIMIT, UNION, ;, or end)
+                let as_of_end_keywords = ["WITH", "WHERE", "GROUP", "ORDER", "LIMIT", "UNION", ";"];
+                let as_of_end = as_of_end_keywords
+                    .iter()
+                    .filter_map(|&kw| {
+                        if let Some(pos) = after_as_of.to_uppercase().find(kw) {
+                            if pos == 0
+                                || after_as_of
+                                    .chars()
+                                    .nth(pos.saturating_sub(1))
+                                    .map(|c| c.is_whitespace())
+                                    .unwrap_or(true)
+                            {
+                                return Some(pos);
+                            }
+                        }
+                        None
+                    })
+                    .min()
+                    .unwrap_or(after_as_of.len());
+                let clause = after_as_of[..as_of_end].trim().trim_end_matches(';').to_string();
+                if clause.is_empty() {
+                    return Err(Error::query_execution("CREATE BRANCH requires valid AS OF clause"));
                 }
-                None
-            })
-            .min()
-            .unwrap_or(after_as_of.len());
-
-        let as_of_clause = after_as_of[..as_of_end].trim().trim_end_matches(';').to_string();
-
-        if as_of_clause.is_empty() {
-            return Err(Error::query_execution("CREATE BRANCH requires valid AS OF clause"));
-        }
+                clause
+            }
+        };
 
         // Find WITH clause (optional)
         let with_options = if let Some(with_pos) = upper_remaining.find("WITH") {

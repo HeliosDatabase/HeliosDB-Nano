@@ -3167,7 +3167,10 @@ impl<'a> Planner<'a> {
                                 return format!("{}({})", func_name, ident.value);
                             }
                         }
-                        format!("{}(...)", func_name)
+                        // PostgreSQL names an unaliased aggregate column after the
+                        // function alone: `count`, `sum`, `avg`. Through v4.29.0 this
+                        // produced `count(...)`.
+                        func_name.to_ascii_lowercase()
                     }
                     _ => func_name,
                 }
@@ -4371,9 +4374,7 @@ impl<'a> Planner<'a> {
                     {
                         if let sqlparser::ast::Expr::Value(sqlparser::ast::Value::SingleQuotedString(s)) = inner {
                             // Infer dimension by counting elements of the literal.
-                            let trimmed = s.trim();
-                            let inner_str = trimmed.trim_start_matches('[').trim_end_matches(']');
-                            let count = inner_str.split(',').map(str::trim).filter(|t| !t.is_empty()).count();
+                            let count = crate::types::parse_vector_text(s).map(|v| v.len()).unwrap_or(0);
                             if count > 0 {
                                 DataType::Vector(count)
                             } else {

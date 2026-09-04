@@ -290,6 +290,32 @@ impl Value {
     }
 }
 
+/// Parse the TEXT form of a vector: pgvector's `[1,2,3]`, the PostgreSQL-array
+/// form `{1,2,3}` this engine's PG wire printed through v4.29.0, or bare
+/// `1,2,3`. Whitespace around elements is ignored. `None` for anything else.
+///
+/// ONE parser for every SQL-side string→vector coercion. Before this existed
+/// there were four independent bracket-only copies (the distance operators,
+/// the HNSW fast path, `cast_value`, and the planner's `::vector` dimension
+/// inference), and the wire printed a fifth format none of them accepted —
+/// a value read back from a SELECT could not be fed into a WHERE. Worse, an
+/// unparseable operand under `ORDER BY … LIMIT` was silently sorted as NULL.
+pub fn parse_vector_text(s: &str) -> Option<Vec<f32>> {
+    let t = s.trim();
+    let inner = if let Some(i) = t.strip_prefix('[') {
+        i.strip_suffix(']')?
+    } else if let Some(i) = t.strip_prefix('{') {
+        i.strip_suffix('}')?
+    } else {
+        t
+    };
+    let inner = inner.trim();
+    if inner.is_empty() {
+        return Some(Vec::new());
+    }
+    inner.split(',').map(|e| e.trim().parse::<f32>().ok()).collect()
+}
+
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

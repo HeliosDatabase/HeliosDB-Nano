@@ -696,21 +696,11 @@ fn value_to_query_vector(value: &crate::Value) -> Option<Vec<f32>> {
             }
             Some(out)
         }
-        Value::String(s) => {
-            let trimmed = s.trim();
-            if !trimmed.starts_with('[') || !trimmed.ends_with(']') {
-                return None;
-            }
-            let inner = trimmed.trim_start_matches('[').trim_end_matches(']').trim();
-            if inner.is_empty() {
-                return Some(Vec::new());
-            }
-            let mut out = Vec::new();
-            for elem in inner.split(',') {
-                out.push(elem.trim().parse::<f32>().ok()?);
-            }
-            Some(out)
-        }
+        // Same parser as the evaluator, so the HNSW fast path and the
+        // brute-force fallback agree about what is a vector literal — before
+        // this, `{…}` was declined here (silently handing the query to a full
+        // scan) AND rejected there.
+        Value::String(s) => crate::types::parse_vector_text(s),
         _ => None,
     }
 }

@@ -4801,55 +4801,44 @@ impl Evaluator {
     where
         F: Fn(&[f32], &[f32]) -> f32,
     {
-        // Auto-cast strings to vectors if needed
-        let left_vec = match left {
-            Value::Vector(v) => v.clone(),
-            Value::String(s) if s.trim().starts_with('[') && s.trim().ends_with(']') => {
-                // Parse string as vector
-                let trimmed = s.trim();
-                let without_brackets = trimmed.trim_start_matches('[').trim_end_matches(']');
-                let elements: Result<Vec<f32>> = without_brackets
-                    .split(',')
-                    .map(|elem| {
-                        elem.trim()
-                            .parse::<f32>()
-                            .map_err(|e| Error::query_execution(format!("Invalid vector element '{}': {}", elem, e)))
+        // ONE coercion rule for both operands, shared with the HNSW fast path
+        // and `cast_value`: `[…]`, `{…}` (what the PG wire printed through
+        // v4.29.0) and bare `a,b,c` are all vectors; anything else is an
+        // ERROR on every operator — identically for `<->`, `<=>` and `<#>`.
+        fn operand(side: &str, v: &Value, other: &Value) -> Result<Vec<f32>> {
+            match v {
+                Value::Vector(x) => Ok(x.clone()),
+                Value::Array(items) => items
+                    .iter()
+                    .map(|it| match it {
+                        Value::Float4(f) => Ok(*f),
+                        Value::Float8(f) => Ok(*f as f32),
+                        Value::Int2(i) => Ok(*i as f32),
+                        Value::Int4(i) => Ok(*i as f32),
+                        Value::Int8(i) => Ok(*i as f32),
+                        o => Err(Error::query_execution(format!(
+                            "Vector distance operators require numeric array elements, got {o:?}"
+                        ))),
                     })
-                    .collect();
-                elements?
+                    .collect(),
+                Value::String(text) => crate::types::parse_vector_text(text).ok_or_else(|| {
+                    Error::query_execution(format!(
+                        "Vector distance operators require vector operands: the {side} operand {:?} is not a vector \
+                         literal (expected '[1,2,3]' or '{{1,2,3}}'); the other operand is {}",
+                        text,
+                        match other {
+                            Value::Vector(o) => format!("a {}-dimensional vector", o.len()),
+                            o => format!("{o:?}"),
+                        }
+                    ))
+                }),
+                o => Err(Error::query_execution(format!(
+                    "Vector distance operators require vector operands, got {o:?}"
+                ))),
             }
-            _ => {
-                return Err(Error::query_execution(format!(
-                    "Vector distance operators require vector operands, got {:?} and {:?}",
-                    left, right
-                )))
-            }
-        };
-
-        let right_vec = match right {
-            Value::Vector(v) => v.clone(),
-            Value::String(s) if s.trim().starts_with('[') && s.trim().ends_with(']') => {
-                // Parse string as vector
-                let trimmed = s.trim();
-                let without_brackets = trimmed.trim_start_matches('[').trim_end_matches(']');
-                let elements: Result<Vec<f32>> = without_brackets
-                    .split(',')
-                    .map(|elem| {
-                        elem.trim()
-                            .parse::<f32>()
-                            .map_err(|e| Error::query_execution(format!("Invalid vector element '{}': {}", elem, e)))
-                    })
-                    .collect();
-                elements?
-            }
-            _ => {
-                return Err(Error::query_execution(format!(
-                    "Vector distance operators require vector operands, got {:?} and {:?}",
-                    left, right
-                )))
-            }
-        };
-
+        }
+        let left_vec = operand("left", left, right)?;
+        let right_vec = operand("right", right, left)?;
         if left_vec.len() != right_vec.len() {
             return Err(Error::query_execution(format!(
                 "Vector dimension mismatch: {} vs {}",
@@ -4857,7 +4846,6 @@ impl Evaluator {
                 right_vec.len()
             )));
         }
-
         let distance = distance_fn(&left_vec, &right_vec);
         Ok(Value::Float4(distance))
     }
@@ -5643,20 +5631,12 @@ impl Evaluator {
                     }
                 }
                 Value::String(s) => {
-                    // Parse string as vector: "[1.0, 2.0, 3.0]" or "1.0, 2.0, 3.0"
-                    let trimmed = s.trim();
-                    let without_brackets = trimmed.trim_start_matches('[').trim_end_matches(']');
-
-                    let elements: Result<Vec<f32>> = without_brackets
-                        .split(',')
-                        .map(|elem| {
-                            elem.trim().parse::<f32>().map_err(|e| {
-                                Error::query_execution(format!("Invalid vector element '{}': {}", elem, e))
-                            })
-                        })
-                        .collect();
-
-                    let vec = elements?;
+                    // "[1.0, 2.0, 3.0]", "{1.0,2.0,3.0}" or "1.0, 2.0, 3.0" — one parser.
+                    let vec = crate::types::parse_vector_text(&s).ok_or_else(|| {
+                        Error::query_execution(format!(
+                            "Invalid vector literal {s:?}: expected '[1,2,3]' or '{{1,2,3}}' with numeric elements"
+                        ))
+                    })?;
                     if vec.len() != *dimension {
                         return Err(Error::query_execution(format!(
                             "Vector dimension mismatch: got {}, expected {}",
