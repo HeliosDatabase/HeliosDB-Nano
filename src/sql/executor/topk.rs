@@ -125,10 +125,18 @@ impl TopKOperator {
                     SortKeyAccessor::Column(index) => {
                         key.push(tuple.get(*index).cloned().unwrap_or(Value::Null));
                     }
-                    SortKeyAccessor::Expr(expr) => match evaluator.evaluate(expr, &tuple) {
-                        Ok(v) => key.push(v),
-                        Err(_) => key.push(Value::Null),
-                    },
+                    // SURFACE evaluation errors — never sort on a swallowed one.
+                    // `Err(_) => key.push(Value::Null)` made every row's key NULL
+                    // whenever the ORDER BY expression could not be evaluated
+                    // (an unmaterialised scalar subquery, a vector literal in an
+                    // unrecognised format, a dimension mismatch, a NULL
+                    // parameter), so `ORDER BY embedding <=> … LIMIT 5` returned
+                    // the first k rows in arbitrary order with NO error — the
+                    // worst outcome for a vector store. `SortOperator` was
+                    // already fixed for exactly this class (aggregate.rs, "the
+                    // old continue-on-error produced silently mis-sorted
+                    // output"); the fix never reached the LIMIT path.
+                    SortKeyAccessor::Expr(expr) => key.push(evaluator.evaluate(expr, &tuple)?),
                 }
             }
             let entry = HeapEntry {

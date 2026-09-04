@@ -2236,11 +2236,14 @@ where
                     self.write_buf[val_length_pos..val_length_pos + 4].copy_from_slice(&val_len.to_be_bytes());
                 }
                 Value::Vector(v) => {
-                    // Format as PostgreSQL array: {1.0,2.0,3.0}
+                    // pgvector text format: [1.0,2.0,3.0]. Through v4.29.0 this
+                    // printed the PostgreSQL ARRAY form {1.0,2.0,3.0}, which no
+                    // SQL-side vector parser in this engine accepted back — a
+                    // value read from a SELECT could not be pasted into a WHERE.
                     // Reserve length slot, write content, backpatch
                     let val_length_pos = self.write_buf.len();
                     self.write_buf.put_i32(0);
-                    self.write_buf.put_u8(b'{');
+                    self.write_buf.put_u8(b'[');
                     for (i, x) in v.iter().enumerate() {
                         if i > 0 {
                             self.write_buf.put_u8(b',');
@@ -2248,7 +2251,7 @@ where
                         let s = ryu_buf.format(*x);
                         self.write_buf.put_slice(s.as_bytes());
                     }
-                    self.write_buf.put_u8(b'}');
+                    self.write_buf.put_u8(b']');
                     let val_len = (self.write_buf.len() - val_length_pos - 4) as i32;
                     self.write_buf[val_length_pos..val_length_pos + 4].copy_from_slice(&val_len.to_be_bytes());
                 }
@@ -2929,9 +2932,9 @@ pub(super) fn tuple_to_pg_values(tuple: &Tuple) -> Vec<Option<Vec<u8>>> {
                     Some(buf.into_bytes())
                 }
                 Value::Vector(v) => {
-                    // Format as PostgreSQL array: {1.0,2.0,3.0}
+                    // pgvector text format: [1.0,2.0,3.0] (see the fast encoder).
                     let mut buf = String::with_capacity(v.len() * 8 + 2);
-                    buf.push('{');
+                    buf.push('[');
                     let mut ryu_buf = ryu::Buffer::new();
                     for (i, x) in v.iter().enumerate() {
                         if i > 0 {
@@ -2939,7 +2942,7 @@ pub(super) fn tuple_to_pg_values(tuple: &Tuple) -> Vec<Option<Vec<u8>>> {
                         }
                         buf.push_str(ryu_buf.format(*x));
                     }
-                    buf.push('}');
+                    buf.push(']');
                     Some(buf.into_bytes())
                 }
                 Value::DictRef { dict_id } => Some(itoa::Buffer::new().format(*dict_id).as_bytes().to_vec()),

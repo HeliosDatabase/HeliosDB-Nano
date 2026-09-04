@@ -619,14 +619,22 @@ impl SnapshotManager {
 
     /// Resolve timestamp string to snapshot timestamp
     fn resolve_timestamp(&self, ts_str: &str) -> Result<u64> {
-        // Parse timestamp string
+        // Accept RFC3339, `YYYY-MM-DD HH:MM:SS[.fff][±HH:MM]` and the `T`
+        // variant. An offset-less literal is interpreted as UTC — stated in
+        // the error below, because a client in UTC−3 asking for its local
+        // 18:30 is asking for 21:30 UTC, which may be in the future.
         let target_time = if let Ok(dt) = DateTime::parse_from_rfc3339(ts_str) {
             dt.timestamp() as u64
+        } else if let Ok(dt) = DateTime::parse_from_str(ts_str, "%Y-%m-%d %H:%M:%S%.f%:z")
+            .or_else(|_| DateTime::parse_from_str(ts_str, "%Y-%m-%d %H:%M:%S%:z"))
+        {
+            dt.timestamp() as u64
         } else {
-            let dt = NaiveDateTime::parse_from_str(ts_str, "%Y-%m-%d %H:%M:%S")
+            let dt = NaiveDateTime::parse_from_str(ts_str, "%Y-%m-%d %H:%M:%S%.f")
+                .or_else(|_| NaiveDateTime::parse_from_str(ts_str, "%Y-%m-%d %H:%M:%S"))
+                .or_else(|_| NaiveDateTime::parse_from_str(ts_str, "%Y-%m-%dT%H:%M:%S%.f"))
                 .or_else(|_| NaiveDateTime::parse_from_str(ts_str, "%Y-%m-%dT%H:%M:%S"))
                 .map_err(|e| Error::query_execution(format!("Invalid timestamp format: {}", e)))?;
-
             dt.and_utc().timestamp() as u64
         };
 
@@ -647,7 +655,33 @@ impl SnapshotManager {
             }
         }
 
-        best_match.ok_or_else(|| Error::query_execution(format!("No snapshot found for timestamp '{}'", ts_str)))
+        best_match.ok_or_else(|| {
+            // Say WHY: the instant the literal was read as, and what exists.
+            // "No snapshot found for timestamp" gave the user nothing to act on.
+            let mut secs: Vec<i64> = snapshots.values().map(|m| m.wall_clock_unix_secs() as i64).collect();
+            secs.sort_unstable();
+            let fmt = |s: i64| {
+                chrono::DateTime::from_timestamp(s, 0)
+                    .map(|d| d.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+                    .unwrap_or_else(|| s.to_string())
+            };
+            let target = fmt(target_time as i64);
+            match (secs.first(), secs.last()) {
+                (Some(&lo), Some(&hi)) => Error::query_execution(format!(
+                    "No snapshot at or before {target} (literal '{ts_str}' interpreted as UTC unless it \
+                     carries an offset); earliest snapshot {}, latest {} ({} snapshots). Use an explicit \
+                     offset such as '… -03:00', a later timestamp, or AS OF TRANSACTION <id>.",
+                    fmt(lo),
+                    fmt(hi),
+                    secs.len()
+                )),
+                _ => Error::query_execution(format!(
+                    "No snapshot at or before {target} (literal '{ts_str}'): this database has no \
+                     time-travel snapshots yet — time travel may be disabled for this profile, or no \
+                     write has been snapshotted. Use AS OF NOW or AS OF TRANSACTION <id>."
+                )),
+            }
+        })
     }
 
     /// Resolve timestamp for VERSIONS BETWEEN range queries

@@ -7,7 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [4.29.0] - 2026-09-02
+## [4.30.0] - 2026-09-04
+
+Seven fixes from the PGConf.Brasil 2026 lightning-demo capture, each verified still present on
+the prior release by direct repro and each guarded by a test that failed before the fix.
+
+### Fixed — vector KNN silently returned non-KNN order (worst-case for a vector store)
+
+`… ORDER BY embedding <=> <operand> LIMIT n` returned rows in arbitrary (id) order, with NO
+error, whenever the ORDER BY key could not be evaluated — an unmaterialised scalar subquery, a
+vector literal in an unrecognised format, a dimension mismatch, a NULL parameter. The top-k
+operator swallowed the evaluation error and sorted every row on a NULL key. It now surfaces the
+error, exactly as the non-LIMIT sort path and the SELECT list already did.
+
+### Fixed — vector text format: `{…}` rejected, `[…]` printed as `{…}`
+
+The PostgreSQL wire printed vectors as `{1,2,3}` but every SQL-side parser accepted only
+`[1,2,3]`, so a value read from a `SELECT` could not be pasted into a `WHERE`; and a `{…}` operand
+was silently mis-ordered rather than rejected. There is now one shared vector-text parser that
+accepts `[…]`, `{…}` and bare `1,2,3`; the wire prints pgvector's `[…]`; and every distance
+operator rejects a non-vector operand identically.
+
+### Fixed — multi-row `INSERT … VALUES` with vectors was O(n²) (~60 s per 500-row statement)
+
+The `DECIMAL`→`NUMERIC` statement preprocessor called `to_uppercase()` on the entire remaining
+statement at every character position — quadratic, and paid by every statement before parsing. A
+1.45 MB multi-row vector INSERT took ~60 s. It is now a single linear, quote-aware scan with a
+fast exit when the statement contains no `DECIMAL` at all.
+
+### Fixed — `CREATE DATABASE BRANCH x FROM main` required `AS OF`
+
+`AS OF` is now optional and defaults to `AS OF NOW`, matching the documented grammar. A present
+but empty `AS OF` is still an error.
+
+### Fixed — `AS OF TIMESTAMP` diagnostics and parsing
+
+A timestamp with no snapshot at or before it now reports the interpreted instant and the
+available snapshot range instead of a bare "No snapshot found"; fractional seconds and explicit
+UTC offsets now parse.
+
+### Fixed — unaliased aggregate column name
+
+`SELECT count(*)` now names the column `count`, as PostgreSQL does, rather than `count(...)`. - 2026-09-02
 
 ### Fixed — **`INSERT … SELECT` now participates in the enclosing transaction** (#100)
 
