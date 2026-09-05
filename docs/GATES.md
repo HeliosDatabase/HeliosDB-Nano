@@ -122,17 +122,24 @@ Most are legitimately opt-in and expected: `code-graph` (16), `mcp-endpoint` (6)
 `#![cfg(feature = "x")]` misses `#![cfg(all(feature = "x", feature = "y"))]`, and misses
 feature names containing underscores.
 
-**The one that is not opt-in: `internal-tests`.** 15 files, ~202 `#[test]` functions —
+**The one that is not opt-in: `internal-tests`.** 16 files, 232 `#[test]` functions —
 all time-travel/`AS OF`, encryption, materialized-view, branch-merge, protocol-integration
-and REPL-tenant coverage. `internal-tests = []` (Cargo.toml) is not a default feature and
-is enabled by no workflow and no command in this document's history, so those 202 tests
-have never run in any gate. **They also no longer compile**: `cargo build --features
-internal-tests --tests` fails with `E0063` missing-field errors in struct literals whose
-structs gained fields in 2026-02 and 2026-04. Six months of unobserved rot.
+and REPL-tenant coverage. `internal-tests = []` (Cargo.toml) is not a default feature, so
+the default command never executes those tests. **Status (updated 2026-09-05):** the
+suite compiles again and is a mandatory tier of the local ten-check gate. Last green run,
+2026-09-04 on the v4.30.0 gate: 5553 passed / 0 failed across 283 suites, the 16 gated
+files contributing 232 / 0; the only `EMPTY:` lines were the expected `code-graph` opt-ins.
+CI still only compiles it (`feature-gated-compile`); executing it remains a local duty.
 
 ```bash
-cargo test --features internal-tests --tests --no-fail-fast   # currently fails to build
+cargo test --features internal-tests --tests --no-fail-fast -- --skip ha_tests::streaming_tests --skip lock_management
 ```
+
+**History, kept because it is the point of §3b:** as of 2026-08-17 this suite had never run
+in any gate and did not even build — `cargo build --features internal-tests --tests` failed
+with `E0063` missing-field errors in struct literals whose structs gained fields in 2026-02
+and 2026-04. Six months of unobserved rot, invisible precisely because a feature-gated file
+reports `ok. 0 passed` under the default command.
 
 **Capture:** found 2026-08-16 while gating the RLS projection fix. That change altered
 `handle_filtered_scan`'s `AS OF` handling, so a time-travel stage was added to the gate
