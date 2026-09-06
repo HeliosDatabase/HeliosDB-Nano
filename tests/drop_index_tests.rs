@@ -375,11 +375,18 @@ fn a_table_sharing_the_index_name_is_never_dropped() {
 ///
 /// These names are genuinely reachable, which is why this is not theoretical:
 /// `create_pk_index` names the PK index `<table>_pkey`, and `create_unique_index`
-/// is called with the COLUMN NAME as the constraint name (`Catalog` at CREATE
-/// TABLE and again at rebuild) — so a `UNIQUE` column `email` registers an ART
-/// index literally called `email`. Both spellings are refused here, and the
-/// assertion that actually matters is the one after: the constraints still
-/// enforce.
+/// generates `<table>_<cols>_key` for a constraint index (`Catalog` at CREATE
+/// TABLE and again at rebuild) — so a `UNIQUE` column `email` on `accounts`
+/// registers an ART index called `accounts_email_key`. Both spellings are
+/// refused here, and the assertion that actually matters is the one after: the
+/// constraints still enforce.
+///
+/// v4.31.0 renamed that index: `create_unique_index` used to be called with the
+/// bare COLUMN NAME, which made the index name `email` — and because the ART
+/// registry is one GLOBAL map, the SECOND table in the database to declare a
+/// `UNIQUE email` could not register its index at all and its constraint was
+/// enforced by nothing. This test is updated to the new name, not relaxed: the
+/// refusal, and the enforcement it protects, are asserted exactly as before.
 #[test]
 fn refusing_to_drop_a_constraint_index_keeps_the_constraint_enforced() {
     for params_family in [false, true] {
@@ -391,7 +398,7 @@ fn refusing_to_drop_a_constraint_index_keeps_the_constraint_enforced() {
         db.execute("INSERT INTO accounts (id, email, note) VALUES (1, 'a@x', 'first')")
             .unwrap();
 
-        for (target, kind) in [("accounts_pkey", "PRIMARY KEY"), ("email", "UNIQUE")] {
+        for (target, kind) in [("accounts_pkey", "PRIMARY KEY"), ("accounts_email_key", "UNIQUE")] {
             let err = run(&db, &format!("DROP INDEX {target}"), params_family)
                 .err()
                 .unwrap_or_else(|| panic!("[{fam}] *** SILENT CONSTRAINT REMOVAL *** DROP INDEX {target} succeeded"))

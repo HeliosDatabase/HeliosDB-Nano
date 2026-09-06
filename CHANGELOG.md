@@ -27,6 +27,25 @@ re-raises 23505 for a collision on a different constraint, and rejects targets w
 constraint with 42P10 — so Prisma upserts, including composite ones, no longer insert
 duplicates. `REFERENCES t(c)` is validated when the table is created or altered (42P01 / 42703).
 
+Two older index-maintenance defects were reachable behind it and are fixed too: the text-family
+`ON CONFLICT … DO UPDATE` leg maintained indexes from the PROPOSED row's values instead of the
+updated row's pre-image (a bystander row could lose its index entries, and the updated row
+vanished from equality lookups on its unique column while a scan still found it), and the
+autocommit `UPDATE … RETURNING` path — Prisma's update shape — performed no ART index
+maintenance at all (after changing a unique column, `= new value` missed and `= old value` still
+matched; re-inserting the vacated value was wrongly rejected). Index maintenance now visits every
+index and reports the first error instead of abandoning the rest mid-loop; a refused INSERT that
+never stored its row leaves no index entry behind, while a row that is already stored always keeps
+its primary-key entry; NULLs are distinct under every UNIQUE spelling (single and composite) on
+every insert, update and upsert path; an UPDATE is never reported as a duplicate of its own row
+— including the plain `UPDATE t SET v = <a value no other row holds>`, which failed with 23505 on
+every table declaring `UNIQUE (v)` at table level, because that spelling is recorded as two
+constraints over one column and the per-statement duplicate check counted the row against its own
+first pass (both executor families, with and without RETURNING);
+and `ALTER TABLE … RENAME TO "Quoted"` resolves its target like CREATE TABLE does, keeps the
+source schema (a different schema qualifier is rejected as in PostgreSQL), and carries the
+table's constraint, identity and partition records with it.
+
 Operators: an ART index snapshot written by an earlier release names indexes the old way, so the
 first open after upgrading rebuilds them from rows (correct, one slower open); duplicates that an
 unenforced constraint let in earlier surface as 23505 when the constraint is rebuilt.

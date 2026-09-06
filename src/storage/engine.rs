@@ -5,6 +5,7 @@
 #![allow(unused_variables)]
 #![allow(unused_mut)]
 
+use super::art_index::ArtIndexError;
 use super::art_manager::ArtIndexManager;
 use super::bloom_filter::TableBloomFilters;
 use super::columnar::{BatchPresence, BatchStats, ColumnBatch, ColumnarStore, BATCH_SIZE};
@@ -3900,25 +3901,76 @@ impl StorageEngine {
             .map_err(|e| Error::constraint_violation(e.to_string()))
     }
 
-    /// Report a post-write index-maintenance failure.
+    /// Report an index-maintenance failure for a row that is stored anyway.
     ///
-    /// This runs AFTER the row is durable, so it cannot be turned into an error
-    /// return: the caller would be told the insert failed while the row stays in
-    /// the heap forever — a torn insert, strictly worse than the divergence it
-    /// reports (and it would change `time_travel_enabled = true` behaviour, which
+    /// Every caller is past the point of refusing the row — it is already
+    /// durable, or (the transactional batch arm) it is written whatever the ART
+    /// answers — so this cannot be turned into an error return: the caller would
+    /// be told the insert failed while the row stays in the heap forever — a
+    /// torn insert, strictly worse than the divergence it reports (and it would change `time_travel_enabled = true` behaviour, which
     /// this path must preserve). What it must not be is invisible: it was
     /// `tracing::debug!`, which is off in every shipped configuration, so a
     /// dropped index write left an indexed lookup and a full scan disagreeing
-    /// about the same table with nothing in the log. WARN, with the row id and
-    /// the recovery action, is the correct level: it is not a user error, it is
-    /// an internal invariant breaking.
-    fn note_index_maintenance_failure(table_name: &str, row_id: u64, err: &dyn std::fmt::Display) {
+    /// about the same table with nothing in the log.
+    ///
+    /// Two severities, because there are two very different facts here:
+    ///
+    /// * `DuplicateKey` — a PK/UNIQUE tree REFUSED this row's key while the row
+    ///   was already stored (or was stored regardless; see
+    ///   [`crate::storage::RowState`]). The table now holds a DUPLICATE that the
+    ///   constraint did not stop: a data-correctness fact an operator has to act
+    ///   on, and the reason the row is not simply dropped from the index — its
+    ///   other entries, its PRIMARY KEY included, are kept so the row stays
+    ///   reachable. ERROR.
+    /// * anything else — an internal invariant breaking (a corrupt tree), where
+    ///   an indexed lookup and a full scan may disagree until the ART is rebuilt.
+    ///   WARN, with the row id and the recovery action.
+    pub(crate) fn note_index_maintenance_failure(table_name: &str, row_id: u64, err: &ArtIndexError) {
+        if matches!(err, ArtIndexError::DuplicateKey(_)) {
+            tracing::error!(
+                "UNIQUE/PRIMARY KEY constraint refused row {} of table '{}', which is stored anyway: {} — \
+                 the table now holds a duplicate that this index cannot find (the refusal arrived after \
+                 the row was written, or on a path that writes it regardless). The row keeps its other \
+                 index entries, its primary key included, on purpose, so it stays reachable; resolve the \
+                 duplicate and reopen the database to rebuild the ART from `data:`.",
+                row_id,
+                table_name,
+                err
+            );
+            return;
+        }
         tracing::warn!(
             "ART index maintenance failed for table '{}' row {}: {} — the row is already durable, so an \
              indexed lookup may now disagree with a full scan for this table. The ART is rebuilt from \
              `data:` when the database is next opened; reopen to restore agreement.",
             table_name,
             row_id,
+            err
+        );
+    }
+
+    /// The batch shape of [`Self::note_index_maintenance_failure`], for the COPY
+    /// funnel: `ArtIndexManager::on_insert_tuples` has already named EVERY
+    /// refused row (table, row id, refusing index) at ERROR level — it is the
+    /// only place that knows which rows they were — and returns the first
+    /// refusal so this side can record the table-level fact and the recovery
+    /// action. The batch is committed by then, so there is nothing to propagate.
+    pub(crate) fn note_batch_index_maintenance_failure(table_name: &str, err: &ArtIndexError) {
+        if matches!(err, ArtIndexError::DuplicateKey(_)) {
+            tracing::error!(
+                "UNIQUE/PRIMARY KEY constraint refused at least one row of the committed COPY batch for \
+                 table '{}': {} — those rows are stored and keep their other index entries; resolve the \
+                 duplicates and reopen the database to rebuild the ART from `data:`.",
+                table_name,
+                err
+            );
+            return;
+        }
+        tracing::warn!(
+            "ART index maintenance failed for at least one row of the committed COPY batch for table \
+             '{}': {} — an indexed lookup may now disagree with a full scan for this table. The ART is \
+             rebuilt from `data:` when the database is next opened; reopen to restore agreement.",
+            table_name,
             err
         );
     }
@@ -11026,7 +11078,17 @@ impl StorageEngine {
             }
         }
 
-        // ART index update (constraint already verified above)
+        // ART index update (constraint already verified above).
+        //
+        // The row is STORED by now — `put()` (or the batched `data:` write) and
+        // the logical-WAL record are both above this line — so `on_insert_tuple`
+        // is a `RowState::Stored` funnel: a refusal here cannot unmake the row,
+        // and must not take the row's PRIMARY KEY entry away either (that would
+        // hide a durable row from `WHERE pk = …` and free its key for the next
+        // INSERT). It keeps every entry the row owns and reports the refusal,
+        // which `note_index_maintenance_failure` logs at ERROR: a duplicate got
+        // past the pre-check (a concurrent writer between
+        // `check_insert_constraints` and here) and is now stored.
         if let Err(e) = self
             .art_index_manager
             .on_insert_tuple(table_name, row_id, schema, &tuple)
@@ -11410,7 +11472,12 @@ impl StorageEngine {
             .art_index_manager
             .on_insert_tuples(table_name, schema, &indexed_rows)
         {
-            tracing::debug!("ART index batch insert for table '{}': {}", table_name, e);
+            // Post-fact: the batch is already durable, so this cannot be
+            // propagated — but it is a stored duplicate, not a debug detail.
+            // `on_insert_tuples` has already named every refused row at ERROR
+            // (`RowState::Stored`: it kept their entries rather than stripping a
+            // committed row of its primary key); this adds the recovery note.
+            Self::note_batch_index_maintenance_failure(table_name, &e);
         }
         for (row_id, tuple) in &indexed_rows {
             // R5.V1: maintain HNSW vector indexes (single atomic load when the

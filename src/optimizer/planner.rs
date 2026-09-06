@@ -370,6 +370,7 @@ impl Planner {
             | LogicalPlan::AlterTableRename { .. }
             | LogicalPlan::AlterTableSetSchema { .. }
             | LogicalPlan::AlterTableAddForeignKey { .. }
+            | LogicalPlan::AlterTableAddUnique { .. }
             | LogicalPlan::AlterTableAlterConstraintEnforcement { .. }
             | LogicalPlan::AlterTableDropConstraint { .. }
             | LogicalPlan::Truncate { .. }

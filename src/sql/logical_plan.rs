@@ -96,10 +96,36 @@ pub enum ReturningItem {
 }
 
 /// ON CONFLICT action for INSERT ... ON CONFLICT DO NOTHING / DO UPDATE
+///
+/// # The `conflict_target` (the ARBITER)
+///
+/// `ON CONFLICT (<cols>)` / `ON CONFLICT ON CONSTRAINT <name>` does not merely
+/// document which constraint the author had in mind: in PostgreSQL it SELECTS
+/// the constraint, and a collision on any OTHER constraint is an ordinary 23505
+/// that the ON CONFLICT clause does not handle at all.
+///
+/// The planner used to validate the target (42P10 when it matched nothing) and
+/// then THROW IT AWAY, so both executor families upserted on "whatever index
+/// trips first" — with the PRIMARY KEY probed first. Two silent wrongs followed
+/// from that: a PK collision on a statement targeting a UNIQUE column was
+/// swallowed into an update instead of raising, and a row colliding on BOTH
+/// updated the PK's row rather than the target's. Carrying the resolved column
+/// set on the plan is what lets `ArtIndexManager::find_unique_conflict`
+/// arbitrate on the constraint the statement actually named.
+///
+/// `None` means a TARGETLESS `ON CONFLICT` (and MySQL's
+/// `ON DUPLICATE KEY UPDATE`), which really does mean "any unique constraint" —
+/// the historical behaviour, and correct for that spelling only.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum OnConflictAction {
     /// ON CONFLICT DO NOTHING — silently skip conflicting rows
-    DoNothing,
+    DoNothing {
+        /// The resolved arbiter columns, or `None` for a targetless clause.
+        /// A conflict on a constraint OUTSIDE this set is raised, not skipped
+        /// (PostgreSQL does the same): silently swallowing the rows of a
+        /// mis-targeted statement is the worse of the two failures.
+        conflict_target: Option<Vec<String>>,
+    },
     /// ON CONFLICT DO UPDATE SET col = expr — upsert semantics
     DoUpdate {
         /// Column assignments (col_name, expression).
@@ -108,6 +134,10 @@ pub enum OnConflictAction {
         /// Optional `WHERE` predicate for the `DO UPDATE` arm.
         /// May reference existing-row columns and `EXCLUDED.col`.
         selection: Option<LogicalExpr>,
+        /// The resolved arbiter columns, or `None` for a targetless clause.
+        /// A conflict on a constraint OUTSIDE this set is raised as 23505
+        /// rather than upserted onto a row the statement never named.
+        conflict_target: Option<Vec<String>>,
     },
 }
 
@@ -1285,6 +1315,31 @@ pub enum LogicalPlan {
         /// `IF EXISTS` — a missing index is then a genuine no-op success.
         if_exists: bool,
     },
+
+    /// `ALTER TABLE <t> ADD [CONSTRAINT <name>] UNIQUE (<cols>)`.
+    ///
+    /// The sibling of [`LogicalPlan::AlterTableAddForeignKey`], and the last
+    /// UNIQUE spelling that had no plan at all: the planner's ALTER arm rejected
+    /// it with `Unsupported ALTER TABLE operation: AddConstraint(Unique …)`.
+    /// Prisma, Drizzle, Flyway and Liquibase all emit unique constraints as a
+    /// trailing ALTER step, so this was a hard migration stop.
+    ///
+    /// Unlike the inline spellings this one must VALIDATE the rows already in
+    /// the table (PostgreSQL builds the index and fails with 23505 if the data
+    /// violates it), which is why it is executed rather than merely recorded.
+    ///
+    /// APPEND-ONLY — see [`LogicalPlan::Noop`]. Declared after
+    /// [`LogicalPlan::DropIndex`], which was the last variant when this was
+    /// added.
+    AlterTableAddUnique {
+        /// Table the constraint is added to (already schema-resolved).
+        table_name: String,
+        /// `CONSTRAINT <name>` when the user named it; otherwise `None` and the
+        /// executor derives PostgreSQL's `{table}_{cols}_key`.
+        constraint_name: Option<String>,
+        /// The constrained columns, normalized like every other identifier.
+        columns: Vec<String>,
+    },
 }
 
 /// Function/Procedure parameter
@@ -2023,6 +2078,14 @@ pub enum AsOfClause {
 }
 
 /// Index creation options
+///
+/// # APPEND-ONLY — this enum is PERSISTED
+///
+/// `IndexOption` is bincode-encoded by POSITION inside
+/// `PersistedIndexDefinition.options` (`meta:index:<name>`) and inside
+/// `WalOperation::CreateIndex.options`. Inserting or reordering a variant would
+/// re-interpret every index record an older binary wrote. New variants MUST be
+/// APPENDED at the end.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum IndexOption {
     /// quantization = 'product'
@@ -2045,6 +2108,28 @@ pub enum IndexOption {
     DistanceMetric(String),
     /// rerank_precision = 'f32' | 'f16' | 'i8'
     RerankPrecision(String),
+    /// `CREATE UNIQUE INDEX` — the index enforces uniqueness.
+    ///
+    /// Carried as an option rather than as a new `LogicalPlan::CreateIndex`
+    /// field so it reaches the two places that make the constraint OUTLIVE the
+    /// statement for free: `PersistedIndexDefinition.options` (which
+    /// `Catalog::rebuild_all_indexes` reads at open, to re-register the index as
+    /// UNIQUE rather than as a plain secondary index) and
+    /// `WalOperation::CreateIndex.options` (replicated to standbys). Before
+    /// v4.31.0 the parser's `unique` flag was dropped on the floor by the
+    /// planner, so `CREATE UNIQUE INDEX u4_v ON u4 (v)` — the statement Prisma
+    /// emits for every `@unique` — built an ordinary index and enforced nothing.
+    Unique(bool),
+    /// The FULL column list of a multi-column `CREATE UNIQUE INDEX`.
+    ///
+    /// `LogicalPlan::CreateIndex` carries a single `column_name` because an
+    /// ordinary composite index deliberately indexes only its leading column
+    /// (the others are recorded for catalog visibility). A UNIQUE index cannot
+    /// do that — constraining the leading column alone rejects rows PostgreSQL
+    /// accepts — so the whole key travels here, alongside `Unique(true)`, and is
+    /// persisted and replicated with it. Absent for the single-column case,
+    /// where `column_name` is the whole key.
+    UniqueColumns(Vec<String>),
 }
 
 /// Quantization type for vector indexes
@@ -2168,6 +2253,7 @@ impl LogicalPlan {
             Self::GrantPrivileges { .. } => "GrantPrivileges",
             Self::RevokePrivileges { .. } => "RevokePrivileges",
             Self::DropIndex { .. } => "DropIndex",
+            Self::AlterTableAddUnique { .. } => "AlterTableAddUnique",
             Self::CreateExtension { .. } => "CreateExtension",
             Self::CreateDatabase { .. } => "CreateDatabase",
             Self::DropDatabase { .. } => "DropDatabase",
@@ -2607,6 +2693,8 @@ impl LogicalPlan {
             | LogicalPlan::RevokePrivileges { .. }
             // DROP INDEX returns no rows, exactly like DROP TABLE.
             | LogicalPlan::DropIndex { .. }
+            // ALTER TABLE … ADD [CONSTRAINT] UNIQUE: DDL, no output rows.
+            | LogicalPlan::AlterTableAddUnique { .. }
             | LogicalPlan::Noop => {
                 // KanttBan #20 (v3.31.0): DDL — no output rows.
                 Arc::new(Schema { columns: vec![] })
