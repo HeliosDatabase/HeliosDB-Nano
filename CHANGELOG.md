@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — `FROM generate_series(1, n) AS g` could not be referenced as `g` (PGConf.Brasil #10)
+
+`SELECT g FROM generate_series(1, 3) AS g`, `SELECT g.g FROM generate_series(1, 3) g` and
+`SELECT u FROM unnest(ARRAY[1,2,3]) AS u` all failed with `Column 'g' not found in schema`,
+reproduced over the PostgreSQL wire on v4.30.0. PostgreSQL names the single output column of a
+scalar-returning table function after the table alias when no column list is given; Nano used
+the alias only as the source-table name and kept `generate_series` / `unnest` as the column name.
+Both places that derive that schema — the logical plan (which `SELECT *` expands from) and the
+executor (which the rows carry) — now use the same precedence: explicit column list (`g(i)`),
+then table alias (`AS g`), then the function name. The alias-less form and `g(i)` are unchanged
+and pinned by tests. Nine new tests in `tests/generate_series_alias_tests.rs`, seven of which
+failed on the unfixed tree.
+
+Not in this change: `generate_series` in the SELECT list (`SELECT generate_series(1, 3)`) still
+reports `Unknown scalar function` — set-returning functions in the projection are a separate
+feature (sprinter item filed).
+
 ## [4.30.0] - 2026-09-04
 
 Seven fixes from the PGConf.Brasil 2026 lightning-demo capture, each verified still present on
