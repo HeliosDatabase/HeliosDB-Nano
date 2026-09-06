@@ -61,10 +61,39 @@ impl LockState {
         }
     }
 
-    /// Check if a transaction can acquire this lock
-    fn can_acquire(&self, requested_type: LockType) -> bool {
+    /// Check if `transaction_id` can acquire this lock with `requested_type`.
+    ///
+    /// RE-ENTRANCY: a transaction never conflicts with ITSELF. Locks here are
+    /// held for the whole transaction (every guard lives in
+    /// `Transaction::acquired_locks` until commit/rollback), so the second
+    /// statement of a transaction that writes a row its own earlier statement
+    /// already wrote asks for a lock it is *already* holding. Without this
+    /// clause that request took the conflict path, inserted the self-edge
+    /// `txn -> txn` into the wait-for graph, and `detect_deadlock` — a plain DFS
+    /// cycle check — dutifully reported a cycle: a transaction deadlocked
+    /// against itself on its own row (`Deadlock: Deadlock detected for
+    /// transaction N`, SQLSTATE 40P01) with no second party anywhere. That is
+    /// reachable from every ordinary interactive session: `BEGIN; UPDATE t …
+    /// WHERE id = 1; UPDATE t … WHERE id = 1;` — the shape Prisma's
+    /// `$transaction` emits constantly — and, under `REPEATABLE READ` /
+    /// `SERIALIZABLE`, any [`Transaction::get`](super::Transaction::get) of a
+    /// key the same transaction later writes (`get` takes a Read lock on the
+    /// very key `put` then wants for Write).
+    ///
+    /// Sole ownership is what makes this safe rather than a hole: when this
+    /// transaction is the ONLY holder no other transaction can observe the
+    /// difference, and a Read->Write upgrade is uncontended by construction. A
+    /// transaction sharing a Read lock with OTHERS still cannot upgrade to
+    /// Write — that is a genuine conflict between two parties and keeps
+    /// failing closed, exactly as before.
+    fn can_acquire(&self, transaction_id: u64, requested_type: LockType) -> bool {
         if self.holders.is_empty() {
             // No holders, lock is free
+            return true;
+        }
+
+        // Sole holder re-acquiring (including a Read -> Write upgrade).
+        if self.holders.len() == 1 && self.holders.first() == Some(&transaction_id) {
             return true;
         }
 
@@ -76,12 +105,22 @@ impl LockState {
         }
     }
 
-    /// Add a holder to this lock
+    /// Add a holder to this lock.
+    ///
+    /// The recorded `lock_type` only ever STRENGTHENS: with re-entrant
+    /// acquisition a transaction holding the exclusive lock can ask for a Read
+    /// on the same key (`REPEATABLE READ` re-reading a row it has written), and
+    /// stamping `Read` there would advertise the resource as shared — another
+    /// transaction's Read would then be granted against uncommitted data. Write
+    /// wins over Read, always.
     fn add_holder(&mut self, transaction_id: u64, lock_type: LockType) {
         if !self.holders.contains(&transaction_id) {
             self.holders.push(transaction_id);
         }
-        self.lock_type = Some(lock_type);
+        self.lock_type = match (self.lock_type, lock_type) {
+            (Some(LockType::Write), _) => Some(LockType::Write),
+            (_, requested) => Some(requested),
+        };
     }
 
     /// Remove a holder from this lock
@@ -428,7 +467,7 @@ impl LockManager {
         let mut lock_state = self.locks.entry(resource.to_string()).or_insert_with(LockState::new);
 
         // Check if we can acquire the lock
-        if lock_state.can_acquire(lock_type) {
+        if lock_state.can_acquire(transaction_id, lock_type) {
             // Acquire the lock
             lock_state.add_holder(transaction_id, lock_type);
 
@@ -443,8 +482,19 @@ impl LockManager {
             // Cannot acquire - add to waiters and update wait graph
             lock_state.add_waiter(transaction_id, lock_type);
 
-            // Update wait-for graph: this transaction waits for all current holders
-            let holders = lock_state.holders.clone();
+            // Update wait-for graph: this transaction waits for all current
+            // holders OTHER than itself. A self-edge is never a wait — nothing
+            // it holds will be released by anyone but itself — but the DFS in
+            // `has_cycle` cannot tell the two apart and reports `txn -> txn` as
+            // a deadlock. The only way to reach this arm while already holding
+            // the lock is a contended Read -> Write upgrade, and there the real
+            // waiting is on the OTHER readers, which is what stays in the graph.
+            let holders: Vec<u64> = lock_state
+                .holders
+                .iter()
+                .copied()
+                .filter(|holder| *holder != transaction_id)
+                .collect();
             self.wait_graph.insert(transaction_id, holders);
 
             Err(Error::transaction(format!(
@@ -982,6 +1032,126 @@ mod tests {
             3,
             "sequence advanced on every attempt — the retried INSERT skips values"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Re-entrancy: a transaction never conflicts with itself
+    //
+    // Row locks live for the whole transaction, so a transaction's second write
+    // of a row it already wrote re-requests a lock it is still holding. Before
+    // this, that request took the conflict path and the wait-for graph gained
+    // the self-edge `txn -> txn`, which the DFS reported as a cycle: a
+    // transaction deadlocked against itself. `BEGIN; UPDATE t … WHERE id = 1;
+    // UPDATE t … WHERE id = 1;` — and every Prisma `$transaction` that touches
+    // a row twice — hit it.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn same_transaction_may_reacquire_its_own_write_lock() {
+        let manager = Arc::new(LockManager::new(1000));
+
+        let first = manager
+            .acquire_lock("data:t:1", 7, LockType::Write)
+            .expect("the first write lock must be granted");
+        // Re-acquired by the SAME transaction: granted immediately, no deadlock
+        // and no spin (the manager's timeout is 1 s, so a conflict would show).
+        let second = manager
+            .acquire_lock("data:t:1", 7, LockType::Write)
+            .expect("*** a transaction deadlocked against its own row lock ***");
+
+        assert_eq!(manager.get_lock_holders("data:t:1"), vec![7]);
+        assert!(
+            !manager.detect_deadlock(7).expect("deadlock check"),
+            "re-locking a row you already hold is not a deadlock"
+        );
+
+        drop(second);
+        drop(first);
+        assert!(!manager.is_locked("data:t:1"));
+    }
+
+    #[test]
+    fn sole_reader_may_upgrade_its_own_lock_to_write() {
+        let manager = Arc::new(LockManager::new(1000));
+
+        // REPEATABLE READ takes a Read lock on a row, then writes the same row.
+        let read = manager
+            .acquire_lock("data:t:1", 7, LockType::Read)
+            .expect("the sole reader's read lock must be granted");
+        let write = manager
+            .acquire_lock("data:t:1", 7, LockType::Write)
+            .expect("*** the sole reader could not upgrade its own lock ***");
+
+        // The resource is now EXCLUSIVE, and a re-entrant Read must not
+        // advertise it as shared again — another transaction's Read would then
+        // be granted against this transaction's uncommitted write.
+        let read_again = manager
+            .acquire_lock("data:t:1", 7, LockType::Read)
+            .expect("a re-entrant read must be granted");
+        assert!(
+            manager.try_acquire_lock("data:t:1", 8, LockType::Read).is_err(),
+            "a re-entrant Read must not downgrade a held Write lock to shared"
+        );
+
+        drop(read_again);
+        drop(write);
+        drop(read);
+    }
+
+    #[test]
+    fn another_transaction_is_still_refused_while_the_holder_re_locks() {
+        let manager = Arc::new(LockManager::new(1000));
+
+        let held = manager
+            .acquire_lock("data:t:1", 7, LockType::Write)
+            .expect("the write lock must be granted");
+        let held_again = manager
+            .acquire_lock("data:t:1", 7, LockType::Write)
+            .expect("the re-entrant write lock must be granted");
+
+        // Fail closed: re-entrancy is scoped to the holder itself. A DIFFERENT
+        // transaction still cannot take the row, in either mode.
+        assert!(
+            manager.try_acquire_lock("data:t:1", 8, LockType::Write).is_err(),
+            "another transaction must still be refused the row"
+        );
+        assert!(
+            manager.try_acquire_lock("data:t:1", 8, LockType::Read).is_err(),
+            "another transaction must still be refused a read of the row"
+        );
+
+        drop(held_again);
+        drop(held);
+    }
+
+    #[test]
+    fn contended_read_upgrade_waits_on_the_other_reader_only() {
+        let manager = Arc::new(LockManager::new(1000));
+
+        let mine = manager
+            .acquire_lock("data:t:1", 7, LockType::Read)
+            .expect("this transaction's read lock must be granted");
+        let theirs = manager
+            .acquire_lock("data:t:1", 8, LockType::Read)
+            .expect("the other transaction's read lock must be granted");
+
+        // Sharing the read with someone else, an upgrade is a REAL conflict
+        // between two parties and must not be granted.
+        assert!(
+            manager.try_acquire_lock("data:t:1", 7, LockType::Write).is_err(),
+            "an upgrade contended by another reader must fail closed"
+        );
+        // …and the wait-for graph must record the OTHER reader, never a
+        // self-edge — a self-edge is what the DFS misreports as a deadlock.
+        let waits_for = manager.wait_graph.get(&7).map(|e| e.value().clone());
+        assert_eq!(waits_for, Some(vec![8]));
+        assert!(
+            !manager.detect_deadlock(7).expect("deadlock check"),
+            "waiting for one other reader is not a cycle"
+        );
+
+        drop(theirs);
+        drop(mine);
     }
 
     #[test]

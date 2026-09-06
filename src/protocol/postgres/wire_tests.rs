@@ -4035,3 +4035,550 @@ async fn discard_all_releases_session_advisory_locks() {
         "*** the migration lock was never released by DISCARD ALL ***"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Prisma P0 spec 04 — a parameterized DML … RETURNING must join the session's
+// explicit transaction.
+//
+// Prisma binds every value and appends RETURNING to every create/update/delete,
+// so every write inside `prisma.$transaction(...)` arrives as Parse/Bind/Execute
+// of a DML … RETURNING with bound parameters. That arm of
+// `handle_execute_extended` routed through the SESSION-LESS
+// `execute_params_returning`, which resolves its transaction from the GLOBAL
+// `current_transaction` slot a wire session never uses — so the write went
+// straight to storage and AUTOCOMMITTED. Every neighbouring spelling honoured
+// the transaction (the simple protocol, and the non-RETURNING parameterized
+// form), which is exactly why it went unnoticed.
+//
+// Tests marked *** UNFIXED *** fail on the unfixed tree at the marked assertion.
+// ---------------------------------------------------------------------------
+
+/// Parse / Bind / Execute one statement over the EXTENDED protocol (no
+/// Describe — the assertions below read DataRow / CommandComplete /
+/// ErrorResponse only) and return the drained reply bytes.
+///
+/// Boxed for the same reason `wire_query` is: these futures are large, and an
+/// `async fn`'s state is inlined into its caller's, so a test issuing half a
+/// dozen statements otherwise overflows the 2 MB test-thread stack and aborts
+/// the whole binary.
+fn wire_extended<'a>(
+    handler: &'a mut PgConnectionHandler<DuplexStream>,
+    client: &'a mut DuplexStream,
+    name: &'a str,
+    sql: &'a str,
+    param_types: Vec<i32>,
+    params: Vec<Option<Vec<u8>>>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<u8>> + 'a>> {
+    Box::pin(async move {
+        let portal = format!("portal_{name}");
+        let formats = vec![0i16; params.len()];
+        handler
+            .handle_parse_extended(name.to_string(), sql.to_string(), param_types)
+            .await
+            .unwrap_or_else(|e| panic!("parse `{sql}`: {e}"));
+        handler
+            .handle_bind_extended(portal.clone(), name.to_string(), formats, params, vec![])
+            .await
+            .unwrap_or_else(|e| panic!("bind `{sql}`: {e}"));
+        handler
+            .handle_execute_extended(portal, 0)
+            .await
+            .unwrap_or_else(|e| panic!("execute `{sql}`: {e}"));
+        drain(client).await
+    })
+}
+
+/// An extended-protocol statement that must complete without an ErrorResponse.
+fn assert_extended_ok(out: &[u8], sql: &str) {
+    assert!(
+        sqlstates(out).is_empty(),
+        "`{sql}` must not error over the extended protocol, got {:?}",
+        sqlstates(out)
+    );
+}
+
+/// Every `id` in `t` visible to this connection, as wire text, sorted here
+/// rather than by the engine (a bare scan keeps the read on the plain
+/// `data:`-key path, which is the one an uncommitted row must be absent from).
+///
+/// Deliberately a row-returning scan rather than `SELECT count(*)`: COUNT(\*)
+/// can be answered from the primary-key ART index, and that index is maintained
+/// EAGERLY for in-transaction inserts (with a rollback undo log), so it is not a
+/// witness for what a row read — or another connection — can actually see.
+fn wire_ids<'a>(
+    handler: &'a mut PgConnectionHandler<DuplexStream>,
+    client: &'a mut DuplexStream,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<String>> + 'a>> {
+    Box::pin(async move {
+        let out = wire_query(handler, client, "SELECT id FROM t").await;
+        assert!(
+            sqlstates(&out).is_empty(),
+            "`SELECT id FROM t` must not error, got {:?}",
+            sqlstates(&out)
+        );
+        let mut seen: Vec<String> = data_rows(&out)
+            .into_iter()
+            .map(|row| {
+                row.into_iter()
+                    .next()
+                    .flatten()
+                    .map(|b| String::from_utf8_lossy(&b).to_string())
+                    .unwrap_or_else(|| "NULL".to_string())
+            })
+            .collect();
+        seen.sort();
+        seen
+    })
+}
+
+fn ids(list: &[&str]) -> Vec<String> {
+    list.iter().map(|s| (*s).to_string()).collect()
+}
+
+/// The spec's literal reproducer:
+/// `BEGIN; INSERT INTO t (id, v) VALUES ($1,$2) RETURNING id; ROLLBACK;`
+///
+/// *** UNFIXED ***: the final read still returns `["1"]` — the row autocommitted
+/// straight past the open transaction, so `ROLLBACK` had nothing to undo.
+#[tokio::test]
+async fn extended_parameterized_insert_returning_honours_rollback() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut h, mut c) = test_handler(db);
+    wire_setup(&mut h, &mut c, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").await;
+    wire_setup(&mut h, &mut c, "BEGIN").await;
+
+    let sql = "INSERT INTO t (id, v) VALUES ($1, $2) RETURNING id";
+    let out = wire_extended(
+        &mut h,
+        &mut c,
+        "ins",
+        sql,
+        vec![23, 25],
+        vec![Some(b"1".to_vec()), Some(b"alpha".to_vec())],
+    )
+    .await;
+    assert_extended_ok(&out, sql);
+    assert_eq!(
+        first_data_row_text(&out).as_deref(),
+        Some("1"),
+        "RETURNING id must come back"
+    );
+    assert_eq!(command_tags(&out), vec!["INSERT 0 1".to_string()]);
+
+    // Read-your-writes, and the connection is STILL inside the transaction
+    // block: the statement joined the transaction rather than bypassing it.
+    let inside = wire_query(&mut h, &mut c, "SELECT id FROM t").await;
+    assert_eq!(
+        data_rows(&inside).len(),
+        1,
+        "the inserting connection must see its own uncommitted RETURNING row"
+    );
+    assert_eq!(
+        ready_for_query_statuses(&inside),
+        vec![b'T'],
+        "the RETURNING insert must not have ended the transaction block"
+    );
+
+    wire_setup(&mut h, &mut c, "ROLLBACK").await;
+    assert_eq!(
+        wire_ids(&mut h, &mut c).await,
+        Vec::<String>::new(),
+        "*** a parameterized INSERT … RETURNING escaped the session transaction: \
+         ROLLBACK did not undo it ***"
+    );
+}
+
+/// The COMMIT half — the write must still persist. Passes on the unfixed tree
+/// (it autocommitted); pinned so the fix cannot turn the write into a no-op.
+#[tokio::test]
+async fn extended_parameterized_insert_returning_honours_commit() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut h, mut c) = test_handler(db);
+    wire_setup(&mut h, &mut c, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").await;
+    wire_setup(&mut h, &mut c, "BEGIN").await;
+
+    let sql = "INSERT INTO t (id, v) VALUES ($1, $2) RETURNING id";
+    let out = wire_extended(
+        &mut h,
+        &mut c,
+        "ins",
+        sql,
+        vec![23, 25],
+        vec![Some(b"1".to_vec()), Some(b"alpha".to_vec())],
+    )
+    .await;
+    assert_extended_ok(&out, sql);
+
+    wire_setup(&mut h, &mut c, "COMMIT").await;
+    assert_eq!(
+        wire_ids(&mut h, &mut c).await,
+        ids(&["1"]),
+        "a committed parameterized RETURNING insert must persist"
+    );
+}
+
+/// *** UNFIXED ***: `v` is still `new` after ROLLBACK.
+#[tokio::test]
+async fn extended_parameterized_update_returning_honours_rollback() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut h, mut c) = test_handler(db);
+    wire_setup(&mut h, &mut c, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").await;
+    wire_setup(&mut h, &mut c, "INSERT INTO t VALUES (1, 'old')").await;
+    wire_setup(&mut h, &mut c, "BEGIN").await;
+
+    let sql = "UPDATE t SET v = $1 WHERE id = $2 RETURNING v";
+    let out = wire_extended(
+        &mut h,
+        &mut c,
+        "upd",
+        sql,
+        vec![25, 23],
+        vec![Some(b"new".to_vec()), Some(b"1".to_vec())],
+    )
+    .await;
+    assert_extended_ok(&out, sql);
+    assert_eq!(
+        first_data_row_text(&out).as_deref(),
+        Some("new"),
+        "RETURNING must show the post-update value"
+    );
+    assert_eq!(command_tags(&out), vec!["UPDATE 1".to_string()]);
+
+    wire_setup(&mut h, &mut c, "ROLLBACK").await;
+    let out = wire_query(&mut h, &mut c, "SELECT v FROM t WHERE id = 1").await;
+    assert_eq!(
+        first_data_row_text(&out).as_deref(),
+        Some("old"),
+        "*** a parameterized UPDATE … RETURNING escaped the session transaction ***"
+    );
+}
+
+/// *** UNFIXED ***: the table is empty after ROLLBACK — the delete was already
+/// durable when ROLLBACK ran.
+#[tokio::test]
+async fn extended_parameterized_delete_returning_honours_rollback() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut h, mut c) = test_handler(db);
+    wire_setup(&mut h, &mut c, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").await;
+    wire_setup(&mut h, &mut c, "INSERT INTO t VALUES (1, 'old')").await;
+    wire_setup(&mut h, &mut c, "BEGIN").await;
+
+    let sql = "DELETE FROM t WHERE id = $1 RETURNING v";
+    let out = wire_extended(&mut h, &mut c, "del", sql, vec![23], vec![Some(b"1".to_vec())]).await;
+    assert_extended_ok(&out, sql);
+    assert_eq!(
+        first_data_row_text(&out).as_deref(),
+        Some("old"),
+        "RETURNING must show the deleted row"
+    );
+    assert_eq!(command_tags(&out), vec!["DELETE 1".to_string()]);
+
+    wire_setup(&mut h, &mut c, "ROLLBACK").await;
+    assert_eq!(
+        wire_ids(&mut h, &mut c).await,
+        ids(&["1"]),
+        "*** a parameterized DELETE … RETURNING escaped the session transaction ***"
+    );
+}
+
+/// A second connection must not see the uncommitted RETURNING row.
+///
+/// *** UNFIXED ***: the observer's first read returns `["1"]` — an autocommitted
+/// write is visible to everyone immediately, which is precisely the dirty read
+/// an interactive transaction exists to prevent.
+#[tokio::test]
+async fn extended_parameterized_returning_insert_is_invisible_to_other_connections() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut writer, mut cw) = test_handler(Arc::clone(&db));
+    let (mut observer, mut co) = test_handler(Arc::clone(&db));
+
+    wire_setup(&mut writer, &mut cw, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").await;
+    wire_setup(&mut writer, &mut cw, "BEGIN").await;
+
+    let sql = "INSERT INTO t (id, v) VALUES ($1, $2) RETURNING id";
+    let out = wire_extended(
+        &mut writer,
+        &mut cw,
+        "ins",
+        sql,
+        vec![23, 25],
+        vec![Some(b"1".to_vec()), Some(b"alpha".to_vec())],
+    )
+    .await;
+    assert_extended_ok(&out, sql);
+
+    assert_eq!(
+        wire_ids(&mut observer, &mut co).await,
+        Vec::<String>::new(),
+        "*** a second connection saw an UNCOMMITTED parameterized RETURNING row ***"
+    );
+
+    wire_setup(&mut writer, &mut cw, "COMMIT").await;
+    assert_eq!(
+        wire_ids(&mut observer, &mut co).await,
+        ids(&["1"]),
+        "and must see it once the writer commits"
+    );
+}
+
+/// `SAVEPOINT` / `ROLLBACK TO SAVEPOINT` must undo a parameterized RETURNING
+/// insert, exactly as they undo every other write in the transaction.
+///
+/// *** UNFIXED ***: the surviving ids are `["1", "2"]` — the savepoint stack can
+/// only restore the transaction's write set, and this row never entered it.
+#[tokio::test]
+async fn extended_parameterized_returning_insert_is_undone_by_rollback_to_savepoint() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut h, mut c) = test_handler(db);
+    wire_setup(&mut h, &mut c, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").await;
+    wire_setup(&mut h, &mut c, "BEGIN").await;
+    wire_setup(&mut h, &mut c, "INSERT INTO t VALUES (1, 'keep')").await;
+    wire_setup(&mut h, &mut c, "SAVEPOINT sp1").await;
+
+    let sql = "INSERT INTO t (id, v) VALUES ($1, $2) RETURNING id";
+    let out = wire_extended(
+        &mut h,
+        &mut c,
+        "ins",
+        sql,
+        vec![23, 25],
+        vec![Some(b"2".to_vec()), Some(b"discard".to_vec())],
+    )
+    .await;
+    assert_extended_ok(&out, sql);
+
+    wire_setup(&mut h, &mut c, "ROLLBACK TO SAVEPOINT sp1").await;
+    wire_setup(&mut h, &mut c, "COMMIT").await;
+
+    assert_eq!(
+        wire_ids(&mut h, &mut c).await,
+        ids(&["1"]),
+        "*** ROLLBACK TO SAVEPOINT did not undo the parameterized RETURNING insert ***"
+    );
+}
+
+/// The statement must READ the session's uncommitted state, which is what makes
+/// the RETURNING projection correct: the first statement stages `v = 'mid'` in
+/// the transaction, and the parameterized statement then selects on `v = 'mid'`.
+///
+/// *** UNFIXED ***: the tag is `UPDATE 0` and no DataRow arrives — running
+/// outside the transaction, the statement only ever saw the committed `'old'`
+/// row, so it matched nothing.
+#[tokio::test]
+async fn extended_parameterized_returning_reads_the_transactions_own_uncommitted_writes() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut h, mut c) = test_handler(db);
+    wire_setup(&mut h, &mut c, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").await;
+    wire_setup(&mut h, &mut c, "INSERT INTO t VALUES (1, 'old')").await;
+    wire_setup(&mut h, &mut c, "BEGIN").await;
+    wire_setup(&mut h, &mut c, "UPDATE t SET v = 'mid' WHERE id = 1").await;
+
+    let sql = "UPDATE t SET v = $1 WHERE v = $2 RETURNING v";
+    let out = wire_extended(
+        &mut h,
+        &mut c,
+        "upd",
+        sql,
+        vec![25, 25],
+        vec![Some(b"new".to_vec()), Some(b"mid".to_vec())],
+    )
+    .await;
+    assert_extended_ok(&out, sql);
+    assert_eq!(
+        command_tags(&out),
+        vec!["UPDATE 1".to_string()],
+        "*** the parameterized RETURNING statement did not see its own transaction's \
+         uncommitted write ***"
+    );
+    assert_eq!(first_data_row_text(&out).as_deref(), Some("new"));
+
+    wire_setup(&mut h, &mut c, "ROLLBACK").await;
+    let out = wire_query(&mut h, &mut c, "SELECT v FROM t WHERE id = 1").await;
+    assert_eq!(
+        first_data_row_text(&out).as_deref(),
+        Some("old"),
+        "both writes must roll back together"
+    );
+}
+
+/// The same defect with ZERO bound parameters. Every driver that prepares
+/// statements (JDBC, sqlx, node-postgres) sends Parse/Bind/Execute even when
+/// there are no placeholders, so this is not a parameters bug — it is a
+/// `RETURNING`-arm bug.
+///
+/// (psycopg3 falls back to the simple protocol when a statement has no
+/// parameters, which is why the spike recorded "the same statement WITHOUT
+/// bound parameters honours ROLLBACK": it was never on this path.)
+///
+/// *** UNFIXED ***: the final read still returns `["1"]`.
+#[tokio::test]
+async fn extended_zero_parameter_insert_returning_honours_rollback() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut h, mut c) = test_handler(db);
+    wire_setup(&mut h, &mut c, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").await;
+    wire_setup(&mut h, &mut c, "BEGIN").await;
+
+    let sql = "INSERT INTO t (id, v) VALUES (1, 'alpha') RETURNING id";
+    let out = wire_extended(&mut h, &mut c, "ins0", sql, vec![], vec![]).await;
+    assert_extended_ok(&out, sql);
+    assert_eq!(first_data_row_text(&out).as_deref(), Some("1"));
+
+    wire_setup(&mut h, &mut c, "ROLLBACK").await;
+    assert_eq!(
+        wire_ids(&mut h, &mut c).await,
+        Vec::<String>::new(),
+        "*** an unparameterized EXTENDED-protocol INSERT … RETURNING escaped the \
+         session transaction ***"
+    );
+}
+
+/// Pin: the NON-RETURNING parameterized form already honoured the transaction
+/// (`execute_params_for_session`). It is the control for the failing tests
+/// above — same family, same parameters, only `RETURNING` differs — and it must
+/// keep working.
+#[tokio::test]
+async fn extended_parameterized_insert_without_returning_still_honours_rollback() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut h, mut c) = test_handler(db);
+    wire_setup(&mut h, &mut c, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").await;
+    wire_setup(&mut h, &mut c, "BEGIN").await;
+
+    let sql = "INSERT INTO t (id, v) VALUES ($1, $2)";
+    let out = wire_extended(
+        &mut h,
+        &mut c,
+        "insp",
+        sql,
+        vec![23, 25],
+        vec![Some(b"1".to_vec()), Some(b"alpha".to_vec())],
+    )
+    .await;
+    assert_extended_ok(&out, sql);
+
+    wire_setup(&mut h, &mut c, "ROLLBACK").await;
+    assert_eq!(
+        wire_ids(&mut h, &mut c).await,
+        Vec::<String>::new(),
+        "the non-RETURNING parameterized form must still roll back"
+    );
+}
+
+/// Pin: the SIMPLE-protocol `RETURNING` form already honoured the transaction
+/// (`execute_returning_for_session`) and must keep doing so.
+#[tokio::test]
+async fn simple_protocol_insert_returning_still_honours_rollback() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut h, mut c) = test_handler(db);
+    wire_setup(&mut h, &mut c, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").await;
+    wire_setup(&mut h, &mut c, "BEGIN").await;
+
+    let out = wire_query(&mut h, &mut c, "INSERT INTO t VALUES (1, 'alpha') RETURNING id").await;
+    assert!(
+        sqlstates(&out).is_empty(),
+        "simple-protocol RETURNING must not error, got {:?}",
+        sqlstates(&out)
+    );
+    assert_eq!(first_data_row_text(&out).as_deref(), Some("1"));
+
+    wire_setup(&mut h, &mut c, "ROLLBACK").await;
+    assert_eq!(
+        wire_ids(&mut h, &mut c).await,
+        Vec::<String>::new(),
+        "the simple-protocol RETURNING form must still roll back"
+    );
+}
+
+/// Pin: outside a transaction the extended RETURNING form still autocommits, so
+/// another connection sees the row at once. Guards the new
+/// `session_transactions` branch against swallowing the autocommit path.
+#[tokio::test]
+async fn extended_parameterized_returning_outside_a_transaction_still_autocommits() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut writer, mut cw) = test_handler(Arc::clone(&db));
+    let (mut observer, mut co) = test_handler(Arc::clone(&db));
+
+    wire_setup(&mut writer, &mut cw, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").await;
+
+    let sql = "INSERT INTO t (id, v) VALUES ($1, $2) RETURNING id";
+    let out = wire_extended(
+        &mut writer,
+        &mut cw,
+        "ins",
+        sql,
+        vec![23, 25],
+        vec![Some(b"1".to_vec()), Some(b"alpha".to_vec())],
+    )
+    .await;
+    assert_extended_ok(&out, sql);
+    assert_eq!(first_data_row_text(&out).as_deref(), Some("1"));
+
+    assert_eq!(
+        wire_ids(&mut observer, &mut co).await,
+        ids(&["1"]),
+        "an autocommit RETURNING insert must be visible to every connection at once"
+    );
+}
+
+/// Two parameterized `UPDATE … RETURNING`s against the SAME ROW in one
+/// transaction — a Prisma `$transaction` that updates a record twice, and the
+/// commonest shape of "write a row you already wrote".
+///
+/// Joining the session transaction (the change above) exposed an older defect
+/// underneath it: row locks are held for the whole transaction, so the second
+/// statement re-requested a lock the transaction was already holding, the
+/// wait-for graph gained the self-edge `txn -> txn`, and the DFS cycle check
+/// reported it as a deadlock — a transaction deadlocked against itself, with no
+/// second connection anywhere.
+///
+/// *** UNFIXED ***: the second Execute fails with SQLSTATE 40P01
+/// (`Deadlock detected for transaction N`).
+#[tokio::test]
+async fn extended_parameterized_returning_may_update_the_same_row_twice_in_one_transaction() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut h, mut c) = test_handler(db);
+    wire_setup(&mut h, &mut c, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").await;
+    wire_setup(&mut h, &mut c, "INSERT INTO t VALUES (1, 'old')").await;
+    wire_setup(&mut h, &mut c, "BEGIN").await;
+
+    let sql = "UPDATE t SET v = $1 WHERE id = $2 RETURNING v";
+    let first = wire_extended(
+        &mut h,
+        &mut c,
+        "upd1",
+        sql,
+        vec![25, 23],
+        vec![Some(b"first".to_vec()), Some(b"1".to_vec())],
+    )
+    .await;
+    assert_extended_ok(&first, sql);
+    assert_eq!(first_data_row_text(&first).as_deref(), Some("first"));
+
+    let second = wire_extended(
+        &mut h,
+        &mut c,
+        "upd2",
+        sql,
+        vec![25, 23],
+        vec![Some(b"second".to_vec()), Some(b"1".to_vec())],
+    )
+    .await;
+    assert!(
+        sqlstates(&second).is_empty(),
+        "*** the transaction deadlocked against its own row lock: {:?} ***",
+        sqlstates(&second)
+    );
+    assert_eq!(
+        command_tags(&second),
+        vec!["UPDATE 1".to_string()],
+        "the second update must match the row the first one wrote"
+    );
+    assert_eq!(first_data_row_text(&second).as_deref(), Some("second"));
+
+    wire_setup(&mut h, &mut c, "ROLLBACK").await;
+    let out = wire_query(&mut h, &mut c, "SELECT v FROM t WHERE id = 1").await;
+    assert_eq!(
+        first_data_row_text(&out).as_deref(),
+        Some("old"),
+        "both updates roll back together"
+    );
+}
