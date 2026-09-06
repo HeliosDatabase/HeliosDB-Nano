@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security — `mcp-endpoint` builds: the HTTP listener never started, and the duplicate `/mcp` was unauthenticated
+
+Since v4.27.0 (which mounted the BaaS router on the HTTP listener) every binary built with
+`--features mcp-endpoint` panicked at startup on `Overlapping method route: POST /mcp` and the
+HTTP port never came up: `ApiServer` mounted its own copy of the MCP routes without bearer
+auth or the bind-safety check, next to the authenticated mount from `main.rs`. The
+unauthenticated copy is removed; the token-checked, bind-safety-checked mount is the only one.
+A composition test now builds the listener router exactly as the binary does and asserts
+401 without the bearer / 200 with it. Default builds (crates.io, PyPI wheel, the Docker image)
+do not include the feature and were not affected.
+
 ### Fixed — MCP `tools/list` now always includes `inputSchema`
 
 Real MCP clients (Claude Code, Codex CLI, MCP Inspector) received tools without a schema
