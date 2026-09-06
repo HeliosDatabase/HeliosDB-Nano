@@ -120,7 +120,12 @@ Most are legitimately opt-in and expected: `code-graph` (16), `mcp-endpoint` (6)
 `graph-rag` (6), four more gated on `cfg(all(...))` combinations of those, plus
 `legacy-network` and `code-embed`. Note the compound gates — a naive grep for
 `#![cfg(feature = "x")]` misses `#![cfg(all(feature = "x", feature = "y"))]`, and misses
-feature names containing underscores.
+feature names containing underscores. Concretely, running the MCP suites with
+`--features mcp-endpoint` alone executes only mcp_auth, mcp_axum_routes, mcp_conformance,
+mcp_introspection and mcp_new_tools; `mcp_auto_register` also needs `code-graph`, and
+`mcp_followups`, `mcp_progress`, `mcp_progress_http` also need `graph-rag` — those four report
+`0 passed` under the plain feature and that is expected, not a gate failure (first executed in a
+gate on 2026-09-06).
 
 **The one that is not opt-in: `internal-tests`.** 16 files, 232 `#[test]` functions —
 all time-travel/`AS OF`, encryption, materialized-view, branch-merge, protocol-integration

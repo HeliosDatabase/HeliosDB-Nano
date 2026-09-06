@@ -302,24 +302,14 @@ impl ApiServer {
             .route("/docs", axum::routing::get(swagger_ui))
             .route("/openapi.json", axum::routing::get(openapi_json));
 
-        // MCP endpoint (`POST /mcp`, `GET /mcp/ws`, `GET /mcp/sse`) is
-        // mounted alongside the regular API routes when the
-        // `mcp-endpoint` feature is enabled. Same listener, no
-        // separate process required.
-        #[cfg(feature = "mcp-endpoint")]
-        let router = {
-            let mcp_state = crate::mcp::McpState::new(self.state.db.clone());
-            let mcp_only = Router::new()
-                .route("/mcp", axum::routing::post(crate::mcp::axum_routes::handle_post))
-                .route(
-                    "/mcp/ws",
-                    axum::routing::get(crate::mcp::axum_routes::handle_ws_upgrade),
-                )
-                .route("/mcp/sse", axum::routing::get(crate::mcp::axum_routes::handle_sse))
-                .route("/mcp/info", axum::routing::get(crate::mcp::axum_routes::handle_info))
-                .with_state(mcp_state);
-            router.merge(mcp_only)
-        };
+        // MCP is deliberately NOT mounted here. The host process mounts it once, with
+        // the bearer token and the bind-safety check, via `mcp::attach_mcp_routes`
+        // (see `run_http_listener` in src/main.rs). Until v4.31 this router carried its
+        // own copy built from `McpState::new(db)` — no auth — and the two mounts
+        // collided at build time ("Overlapping method route … POST /mcp"), which
+        // killed the HTTP listener of every `mcp-endpoint` build since v4.27.0
+        // (sprinter 43b59beba8a9). Exactly one mount, and it must be the
+        // authenticated one.
 
         router.layer(base_middleware).with_state(self.state.clone())
     }
