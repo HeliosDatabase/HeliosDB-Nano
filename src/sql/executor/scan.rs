@@ -2801,9 +2801,17 @@ impl PhysicalOperator for UnnestOperator {
 /// column stayed named after the function itself and a `SELECT i FROM
 /// ... g(i)` referencing the aliased name failed with "Column 'i' not
 /// found in schema".
+#[cold]
+#[inline(never)]
 fn build_table_function_schema(col_name: &str, alias: &Option<String>, column_alias: &Option<String>) -> Arc<Schema> {
     let source_name = alias.as_deref().unwrap_or(col_name);
-    let output_col_name = column_alias.as_deref().unwrap_or(col_name);
+    // PostgreSQL: a table function returning one scalar column names that column
+    // after the explicit column list if given (`g(i)` -> `i`), else after the
+    // table alias (`AS g` -> `g`), else after the function (`generate_series`).
+    // Before v4.31 the alias only became the source-table name, so
+    // `SELECT g FROM generate_series(1, 3) AS g` failed with "Column 'g' not
+    // found" (PGConf.Brasil #10).
+    let output_col_name = column_alias.as_deref().or(alias.as_deref()).unwrap_or(col_name);
     Arc::new(Schema {
         columns: vec![crate::Column {
             name: output_col_name.to_string(),
@@ -2859,6 +2867,13 @@ fn eval_table_function_arg(expr: &crate::sql::LogicalExpr, params: &[crate::Valu
 }
 
 /// Handle TableFunction logical plan node
+///
+/// `#[cold]`: table functions are rare next to the scan/filter/aggregate loops
+/// that share this module; keeping this path out of the hot text keeps their
+/// layout stable (measured: a code-size change here moved `group_by_status`
+/// by ~8% with no semantic connection).
+#[cold]
+#[inline(never)]
 pub(super) fn handle_table_function(executor: &Executor, plan: &LogicalPlan) -> Result<Box<dyn PhysicalOperator>> {
     if let LogicalPlan::TableFunction {
         function_name,

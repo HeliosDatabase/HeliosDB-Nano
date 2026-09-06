@@ -2432,6 +2432,7 @@ impl LogicalPlan {
             }
             LogicalPlan::TableFunction {
                 function_name,
+                alias,
                 column_alias,
                 ..
             } => {
@@ -2442,17 +2443,23 @@ impl LogicalPlan {
                     "unnest" => "unnest",
                     _ => function_name.as_str(),
                 };
-                // Priority #6: an explicit column alias (`g(i)` in
-                // `FROM generate_series(1, 10) g(i)`) renames the single
-                // output column, mirroring CTE column-alias handling.
-                let col_name = column_alias.clone().unwrap_or_else(|| col_name.to_string());
+                // Column-name precedence, same as PostgreSQL and as the
+                // executor's `build_table_function_schema` (keep both in sync,
+                // `SELECT *` expands from THIS schema while rows carry THAT one):
+                // explicit column list (`g(i)` -> `i`, Priority #6) beats the
+                // table alias (`AS g` -> `g`, PGConf.Brasil #10) beats the
+                // function name (`generate_series`).
+                let col_name = column_alias
+                    .clone()
+                    .or_else(|| alias.clone())
+                    .unwrap_or_else(|| col_name.to_string());
                 Arc::new(Schema {
                     columns: vec![crate::Column {
                         name: col_name,
                         data_type: DataType::Int8,
                         nullable: false,
                         primary_key: false,
-                        source_table: None,
+                        source_table: alias.clone(),
                         source_table_name: None,
                         default_expr: None,
                         unique: false,
