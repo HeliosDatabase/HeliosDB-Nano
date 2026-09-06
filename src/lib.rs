@@ -241,6 +241,7 @@
 #![allow(unused_variables)]
 
 // Public modules
+pub mod advisory_lock; // PostgreSQL pg_advisory_lock family (process-global lock table)
 pub mod ai; // AI/NL query module
 pub mod api; // REST API module
 pub mod audit;
@@ -868,6 +869,15 @@ impl Drop for EmbeddedDatabase {
                 worker.request_stop();
             }
         }
+
+        // NO advisory-lock sweep here, deliberately. This handle owns no
+        // advisory lock: a wire/embedded SESSION owns the ones it takes (freed
+        // by `destroy_session`), and a session-less statement owns its own
+        // (freed by the statement's `AdvisoryContextGuard`, which runs on the
+        // error and panic paths too). A handle-wide owner is exactly the
+        // fail-open this build removed — it gave two concurrent HTTP/MCP
+        // callers of one handle the SAME lock and released it only when the
+        // last handle dropped.
 
         // Clear session transactions
         self.session_transactions.clear();
@@ -2370,6 +2380,14 @@ impl EmbeddedDatabase {
             b"RANDOM(".as_slice(),
             b"NOW(".as_slice(),
             b"CLOCK_TIMESTAMP".as_slice(),
+            // Spec 03: the advisory-lock family MUTATES the process-global lock
+            // table and must run on every call. A cached result row would report
+            // "lock acquired" for a lock that was never taken — and a cached
+            // `pg_try_advisory_lock` = false would keep reporting false after the
+            // holder released. `PG_ADVISORY` covers the plain and `_xact_`
+            // spellings plus the unlocks; `PG_TRY_ADVISORY` the `try` ones.
+            b"PG_ADVISORY".as_slice(),
+            b"PG_TRY_ADVISORY".as_slice(),
         ]
         .iter()
         .any(|needle| Self::contains_ascii_case_insensitive(sql, needle))
@@ -2965,6 +2983,16 @@ impl EmbeddedDatabase {
 
     /// Internal method to commit the current transaction
     fn commit_internal(&self) -> Result<()> {
+        // Spec 03: nothing to release here. The global transaction slot is
+        // shared by every thread and every HTTP/MCP caller of this handle, so
+        // no advisory lock is ever attributed to it — a session-less statement
+        // owns its transaction-scope locks for exactly its own duration (see
+        // `embedded_advisory_context_guard`). Wire/embedded SESSION
+        // transactions release theirs in `commit_transaction_for_session`.
+        self.commit_internal_locked()
+    }
+
+    fn commit_internal_locked(&self) -> Result<()> {
         let mut txn_ref = self.current_transaction.lock();
         // Deferred-FK validation runs BEFORE the durable commit. A failure here
         // ABORTS the transaction — PostgreSQL rolls back a COMMIT that trips a
@@ -3027,6 +3055,12 @@ impl EmbeddedDatabase {
 
     /// Internal method to rollback the current transaction
     fn rollback_internal(&self) -> Result<()> {
+        // Spec 03: nothing to release here, for the same reason as
+        // `commit_internal`.
+        self.rollback_internal_locked()
+    }
+
+    fn rollback_internal_locked(&self) -> Result<()> {
         let mut txn_ref = self.current_transaction.lock();
         if let Some(txn) = txn_ref.take() {
             // Slot emptied (the transaction is consumed even if rollback
@@ -8615,6 +8649,9 @@ impl EmbeddedDatabase {
         // so a DML statement evaluating `current_schema()` sees the right schema
         // (see `embedded_current_schema_guard`). Free on the default path.
         let _embedded_schema = self.embedded_current_schema_guard();
+        // Spec 03: advisory-lock owner for a statement with no session. A no-op
+        // when `execute_for_session` already installed its own.
+        let _advisory = self.embedded_advisory_context_guard(sql);
         // SQLite-compat: PRAGMA without a result-set (assignments / no-op
         // tunables) — `execute()` callers don't expect rows back.
         if let Some((_, _)) = crate::sql::sqlite_compat::parse_pragma(sql) {
@@ -13936,6 +13973,9 @@ impl EmbeddedDatabase {
         // (see `embedded_current_schema_guard`). Free on the default path; a
         // no-op when a wire session already installed its own override.
         let _embedded_schema = self.embedded_current_schema_guard();
+        // Spec 03: advisory-lock owner for a params-family statement with no
+        // session. A no-op under `execute_params_for_session_inner`.
+        let _advisory = self.embedded_advisory_context_guard(sql);
         // These param fast paths resolve the target table from the SQL text
         // (bare) or from SQL-keyed spec caches that are shared across sessions,
         // so under a non-`public` `search_path` they would touch the wrong
@@ -14052,6 +14092,9 @@ impl EmbeddedDatabase {
         // so RETURNING `current_schema()` sees the right schema (see
         // `embedded_current_schema_guard`). Free on the default path.
         let _embedded_schema = self.embedded_current_schema_guard();
+        // Spec 03: advisory-lock owner for a statement with no session. A no-op
+        // under `execute_returning_for_session`.
+        let _advisory = self.embedded_advisory_context_guard(sql);
         let plan = self.parameterized_plan_cached(sql)?;
 
         let out = self.execute_plan_with_params(&plan, params, None);
@@ -15776,6 +15819,9 @@ impl EmbeddedDatabase {
         // storage-less evaluator reads for `current_schema()`/`current_schemas()`.
         // Free on the default path; a no-op under a wire session's own override.
         let _embedded_schema = self.embedded_current_schema_guard();
+        // Spec 03: advisory-lock owner for a statement with no session. A no-op
+        // when a wire/`_in_session` entry point already installed its own.
+        let _advisory = self.embedded_advisory_context_guard(sql);
         // SQLite-compat: PRAGMA short-circuit. `table_info(t)` returns
         // SQLite-shaped rows; everything else returns an empty result so
         // sqlite3-driven apps can issue PRAGMAs without parser errors.
@@ -16358,6 +16404,10 @@ impl EmbeddedDatabase {
         // (see `embedded_current_schema_guard`). Free on the default path; a
         // no-op when a wire session already installed its own override.
         let _embedded_schema = self.embedded_current_schema_guard();
+        // Spec 03: advisory-lock owner for a statement with no session. A no-op
+        // when `query_with_columns_for_session` already installed its own — the
+        // wire simple-query path always does.
+        let _advisory = self.embedded_advisory_context_guard(sql);
         if let Some(result) = self.try_fast_select_with_columns(sql) {
             return result;
         }
@@ -16762,6 +16812,16 @@ impl EmbeddedDatabase {
         self.finish_session_art_undo(session_id, true);
         // #103: a disconnected session's undelivered notices have nowhere to go.
         self.session_notices.remove(&session_id);
+        // Spec 03: advisory locks are owned by the CONNECTION and die with it —
+        // session-level and transaction-level alike. This is the ONE funnel every
+        // disconnect reaches: the PG handler's `Drop` calls it, so a clean
+        // Terminate, a dropped socket and an error-path teardown all release
+        // here, and a migration lock can never outlive the client holding it.
+        // One atomic load when the table is empty, which it is on every
+        // deployment that never calls an advisory function.
+        if advisory_lock::manager().has_locks() {
+            advisory_lock::manager().release_session(session_id);
+        }
         self.session_manager.destroy_session(session_id)
     }
 
@@ -16974,6 +17034,23 @@ impl EmbeddedDatabase {
     ///
     /// Returns an error if the session has no active transaction.
     pub fn commit_transaction_for_session(&self, session_id: crate::session::SessionId) -> Result<()> {
+        let result = self.commit_transaction_for_session_inner(session_id);
+        // Spec 03: `pg_advisory_xact_lock` locks end with the transaction, and
+        // the transaction is over on EVERY exit below — a clean commit, a
+        // deferred-FK failure, a serialization failure (all of which abort it).
+        // Released after the inner call so a concurrent waiter cannot observe
+        // the key free while this commit is still writing. Gated on one atomic
+        // load: COMMIT is a hot path (162k wire txns/s on the pg35 rig)
+        // and must not take a process-global mutex when nothing holds a
+        // transaction-scope advisory lock — which is every workload but a
+        // migration.
+        if advisory_lock::manager().has_transaction_locks() {
+            advisory_lock::manager().release_transaction(session_id);
+        }
+        result
+    }
+
+    fn commit_transaction_for_session_inner(&self, session_id: crate::session::SessionId) -> Result<()> {
         let session_lock = self.session_manager.get_session(session_id)?;
         let mut session = session_lock.write();
 
@@ -17067,6 +17144,17 @@ impl EmbeddedDatabase {
     ///
     /// Returns an error if the session has no active transaction.
     pub fn rollback_transaction_for_session(&self, session_id: crate::session::SessionId) -> Result<()> {
+        let result = self.rollback_transaction_for_session_inner(session_id);
+        // Spec 03: `pg_advisory_xact_lock` locks end with the transaction —
+        // ROLLBACK releases them exactly as COMMIT does. Same lock-free gate as
+        // the commit path.
+        if advisory_lock::manager().has_transaction_locks() {
+            advisory_lock::manager().release_transaction(session_id);
+        }
+        result
+    }
+
+    fn rollback_transaction_for_session_inner(&self, session_id: crate::session::SessionId) -> Result<()> {
         let session_lock = self.session_manager.get_session(session_id)?;
         let mut session = session_lock.write();
 
@@ -17119,6 +17207,8 @@ impl EmbeddedDatabase {
     ///
     /// Number of rows affected by the statement
     pub fn execute_in_session(&self, session_id: crate::session::SessionId, sql: &str) -> Result<u64> {
+        // Spec 03: this session owns any advisory lock the statement takes.
+        let _advisory = self.advisory_context_guard(session_id, sql);
         // R1.3-p2: session-scoped SET/RESET synchronous_commit. Must run
         // BEFORE the session write lock below (the handler re-locks it).
         if let Some(handled) = self.try_handle_session_synchronous_commit(session_id, sql)? {
@@ -17247,6 +17337,10 @@ impl EmbeddedDatabase {
         sql: &str,
         _params: &[&dyn std::fmt::Display],
     ) -> Result<Vec<Tuple>> {
+        // Spec 03: this session owns any advisory lock the statement takes —
+        // installed before the `self.query(...)` delegate below so the shared
+        // funnel does not re-attribute the lock to the embedded handle.
+        let _advisory = self.advisory_context_guard(session_id, sql);
         let session_lock = self.session_manager.get_session(session_id)?;
         let mut session = session_lock.write();
         session.touch();
@@ -17574,6 +17668,126 @@ impl EmbeddedDatabase {
         })
     }
 
+    /// Install THIS WIRE/EMBEDDED SESSION as the advisory-lock owner for the
+    /// duration of one statement (spec 03).
+    ///
+    /// The expression evaluator that serves `pg_advisory_lock(…)` is
+    /// storage-less and session-less, so — exactly like the `search_path`
+    /// override above — the owner, the effective `statement_timeout` and the
+    /// per-session lock quota reach it through a per-statement thread-local.
+    /// Every session entry point installs one; a nested engine call (this
+    /// method's own delegation to the embedded autocommit funnel, a trigger
+    /// body, a `CALL`) finds it already installed and keeps the outer owner.
+    ///
+    /// PERF: this runs on EVERY statement, so it gathers only what is free —
+    /// two `Copy` reads plus one atomic (see `session_has_open_transaction`).
+    /// The one costly input, `statement_timeout`, is gated on the statement
+    /// text (see `advisory_statement_timeout`), and the context itself is built
+    /// lazily so a nested install costs a single thread-local read.
+    fn advisory_context_guard(
+        &self,
+        session_id: crate::session::SessionId,
+        sql: &str,
+    ) -> advisory_lock::AdvisoryContextGuard {
+        advisory_lock::AdvisoryContextGuard::install_if_absent(|| advisory_lock::AdvisoryContext {
+            owner: Some(session_id),
+            ownership: advisory_lock::AdvisoryOwnership::Connection,
+            statement_timeout: self.advisory_statement_timeout(sql),
+            max_locks_per_session: self.config.locks.max_advisory_locks_per_session,
+            in_explicit_transaction: self.session_has_open_transaction(session_id),
+            took_transaction_lock: false,
+            took_session_lock: false,
+        })
+    }
+
+    /// Advisory-lock context for a statement that arrives on this handle
+    /// WITHOUT a session: the embedded `query()`/`execute()` funnels, and
+    /// through them the REST/BaaS layer, the MCP query tool and the REPL.
+    ///
+    /// There is NO connection identity on this path, and the handle's identity
+    /// is not a substitute for one. Every concurrent HTTP request, MCP call and
+    /// embedded thread shares one `EmbeddedDatabase`, so a handle-wide owner
+    /// would make `pg_try_advisory_lock` re-entrant between two unrelated
+    /// clients — both told `true` for the same key, which is precisely the
+    /// mutual exclusion a migration lock exists to provide — and nothing would
+    /// ever release it, because `destroy_session` is never called for a handle.
+    ///
+    /// So the owner is minted for THIS STATEMENT
+    /// ([`advisory_lock::AdvisoryOwnership::Statement`]): two concurrent
+    /// session-less callers get two distinct owners and therefore real
+    /// exclusion, and the context guard releases everything the statement took
+    /// when it ends, so no key can strand. `evaluate` refuses the session-scope
+    /// half of the family under such an owner (it could not outlive the
+    /// statement) and serves the transaction-scope half, which in autocommit is
+    /// exactly a statement's lifetime in PostgreSQL too.
+    ///
+    /// A no-op (keeps the outer context) when a session entry point already
+    /// installed one on this thread — which is what makes it safe to call from
+    /// the shared funnels the `_for_session` paths delegate into, and why a
+    /// wire client never sees the refusal above.
+    ///
+    /// PERF: the whole context is built lazily, and the one allocation-free
+    /// scan it does (`ADVISORY` in the statement text — the same gate
+    /// `advisory_statement_timeout` uses) keeps a statement that cannot reach
+    /// an advisory function from minting an id or reading session settings.
+    fn embedded_advisory_context_guard(&self, sql: &str) -> advisory_lock::AdvisoryContextGuard {
+        advisory_lock::AdvisoryContextGuard::install_if_absent(|| {
+            let reaches_advisory = Self::contains_ascii_case_insensitive(sql, b"ADVISORY");
+            advisory_lock::AdvisoryContext {
+                owner: reaches_advisory.then(crate::session::SessionId::new),
+                ownership: advisory_lock::AdvisoryOwnership::Statement,
+                statement_timeout: if reaches_advisory {
+                    self.effective_statement_timeout_ms()
+                        .map(std::time::Duration::from_millis)
+                } else {
+                    None
+                },
+                max_locks_per_session: self.config.locks.max_advisory_locks_per_session,
+                // A statement-scoped owner is inside nobody's transaction: its
+                // locks end with the statement whatever some other caller of
+                // this handle is doing. Reading the handle-global
+                // `global_txn_active` here (as this used to) meant that while
+                // ANY thread sat inside an embedded `BEGIN`, every other
+                // thread's autocommit transaction-scope lock was treated as
+                // transaction-scoped and leaked until that unrelated
+                // transaction committed.
+                in_explicit_transaction: false,
+                took_transaction_lock: false,
+                took_session_lock: false,
+            }
+        })
+    }
+
+    /// Effective `statement_timeout` for a statement that could block on an
+    /// advisory lock — `None` for every other statement.
+    ///
+    /// `effective_statement_timeout_ms` reaches `SessionSettings::get`, which
+    /// lowercases the setting name into a fresh `String` and takes the settings
+    /// `RwLock`. That is affordable once per query on the read path (the
+    /// executor already pays it) but not a second time on every statement,
+    /// including writes. Every function in the advisory family contains
+    /// `advisory` in its name, so one case-insensitive scan of the statement
+    /// text is a sound gate: a statement without it can never read this field.
+    ///
+    /// A statement that reaches an advisory call WITHOUT the name in its own
+    /// text (only possible through a view or routine body) simply waits with no
+    /// timeout — PostgreSQL's own default — rather than misbehaving.
+    fn advisory_statement_timeout(&self, sql: &str) -> Option<std::time::Duration> {
+        if !Self::contains_ascii_case_insensitive(sql, b"ADVISORY") {
+            return None;
+        }
+        self.effective_statement_timeout_ms()
+            .map(std::time::Duration::from_millis)
+    }
+
+    /// Does THIS session have an explicit transaction open? One relaxed atomic
+    /// load in the common (all-autocommit) case: `session_txn_count` is zero
+    /// exactly when no session anywhere has one, so the per-session DashMap
+    /// probe is only paid when some session actually is in a transaction.
+    fn session_has_open_transaction(&self, session_id: crate::session::SessionId) -> bool {
+        self.any_session_txns() && self.session_transactions.contains_key(&session_id)
+    }
+
     /// Intercept `SET`/`RESET search_path` for a wire session, storing the schema
     /// per-session (never the shared embedded field). Mirrors
     /// `try_handle_session_fast_autocommit`: the simple-query handler intercepts
@@ -17706,6 +17920,8 @@ impl EmbeddedDatabase {
 
     /// Execute a statement on behalf of a wire-protocol session.
     pub fn execute_for_session(&self, session_id: crate::session::SessionId, sql: &str) -> Result<u64> {
+        // Spec 03: this connection owns any advisory lock the statement takes.
+        let _advisory = self.advisory_context_guard(session_id, sql);
         if Self::is_transaction_control(sql) {
             return self.handle_transaction_control_for_session(session_id, sql);
         }
@@ -17772,6 +17988,10 @@ impl EmbeddedDatabase {
         session_id: crate::session::SessionId,
         sql: &str,
     ) -> Result<(Vec<Tuple>, Vec<String>)> {
+        // Spec 03: this connection owns any advisory lock the statement takes.
+        // Installed before the autocommit delegate below, so the shared funnel
+        // does not re-attribute the lock to the embedded handle.
+        let _advisory = self.advisory_context_guard(session_id, sql);
         // Resolve bare names against THIS session's schema for both the
         // autocommit delegate and the in-transaction planner below.
         let _schema_override = self.session_schema_override_guard(session_id);
@@ -17820,6 +18040,8 @@ impl EmbeddedDatabase {
         session_id: crate::session::SessionId,
         sql: &str,
     ) -> Result<(u64, Vec<Tuple>)> {
+        // Spec 03: this connection owns any advisory lock the statement takes.
+        let _advisory = self.advisory_context_guard(session_id, sql);
         if Self::is_transaction_control(sql) {
             let count = self.handle_transaction_control_for_session(session_id, sql)?;
             return Ok((count, Vec::new()));
@@ -17859,6 +18081,36 @@ impl EmbeddedDatabase {
         out
     }
 
+    /// `execute_params_returning` for a wire session — the extended-protocol
+    /// `INSERT`/`UPDATE`/`DELETE … RETURNING` arm
+    /// (`handler_extended::handle_execute_extended`).
+    ///
+    /// Spec 03: it exists because that arm used to call the SESSION-LESS
+    /// [`execute_params_returning`](Self::execute_params_returning) directly.
+    /// Any advisory lock a `RETURNING` expression took there was attributed to
+    /// the session-less owner rather than to this connection, so
+    /// `destroy_session` never released it — `INSERT … RETURNING
+    /// pg_try_advisory_lock(k)` over psycopg3/JDBC/sqlx stranded key `k` in the
+    /// process-global table for the life of the server. The simple-query twin
+    /// ([`execute_returning_for_session`](Self::execute_returning_for_session))
+    /// was always session-aware; this is the params family's half.
+    ///
+    /// Only the advisory ownership differs from the session-less entry point;
+    /// execution is unchanged, so this cannot alter any other behaviour of the
+    /// extended `RETURNING` path.
+    pub fn execute_params_returning_for_session(
+        &self,
+        session_id: crate::session::SessionId,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<(u64, Vec<Tuple>)> {
+        // Installed BEFORE the delegate, so the session-less guard inside
+        // `execute_params_returning` finds a context already present and keeps
+        // this connection as the owner.
+        let _advisory = self.advisory_context_guard(session_id, sql);
+        self.execute_params_returning(sql, params)
+    }
+
     /// `execute_params` for a wire session (extended-protocol DML).
     pub fn execute_params_for_session(
         &self,
@@ -17888,6 +18140,9 @@ impl EmbeddedDatabase {
         params: &[Value],
         plan_override: Option<&std::sync::Arc<sql::LogicalPlan>>,
     ) -> Result<u64> {
+        // Spec 03: this connection owns any advisory lock the statement takes
+        // (extended protocol / params family).
+        let _advisory = self.advisory_context_guard(session_id, sql);
         if Self::is_transaction_control(sql) {
             return self.handle_transaction_control_for_session(session_id, sql);
         }
@@ -17959,6 +18214,10 @@ impl EmbeddedDatabase {
         params: &[Value],
         plan_override: Option<&std::sync::Arc<sql::LogicalPlan>>,
     ) -> Result<Vec<Tuple>> {
+        // Spec 03: this connection owns any advisory lock the statement takes
+        // (extended protocol / params family — the shape Prisma's psycopg3-style
+        // clients send).
+        let _advisory = self.advisory_context_guard(session_id, sql);
         let _schema_override = self.session_schema_override_guard(session_id);
         if !self.session_transactions.contains_key(&session_id) {
             return self.query_params_inner(sql, params, plan_override);
@@ -18005,6 +18264,8 @@ impl EmbeddedDatabase {
         sql: &str,
         params: &[Value],
     ) -> Result<(Vec<Tuple>, Vec<String>)> {
+        // Spec 03: this connection owns any advisory lock the statement takes.
+        let _advisory = self.advisory_context_guard(session_id, sql);
         let _schema_override = self.session_schema_override_guard(session_id);
         if !self.session_transactions.contains_key(&session_id) {
             return self.query_params_with_columns(sql, params);
@@ -18195,6 +18456,9 @@ impl EmbeddedDatabase {
         params: &[Value],
         plan_override: Option<&std::sync::Arc<sql::LogicalPlan>>,
     ) -> Result<Vec<Tuple>> {
+        // Spec 03: advisory-lock owner for a params-family statement with no
+        // session. A no-op under `query_params_for_session_inner`.
+        let _advisory = self.embedded_advisory_context_guard(sql);
         // Code-graph pre-parser: see `maybe_rewrite_code_graph`.
         // `ON BRANCH '…'` directives swap the active branch via a
         // Drop guard for the duration of this query.
@@ -18390,6 +18654,9 @@ impl EmbeddedDatabase {
     /// `query_with_columns`. Row-level security policies are applied, as in
     /// `query_params`.
     pub fn query_params_with_columns(&self, sql: &str, params: &[Value]) -> Result<(Vec<Tuple>, Vec<String>)> {
+        // Spec 03: advisory-lock owner for a params-family statement with no
+        // session. A no-op under `query_params_with_columns_for_session`.
+        let _advisory = self.embedded_advisory_context_guard(sql);
         #[cfg(feature = "code-graph")]
         let (rewritten_owned, _branch_guard) = self.rewrite_and_scope(sql);
         #[cfg(feature = "code-graph")]

@@ -3154,27 +3154,24 @@ impl<'a> Planner<'a> {
                 .last()
                 .map(|i| i.value.clone())
                 .unwrap_or_else(|| format!("col_{}", index)),
-            // Aggregate functions: use function name + column
-            Expr::Function(func) => {
-                let func_name = func.name.to_string().to_lowercase();
-                match func.args {
-                    sqlparser::ast::FunctionArguments::List(ref list) if !list.args.is_empty() => {
-                        if let Some(sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
-                            inner,
-                        ))) = list.args.first()
-                        {
-                            if let Expr::Identifier(ident) = inner {
-                                return format!("{}({})", func_name, ident.value);
-                            }
-                        }
-                        // PostgreSQL names an unaliased aggregate column after the
-                        // function alone: `count`, `sum`, `avg`. Through v4.29.0 this
-                        // produced `count(...)`.
-                        func_name.to_ascii_lowercase()
-                    }
-                    _ => func_name,
-                }
-            }
+            // Function calls, aggregate or scalar: PostgreSQL names an
+            // unaliased function output column after the FUNCTION ALONE —
+            // `count`, `sum`, `avg`, `upper`, `now` — never after the argument
+            // text.
+            //
+            // v4.29.0 moved the AGGREGATE half of this arm onto that rule, but
+            // left an early return that still spelled the *bare-identifier
+            // argument* case as `func(arg)`. The result was a rule that
+            // depended on how the argument happened to be written:
+            // `count(*)` → `count` and `sum(t.amount)` → `sum` (both fall
+            // through), yet `sum(amount)` → `sum(amount)` and
+            // `upper("email")` → `upper(email)`. That inconsistency was only
+            // cosmetic while this function named SELECT projections; it becomes
+            // a wire contract now that `convert_returning` derives
+            // RowDescription names from the same function, so the whole arm is
+            // unified on PostgreSQL's rule instead of being forked per call
+            // site. SELECT and RETURNING stay in parity by construction.
+            Expr::Function(func) => func.name.to_string().to_lowercase(),
             // Binary expressions: left op right
             Expr::BinaryOp { left, op, right } => {
                 let left_name = self.extract_expr_alias(left, 0);
@@ -6208,19 +6205,104 @@ impl<'a> Planner<'a> {
     }
 
     /// Convert RETURNING clause SelectItems to ReturningItems
+    ///
+    /// Output-column NAMING is the SELECT list's naming, not the raw
+    /// expression text. PostgreSQL derives a `RETURNING` output column's name
+    /// exactly the way it derives a `SELECT` output column's name, so
+    /// `INSERT INTO "public"."Account" (…) VALUES (…) RETURNING
+    /// "public"."Account"."id"` must describe one field called `id` — the same name
+    /// `SELECT "public"."Account"."id" FROM "public"."Account"` already
+    /// produces here. Through v4.30.0 the unaliased arm below named the column
+    /// `format!("{expr}")`, which re-emits sqlparser's Display form *including
+    /// the quote characters* — the field arrived on the wire as the 25-byte
+    /// string `"public"."Account"."id"`. Every ORM that maps result rows by
+    /// column name (Prisma's `create`/`update`, which always fully qualifies
+    /// its RETURNING list) then failed to find its own columns and needed a
+    /// client-side rename shim.
+    ///
+    /// The fix has two halves. A COLUMN REFERENCE — bare or qualified to any
+    /// depth — is lowered to [`ReturningItem::Column`] on its bare part, which
+    /// gives it the right name *and* the catalog column's real type,
+    /// nullability and `primary_key` (see the arm below for why an
+    /// `Expression` would get all three wrong). EVERYTHING ELSE keeps its
+    /// `Expression` lowering but takes its name from
+    /// [`Self::extract_expr_alias`] — the single naming function the SELECT
+    /// projection list uses (`select_items_to_exprs`) — so the two surfaces
+    /// cannot drift apart again: a function call is named by the function name
+    /// and anything else by whatever the SELECT list would call it.
+    /// `expr AS alias`, `*` and `t.*` are unchanged; so are the values, which
+    /// are projected from the evaluated expression either way.
+    ///
+    /// The ordinal handed to `extract_expr_alias` is the RETURNING item's
+    /// position, which is the output-column position for every list that does
+    /// not mix `*` with an unnameable expression (`*` expands to N columns at
+    /// projection time, in `EmbeddedDatabase::returning_schema`, and only the
+    /// `col_<n>` last-resort fallback reads the ordinal at all).
     fn convert_returning(&self, items: &[sqlparser::ast::SelectItem]) -> Result<Vec<ReturningItem>> {
         items
             .iter()
-            .map(|item| {
+            .enumerate()
+            .map(|(index, item)| {
                 match item {
                     sqlparser::ast::SelectItem::Wildcard(_) => Ok(ReturningItem::Wildcard),
                     sqlparser::ast::SelectItem::UnnamedExpr(sqlparser::ast::Expr::Identifier(ident)) => {
                         Ok(ReturningItem::Column(Self::normalize_ident(ident)))
                     }
+                    // A QUALIFIED column reference (`"public"."Account"."id"`,
+                    // `"Account"."id"`, `t.id`) is the SAME THING as the bare
+                    // reference above: in a DML `RETURNING` list the only
+                    // relation in scope is the statement's own target table, so
+                    // the qualifier can never select a different column. It is
+                    // therefore lowered to `ReturningItem::Column` on its bare
+                    // part rather than to `Expression`, which fixes three
+                    // things at once that a name-only fix would leave broken:
+                    //
+                    //  1. TYPE. `EmbeddedDatabase::returning_schema` types a
+                    //     `Column` item from the CATALOG column (`int4` → OID
+                    //     23, real nullability, real `primary_key`) but
+                    //     hard-codes an `Expression` item to `DataType::Text`
+                    //     (OID 25). As an `Expression`,
+                    //     `RETURNING "public"."Account"."id"` described an INT
+                    //     column as `text` while the bare `RETURNING id`
+                    //     described the very same column as `int4` — the
+                    //     qualified spelling being exactly the one Prisma
+                    //     emits.
+                    //  2. BINARY RESULTS. `Text` is in
+                    //     `datatype_has_binary_result`, so a portal that asked
+                    //     for binary got `format_code = 1` on that field while
+                    //     `tuple_to_pg_values_with_formats` encoded the ACTUAL
+                    //     `Value::Int4` as four big-endian bytes: the client was
+                    //     told "text, binary" and handed `00 00 00 01`, which it
+                    //     then decoded as a UTF-8 string. tokio-postgres — the
+                    //     driver under Prisma's Rust query engine — always
+                    //     requests binary results.
+                    //  3. VALUE. `project_returning_columns` resolves a `Column`
+                    //     item by bare name, but an `Expression` item through
+                    //     `Evaluator::evaluate`, which matches a qualified
+                    //     `LogicalExpr::Column` against the catalog's stamped
+                    //     `source_table` / `source_table_name` BYTE-EXACTLY and
+                    //     maps a miss to `Value::Null`. An unquoted qualifier is
+                    //     case-folded (`Account.id` → `account`.`id`) and an
+                    //     alias qualifier (`DELETE FROM "Account" AS x
+                    //     RETURNING x."id"`) never matches at all, so those rows
+                    //     silently carried NULL. Naming the field correctly
+                    //     without this would have made that WORSE, not better:
+                    //     the field would arrive under the name an ORM binds
+                    //     (`id`) carrying NULL for the primary key, with no
+                    //     error anywhere.
+                    sqlparser::ast::SelectItem::UnnamedExpr(sqlparser::ast::Expr::CompoundIdentifier(parts)) => {
+                        match parts.last() {
+                            Some(last) => Ok(ReturningItem::Column(Self::normalize_ident(last))),
+                            // sqlparser never builds an empty CompoundIdentifier;
+                            // reject rather than invent a column if it ever does.
+                            None => Err(Error::query_execution("RETURNING: empty qualified column reference")),
+                        }
+                    }
                     sqlparser::ast::SelectItem::UnnamedExpr(expr) => {
-                        // Expression without alias - generate alias from expression text
+                        // Expression without alias — named exactly as the SELECT
+                        // projection list names the same expression.
                         let logical_expr = self.expr_to_logical(expr)?;
-                        let alias = format!("{expr}");
+                        let alias = self.extract_expr_alias(expr, index);
                         Ok(ReturningItem::Expression {
                             expr: logical_expr,
                             alias,

@@ -644,6 +644,32 @@ statement_retry_max = 0
 # Default: 5
 statement_retry_backoff_ms = 5
 
+# Maximum number of DISTINCT advisory-lock keys ONE session may hold at once
+# (the pg_advisory_lock / pg_advisory_xact_lock family). 0 = unlimited.
+# The advisory-lock table is process-global and only grows when a client asks
+# it to, so an unbounded table is a client-controlled memory sink; PostgreSQL
+# bounds the equivalent with max_locks_per_transaction against a fixed shared
+# memory pool. Exceeding the cap REFUSES the new lock (fails closed); it never
+# evicts a lock another session holds, and re-acquiring a key the session
+# already holds is never refused.
+# A blocking pg_advisory_lock() honours [storage] statement_timeout_ms / the
+# session's SET statement_timeout; with neither set it waits indefinitely,
+# exactly like PostgreSQL.
+#
+# SESSION SCOPE NEEDS A CONNECTION. pg_advisory_lock / pg_try_advisory_lock /
+# pg_advisory_unlock / pg_advisory_unlock_all are served to a PostgreSQL or
+# MySQL wire connection, and to an embedded session
+# (EmbeddedDatabase::create_session + the *_for_session entry points). They are
+# REFUSED (SQLSTATE 0A000) on the session-less paths — the embedded
+# db.query()/db.execute() funnels and therefore the REST/BaaS layer, the MCP
+# query tool and the REPL — because every concurrent caller there shares one
+# database handle: the lock would exclude nobody and nothing would release it.
+# The transaction-scope pair (pg_advisory_xact_lock / pg_try_advisory_xact_lock)
+# IS served on those paths and is released when the statement ends, exactly as
+# PostgreSQL releases a transaction-scope lock taken in autocommit.
+# Default: 1024
+max_advisory_locks_per_session = 1024
+
 # Cap on the backoff sleep per statement retry (milliseconds). Must be >=
 # statement_retry_backoff_ms.
 # Default: 100
