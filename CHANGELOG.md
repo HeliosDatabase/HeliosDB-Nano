@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security — dependency advisories (lockfile only)
+
+`h2` 0.4.13 → 0.4.19 closes RUSTSEC-2026-0258 (unbounded empty DATA frames) on the HTTP
+listener that serves the BaaS/REST/MCP routes on `--http-port`; `chacha20` 0.10.1 → 0.10.2
+replaces a yanked release reachable only from the benchmark harness; `lru` 0.12 → 0.18 closes
+RUSTSEC-2026-0253 (`LruCache::pop()` panic safety — a method this codebase never calls). Still
+open and tracked separately: `h2` 0.3 under `oauth2` 4.x (client side of the OAuth flow; no
+patched 0.3.x exists, remedy is the oauth2 5.x major).
+
 ### Fixed — `FROM generate_series(1, n) AS g` could not be referenced as `g` (PGConf.Brasil #10)
 
 `SELECT g FROM generate_series(1, 3) AS g`, `SELECT g.g FROM generate_series(1, 3) g` and
