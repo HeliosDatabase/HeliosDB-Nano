@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — MCP `tools/list` now always includes `inputSchema`
+
+Real MCP clients (Claude Code, Codex CLI, MCP Inspector) received tools without a schema
+and could not build typed calls: `inputSchema` was only sent with a non-standard
+`params.verbose = true`. It is now unconditional, as the MCP `Tool` schema requires;
+`verbose` only adds the non-spec extras `category` and `requiresDatabase`.
+
 ### Security — dependency advisories (lockfile only)
 
 `h2` 0.4.13 → 0.4.19 closes RUSTSEC-2026-0258 (unbounded empty DATA frames) on the HTTP

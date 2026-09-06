@@ -182,14 +182,20 @@ fn tools_list_result(verbose: bool) -> JsonValue {
 }
 
 fn tool_to_json(t: ToolDescriptor, verbose: bool) -> JsonValue {
+    // MCP `Tool` requires `name`, `description` and `inputSchema` (a JSON
+    // Schema object). `inputSchema` is what lets a client build a typed call,
+    // so it is ALWAYS present. Until v4.31 it was only sent when the request
+    // carried a non-standard `params.verbose = true`; real clients (Claude
+    // Code, Codex CLI, MCP Inspector) never send that, so they saw schema-less
+    // tools and could not call them (sprinter a5527633c2e8).
+    // `verbose` now only adds the non-spec extras (`category`,
+    // `requiresDatabase`) for clients that want to gate tools by kind.
     let mut out = json!({
         "name": t.name,
         "description": t.description,
+        "inputSchema": t.input_schema,
     });
     if verbose {
-        if let Some(obj) = out.as_object_mut() {
-            obj.insert("inputSchema".into(), t.input_schema);
-        }
         // `category` distinguishes the unified DB-backed catalogue
         // (heliosdb_*) from the auto-registered helios_* extensions
         // declared via mcp_tool!.  Useful for clients wanting to
@@ -300,16 +306,25 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_omits_schema_unless_verbose() {
+    fn tools_list_always_has_schema_and_verbose_only_adds_extras() {
+        // Spec-required fields on EVERY tool, with or without `verbose`.
         let terse = tools_list_result(false);
-        let terse_tool = &terse["tools"].as_array().unwrap()[0];
-        assert!(terse_tool.get("inputSchema").is_none());
+        for t in terse["tools"].as_array().unwrap() {
+            assert!(t["name"].is_string(), "{t}");
+            assert!(t["description"].is_string(), "{t}");
+            assert!(t["inputSchema"].is_object(), "inputSchema missing on {t}");
+            assert_eq!(t["inputSchema"]["type"].as_str(), Some("object"), "{t}");
+            // The non-spec extras are opt-in.
+            assert!(t.get("category").is_none(), "{t}");
+            assert!(t.get("requiresDatabase").is_none(), "{t}");
+        }
 
         let verbose = tools_list_result(true);
-        let verbose_tool = &verbose["tools"].as_array().unwrap()[0];
-        assert!(verbose_tool.get("inputSchema").is_some());
-        assert!(verbose_tool.get("category").is_some());
-        assert!(verbose_tool.get("requiresDatabase").is_some());
+        for t in verbose["tools"].as_array().unwrap() {
+            assert!(t["inputSchema"].is_object(), "{t}");
+            assert!(t.get("category").is_some(), "{t}");
+            assert!(t.get("requiresDatabase").is_some(), "{t}");
+        }
     }
 
     #[test]
