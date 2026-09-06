@@ -81,9 +81,24 @@ async fn http_sse_emits_endpoint_event() {
         .unwrap_or("");
     assert!(ct.starts_with("text/event-stream"), "ct={ct}");
 
-    // Read a small slice — enough to see the endpoint event then drop.
-    let bytes = resp.bytes().await.unwrap();
-    let text = String::from_utf8_lossy(&bytes);
+    // GET /mcp/sse is an endless stream by design (the endpoint event first,
+    // then session-keyed events plus a keep-alive every 15 s), so a full-body
+    // read never returns. Read chunk by chunk until the endpoint frame has
+    // arrived, under a hard timeout so a regression fails instead of hanging
+    // the test runner (sprinter 2fcc8a6b821f: this test froze a gate for 67 min).
+    let mut text = String::new();
+    let mut resp = resp;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while let Some(chunk) = resp.chunk().await.unwrap() {
+            text.push_str(&String::from_utf8_lossy(&chunk));
+            if text.contains("event: endpoint") && text.contains("data: ") && text.contains('\n') {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("endpoint event must arrive within 10 s");
+    drop(resp);
     assert!(text.contains("event: endpoint"), "no endpoint event: {text}");
     assert!(text.contains("data: /mcp"), "no POST URI: {text}");
 
