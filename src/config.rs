@@ -1569,6 +1569,16 @@ pub struct LockConfig {
     /// W3.3: cap on the backoff sleep per statement retry (milliseconds).
     /// Default: 100.
     pub statement_retry_backoff_max_ms: u64,
+    /// Maximum number of DISTINCT advisory-lock keys one session may hold at
+    /// once (`pg_advisory_lock` family). `0` = unlimited.
+    ///
+    /// The advisory-lock table is process-global and grows only when a client
+    /// asks it to, so an unbounded table is a client-controlled memory sink —
+    /// PostgreSQL bounds the equivalent with `max_locks_per_transaction`
+    /// against a fixed shared-memory pool. Exceeding the cap REFUSES the new
+    /// lock (fails closed) rather than evicting someone else's. Re-acquiring a
+    /// key the session already holds is never refused. Default: 1024.
+    pub max_advisory_locks_per_session: u32,
 }
 
 impl Default for LockConfig {
@@ -1583,6 +1593,7 @@ impl Default for LockConfig {
             statement_retry_max: 0,
             statement_retry_backoff_ms: 5,
             statement_retry_backoff_max_ms: 100,
+            max_advisory_locks_per_session: 1024,
         }
     }
 }

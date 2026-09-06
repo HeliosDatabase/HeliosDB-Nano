@@ -2043,6 +2043,29 @@ impl SystemViewRegistry {
             description: "COPY fast-path phase-timing census (W3.4 ART-maintenance attribution)".to_string(),
         });
 
+        // pg_advisory_locks — who holds which advisory lock right now (spec 03).
+        // A `pg_locks`-shaped answer to "a migration is hanging on
+        // pg_advisory_lock(72707369); who has it?". One row per held key.
+        // `objsubid` follows PostgreSQL's own lock-tag convention: 1 for the
+        // `bigint` overload, 2 for the `(int, int)` overload, which is what
+        // makes the two key forms distinct namespaces.
+        self.register_view(SystemViewSchema {
+            name: "pg_advisory_locks".to_string(),
+            schema: Schema {
+                columns: vec![
+                    sv_col("key_kind", DataType::Text),
+                    sv_col("classid", DataType::Int4),
+                    sv_col("objid", DataType::Int8),
+                    sv_col("objsubid", DataType::Int4),
+                    sv_col("session_id", DataType::Int8),
+                    sv_col("session_locks", DataType::Int8),
+                    sv_col("xact_locks", DataType::Int8),
+                    sv_col("mode", DataType::Text),
+                ],
+            },
+            description: "Advisory locks (pg_advisory_lock family) currently held, by session".to_string(),
+        });
+
         // pg_tables — make the basic catalog query work over SQL.
         // The legacy SystemViewRegistry in sql/system_views.rs has
         // a richer implementation we delegate to at execute time.
@@ -3096,6 +3119,8 @@ impl SystemViewRegistry {
             "heliosdb_row_cache_stats" => Self::execute_heliosdb_row_cache_stats(storage),
             // Read-hot-path lock-contention census (W3.1)
             "heliosdb_lock_census" => Self::execute_heliosdb_lock_census(),
+            // Advisory locks currently held (spec 03)
+            "pg_advisory_locks" => Self::execute_pg_advisory_locks(),
             // Per-statement-class write-volume census (W3.2)
             "heliosdb_write_volume" => Self::execute_heliosdb_write_volume(),
             // COPY fast-path phase-timing census (W3.4)
@@ -5176,6 +5201,32 @@ impl SystemViewRegistry {
                     Value::Int8(site.acquisitions as i64),
                     Value::Int8(site.contended as i64),
                     Value::Int8(site.contended_wait_nanos as i64),
+                ])
+            })
+            .collect();
+        Ok(results)
+    }
+
+    /// Execute the `pg_advisory_locks` view (spec 03).
+    ///
+    /// Reads the process-global advisory-lock table, so it answers "who holds
+    /// 72707369?" for EVERY connection on this server, not just the caller's.
+    /// Locks are exclusive-only in this build, so `mode` is a constant.
+    fn execute_pg_advisory_locks() -> Result<Vec<Tuple>> {
+        let results = crate::advisory_lock::manager()
+            .snapshot()
+            .into_iter()
+            .map(|lock| {
+                Tuple::new(vec![
+                    Value::String(lock.key.kind().to_string()),
+                    lock.key.classid().map_or(Value::Null, Value::Int4),
+                    Value::Int8(lock.key.objid()),
+                    // PostgreSQL lock-tag convention: 1 = bigint key, 2 = (int, int).
+                    Value::Int4(if lock.key.classid().is_some() { 2 } else { 1 }),
+                    Value::Int8(lock.owner.0 as i64),
+                    Value::Int8(lock.session_count as i64),
+                    Value::Int8(lock.xact_count as i64),
+                    Value::String("ExclusiveLock".to_string()),
                 ])
             })
             .collect();

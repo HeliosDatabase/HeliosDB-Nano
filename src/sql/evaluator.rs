@@ -977,6 +977,9 @@ impl Evaluator {
                     "  Multi-statement simple query (Q message)   : yes\n",
                     "  Case-folding of unquoted identifiers       : yes (lowercase, PG-compatible)\n",
                     "  CREATE SEQUENCE / nextval / currval / setval: yes\n",
+                    "  pg_advisory_lock family (session + xact)   : yes (exclusive only, no _shared;\n",
+                    "                                               session scope needs a connection —\n",
+                    "                                               PG/MySQL wire or create_session())\n",
                     "  GIN / GiST indexes                         : DDL accepted, no backing store yet\n",
                     "  PL/pgSQL control flow (IF/LOOP/RAISE)      : no — use procedures\n",
                     "  Language-specific FTS stemmers             : no — tokenize + lowercase only\n",
@@ -1061,6 +1064,27 @@ impl Evaluator {
                     ))),
                 }
             }
+
+            // PostgreSQL advisory locks. Prisma Migrate serialises every
+            // migration run with `SELECT pg_advisory_lock(72707369)` and
+            // releases it with `pg_advisory_unlock(72707369)`; Rails, Flyway,
+            // Liquibase and Atlas do the same. The lock table itself is
+            // process-global (`crate::advisory_lock::manager`); the OWNER and
+            // the effective `statement_timeout` reach this storage-less
+            // evaluator through the per-statement thread-local context the
+            // engine's session/embedded entry points install — the same
+            // mechanism `current_schema()` above uses.
+            //
+            // The `_shared` variants are NOT listed: they fall through to the
+            // `Unknown scalar function` arm below rather than being served as
+            // exclusive locks, which would be a correctness lie in the unsafe
+            // direction.
+            "pg_advisory_lock"
+            | "pg_advisory_xact_lock"
+            | "pg_try_advisory_lock"
+            | "pg_try_advisory_xact_lock"
+            | "pg_advisory_unlock"
+            | "pg_advisory_unlock_all" => crate::advisory_lock::evaluate(fun_dispatch, &arg_values),
 
             // KanttBan #23 (v3.31.1 phase 1): pg_catalog helpers
             // drizzle-kit's getColumnsInfoQuery calls into.

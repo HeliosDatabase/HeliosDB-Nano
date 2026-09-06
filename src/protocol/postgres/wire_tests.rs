@@ -3325,3 +3325,713 @@ async fn wire_extended_execute_of_end_commits() {
         "*** extended-protocol `END` did not commit ***"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Prisma P0 spec 02 — RowDescription names for DML … RETURNING.
+//
+// Prisma 7.10 fully qualifies every RETURNING item and then maps the result
+// row BY COLUMN NAME. Through v4.30.0 the planner named an unaliased RETURNING
+// item with sqlparser's `Display` (`Planner::convert_returning` →
+// `format!("{expr}")`), which re-emits the quote characters, so the wire
+// advertised a field literally called `"public"."Account"."id"` where
+// PostgreSQL calls it `id` — and the portal needed a client-side rename shim.
+// A qualified column reference is now lowered to `ReturningItem::Column` on
+// its bare part — same name as the SELECT list gives it, plus the catalog
+// column's TYPE (int4, not the `Expression` fallback's hard-coded text) and its
+// VALUE (resolved by bare name, not by a byte-exact qualifier match that a
+// case-folded or aliased qualifier could never satisfy). Everything that is not
+// a column reference keeps its `Expression` lowering but takes its name from
+// `Planner::extract_expr_alias`, the same function the SELECT projection list
+// uses.
+//
+// Both wire routes derive the RowDescription from the plan's ReturningItems
+// via `EmbeddedDatabase::returning_schema`, but through different call sites:
+// Describe on the extended protocol (`handler_extended::derive_result_schema`)
+// and `derive_returning_schema` on the simple-query path.
+// ---------------------------------------------------------------------------
+
+/// Decode a RowDescription into `(name, data_type_oid, format_code)` per field.
+/// [`row_description`] above drops the format code; the binary-result contract
+/// below needs all three, because the defect was a field whose DECLARED type
+/// and ACTUAL encoding disagreed.
+fn row_description_fields(bytes: &[u8]) -> Vec<(String, i32, i16)> {
+    let mut out = Vec::new();
+    for (ty, payload) in parse_messages(bytes) {
+        if ty != b'T' {
+            continue;
+        }
+        let nfields = i16::from_be_bytes([payload[0], payload[1]]) as usize;
+        let mut pos = 2;
+        for _ in 0..nfields {
+            let name_end = pos + payload[pos..].iter().position(|&b| b == 0).expect("field name cstring");
+            let name = String::from_utf8_lossy(&payload[pos..name_end]).to_string();
+            pos = name_end + 1;
+            // skip table_oid(i32) + column_attr_num(i16)
+            let oid_pos = pos + 4 + 2;
+            let oid = i32::from_be_bytes([
+                payload[oid_pos],
+                payload[oid_pos + 1],
+                payload[oid_pos + 2],
+                payload[oid_pos + 3],
+            ]);
+            // …then skip data_type_size(i16) + type_modifier(i32)
+            let fmt_pos = oid_pos + 4 + 2 + 4;
+            let format = i16::from_be_bytes([payload[fmt_pos], payload[fmt_pos + 1]]);
+            out.push((name, oid, format));
+            pos += 18;
+        }
+    }
+    out
+}
+
+/// Raw bytes of a DataRow cell, `None` for SQL NULL. The text-mode sibling
+/// [`cell`] is lossy, and a binary-format cell is not UTF-8 at all.
+fn cell_bytes(row: &[Option<Vec<u8>>], idx: usize) -> Option<&[u8]> {
+    row.get(idx).and_then(|v| v.as_deref())
+}
+
+/// The Prisma `Account` table, quoted and mixed-case exactly as Prisma emits it.
+fn prisma_account_db() -> Arc<EmbeddedDatabase> {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    db.execute(r#"CREATE TABLE "Account" (id INT PRIMARY KEY, email TEXT, "createdAt" TEXT, "updatedAt" TEXT)"#)
+        .expect("create");
+    db
+}
+
+/// Extended protocol (psycopg3 / Prisma / JDBC): the exact statement a
+/// `prisma.account.create()` sends. Describe must advertise `id, email,
+/// createdAt, updatedAt`.
+///
+/// FAILS on the unfixed tree twice over: the four field names come back as
+/// `"public"."Account"."id"`, `"public"."Account"."email"`,
+/// `"public"."Account"."createdAt"`, `"public"."Account"."updatedAt"` — and
+/// `id` is advertised with OID 25 (text) instead of 23 (int4), because a
+/// qualified reference was lowered to `ReturningItem::Expression`, which
+/// `EmbeddedDatabase::returning_schema` types as `DataType::Text` regardless of
+/// the catalog.
+#[tokio::test]
+async fn prisma_insert_returning_describe_names_bare_columns() {
+    let db = prisma_account_db();
+    let (mut handler, mut client) = test_handler(db);
+
+    let sql = r#"INSERT INTO "public"."Account" ("id","email","createdAt","updatedAt") VALUES ($1,$2,$3,$4) RETURNING "public"."Account"."id", "public"."Account"."email", "public"."Account"."createdAt", "public"."Account"."updatedAt""#;
+    handler
+        .handle_parse_extended("prisma_ins".into(), sql.into(), vec![23, 25, 25, 25])
+        .await
+        .expect("parse");
+    handler
+        .handle_describe_extended(super::messages::DescribeTarget::Statement, "prisma_ins".into())
+        .await
+        .expect("describe");
+    let described = drain(&mut client).await;
+    assert_eq!(
+        row_description_names(&described),
+        vec![
+            "id".to_string(),
+            "email".to_string(),
+            "createdAt".to_string(),
+            "updatedAt".to_string()
+        ],
+        "RETURNING field names must be the bare column names PostgreSQL uses — \
+         quotes stripped, quoted case preserved"
+    );
+    // …and the TYPES must come from the catalog column, exactly as the bare
+    // `RETURNING id` spelling already did. A qualified reference lowered to
+    // `ReturningItem::Expression` was hard-coded to `DataType::Text` by
+    // `EmbeddedDatabase::returning_schema`, so the same INT column was
+    // advertised as int4 (23) when written bare and as text (25) when written
+    // the way Prisma writes it.
+    assert_eq!(
+        row_description(&described),
+        vec![
+            ("id".to_string(), 23),
+            ("email".to_string(), 25),
+            ("createdAt".to_string(), 25),
+            ("updatedAt".to_string(), 25)
+        ],
+        "a qualified RETURNING reference must carry the CATALOG column's type \
+         (id → int4/23), not the `Expression` fallback's hard-coded text/25"
+    );
+
+    // The rename must not disturb the rows: Bind/Execute still returns the
+    // inserted row, in RETURNING order.
+    let params: Vec<Option<Vec<u8>>> = vec![
+        Some(b"1".to_vec()),
+        Some(b"a@example.com".to_vec()),
+        Some(b"2026-09-06".to_vec()),
+        Some(b"2026-09-07".to_vec()),
+    ];
+    handler
+        .handle_bind_extended("prisma_p".into(), "prisma_ins".into(), vec![0; 4], params, vec![])
+        .await
+        .expect("bind");
+    handler
+        .handle_execute_extended("prisma_p".into(), 0)
+        .await
+        .expect("execute");
+    let rows = data_rows(&drain(&mut client).await);
+    assert_eq!(rows.len(), 1, "INSERT … RETURNING must emit exactly one DataRow");
+    assert_eq!(cell(&rows[0], 0).as_deref(), Some("1"));
+    assert_eq!(cell(&rows[0], 1).as_deref(), Some("a@example.com"));
+    assert_eq!(cell(&rows[0], 2).as_deref(), Some("2026-09-06"));
+    assert_eq!(cell(&rows[0], 3).as_deref(), Some("2026-09-07"));
+}
+
+/// Simple query protocol (psycopg2 / psql): the `prisma.account.update()`
+/// shape. The simple path builds its RowDescription in
+/// `PgConnectionHandler::derive_returning_schema`, a different call site from
+/// the extended path's Describe — so it gets its own assertion.
+///
+/// FAILS on the unfixed tree with `"public"."Account"."id"` /
+/// `"public"."Account"."email"` — and, once the names are right, with OID 25
+/// on `id`: psycopg2 casts by OID, so a text-typed primary key comes back as
+/// the str `"1"` where PostgreSQL hands back `1`.
+#[tokio::test]
+async fn prisma_update_returning_simple_query_names_bare_columns() {
+    let db = prisma_account_db();
+    db.execute(
+        r#"INSERT INTO "public"."Account" ("id","email","createdAt","updatedAt")
+           VALUES (1,'a@example.com','2026-09-06','2026-09-06')"#,
+    )
+    .expect("seed");
+    let (mut handler, mut client) = test_handler(db);
+
+    handler
+        .handle_single_query(
+            r#"UPDATE "public"."Account" SET "email"='b@example.com' WHERE "public"."Account"."id"=1 RETURNING "public"."Account"."id", "public"."Account"."email""#,
+        )
+        .await
+        .expect("update … returning");
+    let out = drain(&mut client).await;
+    assert_eq!(
+        row_description(&out),
+        vec![("id".to_string(), 23), ("email".to_string(), 25)],
+        "simple-query UPDATE … RETURNING must name AND type its fields like \
+         PostgreSQL (psycopg2 casts by OID, so id must be int4/23 here too)"
+    );
+    let rows = data_rows(&out);
+    assert_eq!(rows.len(), 1, "UPDATE … RETURNING must emit exactly one DataRow");
+    assert_eq!(cell(&rows[0], 0).as_deref(), Some("1"));
+    assert_eq!(
+        cell(&rows[0], 1).as_deref(),
+        Some("b@example.com"),
+        "RETURNING must carry the POST-update value"
+    );
+}
+
+/// `RETURNING *` must keep naming every column of the table — the shape
+/// `tests/delete_returning_tests.rs` and drizzle depend on — and an explicit
+/// `AS` alias must still win over the derived name.
+#[tokio::test]
+async fn returning_wildcard_and_alias_names_are_unchanged() {
+    let db = prisma_account_db();
+    db.execute(
+        r#"INSERT INTO "public"."Account" ("id","email","createdAt","updatedAt")
+           VALUES (1,'a@example.com','2026-09-06','2026-09-06')"#,
+    )
+    .expect("seed");
+    let (mut handler, mut client) = test_handler(db);
+
+    handler
+        .handle_single_query(r#"DELETE FROM "public"."Account" WHERE "public"."Account"."id"=1 RETURNING *"#)
+        .await
+        .expect("delete … returning *");
+    let out = drain(&mut client).await;
+    assert_eq!(
+        row_description_names(&out),
+        vec![
+            "id".to_string(),
+            "email".to_string(),
+            "createdAt".to_string(),
+            "updatedAt".to_string()
+        ],
+        "RETURNING * must still expand to the table's own column names"
+    );
+    assert_eq!(data_rows(&out).len(), 1);
+
+    handler
+        .handle_single_query(
+            r#"INSERT INTO "public"."Account" ("id","email") VALUES (2,'c@example.com') RETURNING "public"."Account"."id" AS "accountId""#,
+        )
+        .await
+        .expect("insert … returning alias");
+    let out = drain(&mut client).await;
+    assert_eq!(
+        row_description_names(&out),
+        vec!["accountId".to_string()],
+        "an explicit alias must win over the derived name, case intact"
+    );
+}
+
+/// The half of the defect a NAME-only fix leaves in place, and the reason the
+/// planner lowers a qualified reference to `ReturningItem::Column` rather than
+/// renaming an `Expression`.
+///
+/// `EmbeddedDatabase::returning_schema` types every `ReturningItem::Expression`
+/// as `DataType::Text` (OID 25). `DataType::Text` IS in
+/// `datatype_has_binary_result`, so `effective_result_format` grants
+/// `format_code = 1` to a portal that asked for binary — while
+/// `tuple_to_pg_values_with_formats` encodes the row's ACTUAL `Value::Int4`
+/// with `value_to_pg_binary`, i.e. four big-endian bytes. The client is told
+/// "text, binary format" and handed `00 00 00 01`, which it decodes as a UTF-8
+/// string. tokio-postgres — the driver under Prisma's Rust query engine —
+/// always requests binary results, so this is the shape that actually ships.
+///
+/// FAILS on the unfixed tree: `id` is advertised with OID 25 (text) instead of
+/// 23 (int4) while its DataRow payload is int4-binary. Both new name tests
+/// above bind with `vec![]` result formats (all text), so neither can catch it.
+#[tokio::test]
+async fn prisma_returning_types_are_coherent_with_binary_result_formats() {
+    let db = prisma_account_db();
+    let (mut handler, mut client) = test_handler(db);
+
+    let sql = r#"INSERT INTO "public"."Account" ("id","email","createdAt","updatedAt") VALUES ($1,$2,$3,$4) RETURNING "public"."Account"."id", "public"."Account"."email""#;
+    handler
+        .handle_parse_extended("bin_ins".into(), sql.into(), vec![23, 25, 25, 25])
+        .await
+        .expect("parse");
+
+    let params: Vec<Option<Vec<u8>>> = vec![
+        Some(b"1".to_vec()),
+        Some(b"a@example.com".to_vec()),
+        Some(b"2026-09-06".to_vec()),
+        Some(b"2026-09-07".to_vec()),
+    ];
+    // Result formats = binary for BOTH output columns.
+    handler
+        .handle_bind_extended("bin_p".into(), "bin_ins".into(), vec![0; 4], params, vec![1, 1])
+        .await
+        .expect("bind");
+    let _ = drain(&mut client).await;
+
+    handler
+        .handle_describe_extended(super::messages::DescribeTarget::Portal, "bin_p".into())
+        .await
+        .expect("describe portal");
+    let fields = row_description_fields(&drain(&mut client).await);
+    assert_eq!(
+        fields.iter().map(|f| (f.1, f.2)).collect::<Vec<_>>(),
+        vec![(23, 1), (25, 1)],
+        "the portal must advertise (int4, binary) for `id` and (text, binary) for \
+         `email`; OID 25 on `id` is the `ReturningItem::Expression` text fallback \
+         describing an int4 column as text while sending int4-binary bytes"
+    );
+    assert_eq!(
+        fields.iter().map(|f| f.0.clone()).collect::<Vec<_>>(),
+        vec!["id".to_string(), "email".to_string()]
+    );
+
+    handler
+        .handle_execute_extended("bin_p".into(), 0)
+        .await
+        .expect("execute");
+    let rows = data_rows(&drain(&mut client).await);
+    assert_eq!(rows.len(), 1, "INSERT … RETURNING must emit exactly one DataRow");
+    let int4_one = 1i32.to_be_bytes();
+    assert_eq!(
+        cell_bytes(&rows[0], 0),
+        Some(&int4_one[..]),
+        "int4 binary output is 4 big-endian bytes — and the field it lands in \
+         must be the one advertised as int4"
+    );
+    assert_eq!(cell_bytes(&rows[0], 1), Some(&b"a@example.com"[..]));
+}
+
+/// A CASE-FOLDED qualifier (`Account.id` against table `"Account"`) and an
+/// ALIAS qualifier (`AS x … RETURNING x."id"`) are the fail-open half of the
+/// same defect: `Evaluator::evaluate` compares the qualifier to the catalog's
+/// stamped `source_table_name` byte-exactly, misses, and
+/// `project_returning_columns` maps the `Err` to `Value::Null`. Getting the
+/// NAME right without the lowering would have made that worse — the field
+/// would arrive over the wire under the exact name an ORM binds, carrying NULL
+/// for the primary key, with no error anywhere.
+///
+/// FAILS on the unfixed tree on the NAMES (`Account.id`, `x."id"`); it also
+/// fails on a name-only fix, on the NULL values.
+#[tokio::test]
+async fn returning_folded_and_alias_qualifiers_resolve_over_the_wire() {
+    let db = prisma_account_db();
+    db.execute(
+        r#"INSERT INTO "public"."Account" ("id","email","createdAt","updatedAt")
+           VALUES (1,'a@example.com','2026-09-06','2026-09-06'),
+                  (2,'b@example.com','2026-09-06','2026-09-06')"#,
+    )
+    .expect("seed");
+    let (mut handler, mut client) = test_handler(db);
+
+    handler
+        .handle_single_query(
+            r#"UPDATE "public"."Account" SET "email"='c@example.com' WHERE id=1 RETURNING Account.id, Account.email"#,
+        )
+        .await
+        .expect("update … returning folded qualifier");
+    let out = drain(&mut client).await;
+    assert_eq!(
+        row_description_names(&out),
+        vec!["id".to_string(), "email".to_string()],
+        "an unquoted qualifier must not leak into the field name"
+    );
+    let rows = data_rows(&out);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        cell(&rows[0], 0).as_deref(),
+        Some("1"),
+        "*** fail-open: a case-folded qualifier projected NULL under the right name ***"
+    );
+    assert_eq!(cell(&rows[0], 1).as_deref(), Some("c@example.com"));
+
+    handler
+        .handle_single_query(r#"DELETE FROM "Account" AS x WHERE id=2 RETURNING x."id", x."email""#)
+        .await
+        .expect("delete … returning alias qualifier");
+    let out = drain(&mut client).await;
+    assert_eq!(
+        row_description_names(&out),
+        vec!["id".to_string(), "email".to_string()],
+        "an alias qualifier must not leak into the field name"
+    );
+    let rows = data_rows(&out);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        cell(&rows[0], 0).as_deref(),
+        Some("2"),
+        "*** fail-open: an alias-qualified RETURNING projected NULL ***"
+    );
+    assert_eq!(cell(&rows[0], 1).as_deref(), Some("b@example.com"));
+}
+
+// Prisma P0 spec 03 — pg_advisory_lock over the wire.
+//
+// Prisma Migrate serialises every migration run with
+// `SELECT pg_advisory_lock(72707369)` and releases it with
+// `SELECT pg_advisory_unlock(72707369)`. Both raised
+// `Unknown scalar function` (42883) before this change, so no migration could
+// run against Nano at all. Two handlers over the same `Arc<EmbeddedDatabase>`
+// are two connections: each mints its own wire session, and the handler's
+// `Drop` is the disconnect.
+// ---------------------------------------------------------------------------
+
+/// The `void` then `true` result shapes psycopg / Prisma expect from the
+/// canonical lock/unlock pair, on the simple-query path.
+#[tokio::test]
+async fn advisory_lock_then_unlock_returns_void_then_true() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut handler, mut client) = test_handler(db);
+
+    handler
+        .handle_single_query("SELECT pg_advisory_lock(72707369)")
+        .await
+        .expect("pg_advisory_lock must not fail");
+    let out = drain(&mut client).await;
+    assert!(
+        sqlstates(&out).is_empty(),
+        "pg_advisory_lock() must not error, got {:?}",
+        sqlstates(&out)
+    );
+    let rows = data_rows(&out);
+    assert_eq!(rows.len(), 1, "pg_advisory_lock() returns exactly one row");
+    let row = rows.first().expect("one row");
+    assert_eq!(row.len(), 1, "pg_advisory_lock() returns exactly one column");
+    let column = row.first().expect("one column");
+    assert!(
+        column.is_none(),
+        "pg_advisory_lock() is a void function: the column is NULL-typed, got {column:?}"
+    );
+
+    handler
+        .handle_single_query("SELECT pg_advisory_unlock(72707369)")
+        .await
+        .expect("pg_advisory_unlock must not fail");
+    let out = drain(&mut client).await;
+    assert!(
+        sqlstates(&out).is_empty(),
+        "pg_advisory_unlock() must not error, got {:?}",
+        sqlstates(&out)
+    );
+    assert_eq!(
+        first_data_row_text(&out).as_deref(),
+        Some("t"),
+        "the holder's pg_advisory_unlock() returns true"
+    );
+}
+
+/// A holds the migration lock, B cannot take it, and B CAN take it as soon as
+/// A's connection ends — the handler's `Drop` (Terminate, dropped socket and
+/// error path alike) releases through `destroy_session`.
+///
+/// Also proves the result cache never serves an advisory answer: B runs the
+/// byte-identical statement twice and gets `f` then `t`.
+#[tokio::test]
+async fn advisory_lock_is_released_when_the_holding_connection_drops() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut holder, mut holder_client) = test_handler(Arc::clone(&db));
+    let (mut other, mut other_client) = test_handler(Arc::clone(&db));
+
+    holder
+        .handle_single_query("SELECT pg_advisory_lock(72707374)")
+        .await
+        .expect("holder acquires");
+    let _ = drain(&mut holder_client).await;
+
+    other
+        .handle_single_query("SELECT pg_try_advisory_lock(72707374)")
+        .await
+        .expect("try must not error");
+    assert_eq!(
+        first_data_row_text(&drain(&mut other_client).await).as_deref(),
+        Some("f"),
+        "a second connection must not get the migration lock"
+    );
+
+    // The holding connection goes away.
+    drop(holder);
+    drop(holder_client);
+
+    other
+        .handle_single_query("SELECT pg_try_advisory_lock(72707374)")
+        .await
+        .expect("try must not error");
+    assert_eq!(
+        first_data_row_text(&drain(&mut other_client).await).as_deref(),
+        Some("t"),
+        "*** the lock outlived the connection that held it ***"
+    );
+}
+
+/// A BLOCKING `pg_advisory_lock` on a busy key is granted once the holder's
+/// connection drops, and it does not wedge the runtime while it waits — the
+/// wait is handed to `block_in_place`, so the other task still runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn blocking_advisory_lock_is_granted_after_the_holder_disconnects() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut holder, mut holder_client) = test_handler(Arc::clone(&db));
+    holder
+        .handle_single_query("SELECT pg_advisory_lock(72707370)")
+        .await
+        .expect("holder acquires");
+    let _ = drain(&mut holder_client).await;
+
+    let (mut waiter, mut waiter_client) = test_handler(Arc::clone(&db));
+    let waiting = tokio::spawn(async move {
+        waiter
+            .handle_single_query("SELECT pg_advisory_lock(72707370)")
+            .await
+            .expect("waiter must be granted the lock");
+        waiter
+    });
+
+    // Still blocked while the holder keeps the key.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert!(!waiting.is_finished(), "the waiter must still be blocked");
+
+    drop(holder);
+    drop(holder_client);
+
+    let waiter = tokio::time::timeout(std::time::Duration::from_secs(10), waiting)
+        .await
+        .expect("*** a blocked pg_advisory_lock was never granted after the holder disconnected ***")
+        .expect("waiter task must not panic");
+    let out = drain(&mut waiter_client).await;
+    assert!(
+        sqlstates(&out).is_empty(),
+        "the granted pg_advisory_lock must not error, got {:?}",
+        sqlstates(&out)
+    );
+    assert_eq!(data_rows(&out).len(), 1, "one void row");
+    drop(waiter);
+}
+
+/// A transaction-level advisory lock taken over the wire is released by the
+/// wire COMMIT, and by ROLLBACK.
+#[tokio::test]
+async fn advisory_xact_lock_is_released_by_wire_commit_and_rollback() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut a, mut ca) = test_handler(Arc::clone(&db));
+    let (mut b, mut cb) = test_handler(Arc::clone(&db));
+
+    for (finish, key) in [("COMMIT", 72707371_i64), ("ROLLBACK", 72707372_i64)] {
+        a.handle_single_query("BEGIN").await.expect("begin");
+        let _ = drain(&mut ca).await;
+        a.handle_single_query(&format!("SELECT pg_advisory_xact_lock({key})"))
+            .await
+            .expect("xact lock");
+        let out = drain(&mut ca).await;
+        assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
+
+        b.handle_single_query(&format!("SELECT pg_try_advisory_lock({key})"))
+            .await
+            .expect("try");
+        assert_eq!(
+            first_data_row_text(&drain(&mut cb).await).as_deref(),
+            Some("f"),
+            "held for the duration of A's transaction"
+        );
+
+        a.handle_single_query(finish).await.expect("finish txn");
+        let _ = drain(&mut ca).await;
+
+        b.handle_single_query(&format!("SELECT pg_try_advisory_lock({key})"))
+            .await
+            .expect("try");
+        assert_eq!(
+            first_data_row_text(&drain(&mut cb).await).as_deref(),
+            Some("t"),
+            "*** {finish} did not release the transaction-level advisory lock ***"
+        );
+    }
+}
+
+/// The extended query protocol (Parse/Bind/Execute — the params family) serves
+/// the advisory functions too, and attributes the lock to the same connection.
+#[tokio::test]
+async fn advisory_lock_works_on_the_extended_protocol() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut a, mut ca) = test_handler(Arc::clone(&db));
+    let (mut b, mut cb) = test_handler(Arc::clone(&db));
+
+    a.handle_parse_extended("adv".into(), "SELECT pg_advisory_lock(72707373)".into(), vec![])
+        .await
+        .expect("parse");
+    a.handle_bind_extended("padv".into(), "adv".into(), vec![], vec![], vec![])
+        .await
+        .expect("bind");
+    a.handle_execute_extended("padv".into(), 0).await.expect("execute");
+    let out = drain(&mut ca).await;
+    assert!(
+        sqlstates(&out).is_empty(),
+        "extended pg_advisory_lock() must not error, got {:?}",
+        sqlstates(&out)
+    );
+    assert_eq!(data_rows(&out).len(), 1, "one void row");
+
+    b.handle_single_query("SELECT pg_try_advisory_lock(72707373)")
+        .await
+        .expect("try");
+    assert_eq!(
+        first_data_row_text(&drain(&mut cb).await).as_deref(),
+        Some("f"),
+        "*** the extended-protocol lock was never taken ***"
+    );
+}
+
+/// Spec 03 / ownership: an advisory lock taken by an EXTENDED-protocol
+/// `INSERT … RETURNING` belongs to the connection that took it, and dies with
+/// it.
+///
+/// That arm (`handler_extended::handle_execute_extended`) routed through the
+/// SESSION-LESS `execute_params_returning`, so the lock was attributed to the
+/// process-wide embedded owner instead of this wire session: `destroy_session`
+/// never matched it and `Drop` only fires for the last handle, so
+/// `INSERT … RETURNING pg_try_advisory_lock(k)` over psycopg3 / JDBC / sqlx
+/// stranded key `k` for the life of the server. The simple-query twin was
+/// always session-aware — the "fixed in one family only" defect class.
+///
+/// FAILS on the unfixed tree at the last assertion (`f`, not `t`).
+#[tokio::test]
+async fn extended_dml_returning_advisory_lock_dies_with_the_connection() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    db.execute("CREATE TABLE adv_ret (id INT PRIMARY KEY, got BOOLEAN)")
+        .expect("create table");
+    let (mut a, mut ca) = test_handler(Arc::clone(&db));
+    let (mut b, mut cb) = test_handler(Arc::clone(&db));
+
+    a.handle_parse_extended(
+        "ins".into(),
+        "INSERT INTO adv_ret VALUES (1, pg_try_advisory_lock(72707375)) RETURNING got".into(),
+        vec![],
+    )
+    .await
+    .expect("parse");
+    a.handle_bind_extended("pins".into(), "ins".into(), vec![], vec![], vec![])
+        .await
+        .expect("bind");
+    a.handle_execute_extended("pins".into(), 0).await.expect("execute");
+    let out = drain(&mut ca).await;
+    assert!(
+        sqlstates(&out).is_empty(),
+        "extended INSERT … RETURNING pg_try_advisory_lock must not error, got {:?}",
+        sqlstates(&out)
+    );
+    assert_eq!(
+        first_data_row_text(&out).as_deref(),
+        Some("t"),
+        "the RETURNING expression must actually take the lock"
+    );
+
+    b.handle_single_query("SELECT pg_try_advisory_lock(72707375)")
+        .await
+        .expect("try");
+    assert_eq!(
+        first_data_row_text(&drain(&mut cb).await).as_deref(),
+        Some("f"),
+        "A holds it while its connection is alive"
+    );
+
+    // A's connection ends — Terminate, dropped socket and error path all funnel
+    // through the handler's `Drop` → `destroy_session`.
+    drop(a);
+    drop(ca);
+
+    b.handle_single_query("SELECT pg_try_advisory_lock(72707375)")
+        .await
+        .expect("try");
+    assert_eq!(
+        first_data_row_text(&drain(&mut cb).await).as_deref(),
+        Some("t"),
+        "*** an extended-protocol RETURNING advisory lock outlived the connection that took it ***"
+    );
+}
+
+/// Spec 03 / pooling: `DISCARD ALL` releases this session's advisory locks,
+/// exactly as PostgreSQL documents (`DISCARD ALL` is defined to include
+/// `SELECT pg_advisory_unlock_all();`).
+///
+/// Without it a pool that recycles a physical connection after a failed
+/// migration leaves key 72707369 held: the client believes the lock is gone,
+/// every other connection blocks forever, and the recycled session itself
+/// re-enters the lock (same owner) and appears to succeed.
+///
+/// FAILS on the unfixed tree at the first assertion (`t`, not `f`): the lock
+/// survives the reset.
+#[tokio::test]
+async fn discard_all_releases_session_advisory_locks() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut pooled, mut cp) = test_handler(Arc::clone(&db));
+    let (mut other, mut co) = test_handler(Arc::clone(&db));
+
+    pooled
+        .handle_single_query("SELECT pg_advisory_lock(72707376)")
+        .await
+        .expect("holder acquires");
+    let _ = drain(&mut cp).await;
+
+    pooled.handle_single_query("DISCARD ALL").await.expect("discard all");
+    let out = drain(&mut cp).await;
+    assert!(
+        sqlstates(&out).is_empty(),
+        "DISCARD ALL must not error, got {:?}",
+        sqlstates(&out)
+    );
+
+    // The recycled connection no longer owns the key...
+    pooled
+        .handle_single_query("SELECT pg_advisory_unlock(72707376)")
+        .await
+        .expect("unlock");
+    assert_eq!(
+        first_data_row_text(&drain(&mut cp).await).as_deref(),
+        Some("f"),
+        "*** DISCARD ALL left the migration lock held on the recycled connection ***"
+    );
+
+    // ... and the next client can take it.
+    other
+        .handle_single_query("SELECT pg_try_advisory_lock(72707376)")
+        .await
+        .expect("try");
+    assert_eq!(
+        first_data_row_text(&drain(&mut co).await).as_deref(),
+        Some("t"),
+        "*** the migration lock was never released by DISCARD ALL ***"
+    );
+}

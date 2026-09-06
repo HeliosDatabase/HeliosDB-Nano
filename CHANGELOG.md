@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — RETURNING names and types qualified columns like PostgreSQL (Prisma create/update)
+
+`INSERT … RETURNING "public"."Account"."id"` — the statement Prisma emits for every write — came
+back with the raw expression text as the field name and typed TEXT, with values serialised as
+text; Prisma mapped rows by name and raised P2023 on the types. A qualified column reference in a
+RETURNING list is now lowered to the target table's column, so it is named `id`, typed by the
+catalog (int4/bool/timestamp…), and encoded accordingly, on both wire protocols and both executor
+families. Unaliased expressions are named by the same rule the SELECT list uses (a function call
+by its name). The client-side rename/type shim the Partner Portal added is no longer needed.
+
+### Added — `pg_advisory_lock` family (session and transaction scope)
+
+`pg_advisory_lock`, `pg_try_advisory_lock`, `pg_advisory_unlock`, `pg_advisory_unlock_all`,
+`pg_advisory_xact_lock`, `pg_try_advisory_xact_lock` in the `(bigint)` and `(int, int)` forms —
+what `prisma migrate` needs (`pg_advisory_lock(72707369)`). Locks are process-global, owned by the
+connection's session, re-entrant, released at COMMIT/ROLLBACK for the transaction scope, on
+disconnect for everything, and by `DISCARD ALL` for the session scope. A blocking acquire honours
+`statement_timeout` and holds no engine lock while waiting. New `pg_advisory_locks` system view and
+`[locks] advisory_max_per_session` setting. The `_shared` variants are not provided (they fail with
+42883 rather than being served as exclusive locks).
+
 ### Security — `mcp-endpoint` builds: the HTTP listener never started, and the duplicate `/mcp` was unauthenticated
 
 Since v4.27.0 (which mounted the BaaS router on the HTTP listener) every binary built with

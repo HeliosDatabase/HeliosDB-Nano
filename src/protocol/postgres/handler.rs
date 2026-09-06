@@ -1333,6 +1333,18 @@ where
                     }
                     self.transaction_status = TransactionStatus::Idle;
                     self.prepared_statements.clear_all()?;
+                    // Spec 03: PostgreSQL documents `DISCARD ALL` as equivalent
+                    // to a sequence that includes `SELECT pg_advisory_unlock_all()`.
+                    // Without this a pooled connection recycled after a failed
+                    // migration keeps holding key 72707369: the client believes
+                    // the lock is gone, every other connection blocks forever,
+                    // and the recycled session itself re-enters the lock (same
+                    // owner) and appears to succeed. Session scope only — the
+                    // transaction-scope holds died with the rollback above.
+                    // One atomic load on the common path where nothing is held.
+                    if crate::advisory_lock::manager().has_locks() {
+                        crate::advisory_lock::manager().unlock_all(self.session_id);
+                    }
                     // Reset session GUCs to their defaults.
                     let _ = self.database.set_session_synchronous_commit(self.session_id, None);
                     let _ = self.database.set_session_fast_autocommit(self.session_id, false);
@@ -3735,6 +3747,16 @@ fn sqlstate_for_query_execution_message(message: &str) -> &'static str {
 
     let lower = message.to_ascii_lowercase();
     let not_found = lower.contains("not found") || lower.contains("does not exist") || lower.contains("doesn't exist");
+
+    // Spec 03: the advisory family refuses the session-scope half on a
+    // session-less execution path (REST/BaaS, MCP, the embedded funnel, the
+    // REPL) because there is no connection to own or release the lock. That is
+    // `0A000 feature_not_supported`, not `XX000 internal_error` — poolers and
+    // HA proxies read XX000 as a server fault and may drop the backend. The
+    // marker is a const owned by the single emitter, so the two cannot drift.
+    if lower.contains(crate::advisory_lock::UNSCOPED_ADVISORY_MARKER) {
+        return sqlstate::FEATURE_NOT_SUPPORTED; // 0A000
+    }
 
     // HC4 role/ACL mappings, checked BEFORE the table/relation rules: the role
     // errors deliberately avoid the words "table"/"relation" so they cannot be

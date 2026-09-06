@@ -403,7 +403,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
                 // planner/evaluator becomes a recoverable XX000 error instead
                 // of unwinding the connection task and dropping the client.
                 let (affected, tuples) = super::handler::run_guarded(|| {
-                    self.database.execute_params_returning(&statement.query, &param_values)
+                    // Spec 03: `_for_session`, not the session-less twin. Any
+                    // advisory lock a RETURNING expression takes must belong to
+                    // THIS connection, so `destroy_session` releases it when the
+                    // client goes away; the session-less entry point attributed
+                    // it to a per-statement owner instead, and a wire client's
+                    // `INSERT … RETURNING pg_try_advisory_lock(k)` would have
+                    // been refused outright.
+                    self.database
+                        .execute_params_returning_for_session(self.session_id, &statement.query, &param_values)
                 })?;
                 self.prepared_statements
                     .update_portal_state(&portal_name, PortalState::Complete)?;
