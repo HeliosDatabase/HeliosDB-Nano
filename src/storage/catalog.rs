@@ -2,6 +2,7 @@
 //!
 //! Handles table schemas, row IDs, and metadata storage in RocksDB.
 
+use super::art_manager::ArtIndexManager;
 use super::compression::{CompressionConfig, CompressionStats};
 use super::statistics::TableStatistics;
 use super::StorageEngine;
@@ -481,6 +482,61 @@ impl<'a> Catalog<'a> {
             return Err(Error::query_execution(format!("Table '{}' already exists", table_name)));
         }
 
+        // PRE-FLIGHT, before ANY durable write.
+        //
+        // The UNIQUE-index loop at the bottom of this method fails CLOSED: a
+        // constraint whose index could not be registered is enforced by
+        // nothing, so it must not be reported as created. But everything below
+        // — the WAL `CreateTable` record shipped to standbys, the schema, the
+        // schema cache, the row counter — commits BEFORE that loop runs, so
+        // erroring there left a HALF-CREATED table: the statement said "error",
+        // `table_exists()` said true, the UNIQUE column was indexed by nothing,
+        // and the retry failed with "Table 'x' already exists". That is the
+        // same silently-unenforced constraint the fail-closed rule exists to
+        // prevent, reached through the error path.
+        //
+        // So the whole question — "can every UNIQUE column get its index?" — is
+        // answered HERE, where the answer costs nothing but a lookup. The loop
+        // below then registers from this plan and cannot normally fail; if it
+        // does anyway (a concurrent DDL claimed the name between the two), the
+        // unwind restores the pre-CREATE state before returning the error.
+        //
+        // Hoisted for exactly the reason the FK target check in
+        // `EmbeddedDatabase`'s CREATE TABLE arm is hoisted above this call.
+        let art_manager = self.storage.art_indexes();
+        let mut unique_index_plan: Vec<(String, Vec<String>)> = Vec::new();
+        for col in schema.columns.iter() {
+            if !col.unique || col.primary_key {
+                continue;
+            }
+            let unique_columns = vec![col.name.clone()];
+            // Already covered by an equivalent index — a re-entrant
+            // registration (e.g. `rebuild_all_indexes` in a process that
+            // already ran this CREATE). Benign, and NOT a name conflict.
+            if art_manager.has_unique_index_on(table_name, &unique_columns) {
+                continue;
+            }
+            let index_name = ArtIndexManager::generated_unique_index_name(table_name, &unique_columns);
+            if art_manager.index_exists(&index_name) {
+                return Err(Error::query_execution(format!(
+                    "could not create UNIQUE index \"{}\" for column '{}' of table '{}': \
+                     an index with that name is already registered — the constraint would not be enforced",
+                    index_name, col.name, table_name
+                )));
+            }
+            if unique_index_plan.iter().any(|(name, _)| name == &index_name) {
+                // Two columns cannot generate the same name (the name embeds
+                // the column), so this is unreachable in practice; refuse
+                // rather than register one index for two constraints.
+                return Err(Error::query_execution(format!(
+                    "could not create UNIQUE index \"{}\" for column '{}' of table '{}': \
+                     the generated name is not unique — the constraint would not be enforced",
+                    index_name, col.name, table_name
+                )));
+            }
+            unique_index_plan.push((index_name, unique_columns));
+        }
+
         // Log CreateTable to WAL first (for replication to standbys)
         // This must happen before the actual table creation so standbys
         // receive and apply the operation in the correct order.
@@ -503,7 +559,7 @@ impl<'a> Catalog<'a> {
         self.storage.put(&counter_key, &counter_value)?;
 
         // Auto-create ART indexes for PRIMARY KEY and UNIQUE constraints
-        let art_manager = self.storage.art_indexes();
+        // (`art_manager` was resolved by the pre-flight above).
 
         // Collect PRIMARY KEY columns
         let pk_columns: Vec<String> = schema
@@ -525,23 +581,61 @@ impl<'a> Catalog<'a> {
             }
         }
 
-        // Collect UNIQUE columns (non-PK) and create individual UNIQUE indexes
-        for col in schema.columns.iter() {
-            if col.unique && !col.primary_key {
-                let unique_columns = vec![col.name.clone()];
-                if let Err(e) = art_manager.create_unique_index(table_name, &unique_columns, Some(&col.name)) {
-                    tracing::warn!(
-                        "Failed to create UNIQUE ART index for table '{}' column '{}': {}",
-                        table_name,
-                        col.name,
-                        e
-                    );
-                } else {
+        // Collect UNIQUE columns (non-PK) and create individual UNIQUE indexes.
+        //
+        // THE INDEX NAME IS `{table}_{column}_key`, NOT the bare column name.
+        // `ArtIndexManager`'s registry is a single GLOBAL map keyed by index
+        // name, so passing `Some(&col.name)` put every table's `UNIQUE email`
+        // under the one name `email`: the FIRST table to declare it won, and
+        // every later table's `create_unique_index` failed with
+        // `IndexAlreadyExists` — which this loop logged at warn and swallowed.
+        // With no index registered there was nothing to probe, so the second
+        // table's UNIQUE constraint was enforced by NOTHING, on either executor
+        // family, on every write path. That is exactly the shape the Prisma
+        // spike hit (`u1(v UNIQUE)` enforced, `u2(…, UNIQUE (v))` not; `O1.login`
+        // enforced, `O2.login` not) and why enforcement looked "state-dependent".
+        // `{table}_{cols}_key` is PostgreSQL's own constraint-index name and the
+        // namespace `create_index_generated_name_tests` already documents as
+        // reserved for constraints, so it collides with nothing.
+        //
+        // Register from the pre-flight plan (which already skipped the column
+        // sets an equivalent index covers, and already proved every generated
+        // name free).
+        let mut registered: Vec<String> = Vec::with_capacity(unique_index_plan.len());
+        for (index_name, unique_columns) in &unique_index_plan {
+            match art_manager.create_unique_index(table_name, unique_columns, None) {
+                Ok(name) => {
                     tracing::debug!(
-                        "Created UNIQUE ART index for table '{}' on column '{}'",
+                        "Created UNIQUE ART index '{}' for table '{}' on columns {:?}",
+                        name,
                         table_name,
-                        col.name
+                        unique_columns
                     );
+                    registered.push(name);
+                }
+                // FAIL CLOSED. The index IS the enforcement, so a constraint we
+                // could not register is a constraint that does not exist;
+                // reporting CREATE TABLE success would hand back a table whose
+                // UNIQUE column silently accepts duplicates. The pre-flight
+                // above rules this out except under a concurrent DDL that
+                // claimed the name in between — so UNWIND rather than return an
+                // error over a half-created table (see the pre-flight comment).
+                Err(e) => {
+                    if art_manager.has_unique_index_on(table_name, unique_columns) {
+                        tracing::debug!(
+                            "UNIQUE ART index '{}' for '{}' already registered: {}",
+                            index_name,
+                            table_name,
+                            e
+                        );
+                        continue;
+                    }
+                    self.unwind_failed_create_table(table_name, &pk_columns, &registered);
+                    return Err(Error::query_execution(format!(
+                        "could not create UNIQUE index \"{}\" for table '{}': {} — \
+                         the constraint would not be enforced",
+                        index_name, table_name, e
+                    )));
                 }
             }
         }
@@ -554,8 +648,65 @@ impl<'a> Catalog<'a> {
         Ok(())
     }
 
-    /// Register the ART unique indexes for a table's MULTI-COLUMN (composite)
-    /// table-level `UNIQUE (a, b)` constraints.
+    /// Undo the durable half of a [`Self::create_table`] that then failed to
+    /// register a UNIQUE constraint index.
+    ///
+    /// `create_table` fails CLOSED — it will not report success for a table
+    /// whose UNIQUE column is enforced by nothing — and the pre-flight makes
+    /// that outcome unreachable except under a concurrent DDL. If it happens
+    /// anyway, the statement must leave NO table behind: an error over a table
+    /// that `table_exists()` reports as present is the worst of both worlds
+    /// (the constraint is unenforced AND the retry fails with "already
+    /// exists"). Removes exactly what `create_table` wrote, in reverse order,
+    /// and bumps the schema generation so the existence cache re-derives
+    /// `Missing`.
+    ///
+    /// Best effort per step, like the `drop_table` teardown: the caller is
+    /// already returning an error, and a failing cleanup step must not mask it.
+    /// The WAL `CreateTable` record cannot be un-logged; a standby that applied
+    /// it sees the same empty table a `CREATE TABLE` + `DROP TABLE` pair would
+    /// leave, which is why this path is a last resort and not the design.
+    fn unwind_failed_create_table(&self, table_name: &str, pk_columns: &[String], registered_unique: &[String]) {
+        let art_manager = self.storage.art_indexes();
+        for name in registered_unique {
+            if let Err(e) = art_manager.drop_index(name) {
+                tracing::warn!(
+                    "CREATE TABLE '{}' unwind: failed to drop UNIQUE index '{}': {}",
+                    table_name,
+                    name,
+                    e
+                );
+            }
+        }
+        if !pk_columns.is_empty() {
+            let pk_name = ArtIndexManager::generated_pk_index_name(table_name);
+            if art_manager.index_exists(&pk_name) {
+                if let Err(e) = art_manager.drop_index(&pk_name) {
+                    tracing::warn!(
+                        "CREATE TABLE '{}' unwind: failed to drop PK index '{}': {}",
+                        table_name,
+                        pk_name,
+                        e
+                    );
+                }
+            }
+        }
+        self.storage.invalidate_schema_cache(table_name);
+        if let Err(e) = self.storage.delete(&Self::table_metadata_key(table_name)) {
+            tracing::warn!("CREATE TABLE '{}' unwind: failed to delete schema: {}", table_name, e);
+        }
+        if let Err(e) = self.storage.delete(&Self::table_counter_key(table_name)) {
+            tracing::warn!(
+                "CREATE TABLE '{}' unwind: failed to delete row counter: {}",
+                table_name,
+                e
+            );
+        }
+        self.storage.bump_schema_generation();
+    }
+
+    /// Register the ART unique index behind every table-level UNIQUE constraint
+    /// of `table_name` that is not already backed by one.
     ///
     /// Why this exists: `create_table` above derives unique indexes from
     /// `schema.columns` — i.e. from the COLUMN-level `unique` flag only. A
@@ -570,33 +721,49 @@ impl<'a> Catalog<'a> {
     /// constraint when any column is NULL (PostgreSQL semantics). Only the
     /// creation call was missing.
     ///
-    /// SINGLE-column table-level `UNIQUE (a)` is deliberately skipped: it is
-    /// already enforced today (verified end to end), because that shape also sets
-    /// the column-level flag `create_table` reads. Creating a second index for it
-    /// would double-register the same rule under a different name and change the
-    /// error text of a case that already works.
+    /// ARITY-GENERIC, deduped by COLUMN SET (v4.31.0). It used to skip anything
+    /// narrower than two columns, on the reasoning that a single-column
+    /// table-level `UNIQUE (a)` also sets the column flag `create_table` reads.
+    /// That reasoning does not extend to `ALTER TABLE … ADD CONSTRAINT … UNIQUE
+    /// (a)`, which writes a constraint record and no column flag — so skipping
+    /// by ARITY would have left the altered constraint unenforced after a
+    /// restart. Skipping by "is this column set already backed by a live
+    /// PK/UNIQUE index?" keeps exactly one enforcing index per column set (the
+    /// original no-double-registration guarantee, so the error text of the
+    /// already-working shapes is unchanged) while covering every arity.
     ///
     /// Idempotent: `IndexAlreadyExists` is the expected outcome when
     /// `rebuild_all_indexes` runs in a process that already executed the
     /// `CREATE TABLE`, and is logged at debug like the sibling PK/FK loops.
-    pub fn register_composite_unique_indexes(&self, table_name: &str, constraints: &crate::sql::TableConstraints) {
+    pub fn register_unique_constraint_indexes(&self, table_name: &str, constraints: &crate::sql::TableConstraints) {
         let art_manager = self.storage.art_indexes();
         for uc in &constraints.unique_constraints {
-            if uc.is_primary_key || uc.columns.len() < 2 {
+            if uc.is_primary_key || uc.columns.is_empty() {
+                continue;
+            }
+            // Already enforced by the column-flag index `create_table` built (or
+            // by the PK index, or by a previous pass) — one rule, one index.
+            if art_manager.has_unique_index_on(table_name, &uc.columns) {
+                tracing::debug!(
+                    "UNIQUE constraint '{}' on {}({}) is already backed by an index",
+                    uc.name,
+                    table_name,
+                    uc.columns.join(", ")
+                );
                 continue;
             }
             match art_manager.create_unique_index(table_name, &uc.columns, Some(&uc.name)) {
                 Ok(_) => tracing::debug!(
-                    "Registered composite UNIQUE ART index '{}' on {}({})",
+                    "Registered UNIQUE ART index '{}' on {}({})",
                     uc.name,
                     table_name,
                     uc.columns.join(", ")
                 ),
                 Err(super::art_index::ArtIndexError::IndexAlreadyExists(_)) => {
-                    tracing::debug!("Composite UNIQUE index '{}' already registered", uc.name);
+                    tracing::debug!("UNIQUE index '{}' already registered", uc.name);
                 }
                 Err(e) => tracing::warn!(
-                    "Failed to register composite UNIQUE index '{}' on {}({}): {} — \
+                    "Failed to register UNIQUE index '{}' on {}({}): {} — \
                      the constraint will NOT be enforced until it is registered",
                     uc.name,
                     table_name,
@@ -607,15 +774,68 @@ impl<'a> Catalog<'a> {
         }
     }
 
+    /// Every column set of `table_name` that a UNIQUE (or PRIMARY KEY)
+    /// constraint covers — the set an `ON CONFLICT (…)` target is matched
+    /// against.
+    ///
+    /// Unions the three places a unique rule can be recorded, because no single
+    /// one of them sees all five spellings:
+    ///   * `schema.columns[i].unique` / `.primary_key` — inline `UNIQUE`, and
+    ///     single-column table-level `UNIQUE (a)` (which the planner lowers to
+    ///     the column flag);
+    ///   * `TableConstraints.unique_constraints` — table-level and
+    ///     `ALTER TABLE … ADD CONSTRAINT … UNIQUE`, at any arity;
+    ///   * the live ART registry — `CREATE UNIQUE INDEX`, which is an index and
+    ///     not a constraint record.
+    /// Column names come back exactly as the catalog stores them, so callers
+    /// must compare with the same normalisation the planner applies to
+    /// identifiers.
+    pub fn unique_column_sets(&self, table_name: &str) -> Vec<Vec<String>> {
+        let mut sets: Vec<Vec<String>> = Vec::new();
+        let mut push = |cols: Vec<String>| {
+            if !cols.is_empty() && !sets.contains(&cols) {
+                sets.push(cols);
+            }
+        };
+
+        if let Ok(schema) = self.get_table_schema(table_name) {
+            let pk: Vec<String> = schema
+                .columns
+                .iter()
+                .filter(|c| c.primary_key)
+                .map(|c| c.name.clone())
+                .collect();
+            push(pk);
+            for col in &schema.columns {
+                if col.unique && !col.primary_key {
+                    push(vec![col.name.clone()]);
+                }
+            }
+        }
+        if let Ok(constraints) = self.load_table_constraints(table_name) {
+            for uc in &constraints.unique_constraints {
+                push(uc.columns.clone());
+            }
+        }
+        for cols in self.storage.art_indexes().unique_column_sets(table_name) {
+            push(cols);
+        }
+        sets
+    }
+
     /// Drop the ART unique index backing each of `removed` (unique constraints that have
     /// just been removed from a table's persisted constraint set).
     ///
-    /// TWO candidate names, because unique indexes are not all named the same way:
+    /// SEVERAL candidate names, because unique indexes are not all named the same way:
     /// `create_unique_index` uses the name it is GIVEN, and callers pass different things —
-    /// `create_table`'s column-level loop passes the COLUMN name, while
-    /// `register_composite_unique_indexes` passes the CONSTRAINT name. The
+    /// `create_table`'s column-level loop lets it GENERATE `{table}_{cols}_key`, while
+    /// `register_unique_constraint_indexes` passes the CONSTRAINT name. The
     /// `unique_{table}_{name}` form is the original guess and matches neither; it is tried
-    /// last so that any index which does carry it is still cleaned up.
+    /// last so that any index which does carry it is still cleaned up. The bare COLUMN name
+    /// is the pre-v4.31.0 spelling of `create_table`'s index and is still tried so a data
+    /// directory written by an older binary (whose indexes are re-registered under the old
+    /// name only if that binary also created them in this process) is not left enforcing a
+    /// dropped constraint.
     ///
     /// Leaving the index behind is not cosmetic: the index, not the constraint record, is
     /// what the write path probes, so a stale one keeps rejecting rows for a constraint the
@@ -624,17 +844,73 @@ impl<'a> Catalog<'a> {
         let art_manager = self.storage.art_indexes();
         for uc in removed {
             let mut candidates: Vec<String> = vec![uc.name.clone()];
+            // The generated constraint-namespace name `create_table` and
+            // `ALTER TABLE … ADD CONSTRAINT … UNIQUE` register under.
+            candidates.push(ArtIndexManager::generated_unique_index_name(table_name, &uc.columns));
             if uc.columns.len() == 1 {
-                // Column-level UNIQUE registers under the bare column name.
+                // Pre-v4.31.0: the column-level UNIQUE index was registered
+                // under the bare column name.
                 candidates.push(uc.columns[0].clone());
             }
             candidates.push(format!("unique_{}_{}", table_name, uc.name));
 
+            // Is this column set STILL claimed after `removed` was retired?
+            //
+            // Two rules can share ONE index: `alter_table_add_unique`
+            // deliberately registers no second index when the column set is
+            // already covered (`has_unique_index_on`), and an inline `UNIQUE`
+            // writes BOTH a column flag and a constraint record. So dropping
+            // the redundant one must not drop the index the survivor is
+            // enforced by:
+            //   CREATE TABLE t (id INT PRIMARY KEY, v TEXT UNIQUE);   -- t_v_key
+            //   ALTER TABLE t ADD CONSTRAINT c UNIQUE (v);            -- no index
+            //   ALTER TABLE t DROP CONSTRAINT c;                      -- must keep t_v_key
+            // Without this check the candidate sweep found `t_v_key` and
+            // dropped it, `col.unique` stayed true in the schema, and the table
+            // went on ADVERTISING a constraint that `check_unique_constraints`
+            // had nothing to probe — duplicates landing silently, the exact
+            // fail-open class this whole change exists to close.
+            //
+            // The caller persists the surviving constraint set BEFORE calling
+            // this, so `unique_column_sets` below already excludes `removed`
+            // — except for the ART registry it also unions, which is why the
+            // comparison is against the schema flags and the constraint records
+            // only.
+            let still_claimed = self.column_set_still_claimed(table_name, &uc.columns);
+
             let mut dropped = false;
             for candidate in candidates {
+                // STOP at the first candidate that resolves. The list is a set
+                // of GUESSES at one index's name, not a list of indexes to
+                // remove; continuing past a hit meant a second guess that
+                // happened to name a DIFFERENT live index (e.g. the generated
+                // `{table}_{cols}_key` of an inline UNIQUE, when the constraint
+                // being dropped carried a user-chosen name) was dropped too.
+                let Some((kind, owner)) = art_manager.index_kind_and_table(&candidate) else {
+                    continue;
+                };
+                if owner != table_name || kind != super::ArtIndexType::Unique {
+                    // Never touch another table's index, and never drop a
+                    // PRIMARY KEY index because a constraint record happened to
+                    // guess its name.
+                    continue;
+                }
+                if still_claimed {
+                    tracing::debug!(
+                        "Keeping UNIQUE ART index '{}' after dropping constraint '{}': \
+                         columns ({}) are still claimed by another constraint on '{}'",
+                        candidate,
+                        uc.name,
+                        uc.columns.join(", "),
+                        table_name
+                    );
+                    dropped = true;
+                    break;
+                }
                 if art_manager.drop_index(&candidate).is_ok() {
                     dropped = true;
                     tracing::debug!("Dropped UNIQUE ART index '{}' for constraint '{}'", candidate, uc.name);
+                    break;
                 }
             }
             if !dropped {
@@ -645,6 +921,49 @@ impl<'a> Catalog<'a> {
                 );
             }
         }
+    }
+
+    /// After a UNIQUE constraint record has been retired, is its column set
+    /// still enforced by some OTHER surviving rule on the same table?
+    ///
+    /// Looks at the two places a rule can be recorded independently of the ART
+    /// registry — the column-level `unique` / `primary_key` flags in the schema,
+    /// and the remaining `TableConstraints.unique_constraints` records. The ART
+    /// registry itself is deliberately NOT consulted: the index whose fate is
+    /// being decided is in it, so it would always answer "yes".
+    ///
+    /// Case-insensitive and order-independent, because a unique constraint is a
+    /// SET of columns.
+    fn column_set_still_claimed(&self, table_name: &str, columns: &[String]) -> bool {
+        let same_set = |other: &[String]| -> bool {
+            other.len() == columns.len() && columns.iter().all(|c| other.iter().any(|o| o.eq_ignore_ascii_case(c)))
+        };
+
+        if let Ok(schema) = self.get_table_schema(table_name) {
+            let pk: Vec<String> = schema
+                .columns
+                .iter()
+                .filter(|c| c.primary_key)
+                .map(|c| c.name.clone())
+                .collect();
+            if !pk.is_empty() && same_set(&pk) {
+                return true;
+            }
+            if columns.len() == 1
+                && schema
+                    .columns
+                    .iter()
+                    .any(|c| c.unique && !c.primary_key && columns.iter().any(|w| c.name.eq_ignore_ascii_case(w)))
+            {
+                return true;
+            }
+        }
+        if let Ok(constraints) = self.load_table_constraints(table_name) {
+            if constraints.unique_constraints.iter().any(|uc| same_set(&uc.columns)) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Check if a table exists
@@ -1202,30 +1521,48 @@ impl<'a> Catalog<'a> {
             }
 
             // (Re)register UNIQUE indexes (one per UNIQUE non-PK column).
+            // `None` for the name, so the index comes back under the SAME
+            // generated `{table}_{col}_key` that `create_table` used — passing
+            // the bare column name here put every table's `email` index under
+            // one global key and lost all but the first (see `create_table`).
             for col in &schema.columns {
                 if col.unique && !col.primary_key {
                     let cols = vec![col.name.clone()];
-                    if let Err(e) = art_manager.create_unique_index(&table_name, &cols, Some(&col.name)) {
-                        tracing::debug!(
-                            "Index rebuild: UNIQUE index for {}.{} already registered: {}",
-                            table_name,
-                            col.name,
-                            e
-                        );
+                    if let Err(e) = art_manager.create_unique_index(&table_name, &cols, None) {
+                        if art_manager.has_unique_index_on(&table_name, &cols) {
+                            tracing::debug!(
+                                "Index rebuild: UNIQUE index for {}.{} already registered: {}",
+                                table_name,
+                                col.name,
+                                e
+                            );
+                        } else {
+                            // Not a re-registration: this column's UNIQUE
+                            // constraint is now enforced by nothing. Loud,
+                            // because every INSERT will silently accept
+                            // duplicates until it is fixed.
+                            tracing::warn!(
+                                "Index rebuild: UNIQUE index for {}.{} FAILED to register ({}); \
+                                 the constraint is NOT enforced in this process",
+                                table_name,
+                                col.name,
+                                e
+                            );
+                        }
                     }
                 }
             }
 
             // (Re)register FK indexes from persisted constraints — and, from the
-            // same load, the composite UNIQUE indexes. Both are constraint-derived
+            // same load, the table-level UNIQUE indexes. Both are constraint-derived
             // rather than schema-derived, so neither is covered by the
             // `schema.columns` loops above. Registering here (before the snapshot
-            // load / row replay below) is what makes a composite UNIQUE survive a
+            // load / row replay below) is what makes a table-level UNIQUE survive a
             // restart AND get backfilled with the table's existing rows; register
             // it after the replay and the tree would be empty, so duplicates
             // against pre-restart rows would be accepted.
             if let Ok(constraints) = self.load_table_constraints(&table_name) {
-                self.register_composite_unique_indexes(&table_name, &constraints);
+                self.register_unique_constraint_indexes(&table_name, &constraints);
                 for fk in &constraints.foreign_keys {
                     if let Err(e) = art_manager.create_fk_index(
                         &fk.table_name,
@@ -1247,6 +1584,34 @@ impl<'a> Catalog<'a> {
             {
                 if matches!(definition.index_type.as_deref(), None | Some("art" | "btree" | "hash")) {
                     let columns = vec![definition.column_name.clone()];
+                    // `CREATE UNIQUE INDEX` persists `IndexOption::Unique(true)`
+                    // in the definition; it must come back as a UNIQUE index,
+                    // not a plain secondary one, or the constraint the user
+                    // created would be enforced only until the first restart.
+                    // Registered here — before the snapshot load / row replay —
+                    // for the same reason the constraint indexes are: an index
+                    // registered afterwards is empty, so duplicates of
+                    // pre-restart rows would be accepted.
+                    if let Some(unique_columns) =
+                        crate::sql::executor::ddl::unique_index_columns(&definition.options, &definition.column_name)
+                    {
+                        if let Err(e) = art_manager.create_unique_index(&table_name, &unique_columns, Some(index_name))
+                        {
+                            if art_manager.has_unique_index_on(&table_name, &unique_columns) {
+                                tracing::debug!("Index rebuild: unique index {} already registered", index_name);
+                            } else {
+                                tracing::warn!(
+                                    "Index rebuild: UNIQUE index '{}' on {}.{} FAILED to register ({}); \
+                                     the constraint is NOT enforced in this process",
+                                    index_name,
+                                    table_name,
+                                    definition.column_name,
+                                    e
+                                );
+                            }
+                        }
+                        continue;
+                    }
                     if let Err(e) = art_manager.create_manual_index(index_name, &table_name, &columns) {
                         // IndexAlreadyExists is expected when CREATE INDEX ran
                         // earlier in this same process. Anything else is a real
@@ -1643,13 +2008,57 @@ impl<'a> Catalog<'a> {
     /// Rename a table atomically
     ///
     /// This operation renames a table by updating its metadata and moving all data rows
-    /// to use the new table name. This is used for concurrent materialized view refresh.
+    /// to use the new table name.
+    ///
+    /// Everything keyed by the table NAME moves with it: the schema record, the
+    /// row counter, the data rows, the compression config/stats, the ART index
+    /// entries and their `meta:index:` definitions, the trigger records, and —
+    /// via [`Self::move_table_side_records`] — the CONSTRAINT record
+    /// (`table_constraints:{t}`: CHECK, FOREIGN KEY, table-level UNIQUE), the
+    /// IDENTITY record and the partition registry links. A record left behind is
+    /// a rule that silently stops being enforced under the new name, so this is
+    /// the single place every rename caller gets them from.
+    ///
+    /// This is the USER-VISIBLE rename (`ALTER TABLE … RENAME TO`, `SET SCHEMA`):
+    /// the relation keeps its identity and everything that describes it follows.
+    /// The internal three-step swap of a CONCURRENT materialized-view refresh is
+    /// a different operation and uses [`Self::rename_table_data_swap`].
     pub fn rename_table(&self, old_name: &str, new_name: &str) -> Result<()> {
         // Check that new table name is not already in use
         if self.table_exists(new_name)? {
             return Err(Error::query_execution(format!("Table '{}' already exists", new_name)));
         }
-        self.rename_table_inner(old_name, new_name)
+        self.rename_table_inner(old_name, new_name, true)
+    }
+
+    /// Physical relocation of a table's STORAGE under a new key, WITHOUT
+    /// carrying the per-table side records (`table_constraints:{t}`, the
+    /// IDENTITY record, the partition registry links).
+    ///
+    /// This exists for exactly one caller: the three-step swap of a CONCURRENT
+    /// `REFRESH MATERIALIZED VIEW` (`__mv_v` → `__mv_v__old_<ts>` → dropped,
+    /// `__mv_v__temp_<ts>` → `__mv_v`). There the two renames are not a relation
+    /// changing its name — they are the view's DATA being replaced under a
+    /// stable name — so a side record belongs to the NAME `__mv_v`, not to the
+    /// row set moving through it. Carrying them would walk the MV's records onto
+    /// the backup table and drop them with it, silently, once per refresh.
+    ///
+    /// Verified when this split was made: an MV data table cannot own such a
+    /// record today. It is created by [`Self::create_table`], which writes only
+    /// the schema, the counter and the PK/UNIQUE ART indexes; every writer of a
+    /// side record (`save_table_constraints`, `register_identity_columns`,
+    /// `register_partition_child`) is a CREATE/ALTER TABLE arm in `lib.rs` keyed
+    /// by a user table name. So today this is a no-op difference — and the point
+    /// of the split is that it STAYS one if that ever changes.
+    ///
+    /// Everything else the rename carries (schema record, counter, data rows,
+    /// compression config/stats, ART entries + `meta:index:` definitions,
+    /// triggers, the schema caches) still moves: those describe the row set.
+    pub(crate) fn rename_table_data_swap(&self, old_name: &str, new_name: &str) -> Result<()> {
+        if self.table_exists(new_name)? {
+            return Err(Error::query_execution(format!("Table '{}' already exists", new_name)));
+        }
+        self.rename_table_inner(old_name, new_name, false)
     }
 
     /// Replay-path rename: WAL replay re-applies operations onto a state
@@ -1657,11 +2066,15 @@ impl<'a> Catalog<'a> {
     /// checkpointed data already contains the new name — so the
     /// target-must-not-exist validation must not apply (the re-moved keys are
     /// byte-identical). Runtime callers go through `rename_table`.
+    ///
+    /// Moves the side records, like the user-visible rename it replays. The MV
+    /// swap logs renames too, but its tables own no side records (see
+    /// `rename_table_data_swap`), so replaying one moves nothing either way.
     pub(crate) fn rename_table_replay(&self, old_name: &str, new_name: &str) -> Result<()> {
-        self.rename_table_inner(old_name, new_name)
+        self.rename_table_inner(old_name, new_name, true)
     }
 
-    fn rename_table_inner(&self, old_name: &str, new_name: &str) -> Result<()> {
+    fn rename_table_inner(&self, old_name: &str, new_name: &str, move_side_records: bool) -> Result<()> {
         // Check that old table exists
         if !self.table_exists(old_name)? {
             return Err(Error::query_execution(format!("Table '{}' does not exist", old_name)));
@@ -1803,9 +2216,59 @@ impl<'a> Catalog<'a> {
         // Rename compression manager resources (no-op - compression handled by RocksDB LZ4)
         super::CompressionManager::new().rename_table(old_name, new_name)?;
 
-        // Rename ART indexes
+        // Rename ART indexes.
+        //
+        // Every index that has a durable `meta:index:<name>` definition record
+        // (i.e. every `CREATE INDEX` / `CREATE UNIQUE INDEX`) KEEPS ITS NAME —
+        // PostgreSQL does not rename indexes on `ALTER TABLE … RENAME TO`
+        // either — and its record is rewritten to point at the new table.
+        // Renaming the live entry away from a record that still names the old
+        // index (and the old table) desyncs the two: `DROP INDEX
+        // "Account_email_key"` would then find no live index, delete the
+        // record, and leave the renamed entry enforcing forever — an index the
+        // user can neither name nor drop, still rejecting rows. And a record
+        // left pointing at the OLD table name is an index that silently fails
+        // to come back at the next open (`rebuild_all_indexes` cannot find its
+        // table), so the rewrite below is what makes a renamed table's user
+        // indexes durable at all.
+        let mut preserved_index_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        match self.list_index_definitions() {
+            Ok(definitions) => {
+                for (index_name, mut definition) in definitions {
+                    if definition.table_name != old_name {
+                        continue;
+                    }
+                    preserved_index_names.insert(index_name.clone());
+                    definition.table_name = new_name.to_string();
+                    if let Err(e) = self.save_index_definition(&index_name, &definition) {
+                        tracing::warn!(
+                            "RENAME TABLE '{}' -> '{}': failed to move index definition '{}': {}",
+                            old_name,
+                            new_name,
+                            index_name,
+                            e
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                // Fail SAFE for the rename: with the record list unknown we
+                // cannot tell which names are user-owned, so preserve them all
+                // (no name is rewritten) rather than risk desyncing one.
+                tracing::warn!(
+                    "RENAME TABLE '{}' -> '{}': could not list index definitions ({}); \
+                     leaving every index name unchanged",
+                    old_name,
+                    new_name,
+                    e
+                );
+                for (name, _, _) in self.storage.art_indexes().list_table_indexes(old_name) {
+                    preserved_index_names.insert(name);
+                }
+            }
+        }
         let art_manager = self.storage.art_indexes();
-        if let Err(e) = art_manager.rename_table_indexes(old_name, new_name) {
+        if let Err(e) = art_manager.rename_table_indexes(old_name, new_name, &preserved_index_names) {
             tracing::warn!(
                 "Failed to rename ART indexes from '{}' to '{}': {}",
                 old_name,
@@ -1829,7 +2292,15 @@ impl<'a> Catalog<'a> {
             );
         }
 
-        // Update schema cache: remove old, add new
+        // CACHES FIRST, and unconditionally. The durable rename is already
+        // committed by the batch above, so from here on the table IS `new_name`
+        // whatever else happens; a cache that still answers for `old_name` (or
+        // does not answer for `new_name`) is wrong on BOTH the success and the
+        // failure path. Doing this after the fallible `move_table_side_records`
+        // below left an error path that skipped it entirely: the rename had
+        // physically happened, the statement reported failure, and the process
+        // went on serving the OLD name from `schema_cache` — a table readable
+        // under a name whose keys no longer exist.
         self.storage.invalidate_schema_cache(old_name);
         self.storage.cache_schema(new_name, schema);
 
@@ -1837,18 +2308,66 @@ impl<'a> Catalog<'a> {
         // new → Table); bump so the existence cache recomputes both.
         self.storage.bump_schema_generation();
 
+        // The per-table SIDE records — `table_constraints:{t}` (every CHECK,
+        // FOREIGN KEY and table-level UNIQUE the table owns), the IDENTITY
+        // record and the Stage-0 partition registry.
+        //
+        // These were left behind entirely: a renamed table's CHECK constraints
+        // and foreign keys silently STOPPED BEING ENFORCED (the enforcement
+        // paths load `table_constraints:{new_name}`, which did not exist, and an
+        // absent record reads as `TableConstraints::default()` — no constraints,
+        // no error), `DROP CONSTRAINT <name>` could no longer find them, and the
+        // orphaned record under the old name was inherited by the next
+        // `CREATE TABLE <old_name>`. Fail-open, durable, and invisible: nothing
+        // reported anything.
+        //
+        // `ALTER TABLE … SET SCHEMA` — which is *implemented as* a rename onto a
+        // new storage key — already carried them by calling this same helper
+        // itself; doing it HERE is what makes every RELATION rename (both
+        // executor families' `AlterTableRename` arms, SET SCHEMA and WAL replay)
+        // get the same treatment from one place. The MV refresh swap is not a
+        // relation rename and opts out — see `rename_table_data_swap`.
+        //
+        // Propagated, not warn-and-continue: a table whose constraint records
+        // did not follow it is a table with unenforced constraints, so the
+        // statement must report failure rather than return success over it. This
+        // is the same posture `alter_table_set_schema` already had (`?`).
+        //
+        // LAST, because it is the one step here that can fail: everything above
+        // (the durable batch, the ART/trigger moves, the caches) has already
+        // taken effect, so nothing that must hold on both outcomes is sequenced
+        // behind it.
+        //
+        // Skipped by `rename_table_data_swap` (the CONCURRENT MV refresh), where
+        // the rename moves a ROW SET under a stable name rather than renaming a
+        // relation — see that function for why the records must stay put.
+        if move_side_records {
+            self.move_table_side_records(old_name, new_name)?;
+        }
+
         Ok(())
     }
 
-    /// Migrate the per-table SIDE records that [`Self::rename_table`] does NOT
-    /// move — the constraint metadata, the IDENTITY-column record and the
-    /// Stage-0 partition registry. Used by `ALTER TABLE … SET SCHEMA`, which
-    /// relocates a table to a new storage key via `rename_table` (data + schema
-    /// + counter + compression + ART indexes) and must carry these along or the
-    /// moved table loses its FK/CHECK enforcement and its partition-cascade
-    /// links. Best-effort per record; a missing record is a no-op. Not atomic
-    /// with the `rename_table` batch (Stage-0 DDL is non-transactional
-    /// generally), but every step is idempotent on replay.
+    /// Migrate the per-table SIDE records that the `rename_table` write batch
+    /// itself does not carry — the constraint metadata (CHECK / FOREIGN KEY /
+    /// table-level UNIQUE), the IDENTITY-column record and the Stage-0 partition
+    /// registry.
+    ///
+    /// Called from [`Self::rename_table`], so every RELATION rename gets them:
+    /// plain `ALTER TABLE … RENAME TO`, `ALTER TABLE … SET SCHEMA` (which
+    /// relocates a table by renaming its storage key) and WAL replay alike.
+    /// Leaving them behind makes the moved table lose its FK/CHECK enforcement
+    /// and its partition-cascade links — silently, since an absent constraint
+    /// record reads as "no constraints".
+    ///
+    /// NOT called by [`Self::rename_table_data_swap`], the CONCURRENT MV refresh
+    /// swap: there the key move replaces a row set under a stable name, so a
+    /// side record must stay with the name rather than ride the backup table
+    /// into its own drop.
+    ///
+    /// A missing record is a no-op, and every step is idempotent, so calling it
+    /// twice (or replaying it) is harmless. Not atomic with the `rename_table`
+    /// batch (Stage-0 DDL is non-transactional generally).
     pub fn move_table_side_records(&self, old: &str, new: &str) -> Result<()> {
         // Constraint metadata (FK / UNIQUE / CHECK). Rewrite each constraint's
         // owning-table field to the new key, and any SELF-referential FK's
@@ -1874,6 +2393,12 @@ impl<'a> Catalog<'a> {
             self.save_table_constraints(new, &constraints)?;
         }
         self.storage.delete(&Self::table_constraints_key(old))?;
+        // The durable record is gone, but `load_table_constraints` memoises per
+        // table NAME — leaving `old` cached would hand the constraint set of a
+        // table that no longer exists to the next `CREATE TABLE <old>` (which
+        // reads through the same cache), and would keep answering for the old
+        // name until the process restarts.
+        self.storage.invalidate_table_constraints_cache(old);
         self.storage.clear_referencing_fk_cache();
 
         // IDENTITY-column side record.

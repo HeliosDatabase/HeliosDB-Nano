@@ -402,8 +402,15 @@ impl<'a> MaterializedViewCatalog<'a> {
         };
 
         if table_exists {
-            // Rename: old table -> backup table
-            if let Err(e) = catalog.rename_table(&data_table, &backup_table) {
+            // Rename: old table -> backup table.
+            //
+            // `rename_table_data_swap`, not `rename_table`: these three renames
+            // move a ROW SET under a stable name, they do not rename a relation.
+            // The user-visible rename carries the per-table side records
+            // (`table_constraints:{t}`, IDENTITY, partition links) with the key,
+            // which here would walk whatever `__mv_<view>` owns onto the backup
+            // table and drop it with the backup — once per refresh, silently.
+            if let Err(e) = catalog.rename_table_data_swap(&data_table, &backup_table) {
                 tracing::error!("Failed to rename '{}' to '{}': {}", data_table, backup_table, e);
 
                 // Cleanup temporary table
@@ -416,8 +423,8 @@ impl<'a> MaterializedViewCatalog<'a> {
             tracing::debug!("Renamed '{}' to '{}'", data_table, backup_table);
         }
 
-        // Rename: temp table -> main table
-        if let Err(e) = catalog.rename_table(&temp_table, &data_table) {
+        // Rename: temp table -> main table (data swap; see above).
+        if let Err(e) = catalog.rename_table_data_swap(&temp_table, &data_table) {
             tracing::error!("CRITICAL: Failed to rename '{}' to '{}': {}", temp_table, data_table, e);
 
             // Attempt to restore original state if old table was renamed
@@ -428,7 +435,7 @@ impl<'a> MaterializedViewCatalog<'a> {
                     data_table
                 );
 
-                if let Err(restore_err) = catalog.rename_table(&backup_table, &data_table) {
+                if let Err(restore_err) = catalog.rename_table_data_swap(&backup_table, &data_table) {
                     tracing::error!(
                         "CRITICAL: Failed to restore original table '{}': {}. Manual intervention may be required.",
                         data_table,
@@ -643,6 +650,147 @@ mod tests {
             .read_view_data("test_view")
             .expect("Failed to read view data");
         assert_eq!(retrieved.len(), 2);
+    }
+
+    /// A CONCURRENT refresh is a three-step key swap: `__mv_v` → `__mv_v__old_<ts>`
+    /// (dropped seconds later), `__mv_v__temp_<ts>` → `__mv_v`. It moves the
+    /// view's ROW SET under a stable name — it does not rename a relation.
+    ///
+    /// `Catalog::rename_table` now carries the per-table SIDE records
+    /// (`table_constraints:{t}`, the IDENTITY record, the partition links) with
+    /// the key, because for a user's `ALTER TABLE … RENAME TO` a record left
+    /// behind is a constraint that silently stops enforcing. Applied to this
+    /// swap, that same rule walks whatever `__mv_v` owns onto the BACKUP table
+    /// and destroys it with the backup — once per refresh, with nothing
+    /// reported. So the swap uses `rename_table_data_swap`, which moves
+    /// everything that describes the ROWS (schema, counter, data, ART indexes,
+    /// triggers, caches) and leaves the records that describe the NAME alone.
+    ///
+    /// The premise is asserted first: a data table created by `create_table` owns
+    /// no side record at all today, so the split changes nothing in practice —
+    /// its whole job is that it keeps changing nothing if that ever stops being
+    /// true. The planted record stands in for that future.
+    #[test]
+    fn concurrent_refresh_leaves_the_data_tables_side_records_under_its_own_name() {
+        use crate::sql::{TableConstraints, UniqueConstraint};
+
+        let config = Config::in_memory();
+        let storage = StorageEngine::open_in_memory(&config).expect("Failed to open storage");
+        let mv_catalog = MaterializedViewCatalog::new(&storage);
+        let catalog = storage.catalog();
+
+        let schema = Schema::new(vec![
+            Column::new("id", DataType::Int4),
+            Column::new("label", DataType::Text),
+        ]);
+        let query_plan = LogicalPlan::Scan {
+            alias: None,
+            table_name: "src".to_string(),
+            schema: std::sync::Arc::new(schema.clone()),
+            projection: None,
+            as_of: None,
+        };
+        let metadata = MaterializedViewMetadata::new(
+            "swapv".to_string(),
+            "SELECT id, label FROM src".to_string(),
+            bincode::serialize(&query_plan).unwrap(),
+            vec!["src".to_string()],
+            schema.clone(),
+        );
+        mv_catalog.create_view(metadata).expect("create view");
+
+        let data_table = MaterializedViewCatalog::mv_data_table_name("swapv");
+        let constraints_key = format!("table_constraints:{}", data_table).into_bytes();
+
+        // First refresh: creates the data table (nothing to swap yet).
+        let rows = vec![Tuple::new(vec![Value::Int4(1), Value::String("one".to_string())])];
+        assert_eq!(
+            mv_catalog
+                .store_view_data_concurrent("swapv", rows, &schema)
+                .expect("first concurrent refresh"),
+            1
+        );
+
+        // PREMISE: an MV data table owns no side record of its own. `create_table`
+        // writes the schema, the counter and the PK/UNIQUE ART indexes — every
+        // writer of a side record is a CREATE/ALTER TABLE arm keyed by a USER
+        // table name.
+        assert!(
+            storage.get(&constraints_key).expect("read back").is_none(),
+            "an MV data table gained a constraint record — the swap's assumption no longer holds"
+        );
+        assert!(
+            catalog.list_identity_columns(&data_table).expect("identity").is_empty(),
+            "an MV data table gained an IDENTITY record"
+        );
+
+        // Now plant one, standing in for any side record a future data table
+        // might own, and refresh again — this time through the full
+        // data → backup → temp → data swap.
+        let mut planted = TableConstraints::new();
+        planted.unique_constraints.push(UniqueConstraint::new(
+            "mv_swap_marker".to_string(),
+            data_table.clone(),
+            vec!["id".to_string()],
+            false,
+        ));
+        catalog
+            .save_table_constraints(&data_table, &planted)
+            .expect("plant a side record");
+
+        let rows = vec![
+            Tuple::new(vec![Value::Int4(2), Value::String("two".to_string())]),
+            Tuple::new(vec![Value::Int4(3), Value::String("three".to_string())]),
+        ];
+        assert_eq!(
+            mv_catalog
+                .store_view_data_concurrent("swapv", rows, &schema)
+                .expect("second concurrent refresh"),
+            2
+        );
+
+        // The refresh itself still works: the new row set is what the view reads.
+        let read_back = mv_catalog.read_view_data("swapv").expect("read view data");
+        assert_eq!(read_back.len(), 2, "the concurrent swap lost the refreshed rows");
+        let mut ids: Vec<i32> = read_back
+            .iter()
+            .map(|t| match t.values.first() {
+                Some(Value::Int4(v)) => *v,
+                other => panic!("unexpected id value {other:?}"),
+            })
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![2, 3], "the swap did not install the new row set");
+
+        // …and the side record is still under the data table's OWN name — not
+        // riding the backup into the drop, and not orphaned under the backup's
+        // name either (the backup is dropped, so a record moved there is either
+        // destroyed or leaked, once per refresh).
+        let records: Vec<(String, Vec<u8>)> = storage
+            .meta_blobs_with_prefix("table_constraints:")
+            .expect("scan constraint records")
+            .into_iter()
+            // The view's own family only: `__mv_swapv`, plus the transient
+            // `__mv_swapv__old_<ts>` / `__mv_swapv__temp_<ts>` the swap creates.
+            .filter(|(owner, _)| owner.starts_with(&data_table))
+            .collect();
+        let owners: Vec<&str> = records.iter().map(|(suffix, _)| suffix.as_str()).collect();
+        assert_eq!(
+            owners,
+            vec![data_table.as_str()],
+            "*** SIDE RECORD LOST *** the MV data table's constraint record followed the rename \
+             onto the backup table instead of staying under '{data_table}'"
+        );
+        let survived: TableConstraints = bincode::deserialize(&records[0].1).expect("decode constraints");
+        assert_eq!(
+            survived
+                .unique_constraints
+                .iter()
+                .map(|u| u.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["mv_swap_marker"],
+            "the side record under the data table's name was rewritten by the swap"
+        );
     }
 
     #[test]

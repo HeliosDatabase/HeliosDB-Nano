@@ -484,6 +484,48 @@ impl<'a> Planner<'a> {
         }
     }
 
+    /// Split an already-resolved key into `(schema, bare_table)` using the NAME
+    /// it was built from, instead of guessing at its first `.`.
+    ///
+    /// [`Self::split_schema_key`] is a display-surface heuristic and says so: it
+    /// cuts at the first dot, which is wrong whenever a dot is part of an
+    /// IDENTIFIER rather than a separator. `normalize_object_name` deliberately
+    /// keeps such a spelling intact — a single quoted identifier is ONE part, so
+    /// `CREATE TABLE "we.ird"` is a `public` table whose key is `we.ird`, and
+    /// `"my.schema".t` is a table `t` in schema `my.schema`. Splitting either key
+    /// on the first dot invents a different table.
+    ///
+    /// That is fine for `pg_class.relname`; it is NOT fine for `RENAME TO`,
+    /// which builds the target key from the source's schema: `ALTER TABLE
+    /// "we.ird" RENAME TO "we.ird2"` read the schema as `we` and produced the key
+    /// `we.we.ird2` — a rename that reported success and left a table nobody
+    /// could name.
+    ///
+    /// The exact decomposition is available here because the key is built as
+    /// `<schema>.<identifier>` (or a bare `<identifier>` under `public`), where
+    /// `<identifier>` is the normalised LAST part of the name: peel that known
+    /// suffix off. Anything that does not have that shape — the `_hdb_*` schema
+    /// dealias, which folds `_hdb_code.t` into the single key `_hdb_code_t` —
+    /// falls back to the first-dot split, exactly as before.
+    pub(crate) fn split_key_by_name(key: &str, name: &sqlparser::ast::ObjectName) -> (String, String) {
+        let Some(last) = name.0.last() else {
+            return Self::split_schema_key(key);
+        };
+        let ident = Self::normalize_ident(last);
+        if key == ident {
+            // Bare key: `public` (or a `public.`/`pg_catalog.` that collapsed).
+            return ("public".to_string(), ident);
+        }
+        if let Some(prefix) = key.strip_suffix(&ident) {
+            if let Some(schema) = prefix.strip_suffix('.') {
+                if !schema.is_empty() {
+                    return (schema.to_string(), ident);
+                }
+            }
+        }
+        Self::split_schema_key(key)
+    }
+
     /// PostgreSQL's `NAMEDATALEN - 1`. A generated index name is truncated to
     /// this before the uniquifying suffix is appended, exactly as
     /// `ChooseRelationName` does, so a long table/column pair cannot produce a
@@ -705,6 +747,85 @@ impl<'a> Planner<'a> {
         }
     }
 
+    /// Compose the storage key for `bare` living in `schema`.
+    ///
+    /// `public` and `pg_catalog` are Nano's BARE key-space (both collapse in
+    /// [`Self::normalize_object_name`] / `dealias_schema`), so a table in either
+    /// is keyed by its bare name; every other schema is keyed `<schema>.<t>`.
+    /// This is the exact inverse of [`Self::split_schema_key`].
+    pub(crate) fn schema_qualified_key(schema: &str, bare: &str) -> String {
+        if schema == "public" || schema == "pg_catalog" {
+            bare.to_string()
+        } else {
+            format!("{schema}.{bare}")
+        }
+    }
+
+    /// Resolve the TARGET storage key of `ALTER TABLE <source> RENAME TO <t>`.
+    ///
+    /// `source_key` is the ALREADY-RESOLVED source key (what `resolve_table_ref`
+    /// returned for the ALTER's subject), so its schema is whichever schema the
+    /// table actually lives in — which is NOT necessarily the session's
+    /// `current_schema`.
+    ///
+    /// PostgreSQL's `RENAME TO` never changes a relation's schema — that is what
+    /// `ALTER TABLE … SET SCHEMA` is for — and its grammar accepts only a BARE
+    /// target name for exactly that reason. So:
+    ///
+    ///  * a BARE target keeps the SOURCE table's schema. Resolving it with
+    ///    [`Self::resolve_table_create`] instead (which eagerly prefixes the
+    ///    session's `current_schema` onto any bare name, because a CREATE target
+    ///    does not exist yet) silently RELOCATED the table: with
+    ///    `search_path = s` a `public` table renamed by a bare name landed on the
+    ///    key `s.<new>`, disappearing from `public` — a schema move nobody asked
+    ///    for, reported as a successful rename.
+    ///  * a SCHEMA-QUALIFIED target naming a DIFFERENT schema is rejected. The
+    ///    executor's rename (`Catalog::rename_table`) is a pure key move and
+    ///    would happily perform the relocation, but silently accepting
+    ///    `RENAME TO other.t` as a schema move is exactly the PostgreSQL
+    ///    incompatibility above with the user's own quotes on it; PostgreSQL
+    ///    refuses, and so do we, pointing at `SET SCHEMA`.
+    ///  * a schema-qualified target naming the SAME schema is accepted and is
+    ///    equivalent to the bare spelling (so `s.t → s.t2` works).
+    ///
+    /// Quoting/case handling is unchanged: the target identifier is normalised
+    /// by [`Self::normalize_object_name`], so `"Account2"` keeps its case and
+    /// loses its quotes, and an unquoted `Account2` lowercases.
+    ///
+    /// `source_name` is that same subject as PARSED. Both schema halves are
+    /// recovered with [`Self::split_key_by_name`] rather than by cutting the
+    /// joined key at its first `.`: a quoted identifier may CONTAIN a dot
+    /// (`"we.ird"` is one `public` table, not `we`.`ird`), and reading its
+    /// schema as `we` built the target key `we.we.ird2` — a successful-looking
+    /// rename onto a name nothing could address afterwards.
+    pub(crate) fn resolve_rename_target(
+        source_key: &str,
+        source_name: &sqlparser::ast::ObjectName,
+        new_name: &sqlparser::ast::ObjectName,
+    ) -> Result<String> {
+        let (source_schema, _) = Self::split_key_by_name(source_key, source_name);
+        // The key the target name would have ON ITS OWN: bare under
+        // `public`/`pg_catalog`, `<schema>.<t>` under any other qualifier.
+        let target_key = Self::normalize_object_name(new_name);
+
+        if new_name.0.len() < 2 {
+            // BARE target: keep the source table's schema. `target_key` is the
+            // WHOLE normalised identifier — a quoted `"we.ird2"` included — and
+            // is never re-split here.
+            return Ok(Self::schema_qualified_key(&source_schema, &target_key));
+        }
+
+        let (target_schema, target_bare) = Self::split_key_by_name(&target_key, new_name);
+        if target_schema != source_schema {
+            return Err(Error::query_execution(format!(
+                "cannot change schema with RENAME: relation \"{source_key}\" is in schema \"{source_schema}\", \
+                 but the new name specifies schema \"{target_schema}\" \
+                 (use ALTER TABLE ... SET SCHEMA to move a table between schemas)"
+            )));
+        }
+        Ok(Self::schema_qualified_key(&source_schema, &target_bare))
+    }
+
     /// Normalise a raw (possibly quoted / schema-qualified) dotted name string
     /// the SAME way [`Self::normalize_object_name`] normalises a parsed
     /// `ObjectName`, so names that arrive via a custom string pre-parse path
@@ -810,7 +931,7 @@ impl<'a> Planner<'a> {
                     .map(|ret_items| self.convert_returning(ret_items))
                     .transpose()?;
                 // Extract ON CONFLICT clause if present
-                let on_conflict = self.convert_on_conflict(&insert.on)?;
+                let on_conflict = self.convert_on_conflict(&insert.on, &table_name)?;
                 match source_opt {
                     Some(source) => self.insert_to_plan(table_name, columns, source, returning, on_conflict),
                     None => Ok(LogicalPlan::Insert {
@@ -1138,7 +1259,50 @@ impl<'a> Planner<'a> {
                 }
 
                 // Parse WITH options from SQL
-                let options = self.parse_index_options(&create_index.with)?;
+                let mut options = self.parse_index_options(&create_index.with)?;
+
+                // `CREATE UNIQUE INDEX` — the flag sqlparser has always parsed
+                // and this planner used to DISCARD, so the statement Prisma
+                // emits for every `@unique` built an ordinary secondary index
+                // and enforced nothing. Carried as an `IndexOption` because the
+                // option list is what `persist_index_definition` stores and what
+                // `WalOperation::CreateIndex` replicates, so the constraint
+                // survives a restart and reaches a standby (see
+                // `IndexOption::Unique`).
+                if create_index.unique {
+                    // Only the ART family can enforce uniqueness: an HNSW /
+                    // gin / gist index has no unique key space at all, so
+                    // accepting the modifier there would report a constraint
+                    // that nothing checks. Fail closed and say why.
+                    if is_vector_index || matches!(index_type.as_deref(), Some("gin") | Some("gist")) {
+                        return Err(Error::query_execution(format!(
+                            "CREATE UNIQUE INDEX is not supported for USING {} indexes",
+                            index_type.as_deref().unwrap_or("?")
+                        )));
+                    }
+                    // A UNIQUE index constrains the WHOLE key, so — unlike an
+                    // ordinary composite index, which is allowed to index only
+                    // its leading column — every column must be carried through.
+                    // Indexing just the leading one would enforce a NARROWER
+                    // rule than the user asked for and reject rows PostgreSQL
+                    // accepts. `CREATE UNIQUE INDEX … ("repo","login","periodStart")`
+                    // is the shape Prisma emits for a composite `@@unique`.
+                    let mut unique_columns = Vec::with_capacity(create_index.columns.len());
+                    for col in &create_index.columns {
+                        match &col.expr {
+                            Expr::Identifier(ident) => unique_columns.push(Self::normalize_ident(ident)),
+                            _ => {
+                                return Err(Error::query_execution(
+                                    "CREATE UNIQUE INDEX accepts column names only (no expressions)",
+                                ))
+                            }
+                        }
+                    }
+                    options.push(crate::sql::logical_plan::IndexOption::Unique(true));
+                    if unique_columns.len() > 1 {
+                        options.push(crate::sql::logical_plan::IndexOption::UniqueColumns(unique_columns));
+                    }
+                }
 
                 Ok(LogicalPlan::CreateIndex {
                     name: index_name,
@@ -1150,7 +1314,7 @@ impl<'a> Planner<'a> {
                 })
             }
             Statement::AlterTable { name, operations, .. } => {
-                self.alter_table_to_plan(self.resolve_table_ref(&name), operations)
+                self.alter_table_to_plan(self.resolve_table_ref(&name), &name, operations)
             }
             Statement::CreateTrigger {
                 or_replace,
@@ -5478,13 +5642,24 @@ impl<'a> Planner<'a> {
         use sqlparser::ast::TableConstraint as SqlTC;
 
         match constraint {
+            // Identifiers are NORMALISED, exactly as the ForeignKey arm below
+            // already does it. `Ident::to_string()` re-emits the QUOTES, so
+            // `UNIQUE ("email")` — the spelling Prisma, Drizzle and every
+            // quoting ORM emit — produced the column name `"email"` (with the
+            // quote characters). That name matches no column: the propagation
+            // to `col_def.unique` below missed it, and a composite constraint
+            // built an ART index on a column `insert_row_indexes` could never
+            // resolve, so the index stayed empty and the constraint was
+            // enforced by nothing. Unquoted spellings are unaffected
+            // (`normalize_ident` lowercases them, matching how the columns
+            // themselves were stored).
             SqlTC::PrimaryKey { name, columns, .. } => Some(TableConstraint::PrimaryKey {
-                name: name.as_ref().map(|n| n.to_string()),
-                columns: columns.iter().map(|c| c.to_string()).collect(),
+                name: name.as_ref().map(Self::normalize_ident),
+                columns: columns.iter().map(Self::normalize_ident).collect(),
             }),
             SqlTC::Unique { name, columns, .. } => Some(TableConstraint::Unique {
-                name: name.as_ref().map(|n| n.to_string()),
-                columns: columns.iter().map(|c| c.to_string()).collect(),
+                name: name.as_ref().map(Self::normalize_ident),
+                columns: columns.iter().map(Self::normalize_ident).collect(),
             }),
             SqlTC::ForeignKey {
                 name,
@@ -5546,6 +5721,12 @@ impl<'a> Planner<'a> {
     fn alter_table_to_plan(
         &self,
         table_name: String,
+        // The SOURCE name as written. `table_name` is its already-RESOLVED
+        // storage key, and a key alone cannot be decomposed back into
+        // (schema, table) — `"we.ird"` in `public` and `we`.`ird` produce the
+        // same string. `RENAME TO` needs the schema half, so it gets the parsed
+        // name too (see `resolve_rename_target`).
+        source_name: &sqlparser::ast::ObjectName,
         operations: Vec<sqlparser::ast::AlterTableOperation>,
     ) -> Result<LogicalPlan> {
         // Check if operations are empty
@@ -5559,13 +5740,13 @@ impl<'a> Planner<'a> {
                 .into_iter()
                 .next()
                 .ok_or_else(|| Error::query_execution("ALTER TABLE requires an operation"))?;
-            return self.alter_table_single_op_to_plan(table_name, operation);
+            return self.alter_table_single_op_to_plan(table_name, source_name, operation);
         }
 
         // Multiple operations: plan each individually, wrap in AlterTableMulti
         let mut plans = Vec::with_capacity(operations.len());
         for operation in operations {
-            plans.push(self.alter_table_single_op_to_plan(table_name.clone(), operation)?);
+            plans.push(self.alter_table_single_op_to_plan(table_name.clone(), source_name, operation)?);
         }
         Ok(LogicalPlan::AlterTableMulti { operations: plans })
     }
@@ -5574,6 +5755,7 @@ impl<'a> Planner<'a> {
     fn alter_table_single_op_to_plan(
         &self,
         table_name: String,
+        source_name: &sqlparser::ast::ObjectName,
         operation: sqlparser::ast::AlterTableOperation,
     ) -> Result<LogicalPlan> {
         use sqlparser::ast::AlterTableOperation;
@@ -5609,10 +5791,27 @@ impl<'a> Planner<'a> {
                 old_column_name: old_column_name.value,
                 new_column_name: new_column_name.value,
             }),
-            AlterTableOperation::RenameTable { table_name: new_name } => Ok(LogicalPlan::AlterTableRename {
-                table_name,
-                new_table_name: new_name.to_string(),
-            }),
+            // `RENAME TO` names a table that does not exist yet, so the target
+            // identifier is normalised the way `CREATE TABLE` normalises its
+            // name — NOT with `ObjectName::to_string()`, which keeps the quote
+            // characters verbatim (the same B36 defect fixed above for a FK's
+            // `references_table`). `ALTER TABLE "Account" RENAME TO "Account2"`
+            // — the quoting Prisma and every camelCase schema emit — renamed the
+            // table to the eight-character key `"Account2"` (quotes included),
+            // while the source name had been normalised to `Account`. The
+            // rename itself "succeeded" and every later statement failed with
+            // `Table 'Account2' does not exist`: a table that could not be
+            // selected, inserted into, or dropped by the name the user gave it.
+            //
+            // The SCHEMA half of the target key comes from the SOURCE table, not
+            // from the session — see `resolve_rename_target`.
+            AlterTableOperation::RenameTable { table_name: new_name } => {
+                let new_table_name = Self::resolve_rename_target(&table_name, source_name, &new_name)?;
+                Ok(LogicalPlan::AlterTableRename {
+                    table_name,
+                    new_table_name,
+                })
+            }
             AlterTableOperation::AlterColumn {
                 column_name,
                 op: sqlparser::ast::AlterColumnOperation::DropNotNull,
@@ -5661,6 +5860,30 @@ impl<'a> Planner<'a> {
                     deferrable,
                     initially_deferred,
                     enforcement,
+                })
+            }
+            // ALTER TABLE … ADD [CONSTRAINT <name>] UNIQUE (<cols>) — the last
+            // UNIQUE spelling with no plan at all. It used to fall through to
+            // the catch-all below and report `Unsupported ALTER TABLE
+            // operation: AddConstraint(Unique { … })`, which is a hard stop for
+            // every migration tool that adds unique constraints as a trailing
+            // ALTER step (Prisma, drizzle-kit, Flyway, Liquibase).
+            //
+            // `ADD PRIMARY KEY` deliberately stays unsupported: it would have to
+            // rewrite the stored schema's `primary_key` flags and rebuild the PK
+            // ART index (whose row_id key space the storage layer also uses for
+            // SERIAL fill), which is a different change with a different risk
+            // profile. It keeps reporting the catch-all error.
+            AlterTableOperation::AddConstraint(sqlparser::ast::TableConstraint::Unique { name, columns, .. }) => {
+                if columns.is_empty() {
+                    return Err(Error::query_execution(
+                        "ALTER TABLE … ADD CONSTRAINT UNIQUE requires at least one column",
+                    ));
+                }
+                Ok(LogicalPlan::AlterTableAddUnique {
+                    table_name,
+                    constraint_name: name.as_ref().map(Self::normalize_ident),
+                    columns: columns.iter().map(Self::normalize_ident).collect(),
                 })
             }
             // ALTER TABLE … DROP CONSTRAINT [IF EXISTS] name [CASCADE].
@@ -6346,15 +6569,151 @@ impl<'a> Planner<'a> {
         }
     }
 
-    fn convert_on_conflict(&self, on_insert: &Option<sqlparser::ast::OnInsert>) -> Result<Option<OnConflictAction>> {
+    /// Resolve an `ON CONFLICT (<cols>)` / `ON CONFLICT ON CONSTRAINT <name>`
+    /// target against the table's real unique constraints.
+    ///
+    /// PostgreSQL does this in parse analysis and raises 42P10
+    /// ("there is no unique or exclusion constraint matching the ON CONFLICT
+    /// specification") when nothing matches. HeliosDB used to DISCARD the target
+    /// entirely: `ON CONFLICT (any_column_at_all) DO UPDATE` was accepted and
+    /// silently behaved as "conflict on whatever constraint happens to trip",
+    /// so a typo'd or dropped constraint turned an upsert into a blind update of
+    /// an unrelated row. Matching happens here, at plan time, against
+    /// [`Catalog::unique_column_sets`] — which unions the column flags, the
+    /// persisted `TableConstraints` and the live ART registry, so every spelling
+    /// (inline `UNIQUE`, table-level, composite, `CREATE UNIQUE INDEX`,
+    /// `ALTER TABLE … ADD CONSTRAINT … UNIQUE`) is a valid target.
+    ///
+    /// The target's identifiers go through `normalize_ident`, so the quoted
+    /// spelling every ORM emits (`ON CONFLICT ("v")`) matches the unquoted one.
+    /// Column ORDER is irrelevant to a unique constraint, so `(v, w)` matches a
+    /// `UNIQUE (w, v)` — as in PostgreSQL.
+    ///
+    /// Returns the RESOLVED arbiter column set, which travels on the plan (see
+    /// [`OnConflictAction`]) so the executor upserts on the constraint the
+    /// statement named and raises 23505 on every other one. `None` means
+    /// "no arbiter" — a targetless `ON CONFLICT`, or the two skip cases below.
+    ///
+    /// Skipped (returns `Ok(None)`) when the planner has no catalog, or the
+    /// table is unknown to it: this must never be the thing that rejects a
+    /// statement the executor would have run — the executor raises the real
+    /// "Table 'x' does not exist" a moment later. Skipping loses the arbiter,
+    /// which degrades to the historical "any unique constraint" behaviour; it
+    /// cannot reject a legal statement, and the executor still enforces every
+    /// constraint, so the failure mode is the pre-existing one and not a new
+    /// silently-unenforced constraint.
+    fn validate_conflict_target(
+        &self,
+        conflict_target: &Option<sqlparser::ast::ConflictTarget>,
+        table_name: &str,
+    ) -> Result<Option<Vec<String>>> {
+        use sqlparser::ast::ConflictTarget;
+
+        let Some(target) = conflict_target else {
+            // No target: "conflict on any unique constraint" — always legal.
+            return Ok(None);
+        };
+        let Some(catalog) = self.catalog else {
+            return Ok(None);
+        };
+        let unique_sets = catalog.unique_column_sets(table_name);
+        if unique_sets.is_empty() {
+            // Either the table has no unique constraint at all, or it is not in
+            // this catalog. Only the first is a genuine 42P10, and the arms
+            // below tell them apart via `table_exists`.
+            if !catalog.table_exists(table_name).unwrap_or(false) {
+                return Ok(None);
+            }
+        }
+
+        match target {
+            ConflictTarget::Columns(idents) => {
+                // Case-folded and ORDER-INDEPENDENT on both sides: a unique
+                // constraint is a SET of columns, so `(v, w)` targets a
+                // `UNIQUE (w, v)` exactly as in PostgreSQL. Fold BEFORE sorting
+                // — sorting mixed-case strings first and folding after would
+                // order the two sides differently.
+                let mut wanted: Vec<String> = idents.iter().map(|i| Self::normalize_ident(i).to_lowercase()).collect();
+                wanted.sort();
+                // Keep the CATALOG's spelling of the matched set, not the
+                // user's: the executor compares it against `entry.columns` of
+                // the ART index, which the catalog owns.
+                let matched = unique_sets.iter().find(|cols| {
+                    let mut have: Vec<String> = cols.iter().map(|c| c.to_lowercase()).collect();
+                    have.sort();
+                    have == wanted
+                });
+                match matched {
+                    Some(cols) => Ok(Some(cols.clone())),
+                    None => Err(Error::query_execution(
+                        "there is no unique or exclusion constraint matching the ON CONFLICT specification",
+                    )),
+                }
+            }
+            ConflictTarget::OnConstraint(name) => {
+                let wanted = Self::normalize_nontable_name(name);
+                // Resolve the constraint to its COLUMNS, so `ON CONSTRAINT` is
+                // arbitrated exactly like the column-list spelling.
+                let from_record = catalog.load_table_constraints(table_name).ok().and_then(|c| {
+                    c.unique_constraints
+                        .iter()
+                        .find(|uc| uc.name.eq_ignore_ascii_case(&wanted))
+                        .map(|uc| uc.columns.clone())
+                });
+                // …and, for a `CREATE UNIQUE INDEX`, from the live registry.
+                // PK/UNIQUE only: a plain secondary index is not a unique
+                // constraint and so is not a legal arbiter (PostgreSQL: 42P10).
+                // The old check accepted ANY index the table owned, which made
+                // `ON CONFLICT ON CONSTRAINT <a_plain_index>` a silent
+                // "conflict on whatever trips first".
+                let from_index = catalog
+                    .storage()
+                    .art_indexes()
+                    .list_table_indexes(table_name)
+                    .into_iter()
+                    .find(|(index_name, kind, _)| {
+                        index_name.eq_ignore_ascii_case(&wanted)
+                            && matches!(
+                                *kind,
+                                crate::storage::ArtIndexType::PrimaryKey | crate::storage::ArtIndexType::Unique
+                            )
+                    })
+                    .map(|(_, _, columns)| columns);
+                match from_record.or(from_index) {
+                    Some(columns) => Ok(Some(columns)),
+                    None => Err(Error::query_execution(format!(
+                        "constraint \"{}\" for table \"{}\" does not exist",
+                        wanted, table_name
+                    ))),
+                }
+            }
+        }
+    }
+
+    fn convert_on_conflict(
+        &self,
+        on_insert: &Option<sqlparser::ast::OnInsert>,
+        table_name: &str,
+    ) -> Result<Option<OnConflictAction>> {
         let on = match on_insert {
             Some(on) => on,
             None => return Ok(None),
         };
         match on {
             sqlparser::ast::OnInsert::OnConflict(conflict) => match &conflict.action {
-                sqlparser::ast::OnConflictAction::DoNothing => Ok(Some(OnConflictAction::DoNothing)),
+                sqlparser::ast::OnConflictAction::DoNothing => {
+                    // A target is validated for DO NOTHING too: PostgreSQL
+                    // raises 42P10 on `ON CONFLICT (nope) DO NOTHING` just as it
+                    // does for DO UPDATE, and silently swallowing the rows of a
+                    // mis-targeted statement is the worse failure of the two.
+                    // The resolved set rides along for the same reason: with a
+                    // named target, a conflict on a DIFFERENT constraint is a
+                    // 23505 in PostgreSQL, not a skipped row.
+                    let conflict_target = self.validate_conflict_target(&conflict.conflict_target, table_name)?;
+                    Ok(Some(OnConflictAction::DoNothing { conflict_target }))
+                }
                 sqlparser::ast::OnConflictAction::DoUpdate(do_update) => {
+                    let conflict_target = self.validate_conflict_target(&conflict.conflict_target, table_name)?;
                     let assignments = do_update
                         .assignments
                         .iter()
@@ -6369,7 +6728,11 @@ impl<'a> Planner<'a> {
                         .as_ref()
                         .map(|expr| self.expr_to_logical(expr))
                         .transpose()?;
-                    Ok(Some(OnConflictAction::DoUpdate { assignments, selection }))
+                    Ok(Some(OnConflictAction::DoUpdate {
+                        assignments,
+                        selection,
+                        conflict_target,
+                    }))
                 }
             },
             sqlparser::ast::OnInsert::DuplicateKeyUpdate(assignments) => {
@@ -6382,9 +6745,12 @@ impl<'a> Planner<'a> {
                         Ok((col_name, expr))
                     })
                     .collect::<Result<Vec<_>>>()?;
+                // MySQL's `ON DUPLICATE KEY UPDATE` names no constraint and
+                // genuinely means "any unique key" — no arbiter.
                 Ok(Some(OnConflictAction::DoUpdate {
                     assignments: assign_pairs,
                     selection: None,
+                    conflict_target: None,
                 }))
             }
             _ => {
@@ -6837,6 +7203,117 @@ mod tests {
         assert_eq!(
             Planner::normalize_dotted_name("information_schema.columns"),
             "information_schema.columns"
+        );
+    }
+
+    /// `ALTER TABLE … RENAME TO` builds the target key from the SOURCE table's
+    /// schema, so it has to read that schema correctly — and a dot in a key is
+    /// not necessarily a schema separator.
+    ///
+    /// `normalize_object_name` deliberately keeps a quoted identifier that
+    /// contains a dot intact (it is ONE part), so `CREATE TABLE "we.ird"` is a
+    /// `public` table whose storage key is `we.ird`. Cutting that key at its
+    /// first `.` read the schema as `we`, and the bare-target branch then
+    /// re-qualified the new name with it: `RENAME TO "we.ird2"` produced the key
+    /// `we.we.ird2` and `RENAME TO plain` produced `we.plain`. Both reported
+    /// success and left a table that no later statement could address — the same
+    /// shape as the quoted-target bug this arm already fixes.
+    #[test]
+    fn rename_target_reads_the_source_schema_from_the_parsed_name() {
+        let parser = Parser::new();
+        let plan = |sql: &str| Planner::new().statement_to_plan(parser.parse_one(sql).expect("parse"));
+        let renamed = |sql: &str| match plan(sql).unwrap_or_else(|e| panic!("`{sql}` failed to plan: {e}")) {
+            LogicalPlan::AlterTableRename {
+                table_name,
+                new_table_name,
+            } => (table_name, new_table_name),
+            other => panic!("expected AlterTableRename for `{sql}`, got {other:?}"),
+        };
+
+        // A quoted dotted name is one `public` table: the dot is part of the
+        // IDENTIFIER, and the rename must not read it as a schema.
+        assert_eq!(
+            renamed(r#"ALTER TABLE "we.ird" RENAME TO "we.ird2""#),
+            ("we.ird".to_string(), "we.ird2".to_string()),
+            "*** UNADDRESSABLE TABLE *** the dot in a quoted identifier was read as a schema \
+             separator, so the target key was re-qualified with the phantom schema"
+        );
+        assert_eq!(
+            renamed(r#"ALTER TABLE "we.ird" RENAME TO plain"#),
+            ("we.ird".to_string(), "plain".to_string()),
+            "*** UNADDRESSABLE TABLE *** a plain target inherited a phantom schema from the \
+             source's quoted dot"
+        );
+
+        // …and a dot-bearing SCHEMA still decomposes the other way round.
+        assert_eq!(
+            renamed(r#"ALTER TABLE "my.schema".t RENAME TO "my.schema".t2"#),
+            ("my.schema.t".to_string(), "my.schema.t2".to_string()),
+            "a quoted dotted SCHEMA qualifier stopped resolving"
+        );
+
+        // Regressions: the ordinary spellings are untouched.
+        assert_eq!(
+            renamed("ALTER TABLE myschema.t RENAME TO t2"),
+            ("myschema.t".to_string(), "myschema.t2".to_string()),
+            "a bare target no longer keeps the source table's schema"
+        );
+        assert_eq!(
+            renamed("ALTER TABLE myschema.t RENAME TO myschema.t2"),
+            ("myschema.t".to_string(), "myschema.t2".to_string()),
+        );
+        assert_eq!(
+            renamed(r#"ALTER TABLE "Account" RENAME TO "Account2""#),
+            ("Account".to_string(), "Account2".to_string()),
+            "the quoted-target normalisation regressed"
+        );
+        // A cross-schema RENAME TO is still refused (PostgreSQL: use SET SCHEMA).
+        assert!(
+            plan("ALTER TABLE myschema.t RENAME TO other.t2").is_err(),
+            "RENAME TO a different schema must be refused, not silently relocated"
+        );
+    }
+
+    /// The decomposition itself: peel the KNOWN identifier off the end of the
+    /// key, never cut at the first dot.
+    ///
+    /// Split out from the behaviour test above so THAT one runs unchanged
+    /// against a tree without this helper.
+    #[test]
+    fn split_key_by_name_peels_the_identifier_instead_of_cutting_at_the_first_dot() {
+        use sqlparser::ast::{Ident, ObjectName};
+        let quoted = |q: &str, t: &str| ObjectName(vec![Ident::with_quote('"', q), Ident::new(t)]);
+
+        // A quoted identifier that CONTAINS a dot is the whole table name.
+        assert_eq!(
+            Planner::split_key_by_name("we.ird", &ObjectName(vec![Ident::with_quote('"', "we.ird")])),
+            ("public".to_string(), "we.ird".to_string())
+        );
+        // A quoted SCHEMA that contains a dot splits the other way round.
+        assert_eq!(
+            Planner::split_key_by_name("my.schema.t", &quoted("my.schema", "t")),
+            ("my.schema".to_string(), "t".to_string())
+        );
+        // The ordinary shapes are what `split_schema_key` always said.
+        assert_eq!(
+            Planner::split_key_by_name("s.t", &quoted("s", "t")),
+            ("s".to_string(), "t".to_string())
+        );
+        assert_eq!(
+            Planner::split_key_by_name("t", &ObjectName(vec![Ident::new("t")])),
+            ("public".to_string(), "t".to_string())
+        );
+        // A BARE name that `resolve_table_ref` qualified from the search_path
+        // still decomposes (the AST has one part, the key has two).
+        assert_eq!(
+            Planner::split_key_by_name("s.t", &ObjectName(vec![Ident::new("t")])),
+            ("s".to_string(), "t".to_string())
+        );
+        // The `_hdb_*` dealias produces a key that is NOT `<schema>.<ident>`;
+        // it falls back to the historical first-dot split, unchanged.
+        assert_eq!(
+            Planner::split_key_by_name("_hdb_code_symbols", &ObjectName(vec![Ident::new("symbols")])),
+            ("public".to_string(), "_hdb_code_symbols".to_string())
         );
     }
 

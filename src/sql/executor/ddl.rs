@@ -24,12 +24,44 @@ fn empty_ddl_result(executor: &Executor) -> Box<dyn PhysicalOperator> {
     )
 }
 
+/// The unique key a `CREATE [UNIQUE] INDEX` option list describes, or `None`
+/// when the index is not unique.
+///
+/// ONE reader of the `Unique` / `UniqueColumns` option pair, shared by
+/// `handle_create_index` and `Catalog::rebuild_all_indexes` (through
+/// `crate::storage::unique_index_columns`), so the statement and the reopen
+/// cannot disagree about which columns the constraint covers.
+pub(crate) fn unique_index_columns(
+    options: &[crate::sql::logical_plan::IndexOption],
+    column_name: &str,
+) -> Option<Vec<String>> {
+    use crate::sql::logical_plan::IndexOption;
+    if !options.iter().any(|o| matches!(o, IndexOption::Unique(true))) {
+        return None;
+    }
+    for option in options {
+        if let IndexOption::UniqueColumns(cols) = option {
+            if !cols.is_empty() {
+                return Some(cols.clone());
+            }
+        }
+    }
+    Some(vec![column_name.to_string()])
+}
+
+/// Build one ART secondary index.
+///
+/// `unique_columns` is `Some` only for `CREATE UNIQUE INDEX`, and then it is the
+/// COMPLETE key (one entry for the single-column spelling, several for a
+/// composite one) — a unique index must constrain every column it names, while
+/// an ordinary composite index deliberately indexes only its leading column.
 fn create_art_secondary_index(
     storage: &crate::storage::StorageEngine,
     name: &str,
     table_name: &str,
     column_name: &str,
     if_not_exists: bool,
+    unique_columns: Option<Vec<String>>,
 ) -> Result<Option<usize>> {
     if storage.is_branch_active() {
         return Err(Error::query_execution(
@@ -55,6 +87,41 @@ fn create_art_secondary_index(
     }
 
     let columns = vec![column_name.to_string()];
+    if let Some(unique_columns) = unique_columns {
+        // `CREATE UNIQUE INDEX` — registered as a UNIQUE index, so
+        // `check_unique_constraints` (INSERT, INSERT…SELECT, COPY, the
+        // ON CONFLICT probe) and `unique_key_exists` (UPDATE) all see it. It
+        // used to be built as an ordinary secondary index, which enforces
+        // nothing: the statement reported success and duplicates kept landing.
+        for col in &unique_columns {
+            if !schema.columns.iter().any(|c| &c.name == col) {
+                return Err(Error::query_execution(format!(
+                    "Column '{}' not found in table '{}'",
+                    col, table_name
+                )));
+            }
+        }
+        art_manager
+            .create_unique_index(table_name, &unique_columns, Some(name))
+            .map_err(|e| Error::query_execution(format!("Failed to create UNIQUE ART index: {}", e)))?;
+
+        let tuples = storage.scan_table_with_schema(table_name, &schema)?;
+        return match art_manager.backfill_unique_index(name, &schema, &tuples) {
+            Ok(backfilled) => Ok(Some(backfilled)),
+            Err(e) => {
+                // FAIL CLOSED, PostgreSQL-style: the index is not created when
+                // the existing rows already violate it, and the statement says
+                // so with a 23505-classified message rather than leaving a
+                // half-built index behind.
+                let _ = art_manager.drop_index(name);
+                Err(Error::constraint_violation(format!(
+                    "could not create unique index \"{}\": {}",
+                    name, e
+                )))
+            }
+        };
+    }
+
     art_manager
         .create_manual_index(name, table_name, &columns)
         .map_err(|e| Error::query_execution(format!("Failed to create ART index: {}", e)))?;
@@ -214,11 +281,20 @@ pub(super) fn handle_create_index(executor: &Executor, plan: &LogicalPlan) -> Re
         if let Some(storage) = executor.storage() {
             let family = index_family(index_type.as_deref());
             if family == Some(IndexFamily::Art) {
+                // `CREATE UNIQUE INDEX` arrives as `IndexOption::Unique(true)`
+                // (see the planner's CreateIndex arm). It travels in `options`
+                // so that `persist_index_definition` and `log_create_index`
+                // below carry it unchanged — which is what makes the constraint
+                // survive a restart (`Catalog::rebuild_all_indexes` re-registers
+                // it as UNIQUE) and reach a standby.
+                let unique_columns = unique_index_columns(options, column_name);
+                let unique = unique_columns.is_some();
                 if let Some(backfilled) =
-                    create_art_secondary_index(storage, name, table_name, column_name, *if_not_exists)?
+                    create_art_secondary_index(storage, name, table_name, column_name, *if_not_exists, unique_columns)?
                 {
                     tracing::info!(
-                        "Created ART index '{}' on table '{}' column '{}' with {} existing rows",
+                        "Created {}ART index '{}' on table '{}' column '{}' with {} existing rows",
+                        if unique { "UNIQUE " } else { "" },
                         name,
                         table_name,
                         column_name,
@@ -631,14 +707,26 @@ pub(super) fn handle_drop_index(executor: &Executor, name: &str, if_exists: bool
     // Message shape is PostgreSQL's ("cannot drop index … because constraint …
     // requires it") so the PG wire classifier maps it to 2BP01
     // dependent_objects_still_exist rather than XX000.
+    //
+    // ONE exception, and it is the reason the `meta:index:` record is consulted
+    // rather than assumed absent: `CREATE UNIQUE INDEX u ON t (c)` registers a
+    // UNIQUE ART index AND persists a definition for it. In PostgreSQL that
+    // index is an ordinary index the user may drop (only an index owned by a
+    // CONSTRAINT — `ALTER TABLE … ADD CONSTRAINT … UNIQUE`, PRIMARY KEY, FK — is
+    // undroppable), and refusing it would leave the user with an index they
+    // could create and never remove. Constraint-owned indexes still have NO
+    // definition record, so they still land in the refusal above.
+    let catalog = storage.catalog();
     if let Some((kind, owner)) = constraint_index_kind(storage, name) {
-        return Err(Error::query_execution(format!(
-            "cannot drop index \"{name}\" because constraint {kind} on \"{owner}\" requires it; \
-             drop the constraint instead"
-        )));
+        let user_created_unique = kind == "UNIQUE" && catalog.index_definition_exists(name)?;
+        if !user_created_unique {
+            return Err(Error::query_execution(format!(
+                "cannot drop index \"{name}\" because constraint {kind} on \"{owner}\" requires it; \
+                 drop the constraint instead"
+            )));
+        }
     }
 
-    let catalog = storage.catalog();
     let definition = match catalog.get_index_definition(name)? {
         Some(definition) => Some(definition),
         // Record present but undecodable (a future on-disk format, or

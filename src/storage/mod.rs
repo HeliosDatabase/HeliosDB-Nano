@@ -211,7 +211,7 @@ pub use row_cache::{RowCache, RowCacheConfig, RowCacheKey, RowCacheStats};
 
 // ART Index exports
 pub use art_index::{AdaptiveRadixTree, ArtIndexError, ArtIndexStats, ArtIndexType, ArtIterator, ArtResult};
-pub use art_manager::{ArtIndexManager, ArtManagerStats, ForeignKeyInfo, SharedArtIndex};
+pub use art_manager::{ArtIndexManager, ArtManagerStats, ForeignKeyInfo, RowState, SharedArtIndex, UniqueConflict};
 pub use art_node::{ArtNode, LeafNode, Node16, Node256, Node4, Node48, NodeHeader, RowId, MAX_PREFIX_LEN};
 
 use crate::Value;

@@ -1472,6 +1472,11 @@ impl EmbeddedDatabase {
                 | sql::LogicalPlan::AlterTableRenameColumn { .. }
                 | sql::LogicalPlan::AlterTableAlterColumnNullability { .. }
                 | sql::LogicalPlan::AlterTableAddForeignKey { .. }
+                // ADD CONSTRAINT … UNIQUE changes what `ON CONFLICT (…)`
+                // resolves against (the target is validated at PLAN time), and
+                // adds an index the planner may pick — so a cached plan built
+                // before it must not be reused.
+                | sql::LogicalPlan::AlterTableAddUnique { .. }
                 | sql::LogicalPlan::AlterTableAlterConstraintEnforcement { .. }
                 | sql::LogicalPlan::AlterTableDropConstraint { .. }
                 | sql::LogicalPlan::AlterTableMulti { .. }
@@ -4956,6 +4961,15 @@ impl EmbeddedDatabase {
                 let schema = Schema::new(schema_columns);
                 let catalog = self.storage.catalog();
 
+                // FOREIGN KEY targets are validated BEFORE the table is created
+                // (42P01 / 42703). Deliberately not in the constraint loop
+                // below: that runs AFTER `create_table`, so a rejected
+                // constraint would leave the table itself behind — a
+                // half-created relation PostgreSQL never produces. A
+                // SELF-reference is resolved against the columns being declared
+                // here, since the table does not exist yet at this point.
+                Self::validate_create_table_fk_targets(&catalog, name, columns, constraints)?;
+
                 // Log to WAL for replication before creating (schema will be moved)
                 if let Err(e) = self.storage.log_create_table(name, &schema) {
                     tracing::warn!("Failed to log CREATE TABLE to WAL: {}", e);
@@ -5054,6 +5068,10 @@ impl EmbeddedDatabase {
                                 // right key-space instead of an empty list (which
                                 // degraded to "any parent row exists" and printed a
                                 // malformed `parent()` violation message).
+                                //
+                                // The targets were validated (42P01 / 42703)
+                                // before `catalog.create_table` ran — see
+                                // `validate_create_table_fk_targets`.
                                 let references_columns =
                                     Self::resolve_fk_referenced_columns(&catalog, references_table, references_columns);
                                 let fk = sql::ForeignKeyConstraint::new(
@@ -5129,7 +5147,7 @@ impl EmbeddedDatabase {
                     // constraint lives here in `TableConstraints`. Same helper
                     // `rebuild_all_indexes` calls at open, so create-time and
                     // reopen-time agree.
-                    catalog.register_composite_unique_indexes(name, &table_constraints);
+                    catalog.register_unique_constraint_indexes(name, &table_constraints);
                 }
 
                 // Also add column-level UNIQUE and PRIMARY KEY constraints
@@ -5485,11 +5503,30 @@ impl EmbeddedDatabase {
                                 .check_unique_constraints(table_name, &col_values_map)
                             {
                                 match on_conflict {
-                                    Some(sql::logical_plan::OnConflictAction::DoNothing) => {
-                                        // Skip this row silently
+                                    Some(sql::logical_plan::OnConflictAction::DoNothing { conflict_target }) => {
+                                        // Skip this row silently — but ONLY if
+                                        // the conflict is on the constraint the
+                                        // statement named. `ON CONFLICT (v) DO
+                                        // NOTHING` does not swallow a PRIMARY
+                                        // KEY collision in PostgreSQL; it
+                                        // raises 23505.
+                                        if !self.conflict_matches_target(
+                                            table_name,
+                                            &col_values_map,
+                                            conflict_target.as_deref(),
+                                        ) {
+                                            // Same classification the no-ON-CONFLICT
+                                            // arm below uses, so the wire still maps
+                                            // it to 23505.
+                                            return Err(Error::constraint_violation(e.to_string()));
+                                        }
                                         continue;
                                     }
-                                    Some(sql::logical_plan::OnConflictAction::DoUpdate { assignments, selection }) => {
+                                    Some(sql::logical_plan::OnConflictAction::DoUpdate {
+                                        assignments,
+                                        selection,
+                                        conflict_target,
+                                    }) => {
                                         // Upsert: find existing row by the conflicting constraint and update it.
                                         // The conflict might be on PK or a UNIQUE key — extract which from the error.
                                         let err_msg = e.to_string();
@@ -5506,83 +5543,59 @@ impl EmbeddedDatabase {
                                             }
                                         }
 
-                                        // Determine which column caused the conflict:
-                                        // 1. Try UNIQUE column mentioned in error message
-                                        // 2. Fall back to scanning UNIQUE columns for matching values
-                                        // 3. Last resort: try PK
-                                        let existing_row_id = {
-                                            let mut found_row_id: Option<u64> = None;
-
-                                            // Strategy 1: Try each UNIQUE column that has a non-null value in the INSERT
-                                            for (i, col) in schema.columns.iter().enumerate() {
-                                                if (col.unique || col.primary_key) && !col.primary_key {
-                                                    // UNIQUE (non-PK) column — check if it caused the conflict
-                                                    if let Some(val) = tuple.values.get(i) {
-                                                        if !matches!(val, Value::Null) {
-                                                            // Scan table for existing row with this UNIQUE value
-                                                            let scan_sql = format!(
-                                                                "SELECT {} FROM {} WHERE {} = '{}'",
-                                                                schema
-                                                                    .columns
-                                                                    .iter()
-                                                                    .find(|c| c.primary_key)
-                                                                    .map(|c| c.name.as_str())
-                                                                    .unwrap_or("rowid"),
-                                                                table_name,
-                                                                col.name,
-                                                                val.to_string().trim_matches('\'')
-                                                            );
-                                                            if let Ok(rows) = self.query(&scan_sql, &[]) {
-                                                                if let Some(row) = rows.first() {
-                                                                    if let Some(pk_val) = row.values.first() {
-                                                                        match pk_val {
-                                                                            Value::Int8(id) => {
-                                                                                found_row_id = Some(*id as u64);
-                                                                            }
-                                                                            Value::Int4(id) => {
-                                                                                found_row_id = Some(*id as u64);
-                                                                            }
-                                                                            _ => {}
-                                                                        }
-                                                                    }
-                                                                }
-                                                            }
-                                                            if found_row_id.is_some() {
-                                                                break;
-                                                            }
-                                                        }
-                                                    }
-                                                }
+                                        // Which row conflicted? Ask the index that
+                                        // just reported the conflict.
+                                        //
+                                        // This used to re-derive the answer from
+                                        // `schema.columns`: for each column with
+                                        // the `unique` FLAG, run
+                                        // `SELECT <pk> FROM t WHERE <col> = '<value>'`
+                                        // — a string-interpolated SQL round-trip
+                                        // per conflicting row — and decode the
+                                        // result only if the primary key was
+                                        // `Int4`/`Int8`. That missed every
+                                        // constraint the flag does not describe
+                                        // (composite `UNIQUE (a, b)`,
+                                        // `CREATE UNIQUE INDEX`, a constraint
+                                        // added by ALTER) and every non-integer
+                                        // primary key (UUID/TEXT — the shape
+                                        // Prisma generates), so a legitimate
+                                        // upsert failed with "could not find
+                                        // existing row". `find_unique_conflict`
+                                        // probes the PK index and every UNIQUE
+                                        // index of the table and returns the
+                                        // row_id directly — same structure the
+                                        // conflict was detected against, so it
+                                        // cannot disagree with it.
+                                        //
+                                        // ARBITER: with `ON CONFLICT (<cols>)`
+                                        // the probe is restricted to THAT
+                                        // constraint. A collision on any other
+                                        // one is not this statement's business
+                                        // — PostgreSQL raises 23505 — so the
+                                        // `None` arm below re-raises the
+                                        // original unique violation instead of
+                                        // upserting onto a row the statement
+                                        // never named.
+                                        let existing_row_id = match self.storage.art_indexes().find_unique_conflict(
+                                            table_name,
+                                            &col_values_map,
+                                            conflict_target.as_deref(),
+                                        ) {
+                                            Some(conflict) => conflict.row_id,
+                                            // Conflict on a NON-target constraint:
+                                            // re-raise the original violation with the
+                                            // same classification the no-ON-CONFLICT
+                                            // arm uses (the wire maps it to 23505).
+                                            None if conflict_target.is_some() => {
+                                                return Err(Error::constraint_violation(err_msg))
                                             }
-
-                                            // Strategy 2: Try PK lookup (for PK conflicts)
-                                            if found_row_id.is_none() {
-                                                let pk_cols: Vec<(usize, &crate::Column)> = schema
-                                                    .columns
-                                                    .iter()
-                                                    .enumerate()
-                                                    .filter(|(_, c)| c.primary_key)
-                                                    .collect();
-                                                let pk_values: Vec<Value> = pk_cols
-                                                    .iter()
-                                                    .filter_map(|(idx, _)| tuple.values.get(*idx).cloned())
-                                                    .collect();
-                                                if !pk_values.is_empty()
-                                                    && !pk_values.iter().any(|v| matches!(v, Value::Null))
-                                                {
-                                                    let pk_key =
-                                                        crate::storage::ArtIndexManager::encode_key(&pk_values);
-                                                    found_row_id =
-                                                        self.storage.art_indexes().pk_index_lookup(table_name, &pk_key);
-                                                }
-                                            }
-
-                                            found_row_id.ok_or_else(|| {
-                                                Error::query_execution(format!(
+                                            None => {
+                                                return Err(Error::query_execution(format!(
                                                     "ON CONFLICT DO UPDATE: could not find existing row ({})",
                                                     err_msg
-                                                ))
-                                            })?
+                                                )))
+                                            }
                                         };
 
                                         // Read existing row through the transaction so that rows
@@ -5719,23 +5732,89 @@ impl EmbeddedDatabase {
                                         // Update ART index (main only — a branch
                                         // ON CONFLICT DO UPDATE writes to `bdata:`
                                         // and must not touch the shared ART; W2.0).
-                                        if !on_branch {
-                                            let mut updated_col_values = std::collections::HashMap::new();
+                                        //
+                                        // The old-entry removal is keyed on the row's
+                                        // PRE-IMAGE (`pre_update_tuple`), never on the
+                                        // PROPOSED row: the DO UPDATE leg rewrites the
+                                        // row the ARBITER found, which is a DIFFERENT
+                                        // row from the one the INSERT proposed. Passing
+                                        // the proposed values (what this did) is wrong
+                                        // in both directions, and both bit:
+                                        //
+                                        //  * it deletes index entries the proposed
+                                        //    values name, which may belong to ANOTHER
+                                        //    row — `INSERT (2,'a',9) ON CONFLICT (v)`
+                                        //    against `(1,'a')`/`(2,'b')` erased the PK
+                                        //    entry for id=2, so row 2 vanished from
+                                        //    `WHERE id = 2`; and
+                                        //  * it does NOT delete the updated row's own
+                                        //    entries, so `on_insert` re-adds a key that
+                                        //    is still present. `AdaptiveRadixTree::
+                                        //    insert` rejects a duplicate on a PK/UNIQUE
+                                        //    tree and `on_insert` propagates with `?`,
+                                        //    abandoning every index AFTER the first
+                                        //    unchanged one — normally the PK — so the
+                                        //    UNIQUE index the upsert arbitrated on kept
+                                        //    the entry `on_delete` had just removed and
+                                        //    the updated row disappeared from `=`
+                                        //    lookups on its own unique column (the
+                                        //    portal's A3.2).
+                                        //
+                                        // Gated on an indexed column actually changing,
+                                        // like every other UPDATE site (R0.2), and
+                                        // undone on ROLLBACK like the params family's
+                                        // UPDATE arm — the ART is mutated eagerly here
+                                        // but `txn` may still roll back.
+                                        if !on_branch
+                                            && self.storage.art_indexes().tuple_update_affects_indexes(
+                                                table_name,
+                                                &schema,
+                                                &pre_update_tuple,
+                                                &existing_tuple,
+                                            )
+                                        {
+                                            let mut old_col_values =
+                                                std::collections::HashMap::with_capacity(schema.columns.len());
+                                            let mut new_col_values =
+                                                std::collections::HashMap::with_capacity(schema.columns.len());
                                             for (i, col) in schema.columns.iter().enumerate() {
+                                                if let Some(v) = pre_update_tuple.values.get(i) {
+                                                    old_col_values.insert(col.name.clone(), v.clone());
+                                                }
                                                 if let Some(v) = existing_tuple.values.get(i) {
-                                                    updated_col_values.insert(col.name.clone(), v.clone());
+                                                    new_col_values.insert(col.name.clone(), v.clone());
                                                 }
                                             }
-                                            // Remove old entry and insert new one
-                                            let _ = self.storage.art_indexes().on_delete(
+                                            if let Err(e) = self.storage.art_indexes().on_delete(
                                                 table_name,
                                                 existing_row_id,
-                                                &col_values_map,
-                                            );
-                                            let _ = self.storage.art_indexes().on_insert(
+                                                &old_col_values,
+                                            ) {
+                                                tracing::debug!(
+                                                    "ART index on-conflict/delete-old for '{}': {}",
+                                                    table_name,
+                                                    e
+                                                );
+                                            }
+                                            if let Err(e) = self.storage.art_indexes().on_insert(
                                                 table_name,
                                                 existing_row_id,
-                                                &updated_col_values,
+                                                &new_col_values,
+                                            ) {
+                                                tracing::debug!(
+                                                    "ART index on-conflict/insert-new for '{}': {}",
+                                                    table_name,
+                                                    e
+                                                );
+                                            }
+                                            self.push_art_undo(
+                                                txn,
+                                                ArtUndoOp::RestoreUpdated {
+                                                    table_name: table_name.clone(),
+                                                    row_id: existing_row_id,
+                                                    old_col_values,
+                                                    new_col_values,
+                                                },
                                             );
                                         }
 
@@ -5919,7 +5998,13 @@ impl EmbeddedDatabase {
                         // unique checks observe the branch row; W2.0).
                         if !on_branch {
                             if let Err(e) = self.storage.art_indexes().on_insert(table_name, row_id, &col_values) {
-                                tracing::debug!("ART index insert for '{}': {}", table_name, e);
+                                // The row is written by the line above, so this
+                                // refusal cannot unmake it: a duplicate is being
+                                // stored. `on_insert` keeps every entry the row
+                                // owns (maintenance-shaped, never all-or-nothing
+                                // — see `RowState`), and the fact goes to the log
+                                // at ERROR instead of a `debug!` nobody enables.
+                                storage::StorageEngine::note_index_maintenance_failure(table_name, row_id, &e);
                             }
                             self.push_art_undo(
                                 txn,
@@ -6204,7 +6289,11 @@ impl EmbeddedDatabase {
                                 }
                             }
                             if let Err(e) = self.storage.art_indexes().on_insert(table_name, row_id, &col_values) {
-                                tracing::debug!("ART index insert for '{}': {}", table_name, e);
+                                // Same rule as the plain INSERT arm: the row is
+                                // already written, so a refusal here means a
+                                // stored duplicate and belongs in the log at
+                                // ERROR, not at `debug!`.
+                                storage::StorageEngine::note_index_maintenance_failure(table_name, row_id, &e);
                             }
                         }
 
@@ -6316,8 +6405,17 @@ impl EmbeddedDatabase {
                     self.storage.scan_table_branch_aware(table_name)?
                 };
                 let mut updates: Vec<(u64, Tuple, Tuple)> = Vec::new();
-                let mut seen_column_unique_update_keys: Vec<(String, Value)> = Vec::new();
-                let mut seen_table_unique_update_keys: Vec<(Vec<String>, Vec<Value>)> = Vec::new();
+                let mut seen_column_unique_update_keys: Vec<(String, Value, Option<u64>)> = Vec::new();
+                let mut seen_table_unique_update_keys: Vec<(Vec<String>, Vec<Value>, Option<u64>)> = Vec::new();
+                // The column sets the LIVE ART registry enforces (a
+                // `CREATE UNIQUE INDEX` sets no schema flag and writes no
+                // constraint record, so nothing else sees it). Resolved ONCE
+                // here, not inside `enforce_unique_on_update`: that helper runs
+                // per updated ROW, and asking the registry per row took a
+                // global lock and cloned a `Vec<String>` per index of the table
+                // on every row of a bulk UPDATE — for an answer that cannot
+                // change within one statement.
+                let index_unique_sets = self.storage.art_indexes().unique_column_sets(table_name);
 
                 for old_tuple in tuples {
                     let matches = if let Some(predicate) = selection {
@@ -6465,6 +6563,7 @@ impl EmbeddedDatabase {
                             &new_tuple,
                             &mut seen_column_unique_update_keys,
                             &mut seen_table_unique_update_keys,
+                            &index_unique_sets,
                         )?;
 
                         let row_id = new_tuple.row_id.unwrap_or(0);
@@ -7252,65 +7351,7 @@ impl EmbeddedDatabase {
                 new_schema,
                 if_exists,
             } => self.alter_table_set_schema(table_name, new_schema, *if_exists),
-            sql::LogicalPlan::AlterTableAddForeignKey {
-                table_name,
-                constraint_name,
-                columns,
-                references_table,
-                references_columns,
-                on_delete,
-                on_update,
-                deferrable,
-                initially_deferred,
-                enforcement,
-            } => {
-                // Validate the parent table exists.
-                let catalog = self.storage.catalog();
-                catalog.get_table_schema(table_name)?;
-                catalog.get_table_schema(references_table)?;
-
-                let fk_name = constraint_name.clone().unwrap_or_else(|| {
-                    // Dedup the auto-name against the FKs already on this table:
-                    // the schema no longer disambiguates the generated name, so
-                    // two FKs to like-named tables in different schemas would
-                    // otherwise collide (see `generate_unique_name`).
-                    let existing_fk_names: Vec<String> = catalog
-                        .load_table_constraints(table_name)
-                        .map(|c| c.foreign_keys.into_iter().map(|f| f.name).collect())
-                        .unwrap_or_default();
-                    sql::ForeignKeyConstraint::generate_unique_name(
-                        table_name,
-                        columns,
-                        references_table,
-                        &existing_fk_names,
-                    )
-                });
-                // `REFERENCES parent` without a column list binds to the
-                // parent's PRIMARY KEY (PostgreSQL parity); resolve it against
-                // the already-resolved `references_table` key so enforcement
-                // probes the right columns. See `resolve_fk_referenced_columns`.
-                let references_columns =
-                    Self::resolve_fk_referenced_columns(&catalog, references_table, references_columns);
-                let mut fk = sql::ForeignKeyConstraint::new(
-                    fk_name,
-                    table_name.clone(),
-                    columns.clone(),
-                    references_table.clone(),
-                    references_columns,
-                );
-                if let Some(action) = on_delete {
-                    fk = fk.on_delete(convert_logical_referential_action(action));
-                }
-                if let Some(action) = on_update {
-                    fk = fk.on_update(convert_logical_referential_action(action));
-                }
-                if *deferrable {
-                    fk = fk.deferrable(*initially_deferred);
-                }
-                fk = fk.with_enforcement(*enforcement);
-                catalog.add_foreign_key(fk)?;
-                Ok(0)
-            }
+            sql::LogicalPlan::AlterTableAddForeignKey { .. } => self.alter_table_add_foreign_key(&plan),
             sql::LogicalPlan::AlterTableAlterConstraintEnforcement {
                 table_name,
                 constraint_name,
@@ -7334,62 +7375,19 @@ impl EmbeddedDatabase {
                 catalog.save_table_constraints(table_name, &constraints)?;
                 Ok(0)
             }
+            // Both constraint arms delegate to ONE shared body each, so the
+            // params family (which routes the same plans through
+            // `execute_plan_with_params_inner`) runs identical code.
+            sql::LogicalPlan::AlterTableAddUnique {
+                table_name,
+                constraint_name,
+                columns,
+            } => self.alter_table_add_unique(table_name, constraint_name, columns),
             sql::LogicalPlan::AlterTableDropConstraint {
                 table_name,
                 constraint_name,
                 if_exists,
-            } => {
-                let catalog = self.storage.catalog();
-                // Surface a clear error if the table itself is missing.
-                catalog.get_table_schema(table_name)?;
-                let mut constraints = catalog.load_table_constraints(table_name)?;
-                let before = constraints.foreign_keys.len()
-                    + constraints.check_constraints.len()
-                    + constraints.unique_constraints.len();
-                // DROP CONSTRAINT names a single object; match it across FK,
-                // UNIQUE/PK, and CHECK by name (case-insensitive, PG-style).
-                constraints
-                    .foreign_keys
-                    .retain(|c| !c.name.eq_ignore_ascii_case(constraint_name));
-                constraints
-                    .check_constraints
-                    .retain(|c| !c.name.eq_ignore_ascii_case(constraint_name));
-                // Keep the removed UNIQUE constraints: their ART index has to go
-                // too. The index — not the constraint record — is what the write
-                // path probes, so leaving it registered means DROP CONSTRAINT
-                // reports success while the constraint keeps rejecting rows.
-                // This arm never dropped it (it reimplements the removal inline
-                // rather than calling `Catalog::drop_constraint`, whose
-                // index-dropping half consequently had no caller from SQL), so a
-                // dropped UNIQUE went on being enforced forever.
-                let removed_uniques: Vec<sql::UniqueConstraint> = constraints
-                    .unique_constraints
-                    .iter()
-                    .filter(|c| c.name.eq_ignore_ascii_case(constraint_name))
-                    .cloned()
-                    .collect();
-                constraints
-                    .unique_constraints
-                    .retain(|c| !c.name.eq_ignore_ascii_case(constraint_name));
-                let after = constraints.foreign_keys.len()
-                    + constraints.check_constraints.len()
-                    + constraints.unique_constraints.len();
-                if before == after {
-                    // Nothing matched. IF EXISTS makes this a no-op (the shape
-                    // a2h emits before a fresh load, where no FK exists yet);
-                    // otherwise it is an error like PostgreSQL.
-                    if *if_exists {
-                        return Ok(0);
-                    }
-                    return Err(Error::query_execution(format!(
-                        "constraint \"{}\" of relation \"{}\" does not exist",
-                        constraint_name, table_name
-                    )));
-                }
-                catalog.save_table_constraints(table_name, &constraints)?;
-                catalog.drop_unique_constraint_indexes(table_name, &removed_uniques);
-                Ok(0)
-            }
+            } => self.alter_table_drop_constraint(table_name, constraint_name, *if_exists),
             sql::LogicalPlan::AlterTableMulti { operations } => {
                 let mut total_rows = 0u64;
                 for sub_plan in operations {
@@ -10428,7 +10426,16 @@ impl EmbeddedDatabase {
                 Some(column) => column,
                 None => return None,
             };
-            if column.primary_key || column.unique || !Self::fast_update_expr_supported(expr) {
+            // `column.unique` is the SCHEMA flag, which no longer describes
+            // every uniqueness rule: `CREATE UNIQUE INDEX` and
+            // `ALTER TABLE … ADD CONSTRAINT … UNIQUE` set no flag. Ask the index
+            // registry as well, or an UPDATE onto a duplicate value takes this
+            // fast path and skips `enforce_unique_on_update` entirely.
+            if column.primary_key
+                || column.unique
+                || self.storage.art_indexes().column_in_unique_index(table_name, col_name)
+                || !Self::fast_update_expr_supported(expr)
+            {
                 tracing::debug!(target: "helios::fastpath", reason = "param-update-spec:set-col-pk-unique-or-expr-unsupported", "fast-update bail");
                 return None;
             }
@@ -11000,9 +11007,9 @@ impl EmbeddedDatabase {
     /// as `schema.table` (bare for `public`), so a schema move is a rename of
     /// that storage key. For a TABLE we reuse the RENAME-TABLE machinery
     /// (`rename_table` moves data rows, schema metadata, row counter,
-    /// compression config and ART indexes atomically) and then migrate the
-    /// side records rename does not touch — constraints, IDENTITY record and
-    /// the Stage-0 partition registry — via `move_table_side_records`. For a
+    /// compression config, ART indexes, trigger records and — via
+    /// `move_table_side_records` — the constraint records, IDENTITY record and
+    /// Stage-0 partition registry, atomically enough for Stage-0 DDL). For a
     /// VIEW we move the view metadata record only.
     ///
     /// LIMITATION (documented): a moved view's stored body SQL is NOT rewritten,
@@ -11054,10 +11061,12 @@ impl EmbeddedDatabase {
         }
 
         if is_table {
-            // Data + schema + counter + compression + ART indexes.
+            // Data + schema + counter + compression + ART indexes + triggers,
+            // AND the side records (constraints / IDENTITY / partition registry)
+            // — `Catalog::rename_table` carries those itself now, so a plain
+            // `RENAME TO` cannot lose the CHECK/FK enforcement that this path
+            // has always preserved.
             self.storage.rename_table(old_key, &new_key)?;
-            // Constraints + IDENTITY + partition registry (rename skips these).
-            catalog.move_table_side_records(old_key, &new_key)?;
         } else {
             // Regular view: move the metadata record; rebind its creator schema
             // to the destination so a bare reference in the body binds there.
@@ -11078,6 +11087,246 @@ impl EmbeddedDatabase {
             new_schema,
             new_key
         );
+        Ok(0)
+    }
+
+    /// `ALTER TABLE <t> ADD [CONSTRAINT <name>] UNIQUE (<cols>)`.
+    ///
+    /// ONE implementation, called by BOTH executor families (the text family's
+    /// `execute_in_transaction_inner` arm and the params family's
+    /// `execute_plan_with_params_inner` arm), so `db.execute()` and
+    /// `db.execute_params()` / the PG extended protocol cannot diverge on it.
+    ///
+    /// Order is load-bearing and matches PostgreSQL: the index is built and
+    /// BACKFILLED from the existing rows FIRST, and only if that succeeds is the
+    /// constraint recorded. A table that already holds duplicates therefore ends
+    /// with NO index and NO constraint record (23505), instead of a constraint
+    /// that claims to hold over data violating it.
+    ///
+    /// Durability comes from the constraint record: `Catalog::rebuild_all_indexes`
+    /// re-registers (and re-backfills) every table-level unique constraint at
+    /// open through `register_unique_constraint_indexes`, exactly as it does for
+    /// the composite constraints from v4.25.0.
+    fn alter_table_add_unique(
+        &self,
+        table_name: &str,
+        constraint_name: &Option<String>,
+        columns: &[String],
+    ) -> Result<u64> {
+        if self.storage.is_branch_active() {
+            // Same rule as CREATE INDEX: index state lives on main, and a
+            // branch is supposed to be discardable.
+            return Err(Error::query_execution(
+                "ALTER TABLE … ADD CONSTRAINT … UNIQUE must run on the main branch",
+            ));
+        }
+        let catalog = self.storage.catalog();
+        let schema = catalog.get_table_schema(table_name)?;
+
+        // Resolve every named column to the catalog's own spelling: the ART
+        // index resolves its columns through `schema.get_column_index`, so a
+        // constraint recorded under a differently-cased name would build an
+        // index that silently never matches a row.
+        let mut resolved: Vec<String> = Vec::with_capacity(columns.len());
+        for col in columns {
+            let found = schema
+                .columns
+                .iter()
+                .find(|c| c.name.eq_ignore_ascii_case(col))
+                .ok_or_else(|| {
+                    Error::query_execution(format!(
+                        "column \"{}\" named in key does not exist in table \"{}\"",
+                        col, table_name
+                    ))
+                })?;
+            if resolved.iter().any(|c| c.eq_ignore_ascii_case(&found.name)) {
+                return Err(Error::query_execution(format!(
+                    "column \"{}\" appears twice in unique constraint",
+                    found.name
+                )));
+            }
+            resolved.push(found.name.clone());
+        }
+
+        let name = constraint_name
+            .clone()
+            .unwrap_or_else(|| format!("{}_{}_key", table_name, resolved.join("_")));
+
+        let mut constraints = catalog.load_table_constraints(table_name)?;
+        if constraints
+            .unique_constraints
+            .iter()
+            .any(|uc| uc.name.eq_ignore_ascii_case(&name))
+            || constraints
+                .foreign_keys
+                .iter()
+                .any(|fk| fk.name.eq_ignore_ascii_case(&name))
+            || constraints
+                .check_constraints
+                .iter()
+                .any(|ck| ck.name.eq_ignore_ascii_case(&name))
+        {
+            return Err(Error::query_execution(format!(
+                "constraint \"{}\" for relation \"{}\" already exists",
+                name, table_name
+            )));
+        }
+
+        let art = self.storage.art_indexes();
+        // A column set already backed by a PK/UNIQUE index (an inline UNIQUE, or
+        // a constraint added earlier) is already enforced; record the new
+        // constraint but do not register a second index for the same rule —
+        // `register_unique_constraint_indexes` applies the same dedup at open.
+        if !art.has_unique_index_on(table_name, &resolved) {
+            art.create_unique_index(table_name, &resolved, Some(&name))
+                .map_err(|e| {
+                    Error::query_execution(format!("could not create unique constraint \"{}\": {}", name, e))
+                })?;
+            let tuples = self.storage.scan_table_with_schema(table_name, &schema)?;
+            if let Err(e) = art.backfill_unique_index(&name, &schema, &tuples) {
+                let _ = art.drop_index(&name);
+                return Err(Error::constraint_violation(format!(
+                    "could not create unique constraint \"{}\" on relation \"{}\": {}",
+                    name, table_name, e
+                )));
+            }
+        }
+
+        constraints.add_unique(sql::UniqueConstraint::new(
+            name.clone(),
+            table_name.to_string(),
+            resolved.clone(),
+            false,
+        ));
+        catalog.save_table_constraints(table_name, &constraints)?;
+        tracing::info!(
+            "Added UNIQUE constraint '{}' on {}({})",
+            name,
+            table_name,
+            resolved.join(", ")
+        );
+        Ok(0)
+    }
+
+    /// `ALTER TABLE <t> ADD [CONSTRAINT <name>] FOREIGN KEY … REFERENCES …`.
+    ///
+    /// Extracted from the text family's arm (unchanged apart from the DDL-time
+    /// target validation) so the params family can call the SAME body.
+    fn alter_table_add_foreign_key(&self, plan: &sql::LogicalPlan) -> Result<u64> {
+        let sql::LogicalPlan::AlterTableAddForeignKey {
+            table_name,
+            constraint_name,
+            columns,
+            references_table,
+            references_columns,
+            on_delete,
+            on_update,
+            deferrable,
+            initially_deferred,
+            enforcement,
+        } = plan
+        else {
+            return Err(Error::internal("alter_table_add_foreign_key called with another plan"));
+        };
+        // Validate the child table exists, and that the parent table AND the
+        // referenced columns do too (42P01 / 42703 — see
+        // `validate_fk_reference`; the bare `get_table_schema` here checked the
+        // parent TABLE but never its COLUMNS, so `REFERENCES parent(no_such_col)`
+        // was accepted and enforced nothing).
+        let catalog = self.storage.catalog();
+        catalog.get_table_schema(table_name)?;
+        Self::validate_fk_reference(&catalog, references_table, references_columns)?;
+
+        let fk_name = constraint_name.clone().unwrap_or_else(|| {
+            // Dedup the auto-name against the FKs already on this table:
+            // the schema no longer disambiguates the generated name, so
+            // two FKs to like-named tables in different schemas would
+            // otherwise collide (see `generate_unique_name`).
+            let existing_fk_names: Vec<String> = catalog
+                .load_table_constraints(table_name)
+                .map(|c| c.foreign_keys.into_iter().map(|f| f.name).collect())
+                .unwrap_or_default();
+            sql::ForeignKeyConstraint::generate_unique_name(table_name, columns, references_table, &existing_fk_names)
+        });
+        // `REFERENCES parent` without a column list binds to the
+        // parent's PRIMARY KEY (PostgreSQL parity); resolve it against
+        // the already-resolved `references_table` key so enforcement
+        // probes the right columns. See `resolve_fk_referenced_columns`.
+        let references_columns = Self::resolve_fk_referenced_columns(&catalog, references_table, references_columns);
+        let mut fk = sql::ForeignKeyConstraint::new(
+            fk_name,
+            table_name.clone(),
+            columns.clone(),
+            references_table.clone(),
+            references_columns,
+        );
+        if let Some(action) = on_delete {
+            fk = fk.on_delete(convert_logical_referential_action(action));
+        }
+        if let Some(action) = on_update {
+            fk = fk.on_update(convert_logical_referential_action(action));
+        }
+        if *deferrable {
+            fk = fk.deferrable(*initially_deferred);
+        }
+        fk = fk.with_enforcement(*enforcement);
+        catalog.add_foreign_key(fk)?;
+        Ok(0)
+    }
+
+    /// `ALTER TABLE <t> DROP CONSTRAINT [IF EXISTS] <name>` — extracted from the
+    /// text family's arm so the params family can call the SAME body (see
+    /// `alter_table_add_unique` for why that matters: `ADD CONSTRAINT` and
+    /// `DROP CONSTRAINT` are a pair, and a family that can add but not drop is
+    /// worse than one that can do neither).
+    fn alter_table_drop_constraint(&self, table_name: &str, constraint_name: &str, if_exists: bool) -> Result<u64> {
+        let catalog = self.storage.catalog();
+        // Surface a clear error if the table itself is missing.
+        catalog.get_table_schema(table_name)?;
+        let mut constraints = catalog.load_table_constraints(table_name)?;
+        let before =
+            constraints.foreign_keys.len() + constraints.check_constraints.len() + constraints.unique_constraints.len();
+        // DROP CONSTRAINT names a single object; match it across FK,
+        // UNIQUE/PK, and CHECK by name (case-insensitive, PG-style).
+        constraints
+            .foreign_keys
+            .retain(|c| !c.name.eq_ignore_ascii_case(constraint_name));
+        constraints
+            .check_constraints
+            .retain(|c| !c.name.eq_ignore_ascii_case(constraint_name));
+        // Keep the removed UNIQUE constraints: their ART index has to go
+        // too. The index — not the constraint record — is what the write
+        // path probes, so leaving it registered means DROP CONSTRAINT
+        // reports success while the constraint keeps rejecting rows.
+        // This arm never dropped it (it reimplements the removal inline
+        // rather than calling `Catalog::drop_constraint`, whose
+        // index-dropping half consequently had no caller from SQL), so a
+        // dropped UNIQUE went on being enforced forever.
+        let removed_uniques: Vec<sql::UniqueConstraint> = constraints
+            .unique_constraints
+            .iter()
+            .filter(|c| c.name.eq_ignore_ascii_case(constraint_name))
+            .cloned()
+            .collect();
+        constraints
+            .unique_constraints
+            .retain(|c| !c.name.eq_ignore_ascii_case(constraint_name));
+        let after =
+            constraints.foreign_keys.len() + constraints.check_constraints.len() + constraints.unique_constraints.len();
+        if before == after {
+            // Nothing matched. IF EXISTS makes this a no-op (the shape
+            // a2h emits before a fresh load, where no FK exists yet);
+            // otherwise it is an error like PostgreSQL.
+            if if_exists {
+                return Ok(0);
+            }
+            return Err(Error::query_execution(format!(
+                "constraint \"{}\" of relation \"{}\" does not exist",
+                constraint_name, table_name
+            )));
+        }
+        catalog.save_table_constraints(table_name, &constraints)?;
+        catalog.drop_unique_constraint_indexes(table_name, &removed_uniques);
         Ok(0)
     }
 
@@ -11232,6 +11481,21 @@ impl EmbeddedDatabase {
                 column_name,
                 nullable,
             } => self.alter_table_set_column_nullability(table_name, column_name, *nullable),
+            // The constraint sub-operations, so the COMMA-LIST spelling
+            // (`ALTER TABLE t ADD COLUMN c INT, ADD CONSTRAINT k UNIQUE (c)`,
+            // which plans as one `AlterTableMulti`) applies them instead of
+            // failing on the sub-plan with "called with non-ALTER plan".
+            sql::LogicalPlan::AlterTableAddUnique {
+                table_name,
+                constraint_name,
+                columns,
+            } => self.alter_table_add_unique(table_name, constraint_name, columns),
+            sql::LogicalPlan::AlterTableDropConstraint {
+                table_name,
+                constraint_name,
+                if_exists,
+            } => self.alter_table_drop_constraint(table_name, constraint_name, *if_exists),
+            sql::LogicalPlan::AlterTableAddForeignKey { .. } => self.alter_table_add_foreign_key(plan),
             sql::LogicalPlan::AlterTableRename {
                 table_name,
                 new_table_name,
@@ -11797,14 +12061,37 @@ impl EmbeddedDatabase {
         let col_values = if on_branch {
             Self::tuple_column_values(schema, &tuple)
         } else {
+            // `constraints_prechecked` IS the row state, and the funnel needs
+            // it spelled out rather than inferred:
+            //
+            // * `false` — the refusal below becomes this statement's error and
+            //   the row is never written, so the entries it managed to take are
+            //   phantoms and the funnel must take them all back
+            //   (`RowState::NotStored`, all-or-nothing).
+            // * `true` — the batch caller validated PK/UNIQUE for every row up
+            //   front and writes this one whatever the ART answers (the `put`
+            //   below is unconditional), so the row IS stored:
+            //   `RowState::Stored`. Undoing there would leave a committed row
+            //   with no PRIMARY KEY entry — countable by a full scan,
+            //   unreachable by `WHERE pk = …`, its key free for the next INSERT
+            //   to claim a second time. The refusal is instead reported at ERROR
+            //   (a duplicate raced past the pre-check and is now stored); it is
+            //   not turned into a statement error because the entries this row
+            //   already owns are being KEPT, so unwinding the statement here
+            //   would leave them behind with no row to describe.
+            let row_state = if constraints_prechecked {
+                storage::RowState::Stored
+            } else {
+                storage::RowState::NotStored
+            };
             match self
                 .storage
                 .art_indexes()
-                .on_insert_tuple_collect_index_values(table_name, row_id, schema, &tuple)
+                .on_insert_tuple_collect_index_values(table_name, row_id, schema, &tuple, row_state)
             {
                 Ok(values) => values,
                 Err(e) if constraints_prechecked => {
-                    tracing::debug!("ART index insert for '{}': {}", table_name, e);
+                    storage::StorageEngine::note_index_maintenance_failure(table_name, row_id, &e);
                     Self::tuple_column_values(schema, &tuple)
                 }
                 Err(e) => return Err(Error::constraint_violation(e.to_string())),
@@ -11905,7 +12192,13 @@ impl EmbeddedDatabase {
 
         let set_col_idx = schema.get_column_index(set_col)?;
         let set_column = schema.get_column_at(set_col_idx)?;
-        if set_column.primary_key || set_column.unique {
+        // See the param-update spec: the schema flag misses `CREATE UNIQUE
+        // INDEX` / `ALTER TABLE … ADD CONSTRAINT … UNIQUE`, so the index
+        // registry decides too.
+        if set_column.primary_key
+            || set_column.unique
+            || self.storage.art_indexes().column_in_unique_index(table_name, set_col)
+        {
             tracing::debug!(target: "helios::fastpath", reason = "lit-update-spec:set-col-pk-or-unique", "fast-update bail");
             return None;
         }
@@ -14453,6 +14746,36 @@ impl EmbeddedDatabase {
             return self.handle_drop_database(name, *if_exists);
         }
         match plan {
+            // CONSTRAINT DDL, routed to the SAME bodies the text family runs.
+            //
+            // ALTER TABLE as a whole is still unimplemented on this family (it
+            // falls through to `Executor::plan_to_operator`'s catch-all —
+            // `rename_table_trigger_tests` pins that), but a constraint
+            // statement that works over psql and errors over psycopg3 / JDBC /
+            // sqlx is exactly the path-dependent enforcement this repo keeps
+            // shipping: extended-protocol drivers are what migration tools use,
+            // and `ADD CONSTRAINT … UNIQUE` is one of the statements Prisma
+            // emits. The three constraint arms therefore route here explicitly;
+            // widening the rest of ALTER to this family is a separate change.
+            sql::LogicalPlan::AlterTableAddUnique {
+                table_name,
+                constraint_name,
+                columns,
+            } => Ok((
+                self.alter_table_add_unique(table_name, constraint_name, columns)?,
+                Vec::new(),
+            )),
+            sql::LogicalPlan::AlterTableDropConstraint {
+                table_name,
+                constraint_name,
+                if_exists,
+            } => Ok((
+                self.alter_table_drop_constraint(table_name, constraint_name, *if_exists)?,
+                Vec::new(),
+            )),
+            sql::LogicalPlan::AlterTableAddForeignKey { .. } => {
+                Ok((self.alter_table_add_foreign_key(plan)?, Vec::new()))
+            }
             sql::LogicalPlan::Insert {
                 table_name,
                 columns,
@@ -14713,7 +15036,10 @@ impl EmbeddedDatabase {
                                             .art_indexes()
                                             .on_insert(table_name, row_id, &staged_col_values)
                                     {
-                                        tracing::debug!("ART index insert for '{}': {}", table_name, e);
+                                        // The row is in the transaction's write
+                                        // set by now: a refusal is a stored
+                                        // duplicate, reported at ERROR.
+                                        storage::StorageEngine::note_index_maintenance_failure(table_name, row_id, &e);
                                     }
                                     self.push_art_undo(
                                         txn,
@@ -14756,10 +15082,25 @@ impl EmbeddedDatabase {
                             }
                             count += 1;
                         }
-                        (Err(_), Some(sql::logical_plan::OnConflictAction::DoNothing)) => {
-                            // Silent skip — no count increment.
+                        (Err(e), Some(sql::logical_plan::OnConflictAction::DoNothing { conflict_target })) => {
+                            // Silent skip — no count increment — but ONLY when
+                            // the conflict is on the named constraint. Mirrors
+                            // the text family: `ON CONFLICT (v) DO NOTHING`
+                            // does not swallow a PRIMARY KEY collision.
+                            if !self.conflict_matches_target(table_name, &col_values_map, conflict_target.as_deref()) {
+                                // Same classification the `(Err(e), None)` arm
+                                // below uses, so the wire still maps it to 23505.
+                                return Err(Error::constraint_violation(e.to_string()));
+                            }
                         }
-                        (Err(e), Some(sql::logical_plan::OnConflictAction::DoUpdate { assignments, selection })) => {
+                        (
+                            Err(e),
+                            Some(sql::logical_plan::OnConflictAction::DoUpdate {
+                                assignments,
+                                selection,
+                                conflict_target,
+                            }),
+                        ) => {
                             // Locate the existing row.
                             //
                             // KanttBan / Token-Dashboard Quirk I (v3.27):
@@ -14775,48 +15116,45 @@ impl EmbeddedDatabase {
                             // checked by `check_unique_constraints` above
                             // — we're just reading the row_id we already
                             // know exists).
-                            let mut found_row_id: Option<u64> = None;
-                            let art = self.storage.art_indexes();
-                            for (i, col) in schema.columns.iter().enumerate() {
-                                if (col.unique || col.primary_key) && !col.primary_key {
-                                    if let Some(val) = tuple.values.get(i) {
-                                        if !matches!(val, Value::Null) {
-                                            // Index fast-path: O(log N) lookup against the
-                                            // unique index that the conflict above already
-                                            // proved exists.
-                                            if let Some(name) = art.find_column_index(table_name, &col.name) {
-                                                let key = storage::ArtIndexManager::encode_key(&[val.clone()]);
-                                                let row_ids = art.index_get_all(&name, &key);
-                                                if let Some(rid) = row_ids.first() {
-                                                    found_row_id = Some(*rid);
-                                                }
-                                            }
-                                            if found_row_id.is_some() {
-                                                break;
-                                            }
-                                        }
-                                    }
+                            //
+                            // v4.31.0: the same shared probe the text family
+                            // uses. It used to walk `schema.columns` looking for
+                            // the `unique` FLAG and fall back to the PK, which
+                            // saw neither a composite `UNIQUE (a, b)` nor a
+                            // `CREATE UNIQUE INDEX` — the two shapes Prisma's
+                            // upserts actually target — and could pick the WRONG
+                            // index entirely (`find_column_index` returns any
+                            // single-column index on the column, including a
+                            // non-unique secondary one, whose `index_get_all`
+                            // can return an unrelated row). `find_unique_conflict`
+                            // returns the row_id of the row the PK/UNIQUE index
+                            // says collides, and nothing else.
+                            //
+                            // ARBITER: identical rule to the text family — with
+                            // an `ON CONFLICT (<cols>)` target, only THAT
+                            // constraint is probed, and a collision on any
+                            // other one re-raises the original 23505 rather
+                            // than upserting onto a row the statement never
+                            // named.
+                            let existing_row_id = match self.storage.art_indexes().find_unique_conflict(
+                                table_name,
+                                &col_values_map,
+                                conflict_target.as_deref(),
+                            ) {
+                                Some(conflict) => conflict.row_id,
+                                // Conflict on a NON-target constraint: re-raise the
+                                // original violation, classified exactly as the
+                                // `(Err(e), None)` arm classifies it (23505).
+                                None if conflict_target.is_some() => {
+                                    return Err(Error::constraint_violation(e.to_string()))
                                 }
-                            }
-                            if found_row_id.is_none() {
-                                let pk_values: Vec<Value> = schema
-                                    .columns
-                                    .iter()
-                                    .enumerate()
-                                    .filter(|(_, c)| c.primary_key)
-                                    .filter_map(|(i, _)| tuple.values.get(i).cloned())
-                                    .collect();
-                                if !pk_values.is_empty() && !pk_values.iter().any(|v| matches!(v, Value::Null)) {
-                                    let pk_key = crate::storage::ArtIndexManager::encode_key(&pk_values);
-                                    found_row_id = self.storage.art_indexes().pk_index_lookup(table_name, &pk_key);
+                                None => {
+                                    return Err(Error::query_execution(format!(
+                                        "ON CONFLICT DO UPDATE: could not find existing row ({})",
+                                        e
+                                    )))
                                 }
-                            }
-                            let existing_row_id = found_row_id.ok_or_else(|| {
-                                Error::query_execution(format!(
-                                    "ON CONFLICT DO UPDATE: could not find existing row ({})",
-                                    e
-                                ))
-                            })?;
+                            };
 
                             // Read the existing tuple from storage.
                             let existing_key = self.storage.branch_aware_data_key(table_name, existing_row_id);
@@ -15156,8 +15494,17 @@ impl EmbeddedDatabase {
                 // Intra-statement UNIQUE/PK dedup state — declared before the
                 // per-row loop so a multi-row UPDATE that creates a duplicate
                 // *within itself* is caught, exactly as in the text family.
-                let mut seen_column_unique_update_keys: Vec<(String, Value)> = Vec::new();
-                let mut seen_table_unique_update_keys: Vec<(Vec<String>, Vec<Value>)> = Vec::new();
+                let mut seen_column_unique_update_keys: Vec<(String, Value, Option<u64>)> = Vec::new();
+                let mut seen_table_unique_update_keys: Vec<(Vec<String>, Vec<Value>, Option<u64>)> = Vec::new();
+                // The column sets the LIVE ART registry enforces (a
+                // `CREATE UNIQUE INDEX` sets no schema flag and writes no
+                // constraint record, so nothing else sees it). Resolved ONCE
+                // here, not inside `enforce_unique_on_update`: that helper runs
+                // per updated ROW, and asking the registry per row took a
+                // global lock and cloned a `Vec<String>` per index of the table
+                // on every row of a bulk UPDATE — for an answer that cannot
+                // change within one statement.
+                let index_unique_sets = self.storage.art_indexes().unique_column_sets(table_name);
 
                 for tuple in tuples {
                     let matches = if let Some(predicate) = selection {
@@ -15255,6 +15602,7 @@ impl EmbeddedDatabase {
                             &tuple,
                             &mut seen_column_unique_update_keys,
                             &mut seen_table_unique_update_keys,
+                            &index_unique_sets,
                         )?;
 
                         let row_id = tuple.row_id.unwrap_or(0);
@@ -15353,11 +15701,83 @@ impl EmbeddedDatabase {
                     }
                     updates.len() as u64
                 } else {
+                    // AUTOCOMMIT params-family UPDATE (no session transaction):
+                    // `update_tuples_branch_aware` writes the row, the versions,
+                    // the WAL record, the MV/SMFI deltas and the HNSW vector
+                    // index — but it does NOT touch the ART indexes, and it is
+                    // the ONLY write funnel that does not. Every row updated
+                    // through it (an UPDATE with RETURNING, or with a non-PK
+                    // predicate, on the extended protocol / REST) therefore left
+                    // stale ART entries behind: `WHERE unique_col = <old value>`
+                    // kept resolving to the row and `WHERE unique_col = <new
+                    // value>` could not find it, and — once UNIQUE is actually
+                    // enforced on UPDATE — the stale entry rejected the row's
+                    // OWN value as a duplicate ("toggle a UNIQUE column through
+                    // NULL and back" failed on round 1 with 23505).
+                    //
+                    // Maintained here rather than inside the storage funnel
+                    // because this is where the logical pre-image lives: the
+                    // funnel only receives the new tuples, and the pre-image it
+                    // could re-read is the STORED form (dictionary / columnar
+                    // references), whose encoded index keys are not the row's.
+                    //
+                    // Same shape as the transactional branch above: gated on an
+                    // indexed column actually changing (R0.2), skipped entirely
+                    // on a branch (W2.0 — the row lands in `bdata:` and the
+                    // shared ART is branch-blind). No undo log: an autocommit
+                    // statement has no ROLLBACK to undo it.
+                    let on_branch = self.storage.get_current_branch().is_some();
+                    let mut art_maintenance: Vec<(
+                        u64,
+                        std::collections::HashMap<String, Value>,
+                        std::collections::HashMap<String, Value>,
+                    )> = Vec::new();
+                    if !on_branch {
+                        for (row_id, old_tuple, tuple) in &updates {
+                            if !self
+                                .storage
+                                .art_indexes()
+                                .tuple_update_affects_indexes(table_name, &schema, old_tuple, tuple)
+                            {
+                                continue;
+                            }
+                            let mut old_col_values = std::collections::HashMap::with_capacity(schema.columns.len());
+                            let mut new_col_values = std::collections::HashMap::with_capacity(schema.columns.len());
+                            for (i, col) in schema.columns.iter().enumerate() {
+                                if let Some(v) = old_tuple.values.get(i) {
+                                    old_col_values.insert(col.name.clone(), v.clone());
+                                }
+                                if let Some(v) = tuple.values.get(i) {
+                                    new_col_values.insert(col.name.clone(), v.clone());
+                                }
+                            }
+                            art_maintenance.push((*row_id, old_col_values, new_col_values));
+                        }
+                    }
                     let updates: Vec<(u64, Tuple)> = updates
                         .into_iter()
                         .map(|(row_id, _old_tuple, tuple)| (row_id, tuple))
                         .collect();
-                    self.storage.update_tuples_branch_aware(table_name, updates)?
+                    let written = self.storage.update_tuples_branch_aware(table_name, updates)?;
+                    // After the row is durable, so a concurrent probe can never
+                    // be pointed at a row that is not there yet.
+                    for (row_id, old_col_values, new_col_values) in &art_maintenance {
+                        if let Err(e) = self
+                            .storage
+                            .art_indexes()
+                            .on_delete(table_name, *row_id, old_col_values)
+                        {
+                            tracing::debug!("ART index update/delete-old for '{}': {}", table_name, e);
+                        }
+                        if let Err(e) = self
+                            .storage
+                            .art_indexes()
+                            .on_insert(table_name, *row_id, new_col_values)
+                        {
+                            tracing::debug!("ART index update/insert-new for '{}': {}", table_name, e);
+                        }
+                    }
+                    written
                 };
                 Ok((count, returned_tuples))
             }
@@ -19911,6 +20331,91 @@ impl EmbeddedDatabase {
     /// degrade to "does the parent have ANY row" instead of the keyed probe.
     /// A parent without a PRIMARY KEY yields an empty list (unchanged
     /// behavior); the FK is recorded but the keyed fast path stays off.
+    /// Reject a FOREIGN KEY whose target does not exist, at DDL time, the way
+    /// PostgreSQL does.
+    ///
+    /// `CREATE TABLE t (p INT REFERENCES nosuch(id))` and
+    /// `ALTER TABLE t ADD FOREIGN KEY (p) REFERENCES nosuch(id)` both used to
+    /// SUCCEED here: the constraint was persisted against a table that does not
+    /// exist, `create_fk_index` registered an index whose parent probe could
+    /// never resolve, and every later INSERT passed the FK check. A migration
+    /// with a typo'd or out-of-order table therefore reported success and
+    /// produced a database with no referential integrity at all — the failure
+    /// mode is silent, which is why this is checked at DDL time and not left to
+    /// the write path.
+    ///
+    /// * missing table  → `relation "t" does not exist`  (the wire classifier
+    ///   maps the "relation … does not exist" shape to 42P01 undefined_table);
+    /// * missing column → `column "c" referenced in foreign key constraint does
+    ///   not exist` (the `column "` shape maps to 42703 undefined_column).
+    ///
+    /// A SELF-reference stays legal: `CREATE TABLE t (id INT PRIMARY KEY, p INT
+    /// REFERENCES t(id))` reaches this only after `catalog.create_table` has
+    /// registered `t`, so the lookup succeeds like any other.
+    fn validate_fk_reference(
+        catalog: &storage::Catalog<'_>,
+        references_table: &str,
+        referenced_columns: &[String],
+    ) -> Result<()> {
+        let parent = catalog
+            .get_table_schema(references_table)
+            .map_err(|_| Error::query_execution(format!("relation \"{}\" does not exist", references_table)))?;
+        for col in referenced_columns {
+            if !parent.columns.iter().any(|c| c.name.eq_ignore_ascii_case(col)) {
+                return Err(Error::query_execution(format!(
+                    "column \"{}\" referenced in foreign key constraint does not exist",
+                    col
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate every FOREIGN KEY target of a `CREATE TABLE`, BEFORE the table
+    /// is created.
+    ///
+    /// Runs ahead of `catalog.create_table` so a bad target rejects the whole
+    /// statement instead of leaving a created-but-constraint-less table behind.
+    /// That ordering is what makes a SELF-reference a special case here: the
+    /// table is not in the catalog yet, so `REFERENCES <self>(col)` is checked
+    /// against the columns being declared.
+    fn validate_create_table_fk_targets(
+        catalog: &storage::Catalog<'_>,
+        table_name: &str,
+        columns: &[sql::logical_plan::ColumnDef],
+        constraints: &[sql::logical_plan::TableConstraint],
+    ) -> Result<()> {
+        for constraint in constraints {
+            let sql::logical_plan::TableConstraint::ForeignKey {
+                references_table,
+                references_columns,
+                ..
+            } = constraint
+            else {
+                continue;
+            };
+            // Self-reference. Compared on the BARE name as well as the full key:
+            // inside `CREATE TABLE s.emp (… REFERENCES emp(id))` under
+            // `search_path TO s`, the planner cannot resolve `emp` to `s.emp`
+            // (it does not exist yet) and leaves it bare, so a full-key
+            // comparison alone would call a legal self-reference a dangling one.
+            let bare = |name: &str| name.rsplit('.').next().unwrap_or(name).to_ascii_lowercase();
+            if references_table.eq_ignore_ascii_case(table_name) || bare(references_table) == bare(table_name) {
+                for col in references_columns {
+                    if !columns.iter().any(|c| c.name.eq_ignore_ascii_case(col)) {
+                        return Err(Error::query_execution(format!(
+                            "column \"{}\" referenced in foreign key constraint does not exist",
+                            col
+                        )));
+                    }
+                }
+                continue;
+            }
+            Self::validate_fk_reference(catalog, references_table, references_columns)?;
+        }
+        Ok(())
+    }
+
     fn resolve_fk_referenced_columns(
         catalog: &storage::Catalog<'_>,
         references_table: &str,
@@ -20532,6 +21037,61 @@ impl EmbeddedDatabase {
         Ok(())
     }
 
+    /// Is the unique conflict a row provokes on the constraint the
+    /// `ON CONFLICT (<cols>)` clause NAMED?
+    ///
+    /// `None` (a targetless `ON CONFLICT`, or MySQL's `ON DUPLICATE KEY
+    /// UPDATE`) means "any unique constraint" and is always a match.
+    ///
+    /// Used by the DO NOTHING legs of both executor families. PostgreSQL's
+    /// arbiter selects a constraint: a collision on a DIFFERENT one is an
+    /// ordinary 23505 the clause does not handle, so skipping the row there
+    /// would silently swallow a write the user never told us to drop.
+    fn conflict_matches_target(
+        &self,
+        table_name: &str,
+        col_values: &std::collections::HashMap<String, Value>,
+        conflict_target: Option<&[String]>,
+    ) -> bool {
+        let Some(target) = conflict_target else {
+            return true;
+        };
+        self.storage
+            .art_indexes()
+            .find_unique_conflict(table_name, col_values, Some(target))
+            .is_some()
+    }
+
+    /// Does an intra-statement dedup entry recorded for `seen_row` collide with
+    /// the row being validated now?
+    ///
+    /// The `seen_*` vectors exist for ONE case: a single statement that moves
+    /// TWO rows onto the same unique value must be rejected even though neither
+    /// row collides with anything already in the index. Keyed by
+    /// `(columns, values)` alone, they silently assumed each row is validated at
+    /// most ONCE per column set — and that is false. A table-level
+    /// `UNIQUE (v)` on a single column is recorded TWICE: once as the
+    /// table-level constraint the `CREATE TABLE` arm saves, and once as the
+    /// column-flag constraint the same arm's column pass adds before merging the
+    /// records back together. Both records name the same column set, so the same
+    /// row was checked against it twice and the second check reported the first
+    /// check's own entry as a duplicate. `UPDATE t SET v = 'x' WHERE id = 1`
+    /// then failed with a UNIQUE violation against ITSELF whenever the row did
+    /// not already hold `'x'` — the "row wedges after toggling a UNIQUE column
+    /// through NULL" report, which reproduced on both executor families and with
+    /// or without RETURNING because the dedup sits above all four funnels.
+    ///
+    /// Keying on the row id makes the check say what it always meant: a
+    /// collision only when a DIFFERENT row claimed the value earlier in this
+    /// statement. An unknown identity on either side still counts as a
+    /// collision, so this can only ever fail CLOSED.
+    fn intra_statement_collision(seen_row: Option<u64>, current_row: Option<u64>) -> bool {
+        match (seen_row, current_row) {
+            (Some(seen), Some(current)) => seen != current,
+            _ => true,
+        }
+    }
+
     /// Enforce column-level and table-level UNIQUE / PRIMARY KEY constraints
     /// for a row that is about to be updated.
     ///
@@ -20545,10 +21105,36 @@ impl EmbeddedDatabase {
     /// still be rejected, so callers declare both vectors once before their
     /// per-row loop and pass them in for every row.
     ///
-    /// Self-collision: `unique_key_exists` probes an ART index that still
-    /// contains the row being updated, so every check is gated on the value
-    /// having actually *changed* (`old == new` → skip). A no-op
-    /// `SET email = <the value it already holds>` therefore does not raise.
+    /// `index_unique_sets` is the third of those per-STATEMENT values: the
+    /// column sets the live ART registry enforces, from
+    /// `ArtIndexManager::unique_column_sets`. It is a parameter and not a call
+    /// inside this function because this function runs ONCE PER UPDATED ROW —
+    /// asking the registry per row took a global lock and cloned a `Vec<String>`
+    /// for every PK/UNIQUE index of the table on every row of a bulk UPDATE,
+    /// work that cannot change between rows of one statement. Callers build it
+    /// alongside the two `seen_*` vectors, before their row loop.
+    ///
+    /// Self-collision: the probe runs against an ART index that still contains
+    /// the row being updated, so a row must never be reported as colliding with
+    /// ITSELF. Two independent guards, because either one alone has a hole:
+    ///
+    ///  * every check is gated on the value having actually *changed*
+    ///    (`old == new` → skip), so a no-op `SET email = <the value it already
+    ///    holds>` does not raise; and
+    ///  * the index probe EXCLUDES this row's own row id
+    ///    (`unique_key_taken_by_other_row`), so a value the row itself owns in
+    ///    the index cannot reject it even when the pre-image disagrees with
+    ///    what the index holds. That happens whenever some write path failed to
+    ///    maintain the index — which is exactly how `UPDATE tog SET v = 'tick'`
+    ///    came to be rejected as a duplicate of the same row's own earlier
+    ///    `'tick'` after a round-trip through NULL. Fixing the maintenance is
+    ///    the real repair (and is done); this makes the CHECK correct on its
+    ///    own terms instead of depending on it.
+    ///
+    /// Excluding one row id can only ever accept a row PostgreSQL also accepts:
+    /// a genuine duplicate is held by a DIFFERENT row id and still rejects. A
+    /// row with no id (`row_id: None`) excludes nothing and takes the strict
+    /// existence check — fail closed.
     fn enforce_unique_on_update(
         &self,
         table_name: &str,
@@ -20556,9 +21142,14 @@ impl EmbeddedDatabase {
         table_constraints: &sql::TableConstraints,
         old_tuple: &Tuple,
         new_tuple: &Tuple,
-        seen_column_keys: &mut Vec<(String, Value)>,
-        seen_table_keys: &mut Vec<(Vec<String>, Vec<Value>)>,
+        seen_column_keys: &mut Vec<(String, Value, Option<u64>)>,
+        seen_table_keys: &mut Vec<(Vec<String>, Vec<Value>, Option<u64>)>,
+        index_unique_sets: &[Vec<String>],
     ) -> Result<()> {
+        // The row being updated, so no pass can report it as its own duplicate.
+        // `new_tuple` carries the id on the UPDATE arms (it is a clone of the
+        // scanned row); `old_tuple` carries it on the ON CONFLICT DO UPDATE leg.
+        let updated_row_id = new_tuple.row_id.or(old_tuple.row_id);
         for (idx, col) in schema.columns.iter().enumerate() {
             if !col.primary_key && !col.unique {
                 continue;
@@ -20577,27 +21168,29 @@ impl EmbeddedDatabase {
             if col.unique && matches!(new_value, Value::Null) {
                 continue;
             }
-            if seen_column_keys
-                .iter()
-                .any(|(seen_col, seen_value)| seen_col == &col.name && seen_value == new_value)
-            {
+            if seen_column_keys.iter().any(|(seen_col, seen_value, seen_row)| {
+                seen_col == &col.name
+                    && seen_value == new_value
+                    && Self::intra_statement_collision(*seen_row, updated_row_id)
+            }) {
                 return Err(Error::constraint_violation(format!(
                     "UNIQUE constraint violated: duplicate value for column '{}'",
                     col.name
                 )));
             }
             let columns = [col.name.clone()];
-            if self
-                .storage
-                .art_indexes()
-                .unique_key_exists(table_name, &columns, std::slice::from_ref(new_value))
-            {
+            if self.storage.art_indexes().unique_key_taken_by_other_row(
+                table_name,
+                &columns,
+                std::slice::from_ref(new_value),
+                updated_row_id,
+            ) {
                 return Err(Error::constraint_violation(format!(
                     "UNIQUE constraint violated: duplicate value for column '{}'",
                     col.name
                 )));
             }
-            seen_column_keys.push((col.name.clone(), new_value.clone()));
+            seen_column_keys.push((col.name.clone(), new_value.clone(), updated_row_id));
         }
 
         for unique in &table_constraints.unique_constraints {
@@ -20633,29 +21226,106 @@ impl EmbeddedDatabase {
                 continue;
             }
             if old_values.len() == unique.columns.len() && new_values.len() == unique.columns.len() {
-                if seen_table_keys
-                    .iter()
-                    .any(|(seen_cols, seen_values)| seen_cols == &unique.columns && seen_values == &new_values)
-                {
+                if seen_table_keys.iter().any(|(seen_cols, seen_values, seen_row)| {
+                    seen_cols == &unique.columns
+                        && seen_values == &new_values
+                        && Self::intra_statement_collision(*seen_row, updated_row_id)
+                }) {
                     return Err(Error::constraint_violation(format!(
                         "UNIQUE constraint '{}' violated: duplicate value for columns ({})",
                         unique.name,
                         unique.columns.join(", ")
                     )));
                 }
-                if self
-                    .storage
-                    .art_indexes()
-                    .unique_key_exists(table_name, &unique.columns, &new_values)
-                {
+                if self.storage.art_indexes().unique_key_taken_by_other_row(
+                    table_name,
+                    &unique.columns,
+                    &new_values,
+                    updated_row_id,
+                ) {
                     return Err(Error::constraint_violation(format!(
                         "UNIQUE constraint '{}' violated: duplicate value for columns ({})",
                         unique.name,
                         unique.columns.join(", ")
                     )));
                 }
-                seen_table_keys.push((unique.columns.clone(), new_values));
+                seen_table_keys.push((unique.columns.clone(), new_values, updated_row_id));
             }
+        }
+
+        // A `CREATE UNIQUE INDEX` is an index and NOT a constraint record: it
+        // sets no column flag and writes no `TableConstraints` entry, so neither
+        // loop above can see it. Without this third pass the index rejected
+        // duplicate INSERTs (which probe the ART registry) while an UPDATE onto
+        // an existing value went straight through — enforcement that depends on
+        // which statement you use. Driven off the live registry (resolved ONCE
+        // per statement by the caller — see `index_unique_sets`), and skipping
+        // any column set the loops above already covered so no constraint is
+        // checked (or reported) twice.
+        for columns in index_unique_sets {
+            let covered_by_column_flag = columns.len() == 1
+                && columns.first().is_some_and(|c| {
+                    schema
+                        .columns
+                        .iter()
+                        .any(|sc| sc.name.eq_ignore_ascii_case(c) && (sc.unique || sc.primary_key))
+                });
+            let covered_by_constraint = table_constraints
+                .unique_constraints
+                .iter()
+                .any(|uc| &uc.columns == columns);
+            if covered_by_column_flag || covered_by_constraint {
+                continue;
+            }
+
+            let mut old_values = Vec::with_capacity(columns.len());
+            let mut new_values = Vec::with_capacity(columns.len());
+            let mut changed = false;
+            let mut has_null = false;
+            let mut resolvable = true;
+            for col_name in columns {
+                let Some(idx) = schema.get_column_index(col_name) else {
+                    resolvable = false;
+                    break;
+                };
+                let old_value = old_tuple.values.get(idx).cloned().unwrap_or(Value::Null);
+                let new_value = new_tuple.values.get(idx).cloned().unwrap_or(Value::Null);
+                if old_value != new_value {
+                    changed = true;
+                }
+                if matches!(new_value, Value::Null) {
+                    has_null = true;
+                }
+                old_values.push(old_value);
+                new_values.push(new_value);
+            }
+            // NULLs are distinct (PostgreSQL), and an unchanged key cannot
+            // collide with anything it did not already collide with.
+            if !resolvable || !changed || has_null {
+                continue;
+            }
+            if seen_table_keys.iter().any(|(seen_cols, seen_values, seen_row)| {
+                seen_cols == columns
+                    && seen_values == &new_values
+                    && Self::intra_statement_collision(*seen_row, updated_row_id)
+            }) {
+                return Err(Error::constraint_violation(format!(
+                    "UNIQUE constraint violated: duplicate value for columns ({})",
+                    columns.join(", ")
+                )));
+            }
+            if self.storage.art_indexes().unique_key_taken_by_other_row(
+                table_name,
+                columns,
+                &new_values,
+                updated_row_id,
+            ) {
+                return Err(Error::constraint_violation(format!(
+                    "UNIQUE constraint violated: duplicate value for columns ({})",
+                    columns.join(", ")
+                )));
+            }
+            seen_table_keys.push((columns.clone(), new_values, updated_row_id));
         }
 
         Ok(())
@@ -20692,8 +21362,12 @@ impl EmbeddedDatabase {
         self.validate_check_constraints(table_constraints, schema, &updated_tuple.values)?;
         // ON CONFLICT handles one conflicting row at a time, so the
         // intra-statement dedup state starts empty for every conflicting row.
-        let mut seen_column_keys: Vec<(String, Value)> = Vec::new();
-        let mut seen_table_keys: Vec<(Vec<String>, Vec<Value>)> = Vec::new();
+        let mut seen_column_keys: Vec<(String, Value, Option<u64>)> = Vec::new();
+        let mut seen_table_keys: Vec<(Vec<String>, Vec<Value>, Option<u64>)> = Vec::new();
+        // ON CONFLICT re-validates one row at a time, so this is already a
+        // per-statement-per-conflicting-row call; resolving the registry sets
+        // here costs the same as passing them in would.
+        let index_unique_sets = self.storage.art_indexes().unique_column_sets(table_name);
         self.enforce_unique_on_update(
             table_name,
             schema,
@@ -20702,6 +21376,7 @@ impl EmbeddedDatabase {
             updated_tuple,
             &mut seen_column_keys,
             &mut seen_table_keys,
+            &index_unique_sets,
         )
     }
 

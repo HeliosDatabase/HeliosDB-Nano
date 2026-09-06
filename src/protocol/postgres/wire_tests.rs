@@ -4582,3 +4582,414 @@ async fn extended_parameterized_returning_may_update_the_same_row_twice_in_one_t
         "both updates roll back together"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Prisma P0 — UNIQUE enforcement and ON CONFLICT over the wire.
+//
+// The statements below are the ones the HeliosDB Partner Portal (Prisma 7.10)
+// actually emits, verbatim: quoted, schema-qualified, `CREATE UNIQUE INDEX` for
+// every `@unique`, and `ON CONFLICT (…) DO UPDATE … RETURNING` for every
+// upsert. All of them used to report success and enforce nothing:
+//   * `CREATE UNIQUE INDEX` built an ordinary secondary index (the planner
+//     discarded sqlparser's `unique` flag), so duplicates kept landing;
+//   * a second table declaring the same UNIQUE column name could not register
+//     its index at all (the ART registry is one GLOBAL name map and the index
+//     was named after the bare COLUMN), so its constraint was enforced by
+//     nothing — which is why enforcement looked state-dependent;
+//   * `ON CONFLICT` discarded the conflict target, and its DO UPDATE leg could
+//     not resolve the existing row for a composite constraint or a non-integer
+//     primary key.
+// ---------------------------------------------------------------------------
+
+/// Prisma's `@unique`: `CREATE UNIQUE INDEX "Account_email_key" ON
+/// "public"."Account"("email")`, then a duplicate INSERT through the EXTENDED
+/// protocol (the family every real driver uses) — 23505, no command tag, and a
+/// connection that survives.
+#[tokio::test]
+async fn wire_prisma_unique_index_rejects_a_duplicate_with_23505() {
+    use super::messages::FrontendMessage;
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+
+    for setup in [
+        "CREATE TABLE \"Account\" (\"id\" TEXT PRIMARY KEY, \"email\" TEXT, \"n\" INTEGER)",
+        "CREATE UNIQUE INDEX \"Account_email_key\" ON \"public\".\"Account\"(\"email\")",
+        "INSERT INTO \"public\".\"Account\" (\"id\", \"email\", \"n\") VALUES ('a', 'a@x.dev', 1)",
+    ] {
+        wire_setup(&mut handler, &mut client, setup).await;
+    }
+
+    handler
+        .dispatch_message(FrontendMessage::Parse {
+            statement_name: "s_acct".into(),
+            query: "INSERT INTO \"public\".\"Account\" (\"id\", \"email\", \"n\") VALUES ($1, $2, $3)".into(),
+            param_types: vec![25, 25, 23],
+        })
+        .await
+        .expect("parse");
+    handler
+        .dispatch_message(FrontendMessage::Bind {
+            portal_name: "p_acct".into(),
+            statement_name: "s_acct".into(),
+            param_formats: vec![0, 0, 0],
+            params: vec![Some(b"b".to_vec()), Some(b"a@x.dev".to_vec()), Some(b"2".to_vec())],
+            result_formats: vec![],
+        })
+        .await
+        .expect("bind");
+    let _ = drain(&mut client).await;
+
+    handler
+        .dispatch_message(FrontendMessage::Execute {
+            portal_name: "p_acct".into(),
+            max_rows: 0,
+        })
+        .await
+        .expect("execute");
+    let out = drain(&mut client).await;
+    assert_eq!(
+        sqlstates(&out),
+        vec!["23505".to_string()],
+        "*** UNENFORCED CONSTRAINT *** a duplicate email was accepted through CREATE UNIQUE INDEX"
+    );
+    assert!(
+        command_tags(&out).is_empty(),
+        "a rejected Execute must not also be acked, got {:?}",
+        command_tags(&out)
+    );
+
+    handler.dispatch_message(FrontendMessage::Sync).await.expect("sync");
+    let _ = drain(&mut client).await;
+
+    // Exactly one row survives, and the connection is still usable.
+    let out = wire_query(&mut handler, &mut client, "SELECT \"id\" FROM \"Account\"").await;
+    assert!(sqlstates(&out).is_empty(), "connection wedged: {:?}", sqlstates(&out));
+    assert_eq!(data_rows(&out).len(), 1, "the duplicate row was stored anyway");
+}
+
+/// A SECOND table declaring the same UNIQUE column name — the portal's
+/// `"O1"."login"` / `"O2"."login"` finding.
+#[tokio::test]
+async fn wire_second_table_with_the_same_unique_column_still_enforces() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+
+    for setup in [
+        "CREATE TABLE \"O1\" (\"id\" INT PRIMARY KEY, \"login\" VARCHAR(39) UNIQUE NOT NULL)",
+        "CREATE TABLE \"O2\" (\"id\" INT PRIMARY KEY, \"login\" VARCHAR(39) NOT NULL UNIQUE)",
+        "INSERT INTO \"O1\" (\"id\", \"login\") VALUES (1, 'octocat')",
+        "INSERT INTO \"O2\" (\"id\", \"login\") VALUES (1, 'octocat')",
+    ] {
+        wire_setup(&mut handler, &mut client, setup).await;
+    }
+
+    assert_wire_sqlstate(
+        &mut handler,
+        &mut client,
+        "INSERT INTO \"O2\" (\"id\", \"login\") VALUES (2, 'octocat')",
+        "23505",
+    )
+    .await;
+
+    let out = wire_query(&mut handler, &mut client, "SELECT \"id\" FROM \"O2\"").await;
+    assert_eq!(data_rows(&out).len(), 1, "*** DUPLICATE STORED *** in the second table");
+}
+
+/// Prisma's upsert shape against a COMPOSITE unique: quoted multi-column target,
+/// bound parameters, `EXCLUDED.*` and `RETURNING`. Run twice — the second run
+/// must UPDATE the existing row, not add a second one.
+#[tokio::test]
+async fn wire_prisma_composite_upsert_updates_and_never_duplicates() {
+    use super::messages::FrontendMessage;
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+
+    for setup in [
+        "CREATE TABLE \"ContributorStat\" (\"id\" TEXT PRIMARY KEY, \"repo\" TEXT, \"login\" TEXT, \
+         \"periodStart\" TEXT, \"commits\" INTEGER)",
+        "CREATE UNIQUE INDEX \"ContributorStat_repo_login_periodStart_key\" ON \
+         \"public\".\"ContributorStat\"(\"repo\", \"login\", \"periodStart\")",
+    ] {
+        wire_setup(&mut handler, &mut client, setup).await;
+    }
+
+    let upsert = "INSERT INTO \"public\".\"ContributorStat\" \
+                  (\"id\", \"repo\", \"login\", \"periodStart\", \"commits\") \
+                  VALUES ($1, $2, $3, $4, $5) \
+                  ON CONFLICT (\"repo\", \"login\", \"periodStart\") \
+                  DO UPDATE SET \"commits\" = EXCLUDED.\"commits\" \
+                  RETURNING \"id\", \"commits\"";
+
+    for (round, (id, commits)) in [("row-1", "3"), ("row-2", "9")].into_iter().enumerate() {
+        let stmt = format!("s_up{round}");
+        let portal = format!("p_up{round}");
+        handler
+            .dispatch_message(FrontendMessage::Parse {
+                statement_name: stmt.clone(),
+                query: upsert.into(),
+                param_types: vec![25, 25, 25, 25, 23],
+            })
+            .await
+            .unwrap_or_else(|e| panic!("round {round} parse: {e}"));
+        handler
+            .dispatch_message(FrontendMessage::Bind {
+                portal_name: portal.clone(),
+                statement_name: stmt,
+                param_formats: vec![0, 0, 0, 0, 0],
+                params: vec![
+                    Some(id.as_bytes().to_vec()),
+                    Some(b"helios/nano".to_vec()),
+                    Some(b"octocat".to_vec()),
+                    Some(b"2026-09-01".to_vec()),
+                    Some(commits.as_bytes().to_vec()),
+                ],
+                result_formats: vec![],
+            })
+            .await
+            .unwrap_or_else(|e| panic!("round {round} bind: {e}"));
+        let _ = drain(&mut client).await;
+        handler
+            .dispatch_message(FrontendMessage::Execute {
+                portal_name: portal,
+                max_rows: 0,
+            })
+            .await
+            .unwrap_or_else(|e| panic!("round {round} execute: {e}"));
+        let out = drain(&mut client).await;
+        assert!(
+            sqlstates(&out).is_empty(),
+            "round {round}: the Prisma upsert must succeed, got {:?}",
+            sqlstates(&out)
+        );
+        handler.dispatch_message(FrontendMessage::Sync).await.expect("sync");
+        let _ = drain(&mut client).await;
+    }
+
+    let out = wire_query(
+        &mut handler,
+        &mut client,
+        "SELECT \"id\", \"commits\" FROM \"ContributorStat\"",
+    )
+    .await;
+    let rows = data_rows(&out);
+    assert_eq!(
+        rows.len(),
+        1,
+        "*** DUPLICATE INSERTED *** the upsert added a second row for the same composite key"
+    );
+    let cells: Vec<String> = rows
+        .first()
+        .expect("one row")
+        .iter()
+        .map(|c| String::from_utf8_lossy(c.as_deref().unwrap_or(b"")).to_string())
+        .collect();
+    assert_eq!(
+        cells.first().map(String::as_str),
+        Some("row-1"),
+        "the EXISTING row must be the one updated"
+    );
+    assert_eq!(
+        cells.get(1).map(String::as_str),
+        Some("9"),
+        "EXCLUDED.commits was not applied"
+    );
+}
+
+/// `ON CONFLICT` on a column no unique constraint covers is 42P10
+/// invalid_column_reference, not a silent upsert against some other constraint.
+#[tokio::test]
+async fn wire_on_conflict_target_without_a_constraint_is_42p10() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+
+    for setup in [
+        "CREATE TABLE oc_wire (id INT PRIMARY KEY, v TEXT UNIQUE, n INT)",
+        "INSERT INTO oc_wire (id, v, n) VALUES (1, 'a', 1)",
+    ] {
+        wire_setup(&mut handler, &mut client, setup).await;
+    }
+
+    assert_wire_sqlstate(
+        &mut handler,
+        &mut client,
+        "INSERT INTO oc_wire (id, v, n) VALUES (2, 'b', 2) ON CONFLICT (n) DO UPDATE SET v = EXCLUDED.v",
+        "42P10",
+    )
+    .await;
+
+    // The legitimate target still works, and still does not duplicate.
+    let out = wire_query(
+        &mut handler,
+        &mut client,
+        "INSERT INTO oc_wire (id, v, n) VALUES (3, 'a', 7) ON CONFLICT (v) DO UPDATE SET n = EXCLUDED.n",
+    )
+    .await;
+    assert!(
+        sqlstates(&out).is_empty(),
+        "the valid target must work: {:?}",
+        sqlstates(&out)
+    );
+    let out = wire_query(&mut handler, &mut client, "SELECT id FROM oc_wire").await;
+    assert_eq!(data_rows(&out).len(), 1, "*** DUPLICATE INSERTED *** by the upsert");
+}
+
+/// The ON CONFLICT target ARBITRATES: a conflict on a constraint the clause
+/// does NOT name is 23505 over the wire, not a silent upsert onto a row the
+/// statement never mentioned.
+///
+/// `oc_arb (id PK, v UNIQUE)` holds `(1,'a',1)`. The statement proposes
+/// `(1,'z',5)` — clean on the named target `v`, colliding on the PRIMARY KEY.
+/// PostgreSQL raises 23505 on `oc_arb_pkey`. Before the arbiter reached the
+/// executor, the PK index was probed FIRST, its conflict was reported as the
+/// one to upsert on, and row 1 was silently rewritten — a wrong-row write with a
+/// success tag on the wire.
+#[tokio::test]
+async fn wire_on_conflict_non_target_conflict_is_23505_not_a_silent_upsert() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+
+    for setup in [
+        "CREATE TABLE oc_arb (id INT PRIMARY KEY, v TEXT UNIQUE, n INT)",
+        "INSERT INTO oc_arb (id, v, n) VALUES (1, 'a', 1)",
+        "INSERT INTO oc_arb (id, v, n) VALUES (2, 'b', 2)",
+    ] {
+        wire_setup(&mut handler, &mut client, setup).await;
+    }
+
+    assert_wire_sqlstate(
+        &mut handler,
+        &mut client,
+        "INSERT INTO oc_arb (id, v, n) VALUES (1, 'z', 5) ON CONFLICT (v) DO UPDATE SET n = EXCLUDED.n",
+        "23505",
+    )
+    .await;
+
+    // Nothing moved: neither row was rewritten by the rejected statement.
+    let out = wire_query(&mut handler, &mut client, "SELECT id, n FROM oc_arb ORDER BY id").await;
+    let rows = data_rows(&out);
+    assert_eq!(rows.len(), 2, "the rejected upsert changed the row count");
+    let cell = |row: usize, col: usize| -> String {
+        rows.get(row)
+            .and_then(|r| r.get(col))
+            .map(|c| String::from_utf8_lossy(c.as_deref().unwrap_or(b"")).to_string())
+            .unwrap_or_default()
+    };
+    assert_eq!(
+        cell(0, 1),
+        "1",
+        "*** WRONG ROW *** row id=1 was updated by a rejected statement"
+    );
+    assert_eq!(cell(1, 1), "2", "row id=2 was updated by a rejected statement");
+
+    // And a row colliding on BOTH constraints updates the TARGET's row (id=1,
+    // the one holding v='a'), never the PRIMARY KEY's (id=2).
+    let out = wire_query(
+        &mut handler,
+        &mut client,
+        "INSERT INTO oc_arb (id, v, n) VALUES (2, 'a', 9) ON CONFLICT (v) DO UPDATE SET n = EXCLUDED.n",
+    )
+    .await;
+    assert!(
+        sqlstates(&out).is_empty(),
+        "an upsert on the NAMED target must succeed: {:?}",
+        sqlstates(&out)
+    );
+    let out = wire_query(&mut handler, &mut client, "SELECT id, n FROM oc_arb ORDER BY id").await;
+    let rows = data_rows(&out);
+    assert_eq!(rows.len(), 2, "*** DUPLICATE INSERTED *** by the upsert");
+    let cell = |row: usize, col: usize| -> String {
+        rows.get(row)
+            .and_then(|r| r.get(col))
+            .map(|c| String::from_utf8_lossy(c.as_deref().unwrap_or(b"")).to_string())
+            .unwrap_or_default()
+    };
+    assert_eq!(
+        cell(0, 1),
+        "9",
+        "the ON CONFLICT target's row (id=1, v='a') was not the one updated"
+    );
+    assert_eq!(
+        cell(1, 1),
+        "2",
+        "*** WRONG ROW *** the PRIMARY KEY's row was updated instead of the target's"
+    );
+}
+
+/// `ALTER TABLE … ADD CONSTRAINT … UNIQUE` over the wire: accepted (it used to
+/// be "Unsupported ALTER TABLE operation"), enforced, and rejected with 23505
+/// when the table already holds duplicates.
+#[tokio::test]
+async fn wire_alter_table_add_unique_is_supported_and_enforced() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+
+    for setup in [
+        "CREATE TABLE alt_wire (id INT PRIMARY KEY, v TEXT)",
+        "INSERT INTO alt_wire (id, v) VALUES (1, 'a')",
+        "ALTER TABLE alt_wire ADD CONSTRAINT alt_wire_v_key UNIQUE (v)",
+    ] {
+        wire_setup(&mut handler, &mut client, setup).await;
+    }
+
+    assert_wire_sqlstate(
+        &mut handler,
+        &mut client,
+        "INSERT INTO alt_wire (id, v) VALUES (2, 'a')",
+        "23505",
+    )
+    .await;
+
+    // A table that already holds duplicates cannot gain the constraint.
+    for setup in [
+        "CREATE TABLE alt_dup (id INT PRIMARY KEY, v TEXT)",
+        "INSERT INTO alt_dup (id, v) VALUES (1, 'a')",
+        "INSERT INTO alt_dup (id, v) VALUES (2, 'a')",
+    ] {
+        wire_setup(&mut handler, &mut client, setup).await;
+    }
+    assert_wire_sqlstate(
+        &mut handler,
+        &mut client,
+        "ALTER TABLE alt_dup ADD CONSTRAINT alt_dup_v_key UNIQUE (v)",
+        "23505",
+    )
+    .await;
+}
+
+/// A FOREIGN KEY to a missing table is 42P01 at DDL time, and to a missing
+/// column 42703 — not an accepted constraint that enforces nothing.
+#[tokio::test]
+async fn wire_foreign_key_ddl_validates_its_target() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+
+    assert_wire_sqlstate(
+        &mut handler,
+        &mut client,
+        "CREATE TABLE fk_wire (id INT PRIMARY KEY, p INT REFERENCES nosuch(id))",
+        "42P01",
+    )
+    .await;
+
+    wire_setup(
+        &mut handler,
+        &mut client,
+        "CREATE TABLE fk_parent (id INT PRIMARY KEY, name TEXT)",
+    )
+    .await;
+    assert_wire_sqlstate(
+        &mut handler,
+        &mut client,
+        "CREATE TABLE fk_wire2 (id INT PRIMARY KEY, p INT REFERENCES fk_parent(nocol))",
+        "42703",
+    )
+    .await;
+
+    // The valid spelling still works.
+    wire_setup(
+        &mut handler,
+        &mut client,
+        "CREATE TABLE fk_child (id INT PRIMARY KEY, p INT REFERENCES fk_parent(id))",
+    )
+    .await;
+}

@@ -3761,7 +3761,15 @@ fn sqlstate_for_query_execution_message(message: &str) -> &'static str {
     // HC4 role/ACL mappings, checked BEFORE the table/relation rules: the role
     // errors deliberately avoid the words "table"/"relation" so they cannot be
     // mis-mapped, but ordering makes that independent of message wording.
-    if lower.contains("cannot be dropped because some objects depend")
+    if lower.contains("no unique or exclusion constraint matching") {
+        // `INSERT … ON CONFLICT (<cols>)` whose target matches no unique
+        // constraint (`Planner::validate_conflict_target`). PostgreSQL reports
+        // 42P10 invalid_column_reference and ORMs branch on it, so it is checked
+        // FIRST: the message names neither a table nor a column in the shapes
+        // the arms below anchor on, and would otherwise degrade to XX000
+        // internal_error — which poolers and HA proxies read as a server fault.
+        sqlstate::INVALID_COLUMN_REFERENCE // 42P10
+    } else if lower.contains("cannot be dropped because some objects depend")
         // `DROP INDEX` on a PK/UNIQUE/FK backing index, worded the way
         // PostgreSQL words it ("cannot drop index … because constraint …
         // requires it"). Same class, same SQLSTATE.
