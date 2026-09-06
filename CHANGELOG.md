@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — UNIQUE was enforced only for the first table to use a column name; every spelling now enforces; ON CONFLICT never duplicates; FK targets validated at DDL
+
+The Partner Portal saw "state-dependent" uniqueness: identical DDL rejected duplicates in one run
+and accepted them in the next, a fresh table lost a constraint an older one had, and a table with
+two UNIQUE columns behaved differently depending on which column was violated first. Root cause:
+column-level UNIQUE indexes were registered in a process-global name map under the bare column
+name, so the first table to declare `login UNIQUE` owned the name and every later table's index
+registration failed silently — leaving those constraints enforced by nothing.
+
+Now: constraint indexes are named per table; a registration that cannot enforce fails the DDL;
+table-level `UNIQUE (col)`, `CREATE UNIQUE INDEX` and `ALTER TABLE … ADD CONSTRAINT UNIQUE` all
+create the same enforced, durable constraint (existing duplicates are rejected with 23505 at
+creation); quoted identifiers in table constraints resolve; `DROP CONSTRAINT` / `DROP INDEX`
+remove exactly what they name and never an index another table or the primary key still owns.
+`INSERT … ON CONFLICT (target) DO UPDATE` resolves the target against every unique constraint
+(inline, table-level, composite, unique index; quoted or unordered), updates the existing row,
+re-raises 23505 for a collision on a different constraint, and rejects targets without a unique
+constraint with 42P10 — so Prisma upserts, including composite ones, no longer insert
+duplicates. `REFERENCES t(c)` is validated when the table is created or altered (42P01 / 42703).
+
+Operators: an ART index snapshot written by an earlier release names indexes the old way, so the
+first open after upgrading rebuilds them from rows (correct, one slower open); duplicates that an
+unenforced constraint let in earlier surface as 23505 when the constraint is rebuilt.
+
+### Fixed — a session transaction deadlocked against ITSELF when it wrote the same row twice
+
+Over the wire (per-session transactions carry a lock manager; embedded transactions do not), a
+transaction that updated a row and then updated it again — two plain UPDATEs, or Prisma's
+create-then-update inside one `$transaction` — failed the second statement with
+`Deadlock detected` (40P01) although no other transaction existed: lock compatibility ignored who
+was asking, so a transaction's own write lock counted as a conflict, and the wait-for graph then
+recorded a self-edge the cycle detector reported. The lock manager is now re-entrant for the
+holder (re-request and uncontended read-to-write upgrade are granted, a re-entrant read never
+downgrades a held write), and a requester is never recorded as waiting on itself. Behaviour
+between different transactions is unchanged.
+
+### Fixed — parameterized INSERT/UPDATE/DELETE … RETURNING escaped the session transaction (Prisma `$transaction`)
+
+Over the extended protocol, a DML statement with bound parameters AND a RETURNING clause was
+executed through a session-less entry point that used the global transaction slot, so inside an
+explicit BEGIN it wrote straight to storage and autocommitted: ROLLBACK did not undo it, other
+connections saw it, and `ROLLBACK TO SAVEPOINT` could not reach it. Every Prisma write is exactly
+that shape, so interactive transactions were not atomic. The parameterized RETURNING path now
+mirrors the simple-protocol one: it joins the session's transaction, reads its own uncommitted
+writes, stays invisible to other sessions until COMMIT, and is discarded by ROLLBACK and by
+ROLLBACK TO SAVEPOINT. Outside a transaction it still autocommits.
+
 ### Fixed — RETURNING names and types qualified columns like PostgreSQL (Prisma create/update)
 
 `INSERT … RETURNING "public"."Account"."id"` — the statement Prisma emits for every write — came

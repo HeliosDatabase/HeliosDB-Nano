@@ -18085,19 +18085,39 @@ impl EmbeddedDatabase {
     /// `INSERT`/`UPDATE`/`DELETE … RETURNING` arm
     /// (`handler_extended::handle_execute_extended`).
     ///
-    /// Spec 03: it exists because that arm used to call the SESSION-LESS
-    /// [`execute_params_returning`](Self::execute_params_returning) directly.
-    /// Any advisory lock a `RETURNING` expression took there was attributed to
-    /// the session-less owner rather than to this connection, so
-    /// `destroy_session` never released it — `INSERT … RETURNING
-    /// pg_try_advisory_lock(k)` over psycopg3/JDBC/sqlx stranded key `k` in the
-    /// process-global table for the life of the server. The simple-query twin
-    /// ([`execute_returning_for_session`](Self::execute_returning_for_session))
-    /// was always session-aware; this is the params family's half.
+    /// This is the params family's half of
+    /// [`execute_returning_for_session`](Self::execute_returning_for_session),
+    /// and it must behave identically to it — the only difference being that
+    /// `$N` placeholders are evaluated against `params` instead of having been
+    /// parsed as literals.
     ///
-    /// Only the advisory ownership differs from the session-less entry point;
-    /// execution is unchanged, so this cannot alter any other behaviour of the
-    /// extended `RETURNING` path.
+    /// Spec 03 introduced it for advisory-lock ownership: the arm used to call
+    /// the SESSION-LESS
+    /// [`execute_params_returning`](Self::execute_params_returning) directly, so
+    /// any advisory lock a `RETURNING` expression took was attributed to the
+    /// session-less owner rather than to this connection, and `destroy_session`
+    /// never released it.
+    ///
+    /// Spec 04 fixes the second, larger consequence of that same delegation: the
+    /// session-less entry point resolves its transaction from the GLOBAL
+    /// `current_transaction` slot, which a wire session never uses. So a
+    /// parameterized `INSERT`/`UPDATE`/`DELETE … RETURNING` sent inside an
+    /// explicit `BEGIN` wrote straight through to storage and AUTOCOMMITTED:
+    /// `ROLLBACK` did not undo it, a concurrent connection saw the row before
+    /// `COMMIT`, and `ROLLBACK TO SAVEPOINT` could not take it back. Every other
+    /// shape honoured the transaction — the simple-protocol form, the
+    /// unparameterized form, and the non-`RETURNING` parameterized form via
+    /// [`execute_params_for_session`](Self::execute_params_for_session) — which is
+    /// exactly why it went unnoticed: it is the ONE shape Prisma sends, because
+    /// Prisma binds every value and appends `RETURNING` to every write, so
+    /// `$transaction` was not atomic.
+    ///
+    /// So: intercept the session-owned statement classes first (identically to
+    /// the simple-protocol twin), then — when this session has an open
+    /// transaction — plan the statement and execute it WITH that transaction
+    /// attached, so the writes stage in its write set and the `RETURNING`
+    /// projection is computed from the session's own uncommitted state. With no
+    /// open transaction the autocommit delegate is unchanged.
     pub fn execute_params_returning_for_session(
         &self,
         session_id: crate::session::SessionId,
@@ -18108,7 +18128,58 @@ impl EmbeddedDatabase {
         // `execute_params_returning` finds a context already present and keeps
         // this connection as the owner.
         let _advisory = self.advisory_context_guard(session_id, sql);
-        self.execute_params_returning(sql, params)
+        // The interceptor prologue is the simple-protocol twin's: a driver that
+        // binds parameters reaches Execute for EVERY statement it sends, so this
+        // entry point must recognise the same session-owned classes rather than
+        // hand them to the in-transaction planner.
+        if Self::is_transaction_control(sql) {
+            let count = self.handle_transaction_control_for_session(session_id, sql)?;
+            return Ok((count, Vec::new()));
+        }
+        if let Some(handled) = self.try_handle_session_synchronous_commit(session_id, sql)? {
+            return Ok((handled, Vec::new()));
+        }
+        if let Some(handled) = self.try_handle_session_fast_autocommit(session_id, sql)? {
+            return Ok((handled, Vec::new()));
+        }
+        if let Some(handled) = self.try_handle_session_search_path(session_id, sql)? {
+            return Ok((handled, Vec::new()));
+        }
+        // `SET CONSTRAINTS` arms transaction-scoped FK deferral (see
+        // `execute_for_session`); it never returns rows.
+        if let Some(count) = self.try_handle_set_constraints(sql)? {
+            return Ok((count, Vec::new()));
+        }
+        // Resolve bare names against THIS session's schema for both the
+        // autocommit delegate below and the in-transaction planner.
+        let _schema_override = self.session_schema_override_guard(session_id);
+        if !self.session_transactions.contains_key(&session_id) {
+            let _sync_override = self.session_durability_override_guard(session_id);
+            return self.execute_params_returning(sql, params);
+        }
+
+        self.touch_session_for_statement(session_id)?;
+        let slot = self
+            .session_txn_slot(session_id)
+            .ok_or_else(|| Error::transaction("Session transaction disappeared during execute"))?;
+        let txn = parking_lot::RwLockReadGuard::try_map(slot.read(), |t| t.as_ref())
+            .map_err(|_| Error::transaction("Session transaction disappeared during execute"))?;
+        let plan = self.parameterized_plan_cached(sql)?;
+        // `Some(&txn)`: the whole point. Every DML arm of
+        // `execute_plan_with_params_inner` prefers this transaction over the
+        // global slot, so the rows are staged in the session's write set and
+        // `project_returning_columns` runs over the tuple that transaction just
+        // produced — visible to this session, invisible to others until COMMIT,
+        // and discarded by ROLLBACK / ROLLBACK TO SAVEPOINT.
+        let out = self.execute_plan_with_params(&plan, params, Some(&txn));
+
+        #[cfg(feature = "code-graph")]
+        if out.is_ok() {
+            let touched = Self::touched_table_from_sql(sql);
+            self.maybe_auto_reparse(touched.as_deref());
+        }
+
+        out
     }
 
     /// `execute_params` for a wire session (extended-protocol DML).
