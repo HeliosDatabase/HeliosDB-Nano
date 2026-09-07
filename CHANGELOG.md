@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — DATA LOSS on upgrade: opening a store re-executed its whole logged history
+
+**Any 3.x store opened by 4.30.0 or 4.31.0 could silently lose a table and its rows.** Nano keeps a
+logical write-ahead log inside the store. On open it replayed *all* of the retained log, with no
+record of what had already been applied — the replay function's own comment noted that a production
+implementation would track a checkpoint and replay only past it. The intended design was "replay
+once, then truncate", which never happens for a store written by a version that did not truncate,
+so the first open by a newer binary re-executed history against tables that legitimately exist now.
+
+Found by upgrade-testing a real Cloud store: its retained log still held `CreateTable
+organizations_new` and `DropTable organizations` from a create-copy-drop-rename maintenance, and no
+rename entry at all, because that log operation did not exist when the maintenance ran. Every open
+therefore recreated the empty table and dropped the live one. A whole-keyspace diff across a single
+open showed the table's catalog record and its customer row removed, and an older schema
+resurrected under the `_new` name.
+
+The log now carries a durable checkpoint meaning "everything at or below this point is already
+applied", written atomically with the truncation that follows a replay; recovery replays only past
+it. A store with no checkpoint — every store written before this release — adopts its highest
+retained position instead of replaying, because re-executing that history is proven to destroy live
+data while the committed data is already durable in the underlying store. Replayed DDL that would
+destroy rows now logs a loud warning first, so a future occurrence is visible rather than silent.
+
+Verified against a copy of the affected production store: before, the table and its row are gone
+after one open; after, they survive that open and two further reopens. Genuine crash recovery is
+unchanged and pinned by a test that a post-checkpoint entry is still replayed, so the fix cannot
+degrade into "replay nothing".
+
+**Operators upgrading in place:** the container now runs as uid 999 rather than root, so
+`chown -R 999:999` the data volume before starting, otherwise the store's lock file cannot be
+opened.
+
+
 ### Fixed — OAuth sign-in could never work: nothing wired the configured providers into the server
 
 `GET /auth/v1/authorize?provider=google` answered 503 "OAuth is not configured" however the

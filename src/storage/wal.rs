@@ -762,19 +762,175 @@ impl WriteAheadLog {
         }
     }
 
+    /// Storage key holding this store's WAL checkpoint LSN.
+    ///
+    /// The value is a little-endian `u64` `N` and means exactly one thing:
+    /// **every WAL entry with `lsn <= N` has already been applied to this
+    /// store's data keyspace and must never be replayed again.**
+    ///
+    /// The key's ABSENCE is meaningful too, and is the crux of the data-loss
+    /// fix in `StorageEngine::open`: a store that has never recorded a
+    /// checkpoint carries retained `wal:entries:` written by a build that
+    /// never truncated them, so its retained log is history, not redo.
+    pub const CHECKPOINT_KEY: &'static [u8] = b"wal:checkpoint";
+
+    /// Prefix under which individual entries live: `wal:entries:{lsn:020}`.
+    pub const ENTRY_PREFIX: &'static [u8] = b"wal:entries:";
+
+    /// Parse the LSN out of a `wal:entries:{lsn:020}` storage key.
+    ///
+    /// Key-level rather than value-level on purpose: it needs neither
+    /// decryption nor bincode, so it still works for an entry whose VALUE is
+    /// torn or was sealed under a key we no longer hold. Both the checkpoint
+    /// scan and the truncation below rely on that — a single undecodable
+    /// record must not be able to wedge recovery or leave the log
+    /// un-truncatable forever.
+    fn lsn_from_entry_key(key: &[u8]) -> Option<u64> {
+        let digits = key.strip_prefix(Self::ENTRY_PREFIX)?;
+        std::str::from_utf8(digits).ok()?.parse::<u64>().ok()
+    }
+
+    /// Read the durable checkpoint LSN, or `None` if this store has never
+    /// recorded one.
+    ///
+    /// `None` is NOT the same as `Some(0)`: see [`Self::CHECKPOINT_KEY`].
+    pub fn checkpoint_lsn(&self) -> Result<Option<u64>> {
+        match self.db.get(Self::CHECKPOINT_KEY) {
+            Ok(Some(data)) => {
+                let bytes: [u8; 8] = data
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| Error::storage("Invalid WAL checkpoint format"))?;
+                Ok(Some(u64::from_le_bytes(bytes)))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(Error::storage(format!("Failed to read WAL checkpoint: {}", e))),
+        }
+    }
+
+    /// Survey the retained `wal:entries:` keyspace WITHOUT decoding any value.
+    ///
+    /// Returns `(count, min_lsn, max_lsn)`, or `None` when nothing is
+    /// retained. Used at open to classify the store before deciding whether to
+    /// replay, so the decision itself can never be changed by a corrupt
+    /// record.
+    pub fn retained_entry_span(&self) -> Result<Option<(usize, u64, u64)>> {
+        let mut count = 0usize;
+        let mut min_lsn = u64::MAX;
+        let mut max_lsn = 0u64;
+
+        let iter = self.db.prefix_iterator(Self::ENTRY_PREFIX);
+        for item in iter {
+            let (key, _) = item.map_err(|e| Error::storage(format!("WAL entry scan iterator error: {}", e)))?;
+            if !key.starts_with(Self::ENTRY_PREFIX) {
+                break;
+            }
+            count += 1;
+            if let Some(lsn) = Self::lsn_from_entry_key(&key) {
+                min_lsn = min_lsn.min(lsn);
+                max_lsn = max_lsn.max(lsn);
+            }
+            // A key under the entry prefix that does not parse is counted (the
+            // log is not empty) but cannot move the span: replay parses the
+            // same way, so it can never be replayed either.
+        }
+
+        if count == 0 {
+            Ok(None)
+        } else if min_lsn == u64::MAX {
+            // Only unparseable keys: present, but with no usable LSN span.
+            Ok(Some((count, 0, 0)))
+        } else {
+            Ok(Some((count, min_lsn, max_lsn)))
+        }
+    }
+
+    /// Delete every retained entry with `lsn <= up_to_lsn` AND record
+    /// `up_to_lsn` as the checkpoint, in ONE RocksDB `WriteBatch`.
+    ///
+    /// Atomicity here is the whole point. The two facts "these entries are
+    /// gone" and "everything up to this LSN is applied" must never disagree on
+    /// disk: a truncate that landed without its checkpoint would leave a store
+    /// looking un-checkpointed, and a checkpoint that landed without its
+    /// truncate would leave entries that are correctly never replayed but also
+    /// never reclaimed. `WriteBatch` gives all-or-nothing; the write is
+    /// fsynced because this is the one durability boundary that later recovery
+    /// decisions are read from.
+    ///
+    /// LSNs come from the KEY, not the value, so an undecodable record is
+    /// still reclaimed rather than pinning the log forever (the pre-existing
+    /// [`Self::truncate`] decodes every value and aborts on the first bad one).
+    ///
+    /// Returns the number of entries deleted.
+    pub fn truncate_to_checkpoint(&self, up_to_lsn: u64) -> Result<usize> {
+        let mut batch = WriteBatch::default();
+        let mut deleted = 0usize;
+
+        let iter = self.db.prefix_iterator(Self::ENTRY_PREFIX);
+        for item in iter {
+            let (key, _) = item.map_err(|e| Error::storage(format!("WAL truncate iterator error: {}", e)))?;
+            if !key.starts_with(Self::ENTRY_PREFIX) {
+                break;
+            }
+            match Self::lsn_from_entry_key(&key) {
+                Some(lsn) if lsn <= up_to_lsn => {
+                    batch.delete(&key);
+                    deleted += 1;
+                }
+                Some(_) => {}
+                None => {
+                    // Unparseable key under the entry prefix: replay parses the
+                    // same way and would skip it forever, so reclaim it.
+                    batch.delete(&key);
+                    deleted += 1;
+                }
+            }
+        }
+
+        batch.put(Self::CHECKPOINT_KEY, up_to_lsn.to_le_bytes());
+
+        let mut sync_opts = WriteOptions::default();
+        sync_opts.set_sync(true);
+        self.db
+            .write_opt(batch, &sync_opts)
+            .map_err(|e| Error::storage(format!("Failed to checkpoint WAL: {}", e)))?;
+
+        info!(
+            "WAL checkpoint recorded at LSN {} ({} entries reclaimed)",
+            up_to_lsn, deleted
+        );
+        Ok(deleted)
+    }
+
     /// Replay WAL entries for crash recovery
     ///
-    /// Returns all WAL entries in LSN order.
-    /// The caller is responsible for applying these entries to restore state.
-    ///
-    /// Note: This is a simplified implementation. A production WAL would:
-    /// - Track which entries have been checkpointed
-    /// - Only replay entries after the last checkpoint
-    /// - Handle partial writes during crashes
+    /// Returns all retained WAL entries in LSN order. Equivalent to
+    /// `replay_from(0)`; kept for the callers that want the whole retained log
+    /// (integrity checks, tooling, tests). Startup recovery goes through
+    /// [`Self::replay_from`] with the durable checkpoint instead.
     pub fn replay(&self) -> Result<Vec<WalEntry>> {
-        info!("Starting WAL replay for crash recovery");
+        self.replay_from(0)
+    }
+
+    /// Replay only the entries strictly after `after_lsn`.
+    ///
+    /// `after_lsn` is a checkpoint: every entry at or below it is already
+    /// applied to the data keyspace, so re-executing it is not redo, it is
+    /// re-running history — which for DDL (`DropTable`, `Truncate`) destroys
+    /// live rows. Entries at or below the checkpoint are skipped on the KEY,
+    /// without decoding the value at all.
+    pub fn replay_from(&self, after_lsn: u64) -> Result<Vec<WalEntry>> {
+        if after_lsn == 0 {
+            info!("Starting WAL replay for crash recovery");
+        } else {
+            info!(
+                "Starting WAL replay for crash recovery after checkpoint LSN {}",
+                after_lsn
+            );
+        }
         let mut entries = Vec::new();
-        let prefix = b"wal:entries:";
+        let mut skipped_checkpointed = 0usize;
+        let prefix = Self::ENTRY_PREFIX;
 
         // Iterate over all WAL entries. Keys are `wal:entries:{lsn:020}`, so
         // the prefix iterator yields them in ascending-LSN order.
@@ -785,6 +941,15 @@ impl WriteAheadLog {
             // Skip if not a WAL entry
             if !key.starts_with(prefix) {
                 break;
+            }
+
+            // Checkpoint filter, applied on the key so an already-applied entry
+            // is never even decoded.
+            if let Some(lsn) = Self::lsn_from_entry_key(&key) {
+                if lsn <= after_lsn {
+                    skipped_checkpointed += 1;
+                    continue;
+                }
             }
 
             // C13: a record that fails to decode is a torn/corrupt TAIL — the
@@ -811,6 +976,12 @@ impl WriteAheadLog {
             }
         }
 
+        if skipped_checkpointed > 0 {
+            info!(
+                "WAL replay skipped {} entries at or below checkpoint LSN {}",
+                skipped_checkpointed, after_lsn
+            );
+        }
         info!("WAL replay complete, {} entries recovered", entries.len());
         Ok(entries)
     }

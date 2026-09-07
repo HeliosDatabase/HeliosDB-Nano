@@ -2401,28 +2401,139 @@ impl StorageEngine {
         // durably invalidate stale index snapshots.
         engine.wire_index_snapshot_hooks();
 
-        // Replay WAL entries for crash recovery
+        // Replay WAL entries for crash recovery, bounded by the durable
+        // checkpoint. See `recover_wal_at_open` for the decision table.
         if engine.wal.is_some() {
-            match engine.replay_wal() {
-                Ok(0) => debug!("WAL clean, no entries to replay"),
-                Ok(count) => {
-                    info!("WAL crash recovery: replayed {} entries", count);
-                    // Truncate replayed WAL entries to prevent duplicate replay on next restart.
-                    // Insert operations generate new row_ids during replay, so re-replaying
-                    // already-committed entries would create duplicate rows.
-                    if let Some(wal) = &engine.wal {
-                        let wal_guard = wal.read();
-                        let current_lsn = wal_guard.current_lsn();
-                        if let Err(e) = wal_guard.truncate(current_lsn) {
-                            warn!("Failed to truncate WAL after replay: {}", e);
-                        }
-                    }
-                }
-                Err(e) => warn!("WAL replay failed (data may be incomplete): {}", e),
+            if let Err(e) = engine.recover_wal_at_open() {
+                warn!("WAL recovery failed (data may be incomplete): {}", e);
             }
         }
 
         Ok(engine)
+    }
+
+    /// Open-time WAL recovery, bounded by the durable checkpoint.
+    ///
+    /// # Why this is not "replay everything"
+    ///
+    /// The logical WAL lives in `wal:entries:` inside the SAME RocksDB store as
+    /// the `data:` keys it describes, so RocksDB's own physical WAL recovers
+    /// both together. An entry that is still visible after RocksDB has finished
+    /// recovering is therefore, in the overwhelming majority of cases, an entry
+    /// whose effect is ALREADY in the store. Logical redo is only genuinely
+    /// needed for the narrow window where the entry's append landed but the
+    /// corresponding data write did not reach the same atomic batch.
+    ///
+    /// Re-executing an already-applied entry is not free: it is re-running
+    /// history. `Insert`/`Update`/`Delete` are keyed and idempotent, but DDL is
+    /// not — a `DropTable` from six months ago, replayed against a table that
+    /// legitimately exists today, deletes it and every row in it. That is not
+    /// hypothetical: it was reproduced twice on a real 3.58.1 store whose
+    /// retained log held `CreateTable organizations_new` … `DropTable
+    /// organizations`, and opening it destroyed the live `organizations` table
+    /// and its rows.
+    ///
+    /// # The decision table
+    ///
+    /// | `wal:checkpoint` | retained entries | action |
+    /// |---|---|---|
+    /// | any | none | nothing to do; leave the checkpoint as it stands |
+    /// | ABSENT | some | **adopt, do not replay**: record the highest retained LSN as the checkpoint and truncate |
+    /// | present, `>= max` | some | already covered; reclaim them, do not replay |
+    /// | present, `< max` | some | replay only `lsn > checkpoint`, then truncate and advance the checkpoint |
+    ///
+    /// The second row is the fix. A store with no checkpoint key was written by
+    /// a build that never truncated its log, so what it retains is the whole
+    /// history of the database rather than a redo window. Replaying it is
+    /// PROVEN to destroy live data (above), while skipping the redo risks only
+    /// the narrow same-batch window described at the top of this comment — and
+    /// the store's committed data is already durable in RocksDB regardless.
+    /// Conservative here means "do not re-execute history", not "replay
+    /// everything".
+    ///
+    /// Note the checkpoint is deliberately NOT stamped when the log is empty.
+    /// `wal:checkpoint = N` is a claim that entries up to `N` are applied;
+    /// stamping it over an empty log is vacuously true but reclassifies the
+    /// store from "never checkpointed" (unknown provenance, handled
+    /// conservatively) to "checkpointed" (trusted, replayed) without any
+    /// evidence having been gathered. There is no clean-shutdown marker in this
+    /// build (searched for: none exists), so a clean close and a crash are
+    /// indistinguishable at open, and the conservative reading of an
+    /// unclassified store is the one that does not re-execute DDL.
+    fn recover_wal_at_open(&self) -> Result<()> {
+        let Some(wal) = &self.wal else {
+            return Ok(());
+        };
+        let wal_guard = wal.read();
+
+        let checkpoint = wal_guard.checkpoint_lsn()?;
+        let span = wal_guard.retained_entry_span()?;
+
+        let Some((count, min_lsn, max_lsn)) = span else {
+            // Deliberately does NOT stamp a checkpoint over an empty log — see
+            // the last paragraph of this function's doc comment.
+            debug!("WAL clean, no entries to replay (checkpoint: {:?})", checkpoint);
+            return Ok(());
+        };
+
+        // The checkpoint we will record once this open is done. `current_lsn`
+        // comes from `wal:last_lsn` and is the highest LSN ever issued, so it
+        // is >= any retained entry; `max` guards the case where the two
+        // disagree.
+        let target_checkpoint = wal_guard.current_lsn().max(max_lsn);
+
+        match checkpoint {
+            // === LEGACY STORE: adopt, do NOT replay. ===
+            None => {
+                info!(
+                    "WAL upgrade: this store has no checkpoint marker, so its {} retained log \
+                     entries (LSN {}..={}) were written by a build that never truncated the \
+                     logical WAL — they are already applied history, not redo. Adopting LSN {} as \
+                     the checkpoint and reclaiming them WITHOUT replay; re-executing historical \
+                     DDL would drop tables that legitimately exist now.",
+                    count, min_lsn, max_lsn, target_checkpoint
+                );
+                let reclaimed = wal_guard.truncate_to_checkpoint(target_checkpoint)?;
+                info!(
+                    "WAL upgrade complete: {} entries adopted as checkpointed at LSN {}",
+                    reclaimed, target_checkpoint
+                );
+                Ok(())
+            }
+
+            // === Everything retained is at or below the checkpoint. ===
+            Some(cp) if max_lsn <= cp => {
+                debug!(
+                    "WAL clean: {} retained entries (LSN {}..={}) are all at or below checkpoint \
+                     LSN {}; reclaiming without replay",
+                    count, min_lsn, max_lsn, cp
+                );
+                wal_guard.truncate_to_checkpoint(cp.max(target_checkpoint))?;
+                Ok(())
+            }
+
+            // === Genuine crash recovery: replay strictly past the checkpoint. ===
+            Some(cp) => {
+                // Drop the read guard: `replay_wal_after` takes it again.
+                drop(wal_guard);
+
+                // On failure, deliberately do NOT checkpoint or truncate: a
+                // failed replay must stay retryable on the next open.
+                let replayed = self.replay_wal_after(cp)?;
+
+                info!(
+                    "WAL crash recovery: replayed {} of {} retained entries (LSN {}..={}), past \
+                     checkpoint LSN {}",
+                    replayed, count, min_lsn, max_lsn, cp
+                );
+
+                // Truncate the replayed entries to prevent duplicate replay on the next
+                // restart, and advance the checkpoint in the SAME atomic batch so the two
+                // can never disagree on disk.
+                wal.read().truncate_to_checkpoint(target_checkpoint)?;
+                Ok(())
+            }
+        }
     }
 
     /// Open in-memory storage engine
@@ -10106,12 +10217,31 @@ impl StorageEngine {
     /// - CreateTable: Create table schema
     /// - DropTable: Remove table and data
     pub fn replay_wal(&self) -> Result<usize> {
+        self.replay_wal_after(0)
+    }
+
+    /// Replay only the WAL entries strictly after `after_lsn` (a durable
+    /// checkpoint).
+    ///
+    /// `replay_wal()` is `replay_wal_after(0)` — the whole retained log. Open
+    /// time uses the checkpoint instead; see
+    /// [`StorageEngine::recover_wal_at_open`] for why replaying an
+    /// already-checkpointed entry is not redo but a re-execution of history.
+    pub fn replay_wal_after(&self, after_lsn: u64) -> Result<usize> {
         if let Some(wal) = &self.wal {
             // Set replay flag to skip WAL logging during recovery
             self.is_replaying.store(true, Ordering::Release);
 
             let wal = wal.read();
-            let entries = wal.replay()?;
+            // Clear the replay flag on the error path too: leaving it set would
+            // silently disable logical-WAL logging for the life of the process.
+            let entries = match wal.replay_from(after_lsn) {
+                Ok(entries) => entries,
+                Err(e) => {
+                    self.is_replaying.store(false, Ordering::Release);
+                    return Err(e);
+                }
+            };
             let count = entries.len();
 
             if count == 0 {
@@ -10700,6 +10830,68 @@ impl StorageEngine {
     ///
     /// Returns Ok(true) if an operation was added to the batch, Ok(false) if skipped,
     /// or Err if there was an error preparing the operation.
+    /// Tripwire under replayed destructive DDL.
+    ///
+    /// A replayed `DropTable` / `Truncate` whose target currently holds rows is
+    /// the exact shape of the data-loss bug the checkpoint filter in
+    /// [`StorageEngine::recover_wal_at_open`] exists to prevent: history
+    /// re-executed against a table that legitimately exists now. The checkpoint
+    /// is the fix; this is the floor under whatever the checkpoint fails to
+    /// catch.
+    ///
+    /// It WARNs rather than refusing, deliberately. A genuine post-checkpoint
+    /// `DROP TABLE` of a populated table is legitimate redo and refusing it
+    /// would leave the store diverged from its own committed log. Making the
+    /// event loud means the next occurrence is visible in the logs instead of
+    /// silent — which is precisely what made the production case so expensive
+    /// to diagnose. (Turning this into a refusal is a live proposal; see the
+    /// handback for this change.)
+    ///
+    /// Only reached from the local recovery driver `replay_wal_after`. The
+    /// replication path (`apply_replicated_operation`) goes through
+    /// `apply_wal_operation` directly and is not affected: a standby applying a
+    /// primary's DROP of a populated table is normal and must stay quiet.
+    fn warn_if_replayed_ddl_destroys_rows(&self, operation: &WalOperation) {
+        // Counting is a prefix scan, so it is bounded rather than unbounded:
+        // the exact number stops mattering well before this.
+        const COUNT_CAP: usize = 100_000;
+
+        let (verb, table) = match operation {
+            WalOperation::DropTable { table } => ("DROP TABLE", table),
+            WalOperation::Truncate { table } => ("TRUNCATE", table),
+            _ => return,
+        };
+
+        let prefix = format!("data:{}:", table).into_bytes();
+        let mut rows = 0usize;
+        let mut capped = false;
+        for item in self.db.prefix_iterator(prefix.as_slice()) {
+            let Ok((key, _)) = item else { break };
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            rows += 1;
+            if rows >= COUNT_CAP {
+                capped = true;
+                break;
+            }
+        }
+
+        if rows > 0 {
+            warn!(
+                "WAL replay is about to apply '{} {}' to a table that currently holds {}{} row(s), \
+                 which this replayed history does not account for. If this data directory was \
+                 written by a build that predates the `wal:checkpoint` marker, those rows are LIVE \
+                 DATA and this entry is history rather than redo — stop the process and copy the \
+                 data directory before restarting again.",
+                verb,
+                table,
+                if capped { ">=" } else { "" },
+                rows
+            );
+        }
+    }
+
     fn apply_wal_operation_to_batch(&self, operation: &WalOperation, batch: &mut WriteBatch) -> Result<bool> {
         match operation {
             WalOperation::Insert { table, key, tuple } => {
@@ -10806,6 +10998,9 @@ impl StorageEngine {
             | WalOperation::RefreshMaterializedView { .. }
             | WalOperation::AddConstraint { .. }
             | WalOperation::DropConstraint { .. } => {
+                // Belt and braces under destructive replayed DDL — see the
+                // helper. No-op for every variant except DropTable/Truncate.
+                self.warn_if_replayed_ddl_destroys_rows(operation);
                 // Apply immediately via the non-batch handler
                 self.apply_wal_operation(operation.clone())?;
                 Ok(false) // Don't count as batch operation
