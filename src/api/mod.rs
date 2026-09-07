@@ -18,4 +18,4 @@ pub mod server;
 pub use middleware::{AuthMiddleware, RateLimitConfig, RateLimitMiddleware, UserContext};
 pub use models::error::ApiError;
 pub use openapi::OPENAPI_YAML;
-pub use server::ApiServer;
+pub use server::{ApiServer, EPHEMERAL_JWT_WARNING_PREFIX};

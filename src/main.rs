@@ -1817,45 +1817,36 @@ async fn run_http_listener(
         Json(serde_json::json!({ "status": "ok" }))
     }
 
-    // The BaaS layer the README advertises as built in: PostgREST-style
+    // The BaaS layer the README advertises as built in — PostgREST-style
     // `/rest/v1/*`, `/auth/v1/*`, `/realtime/v1/websocket`, Swagger `/docs` +
-    // `/openapi.json`, and `/version`.
+    // `/openapi.json`, `/version` — plus the auth bridge and the OAuth providers
+    // from `[[api.oauth_providers]]`.
     //
-    // Through v4.26.0 this listener served `/` and `/health` and NOTHING else —
-    // every one of those documented endpoints returned 404 on the shipped binary,
-    // because `ApiServer`'s router was only ever reachable as a library API.
-    //
-    // The JWT signing key comes from `[api] jwt_secret`, which defaults to a
-    // freshly generated 256-bit CSPRNG value per start. There is deliberately NO
-    // constant fallback anywhere on this path: a guessable signing key lets
-    // anyone mint a valid session, which is the same shape as the `--auth md5`
-    // fail-open fixed in v4.26.0. A random per-start key means tokens do not
-    // survive a restart unless an operator configures one — that is the correct
-    // trade, and it is logged below so the behaviour is never a surprise.
+    // The assembly itself lives in `ApiServer::from_config`, NOT here. It used to
+    // be written out inline at this spot while `tests/baas_http_surface_tests.rs`
+    // built its own router a second time; the two drifted, and the OAuth registry
+    // was the casualty — no caller ever attached it, so `/auth/v1/authorize`
+    // answered 503 for every operator who configured a provider, with a green test
+    // suite the whole time. One seam, exercised by both, is the fix. The rationale
+    // for each decision that assembly makes (the JWT key policy, why a refused
+    // provider is not fatal, why an empty registry is left unattached) is on
+    // `from_config`'s own doc comment.
     let local_addr = listener.local_addr()?;
-    let auth_bridge = std::sync::Arc::new(heliosdb_nano::api::auth_bridge::AuthBridge::new(
-        std::sync::Arc::clone(&db),
-        &api_config.jwt_secret,
-    ));
-    // `bootstrap` creates `_auth_users` / `_auth_refresh_tokens`. It is
-    // idempotent (CREATE TABLE IF NOT EXISTS) and, until now, was called by
-    // nothing but its own unit tests — so the first real signup failed with
-    // "Table '_auth_users' does not exist". Mounting the auth routes without
-    // this just moves the failure from 404 to 500.
-    if let Err(e) = auth_bridge.bootstrap() {
-        tracing::error!(
-            "auth schema bootstrap failed: {e}; /auth/v1/* endpoints will return errors until this is resolved"
-        );
-    }
-    if api_config.jwt_secret_is_ephemeral {
-        tracing::warn!(
-            "[api] jwt_secret is not configured; generated an ephemeral one for this process. \
-             Auth tokens issued now become invalid on restart. Set [api] jwt_secret to persist them."
-        );
+    let (api_server, warnings) =
+        heliosdb_nano::api::ApiServer::from_config(local_addr, std::sync::Arc::clone(&db), &api_config);
+    // `from_config` never logs; it hands back what an operator needs to see. Only
+    // the ephemeral-JWT notice is expected in a correct default deployment — a
+    // refused OAuth provider or a failed auth bootstrap means an advertised feature
+    // is dead on this process, which is an error, not a nicety.
+    for warning in warnings {
+        if warning.starts_with(heliosdb_nano::api::EPHEMERAL_JWT_WARNING_PREFIX) {
+            tracing::warn!("{warning}");
+        } else {
+            tracing::error!("{warning}");
+        }
     }
 
-    let app = heliosdb_nano::api::ApiServer::new(local_addr, std::sync::Arc::clone(&db))
-        .with_auth_bridge(auth_bridge)
+    let app = api_server
         .into_router()
         // `ApiServer` already serves `/health`; only `/` is additional.
         .route("/", get(health));

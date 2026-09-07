@@ -25,6 +25,7 @@ use super::middleware::{rate_limit_middleware, AuthMiddleware, RateLimitMiddlewa
 use super::oauth::OAuthRegistry;
 use super::routes;
 use crate::compute::QueryRegistry;
+use crate::config::ApiConfig;
 use crate::{EmbeddedDatabase, Error, Result};
 
 /// Shared application state
@@ -41,6 +42,18 @@ pub struct AppState {
     /// Optional realtime change notifier for WebSocket subscriptions
     pub change_notifier: Option<Arc<ChangeNotifier>>,
 }
+
+/// Prefix of the one warning [`ApiServer::from_config`] returns that is EXPECTED in a
+/// correct default deployment.
+///
+/// `from_config` returns `Vec<String>`, which cannot carry a log level, and the two
+/// kinds of warning it produces do not deserve the same one: a refused OAuth provider
+/// or a failed auth bootstrap means an advertised feature is dead and is an ERROR,
+/// while an unconfigured `[api] jwt_secret` is the documented default behaviour and is
+/// a WARN. Rather than have callers sniff message text, the ephemeral notice carries
+/// this stable prefix and `src/main.rs` matches on it. `from_config`'s own unit test
+/// asserts the notice still starts with it, so the two cannot drift apart silently.
+pub const EPHEMERAL_JWT_WARNING_PREFIX: &str = "[api] jwt_secret is not configured";
 
 /// REST API Server
 pub struct ApiServer {
@@ -110,6 +123,84 @@ impl ApiServer {
             auth_middleware: None,
             rate_limit_middleware: None,
         }
+    }
+
+    /// Assemble the server the way `heliosdb-nano start` does: auth bridge bootstrapped,
+    /// OAuth providers registered from `[[api.oauth_providers]]`.
+    ///
+    /// Returns the server plus warnings the caller should log. Nothing here logs or
+    /// panics, so the exact assembly production runs is reachable from a test.
+    ///
+    /// # Why this exists
+    ///
+    /// This is the BaaS layer the README advertises: PostgREST-style `/rest/v1/*`,
+    /// `/auth/v1/*`, `/realtime/v1/websocket`, Swagger `/docs` + `/openapi.json`, and
+    /// `/version`. Through v4.26.0 the `start` listener served `/` and `/health` and
+    /// nothing else, so every one of those endpoints 404'd on the shipped binary.
+    ///
+    /// v4.27.0 mounted the router — by building it INLINE in `run_http_listener`, while
+    /// `tests/baas_http_surface_tests.rs` built its own. Two independent assemblies, so
+    /// a test could pass while production wiring was missing, and it duly did: nothing
+    /// ever called [`ApiServer::with_oauth_registry`], so `AppState.oauth_registry` was
+    /// always `None` and `GET /auth/v1/authorize?provider=google` answered 503
+    /// "oauth_not_configured" no matter what the operator put in `config.toml`. This
+    /// function is the single seam both sides now go through; adding a third copy would
+    /// reopen exactly that gap.
+    ///
+    /// # JWT signing key
+    ///
+    /// The key comes from `[api] jwt_secret`, which defaults to a freshly generated
+    /// 256-bit CSPRNG value per start. There is deliberately NO constant fallback
+    /// anywhere on this path: a guessable signing key lets anyone mint a valid session,
+    /// the same shape as the `--auth md5` fail-open fixed in v4.26.0. A random per-start
+    /// key means tokens do not survive a restart unless an operator configures one —
+    /// that is the correct trade, and the returned warning makes it visible.
+    ///
+    /// # Failure handling
+    ///
+    /// Nothing here is fatal, because a database that refuses to start over a mistyped
+    /// OAuth provider name is worse than one that starts without that provider. Every
+    /// degradation is instead reported:
+    ///
+    /// * `bootstrap()` creating `_auth_users` / `_auth_refresh_tokens` fails -> warning;
+    ///   `/auth/v1/*` will return errors, which is what it did before this was called at
+    ///   all (its first real signup died with "Table '_auth_users' does not exist").
+    /// * A provider entry is refused -> warning, and it is NOT registered
+    ///   (see [`OAuthRegistry::from_config`]).
+    /// * No provider registered -> the registry is NOT attached, so `oauth_registry`
+    ///   stays `None` and `/auth/v1/authorize` keeps returning its existing 503
+    ///   "OAuth is not configured on this server". Attaching an empty registry would
+    ///   instead answer 400 "OAuth provider not found: google", which tells an operator
+    ///   who configured nothing that their provider is unknown — a worse answer.
+    pub fn from_config(addr: SocketAddr, db: Arc<EmbeddedDatabase>, api_config: &ApiConfig) -> (Self, Vec<String>) {
+        let mut warnings = Vec::new();
+
+        let auth_bridge = Arc::new(AuthBridge::new(Arc::clone(&db), &api_config.jwt_secret));
+        // `bootstrap` is idempotent (CREATE TABLE IF NOT EXISTS). Mounting the auth
+        // routes without it just moves the failure from 404 to 500.
+        if let Err(e) = auth_bridge.bootstrap() {
+            warnings.push(format!(
+                "auth schema bootstrap failed: {e}; /auth/v1/* endpoints will return errors until this is resolved"
+            ));
+        }
+
+        let (registry, oauth_warnings) = OAuthRegistry::from_config(&api_config.oauth_providers);
+        warnings.extend(oauth_warnings);
+
+        if api_config.jwt_secret_is_ephemeral {
+            warnings.push(format!(
+                "{EPHEMERAL_JWT_WARNING_PREFIX}; generated an ephemeral one for this process. \
+                 Auth tokens issued now become invalid on restart. \
+                 Set [api] jwt_secret to persist them."
+            ));
+        }
+
+        let mut server = Self::new(addr, db).with_auth_bridge(auth_bridge);
+        if registry.has_providers() {
+            server = server.with_oauth_registry(Arc::new(registry));
+        }
+
+        (server, warnings)
     }
 
     /// Enable authentication middleware
@@ -471,6 +562,71 @@ mod tests {
             change_notifier: None,
         };
         assert!(Arc::strong_count(&state.db) >= 1);
+    }
+
+    /// The ephemeral-JWT notice must keep the prefix `src/main.rs` matches on to decide
+    /// WARN vs ERROR. If this fails, that notice is being logged as an error.
+    #[test]
+    fn test_ephemeral_jwt_warning_carries_its_documented_prefix() {
+        let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+        let config = ApiConfig::default();
+        assert!(config.jwt_secret_is_ephemeral, "Default() means unconfigured");
+
+        let (_server, warnings) = ApiServer::from_config("127.0.0.1:0".parse().unwrap(), db, &config);
+
+        assert!(
+            warnings.iter().any(|w| w.starts_with(EPHEMERAL_JWT_WARNING_PREFIX)),
+            "no warning carries the documented prefix: {warnings:?}"
+        );
+    }
+
+    /// A configured key produces no warning at all — the clean-boot case must be quiet,
+    /// or operators learn to ignore this list.
+    #[test]
+    fn test_configured_secret_and_no_providers_warns_about_nothing() {
+        let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+        let config = ApiConfig {
+            jwt_secret: "operator-chosen-key".to_string(),
+            jwt_secret_is_ephemeral: false,
+            ..ApiConfig::default()
+        };
+
+        let (server, warnings) = ApiServer::from_config("127.0.0.1:0".parse().unwrap(), db, &config);
+
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(server.state.auth_bridge.is_some(), "the auth bridge must be attached");
+        assert!(
+            server.state.oauth_registry.is_none(),
+            "zero configured providers must leave the registry unattached so /auth/v1/authorize \
+             keeps answering 503 'not configured' rather than 400 'provider not found'"
+        );
+    }
+
+    /// A refused provider must not end up in `AppState`.
+    #[test]
+    fn test_refused_provider_is_not_attached() {
+        use crate::config::OAuthProviderConfig;
+
+        let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+        let config = ApiConfig {
+            jwt_secret: "operator-chosen-key".to_string(),
+            jwt_secret_is_ephemeral: false,
+            oauth_providers: vec![OAuthProviderConfig {
+                name: "google".to_string(),
+                client_id: "test-client-id".to_string(),
+                client_secret: "test-client-secret".to_string(),
+                redirect_uri: "not a valid url".to_string(),
+            }],
+            ..ApiConfig::default()
+        };
+
+        let (server, warnings) = ApiServer::from_config("127.0.0.1:0".parse().unwrap(), db, &config);
+
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            server.state.oauth_registry.is_none(),
+            "a provider that failed to build must not be served"
+        );
     }
 
     #[tokio::test]
