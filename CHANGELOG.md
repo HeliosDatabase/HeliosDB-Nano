@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.31.1] - 2026-09-07
+
 ### Fixed — DATA LOSS on upgrade: opening a store re-executed its whole logged history
 
 **Any 3.x store opened by 4.30.0 or 4.31.0 could silently lose a table and its rows.** Nano keeps a
