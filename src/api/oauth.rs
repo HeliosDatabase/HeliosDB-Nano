@@ -6,14 +6,32 @@
 //!    the provider's userinfo endpoint to obtain the user's email/name/avatar.
 //!
 //! The registry is designed to be wrapped in `Arc` and shared across handlers.
+//!
+//! # HTTP transport
+//!
+//! `oauth2` 5 speaks `http::Request<Vec<u8>>` / `http::Response<Vec<u8>>` natively
+//! and implements its own `AsyncHttpClient` trait for `reqwest::Client`, so the
+//! token endpoint is driven by the very same `reqwest` client that fetches the
+//! provider's userinfo endpoint — one connection pool, one TLS stack.
+//!
+//! This file used to carry a hand-rolled adapter (`oauth2_http_adapter`) that
+//! re-encoded every method, header, status code and body between `http` 0.2 (which
+//! `oauth2` 4 was built on) and `http` 1.x (which `reqwest` 0.12 uses), because
+//! `oauth2` 4's `request_async` wanted a closure rather than a client. That adapter
+//! is gone: it was pure translation overhead, it silently dropped any response
+//! header whose name or value failed to round-trip, and the `oauth2` 4 dependency
+//! that forced it also dragged in a duplicate `hyper` 0.14 / `h2` 0.3 subtree
+//! carrying RUSTSEC-2026-0258.
 
+use oauth2::basic::{BasicClient, BasicErrorResponse};
 use oauth2::{
-    basic::BasicClient, AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, PkceCodeChallenge,
-    PkceCodeVerifier, RedirectUrl, Scope, TokenResponse, TokenUrl,
+    AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, EndpointNotSet, EndpointSet, HttpClientError,
+    PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, RequestTokenError, Scope, TokenResponse, TokenUrl,
 };
 use parking_lot::RwLock;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::error::Error as StdError;
 use std::fmt;
 
 // ---------------------------------------------------------------------------
@@ -72,10 +90,25 @@ pub struct OAuthUserInfo {
 // Internal: per-provider config
 // ---------------------------------------------------------------------------
 
+/// The fully-parameterised `BasicClient` this registry stores.
+///
+/// `oauth2` 5 tracks in the type system which endpoints have been configured, so
+/// that a flow can no longer be started against a client that is missing the
+/// endpoint it needs — an error that used to surface only at runtime.
+/// `authorize_url()` exists only once the authorization endpoint is set, and
+/// `exchange_code()` only once the token endpoint is set. `register_google` and
+/// `register_github` set both, hence `EndpointSet` in the first and last slots.
+///
+/// The parameter order is `<HasAuthUrl, HasDeviceAuthUrl, HasIntrospectionUrl,
+/// HasRevocationUrl, HasTokenUrl>`; the three middle endpoints are unused by this
+/// crate and stay `EndpointNotSet`, which statically forbids calling the device-code,
+/// introspection and revocation flows on these clients.
+pub type ConfiguredOAuthClient = BasicClient<EndpointSet, EndpointNotSet, EndpointNotSet, EndpointNotSet, EndpointSet>;
+
 /// A registered OAuth provider with its client, scopes, and userinfo URL.
 pub struct OAuthProvider {
     pub name: String,
-    pub client: BasicClient,
+    pub client: ConfiguredOAuthClient,
     pub scopes: Vec<String>,
     pub userinfo_url: String,
 }
@@ -128,13 +161,11 @@ impl OAuthRegistry {
         let redirect = RedirectUrl::new(redirect_uri.to_string())
             .map_err(|e| OAuthError::ConfigError(format!("Invalid redirect URI: {e}")))?;
 
-        let client = BasicClient::new(
-            ClientId::new(client_id.to_string()),
-            Some(ClientSecret::new(client_secret.to_string())),
-            auth_url,
-            Some(token_url),
-        )
-        .set_redirect_uri(redirect);
+        let client = BasicClient::new(ClientId::new(client_id.to_string()))
+            .set_client_secret(ClientSecret::new(client_secret.to_string()))
+            .set_auth_uri(auth_url)
+            .set_token_uri(token_url)
+            .set_redirect_uri(redirect);
 
         self.providers.insert(
             "google".to_string(),
@@ -167,13 +198,11 @@ impl OAuthRegistry {
         let redirect = RedirectUrl::new(redirect_uri.to_string())
             .map_err(|e| OAuthError::ConfigError(format!("Invalid redirect URI: {e}")))?;
 
-        let client = BasicClient::new(
-            ClientId::new(client_id.to_string()),
-            Some(ClientSecret::new(client_secret.to_string())),
-            auth_url,
-            Some(token_url),
-        )
-        .set_redirect_uri(redirect);
+        let client = BasicClient::new(ClientId::new(client_id.to_string()))
+            .set_client_secret(ClientSecret::new(client_secret.to_string()))
+            .set_auth_uri(auth_url)
+            .set_token_uri(token_url)
+            .set_redirect_uri(redirect);
 
         self.providers.insert(
             "github".to_string(),
@@ -242,20 +271,27 @@ impl OAuthRegistry {
             .get(provider_name)
             .ok_or_else(|| OAuthError::ProviderNotFound(provider_name.clone()))?;
 
-        // 2. Exchange code for tokens
+        // 2. Exchange code for tokens.
+        //
+        // `Policy::none()` is not a nicety: following redirects from the token
+        // endpoint turns this call into an SSRF primitive (the provider, or anyone
+        // who can spoof it, could bounce us at an internal address with the client
+        // secret attached). `oauth2` 5 makes the same recommendation, and the same
+        // client is reused for the userinfo fetch below, exactly as before.
         let http_client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| OAuthError::TokenExchange(format!("Failed to build HTTP client: {e}")))?;
 
-        let client_for_token = http_client.clone();
+        // `reqwest::Client` implements `oauth2::AsyncHttpClient`, so it is passed
+        // straight in; no adapter closure and no `http` 0.2 <-> 1.x translation.
         let token_result = prov
             .client
             .exchange_code(AuthorizationCode::new(code.to_string()))
             .set_pkce_verifier(pending.verifier)
-            .request_async(|req: oauth2::HttpRequest| async move { oauth2_http_adapter(&client_for_token, req).await })
+            .request_async(&http_client)
             .await
-            .map_err(|e| OAuthError::TokenExchange(format!("{e}")))?;
+            .map_err(|e| OAuthError::TokenExchange(token_exchange_message(&e)))?;
 
         let access_token = token_result.access_token().secret().clone();
 
@@ -280,87 +316,70 @@ impl OAuthRegistry {
 }
 
 // ---------------------------------------------------------------------------
-// oauth2 crate <-> reqwest HTTP adapter
+// Token-endpoint error mapping
 // ---------------------------------------------------------------------------
 
-/// Adapter that converts an [`oauth2::HttpRequest`] into a `reqwest` request,
-/// executes it, and converts the response back into [`oauth2::HttpResponse`].
+/// The concrete error `CodeTokenRequest::request_async` yields when the
+/// `AsyncHttpClient` is a `reqwest::Client`.
 ///
-/// The `oauth2` v4 crate expects `request_async` to receive a closure of type
-/// `FnOnce(HttpRequest) -> Future<Output = Result<HttpResponse, E>>`.
+/// Naming it keeps [`token_exchange_message`] a plain, unit-testable function
+/// instead of a generic one that can only be exercised through a live HTTP call.
+type TokenExchangeError = RequestTokenError<HttpClientError<reqwest::Error>, BasicErrorResponse>;
+
+/// Upper bound on how far [`error_chain`] walks a `source()` chain.
 ///
-/// Because `oauth2` v4 depends on `http` 0.2 while `reqwest` 0.12 depends on
-/// `http` 1.x, we convert between the two crate versions manually.
-async fn oauth2_http_adapter(
-    client: &reqwest::Client,
-    req: oauth2::HttpRequest,
-) -> Result<oauth2::HttpResponse, OAuthAdapterError> {
-    // Convert method (http 0.2 -> string -> reqwest/http 1.x)
-    let method_str = req.method.as_str();
-    let rw_method: reqwest::Method = reqwest::Method::from_bytes(method_str.as_bytes())
-        .map_err(|e| OAuthAdapterError(format!("Invalid HTTP method: {e}")))?;
+/// A well-behaved chain terminates on its own; the cap only stops a buggy
+/// third-party `source()` implementation from making this loop forever while
+/// formatting an error.
+const MAX_ERROR_CHAIN_DEPTH: usize = 8;
 
-    let mut builder = client.request(rw_method, req.url.as_str());
-
-    // Convert headers (http 0.2 HeaderMap -> raw bytes -> reqwest/http 1.x)
-    for (name, value) in &req.headers {
-        let name_str = name.as_str();
-        let value_bytes = value.as_bytes();
-        let rw_name = reqwest::header::HeaderName::from_bytes(name_str.as_bytes())
-            .map_err(|e| OAuthAdapterError(format!("Invalid header name: {e}")))?;
-        let rw_value = reqwest::header::HeaderValue::from_bytes(value_bytes)
-            .map_err(|e| OAuthAdapterError(format!("Invalid header value: {e}")))?;
-        builder = builder.header(rw_name, rw_value);
-    }
-
-    builder = builder.body(req.body);
-
-    let resp = builder
-        .send()
-        .await
-        .map_err(|e| OAuthAdapterError(format!("HTTP request failed: {e}")))?;
-
-    // Convert response back (reqwest/http 1.x -> http 0.2)
-    let status_u16 = resp.status().as_u16();
-    let oauth2_status = oauth2::http::StatusCode::from_u16(status_u16)
-        .map_err(|e| OAuthAdapterError(format!("Invalid status code: {e}")))?;
-
-    let rw_headers = resp.headers().clone();
-    let body = resp
-        .bytes()
-        .await
-        .map_err(|e| OAuthAdapterError(format!("Failed to read response body: {e}")))?
-        .to_vec();
-
-    // Convert headers back
-    let mut oauth2_headers = oauth2::http::HeaderMap::new();
-    for (name, value) in &rw_headers {
-        if let (Ok(n), Ok(v)) = (
-            oauth2::http::header::HeaderName::from_bytes(name.as_str().as_bytes()),
-            oauth2::http::header::HeaderValue::from_bytes(value.as_bytes()),
-        ) {
-            oauth2_headers.insert(n, v);
+/// Flatten an error and its `source()` chain into one `": "`-joined message.
+///
+/// Necessary because `oauth2` 5's `thiserror` messages deliberately omit the
+/// source: `HttpClientError::Reqwest` renders as the bare string `"client error"`
+/// and `HttpClientError::Io` as `"I/O error"`. Formatting only the outermost error
+/// would throw away the one thing an operator needs — *why* the request failed.
+fn error_chain(err: &dyn StdError) -> String {
+    let mut parts = vec![err.to_string()];
+    let mut source = err.source();
+    while let Some(inner) = source {
+        if parts.len() >= MAX_ERROR_CHAIN_DEPTH {
+            break;
         }
+        parts.push(inner.to_string());
+        source = inner.source();
     }
-
-    Ok(oauth2::HttpResponse {
-        status_code: oauth2_status,
-        headers: oauth2_headers,
-        body,
-    })
+    parts.join(": ")
 }
 
-/// Simple error type for the HTTP adapter used in `request_async`.
-#[derive(Debug)]
-struct OAuthAdapterError(String);
-
-impl fmt::Display for OAuthAdapterError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
+/// Render a token-endpoint failure as a message that keeps the provider's own words.
+///
+/// The previous code formatted the error with `{e}` alone. That was adequate under
+/// `oauth2` 4 but is not under 5, whose `Display` impls for the transport and parse
+/// variants are stubs (see [`error_chain`]); mapping every variant explicitly keeps
+/// `OAuthError::TokenExchange` as specific as it was, and more specific for
+/// transport failures.
+fn token_exchange_message(err: &TokenExchangeError) -> String {
+    match err {
+        // The provider answered with a structured RFC 6749 §5.2 error.
+        // `StandardErrorResponse`'s Display renders it as
+        // `invalid_grant: <description> (see <uri>)` — the provider's own message.
+        RequestTokenError::ServerResponse(response) => response.to_string(),
+        // Transport failure (DNS, TLS, connection refused, timeout, ...).
+        RequestTokenError::Request(inner) => {
+            format!("HTTP request to token endpoint failed: {}", error_chain(inner))
+        }
+        // Malformed response body. The body itself is deliberately NOT included:
+        // a 200 that fails to deserialize can still contain the access token, and
+        // this string is surfaced to the HTTP client through `ApiError`.
+        RequestTokenError::Parse(parse_err, _body) => {
+            format!("Malformed token response: {}", error_chain(parse_err))
+        }
+        // e.g. "server returned empty error response" / "unexpected response
+        // Content-Type: ...". Already a complete sentence from the oauth2 crate.
+        RequestTokenError::Other(message) => message.clone(),
     }
 }
-
-impl std::error::Error for OAuthAdapterError {}
 
 // ---------------------------------------------------------------------------
 // Userinfo fetch + parsing (provider-specific)
@@ -628,5 +647,89 @@ mod tests {
         let result = registry.register_google("id", "secret", "not a valid url");
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), OAuthError::ConfigError(_)));
+    }
+
+    // -----------------------------------------------------------------------
+    // oauth2 5 typestate + error-mapping seam
+    // -----------------------------------------------------------------------
+
+    /// A registered client must statically satisfy the token endpoint typestate.
+    ///
+    /// `exchange_code()` only exists on a `Client` whose `HasTokenUrl` parameter is
+    /// `EndpointSet`, so this stops compiling if `ConfiguredOAuthClient` or the
+    /// builder chain in `register_*` ever loses `set_token_uri`.
+    #[test]
+    fn test_registered_client_supports_code_exchange() {
+        let mut registry = OAuthRegistry::new();
+        registry.register_google("id", "secret", "http://localhost/cb").unwrap();
+
+        let provider = registry.providers.get("google").unwrap();
+        // Nothing is sent; that this compiles and builds a request is the assertion.
+        let _request = provider
+            .client
+            .exchange_code(AuthorizationCode::new("dummy-code".to_string()))
+            .set_pkce_verifier(PkceCodeVerifier::new("dummy-verifier".to_string()));
+    }
+
+    #[test]
+    fn test_token_exchange_message_keeps_provider_error() {
+        use oauth2::basic::BasicErrorResponseType;
+
+        let response = BasicErrorResponse::new(
+            BasicErrorResponseType::InvalidGrant,
+            Some("authorization code expired".to_string()),
+            None,
+        );
+        let message = token_exchange_message(&RequestTokenError::ServerResponse(response));
+
+        assert!(message.contains("invalid_grant"), "lost the error code: {message}");
+        assert!(
+            message.contains("authorization code expired"),
+            "lost the description: {message}"
+        );
+    }
+
+    #[test]
+    fn test_token_exchange_message_transport_error_is_not_generic() {
+        // `HttpClientError::Io` renders as the stub "I/O error"; the source walk in
+        // `error_chain` is what keeps the real cause in the message.
+        let io_err = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "connection refused");
+        let err: TokenExchangeError = RequestTokenError::Request(HttpClientError::Io(io_err));
+        let message = token_exchange_message(&err);
+
+        assert!(message.contains("token endpoint"), "lost context: {message}");
+        assert!(
+            message.contains("connection refused"),
+            "collapsed to generic: {message}"
+        );
+    }
+
+    #[test]
+    fn test_token_exchange_message_other_is_passed_through() {
+        let err: TokenExchangeError = RequestTokenError::Other("server returned empty error response".to_string());
+        assert_eq!(token_exchange_message(&err), "server returned empty error response");
+    }
+
+    #[test]
+    fn test_error_chain_joins_sources() {
+        let leaf = std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out");
+        let wrapped = HttpClientError::<reqwest::Error>::Io(leaf);
+        let chained = error_chain(&wrapped);
+
+        assert!(chained.starts_with("I/O error"), "{chained}");
+        assert!(chained.contains("timed out"), "{chained}");
+        // Two links, so exactly one separator.
+        assert_eq!(chained.matches(": ").count(), 1, "{chained}");
+    }
+
+    #[test]
+    fn test_token_exchange_error_maps_to_token_exchange_variant() {
+        // Guards the granularity requirement end-to-end: whatever the token endpoint
+        // does, callers keep seeing `OAuthError::TokenExchange` carrying the detail.
+        let err: TokenExchangeError = RequestTokenError::Other("boom".to_string());
+        let mapped = OAuthError::TokenExchange(token_exchange_message(&err));
+
+        assert!(matches!(mapped, OAuthError::TokenExchange(_)));
+        assert!(mapped.to_string().contains("boom"));
     }
 }

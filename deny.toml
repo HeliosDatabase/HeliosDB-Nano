@@ -29,15 +29,12 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 # was repaired (the old-schema keys had made the whole file unparseable, so the
 # gate had been silently disabled). Each has a filed remediation.
 ignore = [
-    # rustls-webpki 0.101 CVEs (URI/wildcard name constraints, CRL panic).
-    # Chain: oauth2 4.4 -> reqwest 0.11 -> rustls 0.21 -> webpki 0.101; no fix
-    # exists inside the 0.101 line. These apply to CLIENT-side verification of
-    # the OAuth provider's cert (server TLS uses current rustls). FILED:
-    # upgrade to oauth2 5.x (reqwest 0.12 / rustls 0.23) — API-breaking,
-    # needs its own gated change in src/api/oauth.rs.
-    { id = "RUSTSEC-2026-0098", reason = "oauth2 4.4 pins rustls 0.21; oauth2 5.x upgrade filed" },
-    { id = "RUSTSEC-2026-0099", reason = "oauth2 4.4 pins rustls 0.21; oauth2 5.x upgrade filed" },
-    { id = "RUSTSEC-2026-0104", reason = "oauth2 4.4 pins rustls 0.21; oauth2 5.x upgrade filed" },
+    # (The three rustls-webpki 0.101 ignores that lived here are GONE, not
+    # renewed: they existed because oauth2 4.4 pinned reqwest 0.11 -> rustls
+    # 0.21 -> webpki 0.101, and the filed remediation was "upgrade to oauth2
+    # 5.x". That upgrade has landed, the 0.21 subtree is out of the tree, and
+    # the advisories are unreachable — so the entries were deleted rather than
+    # kept as permanent debt.)
     # Unmaintained (no vulnerability): bincode 1.x is the on-disk/value codec —
     # replacing it is a storage-format project, not a dep bump. rustls-pemfile
     # is absorbed into rustls-pki-types upstream; number_prefix is a leaf of
