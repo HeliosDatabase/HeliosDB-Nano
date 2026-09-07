@@ -454,6 +454,60 @@ password_hash_algorithm = "argon2"
 # legacy_acl_noop = false
 
 # ============================================================================
+# BaaS HTTP API CONFIGURATION ([api], v4.32)
+# ============================================================================
+# Settings for the built-in REST / Auth / Realtime layer served on --http-port
+# (default 8080). Everything here is COMMENTED OUT ON PURPOSE: shipping a
+# default value for any of these keys would ship a signing key, and a published
+# signing key lets anyone mint a valid session.
+#
+# [api]
+#
+# Key that SIGNS auth tokens for /auth/v1/*. If it is not set, a fresh 256-bit
+# CSPRNG value is generated at every start and the server logs a warning: tokens
+# issued now stop verifying after a restart. Set this to keep sessions across
+# restarts.
+# jwt_secret = "CHANGE-THIS-AND-KEEP-IT-SECRET"
+#
+# Anonymous API key granting unauthenticated read access.
+# anon_key = "..."
+#
+# Service-role API key. BYPASSES ROW-LEVEL SECURITY. Never ship it to a client.
+# service_role_key = "..."
+
+# ----------------------------------------------------------------------------
+# OAuth2 sign-in providers
+# ----------------------------------------------------------------------------
+# One [[api.oauth_providers]] block per provider drives
+# GET /auth/v1/authorize?provider=<name> (Authorization Code + PKCE) and the
+# GET /auth/v1/callback that completes it.
+#
+#   name          "google" or "github" (matched case-insensitively). Any other
+#                 name is REFUSED with an error in the log and is not served —
+#                 it is never silently ignored.
+#   client_id     Public: it travels to the provider in the authorize redirect.
+#   client_secret SECRET. Never logged, never printed in a Debug dump.
+#   redirect_uri  Absolute URL of this server's callback. Must match the one
+#                 registered with the provider exactly, or the provider rejects
+#                 the flow. An unparseable value REFUSES the provider (it is not
+#                 registered at all) rather than failing later mid-login.
+#
+# With no provider configured, /auth/v1/authorize answers
+# 503 "oauth_not_configured".
+#
+# [[api.oauth_providers]]
+# name = "google"
+# client_id = "123456.apps.googleusercontent.com"
+# client_secret = "GOCSPX-..."
+# redirect_uri = "http://localhost:8080/auth/v1/callback"
+#
+# [[api.oauth_providers]]
+# name = "github"
+# client_id = "Iv1.abc123"
+# client_secret = "..."
+# redirect_uri = "http://localhost:8080/auth/v1/callback"
+
+# ============================================================================
 # COMPRESSION CONFIGURATION (v2.1)
 # ============================================================================
 [compression]

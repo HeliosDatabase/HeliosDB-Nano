@@ -1753,7 +1753,18 @@ impl ResourceQuotaConfig {
 /// anon_key = "eyJhbGciOi..."
 /// service_role_key = "eyJhbGciOi..."
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// # Why `Debug` is hand-written
+///
+/// Every field below except `jwt_secret_is_ephemeral` and `oauth_providers` is a
+/// CREDENTIAL. A derived `Debug` would print all of them, and a single `{:?}` in a
+/// future log line — `tracing::debug!("api config: {config:?}")` is the obvious way to
+/// write it — would put the token-signing key and the service-role key, which bypasses
+/// RLS, into the log file. The impl below renders each secret as `<redacted>` while
+/// keeping `None` distinguishable from a redacted `Some`, so the output is still worth
+/// printing. `Serialize`/`Deserialize` are untouched: config round-tripping must keep
+/// working, and that path writes to a file the operator already controls.
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ApiConfig {
     /// JWT secret used to sign and verify authentication tokens.
@@ -1801,7 +1812,10 @@ pub struct ApiConfig {
 }
 
 /// Configuration for a single OAuth2 provider.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written for the same reason as [`ApiConfig`]: `client_secret` is a
+/// credential, and this struct is reachable from a `{:?}` of the whole [`Config`].
+#[derive(Clone, Serialize, Deserialize)]
 pub struct OAuthProviderConfig {
     /// Provider name: `"google"` or `"github"`.
     pub name: String,
@@ -1811,6 +1825,48 @@ pub struct OAuthProviderConfig {
     pub client_secret: String,
     /// The absolute URL the provider should redirect back to after authorization.
     pub redirect_uri: String,
+}
+
+/// What a redacted secret renders as in `Debug` output.
+///
+/// A fixed marker rather than a length or a prefix: both of those are information about
+/// the key, and neither helps anyone reading a log.
+const REDACTED: &str = "<redacted>";
+
+/// Render an optional secret for `Debug`.
+///
+/// Deliberately returns `Option<&str>` rather than a `String`, so `None` prints as
+/// `None` and a configured value prints as `Some("<redacted>")`. "Is this key set at
+/// all?" is the question a debug dump is usually being read to answer, and collapsing
+/// both cases to one string would throw that answer away.
+fn redacted_opt(value: &Option<String>) -> Option<&'static str> {
+    value.as_ref().map(|_| REDACTED)
+}
+
+impl std::fmt::Debug for ApiConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApiConfig")
+            .field("jwt_secret", &REDACTED)
+            .field("jwt_secret_is_ephemeral", &self.jwt_secret_is_ephemeral)
+            .field("anon_key", &redacted_opt(&self.anon_key))
+            .field("service_role_key", &redacted_opt(&self.service_role_key))
+            // `OAuthProviderConfig` redacts its own secret, so nesting is safe.
+            .field("oauth_providers", &self.oauth_providers)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for OAuthProviderConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OAuthProviderConfig")
+            .field("name", &self.name)
+            // Not a secret: it travels to the provider in the authorize redirect, in
+            // plain sight of the user's browser.
+            .field("client_id", &self.client_id)
+            .field("client_secret", &REDACTED)
+            .field("redirect_uri", &self.redirect_uri)
+            .finish()
+    }
 }
 
 impl Default for ApiConfig {
@@ -1854,6 +1910,136 @@ fn generate_random_secret() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ------------------------------------------------------------------
+    // Credential hygiene: `Debug` must not print secrets
+    // ------------------------------------------------------------------
+
+    /// A `{:?}` of the API config must never render a credential.
+    ///
+    /// Nothing prints this struct today. That is exactly why the guard belongs in a
+    /// test: the leak would arrive with the first debug log line someone adds, long
+    /// after this file is out of anyone's head.
+    #[test]
+    fn api_config_debug_redacts_every_secret() {
+        let config = ApiConfig {
+            jwt_secret: "jwt-secret-value".to_string(),
+            jwt_secret_is_ephemeral: false,
+            anon_key: Some("anon-key-value".to_string()),
+            service_role_key: Some("service-role-key-value".to_string()),
+            oauth_providers: vec![OAuthProviderConfig {
+                name: "google".to_string(),
+                client_id: "test-client-id".to_string(),
+                client_secret: "client-secret-value".to_string(),
+                redirect_uri: "http://localhost:8080/auth/v1/callback".to_string(),
+            }],
+        };
+
+        let rendered = format!("{config:?}");
+
+        for secret in [
+            "jwt-secret-value",
+            "anon-key-value",
+            "service-role-key-value",
+            "client-secret-value",
+        ] {
+            assert!(!rendered.contains(secret), "Debug leaked {secret}: {rendered}");
+        }
+
+        // Still useful for debugging: the non-secret fields survive.
+        assert!(rendered.contains("jwt_secret_is_ephemeral: false"), "{rendered}");
+        assert!(rendered.contains("test-client-id"), "{rendered}");
+        assert!(rendered.contains("localhost:8080"), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+    }
+
+    /// An unset optional key must stay visibly unset — redaction must not turn `None`
+    /// into something that looks configured.
+    #[test]
+    fn api_config_debug_distinguishes_none_from_a_redacted_some() {
+        let unset = ApiConfig {
+            jwt_secret: "k".to_string(),
+            jwt_secret_is_ephemeral: true,
+            anon_key: None,
+            service_role_key: None,
+            oauth_providers: Vec::new(),
+        };
+        let rendered = format!("{unset:?}");
+        assert!(rendered.contains("anon_key: None"), "{rendered}");
+        assert!(rendered.contains("service_role_key: None"), "{rendered}");
+
+        let set = ApiConfig {
+            anon_key: Some("anon-key-value".to_string()),
+            ..unset
+        };
+        let rendered = format!("{set:?}");
+        assert!(rendered.contains("anon_key: Some(\"<redacted>\")"), "{rendered}");
+        assert!(!rendered.contains("anon-key-value"), "{rendered}");
+    }
+
+    /// Redaction must not break config round-tripping: `Serialize`/`Deserialize` still
+    /// carry the real values, because that path writes a file the operator owns.
+    #[test]
+    fn redaction_does_not_leak_into_serialization() {
+        let config = ApiConfig {
+            jwt_secret: "jwt-secret-value".to_string(),
+            jwt_secret_is_ephemeral: false,
+            anon_key: Some("anon-key-value".to_string()),
+            service_role_key: Some("service-role-key-value".to_string()),
+            oauth_providers: vec![OAuthProviderConfig {
+                name: "github".to_string(),
+                client_id: "test-client-id".to_string(),
+                client_secret: "client-secret-value".to_string(),
+                redirect_uri: "http://localhost:8080/auth/v1/callback".to_string(),
+            }],
+        };
+
+        let toml_text = toml::to_string(&config).expect("serialize");
+        let round_tripped: ApiConfig = toml::from_str(&toml_text).expect("deserialize");
+
+        assert_eq!(round_tripped.jwt_secret, "jwt-secret-value");
+        assert_eq!(round_tripped.anon_key.as_deref(), Some("anon-key-value"));
+        assert_eq!(
+            round_tripped.service_role_key.as_deref(),
+            Some("service-role-key-value")
+        );
+        assert_eq!(
+            round_tripped
+                .oauth_providers
+                .first()
+                .expect("one provider")
+                .client_secret,
+            "client-secret-value"
+        );
+        assert!(!toml_text.contains("<redacted>"), "{toml_text}");
+    }
+
+    /// `[[api.oauth_providers]]` must actually parse into the struct the wiring reads.
+    #[test]
+    fn oauth_providers_parse_from_toml() {
+        let config = Config::from_toml_str(
+            r#"
+[[api.oauth_providers]]
+name = "google"
+client_id = "test-client-id"
+client_secret = "test-client-secret"
+redirect_uri = "http://localhost:8080/auth/v1/callback"
+
+[[api.oauth_providers]]
+name = "github"
+client_id = "test-client-id-2"
+client_secret = "test-client-secret-2"
+redirect_uri = "http://localhost:8080/auth/v1/callback"
+"#,
+        )
+        .expect("parse");
+
+        assert_eq!(config.api.oauth_providers.len(), 2);
+        let first = config.api.oauth_providers.first().expect("first");
+        assert_eq!(first.name, "google");
+        assert_eq!(first.client_id, "test-client-id");
+        assert_eq!(first.redirect_uri, "http://localhost:8080/auth/v1/callback");
+    }
 
     // ------------------------------------------------------------------
     // D3: profile bundles

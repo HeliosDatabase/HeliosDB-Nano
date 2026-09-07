@@ -30,6 +30,8 @@ use oauth2::{
 };
 use parking_lot::RwLock;
 use serde::Deserialize;
+
+use crate::config::OAuthProviderConfig;
 use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::fmt;
@@ -140,6 +142,99 @@ impl OAuthRegistry {
             providers: HashMap::new(),
             pending_flows: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Build a registry from the `[[api.oauth_providers]]` entries of a parsed config.
+    ///
+    /// Returns the registry plus one human-readable warning for every entry that was
+    /// REFUSED. The caller ([`crate::api::ApiServer::from_config`]) logs those warnings;
+    /// nothing here writes to the log itself, so this stays a pure, unit-testable
+    /// function.
+    ///
+    /// # Why warnings instead of an error
+    ///
+    /// One misspelled provider name must not stop the server from booting, and it must
+    /// not be swallowed either: an operator who writes `name = "gooogle"` and gets a
+    /// silently empty registry sees exactly the 503 this seam exists to remove, with
+    /// nothing in the log to explain it. Every refusal therefore produces a line.
+    ///
+    /// # Fail closed
+    ///
+    /// A refused entry is never served. `register_*` validates every URL before it
+    /// inserts, so a failure cannot leave a half-built provider behind — but a *later*
+    /// duplicate entry that fails to build could otherwise leave the *earlier* entry
+    /// registered under the same name, and the server would then serve a configuration
+    /// the operator has since replaced. The explicit `remove` below closes that: once
+    /// any entry for a provider is refused, that provider is not served at all.
+    ///
+    /// # Secrets
+    ///
+    /// Warning strings quote the provider name and a bounded prefix of the `client_id`
+    /// (public by construction — it is handed to the user's browser in the authorize
+    /// redirect). The `client_secret` is read only to check that it is non-empty and is
+    /// never formatted into a message.
+    pub fn from_config(providers: &[OAuthProviderConfig]) -> (Self, Vec<String>) {
+        let mut registry = Self::new();
+        let mut warnings = Vec::new();
+        // Canonical names already accepted, in config order.
+        let mut seen: Vec<String> = Vec::new();
+
+        for entry in providers {
+            // Provider names match case-insensitively: `Google`, `GOOGLE` and `google`
+            // are the same provider. This TOML is written by hand.
+            let canonical = entry.name.trim().to_ascii_lowercase();
+
+            // 1. An unrecognised name is a refusal with a message, never a silent skip.
+            if !matches!(canonical.as_str(), "google" | "github") {
+                warnings.push(format!(
+                    "unknown OAuth provider '{}'; supported: {SUPPORTED_PROVIDERS}",
+                    entry.name
+                ));
+                continue;
+            }
+
+            // 2. A second entry for the same provider overwrites the first. That is
+            //    allowed (last one wins), but it is never what the operator meant.
+            if seen.iter().any(|name| name == &canonical) {
+                warnings.push(format!(
+                    "duplicate [[api.oauth_providers]] entry for '{canonical}'; the last entry in \
+                     the config wins and the earlier one is ignored"
+                ));
+            } else {
+                seen.push(canonical.clone());
+            }
+
+            // 3. Blank credentials build a client that fails only at the provider, with
+            //    an opaque error, after the user has already been redirected away.
+            if let Some(field) = blank_required_field(entry) {
+                warnings.push(format!(
+                    "OAuth provider '{canonical}' is REFUSED and will not be served: {field} is empty"
+                ));
+                registry.providers.remove(&canonical);
+                continue;
+            }
+
+            // 4. Build. `register_*` validates the redirect URI (and the fixed endpoint
+            //    URLs) before inserting anything.
+            let built = match canonical.as_str() {
+                "google" => registry.register_google(&entry.client_id, &entry.client_secret, &entry.redirect_uri),
+                "github" => registry.register_github(&entry.client_id, &entry.client_secret, &entry.redirect_uri),
+                // Unreachable: step 1 rejected every other name. Written as an error
+                // rather than a panic so that a future edit to that guard degrades to a
+                // refusal instead of taking the process down.
+                other => Err(OAuthError::ConfigError(format!("unsupported provider '{other}'"))),
+            };
+
+            if let Err(e) = built {
+                warnings.push(format!(
+                    "OAuth provider '{canonical}' (client_id '{}') is REFUSED and will not be served: {e}",
+                    short_client_id(&entry.client_id)
+                ));
+                registry.providers.remove(&canonical);
+            }
+        }
+
+        (registry, warnings)
     }
 
     /// Register Google as an OAuth provider.
@@ -312,6 +407,51 @@ impl OAuthRegistry {
     /// Returns `true` if there is at least one registered provider.
     pub fn has_providers(&self) -> bool {
         !self.providers.is_empty()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Config -> registry helpers
+// ---------------------------------------------------------------------------
+
+/// The provider names [`OAuthRegistry::from_config`] accepts, for its error messages.
+///
+/// Kept next to the `matches!` guard that enforces it so the two cannot drift.
+const SUPPORTED_PROVIDERS: &str = "google, github";
+
+/// Upper bound, in characters, on how much of a `client_id` a refusal warning quotes.
+///
+/// The `client_id` is not a secret — it travels to the provider in the authorize
+/// redirect, in plain sight of the user's browser — but it is operator-supplied text
+/// that ends up in the server log, so the line is bounded rather than echoing it
+/// wholesale. Long enough that a Google (`....apps.googleusercontent.com`) or GitHub
+/// (`Iv1....`) client id stays recognisable at a glance.
+const MAX_LOGGED_CLIENT_ID_CHARS: usize = 48;
+
+/// Quote a `client_id` for a log line, truncated to [`MAX_LOGGED_CLIENT_ID_CHARS`].
+///
+/// Truncation lands on a character boundary (`char_indices`), so a multi-byte client
+/// id cannot panic here.
+fn short_client_id(client_id: &str) -> String {
+    match client_id.char_indices().nth(MAX_LOGGED_CLIENT_ID_CHARS) {
+        Some((byte_idx, _)) => format!("{}...", client_id.get(..byte_idx).unwrap_or_default()),
+        None => client_id.to_string(),
+    }
+}
+
+/// Name of the first required credential field that is blank, if any.
+///
+/// `client_secret` is inspected here and nowhere else outside the `oauth2` client it is
+/// handed to: this function returns the field's NAME, never its value.
+fn blank_required_field(entry: &OAuthProviderConfig) -> Option<&'static str> {
+    if entry.client_id.trim().is_empty() {
+        Some("client_id")
+    } else if entry.client_secret.trim().is_empty() {
+        Some("client_secret")
+    } else if entry.redirect_uri.trim().is_empty() {
+        Some("redirect_uri")
+    } else {
+        None
     }
 }
 
@@ -720,6 +860,174 @@ mod tests {
         assert!(chained.contains("timed out"), "{chained}");
         // Two links, so exactly one separator.
         assert_eq!(chained.matches(": ").count(), 1, "{chained}");
+    }
+
+    // -----------------------------------------------------------------------
+    // from_config: the config -> registry seam (sprinter e7b6cea1d3bc)
+    // -----------------------------------------------------------------------
+
+    fn provider(name: &str, redirect: &str) -> OAuthProviderConfig {
+        OAuthProviderConfig {
+            name: name.to_string(),
+            client_id: "test-client-id".to_string(),
+            client_secret: "test-client-secret".to_string(),
+            redirect_uri: redirect.to_string(),
+        }
+    }
+
+    /// The happy path: a well-formed entry registers and says nothing.
+    #[test]
+    fn test_from_config_registers_google_without_warnings() {
+        let (registry, warnings) =
+            OAuthRegistry::from_config(&[provider("google", "http://localhost:8080/auth/v1/callback")]);
+
+        assert!(registry.providers.contains_key("google"));
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    /// TOML is hand-written; `Google` and `google` are the same provider.
+    #[test]
+    fn test_from_config_matches_provider_names_case_insensitively() {
+        let (registry, warnings) =
+            OAuthRegistry::from_config(&[provider("GitHub", "http://localhost:8080/auth/v1/callback")]);
+
+        assert!(registry.providers.contains_key("github"));
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    /// An unknown name must WARN, not vanish — a silent skip is indistinguishable
+    /// from "OAuth is not configured", which is the bug this seam exists to fix.
+    #[test]
+    fn test_from_config_unknown_provider_warns_and_is_not_registered() {
+        let (registry, warnings) =
+            OAuthRegistry::from_config(&[provider("gooogle", "http://localhost:8080/auth/v1/callback")]);
+
+        assert!(!registry.has_providers(), "an unknown provider must not be served");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        let warning = warnings.first().expect("one warning");
+        assert!(warning.contains("gooogle"), "{warning}");
+        assert!(
+            warning.contains("google, github"),
+            "must list what IS supported: {warning}"
+        );
+    }
+
+    /// A build failure fails CLOSED: the provider is not in the registry at all.
+    #[test]
+    fn test_from_config_build_failure_is_refused_not_registered() {
+        let (registry, warnings) = OAuthRegistry::from_config(&[provider("google", "not a valid url")]);
+
+        assert!(
+            !registry.has_providers(),
+            "a provider that failed to build must NOT be served"
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        let warning = warnings.first().expect("one warning");
+        assert!(warning.contains("google"), "{warning}");
+        assert!(warning.contains("REFUSED"), "{warning}");
+    }
+
+    /// A later entry that fails must not leave an earlier, good one serving a config
+    /// the operator has already replaced.
+    #[test]
+    fn test_from_config_failed_duplicate_unregisters_the_earlier_entry() {
+        let (registry, warnings) = OAuthRegistry::from_config(&[
+            provider("google", "http://localhost:8080/auth/v1/callback"),
+            provider("google", "not a valid url"),
+        ]);
+
+        assert!(
+            !registry.has_providers(),
+            "the refused second entry must take the first one down with it"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("duplicate")),
+            "the duplicate must be reported: {warnings:?}"
+        );
+        assert!(warnings.iter().any(|w| w.contains("REFUSED")), "{warnings:?}");
+    }
+
+    /// Blank credentials would redirect the user to a provider that rejects them.
+    #[test]
+    fn test_from_config_blank_credentials_are_refused() {
+        let mut entry = provider("google", "http://localhost:8080/auth/v1/callback");
+        entry.client_secret = "   ".to_string();
+
+        let (registry, warnings) = OAuthRegistry::from_config(&[entry]);
+
+        assert!(!registry.has_providers());
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        let warning = warnings.first().expect("one warning");
+        assert!(warning.contains("client_secret"), "must name the field: {warning}");
+        assert!(warning.contains("is empty"), "{warning}");
+    }
+
+    /// No entries at all is not an error and produces no noise; the caller uses
+    /// `has_providers()` to decide whether to attach the registry.
+    #[test]
+    fn test_from_config_empty_is_silent_and_has_no_providers() {
+        let (registry, warnings) = OAuthRegistry::from_config(&[]);
+        assert!(!registry.has_providers());
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn test_from_config_registers_both_providers() {
+        let (registry, warnings) = OAuthRegistry::from_config(&[
+            provider("google", "http://localhost:8080/auth/v1/callback"),
+            provider("github", "http://localhost:8080/auth/v1/callback"),
+        ]);
+
+        assert_eq!(registry.providers.len(), 2, "{warnings:?}");
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    /// No warning may ever carry the client secret. This is the assertion that keeps a
+    /// future "helpful" error message from writing a credential into the server log.
+    #[test]
+    fn test_from_config_warnings_never_contain_the_client_secret() {
+        let secret = "GOCSPX-super-secret-value";
+        let entries = vec![
+            OAuthProviderConfig {
+                name: "nope".to_string(),
+                client_id: "test-client-id".to_string(),
+                client_secret: secret.to_string(),
+                redirect_uri: "http://localhost:8080/auth/v1/callback".to_string(),
+            },
+            OAuthProviderConfig {
+                name: "google".to_string(),
+                client_id: "test-client-id".to_string(),
+                client_secret: secret.to_string(),
+                redirect_uri: "not a valid url".to_string(),
+            },
+        ];
+
+        let (_registry, warnings) = OAuthRegistry::from_config(&entries);
+
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        for warning in &warnings {
+            assert!(
+                !warning.contains(secret),
+                "a refusal warning leaked the client_secret: {warning}"
+            );
+        }
+    }
+
+    /// A long client id is truncated rather than echoed wholesale into the log.
+    #[test]
+    fn test_short_client_id_truncates_on_a_char_boundary() {
+        let long = "\u{e9}".repeat(MAX_LOGGED_CLIENT_ID_CHARS * 2);
+        let shortened = short_client_id(&long);
+
+        assert!(shortened.ends_with("..."), "{shortened}");
+        assert_eq!(
+            shortened.chars().count(),
+            MAX_LOGGED_CLIENT_ID_CHARS + 3,
+            "expected {MAX_LOGGED_CLIENT_ID_CHARS} chars plus the ellipsis: {shortened}"
+        );
+
+        let short = "Iv1.abc123";
+        assert_eq!(short_client_id(short), short, "a short id is quoted verbatim");
     }
 
     #[test]
