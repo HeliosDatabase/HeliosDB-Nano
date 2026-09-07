@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.31.0] - 2026-09-07
+
 ### Fixed — UNIQUE was enforced only for the first table to use a column name; every spelling now enforces; ON CONFLICT never duplicates; FK targets validated at DDL
 
 The Partner Portal saw "state-dependent" uniqueness: identical DDL rejected duplicates in one run
