@@ -17,7 +17,7 @@ use crate::{Error, Result, Tuple};
 use dashmap::{DashMap, DashSet};
 use parking_lot::RwLock;
 use rocksdb::{WriteOptions, DB};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tracing::{debug, trace, warn};
 
@@ -196,6 +196,15 @@ pub struct Transaction {
     /// `None` (the default configuration) makes every use a single `Option`
     /// check with no allocation and no copy.
     key_manager: Option<Arc<KeyManager>>,
+    /// Membership in the engine's [`UncommittedWriteCensus`], armed on this
+    /// transaction's first staged write and released in `Drop`.
+    ///
+    /// `Some` for every EXPLICIT transaction (`StorageEngine::begin_transaction`
+    /// and the session transactions `lib.rs` builds with `new_with_session`);
+    /// `None` for `begin_autocommit_transaction`, whose writes become visible
+    /// within the statement that made them and which would otherwise hold the
+    /// census non-zero for the whole of any write workload.
+    write_census: Option<WriteCensusGate>,
 }
 
 impl Drop for Transaction {
@@ -215,7 +224,379 @@ impl Drop for Transaction {
                 registry.unpin_snapshot(pin_id);
             }
         }
+        // Leave the uncommitted-write census however this transaction ended.
+        // `Drop` is the ONLY release point precisely because it is the one
+        // thing every path shares (commit, rollback, an error path that drops
+        // the transaction, a session map cleared at shutdown).
+        //
+        // ORDERING REQUIREMENT: the eager ART index entries this transaction
+        // made are undone by the CALLER (`rollback_art_undo_log` /
+        // `finish_session_art_undo`), not here. A caller that rolls back MUST
+        // replay that undo log BEFORE dropping the transaction — otherwise the
+        // census reads zero while the index still holds rows the rollback
+        // erased, and a concurrent `COUNT(*)` takes the index fast path and
+        // counts them. `rollback_internal_locked`, `destroy_session` and
+        // `rollback_transaction_for_session_inner` are ordered that way.
+        if let Some(gate) = &self.write_census {
+            gate.release();
+        }
     }
+}
+
+/// Census of the staged (uncommitted) writes that could make an ART index
+/// answer for rows no other transaction may see.
+///
+/// ## Why this exists
+///
+/// The ART indexes are maintained EAGERLY: an `INSERT` inside an explicit
+/// transaction adds its key at statement time (that is what makes PK/UNIQUE
+/// conflicts fail immediately rather than at COMMIT), a `DELETE` strips its key
+/// at statement time, and an `UPDATE` that moves an indexed value does both.
+/// The rows themselves do not reach `data:` until commit. So the index — unlike
+/// row storage — is a single process-wide DIRTY view: exactly right for the
+/// transaction that staged those writes, and wrong for every other session.
+///
+/// Two different questions are asked of it, and they need different answers:
+///
+/// * **Cardinality** (`count_table_rows`'s `pk_index_len` shortcut,
+///   `count_table_pk_int_range_with_schema`, the executor's PK-cardinality
+///   probes). Broken by an insert (over-reports) AND by a delete
+///   (under-reports), so it declines on ANY staged write for the table.
+/// * **A probe that MISSES** (`index_get_all` / `pk_index_lookup` reporting "no
+///   such row"). A staged INSERT can only ADD a key: it can never turn a
+///   present key into an absent one, so it cannot cause a miss. ONLY a staged
+///   REMOVAL — a `DELETE`, or an `UPDATE` that moved an indexed value — can
+///   make a still-committed row look absent. Miss-based paths therefore decline
+///   only on staged removals. (A probe HIT needs no rule in either direction:
+///   rows are materialised from row storage, which holds no uncommitted rows,
+///   so another transaction's staged INSERT contributes a key whose row simply
+///   is not there.)
+///
+/// ## Shape
+///
+/// Both questions are per-TABLE — a staged write to `orders` cannot make the
+/// index for `users` untrustworthy — but the overwhelmingly common case is that
+/// nothing is staged anywhere, and that case must cost ONE atomic load. So
+/// `open` is the global fast-out (`any_uncommitted_writes`) and the per-table
+/// map is consulted only once it is non-zero. Callers must always go through
+/// `StorageEngine::has_uncommitted_writes_for_table` /
+/// `has_uncommitted_index_removals_for_table`, which enforce that order.
+///
+/// A transaction contributes at most 1 to each counter for a given table,
+/// however many rows it stages, and releases exactly what it took in its
+/// `Drop`. Table entries are never removed (the number of tables is bounded,
+/// and removal would race with concurrent arming for no benefit).
+#[derive(Debug, Default)]
+pub struct UncommittedWriteCensus {
+    open: AtomicUsize,
+    tables: DashMap<String, TableWriteCensus>,
+    /// Transactions holding a staged key this census could not attribute to a
+    /// table. Fail-closed: while non-zero, EVERY table reports both staged
+    /// writes and staged removals.
+    unattributed: AtomicUsize,
+}
+
+/// Per-table half of an [`UncommittedWriteCensus`]. Counts TRANSACTIONS, not
+/// rows or keys.
+#[derive(Debug, Default)]
+struct TableWriteCensus {
+    /// Transactions holding any staged write for this table (cardinality gate).
+    writes: AtomicUsize,
+    /// Transactions that have removed at least one index entry for this table
+    /// (miss gate) — a staged `DELETE`, or an `UPDATE` that moved an indexed
+    /// value.
+    removals: AtomicUsize,
+}
+
+impl UncommittedWriteCensus {
+    /// A census with nothing staged.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// True when at least one transaction is holding staged writes ANYWHERE.
+    /// ONE `Acquire` load — the idle fast-out every gated path starts with, and
+    /// the only thing an idle server ever pays.
+    #[inline]
+    pub fn any_uncommitted_writes(&self) -> bool {
+        self.open.load(Ordering::Acquire) > 0
+    }
+
+    /// Number of transactions currently counted (diagnostics and tests).
+    pub fn uncommitted_write_transactions(&self) -> usize {
+        self.open.load(Ordering::Acquire)
+    }
+
+    /// Does any open transaction hold a staged write for `table`? Gate for the
+    /// CARDINALITY fast paths. Call only after `any_uncommitted_writes`.
+    pub fn table_has_staged_writes(&self, table: &str) -> bool {
+        if self.unattributed.load(Ordering::Acquire) > 0 {
+            return true;
+        }
+        self.tables
+            .get(table)
+            .is_some_and(|counts| counts.writes.load(Ordering::Acquire) > 0)
+    }
+
+    /// Has any open transaction REMOVED an index entry for `table`? Gate for
+    /// the miss-based fast paths. Call only after `any_uncommitted_writes`.
+    pub fn table_has_staged_index_removals(&self, table: &str) -> bool {
+        if self.unattributed.load(Ordering::Acquire) > 0 {
+            return true;
+        }
+        self.tables
+            .get(table)
+            .is_some_and(|counts| counts.removals.load(Ordering::Acquire) > 0)
+    }
+
+    fn enter(&self) {
+        self.open.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn leave(&self) {
+        Self::decrement(&self.open);
+    }
+
+    fn enter_unattributed(&self) {
+        self.unattributed.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn leave_unattributed(&self) {
+        Self::decrement(&self.unattributed);
+    }
+
+    fn enter_table_write(&self, table: &str) {
+        self.tables
+            .entry(table.to_string())
+            .or_default()
+            .writes
+            .fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn leave_table_write(&self, table: &str) {
+        if let Some(counts) = self.tables.get(table) {
+            Self::decrement(&counts.writes);
+        }
+    }
+
+    fn enter_table_removal(&self, table: &str) {
+        self.tables
+            .entry(table.to_string())
+            .or_default()
+            .removals
+            .fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn leave_table_removal(&self, table: &str) {
+        if let Some(counts) = self.tables.get(table) {
+            Self::decrement(&counts.removals);
+        }
+    }
+
+    /// `fetch_update` rather than `fetch_sub` so an (edit-induced) unpaired
+    /// release can never wrap a counter to `usize::MAX` and disable a fast path
+    /// for the life of the process. `WriteCensusGate` guarantees pairing; this
+    /// caps the blast radius if a future edit breaks that guarantee.
+    fn decrement(slot: &AtomicUsize) {
+        let _ = slot.fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| Some(v.saturating_sub(1)));
+    }
+
+    /// Take a standalone set of census slots, released when the returned value
+    /// drops. See [`UncommittedWriteHold`].
+    fn hold(self: &Arc<Self>, membership: CensusMembership) -> UncommittedWriteHold {
+        if membership.counted {
+            self.enter();
+        }
+        if membership.unattributed {
+            self.enter_unattributed();
+        }
+        for table in &membership.tables_written {
+            self.enter_table_write(table);
+        }
+        for table in &membership.tables_removed {
+            self.enter_table_removal(table);
+        }
+        UncommittedWriteHold {
+            census: Arc::clone(self),
+            membership,
+        }
+    }
+}
+
+/// The exact set of census slots one transaction holds. Used to hand an
+/// identical set to an [`UncommittedWriteHold`].
+#[derive(Debug, Default, Clone)]
+struct CensusMembership {
+    counted: bool,
+    unattributed: bool,
+    tables_written: Vec<String>,
+    tables_removed: Vec<String>,
+}
+
+/// A standalone copy of one transaction's census membership, released on `Drop`.
+///
+/// For the one case a `Transaction`'s own membership cannot cover: a COMMIT
+/// that FAILS. `commit_with_timestamp` consumes the transaction, so by the time
+/// the caller learns the commit failed the transaction (and its census slots)
+/// are already gone — while its eager ART index entries are still in place,
+/// waiting for the caller to replay the undo log. Holding one of these across
+/// the commit keeps the fast paths off the index until that undo has run. It
+/// takes the SAME per-table slots the transaction held, so the narrowing is
+/// preserved across the window.
+#[derive(Debug)]
+pub struct UncommittedWriteHold {
+    census: Arc<UncommittedWriteCensus>,
+    membership: CensusMembership,
+}
+
+impl Drop for UncommittedWriteHold {
+    fn drop(&mut self) {
+        for table in &self.membership.tables_removed {
+            self.census.leave_table_removal(table);
+        }
+        for table in &self.membership.tables_written {
+            self.census.leave_table_write(table);
+        }
+        if self.membership.unattributed {
+            self.census.leave_unattributed();
+        }
+        if self.membership.counted {
+            self.census.leave();
+        }
+    }
+}
+
+/// One transaction's membership in an [`UncommittedWriteCensus`].
+///
+/// Owned by the `Transaction` itself, so membership ends on EVERY exit path —
+/// commit, rollback, and a transaction dropped on an error path — through the
+/// transaction's `Drop`. Exactness does not depend on finding every
+/// commit/rollback/cleanup call site: it depends on Rust running `Drop` exactly
+/// once for a value with a single owner, which `Transaction` is (it is not
+/// `Clone`).
+///
+/// Every arming site is "insert into MY OWN set, and touch the shared census
+/// only if the insert was the one that added it" — `DashSet::insert` returns
+/// `false` for a value already present, atomically, so two threads staging the
+/// same table for the same transaction cannot both arm a counter.
+#[derive(Debug)]
+struct WriteCensusGate {
+    census: Arc<UncommittedWriteCensus>,
+    /// Holds the global `open` slot.
+    counted: AtomicBool,
+    /// Holds the `unattributed` slot (a staged key with no attributable table).
+    unattributed: AtomicBool,
+    /// Tables whose `writes` slot this transaction holds.
+    tables_written: DashSet<String>,
+    /// Tables whose `removals` slot this transaction holds.
+    tables_removed: DashSet<String>,
+}
+
+impl WriteCensusGate {
+    fn new(census: Arc<UncommittedWriteCensus>) -> Self {
+        Self {
+            census,
+            counted: AtomicBool::new(false),
+            unattributed: AtomicBool::new(false),
+            tables_written: DashSet::new(),
+            tables_removed: DashSet::new(),
+        }
+    }
+
+    /// Called on every staged write; does work only for the first one.
+    #[inline]
+    fn note_write(&self) {
+        if self.counted.load(Ordering::Relaxed) {
+            return;
+        }
+        if self
+            .counted
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            self.census.enter();
+        }
+    }
+
+    /// This transaction has staged a write for `table` (it may have ADDED index
+    /// keys). Called once per table — from the branch that discovers the table
+    /// is new to this transaction — so it is off the per-row path.
+    fn note_table_write(&self, table: &str) {
+        if self.tables_written.insert(table.to_string()) {
+            self.census.enter_table_write(table);
+        }
+    }
+
+    /// This transaction has REMOVED index entries for `table` (a staged DELETE,
+    /// or an UPDATE that moved an indexed value). Cheap repeat calls: one
+    /// `DashSet` probe, on the delete/update path only.
+    fn note_table_removal(&self, table: &str) {
+        if self.tables_removed.contains(table) {
+            return;
+        }
+        // A removal is also a write for cardinality purposes, and it is armed
+        // FIRST: a reader that saw `removals` armed while `writes` was not would
+        // have a window in which a COUNT still took the index fast path with an
+        // entry already stripped from it.
+        self.note_table_write(table);
+        if self.tables_removed.insert(table.to_string()) {
+            self.census.enter_table_removal(table);
+        }
+    }
+
+    /// This transaction staged a key that could not be attributed to a table.
+    /// Fail-closed: every table now reports staged writes AND staged removals
+    /// until this transaction ends.
+    fn note_unattributed(&self) {
+        if self.unattributed.load(Ordering::Relaxed) {
+            return;
+        }
+        if self
+            .unattributed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            self.census.enter_unattributed();
+        }
+    }
+
+    /// The exact set of slots this transaction currently holds.
+    fn membership(&self) -> CensusMembership {
+        CensusMembership {
+            counted: self.counted.load(Ordering::Acquire),
+            unattributed: self.unattributed.load(Ordering::Acquire),
+            tables_written: self.tables_written.iter().map(|t| t.key().clone()).collect(),
+            tables_removed: self.tables_removed.iter().map(|t| t.key().clone()).collect(),
+        }
+    }
+
+    /// Idempotent: leaves every slot exactly once, however this transaction ends.
+    fn release(&self) {
+        for table in self.tables_removed.iter() {
+            self.census.leave_table_removal(table.key());
+        }
+        self.tables_removed.clear();
+        for table in self.tables_written.iter() {
+            self.census.leave_table_write(table.key());
+        }
+        self.tables_written.clear();
+        if self.unattributed.swap(false, Ordering::AcqRel) {
+            self.census.leave_unattributed();
+        }
+        if self.counted.swap(false, Ordering::AcqRel) {
+            self.census.leave();
+        }
+    }
+}
+
+/// What a staged key does to the table's ART indexes: `Value` can only ADD keys
+/// (an INSERT, or an UPDATE's new row), `Tombstone` REMOVES the row and its
+/// keys. The distinction is what keeps a staged INSERT from slowing down every
+/// missing-key lookup in the process — see [`UncommittedWriteCensus`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StagedKey {
+    Value,
+    Tombstone,
 }
 
 /// Transaction state captured by a SAVEPOINT.
@@ -266,6 +647,7 @@ impl Transaction {
             conflict_validation: false,
             gc_pin_id: None,
             key_manager: None,
+            write_census: None,
         })
     }
 
@@ -280,6 +662,61 @@ impl Transaction {
     /// `lib.rs`, and `BranchTransaction::new`) all call it.
     pub fn set_key_manager(&mut self, key_manager: Option<Arc<KeyManager>>) {
         self.key_manager = key_manager;
+    }
+
+    /// Enroll this transaction in the engine's uncommitted-write census (see
+    /// [`UncommittedWriteCensus`]). For EXPLICIT transactions only — autocommit
+    /// transactions publish their writes within the statement that made them,
+    /// and enrolling them would hold the census non-zero (and the COUNT fast
+    /// paths off) for the whole of any write workload.
+    ///
+    /// Enrollment costs nothing until the transaction stages its first write.
+    ///
+    /// MUST be called before the transaction stages anything. The per-table
+    /// arming rides the branch that first sees a table (see
+    /// `note_written_key`), so a write staged before enrollment would leave
+    /// that table permanently unarmed for this transaction.
+    pub fn set_write_census(&mut self, census: Arc<UncommittedWriteCensus>) {
+        self.write_census = Some(WriteCensusGate::new(census));
+    }
+
+    /// True once this transaction has staged a write and is therefore counted
+    /// by the engine census. Diagnostic/test accessor.
+    pub fn is_counted_by_write_census(&self) -> bool {
+        self.write_census
+            .as_ref()
+            .is_some_and(|gate| gate.counted.load(Ordering::Acquire))
+    }
+
+    /// Take a standalone copy of this transaction's census membership, to keep
+    /// the fast paths off its tables across work that outlives the transaction
+    /// object — specifically a FAILED commit, after which the caller still has
+    /// to replay the eager ART undo log. `None` when this transaction holds no
+    /// census slots. See [`UncommittedWriteHold`].
+    pub fn write_census_hold(&self) -> Option<UncommittedWriteHold> {
+        let gate = self.write_census.as_ref()?;
+        let membership = gate.membership();
+        if !membership.counted && !membership.unattributed {
+            return None;
+        }
+        Some(gate.census.hold(membership))
+    }
+
+    /// Record that this transaction REMOVED index entries for `table`.
+    ///
+    /// Called from the ONE funnel every eager ART mutation inside a transaction
+    /// passes through — `EmbeddedDatabase::push_art_undo` — for the ops that
+    /// take a key OUT of an index (`RestoreDeleted`, and `RestoreUpdated` for an
+    /// UPDATE that moved an indexed value). The write-set layer cannot see the
+    /// latter: an UPDATE stages a `data:` VALUE, so nothing about the staged key
+    /// says an index entry disappeared. Without this, a `WHERE pk = <old value>`
+    /// probe would miss a still-committed row and report it absent.
+    ///
+    /// No-op for a transaction not enrolled in a census.
+    pub fn note_index_key_removal(&self, table: &str) {
+        if let Some(gate) = &self.write_census {
+            gate.note_table_removal(table);
+        }
     }
 
     /// Decode a value read straight from RocksDB by this transaction, applying
@@ -407,6 +844,7 @@ impl Transaction {
             conflict_validation: false,
             gc_pin_id: None,
             key_manager: None,
+            write_census: None,
         })
     }
 
@@ -584,7 +1022,7 @@ impl Transaction {
 
         // R2.3: attribute the staged write to its table for the executor's
         // write-set-empty fast-path gate.
-        self.note_written_key(&key);
+        self.note_written_key(&key, StagedKey::Value);
 
         // Lock-free write_set insert using DashMap
         self.write_set.insert(key, Some(value));
@@ -608,7 +1046,7 @@ impl Transaction {
         }
 
         // R2.3: attribute the staged insert to its table (see `written_tables`).
-        self.note_written_key(&key);
+        self.note_written_key(&key, StagedKey::Value);
         self.insert_log.write().push((key, value));
         Ok(())
     }
@@ -627,9 +1065,17 @@ impl Transaction {
             return Err(Error::transaction("Transaction is not active"));
         }
 
+        // A staged row counter implies staged rows (see `note_written_key`).
+        if let Some(gate) = &self.write_census {
+            gate.note_write();
+        }
         // R2.3: a staged row counter implies staged rows for this table.
         if !self.written_tables.contains(table_name) {
-            self.written_tables.insert(table_name.to_string());
+            if self.written_tables.insert(table_name.to_string()) {
+                if let Some(gate) = &self.write_census {
+                    gate.note_table_write(table_name);
+                }
+            }
         }
 
         let mut stages = self.row_counter_stages.write();
@@ -656,7 +1102,7 @@ impl Transaction {
         }
 
         // R2.3: attribute the staged tombstone to its table (see `written_tables`).
-        self.note_written_key(&key);
+        self.note_written_key(&key, StagedKey::Tombstone);
 
         // Lock-free write_set insert (tombstone) using DashMap
         self.write_set.insert(key, None);
@@ -1574,19 +2020,78 @@ impl Transaction {
     /// [`has_writes_for_table`](Self::has_writes_for_table) report `true` for
     /// every table (the staged write could affect anything, so every read in
     /// this transaction must stay on the write-set-merging slow path).
-    fn note_written_key(&self, key: &[u8]) {
+    fn note_written_key(&self, key: &[u8], staged: StagedKey) {
+        // Every staged write funnels through here (`put`, `put_insert_fast`,
+        // `delete`, and `update_tuples`/`delete_tuples` via those), so this is
+        // the one place the census has to be armed. It is armed BEFORE the
+        // write is staged and — in the SQL executor — before the eager ART
+        // index mutation that follows the `txn.put`/`txn.delete`, so the census
+        // is raised no later than the index entry a reader could observe.
+        if let Some(gate) = &self.write_census {
+            gate.note_write();
+        }
         if let Some(rest) = key.strip_prefix(b"data:".as_slice()) {
             if let Ok(text) = std::str::from_utf8(rest) {
                 if let Some(pos) = text.find(':') {
                     let table = &text[..pos];
                     if !self.written_tables.contains(table) {
-                        self.written_tables.insert(table.to_string());
+                        // Arming the census rides the branch that discovers the
+                        // table is new to this transaction, so the per-row cost
+                        // of the census stays at the one relaxed load above.
+                        if self.written_tables.insert(table.to_string()) {
+                            if let Some(gate) = &self.write_census {
+                                gate.note_table_write(table);
+                            }
+                        }
+                    }
+                    // A tombstone REMOVES the row's index entries, which is the
+                    // only thing that can make a probe MISS for a still-committed
+                    // row. One `DashSet` probe, on the delete path only.
+                    if staged == StagedKey::Tombstone {
+                        if let Some(gate) = &self.write_census {
+                            gate.note_table_removal(table);
+                        }
                     }
                     return;
                 }
             }
         }
+        // Not a `data:` row key. Some of these are known to be incapable of
+        // changing an ART index — they are sidecars and counters, written
+        // alongside the row write that already armed the table — and the rest
+        // this census cannot reason about, so they fail closed onto every table.
+        if let Some(gate) = &self.write_census {
+            if !Self::key_cannot_change_an_index(key) {
+                gate.note_unattributed();
+            }
+        }
         self.has_unattributed_writes.store(true, Ordering::Release);
+    }
+
+    /// Staged keys that provably cannot change any ART index, so the census can
+    /// ignore them instead of declaring every table suspect.
+    ///
+    /// The ART indexes map INDEXED COLUMN VALUES to row ids, and are mutated
+    /// only by the executor's `on_insert`/`on_update`/`on_delete` hooks, which
+    /// always accompany a `data:{table}:{row_id}` write — the key shape handled
+    /// above. Everything listed here is a per-table SIDECAR of such a write
+    /// (columnar column batches, their zone stats and manifests, the presence
+    /// map) or the table's row-id counter. None is read by any index probe.
+    ///
+    /// Deliberately an ALLOWLIST: an unrecognised key shape falls through to
+    /// the fail-closed path, so a future key prefix cannot silently open a
+    /// hole. Note this affects the CENSUS only — `has_unattributed_writes`,
+    /// which R2.3's read gates gate on, is still set for every one of them.
+    fn key_cannot_change_an_index(key: &[u8]) -> bool {
+        const INDEX_IRRELEVANT_PREFIXES: [&[u8]; 6] = [
+            b"col:",     // columnar column batch
+            b"colz:",    // columnar zone stats
+            b"colzm:",   // columnar zone-stats manifest
+            b"colp:",    // columnar presence map
+            b"colpm:",   // columnar presence manifest
+            b"counter:", // per-table row-id high-water mark
+        ];
+        INDEX_IRRELEVANT_PREFIXES.iter().any(|prefix| key.starts_with(prefix))
     }
 
     /// R2.3: does this transaction hold staged writes that could affect reads
