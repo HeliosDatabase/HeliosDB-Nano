@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — OAuth sign-in could never work: nothing wired the configured providers into the server
+
+`GET /auth/v1/authorize?provider=google` answered 503 "OAuth is not configured" however the
+operator filled in `[[api.oauth_providers]]`. The Authorization Code + PKCE flow was fully
+implemented and the config was fully parsed, but nothing connected the two: the call that attaches
+the provider registry to the running server had no callers, so the registry was always absent.
+
+It survived because the HTTP router was assembled twice, independently — once at startup and once
+in the test suite — so every test could pass while the production path lacked the wiring. Both now
+build through one shared constructor, which also carries the schema bootstrap and the JWT-key
+handling, so a future gap of this shape fails the tests too.
+
+Configuration mistakes fail closed and are logged: an unknown provider name is refused with the
+supported set named, a provider that fails to build is refused and supersedes any earlier entry for
+the same name, and blank credentials are rejected up front rather than sending the user to a
+provider that will reject them. With no providers configured the endpoint keeps returning "not
+configured" rather than claiming the provider is unknown.
+
+`config.example.toml` gains the `[api]` section it never had, documenting `jwt_secret`, `anon_key`,
+`service_role_key` and `[[api.oauth_providers]]`, entirely commented out.
+
+### Security — configuration secrets are redacted in debug output
+
+`ApiConfig` and `OAuthProviderConfig` derived `Debug` while holding the JWT signing key, the
+service-role key (which bypasses RLS), the anonymous key and every OAuth client secret. Nothing
+printed them, but a single future debug log line would have leaked all of them at once. Both types
+now render secrets as `<redacted>` while still distinguishing an absent value from a redacted one;
+serialization is unchanged, so writing config back out still carries real values.
+
+
 ## [4.31.0] - 2026-09-07
 
 ### Fixed — UNIQUE was enforced only for the first table to use a column name; every spelling now enforces; ON CONFLICT never duplicates; FK targets validated at DDL
