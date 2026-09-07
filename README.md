@@ -14,10 +14,10 @@ Nano is one of four products in the HeliosDB family. SDKs and integrations are c
 
 - **[HeliosDatabase/HeliosDB-SDKs](https://github.com/HeliosDatabase/HeliosDB-SDKs)** — Official client SDKs (Python, TypeScript, Rust, Go) + integrations (VS Code, n8n, Zapier, Make, Retool, AutoGen) + cross-platform CLI. Apache 2.0.
 - **[HeliosDatabase/Any2HeliosDB](https://github.com/HeliosDatabase/Any2HeliosDB)** — Apache-2.0 `a2h` migration toolkit for moving Oracle, MySQL, PostgreSQL, and SQL Server into HeliosDB Nano/Lite/Full or stock PostgreSQL, with wizard setup, resumable loads, validation, CDC, and MCP support.
-- **[HeliosDatabase/HeliosDB-Lite](https://github.com/HeliosDatabase/HeliosDB-Lite)** — Production self-hosted database with HeliosProxy + HeliosCore baked in. SSPL-1.0.
-- **[HeliosDatabase/HeliosDB-Full](https://github.com/HeliosDatabase/HeliosDB-Full)** — Distributed enterprise database with 14 native wire protocols. SSPL-1.0.
+- **[HeliosDB Lite](https://www.heliosdb.com/lite.html)** — Production self-hosted database with HeliosProxy + HeliosCore baked in. SSPL-1.0; source is not publicly released.
+- **[HeliosDB Full](https://www.heliosdb.com/full.html)** — Distributed enterprise database with 14 native wire protocols. SSPL-1.0; source is not publicly released.
 - **[HeliosDatabase/HeliosDB-Proxy](https://github.com/HeliosDatabase/HeliosDB-Proxy)** — Programmable Postgres data-plane (PgBouncer drop-in + WASM plugins + zero-downtime PG-12→17 upgrade). Apache 2.0.
-- **[HeliosDatabase/HeliosDB-Proxy-Plugins](https://github.com/HeliosDatabase/HeliosDB-Proxy-Plugins)** · **[Operator](https://github.com/HeliosDatabase/HeliosDB-Proxy-Operator)** · **[Terraform](https://github.com/HeliosDatabase/terraform-provider-HeliosDB-Proxy)** · **[Pulumi](https://github.com/HeliosDatabase/pulumi-HeliosDB-Proxy)** — Proxy ecosystem.
+- **[HeliosDatabase/HeliosDB-Proxy-Plugins](https://github.com/HeliosDatabase/HeliosDB-Proxy-Plugins)** — Plugin interfaces and examples for extending HeliosProxy. Apache 2.0. The Kubernetes Operator, Terraform provider, and Pulumi provider are not publicly released.
 
 **[HeliosDatabase/HeliosDB-CodeKB-MCP](https://github.com/HeliosDatabase/HeliosDB-CodeKB-MCP)** provides an MCP server that turns HeliosDB codebases and docs into queryable technical knowledge for Claude Code, Codex, and other MCP clients.
 
