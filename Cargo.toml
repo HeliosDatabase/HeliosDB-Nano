@@ -70,8 +70,17 @@ async-trait = "0.1"
 # system trust store so custom-CA deployments behave as before.
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls-native-roots", "http2", "charset"] }
 # default-features = false drops oauth2's native-tls option (openssl stack,
-# banned) — rustls only, matching the reqwest pin above.
-oauth2 = { version = "4.4", default-features = false, features = ["reqwest", "rustls-tls"] }
+# banned) — rustls only, matching the reqwest pin above. The "reqwest" and
+# "rustls-tls" feature names are unchanged in 5.0.
+# Pinned to 5.x, not 4.x, for a security reason: oauth2 4.4 depends on reqwest
+# 0.11, which pulled a SECOND hyper 0.14 / h2 0.3 subtree into the tree alongside
+# our own reqwest 0.12. h2 0.3.27 is vulnerable to RUSTSEC-2026-0258 (it accepts
+# unbounded empty DATA frames, so a peer can drive unbounded memory growth or a
+# panic) and there is no patched 0.3.x release — the only fix is to leave reqwest
+# 0.11 behind. oauth2 5.0 depends on reqwest 0.12, which this crate already has,
+# so the duplicate subtree disappears entirely and `cargo deny check advisories`
+# goes green.
+oauth2 = { version = "5.0.0", default-features = false, features = ["reqwest", "rustls-tls"] }
 futures = "0.3"
 async-stream = "0.3"
 
