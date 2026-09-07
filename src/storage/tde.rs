@@ -51,7 +51,11 @@ static PLAINTEXT_PASSTHROUGH_COUNT: AtomicU64 = AtomicU64::new(0);
 ///   `wal:entries:` values are covered: `wal:last_lsn` is an 8-byte
 ///   little-endian marker parsed by `WriteAheadLog::recover_last_lsn` with a
 ///   fixed-width `try_into`, it holds no user data, and a 28-byte AEAD frame
-///   there would change a counter encoding to protect nothing.
+///   there would change a counter encoding to protect nothing. `wal:checkpoint`
+///   (`WriteAheadLog::CHECKPOINT_KEY`, the recovery watermark read by
+///   `StorageEngine::recover_wal_at_open`) is excluded for exactly the same
+///   reason and is parsed the same way. Note the 5-byte RocksDB prefix
+///   extractor keeps the three apart: `wal:e`, `wal:l`, `wal:c`.
 /// * `bdata:{branch_id}:{table}:{row_id}` — branch row overlays. A row inserted
 ///   or updated on a non-`main` branch is a full user row image, so it is sealed
 ///   by the same rule as `data:` and by every route that writes it:
