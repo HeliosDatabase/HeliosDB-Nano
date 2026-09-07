@@ -686,6 +686,20 @@ pub struct EmbeddedDatabase {
     /// Fast DML invalidation gate; avoids taking the result-cache mutex when
     /// no query has populated it since the last invalidation.
     result_cache_nonempty: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Monotonic count of result-cache invalidations.
+    ///
+    /// A read computes its rows and publishes them to the cache LATER, so an
+    /// invalidation can land in between and be undone by the publish — the
+    /// cache then serves a value that was already known to be wrong, and keeps
+    /// serving it until the NEXT invalidation. That is how a `COUNT(*)` taken
+    /// while another session held an open write transaction could survive that
+    /// transaction's COMMIT/ROLLBACK: both end by invalidating, and the racing
+    /// reader's publish re-installed the pre-event count afterwards.
+    ///
+    /// Readers snapshot this on entry and publish only if it is unchanged, so a
+    /// result can never be installed across the event that invalidated it. One
+    /// `fetch_add` per invalidation, two loads per cached read.
+    result_cache_epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// `StorageEngine::schema_generation` as of the last result-cache read.
     ///
     /// Every cache invalidation hook in this struct fires on mutations that go
@@ -1145,6 +1159,9 @@ struct InsertSelectGate<'a> {
 struct FastSelectSpec {
     table_name: String,
     pk_col: String,
+    /// Position of `pk_col` in `schema`. Kept so the index-hint verification in
+    /// `fast_row_matches_probed_pk` costs no per-query column lookup.
+    pk_col_idx: usize,
     schema: std::sync::Arc<Schema>,
     pk_data_type: DataType,
 }
@@ -2097,7 +2114,7 @@ impl EmbeddedDatabase {
             .iter()
             .map(|column| column.name.clone())
             .collect();
-        Some(self.fast_select_rows(&spec.select, &value).map(|rows| (rows, columns)))
+        Some(self.fast_select_rows(&spec.select, &value)?.map(|rows| (rows, columns)))
     }
 
     fn split_fast_prepare(rest: &str) -> Option<(String, &str)> {
@@ -2273,7 +2290,7 @@ impl EmbeddedDatabase {
         })
     }
 
-    fn maybe_cache_repeated_fast_select(&self, sql: &str, results: &[Tuple]) {
+    fn maybe_cache_repeated_fast_select(&self, sql: &str, results: &[Tuple], cache_epoch: u64) {
         let fingerprint = Self::fast_select_fingerprint(sql);
         let previous = self
             .last_fast_select_fingerprint
@@ -2282,7 +2299,15 @@ impl EmbeddedDatabase {
             return;
         }
 
-        self.cache_query_result(sql, results);
+        self.cache_query_result(sql, results, cache_epoch);
+    }
+
+    /// Snapshot of the result-cache invalidation epoch. Taken by a reader
+    /// BEFORE it reads any data; passed back to `cache_query_result`, which
+    /// refuses to publish if anything invalidated the cache in between.
+    #[inline]
+    fn result_cache_epoch(&self) -> u64 {
+        self.result_cache_epoch.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// R1.1 (ROADMAP_V5 §1.1 Residual, "the result cache is not tenant-keyed"):
@@ -2306,8 +2331,16 @@ impl EmbeddedDatabase {
     /// context-active reader can reach it. Entries cached *before* a context
     /// was ever set (the poisoned-pre-existing-entry case) need no migration or
     /// epoch bump for the same reason: the read gate makes them inert.
-    fn cache_query_result(&self, sql: &str, results: &[Tuple]) {
+    fn cache_query_result(&self, sql: &str, results: &[Tuple], cache_epoch: u64) {
         if self.tenant_manager.has_current_context() {
+            return;
+        }
+        // Refuse to publish a result that was computed before an invalidation
+        // this reader has already been overtaken by — otherwise the publish
+        // silently reinstates a value the invalidating event (a DML, a COMMIT,
+        // a ROLLBACK) had just corrected, and the cache serves it until the
+        // next invalidation. See `result_cache_epoch`.
+        if self.result_cache_epoch() != cache_epoch {
             return;
         }
         let cached = std::sync::Arc::new(results.to_vec());
@@ -3013,10 +3046,15 @@ impl EmbeddedDatabase {
             };
             if let Err(e) = validation {
                 if let Some(txn) = txn_ref.take() {
+                    // Same ordering requirement as `rollback_internal_locked`:
+                    // the ART undo must be replayed before the gates that keep
+                    // a concurrent `COUNT(*)` off the index come down (the
+                    // fast-out below, and this transaction's census slot, which
+                    // its `Drop` clears).
+                    self.rollback_art_undo_log();
                     self.global_txn_active
                         .store(false, std::sync::atomic::Ordering::Release);
                     let _ = txn.rollback();
-                    self.rollback_art_undo_log();
                 }
                 self.deferred_fk_checks.lock().clear();
                 self.constraints_all_deferred
@@ -3068,12 +3106,20 @@ impl EmbeddedDatabase {
     fn rollback_internal_locked(&self) -> Result<()> {
         let mut txn_ref = self.current_transaction.lock();
         if let Some(txn) = txn_ref.take() {
+            // ORDER: replay the eager ART index undo BEFORE the fast-out is
+            // cleared and before `txn` is dropped (dropping it also clears this
+            // transaction's slot in the storage-level uncommitted-write
+            // census). Both are gates on the `COUNT(*)` ART fast path, and
+            // undoing afterwards left a window in which a concurrent reader saw
+            // both gates down while the index still held the rows this ROLLBACK
+            // erased. Also runs the undo when `rollback()` errors, which the
+            // previous order did not.
+            self.rollback_art_undo_log();
             // Slot emptied (the transaction is consumed even if rollback
-            // errors) — clear the fast-out immediately.
+            // errors) — clear the fast-out.
             self.global_txn_active
                 .store(false, std::sync::atomic::Ordering::Release);
             txn.rollback()?;
-            self.rollback_art_undo_log();
             self.deferred_fk_checks.lock().clear();
             self.constraints_all_deferred
                 .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -3088,6 +3134,27 @@ impl EmbeddedDatabase {
     /// cleared by session COMMIT); the global-slot transaction keeps using
     /// the shared `art_undo_log`.
     fn push_art_undo(&self, txn: &storage::Transaction, op: ArtUndoOp) {
+        // THE funnel for every eager ART mutation made inside a transaction —
+        // which makes it the one place that knows a key was taken OUT of an
+        // index, and for which table. The write-set layer cannot tell: an
+        // UPDATE that moves an indexed value stages an ordinary `data:` VALUE,
+        // so nothing about the staged key says an entry disappeared. Feeding
+        // the census here is what lets a probe MISS stay fast when the only
+        // open writer is inserting (see `UncommittedWriteCensus`).
+        //
+        // This runs AFTER the index mutation it records, so a reader can in
+        // principle see the stripped entry a few instructions before the census
+        // says so; every gated caller re-checks after its probe, which closes
+        // that window for the answer it is about to give.
+        match &op {
+            ArtUndoOp::RestoreDeleted { table_name, .. } | ArtUndoOp::RestoreUpdated { table_name, .. } => {
+                txn.note_index_key_removal(table_name);
+            }
+            // An INSERT only ADDS keys: it can never cause a probe to miss.
+            // `note_written_key` has already armed this table's cardinality
+            // half from the staged `data:` key.
+            ArtUndoOp::RemoveInserted { .. } | ArtUndoOp::VectorUndo(_) => {}
+        }
         match txn.session_id() {
             Some(session_id) => {
                 self.session_art_undo.entry(session_id).or_default().push(op);
@@ -7647,6 +7714,7 @@ impl EmbeddedDatabase {
                     .with_site(lock_census::Site::ResultCache),
             ),
             result_cache_nonempty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            result_cache_epoch: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             seen_schema_generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(initial_schema_generation)),
             hot_result_cache_entry: std::sync::Arc::new(parking_lot::RwLock::new(None)),
             last_fast_select_fingerprint: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -7767,6 +7835,7 @@ impl EmbeddedDatabase {
                     .with_site(lock_census::Site::ResultCache),
             ),
             result_cache_nonempty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            result_cache_epoch: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             seen_schema_generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(initial_schema_generation)),
             hot_result_cache_entry: std::sync::Arc::new(parking_lot::RwLock::new(None)),
             last_fast_select_fingerprint: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -7923,6 +7992,7 @@ impl EmbeddedDatabase {
                     .with_site(lock_census::Site::ResultCache),
             ),
             result_cache_nonempty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            result_cache_epoch: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             seen_schema_generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(initial_schema_generation)),
             hot_result_cache_entry: std::sync::Arc::new(parking_lot::RwLock::new(None)),
             last_fast_select_fingerprint: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -8084,8 +8154,12 @@ impl EmbeddedDatabase {
             match self.execute_in_transaction_no_fast_path(sql, &txn) {
                 Ok(count) => total_rows += count,
                 Err(e) => {
-                    let _ = txn.rollback();
+                    // ORDER: replay the ART undo BEFORE dropping `txn` — the
+                    // drop clears this transaction's uncommitted-write census
+                    // slot, and a concurrent `COUNT(*)` that sees it cleared
+                    // takes the index fast path (see `rollback_internal_locked`).
                     self.rollback_art_undo_log();
+                    let _ = txn.rollback();
                     self.deferred_fk_checks.lock().clear();
                     return Err(e);
                 }
@@ -8094,8 +8168,9 @@ impl EmbeddedDatabase {
 
         let commit_start = std::time::Instant::now();
         if let Err(e) = self.validate_deferred_fk_checks(Some(&txn)) {
-            let _ = txn.rollback();
+            // Same ordering requirement as the per-statement error path above.
             self.rollback_art_undo_log();
+            let _ = txn.rollback();
             return Err(e);
         }
         txn.commit()?;
@@ -10919,6 +10994,11 @@ impl EmbeddedDatabase {
     /// races this store, the cache has just been cleared anyway, so the worst case
     /// is one extra invalidation later — never a stale row.
     fn invalidate_result_cache(&self) {
+        // Bumped FIRST, and unconditionally — ahead of the `result_cache_nonempty`
+        // early-out below — so a reader that computed rows before this call can
+        // never publish them afterwards (see `result_cache_epoch`).
+        self.result_cache_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         self.seen_schema_generation
             .store(self.storage.schema_generation(), std::sync::atomic::Ordering::Release);
         *self.hot_result_cache_entry.write() = None;
@@ -12810,6 +12890,7 @@ impl EmbeddedDatabase {
         let spec = std::sync::Arc::new(FastSelectSpec {
             table_name: table_name.to_string(),
             pk_col: pk_col.to_string(),
+            pk_col_idx,
             schema,
             pk_data_type,
         });
@@ -12827,7 +12908,7 @@ impl EmbeddedDatabase {
             Err(e) => return Some(Err(e)),
         };
 
-        Some(self.fast_select_rows(&spec, &pk_value))
+        self.fast_select_rows(&spec, &pk_value)
     }
 
     fn try_fast_select_with_columns(&self, sql: &str) -> Option<Result<(Vec<Tuple>, Vec<String>)>> {
@@ -12837,7 +12918,7 @@ impl EmbeddedDatabase {
         };
 
         let columns = spec.schema.columns.iter().map(|column| column.name.clone()).collect();
-        Some(self.fast_select_rows(&spec, &pk_value).map(|rows| (rows, columns)))
+        Some(self.fast_select_rows(&spec, &pk_value)?.map(|rows| (rows, columns)))
     }
 
     fn fast_select_lookup(&self, sql: &str) -> Option<Result<(std::sync::Arc<FastSelectSpec>, Value)>> {
@@ -12935,7 +13016,76 @@ impl EmbeddedDatabase {
         Some(Ok((spec, pk_value)))
     }
 
-    fn fast_select_rows(&self, spec: &FastSelectSpec, pk_value: &Value) -> Result<Vec<Tuple>> {
+    /// A PK point lookup on `table` that found NOTHING: may that be reported as
+    /// "no such row", or must the statement fall back to the planner?
+    ///
+    /// Only while no transaction has REMOVED an index entry for that table. The
+    /// PK ART index these lookups resolve through is maintained EAGERLY, so a
+    /// `DELETE` inside an explicit transaction strips its key at statement time
+    /// — before COMMIT, and possibly instead of it — and so does an `UPDATE`
+    /// that moves an indexed value. The row is still committed and still visible
+    /// to every session but the writer, yet the probe misses and the fast path
+    /// answers "no rows": a dirty read of a DELETE that may never happen.
+    /// Declining sends the statement to the planner, whose scan reads committed
+    /// rows (and, inside a transaction, merges the caller's own write set).
+    ///
+    /// A staged INSERT — on this table or any other — is irrelevant here: it can
+    /// only ADD a key, so it cannot cause a miss. Neither is a removal on another
+    /// table. That narrowness is deliberate; this sits on the hot point-lookup
+    /// path, and one open writer must not send every missing-key lookup in the
+    /// process to a full scan.
+    ///
+    /// A HIT needs no such rule in either direction: rows are materialised from
+    /// row storage, which holds no uncommitted rows, so another transaction's
+    /// staged INSERT contributes a key whose row simply is not there.
+    ///
+    /// Mirror of `sql::executor::scan::index_miss_is_authoritative`. The two
+    /// MUST stay in step: they serve the same query shape by different routes,
+    /// and one rule without the other means the same SQL answers differently
+    /// depending on which path happens to serve it. One `Acquire` load when
+    /// nothing is staged anywhere, and only on the miss path.
+    #[inline]
+    fn fast_lookup_miss_is_authoritative(&self, table: &str) -> bool {
+        !self.storage.has_uncommitted_index_removals_for_table(table)
+    }
+
+    /// Is this index HIT honest — does the row it points at actually carry the
+    /// key that was probed?
+    ///
+    /// The ART is a HINT, not the truth, because it is maintained EAGERLY: an
+    /// `UPDATE` that MOVES an indexed value inside an open transaction removes
+    /// the old entry and adds the new one at statement time, while the row keeps
+    /// its committed value until COMMIT. A probe for the NEW key then hits,
+    /// materialises a perfectly committed row, and this path would hand it back
+    /// as a match for a key that row does not hold — content that is committed,
+    /// a MATCH that is fabricated from uncommitted index state, and the same
+    /// existence oracle as the miss case in the opposite direction. (Pre-dates
+    /// the census: the eager `on_delete(old)` + `on_insert(new)` pair has always
+    /// run at statement time.)
+    ///
+    /// Cheap in the case that matters: one `Value` comparison against data
+    /// already in hand. The encoded-key comparison behind it is a second opinion
+    /// in the index's OWN terms, so a representation difference between a probe
+    /// literal and a stored value can never be mistaken for a lie — it runs only
+    /// when the plain comparison already said "no", which is the rare path.
+    ///
+    /// A `false` here means DECLINE, never "no such row": the statement falls
+    /// back to the planner, whose scan (and whose index probes, which re-apply
+    /// the real predicate to every row they fetch) works out the truth.
+    fn fast_row_matches_probed_pk(row: &Tuple, spec: &FastSelectSpec, probe: &Value) -> bool {
+        let Some(value) = row.values.get(spec.pk_col_idx) else {
+            return false;
+        };
+        if value == probe {
+            return true;
+        }
+        storage::ArtIndexManager::encode_key(std::slice::from_ref(value))
+            == storage::ArtIndexManager::encode_key(std::slice::from_ref(probe))
+    }
+
+    /// `None` = this lookup declines (see `fast_lookup_miss_is_authoritative`);
+    /// `Some(Ok(rows))` = the answer, possibly an authoritative empty one.
+    fn fast_select_rows(&self, spec: &FastSelectSpec, pk_value: &Value) -> Option<Result<Vec<Tuple>>> {
         let result = if self.config.storage.memory_only {
             // In-memory hot-set workloads deliberately pre-warm the row cache.
             // Disk-backed random point lookups keep no-cache-fill admission to
@@ -12947,12 +13097,42 @@ impl EmbeddedDatabase {
                 .get_row_by_typed_pk_with_schema_no_cache_fill(&spec.table_name, pk_value, &spec.schema)
         };
         match result {
-            Ok(Some(row)) => Ok(vec![row]),
-            Ok(None) => Ok(vec![]),
-            Err(e) => Err(e),
+            // The index says this row holds the probed key; check that it does
+            // (see `fast_row_matches_probed_pk`).
+            Ok(Some(row)) if Self::fast_row_matches_probed_pk(&row, spec, pk_value) => Some(Ok(vec![row])),
+            Ok(Some(_)) => None,
+            Ok(None) => {
+                if self.fast_lookup_miss_is_authoritative(&spec.table_name) {
+                    Some(Ok(Vec::new()))
+                } else {
+                    None
+                }
+            }
+            Err(e) => Some(Err(e)),
         }
     }
 
+    /// `SELECT count(*) FROM t [WHERE pk …]` answered from the primary-key ART
+    /// index instead of the planner.
+    ///
+    /// ISOLATION GATE (sprinter ca2bd77d03d8) — `has_uncommitted_writes_for_table`,
+    /// applied below as soon as the table name is known. `in_transaction()`
+    /// reads `global_txn_active`, the GLOBAL transaction slot only; every wire
+    /// connection has used a per-SESSION transaction since R0.1, so that check
+    /// was blind to the transactions this database actually runs. The ART index
+    /// is maintained eagerly, so it already holds a session transaction's staged
+    /// rows (and has already lost its staged deletes) — and this path counted
+    /// them: a second connection saw an uncommitted INSERT, and saw a row
+    /// disappear for a DELETE that later rolled back.
+    ///
+    /// The census covers EVERY explicit transaction — session, global slot, and
+    /// the RAII `begin_transaction()` handle — but only those that have actually
+    /// staged a write, and only for the TABLES they staged it in. A session
+    /// sitting in `BEGIN` running SELECTs costs this fast path nothing, and
+    /// neither does a session writing some other table. Counts must decline on
+    /// staged inserts AND deletes (they break the count in opposite
+    /// directions), which is why this uses the writes predicate rather than the
+    /// narrower removals one the miss-based paths use.
     fn try_fast_count_pk_query(&self, sql: &str) -> Option<Result<Vec<Tuple>>> {
         if self.in_transaction()
             || self.storage.is_branch_active()
@@ -12991,6 +13171,13 @@ impl EmbeddedDatabase {
             Ok(false) => {}
         }
 
+        // The census gate is per TABLE, so it waits until the table is known:
+        // a transaction staging rows in `orders` must not push `COUNT(*) FROM
+        // users` off this path. Re-checked after the probes below.
+        if self.storage.has_uncommitted_writes_for_table(table_name) {
+            return None;
+        }
+
         let pk_col = if count_arg == "*" { None } else { Some(count_arg) };
         let spec = match self.fast_count_pk_spec(table_name, pk_col)? {
             Ok(spec) => spec,
@@ -13011,6 +13198,16 @@ impl EmbeddedDatabase {
                 None => return None,
             }
         };
+
+        // Re-check the census AFTER the index probes above: a transaction that
+        // armed it between the gate and the probe would otherwise have its
+        // staged rows counted. Declining here costs a planner round-trip on a
+        // query that raced a write transaction for this table; it is the
+        // difference between "may be stale by a microsecond" (fine — so is every
+        // count) and "reports rows that were never committed" (not fine).
+        if self.storage.has_uncommitted_writes_for_table(&spec.table_name) {
+            return None;
+        }
 
         Some(Ok(vec![Tuple {
             values: vec![Value::Int8(count as i64)],
@@ -13417,8 +13614,16 @@ impl EmbeddedDatabase {
                     .storage
                     .get_row_by_typed_pk_with_schema(&spec.table_name, &pk_value, &spec.schema)
                 {
-                    Ok(Some(row)) => Some(Ok(vec![row])),
-                    Ok(None) => Some(Ok(vec![])),
+                    // Same hit and miss rules as `fast_select_rows`.
+                    Ok(Some(row)) if Self::fast_row_matches_probed_pk(&row, &spec, &pk_value) => Some(Ok(vec![row])),
+                    Ok(Some(_)) => None,
+                    Ok(None) => {
+                        if self.fast_lookup_miss_is_authoritative(&spec.table_name) {
+                            Some(Ok(Vec::new()))
+                        } else {
+                            None
+                        }
+                    }
                     Err(e) => Some(Err(e)),
                 };
             }
@@ -13456,8 +13661,16 @@ impl EmbeddedDatabase {
             .storage
             .get_row_by_typed_pk_with_schema(&spec.table_name, &pk_value, &spec.schema)
         {
-            Ok(Some(row)) => Some(Ok(vec![row])),
-            Ok(None) => Some(Ok(vec![])),
+            // Same hit and miss rules as `fast_select_rows`.
+            Ok(Some(row)) if Self::fast_row_matches_probed_pk(&row, &spec, &pk_value) => Some(Ok(vec![row])),
+            Ok(Some(_)) => None,
+            Ok(None) => {
+                if self.fast_lookup_miss_is_authoritative(&spec.table_name) {
+                    Some(Ok(Vec::new()))
+                } else {
+                    None
+                }
+            }
             Err(e) => Some(Err(e)),
         }
     }
@@ -16235,6 +16448,10 @@ impl EmbeddedDatabase {
     /// # }
     /// ```
     pub fn query(&self, sql: &str, _params: &[&dyn std::fmt::Display]) -> Result<Vec<Tuple>> {
+        // Snapshot the result-cache invalidation epoch BEFORE reading any
+        // data. Every `cache_query_result` below publishes only if nothing
+        // invalidated the cache in between (see `result_cache_epoch`).
+        let cache_epoch = self.result_cache_epoch();
         // Reflect an embedded `SET search_path` into the thread-local the
         // storage-less evaluator reads for `current_schema()`/`current_schemas()`.
         // Free on the default path; a no-op under a wire session's own override.
@@ -16416,7 +16633,7 @@ impl EmbeddedDatabase {
         if let Some(result) = self.try_fast_count_pk_query(sql) {
             let results = result?;
             self.log_slow_query(sql, start.elapsed(), results.len() as u64);
-            self.cache_query_result(sql, &results);
+            self.cache_query_result(sql, &results, cache_epoch);
             return Ok(results);
         }
 
@@ -16430,7 +16647,7 @@ impl EmbeddedDatabase {
             if let Some(result) = self.try_fast_select(sql) {
                 let results = result?;
                 self.log_slow_query(sql, start.elapsed(), results.len() as u64);
-                self.maybe_cache_repeated_fast_select(sql, &results);
+                self.maybe_cache_repeated_fast_select(sql, &results, cache_epoch);
                 return Ok(results);
             }
         }
@@ -16445,7 +16662,7 @@ impl EmbeddedDatabase {
             if let Some(result) = self.try_fast_select(sql) {
                 let results = result?;
                 self.log_slow_query(sql, start.elapsed(), results.len() as u64);
-                self.maybe_cache_repeated_fast_select(sql, &results);
+                self.maybe_cache_repeated_fast_select(sql, &results, cache_epoch);
                 return Ok(results);
             }
         }
@@ -16493,7 +16710,7 @@ impl EmbeddedDatabase {
                     );
                     self.log_slow_query(sql, start.elapsed(), results.len() as u64);
                     if !is_non_deterministic {
-                        self.cache_query_result(sql, &results);
+                        self.cache_query_result(sql, &results, cache_epoch);
                     }
                     return Ok(results);
                 }
@@ -16513,7 +16730,7 @@ impl EmbeddedDatabase {
                 // queries already bypass lookup above and should not pay to
                 // clone rows into a cache they can never read from.
                 if !is_non_deterministic {
-                    self.cache_query_result(sql, &results);
+                    self.cache_query_result(sql, &results, cache_epoch);
                 }
                 return Ok(results);
             }
@@ -16558,7 +16775,7 @@ impl EmbeddedDatabase {
             if let Some(result) = self.try_normalized_query_with_columns(sql) {
                 let (rows, _columns) = result?;
                 if self.cache_admits(sql) {
-                    self.cache_query_result(sql, &rows);
+                    self.cache_query_result(sql, &rows, cache_epoch);
                 }
                 self.log_slow_query(sql, start.elapsed(), rows.len() as u64);
                 return Ok(rows);
@@ -16666,7 +16883,7 @@ impl EmbeddedDatabase {
         // later hit finds both. Non-deterministic queries already bypass
         // lookup above, so caching them only adds clone/lock overhead.
         if admit {
-            self.cache_query_result(sql, &results);
+            self.cache_query_result(sql, &results, cache_epoch);
         }
 
         Ok(results)
@@ -16820,6 +17037,10 @@ impl EmbeddedDatabase {
     }
 
     pub fn query_with_columns(&self, sql: &str) -> Result<(Vec<Tuple>, Vec<String>)> {
+        // Snapshot the result-cache invalidation epoch BEFORE reading any
+        // data. Every `cache_query_result` below publishes only if nothing
+        // invalidated the cache in between (see `result_cache_epoch`).
+        let cache_epoch = self.result_cache_epoch();
         // Reflect an embedded `SET search_path` into the evaluator's thread-local
         // (see `embedded_current_schema_guard`). Free on the default path; a
         // no-op when a wire session already installed its own override.
@@ -16950,7 +17171,7 @@ impl EmbeddedDatabase {
             }
             let result = executor.execute_with_columns(&arc_plan)?;
             if admit {
-                self.cache_query_result(sql, &result.0);
+                self.cache_query_result(sql, &result.0, cache_epoch);
             }
             return Ok(result);
         } else {
@@ -16999,7 +17220,7 @@ impl EmbeddedDatabase {
         }
         let result = executor.execute_with_columns(&plan_arc)?;
         if admit && !is_show_branches {
-            self.cache_query_result(sql, &result.0);
+            self.cache_query_result(sql, &result.0, cache_epoch);
         }
         Ok(result)
     }
@@ -17226,6 +17447,14 @@ impl EmbeddedDatabase {
         if let Some((_, slot)) = self.session_transactions.remove(&session_id) {
             self.session_txn_count.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
             if let Some(txn) = slot.write().take() {
+                // ORDER: undo the eager ART index mutations BEFORE dropping the
+                // transaction. Dropping it clears its slot in the
+                // uncommitted-write census, and a concurrent `COUNT(*)` that
+                // sees the cleared census takes the ART fast path — which must
+                // not still hold the rows this abandoned transaction inserted.
+                // The second call below is then a no-op (the per-session entry
+                // is already removed).
+                self.finish_session_art_undo(session_id, true);
                 let _ = txn.rollback();
             }
         }
@@ -17367,6 +17596,13 @@ impl EmbeddedDatabase {
         // The commit batch writes `data:`/`v:`/`counter:` straight to RocksDB,
         // so it seals them itself (see `Transaction::key_manager`).
         txn.set_key_manager(self.storage.key_manager_arc());
+        // Session transactions are built here rather than by
+        // `StorageEngine::begin_transaction`, so they enroll in the
+        // uncommitted-write census here. Without it, a `COUNT(*)` on ANOTHER
+        // connection answers from the PK ART index while this transaction's
+        // staged rows are in it (sprinter ca2bd77d03d8). The census is armed
+        // only if this transaction actually writes.
+        txn.set_write_census(self.storage.write_census());
         // P0#1: session transactions must honor time_travel_enabled too
         // (new_with_session defaults versioning on).
         txn.set_versioning_enabled(self.storage.time_travel_enabled());
@@ -17501,8 +17737,13 @@ impl EmbeddedDatabase {
             // persisting a dangling reference. `validate_deferred_fk_checks`
             // fast-returns on the (common) empty queue.
             if let Err(e) = self.validate_deferred_fk_checks(Some(&txn)) {
-                let _ = txn.rollback();
+                // ORDER: undo the eager ART index mutations before the
+                // transaction is dropped — its `Drop` clears this
+                // transaction's slot in the uncommitted-write census, which is
+                // what keeps a concurrent `COUNT(*)` off the index (see
+                // `rollback_transaction_for_session_inner`).
                 self.finish_session_art_undo(session_id, true);
+                let _ = txn.rollback();
                 self.deferred_fk_checks.lock().clear();
                 self.constraints_all_deferred
                     .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -17519,6 +17760,15 @@ impl EmbeddedDatabase {
                 txn.written_data_keys()
             };
             let commit_ts = self.storage.next_commit_timestamp(txn.has_tracked_writes());
+            // `commit_with_timestamp` CONSUMES the transaction, so its
+            // uncommitted-write census slot is gone the moment it returns —
+            // including when it returns an error, at which point this
+            // transaction's eager ART index entries are still in place and are
+            // only removed by the undo replay below. This standalone hold keeps
+            // the count fast paths off the index across that window; it is
+            // dropped at the end of this block (after the undo on the failure
+            // path, after the commit is applied on the success path).
+            let _commit_hold = txn.write_census_hold();
             if let Err(e) = txn.commit_with_timestamp(commit_ts) {
                 // Failed commit (e.g. R0.2 serialization failure) behaves
                 // like ROLLBACK: undo eager ART mutations, clear the
@@ -17586,11 +17836,20 @@ impl EmbeddedDatabase {
         if let Some((_, slot)) = self.session_transactions.remove(&session_id) {
             self.session_txn_count.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
             if let Some(txn) = slot.write().take() {
+                // ORDER: undo the eager ART index mutations BEFORE dropping the
+                // transaction — dropping it clears its slot in the
+                // uncommitted-write census, and any reader that observes the
+                // cleared census may take the ART `COUNT(*)` fast path. Undoing
+                // afterwards left a window in which that path counted rows this
+                // ROLLBACK had already erased. Doing it here also means the undo
+                // runs even when `rollback()` below returns an error.
+                self.finish_session_art_undo(session_id, true);
                 txn.rollback()?;
             }
         }
         // Undo the session's eager ART index mutations (insert/update/delete
-        // hooks run at statement time, not commit time).
+        // hooks run at statement time, not commit time). No-op when the branch
+        // above already drained them.
         self.finish_session_art_undo(session_id, true);
 
         // Invalidate result cache since rollback changes visible data state
@@ -20284,6 +20543,7 @@ impl EmbeddedDatabase {
             parse_cache: self.parse_cache.clone(),
             result_cache: self.result_cache.clone(),
             result_cache_nonempty: self.result_cache_nonempty.clone(),
+            result_cache_epoch: self.result_cache_epoch.clone(),
             seen_schema_generation: self.seen_schema_generation.clone(),
             hot_result_cache_entry: self.hot_result_cache_entry.clone(),
             last_fast_select_fingerprint: self.last_fast_select_fingerprint.clone(),

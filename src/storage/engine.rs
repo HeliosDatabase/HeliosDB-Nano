@@ -1775,6 +1775,12 @@ pub struct StorageEngine {
     /// Write-write conflict registry (R0.2): first-committer-wins
     /// validation for snapshot-isolation transactions.
     conflict_registry: Arc<super::conflict::WriteConflictRegistry>,
+    /// Census of explicit transactions holding staged (uncommitted) writes.
+    /// One atomic load tells a reader whether the eagerly-maintained PK ART
+    /// index may contain rows it must not see — see
+    /// [`UncommittedWriteCensus`](super::UncommittedWriteCensus) and
+    /// [`Self::count_table_rows`].
+    write_census: Arc<super::UncommittedWriteCensus>,
     /// R4.3: MVCC version garbage collector (watermark + collector state).
     version_gc: Arc<super::version_gc::VersionGc>,
     /// R4.3: background version-GC thread; joined on engine drop. None
@@ -2339,6 +2345,7 @@ impl StorageEngine {
             vector_indexes: Arc::new(VectorIndexManager::new()),
             snapshot_manager,
             conflict_registry,
+            write_census: Arc::new(super::UncommittedWriteCensus::new()),
             version_gc,
             version_gc_worker,
             branch_manager,
@@ -2588,6 +2595,7 @@ impl StorageEngine {
             vector_indexes: Arc::new(VectorIndexManager::new()),
             snapshot_manager,
             conflict_registry,
+            write_census: Arc::new(super::UncommittedWriteCensus::new()),
             version_gc,
             version_gc_worker,
             branch_manager,
@@ -3638,6 +3646,53 @@ impl StorageEngine {
         self.key_manager.clone()
     }
 
+    /// Handle on the engine's uncommitted-write census, for transactions this
+    /// engine does not construct itself (the per-session transactions in
+    /// `lib.rs` are built with `Transaction::new_with_session`).
+    pub fn write_census(&self) -> Arc<super::UncommittedWriteCensus> {
+        Arc::clone(&self.write_census)
+    }
+
+    /// True while at least one explicit transaction is holding staged writes
+    /// ANYWHERE. One `Acquire` load; the idle fast-out the two per-table
+    /// predicates below start with, and all an idle server ever pays.
+    ///
+    /// Not a correctness gate on its own — a staged write to `orders` says
+    /// nothing about the index for `users`. Use the per-table predicates.
+    #[inline]
+    pub fn has_uncommitted_writes(&self) -> bool {
+        self.write_census.any_uncommitted_writes()
+    }
+
+    /// Does any open transaction hold a staged write for `table`?
+    ///
+    /// THE gate for every fast path that answers a CARDINALITY question from an
+    /// eagerly-maintained ART index rather than from row storage. Broken in both
+    /// directions: a staged insert makes the index over-report, a staged delete
+    /// makes it under-report, so this declines on either.
+    ///
+    /// One `Acquire` load when nothing is staged anywhere (the common case);
+    /// one more load plus a `DashMap` probe otherwise.
+    #[inline]
+    pub fn has_uncommitted_writes_for_table(&self, table: &str) -> bool {
+        self.write_census.any_uncommitted_writes() && self.write_census.table_has_staged_writes(table)
+    }
+
+    /// Has any open transaction REMOVED an index entry for `table` — a staged
+    /// `DELETE`, or an `UPDATE` that moved an indexed value?
+    ///
+    /// THE gate for fast paths that treat an index probe that MISSES as "no such
+    /// row". A staged INSERT can only ADD a key and so can never cause a miss;
+    /// only a removal can make a still-committed row look absent. Keeping these
+    /// two questions apart is what stops one open writer from sending every
+    /// missing-key lookup in the process to a full scan.
+    ///
+    /// Same cost shape as [`Self::has_uncommitted_writes_for_table`].
+    #[inline]
+    pub fn has_uncommitted_index_removals_for_table(&self, table: &str) -> bool {
+        self.write_census.any_uncommitted_writes() && self.write_census.table_has_staged_index_removals(table)
+    }
+
     /// Begin a transaction
     pub fn begin_transaction(&self) -> Result<Transaction> {
         let snapshot_id = self.next_timestamp();
@@ -3664,6 +3719,14 @@ impl StorageEngine {
         // `begin_autocommit_transaction` below — that path already logs per
         // statement and would double-log every autocommit write.
         txn.set_wal(self.wal_arc(), self.config.storage.logical_wal_per_statement);
+        // Explicit transactions stage writes that no other transaction may
+        // see, while eagerly mutating the shared PK ART index. Enrolling them
+        // in the census is what lets a concurrent `COUNT(*)` know it must not
+        // answer from that index. NEVER add this to
+        // `begin_autocommit_transaction` below: a statement-scoped transaction
+        // publishes within its own statement, and counting it would hold the
+        // census non-zero (and the count fast paths off) under any write load.
+        txn.set_write_census(self.write_census());
         Ok(txn)
     }
 
@@ -7391,15 +7454,37 @@ impl StorageEngine {
             .as_ref()
             .map(|manager| manager.has_user_branches_registered())
             .unwrap_or(true);
-        if on_main_branch && !has_user_branches {
+        // ISOLATION GATE (sprinter ca2bd77d03d8). `pk_index_len` is the length
+        // of the PK ART index, and that index is maintained EAGERLY: an INSERT
+        // inside an explicit transaction is in it before COMMIT, a DELETE is
+        // out of it before COMMIT. Answering from it therefore leaked the
+        // cardinality of another transaction's uncommitted work — a second
+        // connection counted a row that was never committed, and counted one
+        // fewer after a DELETE that later rolled back. The `data:` walk below
+        // sees committed rows only (staged writes live in the transaction's
+        // write set until commit), so declining here is correct for every
+        // caller; it is slower, which is why it is gated on one atomic load
+        // and not on the mere existence of a transaction.
+        //
+        // The reader's OWN staged writes are handled a layer up: the executor
+        // declines these fast paths for any table its transaction has written
+        // (`txn_forces_slow_reads_for_table`), so read-your-own-writes still
+        // comes from the write-set merge path.
+        if on_main_branch && !has_user_branches && !self.has_uncommitted_writes_for_table(table_name) {
             if let Some(count) = self.art_index_manager.pk_index_len(table_name) {
-                tracing::debug!(
-                    phase = "count_pk_art_path",
-                    table = table_name,
-                    count = count,
-                    "COUNT(*) primary-key ART fast path completed"
-                );
-                return Ok(count);
+                // Re-check after the probe: a transaction that armed the census
+                // between the gate above and the read here would otherwise have
+                // its staged rows counted. Costs one more atomic load on a path
+                // that already took the `current_branch` mutex.
+                if !self.has_uncommitted_writes_for_table(table_name) {
+                    tracing::debug!(
+                        phase = "count_pk_art_path",
+                        table = table_name,
+                        count = count,
+                        "COUNT(*) primary-key ART fast path completed"
+                    );
+                    return Ok(count);
+                }
             }
         }
 
@@ -7463,14 +7548,27 @@ impl StorageEngine {
         if self.get_current_branch_id().is_some() {
             return Ok(None);
         }
+        // Same isolation gate as `count_table_rows`: this counts ART keys, and
+        // the ART carries another transaction's staged inserts for this table
+        // (and is already missing its staged deletes). `Ok(None)` sends the
+        // caller to the planner path, which reads through row storage.
+        if self.has_uncommitted_writes_for_table(table_name) {
+            return Ok(None);
+        }
         let mut pk_cols = schema.columns.iter().filter(|col| col.primary_key);
         let pk_col = match (pk_cols.next(), pk_cols.next()) {
             (Some(col), None) => col,
             _ => return Ok(None),
         };
-        Ok(self
+        let count = self
             .art_index_manager
-            .pk_index_count_int_range(table_name, &pk_col.data_type, lower, upper))
+            .pk_index_count_int_range(table_name, &pk_col.data_type, lower, upper);
+        // Re-check: a transaction that armed the census between the gate above
+        // and the probe would otherwise have its staged rows counted here.
+        if self.has_uncommitted_writes_for_table(table_name) {
+            return Ok(None);
+        }
+        Ok(count)
     }
 
     /// Scan table with an offset and a row limit (for LIMIT+OFFSET pushdown).

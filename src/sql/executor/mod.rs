@@ -2634,11 +2634,27 @@ impl<'a> Executor<'a> {
         if storage.is_branch_active() {
             return Ok(None);
         }
+        // ISOLATION GATE (sprinter ca2bd77d03d8): both arms below answer from
+        // the PK ART index, which is maintained eagerly and therefore carries
+        // rows another transaction has staged but not committed for THIS table
+        // (and is already missing rows it has staged for deletion).
+        // `txn_forces_slow_reads*` above only knows about THIS executor's
+        // transaction; this knows about every other one. Declining falls through
+        // to the planner path, which reads through row storage.
+        if storage.has_uncommitted_writes_for_table(table_name) {
+            return Ok(None);
+        }
         let predicate = self.materialize_subqueries(predicate)?;
         if let Some((lower, upper)) = self.pk_int_range_from_predicate(&predicate, &pk_col.name, &pk_col.data_type) {
             return storage.count_table_pk_int_range_with_schema(table_name, schema, lower, upper);
         }
-        self.count_single_pk_in_list(table_name, pk_col, &predicate)
+        let count = self.count_single_pk_in_list(table_name, pk_col, &predicate)?;
+        // Re-check after the per-key `pk_index_contains` probes, for a
+        // transaction that armed the census while they ran.
+        if storage.has_uncommitted_writes_for_table(table_name) {
+            return Ok(None);
+        }
+        Ok(count)
     }
 
     fn identity_pk_count_distinct_index(expr: &crate::sql::LogicalExpr, schema: &Schema) -> Option<usize> {
@@ -3866,12 +3882,38 @@ impl<'a> Executor<'a> {
                                 {
                                     if let Some(storage) = self.storage {
                                         let count_table_name = self.fast_path_storage_table_name(table_name)?;
-                                        let count = storage.count_table_rows(&count_table_name)?;
-                                        let result_tuple = crate::Tuple::new(vec![crate::Value::Int8(count as i64)]);
-                                        return Ok(Box::new(MaterializedOperator::new(
-                                            vec![result_tuple],
-                                            count_star_schema(),
-                                        )));
+                                        // R2.3 gate — the ONE storage-aggregate fast
+                                        // path in this file that never had it. Every
+                                        // sibling (`try_count_pk_cardinality`,
+                                        // `try_count_star_pk_cardinality`,
+                                        // `try_columnar_aggregate`,
+                                        // `try_rowstore_aggregate`) declines when the
+                                        // caller's own transaction has staged writes
+                                        // for the table, so read-your-own-writes comes
+                                        // from the write-set-merging scan. This one
+                                        // asked storage regardless, and got away with
+                                        // it only because `count_table_rows` answered
+                                        // from the eagerly-maintained PK ART index —
+                                        // which is the ASKING transaction's dirty view
+                                        // (its staged inserts added, its staged deletes
+                                        // stripped) and simultaneously every other
+                                        // session's. Right for the owner by accident,
+                                        // wrong for everyone else. Now that
+                                        // `count_table_rows` answers committed-only
+                                        // while any transaction holds staged writes,
+                                        // the owner must decline to the generic
+                                        // aggregate or it loses sight of its own write.
+                                        if !self.txn_forces_slow_reads_for_table(table_name)
+                                            && !self.txn_forces_slow_reads_for_table(&count_table_name)
+                                        {
+                                            let count = storage.count_table_rows(&count_table_name)?;
+                                            let result_tuple =
+                                                crate::Tuple::new(vec![crate::Value::Int8(count as i64)]);
+                                            return Ok(Box::new(MaterializedOperator::new(
+                                                vec![result_tuple],
+                                                count_star_schema(),
+                                            )));
+                                        }
                                     }
                                 }
                             }

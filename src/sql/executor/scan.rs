@@ -315,6 +315,35 @@ fn filter_tuples_with_evaluator(
     Ok(filtered)
 }
 
+/// Can an EMPTY ART probe on `table` be reported as "no such row"?
+///
+/// Only when no transaction has REMOVED an index entry for that table. The
+/// indexes are maintained EAGERLY, so a `DELETE` inside an explicit transaction
+/// strips its key at statement time — long before (and possibly instead of)
+/// COMMIT — and so does an `UPDATE` that moves an indexed value. A probe for
+/// that key then misses even though the row is still committed and still
+/// visible to everyone but the writer, and the caller reports "no rows".
+///
+/// Deliberately narrow in two directions, because this sits on the hot indexed
+/// read path:
+///
+/// * A staged INSERT is irrelevant. It can only ADD a key, never turn a present
+///   key into an absent one, so it cannot cause a miss — hence
+///   `has_uncommitted_index_removals_for_table` and not "any staged write".
+/// * A staged removal on ANOTHER table is irrelevant.
+///
+/// A HIT needs no rule in either direction: rows are fetched from row storage,
+/// which has no uncommitted rows, so another transaction's staged INSERT
+/// contributes a key whose row simply fetches nothing.
+///
+/// Same shape as the NUMERIC miss rule the point-lookup path already applies —
+/// a miss the probe cannot vouch for declines to the filtered scan, which reads
+/// committed rows (and, inside a transaction, the write-set-merging scan). One
+/// `Acquire` load when nothing is staged anywhere, and only on the miss path.
+fn index_miss_is_authoritative(storage: &crate::storage::StorageEngine, table_name: &str) -> bool {
+    !storage.has_uncommitted_index_removals_for_table(table_name)
+}
+
 pub(super) fn try_index_point_lookup_for_scan(
     executor: &Executor,
     input: &LogicalPlan,
@@ -384,7 +413,9 @@ pub(super) fn try_index_point_lookup_for_scan(
     // `DataType::Numeric` and for no other declared type, so this test is
     // exactly "the probed column is NUMERIC" without threading the column type
     // down. Cost: one discriminant compare, and only on the miss path.
-    if row_ids.is_empty() && matches!(lookup_value, Value::Numeric(_)) {
+    if row_ids.is_empty()
+        && (matches!(lookup_value, Value::Numeric(_)) || !index_miss_is_authoritative(storage, table_name))
+    {
         return Ok(None);
     }
     let mut tuples = Vec::with_capacity(row_ids.len());
@@ -520,12 +551,15 @@ pub(super) fn try_index_in_list_for_scan(
     for value in &lookup_values {
         let key = crate::storage::ArtIndexManager::encode_key_from_values(std::iter::once(value));
         let probed = storage.art_indexes().index_get_all(&index_name, &key);
-        // Same NUMERIC miss rule as `try_index_lookup_for_scan` (see the long
-        // note there). Here it is per ELEMENT: one element whose rows the key
-        // probe cannot find would silently drop them from the union, turning
-        // `IN (6, 7)` into `IN (7)`. So a NUMERIC element that misses declines
-        // the whole pushdown.
-        if probed.is_empty() && matches!(value, Value::Numeric(_)) {
+        // Same two miss rules as `try_index_point_lookup_for_scan` — NUMERIC
+        // (see the long note there) and uncommitted writes (see
+        // `index_miss_is_authoritative`). Here they apply per ELEMENT: one
+        // element whose rows the key probe cannot find would silently drop them
+        // from the union, turning `IN (6, 7)` into `IN (7)`. So an element that
+        // misses for either reason declines the whole pushdown.
+        if probed.is_empty()
+            && (matches!(value, Value::Numeric(_)) || !index_miss_is_authoritative(storage, table_name))
+        {
             return Ok(None);
         }
         for row_id in probed {

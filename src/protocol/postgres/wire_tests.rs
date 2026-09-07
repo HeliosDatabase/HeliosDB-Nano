@@ -4993,3 +4993,159 @@ async fn wire_foreign_key_ddl_validates_its_target() {
     )
     .await;
 }
+
+// ===========================================================================
+// COUNT(*) must obey MVCC: the primary-key fast path is not a licence to
+// dirty-read another session's open transaction (sprinter ca2bd77d03d8).
+// ===========================================================================
+
+/// One `SELECT count(*)` over the wire, returning the scalar as text.
+fn wire_count<'a>(
+    handler: &'a mut PgConnectionHandler<DuplexStream>,
+    client: &'a mut DuplexStream,
+    sql: &'a str,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = String> + 'a>> {
+    Box::pin(async move {
+        let out = wire_query(handler, client, sql).await;
+        assert!(
+            sqlstates(&out).is_empty(),
+            "`{sql}` must not error, got {:?}",
+            sqlstates(&out)
+        );
+        first_data_row_text(&out).unwrap_or_else(|| panic!("`{sql}` returned no row"))
+    })
+}
+
+/// `SELECT count(*)` on a second connection must not count rows a first
+/// connection has inserted but not committed.
+///
+/// `try_fast_count_pk_query` answers from `pk_index_len` — the ART primary-key
+/// index — and gates itself on `in_transaction()`, which reads the GLOBAL
+/// transaction slot only. Every wire client has used a per-SESSION transaction
+/// since R0.1, so that gate is blind to exactly the transactions this database
+/// actually runs: the observer takes the fast path, reads an index that already
+/// carries the writer's staged rows, and reports them. A dirty read is the one
+/// thing READ COMMITTED promises cannot happen, and it is worse here than a
+/// merely stale answer, because the row can still be rolled back and un-happen.
+#[tokio::test]
+async fn count_star_does_not_see_another_sessions_uncommitted_rows() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut writer, mut cw) = test_handler(Arc::clone(&db));
+    let (mut observer, mut co) = test_handler(Arc::clone(&db));
+
+    wire_setup(&mut writer, &mut cw, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").await;
+    wire_setup(&mut writer, &mut cw, "INSERT INTO t (id, v) VALUES (1, 'committed')").await;
+
+    assert_eq!(
+        wire_count(&mut observer, &mut co, "SELECT count(*) FROM t").await,
+        "1",
+        "baseline: one committed row"
+    );
+
+    wire_setup(&mut writer, &mut cw, "BEGIN").await;
+    wire_setup(&mut writer, &mut cw, "INSERT INTO t (id, v) VALUES (2, 'uncommitted')").await;
+
+    assert_eq!(
+        wire_count(&mut observer, &mut co, "SELECT count(*) FROM t").await,
+        "1",
+        "*** a second connection COUNTED an UNCOMMITTED row ***"
+    );
+    assert_eq!(
+        wire_count(&mut observer, &mut co, "SELECT count(*) FROM t WHERE id = 2").await,
+        "0",
+        "*** the predicate form of the fast path also counted an UNCOMMITTED row ***"
+    );
+
+    // The writer sees its own write (read-your-own-writes is not a dirty read).
+    assert_eq!(
+        wire_count(&mut writer, &mut cw, "SELECT count(*) FROM t").await,
+        "2",
+        "the writing session must see its own uncommitted row"
+    );
+
+    wire_setup(&mut writer, &mut cw, "COMMIT").await;
+    assert_eq!(
+        wire_count(&mut observer, &mut co, "SELECT count(*) FROM t").await,
+        "2",
+        "and must see it once the writer commits"
+    );
+}
+
+/// The same, for a transaction that ends in ROLLBACK: a count taken while the
+/// write was open must never have included a row that then ceased to exist.
+#[tokio::test]
+async fn count_star_does_not_see_rows_a_rollback_removes() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut writer, mut cw) = test_handler(Arc::clone(&db));
+    let (mut observer, mut co) = test_handler(Arc::clone(&db));
+
+    wire_setup(&mut writer, &mut cw, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").await;
+    wire_setup(&mut writer, &mut cw, "BEGIN").await;
+    wire_setup(&mut writer, &mut cw, "INSERT INTO t (id, v) VALUES (7, 'doomed')").await;
+
+    let out = wire_query(&mut observer, &mut co, "SELECT count(*) FROM t").await;
+    assert!(
+        sqlstates(&out).is_empty(),
+        "count must not error, got {:?}",
+        sqlstates(&out)
+    );
+    let during = first_data_row_text(&out).expect("count row");
+
+    wire_setup(&mut writer, &mut cw, "ROLLBACK").await;
+
+    let out = wire_query(&mut observer, &mut co, "SELECT count(*) FROM t").await;
+    let after = first_data_row_text(&out).expect("count row");
+
+    assert_eq!(after, "0", "the rolled-back row must not survive");
+    assert_eq!(
+        during, "0",
+        "*** the observer counted a row that ROLLBACK then removed — it never existed ***"
+    );
+}
+
+/// Scope probe for the same defect class: the primary-key POINT-LOOKUP fast
+/// path (`fast_select_lookup`) is gated by the same global-slot check as the
+/// COUNT fast path. If it also bypasses session visibility, the leak is not
+/// counts but ROW VALUES — a strictly worse disclosure.
+#[tokio::test]
+async fn point_lookup_does_not_see_another_sessions_uncommitted_row() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut writer, mut cw) = test_handler(Arc::clone(&db));
+    let (mut observer, mut co) = test_handler(Arc::clone(&db));
+
+    wire_setup(&mut writer, &mut cw, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").await;
+    wire_setup(&mut writer, &mut cw, "INSERT INTO t (id, v) VALUES (1, 'committed')").await;
+    wire_setup(&mut writer, &mut cw, "BEGIN").await;
+    wire_setup(
+        &mut writer,
+        &mut cw,
+        "INSERT INTO t (id, v) VALUES (2, 'secret-uncommitted')",
+    )
+    .await;
+
+    let out = wire_query(&mut observer, &mut co, "SELECT v FROM t WHERE id = 2").await;
+    assert!(
+        sqlstates(&out).is_empty(),
+        "lookup must not error, got {:?}",
+        sqlstates(&out)
+    );
+    let rows = data_rows(&out);
+    let leaked: Vec<String> = rows
+        .iter()
+        .filter_map(|r| r.first().cloned().flatten())
+        .map(|b| String::from_utf8_lossy(&b).to_string())
+        .collect();
+
+    assert!(
+        leaked.is_empty(),
+        "*** the point-lookup fast path returned another session's UNCOMMITTED ROW VALUES: {leaked:?} ***"
+    );
+
+    wire_setup(&mut writer, &mut cw, "COMMIT").await;
+    let out = wire_query(&mut observer, &mut co, "SELECT v FROM t WHERE id = 2").await;
+    assert_eq!(
+        data_rows(&out).len(),
+        1,
+        "and the row must be visible once the writer commits"
+    );
+}
