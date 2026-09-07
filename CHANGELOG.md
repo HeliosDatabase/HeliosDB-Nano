@@ -117,9 +117,19 @@ and could not build typed calls: `inputSchema` was only sent with a non-standard
 `h2` 0.4.13 → 0.4.19 closes RUSTSEC-2026-0258 (unbounded empty DATA frames) on the HTTP
 listener that serves the BaaS/REST/MCP routes on `--http-port`; `chacha20` 0.10.1 → 0.10.2
 replaces a yanked release reachable only from the benchmark harness; `lru` 0.12 → 0.18 closes
-RUSTSEC-2026-0253 (`LruCache::pop()` panic safety — a method this codebase never calls). Still
-open and tracked separately: `h2` 0.3 under `oauth2` 4.x (client side of the OAuth flow; no
-patched 0.3.x exists, remedy is the oauth2 5.x major).
+RUSTSEC-2026-0253 (`LruCache::pop()` panic safety — a method this codebase never calls).
+
+`oauth2` 4.4 → 5.0 closes the rest. oauth2 4.x pinned `reqwest` 0.11, which dragged a SECOND
+HTTP stack (`hyper` 0.14, `h2` 0.3, `rustls` 0.21, `rustls-webpki` 0.101) alongside the
+`reqwest` 0.12 / `hyper` 1.x / `rustls` 0.23 used everywhere else. That stack carried the h2
+advisory above on the OAuth client side, where no patched 0.3.x exists, plus RUSTSEC-2026-0098,
+-0099 and -0104 against rustls-webpki 0.101 — three advisories this project had been carrying as
+documented `deny.toml` ignores whose stated remedy was this very upgrade. The upgrade removes 19
+crates from the lock file and adds none, no other crate changes version, and the three ignores are
+DELETED rather than renewed: `cargo deny check` is green on advisories, bans, licenses and sources
+with no suppression in that chain. Operators configuring OAuth providers get more specific errors
+from a failed token exchange (oauth2 5's own transport `Display` is a stub, so the message now
+carries the underlying cause chain); the flow, the settings and the endpoints are unchanged.
 
 ### Fixed — `FROM generate_series(1, n) AS g` could not be referenced as `g` (PGConf.Brasil #10)
 
