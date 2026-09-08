@@ -52,6 +52,7 @@ mcp_conformance
 mcp_endpoint_phase4
 mcp_followups
 mcp_introspection
+mcp_listener_composition
 mcp_new_tools
 mcp_progress
 mcp_progress_http
