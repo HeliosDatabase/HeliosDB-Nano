@@ -5214,7 +5214,42 @@ impl EmbeddedDatabase {
                     // constraint lives here in `TableConstraints`. Same helper
                     // `rebuild_all_indexes` calls at open, so create-time and
                     // reopen-time agree.
-                    catalog.register_unique_constraint_indexes(name, &table_constraints);
+                    //
+                    // FAIL CLOSED. The index IS the enforcement, so a declared
+                    // constraint that could not be installed is a constraint
+                    // that does not exist; reporting CREATE TABLE success would
+                    // hand back a table whose UNIQUE silently accepts
+                    // duplicates — the reported defect. Registration mints its
+                    // own key with a free-name fallback, so this is unreachable
+                    // short of a genuine structural failure; when it does fire,
+                    // the statement must leave NO table behind.
+                    //
+                    // `catalog.drop_table` rather than a bespoke teardown: it
+                    // emits the compensating `DropTable` WAL record a standby
+                    // that already applied `CreateTable` needs, and clears the
+                    // ART indexes, the `meta:index:` definitions, the schema,
+                    // the counter, the compression keys, the triggers and the
+                    // rows. It does not own the constraint record, so that is
+                    // deleted after it (which also invalidates the memoised
+                    // constraint set — otherwise the next `CREATE TABLE` of
+                    // this name is handed the dead one).
+                    if let Err(e) = catalog.register_unique_constraint_indexes(name, &table_constraints) {
+                        if let Err(unwind) = catalog.drop_table(name) {
+                            tracing::warn!(
+                                "CREATE TABLE '{}' unwind: failed to drop the half-created table: {}",
+                                name,
+                                unwind
+                            );
+                        }
+                        if let Err(unwind) = catalog.delete_table_constraints(name) {
+                            tracing::warn!(
+                                "CREATE TABLE '{}' unwind: failed to delete the constraint record: {}",
+                                name,
+                                unwind
+                            );
+                        }
+                        return Err(e);
+                    }
                 }
 
                 // Also add column-level UNIQUE and PRIMARY KEY constraints
@@ -5233,6 +5268,39 @@ impl EmbeddedDatabase {
                         ));
                         has_col_constraints = true;
                     } else if col_def.unique {
+                        // ONE SQL declaration, ONE constraint record.
+                        //
+                        // The planner propagates a single-column table-level
+                        // `UNIQUE (u)` into `col_def.unique` (MySQL
+                        // `UNIQUE KEY` / SHOW INDEX parity), so synthesising
+                        // `{t}_{col}_unique` unconditionally minted a SECOND
+                        // record for a constraint the user wrote once. Dropping
+                        // the constraint by its own name then retired only one
+                        // of the two claims and the rule survived — the index
+                        // stayed, duplicates stayed rejected, and the reopen
+                        // rebuild resurrected it (Sprinter 3441d3e21453).
+                        //
+                        // Skipped only when a table-level `UNIQUE` staged in
+                        // THIS statement already covers exactly this one
+                        // column, so a genuinely declared inline `UNIQUE` — the
+                        // overwhelmingly common case, where no table-level
+                        // constraint exists at all — still gets its record. The
+                        // residual divergence from PostgreSQL is the rare
+                        // `CREATE TABLE t (v INT UNIQUE, UNIQUE (v))`, which
+                        // records one constraint here and two there; the rule
+                        // is enforced either way, and what the catalog shows is
+                        // exactly what `DROP CONSTRAINT` can retire.
+                        let covered_by_table_level = constraints.iter().any(|c| {
+                            matches!(
+                                c,
+                                sql::logical_plan::TableConstraint::Unique { columns: uq_cols, .. }
+                                    if uq_cols.len() == 1
+                                        && uq_cols[0].eq_ignore_ascii_case(&col_def.name)
+                            )
+                        });
+                        if covered_by_table_level {
+                            continue;
+                        }
                         col_constraints.add_unique(sql::UniqueConstraint::new(
                             format!("{}_{}_unique", name, col_def.name),
                             name.clone(),
@@ -11253,18 +11321,34 @@ impl EmbeddedDatabase {
         }
 
         let art = self.storage.art_indexes();
-        // A column set already backed by a PK/UNIQUE index (an inline UNIQUE, or
-        // a constraint added earlier) is already enforced; record the new
-        // constraint but do not register a second index for the same rule —
-        // `register_unique_constraint_indexes` applies the same dedup at open.
-        if !art.has_unique_index_on(table_name, &resolved) {
-            art.create_unique_index(table_name, &resolved, Some(&name))
+        // A column set already backed by a CONSTRAINT-OWNED PK/UNIQUE index (an
+        // inline UNIQUE, or a constraint added earlier) is already enforced;
+        // record the new constraint but do not register a second index for the
+        // same rule — `register_unique_constraint_indexes` applies the SAME
+        // test at open, so DDL and reopen build the same set. A user
+        // `CREATE UNIQUE INDEX` over the same columns does NOT count: a
+        // constraint riding on it would be unenforced the moment the user ran
+        // `DROP INDEX` (which `handle_drop_index` allows for a recorded name),
+        // so the constraint gets a tree of its own.
+        if !catalog.constraint_owned_unique_index_on(table_name, &resolved)? {
+            // The registry key is MINTED from (table, columns) and the user's
+            // constraint name rides along as a LABEL; `indexes` is one
+            // database-global map, while a constraint name is per-table.
+            //
+            // THE RETURNED NAME IS LOAD-BEARING. `backfill_unique_index` and
+            // the rollback `drop_index` below must both address the index that
+            // was actually registered: passing `name` after the key is minted
+            // would silently target a nonexistent index, leaving an EMPTY
+            // unique index over a table that may already hold duplicates — a
+            // brand-new fail-open.
+            let index_name = art
+                .create_constraint_unique_index(table_name, &resolved, Some(&name))
                 .map_err(|e| {
                     Error::query_execution(format!("could not create unique constraint \"{}\": {}", name, e))
                 })?;
             let tuples = self.storage.scan_table_with_schema(table_name, &schema)?;
-            if let Err(e) = art.backfill_unique_index(&name, &schema, &tuples) {
-                let _ = art.drop_index(&name);
+            if let Err(e) = art.backfill_unique_index(&index_name, &schema, &tuples) {
+                let _ = art.drop_index(&index_name);
                 return Err(Error::constraint_violation(format!(
                     "could not create unique constraint \"{}\" on relation \"{}\": {}",
                     name, table_name, e

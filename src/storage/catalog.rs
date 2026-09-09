@@ -495,46 +495,39 @@ impl<'a> Catalog<'a> {
         // same silently-unenforced constraint the fail-closed rule exists to
         // prevent, reached through the error path.
         //
-        // So the whole question — "can every UNIQUE column get its index?" — is
-        // answered HERE, where the answer costs nothing but a lookup. The loop
-        // below then registers from this plan and cannot normally fail; if it
-        // does anyway (a concurrent DDL claimed the name between the two), the
-        // unwind restores the pre-CREATE state before returning the error.
+        // So the plan — "which UNIQUE columns still need a tree?" — is drawn up
+        // HERE, where it costs nothing but a lookup. There is deliberately NO
+        // name question left in it: the loop below registers through
+        // `create_constraint_unique_index`, which never fails for a name
+        // reason (a taken `{table}_{col}_key` yields the smallest free
+        // `{key}_{n}`), so a derived-name clash can no longer reject a CREATE
+        // that PostgreSQL accepts. `_` is both the joiner and a legal
+        // identifier character, so `acct (role, name)` and `acct_role (name)`
+        // derive the SAME `acct_role_name_key` with no user-chosen name
+        // involved; the second table simply gets `acct_role_name_key_2` and
+        // BOTH enforce. `rebuild_all_indexes` registers the same flag through
+        // the same call at reopen, so DDL and reopen agree. If the loop fails
+        // anyway (a non-name failure), the unwind restores the pre-CREATE state
+        // before returning the error.
         //
         // Hoisted for exactly the reason the FK target check in
         // `EmbeddedDatabase`'s CREATE TABLE arm is hoisted above this call.
         let art_manager = self.storage.art_indexes();
-        let mut unique_index_plan: Vec<(String, Vec<String>)> = Vec::new();
+        let mut unique_index_plan: Vec<Vec<String>> = Vec::new();
         for col in schema.columns.iter() {
             if !col.unique || col.primary_key {
                 continue;
             }
             let unique_columns = vec![col.name.clone()];
-            // Already covered by an equivalent index — a re-entrant
-            // registration (e.g. `rebuild_all_indexes` in a process that
-            // already ran this CREATE). Benign, and NOT a name conflict.
-            if art_manager.has_unique_index_on(table_name, &unique_columns) {
+            // Already enforced by a CONSTRAINT-OWNED tree — a re-entrant
+            // registration (a WAL-recovered `CreateTable` this process replayed
+            // before `rebuild_all_indexes` ran). Benign, and NOT a name
+            // conflict. A user `CREATE UNIQUE INDEX` over the same column does
+            // not count — see `constraint_owned_unique_index_on`.
+            if self.constraint_owned_unique_index_on(table_name, &unique_columns)? {
                 continue;
             }
-            let index_name = ArtIndexManager::generated_unique_index_name(table_name, &unique_columns);
-            if art_manager.index_exists(&index_name) {
-                return Err(Error::query_execution(format!(
-                    "could not create UNIQUE index \"{}\" for column '{}' of table '{}': \
-                     an index with that name is already registered — the constraint would not be enforced",
-                    index_name, col.name, table_name
-                )));
-            }
-            if unique_index_plan.iter().any(|(name, _)| name == &index_name) {
-                // Two columns cannot generate the same name (the name embeds
-                // the column), so this is unreachable in practice; refuse
-                // rather than register one index for two constraints.
-                return Err(Error::query_execution(format!(
-                    "could not create UNIQUE index \"{}\" for column '{}' of table '{}': \
-                     the generated name is not unique — the constraint would not be enforced",
-                    index_name, col.name, table_name
-                )));
-            }
-            unique_index_plan.push((index_name, unique_columns));
+            unique_index_plan.push(unique_columns);
         }
 
         // Log CreateTable to WAL first (for replication to standbys)
@@ -596,14 +589,18 @@ impl<'a> Catalog<'a> {
         // enforced, `O2.login` not) and why enforcement looked "state-dependent".
         // `{table}_{cols}_key` is PostgreSQL's own constraint-index name and the
         // namespace `create_index_generated_name_tests` already documents as
-        // reserved for constraints, so it collides with nothing.
+        // reserved for constraints. It is DERIVED, though, not unique by
+        // construction (see the pre-flight comment), so the key is MINTED
+        // through the constraint namespace — the derived name when it is free,
+        // else the smallest free `{key}_{n}` — and never refused. No user
+        // constraint name is involved, so no label: the violation names the
+        // key, exactly as before.
         //
         // Register from the pre-flight plan (which already skipped the column
-        // sets an equivalent index covers, and already proved every generated
-        // name free).
+        // sets a constraint-owned tree covers).
         let mut registered: Vec<String> = Vec::with_capacity(unique_index_plan.len());
-        for (index_name, unique_columns) in &unique_index_plan {
-            match art_manager.create_unique_index(table_name, unique_columns, None) {
+        for unique_columns in &unique_index_plan {
+            match art_manager.create_constraint_unique_index(table_name, unique_columns, None) {
                 Ok(name) => {
                     tracing::debug!(
                         "Created UNIQUE ART index '{}' for table '{}' on columns {:?}",
@@ -616,25 +613,31 @@ impl<'a> Catalog<'a> {
                 // FAIL CLOSED. The index IS the enforcement, so a constraint we
                 // could not register is a constraint that does not exist;
                 // reporting CREATE TABLE success would hand back a table whose
-                // UNIQUE column silently accepts duplicates. The pre-flight
-                // above rules this out except under a concurrent DDL that
-                // claimed the name in between — so UNWIND rather than return an
-                // error over a half-created table (see the pre-flight comment).
+                // UNIQUE column silently accepts duplicates. A name clash cannot
+                // land here any more (the key is minted free under one write
+                // lock), so this is a non-name failure — UNWIND rather than
+                // return an error over a half-created table (see the pre-flight
+                // comment).
                 Err(e) => {
-                    if art_manager.has_unique_index_on(table_name, unique_columns) {
+                    if self
+                        .constraint_owned_unique_index_on(table_name, unique_columns)
+                        .unwrap_or(false)
+                    {
                         tracing::debug!(
-                            "UNIQUE ART index '{}' for '{}' already registered: {}",
-                            index_name,
+                            "UNIQUE ART index for {}({}) already registered: {}",
                             table_name,
+                            unique_columns.join(", "),
                             e
                         );
                         continue;
                     }
                     self.unwind_failed_create_table(table_name, &pk_columns, &registered);
                     return Err(Error::query_execution(format!(
-                        "could not create UNIQUE index \"{}\" for table '{}': {} — \
+                        "could not create UNIQUE index for {}({}): {} — \
                          the constraint would not be enforced",
-                        index_name, table_name, e
+                        table_name,
+                        unique_columns.join(", "),
+                        e
                     )));
                 }
             }
@@ -705,8 +708,52 @@ impl<'a> Catalog<'a> {
         self.storage.bump_schema_generation();
     }
 
+    /// Is `columns` of `table_name` already enforced by a CONSTRAINT-OWNED
+    /// tree — a live PK/UNIQUE ART index over exactly this column set that has
+    /// NO durable `meta:index:` definition record?
+    ///
+    /// This is the ONE structural idempotency test every constraint
+    /// registration path asks — `create_table`'s column flags,
+    /// [`Self::register_unique_constraint_indexes`], `alter_table_add_unique`
+    /// (src/lib.rs) and the reopen column-flag pass of
+    /// [`Self::rebuild_all_indexes`] — so DDL and reopen skip for the same
+    /// reason and build the same registered set. It is the exact dual of the
+    /// rule [`Self::drop_unique_constraint_indexes`] retires by (a UNIQUE index
+    /// over the column set WITHOUT a definition record).
+    ///
+    /// Why not [`ArtIndexManager::has_unique_index_on`]: that answers "is this
+    /// column set covered by ANY unique index", which a user's
+    /// `CREATE UNIQUE INDEX ux ON t (v)` satisfies. A constraint that skipped
+    /// its own tree because `ux` covered the column set would be enforced by
+    /// `ux` alone — and `DROP INDEX ux`, which `handle_drop_index` allows for a
+    /// recorded name, would silently unenforce the constraint. A user index is
+    /// therefore NOT a reason to skip; a constraint always owns its tree. The
+    /// PK counts (it is constraint-owned and never has a record), so a
+    /// `UNIQUE` over the PK column set is still deduplicated as before.
+    ///
+    /// Exact column-set equality, like `has_unique_index_on`; a read failure on
+    /// a definition record propagates so the DDL caller fails closed.
+    pub fn constraint_owned_unique_index_on(&self, table_name: &str, columns: &[String]) -> Result<bool> {
+        let art_manager = self.storage.art_indexes();
+        for (name, index_type, index_columns) in art_manager.list_table_indexes(table_name) {
+            if !matches!(
+                index_type,
+                crate::storage::ArtIndexType::PrimaryKey | crate::storage::ArtIndexType::Unique
+            ) {
+                continue;
+            }
+            if index_columns.as_slice() != columns {
+                continue;
+            }
+            if !self.index_definition_exists(&name)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Register the ART unique index behind every table-level UNIQUE constraint
-    /// of `table_name` that is not already backed by one.
+    /// of `table_name` that is not already backed by a constraint-owned one.
     ///
     /// Why this exists: `create_table` above derives unique indexes from
     /// `schema.columns` — i.e. from the COLUMN-level `unique` flag only. A
@@ -728,22 +775,50 @@ impl<'a> Catalog<'a> {
     /// (a)`, which writes a constraint record and no column flag — so skipping
     /// by ARITY would have left the altered constraint unenforced after a
     /// restart. Skipping by "is this column set already backed by a live
-    /// PK/UNIQUE index?" keeps exactly one enforcing index per column set (the
+    /// CONSTRAINT-OWNED PK/UNIQUE index?" keeps exactly one enforcing index per
+    /// constraint column set (the
     /// original no-double-registration guarantee, so the error text of the
     /// already-working shapes is unchanged) while covering every arity.
     ///
-    /// Idempotent: `IndexAlreadyExists` is the expected outcome when
-    /// `rebuild_all_indexes` runs in a process that already executed the
-    /// `CREATE TABLE`, and is logged at debug like the sibling PK/FK loops.
-    pub fn register_unique_constraint_indexes(&self, table_name: &str, constraints: &crate::sql::TableConstraints) {
+    /// FAIL CLOSED, and the index key is MINTED — never the user's constraint
+    /// name (`create_constraint_unique_index`). It used to pass `uc.name` as
+    /// the key of a DATABASE-GLOBAL map and then swallow the collision — the
+    /// `IndexAlreadyExists => debug!` and `_ => warn!` arms that made
+    /// `CONSTRAINT ux` on a second table, and a second unnamed `UNIQUE (c, d)`
+    /// on one table, succeed with the constraint enforced by NOTHING
+    /// (tests/gh_issue_24.rs:731 and :776). Both arms are gone: an `Err` is
+    /// returned, and a DDL caller must unwind on it.
+    ///
+    /// # Idempotency is STRUCTURAL, never by error kind
+    ///
+    /// `rebuild_all_indexes` legitimately re-registers every constraint in a
+    /// process that already ran `CREATE TABLE`, so "already registered by this
+    /// same rule" (fine, skip) has to be told apart from "collided with a
+    /// DIFFERENT rule" (fatal). The question asked is
+    /// [`Self::constraint_owned_unique_index_on`] — a question about the COLUMN
+    /// SET, put to the live registry, that a user `CREATE UNIQUE INDEX` over the
+    /// same set does NOT satisfy — and never `matches!(e, IndexAlreadyExists)`,
+    /// which conflated the two. It is asked again after a failure, because a
+    /// concurrent DDL may have installed the index in between.
+    ///
+    /// Returns the keys it minted, so a caller that has to unwind knows exactly
+    /// which indexes to take back out.
+    pub fn register_unique_constraint_indexes(
+        &self,
+        table_name: &str,
+        constraints: &crate::sql::TableConstraints,
+    ) -> Result<Vec<String>> {
         let art_manager = self.storage.art_indexes();
+        let mut registered: Vec<String> = Vec::new();
         for uc in &constraints.unique_constraints {
             if uc.is_primary_key || uc.columns.is_empty() {
                 continue;
             }
             // Already enforced by the column-flag index `create_table` built (or
-            // by the PK index, or by a previous pass) — one rule, one index.
-            if art_manager.has_unique_index_on(table_name, &uc.columns) {
+            // by the PK index, or by a previous pass) — one rule, one index. A
+            // user `CREATE UNIQUE INDEX` over the set does not count.
+            // This is the STRUCTURAL idempotency test; see the doc comment.
+            if self.constraint_owned_unique_index_on(table_name, &uc.columns)? {
                 tracing::debug!(
                     "UNIQUE constraint '{}' on {}({}) is already backed by an index",
                     uc.name,
@@ -752,26 +827,45 @@ impl<'a> Catalog<'a> {
                 );
                 continue;
             }
-            match art_manager.create_unique_index(table_name, &uc.columns, Some(&uc.name)) {
-                Ok(_) => tracing::debug!(
-                    "Registered UNIQUE ART index '{}' on {}({})",
-                    uc.name,
-                    table_name,
-                    uc.columns.join(", ")
-                ),
-                Err(super::art_index::ArtIndexError::IndexAlreadyExists(_)) => {
-                    tracing::debug!("UNIQUE index '{}' already registered", uc.name);
+            match art_manager.create_constraint_unique_index(table_name, &uc.columns, Some(&uc.name)) {
+                Ok(index_name) => {
+                    tracing::debug!(
+                        "Registered UNIQUE ART index '{}' enforcing constraint '{}' on {}({})",
+                        index_name,
+                        uc.name,
+                        table_name,
+                        uc.columns.join(", ")
+                    );
+                    registered.push(index_name);
                 }
-                Err(e) => tracing::warn!(
-                    "Failed to register UNIQUE index '{}' on {}({}): {} — \
-                     the constraint will NOT be enforced until it is registered",
-                    uc.name,
-                    table_name,
-                    uc.columns.join(", "),
-                    e
-                ),
+                Err(e) => {
+                    // Re-ask the STRUCTURAL question rather than classifying
+                    // the error: between the check above and here a concurrent
+                    // DDL may have installed an index for this very column set,
+                    // which is benign. Anything else is fatal — the index IS
+                    // the enforcement.
+                    if self.constraint_owned_unique_index_on(table_name, &uc.columns)? {
+                        tracing::debug!(
+                            "UNIQUE constraint '{}' on {}({}) was backed concurrently: {}",
+                            uc.name,
+                            table_name,
+                            uc.columns.join(", "),
+                            e
+                        );
+                        continue;
+                    }
+                    return Err(Error::query_execution(format!(
+                        "could not create the index enforcing UNIQUE constraint \"{}\" on {}({}): {} — \
+                         the constraint would not be enforced",
+                        uc.name,
+                        table_name,
+                        uc.columns.join(", "),
+                        e
+                    )));
+                }
             }
         }
+        Ok(registered)
     }
 
     /// Every column set of `table_name` that a UNIQUE (or PRIMARY KEY)
@@ -823,103 +917,154 @@ impl<'a> Catalog<'a> {
         sets
     }
 
-    /// Drop the ART unique index backing each of `removed` (unique constraints that have
-    /// just been removed from a table's persisted constraint set).
+    /// Drop the ART unique index backing each of `removed` (unique constraints
+    /// that have just been removed from a table's persisted constraint set),
+    /// and retire the co-declared column flag with it.
     ///
-    /// SEVERAL candidate names, because unique indexes are not all named the same way:
-    /// `create_unique_index` uses the name it is GIVEN, and callers pass different things —
-    /// `create_table`'s column-level loop lets it GENERATE `{table}_{cols}_key`, while
-    /// `register_unique_constraint_indexes` passes the CONSTRAINT name. The
-    /// `unique_{table}_{name}` form is the original guess and matches neither; it is tried
-    /// last so that any index which does carry it is still cleaned up. The bare COLUMN name
-    /// is the pre-v4.31.0 spelling of `create_table`'s index and is still tried so a data
-    /// directory written by an older binary (whose indexes are re-registered under the old
-    /// name only if that binary also created them in this process) is not left enforcing a
-    /// dropped constraint.
+    /// Leaving either behind is not cosmetic. The INDEX — not the constraint
+    /// record — is what the write path probes, so a stale one keeps rejecting
+    /// rows for a constraint the user already dropped; and the column
+    /// `unique` FLAG is what `Catalog::rebuild_all_indexes` re-derives an index
+    /// from at every open, so a stale flag brings the retired rule back after a
+    /// restart.
     ///
-    /// Leaving the index behind is not cosmetic: the index, not the constraint record, is
-    /// what the write path probes, so a stale one keeps rejecting rows for a constraint the
-    /// user has already dropped.
+    /// # Resolution is by COLUMN SET, never by a guessed name
+    ///
+    /// This used to try four candidate NAMES (`uc.name`, the generated
+    /// `{table}_{cols}_key`, the pre-4.31.0 bare column name,
+    /// `unique_{table}_{name}`) and stop at the first that resolved. Two live
+    /// hazards came out of that: `uc.name` heading the list meant
+    /// `DROP CONSTRAINT ux` could drop a user's `CREATE UNIQUE INDEX ux ON
+    /// t (w)` on entirely different columns, and no guess matches a minted
+    /// `{key}_2` fallback name at all.
+    /// [`ArtIndexManager::unique_indexes_on_columns`] answers the real
+    /// question — which live UNIQUE index of THIS table covers THIS column set
+    /// — and excludes PRIMARY KEY indexes by kind. Indexes that carry a durable
+    /// `meta:index:` definition are then excluded as well: those are user
+    /// `CREATE UNIQUE INDEX` objects, which PostgreSQL keeps across a
+    /// `DROP CONSTRAINT` and which `DROP INDEX` owns.
     pub fn drop_unique_constraint_indexes(&self, table_name: &str, removed: &[crate::sql::UniqueConstraint]) {
         let art_manager = self.storage.art_indexes();
         for uc in removed {
-            let mut candidates: Vec<String> = vec![uc.name.clone()];
-            // The generated constraint-namespace name `create_table` and
-            // `ALTER TABLE … ADD CONSTRAINT … UNIQUE` register under.
-            candidates.push(ArtIndexManager::generated_unique_index_name(table_name, &uc.columns));
-            if uc.columns.len() == 1 {
-                // Pre-v4.31.0: the column-level UNIQUE index was registered
-                // under the bare column name.
-                candidates.push(uc.columns[0].clone());
+            // (1) RETIRE THE CO-DECLARED COLUMN FLAG.
+            //
+            // The planner propagates a single-column table-level `UNIQUE (u)`
+            // into `ColumnDef.unique` (src/sql/planner.rs, for MySQL
+            // `UNIQUE KEY` / SHOW INDEX parity), and `Catalog::create_table`
+            // builds the enforcing index from that FLAG. So one SQL declaration
+            // leaves a record AND a flag, and retiring only the record left the
+            // flag claiming the column: the index survived, the duplicate stayed
+            // rejected, and the reopen rebuild resurrected the rule
+            // (Sprinter 3441d3e21453).
+            //
+            // Cleared only when NO surviving record and no PRIMARY KEY still
+            // covers the column — deliberately asking a question the flag
+            // itself is not part of, or a genuine inline `UNIQUE` would clear
+            // its own flag. Never touches `primary_key`.
+            if !uc.is_primary_key
+                && uc.columns.len() == 1
+                && !self.column_set_claimed_by_record_or_pk(table_name, &uc.columns)
+            {
+                self.clear_column_unique_flag(table_name, &uc.columns[0]);
             }
-            candidates.push(format!("unique_{}_{}", table_name, uc.name));
 
             // Is this column set STILL claimed after `removed` was retired?
             //
             // Two rules can share ONE index: `alter_table_add_unique`
             // deliberately registers no second index when the column set is
-            // already covered (`has_unique_index_on`), and an inline `UNIQUE`
+            // already covered by a constraint-owned one
+            // (`constraint_owned_unique_index_on`), and an inline `UNIQUE`
             // writes BOTH a column flag and a constraint record. So dropping
             // the redundant one must not drop the index the survivor is
             // enforced by:
             //   CREATE TABLE t (id INT PRIMARY KEY, v TEXT UNIQUE);   -- t_v_key
             //   ALTER TABLE t ADD CONSTRAINT c UNIQUE (v);            -- no index
             //   ALTER TABLE t DROP CONSTRAINT c;                      -- must keep t_v_key
-            // Without this check the candidate sweep found `t_v_key` and
-            // dropped it, `col.unique` stayed true in the schema, and the table
-            // went on ADVERTISING a constraint that `check_unique_constraints`
-            // had nothing to probe — duplicates landing silently, the exact
-            // fail-open class this whole change exists to close.
-            //
-            // The caller persists the surviving constraint set BEFORE calling
-            // this, so `unique_column_sets` below already excludes `removed`
-            // — except for the ART registry it also unions, which is why the
-            // comparison is against the schema flags and the constraint records
-            // only.
+            // Read AFTER the flag retirement above, so it sees the flag's real
+            // post-drop state. The caller persists the surviving constraint set
+            // BEFORE calling this, so `removed` is already out of the records.
             let still_claimed = self.column_set_still_claimed(table_name, &uc.columns);
 
-            let mut dropped = false;
-            for candidate in candidates {
-                // STOP at the first candidate that resolves. The list is a set
-                // of GUESSES at one index's name, not a list of indexes to
-                // remove; continuing past a hit meant a second guess that
-                // happened to name a DIFFERENT live index (e.g. the generated
-                // `{table}_{cols}_key` of an inline UNIQUE, when the constraint
-                // being dropped carried a user-chosen name) was dropped too.
-                let Some((kind, owner)) = art_manager.index_kind_and_table(&candidate) else {
-                    continue;
-                };
-                if owner != table_name || kind != super::ArtIndexType::Unique {
-                    // Never touch another table's index, and never drop a
-                    // PRIMARY KEY index because a constraint record happened to
-                    // guess its name.
-                    continue;
-                }
-                if still_claimed {
-                    tracing::debug!(
-                        "Keeping UNIQUE ART index '{}' after dropping constraint '{}': \
-                         columns ({}) are still claimed by another constraint on '{}'",
-                        candidate,
-                        uc.name,
-                        uc.columns.join(", "),
-                        table_name
-                    );
-                    dropped = true;
-                    break;
-                }
-                if art_manager.drop_index(&candidate).is_ok() {
-                    dropped = true;
-                    tracing::debug!("Dropped UNIQUE ART index '{}' for constraint '{}'", candidate, uc.name);
-                    break;
-                }
-            }
-            if !dropped {
+            // (2) RESOLVE THE INDEX BY COLUMN SET.
+            let mut candidates = art_manager.unique_indexes_on_columns(table_name, &uc.columns);
+            // A durable `meta:index:` definition means a user
+            // `CREATE UNIQUE INDEX`; PostgreSQL keeps it. `unwrap_or(true)`
+            // excludes on a read failure too — keeping an index we could not
+            // classify only over-enforces, while dropping one we should not
+            // have silently unenforces a rule the user created.
+            candidates.retain(|name| !self.index_definition_exists(name).unwrap_or(true));
+
+            if candidates.is_empty() {
                 tracing::debug!(
-                    "No UNIQUE ART index found for dropped constraint '{}' on '{}'",
+                    "No constraint-owned UNIQUE ART index to retire for dropped constraint '{}' on '{}'",
                     uc.name,
                     table_name
                 );
+                continue;
             }
+            if still_claimed {
+                tracing::debug!(
+                    "Keeping UNIQUE ART index(es) {:?} after dropping constraint '{}': \
+                     columns ({}) are still claimed by another rule on '{}'",
+                    candidates,
+                    uc.name,
+                    uc.columns.join(", "),
+                    table_name
+                );
+                continue;
+            }
+            // No rule survives for this column set, so EVERY constraint-owned
+            // index over it goes — not just the first. Stopping at one is what
+            // leaves a suffixed `{key}_2` fallback behind, still rejecting rows
+            // for a constraint that no longer exists.
+            for candidate in candidates {
+                match art_manager.drop_index(&candidate) {
+                    Ok(_) => tracing::debug!(
+                        "Dropped UNIQUE ART index '{}' for retired constraint '{}'",
+                        candidate,
+                        uc.name
+                    ),
+                    Err(e) => tracing::warn!(
+                        "Failed to drop UNIQUE ART index '{}' for retired constraint '{}' on '{}': {} — \
+                         the dropped constraint may keep rejecting rows",
+                        candidate,
+                        uc.name,
+                        table_name,
+                        e
+                    ),
+                }
+            }
+        }
+    }
+
+    /// Clear the column-level `unique` flag a retired single-column UNIQUE
+    /// constraint co-declared. Never touches `primary_key`.
+    ///
+    /// Best effort: the constraint record is already gone and the caller cannot
+    /// unwind, so a failure here is logged rather than propagated — the residue
+    /// is an over-enforcing table, not an unenforced one.
+    fn clear_column_unique_flag(&self, table_name: &str, column: &str) {
+        let Ok(mut schema) = self.get_table_schema(table_name) else {
+            return;
+        };
+        let mut changed = false;
+        for col in schema.columns.iter_mut() {
+            if col.unique && !col.primary_key && col.name.eq_ignore_ascii_case(column) {
+                col.unique = false;
+                changed = true;
+            }
+        }
+        if !changed {
+            return;
+        }
+        if let Err(e) = self.update_table_schema(table_name, &schema) {
+            tracing::warn!(
+                "DROP CONSTRAINT on '{}': failed to clear the UNIQUE flag of column '{}': {} — \
+                 the retired constraint will come back at the next open",
+                table_name,
+                column,
+                e
+            );
         }
     }
 
@@ -935,6 +1080,30 @@ impl<'a> Catalog<'a> {
     /// Case-insensitive and order-independent, because a unique constraint is a
     /// SET of columns.
     fn column_set_still_claimed(&self, table_name: &str, columns: &[String]) -> bool {
+        if self.column_set_claimed_by_record_or_pk(table_name, columns) {
+            return true;
+        }
+        if columns.len() != 1 {
+            return false;
+        }
+        match self.get_table_schema(table_name) {
+            Ok(schema) => schema
+                .columns
+                .iter()
+                .any(|c| c.unique && !c.primary_key && columns.iter().any(|w| c.name.eq_ignore_ascii_case(w))),
+            Err(_) => false,
+        }
+    }
+
+    /// The half of [`Self::column_set_still_claimed`] that does NOT look at the
+    /// column-level `unique` flag: the PRIMARY KEY and the surviving
+    /// `TableConstraints.unique_constraints` records.
+    ///
+    /// Separate because the flag's own fate is what
+    /// `drop_unique_constraint_indexes` is deciding — asking a predicate that
+    /// includes the flag whether the flag should be cleared always answers
+    /// "yes, it is claimed", and the retired rule survives forever.
+    fn column_set_claimed_by_record_or_pk(&self, table_name: &str, columns: &[String]) -> bool {
         let same_set = |other: &[String]| -> bool {
             other.len() == columns.len() && columns.iter().all(|c| other.iter().any(|o| o.eq_ignore_ascii_case(c)))
         };
@@ -947,14 +1116,6 @@ impl<'a> Catalog<'a> {
                 .map(|c| c.name.clone())
                 .collect();
             if !pk.is_empty() && same_set(&pk) {
-                return true;
-            }
-            if columns.len() == 1
-                && schema
-                    .columns
-                    .iter()
-                    .any(|c| c.unique && !c.primary_key && columns.iter().any(|w| c.name.eq_ignore_ascii_case(w)))
-            {
                 return true;
             }
         }
@@ -1461,6 +1622,11 @@ impl<'a> Catalog<'a> {
     /// committed by a previous process.
     ///
     /// Behaviour:
+    /// - Tables are visited in NAME order (`list_tables` sorts), so the
+    ///   constraint keys minted below are reproducible across restarts.
+    /// - User `CREATE [UNIQUE] INDEX` definitions (`meta:index:`) are
+    ///   registered FIRST, for every table, before any constraint-derived key
+    ///   is minted — a durable name is honoured, a derived name yields.
     /// - PK and UNIQUE indexes are registered from the persisted schema.
     /// - FK indexes are registered from the persisted `table_constraints`.
     /// - Every row in every user table is replayed through `on_insert` to
@@ -1485,6 +1651,22 @@ impl<'a> Catalog<'a> {
         let art_snapshots = self.storage.load_art_table_snapshots();
         let vector_sidecars = self.storage.load_vector_sidecars();
 
+        // Pass 0 — the tables to rebuild, with their schemas, in NAME order.
+        //
+        // THE ORDER IS LOAD-BEARING and must be DETERMINISTIC across restarts.
+        // The constraint keys minted in pass 2 (`{table}_{cols}_key`, else the
+        // smallest free `{key}_{n}`) depend on which registration reached a
+        // contended name first, and `load_table_from_snapshot` accepts a
+        // checkpointed snapshot only when the registered `(name, type, columns)`
+        // set matches it EXACTLY — a key that came back under a different
+        // suffix would silently turn every open into a full scan rebuild.
+        // `list_tables` walks the `meta:table:` keyspace and then `sort()`s the
+        // names, so this iterates by table name, not by RocksDB key or hash
+        // order; do not swap in an unsorted source. Within a table the sources
+        // are ordered too: `schema.columns` is positional, `TableConstraints`
+        // is a `Vec` in declaration order, and `list_index_definitions` sorts
+        // by index name.
+        let mut tables: Vec<(String, Schema)> = Vec::new();
         for table_name in self.list_tables()? {
             // Skip system / internal bookkeeping tables — they have no
             // user-facing constraint indexes and rebuilding them just
@@ -1493,18 +1675,87 @@ impl<'a> Catalog<'a> {
                 continue;
             }
 
-            let schema = match self.get_table_schema(&table_name) {
-                Ok(s) => s,
+            match self.get_table_schema(&table_name) {
+                Ok(schema) => tables.push((table_name, schema)),
                 Err(e) => {
                     tracing::warn!(
                         "Index rebuild: skipping table {} — schema load failed: {}",
                         table_name,
                         e
                     );
-                    continue;
                 }
-            };
+            }
+        }
 
+        // Pass 1 — DURABLE names first: every `meta:index:` definition, of
+        // every table, BEFORE any constraint-derived key is minted.
+        //
+        // There are two namespaces (see `create_constraint_unique_index`). A
+        // `CREATE [UNIQUE] INDEX` name is the user's, backed by a durable
+        // record, and must come back under exactly that name or `DROP INDEX`
+        // can never find it. A constraint key is DERIVED and MINTABLE: it
+        // yields to a taken name by taking `{key}_{n}` instead. So durable
+        // names are registered first and mintable names after — for ALL tables
+        // at once rather than per table, because `CREATE UNIQUE INDEX
+        // acct_role_name_key ON z (x)` must keep its name against the flag of
+        // `acct_role (name)` whichever way the two tables sort.
+        //
+        // This is the same outcome the DDL path produces:
+        // `create_art_secondary_index` (src/sql/executor/ddl.rs) refuses a name
+        // that is already registered, and every constraint path only ever
+        // mints a FREE key, so at DDL time a recorded name is never a
+        // constraint-owned tree either. Registering the constraint records
+        // FIRST — as this method did until v4.31.2 — inverted that at reopen:
+        // the constraint claimed `sq_v_key` for `(v)`, the user's
+        // `CREATE UNIQUE INDEX sq_v_key ON sq (w)` then failed with
+        // `IndexAlreadyExists` and only warned, so a store that was correct
+        // when written came back with a declared UNIQUE enforced by NOTHING —
+        // and `DROP INDEX sq_v_key`, which `handle_drop_index` allows because
+        // the name has a definition record, would have removed the
+        // CONSTRAINT's enforcement.
+        //
+        // DROP INDEX INVARIANT (`handle_drop_index`, src/sql/executor/ddl.rs,
+        // `user_created_unique`): a name with a `meta:index:` definition is
+        // never ALSO a constraint-owned tree. It is guaranteed HERE at reopen
+        // (the recorded name is registered before any mint could take it) and
+        // at DDL time by the two facts in the previous paragraph. The residue
+        // is a definition record whose index did NOT register (undecodable
+        // record, skipped by `list_index_definitions`): its name is then free
+        // for a mint, and `DROP INDEX` of that name would drop the mint.
+        //
+        // CRASH-RECOVERY LEG. "Before any mint" is only true of the mints THIS
+        // method makes. `StorageEngine::open` runs `recover_wal_at_open`
+        // first, and a post-checkpoint `CreateTable` entry whose
+        // `meta:table:` record never landed (`log_create_table` appends the
+        // entry separately from the schema put, so a crash between the two
+        // leaves exactly that) is replayed through `Catalog::create_table` —
+        // which mints its column-flag keys into the still-EMPTY registry,
+        // ahead of this pass. So a durable name can already be held when
+        // pass 1 reaches it, by a tree that has no record of its own.
+        // `register_persisted_art_index` classifies that holder and EVICTS a
+        // constraint mint (the durable definition wins, the mint is re-minted
+        // onto a free `{key}_{n}` by pass 2 below and backfilled by the row
+        // replay), so the invariant holds on the crash-recovery open as well
+        // as on the clean one. A PK tree is never evicted.
+        //
+        // Still ahead of every table's snapshot load / row replay (both run per
+        // table in pass 2), so backfill semantics are unchanged: an index
+        // registered after the replay would be empty and accept duplicates of
+        // pre-restart rows.
+        for (index_name, definition) in &persisted_indexes {
+            if !tables.iter().any(|(name, _)| name == &definition.table_name) {
+                // A definition for a table that no longer exists (or whose
+                // schema did not load): skipped, exactly as the per-table
+                // filter used to skip it.
+                continue;
+            }
+            self.register_persisted_art_index(index_name, definition);
+        }
+
+        // Pass 2 — per table: PK, column-flag UNIQUEs, constraint records (all
+        // constraint-owned, all minted onto a FREE key), FK, then the snapshot
+        // load or the row replay.
+        for (table_name, schema) in tables {
             // (Re)register the PK index structure if the table has one.
             let pk_columns: Vec<String> = schema
                 .columns
@@ -1520,35 +1771,50 @@ impl<'a> Catalog<'a> {
                 }
             }
 
-            // (Re)register UNIQUE indexes (one per UNIQUE non-PK column).
-            // `None` for the name, so the index comes back under the SAME
-            // generated `{table}_{col}_key` that `create_table` used — passing
-            // the bare column name here put every table's `email` index under
-            // one global key and lost all but the first (see `create_table`).
+            // (Re)register UNIQUE indexes (one per UNIQUE non-PK column),
+            // through the SAME call `create_table` uses, so the key comes back
+            // as the same `{table}_{col}_key` — or, when that name is taken by
+            // a durable index registered in pass 1 (or by another table's
+            // identically-derived flag), as the same free `{key}_{n}` the DDL
+            // minted. Passing the bare column name here once put every
+            // table's `email` index under one global key and lost all but the
+            // first (see `create_table`); failing on a taken name, as
+            // `create_unique_index` does, lost the flag instead.
             for col in &schema.columns {
                 if col.unique && !col.primary_key {
                     let cols = vec![col.name.clone()];
-                    if let Err(e) = art_manager.create_unique_index(&table_name, &cols, None) {
-                        if art_manager.has_unique_index_on(&table_name, &cols) {
-                            tracing::debug!(
-                                "Index rebuild: UNIQUE index for {}.{} already registered: {}",
-                                table_name,
-                                col.name,
-                                e
-                            );
-                        } else {
-                            // Not a re-registration: this column's UNIQUE
-                            // constraint is now enforced by nothing. Loud,
-                            // because every INSERT will silently accept
-                            // duplicates until it is fixed.
-                            tracing::warn!(
-                                "Index rebuild: UNIQUE index for {}.{} FAILED to register ({}); \
-                                 the constraint is NOT enforced in this process",
-                                table_name,
-                                col.name,
-                                e
-                            );
-                        }
+                    // Structural idempotency, the same test as `create_table`:
+                    // a WAL-recovered `CreateTable` this process replayed
+                    // before the rebuild already installed this flag's tree,
+                    // and minting again would add a duplicate `{key}_2`. A user
+                    // index over the column does NOT satisfy it (the flag would
+                    // ride on a droppable index, and the registered set would
+                    // differ from the one `create_table` produced). A read
+                    // failure registers rather than skips — a second tree only
+                    // over-enforces.
+                    if self
+                        .constraint_owned_unique_index_on(&table_name, &cols)
+                        .unwrap_or(false)
+                    {
+                        tracing::debug!(
+                            "Index rebuild: UNIQUE index for {}.{} already registered",
+                            table_name,
+                            col.name
+                        );
+                        continue;
+                    }
+                    if let Err(e) = art_manager.create_constraint_unique_index(&table_name, &cols, None) {
+                        // Not a name clash (those are absorbed by the mint):
+                        // this column's UNIQUE constraint is now enforced by
+                        // nothing. Loud, because every INSERT will silently
+                        // accept duplicates until it is fixed.
+                        tracing::warn!(
+                            "Index rebuild: UNIQUE index for {}.{} FAILED to register ({}); \
+                             the constraint is NOT enforced in this process",
+                            table_name,
+                            col.name,
+                            e
+                        );
                     }
                 }
             }
@@ -1562,7 +1828,26 @@ impl<'a> Catalog<'a> {
             // it after the replay and the tree would be empty, so duplicates
             // against pre-restart rows would be accepted.
             if let Ok(constraints) = self.load_table_constraints(&table_name) {
-                self.register_unique_constraint_indexes(&table_name, &constraints);
+                // OPEN, not DDL — deliberately log-and-continue, which is
+                // TODAY's behaviour and must stay that way. Fail closed on the
+                // DDL path only: there is no statement to return an error to
+                // here, and a constraint can legitimately be unregisterable on
+                // an existing store (RENAME COLUMN / DROP COLUMN never update
+                // `TableConstraints`, so a renamed column already leaves a
+                // record naming a column that no longer exists — src/lib.rs
+                // `AlterTableRenameColumn` / `AlterTableDropColumn` mutate only
+                // `schema.columns[i].name`). Turning that into a refusal to
+                // open, or into a write block, would permanently brick such a
+                // table on restart. Recording it and refusing writes is
+                // separately tracked; do NOT "fix" this into a hard failure.
+                if let Err(e) = self.register_unique_constraint_indexes(&table_name, &constraints) {
+                    tracing::error!(
+                        "Index rebuild: a UNIQUE constraint of '{}' could NOT be backed by an index ({}); \
+                         it is not enforced in this process",
+                        table_name,
+                        e
+                    );
+                }
                 for fk in &constraints.foreign_keys {
                     if let Err(e) = art_manager.create_fk_index(
                         &fk.table_name,
@@ -1576,63 +1861,8 @@ impl<'a> Catalog<'a> {
                 }
             }
 
-            // (Re)register user-created scalar secondary indexes from the
-            // durable index catalog.
-            for (index_name, definition) in persisted_indexes
-                .iter()
-                .filter(|(_, definition)| definition.table_name == table_name)
-            {
-                if matches!(definition.index_type.as_deref(), None | Some("art" | "btree" | "hash")) {
-                    let columns = vec![definition.column_name.clone()];
-                    // `CREATE UNIQUE INDEX` persists `IndexOption::Unique(true)`
-                    // in the definition; it must come back as a UNIQUE index,
-                    // not a plain secondary one, or the constraint the user
-                    // created would be enforced only until the first restart.
-                    // Registered here — before the snapshot load / row replay —
-                    // for the same reason the constraint indexes are: an index
-                    // registered afterwards is empty, so duplicates of
-                    // pre-restart rows would be accepted.
-                    if let Some(unique_columns) =
-                        crate::sql::executor::ddl::unique_index_columns(&definition.options, &definition.column_name)
-                    {
-                        if let Err(e) = art_manager.create_unique_index(&table_name, &unique_columns, Some(index_name))
-                        {
-                            if art_manager.has_unique_index_on(&table_name, &unique_columns) {
-                                tracing::debug!("Index rebuild: unique index {} already registered", index_name);
-                            } else {
-                                tracing::warn!(
-                                    "Index rebuild: UNIQUE index '{}' on {}.{} FAILED to register ({}); \
-                                     the constraint is NOT enforced in this process",
-                                    index_name,
-                                    table_name,
-                                    definition.column_name,
-                                    e
-                                );
-                            }
-                        }
-                        continue;
-                    }
-                    if let Err(e) = art_manager.create_manual_index(index_name, &table_name, &columns) {
-                        // IndexAlreadyExists is expected when CREATE INDEX ran
-                        // earlier in this same process. Anything else is a real
-                        // degradation — the index stays unregistered and queries
-                        // silently full-scan — so it must be surfaced, not
-                        // swallowed at debug level.
-                        if matches!(e, super::art_index::ArtIndexError::IndexAlreadyExists(_)) {
-                            tracing::debug!("Index rebuild: manual index {} already registered", index_name);
-                        } else {
-                            tracing::warn!(
-                                "Index rebuild: manual index '{}' on {}.{} FAILED to register ({}); \
-                                 queries will full-scan until it is rebuilt with CREATE INDEX",
-                                index_name,
-                                table_name,
-                                definition.column_name,
-                                e
-                            );
-                        }
-                    }
-                }
-            }
+            // User `CREATE [UNIQUE] INDEX` definitions were registered for this
+            // table in pass 1, ahead of every mint above.
 
             // R4.2 fast path: a valid snapshot whose index set matches the
             // registrations above is bulk-loaded directly into the trees —
@@ -1737,6 +1967,211 @@ impl<'a> Catalog<'a> {
         );
         self.storage.set_last_index_open_report(report);
         Ok(())
+    }
+
+    /// (Re)register one user-created scalar secondary index from its durable
+    /// `meta:index:` definition — pass 1 of [`Self::rebuild_all_indexes`].
+    ///
+    /// Registered under the RECORDED name, in the relation namespace
+    /// (`create_unique_index` / `create_manual_index` with an explicit name):
+    /// a user index that came back under any other name could never be found
+    /// by `DROP INDEX`. Runs before any constraint key is minted BY THE
+    /// REBUILD, so the name can already be taken in two ways only, which
+    /// [`Self::evict_mint_squatting_persisted_name`] tells apart before the
+    /// registration is attempted: a re-registration of this same definition in
+    /// this same process (benign — the `IndexAlreadyExists` arms below classify
+    /// it), or a constraint key minted by a WAL-replayed `CreateTable` BEFORE
+    /// the rebuild ran (the crash-recovery leg of the pass-1 invariant in
+    /// [`Self::rebuild_all_indexes`] — evicted, so the durable name wins).
+    ///
+    /// Log-and-continue, like the rest of the open path: there is no statement
+    /// to return an error to.
+    fn register_persisted_art_index(&self, index_name: &str, definition: &PersistedIndexDefinition) {
+        let art_manager = self.storage.art_indexes();
+        let table_name = definition.table_name.as_str();
+        if !matches!(definition.index_type.as_deref(), None | Some("art" | "btree" | "hash")) {
+            // Vector families are reopened by `rebuild_vector_indexes`;
+            // DDL-only families (gin / gist) never had a backing index.
+            return;
+        }
+        let columns = vec![definition.column_name.clone()];
+        // `CREATE UNIQUE INDEX` persists `IndexOption::Unique(true)` in the
+        // definition; it must come back as a UNIQUE index, not a plain
+        // secondary one, or the constraint the user created would be enforced
+        // only until the first restart. Registered ahead of the snapshot load /
+        // row replay for the same reason the constraint indexes are: an index
+        // registered afterwards is empty, so duplicates of pre-restart rows
+        // would be accepted.
+        if let Some(unique_columns) =
+            crate::sql::executor::ddl::unique_index_columns(&definition.options, &definition.column_name)
+        {
+            self.evict_mint_squatting_persisted_name(index_name, definition, &unique_columns, true);
+            if let Err(e) = art_manager.create_unique_index(table_name, &unique_columns, Some(index_name)) {
+                if art_manager.has_unique_index_on(table_name, &unique_columns) {
+                    tracing::debug!("Index rebuild: unique index {} already registered", index_name);
+                } else {
+                    tracing::warn!(
+                        "Index rebuild: UNIQUE index '{}' on {}.{} FAILED to register ({}); \
+                         the constraint is NOT enforced in this process",
+                        index_name,
+                        table_name,
+                        definition.column_name,
+                        e
+                    );
+                }
+            }
+            return;
+        }
+        self.evict_mint_squatting_persisted_name(index_name, definition, &columns, false);
+        if let Err(e) = art_manager.create_manual_index(index_name, table_name, &columns) {
+            // IndexAlreadyExists is expected when CREATE INDEX ran earlier in
+            // this same process. Anything else is a real degradation — the
+            // index stays unregistered and queries silently full-scan — so it
+            // must be surfaced, not swallowed at debug level.
+            if matches!(e, super::art_index::ArtIndexError::IndexAlreadyExists(_)) {
+                tracing::debug!("Index rebuild: manual index {} already registered", index_name);
+            } else {
+                tracing::warn!(
+                    "Index rebuild: manual index '{}' on {}.{} FAILED to register ({}); \
+                     queries will full-scan until it is rebuilt with CREATE INDEX",
+                    index_name,
+                    table_name,
+                    definition.column_name,
+                    e
+                );
+            }
+        }
+    }
+
+    /// DURABLE WINS — the crash-recovery leg of the pass-1 invariant of
+    /// [`Self::rebuild_all_indexes`] (see "DROP INDEX INVARIANT" there).
+    ///
+    /// Pass 1 registers every `meta:index:` definition under its recorded
+    /// name before the rebuild mints any constraint key. That ordering is only
+    /// as good as what ran BEFORE the rebuild: `recover_wal_at_open` replays a
+    /// post-checkpoint `CreateTable` whose `meta:table:` record never landed
+    /// through `Catalog::create_table`, which mints the table's column-flag
+    /// keys into the fresh registry first. `CREATE UNIQUE INDEX
+    /// acct_role_name_key ON z (x)` (durable, checkpointed) then finds its own
+    /// name held by the replayed `acct_role (name UNIQUE)` flag, and with no
+    /// eviction the user's index is registered by NOTHING — `z.x` accepts
+    /// duplicates for the life of the process while `DROP INDEX
+    /// acct_role_name_key` would drop the CONSTRAINT's tree.
+    ///
+    /// The holder is classified STRUCTURALLY, never by error kind:
+    ///
+    /// * No holder — nothing to do.
+    /// * The holder IS this definition (same table, same column set, the kind
+    ///   this definition registers as): a re-registration in this same
+    ///   process. Left alone; the caller's `IndexAlreadyExists` arm logs it at
+    ///   debug, exactly as before. "Has a `meta:index:` record" collapses to
+    ///   this test: the record is keyed by NAME and there is exactly one per
+    ///   name — the one being registered — so a holder that does not match it
+    ///   was not registered from a record, i.e. it is a mint.
+    /// * A PRIMARY KEY holder is NEVER evicted (a table without its PK tree is
+    ///   worse than a user index without a tree); logged at warn, and the
+    ///   caller's warn arm then reports the user index as unregistered.
+    /// * A UNIQUE holder is a constraint-owned mint: `drop_index` it, then the
+    ///   caller registers the durable definition under its own name. The mint
+    ///   is EMPTY at this point (the WAL replay writes rows to RocksDB only;
+    ///   nothing has been fed through `on_insert` before the rebuild), so
+    ///   nothing is lost by dropping rather than renaming — there is no
+    ///   single-index rename primitive on the manager and one is not worth
+    ///   adding for a tree with no entries. Pass 2 of the rebuild then asks
+    ///   [`Self::constraint_owned_unique_index_on`] for the replayed table's
+    ///   flag, finds the column set no longer constraint-owned (the durable
+    ///   holder has a record, so it does not count), re-mints onto the
+    ///   smallest free `{key}_{n}` — the durable name is taken now — and the
+    ///   table's row replay backfills it. The constraint ends up enforced by
+    ///   exactly one tree, the user index by exactly one tree, and `DROP
+    ///   INDEX` of the recorded name touches only the user's.
+    /// * A FOREIGN KEY or MANUAL holder is not re-mintable by pass 2
+    ///   (`create_fk_index` refuses a taken name; nothing re-registers a
+    ///   manual tree), so evicting it would trade one missing index for
+    ///   another. Left alone at warn — today's behaviour.
+    fn evict_mint_squatting_persisted_name(
+        &self,
+        index_name: &str,
+        definition: &PersistedIndexDefinition,
+        definition_columns: &[String],
+        definition_is_unique: bool,
+    ) {
+        use crate::storage::ArtIndexType;
+
+        let art_manager = self.storage.art_indexes();
+        let Some((holder_kind, holder_table)) = art_manager.index_kind_and_table(index_name) else {
+            return;
+        };
+        let holder_columns: Vec<String> = art_manager
+            .list_table_indexes(&holder_table)
+            .into_iter()
+            .find(|(name, _, _)| name == index_name)
+            .map(|(_, _, cols)| cols)
+            .unwrap_or_default();
+
+        let expected_kind = if definition_is_unique {
+            ArtIndexType::Unique
+        } else {
+            ArtIndexType::Manual
+        };
+        let same_columns = holder_columns.len() == definition_columns.len()
+            && holder_columns
+                .iter()
+                .zip(definition_columns)
+                .all(|(a, b)| a.eq_ignore_ascii_case(b));
+        if holder_table == definition.table_name && holder_kind == expected_kind && same_columns {
+            // This definition, already registered in this process.
+            return;
+        }
+
+        match holder_kind {
+            ArtIndexType::PrimaryKey => {
+                tracing::warn!(
+                    "Index rebuild: the recorded index name '{}' ({}.{}) is held by the PRIMARY KEY \
+                     index of '{}'; a PK tree is never evicted, so the user index will not register",
+                    index_name,
+                    definition.table_name,
+                    definition_columns.join(", "),
+                    holder_table
+                );
+            }
+            ArtIndexType::Unique => match art_manager.drop_index(index_name) {
+                Ok(()) => {
+                    tracing::warn!(
+                        "Index rebuild: the recorded index name '{}' ({}.{}) was held by a constraint \
+                         index minted for {}({}) before the rebuild ran (WAL-replayed CreateTable); \
+                         the mint is evicted so the durable definition keeps its name, and the \
+                         constraint is re-minted onto a free key",
+                        index_name,
+                        definition.table_name,
+                        definition_columns.join(", "),
+                        holder_table,
+                        holder_columns.join(", ")
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Index rebuild: could not evict the constraint index squatting the recorded \
+                         name '{}' ({}.{}): {}",
+                        index_name,
+                        definition.table_name,
+                        definition_columns.join(", "),
+                        e
+                    );
+                }
+            },
+            ArtIndexType::ForeignKey | ArtIndexType::Manual => {
+                tracing::warn!(
+                    "Index rebuild: the recorded index name '{}' ({}.{}) is held by a {} index of \
+                     '{}' that pass 2 cannot re-mint; left in place, so the user index will not register",
+                    index_name,
+                    definition.table_name,
+                    definition_columns.join(", "),
+                    holder_kind,
+                    holder_table
+                );
+            }
+        }
     }
 
     /// R4.2: load one table's ART indexes from a snapshot. Fails (and the
