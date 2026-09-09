@@ -40,16 +40,36 @@ struct IndexEntry {
     columns: Vec<String>,
     /// Index kind (mirrors `tree.index_type()`).
     index_type: ArtIndexType,
+    /// The user-facing CONSTRAINT name this index enforces, when the registry
+    /// key was MINTED rather than chosen by the user.
+    ///
+    /// NOT a registry key, and NOT persisted: `IndexEntry` derives
+    /// `Debug, Clone` only — there is no `serde` on it — so this field changes
+    /// no on-disk format. It exists because a constraint's name and its index's
+    /// name live in two different namespaces (see
+    /// [`ArtIndexManager::create_constraint_unique_index`]) and a 23505 has to
+    /// print the one the USER wrote: Prisma parses that name out of the message
+    /// into `P2002`.
+    ///
+    /// `None` for a user `CREATE INDEX` (whose key IS its user-facing name),
+    /// for a column-flag UNIQUE (which has no user-written constraint name),
+    /// and for a constraint whose name is the minted one anyway.
+    constraint_label: Option<String>,
     /// The actual tree, individually locked.
     tree: SharedArtIndex,
 }
 
 impl IndexEntry {
     fn new(tree: AdaptiveRadixTree) -> Self {
+        Self::with_label(tree, None)
+    }
+
+    fn with_label(tree: AdaptiveRadixTree, constraint_label: Option<String>) -> Self {
         Self {
             table: tree.table().to_string(),
             columns: tree.columns().to_vec(),
             index_type: tree.index_type(),
+            constraint_label,
             tree: Arc::new(RwLock::new(tree)),
         }
     }
@@ -466,16 +486,6 @@ impl ArtIndexManager {
         format!("{}_{}_key", table, columns.join("_"))
     }
 
-    /// The name [`Self::create_unique_index`] generates when the caller does
-    /// not supply one — PostgreSQL's own `{table}_{cols}_key` spelling.
-    ///
-    /// Public so `Catalog::create_table` can check that name for a collision
-    /// BEFORE it persists anything: it fails closed on a registration failure,
-    /// and an error over a half-created table is worse than a rejected CREATE.
-    pub fn generated_unique_index_name(table: &str, columns: &[String]) -> String {
-        Self::unique_index_name(table, columns)
-    }
-
     /// The name [`Self::create_pk_index`] generates — `{table}_pkey`. Public
     /// for the `Catalog::create_table` unwind, which has to find the PK index
     /// it just registered in order to drop it again.
@@ -611,7 +621,14 @@ impl ArtIndexManager {
         Ok(index_name)
     }
 
-    /// Create a unique constraint index (auto-called on CREATE TABLE UNIQUE or ALTER TABLE ADD UNIQUE)
+    /// Register a UNIQUE index under the caller's OWN name — the RELATION
+    /// namespace: `CREATE UNIQUE INDEX`, and its re-registration at open from
+    /// the `meta:index:` record. Fails with `IndexAlreadyExists` on a taken
+    /// name, which is right for a name the user chose. Every CONSTRAINT path
+    /// (column-flag `UNIQUE`, table-level `UNIQUE (…)`, `ADD CONSTRAINT`)
+    /// goes through [`Self::create_constraint_unique_index`] instead, which
+    /// mints a free key; `None` here still derives `{table}_{cols}_key` but no
+    /// production caller passes it.
     pub fn create_unique_index(
         &self,
         table: &str,
@@ -652,6 +669,150 @@ impl ArtIndexManager {
         self.stats.add_index(ArtIndexType::Unique);
 
         Ok(index_name)
+    }
+
+    /// Register the index that ENFORCES a uniqueness CONSTRAINT.
+    ///
+    /// There are TWO namespaces and this is the constraint one. The registry
+    /// key is MINTED from `(table, columns)` — PostgreSQL's own
+    /// `{table}_{cols}_key` — and `constraint_label` (the user's
+    /// `CONSTRAINT ux` name) is carried as a LABEL for messages only.
+    /// [`Self::create_unique_index`] is the RELATION namespace, where the
+    /// caller really is naming an index (`CREATE UNIQUE INDEX`); it is
+    /// deliberately left alone. ADD, never repurpose: a parameter that silently
+    /// means the opposite of what it says is a future fail-open.
+    ///
+    /// Why a user constraint name must never be a registry key: `indexes` is
+    /// ONE database-global map, while a constraint name is per-TABLE in both
+    /// PostgreSQL and MySQL. `CONSTRAINT ux` on a second table therefore
+    /// collided with the first table's entry, and the caller swallowed the
+    /// collision — so the DDL SUCCEEDED with the constraint enforced by
+    /// NOTHING (GH#21 / tests/gh_issue_24.rs:776). Two unnamed table-level
+    /// constraints on one table hit the same wall through another door, both
+    /// minting the record name `{table}_unique` (tests/gh_issue_24.rs:731).
+    ///
+    /// # It never fails for a NAME reason
+    ///
+    /// If the minted key is already taken — a user index squatting it, or the
+    /// degenerate `UNIQUE (a_b)` + `UNIQUE (a, b)` pair, which mint the same
+    /// string — the smallest free `{key}_{n}` from `n = 2` is taken and the
+    /// squatter is named at WARN. Refusing would turn a name clash into a
+    /// rejected CREATE (or, on the reopen path, a database that cannot come
+    /// back enforcing), whereas a suffixed name still INSTALLS the enforcement
+    /// — which is the entire point of failing closed. No bound constant is
+    /// needed: the map is finite, so the loop terminates; this is deliberately
+    /// not a tunable.
+    ///
+    /// The `ArtResult` is kept for a non-name failure (a poisoned tree, a
+    /// future validation); callers must still treat `Err` as fatal on a DDL
+    /// path.
+    pub fn create_constraint_unique_index(
+        &self,
+        table: &str,
+        columns: &[String],
+        constraint_label: Option<&str>,
+    ) -> ArtResult<String> {
+        self.note_mutation();
+        let base = Self::unique_index_name(table, columns);
+
+        // ONE `indexes` write lock covers "pick a free key AND claim it".
+        // Testing under a read lock and inserting under a write lock would let
+        // a concurrent DDL claim the key in between — exactly the race the
+        // fail-closed callers would have to unwind for. No other lock is held
+        // while this one is (locking rule #4): `unique_indexes` and
+        // `table_indexes` are updated only after it is released.
+        let index_name = {
+            let mut indexes = self.indexes.write().unwrap_or_else(|e| e.into_inner());
+            let mut candidate = base.clone();
+            let mut n: u32 = 1;
+            while indexes.contains_key(&candidate) {
+                n += 1;
+                candidate = format!("{}_{}", base, n);
+            }
+            if n > 1 {
+                let squatter = indexes
+                    .get(&base)
+                    .map(|e| format!("{} on {}({})", e.index_type, e.table, e.columns.join(", ")))
+                    .unwrap_or_else(|| "an unknown index".to_string());
+                tracing::warn!(
+                    "Constraint index for {}({}) registered as '{}': the derived name '{}' is already \
+                     taken by {}. The constraint IS enforced, under the suffixed name.",
+                    table,
+                    columns.join(", "),
+                    candidate,
+                    base,
+                    squatter
+                );
+            }
+            let tree = AdaptiveRadixTree::new(&candidate, table, columns.to_vec(), ArtIndexType::Unique);
+            // A label identical to the key carries no information; keeping it
+            // `None` there means the violation text is byte-for-byte what it
+            // was before this change.
+            let label = constraint_label
+                .filter(|l| *l != candidate.as_str())
+                .map(|l| l.to_string());
+            indexes.insert(candidate.clone(), IndexEntry::with_label(tree, label));
+            candidate
+        };
+
+        {
+            let mut unique_indexes = self.unique_indexes.write().unwrap_or_else(|e| e.into_inner());
+            unique_indexes
+                .entry(table.to_string())
+                .or_insert_with(Vec::new)
+                .push(index_name.clone());
+        }
+
+        self.table_index_add(table, &index_name);
+        self.stats.add_index(ArtIndexType::Unique);
+
+        Ok(index_name)
+    }
+
+    /// The names of the live UNIQUE ART indexes of `table` whose column set is
+    /// `columns` (case-insensitive and ORDER-INDEPENDENT — a unique constraint
+    /// is a SET of columns).
+    ///
+    /// `DROP CONSTRAINT` resolves the index to retire through this, never by
+    /// guessing at a name. Once a key can be minted with a `_2` suffix, name
+    /// guessing cannot be complete; worse, a guess list headed by the user's
+    /// constraint name would drop a user's `CREATE UNIQUE INDEX ux ON t (w)`
+    /// because some constraint on entirely different columns happened to be
+    /// called `ux`. PRIMARY KEY indexes are excluded BY KIND, so a retirement
+    /// can never take the PK index with it.
+    pub fn unique_indexes_on_columns(&self, table: &str, columns: &[String]) -> Vec<String> {
+        // Leaf lock first and released (rule #4), so `indexes` is never taken
+        // while `unique_indexes` is held.
+        let names: Vec<String> = {
+            let unique_indexes = self.unique_indexes.read().unwrap_or_else(|e| e.into_inner());
+            unique_indexes.get(table).cloned().unwrap_or_default()
+        };
+        if names.is_empty() {
+            return Vec::new();
+        }
+        let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
+        names
+            .into_iter()
+            .filter(|name| {
+                indexes.get(name).is_some_and(|entry| {
+                    entry.table == table
+                        && entry.index_type == ArtIndexType::Unique
+                        && Self::column_sets_match(&entry.columns, columns)
+                })
+            })
+            .collect()
+    }
+
+    /// The name a PK/UNIQUE violation must PRINT for `entry`.
+    ///
+    /// The registry key is an implementation detail once constraint indexes are
+    /// minted ([`Self::create_constraint_unique_index`]); the user wrote
+    /// `CONSTRAINT ux`, and Prisma parses `ux` out of the 23505 into `P2002`.
+    /// Falls back to the key, which is the right answer for a
+    /// `CREATE UNIQUE INDEX` (whose key IS its user-facing name) and for a
+    /// column-flag UNIQUE (which has no user-written name at all).
+    fn violation_name<'a>(entry: &'a IndexEntry, index_name: &'a str) -> &'a str {
+        entry.constraint_label.as_deref().unwrap_or(index_name)
     }
 
     /// Create a manual index (via CREATE INDEX ... USING ART)
@@ -1655,7 +1816,11 @@ impl ArtIndexManager {
                                 // did NOT refuse it. The refusal is reported
                                 // after the row is finished.
                                 if first_error.is_none() {
-                                    first_error = Some(Self::stored_duplicate_error(name, row_id, &e));
+                                    first_error = Some(Self::stored_duplicate_error(
+                                        Self::violation_name(entry, name),
+                                        row_id,
+                                        &e,
+                                    ));
                                 }
                             }
                         }
@@ -1765,7 +1930,7 @@ impl ArtIndexManager {
                 if tree.contains(&key) {
                     return Err(ArtIndexError::DuplicateKey(format!(
                         "Duplicate key value violates PRIMARY KEY constraint \"{}\"",
-                        pk_name
+                        Self::violation_name(entry, &pk_name)
                     )));
                 }
             }
@@ -1816,7 +1981,7 @@ impl ArtIndexManager {
                     if tree.contains(&key) {
                         return Err(ArtIndexError::DuplicateKey(format!(
                             "Duplicate key value violates PRIMARY KEY constraint \"{}\"",
-                            pk_name
+                            Self::violation_name(entry, &pk_name)
                         )));
                     }
                 }
@@ -1852,7 +2017,7 @@ impl ArtIndexManager {
                     if tree.contains(&key) {
                         return Err(ArtIndexError::DuplicateKey(format!(
                             "Duplicate key value violates UNIQUE constraint \"{}\"",
-                            unique_name
+                            Self::violation_name(entry, unique_name)
                         )));
                     }
                 }
@@ -1890,7 +2055,7 @@ impl ArtIndexManager {
                         if tree.contains(&key) {
                             return Err(ArtIndexError::DuplicateKey(format!(
                                 "Duplicate key value violates PRIMARY KEY constraint \"{}\"",
-                                pk_name
+                                Self::violation_name(entry, &pk_name)
                             )));
                         }
                     }
@@ -1909,7 +2074,7 @@ impl ArtIndexManager {
                     if tree.contains(&key) {
                         return Err(ArtIndexError::DuplicateKey(format!(
                             "Duplicate key value violates UNIQUE constraint \"{}\"",
-                            unique_name
+                            Self::violation_name(entry, unique_name)
                         )));
                     }
                 }
@@ -2183,11 +2348,12 @@ impl ArtIndexManager {
 
     /// Is there already a PK/UNIQUE index on exactly `columns` of `table`?
     ///
-    /// Metadata only — no tree lock. Used to keep one column set backed by ONE
-    /// enforcing index no matter how many catalog records describe it (an
-    /// inline `UNIQUE` writes both a column flag and a `TableConstraints`
-    /// record), and to let `Catalog::create_table` fail CLOSED: a unique
-    /// constraint whose index could not be registered is enforced by nothing.
+    /// Metadata only — no tree lock. Answers "is this column set covered by
+    /// ANY unique index", which a user `CREATE UNIQUE INDEX` satisfies. The
+    /// constraint registration paths ask the narrower
+    /// `Catalog::constraint_owned_unique_index_on` (same equality, but only
+    /// indexes WITHOUT a `meta:index:` record count), so a constraint never
+    /// rides on an index the user can `DROP INDEX`.
     pub fn has_unique_index_on(&self, table: &str, columns: &[String]) -> bool {
         let names = self.unique_index_names(table);
         if names.is_empty() {
@@ -2289,7 +2455,7 @@ impl ArtIndexManager {
             if index.contains(&key) {
                 return Err(ArtIndexError::DuplicateKey(format!(
                     "Duplicate key value violates UNIQUE constraint \"{}\"",
-                    name
+                    Self::violation_name(&entry, name)
                 )));
             }
             index.insert(&key, row_id)?;
@@ -2725,7 +2891,11 @@ impl ArtIndexManager {
                                     // answer: keep every entry it already owns
                                     // and keep maintaining the rest, then report.
                                     if first_error.is_none() {
-                                        first_error = Some(Self::stored_duplicate_error(name, row_id, &e));
+                                        first_error = Some(Self::stored_duplicate_error(
+                                            Self::violation_name(entry, name),
+                                            row_id,
+                                            &e,
+                                        ));
                                     }
                                 }
                             }

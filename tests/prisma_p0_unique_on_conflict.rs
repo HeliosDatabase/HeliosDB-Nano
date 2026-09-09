@@ -1556,6 +1556,18 @@ fn renaming_a_table_keeps_a_user_unique_index_nameable_and_enforcing() {
 /// Reproduced by squatting the generated constraint-index name from another
 /// table (the ART registry is one GLOBAL map keyed by index name).
 ///
+/// GH21 candidate 3 changed the contract this test pins. Before, a squatted
+/// derived name made `CREATE TABLE` REFUSE (fail closed, but an over-rejection:
+/// PostgreSQL accepts this statement and simply chooses another index name via
+/// `ChooseRelationName`). Now a constraint-backed index is minted into a FREE
+/// key (`t2_v_key_2`) and the CREATE succeeds, so the assertion is inverted:
+/// the table exists, ITS unique enforces, and the squatter's user index is
+/// untouched and still enforces. The "no half-created table on failure"
+/// invariant this test used to carry is still exercised for the only CREATE
+/// TABLE failure that remains reachable — an existing-duplicates backfill on
+/// ADD CONSTRAINT — by `add_constraint_over_existing_duplicates_fails_and_leaves_no_index`
+/// in tests/gh_issue_21_constraint_namespace.rs.
+///
 /// Not looped over the two DML families on purpose: `CREATE TABLE` has no
 /// params-family arm (`LogicalPlan::CreateTable` is not routed through
 /// `execute_plan_with_params_inner`), and `Catalog::create_table` is the ONE
@@ -1563,31 +1575,37 @@ fn renaming_a_table_keeps_a_user_unique_index_nameable_and_enforcing() {
 /// and WAL recovery all land here, which is what the method's own W1.3 comment
 /// records. There is no second implementation to diverge from.
 #[test]
-fn a_create_table_that_cannot_enforce_its_unique_leaves_no_table_behind() {
+fn a_create_table_whose_derived_index_name_is_squatted_still_enforces_its_unique() {
     let db = mem_db();
     db.execute("CREATE TABLE squat (id INT PRIMARY KEY, v VARCHAR(50))")
         .unwrap();
-    // Claim exactly the name `CREATE TABLE t2 (… v UNIQUE)` would generate.
+    // Claim exactly the name `CREATE TABLE t2 (… v UNIQUE)` would derive.
     db.execute("CREATE UNIQUE INDEX t2_v_key ON squat (v)").unwrap();
 
+    // The CREATE must SUCCEED — PostgreSQL accepts it — and must not be enforced by
+    // nothing: a second `v` must be rejected on t2.
+    db.execute("CREATE TABLE t2 (id INT PRIMARY KEY, v VARCHAR(50) UNIQUE)")
+        .unwrap_or_else(|e| {
+            panic!("*** REFUSED DDL *** a squatted derived index name must not reject CREATE TABLE: {e}")
+        });
+    db.execute("INSERT INTO t2 VALUES (1, 'a')").unwrap();
     let err = db
-        .execute("CREATE TABLE t2 (id INT PRIMARY KEY, v VARCHAR(50) UNIQUE)")
+        .execute("INSERT INTO t2 VALUES (2, 'a')")
         .err()
-        .expect("*** UNENFORCED CONSTRAINT *** CREATE TABLE succeeded without an index for its UNIQUE");
+        .expect("*** UNENFORCED CONSTRAINT *** t2.v UNIQUE accepted a duplicate after a squatted derived name");
     assert!(
         err.to_string().to_ascii_lowercase().contains("unique"),
         "unexpected error: {err}"
     );
 
-    // NOTHING was left behind: the table does not exist…
+    // The squatter's user index is untouched and still enforces on ITS table.
+    db.execute("INSERT INTO squat VALUES (1, 'x')").unwrap();
     assert!(
-        db.query("SELECT * FROM t2", &[]).is_err(),
-        "*** HALF-CREATED TABLE *** the failed CREATE TABLE left the table behind"
+        db.execute("INSERT INTO squat VALUES (2, 'x')").is_err(),
+        "*** UNENFORCED CONSTRAINT *** the user index t2_v_key on squat(v) stopped enforcing"
     );
-    // …and the name is free, so a corrected statement can use it.
-    db.execute("CREATE TABLE t2 (id INT PRIMARY KEY, v VARCHAR(50))")
-        .unwrap_or_else(|e| panic!("the failed CREATE TABLE squatted the table name: {e}"));
-    assert_eq!(rows_in(&db, "t2"), 0);
+    assert_eq!(rows_in(&db, "t2"), 1);
+    assert_eq!(rows_in(&db, "squat"), 1);
 }
 
 // ===========================================================================
