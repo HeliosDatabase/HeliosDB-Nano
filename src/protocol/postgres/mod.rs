@@ -61,6 +61,7 @@
 pub mod auth;
 pub mod catalog;
 pub mod certs;
+mod codec; // ONE wire plan behind RowDescription and DataRow (GH#23)
 pub(crate) mod copy;
 pub mod handler;
 mod handler_extended;

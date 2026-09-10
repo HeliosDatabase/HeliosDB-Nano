@@ -1204,7 +1204,7 @@ where
             let schema = Schema::new(vec![crate::Column::new(&col_name, crate::DataType::Text)]);
             let row = Tuple::new(vec![Value::String(value)]);
             let rows = vec![row];
-            self.send_query_result(schema, &rows).await?;
+            self.send_query_result(&schema, &rows).await?;
             self.send_ready_for_query().await?;
             return Ok(());
         } else if starts_with_icase(trimmed, "PRAGMA ") || trimmed.eq_ignore_ascii_case("PRAGMA") {
@@ -1230,7 +1230,7 @@ where
                             crate::Column::new("dflt_value", crate::DataType::Text),
                             crate::Column::new("pk", crate::DataType::Int4),
                         ]);
-                        self.send_query_result(schema, &rows).await?;
+                        self.send_query_result(&schema, &rows).await?;
                         self.send_ready_for_query().await?;
                         return Ok(());
                     }
@@ -1473,7 +1473,7 @@ where
         // Check for pg_catalog queries
         if let Some(result) = self.catalog.handle_query(query)? {
             let (schema, rows) = result;
-            self.send_query_result(schema, &rows).await?;
+            self.send_query_result(&schema, &rows).await?;
             self.send_ready_for_query().await?;
             return Ok(());
         }
@@ -1505,16 +1505,16 @@ where
             {
                 None
             } else {
-                self.database.try_cached_query_with_columns(query)
+                self.database.try_cached_query_with_schema(query)
             };
-            if let Some((cached_results, columns)) = cached_query {
-                let schema = Self::schema_from_query_columns(&columns, cached_results.as_slice());
-                self.send_query_result(schema, cached_results.as_slice()).await?;
+            if let Some((cached_results, plan_schema)) = cached_query {
+                let schema = Self::result_schema_for_rows(&plan_schema, cached_results.as_slice());
+                self.send_query_result(&schema, cached_results.as_slice()).await?;
             } else {
-                match run_guarded(|| self.database.query_with_columns_for_session(self.session_id, query)) {
-                    Ok((results, columns)) => {
-                        let schema = Self::schema_from_query_columns(&columns, &results);
-                        self.send_query_result(schema, &results).await?;
+                match run_guarded(|| self.database.query_with_schema_for_session(self.session_id, query)) {
+                    Ok((results, plan_schema)) => {
+                        let schema = Self::result_schema_for_rows(&plan_schema, &results);
+                        self.send_query_result(&schema, &results).await?;
                     }
                     // A STANDALONE row-returning statement surfaces its own error
                     // as a wire ErrorResponse and completes with Ok — the same
@@ -1537,10 +1537,10 @@ where
                 }
             }
         } else if is_cte {
-            let (results, columns) =
-                run_guarded(|| self.database.query_with_columns_for_session(self.session_id, query))?;
-            let schema = Self::schema_from_query_columns(&columns, &results);
-            self.send_query_result(schema, &results).await?;
+            let (results, plan_schema) =
+                run_guarded(|| self.database.query_with_schema_for_session(self.session_id, query))?;
+            let schema = Self::result_schema_for_rows(&plan_schema, &results);
+            self.send_query_result(&schema, &results).await?;
         } else if is_dml_returning {
             // DML with RETURNING clause - returns rows like a query. W3.3:
             // same autocommit write-conflict retry as the plain-DML arm below.
@@ -1563,7 +1563,7 @@ where
                         Schema::new(vec![])
                     }
                 });
-                self.send_query_result(schema, &tuples).await?;
+                self.send_query_result(&schema, &tuples).await?;
             }
         } else {
             // W3.3: autocommit same-row write-conflict retry (default OFF). The
@@ -1583,37 +1583,78 @@ where
         Ok(())
     }
 
-    fn schema_from_query_columns(columns: &[String], rows: &[Tuple]) -> Schema {
-        if !columns.is_empty() {
-            Schema::new(
-                columns
-                    .iter()
-                    .enumerate()
-                    .map(|(i, name)| {
-                        let data_type = rows
-                            .first()
-                            .and_then(|r| r.values.get(i))
-                            .map(Value::data_type)
-                            .unwrap_or(crate::DataType::Text);
-                        crate::Column {
-                            name: name.clone(),
-                            data_type,
-                            nullable: true,
-                            primary_key: false,
-                            source_table: None,
-                            source_table_name: None,
-                            default_expr: None,
-                            unique: false,
-                            storage_mode: crate::ColumnStorageMode::Default,
-                        }
-                    })
-                    .collect(),
-            )
-        } else if !rows.is_empty() {
-            rows[0].schema()
-        } else {
-            Schema::new(vec![])
+    /// The schema a simple-query `RowDescription` is typed from (GH#23) — a
+    /// HYBRID, decided per column:
+    ///
+    /// * a column the plan carries with its catalog identity
+    ///   (`source_table` / `source_table_name` stamped), or any column whose
+    ///   plan type is NOT `Text` → the PLAN's type: declared column types,
+    ///   the same source the extended protocol's Describe reads. VARCHAR is
+    ///   1043, a NULL first row keeps its declared type, TIMESTAMPTZ is 1184.
+    /// * a column whose plan type IS `Text` and that carries no catalog
+    ///   identity → the first non-NULL value in that position across the rows
+    ///   (`text` where every row is NULL). `TypeInference` falls back to
+    ///   `Text` for every scalar function it does not know (`coalesce`,
+    ///   `nullif`, `nextval`, `pg_try_advisory_lock`, `date_trunc`, …), and
+    ///   Text-by-fallback is indistinguishable from a genuine text expression
+    ///   — so for that class the row's value is the better witness, exactly
+    ///   as the pre-GH#23 sniff typed it. A simple-protocol client (psycopg2)
+    ///   therefore never sees a type get WORSE than it was: `SELECT nextval(…)`
+    ///   stays int8, `SELECT coalesce(n, 0)` stays int4.
+    ///
+    /// A plan-less result (a utility that hands back bare rows under an empty
+    /// schema) is typed from the rows alone, `column_<i>` names.
+    fn result_schema_for_rows<'a>(plan_schema: &'a Schema, rows: &[Tuple]) -> std::borrow::Cow<'a, Schema> {
+        if plan_schema.columns.is_empty() {
+            return if rows.is_empty() {
+                std::borrow::Cow::Borrowed(plan_schema)
+            } else {
+                std::borrow::Cow::Owned(Self::schema_from_rows(rows))
+            };
         }
+        let needs_sniff = |col: &crate::Column| {
+            matches!(col.data_type, crate::DataType::Text)
+                && col.source_table.is_none()
+                && col.source_table_name.is_none()
+        };
+        if rows.is_empty() || !plan_schema.columns.iter().any(|col| needs_sniff(col)) {
+            return std::borrow::Cow::Borrowed(plan_schema);
+        }
+        let columns = plan_schema
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, col)| {
+                if !needs_sniff(col) {
+                    return col.clone();
+                }
+                let mut sniffed = col.clone();
+                sniffed.data_type = Self::sniff_column_type(rows, i);
+                sniffed
+            })
+            .collect();
+        std::borrow::Cow::Owned(Schema::new(columns))
+    }
+
+    /// The type of the first non-NULL value in position `i` across `rows`;
+    /// `text` where every row is NULL (a NULL is never typed as anything).
+    fn sniff_column_type(rows: &[Tuple], i: usize) -> crate::DataType {
+        rows.iter()
+            .filter_map(|r| r.values.get(i))
+            .find(|v| !matches!(v, Value::Null))
+            .map(Value::data_type)
+            .unwrap_or(crate::DataType::Text)
+    }
+
+    /// No-plan fallback for [`Self::result_schema_for_rows`]: `column_<i>`
+    /// names, each typed from the first non-NULL value in that position.
+    fn schema_from_rows(rows: &[Tuple]) -> Schema {
+        let width = rows.iter().map(|r| r.values.len()).max().unwrap_or(0);
+        Schema::new(
+            (0..width)
+                .map(|i| crate::Column::new(format!("column_{i}"), Self::sniff_column_type(rows, i)))
+                .collect(),
+        )
     }
 
     // Extended protocol methods are in handler_extended.rs module
@@ -1784,13 +1825,15 @@ where
         Ok(())
     }
 
-    /// Send query results
-    async fn send_query_result(&mut self, schema: Schema, rows: &[Tuple]) -> Result<()> {
-        // Send RowDescription
-        let fields = schema_to_field_descriptions(&schema);
+    /// Send query results: ONE wire plan (`codec::wire_plan`) feeds both the
+    /// RowDescription and every DataRow, so the advertised type and the
+    /// encoded text form of each column come from the same premise (GH#23).
+    async fn send_query_result(&mut self, schema: &Schema, rows: &[Tuple]) -> Result<()> {
+        let plan = super::codec::wire_plan(schema, &[]);
+        let fields = super::codec::field_descriptions(schema, &plan);
         self.send_message(BackendMessage::RowDescription { fields }).await?;
 
-        self.send_data_rows_direct(rows).await?;
+        self.send_data_rows_direct(rows, &plan).await?;
 
         // Send CommandComplete
         let tag = format!("SELECT {}", rows.len());
@@ -1799,18 +1842,27 @@ where
         Ok(())
     }
 
-    /// Extended-protocol DataRow emission honouring the portal's result
-    /// formats (R5.W1): all-text format requests stream through the direct
-    /// encoder; any binary format code falls back to the legacy per-row
-    /// conversion path, where the existing binary value encoders
-    /// (`value_to_pg_binary`) live. Wire output is identical either way for
-    /// text formats — both encoders share the same per-type text forms.
-    pub(super) async fn send_data_rows_with_formats(&mut self, rows: &[Tuple], result_formats: &[i16]) -> Result<()> {
-        if formats_request_text_only(result_formats) {
-            return self.send_data_rows_direct(rows).await;
+    /// Extended-protocol DataRow emission under the portal's wire plan
+    /// (R5.W1 + GH#23): an all-text plan streams through the direct encoder;
+    /// any binary column goes through the per-row conversion path, where the
+    /// declared-type binary encoder (`codec::encode_binary`) lives. The plan
+    /// — not the raw Bind request — decides each column's format, so the
+    /// DataRow agrees with the RowDescription Describe built from the same
+    /// plan. Wire output is identical either way for text columns: both
+    /// encoders share the same per-type text forms.
+    pub(super) async fn send_data_rows_with_formats(
+        &mut self,
+        rows: &[Tuple],
+        plan: &[super::codec::ColumnCodec],
+    ) -> Result<()> {
+        if super::codec::all_text(plan) {
+            return self.send_data_rows_direct(rows, plan).await;
         }
         for row in rows {
-            let values = tuple_to_pg_values_with_formats(row, result_formats);
+            // A cell the declared type cannot represent in binary refuses the
+            // whole row (22P03) — rows already sent stand, exactly as a
+            // runtime error mid-query does in PostgreSQL.
+            let values = tuple_to_pg_values_with_formats(row, plan)?;
             self.send_message(BackendMessage::DataRow { values }).await?;
         }
         Ok(())
@@ -1824,11 +1876,15 @@ where
     /// since R5.W1, by extended-protocol Execute whenever every requested
     /// result format is text (format code 0) — which is what mainstream
     /// drivers request.
-    pub(super) async fn send_data_rows_direct(&mut self, rows: &[Tuple]) -> Result<()> {
+    pub(super) async fn send_data_rows_direct(
+        &mut self,
+        rows: &[Tuple],
+        plan: &[super::codec::ColumnCodec],
+    ) -> Result<()> {
         const DATA_ROW_FLUSH_AT: usize = 64 * 1024;
         self.write_buf.clear();
         for row in rows {
-            self.encode_data_row_direct(row);
+            self.encode_data_row_direct(row, plan);
             if self.write_buf.len() >= DATA_ROW_FLUSH_AT {
                 self.stream
                     .write_all(&self.write_buf)
@@ -2112,8 +2168,12 @@ where
 
     /// Encode a DataRow directly from a Tuple, avoiding intermediate Vec allocations.
     /// Uses length-prefix backpatching: writes placeholder, encodes values, then patches the length.
+    ///
+    /// `plan` (see `codec::wire_plan`) is consulted for the per-column TEXT
+    /// form only where a declared type changes it — today the `timestamptz`
+    /// zone suffix; every other arm is the value's natural rendering.
     #[allow(clippy::indexing_slicing)] // length_pos and count_pos are set by us, always valid
-    fn encode_data_row_direct(&mut self, tuple: &Tuple) {
+    fn encode_data_row_direct(&mut self, tuple: &Tuple, plan: &[super::codec::ColumnCodec]) {
         self.write_buf.put_u8(b'D');
 
         // Reserve space for message length (4 bytes) — will be backpatched
@@ -2126,7 +2186,7 @@ where
         // Encode each value directly into the buffer
         let mut itoa_buf = itoa::Buffer::new();
         let mut ryu_buf = ryu::Buffer::new();
-        for val in &tuple.values {
+        for (index, val) in tuple.values.iter().enumerate() {
             match val {
                 Value::Null => {
                     self.write_buf.put_i32(-1);
@@ -2193,9 +2253,14 @@ where
                     // output (9 fractional digits) crashes psycopg
                     // ("timestamp too large (after year 10K)") and
                     // makes drizzle-orm's timestamp parser return null.
+                    // A column DECLARED `timestamptz` (advertised 1184)
+                    // additionally carries the session zone offset, exactly
+                    // as PostgreSQL renders it under TimeZone=UTC (GH#23).
                     let s = ts.naive_utc().format("%Y-%m-%d %H:%M:%S%.6f").to_string();
-                    self.write_buf.put_i32(s.len() as i32);
+                    let suffix = timestamptz_suffix(plan, index);
+                    self.write_buf.put_i32((s.len() + suffix.len()) as i32);
                     self.write_buf.put_slice(s.as_bytes());
+                    self.write_buf.put_slice(suffix.as_bytes());
                 }
                 Value::Date(d) => {
                     let s = d.format("%Y-%m-%d").to_string();
@@ -2549,7 +2614,7 @@ where
 
         if let Some(items) = returning_items {
             let table_schema = catalog.get_table_schema(table_name)?;
-            Ok(crate::EmbeddedDatabase::returning_schema(&table_schema, items))
+            crate::EmbeddedDatabase::returning_schema(&table_schema, items)
         } else {
             Ok(Schema::new(vec![]))
         }
@@ -2742,87 +2807,31 @@ where
     }
 }
 
-/// Convert Schema to FieldDescriptions
+/// Convert Schema to FieldDescriptions (text format everywhere).
+///
+/// Thin wrapper over `codec::wire_plan` + `codec::field_descriptions`: the
+/// descriptor is derived from the same plan the DataRow encoders read.
 pub(super) fn schema_to_field_descriptions(schema: &Schema) -> Vec<FieldDescription> {
-    schema
-        .columns
-        .iter()
-        .map(|col| {
-            FieldDescription {
-                name: col.name.clone(),
-                table_oid: 0,
-                column_attr_num: 0,
-                data_type_oid: datatype_to_oid(&col.data_type),
-                data_type_size: datatype_to_size(&col.data_type),
-                type_modifier: -1,
-                format_code: 0, // text format
-            }
-        })
-        .collect()
+    super::codec::field_descriptions(schema, &super::codec::wire_plan(schema, &[]))
 }
 
-/// Convert Schema to FieldDescriptions, honoring requested result formats
-/// where this wire encoder has a matching binary representation.
+/// Convert Schema to FieldDescriptions under the portal's result formats.
+/// Binary is advertised only where `codec::wire_plan` grants it, which is
+/// exactly where the DataRow encoder will produce it.
 pub(super) fn schema_to_field_descriptions_with_formats(
     schema: &Schema,
     result_formats: &[i16],
 ) -> Vec<FieldDescription> {
-    schema
-        .columns
-        .iter()
-        .enumerate()
-        .map(|(index, col)| FieldDescription {
-            name: col.name.clone(),
-            table_oid: 0,
-            column_attr_num: 0,
-            data_type_oid: datatype_to_oid(&col.data_type),
-            data_type_size: datatype_to_size(&col.data_type),
-            type_modifier: -1,
-            format_code: effective_result_format(&col.data_type, result_formats, index),
-        })
-        .collect()
+    super::codec::field_descriptions(schema, &super::codec::wire_plan(schema, result_formats))
 }
 
-/// True when the portal's result-format codes request text for every column
-/// (empty list, all zeros, or the single-`0` shorthand) — the precondition
-/// for routing extended-protocol rows through the direct encoder (R5.W1).
-pub(super) fn formats_request_text_only(result_formats: &[i16]) -> bool {
-    result_formats.iter().all(|f| *f == 0)
-}
-
-pub(super) fn requested_result_format(result_formats: &[i16], column_index: usize) -> i16 {
-    if result_formats.is_empty() {
-        0
-    } else if result_formats.len() == 1 {
-        result_formats[0]
-    } else {
-        result_formats.get(column_index).copied().unwrap_or(0)
+/// The text suffix a `Value::Timestamp` carries in column `index`: the UTC
+/// offset when the column is declared `timestamptz`, nothing otherwise.
+fn timestamptz_suffix(plan: &[super::codec::ColumnCodec], index: usize) -> &'static str {
+    match plan.get(index).map(|c| c.text) {
+        Some(super::codec::TextForm::TimestamptzUtc) => super::codec::TIMESTAMPTZ_UTC_SUFFIX,
+        _ => "",
     }
-}
-
-fn effective_result_format(data_type: &crate::DataType, result_formats: &[i16], column_index: usize) -> i16 {
-    let requested = requested_result_format(result_formats, column_index);
-    if requested == 1 && datatype_has_binary_result(data_type) {
-        1
-    } else {
-        0
-    }
-}
-
-fn datatype_has_binary_result(data_type: &crate::DataType) -> bool {
-    matches!(
-        data_type,
-        crate::DataType::Boolean
-            | crate::DataType::Int2
-            | crate::DataType::Int4
-            | crate::DataType::Int8
-            | crate::DataType::Float4
-            | crate::DataType::Float8
-            | crate::DataType::Bytea
-            | crate::DataType::Text
-            | crate::DataType::Varchar(_)
-            | crate::DataType::Uuid
-    )
 }
 
 /// Convert DataType to PostgreSQL OID
@@ -2965,40 +2974,42 @@ pub(super) fn tuple_to_pg_values(tuple: &Tuple) -> Vec<Option<Vec<u8>>> {
         .collect()
 }
 
-/// Convert Tuple to PostgreSQL wire-format values using portal result formats.
-pub(super) fn tuple_to_pg_values_with_formats(tuple: &Tuple, result_formats: &[i16]) -> Vec<Option<Vec<u8>>> {
+/// Convert Tuple to PostgreSQL wire-format values under the portal's wire
+/// plan. The plan's `format` — not the raw Bind request — decides binary vs
+/// text per column, so the cell agrees with the RowDescription. A binary
+/// column is encoded BY ITS DECLARED TYPE (`codec::encode_binary`): the
+/// value is widened to the advertised width, and a value the declared type
+/// cannot represent is an error (22P03 on the wire) — never bytes of another
+/// width, never a one-cell downgrade to text.
+pub(super) fn tuple_to_pg_values_with_formats(
+    tuple: &Tuple,
+    plan: &[super::codec::ColumnCodec],
+) -> Result<Vec<Option<Vec<u8>>>> {
     tuple
         .values
         .iter()
         .enumerate()
-        .map(|(index, val)| match val {
-            Value::Null => None,
-            _ if requested_result_format(result_formats, index) == 1 => {
-                value_to_pg_binary(val).or_else(|| single_value_to_pg_text(val))
+        .map(|(index, val)| {
+            let codec = plan.get(index);
+            match (val, codec) {
+                (Value::Null, _) => Ok(None),
+                (_, Some(c)) if c.format == 1 => super::codec::encode_binary(val, c).map(Some),
+                _ => Ok(single_value_to_pg_text(val, codec)),
             }
-            _ => single_value_to_pg_text(val),
         })
         .collect()
 }
 
-fn single_value_to_pg_text(value: &Value) -> Option<Vec<u8>> {
+/// Text form of one value under its column codec: the natural rendering
+/// (`tuple_to_pg_values`), plus the UTC offset for a `timestamptz` column.
+fn single_value_to_pg_text(value: &Value, codec: Option<&super::codec::ColumnCodec>) -> Option<Vec<u8>> {
+    if let (Value::Timestamp(ts), Some(super::codec::TextForm::TimestamptzUtc)) = (value, codec.map(|c| c.text)) {
+        let mut s = ts.naive_utc().format("%Y-%m-%d %H:%M:%S%.6f").to_string();
+        s.push_str(super::codec::TIMESTAMPTZ_UTC_SUFFIX);
+        return Some(s.into_bytes());
+    }
     let tuple = Tuple::new(vec![value.clone()]);
     tuple_to_pg_values(&tuple).into_iter().next().flatten()
-}
-
-fn value_to_pg_binary(value: &Value) -> Option<Vec<u8>> {
-    match value {
-        Value::Boolean(value) => Some(vec![u8::from(*value)]),
-        Value::Int2(value) => Some(value.to_be_bytes().to_vec()),
-        Value::Int4(value) => Some(value.to_be_bytes().to_vec()),
-        Value::Int8(value) => Some(value.to_be_bytes().to_vec()),
-        Value::Float4(value) => Some(value.to_be_bytes().to_vec()),
-        Value::Float8(value) => Some(value.to_be_bytes().to_vec()),
-        Value::String(value) => Some(value.as_bytes().to_vec()),
-        Value::Bytes(value) => Some(value.clone()),
-        Value::Uuid(value) => Some(value.as_bytes().to_vec()),
-        _ => None,
-    }
 }
 
 /// Split a SQL string on `;` while respecting single-quoted strings
@@ -3756,6 +3767,30 @@ fn sqlstate_for_query_execution_message(message: &str) -> &'static str {
     // marker is a const owned by the single emitter, so the two cannot drift.
     if lower.contains(crate::advisory_lock::UNSCOPED_ADVISORY_MARKER) {
         return sqlstate::FEATURE_NOT_SUPPORTED; // 0A000
+    }
+
+    // GH#23: a binary-format cell the column's DECLARED type cannot represent
+    // (`codec::encode_binary`). PostgreSQL's class for "the bytes cannot be
+    // produced/consumed in binary" is 22P03 invalid_binary_representation.
+    // Same marker-const discipline as the advisory arm above; checked before
+    // the shape-anchored arms because the message names the declared type.
+    if lower.contains(super::codec::INVALID_BINARY_REPRESENTATION_MARKER) {
+        return sqlstate::INVALID_BINARY_REPRESENTATION; // 22P03
+    }
+
+    // GH#23 candidate 3: an aggregate / window function in a RETURNING list is
+    // refused at bind time (`sql::returning::ReturningProjection::bind`) with
+    // PostgreSQL's own wording, and PostgreSQL's own classes: 42803
+    // grouping_error for the aggregate, 42P20 windowing_error for the window
+    // call. Anchored on the emitter's consts (same discipline as the two
+    // marker arms above) and checked before the shape arms: the wording says
+    // "functions", which `message_names_a_function` does not match, but the
+    // ordering keeps that independent of the anchors.
+    if message.contains(crate::sql::returning::AGGREGATE_IN_RETURNING) {
+        return sqlstate::GROUPING_ERROR; // 42803
+    }
+    if message.contains(crate::sql::returning::WINDOW_IN_RETURNING) {
+        return sqlstate::WINDOWING_ERROR; // 42P20
     }
 
     // HC4 role/ACL mappings, checked BEFORE the table/relation rules: the role

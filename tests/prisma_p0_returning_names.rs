@@ -58,6 +58,24 @@
 //! covered here for acceptance + row effect, and end-to-end for names by
 //! `src/protocol/postgres/wire_tests.rs` (simple-query `handle_single_query`,
 //! which derives its RowDescription from the same plan items).
+//!
+//! ## Contract change — GH#23 candidate 3: `RETURNING count(*)` is REFUSED
+//!
+//! The parity table in `returning_names_match_select_names` used to carry a
+//! row 8, `("count(*)", "count")`: it pinned that `RETURNING count(*)` came
+//! back under the name `count` — and, unstated, that it came back at all,
+//! carrying NULL (`project_returning_columns` mapped the evaluator's "no
+//! aggregate arm" failure to `Value::Null`). That enshrined a
+//! PostgreSQL-incorrect result. PostgreSQL refuses the statement at parse
+//! analysis: `ERROR 42803 grouping_error: aggregate functions are not allowed
+//! in RETURNING` (and `42P20: window functions are not allowed in RETURNING`
+//! for `row_number() OVER ()`): a RETURNING list projects each written row and
+//! has no group to aggregate over. The row is gone from the table and
+//! `returning_aggregate_and_window_are_refused_before_any_row_is_written`
+//! pins the refusal instead — same wording, both executor families, zero rows
+//! written. The SQLSTATE half is pinned on the wire in
+//! `src/protocol/postgres/wire_tests.rs` (`gh23_c3_*`), the only surface
+//! that can observe it.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -276,12 +294,14 @@ fn returning_name(expr: &str) -> String {
 /// The contract: for every expression shape, `RETURNING <e>` and `SELECT <e>`
 /// agree on the output column name, and that name is PostgreSQL's.
 ///
-/// FAILS on the unfixed tree at rows 1, 2, 5, 7 and 8, where `RETURNING`
+/// FAILS on the unfixed tree at rows 1, 2, 5 and 7, where `RETURNING`
 /// reported the raw expression text (`"public"."Account"."id"`,
-/// `upper("email")`, `"id" + 1`, `count(*)`) while `SELECT` already reported
-/// `id`, `upper(email)`, `id + 1`, `count`; and at row 6, where the two AGREED
-/// on `lower(email)` but PostgreSQL says `lower`. Rows 3, 4 and 9 already
-/// passed and are kept as controls.
+/// `upper("email")`, `"id" + 1`) while `SELECT` already reported `id`,
+/// `upper(email)`, `id + 1`; and at row 6, where the two AGREED on
+/// `lower(email)` but PostgreSQL says `lower`. Rows 3, 4 and 8 already passed
+/// and are kept as controls. (A former row `("count(*)", "count")` between
+/// rows 7 and 8 was removed by GH#23 candidate 3 — see the module doc: an
+/// aggregate in RETURNING is refused, so it has no output name to compare.)
 ///
 /// Rows 5 and 6 additionally pin the SELECT side onto PostgreSQL's rule: an
 /// unaliased function column is named after the FUNCTION ALONE, so
@@ -301,7 +321,6 @@ fn returning_names_match_select_names() {
         (r#"upper("email")"#, "upper"),
         ("lower(email)", "lower"),
         (r#""id" + 1"#, "id + 1"),
-        ("count(*)", "count"),
         ("1", "1"),
     ];
 
@@ -318,6 +337,123 @@ fn returning_names_match_select_names() {
             "RETURNING {expr} must be named `{expected}` (PostgreSQL), got `{ret}`"
         );
     }
+}
+
+/// GH#23 candidate 3 — the contract change described in the module doc.
+///
+/// `RETURNING count(*)` (and any aggregate nested in an expression, and any
+/// window call) is refused with PostgreSQL's wording, on BOTH executor
+/// families, for INSERT, UPDATE and DELETE alike, and the refusal lands
+/// before the first write: the table is exactly as it was. Through candidate
+/// 2 the params family failed the statement AFTER binding (`Expression not
+/// yet implemented: AggregateFunction`, an XX000 on the wire) and v4.31.1
+/// returned a NULL named `count`; the former row 8 of the parity table above
+/// pinned that NULL.
+///
+/// Three surfaces per family: `execute` (text family), `execute_params` and
+/// `query_params_with_columns` (params family — the latter is the exact
+/// surface the removed parity row drove, so the refusal is observed where the
+/// NULL used to be).
+#[test]
+fn returning_aggregate_and_window_are_refused_before_any_row_is_written() {
+    const AGGREGATE: &str = "aggregate functions are not allowed in RETURNING";
+    const WINDOW: &str = "window functions are not allowed in RETURNING";
+
+    fn account_count(db: &EmbeddedDatabase) -> i64 {
+        let (rows, _) = run(db, r#"SELECT count(*) FROM "public"."Account""#, &[]);
+        int_at(&rows[0], 0)
+    }
+    fn email_of_1(db: &EmbeddedDatabase) -> String {
+        let (rows, _) = run(db, r#"SELECT "email" FROM "public"."Account" WHERE "id" = 1"#, &[]);
+        assert_eq!(rows.len(), 1, "row 1 must still exist");
+        text_at(&rows[0], 0)
+    }
+
+    // (statement, expected wording) — every DML verb, top-level and nested
+    // aggregates, and a window call.
+    let cases: &[(&str, &str)] = &[
+        (
+            r#"INSERT INTO "public"."Account" ("id","email","createdAt") VALUES (2,'n@example.com','2026-09-06')
+               RETURNING count(*)"#,
+            AGGREGATE,
+        ),
+        (
+            r#"UPDATE "public"."Account" SET "email" = 'z@example.com' RETURNING count(*) AS "c""#,
+            AGGREGATE,
+        ),
+        (
+            r#"UPDATE "public"."Account" SET "email" = 'z@example.com' RETURNING coalesce(max("id"), 0)"#,
+            AGGREGATE,
+        ),
+        (
+            r#"UPDATE "public"."Account" SET "email" = 'z@example.com' RETURNING "id", "id" + count(*)"#,
+            AGGREGATE,
+        ),
+        (r#"DELETE FROM "public"."Account" RETURNING count(*)"#, AGGREGATE),
+        (
+            r#"UPDATE "public"."Account" SET "email" = 'z@example.com' RETURNING row_number() OVER ()"#,
+            WINDOW,
+        ),
+        (
+            r#"DELETE FROM "public"."Account" RETURNING rank() OVER (ORDER BY "id")"#,
+            WINDOW,
+        ),
+    ];
+
+    for &(sql, wording) in cases {
+        // Text family.
+        let db = seeded_db();
+        let err = db.execute(sql).expect_err("text family must refuse");
+        assert!(
+            err.to_string().contains(wording),
+            "text family `{sql}` must be refused with `{wording}`, got: {err}"
+        );
+        assert_eq!(account_count(&db), 1, "text family `{sql}` must write nothing");
+        assert_eq!(
+            email_of_1(&db),
+            "a@example.com",
+            "text family `{sql}` must change nothing"
+        );
+
+        // Params family, count-returning surface.
+        let db = seeded_db();
+        let err = db.execute_params(sql, &[]).expect_err("params family must refuse");
+        assert!(
+            err.to_string().contains(wording),
+            "params family `{sql}` must be refused with `{wording}`, got: {err}"
+        );
+        assert_eq!(account_count(&db), 1, "params family `{sql}` must write nothing");
+        assert_eq!(
+            email_of_1(&db),
+            "a@example.com",
+            "params family `{sql}` must change nothing"
+        );
+
+        // Params family, row-and-names surface (where the NULL used to arrive).
+        let db = seeded_db();
+        let err = db
+            .query_params_with_columns(sql, &[])
+            .expect_err("query_params_with_columns must refuse, never hand back a NULL row");
+        assert!(
+            err.to_string().contains(wording),
+            "query_params_with_columns `{sql}` must be refused with `{wording}`, got: {err}"
+        );
+        assert_eq!(account_count(&db), 1);
+        assert_eq!(email_of_1(&db), "a@example.com");
+    }
+
+    // GUARD: the same verbs with an ordinary expression still write and
+    // project, so the refusal is specific to aggregates / windows.
+    let db = seeded_db();
+    let (rows, cols) = run(
+        &db,
+        r#"UPDATE "public"."Account" SET "email" = 'z@example.com' RETURNING coalesce("id", 0) AS "c""#,
+        &[],
+    );
+    assert_eq!(cols, vec!["c"]);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(int_at(&rows[0], 0), 1);
+    assert_eq!(email_of_1(&db), "z@example.com");
 }
 
 /// `"MixedCase"` inside quotes keeps its case; an unquoted qualifier does not
