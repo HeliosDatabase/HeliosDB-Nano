@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — `ALTER TABLE … ADD COLUMN … REFERENCES` silently discarded the foreign key (GH#27, residual)
+
+`ALTER TABLE t ADD COLUMN p INT REFERENCES parent(id)` added the column and threw the constraint
+away: a parent that did not exist was accepted without a `42P01`, and a parent that did exist was
+never enforced — a migration reported success and produced a database with no referential
+integrity, the exact defect GH#27 reported for `CREATE TABLE` and v4.31.0 fixed there only. The
+planner now plans the statement as the pair of operations it is shorthand for (`ADD COLUMN`, then
+`ADD FOREIGN KEY`), so the foreign key goes through the same validation, naming and index creation
+as an explicit `ALTER TABLE … ADD FOREIGN KEY`. Every foreign-key target in a multi-operation
+`ALTER TABLE` is validated before the first operation mutates anything, so a rejected statement
+leaves no column behind.
+
+`ALTER TABLE t ADD [CONSTRAINT c] FOREIGN KEY (p) REFERENCES parent` — with no referenced-column
+list, as PostgreSQL allows — was a hard parse error (`Expected: a list of columns in parentheses`);
+it now parses in `ALTER TABLE … ADD` and in `CREATE TABLE`, and binds to the parent's PRIMARY KEY
+at DDL time.
+
+That default now fails closed the way PostgreSQL does: a list-less `REFERENCES t` against a table
+with no primary key is rejected with `42704 there is no primary key for referenced table "t"`
+(previously an EMPTY referenced-column list was persisted — a constraint enforced by nothing), and
+a referencing/referenced column-count mismatch is rejected with `42830 number of referencing and
+referenced columns for foreign key disagree`. The first is `42704 undefined_object`, the second `42830 invalid_foreign_key`, on the
+PostgreSQL wire and `1215 ER_CANNOT_ADD_FOREIGN` on the MySQL wire. Both executor families
+(simple and extended protocol) report the same codes.
+
 ## [4.31.1] - 2026-09-07
 
 ### Fixed — DATA LOSS on upgrade: opening a store re-executed its whole logged history

@@ -3769,6 +3769,20 @@ fn sqlstate_for_query_execution_message(message: &str) -> &'static str {
         // the arms below anchor on, and would otherwise degrade to XX000
         // internal_error — which poolers and HA proxies read as a server fault.
         sqlstate::INVALID_COLUMN_REFERENCE // 42P10
+    } else if lower.contains("there is no primary key for referenced table") {
+        // DDL-time foreign-key defaulting (GH#27,
+        // `EmbeddedDatabase::validate_fk_reference`): a list-less `REFERENCES t`
+        // against a key-less `t`. PostgreSQL reports 42704 undefined_object
+        // here (tablecmds.c `transformFkeyGetPrimaryKey`) — NOT 42830, which
+        // it reserves for arity and "no unique constraint matching given keys".
+        // Checked ahead of the table/relation arms: the message contains
+        // "table" but no not-found token, so it would otherwise degrade to XX000.
+        sqlstate::UNDEFINED_OBJECT // 42704
+    } else if lower.contains("number of referencing and referenced columns for foreign key disagree") {
+        // Referencing/referenced column-count mismatch (GH#27): PostgreSQL
+        // reports 42830 invalid_foreign_key (tablecmds.c). Same ordering reason
+        // as the arm above.
+        sqlstate::INVALID_FOREIGN_KEY // 42830
     } else if lower.contains("cannot be dropped because some objects depend")
         // `DROP INDEX` on a PK/UNIQUE/FK backing index, worded the way
         // PostgreSQL words it ("cannot drop index … because constraint …
@@ -4518,6 +4532,78 @@ mod sqlstate_mapping_unit_tests {
                 "`{message}` must map to {expected}"
             );
         }
+    }
+
+    /// GH#27 (residual): the DDL-time foreign-key defaulting and arity
+    /// rejections are 42704 undefined_object (key-less parent) and 42830
+    /// invalid_foreign_key (arity), produced by real DDL. Before
+    /// this both messages fell through to XX000 — and the key-less parent was
+    /// not rejected at all (an EMPTY referenced list was persisted).
+    #[test]
+    fn foreign_key_defaulting_maps_to_42704_and_arity_to_42830() {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE fk42830_nopk (id INT)").unwrap();
+        db.execute("CREATE TABLE fk42830_pk (id INT PRIMARY KEY)").unwrap();
+        db.execute("CREATE TABLE fk42830_child (id INT PRIMARY KEY, p INT, q INT)")
+            .unwrap();
+
+        // List-less REFERENCES against a table with no primary key, every
+        // spelling and both executor families where the statement reaches both.
+        for sql in [
+            "CREATE TABLE fk42830_a (id INT PRIMARY KEY, p INT REFERENCES fk42830_nopk)",
+            "CREATE TABLE fk42830_b (id INT PRIMARY KEY, p INT, FOREIGN KEY (p) REFERENCES fk42830_nopk)",
+            "ALTER TABLE fk42830_child ADD FOREIGN KEY (p) REFERENCES fk42830_nopk",
+            "ALTER TABLE fk42830_child ADD COLUMN r INT REFERENCES fk42830_nopk",
+        ] {
+            let err = sql_error(&db, sql);
+            assert_eq!(sqlstate_for_error(&err), "42704", "`{sql}` gave: {err}");
+            assert!(
+                err.to_string().contains("there is no primary key for referenced table"),
+                "`{sql}` must carry PostgreSQL's wording, got: {err}"
+            );
+        }
+        let err = db
+            .execute_params(
+                "ALTER TABLE fk42830_child ADD FOREIGN KEY (p) REFERENCES fk42830_nopk",
+                &[],
+            )
+            .expect_err("params family must reject too");
+        assert_eq!(sqlstate_for_error(&err), "42704", "params family gave: {err}");
+
+        // Arity: two referencing columns against a one-column target.
+        for sql in [
+            "CREATE TABLE fk42830_c (a INT PRIMARY KEY, b INT, FOREIGN KEY (a, b) REFERENCES fk42830_pk(id))",
+            "ALTER TABLE fk42830_child ADD FOREIGN KEY (p, q) REFERENCES fk42830_pk(id)",
+            "ALTER TABLE fk42830_child ADD FOREIGN KEY (p, q) REFERENCES fk42830_pk",
+        ] {
+            let err = sql_error(&db, sql);
+            assert_eq!(sqlstate_for_error(&err), "42830", "`{sql}` gave: {err}");
+            assert!(
+                err.to_string()
+                    .contains("number of referencing and referenced columns for foreign key disagree"),
+                "`{sql}` must carry PostgreSQL's wording, got: {err}"
+            );
+        }
+
+        // Nothing above left a relation or a constraint behind.
+        assert!(db.query("SELECT * FROM fk42830_a", &[]).is_err());
+        assert!(db.query("SELECT * FROM fk42830_b", &[]).is_err());
+        assert!(db.query("SELECT * FROM fk42830_c", &[]).is_err());
+        // Probe the CATALOG: `SELECT r FROM t` succeeds with zero rows on an
+        // empty table (the projection is never evaluated — a separate
+        // lenient-resolution defect), so it cannot prove a column is absent.
+        let leftover = db
+            .query(
+                "SELECT column_name FROM information_schema.columns WHERE table_name = 'fk42830_child' AND column_name = 'r'",
+                &[],
+            )
+            .unwrap();
+        assert!(
+            leftover.is_empty(),
+            "the rejected ADD COLUMN … REFERENCES must not leave the column behind"
+        );
+        db.execute("INSERT INTO fk42830_child VALUES (1, 77, 77)")
+            .expect("no constraint was recorded by a refused ALTER");
     }
 }
 

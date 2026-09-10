@@ -3220,6 +3220,13 @@ fn map_error_code(err_msg: &str) -> (u16, &'static str) {
         // transaction N", storage/lock_manager.rs). MySQL reports SQLSTATE
         // 40001 for deadlocks (no 40P01 in MySQL).
         (1213, "40001")
+    } else if lower.contains("no primary key for referenced table") || lower.contains("for foreign key disagree") {
+        // GH#27: DDL-time foreign-key defaulting / arity rejection
+        // (`EmbeddedDatabase::validate_fk_reference`). MySQL reports
+        // ER_CANNOT_ADD_FOREIGN for a foreign key it cannot create; without
+        // this arm the arity text hit the `foreign key` arm below and reported
+        // the DML code 1452 for a DDL error.
+        (1215, "HY000") // ER_CANNOT_ADD_FOREIGN
     } else if lower.contains("duplicate") || lower.contains("unique") || lower.contains("already exists") {
         (1062, "23000") // ER_DUP_ENTRY
     } else if lower.contains("does not exist") || lower.contains("not found") || lower.contains("doesn't exist") {
@@ -3516,6 +3523,20 @@ mod tests {
         let (code, state) = map_error_code("Transaction error: Deadlock: Deadlock detected for transaction 7");
         assert_eq!(code, 1213);
         assert_eq!(state, "40001");
+    }
+
+    /// GH#27: DDL-time foreign-key defaulting / arity rejections are
+    /// ER_CANNOT_ADD_FOREIGN (1215), not the DML code 1452 or 1105 unknown.
+    #[test]
+    fn test_map_error_code_cannot_add_foreign_key() {
+        for msg in [
+            "there is no primary key for referenced table \"parent\"",
+            "number of referencing and referenced columns for foreign key disagree",
+        ] {
+            let (code, state) = map_error_code(msg);
+            assert_eq!(code, 1215, "{msg}");
+            assert_eq!(state, "HY000", "{msg}");
+        }
     }
 
     #[test]
