@@ -10,6 +10,20 @@ pub struct Parser {
     dialect: PostgreSqlDialect,
 }
 
+/// Placeholder injected in place of an OMITTED referenced-column list on a
+/// table-level `FOREIGN KEY (…) REFERENCES <table>` (GH#27). sqlparser 0.53's
+/// table-constraint production makes the list `Mandatory` while PostgreSQL —
+/// and sqlparser's own column-level production — allow it to be omitted, in
+/// which case it binds to the referenced table's PRIMARY KEY.
+///
+/// The placeholder is erased by [`Parser::strip_fk_default_pk_sentinel`]
+/// before the AST leaves [`Parser::parse`], so it can never reach the planner,
+/// the catalog or an error message. Unquoted on purpose: the scrub also
+/// requires `quote_style.is_none()`, and the rewrite DECLINES any input that
+/// already contains this text, so a user identifier can never be mistaken for
+/// it. Private: nothing outside this module may depend on it.
+const FK_DEFAULT_PK_SENTINEL: &str = "__hdb_fk_ref_default_pk";
+
 /// Stage-0 partitioning: the pre-parse-captured shape of a
 /// `CREATE TABLE child PARTITION OF parent { FOR VALUES … | DEFAULT } …`
 /// child-table declaration. sqlparser 0.53 has no `PARTITION OF` grammar, so
@@ -373,17 +387,42 @@ impl Parser {
         // `DELETE` vs `DROP INDEX`), so `or_else` chaining is order-independent;
         // it is written this way so each rewrite keeps its own single
         // responsibility and any future sibling only has to return `None` for
-        // what it does not own.
+        // what it does not own. The one exception is the LAST link, the
+        // omitted-referenced-column-list rewrite (GH#27): it shares `CREATE
+        // TABLE` with the partition rewrite, which declines unless it sees
+        // `PARTITION OF/BY`, so the pair is disjoint in practice; a statement
+        // that needs BOTH reports the original diagnostic — fail closed, never
+        // masked. That link is also the only one that injects a placeholder
+        // into the text, so it is flagged and the placeholder is erased from
+        // the AST right here, before anything outside `parse` can see it.
         let mut statements = match SqlParser::parse_sql(&self.dialect, &processed_sql) {
             Ok(statements) => statements,
             Err(orig_err) => {
                 let orig_msg = format!("Failed to parse SQL: {}", orig_err);
                 let rewritten = Self::rewrite_partition_syntax(&processed_sql)
                     .or_else(|| Self::rewrite_delete_returning(&processed_sql))
-                    .or_else(|| Self::rewrite_drop_index_on(&processed_sql));
+                    .or_else(|| Self::rewrite_drop_index_on(&processed_sql))
+                    .map(|s| (s, false))
+                    .or_else(|| Self::rewrite_fk_default_referenced_columns(&processed_sql).map(|s| (s, true)));
                 match rewritten {
-                    Some(rewritten) => {
-                        SqlParser::parse_sql(&self.dialect, &rewritten).map_err(|_| Error::sql_parse(orig_msg))?
+                    Some((rewritten, injected_fk_sentinel)) => {
+                        let mut stmts = SqlParser::parse_sql(&self.dialect, &rewritten)
+                            .map_err(|_| Error::sql_parse(orig_msg.clone()))?;
+                        if injected_fk_sentinel {
+                            stmts.iter_mut().for_each(Self::strip_fk_default_pk_sentinel);
+                            // Defense in depth: the placeholder must never leave
+                            // this function. If the scrub could not account for
+                            // every occurrence (a shape the rewrite did not
+                            // anticipate), report the ORIGINAL diagnostic
+                            // rather than hand a planted identifier downstream.
+                            if stmts
+                                .iter()
+                                .any(|s| s.to_string().to_ascii_lowercase().contains(FK_DEFAULT_PK_SENTINEL))
+                            {
+                                return Err(Error::sql_parse(orig_msg));
+                            }
+                        }
+                        stmts
                     }
                     None => return Err(Error::sql_parse(orig_msg)),
                 }
@@ -2957,6 +2996,208 @@ impl Parser {
         })
     }
 
+    /// Omitted referenced-column list on a TABLE-level foreign key (GH#27):
+    /// `[CONSTRAINT n] FOREIGN KEY (c) REFERENCES p` → `… REFERENCES p
+    /// (__hdb_fk_ref_default_pk)`. Invoked by [`Parser::parse`] ONLY after
+    /// the normal parse fails, exactly like its siblings, so SQL that parses
+    /// today is byte-identically untouched.
+    ///
+    /// **The defect.** PostgreSQL allows the list to be omitted, defaulting to
+    /// the referenced table's PRIMARY KEY. sqlparser 0.53 accepts that on the
+    /// COLUMN-level production (`p INT REFERENCES parent` parses, with an empty
+    /// `referred_columns`) but makes the list `Mandatory` on the TABLE-level
+    /// production, so `ALTER TABLE t ADD FOREIGN KEY (c) REFERENCES p` and the
+    /// same clause inside `CREATE TABLE` died with "Expected: a list of columns
+    /// in parentheses, found: EOF" before the planner was ever reached. There
+    /// is no dialect hook for it, and `REFERENCES p ()` is rejected too.
+    ///
+    /// **The rewrite.** A structural, quote-aware byte walk that matches
+    /// `FOREIGN` → `KEY` → a balanced `(…)` → `REFERENCES` → ONE object name
+    /// and then asks a single question: is the next non-blank byte `(`? If not,
+    /// the placeholder list is spliced in right after the name. Every trailing
+    /// clause is covered by that one question (`)`, `,`, `;`, `ON DELETE …`,
+    /// `DEFERRABLE …`, end of text). Anchoring on `FOREIGN KEY (…)` — never on
+    /// the bare word `REFERENCES` — is what guarantees the already-legal
+    /// column-level `REFERENCES p` and `GRANT REFERENCES` are never touched.
+    /// The placeholder is then erased from the parsed AST by
+    /// [`Parser::strip_fk_default_pk_sentinel`], leaving `referred_columns`
+    /// EMPTY — byte-identical to what the column-level spelling produces, so
+    /// the planner needs no change: the executor resolves the empty list
+    /// against the parent's PRIMARY KEY at DDL time (and fails closed with
+    /// 42830 when there is none).
+    ///
+    /// Returns `None` — leaving the ORIGINAL diagnostic untouched — unless the
+    /// statement starts with `ALTER`/`CREATE`, names `TABLE` before its first
+    /// `(` (this excludes `CREATE FUNCTION / PROCEDURE / TRIGGER`, whose
+    /// dollar-quoted bodies a `'`/`"` quote walk does not track), contains the
+    /// phrase `FOREIGN KEY` outside quotes, does NOT already contain the
+    /// placeholder text, and at least one splice happened. An unbalanced
+    /// parenthesis declines outright.
+    #[allow(clippy::indexing_slicing)] // Byte cursor bounded by `while i < n`; every slice end is an ASCII byte or the text end.
+    fn rewrite_fk_default_referenced_columns(sql: &str) -> Option<String> {
+        // 1. Head gate: `ALTER …` / `CREATE …` with `TABLE` before the first `(`.
+        let head = sql.trim_start();
+        if !(Self::starts_kw(head, "ALTER") || Self::starts_kw(head, "CREATE")) {
+            return None;
+        }
+        let prefix_end = head.find('(').unwrap_or(head.len());
+        let prefix = head.as_bytes();
+        if !(0..prefix_end).any(|i| Self::kw_at(&prefix[..prefix_end], i, b"TABLE")) {
+            return None;
+        }
+        // 2. Cheap probes.
+        if !Self::contains_kw_phrase(sql, b"FOREIGN KEY") {
+            return None;
+        }
+        if sql.to_ascii_lowercase().contains(FK_DEFAULT_PK_SENTINEL) {
+            return None;
+        }
+        // 3. Structural, quote-aware walk.
+        let bytes = sql.as_bytes();
+        let n = bytes.len();
+        let skip_ws = |mut k: usize| {
+            while k < n && bytes[k].is_ascii_whitespace() {
+                k += 1;
+            }
+            k
+        };
+        let mut out = String::with_capacity(n + 32);
+        let mut copied = 0usize;
+        let mut i = 0usize;
+        while i < n {
+            let c = bytes[i];
+            if c == b'\'' || c == b'"' {
+                i = Self::skip_quoted_span(bytes, i);
+                continue;
+            }
+            if !Self::kw_at(bytes, i, b"FOREIGN") {
+                i += 1;
+                continue;
+            }
+            let mut j = i + b"FOREIGN".len();
+            let ws = skip_ws(j);
+            if ws == j || !Self::kw_at(bytes, ws, b"KEY") {
+                i += 1;
+                continue;
+            }
+            j = skip_ws(ws + b"KEY".len());
+            if j >= n || bytes[j] != b'(' {
+                i += 1;
+                continue;
+            }
+            let close = Self::matching_paren_bytes(bytes, j)?;
+            j = skip_ws(close + 1);
+            if !Self::kw_at(bytes, j, b"REFERENCES") {
+                i = close + 1;
+                continue;
+            }
+            j += b"REFERENCES".len();
+            let ws = skip_ws(j);
+            if ws == j {
+                i = close + 1;
+                continue;
+            }
+            let Some(name_end) = Self::object_name_end(bytes, ws) else {
+                i = close + 1;
+                continue;
+            };
+            let after = skip_ws(name_end);
+            if after < n && bytes[after] == b'(' {
+                // The list is present: untouched.
+                i = name_end;
+                continue;
+            }
+            out.push_str(sql.get(copied..name_end)?);
+            out.push_str(" (");
+            out.push_str(FK_DEFAULT_PK_SENTINEL);
+            out.push(')');
+            copied = name_end;
+            i = name_end;
+        }
+        if copied == 0 {
+            return None;
+        }
+        out.push_str(sql.get(copied..)?);
+        Some(out)
+    }
+
+    /// Case-insensitive, word-bounded keyword test at byte offset `i`.
+    #[allow(clippy::indexing_slicing)] // Bounds checked explicitly before every index.
+    fn kw_at(bytes: &[u8], i: usize, kw: &[u8]) -> bool {
+        let n = bytes.len();
+        let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b >= 0x80;
+        i + kw.len() <= n
+            && bytes[i..i + kw.len()].eq_ignore_ascii_case(kw)
+            && (i == 0 || !is_ident(bytes[i - 1]))
+            && (i + kw.len() >= n || !is_ident(bytes[i + kw.len()]))
+    }
+
+    /// End offset (exclusive) of ONE object name starting at `start`: parts
+    /// separated by `.`, each either `"…"` (with `""` doubling) or a bare run of
+    /// `[A-Za-z0-9_$]` / non-ASCII bytes. `None` if no name starts there.
+    #[allow(clippy::indexing_slicing)] // Byte cursor bounded by `while k < n`.
+    fn object_name_end(bytes: &[u8], start: usize) -> Option<usize> {
+        let n = bytes.len();
+        let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b >= 0x80;
+        let mut k = start;
+        loop {
+            if k >= n {
+                return None;
+            }
+            if bytes[k] == b'"' {
+                let end = Self::skip_quoted_span(bytes, k);
+                if end <= k + 1 || bytes[end - 1] != b'"' {
+                    return None; // unterminated
+                }
+                k = end;
+            } else if is_ident(bytes[k]) {
+                while k < n && is_ident(bytes[k]) {
+                    k += 1;
+                }
+            } else {
+                return None;
+            }
+            if k < n && bytes[k] == b'.' {
+                k += 1;
+                continue;
+            }
+            return Some(k);
+        }
+    }
+
+    /// Erase the placeholder planted by
+    /// [`Parser::rewrite_fk_default_referenced_columns`]: wherever a table-level
+    /// foreign key's `referred_columns` is exactly one UNQUOTED identifier equal
+    /// to [`FK_DEFAULT_PK_SENTINEL`], clear it back to EMPTY — the shape the
+    /// column-level `REFERENCES p` already produces and the executor already
+    /// resolves against the parent's PRIMARY KEY. Only the two positions the
+    /// rewrite can reach are visited (`CREATE TABLE` constraints and `ALTER
+    /// TABLE … ADD <constraint>`); the caller verifies nothing else carries it.
+    fn strip_fk_default_pk_sentinel(stmt: &mut Statement) {
+        fn clear(tc: &mut sqlparser::ast::TableConstraint) {
+            if let sqlparser::ast::TableConstraint::ForeignKey { referred_columns, .. } = tc {
+                let is_sentinel = referred_columns.len() == 1
+                    && referred_columns
+                        .first()
+                        .is_some_and(|i| i.quote_style.is_none() && i.value == FK_DEFAULT_PK_SENTINEL);
+                if is_sentinel {
+                    referred_columns.clear();
+                }
+            }
+        }
+        match stmt {
+            Statement::CreateTable(ct) => ct.constraints.iter_mut().for_each(clear),
+            Statement::AlterTable { operations, .. } => {
+                for op in operations {
+                    if let sqlparser::ast::AlterTableOperation::AddConstraint(tc) = op {
+                        clear(tc);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// True when `name` is a plain, possibly schema-qualified object name: one
     /// or more `.`-separated parts, each either a bare identifier (letter /
     /// `_` / non-ASCII start, then alphanumerics / `_` / `$` / non-ASCII) or a
@@ -4988,6 +5229,170 @@ mod tests {
                     "diagnostic was masked for {sql:?}: got {err:?}, want it to contain {direct:?}"
                 );
                 assert!(!err.contains("TRUE"), "the injected predicate leaked into {err:?}");
+            }
+        }
+    }
+
+    /// GH#27 (residual): the omitted referenced-column list on a TABLE-level
+    /// foreign key — `[CONSTRAINT n] FOREIGN KEY (c) REFERENCES p` — parses,
+    /// binds to an EMPTY `referred_columns` (the shape the column-level
+    /// `REFERENCES p` already produces), and never lets the placeholder out.
+    mod gh27_fk_default_referenced_columns {
+        use super::*;
+        use sqlparser::ast::{AlterTableOperation, TableConstraint};
+
+        fn fk_referred_columns(stmt: &Statement) -> Vec<(Option<String>, Vec<String>)> {
+            let read = |tc: &TableConstraint| match tc {
+                TableConstraint::ForeignKey {
+                    name, referred_columns, ..
+                } => Some((
+                    name.as_ref().map(|n| n.value.clone()),
+                    referred_columns.iter().map(|i| i.value.clone()).collect(),
+                )),
+                _ => None,
+            };
+            match stmt {
+                Statement::CreateTable(ct) => ct.constraints.iter().filter_map(read).collect(),
+                Statement::AlterTable { operations, .. } => operations
+                    .iter()
+                    .filter_map(|op| match op {
+                        AlterTableOperation::AddConstraint(tc) => read(tc),
+                        _ => None,
+                    })
+                    .collect(),
+                other => panic!("unexpected statement {other:?}"),
+            }
+        }
+
+        #[test]
+        fn list_less_table_level_foreign_key_parses_with_an_empty_referred_list() {
+            let parser = Parser::new();
+            for (sql, want_name) in [
+                ("ALTER TABLE c ADD FOREIGN KEY (p) REFERENCES par", None),
+                (
+                    "ALTER TABLE c ADD CONSTRAINT c_p_fkey FOREIGN KEY (p) REFERENCES par",
+                    Some("c_p_fkey"),
+                ),
+                ("ALTER TABLE c ADD FOREIGN KEY (p) REFERENCES par;", None),
+                (
+                    "ALTER TABLE c ADD FOREIGN KEY (p) REFERENCES par ON DELETE CASCADE",
+                    None,
+                ),
+                (
+                    "ALTER TABLE c ADD FOREIGN KEY (p) REFERENCES par DEFERRABLE INITIALLY DEFERRED",
+                    None,
+                ),
+                ("ALTER TABLE c ADD FOREIGN KEY (p) REFERENCES \"Sch\".\"Par\"", None),
+                (
+                    "CREATE TABLE c (id INT PRIMARY KEY, p INT, FOREIGN KEY (p) REFERENCES par)",
+                    None,
+                ),
+                (
+                    "CREATE TABLE c (id INT PRIMARY KEY, p INT, CONSTRAINT c_p FOREIGN KEY (p) REFERENCES par, q INT)",
+                    Some("c_p"),
+                ),
+            ] {
+                // The rewrite must be the reason it parses: sqlparser alone rejects it.
+                assert!(
+                    SqlParser::parse_sql(&PostgreSqlDialect {}, sql).is_err(),
+                    "fixture must need the rewrite: {sql}"
+                );
+                let stmt = parser
+                    .parse_one(sql)
+                    .unwrap_or_else(|e| panic!("`{sql}` must parse after GH#27: {e}"));
+                let fks = fk_referred_columns(&stmt);
+                assert_eq!(fks.len(), 1, "{sql}: {fks:?}");
+                assert_eq!(fks[0].0.as_deref(), want_name, "{sql}: constraint name must survive");
+                assert!(
+                    fks[0].1.is_empty(),
+                    "{sql}: referred_columns must be EMPTY, got {:?}",
+                    fks[0].1
+                );
+                assert!(
+                    !stmt.to_string().to_ascii_lowercase().contains(FK_DEFAULT_PK_SENTINEL),
+                    "the placeholder leaked into the AST: {stmt}"
+                );
+            }
+        }
+
+        #[test]
+        fn several_list_less_foreign_keys_in_one_statement_are_all_rewritten() {
+            let parser = Parser::new();
+            let stmt = parser
+                .parse_one(
+                    "CREATE TABLE c (a INT, b INT, FOREIGN KEY (a) REFERENCES pa, \
+                     FOREIGN KEY (b) REFERENCES pb ON UPDATE CASCADE)",
+                )
+                .expect("both list-less FKs must parse");
+            let fks = fk_referred_columns(&stmt);
+            assert_eq!(fks.len(), 2, "{fks:?}");
+            assert!(fks.iter().all(|(_, cols)| cols.is_empty()), "{fks:?}");
+        }
+
+        #[test]
+        fn a_present_column_list_is_untouched_and_parses_first_time() {
+            let parser = Parser::new();
+            for sql in [
+                "ALTER TABLE c ADD FOREIGN KEY (p) REFERENCES par (id)",
+                "ALTER TABLE c ADD FOREIGN KEY (p) REFERENCES par(id) ON DELETE SET NULL",
+                "CREATE TABLE c (p INT REFERENCES par)",
+            ] {
+                assert!(SqlParser::parse_sql(&PostgreSqlDialect {}, sql).is_ok(), "{sql}");
+                assert!(
+                    Parser::rewrite_fk_default_referenced_columns(sql).is_none(),
+                    "rewrite must decline `{sql}`"
+                );
+                parser.parse_one(sql).expect(sql);
+            }
+        }
+
+        #[test]
+        fn the_rewrite_never_fires_inside_a_literal_or_on_other_statements() {
+            for sql in [
+                // Phrase inside a string literal.
+                "CREATE TABLE t (id INT, note TEXT DEFAULT 'FOREIGN KEY (x) REFERENCES y' NOT NULL, p INT REFERENCES q(id)",
+                // Phrase inside a quoted identifier.
+                "ALTER TABLE t ADD COLUMN \"FOREIGN KEY (x) REFERENCES y\" INT",
+                // Not a TABLE statement.
+                "GRANT REFERENCES ON t TO r FOREIGN KEY (x) REFERENCES y",
+                "CREATE FUNCTION f() RETURNS void AS $$ FOREIGN KEY (x) REFERENCES y $$ LANGUAGE sql",
+                // Column-level spelling: already legal, must not be touched.
+                "CREATE TABLE t (p INT REFERENCES q, r INT REFERENCES s ON DELETE CASCADE)",
+                // Unbalanced parenthesis: decline outright.
+                "ALTER TABLE t ADD FOREIGN KEY (p REFERENCES q",
+                // Already contains the placeholder text: decline.
+                "ALTER TABLE t ADD FOREIGN KEY (p) REFERENCES q (__hdb_fk_ref_default_pk)",
+                "ALTER TABLE t ADD FOREIGN KEY (p) REFERENCES __hdb_fk_ref_default_pk",
+            ] {
+                assert!(
+                    Parser::rewrite_fk_default_referenced_columns(sql).is_none(),
+                    "the rewrite must decline `{sql}`"
+                );
+            }
+        }
+
+        /// The strictly-additive guarantee: a statement the rewrite claims but
+        /// which still fails must surface sqlparser's diagnostic for the
+        /// ORIGINAL text, and never the placeholder.
+        #[test]
+        fn a_statement_that_still_fails_reports_the_original_diagnostic() {
+            let parser = Parser::new();
+            for sql in [
+                "ALTER TABLE c ADD FOREIGN KEY (p) REFERENCES par ON DELETE",
+                "CREATE TABLE c (p INT, FOREIGN KEY (p) REFERENCES par, PRIMARY KEY)",
+            ] {
+                let direct = SqlParser::parse_sql(&PostgreSqlDialect {}, sql)
+                    .expect_err("fixture must be unparseable")
+                    .to_string();
+                let err = parser.parse(sql).unwrap_err().to_string();
+                assert!(
+                    err.contains(&direct),
+                    "diagnostic was masked for {sql:?}: got {err:?}, want it to contain {direct:?}"
+                );
+                assert!(
+                    !err.to_ascii_lowercase().contains(FK_DEFAULT_PK_SENTINEL),
+                    "the placeholder leaked into {err:?}"
+                );
             }
         }
     }

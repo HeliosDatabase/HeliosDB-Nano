@@ -5149,3 +5149,2150 @@ async fn point_lookup_does_not_see_another_sessions_uncommitted_row() {
         "and the row must be visible once the writer commits"
     );
 }
+
+// ===== GitHub issue regression tests (proof-first) =====
+
+// ---- GH#21 ----
+// ---------------------------------------------------------------------------
+// GH #21 over the wire — the reporter's own client shape.
+//
+// The issue was filed against psql (simple protocol) and Prisma 7.10 +
+// `@prisma/adapter-pg` / node-pg 8 (extended protocol). This function drives the
+// SIMPLE protocol with the issue's verbatim script; the extended-protocol legs
+// for the same defect are already pinned by
+// `wire_prisma_unique_index_rejects_a_duplicate_with_23505` and
+// `wire_second_table_with_the_same_unique_column_still_enforces` above.
+//
+// Append to src/protocol/postgres/wire_tests.rs. Helpers used: `test_handler`,
+// `wire_setup`, `wire_query`, `assert_wire_sqlstate`, `sqlstates`, `data_rows`
+// — all already defined there. `FrontendMessage` is NOT needed by this
+// function, so no per-function import.
+//
+// NOTE if the #22 snippet is appended in the same pass: that file has its own
+// header, and neither header declares anything, so both can land as-is.
+// ---------------------------------------------------------------------------
+
+/// GH #21 over the wire, verbatim: the reporter's four tables in one session,
+/// all naming the column `v`, plus the `ALTER TABLE … ADD CONSTRAINT … UNIQUE`
+/// the issue says was rejected outright. Every duplicate must come back as
+/// 23505, and the connection must stay usable afterwards.
+#[tokio::test]
+async fn wire_gh21_every_unique_spelling_is_23505_over_the_wire() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+
+    for setup in [
+        "CREATE TABLE u1 (id INT PRIMARY KEY, v VARCHAR(50) UNIQUE)",
+        "CREATE TABLE u2 (id INT PRIMARY KEY, v VARCHAR(50), UNIQUE (v))",
+        "CREATE TABLE u3 (id INT PRIMARY KEY, v VARCHAR(50), w INT, UNIQUE (v,w))",
+        "CREATE TABLE u4 (id INT PRIMARY KEY, v VARCHAR(50))",
+        "CREATE UNIQUE INDEX u4_v ON u4 (v)",
+        // The issue: "Unsupported ALTER TABLE operation: AddConstraint".
+        "ALTER TABLE u4 ADD CONSTRAINT u4_v_key UNIQUE (v)",
+        "INSERT INTO u1 VALUES (1,'a')",
+        "INSERT INTO u2 VALUES (1,'a')",
+        "INSERT INTO u3 VALUES (1,'a',1)",
+        "INSERT INTO u4 VALUES (1,'a')",
+    ] {
+        wire_setup(&mut handler, &mut client, setup).await;
+    }
+
+    // POSITIVE CONTROL, passes on the broken tree too: a column with NO unique
+    // rule accepts a repeat over this same connection. If this errors, the wire
+    // harness — not the constraint fix — is what the assertions below measure.
+    wire_setup(
+        &mut handler,
+        &mut client,
+        "CREATE TABLE ctl (id INT PRIMARY KEY, w INT)",
+    )
+    .await;
+    wire_setup(&mut handler, &mut client, "INSERT INTO ctl VALUES (1,7)").await;
+    wire_setup(&mut handler, &mut client, "INSERT INTO ctl VALUES (2,7)").await;
+    let out = wire_query(&mut handler, &mut client, "SELECT id FROM ctl").await;
+    assert_eq!(
+        data_rows(&out).len(),
+        2,
+        "POSITIVE CONTROL BROKEN: a non-unique column rejected a repeat over the wire"
+    );
+
+    for dup in [
+        "INSERT INTO u1 VALUES (2,'a')",
+        "INSERT INTO u2 VALUES (2,'a')",
+        "INSERT INTO u3 VALUES (2,'a',1)",
+        "INSERT INTO u4 VALUES (2,'a')",
+    ] {
+        assert_wire_sqlstate(&mut handler, &mut client, dup, "23505").await;
+    }
+
+    // …and every table still accepts a genuinely distinct value, so the four
+    // 23505s above are enforcement and not blanket rejection.
+    for setup in [
+        "INSERT INTO u1 VALUES (3,'b')",
+        "INSERT INTO u2 VALUES (3,'b')",
+        "INSERT INTO u3 VALUES (3,'b',1)",
+        "INSERT INTO u4 VALUES (3,'b')",
+    ] {
+        wire_setup(&mut handler, &mut client, setup).await;
+    }
+
+    for table in ["u1", "u2", "u3", "u4"] {
+        let sql = format!("SELECT id FROM {table}");
+        let out = wire_query(&mut handler, &mut client, &sql).await;
+        assert!(sqlstates(&out).is_empty(), "connection wedged on `{sql}`");
+        assert_eq!(
+            data_rows(&out).len(),
+            2,
+            "*** DUPLICATE STORED *** in {table} — the constraint accepted the second row \
+             (expected the original row plus the one distinct value inserted above)"
+        );
+    }
+}
+
+// ---- GH#22 ----
+// ---------------------------------------------------------------------------
+// GH #22 over the wire — the reporter's own client shape.
+//
+// The issue was filed against psql (simple protocol) and Prisma 7.10 +
+// `@prisma/adapter-pg` / node-pg 8 (extended protocol), so BOTH are driven here.
+// `wire_prisma_composite_upsert_updates_and_never_duplicates` above already
+// covers a quoted COMPOSITE target with bound parameters; what is missing is the
+// issue's literal SINGLE-column quoted target `ON CONFLICT ("v")` — reported as
+// `column '"v"' not found` — and a second upsert against a row a first upsert
+// already rewrote (the shape that used to lose the row's ART entries and then
+// append a duplicate).
+//
+// Append to src/protocol/postgres/wire_tests.rs. Helpers used: `test_handler`,
+// `wire_setup`, `wire_query`, `data_rows`, `sqlstates`, `command_tags`, `drain`
+// — all already defined there — plus a per-function
+// `use super::messages::FrontendMessage;` in the extended-protocol test,
+// exactly as the surrounding Prisma tests do it.
+// ---------------------------------------------------------------------------
+
+/// GH #22 over the SIMPLE protocol (psql), verbatim: seed, unquoted-target
+/// upsert, then the quoted-target upsert the issue says errored. One row at the
+/// end, still id 1, and reachable through the UNIQUE column — a row that
+/// survives in `SELECT *` but has lost its index entry is what let the SECOND
+/// upsert append a duplicate.
+#[tokio::test]
+async fn wire_gh22_verbatim_upsert_sequence_never_duplicates() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+
+    for setup in [
+        "CREATE TABLE k (id INT PRIMARY KEY, v VARCHAR(50) UNIQUE, n INT)",
+        "INSERT INTO k VALUES (1,'a',0)",
+        "INSERT INTO k (id, v, n) VALUES (2,'a',1) ON CONFLICT (v) DO UPDATE SET n = EXCLUDED.n",
+        "INSERT INTO k (id, v, n) VALUES (3,'a',2) ON CONFLICT (\"v\") DO UPDATE SET n = EXCLUDED.n",
+    ] {
+        wire_setup(&mut handler, &mut client, setup).await;
+    }
+
+    let out = wire_query(&mut handler, &mut client, "SELECT id, n FROM k").await;
+    let rows = data_rows(&out);
+    assert_eq!(
+        rows.len(),
+        1,
+        "*** DUPLICATE INSERTED *** ON CONFLICT DO UPDATE appended a row instead of updating"
+    );
+    let cells: Vec<String> = rows
+        .first()
+        .expect("one row")
+        .iter()
+        .map(|c| String::from_utf8_lossy(c.as_deref().unwrap_or(b"")).to_string())
+        .collect();
+    assert_eq!(
+        cells.first().map(String::as_str),
+        Some("1"),
+        "the EXISTING row must be the one updated, not replaced by the proposed one"
+    );
+    assert_eq!(
+        cells.get(1).map(String::as_str),
+        Some("2"),
+        "EXCLUDED.n from the quoted-target upsert was not applied"
+    );
+
+    // The row must still be reachable through the UNIQUE column, not only
+    // through a full scan: losing the ART entry is what made the second upsert
+    // see no conflict on the reported build.
+    let out = wire_query(&mut handler, &mut client, "SELECT id FROM k WHERE v = 'a'").await;
+    assert!(sqlstates(&out).is_empty(), "lookup errored: {:?}", sqlstates(&out));
+    assert_eq!(
+        data_rows(&out).len(),
+        1,
+        "the updated row is not reachable through its UNIQUE column — its index entries were dropped"
+    );
+
+    // POSITIVE CONTROL, and it passes on the tree the issue was filed against
+    // too: a NON-conflicting `ON CONFLICT` still INSERTS. If this fails, the
+    // wire harness is broken, not the arbiter — and it also proves the two
+    // "one row" assertions above are not passing because upserts silently write
+    // nothing at all.
+    wire_setup(
+        &mut handler,
+        &mut client,
+        "INSERT INTO k (id, v, n) VALUES (9,'z',9) ON CONFLICT (v) DO UPDATE SET n = EXCLUDED.n",
+    )
+    .await;
+    let out = wire_query(&mut handler, &mut client, "SELECT id FROM k").await;
+    assert_eq!(
+        data_rows(&out).len(),
+        2,
+        "POSITIVE CONTROL BROKEN: a non-conflicting ON CONFLICT statement did not insert"
+    );
+}
+
+/// GH #22 over the EXTENDED protocol with bound parameters — the node-pg /
+/// `@prisma/adapter-pg` path the issue actually used. The same prepared upsert
+/// is executed twice against the same conflicting value: the first Execute
+/// updates, the second must update again and must not append.
+#[tokio::test]
+async fn wire_gh22_extended_protocol_quoted_target_upsert_updates_twice() {
+    use super::messages::FrontendMessage;
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+
+    for setup in [
+        "CREATE TABLE k (id INT PRIMARY KEY, v VARCHAR(50) UNIQUE, n INT)",
+        "INSERT INTO k VALUES (1,'a',0)",
+    ] {
+        wire_setup(&mut handler, &mut client, setup).await;
+    }
+
+    let upsert = "INSERT INTO k (id, v, n) VALUES ($1, $2, $3) \
+                  ON CONFLICT (\"v\") DO UPDATE SET n = EXCLUDED.n";
+
+    for (round, (id, n)) in [("2", "1"), ("3", "2")].into_iter().enumerate() {
+        let stmt = format!("s_gh22_{round}");
+        let portal = format!("p_gh22_{round}");
+        handler
+            .dispatch_message(FrontendMessage::Parse {
+                statement_name: stmt.clone(),
+                query: upsert.into(),
+                param_types: vec![23, 25, 23],
+            })
+            .await
+            .unwrap_or_else(|e| panic!("round {round} parse: {e}"));
+        handler
+            .dispatch_message(FrontendMessage::Bind {
+                portal_name: portal.clone(),
+                statement_name: stmt,
+                param_formats: vec![0, 0, 0],
+                params: vec![
+                    Some(id.as_bytes().to_vec()),
+                    Some(b"a".to_vec()),
+                    Some(n.as_bytes().to_vec()),
+                ],
+                result_formats: vec![],
+            })
+            .await
+            .unwrap_or_else(|e| panic!("round {round} bind: {e}"));
+        let _ = drain(&mut client).await;
+        handler
+            .dispatch_message(FrontendMessage::Execute {
+                portal_name: portal,
+                max_rows: 0,
+            })
+            .await
+            .unwrap_or_else(|e| panic!("round {round} execute: {e}"));
+        let out = drain(&mut client).await;
+        assert!(
+            sqlstates(&out).is_empty(),
+            "round {round}: the quoted-target upsert must succeed over the extended protocol \
+             (the issue got `column '\"v\"' not found`), got {:?}",
+            sqlstates(&out)
+        );
+        assert_eq!(
+            command_tags(&out).len(),
+            1,
+            "round {round}: exactly one CommandComplete, got {:?}",
+            command_tags(&out)
+        );
+        handler.dispatch_message(FrontendMessage::Sync).await.expect("sync");
+        let _ = drain(&mut client).await;
+    }
+
+    let out = wire_query(&mut handler, &mut client, "SELECT id, n FROM k").await;
+    let rows = data_rows(&out);
+    assert_eq!(
+        rows.len(),
+        1,
+        "*** DUPLICATE INSERTED *** the parameterized upsert appended instead of updating"
+    );
+    let cells: Vec<String> = rows
+        .first()
+        .expect("one row")
+        .iter()
+        .map(|c| String::from_utf8_lossy(c.as_deref().unwrap_or(b"")).to_string())
+        .collect();
+    assert_eq!(
+        cells.first().map(String::as_str),
+        Some("1"),
+        "the existing row must survive"
+    );
+    assert_eq!(
+        cells.get(1).map(String::as_str),
+        Some("2"),
+        "the second upsert did not apply"
+    );
+}
+
+// ---- GH#26 ----
+// ===========================================================================
+// GH #26 — the pg_advisory_lock family over the WIRE.
+//
+// APPEND to src/protocol/postgres/wire_tests.rs. Functions only — every
+// helper used here (`test_handler`, `drain`, `data_rows`, `first_data_row_text`,
+// `sqlstates`, `command_tags`, `wire_query`, `wire_setup`, `assert_wire_sqlstate`,
+// `parse_messages`) already exists in that file.
+//
+// The existing advisory wire tests cover: lock/unlock shapes on the simple
+// protocol, release on connection Drop, the blocking grant, COMMIT/ROLLBACK of
+// an xact lock issued on the simple protocol, a LITERAL-keyed extended-protocol
+// lock, the extended `INSERT … RETURNING` ownership case, and `DISCARD ALL`.
+//
+// What is NOT covered there, and is covered here:
+//   * a BOUND PARAMETER key (`SELECT pg_try_advisory_lock($1)`) — the shape
+//     node-pg / Prisma actually put on the wire, where the key arrives as a
+//     text-format parameter with OID 0 (unknown) and must still coerce to a
+//     lock key rather than erroring or locking something else;
+//   * the (int, int) overload over the wire, on both protocols;
+//   * `pg_advisory_unlock_all()` over the wire;
+//   * an xact lock TAKEN on the extended protocol and COMMITted on the
+//     extended protocol (the existing test commits on the simple one);
+//   * the SQLSTATE a session-less refusal must NOT produce on a wire session.
+//
+// Keys: this block owns 91_1xx_xxx.
+// ===========================================================================
+
+/// Positive control for this block: the wire harness runs, a plain SELECT
+/// comes back as one DataRow, and an unknown function still errors. Passes
+/// before AND after any advisory-lock change.
+#[tokio::test]
+async fn gh26_wire_positive_control() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut handler, mut client) = test_handler(db);
+
+    handler.handle_single_query("SELECT 1").await.expect("select 1");
+    let out = drain(&mut client).await;
+    assert!(sqlstates(&out).is_empty(), "SELECT 1 must not error");
+    assert_eq!(first_data_row_text(&out).as_deref(), Some("1"));
+
+    // A genuinely missing function still reports 42883, so "it works" below
+    // cannot be satisfied by a permissive fallback.
+    //
+    // NOTE (adversarial review): this MUST go through `wire_query` /
+    // `assert_wire_sqlstate`. `handle_single_query` PROPAGATES the error
+    // (src/protocol/postgres/handler.rs:931) — it is `dispatch_message`
+    // (handler.rs:557-566) that turns it into an ErrorResponse on the socket.
+    // Calling `handle_single_query` and then draining would find NO 'E'
+    // message at all, so the original form of this control failed for a
+    // harness reason rather than a real one. The `FROM` clause matches the
+    // proven shape of `wire_unquoted_unknown_function_shapes_map_to_undefined_function`
+    // (wire_tests.rs:2885).
+    wire_setup(
+        &mut handler,
+        &mut client,
+        "CREATE TABLE gh26_probe (id INT PRIMARY KEY)",
+    )
+    .await;
+    wire_setup(&mut handler, &mut client, "INSERT INTO gh26_probe VALUES (1)").await;
+    assert_wire_sqlstate(
+        &mut handler,
+        &mut client,
+        "SELECT gh26_no_such_scalar_fn(id) FROM gh26_probe",
+        "42883",
+    )
+    .await;
+}
+
+/// Every member of the family answers over the SIMPLE protocol without an
+/// ErrorResponse, with PostgreSQL's own result shapes: `void` (NULL column)
+/// for the two blocking acquirers and for `pg_advisory_unlock_all`, boolean
+/// for the two `try` forms and for `pg_advisory_unlock`.
+///
+/// FAILS on a tree without the family: every statement returns 42883.
+#[tokio::test]
+async fn gh26_every_advisory_function_answers_on_the_simple_protocol() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut handler, mut client) = test_handler(db);
+
+    // (sql, expected shape) — `None` = void (one NULL column), `Some(t)` = that text.
+    let cases: Vec<(String, Option<&str>)> = vec![
+        ("SELECT pg_advisory_lock(91100001)".to_string(), None),
+        ("SELECT pg_try_advisory_lock(91100002)".to_string(), Some("t")),
+        ("SELECT pg_advisory_xact_lock(91100003)".to_string(), None),
+        ("SELECT pg_try_advisory_xact_lock(91100004)".to_string(), Some("t")),
+        ("SELECT pg_advisory_unlock(91100001)".to_string(), Some("t")),
+        // Not held (it was a transaction-scope hold, already ended) → false,
+        // never an error: PostgreSQL returns false with a WARNING.
+        ("SELECT pg_advisory_unlock(91100003)".to_string(), Some("f")),
+        ("SELECT pg_advisory_unlock_all()".to_string(), None),
+    ];
+
+    for (sql, expected) in cases {
+        handler
+            .handle_single_query(&sql)
+            .await
+            .unwrap_or_else(|e| panic!("*** `{sql}` FAILED on the wire: {e} ***"));
+        let out = drain(&mut client).await;
+        assert!(
+            sqlstates(&out).is_empty(),
+            "*** `{sql}` IS NOT IMPLEMENTED *** — got {:?}",
+            sqlstates(&out)
+        );
+        let rows = data_rows(&out);
+        assert_eq!(rows.len(), 1, "`{sql}` must return exactly one row");
+        assert_eq!(rows[0].len(), 1, "`{sql}` must return exactly one column");
+        match expected {
+            None => assert!(
+                rows[0][0].is_none(),
+                "`{sql}` is a void function: the column must be NULL, got {:?}",
+                rows[0][0]
+            ),
+            Some(text) => assert_eq!(
+                first_data_row_text(&out).as_deref(),
+                Some(text),
+                "`{sql}` returned the wrong boolean"
+            ),
+        }
+    }
+}
+
+/// The shape Prisma / node-pg actually send: the key arrives as a BOUND
+/// PARAMETER over Parse/Bind/Execute, in text format, with the parameter type
+/// left unspecified (OID 0) — so the engine sees `Value::String("91100010")`
+/// and must still coerce it to an integer lock key.
+///
+/// A tree that only handles literal keys either errors here or (worse) locks
+/// nothing while answering `t`, so the second connection is asserted too.
+#[tokio::test]
+async fn gh26_extended_protocol_advisory_lock_with_a_bound_parameter_key() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut a, mut ca) = test_handler(Arc::clone(&db));
+    let (mut b, mut cb) = test_handler(Arc::clone(&db));
+
+    // param_types empty → Parse infers one unknown (OID 0) parameter, exactly
+    // as node-pg leaves it.
+    a.handle_parse_extended("adv_p".into(), "SELECT pg_try_advisory_lock($1)".into(), vec![])
+        .await
+        .expect("parse");
+    a.handle_bind_extended(
+        "padv_p".into(),
+        "adv_p".into(),
+        vec![0],
+        vec![Some(b"91100010".to_vec())],
+        vec![],
+    )
+    .await
+    .expect("bind");
+    a.handle_execute_extended("padv_p".into(), 0).await.expect("execute");
+    let out = drain(&mut ca).await;
+    assert!(
+        sqlstates(&out).is_empty(),
+        "*** a parameterized advisory key was rejected *** — got {:?}",
+        sqlstates(&out)
+    );
+    assert_eq!(
+        first_data_row_text(&out).as_deref(),
+        Some("t"),
+        "the parameterized pg_try_advisory_lock must acquire"
+    );
+
+    // It must be a REAL lock, not a `t` that locked nothing.
+    b.handle_single_query("SELECT pg_try_advisory_lock(91100010)")
+        .await
+        .expect("try");
+    assert_eq!(
+        first_data_row_text(&drain(&mut cb).await).as_deref(),
+        Some("f"),
+        "*** the parameterized advisory lock excluded nobody ***"
+    );
+
+    // And the unlock works with a bound key too.
+    a.handle_parse_extended("unl_p".into(), "SELECT pg_advisory_unlock($1)".into(), vec![])
+        .await
+        .expect("parse");
+    a.handle_bind_extended(
+        "punl_p".into(),
+        "unl_p".into(),
+        vec![0],
+        vec![Some(b"91100010".to_vec())],
+        vec![],
+    )
+    .await
+    .expect("bind");
+    a.handle_execute_extended("punl_p".into(), 0).await.expect("execute");
+    assert_eq!(
+        first_data_row_text(&drain(&mut ca).await).as_deref(),
+        Some("t"),
+        "the parameterized pg_advisory_unlock must release the holder's lock"
+    );
+
+    b.handle_single_query("SELECT pg_try_advisory_lock(91100010)")
+        .await
+        .expect("try");
+    assert_eq!(
+        first_data_row_text(&drain(&mut cb).await).as_deref(),
+        Some("t"),
+        "*** the parameterized unlock released nothing ***"
+    );
+}
+
+/// The `(int, int)` overload over the wire — on the simple protocol AND the
+/// extended one — is a distinct key space from the `bigint` overload.
+#[tokio::test]
+async fn gh26_int_pair_overload_over_the_wire() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut a, mut ca) = test_handler(Arc::clone(&db));
+    let (mut b, mut cb) = test_handler(Arc::clone(&db));
+
+    // Simple protocol: (7, 91100020) is exclusive…
+    a.handle_single_query("SELECT pg_advisory_lock(7, 91100020)")
+        .await
+        .expect("pair lock");
+    let out = drain(&mut ca).await;
+    assert!(
+        sqlstates(&out).is_empty(),
+        "*** pg_advisory_lock(int,int) IS NOT IMPLEMENTED *** — got {:?}",
+        sqlstates(&out)
+    );
+    assert!(data_rows(&out)[0][0].is_none(), "pg_advisory_lock(int,int) is void");
+
+    b.handle_single_query("SELECT pg_try_advisory_lock(7, 91100020)")
+        .await
+        .expect("try pair");
+    assert_eq!(
+        first_data_row_text(&drain(&mut cb).await).as_deref(),
+        Some("f"),
+        "*** the (int,int) lock excluded nobody ***"
+    );
+
+    // … but the bigint key 91100020 is a DIFFERENT lock and is still free.
+    b.handle_single_query("SELECT pg_try_advisory_lock(91100020)")
+        .await
+        .expect("try bigint");
+    assert_eq!(
+        first_data_row_text(&drain(&mut cb).await).as_deref(),
+        Some("t"),
+        "*** (7, k) collided with the bigint key k ***"
+    );
+
+    // Extended protocol, both key components bound as parameters.
+    a.handle_parse_extended("pair".into(), "SELECT pg_try_advisory_lock($1, $2)".into(), vec![])
+        .await
+        .expect("parse");
+    a.handle_bind_extended(
+        "ppair".into(),
+        "pair".into(),
+        vec![0, 0],
+        vec![Some(b"7".to_vec()), Some(b"91100021".to_vec())],
+        vec![],
+    )
+    .await
+    .expect("bind");
+    a.handle_execute_extended("ppair".into(), 0).await.expect("execute");
+    let out = drain(&mut ca).await;
+    assert!(sqlstates(&out).is_empty(), "extended pair lock: {:?}", sqlstates(&out));
+    assert_eq!(first_data_row_text(&out).as_deref(), Some("t"));
+
+    b.handle_single_query("SELECT pg_try_advisory_lock(7, 91100021)")
+        .await
+        .expect("try");
+    assert_eq!(
+        first_data_row_text(&drain(&mut cb).await).as_deref(),
+        Some("f"),
+        "*** the extended-protocol (int,int) lock excluded nobody ***"
+    );
+
+    // The holder's unlock releases the pair key.
+    a.handle_single_query("SELECT pg_advisory_unlock(7, 91100021)")
+        .await
+        .expect("unlock pair");
+    assert_eq!(
+        first_data_row_text(&drain(&mut ca).await).as_deref(),
+        Some("t"),
+        "pg_advisory_unlock(int,int) must release the holder's pair lock"
+    );
+    b.handle_single_query("SELECT pg_try_advisory_lock(7, 91100021)")
+        .await
+        .expect("try");
+    assert_eq!(
+        first_data_row_text(&drain(&mut cb).await).as_deref(),
+        Some("t"),
+        "*** pg_advisory_unlock(int,int) released nothing ***"
+    );
+}
+
+/// `pg_advisory_unlock_all()` over the wire releases every SESSION-scope hold
+/// of the calling connection — both key kinds — and nothing belonging to
+/// another connection.
+#[tokio::test]
+async fn gh26_unlock_all_over_the_wire_releases_only_this_connections_locks() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut a, mut ca) = test_handler(Arc::clone(&db));
+    let (mut b, mut cb) = test_handler(Arc::clone(&db));
+
+    for sql in [
+        "SELECT pg_advisory_lock(91100030)",
+        "SELECT pg_advisory_lock(91100030)", // held twice
+        "SELECT pg_try_advisory_lock(7, 91100031)",
+    ] {
+        a.handle_single_query(sql).await.expect("acquire");
+        let out = drain(&mut ca).await;
+        assert!(sqlstates(&out).is_empty(), "`{sql}`: {:?}", sqlstates(&out));
+    }
+    b.handle_single_query("SELECT pg_advisory_lock(91100032)")
+        .await
+        .expect("B acquires its own key");
+    let _ = drain(&mut cb).await;
+
+    a.handle_single_query("SELECT pg_advisory_unlock_all()")
+        .await
+        .expect("unlock_all");
+    let out = drain(&mut ca).await;
+    assert!(
+        sqlstates(&out).is_empty(),
+        "*** pg_advisory_unlock_all() IS NOT IMPLEMENTED *** — got {:?}",
+        sqlstates(&out)
+    );
+    assert!(
+        data_rows(&out)[0][0].is_none(),
+        "pg_advisory_unlock_all() is a void function"
+    );
+
+    b.handle_single_query("SELECT pg_try_advisory_lock(91100030)")
+        .await
+        .expect("try");
+    assert_eq!(
+        first_data_row_text(&drain(&mut cb).await).as_deref(),
+        Some("t"),
+        "*** unlock_all left the doubly-held bigint key held ***"
+    );
+    b.handle_single_query("SELECT pg_try_advisory_lock(7, 91100031)")
+        .await
+        .expect("try");
+    assert_eq!(
+        first_data_row_text(&drain(&mut cb).await).as_deref(),
+        Some("t"),
+        "*** unlock_all left the (int,int) key held ***"
+    );
+    a.handle_single_query("SELECT pg_try_advisory_lock(91100032)")
+        .await
+        .expect("try");
+    assert_eq!(
+        first_data_row_text(&drain(&mut ca).await).as_deref(),
+        Some("f"),
+        "*** unlock_all released ANOTHER connection's lock ***"
+    );
+}
+
+/// A transaction-scope lock TAKEN on the extended protocol and committed on
+/// the extended protocol is released. (The existing test takes and commits it
+/// on the simple protocol; extended Execute of `COMMIT` is delegated back to
+/// `handle_single_query`, and this pins that delegation still ends the lock.)
+#[tokio::test]
+async fn gh26_extended_protocol_xact_lock_is_released_by_an_extended_commit() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut a, mut ca) = test_handler(Arc::clone(&db));
+    let (mut b, mut cb) = test_handler(Arc::clone(&db));
+
+    for (finish, key) in [("COMMIT", 91_100_040_i64), ("ROLLBACK", 91_100_041)] {
+        // BEGIN over the extended protocol.
+        a.handle_parse_extended(format!("bgn{key}"), "BEGIN".into(), vec![])
+            .await
+            .expect("parse begin");
+        a.handle_bind_extended(format!("pbgn{key}"), format!("bgn{key}"), vec![], vec![], vec![])
+            .await
+            .expect("bind begin");
+        a.handle_execute_extended(format!("pbgn{key}"), 0)
+            .await
+            .expect("execute begin");
+        let _ = drain(&mut ca).await;
+
+        // The xact lock, also over the extended protocol, with a bound key.
+        a.handle_parse_extended(format!("xl{key}"), "SELECT pg_advisory_xact_lock($1)".into(), vec![])
+            .await
+            .expect("parse xact lock");
+        a.handle_bind_extended(
+            format!("pxl{key}"),
+            format!("xl{key}"),
+            vec![0],
+            vec![Some(key.to_string().into_bytes())],
+            vec![],
+        )
+        .await
+        .expect("bind xact lock");
+        a.handle_execute_extended(format!("pxl{key}"), 0)
+            .await
+            .expect("execute xact lock");
+        let out = drain(&mut ca).await;
+        assert!(
+            sqlstates(&out).is_empty(),
+            "extended pg_advisory_xact_lock($1): {:?}",
+            sqlstates(&out)
+        );
+
+        b.handle_single_query(&format!("SELECT pg_try_advisory_lock({key})"))
+            .await
+            .expect("try");
+        assert_eq!(
+            first_data_row_text(&drain(&mut cb).await).as_deref(),
+            Some("f"),
+            "held for the duration of A's transaction"
+        );
+
+        // Finish over the extended protocol too.
+        a.handle_parse_extended(format!("fin{key}"), finish.into(), vec![])
+            .await
+            .expect("parse finish");
+        a.handle_bind_extended(format!("pfin{key}"), format!("fin{key}"), vec![], vec![], vec![])
+            .await
+            .expect("bind finish");
+        a.handle_execute_extended(format!("pfin{key}"), 0)
+            .await
+            .expect("execute finish");
+        let _ = drain(&mut ca).await;
+
+        b.handle_single_query(&format!("SELECT pg_try_advisory_lock({key})"))
+            .await
+            .expect("try");
+        assert_eq!(
+            first_data_row_text(&drain(&mut cb).await).as_deref(),
+            Some("t"),
+            "*** an extended-protocol {finish} did not release the transaction-level advisory lock ***"
+        );
+    }
+}
+
+/// A WIRE session must never be told advisory locks "require a client session"
+/// — that refusal (0A000, `advisory_lock::UNSCOPED_ADVISORY_MARKER`) belongs to
+/// the session-LESS paths (REST/BaaS, MCP, the REPL, embedded `db.query()`).
+/// A regression that dropped the wire session's ownership would surface here.
+#[tokio::test]
+async fn gh26_a_wire_connection_is_never_refused_the_session_scope_family() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut handler, mut client) = test_handler(db);
+
+    for sql in [
+        "SELECT pg_advisory_lock(91100050)",
+        "SELECT pg_try_advisory_lock(91100051)",
+        "SELECT pg_advisory_unlock(91100050)",
+        "SELECT pg_advisory_unlock_all()",
+    ] {
+        handler.handle_single_query(sql).await.expect("must not fail");
+        let out = drain(&mut client).await;
+        assert!(
+            sqlstates(&out).is_empty(),
+            "*** a wire connection was refused `{sql}` *** — got {:?}",
+            sqlstates(&out)
+        );
+    }
+}
+
+// ---- GH#27 ----
+// ===========================================================================
+// GH #27 — a dangling FOREIGN KEY target must be 42P01 / 42703 ON THE WIRE.
+//
+// APPEND to src/protocol/postgres/wire_tests.rs. Functions only — `test_handler`,
+// `wire_query`, `wire_setup`, `assert_wire_sqlstate`, `sqlstates`,
+// `command_tags`, `drain`, `data_rows`, `first_data_row_text` and
+// `parse_messages` already exist there.
+//
+// The embedded repro (tests/gh_issue_27.rs) pins the engine's REJECTION and its
+// WORDING. This block pins the thing only the wire can prove: the SQLSTATE a
+// driver actually receives. Prisma, Drizzle, Alembic and psycopg all branch on
+// the five-character code, not on the message; a correct rejection reported as
+// `XX000 internal_error` is still a migration failure a tool cannot classify,
+// and poolers/HA proxies read XX000 as a server fault.
+//
+// The mapping under audit is `sqlstate_for_query_execution_message`
+// (src/protocol/postgres/handler.rs:3745): `column "` + "does not exist" →
+// 42703 (checked BEFORE the table arms), and "relation"/"table" + "does not
+// exist" → 42P01.
+// ===========================================================================
+
+/// Positive control for this block: a LEGAL foreign key still succeeds over the
+/// wire, with a `CREATE TABLE` command tag and no ErrorResponse — so the
+/// rejections below cannot be an over-rejecting engine. Passes before AND after.
+#[tokio::test]
+async fn gh27_wire_positive_control_a_legal_foreign_key_still_works() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut handler, mut client) = test_handler(db);
+
+    wire_setup(
+        &mut handler,
+        &mut client,
+        "CREATE TABLE w27_parent (id INT PRIMARY KEY, name TEXT)",
+    )
+    .await;
+    let out = wire_query(
+        &mut handler,
+        &mut client,
+        "CREATE TABLE w27_child (id INT PRIMARY KEY, p INT REFERENCES w27_parent(id))",
+    )
+    .await;
+    assert!(
+        sqlstates(&out).is_empty(),
+        "*** a LEGAL foreign key was rejected over the wire *** — got {:?}",
+        sqlstates(&out)
+    );
+    assert_eq!(
+        command_tags(&out),
+        vec!["CREATE TABLE".to_string()],
+        "a successful CREATE TABLE must be acked"
+    );
+
+    wire_setup(&mut handler, &mut client, "INSERT INTO w27_parent VALUES (1, 'a')").await;
+    wire_setup(&mut handler, &mut client, "INSERT INTO w27_child VALUES (1, 1)").await;
+
+    // ... and the constraint is enforced (23503-class rejection, whatever the
+    // engine's violation code is — the point is that it is NOT accepted).
+    let out = wire_query(&mut handler, &mut client, "INSERT INTO w27_child VALUES (2, 99)").await;
+    assert!(
+        !sqlstates(&out).is_empty(),
+        "*** the accepted foreign key is enforced by nothing ***"
+    );
+}
+
+/// The issue's literal reproducer, over the wire: `42P01`, no command tag, and
+/// the relation really is not there afterwards.
+///
+/// FAILS on the unfixed tree at the FIRST assertion — the CREATE TABLE was
+/// acked (`CREATE TABLE`, no ErrorResponse) and the constraint was persisted
+/// against a relation that does not exist.
+#[tokio::test]
+async fn gh27_create_table_with_a_dangling_reference_is_42p01_on_the_wire() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut handler, mut client) = test_handler(db);
+
+    assert_wire_sqlstate(
+        &mut handler,
+        &mut client,
+        "CREATE TABLE w27_a (id INT PRIMARY KEY, parent_id INT REFERENCES parent(id))",
+        "42P01",
+    )
+    .await;
+
+    // The statement was atomic: no half-created relation survived it, so the
+    // corrected migration can be re-run.
+    assert_wire_sqlstate(&mut handler, &mut client, "SELECT * FROM w27_a", "42P01").await;
+    wire_setup(&mut handler, &mut client, "CREATE TABLE parent (id INT PRIMARY KEY)").await;
+    wire_setup(
+        &mut handler,
+        &mut client,
+        "CREATE TABLE w27_a (id INT PRIMARY KEY, parent_id INT REFERENCES parent(id))",
+    )
+    .await;
+}
+
+/// The TABLE-LEVEL spelling of the same clause — the one migration tools emit —
+/// must map to the same code. (Inline and table-level `REFERENCES` reach the
+/// validator through different planner branches; "fixed in one spelling only"
+/// is the v4.31.0 UNIQUE defect class.)
+#[tokio::test]
+async fn gh27_table_level_foreign_key_to_a_missing_table_is_42p01_on_the_wire() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut handler, mut client) = test_handler(db);
+
+    assert_wire_sqlstate(
+        &mut handler,
+        &mut client,
+        "CREATE TABLE w27_b (id INT PRIMARY KEY, p INT, FOREIGN KEY (p) REFERENCES w27_nope(id))",
+        "42P01",
+    )
+    .await;
+
+    assert_wire_sqlstate(
+        &mut handler,
+        &mut client,
+        "CREATE TABLE w27_c (id INT PRIMARY KEY, p INT, \
+         CONSTRAINT w27_c_p_fkey FOREIGN KEY (p) REFERENCES w27_nope(id))",
+        "42P01",
+    )
+    .await;
+
+    // `REFERENCES parent` with no column list is the same rejection.
+    assert_wire_sqlstate(
+        &mut handler,
+        &mut client,
+        "CREATE TABLE w27_d (id INT PRIMARY KEY, p INT REFERENCES w27_nope)",
+        "42P01",
+    )
+    .await;
+}
+
+/// A missing referenced COLUMN is `42703 undefined_column`, NOT 42P01 — the
+/// column arms of the classifier must stay ahead of the table arms.
+#[tokio::test]
+async fn gh27_foreign_key_to_a_missing_column_is_42703_on_the_wire() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut handler, mut client) = test_handler(db);
+
+    wire_setup(
+        &mut handler,
+        &mut client,
+        "CREATE TABLE w27_p (id INT PRIMARY KEY, name TEXT)",
+    )
+    .await;
+
+    assert_wire_sqlstate(
+        &mut handler,
+        &mut client,
+        "CREATE TABLE w27_e (id INT PRIMARY KEY, p INT REFERENCES w27_p(nocol))",
+        "42703",
+    )
+    .await;
+    assert_wire_sqlstate(
+        &mut handler,
+        &mut client,
+        "CREATE TABLE w27_f (id INT PRIMARY KEY, p INT, FOREIGN KEY (p) REFERENCES w27_p(nocol))",
+        "42703",
+    )
+    .await;
+}
+
+/// `ALTER TABLE … ADD FOREIGN KEY` reports the same two codes over the wire.
+#[tokio::test]
+async fn gh27_alter_table_add_foreign_key_reports_42p01_and_42703_on_the_wire() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut handler, mut client) = test_handler(db);
+
+    wire_setup(
+        &mut handler,
+        &mut client,
+        "CREATE TABLE w27_ch (id INT PRIMARY KEY, p INT)",
+    )
+    .await;
+    wire_setup(
+        &mut handler,
+        &mut client,
+        "CREATE TABLE w27_par (id INT PRIMARY KEY, name TEXT)",
+    )
+    .await;
+
+    assert_wire_sqlstate(
+        &mut handler,
+        &mut client,
+        "ALTER TABLE w27_ch ADD CONSTRAINT w27_ch_fkey FOREIGN KEY (p) REFERENCES w27_missing(id)",
+        "42P01",
+    )
+    .await;
+    assert_wire_sqlstate(
+        &mut handler,
+        &mut client,
+        "ALTER TABLE w27_ch ADD CONSTRAINT w27_ch_fkey2 FOREIGN KEY (p) REFERENCES w27_par(nocol)",
+        "42703",
+    )
+    .await;
+    // A missing CHILD is 42P01 too.
+    assert_wire_sqlstate(
+        &mut handler,
+        &mut client,
+        "ALTER TABLE w27_no_child ADD FOREIGN KEY (p) REFERENCES w27_par(id)",
+        "42P01",
+    )
+    .await;
+
+    // Over-rejection guard: the legal ALTER still succeeds over the wire.
+    let out = wire_query(
+        &mut handler,
+        &mut client,
+        "ALTER TABLE w27_ch ADD CONSTRAINT w27_ch_ok FOREIGN KEY (p) REFERENCES w27_par(id)",
+    )
+    .await;
+    assert!(
+        sqlstates(&out).is_empty(),
+        "*** a LEGAL ALTER … ADD FOREIGN KEY was rejected over the wire *** — got {:?}",
+        sqlstates(&out)
+    );
+}
+
+/// A self-referencing foreign key must still be accepted over the wire — the
+/// table is not in the catalog yet when its own constraint is validated, so
+/// this is the case an over-eager DDL-time check breaks first.
+#[tokio::test]
+async fn gh27_a_self_referencing_foreign_key_still_succeeds_on_the_wire() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut handler, mut client) = test_handler(db);
+
+    let out = wire_query(
+        &mut handler,
+        &mut client,
+        "CREATE TABLE w27_tree (id INT PRIMARY KEY, parent INT REFERENCES w27_tree(id))",
+    )
+    .await;
+    assert!(
+        sqlstates(&out).is_empty(),
+        "*** a self-referencing foreign key was rejected over the wire *** — got {:?}",
+        sqlstates(&out)
+    );
+
+    wire_setup(&mut handler, &mut client, "INSERT INTO w27_tree VALUES (1, NULL)").await;
+    wire_setup(&mut handler, &mut client, "INSERT INTO w27_tree VALUES (2, 1)").await;
+    let out = wire_query(&mut handler, &mut client, "INSERT INTO w27_tree VALUES (3, 99)").await;
+    assert!(
+        !sqlstates(&out).is_empty(),
+        "the self-referencing FK must actually be enforced"
+    );
+}
+
+/// ADJACENT GAP, not issue #27 — deliberately `#[ignore]`d, EXPECTED TO FAIL.
+///
+/// Justification for the `#[ignore]` (repo gate 1 requires one in writing):
+/// this pins a defect the engine ALREADY documents as unimplemented, so it is
+/// a specification, not a regression guard. `execute_plan_with_params_inner`
+/// (src/lib.rs:14961-16383) has no `CreateTable` arm; the plan falls to the
+/// catch-all at src/lib.rs:16384 → `Executor::plan_to_operator`'s default arm
+/// (src/sql/executor/mod.rs:4952). The engine records this itself at
+/// src/lib.rs:5072-5079: "The EXTENDED/parameterized route has NO CreateTable
+/// handler today (executor default arm errors on every CREATE)". So a
+/// `CREATE TABLE` sent by ANY driver that binds server-side (node-pg/Prisma,
+/// psycopg3, JDBC, sqlx, Npgsql) is answered `XX000 internal_error`:
+/// "Operator not yet implemented: CreateTable { … }".
+///
+/// It is NOT #27's silent-acceptance bug — nothing is accepted — but it means
+/// the 42P01 this issue asks for is unreachable on the reporter's own client.
+/// Un-ignore this when extended-protocol CREATE TABLE is implemented; it must
+/// then route through `validate_create_table_fk_targets` exactly as the text
+/// family does.
+#[tokio::test]
+#[ignore = "adjacent gap: extended-protocol CREATE TABLE is unimplemented (XX000), see src/lib.rs:5072"]
+async fn gh27_adjacent_gap_extended_protocol_create_table_should_report_42p01() {
+    // NOTE (adversarial review): this MUST drive Parse/Bind/Execute/Sync through
+    // `dispatch_message`, not through `handle_*_extended` directly.
+    // `handle_execute_extended` PROPAGATES its error; it is `dispatch_message`
+    // (src/protocol/postgres/handler.rs:557-566) that turns the error into an
+    // ErrorResponse on the socket, and it also sets `awaiting_sync_after_error`,
+    // which makes every later extended message a no-op until Sync. The original
+    // form of this test called the handlers directly and swallowed the Result,
+    // so it would have found NO 'E' message even after the feature lands, and
+    // its second half would have been silently discarded. Pattern copied from
+    // `wire_extended_protocol_dml_error_sqlstates` (wire_tests.rs:3055).
+    use super::messages::FrontendMessage;
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut handler, mut client) = test_handler(db);
+
+    handler
+        .dispatch_message(FrontendMessage::Parse {
+            statement_name: "gh27_ct".into(),
+            query: "CREATE TABLE w27_x (id INT PRIMARY KEY, p INT REFERENCES w27_x_missing(id))".into(),
+            param_types: vec![],
+        })
+        .await
+        .expect("parse dispatch");
+    handler
+        .dispatch_message(FrontendMessage::Bind {
+            portal_name: "gh27_pct".into(),
+            statement_name: "gh27_ct".into(),
+            param_formats: vec![],
+            params: vec![],
+            result_formats: vec![],
+        })
+        .await
+        .expect("bind dispatch");
+    let _ = drain(&mut client).await;
+
+    handler
+        .dispatch_message(FrontendMessage::Execute {
+            portal_name: "gh27_pct".into(),
+            max_rows: 0,
+        })
+        .await
+        .expect("execute dispatch");
+    let out = drain(&mut client).await;
+    assert_eq!(
+        sqlstates(&out),
+        vec!["42P01".to_string()],
+        "extended-protocol CREATE TABLE with a dangling FK must report 42P01 (today it is \
+         XX000 `Operator not yet implemented: CreateTable`), got {:?}",
+        sqlstates(&out)
+    );
+    assert!(
+        command_tags(&out).is_empty(),
+        "a rejected CREATE TABLE must not also be acked, got {:?}",
+        command_tags(&out)
+    );
+    // Extended-protocol errors defer ReadyForQuery until Sync, and every
+    // message before that Sync is discarded — so the second half below is
+    // unreachable without it.
+    handler.dispatch_message(FrontendMessage::Sync).await.expect("sync");
+    let _ = drain(&mut client).await;
+
+    // And the LEGAL extended-protocol CREATE TABLE must work at all.
+    handler
+        .dispatch_message(FrontendMessage::Parse {
+            statement_name: "gh27_ct2".into(),
+            query: "CREATE TABLE w27_y (id INT PRIMARY KEY)".into(),
+            param_types: vec![],
+        })
+        .await
+        .expect("parse dispatch 2");
+    handler
+        .dispatch_message(FrontendMessage::Bind {
+            portal_name: "gh27_pct2".into(),
+            statement_name: "gh27_ct2".into(),
+            param_formats: vec![],
+            params: vec![],
+            result_formats: vec![],
+        })
+        .await
+        .expect("bind dispatch 2");
+    let _ = drain(&mut client).await;
+    handler
+        .dispatch_message(FrontendMessage::Execute {
+            portal_name: "gh27_pct2".into(),
+            max_rows: 0,
+        })
+        .await
+        .expect("execute dispatch 2");
+    let out = drain(&mut client).await;
+    assert!(
+        sqlstates(&out).is_empty(),
+        "*** extended-protocol CREATE TABLE is unimplemented *** — got {:?}",
+        sqlstates(&out)
+    );
+    assert_eq!(
+        command_tags(&out),
+        vec!["CREATE TABLE".to_string()],
+        "the legal extended CREATE TABLE must be acked"
+    );
+    handler.dispatch_message(FrontendMessage::Sync).await.expect("sync 2");
+}
+
+// ---- GH#29 ----
+// ===========================================================================
+// GH#29 — the four items the issue reports as PROTOCOL-visible, driven through
+// the real PostgreSQL handler.
+//
+// APPEND to src/protocol/postgres/wire_tests.rs. Uses only helpers that file
+// already defines: test_handler, wire_query, wire_setup, sqlstates, data_rows,
+// first_data_row_text, row_description_names, command_tags, wire_extended,
+// assert_extended_ok, drain.
+//
+// Why wire tests and not only embedded ones: item 2 is reported as failing on
+// the SIMPLE protocol and working on the extended one, and item 4 is a query
+// the simple-query path used to answer from a substring router
+// (`Catalog::handle_query`, src/protocol/postgres/catalog.rs:34) BEFORE the
+// planner ever saw it. Neither claim can be settled from the embedded API.
+//
+// Item 1 already has wire coverage in this file
+// (`simple_protocol_insert_returning_still_honours_rollback`,
+// `extended_parameterized_insert_returning_honours_rollback`) and is not
+// duplicated here.
+// ===========================================================================
+
+/// Read one text value out of the single-column, single-row reply of `sql`,
+/// asserting the statement did not error.
+fn wire_scalar<'a>(
+    handler: &'a mut PgConnectionHandler<DuplexStream>,
+    client: &'a mut DuplexStream,
+    sql: &'a str,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = String> + 'a>> {
+    Box::pin(async move {
+        let out = wire_query(handler, client, sql).await;
+        assert!(
+            sqlstates(&out).is_empty(),
+            "`{sql}` must not error over the simple-query protocol, got {:?}",
+            sqlstates(&out)
+        );
+        first_data_row_text(&out).unwrap_or_else(|| panic!("`{sql}` returned no DataRow"))
+    })
+}
+
+/// GH#29 item 2 — `SELECT "t1"."id" FROM "public"."t" AS "t1"` was reported to
+/// fail with `Column 't1.id' not found` over psql (simple protocol) while
+/// working over the extended protocol.
+///
+/// The alias survives planning (`Planner::table_factor_to_plan`,
+/// src/sql/planner.rs:3024) and is stamped onto every scanned column's
+/// `source_table` (`scan::handle_scan`, src/sql/executor/scan.rs:2251), which
+/// `Schema::get_qualified_column_index` (src/types.rs:662) matches. Nothing on
+/// that route is protocol-specific — so assert BOTH protocols here, in one
+/// test, against the same database.
+#[tokio::test]
+async fn wire_quoted_table_alias_resolves_on_both_protocols() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut h, mut c) = test_handler(db);
+    wire_setup(&mut h, &mut c, r#"CREATE TABLE "t" ("id" INT PRIMARY KEY, "v" TEXT)"#).await;
+    wire_setup(&mut h, &mut c, "INSERT INTO t VALUES (1, 'a')").await;
+    wire_setup(&mut h, &mut c, "INSERT INTO t VALUES (2, 'b')").await;
+
+    // --- simple protocol (psql) -----------------------------------------
+    let sql = r#"SELECT "t1"."id" FROM "public"."t" AS "t1" WHERE "t1"."id" = 2"#;
+    let out = wire_query(&mut h, &mut c, sql).await;
+    assert!(
+        sqlstates(&out).is_empty(),
+        "*** GH#29 item 2: a quoted table alias failed on the SIMPLE protocol, got {:?} ***",
+        sqlstates(&out)
+    );
+    assert_eq!(data_rows(&out).len(), 1, "one row matches on the simple protocol");
+    assert_eq!(first_data_row_text(&out).as_deref(), Some("2"));
+    assert_eq!(
+        row_description_names(&out),
+        vec!["id".to_string()],
+        "the field is named `id`, not `t1.id`"
+    );
+
+    // --- extended protocol (node-pg / Prisma) ---------------------------
+    let ext_sql = r#"SELECT "t1"."id" FROM "public"."t" AS "t1" WHERE "t1"."id" = $1"#;
+    let out = wire_extended(&mut h, &mut c, "alias1", ext_sql, vec![23], vec![Some(b"2".to_vec())]).await;
+    assert_extended_ok(&out, ext_sql);
+    assert_eq!(data_rows(&out).len(), 1, "one row matches on the extended protocol");
+    assert_eq!(first_data_row_text(&out).as_deref(), Some("2"));
+}
+
+/// GH#29 item 2, the shapes around it: alias without `AS`, unquoted alias,
+/// alias-qualified ORDER BY, and an alias-qualified self-join — all on the
+/// SIMPLE protocol, which is the one the issue reports as broken.
+#[tokio::test]
+async fn wire_simple_query_alias_spellings() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut h, mut c) = test_handler(db);
+    wire_setup(&mut h, &mut c, r#"CREATE TABLE "t" ("id" INT PRIMARY KEY, "v" TEXT)"#).await;
+    wire_setup(&mut h, &mut c, "INSERT INTO t VALUES (1, 'a')").await;
+    wire_setup(&mut h, &mut c, "INSERT INTO t VALUES (2, 'b')").await;
+
+    for sql in [
+        r#"SELECT "t1"."id" FROM "public"."t" AS "t1""#,
+        r#"SELECT t1.id FROM public.t AS t1"#,
+        r#"SELECT t1.id FROM t t1"#,
+        r#"SELECT "t1"."id" FROM "public"."t" AS "t1" ORDER BY "t1"."id""#,
+    ] {
+        let out = wire_query(&mut h, &mut c, sql).await;
+        assert!(
+            sqlstates(&out).is_empty(),
+            "`{sql}` must resolve on the simple protocol, got {:?}",
+            sqlstates(&out)
+        );
+        assert_eq!(data_rows(&out).len(), 2, "`{sql}` must return both rows");
+    }
+
+    let join = r#"SELECT "a"."id" FROM "public"."t" AS "a" JOIN "public"."t" AS "b" ON "a"."id" = "b"."id""#;
+    let out = wire_query(&mut h, &mut c, join).await;
+    assert!(
+        sqlstates(&out).is_empty(),
+        "an alias-qualified self-join must resolve on the simple protocol, got {:?}",
+        sqlstates(&out)
+    );
+    assert_eq!(data_rows(&out).len(), 2);
+
+    // Teeth: an unknown column behind a valid alias must still be an error, so
+    // the assertions above are not "every qualified name resolves to something".
+    let bad = r#"SELECT "t1"."nope" FROM "public"."t" AS "t1""#;
+    let out = wire_query(&mut h, &mut c, bad).await;
+    assert!(
+        !sqlstates(&out).is_empty(),
+        "an unknown column must still raise an ErrorResponse"
+    );
+}
+
+/// GH#29 item 4 — `SELECT count(*) FROM information_schema.columns WHERE
+/// table_name = 'Account'` returned 0 while the unfiltered query listed the
+/// columns.
+///
+/// This is the simple-query path's most dangerous historical shape: the wire's
+/// substring router used to answer catalog queries itself, with no ability to
+/// filter or project. It now DEFERS every `information_schema.columns` query to
+/// the planner (`return Ok(None)`, src/protocol/postgres/catalog.rs:168), and
+/// the COUNT(*) storage fast path declines for registry-backed views
+/// (`is_registry_backed_system_view`, src/sql/executor/mod.rs:3880) instead of
+/// answering 0 from a row counter that has never heard of the view.
+///
+/// The table name is the mixed-case, quoted `"Account"` Prisma creates — a
+/// lower-case stand-in would not reproduce the reported shape.
+#[tokio::test]
+async fn wire_simple_query_information_schema_columns_count_with_where_filter() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut h, mut c) = test_handler(db);
+    wire_setup(
+        &mut h,
+        &mut c,
+        r#"CREATE TABLE "Account" ("id" INT PRIMARY KEY, "email" TEXT NOT NULL, "createdAt" TIMESTAMP)"#,
+    )
+    .await;
+
+    // The unfiltered listing (the half the issue says works).
+    let out = wire_query(
+        &mut h,
+        &mut c,
+        "SELECT table_name, column_name FROM information_schema.columns",
+    )
+    .await;
+    assert!(sqlstates(&out).is_empty(), "unfiltered listing must not error");
+    // Compare as UTF-8 text rather than as raw bytes: `b"Account".as_ref()`
+    // leaves the `AsRef` target for rustc to infer through the `==`, which is
+    // needlessly fragile in a file this size.
+    let account_rows = data_rows(&out)
+        .into_iter()
+        .filter(|r| {
+            r.first()
+                .and_then(|v| v.as_deref())
+                .map(|b| String::from_utf8_lossy(b).to_string())
+                .as_deref()
+                == Some("Account")
+        })
+        .count();
+    assert_eq!(account_rows, 3, "the UNFILTERED view must list Account's 3 columns");
+
+    // The filtered count (the half the issue says returns 0).
+    let got = wire_scalar(
+        &mut h,
+        &mut c,
+        "SELECT count(*) FROM information_schema.columns WHERE table_name = 'Account'",
+    )
+    .await;
+    assert_eq!(
+        got, "3",
+        "*** GH#29 item 4: a filtered information_schema.columns count returned {got} \
+         while the unfiltered query listed 3 columns ***"
+    );
+
+    // The filtered row listing must agree with the count.
+    let out = wire_query(
+        &mut h,
+        &mut c,
+        "SELECT column_name FROM information_schema.columns WHERE table_name = 'Account' \
+         ORDER BY ordinal_position",
+    )
+    .await;
+    assert!(sqlstates(&out).is_empty(), "filtered listing must not error");
+    let names: Vec<String> = data_rows(&out)
+        .into_iter()
+        .map(|r| {
+            r.into_iter()
+                .next()
+                .flatten()
+                .map(|b| String::from_utf8_lossy(&b).to_string())
+                .unwrap_or_default()
+        })
+        .collect();
+    assert_eq!(
+        names,
+        vec!["id".to_string(), "email".to_string(), "createdAt".to_string()],
+        "filtered information_schema.columns must list Account's columns in order"
+    );
+
+    // Negative control: a filter that matches nothing must return 0, so "3"
+    // above is a real filter result and not the unfiltered view leaking through.
+    let none = wire_scalar(
+        &mut h,
+        &mut c,
+        "SELECT count(*) FROM information_schema.columns WHERE table_name = 'NoSuchTable'",
+    )
+    .await;
+    assert_eq!(none, "0", "a filter matching nothing must count 0");
+}
+
+/// GH#29 item 3 — `CREATE TABLE c (v CHAR(32))` was rejected with
+/// "Data type not yet supported: Char(Some(IntegerLength { length: 32 }))".
+/// `Planner::sql_data_type_to_data_type` handles Char/Character since the
+/// Pagila work (src/sql/planner.rs:5993). Asserted over the wire because the
+/// type must also survive RowDescription (bpchar, OID 1042) and introspection.
+#[tokio::test]
+async fn wire_simple_query_char_n_ddl_and_readback() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut h, mut c) = test_handler(db);
+
+    let out = wire_query(&mut h, &mut c, "CREATE TABLE ch (id INT PRIMARY KEY, v CHAR(32))").await;
+    assert!(
+        sqlstates(&out).is_empty(),
+        "*** GH#29 item 3: CHAR(32) rejected in DDL over the wire, got {:?} ***",
+        sqlstates(&out)
+    );
+    wire_setup(&mut h, &mut c, "CREATE TABLE ch2 (id INT PRIMARY KEY, v CHARACTER(20))").await;
+    wire_setup(&mut h, &mut c, "INSERT INTO ch VALUES (1, 'abc')").await;
+
+    let got = wire_scalar(&mut h, &mut c, "SELECT v FROM ch WHERE id = 1").await;
+    assert_eq!(
+        got.trim_end(),
+        "abc",
+        "the CHAR(32) value must round-trip over the wire (blank padding tolerated)"
+    );
+
+    let udt = wire_scalar(
+        &mut h,
+        &mut c,
+        "SELECT udt_name FROM information_schema.columns WHERE table_name = 'ch' AND column_name = 'v'",
+    )
+    .await;
+    assert!(
+        udt.to_lowercase().contains("char"),
+        "CHAR(32) must introspect as a character type, got {udt:?}"
+    );
+}
+
+/// GH#29 item 5 — `SELECT payload #>> '{b,c}' FROM j` failed with
+/// "Binary operator not yet supported: HashLongArrow". Mapped at
+/// src/sql/planner.rs:5009, evaluated at src/sql/evaluator.rs:5232.
+///
+/// The full operator set is asserted here on the simple protocol, including
+/// `?|` / `?&` (which survive the `?`→`$N` SQLite-compat rewrite by an explicit
+/// exemption at src/sql/sqlite_compat.rs:183) and the bare `?` that does NOT.
+#[tokio::test]
+async fn wire_simple_query_json_operators() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut h, mut c) = test_handler(db);
+    wire_setup(&mut h, &mut c, "CREATE TABLE j (id INT PRIMARY KEY, payload JSONB)").await;
+    wire_setup(
+        &mut h,
+        &mut c,
+        r#"INSERT INTO j VALUES (1, '{"a":1,"b":{"c":"deep"},"arr":["x","y"]}')"#,
+    )
+    .await;
+
+    let got = wire_scalar(&mut h, &mut c, "SELECT payload #>> '{b,c}' FROM j WHERE id = 1").await;
+    assert_eq!(
+        got, "deep",
+        "*** GH#29 item 5: `#>>` must extract a path as bare text over the wire ***"
+    );
+
+    let got = wire_scalar(&mut h, &mut c, "SELECT payload #> '{b,c}' FROM j WHERE id = 1").await;
+    assert_eq!(got, "\"deep\"", "`#>` keeps JSON typing, so the string stays quoted");
+
+    for pred in [
+        "payload -> 'a' IS NOT NULL",
+        "payload ->> 'a' = '1'",
+        "payload #> '{b,c}' IS NOT NULL",
+        "payload #>> '{b,c}' = 'deep'",
+        r#"payload @> '{"a":1}'"#,
+        "payload ?| ARRAY['a','nope']",
+        "payload ?& ARRAY['a','b']",
+    ] {
+        let sql = format!("SELECT id FROM j WHERE {pred}");
+        let out = wire_query(&mut h, &mut c, &sql).await;
+        assert!(
+            sqlstates(&out).is_empty(),
+            "`{pred}` must be supported over the wire, got {:?}",
+            sqlstates(&out)
+        );
+        assert_eq!(data_rows(&out).len(), 1, "`{pred}` must match row 1");
+    }
+
+    // Negative control for the matrix above.
+    let out = wire_query(&mut h, &mut c, "SELECT id FROM j WHERE payload ?& ARRAY['a','missing']").await;
+    assert!(sqlstates(&out).is_empty(), "`?&` must not error");
+    assert_eq!(data_rows(&out).len(), 0, "`?&` must require ALL keys");
+
+    // PINNED LIMITATION: the bare `?` key-existence operator is rewritten into
+    // a positional placeholder before the parser sees it
+    // (src/sql/sqlite_compat.rs:182), so it cannot work. If this assertion ever
+    // fails, `?` became reachable — update docs/llms.txt in the same change.
+    let out = wire_query(&mut h, &mut c, "SELECT id FROM j WHERE payload ? 'a'").await;
+    assert!(
+        !sqlstates(&out).is_empty(),
+        "a bare `?` is consumed as a placeholder; the supported spelling is `?| ARRAY['a']`"
+    );
+}
+
+/// GH#29 item 4, EXTENDED protocol — the half `wire_simple_query_…` above does
+/// not reach, and the one Prisma/node-pg actually send.
+///
+/// This is not redundant with the embedded params-family assertions in
+/// `tests/gh_issue_29.rs`: the wire's catalog interceptor runs on the extended
+/// path too (`maybe_catalog` → `Catalog::handle_query` on the
+/// parameter-substituted text, src/protocol/postgres/handler_extended.rs:310-327)
+/// BEFORE `query_params_for_session` is ever called. Only a wire test can prove
+/// that interceptor defers instead of answering with an unfiltered fixed shape.
+#[tokio::test]
+async fn wire_extended_information_schema_columns_count_with_where_filter() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut h, mut c) = test_handler(db);
+    wire_setup(
+        &mut h,
+        &mut c,
+        r#"CREATE TABLE "Account" ("id" INT PRIMARY KEY, "email" TEXT NOT NULL, "createdAt" TIMESTAMP)"#,
+    )
+    .await;
+
+    // Bound parameter, exactly as an ORM introspection round sends it.
+    let sql = "SELECT count(*) FROM information_schema.columns WHERE table_name = $1";
+    let out = wire_extended(
+        &mut h,
+        &mut c,
+        "isc_cnt",
+        sql,
+        vec![25], // TEXT
+        vec![Some(b"Account".to_vec())],
+    )
+    .await;
+    assert_extended_ok(&out, sql);
+    assert_eq!(
+        first_data_row_text(&out).as_deref(),
+        Some("3"),
+        "*** GH#29 item 4 on the EXTENDED protocol: the filtered count must be 3 ***"
+    );
+
+    // Negative control: the same shape with a name that matches nothing.
+    let out = wire_extended(
+        &mut h,
+        &mut c,
+        "isc_cnt0",
+        sql,
+        vec![25],
+        vec![Some(b"NoSuchTable".to_vec())],
+    )
+    .await;
+    assert_extended_ok(&out, sql);
+    assert_eq!(
+        first_data_row_text(&out).as_deref(),
+        Some("0"),
+        "a bound filter matching nothing must count 0, not the whole view"
+    );
+
+    // And the row listing, so "3" is not a count computed over a wider set.
+    let list = "SELECT column_name FROM information_schema.columns WHERE table_name = $1 ORDER BY ordinal_position";
+    let out = wire_extended(
+        &mut h,
+        &mut c,
+        "isc_list",
+        list,
+        vec![25],
+        vec![Some(b"Account".to_vec())],
+    )
+    .await;
+    assert_extended_ok(&out, list);
+    let names: Vec<String> = data_rows(&out)
+        .into_iter()
+        .map(|r| {
+            r.into_iter()
+                .next()
+                .flatten()
+                .map(|b| String::from_utf8_lossy(&b).to_string())
+                .unwrap_or_default()
+        })
+        .collect();
+    assert_eq!(
+        names,
+        vec!["id".to_string(), "email".to_string(), "createdAt".to_string()],
+        "the extended-protocol filtered listing must match the count"
+    );
+}
+
+/// GH#29 item 5, EXTENDED protocol — `#>>` with a BOUND left-hand row and a
+/// bound path, the shape an ORM sends. The simple-query test above cannot
+/// exercise the parameter binding that `json_path_get_op` has a dedicated
+/// branch for (`Value::Array` / bound `text[]` vs the `'{a,b}'` text form,
+/// src/sql/evaluator.rs:5245-5259).
+#[tokio::test]
+async fn wire_extended_json_path_operator_with_bound_parameter() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut h, mut c) = test_handler(db);
+    wire_setup(&mut h, &mut c, "CREATE TABLE j (id INT PRIMARY KEY, payload JSONB)").await;
+    wire_setup(
+        &mut h,
+        &mut c,
+        r#"INSERT INTO j VALUES (1, '{"a":1,"b":{"c":"deep"}}')"#,
+    )
+    .await;
+
+    let sql = "SELECT payload #>> '{b,c}' FROM j WHERE id = $1";
+    let out = wire_extended(&mut h, &mut c, "jp1", sql, vec![23], vec![Some(b"1".to_vec())]).await;
+    assert_extended_ok(&out, sql);
+    assert_eq!(
+        first_data_row_text(&out).as_deref(),
+        Some("deep"),
+        "*** GH#29 item 5 on the EXTENDED protocol: `#>>` must extract bare text ***"
+    );
+
+    // Negative control: a path that does not exist must yield NULL, not "deep".
+    let miss = "SELECT payload #>> '{b,nope}' FROM j WHERE id = $1";
+    let out = wire_extended(&mut h, &mut c, "jp2", miss, vec![23], vec![Some(b"1".to_vec())]).await;
+    assert_extended_ok(&out, miss);
+    assert_eq!(data_rows(&out).len(), 1, "one row is still returned for a missing path");
+    assert!(
+        data_rows(&out)[0][0].is_none(),
+        "a missing JSON path must render as NULL over the wire"
+    );
+}
+
+// ---- GH#30 ----
+// ---------------------------------------------------------------------------
+// GH #30 — a parameterized `INSERT … RETURNING` sent over the EXTENDED protocol
+// inside `BEGIN … ROLLBACK` must not be persisted.
+//
+// APPEND THESE TO `src/protocol/postgres/wire_tests.rs`.
+//
+// Why the wire, and not `tests/gh_issue_30.rs`: the engine-level contract is
+// pinned by `tests/prisma_p0_extended_returning_txn.rs` and by
+// `tests/gh_issue_30.rs`. Neither can see the ROUTING decision — that
+// `handle_execute_extended`'s `is_dml_returning` arm calls
+// `execute_params_returning_for_session(self.session_id, …)`
+// (`src/protocol/postgres/handler_extended.rs:414`) rather than the
+// session-less `execute_params_returning`, which resolves its transaction from
+// the GLOBAL `current_transaction` slot a wire session never uses. Reverting
+// that ONE call site reintroduces the exact bug the issue reports while every
+// embedded test still passes. These tests are the only ones that fail.
+//
+// Expected outcome on the tree as of `e6ed61f` (v4.31.1): all PASS.
+// ---------------------------------------------------------------------------
+
+/// Parse + Bind + Execute one extended-protocol statement and return the bytes
+/// Execute produced (Parse/Bind acknowledgements are drained and discarded).
+///
+/// Boxed for the same reason `wire_query` is: `dispatch_message`'s future is
+/// ~65 KB and an `async fn` inlines it into its caller, overflowing the test
+/// thread's stack once a test issues several statements.
+fn wire_extended_dispatch<'a>(
+    handler: &'a mut PgConnectionHandler<DuplexStream>,
+    client: &'a mut DuplexStream,
+    tag: &'a str,
+    sql: &'a str,
+    param_types: Vec<i32>,
+    params: Vec<Option<Vec<u8>>>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<u8>> + 'a>> {
+    use super::messages::FrontendMessage;
+    Box::pin(async move {
+        let stmt = format!("s_{tag}");
+        let portal = format!("p_{tag}");
+        handler
+            .dispatch_message(FrontendMessage::Parse {
+                statement_name: stmt.clone(),
+                query: sql.into(),
+                param_types,
+            })
+            .await
+            .unwrap_or_else(|e| panic!("parse `{sql}`: {e}"));
+        handler
+            .dispatch_message(FrontendMessage::Bind {
+                portal_name: portal.clone(),
+                statement_name: stmt,
+                param_formats: vec![0; params.len()],
+                params,
+                result_formats: vec![],
+            })
+            .await
+            .unwrap_or_else(|e| panic!("bind `{sql}`: {e}"));
+        let _ = drain(client).await;
+        handler
+            .dispatch_message(FrontendMessage::Execute {
+                portal_name: portal,
+                max_rows: 0,
+            })
+            .await
+            .unwrap_or_else(|e| panic!("execute `{sql}`: {e}"));
+        drain(client).await
+    })
+}
+
+/// The issue's UUID probe id.
+const GH30_ID: &str = "a1b2c3d4-0000-4000-8000-000000000001";
+
+/// The literal node-pg / Prisma sequence from GH #30:
+///
+/// ```text
+/// BEGIN                                                    (simple query)
+/// INSERT INTO rbprobe (id,v) VALUES ($1,$2) RETURNING id   (Parse/Bind/Execute)
+/// ROLLBACK                                                 (simple query)
+/// SELECT id FROM rbprobe                                   → must be empty
+/// ```
+///
+/// node-pg uses the simple protocol for `BEGIN`/`ROLLBACK` (no values bound) and
+/// the extended protocol for the parameterized write — which is precisely why
+/// only this shape leaked: `BEGIN` opened a SESSION transaction, and the
+/// extended DML-RETURNING arm used to resolve its transaction from the global
+/// slot instead.
+#[tokio::test]
+async fn wire_extended_params_returning_insert_rolls_back_with_the_session_transaction() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+
+    wire_setup(
+        &mut handler,
+        &mut client,
+        "CREATE TABLE rbprobe (id UUID PRIMARY KEY, v INTEGER)",
+    )
+    .await;
+
+    // POSITIVE CONTROL: an autocommit extended-protocol RETURNING insert IS
+    // persisted. Proves the harness drives the extended path at all — a test
+    // whose INSERT silently never ran would "pass" the rollback assertion.
+    let out = wire_extended_dispatch(
+        &mut handler,
+        &mut client,
+        "ctl",
+        "INSERT INTO rbprobe (id, v) VALUES ($1, $2) RETURNING id",
+        vec![2950, 23],
+        vec![
+            Some(b"a1b2c3d4-0000-4000-8000-00000000000f".to_vec()),
+            Some(b"9".to_vec()),
+        ],
+    )
+    .await;
+    assert!(
+        sqlstates(&out).is_empty(),
+        "control insert must succeed, got {:?}",
+        sqlstates(&out)
+    );
+    assert_eq!(data_rows(&out).len(), 1, "control: RETURNING must emit one DataRow");
+    let out = wire_query(&mut handler, &mut client, "SELECT id FROM rbprobe").await;
+    assert_eq!(
+        data_rows(&out).len(),
+        1,
+        "control: an autocommit extended RETURNING insert must persist"
+    );
+    wire_setup(&mut handler, &mut client, "DELETE FROM rbprobe").await;
+
+    // The reproducer.
+    wire_setup(&mut handler, &mut client, "BEGIN").await;
+    let out = wire_extended_dispatch(
+        &mut handler,
+        &mut client,
+        "gh30",
+        "INSERT INTO rbprobe (id, v) VALUES ($1, $2) RETURNING id",
+        vec![2950, 23],
+        vec![Some(GH30_ID.as_bytes().to_vec()), Some(b"1".to_vec())],
+    )
+    .await;
+    assert!(
+        sqlstates(&out).is_empty(),
+        "the in-transaction insert must succeed, got {:?}",
+        sqlstates(&out)
+    );
+    assert_eq!(
+        data_rows(&out).len(),
+        1,
+        "vacuity: RETURNING must have produced a row, else the rollback proves nothing"
+    );
+    assert!(
+        command_tags(&out).iter().any(|t| t == "INSERT 0 1"),
+        "expected `INSERT 0 1`, got {:?}",
+        command_tags(&out)
+    );
+
+    wire_setup(&mut handler, &mut client, "ROLLBACK").await;
+
+    let out = wire_query(&mut handler, &mut client, "SELECT id FROM rbprobe").await;
+    assert_eq!(
+        data_rows(&out).len(),
+        0,
+        "*** GH#30: a parameterized extended-protocol INSERT … RETURNING survived ROLLBACK ***"
+    );
+}
+
+/// The issue's second symptom: after the `ROLLBACK`, retrying the identical
+/// bound statement must succeed instead of raising 23505. A leaked write leaves
+/// the primary key occupied even when a later cleanup hid the row.
+#[tokio::test]
+async fn wire_extended_params_returning_retry_after_rollback_is_not_a_duplicate_key() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+
+    wire_setup(
+        &mut handler,
+        &mut client,
+        "CREATE TABLE rbprobe (id UUID PRIMARY KEY, v INTEGER)",
+    )
+    .await;
+
+    wire_setup(&mut handler, &mut client, "BEGIN").await;
+    let out = wire_extended_dispatch(
+        &mut handler,
+        &mut client,
+        "first",
+        "INSERT INTO rbprobe (id, v) VALUES ($1, $2) RETURNING id",
+        vec![2950, 23],
+        vec![Some(GH30_ID.as_bytes().to_vec()), Some(b"1".to_vec())],
+    )
+    .await;
+    assert_eq!(data_rows(&out).len(), 1, "vacuity: the first insert must have run");
+    wire_setup(&mut handler, &mut client, "ROLLBACK").await;
+    handler
+        .dispatch_message(super::messages::FrontendMessage::Sync)
+        .await
+        .expect("sync");
+    let _ = drain(&mut client).await;
+
+    let out = wire_extended_dispatch(
+        &mut handler,
+        &mut client,
+        "retry",
+        "INSERT INTO rbprobe (id, v) VALUES ($1, $2) RETURNING id",
+        vec![2950, 23],
+        vec![Some(GH30_ID.as_bytes().to_vec()), Some(b"1".to_vec())],
+    )
+    .await;
+    assert!(
+        sqlstates(&out).is_empty(),
+        "*** GH#30: retrying the rolled-back INSERT was rejected ({:?}) — the rolled-back \
+         row still occupies the primary key ***",
+        sqlstates(&out)
+    );
+    assert_eq!(data_rows(&out).len(), 1, "the retry must insert and return one row");
+}
+
+/// The COMMIT half over the wire: the same statement must PERSIST when the
+/// transaction commits, and must be invisible to the store until then. Guards
+/// the fix from becoming "make extended RETURNING a no-op".
+#[tokio::test]
+async fn wire_extended_params_returning_insert_commits_with_the_session_transaction() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(Arc::clone(&db));
+
+    wire_setup(
+        &mut handler,
+        &mut client,
+        "CREATE TABLE rbprobe (id UUID PRIMARY KEY, v INTEGER)",
+    )
+    .await;
+
+    wire_setup(&mut handler, &mut client, "BEGIN").await;
+    let out = wire_extended_dispatch(
+        &mut handler,
+        &mut client,
+        "commit",
+        "INSERT INTO rbprobe (id, v) VALUES ($1, $2) RETURNING id",
+        vec![2950, 23],
+        vec![Some(GH30_ID.as_bytes().to_vec()), Some(b"5".to_vec())],
+    )
+    .await;
+    assert_eq!(data_rows(&out).len(), 1, "vacuity: RETURNING must have produced a row");
+
+    // Before COMMIT, a session-less read of the same handle must not see it —
+    // if it does, the write went straight to storage (the GH#30 leak) and the
+    // ROLLBACK test above would only be passing because of a later cleanup.
+    let uncommitted = db.query("SELECT id FROM rbprobe", &[]).expect("session-less read");
+    assert!(
+        uncommitted.is_empty(),
+        "*** GH#30: the uncommitted extended RETURNING row was already in storage ***"
+    );
+
+    wire_setup(&mut handler, &mut client, "COMMIT").await;
+    let out = wire_query(&mut handler, &mut client, "SELECT id FROM rbprobe").await;
+    assert_eq!(
+        data_rows(&out).len(),
+        1,
+        "a COMMITTED extended-protocol RETURNING insert must persist"
+    );
+}
+
+/// The psycopg3 / JDBC / sqlx spelling: `BEGIN` itself is sent as
+/// Parse/Bind/Execute. It must open the SAME session transaction the DML arm
+/// later joins — otherwise a driver that pipelines everything through the
+/// extended protocol still leaks the write.
+#[tokio::test]
+async fn wire_extended_begin_then_params_returning_still_rolls_back() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+
+    wire_setup(
+        &mut handler,
+        &mut client,
+        "CREATE TABLE ints (id INT PRIMARY KEY, v INT)",
+    )
+    .await;
+
+    let out = wire_extended_dispatch(&mut handler, &mut client, "begin", "BEGIN", vec![], vec![]).await;
+    assert!(
+        sqlstates(&out).is_empty(),
+        "extended BEGIN must succeed, got {:?}",
+        sqlstates(&out)
+    );
+
+    let out = wire_extended_dispatch(
+        &mut handler,
+        &mut client,
+        "ins",
+        "INSERT INTO ints (id, v) VALUES ($1, $2) RETURNING id",
+        vec![23, 23],
+        vec![Some(b"1".to_vec()), Some(b"10".to_vec())],
+    )
+    .await;
+    assert_eq!(data_rows(&out).len(), 1, "vacuity: the insert must have run");
+
+    let out = wire_extended_dispatch(&mut handler, &mut client, "rb", "ROLLBACK", vec![], vec![]).await;
+    assert!(
+        sqlstates(&out).is_empty(),
+        "extended ROLLBACK must succeed, got {:?}",
+        sqlstates(&out)
+    );
+    handler
+        .dispatch_message(super::messages::FrontendMessage::Sync)
+        .await
+        .expect("sync");
+    let _ = drain(&mut client).await;
+
+    let out = wire_query(&mut handler, &mut client, "SELECT id FROM ints").await;
+    assert_eq!(
+        data_rows(&out).len(),
+        0,
+        "*** GH#30: an all-extended-protocol BEGIN/INSERT…RETURNING/ROLLBACK leaked the write ***"
+    );
+}
+
+/// `UPDATE … RETURNING` and `DELETE … RETURNING` take the same arm of
+/// `handle_execute_extended`; Prisma's `update`/`delete` send exactly these.
+#[tokio::test]
+async fn wire_extended_params_returning_update_and_delete_roll_back() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+
+    wire_setup(
+        &mut handler,
+        &mut client,
+        "CREATE TABLE ints (id INT PRIMARY KEY, v INT)",
+    )
+    .await;
+    wire_setup(&mut handler, &mut client, "INSERT INTO ints VALUES (1, 10), (2, 20)").await;
+
+    wire_setup(&mut handler, &mut client, "BEGIN").await;
+    let out = wire_extended_dispatch(
+        &mut handler,
+        &mut client,
+        "upd",
+        "UPDATE ints SET v = $1 WHERE id = $2 RETURNING v",
+        vec![23, 23],
+        vec![Some(b"99".to_vec()), Some(b"1".to_vec())],
+    )
+    .await;
+    assert_eq!(data_rows(&out).len(), 1, "vacuity: the UPDATE must have matched a row");
+    let out = wire_extended_dispatch(
+        &mut handler,
+        &mut client,
+        "del",
+        "DELETE FROM ints WHERE id = $1 RETURNING id",
+        vec![23],
+        vec![Some(b"2".to_vec())],
+    )
+    .await;
+    assert_eq!(data_rows(&out).len(), 1, "vacuity: the DELETE must have matched a row");
+    wire_setup(&mut handler, &mut client, "ROLLBACK").await;
+
+    let out = wire_query(&mut handler, &mut client, "SELECT id, v FROM ints ORDER BY id").await;
+    let rows = data_rows(&out);
+    assert_eq!(
+        rows.len(),
+        2,
+        "*** GH#30: a rolled-back extended DELETE … RETURNING still removed the row ***"
+    );
+    let first_v = rows[0][1].clone().map(|b| String::from_utf8_lossy(&b).to_string());
+    assert_eq!(
+        first_v.as_deref(),
+        Some("10"),
+        "*** GH#30: a rolled-back extended UPDATE … RETURNING still changed the row ***"
+    );
+}
+
+// ---- GH#27 (candidate 1) ----
+
+/// Prove a column is ABSENT via the catalog. `SELECT col FROM t` cannot: on an
+/// empty table it succeeds with zero rows (the projection is never evaluated —
+/// a separate lenient-resolution defect), so an SQLSTATE assertion on it is
+/// vacuous. Boxed for the same stack reason as `wire_query`.
+fn assert_wire_column_absent<'a>(
+    handler: &'a mut PgConnectionHandler<DuplexStream>,
+    client: &'a mut DuplexStream,
+    table: &'a str,
+    column: &'a str,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>> {
+    Box::pin(async move {
+        let sql = format!(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = '{table}' AND column_name = '{column}'"
+        );
+        let out = wire_query(handler, client, &sql).await;
+        assert!(
+            sqlstates(&out).is_empty(),
+            "catalog probe `{sql}` errored: {:?}",
+            sqlstates(&out)
+        );
+        assert!(
+            data_rows(&out).is_empty(),
+            "column `{column}` was left behind on `{table}` (catalog still lists it)"
+        );
+    })
+}
+
+// ===========================================================================
+// GH#27 (residual) — `ALTER TABLE … ADD COLUMN … REFERENCES` and the
+// list-less table-level `FOREIGN KEY (c) REFERENCES p`, over the wire.
+//
+// Through v4.31.1 the first was ACCEPTED with the constraint silently thrown
+// away (no 42P01 for a missing parent, no enforcement for a real one), and the
+// second was a hard 42601 parse error. Both are the same clause; both now
+// validate at DDL time and produce the same SQLSTATEs CREATE TABLE does.
+// ===========================================================================
+
+#[tokio::test]
+async fn wire_gh27_add_column_references_is_validated_atomically_and_enforced() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+
+    wire_setup(&mut handler, &mut client, "CREATE TABLE g27w_par (id INT PRIMARY KEY)").await;
+    wire_setup(&mut handler, &mut client, "CREATE TABLE g27w_nopk (id INT)").await;
+    wire_setup(&mut handler, &mut client, "CREATE TABLE g27w_c (id INT PRIMARY KEY)").await;
+
+    // A dangling parent is 42P01, and the column is NOT left behind.
+    assert_wire_sqlstate(
+        &mut handler,
+        &mut client,
+        "ALTER TABLE g27w_c ADD COLUMN p INT REFERENCES g27w_nosuch(id)",
+        "42P01",
+    )
+    .await;
+    assert_wire_column_absent(&mut handler, &mut client, "g27w_c", "p").await;
+
+    // A missing parent column is 42703; a key-less parent with no list is 42704.
+    assert_wire_sqlstate(
+        &mut handler,
+        &mut client,
+        "ALTER TABLE g27w_c ADD COLUMN p INT REFERENCES g27w_par(nocol)",
+        "42703",
+    )
+    .await;
+    assert_wire_sqlstate(
+        &mut handler,
+        &mut client,
+        "ALTER TABLE g27w_c ADD COLUMN p INT REFERENCES g27w_nopk",
+        "42704",
+    )
+    .await;
+    assert_wire_column_absent(&mut handler, &mut client, "g27w_c", "p").await;
+
+    // A legal one (list-less, binding to the parent PK) succeeds — and is
+    // CREATED, not merely validated: an orphan INSERT is 23503.
+    wire_setup(
+        &mut handler,
+        &mut client,
+        "ALTER TABLE g27w_c ADD COLUMN p INT REFERENCES g27w_par",
+    )
+    .await;
+    wire_setup(&mut handler, &mut client, "INSERT INTO g27w_par VALUES (1)").await;
+    wire_setup(&mut handler, &mut client, "INSERT INTO g27w_c VALUES (1, 1)").await;
+    assert_wire_sqlstate(&mut handler, &mut client, "INSERT INTO g27w_c VALUES (2, 99)", "23503").await;
+}
+
+#[tokio::test]
+async fn wire_gh27_list_less_add_foreign_key_parses_and_validates() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+
+    wire_setup(&mut handler, &mut client, "CREATE TABLE g27l_par (id INT PRIMARY KEY)").await;
+    wire_setup(&mut handler, &mut client, "CREATE TABLE g27l_nopk (id INT)").await;
+    wire_setup(
+        &mut handler,
+        &mut client,
+        "CREATE TABLE g27l_c (id INT PRIMARY KEY, p INT, q INT)",
+    )
+    .await;
+
+    // Was 42601 (parse error) through v4.31.1; now the real diagnostics.
+    assert_wire_sqlstate(
+        &mut handler,
+        &mut client,
+        "ALTER TABLE g27l_c ADD FOREIGN KEY (p) REFERENCES g27l_nosuch",
+        "42P01",
+    )
+    .await;
+    assert_wire_sqlstate(
+        &mut handler,
+        &mut client,
+        "ALTER TABLE g27l_c ADD CONSTRAINT g27l_c_p_fkey FOREIGN KEY (p) REFERENCES g27l_nopk",
+        "42704",
+    )
+    .await;
+    assert_wire_sqlstate(
+        &mut handler,
+        &mut client,
+        "ALTER TABLE g27l_c ADD FOREIGN KEY (p, q) REFERENCES g27l_par",
+        "42830",
+    )
+    .await;
+    // The legal one binds to the PK and is enforced.
+    wire_setup(
+        &mut handler,
+        &mut client,
+        "ALTER TABLE g27l_c ADD CONSTRAINT g27l_c_p_fkey FOREIGN KEY (p) REFERENCES g27l_par",
+    )
+    .await;
+    wire_setup(&mut handler, &mut client, "INSERT INTO g27l_par VALUES (1)").await;
+    wire_setup(&mut handler, &mut client, "INSERT INTO g27l_c VALUES (1, 1, NULL)").await;
+    assert_wire_sqlstate(
+        &mut handler,
+        &mut client,
+        "INSERT INTO g27l_c VALUES (2, 99, NULL)",
+        "23503",
+    )
+    .await;
+}
+
+/// The EXTENDED protocol (params family) for the list-less `ADD FOREIGN KEY`:
+/// Parse/Bind/Execute reach the shared `alter_table_add_foreign_key` body, so
+/// the SQLSTATE must match the simple-query path, with ReadyForQuery deferred
+/// until Sync.
+#[tokio::test]
+async fn wire_gh27_extended_protocol_list_less_add_foreign_key() {
+    use super::messages::FrontendMessage;
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+
+    wire_setup(
+        &mut handler,
+        &mut client,
+        "CREATE TABLE g27x_c (id INT PRIMARY KEY, p INT)",
+    )
+    .await;
+    wire_setup(&mut handler, &mut client, "CREATE TABLE g27x_nopk (id INT)").await;
+
+    for (name, sql, code) in [
+        (
+            "g27x_missing",
+            "ALTER TABLE g27x_c ADD FOREIGN KEY (p) REFERENCES g27x_nosuch",
+            "42P01",
+        ),
+        (
+            "g27x_nopk",
+            "ALTER TABLE g27x_c ADD FOREIGN KEY (p) REFERENCES g27x_nopk",
+            "42704",
+        ),
+    ] {
+        handler
+            .dispatch_message(FrontendMessage::Parse {
+                statement_name: name.into(),
+                query: sql.into(),
+                param_types: vec![],
+            })
+            .await
+            .expect("parse");
+        handler
+            .dispatch_message(FrontendMessage::Bind {
+                portal_name: name.into(),
+                statement_name: name.into(),
+                param_formats: vec![],
+                params: vec![],
+                result_formats: vec![],
+            })
+            .await
+            .expect("bind");
+        let _ = drain(&mut client).await;
+        handler
+            .dispatch_message(FrontendMessage::Execute {
+                portal_name: name.into(),
+                max_rows: 0,
+            })
+            .await
+            .expect("execute");
+        let out = drain(&mut client).await;
+        assert_eq!(
+            sqlstates(&out),
+            vec![code.to_string()],
+            "`{sql}` over the extended protocol must report {code}"
+        );
+        assert!(
+            command_tags(&out).is_empty(),
+            "a rejected Execute must not also be acked, got {:?}",
+            command_tags(&out)
+        );
+        assert!(
+            ready_for_query_statuses(&out).is_empty(),
+            "extended-protocol errors must defer ReadyForQuery until Sync"
+        );
+        handler.dispatch_message(FrontendMessage::Sync).await.expect("sync");
+        let out = drain(&mut client).await;
+        assert!(
+            !ready_for_query_statuses(&out).is_empty(),
+            "Sync must emit ReadyForQuery"
+        );
+    }
+
+    // The connection is usable afterwards and nothing was recorded.
+    wire_setup(&mut handler, &mut client, "INSERT INTO g27x_c VALUES (1, 77)").await;
+}

@@ -5136,11 +5136,21 @@ impl EmbeddedDatabase {
                                 // degraded to "any parent row exists" and printed a
                                 // malformed `parent()` violation message).
                                 //
-                                // The targets were validated (42P01 / 42703)
-                                // before `catalog.create_table` ran — see
-                                // `validate_create_table_fk_targets`.
+                                // The targets were validated (42P01 / 42703 /
+                                // 42704 / 42830) before `catalog.create_table` ran — see
+                                // `validate_create_table_fk_targets` — so this
+                                // cannot fail here. A SELF-reference resolves
+                                // against the table's OWN key: under a non-
+                                // `public` search_path the planner left the
+                                // parent bare (`emp`, not `s.emp`), which the
+                                // catalog cannot look up (see `fk_targets_self`).
+                                let pk_source = if Self::fk_targets_self(name, references_table) {
+                                    name.as_str()
+                                } else {
+                                    references_table.as_str()
+                                };
                                 let references_columns =
-                                    Self::resolve_fk_referenced_columns(&catalog, references_table, references_columns);
+                                    Self::resolve_fk_referenced_columns(&catalog, pk_source, references_columns)?;
                                 let fk = sql::ForeignKeyConstraint::new(
                                     fk_name.clone().unwrap_or_else(|| {
                                         sql::ForeignKeyConstraint::generate_unique_name(
@@ -7524,6 +7534,32 @@ impl EmbeddedDatabase {
                 if_exists,
             } => self.alter_table_drop_constraint(table_name, constraint_name, *if_exists),
             sql::LogicalPlan::AlterTableMulti { operations } => {
+                // GH#27: validate EVERY foreign-key target before the FIRST
+                // sub-operation mutates anything. DDL is not transactional
+                // here and the sub-plans run in order, so without this pass
+                // `ADD COLUMN p INT REFERENCES nosuch(id)` (planned as
+                // `[AddColumn, AddForeignKey]`) would add the column and THEN
+                // report 42P01 — a half-applied statement PostgreSQL never
+                // produces. Parent-side only: the referencing column may be
+                // the one an earlier sub-op is about to add. The hand-written
+                // `ADD COLUMN a INT, ADD FOREIGN KEY (a) REFERENCES p(id)`
+                // gets the same atomicity for free.
+                {
+                    let catalog = self.storage.catalog();
+                    for sub_plan in operations {
+                        if let sql::LogicalPlan::AlterTableAddForeignKey {
+                            table_name,
+                            columns,
+                            references_table,
+                            references_columns,
+                            ..
+                        } = sub_plan
+                        {
+                            catalog.get_table_schema(table_name)?;
+                            Self::validate_fk_reference(&catalog, references_table, columns, references_columns)?;
+                        }
+                    }
+                }
                 let mut total_rows = 0u64;
                 for sub_plan in operations {
                     total_rows += self.execute_alter_table_op(sub_plan)?;
@@ -11399,7 +11435,7 @@ impl EmbeddedDatabase {
         // was accepted and enforced nothing).
         let catalog = self.storage.catalog();
         catalog.get_table_schema(table_name)?;
-        Self::validate_fk_reference(&catalog, references_table, references_columns)?;
+        Self::validate_fk_reference(&catalog, references_table, columns, references_columns)?;
 
         let fk_name = constraint_name.clone().unwrap_or_else(|| {
             // Dedup the auto-name against the FKs already on this table:
@@ -11415,8 +11451,9 @@ impl EmbeddedDatabase {
         // `REFERENCES parent` without a column list binds to the
         // parent's PRIMARY KEY (PostgreSQL parity); resolve it against
         // the already-resolved `references_table` key so enforcement
-        // probes the right columns. See `resolve_fk_referenced_columns`.
-        let references_columns = Self::resolve_fk_referenced_columns(&catalog, references_table, references_columns);
+        // probes the right columns. See `resolve_fk_referenced_columns`
+        // (validated above, so it cannot fail here).
+        let references_columns = Self::resolve_fk_referenced_columns(&catalog, references_table, references_columns)?;
         let mut fk = sql::ForeignKeyConstraint::new(
             fk_name,
             table_name.clone(),
@@ -20696,9 +20733,27 @@ impl EmbeddedDatabase {
     /// A SELF-reference stays legal: `CREATE TABLE t (id INT PRIMARY KEY, p INT
     /// REFERENCES t(id))` reaches this only after `catalog.create_table` has
     /// registered `t`, so the lookup succeeds like any other.
+    ///
+    /// GH#27 (residual): an OMITTED referenced-column list (`REFERENCES t`)
+    /// binds to `t`'s PRIMARY KEY, and that default is resolved HERE, at DDL
+    /// time — the first layer with catalog access. It fails closed:
+    ///
+    /// * no primary key on `t` → `there is no primary key for referenced table
+    ///   "t"` (PostgreSQL's wording; the wire classifier maps it to 42704
+    ///   undefined_object, as PostgreSQL does). Before this, `resolve_fk_referenced_columns`
+    ///   persisted an EMPTY referenced list — a constraint enforced by nothing,
+    ///   which is #27's defect through a different door;
+    /// * referencing / referenced column counts differ (`REFERENCES t` against
+    ///   a composite key, or `FOREIGN KEY (a, b) REFERENCES t(id)`) → `number
+    ///   of referencing and referenced columns for foreign key disagree`
+    ///   (42830).
+    ///
+    /// Order is PostgreSQL's: table (42P01) → named columns (42703) →
+    /// default (42704) / arity (42830).
     fn validate_fk_reference(
         catalog: &storage::Catalog<'_>,
         references_table: &str,
+        referencing_columns: &[String],
         referenced_columns: &[String],
     ) -> Result<()> {
         let parent = catalog
@@ -20712,7 +20767,47 @@ impl EmbeddedDatabase {
                 )));
             }
         }
+        let referenced_count = if referenced_columns.is_empty() {
+            let pk = parent.columns.iter().filter(|c| c.primary_key).count();
+            if pk == 0 {
+                return Err(Self::fk_no_primary_key_error(references_table));
+            }
+            pk
+        } else {
+            referenced_columns.len()
+        };
+        if referencing_columns.len() != referenced_count {
+            return Err(Self::fk_arity_error());
+        }
         Ok(())
+    }
+
+    /// PostgreSQL's `transformFkeyGetPrimaryKey` diagnostic: a list-less
+    /// `REFERENCES t` where `t` has no PRIMARY KEY. SQLSTATE 42704
+    /// undefined_object on the wire, as PostgreSQL emits it (the classifier
+    /// anchors on this text).
+    fn fk_no_primary_key_error(references_table: &str) -> Error {
+        Error::query_execution(format!(
+            "there is no primary key for referenced table \"{}\"",
+            references_table
+        ))
+    }
+
+    /// PostgreSQL's wording for a referencing / referenced column-count
+    /// mismatch. SQLSTATE 42830 invalid_foreign_key on the wire.
+    fn fk_arity_error() -> Error {
+        Error::query_execution("number of referencing and referenced columns for foreign key disagree")
+    }
+
+    /// True when a foreign key declared on `table_name` targets `table_name`
+    /// itself. Compared on the BARE name as well as the full key: inside
+    /// `CREATE TABLE s.emp (… REFERENCES emp(id))` under `search_path TO s`,
+    /// the planner cannot resolve `emp` to `s.emp` (it does not exist yet) and
+    /// leaves it bare, so a full-key comparison alone would call a legal
+    /// self-reference a dangling one.
+    fn fk_targets_self(table_name: &str, references_table: &str) -> bool {
+        let bare = |name: &str| name.rsplit('.').next().unwrap_or(name).to_ascii_lowercase();
+        references_table.eq_ignore_ascii_case(table_name) || bare(references_table) == bare(table_name)
     }
 
     /// Validate every FOREIGN KEY target of a `CREATE TABLE`, BEFORE the table
@@ -20731,6 +20826,7 @@ impl EmbeddedDatabase {
     ) -> Result<()> {
         for constraint in constraints {
             let sql::logical_plan::TableConstraint::ForeignKey {
+                columns: fk_columns,
                 references_table,
                 references_columns,
                 ..
@@ -20738,13 +20834,14 @@ impl EmbeddedDatabase {
             else {
                 continue;
             };
-            // Self-reference. Compared on the BARE name as well as the full key:
-            // inside `CREATE TABLE s.emp (… REFERENCES emp(id))` under
-            // `search_path TO s`, the planner cannot resolve `emp` to `s.emp`
-            // (it does not exist yet) and leaves it bare, so a full-key
-            // comparison alone would call a legal self-reference a dangling one.
-            let bare = |name: &str| name.rsplit('.').next().unwrap_or(name).to_ascii_lowercase();
-            if references_table.eq_ignore_ascii_case(table_name) || bare(references_table) == bare(table_name) {
+            // Self-reference: validated against the columns being DECLARED
+            // (see `fk_targets_self` for why the bare name is compared too).
+            // The same three checks `validate_fk_reference` applies to a
+            // catalogued parent — 42703 for a named column, 42704 for a
+            // list-less reference to a key-less table, 42830 for an arity
+            // mismatch — run here over the ColumnDefs; the planner has already
+            // propagated a table-level `PRIMARY KEY (…)` onto them.
+            if Self::fk_targets_self(table_name, references_table) {
                 for col in references_columns {
                     if !columns.iter().any(|c| c.name.eq_ignore_ascii_case(col)) {
                         return Err(Error::query_execution(format!(
@@ -20753,22 +20850,47 @@ impl EmbeddedDatabase {
                         )));
                     }
                 }
+                let referenced_count = if references_columns.is_empty() {
+                    let pk = columns.iter().filter(|c| c.primary_key).count();
+                    if pk == 0 {
+                        return Err(Self::fk_no_primary_key_error(references_table));
+                    }
+                    pk
+                } else {
+                    references_columns.len()
+                };
+                if fk_columns.len() != referenced_count {
+                    return Err(Self::fk_arity_error());
+                }
                 continue;
             }
-            Self::validate_fk_reference(catalog, references_table, references_columns)?;
+            Self::validate_fk_reference(catalog, references_table, fk_columns, references_columns)?;
         }
         Ok(())
     }
 
+    /// The referenced columns a foreign key is persisted with: the declared
+    /// list, or — for a list-less `REFERENCES t` — `t`'s PRIMARY KEY columns.
+    ///
+    /// Fallible on purpose (GH#27): a key-less `t` is an error, never an EMPTY
+    /// list. Every caller validates first (`validate_fk_reference` /
+    /// `validate_create_table_fk_targets`), so this cannot fail after a
+    /// successful validation; it is defense in depth for a future caller that
+    /// forgets, which then fails closed instead of persisting a constraint
+    /// that enforces nothing.
     fn resolve_fk_referenced_columns(
         catalog: &storage::Catalog<'_>,
         references_table: &str,
         referenced_columns: &[String],
-    ) -> Vec<String> {
+    ) -> Result<Vec<String>> {
         if !referenced_columns.is_empty() {
-            return referenced_columns.to_vec();
+            return Ok(referenced_columns.to_vec());
         }
-        catalog.primary_key_columns(references_table).unwrap_or_default()
+        let pk = catalog.primary_key_columns(references_table)?;
+        if pk.is_empty() {
+            return Err(Self::fk_no_primary_key_error(references_table));
+        }
+        Ok(pk)
     }
 
     /// Coerce a foreign-key probe's values to the DECLARED types of the columns

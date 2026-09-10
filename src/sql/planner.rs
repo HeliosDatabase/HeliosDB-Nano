@@ -5216,33 +5216,14 @@ impl<'a> Planner<'a> {
                         on_update,
                         characteristics,
                     } => {
-                        // Normalize the referenced table / columns (B36).
-                        // See the matching comment on the table-level FK
-                        // branch in `convert_table_constraint`.
-                        let fk_constraint = TableConstraint::ForeignKey {
-                            name: None,
-                            columns: vec![Self::normalize_ident(&col.name)],
-                            references_table: self.resolve_table_ref(foreign_table),
-                            references_columns: referred_columns.iter().map(Self::normalize_ident).collect(),
-                            on_delete: on_delete.as_ref().map(|a| convert_referential_action(a)),
-                            on_update: on_update.as_ref().map(|a| convert_referential_action(a)),
-                            // Mirror the table-level FK branch: PG treats
-                            // INITIALLY DEFERRED as implying DEFERRABLE.
-                            deferrable: characteristics
-                                .as_ref()
-                                .map(|c| {
-                                    c.deferrable.unwrap_or(false)
-                                        || matches!(c.initially, Some(sqlparser::ast::DeferrableInitial::Deferred))
-                                })
-                                .unwrap_or(false),
-                            initially_deferred: characteristics
-                                .as_ref()
-                                .and_then(|c| c.initially)
-                                .map(|i| matches!(i, sqlparser::ast::DeferrableInitial::Deferred))
-                                .unwrap_or(false),
-                            enforcement: convert_constraint_enforcement(characteristics.as_ref()),
-                        };
-                        constraints.push(fk_constraint);
+                        constraints.push(self.inline_reference_constraint(
+                            &col.name,
+                            foreign_table,
+                            referred_columns,
+                            on_delete.as_ref(),
+                            on_update.as_ref(),
+                            characteristics.as_ref(),
+                        ));
                     }
                     ColumnOption::Check(expr) => {
                         // Extract column-level CHECK constraint
@@ -5717,6 +5698,53 @@ impl<'a> Planner<'a> {
         }
     }
 
+    /// A column-level `REFERENCES p[(cols)] [ON DELETE …] [ON UPDATE …]
+    /// [DEFERRABLE …]` as the table-level constraint it is shorthand for.
+    ///
+    /// Shared by the `CREATE TABLE` column loop and the `ALTER TABLE … ADD
+    /// COLUMN` arm (GH#27), so the two spellings of one clause cannot drift:
+    /// through v4.31.1 only `CREATE TABLE` looked at
+    /// `ColumnOption::ForeignKey`; `sql_column_def_to_column_def`'s option
+    /// loop discarded it, so `ADD COLUMN p INT REFERENCES parent(id)` added
+    /// the column and silently threw the foreign key away — no 42P01 for a
+    /// missing parent, and no enforcement for a real one.
+    ///
+    /// `name` stays `None` exactly as before (a named inline
+    /// `CONSTRAINT c REFERENCES …` still auto-names; recorded as a separate
+    /// gap). The referenced table / columns are normalised the same way the
+    /// table-level branch of `convert_table_constraint` normalises them (B36).
+    fn inline_reference_constraint(
+        &self,
+        column: &sqlparser::ast::Ident,
+        foreign_table: &ObjectName,
+        referred_columns: &[sqlparser::ast::Ident],
+        on_delete: Option<&SqlReferentialAction>,
+        on_update: Option<&SqlReferentialAction>,
+        characteristics: Option<&ConstraintCharacteristics>,
+    ) -> TableConstraint {
+        TableConstraint::ForeignKey {
+            name: None,
+            columns: vec![Self::normalize_ident(column)],
+            references_table: self.resolve_table_ref(foreign_table),
+            references_columns: referred_columns.iter().map(Self::normalize_ident).collect(),
+            on_delete: on_delete.map(convert_referential_action),
+            on_update: on_update.map(convert_referential_action),
+            // Mirror the table-level FK branch: PG treats
+            // INITIALLY DEFERRED as implying DEFERRABLE.
+            deferrable: characteristics
+                .map(|c| {
+                    c.deferrable.unwrap_or(false)
+                        || matches!(c.initially, Some(sqlparser::ast::DeferrableInitial::Deferred))
+                })
+                .unwrap_or(false),
+            initially_deferred: characteristics
+                .and_then(|c| c.initially)
+                .map(|i| matches!(i, sqlparser::ast::DeferrableInitial::Deferred))
+                .unwrap_or(false),
+            enforcement: convert_constraint_enforcement(characteristics),
+        }
+    }
+
     /// Convert ALTER TABLE statement to logical plan
     fn alter_table_to_plan(
         &self,
@@ -5743,10 +5771,18 @@ impl<'a> Planner<'a> {
             return self.alter_table_single_op_to_plan(table_name, source_name, operation);
         }
 
-        // Multiple operations: plan each individually, wrap in AlterTableMulti
+        // Multiple operations: plan each individually, wrap in AlterTableMulti.
+        // A single operation may itself desugar to a Multi (`ADD COLUMN …
+        // REFERENCES …`, see the AddColumn arm); flatten it here so a Multi
+        // never nests — `execute_alter_table_op` has no Multi arm and would
+        // report an internal error for `ADD COLUMN c INT REFERENCES p(id),
+        // ADD COLUMN d INT`.
         let mut plans = Vec::with_capacity(operations.len());
         for operation in operations {
-            plans.push(self.alter_table_single_op_to_plan(table_name.clone(), source_name, operation)?);
+            match self.alter_table_single_op_to_plan(table_name.clone(), source_name, operation)? {
+                LogicalPlan::AlterTableMulti { operations } => plans.extend(operations),
+                other => plans.push(other),
+            }
         }
         Ok(LogicalPlan::AlterTableMulti { operations: plans })
     }
@@ -5767,11 +5803,74 @@ impl<'a> Planner<'a> {
                 ..
             } => {
                 let col_def = self.sql_column_def_to_column_def(&column_def)?;
-                Ok(LogicalPlan::AlterTableAddColumn {
-                    table_name,
+                let add = LogicalPlan::AlterTableAddColumn {
+                    table_name: table_name.clone(),
                     column_def: col_def,
                     if_not_exists,
-                })
+                };
+                // GH#27: an inline `REFERENCES` on the new column is the pair of
+                // operations `ADD COLUMN c …, ADD FOREIGN KEY (c) REFERENCES …`,
+                // planned as exactly that — the two plans that already exist —
+                // so the foreign key goes through the ONE executor body both
+                // families share (`alter_table_add_foreign_key`: 42P01 / 42703 /
+                // 42830 validation, auto-naming, index creation) instead of a
+                // new plan field. `ColumnDef` has no room for a foreign key and
+                // `LogicalPlan` is persisted positionally, so nothing is added
+                // to either. A column with no REFERENCES plans byte-identically
+                // to before.
+                let mut fks = Vec::new();
+                for option in &column_def.options {
+                    let ColumnOption::ForeignKey {
+                        foreign_table,
+                        referred_columns,
+                        on_delete,
+                        on_update,
+                        characteristics,
+                    } = &option.option
+                    else {
+                        continue;
+                    };
+                    let TableConstraint::ForeignKey {
+                        columns,
+                        references_table,
+                        references_columns,
+                        on_delete,
+                        on_update,
+                        deferrable,
+                        initially_deferred,
+                        enforcement,
+                        ..
+                    } = self.inline_reference_constraint(
+                        &column_def.name,
+                        foreign_table,
+                        referred_columns,
+                        on_delete.as_ref(),
+                        on_update.as_ref(),
+                        characteristics.as_ref(),
+                    )
+                    else {
+                        continue;
+                    };
+                    fks.push(LogicalPlan::AlterTableAddForeignKey {
+                        table_name: table_name.clone(),
+                        constraint_name: None,
+                        columns,
+                        references_table,
+                        references_columns,
+                        on_delete,
+                        on_update,
+                        deferrable,
+                        initially_deferred,
+                        enforcement,
+                    });
+                }
+                if fks.is_empty() {
+                    return Ok(add);
+                }
+                let mut operations = Vec::with_capacity(1 + fks.len());
+                operations.push(add);
+                operations.extend(fks);
+                Ok(LogicalPlan::AlterTableMulti { operations })
             }
             AlterTableOperation::DropColumn {
                 column_name,
@@ -5942,6 +6041,12 @@ impl<'a> Planner<'a> {
                 } => {
                     is_identity = true;
                 }
+                // `ColumnOption::ForeignKey` is deliberately NOT handled here:
+                // `ColumnDef` carries no foreign key. Both callers recover it
+                // themselves — the CREATE TABLE column loop and the ALTER TABLE
+                // `AddColumn` arm (GH#27) — via `inline_reference_constraint`.
+                // (`CHECK` on a column is likewise recovered only by CREATE
+                // TABLE; on ADD COLUMN it is still dropped — a recorded gap.)
                 _ => {}
             }
         }
