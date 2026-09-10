@@ -7296,3 +7296,2783 @@ async fn wire_gh27_extended_protocol_list_less_add_foreign_key() {
     // The connection is usable afterwards and nothing was recorded.
     wire_setup(&mut handler, &mut client, "INSERT INTO g27x_c VALUES (1, 77)").await;
 }
+// ---- GH#23 ----
+// ===========================================================================
+// GH #23 — RETURNING RowDescription: field names AND dataTypeIDs.
+//
+// APPEND these functions to `src/protocol/postgres/wire_tests.rs`. They reuse
+// that file's existing helpers (`test_handler`, `drain`, `row_description`,
+// `row_description_names`, `data_rows`, `cell`, `wire_query`, `wire_setup`)
+// and add no `use` statements.
+//
+// ---------------------------------------------------------------------------
+// State of the defect on main (v4.31.1)
+// ---------------------------------------------------------------------------
+// The NAME half and the "qualified column reference is typed from the catalog"
+// half were fixed by the Prisma-P0-spec-02 work: `Planner::convert_returning`
+// (src/sql/planner.rs:6516-6523) now lowers `"public"."T"."id"` to
+// `ReturningItem::Column("id")`, and `EmbeddedDatabase::returning_schema`
+// (src/lib.rs:14825-14864) clones the CATALOG column for a `Column` item. Both
+// wire routes read that schema: `derive_result_schema`
+// (src/protocol/postgres/handler_extended.rs:660-755) on the extended protocol
+// and `derive_returning_schema` (src/protocol/postgres/handler.rs:2522-2556) on
+// the simple protocol.
+//
+// Three halves are STILL OPEN, and each has its own test below:
+//
+//   (A) `ReturningItem::Expression` is hard-coded to `DataType::Text`
+//       (src/lib.rs:14850-14862). Every RETURNING item that is not a bare or
+//       qualified column reference lands there — which includes EVERY ALIASED
+//       COLUMN, because `SelectItem::ExprWithAlias` is lowered to `Expression`
+//       (src/sql/planner.rs:6534-6540). So `RETURNING "id" AS "uid"` still
+//       advertises OID 25 for a UUID column. Prisma/Drizzle/Kysely alias
+//       RETURNING items routinely.
+//
+//   (B) The same fallback types real expressions (`"n" + 1`, `upper("note")`)
+//       as text, where the SELECT projection list types them through
+//       `TypeInference::to_column` (src/sql/type_inference.rs:448-464). The
+//       issue's contract is "derive the OID ... exactly as SELECT does".
+//
+//   (C) `TIMESTAMPTZ` never reaches OID 1184 anywhere in the engine:
+//       `Planner::sql_data_type_to_data_type` maps `SqlDataType::Timestamp(_, _)`
+//       to `DataType::Timestamp` (src/sql/planner.rs:6025) and
+//       `parse_data_type_string` maps the string "TIMESTAMPTZ" to
+//       `DataType::Timestamp` (src/sql/planner.rs:309) — discarding
+//       sqlparser's `TimezoneInfo::Tz`. `DataType::Timestamptz` exists
+//       (src/types.rs:139) and every consumer already handles it, including
+//       `datatype_to_oid` -> 1184 (handler.rs:2849),
+//       `SystemViewRegistry::data_type_to_oid` (src/sql/system_views.rs:2684),
+//       `format_pg_type_name` (src/sql/phase3/system_views.rs:2761),
+//       `phase3` OIDs (:4590), `row_blob_fast_skip_supported`
+//       (src/storage/engine.rs:1714), the catalog (catalog.rs:946/1466/1924)
+//       and `pg_typeof` (evaluator.rs:8032) — every one of those arms is
+//       ALREADY PRESENT, so this is a two-line planner change, not a
+//       tree-wide one. The variant IS constructed today, but only by the
+//       built-in system views (src/sql/system_views.rs:348/414/562/…): NO
+//       user-DDL path can ever produce it. The issue explicitly requires
+//       TIMESTAMPTZ -> 1184.
+// ===========================================================================
+
+/// The declared type of every column of the GH#23 fixture table, with the
+/// PostgreSQL OID that `RowDescription.dataTypeID` must carry for it.
+/// `tsz`/TIMESTAMPTZ is deliberately NOT here — it has its own test, because it
+/// is broken for plain SELECT too and would otherwise mask the RETURNING-only
+/// regressions.
+const GH23_TYPES: &[(&str, i32)] = &[
+    ("id", 2950),    // UUID
+    ("isStaff", 16), // BOOLEAN
+    ("n", 23),       // INTEGER
+    ("big", 20),     // BIGINT
+    ("amt", 1700),   // NUMERIC
+    ("ts", 1114),    // TIMESTAMP
+    ("meta", 3802),  // JSONB
+    ("blob", 17),    // BYTEA
+    ("note", 25),    // TEXT
+    ("vc", 1043),    // VARCHAR(32)
+];
+
+/// A table quoted and mixed-cased exactly the way Prisma emits it, covering
+/// every type the issue names.
+fn gh23_typed_db() -> Arc<EmbeddedDatabase> {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    db.execute(
+        r#"CREATE TABLE "Typed" (
+             "id" UUID PRIMARY KEY,
+             "isStaff" BOOLEAN NOT NULL,
+             "n" INTEGER NOT NULL,
+             "big" BIGINT,
+             "amt" NUMERIC,
+             "ts" TIMESTAMP,
+             "tsz" TIMESTAMPTZ,
+             "meta" JSONB,
+             "blob" BYTEA,
+             "note" TEXT,
+             "vc" VARCHAR(32)
+           )"#,
+    )
+    .expect("create \"Typed\"");
+    db
+}
+
+/// Seed one row. `blob` and `tsz` stay NULL — RowDescription is derived from
+/// the CATALOG, never from the values, so a NULL cell cannot mask a type bug.
+fn gh23_seed(db: &EmbeddedDatabase) {
+    db.execute(
+        r#"INSERT INTO "public"."Typed" ("id","isStaff","n","big","amt","ts","meta","note","vc")
+           VALUES ('550e8400-e29b-41d4-a716-446655440000', true, 7, 9000000000, 12.34,
+                   '2026-01-02 03:04:05', '{"a":1}', 'hello', 'nano')"#,
+    )
+    .expect("seed \"Typed\"");
+}
+
+/// `"public"."Typed"."<col>", …` — the fully qualified RETURNING list Prisma
+/// emits.
+fn gh23_qualified_list(cols: &[(&str, i32)]) -> String {
+    cols.iter()
+        .map(|(c, _)| format!("\"public\".\"Typed\".\"{c}\""))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Parse + Describe(Statement) one SQL text and return the decoded
+/// RowDescription as `(name, dataTypeID)` pairs. NOTHING is executed, so a
+/// Describe-only assertion cannot be perturbed by row contents.
+///
+/// Boxed on purpose: see the note on [`wire_query`] — an `async fn` inlines
+/// `dispatch_message`'s ~65 KB future into every caller and overflows the test
+/// thread stack.
+fn gh23_describe<'a>(
+    handler: &'a mut PgConnectionHandler<DuplexStream>,
+    client: &'a mut DuplexStream,
+    stmt: &'a str,
+    sql: &'a str,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<(String, i32)>> + 'a>> {
+    Box::pin(async move {
+        handler
+            .handle_parse_extended(stmt.to_string(), sql.to_string(), vec![])
+            .await
+            .unwrap_or_else(|e| panic!("parse `{sql}`: {e}"));
+        handler
+            .handle_describe_extended(super::messages::DescribeTarget::Statement, stmt.to_string())
+            .await
+            .unwrap_or_else(|e| panic!("describe `{sql}`: {e}"));
+        row_description(&drain(client).await)
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 1. POSITIVE CONTROL + the half that is already fixed.
+// ---------------------------------------------------------------------------
+
+/// POSITIVE CONTROL — must pass BEFORE and AFTER the fix. If this one ever
+/// fails, the harness (fixture DDL, Describe plumbing, OID decoder) is broken
+/// and every other assertion in this block is meaningless.
+///
+/// It pins the two references the issue compares against:
+///   * a plain SELECT of the same columns types them from the catalog, and
+///   * `RETURNING *` and a BARE `RETURNING "n"` already carry the catalog type.
+#[tokio::test]
+async fn gh23_positive_control_select_and_bare_returning_are_typed() {
+    let db = gh23_typed_db();
+    let (mut handler, mut client) = test_handler(db);
+
+    // (a) plain SELECT — the reference the issue calls "typed correctly".
+    let got = gh23_describe(
+        &mut handler,
+        &mut client,
+        "ctl_sel",
+        r#"SELECT "id", "isStaff", "n", "note" FROM "public"."Typed""#,
+    )
+    .await;
+    assert_eq!(
+        got,
+        vec![
+            ("id".to_string(), 2950),
+            ("isStaff".to_string(), 16),
+            ("n".to_string(), 23),
+            ("note".to_string(), 25),
+        ],
+        "CONTROL: a plain SELECT must type its columns from the catalog"
+    );
+
+    // (b) a BARE (unqualified, unaliased) RETURNING item — the spelling that
+    // has been typed from the catalog since long before this issue.
+    let got = gh23_describe(
+        &mut handler,
+        &mut client,
+        "ctl_bare",
+        r#"INSERT INTO "public"."Typed" ("id","isStaff","n") VALUES ('550e8400-e29b-41d4-a716-446655440000', true, 1) RETURNING "id", "n""#,
+    )
+    .await;
+    assert_eq!(
+        got,
+        vec![("id".to_string(), 2950), ("n".to_string(), 23)],
+        "CONTROL: a bare RETURNING column must carry the catalog type"
+    );
+
+    // (c) `RETURNING *` expands to the table's own columns, names and types.
+    let got = gh23_describe(
+        &mut handler,
+        &mut client,
+        "ctl_star",
+        r#"DELETE FROM "public"."Typed" RETURNING *"#,
+    )
+    .await;
+    assert_eq!(got.len(), 11, "CONTROL: RETURNING * must expand to all 11 columns");
+    for (name, oid) in GH23_TYPES {
+        let found = got
+            .iter()
+            .find(|(n, _)| n == name)
+            .unwrap_or_else(|| panic!("CONTROL: RETURNING * dropped column `{name}`; got {got:?}"));
+        assert_eq!(
+            found.1, *oid,
+            "CONTROL: RETURNING * must type `{name}` as OID {oid}, got {}",
+            found.1
+        );
+    }
+}
+
+/// The reported shape, extended protocol: a fully qualified RETURNING list on
+/// INSERT / UPDATE / DELETE must come back with BARE field names and the
+/// CATALOG type for every one of them.
+///
+/// Expected to PASS on v4.31.1 — this is the half the Prisma-P0 work fixed, and
+/// it is here so a future refactor cannot silently undo it.
+#[tokio::test]
+async fn gh23_qualified_returning_names_and_types_extended() {
+    let db = gh23_typed_db();
+    let (mut handler, mut client) = test_handler(db);
+
+    let list = gh23_qualified_list(GH23_TYPES);
+    let want: Vec<(String, i32)> = GH23_TYPES.iter().map(|(n, o)| ((*n).to_string(), *o)).collect();
+
+    let ins = format!(r#"INSERT INTO "public"."Typed" ("id","isStaff","n") VALUES ($1, $2, $3) RETURNING {list}"#);
+    assert_eq!(
+        gh23_describe(&mut handler, &mut client, "q_ins", &ins).await,
+        want,
+        "INSERT … RETURNING: field names must be bare and every dataTypeID must \
+         come from the catalog column (OID 25 on all of them is the defect)"
+    );
+
+    let upd = format!(r#"UPDATE "public"."Typed" SET "n" = 2 RETURNING {list}"#);
+    assert_eq!(
+        gh23_describe(&mut handler, &mut client, "q_upd", &upd).await,
+        want,
+        "UPDATE … RETURNING must name and type its fields like PostgreSQL"
+    );
+
+    let del = format!(r#"DELETE FROM "public"."Typed" RETURNING {list}"#);
+    assert_eq!(
+        gh23_describe(&mut handler, &mut client, "q_del", &del).await,
+        want,
+        "DELETE … RETURNING must name and type its fields like PostgreSQL"
+    );
+}
+
+/// Same matrix on the SIMPLE query protocol (psql / psycopg2), which builds its
+/// RowDescription in `PgConnectionHandler::derive_returning_schema` — a
+/// DIFFERENT call site from the extended path's Describe, so it gets its own
+/// assertion. Executes for real, so it also proves the DataRow still lines up
+/// with the description.
+///
+/// Expected to PASS on v4.31.1.
+#[tokio::test]
+async fn gh23_qualified_returning_names_and_types_simple_query() {
+    let db = gh23_typed_db();
+    gh23_seed(&db);
+    let (mut handler, mut client) = test_handler(db);
+
+    let list = gh23_qualified_list(GH23_TYPES);
+    let want: Vec<(String, i32)> = GH23_TYPES.iter().map(|(n, o)| ((*n).to_string(), *o)).collect();
+
+    let out = wire_query(
+        &mut handler,
+        &mut client,
+        &format!(r#"UPDATE "public"."Typed" SET "n" = 8 RETURNING {list}"#),
+    )
+    .await;
+    assert_eq!(
+        row_description(&out),
+        want,
+        "simple-query UPDATE … RETURNING must name AND type its fields like PostgreSQL"
+    );
+    let rows = data_rows(&out);
+    assert_eq!(rows.len(), 1, "UPDATE … RETURNING must emit exactly one DataRow");
+    // Text-mode payloads: PostgreSQL sends 't' for a true boolean and the plain
+    // digits for an int4. Those are CORRECT on the wire; what the issue's
+    // client mis-parsed is the declared type sitting next to them.
+    assert_eq!(cell(&rows[0], 1).as_deref(), Some("t"), "bool text form is 't'");
+    assert_eq!(
+        cell(&rows[0], 2).as_deref(),
+        Some("8"),
+        "RETURNING carries the POST-update value"
+    );
+
+    let out = wire_query(
+        &mut handler,
+        &mut client,
+        &format!(r#"DELETE FROM "public"."Typed" RETURNING {list}"#),
+    )
+    .await;
+    assert_eq!(
+        row_description(&out),
+        want,
+        "simple-query DELETE … RETURNING must name AND type its fields like PostgreSQL"
+    );
+    assert_eq!(data_rows(&out).len(), 1, "DELETE … RETURNING must emit the deleted row");
+}
+
+// ---------------------------------------------------------------------------
+// 2. OPEN half (A): an ALIASED column loses its type.
+// ---------------------------------------------------------------------------
+
+/// FAILS on v4.31.1.
+///
+/// `SelectItem::ExprWithAlias` is lowered to `ReturningItem::Expression`
+/// (src/sql/planner.rs:6534-6540) and `EmbeddedDatabase::returning_schema`
+/// hard-codes every `Expression` to `DataType::Text`
+/// (src/lib.rs:14850-14862). So `RETURNING "id" AS "uid"` advertises OID 25
+/// for a UUID column while the identical unaliased `RETURNING "id"` advertises
+/// 2950 — the exact same "one spelling is typed, the other is text" split the
+/// issue reported for the qualified spelling, just moved to the alias.
+///
+/// This is not a corner case: aliasing a RETURNING item is how every ORM maps a
+/// snake_case column onto a camelCase field, and PostgreSQL types the aliased
+/// column exactly as the unaliased one.
+#[tokio::test]
+async fn gh23_aliased_returning_column_keeps_catalog_type_extended() {
+    let db = gh23_typed_db();
+    let (mut handler, mut client) = test_handler(db);
+
+    // Bare column + alias.
+    let got = gh23_describe(
+        &mut handler,
+        &mut client,
+        "al_ins",
+        r#"INSERT INTO "public"."Typed" ("id","isStaff","n") VALUES ('550e8400-e29b-41d4-a716-446655440000', true, 1)
+           RETURNING "id" AS "uid", "isStaff" AS "staff", "n" AS "cnt", "big" AS "b", "amt" AS "a", "meta" AS "m""#,
+    )
+    .await;
+    assert_eq!(
+        got,
+        vec![
+            ("uid".to_string(), 2950),
+            ("staff".to_string(), 16),
+            ("cnt".to_string(), 23),
+            ("b".to_string(), 20),
+            ("a".to_string(), 1700),
+            ("m".to_string(), 3802),
+        ],
+        "an ALIASED RETURNING column must keep the catalog column's type — an \
+         alias renames a column, it does not retype it to text"
+    );
+
+    // Qualified column + alias — the two halves of the defect combined.
+    let got = gh23_describe(
+        &mut handler,
+        &mut client,
+        "al_upd",
+        r#"UPDATE "public"."Typed" SET "n" = 2
+           RETURNING "public"."Typed"."id" AS "uid", "public"."Typed"."n" AS "cnt", "public"."Typed"."note" AS "label""#,
+    )
+    .await;
+    assert_eq!(
+        got,
+        vec![
+            ("uid".to_string(), 2950),
+            ("cnt".to_string(), 23),
+            ("label".to_string(), 25),
+        ],
+        "a QUALIFIED + ALIASED RETURNING column must keep the catalog type too"
+    );
+
+    let got = gh23_describe(
+        &mut handler,
+        &mut client,
+        "al_del",
+        r#"DELETE FROM "public"."Typed" RETURNING "id" AS "uid", "vc" AS "v", "ts" AS "t""#,
+    )
+    .await;
+    assert_eq!(
+        got,
+        vec![
+            ("uid".to_string(), 2950),
+            ("v".to_string(), 1043),
+            ("t".to_string(), 1114),
+        ],
+        "DELETE … RETURNING <col> AS <alias> must keep the catalog type"
+    );
+}
+
+/// The same defect on the SIMPLE query protocol, executed for real: the
+/// declared type is wrong AND the value must still be the true value (an
+/// aliased QUALIFIED reference is resolved through `Evaluator::evaluate`, which
+/// matches the qualifier against `source_table` / `source_table_name`
+/// byte-exactly and maps a miss to `Value::Null` in
+/// `project_returning_columns`, src/lib.rs:14658-14663 — so a type-only fix
+/// that leaves the `Expression` lowering in place must not regress the value).
+///
+/// FAILS on v4.31.1 on the OIDs.
+#[tokio::test]
+async fn gh23_aliased_returning_column_keeps_catalog_type_simple_query() {
+    let db = gh23_typed_db();
+    gh23_seed(&db);
+    let (mut handler, mut client) = test_handler(db);
+
+    let out = wire_query(
+        &mut handler,
+        &mut client,
+        r#"UPDATE "public"."Typed" SET "n" = 9
+           RETURNING "public"."Typed"."n" AS "cnt", "isStaff" AS "staff", "note" AS "label""#,
+    )
+    .await;
+    assert_eq!(
+        row_description(&out),
+        vec![
+            ("cnt".to_string(), 23),
+            ("staff".to_string(), 16),
+            ("label".to_string(), 25),
+        ],
+        "simple-query UPDATE … RETURNING <col> AS <alias> must keep the catalog type"
+    );
+    let rows = data_rows(&out);
+    assert_eq!(rows.len(), 1, "UPDATE … RETURNING must emit exactly one DataRow");
+    assert_eq!(
+        cell(&rows[0], 0).as_deref(),
+        Some("9"),
+        "an aliased QUALIFIED reference must carry the row's value, never NULL"
+    );
+    assert_eq!(cell(&rows[0], 1).as_deref(), Some("t"));
+    assert_eq!(cell(&rows[0], 2).as_deref(), Some("hello"));
+}
+
+// ---------------------------------------------------------------------------
+// 3. OPEN half (B): an EXPRESSION is typed text instead of as SELECT types it.
+// ---------------------------------------------------------------------------
+
+/// FAILS on v4.31.1.
+///
+/// The issue's contract is "derive the OID from the table schema / expression
+/// type exactly as SELECT does … including expressions". The SELECT projection
+/// list types an expression through `TypeInference::to_column`
+/// (src/sql/type_inference.rs:448-464, reached from `LogicalPlan::schema()`'s
+/// `Project` arm, src/sql/logical_plan.rs:2297-2311). `returning_schema` does
+/// not call it at all.
+///
+/// The assertion is RELATIVE — whatever OID the SELECT list gives the very same
+/// expression, RETURNING must give it too — with an explicit non-vacuity guard
+/// so it can never pass by both sides agreeing on text.
+#[tokio::test]
+async fn gh23_returning_expression_types_match_the_select_list() {
+    let db = gh23_typed_db();
+    let (mut handler, mut client) = test_handler(db);
+
+    let select_oids = gh23_describe(
+        &mut handler,
+        &mut client,
+        "ex_sel",
+        r#"SELECT "n" + 1 AS "n1", "isStaff" AS "staff2" FROM "public"."Typed""#,
+    )
+    .await;
+    // Non-vacuity guard: if the SELECT reference itself degraded to text this
+    // test would pass for the wrong reason.
+    assert_ne!(
+        select_oids.first().map(|f| f.1),
+        Some(25),
+        "GUARD: the SELECT reference must type `\"n\" + 1` as a numeric OID, not text; \
+         got {select_oids:?} — fix the reference before trusting the comparison"
+    );
+
+    let returning_oids = gh23_describe(
+        &mut handler,
+        &mut client,
+        "ex_ins",
+        r#"INSERT INTO "public"."Typed" ("id","isStaff","n") VALUES ('550e8400-e29b-41d4-a716-446655440000', true, 1)
+           RETURNING "n" + 1 AS "n1", "isStaff" AS "staff2""#,
+    )
+    .await;
+
+    assert_eq!(
+        returning_oids, select_oids,
+        "a RETURNING expression must be typed exactly as the SELECT list types \
+         the same expression; RETURNING hard-codes every non-column item to \
+         DataType::Text (OID 25)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 4. OPEN half (C): TIMESTAMPTZ never reaches OID 1184.
+// ---------------------------------------------------------------------------
+
+/// FAILS on v4.31.1 — on BOTH sides, which is the point: the engine discards
+/// sqlparser's `TimezoneInfo::Tz` at DDL time
+/// (`Planner::sql_data_type_to_data_type`, src/sql/planner.rs:6025, and
+/// `parse_data_type_string`, src/sql/planner.rs:309), so a `TIMESTAMPTZ` column
+/// is stored as `DataType::Timestamp` and advertised as 1114 by every surface.
+/// `DataType::Timestamptz` exists (src/types.rs:139) and `datatype_to_oid`
+/// already maps it to 1184 (src/protocol/postgres/handler.rs:2849); it is
+/// constructed only by the built-in system-view schemas
+/// (src/sql/system_views.rs:348/414/562/…), never by any user-DDL path.
+///
+/// The issue requires TIMESTAMPTZ → 1184 explicitly. A client that reads 1114
+/// parses the value as a local timestamp and silently drops the zone.
+#[tokio::test]
+async fn gh23_timestamptz_column_is_oid_1184_on_select_and_returning() {
+    let db = gh23_typed_db();
+    let (mut handler, mut client) = test_handler(db);
+
+    let got = gh23_describe(
+        &mut handler,
+        &mut client,
+        "tz_sel",
+        r#"SELECT "tsz" FROM "public"."Typed""#,
+    )
+    .await;
+    assert_eq!(
+        got,
+        vec![("tsz".to_string(), 1184)],
+        "a TIMESTAMPTZ column must be advertised as timestamptz (1184), not \
+         timestamp (1114): the DDL path drops sqlparser's TimezoneInfo::Tz"
+    );
+
+    let got = gh23_describe(
+        &mut handler,
+        &mut client,
+        "tz_ins",
+        r#"INSERT INTO "public"."Typed" ("id","isStaff","n") VALUES ('550e8400-e29b-41d4-a716-446655440000', true, 1)
+           RETURNING "public"."Typed"."tsz""#,
+    )
+    .await;
+    assert_eq!(
+        got,
+        vec![("tsz".to_string(), 1184)],
+        "INSERT … RETURNING must advertise a TIMESTAMPTZ column as 1184"
+    );
+}
+
+/// The simple-query SELECT path types its RowDescription from the first row's
+/// VALUES (`PgConnectionHandler::schema_from_query_columns`,
+/// src/protocol/postgres/handler.rs:1586-1617, reached at :1511/:1516/:1542)
+/// while the RETURNING path types it from the CATALOG
+/// (`derive_returning_schema`, handler.rs:2522, reached at :1559). That is the
+/// structural reason the two surfaces can disagree at all, and it is what must
+/// not be left half-fixed: once TIMESTAMPTZ and VARCHAR are modelled, a
+/// simple-query SELECT must report the same OID the same statement's RETURNING
+/// reports.
+///
+/// FAILS on v4.31.1. The per-column assertions below name exactly which side is
+/// wrong, because the two sides are wrong for DIFFERENT reasons and a bare
+/// vector comparison would hide that:
+///
+///   * `vc` (VARCHAR(32)): 1043 through RETURNING (catalog) vs 25 through the
+///     simple SELECT (`Value::String` → `DataType::Text`, src/types.rs:258+267).
+///   * `tsz` (TIMESTAMPTZ): 1114 through RETURNING (the DDL collapsed the zone,
+///     src/sql/planner.rs:6025) vs 25 through the simple SELECT — the seeded row
+///     leaves `tsz` NULL and `Value::Null::data_type()` is `Text`
+///     (src/types.rs:258). So the SELECT side is wrong TWICE over: value-derived
+///     typing cannot see a declared type at all when the first row is NULL.
+///   * `id` (UUID) and `n` (INTEGER) agree today — they are the non-vacuity
+///     anchor proving the comparison itself is meaningful.
+#[tokio::test]
+async fn gh23_simple_query_select_and_returning_agree_on_types() {
+    let db = gh23_typed_db();
+    gh23_seed(&db);
+    let (mut handler, mut client) = test_handler(db);
+
+    let sel = wire_query(
+        &mut handler,
+        &mut client,
+        r#"SELECT "id", "n", "vc", "tsz" FROM "public"."Typed""#,
+    )
+    .await;
+    let ret = wire_query(
+        &mut handler,
+        &mut client,
+        r#"UPDATE "public"."Typed" SET "n" = 11 RETURNING "id", "n", "vc", "tsz""#,
+    )
+    .await;
+
+    let sel_rd = row_description(&sel);
+    let ret_rd = row_description(&ret);
+
+    // Non-vacuity: both surfaces must actually have produced a RowDescription
+    // with all four fields, or the comparisons below compare nothing.
+    assert_eq!(sel_rd.len(), 4, "SELECT must describe 4 fields, got {sel_rd:?}");
+    assert_eq!(ret_rd.len(), 4, "RETURNING must describe 4 fields, got {ret_rd:?}");
+    // …and the columns that already agree must keep agreeing (the anchor).
+    assert_eq!(sel_rd[0], ("id".to_string(), 2950), "ANCHOR: SELECT types uuid as 2950");
+    assert_eq!(
+        ret_rd[0],
+        ("id".to_string(), 2950),
+        "ANCHOR: RETURNING types uuid as 2950"
+    );
+    assert_eq!(sel_rd[1], ("n".to_string(), 23), "ANCHOR: SELECT types int4 as 23");
+    assert_eq!(ret_rd[1], ("n".to_string(), 23), "ANCHOR: RETURNING types int4 as 23");
+
+    let want = vec![
+        ("id".to_string(), 2950),
+        ("n".to_string(), 23),
+        ("vc".to_string(), 1043),
+        ("tsz".to_string(), 1184),
+    ];
+    assert_eq!(
+        ret_rd, want,
+        "RETURNING must advertise the DECLARED column types (varchar 1043, \
+         timestamptz 1184); 1114 on `tsz` is the DDL dropping TimezoneInfo::Tz"
+    );
+    assert_eq!(
+        sel_rd, want,
+        "a simple-query SELECT must advertise the DECLARED column types too — \
+         it derives them from the FIRST ROW'S VALUES instead, so VARCHAR reads \
+         as text (25) and a NULL-in-first-row column reads as text regardless \
+         of its declaration"
+    );
+    assert_eq!(
+        sel_rd, ret_rd,
+        "the SAME columns must carry the SAME dataTypeIDs whether they come \
+         back from a SELECT or from a RETURNING clause"
+    );
+}
+
+/// One RETURNING field of a simple-query reply must arrive under `name`
+/// carrying `want` — or the statement must have been REFUSED with an
+/// ErrorResponse (which is fail-closed and PostgreSQL-shaped for a qualifier
+/// that names no relation in scope). What it must never do is answer OK with a
+/// NULL in that field.
+///
+/// Not `async`: it inspects already-drained bytes, so it adds nothing to any
+/// caller's future.
+fn gh23_assert_field_or_refusal(out: &[u8], index: usize, name: &str, want: &str, what: &str) {
+    if !sqlstates(out).is_empty() {
+        // Refused outright — fail-closed, acceptable.
+        return;
+    }
+    let names = row_description_names(out);
+    assert!(
+        names.len() > index,
+        "{what}: expected at least {} RowDescription fields, got {names:?}",
+        index + 1
+    );
+    assert_eq!(names[index], name, "{what}: the item alias must win the field name");
+    let rows = data_rows(out);
+    assert_eq!(rows.len(), 1, "{what}: exactly one DataRow");
+    let got = cell(&rows[0], index);
+    assert!(
+        got.is_some(),
+        "*** {what}: fail-open — the field arrived under the exact name the ORM \
+         binds (`{name}`) carrying NULL, with no ErrorResponse anywhere ***"
+    );
+    assert_eq!(got.as_deref(), Some(want), "{what}: …and the value must be the row's");
+}
+
+/// FAIL-OPEN, on the wire, under the alias a client binds — the shape that is
+/// strictly worse than a wrong OID.
+///
+/// The existing test `returning_folded_and_alias_qualifiers_resolve_over_the_wire`
+/// (src/protocol/postgres/wire_tests.rs:3652) pins the UNALIASED spellings
+/// (`RETURNING Account.id`, `RETURNING x."id"`), which the qualified-reference
+/// lowering fixed. Adding `AS "…"` to the very same reference routes it back
+/// into `ReturningItem::Expression` (src/sql/planner.rs:6534-6540), whose VALUE
+/// is resolved by `Evaluator::evaluate` (src/sql/evaluator.rs:265-271) against a
+/// schema whose `source_table_name` is the CANONICAL table name (`Account`,
+/// stamped at src/storage/catalog.rs:1019). `Account.id` folds to qualifier
+/// `account` (src/sql/planner.rs:329) and `x."id"` is a FROM-alias: neither
+/// matches, `Evaluator::evaluate` returns `Err`, and
+/// `project_returning_columns` maps it to `Value::Null` (src/lib.rs:14658-14663).
+///
+/// So the field arrives named exactly what the ORM asked for, carrying NULL for
+/// a primary key, with no ErrorResponse anywhere.
+///
+/// FAILS on v4.31.1. Written to accept EITHER correct behaviour (the value) or
+/// fail-closed behaviour (an ErrorResponse), so it does not over-constrain the
+/// fix — only the silent NULL is rejected.
+#[tokio::test]
+async fn gh23_aliased_folded_and_alias_qualifiers_must_not_send_null() {
+    let db = prisma_account_db();
+    db.execute(
+        r#"INSERT INTO "public"."Account" ("id","email","createdAt","updatedAt")
+           VALUES (1,'a@example.com','2026-09-06','2026-09-06'),
+                  (2,'b@example.com','2026-09-06','2026-09-06')"#,
+    )
+    .expect("seed");
+    let (mut handler, mut client) = test_handler(db);
+
+    // CONTROL — passes before AND after the fix. The UNALIASED spelling already
+    // resolves (that is the half the qualified-reference lowering fixed), so if
+    // this fails the fixture or the harness is broken, not the alias lowering.
+    let out = wire_query(
+        &mut handler,
+        &mut client,
+        r#"UPDATE "public"."Account" SET "email"='c@example.com' WHERE id=1 RETURNING Account.id"#,
+    )
+    .await;
+    assert!(
+        sqlstates(&out).is_empty(),
+        "CONTROL: the unaliased folded-qualifier statement must succeed, got {:?}",
+        sqlstates(&out)
+    );
+    let rows = data_rows(&out);
+    assert_eq!(rows.len(), 1, "CONTROL: one row");
+    assert_eq!(
+        cell(&rows[0], 0).as_deref(),
+        Some("1"),
+        "CONTROL: an UNALIASED folded-qualifier item already carries the value"
+    );
+
+    // Case-folded qualifier + item alias.
+    let out = wire_query(
+        &mut handler,
+        &mut client,
+        r#"UPDATE "public"."Account" SET "email"='d@example.com' WHERE id=1 RETURNING Account.id AS "accountId""#,
+    )
+    .await;
+    gh23_assert_field_or_refusal(&out, 0, "accountId", "1", "folded qualifier + item alias");
+
+    // FROM-alias qualifier + item alias, on DELETE — a different projection
+    // call site (src/lib.rs:16067) and a qualifier no quoting can ever match.
+    let out = wire_query(
+        &mut handler,
+        &mut client,
+        r#"DELETE FROM "Account" AS x WHERE id=2 RETURNING x."id" AS "accountId", x."email" AS "mail""#,
+    )
+    .await;
+    gh23_assert_field_or_refusal(&out, 0, "accountId", "2", "FROM-alias qualifier + item alias (id)");
+    gh23_assert_field_or_refusal(
+        &out,
+        1,
+        "mail",
+        "b@example.com",
+        "FROM-alias qualifier + item alias (email)",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 5. Type/encoding coherence under a BINARY result format.
+// ---------------------------------------------------------------------------
+
+/// The reason a wrong OID is worse than cosmetic on the extended protocol.
+///
+/// `datatype_has_binary_result` (src/protocol/postgres/handler.rs:2812-2826)
+/// includes `DataType::Text`, so a portal that asked for binary gets
+/// `format_code = 1` on a field advertised as text — while
+/// `tuple_to_pg_values_with_formats` encodes the row's ACTUAL value in binary.
+/// The client is told "text, binary format" and handed 4 big-endian bytes.
+/// tokio-postgres — the driver under Prisma's Rust query engine — always
+/// requests binary results.
+///
+/// FAILS on v4.31.1: the aliased `"n" AS "cnt"` field is described as (25, 1)
+/// while its DataRow payload is int4-binary.
+#[tokio::test]
+async fn gh23_aliased_returning_binary_format_is_coherent() {
+    let db = gh23_typed_db();
+    let (mut handler, mut client) = test_handler(db);
+
+    // A single INT parameter — the UUID is a literal, so this test cannot fail
+    // for a reason unrelated to the RowDescription it is about.
+    let sql = r#"INSERT INTO "public"."Typed" ("id","isStaff","n")
+                 VALUES ('550e8400-e29b-41d4-a716-446655440000', true, $1)
+                 RETURNING "n" AS "cnt", "note" AS "label""#;
+    handler
+        .handle_parse_extended("bin23".into(), sql.into(), vec![23])
+        .await
+        .expect("parse");
+
+    let params: Vec<Option<Vec<u8>>> = vec![Some(b"5".to_vec())];
+    handler
+        .handle_bind_extended("bin23p".into(), "bin23".into(), vec![0; 1], params, vec![1, 1])
+        .await
+        .expect("bind");
+    let _ = drain(&mut client).await;
+
+    handler
+        .handle_describe_extended(super::messages::DescribeTarget::Portal, "bin23p".into())
+        .await
+        .expect("describe portal");
+    let fields = row_description_fields(&drain(&mut client).await);
+    assert_eq!(
+        fields.iter().map(|f| (f.1, f.2)).collect::<Vec<_>>(),
+        vec![(23, 1), (25, 1)],
+        "the portal must advertise (int4, binary) for the aliased `n` and \
+         (text, binary) for the aliased `note`; OID 25 on `cnt` is the \
+         ReturningItem::Expression text fallback describing an int4 column as \
+         text while sending int4-binary bytes"
+    );
+
+    handler
+        .handle_execute_extended("bin23p".into(), 0)
+        .await
+        .expect("execute");
+    let rows = data_rows(&drain(&mut client).await);
+    assert_eq!(rows.len(), 1, "INSERT … RETURNING must emit exactly one DataRow");
+    let int4_five = 5i32.to_be_bytes();
+    assert_eq!(
+        cell_bytes(&rows[0], 0),
+        Some(&int4_five[..]),
+        "int4 binary output is 4 big-endian bytes — and the field it lands in \
+         must be the one advertised as int4"
+    );
+}
+
+// ---- GH#25 ----
+// ---------------------------------------------------------------------------
+// GH#25 — BYTEA on the wire: the four combinations {text,binary} x
+// {SELECT,RETURNING}, at >4 KiB, over BOTH protocols.
+//
+// Reported against 3.58.1: a `SELECT` of a BYTEA column never completes for
+// node-pg (extended protocol), requesting BINARY results returned 4516 bytes
+// for a 4633-byte value, and `INSERT/UPDATE … RETURNING` of a BYTEA column
+// shipped the RAW bytes as text. psql was fine throughout.
+//
+// The 4633 -> 4516 arithmetic is the whole clue. 4516 is not a truncation and
+// not a re-encoding: it is the number of UNICODE CODE POINTS you get when you
+// UTF-8-decode those 4633 raw bytes (~117 of them pair up into valid two-byte
+// sequences). node-pg hands a field to `String(buffer)` — i.e. utf8 — whenever
+// the field's advertised type OID has no parser for the format the field was
+// sent in. So the client was handed RAW BYTEA BYTES under a NON-BYTEA OID.
+// The server never has to send a malformed length for that to happen: it only
+// has to describe a bytea column as something else while still encoding the
+// runtime `Value::Bytes`.
+//
+// This engine has two independent ways to do exactly that, and they are what
+// these tests pin:
+//
+//   1. SIMPLE-QUERY PATH. `PgConnectionHandler::schema_from_query_columns`
+//      (handler.rs) types every RowDescription field from `rows[0]`'s RUNTIME
+//      value — `rows.first().and_then(|r| r.values.get(i)).map(Value::data_type)
+//      .unwrap_or(DataType::Text)`. A bytea column whose first row is NULL, or
+//      an empty result set, is therefore advertised as text/25 (because
+//      `Value::Null.data_type()` is `DataType::Text`, types.rs). Every later
+//      row's `\x…` payload then reaches the client as a STRING, not a Buffer —
+//      the reported "the client value is lossy".
+//
+//   2. RETURNING SCHEMA. `EmbeddedDatabase::returning_schema` (lib.rs) types a
+//      `ReturningItem::Expression` — which is what an ALIASED item lowers to —
+//      as `DataType::Text` regardless of the catalog. `datatype_has_binary_result`
+//      (handler.rs) claims Text is binary-capable, so `effective_result_format`
+//      stamps format_code = 1 on that field while `tuple_to_pg_values_with_formats`
+//      encodes the actual `Value::Bytes` through `value_to_pg_binary` — RAW
+//      BYTES. The client is told "text, binary format" and handed bytea binary:
+//      4633 bytes in, 4516 characters out.
+//
+// The format code and the payload must come from ONE decision. Today the code
+// comes from the DECLARED column type and the payload from the RUNTIME value,
+// and every test below that fails is a place where those two disagree.
+// ---------------------------------------------------------------------------
+
+/// The reporter's payload size (4,633 bytes), carrying every byte class the
+/// bytea escape/hex encoders and any UTF-8 decoder in the path can trip over:
+/// 0x00 (NUL — dies in a cstring), 0x5c (backslash — dropped by escape-format
+/// un-escaping), 0x27 (single quote — breaks literal splicing), 0x22 (double
+/// quote), 0x7f/0x80/0xa5/0xc3/0xff (high bytes — the ones that decide whether
+/// a UTF-8 decode shortens the value), and 0x0a (newline).
+///
+/// The length also deliberately crosses the handler's 4,096-byte `write_buf`
+/// capacity and its 8,192-byte `BufWriter`, so a length-prefix or chunking bug
+/// cannot hide behind a small value.
+fn gh25_blob() -> Vec<u8> {
+    const PATTERN: [u8; 10] = [0x00, 0x5c, 0x27, 0x22, 0x0a, 0x7f, 0x80, 0xa5, 0xc3, 0xff];
+    let mut out = Vec::with_capacity(4633);
+    while out.len() < 4633 {
+        out.push(PATTERN[out.len() % PATTERN.len()]);
+    }
+    out
+}
+
+/// PostgreSQL's `bytea_output = hex` text form: `\x` followed by lowercase hex.
+fn gh25_hex_text(raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(2 + raw.len() * 2);
+    out.extend_from_slice(b"\\x");
+    out.extend_from_slice(hex::encode(raw).as_bytes());
+    out
+}
+
+fn gh25_db() -> Arc<EmbeddedDatabase> {
+    Arc::new(EmbeddedDatabase::new_in_memory().expect("db"))
+}
+
+/// COMBINATION 1 of 4 — RETURNING, text format — plus the node-pg Bind shape.
+///
+/// node-pg serialises a `Buffer` parameter as RAW BYTES with param format code
+/// 1 (binary) while declaring NO parameter types at Parse (pg-protocol's
+/// `useBinary` branch). Nano fills the missing types with OID 0 at
+/// `handle_parse_extended`, and `decode_binary_parameter`'s catch-all maps
+/// (format 1, OID 0) to `Value::Bytes` — so the value must survive verbatim
+/// and come back from RETURNING as `\x`-hex under OID 17.
+///
+/// POSITIVE CONTROL for this file: it exercises the same handler, the same
+/// >4 KiB payload and the same decoders as the failing tests below, and it
+/// passes both before and after the fix. If this one ever fails, the harness
+/// — not the fix — is what broke.
+#[tokio::test]
+async fn gh25_nodepg_binary_bytea_param_round_trips_through_returning() {
+    let (mut h, mut c) = test_handler(gh25_db());
+    wire_setup(
+        &mut h,
+        &mut c,
+        r#"CREATE TABLE "B" ("id" INT PRIMARY KEY, "blob" BYTEA, "note" TEXT)"#,
+    )
+    .await;
+
+    let blob = gh25_blob();
+    h.handle_parse_extended(
+        "gh25_ins".into(),
+        r#"INSERT INTO "B" ("id","blob","note") VALUES ($1,$2,$3) RETURNING "blob","note""#.into(),
+        // node-pg declares no parameter types.
+        vec![],
+    )
+    .await
+    .expect("parse");
+    h.handle_bind_extended(
+        "gh25_ins_p".into(),
+        "gh25_ins".into(),
+        // …and marks ONLY the Buffer parameter binary.
+        vec![0, 1, 0],
+        vec![Some(b"1".to_vec()), Some(blob.clone()), Some(b"hello".to_vec())],
+        vec![],
+    )
+    .await
+    .expect("bind");
+    let _ = drain(&mut c).await;
+
+    h.handle_describe_extended(super::messages::DescribeTarget::Portal, "gh25_ins_p".into())
+        .await
+        .expect("describe portal");
+    assert_eq!(
+        row_description_fields(&drain(&mut c).await),
+        vec![("blob".to_string(), 17, 0), ("note".to_string(), 25, 0)],
+        "RETURNING must describe a BYTEA column as bytea/17 in text format"
+    );
+
+    h.handle_execute_extended("gh25_ins_p".into(), 0)
+        .await
+        .expect("execute");
+    let out = drain(&mut c).await;
+    assert!(
+        sqlstates(&out).is_empty(),
+        "a node-pg-shaped binary bytea parameter must not error, got {:?}",
+        sqlstates(&out)
+    );
+    let rows = data_rows(&out);
+    assert_eq!(rows.len(), 1, "INSERT … RETURNING must emit exactly one DataRow");
+    assert_eq!(
+        cell_bytes(&rows[0], 0),
+        Some(gh25_hex_text(&blob).as_slice()),
+        "RETURNING bytea in text format must be `\\x`-hex of the EXACT bytes bound \
+         (raw bytes here are the 3.58.1 defect: libpq/node-pg then un-escape the \
+         field and drop every 0x5c)"
+    );
+    assert_eq!(cell_bytes(&rows[0], 1), Some(&b"hello"[..]), "text column unchanged");
+}
+
+/// COMBINATION 2 of 4 — RETURNING, binary format — and the exact 4633 -> 4516
+/// mechanism.
+///
+/// An ALIASED RETURNING item lowers to `ReturningItem::Expression`, which
+/// `EmbeddedDatabase::returning_schema` hard-codes to `DataType::Text`. Text is
+/// in `datatype_has_binary_result`, so the portal is told format_code = 1 while
+/// the DataRow carries `value_to_pg_binary(Value::Bytes)` — the raw bytea
+/// bytes. "text OID + binary format + bytea bytes" is precisely what makes
+/// node-pg run `String(buffer)` and report 4516 characters for 4633 bytes.
+///
+/// FAILS on the current tree: the field is advertised as (25, 1).
+#[tokio::test]
+async fn gh25_aliased_returning_bytea_is_described_as_bytea_not_text() {
+    let (mut h, mut c) = test_handler(gh25_db());
+    wire_setup(
+        &mut h,
+        &mut c,
+        r#"CREATE TABLE "B" ("id" INT PRIMARY KEY, "blob" BYTEA)"#,
+    )
+    .await;
+
+    let blob = gh25_blob();
+    h.handle_parse_extended(
+        "gh25_alias".into(),
+        r#"INSERT INTO "B" ("id","blob") VALUES ($1,$2) RETURNING "blob" AS "b""#.into(),
+        vec![],
+    )
+    .await
+    .expect("parse");
+    h.handle_bind_extended(
+        "gh25_alias_p".into(),
+        "gh25_alias".into(),
+        vec![0, 1],
+        vec![Some(b"1".to_vec()), Some(blob.clone())],
+        // Binary results, the way tokio-postgres (Prisma's engine) always asks.
+        vec![1],
+    )
+    .await
+    .expect("bind");
+    let _ = drain(&mut c).await;
+
+    h.handle_describe_extended(super::messages::DescribeTarget::Portal, "gh25_alias_p".into())
+        .await
+        .expect("describe portal");
+    assert_eq!(
+        row_description_fields(&drain(&mut c).await),
+        vec![("b".to_string(), 17, 1)],
+        "*** an aliased RETURNING of a BYTEA column is advertised as text/25 while \
+         the DataRow carries raw bytea BINARY bytes: the client decodes those \
+         bytes as UTF-8 and 4633 bytes become 4516 characters ***"
+    );
+
+    h.handle_execute_extended("gh25_alias_p".into(), 0)
+        .await
+        .expect("execute");
+    let out = drain(&mut c).await;
+    assert!(
+        sqlstates(&out).is_empty(),
+        "execute must not error, got {:?}",
+        sqlstates(&out)
+    );
+    let rows = data_rows(&out);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        cell_bytes(&rows[0], 0),
+        Some(blob.as_slice()),
+        "bytea in BINARY format is the raw bytes, byte for byte — and the field it \
+         lands in must be the one advertised as bytea"
+    );
+}
+
+/// COMBINATION 3 of 4 — SELECT, text format — over BOTH protocols, with the
+/// value present in row 0.
+///
+/// This is the shape the existing `bytea_text_output_is_hex_not_raw_bytes`
+/// covers for five bytes; here it is 4,633 bytes crossing the write buffer, and
+/// it additionally pins the TYPE OID (which no existing test asserts) and the
+/// extended-protocol Describe.
+///
+/// Expected to PASS on the current tree — it is the second positive control,
+/// and the contrast that proves tests 4 and 5 are about the METADATA, not the
+/// payload.
+#[tokio::test]
+async fn gh25_select_bytea_text_format_both_protocols() {
+    let (mut h, mut c) = test_handler(gh25_db());
+    wire_setup(
+        &mut h,
+        &mut c,
+        r#"CREATE TABLE "B" ("id" INT PRIMARY KEY, "blob" BYTEA)"#,
+    )
+    .await;
+
+    let blob = gh25_blob();
+    let hex_text = gh25_hex_text(&blob);
+    h.handle_parse_extended(
+        "gh25_seed".into(),
+        r#"INSERT INTO "B" ("id","blob") VALUES ($1,$2)"#.into(),
+        vec![],
+    )
+    .await
+    .expect("parse");
+    h.handle_bind_extended(
+        "gh25_seed_p".into(),
+        "gh25_seed".into(),
+        vec![0, 1],
+        vec![Some(b"1".to_vec()), Some(blob.clone())],
+        vec![],
+    )
+    .await
+    .expect("bind");
+    h.handle_execute_extended("gh25_seed_p".into(), 0)
+        .await
+        .expect("execute");
+    let _ = drain(&mut c).await;
+
+    // --- simple query protocol (psql, and node-pg's no-parameter form) -------
+    let simple = wire_query(&mut h, &mut c, r#"SELECT "blob" FROM "B""#).await;
+    assert!(
+        sqlstates(&simple).is_empty(),
+        "simple SELECT errored: {:?}",
+        sqlstates(&simple)
+    );
+    assert_eq!(
+        row_description_fields(&simple),
+        vec![("blob".to_string(), 17, 0)],
+        "simple-query SELECT of a BYTEA column must advertise bytea/17 in text format"
+    );
+    let simple_rows = data_rows(&simple);
+    assert_eq!(simple_rows.len(), 1);
+    assert_eq!(
+        cell_bytes(&simple_rows[0], 0),
+        Some(hex_text.as_slice()),
+        "4,633 bytes must arrive as `\\x`+9,266 hex chars — intact across the \
+         4 KiB write_buf and the 8 KiB BufWriter"
+    );
+
+    // --- extended query protocol (node-pg with values, Prisma) --------------
+    h.handle_parse_extended("gh25_sel".into(), r#"SELECT "blob" FROM "B""#.into(), vec![])
+        .await
+        .expect("parse");
+    h.handle_bind_extended("gh25_sel_p".into(), "gh25_sel".into(), vec![], vec![], vec![])
+        .await
+        .expect("bind");
+    let _ = drain(&mut c).await;
+    h.handle_describe_extended(super::messages::DescribeTarget::Portal, "gh25_sel_p".into())
+        .await
+        .expect("describe portal");
+    assert_eq!(
+        row_description_fields(&drain(&mut c).await),
+        vec![("blob".to_string(), 17, 0)],
+        "extended-protocol Describe must advertise bytea/17 in text format"
+    );
+    h.handle_execute_extended("gh25_sel_p".into(), 0)
+        .await
+        .expect("execute");
+    let ext = drain(&mut c).await;
+    assert!(
+        sqlstates(&ext).is_empty(),
+        "extended SELECT errored: {:?}",
+        sqlstates(&ext)
+    );
+    let ext_rows = data_rows(&ext);
+    assert_eq!(ext_rows.len(), 1, "the extended SELECT must complete with one row");
+    assert_eq!(
+        cell_bytes(&ext_rows[0], 0),
+        Some(hex_text.as_slice()),
+        "the extended path must emit byte-identical DataRows to the simple path"
+    );
+    assert_eq!(
+        command_tags(&ext),
+        vec!["SELECT 1".to_string()],
+        "the SELECT must actually complete — GH#25 reports it never does for node-pg"
+    );
+}
+
+/// COMBINATION 4 of 4 — SELECT, binary format.
+///
+/// PostgreSQL's binary representation of bytea IS the raw bytes, so the payload
+/// here is correct on the current tree; what this pins is that it is only ever
+/// sent under OID 17 with format_code 1. Expected to PASS — it is the
+/// compliance pin that stops a future "fix" from hex-encoding the binary form.
+#[tokio::test]
+async fn gh25_select_bytea_binary_format_is_raw_bytes_under_oid_17() {
+    let (mut h, mut c) = test_handler(gh25_db());
+    wire_setup(
+        &mut h,
+        &mut c,
+        r#"CREATE TABLE "B" ("id" INT PRIMARY KEY, "blob" BYTEA)"#,
+    )
+    .await;
+
+    let blob = gh25_blob();
+    h.handle_parse_extended(
+        "gh25_bseed".into(),
+        r#"INSERT INTO "B" ("id","blob") VALUES ($1,$2)"#.into(),
+        vec![],
+    )
+    .await
+    .expect("parse");
+    h.handle_bind_extended(
+        "gh25_bseed_p".into(),
+        "gh25_bseed".into(),
+        vec![0, 1],
+        vec![Some(b"1".to_vec()), Some(blob.clone())],
+        vec![],
+    )
+    .await
+    .expect("bind");
+    h.handle_execute_extended("gh25_bseed_p".into(), 0)
+        .await
+        .expect("execute");
+    let _ = drain(&mut c).await;
+
+    h.handle_parse_extended("gh25_bin".into(), r#"SELECT "blob" FROM "B""#.into(), vec![])
+        .await
+        .expect("parse");
+    h.handle_bind_extended("gh25_bin_p".into(), "gh25_bin".into(), vec![], vec![], vec![1])
+        .await
+        .expect("bind");
+    let _ = drain(&mut c).await;
+    h.handle_describe_extended(super::messages::DescribeTarget::Portal, "gh25_bin_p".into())
+        .await
+        .expect("describe portal");
+    assert_eq!(
+        row_description_fields(&drain(&mut c).await),
+        vec![("blob".to_string(), 17, 1)],
+        "a binary result request for a BYTEA column must be answered as (bytea/17, binary)"
+    );
+    h.handle_execute_extended("gh25_bin_p".into(), 0)
+        .await
+        .expect("execute");
+    let out = drain(&mut c).await;
+    let rows = data_rows(&out);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        cell_bytes(&rows[0], 0),
+        Some(blob.as_slice()),
+        "bytea binary output is the raw bytes — all 4,633 of them, including \
+         0x00, 0x5c, 0x27 and the high bytes"
+    );
+}
+
+/// The lossy half of GH#25, isolated: a NULL in ROW 0.
+///
+/// `schema_from_query_columns` types the whole result set from `rows[0]`, and
+/// `Value::Null.data_type()` is `DataType::Text`. So one leading NULL retypes a
+/// bytea column to text/25 for every row behind it — node-pg and psycopg2 both
+/// cast by OID, so the app receives the string `"\\x…"` instead of a Buffer.
+/// psql prints the same characters either way, which is exactly why "psql is
+/// fine" in the report.
+///
+/// FAILS on the current tree: OID 25.
+#[tokio::test]
+async fn gh25_simple_select_bytea_oid_survives_a_null_first_row() {
+    let (mut h, mut c) = test_handler(gh25_db());
+    wire_setup(
+        &mut h,
+        &mut c,
+        r#"CREATE TABLE "B" ("id" INT PRIMARY KEY, "blob" BYTEA)"#,
+    )
+    .await;
+
+    let blob = gh25_blob();
+    h.handle_parse_extended(
+        "gh25_nseed".into(),
+        r#"INSERT INTO "B" ("id","blob") VALUES ($1,$2)"#.into(),
+        vec![],
+    )
+    .await
+    .expect("parse");
+    h.handle_bind_extended(
+        "gh25_nseed_p".into(),
+        "gh25_nseed".into(),
+        vec![0, 1],
+        vec![Some(b"2".to_vec()), Some(blob.clone())],
+        vec![],
+    )
+    .await
+    .expect("bind");
+    h.handle_execute_extended("gh25_nseed_p".into(), 0)
+        .await
+        .expect("execute");
+    let _ = drain(&mut c).await;
+    wire_setup(&mut h, &mut c, r#"INSERT INTO "B" ("id","blob") VALUES (1, NULL)"#).await;
+
+    let out = wire_query(&mut h, &mut c, r#"SELECT "blob" FROM "B" ORDER BY "id""#).await;
+    assert!(sqlstates(&out).is_empty(), "SELECT errored: {:?}", sqlstates(&out));
+    let rows = data_rows(&out);
+    assert_eq!(rows.len(), 2, "both rows must come back");
+    assert_eq!(cell_bytes(&rows[0], 0), None, "row 1 is SQL NULL (-1 length sentinel)");
+    assert_eq!(
+        cell_bytes(&rows[1], 0),
+        Some(gh25_hex_text(&blob).as_slice()),
+        "row 2 still carries the full `\\x`-hex payload"
+    );
+    assert_eq!(
+        row_description_fields(&out),
+        vec![("blob".to_string(), 17, 0)],
+        "*** the column TYPE must come from the catalog, not from row 0: one \
+         leading NULL currently retypes a BYTEA column to text/25 and every \
+         OID-casting driver then hands the app a string instead of a Buffer ***"
+    );
+}
+
+/// The same defect with no rows at all — and it is not bytea-specific: an empty
+/// result set describes EVERY column as text/25, so `int` comes back as 23 when
+/// the table has rows and 25 when it does not. A driver that caches field
+/// metadata per statement (node-pg does) then decodes the next, non-empty
+/// execution of that statement with the wrong parsers.
+///
+/// FAILS on the current tree: (25, 25) instead of (23, 17).
+#[tokio::test]
+async fn gh25_simple_select_column_types_do_not_depend_on_row_count() {
+    let (mut h, mut c) = test_handler(gh25_db());
+    wire_setup(
+        &mut h,
+        &mut c,
+        r#"CREATE TABLE "B" ("id" INT PRIMARY KEY, "blob" BYTEA)"#,
+    )
+    .await;
+    wire_setup(&mut h, &mut c, r#"INSERT INTO "B" ("id","blob") VALUES (1, '\x0027')"#).await;
+
+    // Control: with a row present the types are right, so the failure below is
+    // about the ROW COUNT and nothing else.
+    let with_rows = wire_query(&mut h, &mut c, r#"SELECT "id","blob" FROM "B" WHERE "id" = 1"#).await;
+    assert_eq!(
+        row_description_fields(&with_rows)
+            .iter()
+            .map(|f| (f.0.clone(), f.1))
+            .collect::<Vec<_>>(),
+        vec![("id".to_string(), 23), ("blob".to_string(), 17)],
+        "with a row present the simple path already reports int4/23 and bytea/17"
+    );
+
+    let empty = wire_query(&mut h, &mut c, r#"SELECT "id","blob" FROM "B" WHERE "id" = 999"#).await;
+    assert!(sqlstates(&empty).is_empty(), "SELECT errored: {:?}", sqlstates(&empty));
+    assert!(data_rows(&empty).is_empty(), "the WHERE must match nothing");
+    assert_eq!(
+        row_description_fields(&empty)
+            .iter()
+            .map(|f| (f.0.clone(), f.1))
+            .collect::<Vec<_>>(),
+        vec![("id".to_string(), 23), ("blob".to_string(), 17)],
+        "*** an empty result set currently describes every column as text/25 \
+         (`schema_from_query_columns` falls back to DataType::Text when there is \
+         no row 0 to sniff), so the SAME statement changes its advertised types \
+         with the data ***"
+    );
+}
+
+/// The `\x`-hex text form as a `String`, for splicing into a simple-query
+/// literal (the `Vec<u8>` sibling above is for comparing wire payloads).
+fn gh25_hex_string(raw: &[u8]) -> String {
+    format!("\\x{}", hex::encode(raw))
+}
+
+/// ADVERSARIAL-REVIEW ADDITION 1 — the REPORTER'S EXACT STATEMENT, with the
+/// binary result format that produced the reported "4516 bytes for a 4633-byte
+/// value".
+///
+/// GH#25's script is `INSERT INTO "B" VALUES ($1,$2) RETURNING "blob"` — a BARE,
+/// unaliased column reference, which the planner lowers to
+/// `ReturningItem::Column` and `EmbeddedDatabase::returning_schema` therefore
+/// types from the CATALOG. That half is genuinely fixed on main, and the
+/// original triage never pinned it under a BINARY result request — its only
+/// bare-RETURNING test binds `vec![]` result formats (all text), which cannot
+/// distinguish a correct `(17, 1)` from the `(25, 1)` lie that the aliased
+/// spelling still produces.
+///
+/// Expected to PASS on the current tree. It is the THIRD positive control and
+/// the regression pin for the reported half: if a future change to
+/// `returning_schema` or `tuple_to_pg_values_with_formats` re-breaks the bare
+/// spelling, this fails before any user does.
+#[tokio::test]
+async fn gh25_bare_returning_bytea_binary_matches_the_reporters_statement() {
+    let (mut h, mut c) = test_handler(gh25_db());
+    wire_setup(
+        &mut h,
+        &mut c,
+        r#"CREATE TABLE "B" ("id" INT PRIMARY KEY, "blob" BYTEA)"#,
+    )
+    .await;
+
+    let blob = gh25_blob();
+    // No column list and no declared parameter types — node-pg's exact shape.
+    h.handle_parse_extended(
+        "gh25_rep".into(),
+        r#"INSERT INTO "B" VALUES ($1,$2) RETURNING "blob""#.into(),
+        vec![],
+    )
+    .await
+    .expect("parse");
+    h.handle_bind_extended(
+        "gh25_rep_p".into(),
+        "gh25_rep".into(),
+        vec![0, 1],
+        vec![Some(b"1".to_vec()), Some(blob.clone())],
+        // tokio-postgres / Prisma always ask for binary; node-pg asks for it
+        // per-column when it has a binary parser for the OID.
+        vec![1],
+    )
+    .await
+    .expect("bind");
+    let _ = drain(&mut c).await;
+
+    h.handle_describe_extended(super::messages::DescribeTarget::Portal, "gh25_rep_p".into())
+        .await
+        .expect("describe portal");
+    assert_eq!(
+        row_description_fields(&drain(&mut c).await),
+        vec![("blob".to_string(), 17, 1)],
+        "a BARE `RETURNING \"blob\"` under a binary result request must be \
+         (bytea/17, binary) — the type and the format code must name the same \
+         encoding, or the client decodes raw bytea bytes as UTF-8 and 4,633 \
+         bytes become 4,516 characters"
+    );
+
+    h.handle_execute_extended("gh25_rep_p".into(), 0)
+        .await
+        .expect("execute");
+    let out = drain(&mut c).await;
+    assert!(
+        sqlstates(&out).is_empty(),
+        "execute must not error, got {:?}",
+        sqlstates(&out)
+    );
+    let rows = data_rows(&out);
+    assert_eq!(rows.len(), 1, "INSERT … RETURNING must emit exactly one DataRow");
+    assert_eq!(
+        cell_bytes(&rows[0], 0),
+        Some(blob.as_slice()),
+        "bytea binary output is the raw bytes, all 4,633 of them"
+    );
+    assert_eq!(
+        command_tags(&out),
+        vec!["INSERT 0 1".to_string()],
+        "the statement must actually complete"
+    );
+}
+
+/// ADVERSARIAL-REVIEW ADDITION 2 — the SECOND CALL SITE of the same defect.
+///
+/// `EmbeddedDatabase::returning_schema` is reached from TWO independent places:
+/// `handler_extended::derive_result_schema` (extended protocol, the shape
+/// `gh25_aliased_returning_bytea_is_described_as_bytea_not_text` covers) and
+/// `PgConnectionHandler::derive_returning_schema` (simple protocol —
+/// `handle_query`'s `is_dml_returning` arm). A fix applied only where the
+/// extended test fails leaves psql / `psycopg2.execute()` in simple mode / the
+/// MySQL-style single-statement path still describing an aliased bytea
+/// RETURNING as text/25.
+///
+/// The simple protocol always sends text format, so there is no raw-bytes
+/// corruption here — the payload assertion below passes today and is the
+/// in-test control. What fails is the TYPE: an OID-casting driver hands the
+/// application a `str` instead of a `bytes`, silently.
+///
+/// FAILS on the current tree: `("b", 25, 0)`.
+#[tokio::test]
+async fn gh25_simple_query_aliased_returning_bytea_is_described_as_bytea() {
+    let (mut h, mut c) = test_handler(gh25_db());
+    wire_setup(
+        &mut h,
+        &mut c,
+        r#"CREATE TABLE "B" ("id" INT PRIMARY KEY, "blob" BYTEA)"#,
+    )
+    .await;
+
+    let blob = gh25_blob();
+    let sql = format!(
+        r#"INSERT INTO "B" ("id","blob") VALUES (1, '{}') RETURNING "blob" AS "b""#,
+        gh25_hex_string(&blob)
+    );
+    let out = wire_query(&mut h, &mut c, &sql).await;
+    assert!(
+        sqlstates(&out).is_empty(),
+        "INSERT … RETURNING errored: {:?}",
+        sqlstates(&out)
+    );
+
+    // Control — passes today: the simple path's text encoder already emits
+    // `\x`-hex, so only the METADATA is wrong.
+    let rows = data_rows(&out);
+    assert_eq!(rows.len(), 1, "one RETURNING row");
+    assert_eq!(
+        cell_bytes(&rows[0], 0),
+        Some(gh25_hex_text(&blob).as_slice()),
+        "the aliased item must still resolve to the STORED bytes (a `Value::Null` \
+         here would be the `Expression` value-resolution half of the same defect)"
+    );
+
+    assert_eq!(
+        row_description_fields(&out),
+        vec![("b".to_string(), 17, 0)],
+        "*** the SIMPLE-query call site of `returning_schema` types an aliased \
+         RETURNING item as text/25 too: fixing only the extended protocol leaves \
+         psql and simple-mode psycopg2 handed a str where a bytes belongs ***"
+    );
+}
+
+/// ADVERSARIAL-REVIEW ADDITION 3 — the defect is not bytea-specific on the
+/// RETURNING side either, and this is the cheapest proof that the fix must type
+/// the `Expression` arm from the catalog rather than special-case bytea.
+///
+/// An aliased INT column (`RETURNING "id" AS "pk"`) under a binary result
+/// request is told text/25 while its DataRow carries four big-endian bytes —
+/// the identical shape `prisma_returning_types_are_coherent_with_binary_result_formats`
+/// pins for the QUALIFIED spelling that commit 79e2255 fixed. The alias
+/// spelling was never covered.
+///
+/// FAILS on the current tree: `("pk", 25, 1)`.
+#[tokio::test]
+async fn gh25_aliased_returning_int_is_described_as_int4_not_text() {
+    let (mut h, mut c) = test_handler(gh25_db());
+    wire_setup(
+        &mut h,
+        &mut c,
+        r#"CREATE TABLE "B" ("id" INT PRIMARY KEY, "blob" BYTEA)"#,
+    )
+    .await;
+
+    h.handle_parse_extended(
+        "gh25_ali".into(),
+        r#"INSERT INTO "B" ("id","blob") VALUES ($1,$2) RETURNING "id" AS "pk""#.into(),
+        vec![23, 17],
+    )
+    .await
+    .expect("parse");
+    h.handle_bind_extended(
+        "gh25_ali_p".into(),
+        "gh25_ali".into(),
+        vec![0, 0],
+        vec![Some(b"7".to_vec()), Some(b"\\x00ff".to_vec())],
+        vec![1],
+    )
+    .await
+    .expect("bind");
+    let _ = drain(&mut c).await;
+
+    h.handle_describe_extended(super::messages::DescribeTarget::Portal, "gh25_ali_p".into())
+        .await
+        .expect("describe portal");
+    assert_eq!(
+        row_description_fields(&drain(&mut c).await),
+        vec![("pk".to_string(), 23, 1)],
+        "*** an ALIASED RETURNING item is typed `DataType::Text` by \
+         `EmbeddedDatabase::returning_schema`; `Text` is binary-capable, so the \
+         portal is told (text, binary) while the DataRow carries int4-binary ***"
+    );
+
+    h.handle_execute_extended("gh25_ali_p".into(), 0)
+        .await
+        .expect("execute");
+    let out = drain(&mut c).await;
+    let rows = data_rows(&out);
+    assert_eq!(rows.len(), 1);
+    let seven = 7i32.to_be_bytes();
+    assert_eq!(
+        cell_bytes(&rows[0], 0),
+        Some(&seven[..]),
+        "int4 binary output is 4 big-endian bytes — and the field must be the one \
+         advertised as int4"
+    );
+}
+
+// ---- GH#23 (candidate 1) ----
+//
+// New coverage added WITH the fix (the observed-failing `gh23_*` tests live in
+// the coordinator's overlay). Every probe below reads an ACTUAL row or an
+// aggregate over a non-empty table — never `SELECT col FROM empty_table`.
+
+/// One typed table, one seeded row: `n = 7`, `note = 'hello'`, a TIMESTAMP and
+/// a TIMESTAMPTZ holding the same wall-clock instant.
+fn gh23_c1_db() -> Arc<EmbeddedDatabase> {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    db.execute(
+        r#"CREATE TABLE "C1" (
+             "id" INTEGER PRIMARY KEY,
+             "n" INTEGER NOT NULL,
+             "note" TEXT,
+             "vc" VARCHAR(8),
+             "ts" TIMESTAMP,
+             "tsz" TIMESTAMPTZ
+           )"#,
+    )
+    .expect("create \"C1\"");
+    db.execute(
+        r#"INSERT INTO "C1" ("id","n","note","vc","ts","tsz")
+           VALUES (1, 7, 'hello', 'nano', '2026-01-02 03:04:05', '2026-01-02 03:04:05+00')"#,
+    )
+    .expect("seed \"C1\"");
+    db
+}
+
+/// `SELECT count(*) FROM "C1"` as text — a real aggregate row, so a probe of
+/// "nothing was written" cannot pass vacuously.
+fn gh23_c1_count<'a>(
+    handler: &'a mut PgConnectionHandler<DuplexStream>,
+    client: &'a mut DuplexStream,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = String> + 'a>> {
+    Box::pin(async move {
+        let out = wire_query(handler, client, r#"SELECT count(*) FROM "C1""#).await;
+        let rows = data_rows(&out);
+        assert_eq!(rows.len(), 1, "count(*) must produce one row");
+        cell(&rows[0], 0).expect("count(*) is never NULL")
+    })
+}
+
+/// `SELECT "n" FROM "C1" WHERE "id" = 1` as text — the seeded row's value.
+fn gh23_c1_n_of_row_1<'a>(
+    handler: &'a mut PgConnectionHandler<DuplexStream>,
+    client: &'a mut DuplexStream,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = String> + 'a>> {
+    Box::pin(async move {
+        let out = wire_query(handler, client, r#"SELECT "n" FROM "C1" WHERE "id" = 1"#).await;
+        let rows = data_rows(&out);
+        assert_eq!(rows.len(), 1, "row 1 must still exist");
+        cell(&rows[0], 0).expect("\"n\" is NOT NULL")
+    })
+}
+
+/// A RETURNING item that names no column of the target table is REFUSED with
+/// 42703 — on every DML verb, in autocommit and inside a transaction — and the
+/// refusal happens BEFORE any row is touched. Through v4.31.1 the field was
+/// described as text and sent as NULL.
+#[tokio::test]
+async fn gh23_c1_returning_unknown_column_is_refused_42703_with_zero_rows_written() {
+    let db = gh23_c1_db();
+    let (mut handler, mut client) = test_handler(db);
+
+    // UPDATE, autocommit: the write must not have happened.
+    let out = wire_query(
+        &mut handler,
+        &mut client,
+        r#"UPDATE "C1" SET "n" = 99 RETURNING nosuch"#,
+    )
+    .await;
+    assert_eq!(sqlstates(&out), vec!["42703".to_string()], "bare unknown column");
+    assert!(data_rows(&out).is_empty(), "a refused statement sends no DataRow");
+    assert_eq!(
+        gh23_c1_n_of_row_1(&mut handler, &mut client).await,
+        "7",
+        "UPDATE must not have been applied"
+    );
+
+    // UPDATE, aliased + qualified unknown column, inside an explicit transaction.
+    wire_setup(&mut handler, &mut client, "BEGIN").await;
+    let out = wire_query(
+        &mut handler,
+        &mut client,
+        r#"UPDATE "C1" SET "n" = 99 RETURNING "n" + 1 AS "n1", x.nosuch AS "c""#,
+    )
+    .await;
+    assert_eq!(
+        sqlstates(&out),
+        vec!["42703".to_string()],
+        "qualified + aliased unknown column"
+    );
+    let _ = wire_query(&mut handler, &mut client, "ROLLBACK").await;
+    assert_eq!(gh23_c1_n_of_row_1(&mut handler, &mut client).await, "7");
+
+    // DELETE: the row must survive.
+    let out = wire_query(
+        &mut handler,
+        &mut client,
+        r#"DELETE FROM "C1" RETURNING nosuch AS "gone""#,
+    )
+    .await;
+    assert_eq!(sqlstates(&out), vec!["42703".to_string()], "DELETE … RETURNING unknown");
+    assert_eq!(
+        gh23_c1_count(&mut handler, &mut client).await,
+        "1",
+        "DELETE must not have removed the row"
+    );
+
+    // INSERT: nothing may be inserted.
+    let out = wire_query(
+        &mut handler,
+        &mut client,
+        r#"INSERT INTO "C1" ("id","n") VALUES (2, 8) RETURNING "id", nosuch"#,
+    )
+    .await;
+    assert_eq!(sqlstates(&out), vec!["42703".to_string()], "INSERT … RETURNING unknown");
+    assert_eq!(
+        gh23_c1_count(&mut handler, &mut client).await,
+        "1",
+        "INSERT must not have written the row"
+    );
+}
+
+/// `EXCLUDED.col` is only meaningful in `ON CONFLICT DO UPDATE SET`; in a
+/// RETURNING list PostgreSQL refuses it (42P01, missing FROM-clause entry).
+/// Answering with the stored row's column would be silently wrong.
+///
+/// Pinned on the aliased spelling: the UNALIASED `RETURNING EXCLUDED."n"` is
+/// lowered by `Planner::convert_returning` to a bare `Column("n")` before the
+/// binder can see the qualifier (GH#29's lenient-qualifier family).
+#[tokio::test]
+async fn gh23_c1_returning_excluded_qualifier_is_refused_42p01() {
+    let db = gh23_c1_db();
+    let (mut handler, mut client) = test_handler(db);
+    let out = wire_query(
+        &mut handler,
+        &mut client,
+        r#"INSERT INTO "C1" ("id","n") VALUES (1, 8)
+           ON CONFLICT ("id") DO UPDATE SET "n" = EXCLUDED."n" RETURNING EXCLUDED."n" AS "x""#,
+    )
+    .await;
+    assert_eq!(sqlstates(&out), vec!["42P01".to_string()]);
+    assert!(data_rows(&out).is_empty());
+    assert_eq!(
+        gh23_c1_n_of_row_1(&mut handler, &mut client).await,
+        "7",
+        "the DO UPDATE must not have run"
+    );
+}
+
+/// The same refusal on the EXTENDED protocol: Parse succeeds (the statement is
+/// described from the AST), Execute is refused with 42703 and no DataRow, and
+/// the table is untouched.
+#[tokio::test]
+async fn gh23_c1_returning_unknown_column_is_refused_on_the_extended_protocol() {
+    use super::messages::FrontendMessage;
+    let db = gh23_c1_db();
+    let (mut handler, mut client) = test_handler(db);
+
+    for msg in [
+        FrontendMessage::Parse {
+            statement_name: "c1_bad".into(),
+            query: r#"UPDATE "C1" SET "n" = $1 RETURNING "n" AS "cnt", nosuch"#.into(),
+            param_types: vec![23],
+        },
+        FrontendMessage::Bind {
+            portal_name: "c1_bad_p".into(),
+            statement_name: "c1_bad".into(),
+            param_formats: vec![0],
+            params: vec![Some(b"99".to_vec())],
+            result_formats: vec![],
+        },
+        FrontendMessage::Execute {
+            portal_name: "c1_bad_p".into(),
+            max_rows: 0,
+        },
+        FrontendMessage::Sync,
+    ] {
+        handler.dispatch_message(msg).await.expect("dispatch");
+    }
+    let out = drain(&mut client).await;
+    assert_eq!(sqlstates(&out), vec!["42703".to_string()]);
+    assert!(data_rows(&out).is_empty(), "no DataRow may accompany the refusal");
+    assert_eq!(
+        gh23_c1_n_of_row_1(&mut handler, &mut client).await,
+        "7",
+        "Execute must not have written"
+    );
+}
+
+/// A RETURNING expression that fails at runtime surfaces as an error, exactly
+/// as it does in PostgreSQL — never as a NULL cell — and nothing is written.
+#[tokio::test]
+async fn gh23_c1_returning_runtime_error_is_an_error_not_null() {
+    let db = gh23_c1_db();
+    let (mut handler, mut client) = test_handler(db);
+    let out = wire_query(
+        &mut handler,
+        &mut client,
+        r#"UPDATE "C1" SET "n" = 0 RETURNING "n" / 0 AS "q""#,
+    )
+    .await;
+    assert!(
+        !sqlstates(&out).is_empty(),
+        "division by zero in RETURNING must be an ErrorResponse"
+    );
+    assert!(data_rows(&out).is_empty(), "…and must not send a row with a NULL in it");
+    assert_eq!(
+        gh23_c1_n_of_row_1(&mut handler, &mut client).await,
+        "7",
+        "the UPDATE must not have been applied"
+    );
+}
+
+/// `RETURNING *, "n" AS "again"` describes N+1 fields and sends N+1 values —
+/// the wildcard expands in sequence with its siblings (v4.31.1 returned the
+/// bare tuple for `*` and dropped every sibling).
+#[tokio::test]
+async fn gh23_c1_returning_star_with_sibling_sends_every_field() {
+    let db = gh23_c1_db();
+    let (mut handler, mut client) = test_handler(db);
+    let out = wire_query(
+        &mut handler,
+        &mut client,
+        r#"UPDATE "C1" SET "n" = 8 RETURNING *, "n" AS "again""#,
+    )
+    .await;
+    assert!(sqlstates(&out).is_empty(), "got {:?}", sqlstates(&out));
+    let rd = row_description(&out);
+    assert_eq!(
+        rd,
+        vec![
+            ("id".to_string(), 23),
+            ("n".to_string(), 23),
+            ("note".to_string(), 25),
+            ("vc".to_string(), 1043),
+            ("ts".to_string(), 1114),
+            ("tsz".to_string(), 1184),
+            ("again".to_string(), 23),
+        ]
+    );
+    let rows = data_rows(&out);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].len(), rd.len(), "DataRow arity must equal RowDescription arity");
+    assert_eq!(cell(&rows[0], 1).as_deref(), Some("8"));
+    assert_eq!(cell(&rows[0], 6).as_deref(), Some("8"));
+}
+
+/// A TIMESTAMPTZ column is advertised as 1184 AND its text form carries the
+/// session zone offset (`+00` under the server's pinned `TimeZone=UTC`), while
+/// the TIMESTAMP column next to it keeps the offset-less form under 1114. The
+/// two must ship together: 1184 without the offset makes a typed client
+/// re-resolve the instant in its own zone.
+#[tokio::test]
+async fn gh23_c1_timestamptz_returning_is_1184_with_utc_offset_text() {
+    let db = gh23_c1_db();
+    let (mut handler, mut client) = test_handler(db);
+    let out = wire_query(
+        &mut handler,
+        &mut client,
+        r#"UPDATE "C1" SET "n" = 7 RETURNING "ts", "tsz", "tsz" AS "when""#,
+    )
+    .await;
+    assert!(sqlstates(&out).is_empty(), "got {:?}", sqlstates(&out));
+    assert_eq!(
+        row_description(&out),
+        vec![
+            ("ts".to_string(), 1114),
+            ("tsz".to_string(), 1184),
+            ("when".to_string(), 1184),
+        ]
+    );
+    let rows = data_rows(&out);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        cell(&rows[0], 0).as_deref(),
+        Some("2026-01-02 03:04:05.000000"),
+        "timestamp: no zone"
+    );
+    assert_eq!(
+        cell(&rows[0], 1).as_deref(),
+        Some("2026-01-02 03:04:05.000000+00"),
+        "timestamptz: +00"
+    );
+    assert_eq!(
+        cell(&rows[0], 2).as_deref(),
+        Some("2026-01-02 03:04:05.000000+00"),
+        "aliased timestamptz"
+    );
+}
+
+/// Describe/Execute coherence under PER-COLUMN Bind format codes: `[1, 0]` on
+/// `("n" int4, "tsz" timestamptz)` must describe `(23, 1), (1184, 0)` and then
+/// send 4 big-endian bytes followed by the `+00` text form — the descriptor and
+/// the payload are read from the same wire plan. The `[1]` shorthand must
+/// resolve the same way (binary where an encoder exists, text elsewhere).
+#[tokio::test]
+async fn gh23_c1_per_column_bind_formats_describe_and_execute_agree() {
+    let db = gh23_c1_db();
+    let (mut handler, mut client) = test_handler(db);
+    let sql = r#"UPDATE "C1" SET "n" = $1 RETURNING "n", "tsz""#;
+    handler
+        .handle_parse_extended("c1_fmt".into(), sql.into(), vec![23])
+        .await
+        .expect("parse");
+    let _ = drain(&mut client).await;
+
+    for (portal, formats) in [("c1_fmt_p", vec![1i16, 0]), ("c1_fmt_q", vec![1i16])] {
+        handler
+            .handle_bind_extended(
+                portal.into(),
+                "c1_fmt".into(),
+                vec![0],
+                vec![Some(b"5".to_vec())],
+                formats.clone(),
+            )
+            .await
+            .expect("bind");
+        let _ = drain(&mut client).await;
+
+        handler
+            .handle_describe_extended(super::messages::DescribeTarget::Portal, portal.into())
+            .await
+            .expect("describe portal");
+        let fields = row_description_fields(&drain(&mut client).await);
+        assert_eq!(
+            fields.iter().map(|f| (f.1, f.2)).collect::<Vec<_>>(),
+            vec![(23, 1), (1184, 0)],
+            "formats {formats:?}: int4 binary where requested, timestamptz text (no binary encoder)"
+        );
+
+        handler
+            .handle_execute_extended(portal.into(), 0)
+            .await
+            .expect("execute");
+        let rows = data_rows(&drain(&mut client).await);
+        assert_eq!(rows.len(), 1, "formats {formats:?}: one DataRow");
+        let five = 5i32.to_be_bytes();
+        assert_eq!(
+            cell_bytes(&rows[0], 0),
+            Some(&five[..]),
+            "formats {formats:?}: int4 binary"
+        );
+        assert_eq!(
+            cell(&rows[0], 1).as_deref(),
+            Some("2026-01-02 03:04:05.000000+00"),
+            "formats {formats:?}: timestamptz text form under format 0"
+        );
+    }
+}
+
+/// A simple-query SELECT types its RowDescription from the PLAN — the same
+/// source the extended protocol's Describe reads — not from the first row's
+/// values: VARCHAR is 1043 (not 25), a column whose FIRST value is NULL keeps
+/// its declared type, TIMESTAMPTZ is 1184 with the `+00` text form, and the
+/// result-cache hit (third pass; admission is on the second sighting)
+/// describes the result exactly like the miss did.
+#[tokio::test]
+async fn gh23_c1_simple_query_select_types_from_the_plan_not_row_zero() {
+    let db = gh23_c1_db();
+    db.execute(r#"INSERT INTO "C1" ("id","n","note","vc","ts","tsz") VALUES (0, 1, NULL, NULL, NULL, NULL)"#)
+        .expect("all-NULL row");
+    let (mut handler, mut client) = test_handler(db);
+
+    let want = vec![
+        ("vc".to_string(), 1043),
+        ("tsz".to_string(), 1184),
+        ("note".to_string(), 25),
+        ("n".to_string(), 23),
+    ];
+    let sql = r#"SELECT "vc", "tsz", "note", "n" FROM "C1" ORDER BY "id""#;
+    for pass in 0..3 {
+        let out = wire_query(&mut handler, &mut client, sql).await;
+        assert!(sqlstates(&out).is_empty(), "pass {pass}: got {:?}", sqlstates(&out));
+        assert_eq!(
+            row_description(&out),
+            want,
+            "pass {pass}: declared types, NULL first row or not"
+        );
+        let rows = data_rows(&out);
+        assert_eq!(rows.len(), 2, "pass {pass}");
+        assert_eq!(cell(&rows[0], 0), None, "pass {pass}: the first row's vc IS NULL");
+        assert_eq!(cell(&rows[0], 1), None, "pass {pass}: the first row's tsz IS NULL");
+        assert_eq!(cell(&rows[1], 0).as_deref(), Some("nano"), "pass {pass}");
+        assert_eq!(
+            cell(&rows[1], 1).as_deref(),
+            Some("2026-01-02 03:04:05.000000+00"),
+            "pass {pass}: a SELECTed timestamptz carries the same +00 text form RETURNING does"
+        );
+    }
+
+    // …and a plain SELECT agrees with RETURNING on the very same columns.
+    let ret = wire_query(
+        &mut handler,
+        &mut client,
+        r#"UPDATE "C1" SET "n" = 7 WHERE "id" = 1 RETURNING "vc", "tsz", "note", "n""#,
+    )
+    .await;
+    assert_eq!(row_description(&ret), want, "RETURNING and SELECT must agree");
+}
+
+// ---- GH#23 (candidate 2) ----
+//
+// Review fixes on top of candidate 1: TIMESTAMPTZ input honours the literal's
+// offset (FIX 2), the simple-query RowDescription is a per-column hybrid of
+// plan type and row witness (FIX 3), and a binary cell is encoded by the
+// DECLARED OID or refused with 22P03 (FIX 4). Every probe reads an actual row
+// or an aggregate over a non-empty table.
+
+/// `"T2"`: a NOT NULL int, a nullable int, a nullable bool, text, a TIMESTAMP
+/// and a TIMESTAMPTZ. One seeded row with `k`/`b` NULL.
+fn gh23_c2_db() -> Arc<EmbeddedDatabase> {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    db.execute(
+        r#"CREATE TABLE "T2" (
+             "id" INTEGER PRIMARY KEY,
+             "n" INTEGER NOT NULL,
+             "k" INTEGER,
+             "b" BOOLEAN,
+             "note" TEXT,
+             "ts" TIMESTAMP,
+             "tsz" TIMESTAMPTZ
+           )"#,
+    )
+    .expect("create \"T2\"");
+    db.execute(
+        r#"INSERT INTO "T2" ("id","n","note","ts","tsz")
+           VALUES (1, 7, 'hello', '2026-01-02 03:04:05', '2026-01-02 03:04:05+00')"#,
+    )
+    .expect("seed \"T2\"");
+    db
+}
+
+/// `SELECT "<col>" FROM "T2" WHERE "id" = <id>` as text — one cell, or `None`
+/// for NULL. Panics if the row is missing (a probe must never pass vacuously).
+fn gh23_c2_cell_of<'a>(
+    handler: &'a mut PgConnectionHandler<DuplexStream>,
+    client: &'a mut DuplexStream,
+    col: &'a str,
+    id: i32,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + 'a>> {
+    Box::pin(async move {
+        let sql = format!(r#"SELECT "{col}" FROM "T2" WHERE "id" = {id}"#);
+        let out = wire_query(handler, client, &sql).await;
+        assert!(sqlstates(&out).is_empty(), "`{sql}`: {:?}", sqlstates(&out));
+        let rows = data_rows(&out);
+        assert_eq!(rows.len(), 1, "`{sql}`: row {id} must exist");
+        cell(&rows[0], 0)
+    })
+}
+
+/// One full extended-protocol round: Parse → Bind → Describe(Portal) →
+/// Execute → Sync, every step through `dispatch_message` so an Execute-time
+/// refusal arrives as an ErrorResponse (not a Rust `Err`). Returns the
+/// Describe(Portal) fields `(name, oid, format)` and the bytes drained AFTER
+/// Describe (the Execute + Sync reply). Boxed for the same stack reason as
+/// [`wire_query`].
+#[allow(clippy::too_many_arguments)]
+fn gh23_c2_extended<'a>(
+    handler: &'a mut PgConnectionHandler<DuplexStream>,
+    client: &'a mut DuplexStream,
+    name: &'a str,
+    sql: &'a str,
+    param_types: Vec<i32>,
+    param_formats: Vec<i16>,
+    params: Vec<Option<Vec<u8>>>,
+    result_formats: Vec<i16>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = (Vec<(String, i32, i16)>, Vec<u8>)> + 'a>> {
+    use super::messages::{DescribeTarget, FrontendMessage};
+    Box::pin(async move {
+        let portal = format!("{name}_p");
+        for msg in [
+            FrontendMessage::Parse {
+                statement_name: name.to_string(),
+                query: sql.to_string(),
+                param_types,
+            },
+            FrontendMessage::Bind {
+                portal_name: portal.clone(),
+                statement_name: name.to_string(),
+                param_formats,
+                params,
+                result_formats,
+            },
+            FrontendMessage::Describe {
+                target: DescribeTarget::Portal,
+                name: portal.clone(),
+            },
+        ] {
+            handler.dispatch_message(msg).await.expect("dispatch");
+        }
+        let described = drain(client).await;
+        assert!(
+            sqlstates(&described).is_empty(),
+            "`{sql}`: Parse/Bind/Describe must not fail, got {:?}",
+            sqlstates(&described)
+        );
+        let fields = row_description_fields(&described);
+        for msg in [
+            FrontendMessage::Execute {
+                portal_name: portal,
+                max_rows: 0,
+            },
+            FrontendMessage::Sync,
+        ] {
+            handler.dispatch_message(msg).await.expect("dispatch");
+        }
+        (fields, drain(client).await)
+    })
+}
+
+/// The 8-byte binary `timestamptz` parameter form: microseconds since
+/// 2000-01-01 00:00:00 UTC, big-endian.
+fn gh23_c2_pg_binary_timestamp(rfc3339: &str) -> Vec<u8> {
+    const PG_EPOCH_OFFSET_MICROS: i64 = 946_684_800_000_000;
+    let instant = chrono::DateTime::parse_from_rfc3339(rfc3339).expect("rfc3339");
+    (instant.timestamp_micros() - PG_EPOCH_OFFSET_MICROS)
+        .to_be_bytes()
+        .to_vec()
+}
+
+/// FIX 2: a TIMESTAMPTZ literal's zone offset is the INSTANT it denotes.
+/// `10:00:00+02:00` is 08:00 UTC and reads back as `08:00:00.000000+00` —
+/// on every path into a timestamptz cell: the text family (simple-query
+/// INSERT and UPDATE), the params family (RETURNING), an extended TEXT
+/// parameter under OID 1184 and an extended BINARY parameter. A literal
+/// without an offset is UTC and reads back unchanged (`+00`). The TIMESTAMP
+/// column next to it keeps its naive semantics: the offset is dropped.
+#[tokio::test]
+async fn gh23_c2_timestamptz_literal_offset_is_honoured_on_every_write_path() {
+    let db = gh23_c2_db();
+    let (mut handler, mut client) = test_handler(db);
+
+    // Text family, INSERT (simple query, no RETURNING).
+    let out = wire_query(
+        &mut handler,
+        &mut client,
+        r#"INSERT INTO "T2" ("id","n","tsz") VALUES (2, 1, '2026-01-01 10:00:00+02:00')"#,
+    )
+    .await;
+    assert!(sqlstates(&out).is_empty(), "insert: {:?}", sqlstates(&out));
+    assert_eq!(
+        gh23_c2_cell_of(&mut handler, &mut client, "tsz", 2).await.as_deref(),
+        Some("2026-01-01 08:00:00.000000+00"),
+        "text-family INSERT: `+02:00` is the instant 08:00 UTC"
+    );
+
+    // Text family, UPDATE (simple query, no RETURNING), PostgreSQL's `+02` spelling.
+    let out = wire_query(
+        &mut handler,
+        &mut client,
+        r#"UPDATE "T2" SET "tsz" = '2026-02-01 10:00:00+02' WHERE "id" = 1"#,
+    )
+    .await;
+    assert!(sqlstates(&out).is_empty(), "update: {:?}", sqlstates(&out));
+    assert_eq!(
+        gh23_c2_cell_of(&mut handler, &mut client, "tsz", 1).await.as_deref(),
+        Some("2026-02-01 08:00:00.000000+00"),
+        "text-family UPDATE: `+02` is the instant 08:00 UTC"
+    );
+
+    // Params family (RETURNING), a negative offset: 10:00-05:00 is 15:00 UTC.
+    let out = wire_query(
+        &mut handler,
+        &mut client,
+        r#"UPDATE "T2" SET "tsz" = '2026-03-01 10:00:00-05:00' WHERE "id" = 1 RETURNING "tsz""#,
+    )
+    .await;
+    assert!(sqlstates(&out).is_empty(), "returning: {:?}", sqlstates(&out));
+    assert_eq!(row_description(&out), vec![("tsz".to_string(), 1184)]);
+    let rows = data_rows(&out);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        cell(&rows[0], 0).as_deref(),
+        Some("2026-03-01 15:00:00.000000+00"),
+        "params-family RETURNING: `-05:00` is the instant 15:00 UTC"
+    );
+
+    // No offset: UTC, read back unchanged, with the `+00` suffix.
+    let out = wire_query(
+        &mut handler,
+        &mut client,
+        r#"INSERT INTO "T2" ("id","n","tsz") VALUES (3, 1, '2026-04-01 10:00:00')"#,
+    )
+    .await;
+    assert!(sqlstates(&out).is_empty(), "insert no-offset: {:?}", sqlstates(&out));
+    assert_eq!(
+        gh23_c2_cell_of(&mut handler, &mut client, "tsz", 3).await.as_deref(),
+        Some("2026-04-01 10:00:00.000000+00"),
+        "an offset-less timestamptz literal is UTC and reads back unchanged"
+    );
+
+    // Extended protocol, TEXT parameter under OID 1184 (arrives as a string
+    // and takes the same offset-honouring cast).
+    let (fields, out) = gh23_c2_extended(
+        &mut handler,
+        &mut client,
+        "c2_tz_text",
+        r#"UPDATE "T2" SET "tsz" = $1 WHERE "id" = 1 RETURNING "tsz""#,
+        vec![1184],
+        vec![0],
+        vec![Some(b"2026-05-01 10:00:00+02:00".to_vec())],
+        vec![],
+    )
+    .await;
+    assert_eq!(fields, vec![("tsz".to_string(), 1184, 0)]);
+    assert!(sqlstates(&out).is_empty(), "text param: {:?}", sqlstates(&out));
+    let rows = data_rows(&out);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        cell(&rows[0], 0).as_deref(),
+        Some("2026-05-01 08:00:00.000000+00"),
+        "extended TEXT parameter under 1184 honours the offset"
+    );
+
+    // Extended protocol, BINARY parameter (already an instant): round trip.
+    let (fields, out) = gh23_c2_extended(
+        &mut handler,
+        &mut client,
+        "c2_tz_bin",
+        r#"UPDATE "T2" SET "tsz" = $1 WHERE "id" = 1 RETURNING "tsz""#,
+        vec![1184],
+        vec![1],
+        vec![Some(gh23_c2_pg_binary_timestamp("2026-06-01T12:34:56Z"))],
+        vec![],
+    )
+    .await;
+    assert_eq!(fields, vec![("tsz".to_string(), 1184, 0)]);
+    assert!(sqlstates(&out).is_empty(), "binary param: {:?}", sqlstates(&out));
+    let rows = data_rows(&out);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        cell(&rows[0], 0).as_deref(),
+        Some("2026-06-01 12:34:56.000000+00"),
+        "extended BINARY parameter round-trips as the same instant"
+    );
+    assert_eq!(
+        gh23_c2_cell_of(&mut handler, &mut client, "tsz", 1).await.as_deref(),
+        Some("2026-06-01 12:34:56.000000+00"),
+        "…and a plain SELECT reads the same instant back"
+    );
+
+    // CONTROL: the TIMESTAMP (1114) column keeps the written wall-clock and
+    // drops the offset — the pre-existing `::timestamp` rule is untouched.
+    let out = wire_query(
+        &mut handler,
+        &mut client,
+        r#"UPDATE "T2" SET "ts" = '2026-01-01 10:00:00+02:00' WHERE "id" = 1 RETURNING "ts""#,
+    )
+    .await;
+    assert!(sqlstates(&out).is_empty(), "timestamp control: {:?}", sqlstates(&out));
+    assert_eq!(row_description(&out), vec![("ts".to_string(), 1114)]);
+    let rows = data_rows(&out);
+    assert_eq!(
+        cell(&rows[0], 0).as_deref(),
+        Some("2026-01-01 10:00:00.000000"),
+        "CONTROL: `timestamp` keeps the wall-clock, no zone"
+    );
+}
+
+/// FIX 3: the simple-query RowDescription is a per-column HYBRID. A catalog
+/// column keeps its plan type even when the first row is NULL; an expression
+/// the inferencer types as `Text` by FALLBACK (`coalesce`, `nextval`,
+/// `pg_try_advisory_lock`) keeps the OID main derived from the row's value
+/// — no simple-protocol client (psycopg2) sees a type get worse than it was;
+/// and an expression that is NULL in every row stays `text` (fail-closed).
+#[tokio::test]
+async fn gh23_c2_simple_query_hybrid_keeps_main_oids_for_text_fallback_expressions() {
+    use super::messages::{DescribeTarget, FrontendMessage};
+    let db = gh23_c2_db();
+    db.execute(r#"INSERT INTO "T2" ("id","n","k","b") VALUES (2, 8, 5, true)"#)
+        .expect("second row");
+    db.execute(r#"CREATE SEQUENCE "s23""#).expect("sequence");
+    let (mut handler, mut client) = test_handler(db);
+
+    // (a) Catalog columns with a NULL FIRST row: typed from the plan.
+    let out = wire_query(
+        &mut handler,
+        &mut client,
+        r#"SELECT "k", "b", "note" FROM "T2" ORDER BY "id""#,
+    )
+    .await;
+    assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
+    assert_eq!(
+        row_description(&out),
+        vec![("k".to_string(), 23), ("b".to_string(), 16), ("note".to_string(), 25)],
+        "a catalog column whose first row is NULL keeps its declared type"
+    );
+    let rows = data_rows(&out);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(cell(&rows[0], 0), None, "the first row's k IS NULL");
+    assert_eq!(cell(&rows[0], 1), None, "the first row's b IS NULL");
+    assert_eq!(cell(&rows[1], 0).as_deref(), Some("5"));
+    assert_eq!(cell(&rows[1], 1).as_deref(), Some("t"));
+
+    // Non-vacuity GUARD: the inferencer really does fall back to `text` for
+    // `coalesce` — that is what makes the hybrid load-bearing. Read through
+    // the extended protocol's Describe(Statement), which is typed from the
+    // plan alone. If this guard ever fails, the inferencer learned `coalesce`:
+    // move the probes below to a function it still does not know.
+    for msg in [
+        FrontendMessage::Parse {
+            statement_name: "c2_guard".into(),
+            query: r#"SELECT coalesce("k", 0) AS "c" FROM "T2""#.into(),
+            param_types: vec![],
+        },
+        FrontendMessage::Describe {
+            target: DescribeTarget::Statement,
+            name: "c2_guard".into(),
+        },
+        FrontendMessage::Sync,
+    ] {
+        handler.dispatch_message(msg).await.expect("dispatch");
+    }
+    let guard = row_description(&drain(&mut client).await);
+    assert_eq!(
+        guard,
+        vec![("c".to_string(), 25)],
+        "GUARD: the plan types `coalesce(int, int)` as text by fallback; \
+         if it no longer does, retarget this test's fallback probes"
+    );
+
+    // (b) Text-by-fallback expressions keep main's row-derived OID on the
+    // simple protocol: int4 for coalesce over an int (first row's value is
+    // the `0` default), int8 for nextval, bool for pg_try_advisory_lock.
+    let out = wire_query(
+        &mut handler,
+        &mut client,
+        r#"SELECT coalesce("k", 0) AS "c" FROM "T2" ORDER BY "id""#,
+    )
+    .await;
+    assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
+    assert_eq!(
+        row_description(&out),
+        vec![("c".to_string(), 23)],
+        "simple-query `coalesce(int, 0)` must stay int4 (main's OID), not the Text fallback"
+    );
+    let rows = data_rows(&out);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(cell(&rows[0], 0).as_deref(), Some("0"));
+    assert_eq!(cell(&rows[1], 0).as_deref(), Some("5"));
+
+    let out = wire_query(&mut handler, &mut client, r#"SELECT nextval('s23') AS "v""#).await;
+    assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
+    assert_eq!(
+        row_description(&out).iter().map(|f| f.1).collect::<Vec<_>>(),
+        vec![20],
+        "simple-query `nextval(…)` must stay int8 (main's OID)"
+    );
+    assert_eq!(cell(&data_rows(&out)[0], 0).as_deref(), Some("1"));
+
+    let out = wire_query(
+        &mut handler,
+        &mut client,
+        r#"SELECT pg_try_advisory_lock(72723) AS "ok""#,
+    )
+    .await;
+    assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
+    assert_eq!(
+        row_description(&out).iter().map(|f| f.1).collect::<Vec<_>>(),
+        vec![16],
+        "simple-query `pg_try_advisory_lock(…)` must stay bool (main's OID)"
+    );
+    assert_eq!(cell(&data_rows(&out)[0], 0).as_deref(), Some("t"));
+
+    // (c) A fallback-typed expression that is NULL in every row: `text`,
+    // because a NULL witnesses no type (fail-closed, same as main).
+    let out = wire_query(
+        &mut handler,
+        &mut client,
+        r#"SELECT nullif("note", 'hello') AS "z" FROM "T2" ORDER BY "id""#,
+    )
+    .await;
+    assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
+    assert_eq!(row_description(&out), vec![("z".to_string(), 25)]);
+    let rows = data_rows(&out);
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|r| cell(r, 0).is_none()), "every z IS NULL");
+}
+
+/// FIX 4: under a binary Bind, a cell is encoded BY THE DECLARED OID, never
+/// by the runtime value's width. `length("note")` is inferred `int8` (20)
+/// but produced as `Value::Int4`: the wire must carry 8 bytes. `coalesce("n",
+/// 0)` is typed `text` (25) by the inferencer's fallback while its value is
+/// an int4: that cell cannot be represented as text-in-binary, so the row is
+/// REFUSED with 22P03 — never 4 bytes under OID 25, never a one-cell text
+/// downgrade. Both on RETURNING and on SELECT (one shared encoder), and the
+/// connection stays usable afterwards.
+#[tokio::test]
+async fn gh23_c2_binary_bind_encodes_by_the_declared_oid_on_returning_and_select() {
+    let db = gh23_c2_db();
+    let (mut handler, mut client) = test_handler(db);
+
+    // RETURNING, widened: (int8, binary) advertised → 8 big-endian bytes.
+    let (fields, out) = gh23_c2_extended(
+        &mut handler,
+        &mut client,
+        "c2_len_ret",
+        r#"UPDATE "T2" SET "n" = $1 WHERE "id" = 1 RETURNING length("note") AS "l", "n""#,
+        vec![23],
+        vec![0],
+        vec![Some(b"9".to_vec())],
+        vec![1],
+    )
+    .await;
+    assert_eq!(
+        fields,
+        vec![("l".to_string(), 20, 1), ("n".to_string(), 23, 1)],
+        "RETURNING length(): advertised (int8, binary); the catalog column (int4, binary)"
+    );
+    assert!(sqlstates(&out).is_empty(), "RETURNING length(): {:?}", sqlstates(&out));
+    let rows = data_rows(&out);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        cell_bytes(&rows[0], 0),
+        Some(&5i64.to_be_bytes()[..]),
+        "length('hello') must be sent as the 8-byte int8 the field was advertised as, \
+         not the 4-byte int4 the function produced"
+    );
+    assert_eq!(cell_bytes(&rows[0], 1), Some(&9i32.to_be_bytes()[..]));
+
+    // SELECT, widened: the same encoder.
+    let (fields, out) = gh23_c2_extended(
+        &mut handler,
+        &mut client,
+        "c2_len_sel",
+        r#"SELECT length("note") AS "l" FROM "T2" WHERE "id" = 1"#,
+        vec![],
+        vec![],
+        vec![],
+        vec![1],
+    )
+    .await;
+    assert_eq!(fields, vec![("l".to_string(), 20, 1)]);
+    assert!(sqlstates(&out).is_empty(), "SELECT length(): {:?}", sqlstates(&out));
+    let rows = data_rows(&out);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(cell_bytes(&rows[0], 0), Some(&5i64.to_be_bytes()[..]));
+
+    // RETURNING, not representable: (text, binary) advertised, int4 produced
+    // → 22P03 invalid_binary_representation, no DataRow.
+    let (fields, out) = gh23_c2_extended(
+        &mut handler,
+        &mut client,
+        "c2_coal_ret",
+        r#"UPDATE "T2" SET "n" = $1 WHERE "id" = 1 RETURNING coalesce("n", 0) AS "c""#,
+        vec![23],
+        vec![0],
+        vec![Some(b"9".to_vec())],
+        vec![1],
+    )
+    .await;
+    assert_eq!(
+        fields,
+        vec![("c".to_string(), 25, 1)],
+        "GUARD: coalesce is still typed text by fallback and granted binary"
+    );
+    assert_eq!(
+        sqlstates(&out),
+        vec!["22P03".to_string()],
+        "an int4 value under a (text, binary) field must be refused, not sent as 4 bytes"
+    );
+    assert!(data_rows(&out).is_empty(), "no DataRow may accompany the refusal");
+
+    // SELECT, not representable: same refusal from the same encoder.
+    let (fields, out) = gh23_c2_extended(
+        &mut handler,
+        &mut client,
+        "c2_coal_sel",
+        r#"SELECT coalesce("n", 0) AS "c" FROM "T2" WHERE "id" = 1"#,
+        vec![],
+        vec![],
+        vec![],
+        vec![1],
+    )
+    .await;
+    assert_eq!(fields, vec![("c".to_string(), 25, 1)]);
+    assert_eq!(sqlstates(&out), vec!["22P03".to_string()]);
+    assert!(data_rows(&out).is_empty());
+
+    // Text format is unaffected: the same statement under format 0 sends "9".
+    let (fields, out) = gh23_c2_extended(
+        &mut handler,
+        &mut client,
+        "c2_coal_txt",
+        r#"SELECT coalesce("n", 0) AS "c" FROM "T2" WHERE "id" = 1"#,
+        vec![],
+        vec![],
+        vec![],
+        vec![0],
+    )
+    .await;
+    assert_eq!(fields, vec![("c".to_string(), 25, 0)]);
+    assert!(sqlstates(&out).is_empty(), "text format: {:?}", sqlstates(&out));
+    assert_eq!(cell(&data_rows(&out)[0], 0).as_deref(), Some("9"));
+
+    // The connection is still usable after the refusals.
+    let out = wire_query(&mut handler, &mut client, r#"SELECT count(*) FROM "T2""#).await;
+    assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
+    assert_eq!(cell(&data_rows(&out)[0], 0).as_deref(), Some("1"));
+}
+
+/// The refusal `codec::encode_binary` raises classifies as 22P03 through the
+/// handler's SQLSTATE mapping (marker-const discipline, like the advisory arm).
+#[test]
+fn gh23_c2_invalid_binary_representation_classifies_as_22p03() {
+    let err = crate::Error::query_execution(format!(
+        "{}: a INTEGER value cannot be sent as TEXT (OID 25) in binary format",
+        super::codec::INVALID_BINARY_REPRESENTATION_MARKER
+    ));
+    assert_eq!(super::handler::sqlstate_for_error(&err), "22P03");
+}
+
+// ---- GH#23 (candidate 3) ----
+//
+// FIX A: `round` / `floor` / `ceil` / `ceiling` are typed like their first
+// argument (the evaluator keeps the argument's variant), so a NUMERIC column
+// stays 1700 on every surface — and a binary Bind on a 1700 field now ships
+// PostgreSQL's `numeric_send` bytes instead of text under format 0.
+// FIX B: an aggregate / window function in a RETURNING list is refused at
+// bind, before any write, with PostgreSQL's wording and SQLSTATE.
+
+/// The `M` (message) field of every ErrorResponse in `bytes`.
+fn gh23_c3_error_messages(bytes: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    for (ty, payload) in parse_messages(bytes) {
+        if ty != b'E' {
+            continue;
+        }
+        let mut pos = 0;
+        while pos < payload.len() && payload[pos] != 0 {
+            let field = payload[pos];
+            pos += 1;
+            let start = pos;
+            while pos < payload.len() && payload[pos] != 0 {
+                pos += 1;
+            }
+            if field == b'M' {
+                out.push(String::from_utf8_lossy(&payload[start..pos]).to_string());
+            }
+            pos += 1;
+        }
+    }
+    out
+}
+
+/// One row: `price` NUMERIC 10.456, `qty` INTEGER 7, `ratio` FLOAT8 2.5.
+fn gh23_c3_db() -> Arc<EmbeddedDatabase> {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    db.execute(
+        r#"CREATE TABLE "T3" (
+             "id" INTEGER PRIMARY KEY,
+             "price" NUMERIC,
+             "qty" INTEGER,
+             "ratio" DOUBLE PRECISION
+           )"#,
+    )
+    .expect("create \"T3\"");
+    db.execute(r#"INSERT INTO "T3" ("id","price","qty","ratio") VALUES (1, 10.456, 7, 2.5)"#)
+        .expect("seed \"T3\"");
+    db
+}
+
+/// PostgreSQL `numeric_send` bytes of 10.46: ndigits 2, weight 0, positive,
+/// dscale 2, groups [10, 4600].
+fn gh23_c3_numeric_10_46() -> Vec<u8> {
+    [2i16, 0, 0, 2, 10, 4600].iter().flat_map(|w| w.to_be_bytes()).collect()
+}
+
+/// FIX A. `round("price", 2)` over a NUMERIC column is 1700 with its text
+/// intact — on the simple protocol, on the extended protocol's Describe, and
+/// on RETURNING — while an INTEGER argument stays 23 and a FLOAT8 argument
+/// stays 701. Through candidate 2 the inferencer hard-coded 701 and the
+/// simple-protocol hybrid trusted it (v4.31.1 sniffed 1700 from the row), so
+/// a money value was handed to a typed client as a float.
+#[tokio::test]
+async fn gh23_c3_round_keeps_the_argument_type_on_simple_extended_and_returning() {
+    let db = gh23_c3_db();
+    let (mut handler, mut client) = test_handler(db);
+
+    // Simple protocol: RowDescription from the plan, text intact.
+    let out = wire_query(
+        &mut handler,
+        &mut client,
+        r#"SELECT round("price", 2) AS "r", round("qty") AS "q", round("ratio", 1) AS "f" FROM "T3""#,
+    )
+    .await;
+    assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
+    assert_eq!(
+        row_description(&out),
+        vec![("r".to_string(), 1700), ("q".to_string(), 23), ("f".to_string(), 701)],
+        "simple protocol: round() must be typed like its argument (numeric / int4 / float8)"
+    );
+    let rows = data_rows(&out);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        cell(&rows[0], 0).as_deref(),
+        Some("10.46"),
+        "the decimal text must be intact"
+    );
+    assert_eq!(cell(&rows[0], 1).as_deref(), Some("7"));
+    assert_eq!(cell(&rows[0], 2).as_deref(), Some("2.5"));
+
+    // floor / ceil / ceiling follow the same rule on the simple protocol.
+    let out = wire_query(
+        &mut handler,
+        &mut client,
+        r#"SELECT floor("price") AS "a", ceil("price") AS "b", ceiling("qty") AS "c", floor("ratio") AS "d" FROM "T3""#,
+    )
+    .await;
+    assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
+    assert_eq!(
+        row_description(&out).iter().map(|f| f.1).collect::<Vec<_>>(),
+        vec![1700, 1700, 23, 701]
+    );
+    let rows = data_rows(&out);
+    assert_eq!(cell(&rows[0], 0).as_deref(), Some("10"));
+    assert_eq!(cell(&rows[0], 1).as_deref(), Some("11"));
+    assert_eq!(cell(&rows[0], 2).as_deref(), Some("7"));
+    // (`floor(2.5)` is 2.0; its float8 text form is the encoder's business,
+    // the OID 701 above is what this test pins.)
+
+    // Extended protocol, text format: Describe(Portal) agrees with the row.
+    let (fields, out) = gh23_c2_extended(
+        &mut handler,
+        &mut client,
+        "c3_sel",
+        r#"SELECT round("price", 2) AS "r", round("qty") AS "q", round("ratio", 1) AS "f" FROM "T3""#,
+        vec![],
+        vec![],
+        vec![],
+        vec![0],
+    )
+    .await;
+    assert_eq!(
+        fields,
+        vec![
+            ("r".to_string(), 1700, 0),
+            ("q".to_string(), 23, 0),
+            ("f".to_string(), 701, 0)
+        ],
+        "extended Describe: the plan type, which must now match the runtime variant"
+    );
+    assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
+    let rows = data_rows(&out);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(cell(&rows[0], 0).as_deref(), Some("10.46"));
+    assert_eq!(cell(&rows[0], 1).as_deref(), Some("7"));
+    assert_eq!(cell(&rows[0], 2).as_deref(), Some("2.5"));
+
+    // RETURNING on the simple protocol (text family): same typing.
+    let out = wire_query(
+        &mut handler,
+        &mut client,
+        r#"UPDATE "T3" SET "qty" = 8 WHERE "id" = 1
+           RETURNING round("price", 2) AS "r", round("qty") AS "q", round("ratio", 1) AS "f""#,
+    )
+    .await;
+    assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
+    assert_eq!(
+        row_description(&out),
+        vec![("r".to_string(), 1700), ("q".to_string(), 23), ("f".to_string(), 701)],
+        "RETURNING round(): typed like the argument on the text family"
+    );
+    let rows = data_rows(&out);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(cell(&rows[0], 0).as_deref(), Some("10.46"));
+    assert_eq!(cell(&rows[0], 1).as_deref(), Some("8"));
+    assert_eq!(cell(&rows[0], 2).as_deref(), Some("2.5"));
+
+    // RETURNING under a binary Bind (params family): (numeric, binary) is
+    // advertised AND encoded — PostgreSQL's numeric_send bytes, never the
+    // text form, never float8 bytes. The int4 sibling ships 4 bytes.
+    let (fields, out) = gh23_c2_extended(
+        &mut handler,
+        &mut client,
+        "c3_ret_bin",
+        r#"UPDATE "T3" SET "qty" = $1 WHERE "id" = 1 RETURNING round("price", 2) AS "r", round("qty") AS "q""#,
+        vec![23],
+        vec![0],
+        vec![Some(b"9".to_vec())],
+        vec![1],
+    )
+    .await;
+    assert_eq!(
+        fields,
+        vec![("r".to_string(), 1700, 1), ("q".to_string(), 23, 1)],
+        "a binary Bind on a numeric RETURNING field must be granted binary (there is an encoder now)"
+    );
+    assert!(
+        sqlstates(&out).is_empty(),
+        "binary RETURNING round(): {:?}",
+        sqlstates(&out)
+    );
+    let rows = data_rows(&out);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        cell_bytes(&rows[0], 0),
+        Some(&gh23_c3_numeric_10_46()[..]),
+        "numeric under binary must be the numeric_send form of 10.46"
+    );
+    assert_eq!(cell_bytes(&rows[0], 1), Some(&9i32.to_be_bytes()[..]));
+
+    // The same field under a text Bind keeps the text.
+    let (fields, out) = gh23_c2_extended(
+        &mut handler,
+        &mut client,
+        "c3_ret_txt",
+        r#"UPDATE "T3" SET "qty" = $1 WHERE "id" = 1 RETURNING round("price", 2) AS "r""#,
+        vec![23],
+        vec![0],
+        vec![Some(b"7".to_vec())],
+        vec![0],
+    )
+    .await;
+    assert_eq!(fields, vec![("r".to_string(), 1700, 0)]);
+    assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
+    assert_eq!(cell(&data_rows(&out)[0], 0).as_deref(), Some("10.46"));
+
+    // GUARD: the catalog column itself under a binary Bind, and a SELECT
+    // through the shared plan, use the same numeric encoder.
+    let (fields, out) = gh23_c2_extended(
+        &mut handler,
+        &mut client,
+        "c3_sel_bin",
+        r#"SELECT round("price", 2) AS "r", "price" FROM "T3" WHERE "id" = 1"#,
+        vec![],
+        vec![],
+        vec![],
+        vec![1],
+    )
+    .await;
+    assert_eq!(fields, vec![("r".to_string(), 1700, 1), ("price".to_string(), 1700, 1)]);
+    assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
+    let rows = data_rows(&out);
+    assert_eq!(cell_bytes(&rows[0], 0), Some(&gh23_c3_numeric_10_46()[..]));
+    let price_10_456: Vec<u8> = [2i16, 0, 0, 3, 10, 4560].iter().flat_map(|w| w.to_be_bytes()).collect();
+    assert_eq!(cell_bytes(&rows[0], 1), Some(&price_10_456[..]));
+}
+
+/// FIX B. `RETURNING count(*)` — and an aggregate nested inside an
+/// expression, and a window call — is refused with PostgreSQL's wording and
+/// class (42803 grouping_error / 42P20 windowing_error) on every DML verb,
+/// on the simple AND the extended protocol, and nothing is written: the row
+/// count and the seeded value are unchanged after every refusal. Through
+/// candidate 2 the extended path answered XX000 (`Expression not yet
+/// implemented: AggregateFunction`) after binding; v4.31.1 sent a NULL row.
+#[tokio::test]
+async fn gh23_c3_returning_aggregate_and_window_are_refused_with_zero_rows_written() {
+    let db = gh23_c2_db();
+    let (mut handler, mut client) = test_handler(db);
+
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            r#"INSERT INTO "T2" ("id","n") VALUES (2, 1) RETURNING count(*)"#,
+            "42803",
+            "aggregate functions are not allowed in RETURNING",
+        ),
+        (
+            r#"UPDATE "T2" SET "n" = 99 WHERE "id" = 1 RETURNING count(*) AS "c""#,
+            "42803",
+            "aggregate functions are not allowed in RETURNING",
+        ),
+        (
+            r#"UPDATE "T2" SET "n" = 99 WHERE "id" = 1 RETURNING coalesce(max("n"), 0) AS "m""#,
+            "42803",
+            "aggregate functions are not allowed in RETURNING",
+        ),
+        (
+            r#"DELETE FROM "T2" WHERE "id" = 1 RETURNING "n", count(*)"#,
+            "42803",
+            "aggregate functions are not allowed in RETURNING",
+        ),
+        (
+            r#"UPDATE "T2" SET "n" = 99 WHERE "id" = 1 RETURNING row_number() OVER ()"#,
+            "42P20",
+            "window functions are not allowed in RETURNING",
+        ),
+        (
+            r#"DELETE FROM "T2" WHERE "id" = 1 RETURNING rank() OVER (ORDER BY "n")"#,
+            "42P20",
+            "window functions are not allowed in RETURNING",
+        ),
+    ];
+
+    for (i, &(sql, code, wording)) in cases.iter().enumerate() {
+        // Simple protocol.
+        let out = wire_query(&mut handler, &mut client, sql).await;
+        assert_eq!(sqlstates(&out), vec![code.to_string()], "simple `{sql}`");
+        assert!(
+            gh23_c3_error_messages(&out).iter().any(|m| m.contains(wording)),
+            "simple `{sql}`: message must carry `{wording}`, got {:?}",
+            gh23_c3_error_messages(&out)
+        );
+        assert!(command_tags(&out).is_empty(), "simple `{sql}` must not be acked");
+        assert!(data_rows(&out).is_empty(), "simple `{sql}` must send no DataRow");
+        assert!(
+            parse_messages(&out).iter().any(|(ty, _)| *ty == b'Z'),
+            "simple `{sql}` must be followed by ReadyForQuery"
+        );
+
+        // Extended protocol: the refusal arrives at Execute, before any write.
+        let name = format!("c3_agg_{i}");
+        let (_fields, out) =
+            gh23_c2_extended(&mut handler, &mut client, &name, sql, vec![], vec![], vec![], vec![0]).await;
+        assert_eq!(sqlstates(&out), vec![code.to_string()], "extended `{sql}`");
+        assert!(
+            gh23_c3_error_messages(&out).iter().any(|m| m.contains(wording)),
+            "extended `{sql}`: message must carry `{wording}`, got {:?}",
+            gh23_c3_error_messages(&out)
+        );
+        assert!(command_tags(&out).is_empty(), "extended `{sql}` must not be acked");
+        assert!(data_rows(&out).is_empty(), "extended `{sql}` must send no DataRow");
+
+        // Nothing was written by either protocol.
+        let out = wire_query(&mut handler, &mut client, r#"SELECT count(*) FROM "T2""#).await;
+        assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
+        assert_eq!(
+            cell(&data_rows(&out)[0], 0).as_deref(),
+            Some("1"),
+            "`{sql}` must write nothing"
+        );
+        assert_eq!(
+            gh23_c2_cell_of(&mut handler, &mut client, "n", 1).await.as_deref(),
+            Some("7"),
+            "`{sql}` must change nothing"
+        );
+    }
+
+    // GUARD: the same statement shapes with an ordinary expression still
+    // write and project on both protocols.
+    let out = wire_query(
+        &mut handler,
+        &mut client,
+        r#"UPDATE "T2" SET "n" = 8 WHERE "id" = 1 RETURNING coalesce("n", 0) AS "c""#,
+    )
+    .await;
+    assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
+    assert_eq!(cell(&data_rows(&out)[0], 0).as_deref(), Some("8"));
+    let (_fields, out) = gh23_c2_extended(
+        &mut handler,
+        &mut client,
+        "c3_guard",
+        r#"UPDATE "T2" SET "n" = $1 WHERE "id" = 1 RETURNING coalesce("n", 0) AS "c""#,
+        vec![23],
+        vec![0],
+        vec![Some(b"7".to_vec())],
+        vec![0],
+    )
+    .await;
+    assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
+    assert_eq!(cell(&data_rows(&out)[0], 0).as_deref(), Some("7"));
+}
+
+/// The two refusals classify through the handler's SQLSTATE mapping by their
+/// emitter consts (marker-const discipline), and a message that merely
+/// mentions a function elsewhere is not hijacked by the new arms.
+#[test]
+fn gh23_c3_returning_aggregate_and_window_classify_as_42803_and_42p20() {
+    let agg = crate::Error::query_execution(crate::sql::returning::AGGREGATE_IN_RETURNING);
+    assert_eq!(super::handler::sqlstate_for_error(&agg), "42803");
+    let win = crate::Error::query_execution(crate::sql::returning::WINDOW_IN_RETURNING);
+    assert_eq!(super::handler::sqlstate_for_error(&win), "42P20");
+    let unrelated = crate::Error::query_execution("Unknown scalar function: 'aggregate_me'");
+    assert_eq!(super::handler::sqlstate_for_error(&unrelated), "42883");
+}

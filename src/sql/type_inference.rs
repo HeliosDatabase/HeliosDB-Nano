@@ -141,7 +141,18 @@ impl TypeInference for LogicalExpr {
                             args[0].infer_type(schema)
                         }
                     }
-                    "round" | "floor" | "ceil" | "ceiling" => Ok(DataType::Float8),
+                    // GH#23 (candidate 3): these keep the ARGUMENT's variant at
+                    // runtime (`Evaluator::func_round` / `func_floor` /
+                    // `func_ceil`: Int → Int, Numeric → Numeric, Float → Float),
+                    // so the inferred type must be the first argument's — a
+                    // hard-coded `Float8` advertised `round(price, 2)` over a
+                    // NUMERIC column as 701 and a money value lost decimal
+                    // fidelity in a typed client. An un-inferable or
+                    // non-numeric argument keeps the historical `Float8`.
+                    "round" | "floor" | "ceil" | "ceiling" => Ok(rounding_result_type(
+                        fun,
+                        args.first().and_then(|a| a.infer_type(schema).ok()),
+                    )),
                     "now" | "current_timestamp" => Ok(DataType::Timestamp),
                     "current_date" => Ok(DataType::Date),
                     "current_time" => Ok(DataType::Time),
@@ -460,6 +471,35 @@ impl TypeInference for LogicalExpr {
             unique: false,
             storage_mode: crate::ColumnStorageMode::Default,
         }
+    }
+}
+
+/// The result type of `round` / `floor` / `ceil` / `ceiling` given the
+/// inferred type of the FIRST argument, mirroring what the evaluator produces
+/// per `Value` variant:
+///
+/// * `Int2` / `Int4` / `Int8` → the same integer type (`func_round` returns
+///   the integer untouched);
+/// * `Numeric` → `Numeric` (`Decimal::round_dp` / `ceil` / `floor`, the text
+///   form keeps its scale);
+/// * `Float8` → `Float8`;
+/// * `Float4` → `Float4` for `round` (which keeps the f32), `Float8` for
+///   `floor` / `ceil` / `ceiling` (which widen to f64 — evaluator.rs
+///   `func_ceil` / `func_floor`);
+/// * anything else — a non-numeric argument (the evaluator refuses it at run
+///   time), an un-inferable one (`round($1)`) or a missing one → `Float8`,
+///   the type this arm hard-coded before GH#23.
+fn rounding_result_type(fun: &str, arg_type: Option<DataType>) -> DataType {
+    match arg_type {
+        Some(t @ (DataType::Int2 | DataType::Int4 | DataType::Int8 | DataType::Numeric | DataType::Float8)) => t,
+        Some(DataType::Float4) => {
+            if fun.eq_ignore_ascii_case("round") {
+                DataType::Float4
+            } else {
+                DataType::Float8
+            }
+        }
+        _ => DataType::Float8,
     }
 }
 
@@ -1134,5 +1174,97 @@ mod tests {
             right: Box::new(LogicalExpr::Literal(Value::Json("{}".to_string()))),
         };
         assert_eq!(json_contains.infer_type(&schema).unwrap(), DataType::Boolean);
+    }
+
+    /// GH#23 (candidate 3): `round` / `floor` / `ceil` / `ceiling` are typed
+    /// like the FIRST ARGUMENT, the way the evaluator produces them — never a
+    /// blanket `Float8`. The runtime pairing is in evaluator.rs
+    /// (`func_round` keeps Int/Numeric/Float4/Float8; `func_floor` and
+    /// `func_ceil` keep Int/Numeric/Float8 and widen Float4 to Float8).
+    #[test]
+    fn rounding_functions_keep_the_argument_type() {
+        let schema = Schema::new(vec![
+            Column::new("i2", DataType::Int2),
+            Column::new("i4", DataType::Int4),
+            Column::new("i8", DataType::Int8),
+            Column::new("f4", DataType::Float4),
+            Column::new("f8", DataType::Float8),
+            Column::new("num", DataType::Numeric),
+            Column::new("txt", DataType::Text),
+        ]);
+        let call = |fun: &str, args: Vec<LogicalExpr>| LogicalExpr::ScalarFunction {
+            fun: fun.to_string(),
+            args,
+        };
+        let col = |name: &str| LogicalExpr::Column {
+            table: None,
+            name: name.to_string(),
+        };
+
+        for fun in ["round", "ROUND", "floor", "ceil", "ceiling"] {
+            assert_eq!(
+                call(fun, vec![col("i2")]).infer_type(&schema).unwrap(),
+                DataType::Int2,
+                "{fun}"
+            );
+            assert_eq!(
+                call(fun, vec![col("i4")]).infer_type(&schema).unwrap(),
+                DataType::Int4,
+                "{fun}"
+            );
+            assert_eq!(
+                call(fun, vec![col("i8")]).infer_type(&schema).unwrap(),
+                DataType::Int8,
+                "{fun}"
+            );
+            assert_eq!(
+                call(fun, vec![col("f8")]).infer_type(&schema).unwrap(),
+                DataType::Float8,
+                "{fun}"
+            );
+            assert_eq!(
+                call(fun, vec![col("num")]).infer_type(&schema).unwrap(),
+                DataType::Numeric,
+                "{fun}: a NUMERIC argument stays numeric (1700), never float8"
+            );
+            // Non-numeric / missing argument: the historical Float8.
+            assert_eq!(
+                call(fun, vec![col("txt")]).infer_type(&schema).unwrap(),
+                DataType::Float8,
+                "{fun}"
+            );
+            assert_eq!(
+                call(fun, vec![]).infer_type(&schema).unwrap(),
+                DataType::Float8,
+                "{fun}"
+            );
+            // Un-inferable argument (`round($1)`): Float8, not an error.
+            assert_eq!(
+                call(fun, vec![LogicalExpr::Parameter { index: 1 }])
+                    .infer_type(&schema)
+                    .unwrap(),
+                DataType::Float8,
+                "{fun}"
+            );
+        }
+        // The two-argument form types by the FIRST argument only.
+        assert_eq!(
+            call("round", vec![col("num"), LogicalExpr::Literal(Value::Int4(2))])
+                .infer_type(&schema)
+                .unwrap(),
+            DataType::Numeric
+        );
+        // Float4: `round` keeps the f32; the others widen to f64 like the evaluator.
+        assert_eq!(
+            call("round", vec![col("f4")]).infer_type(&schema).unwrap(),
+            DataType::Float4
+        );
+        for fun in ["floor", "ceil", "ceiling"] {
+            assert_eq!(
+                call(fun, vec![col("f4")]).infer_type(&schema).unwrap(),
+                DataType::Float8,
+                "{fun}"
+            );
+        }
     }
 }

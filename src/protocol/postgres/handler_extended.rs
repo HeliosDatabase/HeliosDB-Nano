@@ -3,7 +3,7 @@
 //! This module extends the PgConnectionHandler with full extended query protocol support.
 
 use super::handler::PgConnectionHandler;
-use super::messages::{BackendMessage, FieldDescription};
+use super::messages::BackendMessage;
 use super::prepared::{decode_parameter, substitute_parameters, Portal, PortalState, PreparedStatement};
 use crate::{Error, Result, Value};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -319,8 +319,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
                     // directly against the catalog-emulated result.
                     self.prepared_statements
                         .update_portal_state(&portal_name, PortalState::Complete)?;
-                    self.send_data_rows_with_formats(&catalog_result.1, &portal.result_formats)
-                        .await?;
+                    let plan = super::codec::wire_plan(&catalog_result.0, &portal.result_formats);
+                    self.send_data_rows_with_formats(&catalog_result.1, &plan).await?;
                     let tag = format!("SELECT {}", catalog_result.1.len());
                     self.send_command_complete(&tag).await?;
                     return Ok(());
@@ -377,8 +377,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
 
             // Send DataRows — direct encoder for text formats (R5.W1),
             // legacy per-row conversion when binary formats are requested.
-            self.send_data_rows_with_formats(&results_to_send, &portal.result_formats)
-                .await?;
+            // GH#23: the plan is the SAME `wire_plan(result_schema,
+            // result_formats)` Describe(Portal) rendered, on the same inputs.
+            let plan = super::codec::wire_plan(
+                &Self::execute_result_schema(&statement, &results_to_send),
+                &portal.result_formats,
+            );
+            self.send_data_rows_with_formats(&results_to_send, &plan).await?;
 
             // Send CommandComplete
             let tag = format!("SELECT {}", results_to_send.len());
@@ -416,9 +421,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
                 self.prepared_statements
                     .update_portal_state(&portal_name, PortalState::Complete)?;
                 // RowDescription was already sent during Describe; Execute
-                // only emits DataRows + CommandComplete.
-                self.send_data_rows_with_formats(&tuples, &portal.result_formats)
-                    .await?;
+                // only emits DataRows + CommandComplete — under the SAME wire
+                // plan Describe rendered (GH#23).
+                let plan = super::codec::wire_plan(
+                    &Self::execute_result_schema(&statement, &tuples),
+                    &portal.result_formats,
+                );
+                self.send_data_rows_with_formats(&tuples, &plan).await?;
                 let tag = if is_insert {
                     format!("INSERT 0 {}", affected)
                 } else if is_update {
@@ -568,21 +577,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
                         .await?;
                 }
 
-                // Send RowDescription or NoData based on derived schema
+                // Send RowDescription or NoData based on derived schema. No
+                // portal yet, so no result formats: text everywhere (GH#23:
+                // same builder as the simple path and Describe(Portal)).
                 if let Some(schema) = &statement.result_schema {
-                    let fields: Vec<FieldDescription> = schema
-                        .columns
-                        .iter()
-                        .map(|col| FieldDescription {
-                            name: col.name.clone(),
-                            table_oid: 0,
-                            column_attr_num: 0,
-                            data_type_oid: super::handler::datatype_to_oid(&col.data_type),
-                            data_type_size: super::handler::datatype_to_size(&col.data_type),
-                            type_modifier: -1,
-                            format_code: 0,
-                        })
-                        .collect();
+                    let fields = super::handler::schema_to_field_descriptions(schema);
                     self.send_message(BackendMessage::RowDescription { fields }).await?;
                 } else {
                     // Statement doesn't return results (INSERT, UPDATE, DELETE, DDL)
@@ -634,6 +633,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
 
         self.send_message(BackendMessage::CloseComplete).await?;
         Ok(())
+    }
+
+    /// The schema Execute encodes rows under: the one Parse derived and
+    /// Describe advertised (`statement.result_schema`), else — when no
+    /// Describe was possible — the first row's runtime shape, which can only
+    /// yield each value's natural text form (never a declared-type form).
+    fn execute_result_schema(statement: &PreparedStatement, rows: &[crate::Tuple]) -> crate::Schema {
+        statement
+            .result_schema
+            .clone()
+            .or_else(|| rows.first().map(crate::Tuple::schema))
+            .unwrap_or_else(|| crate::Schema::new(vec![]))
     }
 
     /// Derive result schema from SQL statement for prepared statements
@@ -701,7 +712,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
                     } = plan
                     {
                         let table_schema = catalog.get_table_schema(&table_name)?;
-                        Ok(Some(crate::EmbeddedDatabase::returning_schema(&table_schema, items)))
+                        Ok(Some(crate::EmbeddedDatabase::returning_schema(&table_schema, items)?))
                     } else {
                         Ok(None)
                     }
@@ -723,7 +734,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
                     } = plan
                     {
                         let table_schema = catalog.get_table_schema(&table_name)?;
-                        Ok(Some(crate::EmbeddedDatabase::returning_schema(&table_schema, items)))
+                        Ok(Some(crate::EmbeddedDatabase::returning_schema(&table_schema, items)?))
                     } else {
                         Ok(None)
                     }
@@ -745,7 +756,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
                     } = plan
                     {
                         let table_schema = catalog.get_table_schema(&table_name)?;
-                        Ok(Some(crate::EmbeddedDatabase::returning_schema(&table_schema, items)))
+                        Ok(Some(crate::EmbeddedDatabase::returning_schema(&table_schema, items)?))
                     } else {
                         Ok(None)
                     }

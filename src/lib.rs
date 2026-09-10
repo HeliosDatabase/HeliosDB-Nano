@@ -1721,18 +1721,18 @@ impl EmbeddedDatabase {
     fn try_handle_search_path_setting(
         &self,
         statement: &DbSettingStatement,
-    ) -> Result<Option<(Vec<Tuple>, Vec<String>)>> {
+    ) -> Result<Option<(Vec<Tuple>, std::sync::Arc<Schema>)>> {
         match statement {
             DbSettingStatement::Set { name, value } if name == "search_path" => {
                 // Embedded path has no login identity: `"$user"` is dropped.
                 self.set_current_schema_path(Self::derive_search_path(value, None));
                 self.invalidate_plan_cache();
-                Ok(Some((Vec::new(), Vec::new())))
+                Ok(Some((Vec::new(), Self::empty_result_schema())))
             }
             DbSettingStatement::Reset { name } if name == "search_path" => {
                 self.set_current_schema(None);
                 self.invalidate_plan_cache();
-                Ok(Some((Vec::new(), Vec::new())))
+                Ok(Some((Vec::new(), Self::empty_result_schema())))
             }
             DbSettingStatement::Show { name } if name == "search_path" => {
                 // Reconstruct a PostgreSQL-shaped value from the ordered path:
@@ -1756,14 +1756,17 @@ impl EmbeddedDatabase {
                         row_id: None,
                         branch_id: None,
                     }],
-                    vec!["search_path".to_string()],
+                    Self::typed_result_schema("search_path", DataType::Text),
                 )))
             }
             _ => Ok(None),
         }
     }
 
-    fn try_handle_db_setting_statement_with_columns(&self, sql: &str) -> Result<Option<(Vec<Tuple>, Vec<String>)>> {
+    fn try_handle_db_setting_statement_with_schema(
+        &self,
+        sql: &str,
+    ) -> Result<Option<(Vec<Tuple>, std::sync::Arc<Schema>)>> {
         let Some(statement) = Self::parse_db_setting_statement(sql) else {
             return Ok(None);
         };
@@ -1798,7 +1801,7 @@ impl EmbeddedDatabase {
                 if let Some(enabled) = bulk_flag {
                     self.storage.set_bulk_load_mode(enabled);
                 }
-                Ok(Some((Vec::new(), Vec::new())))
+                Ok(Some((Vec::new(), Self::empty_result_schema())))
             }
             DbSettingStatement::Show { name } => {
                 let Some(value) = self.session_settings.get(&name) else {
@@ -1810,7 +1813,7 @@ impl EmbeddedDatabase {
                         row_id: None,
                         branch_id: None,
                     }],
-                    vec![name],
+                    Self::typed_result_schema(&name, DataType::Text),
                 )))
             }
             DbSettingStatement::Reset { name } => {
@@ -1824,15 +1827,15 @@ impl EmbeddedDatabase {
                 if name == "bulk_load_mode" {
                     self.storage.set_bulk_load_mode(false);
                 }
-                Ok(Some((Vec::new(), Vec::new())))
+                Ok(Some((Vec::new(), Self::empty_result_schema())))
             }
         }
     }
 
-    fn try_handle_prepared_query_plan_with_columns(
+    fn try_handle_prepared_query_plan_with_schema(
         &self,
         plan: &sql::LogicalPlan,
-    ) -> Result<Option<(Vec<Tuple>, Vec<String>)>> {
+    ) -> Result<Option<(Vec<Tuple>, std::sync::Arc<Schema>)>> {
         match plan {
             sql::LogicalPlan::Prepare { name, statement, .. } => {
                 self.prepared_statements
@@ -1840,7 +1843,7 @@ impl EmbeddedDatabase {
                     .insert(name.clone(), *statement.clone());
                 self.prepared_statement_sql.write().remove(name);
                 self.prepared_fast_selects.write().remove(name);
-                Ok(Some((Vec::new(), Vec::new())))
+                Ok(Some((Vec::new(), Self::empty_result_schema())))
             }
             sql::LogicalPlan::Execute { name, parameters } => {
                 let stored_plan = self.prepared_plan_or_lazy_fast_plan(name)?;
@@ -1854,12 +1857,7 @@ impl EmbeddedDatabase {
                     .collect();
                 let param_values = param_values?;
 
-                let columns = stored_plan
-                    .schema()
-                    .columns
-                    .iter()
-                    .map(|column| column.name.clone())
-                    .collect::<Vec<_>>();
+                let columns = stored_plan.schema();
                 if let Some(rows) = self.try_prepared_fast_select_rows(name, &param_values) {
                     return Ok(Some((rows?, columns)));
                 }
@@ -1893,16 +1891,16 @@ impl EmbeddedDatabase {
                     self.prepared_statement_sql.write().clear();
                     self.prepared_fast_selects.write().clear();
                 }
-                Ok(Some((Vec::new(), Vec::new())))
+                Ok(Some((Vec::new(), Self::empty_result_schema())))
             }
             _ => Ok(None),
         }
     }
 
-    fn try_handle_prepared_statement_sql_fast_with_columns(
+    fn try_handle_prepared_statement_sql_fast_with_schema(
         &self,
         sql: &str,
-    ) -> Result<Option<(Vec<Tuple>, Vec<String>)>> {
+    ) -> Result<Option<(Vec<Tuple>, std::sync::Arc<Schema>)>> {
         let trimmed = sql.trim().trim_end_matches(';').trim();
 
         if let Some(rest) = strip_prefix_icase(trimmed, "PREPARE ") {
@@ -1915,31 +1913,26 @@ impl EmbeddedDatabase {
                 self.prepared_statement_sql
                     .write()
                     .insert(name, statement_sql.to_string());
-                return Ok(Some((Vec::new(), Vec::new())));
+                return Ok(Some((Vec::new(), Self::empty_result_schema())));
             }
             let plan = (*self.parameterized_plan_cached(statement_sql)?).clone();
             self.prepared_statements.write().insert(name.clone(), plan);
             self.prepared_statement_sql
                 .write()
                 .insert(name, statement_sql.to_string());
-            return Ok(Some((Vec::new(), Vec::new())));
+            return Ok(Some((Vec::new(), Self::empty_result_schema())));
         }
 
         if let Some(rest) = strip_prefix_icase(trimmed, "EXECUTE ") {
             let Some((name, params)) = Self::split_fast_execute(rest) else {
                 return Ok(None);
             };
-            if let Some(result) = self.try_fast_prepared_select_with_columns(&name, &params) {
+            if let Some(result) = self.try_fast_prepared_select_with_schema(&name, &params) {
                 return Ok(Some(result?));
             }
             let stored_plan = self.prepared_plan_or_lazy_fast_plan(&name)?;
 
-            let columns = stored_plan
-                .schema()
-                .columns
-                .iter()
-                .map(|column| column.name.clone())
-                .collect::<Vec<_>>();
+            let columns = stored_plan.schema();
             if let Some(rows) = self.try_prepared_fast_select_rows(&name, &params) {
                 return Ok(Some((rows?, columns)));
             }
@@ -1967,7 +1960,7 @@ impl EmbeddedDatabase {
                 self.prepared_statements.write().clear();
                 self.prepared_statement_sql.write().clear();
                 self.prepared_fast_selects.write().clear();
-                return Ok(Some((Vec::new(), Vec::new())));
+                return Ok(Some((Vec::new(), Self::empty_result_schema())));
             }
             if name.is_empty() {
                 return Ok(None);
@@ -1978,7 +1971,7 @@ impl EmbeddedDatabase {
                     name
                 )));
             }
-            return Ok(Some((Vec::new(), Vec::new())));
+            return Ok(Some((Vec::new(), Self::empty_result_schema())));
         }
 
         Ok(None)
@@ -2079,11 +2072,11 @@ impl EmbeddedDatabase {
         Some(Ok(PreparedFastSelectSpec { select, param_index }))
     }
 
-    fn try_fast_prepared_select_with_columns(
+    fn try_fast_prepared_select_with_schema(
         &self,
         name: &str,
         params: &[Value],
-    ) -> Option<Result<(Vec<Tuple>, Vec<String>)>> {
+    ) -> Option<Result<(Vec<Tuple>, std::sync::Arc<Schema>)>> {
         if self.in_transaction() {
             return None;
         }
@@ -2107,13 +2100,7 @@ impl EmbeddedDatabase {
                 Err(e) => return Some(Err(e)),
             };
         }
-        let columns = spec
-            .select
-            .schema
-            .columns
-            .iter()
-            .map(|column| column.name.clone())
-            .collect();
+        let columns = std::sync::Arc::clone(&spec.select.schema);
         Some(self.fast_select_rows(&spec.select, &value)?.map(|rows| (rows, columns)))
     }
 
@@ -2539,7 +2526,7 @@ impl EmbeddedDatabase {
     /// cannot parse a top-level RESET at all, so these otherwise fail at the
     /// parse stage; this accepts them as a no-op (the GUC is one Nano does
     /// not model, so there is no session state to restore). Runs only after
-    /// `try_handle_db_setting_statement_with_columns` / `try_handle_fk_setting`
+    /// `try_handle_db_setting_statement_with_schema` / `try_handle_fk_setting`
     /// / `try_handle_trace_*`, so a `RESET` of a real session setting still
     /// performs its actual reset before ever reaching here.
     fn try_handle_reset_statement(&self, sql: &str) -> Result<Option<u64>> {
@@ -4605,7 +4592,7 @@ impl EmbeddedDatabase {
                 // set at exactly ONE site (`execute()`'s in-transaction branch).
                 // That is not enough here: a UDF is evaluated from READ paths too,
                 // and `query()`, `query_plan_with_params` and
-                // `query_plan_with_params_with_columns` each hold that same mutex
+                // `query_plan_with_params_with_schema` each hold that same mutex
                 // across execution WITHOUT setting the marker. So gate on the
                 // condition all of those share — a global transaction being open
                 // at all. Every one of those sites takes the lock if and only if
@@ -4768,14 +4755,33 @@ impl EmbeddedDatabase {
         &self,
         plan: &sql::LogicalPlan,
         session_txn: Option<&storage::Transaction>,
-    ) -> Option<Result<(Vec<Tuple>, Vec<String>)>> {
+    ) -> Option<Result<(Vec<Tuple>, std::sync::Arc<Schema>)>> {
         if !matches!(plan, sql::LogicalPlan::CreateTableAs { .. }) {
             return None;
         }
         Some(
             self.execute_plan_with_params(plan, &[], session_txn)
-                .map(|_| (Vec::new(), Vec::new())),
+                .map(|_| (Vec::new(), Self::empty_result_schema())),
         )
+    }
+
+    /// Output schema of a row-less result (DDL / utility statements answered
+    /// on the result-set surface).
+    fn empty_result_schema() -> std::sync::Arc<Schema> {
+        std::sync::Arc::new(Schema::new(Vec::new()))
+    }
+
+    /// Output schema of a hand-built one-column result, typed — the PG wire
+    /// advertises this type, so it must be the type of the value actually
+    /// placed in the row.
+    fn typed_result_schema(name: &str, data_type: DataType) -> std::sync::Arc<Schema> {
+        std::sync::Arc::new(Schema::new(vec![Column::new(name, data_type)]))
+    }
+
+    /// The name-only view of a result schema, for the public
+    /// `*_with_columns` adapters and the language bindings behind them.
+    fn column_names(schema: &Schema) -> Vec<String> {
+        schema.columns.iter().map(|c| c.name.clone()).collect()
     }
 
     fn execute_in_transaction_inner(
@@ -5409,7 +5415,13 @@ impl EmbeddedDatabase {
 
                 // Collect tuples for RETURNING clause
                 let mut returned_tuples: Vec<Tuple> = Vec::new();
-                let has_returning = returning.is_some();
+                // GH#23: bind the RETURNING list ONCE, before the first write, so an
+                // unresolvable item is refused with zero rows touched and every
+                // projected row uses the binding the RowDescription was built from.
+                let returning_projection = match returning {
+                    Some(items) => Some(sql::returning::ReturningProjection::bind(&schema, items)?),
+                    None => None,
+                };
 
                 // Pre-parse default expressions for columns (lazy evaluation)
                 let default_exprs: Vec<Option<sql::LogicalExpr>> = schema
@@ -5999,12 +6011,8 @@ impl EmbeddedDatabase {
                                         count += 1;
 
                                         // Collect for RETURNING if needed
-                                        if has_returning {
-                                            if let Some(projected) =
-                                                Self::project_returning_columns(&existing_tuple, &schema, returning)
-                                            {
-                                                returned_tuples.push(projected);
-                                            }
+                                        if let Some(p) = &returning_projection {
+                                            returned_tuples.push(p.project(&existing_tuple)?);
                                         }
                                         continue;
                                     }
@@ -6173,15 +6181,11 @@ impl EmbeddedDatabase {
                         count += 1;
 
                         // Collect tuple for RETURNING clause
-                        if has_returning {
+                        if let Some(p) = &returning_projection {
                             // Create tuple with row_id populated for reference
                             let mut returned_tuple = tuple.clone();
                             returned_tuple.row_id = Some(row_id);
-                            if let Some(projected) =
-                                Self::project_returning_columns(&returned_tuple, &schema, returning)
-                            {
-                                returned_tuples.push(projected);
-                            }
+                            returned_tuples.push(p.project(&returned_tuple)?);
                         }
 
                         // Update storage quota tracking
@@ -6312,6 +6316,13 @@ impl EmbeddedDatabase {
 
                 let has_returning = returning.is_some();
                 let mut returned_tuples: Vec<Tuple> = Vec::new();
+                // GH#23: bind the RETURNING list ONCE, before the first write, so an
+                // unresolvable item is refused with zero rows touched and every
+                // projected row uses the binding the RowDescription was built from.
+                let returning_projection = match returning {
+                    Some(items) => Some(sql::returning::ReturningProjection::bind(&schema, items)?),
+                    None => None,
+                };
 
                 // Auto-suspend SMFI tracking for bulk inserts
                 let bulk_threshold = self.storage.smfi_bulk_load_threshold();
@@ -6411,8 +6422,8 @@ impl EmbeddedDatabase {
                             count += ids.len() as u64;
                             for (mut t, id) in pending_returning.drain(..).zip(ids) {
                                 t.row_id = Some(id);
-                                if let Some(p) = Self::project_returning_columns(&t, &schema, returning) {
-                                    returned_tuples.push(p);
+                                if let Some(p) = &returning_projection {
+                                    returned_tuples.push(p.project(&t)?);
                                 }
                             }
                         }
@@ -6448,10 +6459,8 @@ impl EmbeddedDatabase {
                         if has_returning {
                             let mut returned_tuple = tuple.clone();
                             returned_tuple.row_id = Some(row_id);
-                            if let Some(projected) =
-                                Self::project_returning_columns(&returned_tuple, &schema, returning)
-                            {
-                                returned_tuples.push(projected);
+                            if let Some(p) = &returning_projection {
+                                returned_tuples.push(p.project(&returned_tuple)?);
                             }
                         }
                     }
@@ -6488,8 +6497,8 @@ impl EmbeddedDatabase {
                     count += ids.len() as u64;
                     for (mut t, id) in pending_returning.into_iter().zip(ids) {
                         t.row_id = Some(id);
-                        if let Some(p) = Self::project_returning_columns(&t, &schema, returning) {
-                            returned_tuples.push(p);
+                        if let Some(p) = &returning_projection {
+                            returned_tuples.push(p.project(&t)?);
                         }
                     }
                 }
@@ -6508,6 +6517,13 @@ impl EmbeddedDatabase {
                 let eval_schema = schema.clone().with_source_table_name(table_name);
                 let evaluator = sql::Evaluator::with_parameters(std::sync::Arc::new(eval_schema), vec![]);
                 let table_constraints = catalog.load_table_constraints(table_name)?;
+                // GH#23: bind the RETURNING list ONCE, before the first write, so an
+                // unresolvable item is refused with zero rows touched and every
+                // projected row uses the binding the RowDescription was built from.
+                let returning_projection = match returning {
+                    Some(items) => Some(sql::returning::ReturningProjection::bind(&schema, items)?),
+                    None => None,
+                };
 
                 // Initialize trigger context
                 let mut trigger_context = sql::TriggerContext::new();
@@ -6887,13 +6903,12 @@ impl EmbeddedDatabase {
                 }
 
                 // Project RETURNING clause columns from updated tuples
-                let returned_tuples: Vec<Tuple> = if returning.is_some() {
-                    updates
+                let returned_tuples: Vec<Tuple> = match &returning_projection {
+                    Some(p) => updates
                         .iter()
-                        .filter_map(|(_, _, tuple)| Self::project_returning_columns(tuple, &schema, returning))
-                        .collect()
-                } else {
-                    Vec::new()
+                        .map(|(_, _, tuple)| p.project(tuple))
+                        .collect::<Result<Vec<_>>>()?,
+                    None => Vec::new(),
                 };
                 let _ = returned_tuples; // RETURNING clause results handled separately
 
@@ -6953,7 +6968,13 @@ impl EmbeddedDatabase {
 
                 // Collect tuples for RETURNING clause (must be done before deletion)
                 let mut returned_tuples: Vec<Tuple> = Vec::new();
-                let has_returning = returning.is_some();
+                // GH#23: bind the RETURNING list ONCE, before the first write, so an
+                // unresolvable item is refused with zero rows touched and every
+                // projected row uses the binding the RowDescription was built from.
+                let returning_projection = match returning {
+                    Some(items) => Some(sql::returning::ReturningProjection::bind(&schema_arc, items)?),
+                    None => None,
+                };
 
                 for tuple in tuples {
                     let matches = if let Some(predicate) = selection {
@@ -7023,11 +7044,8 @@ impl EmbeddedDatabase {
                             deleted_tuples.push((row_id, tuple.clone()));
 
                             // Collect tuple for RETURNING clause before deletion
-                            if has_returning {
-                                if let Some(projected) = Self::project_returning_columns(&tuple, &schema_arc, returning)
-                                {
-                                    returned_tuples.push(projected);
-                                }
+                            if let Some(p) = &returning_projection {
+                                returned_tuples.push(p.project(&tuple)?);
                             }
 
                             // Record CDC event for DELETE
@@ -8867,7 +8885,7 @@ impl EmbeddedDatabase {
             return Ok(count);
         }
 
-        if let Some((_rows, _columns)) = self.try_handle_db_setting_statement_with_columns(sql)? {
+        if let Some((_rows, _columns)) = self.try_handle_db_setting_statement_with_schema(sql)? {
             return Ok(0);
         }
 
@@ -13032,13 +13050,13 @@ impl EmbeddedDatabase {
         self.fast_select_rows(&spec, &pk_value)
     }
 
-    fn try_fast_select_with_columns(&self, sql: &str) -> Option<Result<(Vec<Tuple>, Vec<String>)>> {
+    fn try_fast_select_with_schema(&self, sql: &str) -> Option<Result<(Vec<Tuple>, std::sync::Arc<Schema>)>> {
         let (spec, pk_value) = match self.fast_select_lookup(sql)? {
             Ok(lookup) => lookup,
             Err(e) => return Some(Err(e)),
         };
 
-        let columns = spec.schema.columns.iter().map(|column| column.name.clone()).collect();
+        let columns = std::sync::Arc::clone(&spec.schema);
         Some(self.fast_select_rows(&spec, &pk_value)?.map(|rows| (rows, columns)))
     }
 
@@ -14738,57 +14756,6 @@ impl EmbeddedDatabase {
         out
     }
 
-    /// Project columns from a tuple according to RETURNING clause
-    ///
-    /// # Arguments
-    /// * `tuple` - The tuple to project from
-    /// * `schema` - The schema of the tuple
-    /// * `returning_items` - RETURNING clause items (None means no RETURNING)
-    ///
-    /// # Returns
-    /// * Some(projected_tuple) if RETURNING items specified
-    /// * None if no RETURNING clause
-    fn project_returning_columns(
-        tuple: &Tuple,
-        schema: &Schema,
-        returning_items: &Option<Vec<sql::logical_plan::ReturningItem>>,
-    ) -> Option<Tuple> {
-        let items = returning_items.as_ref()?;
-
-        let evaluator = sql::Evaluator::new(std::sync::Arc::new(schema.clone()));
-        let mut projected_values = Vec::with_capacity(items.len());
-
-        for item in items {
-            match item {
-                sql::logical_plan::ReturningItem::Wildcard => {
-                    // Return all columns
-                    return Some(tuple.clone());
-                }
-                sql::logical_plan::ReturningItem::Column(col_name) => {
-                    if let Some(col_idx) = schema.get_column_index(col_name) {
-                        if let Some(val) = tuple.values.get(col_idx) {
-                            projected_values.push(val.clone());
-                        } else {
-                            projected_values.push(Value::Null);
-                        }
-                    } else {
-                        // Column not found - return NULL
-                        projected_values.push(Value::Null);
-                    }
-                }
-                sql::logical_plan::ReturningItem::Expression { expr, .. } => {
-                    // Evaluate expression against the tuple
-                    match evaluator.evaluate(expr, tuple) {
-                        Ok(val) => projected_values.push(val),
-                        Err(_) => projected_values.push(Value::Null),
-                    }
-                }
-            }
-        }
-
-        Some(Tuple::new(projected_values))
-    }
-
     /// Resolve `EXCLUDED.col` references in an expression for ON CONFLICT DO UPDATE.
     ///
     /// Replaces `LogicalExpr::Column { table: Some("EXCLUDED"|"excluded"), name }` with
@@ -14942,48 +14909,20 @@ impl EmbeddedDatabase {
         }
     }
 
-    /// Build a schema for RETURNING clause results
+    /// The output schema of a `RETURNING` list — what both wire protocols
+    /// advertise in `RowDescription`.
+    ///
+    /// Thin wrapper over `sql::returning::ReturningProjection::bind`, the SAME
+    /// binding every DML arm runs before its first write; `schema()` column
+    /// *i* and the projected value *i* are one binding, so the advertised type
+    /// and the sent value cannot disagree (GH#23). Refuses — rather than
+    /// describing as `text` and later sending NULL — an item that names no
+    /// column of the target table.
     pub(crate) fn returning_schema(
         table_schema: &Schema,
         returning_items: &[sql::logical_plan::ReturningItem],
-    ) -> Schema {
-        let columns = returning_items
-            .iter()
-            .flat_map(|item| match item {
-                sql::logical_plan::ReturningItem::Wildcard => table_schema.columns.clone(),
-                sql::logical_plan::ReturningItem::Column(col_name) => {
-                    if let Some(col) = table_schema.columns.iter().find(|c| &c.name == col_name) {
-                        vec![col.clone()]
-                    } else {
-                        vec![Column {
-                            name: col_name.clone(),
-                            data_type: DataType::Text,
-                            nullable: true,
-                            primary_key: false,
-                            source_table: None,
-                            source_table_name: None,
-                            default_expr: None,
-                            unique: false,
-                            storage_mode: crate::ColumnStorageMode::Default,
-                        }]
-                    }
-                }
-                sql::logical_plan::ReturningItem::Expression { alias, .. } => {
-                    vec![Column {
-                        name: alias.clone(),
-                        data_type: DataType::Text,
-                        nullable: true,
-                        primary_key: false,
-                        source_table: None,
-                        source_table_name: None,
-                        default_expr: None,
-                        unique: false,
-                        storage_mode: crate::ColumnStorageMode::Default,
-                    }]
-                }
-            })
-            .collect();
-        Schema { columns }
+    ) -> Result<Schema> {
+        Ok(sql::returning::ReturningProjection::bind(table_schema, returning_items)?.schema())
     }
 
     /// Internal method to execute a plan with parameters
@@ -15172,6 +15111,15 @@ impl EmbeddedDatabase {
 
                 let has_returning = returning.is_some();
                 let mut returned_tuples: Vec<Tuple> = Vec::new();
+                // GH#23: bind the RETURNING list ONCE, before the first write (see
+                // the text family's arm); `$n` in a RETURNING expression evaluates
+                // against this statement's parameters.
+                let returning_projection = match returning {
+                    Some(items) => Some(sql::returning::ReturningProjection::bind_with_parameters(
+                        &schema, items, params,
+                    )?),
+                    None => None,
+                };
                 let mut count = 0;
                 for value_row in values {
                     // Always allocate a schema-sized tuple so omitted
@@ -15410,8 +15358,8 @@ impl EmbeddedDatabase {
                                     }
                                 }
                                 filled.row_id = Some(row_id);
-                                if let Some(projected) = Self::project_returning_columns(&filled, &schema, returning) {
-                                    returned_tuples.push(projected);
+                                if let Some(p) = &returning_projection {
+                                    returned_tuples.push(p.project(&filled)?);
                                 }
                             }
                             count += 1;
@@ -15606,12 +15554,8 @@ impl EmbeddedDatabase {
                                 &schema,
                             )?;
 
-                            if has_returning {
-                                if let Some(projected) =
-                                    Self::project_returning_columns(&updated_tuple, &schema, returning)
-                                {
-                                    returned_tuples.push(projected);
-                                }
+                            if let Some(p) = &returning_projection {
+                                returned_tuples.push(p.project(&updated_tuple)?);
                             }
                             count += 1;
                         }
@@ -15710,6 +15654,15 @@ impl EmbeddedDatabase {
 
                 let has_returning = returning.is_some();
                 let mut returned_tuples: Vec<Tuple> = Vec::new();
+                // GH#23: bind the RETURNING list ONCE, before the first write (see
+                // the text family's arm); `$n` in a RETURNING expression evaluates
+                // against this statement's parameters.
+                let returning_projection = match returning {
+                    Some(items) => Some(sql::returning::ReturningProjection::bind_with_parameters(
+                        &schema, items, params,
+                    )?),
+                    None => None,
+                };
                 let mut count = 0u64;
 
                 for source_row in &source_rows {
@@ -15741,17 +15694,15 @@ impl EmbeddedDatabase {
                             count += ids.len() as u64;
                             for (mut t, id) in pending_returning.drain(..).zip(ids) {
                                 t.row_id = Some(id);
-                                if let Some(p) = Self::project_returning_columns(&t, &schema, returning) {
-                                    returned_tuples.push(p);
+                                if let Some(p) = &returning_projection {
+                                    returned_tuples.push(p.project(&t)?);
                                 }
                             }
                         }
                         continue;
                     }
-                    if has_returning {
-                        if let Some(projected) = Self::project_returning_columns(&tuple, &schema, returning) {
-                            returned_tuples.push(projected);
-                        }
+                    if let Some(p) = &returning_projection {
+                        returned_tuples.push(p.project(&tuple)?);
                     }
                     self.storage
                         .insert_tuple_branch_aware_with_schema(table_name, tuple, &schema)?;
@@ -15762,8 +15713,8 @@ impl EmbeddedDatabase {
                     count += ids.len() as u64;
                     for (mut t, id) in pending_returning.into_iter().zip(ids) {
                         t.row_id = Some(id);
-                        if let Some(p) = Self::project_returning_columns(&t, &schema, returning) {
-                            returned_tuples.push(p);
+                        if let Some(p) = &returning_projection {
+                            returned_tuples.push(p.project(&t)?);
                         }
                     }
                 }
@@ -15801,6 +15752,15 @@ impl EmbeddedDatabase {
                 // resolve against this evaluator schema (B31).
                 let eval_schema = schema.clone().with_source_table_name(table_name);
                 let evaluator = sql::Evaluator::with_parameters(std::sync::Arc::new(eval_schema), params.to_vec());
+                // GH#23: bind the RETURNING list ONCE, before the first write (see
+                // the text family's arm); `$n` in a RETURNING expression evaluates
+                // against this statement's parameters.
+                let returning_projection = match returning {
+                    Some(items) => Some(sql::returning::ReturningProjection::bind_with_parameters(
+                        &schema, items, params,
+                    )?),
+                    None => None,
+                };
 
                 // RLS (ROADMAP_V5 §1.1): same helpers as the text family's Update arm.
                 // Once per statement, before the row loop.
@@ -15945,13 +15905,12 @@ impl EmbeddedDatabase {
                 }
 
                 // Project RETURNING clause columns from updated tuples
-                let returned_tuples: Vec<Tuple> = if returning.is_some() {
-                    updates
+                let returned_tuples: Vec<Tuple> = match &returning_projection {
+                    Some(p) => updates
                         .iter()
-                        .filter_map(|(_, _, tuple)| Self::project_returning_columns(tuple, &schema, returning))
-                        .collect()
-                } else {
-                    Vec::new()
+                        .map(|(_, _, tuple)| p.project(tuple))
+                        .collect::<Result<Vec<_>>>()?,
+                    None => Vec::new(),
                 };
 
                 let count = if let Some(txn) = active_txn {
@@ -16150,7 +16109,15 @@ impl EmbeddedDatabase {
                 let mut row_ids_to_delete: Vec<u64> = Vec::new();
                 let mut deleted_tuples: Vec<(u64, Tuple)> = Vec::new();
                 let mut returned_tuples: Vec<Tuple> = Vec::new();
-                let has_returning = returning.is_some();
+                // GH#23: bind the RETURNING list ONCE, before the first write (see
+                // the text family's arm); `$n` in a RETURNING expression evaluates
+                // against this statement's parameters.
+                let returning_projection = match returning {
+                    Some(items) => Some(sql::returning::ReturningProjection::bind_with_parameters(
+                        &schema, items, params,
+                    )?),
+                    None => None,
+                };
 
                 for tuple in tuples {
                     let matches = if let Some(predicate) = selection {
@@ -16184,10 +16151,8 @@ impl EmbeddedDatabase {
                         }
 
                         // Collect tuple for RETURNING clause before deletion
-                        if has_returning {
-                            if let Some(projected) = Self::project_returning_columns(&tuple, &schema, returning) {
-                                returned_tuples.push(projected);
-                            }
+                        if let Some(p) = &returning_projection {
+                            returned_tuples.push(p.project(&tuple)?);
                         }
 
                         if let Some(row_id) = tuple.row_id {
@@ -16612,7 +16577,7 @@ impl EmbeddedDatabase {
             return Ok(rows);
         }
 
-        if let Some((rows, _columns)) = self.try_handle_db_setting_statement_with_columns(sql)? {
+        if let Some((rows, _columns)) = self.try_handle_db_setting_statement_with_schema(sql)? {
             return Ok(rows);
         }
 
@@ -16681,7 +16646,7 @@ impl EmbeddedDatabase {
         }
 
         if Self::is_prepared_statement_sql(sql) {
-            if let Some((rows, _columns)) = self.try_handle_prepared_statement_sql_fast_with_columns(sql)? {
+            if let Some((rows, _columns)) = self.try_handle_prepared_statement_sql_fast_with_schema(sql)? {
                 self.log_slow_query(sql, start.elapsed(), rows.len() as u64);
                 return Ok(rows);
             }
@@ -16692,7 +16657,7 @@ impl EmbeddedDatabase {
                 .with_current_schema(self.current_schema())
                 .with_search_path(self.current_search_path());
             let plan = planner.statement_to_plan(statement)?;
-            if let Some((rows, _columns)) = self.try_handle_prepared_query_plan_with_columns(&plan)? {
+            if let Some((rows, _columns)) = self.try_handle_prepared_query_plan_with_schema(&plan)? {
                 self.log_slow_query(sql, start.elapsed(), rows.len() as u64);
                 return Ok(rows);
             }
@@ -16893,7 +16858,7 @@ impl EmbeddedDatabase {
         // write-invalidated exactly like every other result-cache entry, so it
         // can never serve stale rows.
         if !schema_active && !is_non_deterministic {
-            if let Some(result) = self.try_normalized_query_with_columns(sql) {
+            if let Some(result) = self.try_normalized_query_with_schema(sql) {
                 let (rows, _columns) = result?;
                 if self.cache_admits(sql) {
                     self.cache_query_result(sql, &rows, cache_epoch);
@@ -17015,7 +16980,10 @@ impl EmbeddedDatabase {
     /// Unlike `query()`, this returns the actual column names from the query
     /// plan (e.g. table column names, aliases) instead of requiring the caller
     /// to generate generic names.
-    pub(crate) fn try_cached_query_with_columns(&self, sql: &str) -> Option<(std::sync::Arc<Vec<Tuple>>, Vec<String>)> {
+    pub(crate) fn try_cached_query_with_schema(
+        &self,
+        sql: &str,
+    ) -> Option<(std::sync::Arc<Vec<Tuple>>, std::sync::Arc<Schema>)> {
         if self.in_transaction()
             || Self::query_is_non_deterministic(sql)
             || !self.result_cache_nonempty.load(std::sync::atomic::Ordering::Acquire)
@@ -17025,12 +16993,9 @@ impl EmbeddedDatabase {
 
         let cached_results = self.cached_query_result(sql)?;
         let arc_plan = self.plan_cache.get(sql)?;
-        let columns = arc_plan
-            .schema()
-            .columns
-            .iter()
-            .map(|column| column.name.clone())
-            .collect();
+        // The cached plan's own schema: the cached and the uncached branch now
+        // describe a result identically (GH#23).
+        let columns = arc_plan.schema();
 
         Some((cached_results, columns))
     }
@@ -17050,7 +17015,7 @@ impl EmbeddedDatabase {
     /// does not apply. Correctness is guaranteed by `normalize_select_literals`
     /// (typed through the planner's own literal path) and the
     /// `tests/…::differential` oracle (raw rows == normalized rows).
-    fn try_normalized_query_with_columns(&self, sql: &str) -> Option<Result<(Vec<Tuple>, Vec<String>)>> {
+    fn try_normalized_query_with_schema(&self, sql: &str) -> Option<Result<(Vec<Tuple>, std::sync::Arc<Schema>)>> {
         if !Self::query_normalization_enabled() {
             return None;
         }
@@ -17130,13 +17095,13 @@ impl EmbeddedDatabase {
         // The normalized path deliberately does NOT populate the result cache:
         // the parameters vary per call, so the rows are not reusable under the
         // normalized key (only the plan is).
-        Some(executor.execute_with_columns(&plan_arc))
+        Some(executor.execute_with_schema(&plan_arc))
     }
 
     /// Test-only oracle helper: execute `sql` via the cold parse → plan →
     /// optimize → execute path, bypassing every fast path AND the A2
     /// normalizer. Now that `query()` itself routes eligible SELECTs through
-    /// `try_normalized_query_with_columns` (see above), plain `query()` is no
+    /// `try_normalized_query_with_schema` (see above), plain `query()` is no
     /// longer a guaranteed-raw reference for the differential oracle — a
     /// normalizable query passed to `query()` would silently execute the
     /// *normalized* form on both sides of the comparison, making it vacuous.
@@ -17158,6 +17123,16 @@ impl EmbeddedDatabase {
     }
 
     pub fn query_with_columns(&self, sql: &str) -> Result<(Vec<Tuple>, Vec<String>)> {
+        let (rows, schema) = self.query_with_schema(sql)?;
+        Ok((rows, Self::column_names(&schema)))
+    }
+
+    /// [`query_with_columns`](Self::query_with_columns), returning the
+    /// result's SCHEMA (declared column types) instead of names only — the
+    /// shape the PG simple-query path types its `RowDescription` from
+    /// (GH#23). Every internal fast path answers with a real schema: the
+    /// cached and the uncached branch describe a result identically.
+    pub(crate) fn query_with_schema(&self, sql: &str) -> Result<(Vec<Tuple>, std::sync::Arc<Schema>)> {
         // Snapshot the result-cache invalidation epoch BEFORE reading any
         // data. Every `cache_query_result` below publishes only if nothing
         // invalidated the cache in between (see `result_cache_epoch`).
@@ -17170,16 +17145,16 @@ impl EmbeddedDatabase {
         // when `query_with_columns_for_session` already installed its own — the
         // wire simple-query path always does.
         let _advisory = self.embedded_advisory_context_guard(sql);
-        if let Some(result) = self.try_fast_select_with_columns(sql) {
+        if let Some(result) = self.try_fast_select_with_schema(sql) {
             return result;
         }
 
-        if let Some(result) = self.try_handle_db_setting_statement_with_columns(sql)? {
+        if let Some(result) = self.try_handle_db_setting_statement_with_schema(sql)? {
             return Ok(result);
         }
 
         if Self::is_prepared_statement_sql(sql) {
-            if let Some(result) = self.try_handle_prepared_statement_sql_fast_with_columns(sql)? {
+            if let Some(result) = self.try_handle_prepared_statement_sql_fast_with_schema(sql)? {
                 return Ok(result);
             }
         }
@@ -17193,38 +17168,41 @@ impl EmbeddedDatabase {
                 row_id: None,
                 branch_id: None,
             };
-            return Ok((vec![row], vec!["versions_collected".to_string()]));
+            return Ok((
+                vec![row],
+                Self::typed_result_schema("versions_collected", DataType::Int8),
+            ));
         }
 
         // Priority #5: standard PostgreSQL VACUUM over the result-set
         // surface (REPL/wire protocols) — command-tag-only, no rows.
         if let Some(_count) = self.try_handle_vacuum_statement(sql)? {
-            return Ok((Vec::new(), Vec::new()));
+            return Ok((Vec::new(), Self::empty_result_schema()));
         }
 
         // Priority #7: CREATE TABLESPACE accept-and-ignore no-op.
         if let Some(_count) = self.try_handle_create_tablespace_statement(sql)? {
-            return Ok((Vec::new(), Vec::new()));
+            return Ok((Vec::new(), Self::empty_result_schema()));
         }
 
         // Round-2: standard PostgreSQL RESET name / RESET ALL no-op.
         if let Some(_count) = self.try_handle_reset_statement(sql)? {
-            return Ok((Vec::new(), Vec::new()));
+            return Ok((Vec::new(), Self::empty_result_schema()));
         }
 
         // Round-2: PostgreSQL REINDEX … no-op.
         if let Some(_count) = self.try_handle_reindex_statement(sql)? {
-            return Ok((Vec::new(), Vec::new()));
+            return Ok((Vec::new(), Self::empty_result_schema()));
         }
 
         // Round-2: PostgreSQL CREATE DOMAIN / DROP DOMAIN no-op.
         if let Some(_count) = self.try_handle_domain_ddl_statement(sql)? {
-            return Ok((Vec::new(), Vec::new()));
+            return Ok((Vec::new(), Self::empty_result_schema()));
         }
 
         // Round-3: PostgreSQL ALTER TABLE/INDEX ATTACH/DETACH PARTITION no-op.
         if let Some(_count) = self.try_handle_partition_attach_detach(sql)? {
-            return Ok((Vec::new(), Vec::new()));
+            return Ok((Vec::new(), Self::empty_result_schema()));
         }
 
         // Under a non-`public` `search_path`, bare names resolve against a
@@ -17241,14 +17219,14 @@ impl EmbeddedDatabase {
         // literal variant. Only fires for deterministic autocommit SELECTs it
         // can prove safe; everything else falls through to the raw path below.
         if !schema_active && !Self::query_is_non_deterministic(sql) {
-            if let Some(result) = self.try_normalized_query_with_columns(sql) {
+            if let Some(result) = self.try_normalized_query_with_schema(sql) {
                 return result;
             }
         }
 
         let cacheable = !schema_active && !self.in_transaction() && !Self::query_is_non_deterministic(sql);
         if !schema_active {
-            if let Some((cached_results, columns)) = self.try_cached_query_with_columns(sql) {
+            if let Some((cached_results, columns)) = self.try_cached_query_with_schema(sql) {
                 return Ok(((*cached_results).clone(), columns));
             }
         }
@@ -17266,7 +17244,7 @@ impl EmbeddedDatabase {
         let plan = if sql::Parser::is_show_branches(sql) {
             sql::LogicalPlan::ShowBranches
         } else if let Some(arc_plan) = cached_plan {
-            if let Some(result) = self.try_handle_prepared_query_plan_with_columns(&arc_plan)? {
+            if let Some(result) = self.try_handle_prepared_query_plan_with_schema(&arc_plan)? {
                 return Ok(result);
             }
             // `SELECT … INTO t` plans to CTAS, a WRITE. The cold branch below
@@ -17288,9 +17266,9 @@ impl EmbeddedDatabase {
                 sql::Executor::with_storage(&self.storage).with_timeout(self.effective_statement_timeout_ms());
             if self.tenant_manager.has_current_context() {
                 let plan = self.apply_rls_to_plan_recursive((*arc_plan).clone())?;
-                return executor.execute_with_columns(&plan);
+                return executor.execute_with_schema(&plan);
             }
-            let result = executor.execute_with_columns(&arc_plan)?;
+            let result = executor.execute_with_schema(&arc_plan)?;
             if admit {
                 self.cache_query_result(sql, &result.0, cache_epoch);
             }
@@ -17305,7 +17283,7 @@ impl EmbeddedDatabase {
             planner.statement_to_plan(statement)?
         };
 
-        if let Some(result) = self.try_handle_prepared_query_plan_with_columns(&plan)? {
+        if let Some(result) = self.try_handle_prepared_query_plan_with_schema(&plan)? {
             return Ok(result);
         }
 
@@ -17337,9 +17315,9 @@ impl EmbeddedDatabase {
         // saving — only the rewrite-and-execute step re-runs per call.
         if self.tenant_manager.has_current_context() {
             let plan = self.apply_rls_to_plan_recursive((*plan_arc).clone())?;
-            return executor.execute_with_columns(&plan);
+            return executor.execute_with_schema(&plan);
         }
-        let result = executor.execute_with_columns(&plan_arc)?;
+        let result = executor.execute_with_schema(&plan_arc)?;
         if admit && !is_show_branches {
             self.cache_query_result(sql, &result.0, cache_epoch);
         }
@@ -18788,6 +18766,17 @@ impl EmbeddedDatabase {
         session_id: crate::session::SessionId,
         sql: &str,
     ) -> Result<(Vec<Tuple>, Vec<String>)> {
+        let (rows, schema) = self.query_with_schema_for_session(session_id, sql)?;
+        Ok((rows, Self::column_names(&schema)))
+    }
+
+    /// [`query_with_columns_for_session`](Self::query_with_columns_for_session)
+    /// returning the result SCHEMA — the PG simple-query entry point (GH#23).
+    pub(crate) fn query_with_schema_for_session(
+        &self,
+        session_id: crate::session::SessionId,
+        sql: &str,
+    ) -> Result<(Vec<Tuple>, std::sync::Arc<Schema>)> {
         // Spec 03: this connection owns any advisory lock the statement takes.
         // Installed before the autocommit delegate below, so the shared funnel
         // does not re-attribute the lock to the embedded handle.
@@ -18796,7 +18785,7 @@ impl EmbeddedDatabase {
         // autocommit delegate and the in-transaction planner below.
         let _schema_override = self.session_schema_override_guard(session_id);
         if !self.session_transactions.contains_key(&session_id) {
-            return self.query_with_columns(sql);
+            return self.query_with_schema(sql);
         }
 
         let start = std::time::Instant::now();
@@ -18827,7 +18816,7 @@ impl EmbeddedDatabase {
 
         // R1.2 (Hole 5c): the wire simple-query path inside an open session
         // transaction built its own executor and skipped RLS entirely.
-        let result = self.query_plan_with_params_with_columns(&plan, &[], Some(&txn));
+        let result = self.query_plan_with_params_with_schema(&plan, &[], Some(&txn));
         if let Ok((rows, _)) = &result {
             self.log_slow_query(sql, start.elapsed(), rows.len() as u64);
         }
@@ -18968,7 +18957,7 @@ impl EmbeddedDatabase {
         // `Some(&txn)`: the whole point. Every DML arm of
         // `execute_plan_with_params_inner` prefers this transaction over the
         // global slot, so the rows are staged in the session's write set and
-        // `project_returning_columns` runs over the tuple that transaction just
+        // `ReturningProjection::project` runs over the tuple that transaction just
         // produced — visible to this session, invisible to others until COMMIT,
         // and discarded by ROLLBACK / ROLLBACK TO SAVEPOINT.
         let out = self.execute_plan_with_params(&plan, params, Some(&txn));
@@ -19135,11 +19124,23 @@ impl EmbeddedDatabase {
         sql: &str,
         params: &[Value],
     ) -> Result<(Vec<Tuple>, Vec<String>)> {
+        let (rows, schema) = self.query_params_with_schema_for_session(session_id, sql, params)?;
+        Ok((rows, Self::column_names(&schema)))
+    }
+
+    /// [`query_params_with_columns_for_session`](Self::query_params_with_columns_for_session)
+    /// returning the result SCHEMA (GH#23).
+    pub(crate) fn query_params_with_schema_for_session(
+        &self,
+        session_id: crate::session::SessionId,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<(Vec<Tuple>, std::sync::Arc<Schema>)> {
         // Spec 03: this connection owns any advisory lock the statement takes.
         let _advisory = self.advisory_context_guard(session_id, sql);
         let _schema_override = self.session_schema_override_guard(session_id);
         if !self.session_transactions.contains_key(&session_id) {
-            return self.query_params_with_columns(sql, params);
+            return self.query_params_with_schema(sql, params);
         }
 
         self.touch_session_for_statement(session_id)?;
@@ -19183,13 +19184,9 @@ impl EmbeddedDatabase {
                     ..
                 } => {
                     let schema = self.storage.catalog().get_table_schema(table_name)?;
-                    Self::returning_schema(&schema, items)
-                        .columns
-                        .into_iter()
-                        .map(|c| c.name)
-                        .collect()
+                    std::sync::Arc::new(Self::returning_schema(&schema, items)?)
                 }
-                _ => Vec::new(),
+                _ => Self::empty_result_schema(),
             };
             let (_count, returned) = self.execute_plan_with_params(&plan, params, Some(&txn))?;
             return Ok((returned, columns));
@@ -19197,7 +19194,7 @@ impl EmbeddedDatabase {
 
         // R1.2 (Hole 5e): MySQL binary `COM_STMT_EXECUTE` inside an open session
         // transaction skipped RLS the same way the simple-query path did.
-        self.query_plan_with_params_with_columns(&plan, params, Some(&txn))
+        self.query_plan_with_params_with_schema(&plan, params, Some(&txn))
     }
 
     /// Session-transaction variant of the parameterized fast INSERT path:
@@ -19486,12 +19483,12 @@ impl EmbeddedDatabase {
     /// for the `_with_columns`-shaped read sites (wire simple-query inside a
     /// session transaction, MySQL `COM_STMT_EXECUTE`). Same RLS gate, same
     /// transaction resolution; only the executor call differs.
-    fn query_plan_with_params_with_columns(
+    fn query_plan_with_params_with_schema(
         &self,
         plan: &sql::LogicalPlan,
         params: &[Value],
         session_txn: Option<&storage::Transaction>,
-    ) -> Result<(Vec<Tuple>, Vec<String>)> {
+    ) -> Result<(Vec<Tuple>, std::sync::Arc<Schema>)> {
         let plan = self.rls_filtered_plan(plan)?;
         let mut _txn_guard = None;
         let active_txn: Option<&storage::Transaction> = match session_txn {
@@ -19510,7 +19507,7 @@ impl EmbeddedDatabase {
             executor = executor.with_transaction(txn_ref);
         }
 
-        executor.execute_with_columns(&plan)
+        executor.execute_with_schema(&plan)
     }
 
     /// Run a query with `$1..$n` parameter binding and return the result rows
@@ -19525,6 +19522,18 @@ impl EmbeddedDatabase {
     /// `query_with_columns`. Row-level security policies are applied, as in
     /// `query_params`.
     pub fn query_params_with_columns(&self, sql: &str, params: &[Value]) -> Result<(Vec<Tuple>, Vec<String>)> {
+        let (rows, schema) = self.query_params_with_schema(sql, params)?;
+        Ok((rows, Self::column_names(&schema)))
+    }
+
+    /// [`query_params_with_columns`](Self::query_params_with_columns)
+    /// returning the result SCHEMA (GH#23). A DML `RETURNING` list answers
+    /// with the bound RETURNING schema — the same one the wire advertises.
+    pub(crate) fn query_params_with_schema(
+        &self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<(Vec<Tuple>, std::sync::Arc<Schema>)> {
         // Spec 03: advisory-lock owner for a params-family statement with no
         // session. A no-op under `query_params_with_columns_for_session`.
         let _advisory = self.embedded_advisory_context_guard(sql);
@@ -19583,13 +19592,9 @@ impl EmbeddedDatabase {
                     ..
                 } => {
                     let schema = self.storage.catalog().get_table_schema(table_name)?;
-                    Self::returning_schema(&schema, items)
-                        .columns
-                        .into_iter()
-                        .map(|c| c.name)
-                        .collect()
+                    std::sync::Arc::new(Self::returning_schema(&schema, items)?)
                 }
-                _ => Vec::new(),
+                _ => Self::empty_result_schema(),
             };
             let (_count, rows) = self.execute_plan_with_params(&plan, params, None)?;
             return Ok((rows, columns));
@@ -19625,7 +19630,7 @@ impl EmbeddedDatabase {
         if let Some(txn_ref) = txn_lock.as_ref().and_then(|guard| guard.as_ref()) {
             executor = executor.with_transaction(txn_ref);
         }
-        executor.execute_with_columns(&plan)
+        executor.execute_with_schema(&plan)
     }
 
     /// Begin an explicit transaction
@@ -24340,7 +24345,7 @@ mod tests {
             "query_with_columns should share the deterministic SELECT result cache"
         );
         let cached_rows = db
-            .try_cached_query_with_columns(sql)
+            .try_cached_query_with_schema(sql)
             .expect("cached query_with_columns rows should be available to protocol handlers")
             .0;
         let result_cache_rows = db.result_cache.get(sql).unwrap();
@@ -24391,7 +24396,7 @@ mod tests {
         );
 
         assert!(
-            db.try_cached_query_with_columns(sql).is_some(),
+            db.try_cached_query_with_schema(sql).is_some(),
             "a cache warmed after the DDL must not be discarded by the generation marker"
         );
         assert!(
@@ -24415,7 +24420,7 @@ mod tests {
         db.query_with_columns(sql).unwrap();
         db.query_with_columns(sql).unwrap();
         assert!(
-            db.try_cached_query_with_columns(sql).is_some(),
+            db.try_cached_query_with_schema(sql).is_some(),
             "precondition: the query is cached and served from cache"
         );
 
@@ -24424,7 +24429,7 @@ mod tests {
         db.storage.bump_schema_generation();
 
         assert!(
-            db.try_cached_query_with_columns(sql).is_none(),
+            db.try_cached_query_with_schema(sql).is_none(),
             "an out-of-band schema-generation bump must invalidate cached results"
         );
     }

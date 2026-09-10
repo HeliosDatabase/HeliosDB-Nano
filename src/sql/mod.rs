@@ -20,6 +20,7 @@ pub mod parser;
 pub mod planner;
 pub mod procedural;
 pub mod query_cache;
+pub(crate) mod returning; // ONE binding of a RETURNING list for RowDescription + DataRow (GH#23)
 pub mod sequences;
 pub mod settings;
 pub mod sqlite_compat;

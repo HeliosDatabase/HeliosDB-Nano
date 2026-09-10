@@ -880,15 +880,26 @@ impl<'a> Executor<'a> {
         Ok(results)
     }
 
-    /// Execute a plan and return both tuples and output column names.
-    pub fn execute_with_columns(&mut self, plan: &LogicalPlan) -> Result<(Vec<Tuple>, Vec<String>)> {
+    /// Execute a plan and return the tuples together with the root operator's
+    /// OUTPUT SCHEMA — declared column types, not names only. This is what the
+    /// PG simple-query `RowDescription` is typed from (GH#23): the same schema
+    /// the extended protocol's Describe already reads through
+    /// `LogicalPlan::schema()`.
+    pub fn execute_with_schema(&mut self, plan: &LogicalPlan) -> Result<(Vec<Tuple>, Arc<Schema>)> {
         self.scan_decode_hints = scan::compute_scan_decode_hints(plan);
         let mut operator = self.plan_to_operator(plan)?;
-        let columns: Vec<String> = operator.schema().columns.iter().map(|c| c.name.clone()).collect();
+        let schema = operator.schema();
         let mut results = Vec::with_capacity(256);
         while let Some(tuple) = operator.next()? {
             results.push(tuple);
         }
+        Ok((results, schema))
+    }
+
+    /// Execute a plan and return both tuples and output column names.
+    pub fn execute_with_columns(&mut self, plan: &LogicalPlan) -> Result<(Vec<Tuple>, Vec<String>)> {
+        let (results, schema) = self.execute_with_schema(plan)?;
+        let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
         Ok((results, columns))
     }
 

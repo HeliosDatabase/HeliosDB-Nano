@@ -700,7 +700,7 @@ impl Parser {
     /// spirit as `is_create_tablespace_statement` above.
     ///
     /// It is deliberately checked only AFTER the specific SET/RESET handlers
-    /// (`try_handle_db_setting_statement_with_columns`,
+    /// (`try_handle_db_setting_statement_with_schema`,
     /// `try_handle_fk_setting`, `try_handle_trace_*`), so a `RESET` of a
     /// real session setting still performs its actual reset; only the
     /// otherwise-unhandled GUCs (`RESET search_path`, `RESET

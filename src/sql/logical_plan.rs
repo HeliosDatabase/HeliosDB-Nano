@@ -80,6 +80,15 @@ pub enum TransitionTable {
 /// A single item in a RETURNING clause
 ///
 /// Represents one expression in `RETURNING expr1, expr2, ...`
+///
+/// The variants are a LOWERING convenience for `Planner::convert_returning`;
+/// they are not what decides an item's meaning. `sql::returning::
+/// ReturningProjection::bind` reads the SHAPE of each item once per statement
+/// (a `Column`, or an `Expression` that is a plain column reference under any
+/// qualifier/alias, both bind to the catalog column; anything else is typed as
+/// the SELECT list types it) and produces BOTH the output schema and the
+/// projected values from the same bindings. Do not add a variant to fix a
+/// type or value problem — fix `bind`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ReturningItem {
     /// Wildcard (`RETURNING *`) - return all columns

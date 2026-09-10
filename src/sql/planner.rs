@@ -306,7 +306,10 @@ impl<'a> Planner<'a> {
             "BOOLEAN" | "BOOL" => Ok(DataType::Boolean),
             "DATE" => Ok(DataType::Date),
             "TIME" => Ok(DataType::Time),
-            "TIMESTAMP" | "TIMESTAMPTZ" => Ok(DataType::Timestamp),
+            "TIMESTAMP" | "TIMESTAMP WITHOUT TIME ZONE" => Ok(DataType::Timestamp),
+            // GH#23: a distinct declared type — advertised as OID 1184 and sent
+            // with its zone offset on the PG wire; storage is unchanged.
+            "TIMESTAMPTZ" | "TIMESTAMP WITH TIME ZONE" => Ok(DataType::Timestamptz),
             "INTERVAL" => Ok(DataType::Interval),
             "UUID" => Ok(DataType::Uuid),
             "JSON" => Ok(DataType::Json),
@@ -4782,6 +4785,29 @@ impl<'a> Planner<'a> {
                 })
             }
 
+            // sqlparser parses the SQL-standard spellings `FLOOR(x)` and `CEIL(x)`
+            // into dedicated AST nodes (they also admit `FLOOR(ts TO DAY)` and a
+            // scale argument), so they never reached the plain function-call arm
+            // and every `SELECT floor(x)` failed as "not yet supported" while
+            // `ceiling(x)` — a plain call — worked. The plain numeric form lowers
+            // to the scalar functions the evaluator already implements; the
+            // datetime and scale forms, which PostgreSQL does not have, stay
+            // refused rather than approximated.
+            Expr::Floor {
+                expr: inner,
+                field: sqlparser::ast::CeilFloorKind::DateTimeField(sqlparser::ast::DateTimeField::NoDateTime),
+            } => Ok(LogicalExpr::ScalarFunction {
+                fun: "floor".to_string(),
+                args: vec![self.expr_to_logical(inner)?],
+            }),
+            Expr::Ceil {
+                expr: inner,
+                field: sqlparser::ast::CeilFloorKind::DateTimeField(sqlparser::ast::DateTimeField::NoDateTime),
+            } => Ok(LogicalExpr::ScalarFunction {
+                fun: "ceil".to_string(),
+                args: vec![self.expr_to_logical(inner)?],
+            }),
+
             _ => Err(Error::query_execution(format!(
                 "Expression not yet supported: {:?}",
                 expr
@@ -6127,6 +6153,13 @@ impl<'a> Planner<'a> {
             SqlDataType::Bytea => Ok(DataType::Bytea),
             SqlDataType::Date => Ok(DataType::Date),
             SqlDataType::Time(_, _) => Ok(DataType::Time),
+            // GH#23: `TIMESTAMPTZ` / `TIMESTAMP WITH TIME ZONE` keep sqlparser's
+            // zone marker instead of collapsing to `Timestamp`, so the column is
+            // described as 1184 (and its text form carries the session offset).
+            SqlDataType::Timestamp(
+                _,
+                sqlparser::ast::TimezoneInfo::Tz | sqlparser::ast::TimezoneInfo::WithTimeZone,
+            ) => Ok(DataType::Timestamptz),
             SqlDataType::Timestamp(_, _) => Ok(DataType::Timestamp),
             SqlDataType::Interval => Ok(DataType::Interval),
             SqlDataType::Uuid => Ok(DataType::Uuid),

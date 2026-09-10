@@ -119,28 +119,55 @@ fn normalize_function_name(fun: String) -> String {
 /// Recursively rewrite resolvable `Column` nodes into `BoundColumn` nodes.
 /// See [`Evaluator::bind`] for the contract.
 pub fn bind_expr_columns(expr: LogicalExpr, schema: &Schema) -> LogicalExpr {
-    let bind = |e: LogicalExpr| bind_expr_columns(e, schema);
-    let bind_box = |e: Box<LogicalExpr>| Box::new(bind_expr_columns(*e, schema));
-    let bind_vec = |es: Vec<LogicalExpr>| es.into_iter().map(|e| bind_expr_columns(e, schema)).collect();
-
-    match expr {
-        LogicalExpr::Column { table, name } => match schema.get_qualified_column_index(table.as_deref(), &name) {
+    rewrite_leaves(
+        expr,
+        &mut |table, name| match schema.get_qualified_column_index(table.as_deref(), &name) {
             Some(index) => LogicalExpr::BoundColumn { index, table, name },
             // Unresolvable here — keep the by-name node so per-row behavior
             // (including the error message) is byte-identical.
             None => LogicalExpr::Column { table, name },
         },
+        // R3.5 item 3: normalize the function name ONCE at bind time
+        // (lowercase + `pg_catalog.` prefix strip) so the per-row dispatch in
+        // `evaluate_scalar_function` takes its allocation-free fast path.
+        &mut |fun| normalize_function_name(fun),
+    )
+}
+
+/// Rewrite every `LogicalExpr::Column { table, name }` of `expr` through `f`,
+/// leaving everything else (including scalar-function names) untouched.
+///
+/// The ONE expression walker shared by the evaluator's own binder
+/// ([`bind_expr_columns`]) and the RETURNING binder
+/// (`sql::returning::ReturningProjection::bind`), so both descend into exactly
+/// the same node set: sub-plans (scalar/IN/EXISTS subqueries) and
+/// operator-managed nodes (aggregate/window functions) are NOT descended into
+/// — their column references resolve against different schemas.
+pub fn map_column_refs(expr: LogicalExpr, f: &mut dyn FnMut(Option<String>, String) -> LogicalExpr) -> LogicalExpr {
+    rewrite_leaves(expr, f, &mut |fun| fun)
+}
+
+/// The walker behind [`bind_expr_columns`] and [`map_column_refs`]:
+/// `on_column` rewrites each `Column` node, `on_function` each scalar-function
+/// name, children first.
+fn rewrite_leaves(
+    expr: LogicalExpr,
+    on_column: &mut dyn FnMut(Option<String>, String) -> LogicalExpr,
+    on_function: &mut dyn FnMut(String) -> String,
+) -> LogicalExpr {
+    match expr {
+        LogicalExpr::Column { table, name } => on_column(table, name),
         LogicalExpr::BinaryExpr { left, op, right } => LogicalExpr::BinaryExpr {
-            left: bind_box(left),
+            left: rewrite_boxed(left, on_column, on_function),
             op,
-            right: bind_box(right),
+            right: rewrite_boxed(right, on_column, on_function),
         },
         LogicalExpr::UnaryExpr { op, expr } => LogicalExpr::UnaryExpr {
             op,
-            expr: bind_box(expr),
+            expr: rewrite_boxed(expr, on_column, on_function),
         },
         LogicalExpr::IsNull { expr, is_null } => LogicalExpr::IsNull {
-            expr: bind_box(expr),
+            expr: rewrite_boxed(expr, on_column, on_function),
             is_null,
         },
         LogicalExpr::Between {
@@ -149,18 +176,18 @@ pub fn bind_expr_columns(expr: LogicalExpr, schema: &Schema) -> LogicalExpr {
             high,
             negated,
         } => LogicalExpr::Between {
-            expr: bind_box(expr),
-            low: bind_box(low),
-            high: bind_box(high),
+            expr: rewrite_boxed(expr, on_column, on_function),
+            low: rewrite_boxed(low, on_column, on_function),
+            high: rewrite_boxed(high, on_column, on_function),
             negated,
         },
         LogicalExpr::InList { expr, list, negated } => LogicalExpr::InList {
-            expr: bind_box(expr),
-            list: bind_vec(list),
+            expr: rewrite_boxed(expr, on_column, on_function),
+            list: rewrite_vec(list, on_column, on_function),
             negated,
         },
         LogicalExpr::InSet { expr, values, negated } => LogicalExpr::InSet {
-            expr: bind_box(expr),
+            expr: rewrite_boxed(expr, on_column, on_function),
             values,
             negated,
         },
@@ -169,31 +196,115 @@ pub fn bind_expr_columns(expr: LogicalExpr, schema: &Schema) -> LogicalExpr {
             when_then,
             else_result,
         } => LogicalExpr::Case {
-            expr: expr.map(bind_box),
-            when_then: when_then.into_iter().map(|(w, t)| (bind(w), bind(t))).collect(),
-            else_result: else_result.map(bind_box),
+            expr: expr.map(|e| rewrite_boxed(e, on_column, on_function)),
+            when_then: when_then
+                .into_iter()
+                .map(|(w, t)| {
+                    (
+                        rewrite_leaves(w, on_column, on_function),
+                        rewrite_leaves(t, on_column, on_function),
+                    )
+                })
+                .collect(),
+            else_result: else_result.map(|e| rewrite_boxed(e, on_column, on_function)),
         },
         LogicalExpr::Cast { expr, data_type } => LogicalExpr::Cast {
-            expr: bind_box(expr),
+            expr: rewrite_boxed(expr, on_column, on_function),
             data_type,
         },
-        // R3.5 item 3: normalize the function name ONCE at bind time
-        // (lowercase + `pg_catalog.` prefix strip) so the per-row dispatch in
-        // `evaluate_scalar_function` takes its allocation-free fast path.
         LogicalExpr::ScalarFunction { fun, args } => LogicalExpr::ScalarFunction {
-            fun: normalize_function_name(fun),
-            args: bind_vec(args),
+            fun: on_function(fun),
+            args: rewrite_vec(args, on_column, on_function),
         },
         LogicalExpr::ArraySubscript { array, index } => LogicalExpr::ArraySubscript {
-            array: bind_box(array),
-            index: bind_box(index),
+            array: rewrite_boxed(array, on_column, on_function),
+            index: rewrite_boxed(index, on_column, on_function),
         },
-        LogicalExpr::Tuple { items } => LogicalExpr::Tuple { items: bind_vec(items) },
+        LogicalExpr::Tuple { items } => LogicalExpr::Tuple {
+            items: rewrite_vec(items, on_column, on_function),
+        },
         // Leaves and operator-managed / sub-plan nodes: returned unchanged.
         // AggregateFunction & WindowFunction are evaluated by their dedicated
         // operators; subquery plans resolve against their own schemas.
         other => other,
     }
+}
+
+fn rewrite_boxed(
+    expr: Box<LogicalExpr>,
+    on_column: &mut dyn FnMut(Option<String>, String) -> LogicalExpr,
+    on_function: &mut dyn FnMut(String) -> String,
+) -> Box<LogicalExpr> {
+    Box::new(rewrite_leaves(*expr, on_column, on_function))
+}
+
+fn rewrite_vec(
+    exprs: Vec<LogicalExpr>,
+    on_column: &mut dyn FnMut(Option<String>, String) -> LogicalExpr,
+    on_function: &mut dyn FnMut(String) -> String,
+) -> Vec<LogicalExpr> {
+    exprs
+        .into_iter()
+        .map(|e| rewrite_leaves(e, on_column, on_function))
+        .collect()
+}
+
+/// Parse the TEXT form of a timestamp literal into the engine's UTC
+/// `DateTime`, for the `TIMESTAMP` and `TIMESTAMPTZ` cast arms.
+///
+/// Accepted spellings: RFC 3339 (`2026-01-02T03:04:05Z`, `…+02:00`),
+/// PostgreSQL's space-separated form with an offset
+/// (`2026-06-28 05:52:42.692688+00`, `… +02`), the offset-less forms
+/// (`2026-01-02 03:04:05[.ffffff]`) and a bare date (midnight).
+///
+/// `honour_offset` is the ONE difference between the two targets (GH#23):
+///
+/// * `true` — the `timestamptz` cast: an offset-bearing literal denotes an
+///   INSTANT and is converted to UTC (`'2026-01-01 10:00+02'` → 08:00 UTC),
+///   exactly as PostgreSQL does. A literal WITHOUT an offset is interpreted
+///   as UTC. PostgreSQL would apply the session `TimeZone`; this engine has
+///   no per-session zone (every connection is pinned `TimeZone=UTC`, and the
+///   wire renders every `timestamptz` as `…+00`), so UTC is the fixed,
+///   honest rule — the instant read back is the instant written.
+/// * `false` — the `timestamp` cast: the offset is ACCEPTED and DROPPED,
+///   keeping the written wall-clock — matching PostgreSQL `::timestamp` and
+///   the bulk-COPY path (a2h BUG C: COPY tolerated the offset while the
+///   cast rejected the identical value with "trailing input"). Every
+///   offset-bearing form drops the zone uniformly (rfc3339 must NOT
+///   UTC-convert here, or `+05:30` would shift while `-08` would not).
+fn parse_timestamp_literal(
+    s: &str,
+    honour_offset: bool,
+) -> std::result::Result<chrono::DateTime<Utc>, chrono::ParseError> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .or_else(|_| chrono::DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f%#z"))
+        .or_else(|_| chrono::DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%#z"))
+        .map(|dt| {
+            if honour_offset {
+                // The instant the literal denotes.
+                dt.with_timezone(&Utc)
+            } else {
+                // Drop the zone, keep the written wall-clock.
+                chrono::DateTime::from_naive_utc_and_offset(dt.naive_local(), Utc)
+            }
+        })
+        .or_else(|_| {
+            chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
+                .map(|ndt| chrono::DateTime::from_naive_utc_and_offset(ndt, Utc))
+        })
+        .or_else(|_| {
+            chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
+                .map(|ndt| chrono::DateTime::from_naive_utc_and_offset(ndt, Utc))
+        })
+        .or_else(|e| {
+            // Date-only format: treat as midnight UTC
+            if let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+                if let Some(ndt) = date.and_hms_opt(0, 0, 0) {
+                    return Ok(chrono::DateTime::from_naive_utc_and_offset(ndt, Utc));
+                }
+            }
+            Err(e)
+        })
 }
 
 impl Evaluator {
@@ -5751,58 +5862,34 @@ impl Evaluator {
                 _ => Err(Error::query_execution(format!("Cannot cast {:?} to TIME", value))),
             },
 
-            DataType::Timestamp | DataType::Timestamptz => match value {
-                Value::Timestamp(ts) => Ok(Value::Timestamp(ts)),
-                Value::Date(d) => {
-                    // Convert date to timestamp at midnight UTC
-                    let datetime = d
-                        .and_hms_opt(0, 0, 0)
-                        .ok_or_else(|| Error::query_execution("Invalid date for timestamp conversion"))?;
-                    Ok(Value::Timestamp(chrono::DateTime::from_naive_utc_and_offset(
-                        datetime, Utc,
-                    )))
+            DataType::Timestamp | DataType::Timestamptz => {
+                // GH#23: the two targets differ in ONE thing — what a literal's
+                // zone offset means. `timestamptz` (advertised 1184, sent as
+                // `…+00`) is an INSTANT: `'2026-01-01 10:00+02'` is 08:00 UTC.
+                // `timestamp` keeps the written wall-clock and drops the zone
+                // (PostgreSQL `::timestamp`). See `parse_timestamp_literal`.
+                let honour_offset = matches!(target_type, DataType::Timestamptz);
+                let type_name = if honour_offset { "TIMESTAMPTZ" } else { "TIMESTAMP" };
+                match value {
+                    Value::Timestamp(ts) => Ok(Value::Timestamp(ts)),
+                    Value::Date(d) => {
+                        // Convert date to timestamp at midnight UTC
+                        let datetime = d
+                            .and_hms_opt(0, 0, 0)
+                            .ok_or_else(|| Error::query_execution("Invalid date for timestamp conversion"))?;
+                        Ok(Value::Timestamp(chrono::DateTime::from_naive_utc_and_offset(
+                            datetime, Utc,
+                        )))
+                    }
+                    Value::String(s) => parse_timestamp_literal(&s, honour_offset)
+                        .map(Value::Timestamp)
+                        .map_err(|e| Error::query_execution(format!("Cannot cast '{}' to {}: {}", s, type_name, e))),
+                    _ => Err(Error::query_execution(format!(
+                        "Cannot cast {:?} to {}",
+                        value, type_name
+                    ))),
                 }
-                Value::String(s) => {
-                    // Parse timestamp text, accepting a trailing timezone offset
-                    // (RFC3339 `T`-separated, or Postgres' space-separated form
-                    // `2026-06-28 05:52:42.692688+00`). `timestamptz` downgrades
-                    // to TIMESTAMP: the offset is ACCEPTED and the zone DROPPED,
-                    // keeping the written wall-clock — matching Postgres
-                    // `::timestamp` and the bulk-COPY path, so the literal/cast
-                    // path agrees with COPY (without this, COPY tolerated the
-                    // offset while the cast rejected the identical value with
-                    // "trailing input" — a2h BUG C). All offset-bearing forms
-                    // drop the zone uniformly (rfc3339 must NOT UTC-convert, or
-                    // `+05:30` would shift while `-08` would not). Offset-less
-                    // forms parse as-is below.
-                    chrono::DateTime::parse_from_rfc3339(&s)
-                        .or_else(|_| chrono::DateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S%.f%#z"))
-                        .or_else(|_| chrono::DateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S%#z"))
-                        .map(|dt| {
-                            // Drop the zone, keep the written wall-clock.
-                            Value::Timestamp(chrono::DateTime::from_naive_utc_and_offset(dt.naive_local(), Utc))
-                        })
-                        .or_else(|_| {
-                            chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S")
-                                .map(|ndt| Value::Timestamp(chrono::DateTime::from_naive_utc_and_offset(ndt, Utc)))
-                        })
-                        .or_else(|_| {
-                            chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S%.f")
-                                .map(|ndt| Value::Timestamp(chrono::DateTime::from_naive_utc_and_offset(ndt, Utc)))
-                        })
-                        .or_else(|e| {
-                            // Date-only format: treat as midnight UTC
-                            if let Ok(date) = chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d") {
-                                if let Some(ndt) = date.and_hms_opt(0, 0, 0) {
-                                    return Ok(Value::Timestamp(chrono::DateTime::from_naive_utc_and_offset(ndt, Utc)));
-                                }
-                            }
-                            Err(e)
-                        })
-                        .map_err(|e| Error::query_execution(format!("Cannot cast '{}' to TIMESTAMP: {}", s, e)))
-                }
-                _ => Err(Error::query_execution(format!("Cannot cast {:?} to TIMESTAMP", value))),
-            },
+            }
 
             DataType::Uuid => match value {
                 Value::Uuid(u) => Ok(Value::Uuid(u)),
@@ -8694,5 +8781,69 @@ mod tests {
 
         // Keep `tuple` meaningful: the same column evaluates to NULL.
         assert_eq!(ev.evaluate(&expr, &tuple).unwrap(), Value::Null);
+    }
+
+    /// GH#23: `timestamptz` honours a literal's zone offset (the instant),
+    /// `timestamp` keeps the written wall-clock (the offset is dropped), and
+    /// an offset-less literal is UTC under both.
+    #[test]
+    fn timestamptz_cast_honours_the_offset_and_timestamp_drops_it() {
+        let ev = Evaluator::new(Arc::new(Schema::new(vec![])));
+        let at = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .expect("rfc3339")
+                .with_timezone(&Utc)
+        };
+        for literal in [
+            "2026-01-01 10:00:00+02",
+            "2026-01-01 10:00:00+02:00",
+            "2026-01-01T10:00:00+02:00",
+            "2026-01-01 10:00:00.000000+02",
+        ] {
+            let tz = ev
+                .cast_value(Value::String(literal.into()), &DataType::Timestamptz)
+                .unwrap_or_else(|e| panic!("{literal}: {e}"));
+            assert_eq!(
+                tz,
+                Value::Timestamp(at("2026-01-01T08:00:00Z")),
+                "timestamptz `{literal}` is the instant 08:00 UTC"
+            );
+            let naive = ev
+                .cast_value(Value::String(literal.into()), &DataType::Timestamp)
+                .unwrap_or_else(|e| panic!("{literal}: {e}"));
+            assert_eq!(
+                naive,
+                Value::Timestamp(at("2026-01-01T10:00:00Z")),
+                "timestamp `{literal}` keeps the written wall-clock"
+            );
+        }
+        // A negative offset moves the other way.
+        assert_eq!(
+            ev.cast_value(
+                Value::String("2026-03-01 10:00:00-05:00".into()),
+                &DataType::Timestamptz
+            )
+            .unwrap(),
+            Value::Timestamp(at("2026-03-01T15:00:00Z"))
+        );
+        // No offset: UTC, unchanged, under both targets.
+        for target in [DataType::Timestamptz, DataType::Timestamp] {
+            assert_eq!(
+                ev.cast_value(Value::String("2026-01-01 10:00:00".into()), &target)
+                    .unwrap(),
+                Value::Timestamp(at("2026-01-01T10:00:00Z")),
+                "{target:?}"
+            );
+            assert_eq!(
+                ev.cast_value(Value::String("2026-01-01".into()), &target).unwrap(),
+                Value::Timestamp(at("2026-01-01T00:00:00Z")),
+                "{target:?}"
+            );
+        }
+        // The refusal names the target the caller asked for.
+        let err = ev
+            .cast_value(Value::String("not a time".into()), &DataType::Timestamptz)
+            .unwrap_err();
+        assert!(err.to_string().contains("TIMESTAMPTZ"), "{err}");
     }
 }
