@@ -654,19 +654,38 @@ impl Schema {
 
     /// Get column index with optional table qualifier for disambiguation
     ///
-    /// If table is provided, matches columns where source_table equals table AND name matches.
-    /// If no table is provided, falls back to simple name lookup.
+    /// With a qualifier, the ALIAS match wins over the real-name match
+    /// (GH#29 c3, M1): a column whose `source_table` (the alias a base
+    /// table, derived table or view is known by in `FROM`) equals `table`
+    /// is returned before any column whose `source_table_name` (the real
+    /// table name) equals it, regardless of position. `FROM t AS a JOIN
+    /// (SELECT id FROM u) t` is legal PostgreSQL — the alias `a` hides t's
+    /// real name, so `t.id` names the derived table — and a single
+    /// positional pass over `[a.id (alias a, real t), …, t.id (alias t)]`
+    /// answered `t.id` with a's column. One pass: an alias match returns
+    /// immediately (the common case hits on the first candidate); the first
+    /// real-name match is remembered and returned only when no alias
+    /// matches, so the fallback costs nothing extra on a hit.
+    ///
+    /// Without a qualifier, a simple name lookup (first match).
     pub fn get_qualified_column_index(&self, table: Option<&str>, name: &str) -> Option<usize> {
-        if let Some(table_name) = table {
-            // Look for column with matching source_table (alias) OR source_table_name (actual name)
-            self.columns.iter().position(|c| {
-                (c.source_table.as_deref() == Some(table_name) || c.source_table_name.as_deref() == Some(table_name))
-                    && c.name == name
-            })
-        } else {
+        let Some(table_name) = table else {
             // No table qualifier - use simple name lookup
-            self.get_column_index(name)
+            return self.get_column_index(name);
+        };
+        let mut by_real_name: Option<usize> = None;
+        for (index, column) in self.columns.iter().enumerate() {
+            if column.name != name {
+                continue;
+            }
+            if column.source_table.as_deref() == Some(table_name) {
+                return Some(index);
+            }
+            if by_real_name.is_none() && column.source_table_name.as_deref() == Some(table_name) {
+                by_real_name = Some(index);
+            }
         }
+        by_real_name
     }
 
     /// Get column by index (bounds-checked)

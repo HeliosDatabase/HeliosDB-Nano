@@ -8115,6 +8115,12 @@ impl EmbeddedDatabase {
         // phase boundary — see `copy_phase_stats`).
         copy_phase_stats::set_enabled(config.performance.copy_phase_stats);
 
+        // GH#29 (c7, M3): apply the join materialization cap. Process-global
+        // (last config wins); read once per join operator construction, never
+        // per tuple. `HELIOSDB_HASH_JOIN_MEM_MB` still overrides it at
+        // runtime — see `sql::executor::join::join_memory_limit`.
+        crate::sql::executor::join::set_join_memory_limit_mb(config.performance.join_memory_limit_mb);
+
         // See `new_with_config`: seed from storage, not 0.
         let initial_schema_generation = storage.schema_generation();
 
@@ -12683,6 +12689,25 @@ impl EmbeddedDatabase {
         // a literal with no valid key for the PK column's type (GH#15).
         let pk_value = Self::fast_parse_pk_probe_value(pk_val_str, &spec.pk_data_type)?;
 
+        // GH#29 (c4, F2): classify the SET value BEFORE touching the row. This
+        // path skips the parser, so it is the one UPDATE family that never
+        // ran the planner's plan-time column resolution; through candidate 3
+        // it looked the row up first and answered `Ok(0)` for a missing key —
+        // `UPDATE t SET v = nosuch WHERE id = 99`, or any key on an empty
+        // table — without ever looking at the value. A value that is neither
+        // a whole literal nor `<set column> <op> <number>` yields to the
+        // planner, which refuses an unknown column (42703) regardless of row
+        // count. A literal with trailing text (`SET x = 5 junk`) is not a
+        // literal either.
+        let literal_value = Self::fast_parse_one_value(set_val_str, &spec.set_data_type)
+            .and_then(|(val, rest)| rest.trim().is_empty().then_some(val));
+        if literal_value.is_none()
+            && !Self::fast_simple_expr_shape_supported(set_val_str, &spec.set_col_name, &spec.set_data_type)
+        {
+            tracing::debug!(target: "helios::fastpath", reason = "lit-update:set-expr-unsupported", "fast-update bail");
+            return None; // Complex expression — fall through to normal path
+        }
+
         // Look up the existing row by PK (needed for both literal and expression SET)
         let existing_row =
             match self
@@ -12700,12 +12725,10 @@ impl EmbeddedDatabase {
             return None; // No row_id — can't do fast update
         }
 
-        // Parse SET value: try literal first, then simple expression (col +/- literal).
-        // A literal with trailing text (`SET x = 5 junk`) is not a literal —
-        // fall through to the expression/planner paths.
-        let new_value = if let Some(val) = Self::fast_parse_one_value(set_val_str, &spec.set_data_type)
-            .and_then(|(val, rest)| rest.trim().is_empty().then_some(val))
-        {
+        // The literal, else the self-arithmetic over the existing row (an
+        // operand that does not fit the column's type still yields to the
+        // planner).
+        let new_value = if let Some(val) = literal_value {
             val
         } else if let Some(val) =
             Self::fast_eval_simple_expr(set_val_str, &spec.set_col_name, spec.set_col_idx, &existing_row)
@@ -13922,6 +13945,36 @@ impl EmbeddedDatabase {
         } else {
             token
         }
+    }
+
+    /// The structural half of [`Self::fast_eval_simple_expr`], decidable
+    /// without a row (GH#29 c4, F2): `<set column> <+|-|*> <number>` and
+    /// nothing else. An identifier, a qualified column or a function call
+    /// is not this path's to evaluate, so the caller yields to the planner
+    /// BEFORE looking the row up — the planner, not a missing row, answers.
+    /// The SET column must also be one of the types `fast_eval_simple_expr`
+    /// can evaluate (GH#29 c5, m6): on a TEXT column `v + 1` passed the
+    /// shape check, found no row and answered `Ok(0)` where PostgreSQL
+    /// raises 42883 — the planner now refuses it regardless of row count.
+    fn fast_simple_expr_shape_supported(expr: &str, col_name: &str, set_data_type: &DataType) -> bool {
+        if !matches!(
+            set_data_type,
+            DataType::Int2 | DataType::Int4 | DataType::Int8 | DataType::Float4 | DataType::Float8
+        ) {
+            return false;
+        }
+        let Some(after_col) = expr.trim().strip_prefix(col_name) else {
+            return false;
+        };
+        let after_col = after_col.trim_start();
+        let Some(op) = after_col.chars().next() else {
+            return false;
+        };
+        if !matches!(op, '+' | '-' | '*') {
+            return false;
+        }
+        let operand = after_col.get(op.len_utf8()..).map(str::trim).unwrap_or("");
+        !operand.is_empty() && operand.parse::<f64>().is_ok()
     }
 
     /// Evaluate simple expressions like `col + 0.01`, `col - 5`, `col * 2`, `col || 'suffix'`
@@ -22853,6 +22906,7 @@ impl EmbeddedDatabase {
                 aliases,
                 distinct,
                 distinct_on,
+                source_alias,
             } => LogicalPlan::Project {
                 input: Box::new(Self::bind_outer_refs_in_plan(
                     input,
@@ -22867,6 +22921,7 @@ impl EmbeddedDatabase {
                 aliases: aliases.clone(),
                 distinct: *distinct,
                 distinct_on: distinct_on.clone(),
+                source_alias: source_alias.clone(),
             },
             LogicalPlan::Limit {
                 input,
@@ -23146,12 +23201,14 @@ impl EmbeddedDatabase {
                 aliases,
                 distinct,
                 distinct_on,
+                source_alias,
             } => Ok(sql::LogicalPlan::Project {
                 input: Box::new(self.apply_rls_to_plan_recursive(*input)?),
                 exprs,
                 aliases,
                 distinct,
                 distinct_on,
+                source_alias,
             }),
 
             sql::LogicalPlan::Aggregate {

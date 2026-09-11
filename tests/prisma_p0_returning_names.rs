@@ -183,9 +183,24 @@ fn update_returning_is_named_like_postgres_with_bound_params() {
     );
 }
 
-/// Two-part qualification (`"Account"."id"`, and the unquoted `Account.id`
-/// spelling drizzle/knex emit). FAILS on the unfixed tree with
-/// `"\"Account\".\"id\""` / `"Account.id"`.
+/// Two-part qualification: the quoted `"Account"."id"` and the mixed
+/// `"Account".id` spellings (what Prisma sends for a quoted relation) name the
+/// output `id` and project the row's value. FAILS on the unfixed tree with
+/// `"\"Account\".\"id\""`.
+///
+/// ## Contract change — GH#29 candidate 2: the UNQUOTED `Account.id` is 42P01
+///
+/// This test used to pin `RETURNING Account.id` (unquoted qualifier against
+/// the quoted relation `"Account"`) as resolving to the row's value. That was
+/// the fail-open half of the v4.30.0 defect turned into a pin: PostgreSQL
+/// folds the unquoted `Account` to `account`, which names nothing in the
+/// statement's range table, and refuses the statement with `42P01 missing
+/// FROM-clause entry for table "account"`. Since GH#29 every RETURNING
+/// qualifier must name the statement's target (alias, key or bare name) or
+/// `EXCLUDED`, so the unquoted spelling is now refused — nothing is deleted —
+/// and the pin moved to the PostgreSQL contract, the way the GH#21 / GH#23
+/// pins were moved. drizzle/knex quote the relation and the qualifier
+/// consistently, so their statements are the first half of this test.
 #[test]
 fn delete_returning_two_part_qualification_is_named_like_postgres() {
     let db = seeded_db();
@@ -199,20 +214,12 @@ fn delete_returning_two_part_qualification_is_named_like_postgres() {
     assert_eq!(rows.len(), 1, "DELETE … RETURNING must return the deleted row");
     assert_eq!(int_at(&rows[0], 0), 1);
 
-    // The unquoted spelling folds to the same bare NAME — and must project the
-    // same VALUE. This is the fail-open half of the defect: an unquoted
-    // qualifier is lower-cased by `Planner::normalize_ident` (`account`) while
-    // the catalog stamps the column's `source_table_name` as written
-    // (`Account`), so an `Expression` lowering resolved NOTHING and
-    // `project_returning_columns` mapped the `Err` to `Value::Null`. Naming
-    // that column `id` without also fixing the lowering would have handed an
-    // ORM a NULL primary key under the exact name it binds. Lowering a
-    // qualified reference to `ReturningItem::Column` resolves it by bare name,
-    // where the qualifier cannot mis-fold.
+    // Quoted relation, unquoted column part: the same relation, and the column
+    // part folds to the bare name `id` — value projected, not NULL.
     let db = seeded_db();
     let (rows, cols) = run(
         &db,
-        r#"DELETE FROM "public"."Account" WHERE "public"."Account"."id" = 1 RETURNING Account.id"#,
+        r#"DELETE FROM "public"."Account" WHERE "public"."Account"."id" = 1 RETURNING "Account".id"#,
         &[],
     );
     assert_eq!(cols, vec!["id"]);
@@ -220,7 +227,29 @@ fn delete_returning_two_part_qualification_is_named_like_postgres() {
     assert_eq!(
         int_at(&rows[0], 0),
         1,
-        "an unquoted qualifier must still project the target table's value, not NULL"
+        "a quoted qualifier with an unquoted column part must project the target table's value, not NULL"
+    );
+
+    // The UNQUOTED qualifier folds to `account`: no such range entry → 42P01,
+    // and the row is untouched.
+    let db = seeded_db();
+    let refused = db
+        .query_params_with_columns(
+            r#"DELETE FROM "public"."Account" WHERE "public"."Account"."id" = 1 RETURNING Account.id"#,
+            &[],
+        )
+        .err()
+        .map(|e| e.to_string())
+        .expect("an unquoted qualifier against a quoted relation names nothing (PostgreSQL: 42P01)");
+    assert!(
+        refused.contains("missing FROM-clause entry for table \"account\""),
+        "{refused}"
+    );
+    let (rows, _) = run(&db, r#"SELECT count(*) FROM "Account""#, &[]);
+    assert_eq!(
+        int_at(&rows[0], 0),
+        1,
+        "the refused DELETE must not have removed the row"
     );
 }
 

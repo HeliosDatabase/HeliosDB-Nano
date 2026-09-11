@@ -249,6 +249,25 @@ pub enum LogicalPlan {
         distinct: bool,
         /// DISTINCT ON expressions (PostgreSQL extension)
         distinct_on: Option<Vec<LogicalExpr>>,
+        /// GH#29: the range-table alias this projection's OUTPUT is known by
+        /// when it is a derived table or an expanded view in `FROM`
+        /// (`FROM (SELECT …) AS s`, `FROM myview AS v`). `Some(alias)` makes
+        /// [`LogicalPlan::schema`] and the executor stamp every output column
+        /// with `source_table = alias` — the same thing `handle_scan` does for
+        /// a base table — so a qualified reference `s.id` resolves AT RUNTIME
+        /// even when another `FROM` entry carries an `id` of its own. `None`
+        /// for every other projection (the plan shape and the output schema
+        /// are then exactly what they were before GH#29).
+        ///
+        /// Not persisted: a materialized view's plan is stored as bincode,
+        /// which is positional, so a new field would make every plan written
+        /// by an earlier release undecodable. `#[serde(skip)]` keeps the
+        /// layout byte-identical; the executor's `CREATE MATERIALIZED VIEW`
+        /// path first rewrites the plan so it needs no stamp
+        /// ([`LogicalPlan::destamp_source_aliases`]) and refuses only the
+        /// shadowed shape that cannot be rewritten.
+        #[serde(skip)]
+        source_alias: Option<String>,
     },
 
     /// Aggregate
@@ -2284,6 +2303,17 @@ impl LogicalPlan {
     }
 
     /// Get the schema of this plan's output
+    /// GH#29 (c3): rewrite this plan so it no longer depends on any
+    /// `Project::source_alias` stamp — every unshadowed `alias.col` becomes
+    /// the bare `col` and every stamp is cleared — so it can be persisted as
+    /// a materialized view's plan and re-executed from its stored bytes.
+    /// Refuses (0A000, workaround named) only a reference whose bare name
+    /// another entry of the same input also carries. See
+    /// [`super::mv_destamp`].
+    pub fn destamp_source_aliases(self) -> crate::Result<LogicalPlan> {
+        super::mv_destamp::destamp_source_aliases(self)
+    }
+
     pub fn schema(&self) -> Arc<Schema> {
         match self {
             LogicalPlan::Scan { schema, projection, .. } => {
@@ -2304,7 +2334,11 @@ impl LogicalPlan {
             }
             LogicalPlan::Filter { input, .. } => input.schema(),
             LogicalPlan::Project {
-                input, exprs, aliases, ..
+                input,
+                exprs,
+                aliases,
+                source_alias,
+                ..
             } => {
                 use crate::sql::type_inference::TypeInference;
                 let input_schema = input.schema();
@@ -2313,7 +2347,14 @@ impl LogicalPlan {
                     .zip(exprs.iter())
                     .map(|(alias, expr)| {
                         // Use the new to_column method for complete type + nullability inference
-                        expr.to_column(alias.clone(), &input_schema)
+                        let column = expr.to_column(alias.clone(), &input_schema);
+                        match source_alias {
+                            // GH#29: a derived table / expanded view is known
+                            // by its alias at runtime (`SourceAliasOperator`
+                            // stamps the executor's schema the same way).
+                            Some(alias) => column.with_source_table(alias.clone()),
+                            None => column,
+                        }
                     })
                     .collect();
                 Arc::new(Schema { columns })

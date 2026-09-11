@@ -103,6 +103,31 @@ impl ConnectionPolicyArgs {
     }
 }
 
+/// GH#29 (c7, M3): CLI overrides for the `[performance]` keys that bound a
+/// query's memory. `None` means "not given", so the config file's value (and
+/// then the built-in default) stands — CLI > config file > default, the same
+/// precedence as [`ConnectionPolicyArgs`].
+struct PerformanceArgs {
+    join_memory_limit_mb: Option<usize>,
+}
+
+impl PerformanceArgs {
+    /// Overlay the flags that were given onto the loaded `[performance]` section.
+    fn apply_to(&self, performance: &mut heliosdb_nano::config::PerformanceConfig) {
+        if let Some(v) = self.join_memory_limit_mb {
+            performance.join_memory_limit_mb = v;
+        }
+    }
+
+    /// Forward ONLY the flags that were given to the daemon re-exec.
+    fn push_cli_args(&self, args: &mut Vec<String>) {
+        if let Some(v) = self.join_memory_limit_mb {
+            args.push("--join-memory-limit-mb".to_string());
+            args.push(v.to_string());
+        }
+    }
+}
+
 /// GH#28: one WARN per crossing of `[server] max_connections_warn_percent`
 /// on a listener (edge-triggered via `swap`; re-arms when utilisation drops
 /// back below the threshold). `Semaphore::available_permits()` is the single
@@ -279,6 +304,19 @@ enum Commands {
         /// connections; `SHOW max_connections` reports the effective value.
         #[arg(long)]
         max_connections: Option<usize>,
+
+        /// Memory a single join may materialize before the query is refused,
+        /// in megabytes: the hash join's build side AND the right input of
+        /// EVERY nested-loop join — RIGHT/FULL with a residual ON term,
+        /// LATERAL, theta (`ON a.x > b.y`), and any ON no key term binds
+        /// (`[performance] join_memory_limit_mb`; this flag wins
+        /// over the config file, and the `HELIOSDB_HASH_JOIN_MEM_MB`
+        /// environment variable wins over both). Default 1024. `0` = use the
+        /// default. Exceeding it fails the query with a clear error instead
+        /// of growing until the host runs out of memory. It does NOT cover the
+        /// index nested loop's own result buffer, which is still uncapped.
+        #[arg(long, value_name = "MB")]
+        join_memory_limit_mb: Option<usize>,
 
         // ========== Connection-lifetime options (GH#28) ==========
         /// PostgreSQL `authentication_timeout`: bound on the WHOLE client
@@ -495,6 +533,7 @@ async fn main() -> Result<()> {
             mysql_socket,
             pg_socket_dir,
             max_connections,
+            join_memory_limit_mb,
             authentication_timeout,
             idle_session_timeout,
             idle_in_transaction_session_timeout,
@@ -563,6 +602,8 @@ async fn main() -> Result<()> {
                 tcp_keepalives_count,
                 max_connections_warn_percent,
             };
+            // GH#29 (c7, M3): `[performance]` overrides, same precedence.
+            let performance_args = PerformanceArgs { join_memory_limit_mb };
 
             if daemon {
                 start_server_daemon(
@@ -583,6 +624,7 @@ async fn main() -> Result<()> {
                     mysql_socket,
                     pg_socket_dir,
                     policy_args,
+                    performance_args,
                 )
                 .await
             } else {
@@ -603,6 +645,7 @@ async fn main() -> Result<()> {
                     mysql_socket,
                     pg_socket_dir,
                     policy_args,
+                    performance_args,
                 )
                 .await
             }
@@ -729,6 +772,7 @@ async fn start_server(
     mysql_socket: Option<PathBuf>,
     pg_socket_dir: Option<PathBuf>,
     policy_args: ConnectionPolicyArgs,
+    performance_args: PerformanceArgs,
 ) -> Result<()> {
     use colored::Colorize;
     use heliosdb_nano::protocol::postgres::auth::{AuthManager, AuthMethod};
@@ -776,6 +820,9 @@ async fn start_server(
     // makes `[server] max_connections` live: it used to be read by nothing.
     policy_args.apply_to(&mut db_config.server);
     db_config.server.validate_connection_policy()?;
+    // GH#29 (c7, M3): the join materialization cap, CLI > config > default.
+    // `EmbeddedDatabase` installs it process-wide when it takes `db_config`.
+    performance_args.apply_to(&mut db_config.performance);
     let max_connections = db_config.server.max_connections;
     let connection_policy = ConnectionTimeouts::from_server_config(&db_config.server);
     if ConnectionTimeouts::legacy_idle_alias_in_effect(&db_config.server) {
@@ -1480,6 +1527,7 @@ async fn start_server_daemon(
     mysql_socket: Option<PathBuf>,
     pg_socket_dir: Option<PathBuf>,
     policy_args: ConnectionPolicyArgs,
+    performance_args: PerformanceArgs,
 ) -> Result<()> {
     // Process management (kill -0 liveness probe, daemon re-exec) is unix-only.
     #[cfg(unix)]
@@ -1526,6 +1574,7 @@ async fn start_server_daemon(
     // ONLY when given (previously --max-connections was always pushed, which
     // would now clobber a config-file value in the child).
     policy_args.push_cli_args(&mut args);
+    performance_args.push_cli_args(&mut args);
 
     if let Some(cfg) = config_path {
         args.push("--config".to_string());

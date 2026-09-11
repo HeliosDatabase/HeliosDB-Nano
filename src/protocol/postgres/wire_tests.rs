@@ -3659,17 +3659,33 @@ async fn returning_folded_and_alias_qualifiers_resolve_over_the_wire() {
     .expect("seed");
     let (mut handler, mut client) = test_handler(db);
 
+    // GH#29: the qualifier is resolved at plan time like PostgreSQL — an
+    // UNQUOTED `Account` folds to `account`, which names no FROM entry of
+    // `"Account"`, so it is 42P01 (it used to resolve by bare name). The
+    // QUOTED spelling is the contract, and the one Prisma sends.
+    let out = wire_query(
+        &mut handler,
+        &mut client,
+        r#"UPDATE "public"."Account" SET "email"='zz@example.com' WHERE id=1 RETURNING Account.id"#,
+    )
+    .await;
+    assert_eq!(
+        sqlstates(&out),
+        vec!["42P01".to_string()],
+        "an unquoted qualifier against a quoted table is missing-FROM-clause-entry (PostgreSQL)"
+    );
+    let _ = wire_query(&mut handler, &mut client, "ROLLBACK").await;
     handler
         .handle_single_query(
-            r#"UPDATE "public"."Account" SET "email"='c@example.com' WHERE id=1 RETURNING Account.id, Account.email"#,
+            r#"UPDATE "public"."Account" SET "email"='c@example.com' WHERE id=1 RETURNING "Account".id, "Account".email"#,
         )
         .await
-        .expect("update … returning folded qualifier");
+        .expect("update … returning quoted qualifier");
     let out = drain(&mut client).await;
     assert_eq!(
         row_description_names(&out),
         vec!["id".to_string(), "email".to_string()],
-        "an unquoted qualifier must not leak into the field name"
+        "a qualifier must not leak into the field name"
     );
     let rows = data_rows(&out);
     assert_eq!(rows.len(), 1);
@@ -7983,12 +7999,12 @@ async fn gh23_aliased_folded_and_alias_qualifiers_must_not_send_null() {
     let out = wire_query(
         &mut handler,
         &mut client,
-        r#"UPDATE "public"."Account" SET "email"='c@example.com' WHERE id=1 RETURNING Account.id"#,
+        r#"UPDATE "public"."Account" SET "email"='c@example.com' WHERE id=1 RETURNING "Account".id"#,
     )
     .await;
     assert!(
         sqlstates(&out).is_empty(),
-        "CONTROL: the unaliased folded-qualifier statement must succeed, got {:?}",
+        "CONTROL: the unaliased quoted-qualifier statement must succeed, got {:?}",
         sqlstates(&out)
     );
     let rows = data_rows(&out);
@@ -8003,10 +8019,10 @@ async fn gh23_aliased_folded_and_alias_qualifiers_must_not_send_null() {
     let out = wire_query(
         &mut handler,
         &mut client,
-        r#"UPDATE "public"."Account" SET "email"='d@example.com' WHERE id=1 RETURNING Account.id AS "accountId""#,
+        r#"UPDATE "public"."Account" SET "email"='d@example.com' WHERE id=1 RETURNING "Account".id AS "accountId""#,
     )
     .await;
-    gh23_assert_field_or_refusal(&out, 0, "accountId", "1", "folded qualifier + item alias");
+    gh23_assert_field_or_refusal(&out, 0, "accountId", "1", "quoted qualifier + item alias");
 
     // FROM-alias qualifier + item alias, on DELETE — a different projection
     // call site (src/lib.rs:16067) and a qualifier no quoting can ever match.
@@ -8893,7 +8909,7 @@ async fn gh23_c1_returning_unknown_column_is_refused_42703_with_zero_rows_writte
     let out = wire_query(
         &mut handler,
         &mut client,
-        r#"UPDATE "C1" SET "n" = 99 RETURNING "n" + 1 AS "n1", x.nosuch AS "c""#,
+        r#"UPDATE "C1" AS x SET "n" = 99 RETURNING "n" + 1 AS "n1", x.nosuch AS "c""#,
     )
     .await;
     assert_eq!(
@@ -8901,6 +8917,16 @@ async fn gh23_c1_returning_unknown_column_is_refused_42703_with_zero_rows_writte
         vec!["42703".to_string()],
         "qualified + aliased unknown column"
     );
+    // Without the alias the qualifier itself is unknown: 42P01 (GH#29), and
+    // still nothing is written.
+    let _ = wire_query(&mut handler, &mut client, "ROLLBACK").await;
+    let out = wire_query(
+        &mut handler,
+        &mut client,
+        r#"UPDATE "C1" SET "n" = 99 RETURNING "n" + 1 AS "n1", x.nosuch AS "c""#,
+    )
+    .await;
+    assert_eq!(sqlstates(&out), vec!["42P01".to_string()], "unknown qualifier");
     let _ = wire_query(&mut handler, &mut client, "ROLLBACK").await;
     assert_eq!(gh23_c1_n_of_row_1(&mut handler, &mut client).await, "7");
 
@@ -10797,5 +10823,2132 @@ fn gh28_c2_params_family_hook_is_narrowed_to_show_and_timeout_gucs() {
     assert_eq!(
         db.session_settings.statement_timeout(),
         Some(std::time::Duration::from_millis(5000))
+    );
+}
+// ---- GH#33 ----
+// ---------------------------------------------------------------------------
+// GH #33 — `::vector` over the wire: the parameterised extended-protocol form
+// and the advertised result type OID.
+//
+// APPEND these to src/protocol/postgres/wire_tests.rs. They reuse that file's
+// existing helpers (`test_handler`, `drain`, `data_rows`, `row_description`,
+// `sqlstates`, `parse_messages`) and add no imports.
+//
+// Two separate defects are covered here.
+//
+// (c) THE RESULT OID. `datatype_to_oid` (src/protocol/postgres/handler.rs:2854)
+//     maps `DataType::Vector(_)` to **1000**. OID 1000 is PostgreSQL's `_bool`
+//     — the BOOLEAN ARRAY type. psycopg2 ships a `BOOLEANARRAY` typecaster
+//     registered on 1000, so on receiving the pgvector text `[1,0,0]` it runs
+//     its ARRAY parser and raises `array does not start with '{'`. That is the
+//     issue's "Related observation" verbatim, and it is a RESULT-side error:
+//     the query itself succeeded.
+//
+//     What real pgvector does: `vector` is a base type created by
+//     `CREATE EXTENSION vector`, so it gets a dynamically assigned OID in the
+//     user range (>= 16384) that differs per installation. No client has a
+//     built-in decoder for such an OID, so psycopg2 falls back to its default
+//     STRING typecaster and node-pg's `pg-types` returns the raw string —
+//     which is exactly "opaque text unless a client registers a converter",
+//     and exactly what pgvector-python's `register_vector()` then overrides
+//     after looking the OID up in `pg_type`.
+//
+//     So the property that must hold is: the advertised OID must be one no
+//     driver has a decoder for. TEXT (25) also satisfies "clients treat it as
+//     text" and is what this engine's OWN catalog already reports
+//     (src/protocol/postgres/catalog.rs:952) — note that three maps in this
+//     tree disagree today: 1000 (handler.rs:2854), 25 (catalog.rs:952) and
+//     3614/tsvector (src/sql/phase3/system_views.rs:4596).
+//
+//     The assertion below is therefore written against the PROPERTY, not one
+//     magic number: never a built-in array OID, and either TEXT or an
+//     extension-range OID.
+//
+// (a) THE PARAMETERISED CAST. `SELECT … $1::vector …` is rejected at plan time
+//     by src/sql/planner.rs:4547-4553, so the mem0 shape fails at Execute over
+//     the extended protocol — the only protocol a driver uses for parameters.
+// ---------------------------------------------------------------------------
+
+/// pgvector-shaped fixture: `id INT`, an embedding column literally named
+/// `vector` (mem0's spelling), and a text payload.
+fn vector_test_db() -> Arc<EmbeddedDatabase> {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    db.execute("CREATE TABLE mem0 (id INT PRIMARY KEY, vector VECTOR(3), payload TEXT)")
+        .expect("create mem0");
+    db.execute("INSERT INTO mem0 VALUES (1, '[1.0,0.0,0.0]'::vector(3), 'north')")
+        .expect("seed 1");
+    db.execute("INSERT INTO mem0 VALUES (2, '[0.0,1.0,0.0]'::vector(3), 'east')")
+        .expect("seed 2");
+    db.execute("INSERT INTO mem0 VALUES (3, '[0.0,0.0,1.0]'::vector(3), 'up')")
+        .expect("seed 3");
+    db
+}
+
+/// Built-in PostgreSQL ARRAY type OIDs. Every one of these has a decoder
+/// registered in psycopg2 (`psycopg2.extensions.*ARRAY`) and in node-pg's
+/// `pg-types`, so advertising any of them for `vector` makes the client run an
+/// array parser over the pgvector text form `[1,0,0]` and fail.
+const BUILTIN_ARRAY_OIDS: &[i32] = &[
+    143, 199, 629, 651, 719, 791, 1000, 1001, 1002, 1003, 1005, 1006, 1007, 1008, 1009, 1010, 1011, 1012, 1013, 1014,
+    1015, 1016, 1017, 1018, 1019, 1020, 1021, 1022, 1023, 1024, 1025, 1027, 1028, 1034, 1040, 1041, 1115, 1182, 1183,
+    1185, 1187, 1231, 1263, 1270, 2201, 2207, 2208, 2211, 2951, 3643, 3644, 3645, 3735, 3770, 3807, 3905, 3907, 3909,
+    3911, 3913, 3927, 4090, 4097,
+];
+
+/// Assert the OID this engine advertises for a `vector` result column is one
+/// no standard driver will try to array-parse.
+fn assert_vector_oid_is_client_safe(oid: i32, context: &str) {
+    assert!(
+        !BUILTIN_ARRAY_OIDS.contains(&oid),
+        "{context}: `vector` must NOT be advertised with a built-in ARRAY type OID \
+         (got {oid}; 1000 = `_bool`, which is what psycopg2 array-parses into \
+         `array does not start with '{{'`)"
+    );
+    assert!(
+        oid == 25 || oid >= 16384,
+        "{context}: `vector` must be advertised either as TEXT (25) or with an \
+         extension-range OID (>= 16384, what a real `CREATE EXTENSION vector` \
+         install assigns) so no driver has a built-in decoder for it; got {oid}"
+    );
+}
+
+/// Decoded DataRows: one entry per row, one `Option<Vec<u8>>` per column —
+/// the same shape `data_rows` returns. Aliased so `extended_run`'s signature
+/// stays under clippy's `type_complexity` threshold.
+type WireRows = Vec<Vec<Option<Vec<u8>>>>;
+
+/// Either the rows, or a human-readable description of the failure (a handler
+/// `Err`, or the SQLSTATE of an ErrorResponse on the wire).
+type WireOutcome = std::result::Result<WireRows, String>;
+
+type BoxedWireFuture<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = WireOutcome> + 'a>>;
+
+/// Run Parse / Bind / Execute for one parameterised statement and return the
+/// DataRows, or the first SQLSTATE / handler error as `Err`.
+///
+/// Boxed with explicit lifetimes for the reason documented on `wire_query`
+/// above: `dispatch_message`-sized futures inlined into a test's own future
+/// blow the 2 MB test-thread stack, and a closure that borrows both `handler`
+/// and `client` across an await does not compile.
+fn extended_run<'a>(
+    handler: &'a mut PgConnectionHandler<DuplexStream>,
+    client: &'a mut DuplexStream,
+    name: &'a str,
+    sql: &'a str,
+    param_oids: Vec<i32>,
+    params: Vec<Option<Vec<u8>>>,
+) -> BoxedWireFuture<'a> {
+    Box::pin(async move {
+        let nparams = params.len();
+        let portal = format!("{name}_p");
+        // Every early return drains first. Otherwise a Parse- or Bind-stage
+        // failure leaves its ErrorResponse sitting in the duplex buffer and the
+        // NEXT `extended_run` picks it up as its own outcome — which would let a
+        // later fail-closed guard "pass" on someone else's error bytes.
+        let parsed = handler
+            .handle_parse_extended(name.to_string(), sql.to_string(), param_oids)
+            .await;
+        if let Err(e) = parsed {
+            drain(client).await;
+            return Err(format!("Parse failed: {e}"));
+        }
+        let bound = handler
+            .handle_bind_extended(portal.clone(), name.to_string(), vec![0i16; nparams], params, vec![])
+            .await;
+        if let Err(e) = bound {
+            drain(client).await;
+            return Err(format!("Bind failed: {e}"));
+        }
+        let executed = handler.handle_execute_extended(portal, 0).await;
+        let out = drain(client).await;
+        if let Err(e) = executed {
+            return Err(format!("Execute failed: {e}"));
+        }
+        if let Some(code) = sqlstates(&out).first() {
+            return Err(format!("ErrorResponse SQLSTATE {code}"));
+        }
+        Ok(data_rows(&out))
+    })
+}
+
+fn col_text(row: &[Option<Vec<u8>>], index: usize) -> String {
+    row.get(index)
+        .and_then(|c| c.as_ref())
+        .map(|b| String::from_utf8_lossy(b).to_string())
+        .unwrap_or_else(|| "NULL".to_string())
+}
+
+/// Decode the pgvector wire text form `[a,b,c]` into components. Deliberately
+/// NOT a string comparison: the encoder formats floats with ryu, so `1.0` may
+/// render as `1.0` or `1`, and this file is testing the FORM (square brackets,
+/// comma-separated numbers) and the VALUES, not float formatting.
+fn wire_vector(text: &str) -> Vec<f32> {
+    let inner = text
+        .strip_prefix('[')
+        .and_then(|t| t.strip_suffix(']'))
+        .unwrap_or_else(|| panic!("vector wire text must be pgvector's `[…]` form, got {text:?}"));
+    inner
+        .split(',')
+        .map(|e| {
+            e.trim()
+                .parse::<f32>()
+                .unwrap_or_else(|_| panic!("vector component {e:?} is not numeric in {text:?}"))
+        })
+        .collect()
+}
+
+fn assert_close(got: &[f32], want: &[f32], context: &str) {
+    assert_eq!(got.len(), want.len(), "{context}: dimension, got {got:?} want {want:?}");
+    for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+        assert!(
+            (g - w).abs() < 1e-6,
+            "{context}: component {i} is {g}, expected {w} (full: {got:?})"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// (c) The advertised result type OID.
+// ---------------------------------------------------------------------------
+
+/// OPEN on the current tree — `datatype_to_oid` returns 1000 (`_bool`).
+///
+/// Describe on a statement selecting a `vector` column must advertise an OID
+/// that no driver array-parses. The `id` column in the same RowDescription is
+/// the POSITIVE CONTROL: it must be 23 before and after, which proves the
+/// RowDescription decoding in this test is sound and that only the vector
+/// field is wrong.
+#[tokio::test]
+async fn describe_vector_column_oid_is_not_a_builtin_array_oid() {
+    let db = vector_test_db();
+    let (mut handler, mut client) = test_handler(db);
+    handler
+        .handle_parse_extended("v_oid".into(), "SELECT id, vector FROM mem0 ORDER BY id".into(), vec![])
+        .await
+        .expect("parse");
+    handler
+        .handle_describe_extended(super::messages::DescribeTarget::Statement, "v_oid".into())
+        .await
+        .expect("describe");
+    let fields = row_description(&drain(&mut client).await);
+
+    assert_eq!(
+        fields.len(),
+        2,
+        "RowDescription must describe exactly the two projected columns, got {fields:?}"
+    );
+    // POSITIVE CONTROL — true before and after the fix.
+    assert_eq!(
+        fields[0],
+        ("id".to_string(), 23),
+        "control: the INT primary key must still be advertised as int4 (23)"
+    );
+    assert_eq!(fields[1].0, "vector", "the second field must be the `vector` column");
+    assert_vector_oid_is_client_safe(fields[1].1, "Describe of a vector COLUMN");
+}
+
+/// OPEN on the current tree. The same contract on the simple-query path, which
+/// builds its RowDescription through `schema_to_field_descriptions`
+/// (src/protocol/postgres/handler.rs:2755) rather than through Describe — the
+/// two must not diverge, and a `::vector` CAST expression must be advertised
+/// like a vector column.
+#[tokio::test]
+async fn simple_query_vector_expression_oid_is_not_a_builtin_array_oid() {
+    let db = vector_test_db();
+    let (mut handler, mut client) = test_handler(db);
+    let out = wire_query(
+        &mut handler,
+        &mut client,
+        "SELECT id, vector, '[9.0,9.0,9.0]'::vector AS lit FROM mem0 WHERE id = 1",
+    )
+    .await;
+    assert!(
+        sqlstates(&out).is_empty(),
+        "selecting a vector column must not error, got {:?}",
+        sqlstates(&out)
+    );
+
+    let fields = row_description(&out);
+    assert_eq!(fields.len(), 3, "three fields, got {fields:?}");
+    // POSITIVE CONTROL — true before and after the fix. If this ever fails, the
+    // RowDescription decoding (not the vector OID) is what broke.
+    assert_eq!(fields[0], ("id".to_string(), 23), "control: int4 stays 23");
+    assert_eq!(fields[1].0, "vector", "field 1 is the vector COLUMN");
+    assert_eq!(fields[2].0, "lit", "field 2 is the `::vector` CAST expression");
+    // Both spellings must agree, and both must be client-safe: a stored column
+    // (`datatype_to_oid(Vector(3))`) and a cast expression (whose inferred type
+    // is the cast target, src/sql/type_inference.rs:187) share one OID map.
+    assert_vector_oid_is_client_safe(fields[1].1, "simple-query RowDescription for a vector COLUMN");
+    assert_vector_oid_is_client_safe(fields[2].1, "simple-query RowDescription for a ::vector CAST");
+    assert_eq!(
+        fields[1].1, fields[2].1,
+        "a vector column and a cast must share one OID"
+    );
+
+    // POSITIVE CONTROL on the payload: the wire text is pgvector's `[…]` form,
+    // which is exactly why an ARRAY OID is fatal — an array decoder demands
+    // `{…}`. True before and after the fix.
+    let rows = data_rows(&out);
+    assert_eq!(rows.len(), 1, "one row");
+    assert_close(
+        &wire_vector(&col_text(&rows[0], 1)),
+        &[1.0, 0.0, 0.0],
+        "vector wire text must be the pgvector `[…]` form carrying the stored value",
+    );
+    assert_close(
+        &wire_vector(&col_text(&rows[0], 2)),
+        &[9.0, 9.0, 9.0],
+        "a `::vector` cast expression renders in the same `[…]` wire form",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (a)/(b) The parameterised cast over the extended protocol.
+// ---------------------------------------------------------------------------
+
+/// POSITIVE CONTROL. A plain int parameter over Parse/Bind/Execute must work —
+/// this proves `extended_run` itself is sound. Passes before and after.
+#[tokio::test]
+async fn extended_int_parameter_control() {
+    let db = vector_test_db();
+    let (mut handler, mut client) = test_handler(db);
+    let rows = extended_run(
+        &mut handler,
+        &mut client,
+        "ctl",
+        "SELECT id, payload FROM mem0 WHERE id = $1",
+        vec![23],
+        vec![Some(b"2".to_vec())],
+    )
+    .await
+    .expect("control: an int4 parameter must round-trip through the extended protocol");
+    assert_eq!(rows.len(), 1, "one row");
+    assert_eq!(col_text(&rows[0], 0), "2");
+    assert_eq!(col_text(&rows[0], 1), "east");
+}
+
+/// POSITIVE CONTROL / verdict evidence for sub-defect (b). The EXPLICIT-dimension
+/// cast on a text parameter already works over the extended protocol — so the
+/// issue's `%s::vector(3)` failure ("array does not start with '{'") was the
+/// RESULT OID, not the parameter binding. Passes before and after.
+#[tokio::test]
+async fn extended_explicit_dim_vector_cast_on_text_parameter_control() {
+    let db = vector_test_db();
+    let (mut handler, mut client) = test_handler(db);
+    let rows = extended_run(
+        &mut handler,
+        &mut client,
+        "expl",
+        "SELECT $1::vector(3) AS probe FROM mem0 WHERE id = 1",
+        vec![0],
+        vec![Some(b"[1.0,0.0,0.0]".to_vec())],
+    )
+    .await
+    .expect("control: `$1::vector(3)` on a text parameter already works");
+    assert_eq!(rows.len(), 1);
+    assert_close(
+        &wire_vector(&col_text(&rows[0], 0)),
+        &[1.0, 0.0, 0.0],
+        "an explicitly dimensioned cast on a text parameter round-trips",
+    );
+}
+
+/// OPEN on the current tree.
+///
+/// The issue's mem0 search shape, over the protocol a driver actually uses.
+/// psycopg3 / node-pg / asyncpg all bind `$1` rather than inlining it, so this
+/// statement reaches `Planner::expr_to_logical` with `Cast { Placeholder("$1"),
+/// vector }` and dies at src/sql/planner.rs:4547-4553.
+#[tokio::test]
+async fn extended_bare_vector_cast_on_text_parameter_runs_mem0_search() {
+    let db = vector_test_db();
+    let (mut handler, mut client) = test_handler(db);
+    let rows = extended_run(
+        &mut handler,
+        &mut client,
+        "mem0",
+        "SELECT id, vector <=> $1::vector AS distance, payload FROM mem0 ORDER BY distance LIMIT $2",
+        vec![0, 20],
+        vec![Some(b"[1.0,0.0,0.0]".to_vec()), Some(b"2".to_vec())],
+    )
+    .await
+    .unwrap_or_else(|e| {
+        panic!(
+            "mem0's search shape must execute over the extended protocol — \
+             `$1::vector` must infer its dimension from the bound value: {e}"
+        )
+    });
+
+    assert_eq!(rows.len(), 2, "LIMIT $2 = 2");
+    assert_eq!(col_text(&rows[0], 0), "1", "the probe's own row must sort first");
+    assert_eq!(col_text(&rows[0], 2), "north", "payload must survive");
+    let d0: f64 = col_text(&rows[0], 1)
+        .parse()
+        .expect("distance must be numeric wire text");
+    let d1: f64 = col_text(&rows[1], 1)
+        .parse()
+        .expect("distance must be numeric wire text");
+    assert!(d0.abs() < 1e-4, "self-distance must be ~0, got {d0}");
+    assert!(
+        d0 <= d1,
+        "rows must come back in ascending distance order ({d0} <= {d1})"
+    );
+}
+
+/// OPEN on the current tree. Same statement, but the client declares the
+/// parameter as `float8[]` (OID 1022) and sends the PostgreSQL array text
+/// `{…}` — what node-pg emits for a JS number array and what psycopg sends for
+/// a Python list under server-side binding. Both text forms must be accepted
+/// for a parameterised vector, matching the inline path (`parse_vector_text`,
+/// src/types.rs:303, already accepts `[…]`, `{…}` and bare `a,b,c`).
+#[tokio::test]
+async fn extended_bare_vector_cast_on_float8_array_parameter() {
+    let db = vector_test_db();
+    let (mut handler, mut client) = test_handler(db);
+    let rows = extended_run(
+        &mut handler,
+        &mut client,
+        "arr",
+        "SELECT id, vector <=> $1::vector AS distance FROM mem0 ORDER BY distance LIMIT 1",
+        vec![1022],
+        vec![Some(b"{1.0,0.0,0.0}".to_vec())],
+    )
+    .await
+    .unwrap_or_else(|e| panic!("a float8[] (OID 1022) text parameter must cast to vector: {e}"));
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(col_text(&rows[0], 0), "1", "nearest row is the probe itself");
+}
+
+/// OPEN on the current tree. The INSERT half of mem0's integration, over the
+/// extended protocol: `$2::vector` in a DML statement.
+#[tokio::test]
+async fn extended_bare_vector_cast_in_insert() {
+    let db = vector_test_db();
+    let (mut handler, mut client) = test_handler(Arc::clone(&db));
+    let _ = extended_run(
+        &mut handler,
+        &mut client,
+        "ins",
+        "INSERT INTO mem0 (id, vector, payload) VALUES ($1, $2::vector, $3)",
+        vec![23, 0, 25],
+        vec![
+            Some(b"4".to_vec()),
+            Some(b"[0.0,0.0,0.5]".to_vec()),
+            Some(b"down".to_vec()),
+        ],
+    )
+    .await
+    .unwrap_or_else(|e| panic!("mem0's insert path binds the embedding the same way: {e}"));
+
+    let out = wire_query(
+        &mut handler,
+        &mut client,
+        "SELECT payload, vector FROM mem0 WHERE id = 4",
+    )
+    .await;
+    assert!(sqlstates(&out).is_empty(), "read-back must not error");
+    let rows = data_rows(&out);
+    assert_eq!(rows.len(), 1, "the parameterised INSERT must have stored one row");
+    assert_eq!(col_text(&rows[0], 0), "down");
+    // The stored VECTOR must be the bound value, not a truncated or reordered
+    // one — a cast that "succeeds" but stores garbage is the silent failure this
+    // whole fix must not introduce.
+    assert_close(
+        &wire_vector(&col_text(&rows[0], 1)),
+        &[0.0, 0.0, 0.5],
+        "the parameterised INSERT must store the bound components verbatim",
+    );
+}
+
+/// FAIL-CLOSED guard, over the wire. Widening the bare cast must not make a
+/// wrong-dimension or non-numeric parameter acceptable: both must still come
+/// back as an ErrorResponse, and no row may be stored. Passes before and after.
+#[tokio::test]
+async fn extended_vector_cast_still_rejects_bad_parameters() {
+    let db = vector_test_db();
+    let (mut handler, mut client) = test_handler(Arc::clone(&db));
+
+    let r = extended_run(
+        &mut handler,
+        &mut client,
+        "bad1",
+        "SELECT $1::vector(3) AS probe FROM mem0 WHERE id = 1",
+        vec![0],
+        vec![Some(b"[1.0,2.0,3.0,4.0]".to_vec())],
+    )
+    .await;
+    assert!(
+        r.is_err(),
+        "a 4-element parameter cast to ::vector(3) must be rejected; got {r:?}"
+    );
+
+    let r = extended_run(
+        &mut handler,
+        &mut client,
+        "bad2",
+        "SELECT $1::vector AS probe FROM mem0 WHERE id = 1",
+        vec![0],
+        vec![Some(b"not a vector".to_vec())],
+    )
+    .await;
+    assert!(r.is_err(), "a non-numeric parameter must not cast to vector; got {r:?}");
+
+    let r = extended_run(
+        &mut handler,
+        &mut client,
+        "bad3",
+        "SELECT $1::vector AS probe FROM mem0 WHERE id = 1",
+        vec![0],
+        vec![Some(b"[]".to_vec())],
+    )
+    .await;
+    assert!(
+        r.is_err(),
+        "an empty parameter has no dimension to infer and must be rejected; got {r:?}"
+    );
+
+    // bad2 / bad3 above use the BARE cast, which the current tree refuses at
+    // plan time WHATEVER the value — so on the unfixed tree they are satisfied
+    // vacuously. These three spell the dimension explicitly, which plans fine
+    // TODAY, so they exercise `Evaluator::cast_value` (src/sql/evaluator.rs:5645)
+    // for real both before and after the fix.
+    for (label, name, payload) in [
+        ("prose", "bad4", &b"not a vector"[..]),
+        ("empty", "bad5", &b"[]"[..]),
+        ("json object", "bad6", &b"{\"a\":1}"[..]),
+    ] {
+        let r = extended_run(
+            &mut handler,
+            &mut client,
+            name,
+            "SELECT $1::vector(3) AS probe FROM mem0 WHERE id = 1",
+            vec![0],
+            vec![Some(payload.to_vec())],
+        )
+        .await;
+        assert!(
+            r.is_err(),
+            "{label}: `$1::vector(3)` must reject a non-vector parameter (non-vacuous today); got {r:?}"
+        );
+    }
+
+    // And nothing hostile may have been written along the way.
+    let out = wire_query(&mut handler, &mut client, "SELECT id FROM mem0").await;
+    assert_eq!(data_rows(&out).len(), 3, "no rejected cast may have stored a row");
+}
+
+// ---- GH#29 (candidate 1) ----
+//
+// Plan-time name resolution on the wire (`sql::scope`). The five alias /
+// qualifier defects found while confirming GH#29 item 2, plus the root behind
+// them (sprinter b96bc6b51ae5: an unknown column on an EMPTY table was not an
+// error because resolution only ran per row), are refused at plan time with
+// PostgreSQL's SQLSTATEs on BOTH protocols. The classifier arms for the two
+// new codes (42712 / 42702) and the 0A000 shadowed-materialized-view refusal
+// anchor on the emitter's consts (marker-const discipline, as `gh23_c3_*`).
+
+/// Simple protocol: `SELECT nosuch FROM t` on an EMPTY table is 42703 (it was
+/// an empty, successful result through v4.31.1), an unknown wildcard qualifier
+/// is 42P01 (it was the whole row), and the positive controls on the same
+/// empty table still answer with a RowDescription and zero rows.
+#[tokio::test]
+async fn gh29_c1_simple_unknown_column_on_empty_table_is_42703_and_bogus_wildcard_is_42p01() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut h, mut c) = test_handler(db);
+    wire_setup(&mut h, &mut c, r#"CREATE TABLE "t" ("id" INT PRIMARY KEY, "v" TEXT)"#).await;
+
+    // The root: no rows, still an error.
+    assert_wire_sqlstate(&mut h, &mut c, "SELECT nosuch FROM t", "42703").await;
+    assert_wire_sqlstate(&mut h, &mut c, r#"SELECT "t1"."nope" FROM t AS "t1""#, "42703").await;
+    assert_wire_sqlstate(&mut h, &mut c, "SELECT id FROM t WHERE nosuch = 1", "42703").await;
+    assert_wire_sqlstate(&mut h, &mut c, "SELECT id FROM t ORDER BY nosuch", "42703").await;
+    // Unknown qualifier, column or wildcard: 42P01, never widened.
+    assert_wire_sqlstate(&mut h, &mut c, "SELECT bogus.id FROM t a", "42P01").await;
+    assert_wire_sqlstate(&mut h, &mut c, r#"SELECT "nosuch".* FROM "t" AS "a""#, "42P01").await;
+    assert_wire_sqlstate(&mut h, &mut c, r#"SELECT "T1".id FROM t AS T1"#, "42P01").await;
+    // Duplicate alias.
+    assert_wire_sqlstate(&mut h, &mut c, "SELECT a.id FROM t a JOIN t a ON a.id = a.id", "42712").await;
+    // Candidate 2: a sub-select column shadowed by a base table and a
+    // column-alias list both RESOLVE now (see `gh29_c2_*`); they are positive
+    // controls below rather than the 42702 / 0A000 refusals candidate 1 pinned.
+
+    // Positive controls on the SAME empty table.
+    for sql in [
+        "SELECT id FROM t",
+        "SELECT T1.id FROM t AS T1",
+        "SELECT a.* FROM t a",
+        "SELECT s.x FROM (SELECT id AS x FROM t) s",
+        "SELECT s.id FROM t JOIN (SELECT id FROM t) s ON s.id = t.id",
+        "SELECT * FROM (SELECT id FROM t) s(x)",
+    ] {
+        let out = wire_query(&mut h, &mut c, sql).await;
+        assert!(
+            sqlstates(&out).is_empty(),
+            "`{sql}` must plan on the simple protocol, got {:?}",
+            sqlstates(&out)
+        );
+        assert!(data_rows(&out).is_empty(), "`{sql}`: the table is empty");
+        assert!(
+            !row_description_names(&out).is_empty(),
+            "`{sql}` must still describe its columns"
+        );
+    }
+}
+
+/// Simple protocol: `a.*` over a self-join describes exactly `a`'s two fields
+/// (v4.31.1: all four), and an unquoted mixed-case alias is folded (`T.*`).
+#[tokio::test]
+async fn gh29_c1_simple_qualified_wildcard_projects_only_that_alias() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut h, mut c) = test_handler(db);
+    wire_setup(&mut h, &mut c, r#"CREATE TABLE "t" ("id" INT PRIMARY KEY, "v" TEXT)"#).await;
+    wire_setup(&mut h, &mut c, "INSERT INTO t VALUES (1, 'a'), (2, 'b')").await;
+
+    let out = wire_query(
+        &mut h,
+        &mut c,
+        r#"SELECT "a".* FROM "t" AS "a" JOIN "t" AS "b" ON "a"."id" = "b"."id""#,
+    )
+    .await;
+    assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
+    assert_eq!(
+        row_description_names(&out),
+        vec!["id".to_string(), "v".to_string()],
+        "`a.*` over a self-join is a's two columns"
+    );
+    assert_eq!(data_rows(&out).len(), 2);
+    assert_eq!(data_rows(&out)[0].len(), 2, "…and the rows are that wide");
+
+    let out = wire_query(&mut h, &mut c, "SELECT T.*, b.id FROM t AS T JOIN t b ON T.id = b.id").await;
+    assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
+    assert_eq!(
+        row_description_names(&out),
+        vec!["id".to_string(), "v".to_string(), "id".to_string()]
+    );
+}
+
+/// Extended protocol (node-pg / Prisma): the same refusals reach the client
+/// as one ErrorResponse with the same SQLSTATE, whichever of Parse / Bind /
+/// Execute plans the statement, and a valid alias-qualified statement with a
+/// bound parameter still runs.
+#[tokio::test]
+async fn gh29_c1_extended_unknown_column_on_empty_table_is_42703() {
+    use super::messages::FrontendMessage;
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut h, mut c) = test_handler(db);
+    wire_setup(&mut h, &mut c, r#"CREATE TABLE "t" ("id" INT PRIMARY KEY, "v" TEXT)"#).await;
+
+    for (i, (sql, code)) in [
+        ("SELECT nosuch FROM t WHERE id = $1", "42703"),
+        (r#"SELECT "t1"."nope" FROM t AS "t1" WHERE "t1"."id" = $1"#, "42703"),
+        ("SELECT bogus.* FROM t a WHERE a.id = $1", "42P01"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let name = format!("gh29_ext_{i}");
+        let portal = format!("gh29_portal_{i}");
+        let mut all = Vec::new();
+        h.dispatch_message(FrontendMessage::Parse {
+            statement_name: name.clone(),
+            query: sql.into(),
+            param_types: vec![23],
+        })
+        .await
+        .unwrap_or_else(|e| panic!("parse `{sql}`: {e}"));
+        all.extend(drain(&mut c).await);
+        if sqlstates(&all).is_empty() {
+            h.dispatch_message(FrontendMessage::Bind {
+                portal_name: portal.clone(),
+                statement_name: name.clone(),
+                param_formats: vec![0],
+                params: vec![Some(b"1".to_vec())],
+                result_formats: vec![],
+            })
+            .await
+            .unwrap_or_else(|e| panic!("bind `{sql}`: {e}"));
+            all.extend(drain(&mut c).await);
+        }
+        if sqlstates(&all).is_empty() {
+            h.dispatch_message(FrontendMessage::Execute {
+                portal_name: portal.clone(),
+                max_rows: 0,
+            })
+            .await
+            .unwrap_or_else(|e| panic!("execute `{sql}`: {e}"));
+            all.extend(drain(&mut c).await);
+        }
+        h.dispatch_message(FrontendMessage::Sync)
+            .await
+            .unwrap_or_else(|e| panic!("sync `{sql}`: {e}"));
+        all.extend(drain(&mut c).await);
+        assert_eq!(
+            sqlstates(&all),
+            vec![code.to_string()],
+            "`{sql}` must be refused with {code} exactly once over the extended protocol"
+        );
+        assert!(
+            data_rows(&all).is_empty(),
+            "`{sql}` must not also return rows, got {:?}",
+            data_rows(&all)
+        );
+    }
+
+    // Positive control with a bound parameter on the same empty table.
+    let sql = "SELECT T1.id, T1.v FROM t AS T1 WHERE T1.id = $1";
+    let out = wire_extended(&mut h, &mut c, "gh29_ok", sql, vec![23], vec![Some(b"1".to_vec())]).await;
+    assert_extended_ok(&out, sql);
+    assert!(data_rows(&out).is_empty(), "the table is empty");
+}
+
+/// The three new refusal classes classify through the handler's SQLSTATE
+/// mapping by their emitter consts; the 42703 / 42P01 wordings land on the
+/// existing shape arms; a message that merely mentions a column elsewhere is
+/// not hijacked.
+#[test]
+fn gh29_c1_scope_refusals_classify_by_marker_const() {
+    use crate::sql::scope;
+    let dup = scope::duplicate_range_entry("a");
+    assert_eq!(super::handler::sqlstate_for_error(&dup), "42712");
+    let amb = crate::Error::query_execution(format!("{}c\" is ambiguous", scope::AMBIGUOUS_COLUMN_REFERENCE));
+    assert_eq!(super::handler::sqlstate_for_error(&amb), "42702");
+    let mv = crate::Error::query_execution(format!(
+        "{} (\"s\".\"id\") when another FROM entry also carries \"id\"",
+        scope::MATERIALIZED_VIEW_DERIVED_ALIAS_UNSUPPORTED
+    ));
+    assert_eq!(super::handler::sqlstate_for_error(&mv), "0A000");
+    let col = crate::Error::query_execution("Column \"t1\".\"nope\" does not exist");
+    assert_eq!(super::handler::sqlstate_for_error(&col), "42703");
+    let rel = crate::Error::query_execution(
+        "relation \"bogus\" does not exist (missing FROM-clause entry for table \"bogus\")",
+    );
+    assert_eq!(super::handler::sqlstate_for_error(&rel), "42P01");
+    let unrelated = crate::Error::query_execution("Table 'ambiguous' does not exist");
+    assert_eq!(super::handler::sqlstate_for_error(&unrelated), "42P01");
+}
+
+// ---- GH#29 (candidate 2) ----
+//
+// The candidate-1 review's fix list on the wire. (1) `UPDATE` / `DELETE`
+// refuse an unknown column on an EMPTY table like `SELECT` does (42703).
+// (2) A sub-select's / view's alias resolves AT RUNTIME
+// (`LogicalPlan::Project::source_alias` + `SourceAliasOperator`), so the
+// SQLAlchemy `anon_1` / Prisma `_count` join shapes that candidate 1 refused
+// with 42702 return rows — the RIGHT rows — and a column-alias list
+// `AS s(x)` / `(VALUES …) AS v(id, name)` is honoured (a list longer than the
+// output is 42P10). (4a) `UPDATE … FROM` / `DELETE … USING` plan again.
+// (4b) `ORDER BY total` finds `AS Total` without folding the RowDescription.
+// (4c) The 42712 classifier arm needs both halves of its message, so the
+// CTAS `column "x" specified more than once` is no longer reclassified.
+// Plus the stated MV residual: a materialized view over an alias-qualified
+// sub-select is refused (0A000) with the workaround named, because its
+// stored plan cannot carry the stamp.
+
+/// Simple protocol: DML on an EMPTY table refuses an unknown column in a SET
+/// value or a WHERE clause (candidate 1 closed this for SELECT only), the
+/// legal shapes still plan, and `UPDATE … FROM` / `DELETE … USING` entries
+/// are in scope again — validated like any other range entry.
+#[tokio::test]
+async fn gh29_c2_simple_dml_unknown_column_on_empty_table_is_42703() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut h, mut c) = test_handler(db);
+    wire_setup(&mut h, &mut c, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").await;
+    wire_setup(&mut h, &mut c, "CREATE TABLE s (id INT PRIMARY KEY, v TEXT)").await;
+
+    // FIX 1: the root, closed for DML.
+    assert_wire_sqlstate(&mut h, &mut c, "UPDATE t SET v = nosuch", "42703").await;
+    assert_wire_sqlstate(&mut h, &mut c, "UPDATE t SET v = 'x' WHERE nosuch = 1", "42703").await;
+    assert_wire_sqlstate(&mut h, &mut c, "DELETE FROM t WHERE nosuch = 1", "42703").await;
+    assert_wire_sqlstate(&mut h, &mut c, "DELETE FROM t AS x WHERE x.nosuch = 1", "42703").await;
+    // FIX 4a: the FROM / USING entries resolve — and are validated.
+    assert_wire_sqlstate(
+        &mut h,
+        &mut c,
+        "UPDATE t SET v = s.nosuch FROM s WHERE s.id = t.id",
+        "42703",
+    )
+    .await;
+    assert_wire_sqlstate(&mut h, &mut c, "DELETE FROM t USING s WHERE bogus.id = t.id", "42P01").await;
+
+    // Positive controls on the same empty tables.
+    for (sql, tag) in [
+        ("UPDATE t SET v = 'x' WHERE id = 1", "UPDATE 0"),
+        ("UPDATE t AS x SET v = x.v WHERE x.id = 1", "UPDATE 0"),
+        ("UPDATE t SET v = s.v FROM s WHERE s.id = t.id", "UPDATE 0"),
+        ("DELETE FROM t WHERE id = 1", "DELETE 0"),
+        ("DELETE FROM t USING s WHERE s.id = t.id", "DELETE 0"),
+    ] {
+        let out = wire_query(&mut h, &mut c, sql).await;
+        assert!(
+            sqlstates(&out).is_empty(),
+            "`{sql}` must plan on the simple protocol, got {:?}",
+            sqlstates(&out)
+        );
+        assert_eq!(command_tags(&out), vec![tag.to_string()], "`{sql}`");
+    }
+}
+
+/// Simple protocol: the derived-table join shapes an ORM emits return the
+/// sub-select's rows (candidate 1: 42702), `s.*` describes exactly the
+/// sub-select's columns, a column-alias list renames the output, a list
+/// longer than the output is 42P10, `ORDER BY total` finds `AS Total` with
+/// the RowDescription unchanged, and a materialized view that would need
+/// the stamp is refused up front with 0A000.
+#[tokio::test]
+async fn gh29_c2_simple_derived_alias_resolves_in_join_shapes() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut h, mut c) = test_handler(db);
+    wire_setup(&mut h, &mut c, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").await;
+    wire_setup(&mut h, &mut c, "INSERT INTO t VALUES (1, 'a'), (2, 'b')").await;
+
+    // FIX 2: the shape candidate 1 refused. The values come from the
+    // sub-select (its own WHERE keeps only id = 2).
+    let out = wire_query(
+        &mut h,
+        &mut c,
+        "SELECT s.id, s.v FROM t JOIN (SELECT id, v FROM t WHERE v = 'b') s ON s.id = t.id",
+    )
+    .await;
+    assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
+    assert_eq!(row_description_names(&out), vec!["id".to_string(), "v".to_string()]);
+    assert_eq!(
+        data_rows(&out),
+        vec![vec![Some(b"2".to_vec()), Some(b"b".to_vec())]],
+        "the sub-select's row, resolved through its alias"
+    );
+
+    // `s.*` over the join: exactly the sub-select's two columns, both rows.
+    let out = wire_query(
+        &mut h,
+        &mut c,
+        "SELECT s.* FROM (SELECT id, v FROM t) s JOIN t ON t.id = s.id ORDER BY s.id",
+    )
+    .await;
+    assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
+    assert_eq!(row_description_names(&out), vec!["id".to_string(), "v".to_string()]);
+    assert_eq!(data_rows(&out).len(), 2);
+    assert_eq!(data_rows(&out)[0].len(), 2, "…and the rows are that wide");
+
+    // The column-alias list is honoured (candidate 1: 0A000; v4.31.1: ignored).
+    let out = wire_query(&mut h, &mut c, "SELECT * FROM (SELECT id FROM t) s(x) ORDER BY s.x").await;
+    assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
+    assert_eq!(row_description_names(&out), vec!["x".to_string()]);
+    assert_eq!(data_rows(&out).len(), 2);
+    let out = wire_query(
+        &mut h,
+        &mut c,
+        "SELECT v.id, v.name FROM (VALUES (1, 'one')) AS v(id, name)",
+    )
+    .await;
+    assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
+    assert_eq!(row_description_names(&out), vec!["id".to_string(), "name".to_string()]);
+    assert_eq!(data_rows(&out), vec![vec![Some(b"1".to_vec()), Some(b"one".to_vec())]]);
+    assert_wire_sqlstate(&mut h, &mut c, "SELECT * FROM (SELECT id FROM t) s(x, y)", "42P10").await;
+
+    // FIX 4b: the key folds up to the alias; the RowDescription keeps `Total`.
+    let out = wire_query(&mut h, &mut c, "SELECT count(*) AS Total FROM t ORDER BY total").await;
+    assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
+    assert_eq!(row_description_names(&out), vec!["Total".to_string()]);
+    assert_eq!(data_rows(&out), vec![vec![Some(b"2".to_vec())]]);
+
+    // The stated MV residual: refused at CREATE, never materialized-then-broken.
+    assert_wire_sqlstate(
+        &mut h,
+        &mut c,
+        "CREATE MATERIALIZED VIEW m AS SELECT s.id FROM t JOIN (SELECT id FROM t) s ON s.id = t.id",
+        "0A000",
+    )
+    .await;
+}
+
+/// Extended protocol (node-pg / Prisma / SQLAlchemy): the join shape with a
+/// bound parameter returns the sub-select's row, resolved through its alias.
+#[tokio::test]
+async fn gh29_c2_extended_derived_alias_join_with_bound_parameter() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut h, mut c) = test_handler(db);
+    wire_setup(&mut h, &mut c, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").await;
+    wire_setup(&mut h, &mut c, "INSERT INTO t VALUES (1, 'a'), (2, 'b')").await;
+
+    let sql = "SELECT anon_1.v FROM (SELECT t.id AS id, t.v AS v FROM t) AS anon_1 \
+               JOIN t ON t.id = anon_1.id WHERE t.id = $1";
+    let out = wire_extended(&mut h, &mut c, "gh29_c2_join", sql, vec![23], vec![Some(b"2".to_vec())]).await;
+    assert_extended_ok(&out, sql);
+    assert_eq!(data_rows(&out), vec![vec![Some(b"b".to_vec())]]);
+
+    // FIX 1 over the extended protocol: refused at Parse / Bind, exactly one
+    // SQLSTATE, on the empty table `u`.
+    wire_setup(&mut h, &mut c, "CREATE TABLE u (id INT PRIMARY KEY, v TEXT)").await;
+    use super::messages::FrontendMessage;
+    let sql = "UPDATE u SET v = nosuch WHERE id = $1";
+    let mut all = Vec::new();
+    h.dispatch_message(FrontendMessage::Parse {
+        statement_name: "gh29_c2_dml".into(),
+        query: sql.into(),
+        param_types: vec![23],
+    })
+    .await
+    .unwrap_or_else(|e| panic!("parse `{sql}`: {e}"));
+    all.extend(drain(&mut c).await);
+    if sqlstates(&all).is_empty() {
+        h.dispatch_message(FrontendMessage::Bind {
+            portal_name: "gh29_c2_dml_portal".into(),
+            statement_name: "gh29_c2_dml".into(),
+            param_formats: vec![0],
+            params: vec![Some(b"1".to_vec())],
+            result_formats: vec![],
+        })
+        .await
+        .unwrap_or_else(|e| panic!("bind `{sql}`: {e}"));
+        all.extend(drain(&mut c).await);
+    }
+    if sqlstates(&all).is_empty() {
+        h.dispatch_message(FrontendMessage::Execute {
+            portal_name: "gh29_c2_dml_portal".into(),
+            max_rows: 0,
+        })
+        .await
+        .unwrap_or_else(|e| panic!("execute `{sql}`: {e}"));
+        all.extend(drain(&mut c).await);
+    }
+    h.dispatch_message(FrontendMessage::Sync)
+        .await
+        .unwrap_or_else(|e| panic!("sync `{sql}`: {e}"));
+    all.extend(drain(&mut c).await);
+    assert_eq!(
+        sqlstates(&all),
+        vec!["42703".to_string()],
+        "`{sql}` must be refused with 42703 exactly once over the extended protocol"
+    );
+}
+
+/// FIX 4c and the two new refusal classes classify by their emitter consts:
+/// the duplicate-alias arm needs both halves of its message, so the CTAS
+/// duplicate-column refusal (which shares the trailing phrase) is NOT 42712;
+/// a too-long column-alias list is 42P10; the shadowed MV residual is 0A000
+/// (c3: the column-alias-list-over-duplicates refusal is gone — the list is
+/// applied positionally).
+#[test]
+fn gh29_c2_scope_refusals_classify_by_marker_const() {
+    use crate::sql::scope;
+    let dup = scope::duplicate_range_entry("a");
+    assert_eq!(super::handler::sqlstate_for_error(&dup), "42712");
+    let ctas = crate::Error::query_execution("column \"x\" specified more than once");
+    assert_ne!(
+        super::handler::sqlstate_for_error(&ctas),
+        "42712",
+        "the CTAS duplicate-column refusal must not be taken for a duplicate alias"
+    );
+    let long = scope::derived_column_list_too_long("s", 1, 2);
+    assert_eq!(super::handler::sqlstate_for_error(&long), "42P10");
+    let mv = scope::materialized_view_derived_alias_shadowed("s", "id");
+    assert_eq!(super::handler::sqlstate_for_error(&mv), "0A000");
+}
+
+// ---- GH#29 (candidate 3) ----
+//
+// The candidate-2 review's fix list on the wire. (M1) A derived alias equal
+// to the REAL name of an earlier aliased base table resolves to the derived
+// table (alias match beats real-name match at runtime). (M2+M3) A
+// materialized view rewrites every unshadowed alias-qualified reference to
+// the bare name before storing its plan — aggregate arguments included — and
+// refuses (0A000, workaround named) only the shadowed shape. (m1) `SET col =
+// DEFAULT` applies the declared default. (m2) `GROUP BY <output alias>`
+// groups by the item's expression; `HAVING <output alias>` is 42703. (m3/m4)
+// A sub-select with a repeated output name refuses only that name and takes
+// a positional column-alias list. (m5) The row_number pagination idiom
+// filters on the window result.
+
+/// Simple protocol, value assertions throughout.
+#[tokio::test]
+async fn gh29_c3_simple_alias_first_resolution_mv_destamp_and_minors() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut h, mut c) = test_handler(db);
+    wire_setup(&mut h, &mut c, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").await;
+    wire_setup(&mut h, &mut c, "INSERT INTO t VALUES (1, 'a'), (2, 'b')").await;
+    wire_setup(&mut h, &mut c, "CREATE TABLE u (id INT PRIMARY KEY, tid INT)").await;
+    wire_setup(&mut h, &mut c, "INSERT INTO u VALUES (11, 1), (12, 2)").await;
+
+    // M1: `u` names the DERIVED table (u's real name is hidden by `a`).
+    let out = wire_query(
+        &mut h,
+        &mut c,
+        "SELECT a.id, u.id FROM u AS a JOIN (SELECT id FROM t) u ON u.id = a.tid ORDER BY a.id",
+    )
+    .await;
+    assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
+    assert_eq!(
+        data_rows(&out),
+        vec![
+            vec![Some(b"11".to_vec()), Some(b"1".to_vec())],
+            vec![Some(b"12".to_vec()), Some(b"2".to_vec())],
+        ],
+        "(a-value, derived-value) per row"
+    );
+    let out = wire_query(
+        &mut h,
+        &mut c,
+        "SELECT u.id FROM u AS a JOIN (SELECT id FROM t) u ON u.id + 10 = a.id WHERE u.id = 2",
+    )
+    .await;
+    assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
+    assert_eq!(data_rows(&out), vec![vec![Some(b"2".to_vec())]]);
+
+    // M2+M3: unshadowed references in an MV body are accepted — inside an
+    // aggregate argument too — and REFRESH re-executes the stored plan.
+    wire_setup(
+        &mut h,
+        &mut c,
+        "CREATE MATERIALIZED VIEW m_sum AS SELECT sum(s.id) AS total FROM (SELECT id FROM t) s",
+    )
+    .await;
+    wire_setup(&mut h, &mut c, "CREATE VIEW myview AS SELECT id, v FROM t").await;
+    wire_setup(
+        &mut h,
+        &mut c,
+        "CREATE MATERIALIZED VIEW m_view AS SELECT v.id FROM myview v",
+    )
+    .await;
+    wire_setup(&mut h, &mut c, "INSERT INTO t VALUES (3, 'c')").await;
+    wire_setup(&mut h, &mut c, "REFRESH MATERIALIZED VIEW m_sum").await;
+    wire_setup(&mut h, &mut c, "REFRESH MATERIALIZED VIEW m_view").await;
+    let out = wire_query(&mut h, &mut c, "SELECT total FROM m_sum").await;
+    assert_eq!(data_rows(&out), vec![vec![Some(b"6".to_vec())]]);
+    let out = wire_query(&mut h, &mut c, "SELECT count(*) FROM m_view").await;
+    assert_eq!(data_rows(&out), vec![vec![Some(b"3".to_vec())]]);
+    // …and only the shadowed shape is refused, with the workaround named.
+    let out = wire_query(
+        &mut h,
+        &mut c,
+        "CREATE MATERIALIZED VIEW m_bad AS SELECT s.id FROM t JOIN (SELECT id FROM t) s ON s.id = t.id",
+    )
+    .await;
+    assert_eq!(sqlstates(&out), vec!["0A000".to_string()]);
+    let payload = String::from_utf8_lossy(&out);
+    assert!(payload.contains("alias the column inside the sub-select"), "{payload}");
+    assert_wire_sqlstate(
+        &mut h,
+        &mut c,
+        "CREATE MATERIALIZED VIEW m_bad AS SELECT count(s.id) FROM t JOIN (SELECT id FROM t) s ON s.id = t.id",
+        "0A000",
+    )
+    .await;
+
+    // m1: SET col = DEFAULT.
+    wire_setup(
+        &mut h,
+        &mut c,
+        "CREATE TABLE d (id INT PRIMARY KEY, v INT DEFAULT 7, w INT)",
+    )
+    .await;
+    wire_setup(&mut h, &mut c, "INSERT INTO d VALUES (1, 1, 1)").await;
+    let out = wire_query(&mut h, &mut c, "UPDATE d SET v = DEFAULT, w = DEFAULT WHERE id = 1").await;
+    assert_eq!(command_tags(&out), vec!["UPDATE 1".to_string()]);
+    let out = wire_query(&mut h, &mut c, "SELECT v, w FROM d WHERE id = 1").await;
+    assert_eq!(data_rows(&out), vec![vec![Some(b"7".to_vec()), None]]);
+
+    // m2: GROUP BY folds the alias to its expression; HAVING refuses it.
+    let out = wire_query(
+        &mut h,
+        &mut c,
+        "SELECT v AS Grp, count(*) AS n FROM t GROUP BY grp ORDER BY grp",
+    )
+    .await;
+    assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
+    assert_eq!(row_description_names(&out), vec!["Grp".to_string(), "n".to_string()]);
+    assert_eq!(data_rows(&out).len(), 3);
+    assert_eq!(data_rows(&out)[0], vec![Some(b"a".to_vec()), Some(b"1".to_vec())]);
+    assert_wire_sqlstate(
+        &mut h,
+        &mut c,
+        "SELECT v, count(*) AS n FROM t GROUP BY v HAVING n > 1",
+        "42703",
+    )
+    .await;
+
+    // m3 / m4: only the duplicated name is refused; the list is positional.
+    let dup = "(SELECT t.id, t.v, u.id, u.tid FROM t JOIN u ON u.tid = t.id)";
+    let out = wire_query(&mut h, &mut c, &format!("SELECT s.tid FROM {dup} s ORDER BY s.tid")).await;
+    assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
+    assert_eq!(
+        data_rows(&out),
+        vec![vec![Some(b"1".to_vec())], vec![Some(b"2".to_vec())]]
+    );
+    assert_wire_sqlstate(&mut h, &mut c, &format!("SELECT s.id FROM {dup} s"), "42702").await;
+    let out = wire_query(
+        &mut h,
+        &mut c,
+        &format!("SELECT s.w, s.y FROM {dup} AS s(w, x, y, z) ORDER BY s.w"),
+    )
+    .await;
+    assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
+    assert_eq!(row_description_names(&out), vec!["w".to_string(), "y".to_string()]);
+    assert_eq!(
+        data_rows(&out),
+        vec![
+            vec![Some(b"1".to_vec()), Some(b"11".to_vec())],
+            vec![Some(b"2".to_vec()), Some(b"12".to_vec())],
+        ],
+        "w = t.id, y = u.id: renamed positionally"
+    );
+
+    // m5: the pagination idiom filters on the window result (t has 3 rows).
+    let idiom = "(SELECT id, row_number() OVER (ORDER BY id DESC) AS rn FROM t) s";
+    let out = wire_query(&mut h, &mut c, &format!("SELECT s.id FROM {idiom} WHERE s.rn = 1")).await;
+    assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
+    assert_eq!(data_rows(&out), vec![vec![Some(b"3".to_vec())]]);
+    let out = wire_query(&mut h, &mut c, &format!("SELECT id FROM {idiom} WHERE rn = 1")).await;
+    assert_eq!(data_rows(&out), vec![vec![Some(b"3".to_vec())]]);
+    let out = wire_query(
+        &mut h,
+        &mut c,
+        &format!("SELECT s.id FROM {idiom} WHERE s.rn BETWEEN 2 AND 3 ORDER BY s.id"),
+    )
+    .await;
+    assert_eq!(
+        data_rows(&out),
+        vec![vec![Some(b"1".to_vec())], vec![Some(b"2".to_vec())]]
+    );
+}
+
+/// Extended protocol (node-pg / Prisma / SQLAlchemy): the M1 shape with a
+/// bound parameter returns the derived table's value, and `SET col =
+/// DEFAULT` with a bound key applies the declared default.
+#[tokio::test]
+async fn gh29_c3_extended_alias_first_join_and_set_default_with_bound_parameters() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut h, mut c) = test_handler(db);
+    wire_setup(&mut h, &mut c, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").await;
+    wire_setup(&mut h, &mut c, "INSERT INTO t VALUES (1, 'a'), (2, 'b')").await;
+    wire_setup(&mut h, &mut c, "CREATE TABLE u (id INT PRIMARY KEY, tid INT)").await;
+    wire_setup(&mut h, &mut c, "INSERT INTO u VALUES (11, 1), (12, 2)").await;
+
+    let sql = "SELECT a.id, u.id FROM u AS a JOIN (SELECT id FROM t) u ON u.id = a.tid WHERE a.id = $1";
+    let out = wire_extended(
+        &mut h,
+        &mut c,
+        "gh29_c3_join",
+        sql,
+        vec![23],
+        vec![Some(b"12".to_vec())],
+    )
+    .await;
+    assert_extended_ok(&out, sql);
+    assert_eq!(
+        data_rows(&out),
+        vec![vec![Some(b"12".to_vec()), Some(b"2".to_vec())]],
+        "(a-value, derived-value)"
+    );
+
+    wire_setup(&mut h, &mut c, "CREATE TABLE d (id INT PRIMARY KEY, v INT DEFAULT 7)").await;
+    wire_setup(&mut h, &mut c, "INSERT INTO d VALUES (1, 1)").await;
+    let sql = "UPDATE d SET v = DEFAULT WHERE id = $1";
+    let out = wire_extended(
+        &mut h,
+        &mut c,
+        "gh29_c3_default",
+        sql,
+        vec![23],
+        vec![Some(b"1".to_vec())],
+    )
+    .await;
+    assert_extended_ok(&out, sql);
+    assert_eq!(command_tags(&out), vec!["UPDATE 1".to_string()]);
+    let out = wire_query(&mut h, &mut c, "SELECT v FROM d WHERE id = 1").await;
+    assert_eq!(data_rows(&out), vec![vec![Some(b"7".to_vec())]]);
+}
+// ---- GH#29 (candidate 4) ----
+//
+// The c3 proof run's two residual engine defects, on the wire. (F1) A hash
+// join whose ON operands are EXPRESSIONS decides each operand's side once,
+// at construction (alias tier first), so `ON u.id + 10 = a.id` next to
+// `u AS a` returns the rows instead of none. (F2) An UPDATE that takes the
+// PK point-update fast path, and `INSERT … ON CONFLICT DO UPDATE`, refuse an
+// unknown column at plan time — on an empty table, for a missing key, and
+// before any row is touched.
+
+/// Simple protocol, value assertions throughout.
+#[tokio::test]
+async fn gh29_c4_simple_hash_join_expression_keys_and_update_fast_path_resolution() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut h, mut c) = test_handler(db);
+    wire_setup(&mut h, &mut c, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").await;
+    wire_setup(&mut h, &mut c, "INSERT INTO t VALUES (1, 'a'), (2, 'b')").await;
+    wire_setup(&mut h, &mut c, "CREATE TABLE u (id INT PRIMARY KEY, tid INT)").await;
+    wire_setup(&mut h, &mut c, "INSERT INTO u VALUES (11, 1), (12, 2)").await;
+
+    // F1: every spelling keys the derived table's `u.id`, never a's column.
+    let both = vec![
+        vec![Some(b"11".to_vec()), Some(b"1".to_vec())],
+        vec![Some(b"12".to_vec()), Some(b"2".to_vec())],
+    ];
+    for sql in [
+        "SELECT a.id, u.id FROM u AS a JOIN (SELECT id FROM t) u ON u.id + 10 = a.id ORDER BY a.id",
+        "SELECT a.id, u.id FROM u AS a JOIN (SELECT id FROM t) u ON a.id = u.id + 10 ORDER BY a.id",
+        "SELECT a.id, u.id FROM u AS a JOIN (SELECT id FROM t) u ON u.id = a.tid AND u.id + 10 = a.id ORDER BY a.id",
+        "SELECT a.id, u.id FROM (SELECT id FROM t) u JOIN u AS a ON u.id + 10 = a.id ORDER BY a.id",
+    ] {
+        let out = wire_query(&mut h, &mut c, sql).await;
+        assert!(sqlstates(&out).is_empty(), "`{sql}`: {:?}", sqlstates(&out));
+        assert_eq!(data_rows(&out), both, "(a-value, derived-value) per row for `{sql}`");
+    }
+    let out = wire_query(
+        &mut h,
+        &mut c,
+        "SELECT u.id FROM u AS a JOIN (SELECT id FROM t) u ON u.id + 10 = a.id WHERE u.id = 2",
+    )
+    .await;
+    assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
+    assert_eq!(data_rows(&out), vec![vec![Some(b"2".to_vec())]]);
+    let out = wire_query(&mut h, &mut c, "SELECT x.id, y.id FROM t x JOIN t y ON x.id + 1 = y.id").await;
+    assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
+    assert_eq!(data_rows(&out), vec![vec![Some(b"1".to_vec()), Some(b"2".to_vec())]]);
+
+    // F2: refused at plan time, rows untouched.
+    for sql in [
+        "UPDATE t SET v = t.nosuch WHERE id = 1",
+        "UPDATE t SET v = nosuch WHERE id = 1",
+        "UPDATE t SET v = nosuch WHERE id = 99",
+        "UPDATE t SET v = 'x' WHERE id = 1 AND nosuch = 1",
+        "INSERT INTO t VALUES (1, 'z') ON CONFLICT (id) DO UPDATE SET v = t.nosuch",
+        "INSERT INTO t VALUES (1, 'z') ON CONFLICT (id) DO UPDATE SET v = excluded.nosuch",
+        "INSERT INTO t VALUES (9, 'z') ON CONFLICT (id) DO UPDATE SET v = nosuch",
+    ] {
+        assert_wire_sqlstate(&mut h, &mut c, sql, "42703").await;
+    }
+    let out = wire_query(&mut h, &mut c, "SELECT id, v FROM t ORDER BY id").await;
+    assert_eq!(
+        data_rows(&out),
+        vec![
+            vec![Some(b"1".to_vec()), Some(b"a".to_vec())],
+            vec![Some(b"2".to_vec()), Some(b"b".to_vec())],
+        ],
+        "no refused statement touched a row (and the id 9 INSERT was not applied)"
+    );
+    // …and the legal spellings keep working: the fast path, a missing key,
+    // and the upsert idiom.
+    let out = wire_query(&mut h, &mut c, "UPDATE t SET v = 'x' WHERE id = 1").await;
+    assert_eq!(command_tags(&out), vec!["UPDATE 1".to_string()]);
+    let out = wire_query(&mut h, &mut c, "UPDATE t SET v = 'x' WHERE id = 99").await;
+    assert_eq!(command_tags(&out), vec!["UPDATE 0".to_string()]);
+    let out = wire_query(
+        &mut h,
+        &mut c,
+        "INSERT INTO t VALUES (2, 'z') ON CONFLICT (id) DO UPDATE SET v = excluded.v",
+    )
+    .await;
+    assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
+    let out = wire_query(&mut h, &mut c, "SELECT v FROM t ORDER BY id").await;
+    assert_eq!(
+        data_rows(&out),
+        vec![vec![Some(b"x".to_vec())], vec![Some(b"z".to_vec())]]
+    );
+}
+// ---- GH#29 (candidate 5) ----
+//
+// The c4 review's MAJOR and minors, on the wire. (MAJOR) A hash join keyed
+// on an expression resolves case-distinct quoted aliases EXACTLY before the
+// case-folded fallback and declines a term whose operands fit both sides,
+// so `FROM t AS "A" JOIN t AS "a" ON "a".id = "A".id + 1` answers (1, 2),
+// not (2, 1). (m1) A declined term under RIGHT / FULL takes a nested-loop
+// join: build rows that fail it are NULL-extended, not dropped. (m2) A
+// subquery term is materialized before the join is built and an evaluation
+// error is the statement's error. (m3) A literal-keyed term is left to the
+// coercing evaluator. (m5) A missing target table is 42P01 whatever the SET
+// spelling. (m6) Arithmetic on a TEXT column is 42883 at plan time, for a
+// missing row too. A bare name a derived entry carries twice is 42702.
+
+/// Simple protocol, value assertions throughout.
+#[tokio::test]
+async fn gh29_c5_simple_hash_join_exact_case_aliases_declined_terms_and_update_type_gate() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut h, mut c) = test_handler(db);
+    let b = |s: &str| Some(s.as_bytes().to_vec());
+    wire_setup(&mut h, &mut c, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").await;
+    wire_setup(&mut h, &mut c, "INSERT INTO t VALUES (1, 'a'), (2, 'b')").await;
+
+    // MAJOR: the exact alias, both spellings, and the unquoted twin.
+    let one_two = vec![vec![b("1"), b("2")]];
+    for sql in [
+        r#"SELECT "A".id, "a".id FROM t AS "A" JOIN t AS "a" ON "a".id = "A".id + 1"#,
+        r#"SELECT "A".id, "a".id FROM t AS "A" JOIN t AS "a" ON "A".id + 1 = "a".id"#,
+        "SELECT a.id, b.id FROM t AS a JOIN t AS b ON b.id = a.id + 1",
+    ] {
+        let out = wire_query(&mut h, &mut c, sql).await;
+        assert!(sqlstates(&out).is_empty(), "`{sql}`: {:?}", sqlstates(&out));
+        assert_eq!(data_rows(&out), one_two, "`{sql}`");
+    }
+
+    // m1: `jb.x = jb.y` (both operands on one side) is declined; the build
+    // rows that fail it survive RIGHT and FULL as NULL-extended rows.
+    wire_setup(&mut h, &mut c, "CREATE TABLE ja (id INT PRIMARY KEY)").await;
+    wire_setup(&mut h, &mut c, "INSERT INTO ja VALUES (1), (3)").await;
+    wire_setup(&mut h, &mut c, "CREATE TABLE jb (id INT, x INT, y INT)").await;
+    wire_setup(&mut h, &mut c, "INSERT INTO jb VALUES (1, 1, 1), (1, 1, 2), (2, 5, 5)").await;
+    let out = wire_query(
+        &mut h,
+        &mut c,
+        "SELECT ja.id, jb.id, jb.x, jb.y FROM ja RIGHT JOIN jb ON ja.id = jb.id AND jb.x = jb.y",
+    )
+    .await;
+    assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
+    let mut rows = data_rows(&out);
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            vec![None, b("1"), b("1"), b("2")],
+            vec![None, b("2"), b("5"), b("5")],
+            vec![b("1"), b("1"), b("1"), b("1")],
+        ],
+        "RIGHT JOIN: (ja.id, jb.id, jb.x, jb.y)"
+    );
+    let out = wire_query(
+        &mut h,
+        &mut c,
+        "SELECT ja.id, jb.id, jb.x, jb.y FROM ja FULL JOIN jb ON ja.id = jb.id AND jb.x = jb.y",
+    )
+    .await;
+    assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
+    let mut rows = data_rows(&out);
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            vec![None, b("1"), b("1"), b("2")],
+            vec![None, b("2"), b("5"), b("5")],
+            vec![b("1"), b("1"), b("1"), b("1")],
+            vec![b("3"), None, None, None],
+        ],
+        "FULL JOIN: (ja.id, jb.id, jb.x, jb.y)"
+    );
+
+    // m2: the subquery term is materialized; a LEFT join keeps the left-side
+    // term in the ON clause, so it is declined and re-evaluated per pair.
+    wire_setup(&mut h, &mut c, "CREATE TABLE sa (id INT PRIMARY KEY, x INT)").await;
+    wire_setup(&mut h, &mut c, "INSERT INTO sa VALUES (1, 10), (2, 20)").await;
+    wire_setup(&mut h, &mut c, "CREATE TABLE sb (id INT PRIMARY KEY, x INT)").await;
+    wire_setup(&mut h, &mut c, "INSERT INTO sb VALUES (1, 20), (2, 10)").await;
+    wire_setup(&mut h, &mut c, "CREATE TABLE sc (x INT)").await;
+    wire_setup(&mut h, &mut c, "INSERT INTO sc VALUES (20)").await;
+    let out = wire_query(
+        &mut h,
+        &mut c,
+        "SELECT sa.id, sb.id FROM sa JOIN sb ON sa.id = sb.id AND sa.x = (SELECT max(x) FROM sc)",
+    )
+    .await;
+    assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
+    assert_eq!(data_rows(&out), vec![vec![b("2"), b("2")]]);
+    let out = wire_query(
+        &mut h,
+        &mut c,
+        "SELECT sa.id, sb.id FROM sa LEFT JOIN sb ON sa.id = sb.id AND sa.x = (SELECT max(x) FROM sc) ORDER BY sa.id",
+    )
+    .await;
+    assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
+    assert_eq!(data_rows(&out), vec![vec![b("1"), None], vec![b("2"), b("2")]]);
+
+    // m3: an integer literal against NUMERIC / DOUBLE PRECISION, either
+    // side of `=`, INNER and LEFT (the LEFT keeps the term in the ON).
+    wire_setup(
+        &mut h,
+        &mut c,
+        "CREATE TABLE pa (id INT PRIMARY KEY, pn NUMERIC(10, 2), pd DOUBLE PRECISION)",
+    )
+    .await;
+    wire_setup(&mut h, &mut c, "INSERT INTO pa VALUES (1, 5.00, 5.0), (2, 7.50, 7.5)").await;
+    wire_setup(&mut h, &mut c, "CREATE TABLE pb (id INT PRIMARY KEY)").await;
+    wire_setup(&mut h, &mut c, "INSERT INTO pb VALUES (1), (2)").await;
+    for term in ["5 = pa.pn", "pa.pn = 5", "5 = pa.pd", "pa.pd = 5"] {
+        let sql = format!("SELECT pa.id, pb.id FROM pa JOIN pb ON pa.id = pb.id AND {term}");
+        let out = wire_query(&mut h, &mut c, &sql).await;
+        assert!(sqlstates(&out).is_empty(), "`{sql}`: {:?}", sqlstates(&out));
+        assert_eq!(data_rows(&out), vec![vec![b("1"), b("1")]], "`{sql}`");
+        let sql = format!("SELECT pa.id, pb.id FROM pa LEFT JOIN pb ON pa.id = pb.id AND {term} ORDER BY pa.id");
+        let out = wire_query(&mut h, &mut c, &sql).await;
+        assert!(sqlstates(&out).is_empty(), "`{sql}`: {:?}", sqlstates(&out));
+        assert_eq!(
+            data_rows(&out),
+            vec![vec![b("1"), b("1")], vec![b("2"), None]],
+            "`{sql}`"
+        );
+    }
+
+    // m5: a missing target table is the table's error, whatever the SET
+    // spelling — never an unknown column.
+    for sql in [
+        "INSERT INTO nosuch VALUES (1, 'z') ON CONFLICT (id) DO UPDATE SET v = v + 1",
+        "INSERT INTO nosuch VALUES (1, 'z') ON CONFLICT (id) DO UPDATE SET v = nosuch.v + 1",
+        "UPDATE nosuch SET v = v + 1 WHERE id = 1",
+        "UPDATE nosuch SET v = nosuch.v + 1 WHERE id = 1",
+    ] {
+        assert_wire_sqlstate(&mut h, &mut c, sql, "42P01").await;
+    }
+
+    // m6: arithmetic on a TEXT column is 42883 at plan time — for a missing
+    // row too — and the numeric fast path keeps answering.
+    assert_wire_sqlstate(&mut h, &mut c, "UPDATE t SET v = v + 1 WHERE id = 99", "42883").await;
+    assert_wire_sqlstate(&mut h, &mut c, "UPDATE t SET v = v + 1 WHERE id = 1", "42883").await;
+    let out = wire_query(&mut h, &mut c, "SELECT v FROM t ORDER BY id").await;
+    assert_eq!(data_rows(&out), vec![vec![b("a")], vec![b("b")]], "rows untouched");
+    wire_setup(&mut h, &mut c, "CREATE TABLE n (id INT PRIMARY KEY, k INT)").await;
+    wire_setup(&mut h, &mut c, "INSERT INTO n VALUES (1, 5)").await;
+    let out = wire_query(&mut h, &mut c, "UPDATE n SET k = k + 1 WHERE id = 99").await;
+    assert_eq!(command_tags(&out), vec!["UPDATE 0".to_string()]);
+    let out = wire_query(&mut h, &mut c, "UPDATE n SET k = k + 1 WHERE id = 1").await;
+    assert_eq!(command_tags(&out), vec!["UPDATE 1".to_string()]);
+    let out = wire_query(&mut h, &mut c, "SELECT k FROM n").await;
+    assert_eq!(data_rows(&out), vec![vec![b("6")]]);
+
+    // A bare name one derived entry carries twice is ambiguous.
+    assert_wire_sqlstate(
+        &mut h,
+        &mut c,
+        "SELECT id FROM (SELECT a.id, b.id FROM t a JOIN t b ON a.id = b.id) s",
+        "42702",
+    )
+    .await;
+}
+
+// ---- GH#29 (candidate 6) ----
+//
+// (BLOCKER) `NATURAL JOIN` — INNER, LEFT, RIGHT, FULL — and `JOIN … USING (c)`
+// are equi-joins over the wire, not cartesian products. (m4) An `=` ON term no
+// key binder can bind is re-evaluated, never swallowed — including by the index
+// nested loop, which used to take the FIRST equality of an `AND` chain and drop
+// the rest. (m5) A residual ON term under an OUTER join is evaluated inside the
+// join, so the NULL-extended rows survive. (m1) A CORRELATED scalar subquery in
+// an ON term is 0A000, never a silent NULL.
+
+/// Simple protocol, value assertions throughout.
+#[tokio::test]
+async fn gh29_c6_natural_and_using_joins_declined_terms_and_outer_residuals() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut h, mut c) = test_handler(db);
+    let b = |s: &str| Some(s.as_bytes().to_vec());
+
+    // Two inputs whose ids overlap in exactly ONE row: a cartesian product is
+    // 4 rows, the join is 1.
+    wire_setup(&mut h, &mut c, "CREATE TABLE na (id INT PRIMARY KEY, a INT)").await;
+    wire_setup(&mut h, &mut c, "INSERT INTO na VALUES (1, 10), (2, 20)").await;
+    wire_setup(&mut h, &mut c, "CREATE TABLE nb (id INT PRIMARY KEY, b INT)").await;
+    wire_setup(&mut h, &mut c, "INSERT INTO nb VALUES (1, 100), (3, 300)").await;
+
+    for join in ["NATURAL JOIN nb", "JOIN nb USING (id)"] {
+        let sql = format!("SELECT na.id, na.a, nb.b FROM na {join}");
+        let out = wire_query(&mut h, &mut c, &sql).await;
+        assert!(sqlstates(&out).is_empty(), "`{sql}`: {:?}", sqlstates(&out));
+        assert_eq!(data_rows(&out), vec![vec![b("1"), b("10"), b("100")]], "`{sql}`");
+    }
+    for join in ["NATURAL LEFT JOIN nb", "LEFT JOIN nb USING (id)"] {
+        let sql = format!("SELECT na.id, na.a, nb.b FROM na {join}");
+        let out = wire_query(&mut h, &mut c, &sql).await;
+        assert!(sqlstates(&out).is_empty(), "`{sql}`: {:?}", sqlstates(&out));
+        let mut rows = data_rows(&out);
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![vec![b("1"), b("10"), b("100")], vec![b("2"), b("20"), None]],
+            "`{sql}`"
+        );
+    }
+    for join in ["NATURAL RIGHT JOIN nb", "RIGHT JOIN nb USING (id)"] {
+        let sql = format!("SELECT na.id, na.a, nb.b FROM na {join}");
+        let out = wire_query(&mut h, &mut c, &sql).await;
+        assert!(sqlstates(&out).is_empty(), "`{sql}`: {:?}", sqlstates(&out));
+        let mut rows = data_rows(&out);
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![vec![None, None, b("300")], vec![b("1"), b("10"), b("100")]],
+            "`{sql}`"
+        );
+    }
+    for join in ["NATURAL FULL JOIN nb", "FULL JOIN nb USING (id)"] {
+        let sql = format!("SELECT na.id, na.a, nb.b FROM na {join}");
+        let out = wire_query(&mut h, &mut c, &sql).await;
+        assert!(sqlstates(&out).is_empty(), "`{sql}`: {:?}", sqlstates(&out));
+        let mut rows = data_rows(&out);
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![
+                vec![None, None, b("300")],
+                vec![b("1"), b("10"), b("100")],
+                vec![b("2"), b("20"), None],
+            ],
+            "`{sql}`"
+        );
+    }
+    // `SELECT *` still emits the join column once per side (PostgreSQL merges
+    // it — pre-existing and orthogonal), so pin the ROW COUNT, which is what
+    // the cartesian product got wrong.
+    let out = wire_query(&mut h, &mut c, "SELECT * FROM na NATURAL JOIN nb").await;
+    assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
+    assert_eq!(data_rows(&out).len(), 1, "SELECT * FROM na NATURAL JOIN nb");
+    let out = wire_query(&mut h, &mut c, "SELECT * FROM na JOIN nb USING (id)").await;
+    assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
+    assert_eq!(data_rows(&out).len(), 1, "SELECT * FROM na JOIN nb USING (id)");
+    // A USING column a side does not carry is 42703, never a silent cross join.
+    assert_wire_sqlstate(&mut h, &mut c, "SELECT * FROM na JOIN nb USING (nosuch)", "42703").await;
+    assert_wire_sqlstate(&mut h, &mut c, "SELECT * FROM na JOIN nb USING (a)", "42703").await;
+
+    // m5: the residual is checked INSIDE the outer join. A post-join filter
+    // dropped every NULL-extended row — this LEFT JOIN returned nothing.
+    let out = wire_query(
+        &mut h,
+        &mut c,
+        "SELECT na.id, nb.id FROM na LEFT JOIN nb ON na.id = nb.id AND nb.b > 1000 ORDER BY na.id",
+    )
+    .await;
+    assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
+    assert_eq!(data_rows(&out), vec![vec![b("1"), None], vec![b("2"), None]]);
+    let out = wire_query(
+        &mut h,
+        &mut c,
+        "SELECT na.id, nb.id FROM na LEFT JOIN nb ON na.id = nb.id AND nb.b > 10 ORDER BY na.id",
+    )
+    .await;
+    assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
+    assert_eq!(data_rows(&out), vec![vec![b("1"), b("1")], vec![b("2"), None]]);
+    // INNER keeps the post-join filter, and it is still exactly equivalent.
+    let out = wire_query(
+        &mut h,
+        &mut c,
+        "SELECT na.id, nb.id FROM na JOIN nb ON na.id = nb.id AND nb.b > 1000",
+    )
+    .await;
+    assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
+    assert!(data_rows(&out).is_empty());
+
+    // m4: a term the index nested loop used to drop.
+    wire_setup(&mut h, &mut c, "CREATE TABLE sa (id INT PRIMARY KEY, x INT)").await;
+    wire_setup(&mut h, &mut c, "INSERT INTO sa VALUES (1, 10), (2, 20)").await;
+    wire_setup(&mut h, &mut c, "CREATE TABLE sb (id INT PRIMARY KEY, x INT)").await;
+    wire_setup(&mut h, &mut c, "INSERT INTO sb VALUES (1, 20), (2, 10)").await;
+    let out = wire_query(
+        &mut h,
+        &mut c,
+        "SELECT sa.id, sb.id FROM sa JOIN sb ON sa.id = sb.id AND sa.x = 20",
+    )
+    .await;
+    assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
+    assert_eq!(data_rows(&out), vec![vec![b("2"), b("2")]]);
+    let out = wire_query(
+        &mut h,
+        &mut c,
+        "SELECT sa.id, sb.id FROM sa LEFT JOIN sb ON sa.id = sb.id AND sa.x = 20 ORDER BY sa.id",
+    )
+    .await;
+    assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
+    assert_eq!(data_rows(&out), vec![vec![b("1"), None], vec![b("2"), b("2")]]);
+    let out = wire_query(
+        &mut h,
+        &mut c,
+        "SELECT sa.id, sb.id FROM sa JOIN sb ON sa.id = sb.id AND sa.x = sb.x",
+    )
+    .await;
+    assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
+    assert!(data_rows(&out).is_empty(), "the second equality must not be dropped");
+
+    // m1: a CORRELATED scalar subquery in an ON term is 0A000, never NULL.
+    wire_setup(&mut h, &mut c, "CREATE TABLE cc (k INT, x INT)").await;
+    wire_setup(&mut h, &mut c, "INSERT INTO cc VALUES (1, 10), (2, 99)").await;
+    assert_wire_sqlstate(
+        &mut h,
+        &mut c,
+        "SELECT sa.id, sb.id FROM sa LEFT JOIN sb ON sa.id = sb.id AND sa.x = (SELECT max(x) FROM cc WHERE cc.k = sa.id)",
+        "0A000",
+    )
+    .await;
+    // …while the UNCORRELATED spelling still answers.
+    let out = wire_query(
+        &mut h,
+        &mut c,
+        "SELECT sa.id, sb.id FROM sa LEFT JOIN sb ON sa.id = sb.id AND sa.x = (SELECT min(x) FROM cc) ORDER BY sa.id",
+    )
+    .await;
+    assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
+    assert_eq!(data_rows(&out), vec![vec![b("1"), b("1")], vec![b("2"), None]]);
+}
+
+// ---- GH#29 (candidate 7) ----
+//
+// (M1) A `$n` inside a join's ON residual EVALUATES over the wire's EXTENDED
+// protocol — Parse / Bind with a real value / Execute — instead of failing
+// with `Parameter $1 not provided`. (M2) CHAINED `NATURAL JOIN` and
+// `JOIN … USING` (three and four tables) are equi joins, not cartesian
+// products, over the wire too. (M5) Only a genuinely CORRELATED scalar
+// subquery in an ON clause is 0A000; every other subquery failure keeps its
+// own message and SQLSTATE. (n4 is pinned as a unit test on the MySQL
+// classifier, which is where that mapping lives.)
+
+/// Extended protocol, real bind values, value assertions.
+#[tokio::test]
+async fn gh29_c7_a_parameter_in_a_join_residual_evaluates_over_the_extended_protocol() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut handler, mut client) = test_handler(Arc::clone(&db));
+    db.execute("CREATE TABLE pa (id INT PRIMARY KEY, a INT)").expect("pa");
+    db.execute("INSERT INTO pa VALUES (1, 10), (2, 20)").expect("seed pa");
+    db.execute("CREATE TABLE pb (id INT PRIMARY KEY, k INT)").expect("pb");
+    db.execute("INSERT INTO pb VALUES (1, 7), (2, 9)").expect("seed pb");
+
+    let b = |s: &str| Some(s.as_bytes().to_vec());
+    let mut portal = 0;
+    // (sql, expected rows SORTED) — each with ONE int4 parameter bound to 7.
+    // Sorted rather than ORDER BY: the NULL-extended rows would otherwise pin
+    // this engine's NULLS FIRST/LAST choice, which is not what is under test.
+    let cases: Vec<(&str, Vec<Vec<Option<Vec<u8>>>>)> = vec![
+        (
+            "SELECT pa.id, pb.id FROM pa JOIN pb ON pa.id = pb.id AND pb.k = $1",
+            vec![vec![b("1"), b("1")]],
+        ),
+        (
+            "SELECT pa.id, pb.id FROM pa LEFT JOIN pb ON pa.id = pb.id AND pb.k = $1",
+            vec![vec![b("1"), b("1")], vec![b("2"), None]],
+        ),
+        (
+            "SELECT pa.id, pb.id FROM pa RIGHT JOIN pb ON pa.id = pb.id AND pb.k = $1",
+            vec![vec![None, b("2")], vec![b("1"), b("1")]],
+        ),
+        (
+            "SELECT pa.id, pb.id FROM pa FULL JOIN pb ON pa.id = pb.id AND pb.k = $1",
+            vec![vec![None, b("2")], vec![b("1"), b("1")], vec![b("2"), None]],
+        ),
+        (
+            "SELECT pa.id, pa.a FROM pa NATURAL JOIN pb WHERE pb.k = $1",
+            vec![vec![b("1"), b("10")]],
+        ),
+        (
+            "SELECT pa.id, pa.a FROM pa JOIN pb USING (id) WHERE pb.k = $1",
+            vec![vec![b("1"), b("10")]],
+        ),
+    ];
+    for (sql, expected) in cases {
+        portal += 1;
+        let statement = format!("c7s{portal}");
+        let name = format!("c7p{portal}");
+        handler
+            .handle_parse_extended(statement.clone(), sql.to_string(), vec![23])
+            .await
+            .unwrap_or_else(|e| panic!("parse `{sql}`: {e}"));
+        handler
+            .handle_bind_extended(name.clone(), statement, vec![0], vec![Some(b"7".to_vec())], vec![])
+            .await
+            .unwrap_or_else(|e| panic!("bind `{sql}`: {e}"));
+        handler
+            .handle_execute_extended(name, 0)
+            .await
+            .unwrap_or_else(|e| panic!("`{sql}` must EVALUATE the bound `$1`, not refuse it: {e}"));
+        let out = drain(&mut client).await;
+        assert!(sqlstates(&out).is_empty(), "`{sql}`: {:?}", sqlstates(&out));
+        let mut rows = data_rows(&out);
+        rows.sort();
+        assert_eq!(rows, expected, "`{sql}`");
+    }
+
+    // Simple-protocol control: the same statements with the literal spelled
+    // out answer identically.
+    let out = wire_query(
+        &mut handler,
+        &mut client,
+        "SELECT pa.id, pb.id FROM pa LEFT JOIN pb ON pa.id = pb.id AND pb.k = 7 ORDER BY pa.id",
+    )
+    .await;
+    assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
+    assert_eq!(data_rows(&out), vec![vec![b("1"), b("1")], vec![b("2"), None]]);
+}
+
+/// Chained NATURAL / USING joins over the wire, and the diagnostics.
+#[tokio::test]
+async fn gh29_c7_chained_natural_and_using_joins_and_the_subquery_diagnostics() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut h, mut c) = test_handler(db);
+    let b = |s: &str| Some(s.as_bytes().to_vec());
+
+    wire_setup(&mut h, &mut c, "CREATE TABLE c1 (id INT PRIMARY KEY, a INT)").await;
+    wire_setup(&mut h, &mut c, "INSERT INTO c1 VALUES (1, 10), (2, 20)").await;
+    wire_setup(&mut h, &mut c, "CREATE TABLE c2 (id INT PRIMARY KEY, bb INT)").await;
+    wire_setup(&mut h, &mut c, "INSERT INTO c2 VALUES (1, 100), (3, 300)").await;
+    wire_setup(&mut h, &mut c, "CREATE TABLE c3 (id INT PRIMARY KEY, cc INT)").await;
+    wire_setup(&mut h, &mut c, "INSERT INTO c3 VALUES (1, 1000), (2, 2000)").await;
+    wire_setup(&mut h, &mut c, "CREATE TABLE c4 (id INT PRIMARY KEY, dd INT)").await;
+    wire_setup(&mut h, &mut c, "INSERT INTO c4 VALUES (1, 10000), (2, 20000)").await;
+
+    // Three tables, INNER: a cartesian product is 8 rows, the join is 1.
+    for join in [
+        "c1 NATURAL JOIN c2 NATURAL JOIN c3",
+        "c1 JOIN c2 USING (id) JOIN c3 USING (id)",
+    ] {
+        let sql = format!("SELECT c1.id, c1.a, c2.bb, c3.cc FROM {join}");
+        let out = wire_query(&mut h, &mut c, &sql).await;
+        assert!(sqlstates(&out).is_empty(), "`{sql}`: {:?}", sqlstates(&out));
+        assert_eq!(
+            data_rows(&out),
+            vec![vec![b("1"), b("10"), b("100"), b("1000")]],
+            "`{sql}`"
+        );
+    }
+    // Three tables, LEFT.
+    for join in [
+        "c1 NATURAL LEFT JOIN c2 NATURAL LEFT JOIN c3",
+        "c1 LEFT JOIN c2 USING (id) LEFT JOIN c3 USING (id)",
+    ] {
+        let sql = format!("SELECT c1.id, c1.a, c2.bb, c3.cc FROM {join} ORDER BY c1.id");
+        let out = wire_query(&mut h, &mut c, &sql).await;
+        assert!(sqlstates(&out).is_empty(), "`{sql}`: {:?}", sqlstates(&out));
+        assert_eq!(
+            data_rows(&out),
+            vec![
+                vec![b("1"), b("10"), b("100"), b("1000")],
+                vec![b("2"), b("20"), None, b("2000")],
+            ],
+            "`{sql}`"
+        );
+    }
+    // Four tables.
+    for join in [
+        "c1 NATURAL JOIN c2 NATURAL JOIN c3 NATURAL JOIN c4",
+        "c1 JOIN c2 USING (id) JOIN c3 USING (id) JOIN c4 USING (id)",
+    ] {
+        let sql = format!("SELECT c1.id, c2.bb, c3.cc, c4.dd FROM {join}");
+        let out = wire_query(&mut h, &mut c, &sql).await;
+        assert!(sqlstates(&out).is_empty(), "`{sql}`: {:?}", sqlstates(&out));
+        assert_eq!(
+            data_rows(&out),
+            vec![vec![b("1"), b("100"), b("1000"), b("10000")]],
+            "`{sql}`"
+        );
+    }
+    // `SELECT *` keeps the un-merged arity out of the contract: ROW COUNT only.
+    let out = wire_query(&mut h, &mut c, "SELECT * FROM c1 NATURAL JOIN c2 NATURAL JOIN c3").await;
+    assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
+    assert_eq!(data_rows(&out).len(), 1, "three-table chain is not a cartesian product");
+
+    // M2b: a half-qualified ON term is never pushed out of the join.
+    let out = wire_query(&mut h, &mut c, "SELECT c1.id, c3.cc FROM c1 JOIN c3 ON a = c3.cc").await;
+    assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
+    assert!(
+        data_rows(&out).is_empty(),
+        "c1.a is 10/20 and c3.cc is 1000/2000: the term must still be applied"
+    );
+
+    // M5: only a genuine correlation is 0A000.
+    wire_setup(&mut h, &mut c, "CREATE TABLE mc (k INT, x INT)").await;
+    wire_setup(&mut h, &mut c, "INSERT INTO mc VALUES (1, 10), (2, 99)").await;
+    assert_wire_sqlstate(
+        &mut h,
+        &mut c,
+        "SELECT c1.id, c3.id FROM c1 LEFT JOIN c3 ON c1.id = c3.id AND c1.a = (SELECT max(x) FROM mc WHERE mc.k = c1.id)",
+        "0A000",
+    )
+    .await;
+    // …while an UNCORRELATED subquery that fails keeps its own diagnostic.
+    let out = wire_query(
+        &mut h,
+        &mut c,
+        "SELECT c1.id, c3.id FROM c1 LEFT JOIN c3 ON c1.id = c3.id AND c1.a = (SELECT max(x) / 0 FROM mc)",
+    )
+    .await;
+    assert!(
+        !sqlstates(&out).is_empty() && !sqlstates(&out).contains(&"0A000".to_string()),
+        "a division by zero is not a missing feature: {:?}",
+        sqlstates(&out)
+    );
+    // …and the UNCORRELATED spelling still answers.
+    let out = wire_query(
+        &mut h,
+        &mut c,
+        "SELECT c1.id, c3.id FROM c1 LEFT JOIN c3 ON c1.id = c3.id AND c1.a = (SELECT min(x) FROM mc) ORDER BY c1.id",
+    )
+    .await;
+    assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
+    assert_eq!(data_rows(&out), vec![vec![b("1"), b("1")], vec![b("2"), None]]);
+}
+
+// ---- GH#29 (candidate 8) ----
+//
+// (m2) A `$n` really inside the ON clause of a join whose left input is a
+// NATURAL / USING lowering is evaluated over the EXTENDED protocol (Parse /
+// Bind with a real value / Execute); a parameter in a WHERE clause never
+// reached the join evaluator. (m4) A self-contained subquery over a
+// SCHEMA-QUALIFIED relation keeps its own SQLSTATE instead of being reported
+// as correlated.
+//
+// Candidate 10 removed this block's M1 pin with the qualification design it
+// tested: the generated operands are bare again, so a chain keys on the
+// LEFTMOST contributor.
+
+/// m2 over the wire: a bound `$1` inside the ON clause of a join stacked on a
+/// NATURAL / USING lowering, through Parse / Bind / Execute.
+#[tokio::test]
+async fn gh29_c8_a_parameter_in_the_on_clause_above_a_natural_join_evaluates_over_the_extended_protocol() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut handler, mut client) = test_handler(Arc::clone(&db));
+    db.execute("CREATE TABLE c1 (id INT PRIMARY KEY, a INT)").expect("c1");
+    db.execute("INSERT INTO c1 VALUES (1, 10), (2, 20)").expect("seed c1");
+    db.execute("CREATE TABLE c2 (id INT PRIMARY KEY, bb INT)").expect("c2");
+    db.execute("INSERT INTO c2 VALUES (1, 100), (3, 300)").expect("seed c2");
+    db.execute("CREATE TABLE c3 (id INT PRIMARY KEY, cc INT)").expect("c3");
+    db.execute("INSERT INTO c3 VALUES (1, 1000), (2, 2000)")
+        .expect("seed c3");
+
+    let b = |s: &str| Some(s.as_bytes().to_vec());
+    let mut portal = 0;
+    // (sql, bound value, expected rows SORTED). `c1 NATURAL JOIN c2` is ONE
+    // row (id = 1); the parameter then decides rows INSIDE the third join, so
+    // the two bound values must give different answers.
+    let mut cases: Vec<(String, &str, Vec<Vec<Option<Vec<u8>>>>)> = Vec::new();
+    for chain in ["c1 NATURAL JOIN c2", "c1 JOIN c2 USING (id)"] {
+        cases.push((
+            format!("SELECT c1.id, c3.cc FROM {chain} JOIN c3 ON c3.id = c1.id AND c3.cc = $1"),
+            "1000",
+            vec![vec![b("1"), b("1000")]],
+        ));
+        cases.push((
+            format!("SELECT c1.id, c3.cc FROM {chain} JOIN c3 ON c3.id = c1.id AND c3.cc = $1"),
+            "2000",
+            vec![],
+        ));
+        cases.push((
+            format!("SELECT c1.id, c3.cc FROM {chain} LEFT JOIN c3 ON c3.id = c1.id AND c3.cc = $1"),
+            "1000",
+            vec![vec![b("1"), b("1000")]],
+        ));
+        cases.push((
+            format!("SELECT c1.id, c3.cc FROM {chain} LEFT JOIN c3 ON c3.id = c1.id AND c3.cc = $1"),
+            "2000",
+            vec![vec![b("1"), None]],
+        ));
+        cases.push((
+            format!("SELECT c1.id, c3.cc FROM {chain} RIGHT JOIN c3 ON c3.id = c1.id AND c3.cc = $1"),
+            "1000",
+            vec![vec![None, b("2000")], vec![b("1"), b("1000")]],
+        ));
+        cases.push((
+            format!("SELECT c1.id, c3.cc FROM {chain} FULL JOIN c3 ON c3.id = c1.id AND c3.cc = $1"),
+            "2000",
+            vec![vec![None, b("1000")], vec![None, b("2000")], vec![b("1"), None]],
+        ));
+    }
+    for (sql, bound, expected) in cases {
+        portal += 1;
+        let statement = format!("c8s{portal}");
+        let name = format!("c8p{portal}");
+        handler
+            .handle_parse_extended(statement.clone(), sql.clone(), vec![23])
+            .await
+            .unwrap_or_else(|e| panic!("parse `{sql}`: {e}"));
+        handler
+            .handle_bind_extended(
+                name.clone(),
+                statement,
+                vec![0],
+                vec![Some(bound.as_bytes().to_vec())],
+                vec![],
+            )
+            .await
+            .unwrap_or_else(|e| panic!("bind `{sql}`: {e}"));
+        handler
+            .handle_execute_extended(name, 0)
+            .await
+            .unwrap_or_else(|e| panic!("`{sql}` (${{1}} = {bound}) must EVALUATE the bound value: {e}"));
+        let out = drain(&mut client).await;
+        assert!(sqlstates(&out).is_empty(), "`{sql}`: {:?}", sqlstates(&out));
+        let mut rows = data_rows(&out);
+        rows.sort();
+        assert_eq!(rows, expected, "`{sql}` with $1 = {bound}");
+    }
+
+    // Simple-protocol control: the literal spelling answers identically.
+    let out = wire_query(
+        &mut handler,
+        &mut client,
+        "SELECT c1.id, c3.cc FROM c1 NATURAL JOIN c2 LEFT JOIN c3 ON c3.id = c1.id AND c3.cc = 2000",
+    )
+    .await;
+    assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
+    assert_eq!(data_rows(&out), vec![vec![b("1"), None]]);
+}
+
+/// m4 over the wire: a self-contained subquery over a schema-qualified
+/// relation is not a correlation, and a real one still is.
+#[tokio::test]
+async fn gh29_c8_a_subquery_over_a_schema_qualified_relation_keeps_its_own_sqlstate() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut h, mut c) = test_handler(db);
+    let b = |s: &str| Some(s.as_bytes().to_vec());
+
+    wire_setup(&mut h, &mut c, "CREATE SCHEMA an").await;
+    wire_setup(&mut h, &mut c, "CREATE TABLE qa (id INT PRIMARY KEY, x INT)").await;
+    wire_setup(&mut h, &mut c, "INSERT INTO qa VALUES (1, 10), (2, 20)").await;
+    wire_setup(&mut h, &mut c, "CREATE TABLE qb (id INT PRIMARY KEY)").await;
+    wire_setup(&mut h, &mut c, "INSERT INTO qb VALUES (1), (2)").await;
+    wire_setup(&mut h, &mut c, "CREATE TABLE an.mc (k INT, x INT)").await;
+    wire_setup(&mut h, &mut c, "INSERT INTO an.mc VALUES (1, 10), (2, 99)").await;
+
+    // The scan's key is `an.mc`; the qualifier inside the subquery is `mc`.
+    let out = wire_query(
+        &mut h,
+        &mut c,
+        "SELECT qa.id, qb.id FROM qa LEFT JOIN qb ON qa.id = qb.id \
+         AND qa.x = (SELECT min(x) FROM an.mc WHERE mc.k = 1) ORDER BY qa.id",
+    )
+    .await;
+    assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
+    assert_eq!(data_rows(&out), vec![vec![b("1"), b("1")], vec![b("2"), None]]);
+
+    // A failure inside it keeps its own diagnostic, never the 0A000.
+    let out = wire_query(
+        &mut h,
+        &mut c,
+        "SELECT qa.id, qb.id FROM qa LEFT JOIN qb ON qa.id = qb.id \
+         AND qa.x = (SELECT max(x) / 0 FROM an.mc WHERE mc.k = 1)",
+    )
+    .await;
+    assert!(
+        !sqlstates(&out).is_empty() && !sqlstates(&out).contains(&"0A000".to_string()),
+        "a division by zero in a self-contained subquery is not a missing feature: {:?}",
+        sqlstates(&out)
+    );
+
+    // …and a genuine correlation over the SAME relation is still 0A000.
+    assert_wire_sqlstate(
+        &mut h,
+        &mut c,
+        "SELECT qa.id, qb.id FROM qa LEFT JOIN qb ON qa.id = qb.id \
+         AND qa.x = (SELECT max(x) FROM an.mc WHERE mc.k = qa.id)",
+        "0A000",
+    )
+    .await;
+}
+
+// ---- GH#29 (candidate 10) ----
+//
+// The planner emits BOTH operands of a `NATURAL` / `USING` term UNQUALIFIED
+// again; the equi join comes from the key binder's natural-order rule for an
+// all-unqualified `=` term, not from a qualifier. (P3) A `NATURAL` / `USING`
+// join whose SIDE is a CTE, view or derived table over another one RETURNS
+// ROWS over the wire, including the `SELECT *` spelling — the one shape the
+// removed design answered `42702` for. Candidate 11 (M1) finished that: a
+// WRITTEN `j.id` over such a side returns the row too, as v4.31.1 does. Only
+// `j.*` is still refused here, and the comment on that assertion says why.
+
+/// P3 over the wire, simple protocol, value-asserted.
+#[tokio::test]
+async fn gh29_c10_a_natural_join_over_a_cte_view_or_derived_table_returns_rows() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut h, mut c) = test_handler(db);
+    let b = |s: &str| Some(s.as_bytes().to_vec());
+
+    // z1 ⋈ z2 = {2, 4}; z3 = {1, 2, 3}. One row INNER, two LEFT, three RIGHT,
+    // four FULL — and six for a cartesian product.
+    wire_setup(&mut h, &mut c, "CREATE TABLE z1 (id INT PRIMARY KEY, aa INT)").await;
+    wire_setup(&mut h, &mut c, "INSERT INTO z1 VALUES (1, 11), (2, 22), (4, 44)").await;
+    wire_setup(&mut h, &mut c, "CREATE TABLE z2 (id INT PRIMARY KEY, bb INT)").await;
+    wire_setup(&mut h, &mut c, "INSERT INTO z2 VALUES (2, 222), (3, 333), (4, 444)").await;
+    wire_setup(&mut h, &mut c, "CREATE TABLE z3 (id INT PRIMARY KEY, cc INT)").await;
+    wire_setup(&mut h, &mut c, "INSERT INTO z3 VALUES (1, 1111), (2, 2222), (3, 3333)").await;
+    wire_setup(&mut h, &mut c, "CREATE VIEW zn AS SELECT * FROM z1 NATURAL JOIN z2").await;
+    wire_setup(&mut h, &mut c, "CREATE VIEW zu AS SELECT * FROM z1 JOIN z2 USING (id)").await;
+
+    let sides: [(&str, &str, &str); 6] = [
+        ("derived/NATURAL", "", "(SELECT * FROM z1 NATURAL JOIN z2) j"),
+        ("derived/USING", "", "(SELECT * FROM z1 JOIN z2 USING (id)) j"),
+        ("view/NATURAL", "", "zn j"),
+        ("view/USING", "", "zu j"),
+        ("cte/NATURAL", "WITH j AS (SELECT * FROM z1 NATURAL JOIN z2) ", "j"),
+        ("cte/USING", "WITH j AS (SELECT * FROM z1 JOIN z2 USING (id)) ", "j"),
+    ];
+    let inner = vec![vec![b("22"), b("222"), b("2"), b("2222")]];
+    let left = vec![
+        vec![b("22"), b("222"), b("2"), b("2222")],
+        vec![b("44"), b("444"), None, None],
+    ];
+    // In SORTED order (the assertion sorts the wire rows rather than relying on
+    // an ORDER BY over a column the outer joins NULL-extend).
+    let right = vec![
+        vec![None, None, b("1"), b("1111")],
+        vec![None, None, b("3"), b("3333")],
+        vec![b("22"), b("222"), b("2"), b("2222")],
+    ];
+    let full = vec![
+        vec![None, None, b("1"), b("1111")],
+        vec![None, None, b("3"), b("3333")],
+        vec![b("22"), b("222"), b("2"), b("2222")],
+        vec![b("44"), b("444"), None, None],
+    ];
+
+    for (label, prefix, side) in sides {
+        for (kind, expected) in [("", &inner), ("LEFT ", &left), ("RIGHT ", &right), ("FULL ", &full)] {
+            for join in [format!("NATURAL {kind}JOIN z3"), format!("{kind}JOIN z3 USING (id)")] {
+                let sql = format!("{prefix}SELECT j.aa, j.bb, z3.id, z3.cc FROM {side} {join}");
+                let out = wire_query(&mut h, &mut c, &sql).await;
+                assert!(sqlstates(&out).is_empty(), "[{label}] `{sql}`: {:?}", sqlstates(&out));
+                let mut got = data_rows(&out);
+                got.sort();
+                assert_eq!(&got, expected, "[{label}] `{sql}`");
+            }
+        }
+        // The `SELECT *` spelling: ROW COUNT only, so the un-merged output
+        // arity is never frozen as a contract.
+        for join in ["NATURAL JOIN z3", "JOIN z3 USING (id)"] {
+            let sql = format!("{prefix}SELECT * FROM {side} {join}");
+            let out = wire_query(&mut h, &mut c, &sql).await;
+            assert!(sqlstates(&out).is_empty(), "[{label}] `{sql}`: {:?}", sqlstates(&out));
+            assert_eq!(data_rows(&out).len(), 1, "[{label}] `{sql}` is not a cartesian product");
+        }
+    }
+
+    // `j.*` over such a side is still 42702 — it would emit `j.id` TWICE
+    // under a qualifier that can only read the FIRST slot. OVER-REFUSAL,
+    // stated: PostgreSQL ACCEPTS it, because its `j` carries `id` once (it
+    // merges the shared output column; we do not — sprinter 781f55ba534d).
+    // The WRITTEN `j.id` / bare `id`, which need only one slot, are NOT
+    // refused any more (candidate 11, M1): candidate 10 refused them, and
+    // v4.31.1 answers them, so that was a regression. See
+    // `gh29_c11_a_qualified_reference_to_a_wildcard_expanded_join_side_returns_the_row`.
+    assert_wire_sqlstate(
+        &mut h,
+        &mut c,
+        "SELECT j.* FROM (SELECT * FROM z1 NATURAL JOIN z2) j",
+        "42702",
+    )
+    .await;
+}
+
+// ---- GH#29 (candidate 11) ----
+//
+// (M1) A QUALIFIED reference to a `NATURAL`/`USING` side that carries the
+// shared name twice returns the row over the wire, exactly as v4.31.1 does.
+// Candidate 10 refused it `42702` — a REGRESSION against the shipped release,
+// because the duplicate is an artifact of OUR un-merged output (sprinter
+// 781f55ba534d), not two columns the author named. The refusal now turns on
+// the sub-select's select LIST: written out, it stays `42702`.
+// (M2) A reference QUALIFIED by a relation the FROM chain names TWICE is
+// `42712`, PostgreSQL's own message for that FROM clause.
+
+/// M1 over the wire, simple protocol, value-asserted: `j.id` over a CTE, a
+/// view and a derived table whose body is a `NATURAL` / `USING` join, with and
+/// without a further join — plus the WRITTEN-OUT control that still refuses.
+#[tokio::test]
+async fn gh29_c11_a_qualified_reference_to_a_wildcard_expanded_join_side_returns_the_row() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut h, mut c) = test_handler(db);
+    let b = |s: &str| Some(s.as_bytes().to_vec());
+
+    // q1 ⋈ q2 = {2, 4}; q3 = {1, 2, 3}, so the further join keeps id = 2 only.
+    wire_setup(&mut h, &mut c, "CREATE TABLE q1 (id INT PRIMARY KEY, aa INT)").await;
+    wire_setup(&mut h, &mut c, "INSERT INTO q1 VALUES (1, 11), (2, 22), (4, 44)").await;
+    wire_setup(&mut h, &mut c, "CREATE TABLE q2 (id INT PRIMARY KEY, bb INT)").await;
+    wire_setup(&mut h, &mut c, "INSERT INTO q2 VALUES (2, 222), (3, 333), (4, 444)").await;
+    wire_setup(&mut h, &mut c, "CREATE TABLE q3 (id INT PRIMARY KEY, cc INT)").await;
+    wire_setup(&mut h, &mut c, "INSERT INTO q3 VALUES (1, 1111), (2, 2222), (3, 3333)").await;
+    wire_setup(&mut h, &mut c, "CREATE VIEW qn AS SELECT * FROM q1 NATURAL JOIN q2").await;
+    wire_setup(&mut h, &mut c, "CREATE VIEW qu AS SELECT * FROM q1 JOIN q2 USING (id)").await;
+
+    // (label, WITH prefix, FROM side, qualifier written)
+    let sides: [(&str, &str, &str, &str); 8] = [
+        ("derived/NATURAL", "", "(SELECT * FROM q1 NATURAL JOIN q2) j", "j"),
+        ("derived/USING", "", "(SELECT * FROM q1 JOIN q2 USING (id)) j", "j"),
+        ("view/NATURAL aliased", "", "qn v", "v"),
+        ("view/USING aliased", "", "qu v", "v"),
+        ("view/NATURAL bare", "", "qn", "qn"),
+        ("view/USING bare", "", "qu", "qu"),
+        ("cte/NATURAL", "WITH j AS (SELECT * FROM q1 NATURAL JOIN q2) ", "j", "j"),
+        (
+            "cte/USING",
+            "WITH j AS (SELECT * FROM q1 JOIN q2 USING (id)) ",
+            "j",
+            "j",
+        ),
+    ];
+
+    for (label, prefix, side, q) in sides {
+        // No further join: the plainest spelling of the regression.
+        let sql = format!("{prefix}SELECT {q}.id, {q}.aa, {q}.bb FROM {side} ORDER BY {q}.aa");
+        let out = wire_query(&mut h, &mut c, &sql).await;
+        assert!(sqlstates(&out).is_empty(), "[{label}] `{sql}`: {:?}", sqlstates(&out));
+        assert_eq!(
+            data_rows(&out),
+            vec![vec![b("2"), b("22"), b("222")], vec![b("4"), b("44"), b("444")],],
+            "[{label}] `{sql}`"
+        );
+        assert_eq!(
+            row_description_names(&out),
+            vec!["id".to_string(), "aa".to_string(), "bb".to_string()],
+            "[{label}] `{sql}`"
+        );
+
+        // …the BARE spelling of the same doubled name…
+        let sql = format!("{prefix}SELECT id, aa, bb FROM {side} ORDER BY aa");
+        let out = wire_query(&mut h, &mut c, &sql).await;
+        assert!(sqlstates(&out).is_empty(), "[{label}] `{sql}`: {:?}", sqlstates(&out));
+        assert_eq!(
+            data_rows(&out),
+            vec![vec![b("2"), b("22"), b("222")], vec![b("4"), b("44"), b("444")],],
+            "[{label}] `{sql}`"
+        );
+
+        // …and with a further join, the evidence statement's own shape.
+        for join in ["NATURAL JOIN q3", "JOIN q3 USING (id)"] {
+            let sql = format!("{prefix}SELECT {q}.id, {q}.aa, q3.cc FROM {side} {join}");
+            let out = wire_query(&mut h, &mut c, &sql).await;
+            assert!(sqlstates(&out).is_empty(), "[{label}] `{sql}`: {:?}", sqlstates(&out));
+            assert_eq!(
+                data_rows(&out),
+                vec![vec![b("2"), b("22"), b("2222")]],
+                "[{label}] `{sql}`"
+            );
+        }
+    }
+
+    // CONTROL: a WRITTEN-OUT duplicate select list really does name two
+    // different columns, and PostgreSQL refuses a reference to it too.
+    let explicit = "(SELECT q1.id, q2.id, q1.aa, q2.bb FROM q1 JOIN q2 ON q1.id = q2.id) s";
+    for sql in [
+        format!("SELECT s.id FROM {explicit}"),
+        format!("SELECT id FROM {explicit}"),
+    ] {
+        assert_wire_sqlstate(&mut h, &mut c, &sql, "42702").await;
+    }
+    // …and a name that list carries ONCE still resolves.
+    let sql = format!("SELECT s.aa, s.bb FROM {explicit} ORDER BY s.aa");
+    let out = wire_query(&mut h, &mut c, &sql).await;
+    assert!(sqlstates(&out).is_empty(), "`{sql}`: {:?}", sqlstates(&out));
+    assert_eq!(data_rows(&out), vec![vec![b("22"), b("222")], vec![b("44"), b("444")]]);
+}
+
+/// M2 over the wire. A reference QUALIFIED by a relation the FROM chain names
+/// TWICE is `42712 table name "q1" specified more than once` — PostgreSQL's
+/// own message. v4.31.1 resolved it against the first `q1`. PostgreSQL refuses
+/// the FROM clause itself whether or not anything names the repeated relation;
+/// we refuse only the reference, so the unqualified statement still plans, and
+/// it must still be the join rather than the tautology.
+#[tokio::test]
+async fn gh29_c11_a_reference_qualified_by_a_relation_named_twice_is_refused() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut h, mut c) = test_handler(db);
+    let b = |s: &str| Some(s.as_bytes().to_vec());
+
+    wire_setup(&mut h, &mut c, "CREATE TABLE p1 (id INT PRIMARY KEY, aa INT)").await;
+    wire_setup(&mut h, &mut c, "INSERT INTO p1 VALUES (1, 10), (2, 20)").await;
+    wire_setup(&mut h, &mut c, "CREATE TABLE p2 (id INT PRIMARY KEY, bb INT)").await;
+    wire_setup(&mut h, &mut c, "INSERT INTO p2 VALUES (1, 100), (3, 300)").await;
+
+    for sql in [
+        "SELECT p1.id FROM p1 NATURAL JOIN p2 NATURAL JOIN p1",
+        "SELECT p1.aa FROM p1 JOIN p2 USING (id) JOIN p1 USING (id)",
+    ] {
+        assert_wire_sqlstate(&mut h, &mut c, sql, "42712").await;
+    }
+
+    let out = wire_query(&mut h, &mut c, "SELECT p2.bb FROM p1 NATURAL JOIN p2 NATURAL JOIN p1").await;
+    assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
+    assert_eq!(
+        data_rows(&out),
+        vec![vec![b("100")]],
+        "naming neither `p1` still plans, and it is the join, not a tautology"
     );
 }

@@ -7,6 +7,221 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### BREAKING — column references are resolved at plan time (GH#29; the root behind sprinter b96bc6b51ae5)
+
+Through v4.31.1 the planner emitted every column reference blind and left resolution to the
+evaluator, per row. Three fail-open behaviours followed, all in one family: `SELECT nosuch FROM t`
+on an EMPTY table returned `Ok` with zero rows (nothing was ever evaluated, so nothing was
+refused — a view or prepared statement with a typo was accepted and only failed at the first
+read that had rows); `SELECT bogus.* FROM t a` expanded to the WHOLE row when the qualifier
+matched nothing (and `SELECT a.*` over a self-join returned both sides); and a derived table's
+alias, or an unquoted mixed-case alias (`FROM t AS T1` + `T1.id`), could not qualify its columns
+at all. Every column reference in the `SELECT` list, `WHERE`, `JOIN … ON`, `GROUP BY`, `HAVING`,
+`ORDER BY` and `RETURNING` now resolves against the FROM scope — tables, aliases, sub-selects,
+CTEs and views — by qualifier and name, case-folded unless quoted, and a miss is refused at plan
+time with PostgreSQL's class (`src/sql/scope.rs`): `42703 Column "x" does not exist` regardless
+of row count, `42P01 missing FROM-clause entry for table "q"` for an unknown qualifier or
+wildcard qualifier, `42712` for an alias declared twice, and `42702` for a WRITTEN reference —
+bare or qualified — to a name a sub-select's WRITTEN-OUT select list carries twice (`SELECT id` /
+`SELECT s.id FROM (SELECT a.id, b.id …) s`). That last one turns on the SELECT LIST, not on the
+schema: a duplicate a WILDCARD expanded (`(SELECT * FROM a NATURAL JOIN b) j`) is an artifact of
+THIS engine's output shape — we do not merge the shared output column of a `NATURAL`/`USING` join,
+so `j` carries `id` twice where PostgreSQL's `j` carries it once — and `j.id` therefore resolves
+to the first of the two slots, which is the column the sub-select actually returns and the answer
+v4.31.1 gave. `s.*` over such an entry stays `42702` either way (it would emit the name twice and
+read ONE slot for both), and a name a BARE `*` expands to is not resolved at all: `*` names no
+column, so it can draw no verdict. Every other sub-select and view column resolves through its
+alias AT RUNTIME too: the sub-plan's root
+projection is stamped with the alias (`LogicalPlan::Project::source_alias`) and the executor tags
+its output columns with it exactly as a base-table scan is tagged, so `FROM t JOIN (SELECT id FROM
+t) s ON s.id = t.id` — the SQLAlchemy `anon_1` / Prisma `_count` join shape — returns the
+sub-select's rows; at runtime an ALIAS match beats a real-table-name match, so `FROM t AS a JOIN
+(SELECT id FROM u) t` (legal: the alias `a` hides t's real name) reads `t.id` from the derived
+table. A materialized view's plan is stored without the stamp: before it is serialized every
+unshadowed `alias.col` is rewritten to the bare `col` (`sql::mv_destamp`, walking aggregate and
+window arguments, `CASE` arms, `IN` lists and subqueries), so `CREATE MATERIALIZED VIEW m AS
+SELECT sum(s.x) FROM (…) s` / `SELECT v.id FROM myview v` create and `REFRESH` after a restart;
+only a reference whose bare name another entry of the same join also carries is refused (`0A000`,
+naming the workaround), as is a correlated reference to an outer sub-select alias from a subquery
+whose own input carries that bare name (the same rewrite would rebind it inner-first). Trigger
+bodies are persisted the same way and do not yet get this rewrite (sprinter 4c1cf9054f0f). The
+same planner serves both executor families and both wire protocols. Unaliased `RETURNING bogus."n"` / `bogus.*` — the residual 28f0fc5 (GH#23, the
+RETURNING half of this family) documented — is closed the same way: the qualifier must name the
+statement's own target (alias, key or bare name) or `EXCLUDED`.
+
+Statements that worked by accident and now change:
+
+| statement | v4.31.1 | now |
+|---|---|---|
+| `SELECT nosuch.* FROM t a` (unknown wildcard qualifier) | whole row | `42P01` |
+| `SELECT a.* FROM t a JOIN u b …` | all columns of both sides | `a`'s columns only |
+| `SELECT ACCOUNT.* FROM "Account"` | resolved case-insensitively | `42P01` (unquoted folds to `account`) |
+| `SELECT nosuch FROM t` / `SELECT t.nosuch FROM t` on an EMPTY table | `Ok`, 0 rows | `42703` |
+| `CREATE VIEW v AS SELECT nosuch FROM t`, `CREATE MATERIALIZED VIEW … AS …`, `CREATE TABLE … AS SELECT …`, Parse of a prepared statement | accepted, failed at first read with rows | refused when defined / parsed (as PostgreSQL) |
+| `UPDATE/DELETE/INSERT … RETURNING bogus.col` / `RETURNING bogus.*` | the target's column / whole row | `42P01` |
+| `DELETE FROM "Account" … RETURNING Account.id` (unquoted qualifier, quoted relation) | the row's value | `42P01` — `Account` folds to `account`, which names nothing; `"Account".id` and `"Account"."id"` keep working |
+| `SELECT * FROM (SELECT id FROM t) s(x)` / `(VALUES …) AS v(id, name)` | column named `id`, alias list ignored | column named `x` / `id, name` (PostgreSQL); a list longer than the sub-select's output is `42P10` |
+| `FROM generate_series(1,3) AS G` | column named `G` | column named `g` |
+| `SELECT s.col FROM (sub-select) s` / `SELECT v.col FROM myview v` | runtime error | resolves |
+| `FROM t JOIN (SELECT id FROM t) s ON s.id = t.id`, `SELECT s.* FROM (…) s JOIN t …`, `FROM t JOIN myview v ON v.id = t.id` | runtime error | resolves — the sub-select's / view's column, stamped with its alias at runtime |
+| `FROM t JOIN (SELECT a.id, b.id FROM …) s ON s.id = t.id` (a WRITTEN-OUT select list carrying `id` twice) | runtime error | `42702` for `s.id` and for the bare `id` — every other `s.col` resolves, and a name a bare `*` expands to is not resolved at all; `AS s(w, x, y, z)` renames the output positionally (a shorter list renames the first columns). `s.*` is `42702` over ANY entry carrying the name twice, wildcard-expanded ones included, because it would emit the name twice and read one slot for both |
+| `SELECT t.id FROM t AS a JOIN (SELECT id FROM u) t ON …` (derived alias = an aliased base table's real name) | runtime error | resolves to the DERIVED table's column (alias beats real name) |
+| `UPDATE t SET col = DEFAULT` | runtime miss (`Column 'default' not found`) | the column's declared default, `NULL` when it has none (PostgreSQL); both DML executor families, fast path included |
+| `SELECT v AS Grp, count(*) FROM t GROUP BY grp` / `… GROUP BY <expression alias>` | runtime miss | groups by the item's expression (the key folds to it; a FROM column of the same name wins, as in PostgreSQL) |
+| `… GROUP BY v HAVING n > 1` (`n` an output alias) | runtime miss | `42703` at plan time (PostgreSQL does not allow output aliases in `HAVING`) |
+| `SELECT * FROM (SELECT id, row_number() OVER (…) AS rn FROM t) s WHERE s.rn = 1` (and `WHERE rn = 1`, `WHERE s.id = 2`) | the predicate was pushed BELOW the window projection (the window call as a per-row filter, or the rows renumbered over a pre-filtered input) | evaluated above it: a projection computing a window function is a pushdown barrier |
+| `UPDATE t SET v = nosuch` / `UPDATE … WHERE nosuch = 1` / `DELETE … WHERE nosuch = 1` on an EMPTY table | `Ok`, 0 rows | `42703` |
+| `CREATE MATERIALIZED VIEW m AS SELECT s.col FROM (…) s`, `… SELECT sum(s.x) FROM (…) s`, `… SELECT v.id FROM myview v`, an MV over a view whose body qualifies a nested sub-select | runtime error | creates, and `REFRESH` works after a restart: the alias-qualified reference is rewritten to the bare name before the plan is stored |
+| `CREATE MATERIALIZED VIEW m AS SELECT s.id FROM t JOIN (SELECT id FROM t) s ON …` (the bare `id` is carried by BOTH entries) | runtime error | `0A000` naming the workaround (`alias the column inside the sub-select`) — the stored plan is positional bincode and cannot carry the alias stamp, and the bare name is ambiguous, so it is refused at CREATE rather than materialized once and broken at the first refresh |
+| `DELETE FROM t AS x WHERE x.id = 1` | runtime miss on the alias | resolves |
+| `FROM u AS a JOIN (SELECT id FROM t) u ON u.id + 10 = a.id` (a hash join keyed on an EXPRESSION, or on a term with a literal) | 0 rows — each side's key operand was picked PER TUPLE ("evaluate the natural operand, the other on error"), and `u.id + 10` evaluated on `u AS a` through the real-name fallback | the rows: every `=` term's operands are assigned a side ONCE at construction (alias tier first, real name only when no side carries the alias) and bound against that side; a term that fits no assignment leaves the key and the full condition is re-evaluated on the combined tuple |
+| `UPDATE t SET v = nosuch WHERE id = 1` / `… WHERE id = 99` (the PK point-update fast path, which skips the parser) | `Ok`, 0 rows whenever the key was absent — the row was looked up before the SET value was read | `42703` before any row is touched (the value is classified first; anything but a literal or `col <op> number` yields to the planner) |
+| `INSERT … ON CONFLICT (id) DO UPDATE SET v = t.nosuch` / `… = excluded.nosuch` / `… WHERE nosuch = 1` | accepted, failed per CONFLICTING row only (never on an empty table) | `42703` at plan time: the INSERT target (by alias too, `INSERT INTO t AS x`) is in scope for the DO UPDATE clause; `EXCLUDED.col` must name one of the target's columns |
+| `FROM t AS "A" JOIN t AS "a" ON "a".id = "A".id + 1` (case-distinct quoted aliases, an expression key) | wrong rows — the hash-join key resolver compared aliases case-insensitively while the evaluator is exact-case, so both operands fitted both sides and the natural order was guessed | the rows: the exact-case pass runs first on both sides (the case-folded pass is the fallback for unquoted spellings), and a term whose operands still fit both sides is declined and re-evaluated by the exact-case combined evaluator |
+| `a RIGHT JOIN b ON a.id = b.id AND b.x = b.y` / `FULL JOIN` (a term declined from the hash key under an outer join that preserves the build side) | b's rows failing the declined term were dropped (unmatched build rows were tracked per key bucket) | NULL-extended: the shape takes a nested-loop join, as does an equi part none of whose terms binds; every declined term is traced (`helios::join`) |
+| `… JOIN … ON a.id = b.id AND a.x = (SELECT max(x) FROM c)` | the subquery term was declined and its evaluation error read as "no match" | the ON condition is materialized before the join is built (as the post-join predicate already was) and an evaluation error is the statement's error |
+| `… JOIN … ON a.id = b.id AND 5 = b.price` (`NUMERIC` / `DOUBLE PRECISION`) | matched nothing — the hash key compares raw values without int/float/numeric coercion (main matched everything) | a term with a literal operand is never keyed; the column pair still hashes and the coercing evaluator decides the literal term |
+| `UPDATE t SET v = v + 1 WHERE id = 99` (`v` `TEXT`) | `Ok`, 0 rows on a missing key (the fast-path shape check ignored the column's type; with a row present the executor errored) | `42883` `operator does not exist: text + integer` at plan time, both families — the fast-path shape requires a numeric SET column and the planner refuses arithmetic between a text column of the target and a numeric literal |
+| `SELECT id FROM (SELECT a.id, b.id …) s` / `SELECT s.id FROM …` (a name one derived entry's WRITTEN-OUT select list carries twice) | the first slot | `42702`, bare and qualified alike. This is decided by the SELECT LIST, not by the schema: when the duplicate came from a WILDCARD (`(SELECT * FROM a NATURAL JOIN b) j`) the two columns are this engine's own un-merged output — PostgreSQL's `j` carries `id` ONCE — so `j.id` and the bare `id` resolve to the FIRST slot, exactly as v4.31.1 answered them |
+| `FROM a JOIN b USING (col)` (every join type) | a CARTESIAN PRODUCT — `JoinConstraint::Using` fell to the planner's `_ => None` and was not lowered at all, so the join ran with NO condition | the equi-join. `NATURAL` and `USING` now share ONE lowering: one `=` per shared column, BOTH operands UNQUALIFIED (`Column{None, c} = Column{None, c}`) — which is what `NATURAL` has always emitted. What makes it an equi join rather than a tautology is the join key binder's rule for an all-unqualified `=` term: only a QUALIFIED double fit is an alias collision, so an all-bare term is keyed in the NATURAL ORDER (lhs → left input, rhs → right input) instead of being declined and re-resolved to one slot. A `USING` column either side does not carry is `42703` (PostgreSQL), never a silent cross join. Pinned three and four tables deep, INNER and LEFT, on both executor families and over both wires |
+| `… JOIN … ON a.id = b.id AND a.x = 20` / `AND 5 = a.pn` / `AND a.x = (SELECT …)` (an `=` term no key binder can bind) | the term was SILENTLY DROPPED: ON terms were bucketed by syntax (`op == Eq` → key bucket), the binder declined it there, and it appeared in neither bucket — so `is_pure_equi_join` told the operator the keys were the whole condition. The index nested loop dropped it too: it took the FIRST equality of an `AND` chain and emitted every indexed match | terms are bucketed by BINDABILITY — a declined `=` term goes to the residual, where it is evaluated — and the index nested loop declines a compound ON outright (it has nowhere to apply a second term) |
+| `a LEFT/RIGHT/FULL JOIN b ON a.id = b.id AND <residual>` | the residual was a post-join `FilterOperator`, which is legal only for INNER: the NULL-extended rows fail it and vanish (`na LEFT JOIN nb ON na.id = nb.id AND nb.b > 1000` returned ZERO rows on the parameterized family) | the residual is evaluated INSIDE the join — LEFT re-evaluates the whole condition on each candidate pair before calling it matched, RIGHT/FULL take the nested-loop join (whose matched bookkeeping is per TUPLE, not per key bucket). INNER keeps the post-join filter |
+| `… JOIN … ON a.id = b.id AND a.x = (SELECT max(x) FROM c WHERE c.k = a.k)` (a CORRELATED scalar subquery) | the subquery was materialized once with no outer row, its failure was swallowed and NULL was substituted — so the term was never true and join rows went missing with no diagnostic | `0A000 correlated subquery in JOIN ... ON is not supported`, and ONLY for a reference the subquery's own scopes cannot resolve: an uncorrelated subquery that fails in an ON clause keeps its own message and SQLSTATE. The NULL stand-in (drizzle's introspection queries) is unchanged on every other path |
+| `a LEFT JOIN b ON a.id = b.id AND b.k = $1` (a PARAMETER in the residual) | `Parameter $1 not provided` — the residual moved out of the `FilterOperator` (built with the statement's bind values) into the join operator's own evaluator, which was built with an EMPTY parameter vector | evaluated: every evaluator a join operator builds — the combined one and both key-extraction ones, which a key operand such as `a.id + $1` also reaches — carries the bind values |
+| `a JOIN b ON id = b.id` (a conjunct mixing a bare column reference with a qualified one) | the conjunct looked one-sided and was pushed WHOLE into `b`, where the bare name resolved to b's own column — a tautology, and the join ran with NO condition | kept on the join. A pushdown rule must move a term or leave it alone; it may never drop one |
+| `a RIGHT/FULL JOIN b ON a.id = b.id AND <residual>`, `LATERAL`, `a JOIN b ON a.x > b.y` and every other nested-loop join (memory) | the nested-loop join these shapes take materialized its whole right input with NO cap, while the hash join it replaced was bounded | the SAME cap and the SAME error as the hash join, from one key: `[performance] join_memory_limit_mb` / `--join-memory-limit-mb` (`HELIOSDB_HASH_JOIN_MEM_MB` still overrides), default 1 GB. **The cap covers EVERY nested-loop right input, not only the RIGHT/FULL-with-residual shape**: a LATERAL or theta join whose right input exceeds the limit is now refused where it previously completed slowly — raise the key for it. It covers exactly those two materializations and is not a whole-engine memory bound: the INDEX nested loop still buffers its entire join RESULT with no cap and no accounting |
+| `… JOIN … ON a.id = b.id AND a.x = (SELECT max(x) / 0 FROM analytics.mc WHERE mc.k = 1)` (an UNCORRELATED subquery over a SCHEMA-QUALIFIED relation) | `0A000 correlated subquery in JOIN ... ON is not supported` — the correlation test compared the scan's resolved key (`analytics.mc`) with the column qualifier (`mc`) verbatim, so a self-contained subquery looked correlated and the real diagnostic was replaced | the subquery's own error: both spellings of a scanned relation are registered, so only a qualifier no scope inside the subquery provides counts as an outer reference |
+| `SELECT a.id FROM a NATURAL JOIN b NATURAL JOIN a` (a reference qualified by a relation the FROM clause names TWICE — PostgreSQL: `table name "a" specified more than once`) | the row, resolved against the first `a` | `42712 table name "a" specified more than once` — the range table carries two entries called `a`, so the qualifier names no single one. A move TOWARDS PostgreSQL, which refuses the whole FROM clause; we are still lenient in that `SELECT * FROM a NATURAL JOIN b NATURAL JOIN a`, which names neither `a`, plans and returns the join (never a tautology) |
+
+Deliberately unchanged (lenient, pinned). First, the one people ask about: **`NATURAL JOIN` is not
+a behaviour change in this release.** v4.31.1 lowered it to the same bare `=` pair this release
+lowers it to and already returned the join — every join type, chained three and four tables deep,
+and through a CTE / view / derived-table side — and it still does; it appears nowhere in the table
+above because there is nothing to report. What is new around it is `JOIN … USING`, which v4.31.1
+did not lower at all. Then: the real table name still resolves while an alias is in
+scope (`SELECT t.id FROM t AS t1`; PostgreSQL raises `42P01`) — it can only name the same relation;
+an unqualified name two `FROM` entries share still takes the first match; column aliases are not
+case-folded in the RowDescription (`SELECT id AS Foo` still describes a field named `Foo`) — but
+`ORDER BY foo` / `ORDER BY total` now find `AS Foo` / `AS Total` the way PostgreSQL's parse-time
+folding does (the sort key is folded up to the alias; the field name is untouched). `UPDATE … FROM
+s` and `DELETE … USING s` keep planning: the `FROM` / `USING` entries are in scope for `SET` and
+`WHERE` as in PostgreSQL, and the DML executor evaluates against the target's row as it always did
+(no join support in the DML executor — unchanged). No scope is pushed for trigger `WHEN`
+conditions, `CHECK` constraints, index expressions, tenant/RLS predicates or `ON CONFLICT`
+conflict targets, which are lowered exactly as before (the `DO UPDATE` SET / WHERE now resolve
+against the INSERT target). The 42712 wire classification anchors on both halves
+of `table name "a" specified more than once`, so the CTAS refusal `column "x" specified more than
+once` keeps its class. Unchanged and stated: a bare `SELECT *` over a join whose sides share a
+column name still reads the first slot for both (pre-existing, filed separately); the hash-join
+key resolver still matches COLUMN names ASCII-case-insensitively (a quoted `"Id"` binds to an
+unquoted `u.id` key reference where PostgreSQL says 42703 — lenient, never a wrong row: a side
+carrying both `"Id"` and `id` is ambiguous, the term is declined and the exact-case evaluator
+decides; the same leniency the direct-column path has had since c3); a target the catalog cannot
+describe is recorded opaque, so `UPDATE nosuch SET v = v + 1` and `INSERT INTO nosuch … DO UPDATE
+SET v = v + 1` stay the executor's 42P01, never 42703. Pinned by
+`tests/gh_issue_29.rs`, `tests/gh_issue_29_resolution.rs`, `tests/prisma_p0_returning_names.rs`
+and the `gh29_c1_*` / `gh29_c2_*` / `gh29_c3_*` / `gh29_c4_*` / `gh29_c5_*` / `gh29_c6_*` /
+`gh29_c7_*` / `gh29_c8_*` / `gh29_c10_*` / `gh29_c11_*` wire tests (the `gh29_c7_*` and `gh29_c8_*` blocks drive
+Parse / Bind / Execute with a real bind value). There are THREE read pipelines, not two, and all
+three are pinned: `query()` and `query_params_with_schema()` (reached by
+`query_params_with_columns` and the PyO3 binding) run the five optimizer rules, while
+`query_params()` / `query_params_for_session()` — the embedded params API AND the PostgreSQL
+extended protocol, which routes through `parameterized_plan_cached` — run none of them. The
+extended protocol is the optimizer-FREE path;
+`the_parameterized_on_corpus_also_runs_through_the_optimizer_running_pipeline` adds the
+optimizer-running params path so no pipeline is covered only by assumption.
+
+**Breaking, library surface** (`heliosdb_nano::sql::executor`, re-exported at
+`src/sql/executor/mod.rs`): the three public join-operator constructors take the statement's bind
+values, because every evaluator a join builds for a condition now carries them. Nothing in-tree
+constructs these from outside `join.rs`; an embedded consumer that does must pass a (possibly
+empty) parameter vector.
+
+| before | now |
+|---|---|
+| `HashJoinOperator::new(left, right, join_type, on_condition, timeout_ctx)` | `HashJoinOperator::new(left, right, join_type, on_condition, parameters: Vec<Value>, timeout_ctx)` |
+| `HashJoinOperator::new_build_left(left, right, join_type, on_condition, timeout_ctx)` | `HashJoinOperator::new_build_left(left, right, join_type, on_condition, parameters: Vec<Value>, timeout_ctx)` |
+| `NestedLoopJoinOperator::new(left, right, join_type, on_condition, timeout_ctx)` | `NestedLoopJoinOperator::new(left, right, join_type, on_condition, parameters: Vec<Value>, timeout_ctx)` |
+
+`HashJoinOperator::DEFAULT_MEMORY_LIMIT_MB` is gone with it: the limit is resolved from
+`[performance] join_memory_limit_mb` / `--join-memory-limit-mb` / `HELIOSDB_HASH_JOIN_MEM_MB`.
+
+Known gaps and a performance note, stated. Physical-operator changes from the residual work:
+a join whose ON carries a residual now takes the nested-loop join under RIGHT / FULL (it was a
+hash join plus a post-join filter, which returned wrong rows), and a compound ON no longer takes
+the index nested loop (it dropped every term but the first). Neither shape was previously correct,
+so nothing that was right got slower; plain `Column = Column` equi joins — every PK/FK join, and
+every perf-gate workload — are untouched: the direct slot-index key path is decided first and the
+per-term binder is skipped exactly as before, and the pairs are now bound ONCE at planning instead
+of twice (pre-check plus constructor). A join carrying a residual is now handed the KEYED part and
+the residual SEPARATELY, so a candidate pair re-checks only the residual (not the equality terms
+the hash lookup already proved) and the bucket is streamed in place instead of every surviving
+build tuple being cloned into a vector; and a projected join whose operator already carries the
+whole ON condition no longer has that same condition stacked on it a second time as a filter; and
+that per-candidate-pair residual check now reads the two tuples through a BORROWED pair view
+instead of allocating a combined tuple (a deep clone of every value of both) per pair, the same
+zero-copy seam the nested loop has used since R3.5.
+
+**Known deviation from PostgreSQL, stated and accepted.** Both operands of a `NATURAL`/`USING`
+term are unqualified, so each side is keyed on the FIRST column of that name it carries. Where
+PostgreSQL merged the shared column of an `INNER` or `LEFT` `NATURAL`/`USING` join, both
+contributors hold the same value and the first one IS the merged value; in every other case it is
+not, and the rule is the first column, not "the merged one". Two cases where they differ: a chained
+join whose left input tops out in a `RIGHT` or `FULL` join (PostgreSQL merges to the right
+contributor / `COALESCE(left, right)`), so `a NATURAL RIGHT JOIN b NATURAL JOIN c` can lose or
+NULL-extend rows PostgreSQL matches; and a left input whose two same-named columns were never
+equated AT ALL (`a JOIN b ON a.x = b.x`, both carrying `id`, then a `NATURAL JOIN` on `id`), where
+PostgreSQL has two distinct `id` columns and calls the name ambiguous. This is what the engine does
+today — it is not a regression — and it is a face of the un-merged output arity rather than a
+separate bug: `NATURAL JOIN` and `JOIN … USING (c)` still emit the join column ONCE PER SIDE
+(`(id, a, id, b)`) where PostgreSQL merges it to `(id, a, b)`, so a `SELECT *` over such a join
+already writes the first contributor into both slots and the merged value is not reachable by name
+at all. The same first-column rule is what a WRITTEN `j.id` over a wildcard-expanded side resolves
+to (see the `SELECT id FROM (SELECT a.id, b.id …) s` row above): where PostgreSQL would call that
+ambiguous we answer with the first slot, which is what v4.31.1 answered and what `SELECT * FROM j`
+itself returns. Merging the output column is a change of output arity, its own contract move, and
+is filed separately; until it lands this deviation stands. Also still stated: a bare outer column reference in an ON subquery is not
+reported as a correlation (it keeps the subquery's own error); a residual under `RIGHT`/`FULL` is
+still O(n·m), now bounded rather than unbounded; and the index nested loop's own result buffer is
+not covered by the cap (the configuration key, the flag help and `config.example.toml` all say so —
+this key bounds the hash join's build side and every nested-loop right input, and nothing else).
+
+**Physical plan for a `NATURAL`/`USING` join, stated.** Because both operands are bare, such a term
+takes neither the direct slot-index key path (`build_direct_join_key_indices` needs each operand to
+match exactly ONE side, and a bare name both sides carry matches both) nor the index nested loop
+(which requires a qualified operand naming the right table). It is bound by the per-term key binder
+and takes the HASH join — which is what `NATURAL JOIN` did through v4.31.1 as well, since v4.31.1
+lowered it to the same bare pair. `USING` previously took no join condition at all. Plain
+`Column = Column` joins written with qualifiers — every PK/FK join and every perf-gate workload —
+are unaffected and still take the direct path.
+
+New tunable (quality gate 5): `[performance] join_memory_limit_mb` in `config.toml`, the
+`--join-memory-limit-mb` flag on `heliosdb-nano start`, or the pre-existing
+`HELIOSDB_HASH_JOIN_MEM_MB` environment variable (which still wins). One knob bounds BOTH join
+materializations — the hash join's build side and the nested loop's right input — and both raise
+the same error naming all three ways to raise it. Default 1024 MB, unchanged from the hash join's
+previous hardcoded default.
+
+### Confirmed — GH#29: five items reported against 3.58.1
+
+| # | 3.58.1 behaviour | Status on main | Shipped in | Pinned by |
+|---|---|---|---|---|
+| 1a | `INSERT/UPDATE/DELETE … RETURNING` (unparameterised / simple protocol) persisted through `ROLLBACK` | Fixed | pre-4.31.0 — `execute_returning_for_session` always joined the session transaction | `wire_tests::simple_protocol_insert_returning_still_honours_rollback`; `gh_issue_29::item1_text_family_returning_is_undone_by_rollback` |
+| 1b | same, bound parameters over the extended protocol (GH#30) | Fixed — GH#30 can be closed; the comment asking to keep it open for 4.31.0 is stale | 4.31.0 ("parameterized INSERT/UPDATE/DELETE … RETURNING escaped the session transaction") | `tests/prisma_p0_extended_returning_txn.rs`; `wire_tests::extended_parameterized_insert_returning_honours_rollback`; `gh_issue_29::item1_params_family_returning_is_undone_by_rollback` |
+| 2 | `SELECT "t1"."id" FROM "public"."t" AS "t1"` → `Column 't1.id' not found` on psql, worked on extended | Fixed as reported; not reproducible on either protocol (planner, optimizer and executor are shared — there was never a protocol split). Five adjacent alias/qualifier defects found while confirming it are fixed in this release (see BREAKING above): unquoted mixed-case alias; `a.*` over a self-join; `bogus.*` widened the row; a sub-select's alias; an unknown column on an empty table was not an error | ≤4.31.1 for the reported form; the adjacent five in this release | `gh_issue_29::item2_*` (6), `wire_quoted_table_alias_resolves_on_both_protocols`, `wire_simple_query_alias_spellings`; the five by `alias_unquoted_mixed_case_qualifier_resolves`, `alias_qualified_wildcard_selects_only_that_aliass_columns`, `adjacent_defect_wildcard_with_an_unknown_qualifier_is_silently_widened`, `alias_on_a_derived_table_qualifies_its_columns`, `control_a_nonexistent_column_still_errors` |
+| 3 | `CREATE TABLE c (v CHAR(32))` → "Data type not yet supported: Char(…)" | Fixed on the text family. Known adjacent gap, not CHAR-specific: `CREATE TABLE` over the extended/parameterised route has no handler at all (`src/lib.rs`, "COVERAGE CONSTRAINT") | 3.58.3 | `gh_issue_29::item3_char_spellings_matrix`, `item3_char_column_is_introspectable`; `wire_simple_query_char_n_ddl_and_readback` |
+| 4 | `SELECT count(*) FROM information_schema.columns WHERE table_name='Account'` → 0 | Fixed — the wire router defers the view to the planner; the `COUNT(*)` storage fast path declines for registry-backed views | 3.60.4, then 4.20.0 (catalog unification) | `tests/catalog_introspection_tests.rs`; `gh_issue_29::item4_*` (5); `wire_simple_query_information_schema_columns_count_with_where_filter` |
+| 5 | `payload #>> '{b,c}'` → "Binary operator not yet supported: HashLongArrow" | Fixed | 4.23.0 (4.21.0 first replaced the wrong `#>` → inner-product mapping with a loud error) | `tests/json_path_operators.rs`; `gh_issue_29::item5_*`; `wire_simple_query_json_operators` |
+| doc | "`TEXT` ordering uses C (byte-order) collation — state it in the SQL reference" | Done | this release | `docs/llms.txt` SQL dialect notes, `README.md` Data Types; `gh_issue_29::doc_text_ordering_is_byte_order_c_collation` |
+
+Campaign commits relevant to the family: cd20a79 (GH#21/24 UNIQUE), d1c48b3 (GH#27 FK), 28f0fc5
+(GH#23 — RETURNING bound once, NULL substitution removed; the RETURNING half of this family).
+JSON operator support: `->` `->>` `#>` `#>>` `@>` `<@` `?|` `?&` work on both families and both
+wires; the bare `?` cannot without breaking `?` placeholders — use `col ?| ARRAY['key']`
+(pinned by `gh_issue_29::bare_question_mark_json_exists_is_still_unreachable`). The `docs/llms.txt`
+JSONB bullet, which advertised `?` and omitted five working operators, is corrected in the same
+change, and `CHAR(n)` (supported since 3.58.3) is now listed in the README data-type table.
+
 ### Fixed — `ALTER TABLE … ADD COLUMN … REFERENCES` silently discarded the foreign key (GH#27, residual)
 
 `ALTER TABLE t ADD COLUMN p INT REFERENCES parent(id)` added the column and threw the constraint

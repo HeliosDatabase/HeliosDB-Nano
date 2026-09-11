@@ -4191,6 +4191,37 @@ fn sqlstate_for_query_execution_message(message: &str) -> &'static str {
         return sqlstate::WINDOWING_ERROR; // 42P20
     }
 
+    // GH#29: plan-time name resolution (`sql::scope`). The 42703 / 42P01
+    // refusals land on the shape arms below unchanged (`Column "…" does not
+    // exist`, `relation "…" does not exist (missing FROM-clause entry …)`);
+    // these three have no not-found token and would otherwise degrade to
+    // XX000. Anchored on the emitter's consts — marker-const discipline.
+    // (c2, 4c): the duplicate-alias arm needs BOTH halves of the message —
+    // the trailing phrase alone is a substring of the CTAS refusal
+    // `column "x" specified more than once`, which must not become 42712.
+    if crate::sql::scope::is_duplicate_range_entry(message) {
+        return sqlstate::DUPLICATE_ALIAS; // 42712
+    }
+    if message.contains(crate::sql::scope::AMBIGUOUS_COLUMN_REFERENCE) {
+        return sqlstate::AMBIGUOUS_COLUMN; // 42702
+    }
+    // GH#29 (c5, m6): `operator does not exist: text + integer` — checked
+    // before the generic `does not exist` arms below, which would read the
+    // message as an unknown relation.
+    if message.contains(crate::sql::scope::UNDEFINED_OPERATOR) {
+        return sqlstate::UNDEFINED_FUNCTION; // 42883
+    }
+    if message.contains(crate::sql::scope::MATERIALIZED_VIEW_DERIVED_ALIAS_UNSUPPORTED) {
+        return sqlstate::FEATURE_NOT_SUPPORTED; // 0A000
+    }
+    // GH#29 (c6, m1): a correlated scalar subquery in a JOIN's ON condition.
+    if message.contains(crate::sql::scope::CORRELATED_JOIN_SUBQUERY_UNSUPPORTED) {
+        return sqlstate::FEATURE_NOT_SUPPORTED; // 0A000
+    }
+    if message.contains(crate::sql::scope::DERIVED_COLUMN_LIST_TOO_LONG) {
+        return sqlstate::INVALID_COLUMN_REFERENCE; // 42P10
+    }
+
     // HC4 role/ACL mappings, checked BEFORE the table/relation rules: the role
     // errors deliberately avoid the words "table"/"relation" so they cannot be
     // mis-mapped, but ordering makes that independent of message wording.
@@ -4298,11 +4329,11 @@ pub(crate) fn detail_hint_for_error(code: &str, error: &Error) -> (Option<String
             Some("Retry the transaction.".to_string()),
         ),
         sqlstate::UNDEFINED_TABLE => (
-            first_single_quoted(&message).map(|name| format!("Table '{name}' does not exist in the catalog.")),
+            first_quoted_reference(&message).map(|name| format!("Table '{name}' does not exist in the catalog.")),
             Some("Check the table name, or create the table first.".to_string()),
         ),
         sqlstate::UNDEFINED_COLUMN => (
-            first_single_quoted(&message).map(|name| format!("Column '{name}' does not exist.")),
+            first_quoted_reference(&message).map(|name| format!("Column '{name}' does not exist.")),
             Some("Check the column name against the table definition.".to_string()),
         ),
         _ => (None, None),
@@ -4316,6 +4347,47 @@ fn first_single_quoted(message: &str) -> Option<&str> {
     let rest = message.get(start..)?;
     let end = rest.find('\'')?;
     rest.get(..end)
+}
+
+/// The quoted relation/column reference an engine error names, in EITHER
+/// quoting style, as a dotted string.
+///
+/// GH#29 moved the resolver's messages to PostgreSQL's spelling, which quotes
+/// identifiers with double quotes (`Column "c" does not exist`,
+/// `Column "q"."c" does not exist`, `relation "q" does not exist (…)`), while
+/// every message that predates it uses single quotes (`Table 'users' does not
+/// exist`). `first_single_quoted` saw no `'` in the new shapes and returned
+/// `None`, so the wire's DETAIL field for 42703 / 42P01 silently went EMPTY —
+/// a user-visible diagnostic regression with no error of its own. Both
+/// spellings must produce the same DETAIL.
+///
+/// A double-quoted reference is joined on `.` so `"q"."c"` reads `q.c` rather
+/// than just the qualifier; trailing parenthetical text (the
+/// `(missing FROM-clause entry for table "q")` suffix) is not part of the
+/// reference and is ignored, because only the run of quoted parts immediately
+/// following the first one is consumed.
+fn first_quoted_reference(message: &str) -> Option<String> {
+    if let Some(single) = first_single_quoted(message) {
+        return Some(single.to_string());
+    }
+    let mut rest = message;
+    let mut parts: Vec<&str> = Vec::new();
+    while let Some(open) = rest.find('"') {
+        // Only keep going while the parts are dot-joined (`"q"."c"`); anything
+        // else ends the reference.
+        if !parts.is_empty() && rest.get(..open).is_some_and(|gap| gap != ".") {
+            break;
+        }
+        let after = rest.get(open + 1..)?;
+        let close = after.find('"')?;
+        parts.push(after.get(..close)?);
+        rest = after.get(close + 1..)?;
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("."))
+    }
 }
 
 #[cfg(test)]
@@ -4659,6 +4731,38 @@ mod sqlstate_mapping_unit_tests {
             "detail must carry the column name; got {detail:?} for {err}"
         );
         assert!(hint.is_some());
+    }
+
+    /// GH#29: the resolver now spells identifiers PostgreSQL's way (double
+    /// quotes), and the pre-GH#29 engine messages use single quotes. DETAIL is
+    /// derived from the message text, so BOTH spellings must fill it — the
+    /// double-quoted shapes silently produced an EMPTY DETAIL until
+    /// `first_quoted_reference` replaced `first_single_quoted` here.
+    #[test]
+    fn detail_survives_both_identifier_quoting_styles() {
+        use crate::network::protocol::sqlstate;
+        let cases: [(&str, &str, &str); 5] = [
+            // (sqlstate, engine message, the reference DETAIL must name)
+            (sqlstate::UNDEFINED_COLUMN, "Column \"c\" does not exist", "c"),
+            (sqlstate::UNDEFINED_COLUMN, "Column \"q\".\"c\" does not exist", "q.c"),
+            (sqlstate::UNDEFINED_COLUMN, "Column 'c' does not exist", "c"),
+            (sqlstate::UNDEFINED_TABLE, "Table 'users' does not exist", "users"),
+            (
+                sqlstate::UNDEFINED_TABLE,
+                "relation \"q\" does not exist (missing FROM-clause entry for table \"q\")",
+                "q",
+            ),
+        ];
+        for (code, message, reference) in cases {
+            let err = Error::query_execution(message.to_string());
+            let (detail, hint) = detail_hint_for_error(code, &err);
+            let detail = detail.unwrap_or_else(|| panic!("DETAIL must not be empty for `{message}`"));
+            assert!(
+                detail.contains(reference),
+                "DETAIL for `{message}` must name `{reference}`; got {detail:?}"
+            );
+            assert!(hint.is_some(), "HINT must accompany DETAIL for `{message}`");
+        }
     }
 
     #[test]

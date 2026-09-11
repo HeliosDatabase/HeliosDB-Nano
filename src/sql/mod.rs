@@ -14,6 +14,7 @@ pub mod executor;
 pub mod functions;
 pub mod interpolate; // Shared `$`-placeholder scanner + SQL-literal renderer for routine bodies
 pub mod logical_plan;
+pub(crate) mod mv_destamp; // Materialized-view plans: derived-alias stamps rewritten away before persistence (GH#29 c3)
 pub(crate) mod normalize;
 pub mod numeric_special; // PG NaN/±Infinity semantics for String-backed Value::Numeric
 pub mod parser;
@@ -21,6 +22,7 @@ pub mod planner;
 pub mod procedural;
 pub mod query_cache;
 pub(crate) mod returning; // ONE binding of a RETURNING list for RowDescription + DataRow (GH#23)
+pub(crate) mod scope; // Plan-time range-table resolution: 42703 / 42P01 instead of per-row misses (GH#29)
 pub mod sequences;
 pub mod settings;
 pub mod sqlite_compat;
