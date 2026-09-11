@@ -70,6 +70,7 @@ pub mod password_store;
 pub mod prepared;
 pub mod server;
 pub mod ssl;
+pub mod timeouts;
 #[cfg(test)]
 mod wire_tests;
 

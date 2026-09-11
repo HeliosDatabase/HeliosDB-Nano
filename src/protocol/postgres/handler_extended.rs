@@ -228,7 +228,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
         // from `[authentication] legacy_acl_noop`. Delegate rather than growing
         // a second copy of the rule.
         let is_set_role = Self::parse_set_role_target(trimmed_query).is_some();
-        if is_transaction_control || is_set_role {
+        // GH#28: `SET` / `RESET` of the connection-lifetime GUCs
+        // (`idle_session_timeout`, `idle_in_transaction_session_timeout`,
+        // `authentication_timeout`) — session-scoped storage for the first two
+        // and the 55P02 refusal for the third live in `handle_single_query`;
+        // delegate so psycopg3 / JDBC / sqlx / node-postgres get the same
+        // answer as psql instead of the params planner's error.
+        let is_timeout_guc = crate::EmbeddedDatabase::is_timeout_guc_statement(trimmed_query);
+        if is_transaction_control || is_set_role || is_timeout_guc {
             let previous_suppress_ready = self.suppress_ready_for_query;
             self.suppress_ready_for_query = true;
             let result = self.handle_single_query(&statement.query).await;
@@ -241,6 +248,24 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
 
         if self.transaction_failed() {
             return self.send_extended_failed_transaction_error().await;
+        }
+
+        // GH#28: `SHOW idle_session_timeout` / `idle_in_transaction_session_timeout`
+        // / `authentication_timeout` / `max_connections` over the extended
+        // protocol. Describe already sent the one-column TEXT RowDescription
+        // (`derive_result_schema`), so Execute emits DataRow + CommandComplete
+        // directly under the portal's wire plan — the catalog fast-path shape,
+        // never `send_query_result` (which would repeat the RowDescription).
+        if let Some(param) = Self::session_show_parameter_name(trimmed_query) {
+            let (col, val) = self.resolve_session_show_parameter(&param);
+            let schema = crate::Schema::new(vec![crate::Column::new(col, crate::DataType::Text)]);
+            let rows = vec![crate::Tuple::new(vec![Value::String(val)])];
+            self.prepared_statements
+                .update_portal_state(&portal_name, PortalState::Complete)?;
+            let plan = super::codec::wire_plan(&schema, &portal.result_formats);
+            self.send_data_rows_with_formats(&rows, &plan).await?;
+            self.send_command_complete("SHOW").await?;
+            return Ok(());
         }
 
         // Convert parameters from wire format to Value
@@ -762,6 +787,24 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
                     }
                 } else {
                     Ok(None)
+                }
+            }
+            // GH#28: `SHOW <connection-lifetime GUC | max_connections>` is a
+            // one-column TEXT result so Describe sends a RowDescription (not
+            // NoData) and `Client::query` gets its row. Other SHOW names keep
+            // today's path.
+            Statement::ShowVariable { variable } => {
+                let name = variable
+                    .iter()
+                    .map(|ident| ident.value.to_ascii_lowercase())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                match Self::session_show_parameter_name(&format!("SHOW {name}")) {
+                    Some(param) => Ok(Some(crate::Schema::new(vec![crate::Column::new(
+                        param,
+                        crate::DataType::Text,
+                    )]))),
+                    None => Ok(None),
                 }
             }
             // DDL statements (CREATE, DROP, ALTER) don't return results

@@ -194,7 +194,10 @@ Session-level events are also traced:
 |-------|-------|--------|
 | Session start | INFO | session_id |
 | Session close | INFO | session_id |
-| Idle timeout disconnect | INFO | session_id, idle_timeout_secs |
+| Idle-session timeout disconnect (`FATAL 57P05`) | INFO | session_id |
+| Idle-in-transaction timeout disconnect (`FATAL 25P03`) | INFO | session_id |
+| Authentication timeout (handshake never completed) | DEBUG | — (scanner volume; deliberately not higher) |
+| Connection utilisation crossed `max_connections_warn_percent` | WARN | in_use, max_connections, threshold |
 | Query timeout | ERROR | session_id, timeout_ms |
 | Connection limit reached | WARN | max_connections |
 
@@ -203,5 +206,9 @@ Session-level events are also traced:
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `storage.slow_query_threshold_ms` | 1000 | Slow query log threshold (ms). `null` to disable |
-| `server.idle_timeout_secs` | 300 | Idle connection timeout (seconds). 0 to disable |
+| `server.authentication_timeout` | `"60s"` | Bound on the whole client handshake; `"0"` disables |
+| `server.idle_session_timeout` | `"0"` | Idle-session timeout (PostgreSQL syntax, bare integer = ms); `"0"` disables |
+| `server.idle_in_transaction_session_timeout` | `"0"` | Idle-in-transaction timeout; `"0"` disables |
+| `server.max_connections_warn_percent` | 80 | Utilisation WARN threshold; 0 disables |
+| `server.idle_timeout_secs` | 300 | DEPRECATED alias of `idle_session_timeout`, honoured only when explicitly changed |
 | `RUST_LOG` env var | (none) | Controls tracing verbosity per module |

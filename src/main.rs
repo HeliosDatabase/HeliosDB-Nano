@@ -30,6 +30,115 @@ struct HAConfig {
     node_id: Option<String>,
 }
 
+/// GH#28: CLI overrides for the `[server]` connection-lifetime keys. Every
+/// field is an `Option` so an ABSENT flag never clobbers a config-file value;
+/// the precedence is CLI > config file > default, resolved once in
+/// `start_server` and shared by every listener.
+struct ConnectionPolicyArgs {
+    max_connections: Option<usize>,
+    authentication_timeout: Option<String>,
+    idle_session_timeout: Option<String>,
+    idle_in_transaction_session_timeout: Option<String>,
+    tcp_keepalives_idle: Option<String>,
+    tcp_keepalives_interval: Option<String>,
+    tcp_keepalives_count: Option<u32>,
+    max_connections_warn_percent: Option<u8>,
+}
+
+impl ConnectionPolicyArgs {
+    /// Overlay the flags that were given onto the loaded `[server]` section.
+    fn apply_to(&self, server: &mut heliosdb_nano::config::ServerConfig) {
+        if let Some(v) = self.max_connections {
+            server.max_connections = v;
+        }
+        if let Some(v) = &self.authentication_timeout {
+            server.authentication_timeout = v.clone();
+        }
+        if let Some(v) = &self.idle_session_timeout {
+            server.idle_session_timeout = v.clone();
+        }
+        if let Some(v) = &self.idle_in_transaction_session_timeout {
+            server.idle_in_transaction_session_timeout = v.clone();
+        }
+        if let Some(v) = &self.tcp_keepalives_idle {
+            server.tcp_keepalives_idle = v.clone();
+        }
+        if let Some(v) = &self.tcp_keepalives_interval {
+            server.tcp_keepalives_interval = v.clone();
+        }
+        if let Some(v) = self.tcp_keepalives_count {
+            server.tcp_keepalives_count = v;
+        }
+        if let Some(v) = self.max_connections_warn_percent {
+            server.max_connections_warn_percent = v;
+        }
+    }
+
+    /// Forward ONLY the flags that were given to the daemon re-exec, so the
+    /// child resolves CLI > config file > default exactly like the parent.
+    fn push_cli_args(&self, args: &mut Vec<String>) {
+        let mut push = |flag: &str, value: Option<String>| {
+            if let Some(v) = value {
+                args.push(flag.to_string());
+                args.push(v);
+            }
+        };
+        push("--max-connections", self.max_connections.map(|v| v.to_string()));
+        push("--authentication-timeout", self.authentication_timeout.clone());
+        push("--idle-session-timeout", self.idle_session_timeout.clone());
+        push(
+            "--idle-in-transaction-session-timeout",
+            self.idle_in_transaction_session_timeout.clone(),
+        );
+        push("--tcp-keepalives-idle", self.tcp_keepalives_idle.clone());
+        push("--tcp-keepalives-interval", self.tcp_keepalives_interval.clone());
+        push(
+            "--tcp-keepalives-count",
+            self.tcp_keepalives_count.map(|v| v.to_string()),
+        );
+        push(
+            "--max-connections-warn-percent",
+            self.max_connections_warn_percent.map(|v| v.to_string()),
+        );
+    }
+}
+
+/// GH#28: one WARN per crossing of `[server] max_connections_warn_percent`
+/// on a listener (edge-triggered via `swap`; re-arms when utilisation drops
+/// back below the threshold). `Semaphore::available_permits()` is the single
+/// source of truth — no side counter.
+fn warn_listener_utilisation(
+    listener: &str,
+    warned: &std::sync::atomic::AtomicBool,
+    limiter: &tokio::sync::Semaphore,
+    max: usize,
+    policy: &heliosdb_nano::protocol::postgres::timeouts::ConnectionTimeouts,
+) {
+    let in_use = max.saturating_sub(limiter.available_permits());
+    let over = policy.should_warn_utilisation(in_use, max);
+    if warned.swap(over, std::sync::atomic::Ordering::Relaxed) != over && over {
+        tracing::warn!(
+            "{} connection utilisation {}/{} ({}%) is at or above [server] max_connections_warn_percent = {}; \
+             new connections are refused at {} (raise --max-connections / [server] max_connections)",
+            listener,
+            in_use,
+            max,
+            in_use.saturating_mul(100) / max.max(1),
+            policy.connection_warn_threshold_percent,
+            max
+        );
+    }
+}
+
+/// GH#28: render a policy duration for the startup banner (`0` = disabled).
+fn banner_duration(d: std::time::Duration) -> String {
+    if d.is_zero() {
+        "disabled".to_string()
+    } else {
+        heliosdb_nano::protocol::postgres::timeouts::format_guc_duration_ms(d.as_millis() as u64)
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "heliosdb-nano")]
 #[command(version = env!("CARGO_PKG_VERSION"))]
@@ -160,11 +269,62 @@ enum Commands {
         #[arg(long)]
         pg_socket_dir: Option<PathBuf>,
 
-        /// Maximum number of concurrent client connections. The server
-        /// rejects new connections once this ceiling is reached. Raise it
-        /// for fleets that pool many connections (see NANO-DEFICIENCIES A9).
-        #[arg(long, default_value = "100")]
-        max_connections: usize,
+        /// Maximum concurrent client connections PER LISTENER (the PostgreSQL
+        /// TCP, MySQL TCP and MySQL Unix-socket listeners each get their own
+        /// limit of this size). Default 100 (`[server] max_connections`; this
+        /// flag wins over the config file). When the limit is reached the
+        /// server ACCEPTS the TCP connection and closes it immediately without
+        /// a PostgreSQL error packet, logging `Connection limit reached (N),
+        /// rejecting <addr>` at WARN. Raise it for fleets that pool many
+        /// connections; `SHOW max_connections` reports the effective value.
+        #[arg(long)]
+        max_connections: Option<usize>,
+
+        // ========== Connection-lifetime options (GH#28) ==========
+        /// PostgreSQL `authentication_timeout`: bound on the WHOLE client
+        /// handshake (startup packet, TLS, password / SCRAM). A socket that
+        /// never completes authentication — an internet scanner — is closed
+        /// and its connection slot released. PostgreSQL duration syntax; a
+        /// bare integer is seconds. Default 60s; 0 disables. Server-scoped
+        /// (`SET authentication_timeout` is refused with 55P02).
+        #[arg(long, value_name = "DURATION")]
+        authentication_timeout: Option<String>,
+
+        /// PostgreSQL `idle_session_timeout`: close an authenticated session
+        /// idle outside a transaction for longer than this (FATAL 57P05).
+        /// Bare integer = milliseconds. Default 0 = disabled, as in
+        /// PostgreSQL; sessions may override it with SET.
+        #[arg(long, value_name = "DURATION")]
+        idle_session_timeout: Option<String>,
+
+        /// PostgreSQL `idle_in_transaction_session_timeout`: close a session
+        /// idle INSIDE a transaction block for longer than this (FATAL 25P03,
+        /// transaction rolled back). Bare integer = milliseconds. Default 0 =
+        /// disabled; sessions may override it with SET.
+        #[arg(long, value_name = "DURATION")]
+        idle_in_transaction_session_timeout: Option<String>,
+
+        /// PostgreSQL `tcp_keepalives_idle`: seconds of inactivity before the
+        /// kernel sends the first keepalive probe on an accepted socket.
+        /// 0 = operating-system default (SO_KEEPALIVE is always on).
+        #[arg(long, value_name = "DURATION")]
+        tcp_keepalives_idle: Option<String>,
+
+        /// PostgreSQL `tcp_keepalives_interval`: seconds between keepalive
+        /// probes. 0 = operating-system default.
+        #[arg(long, value_name = "DURATION")]
+        tcp_keepalives_interval: Option<String>,
+
+        /// PostgreSQL `tcp_keepalives_count`: probes before a connection is
+        /// declared dead. 0 = operating-system default.
+        #[arg(long, value_name = "N")]
+        tcp_keepalives_count: Option<u32>,
+
+        /// Log a WARN (once per crossing) when in-use connections on a
+        /// listener reach this percentage of --max-connections. Default 80;
+        /// 0 disables.
+        #[arg(long, value_name = "PERCENT")]
+        max_connections_warn_percent: Option<u8>,
     },
 
     /// Stop a running server
@@ -335,6 +495,13 @@ async fn main() -> Result<()> {
             mysql_socket,
             pg_socket_dir,
             max_connections,
+            authentication_timeout,
+            idle_session_timeout,
+            idle_in_transaction_session_timeout,
+            tcp_keepalives_idle,
+            tcp_keepalives_interval,
+            tcp_keepalives_count,
+            max_connections_warn_percent,
         } => {
             // Validate that either --data-dir or --memory is specified
             if !memory && data_dir.is_none() {
@@ -385,6 +552,18 @@ async fn main() -> Result<()> {
                 node_id,
             };
 
+            // GH#28: connection-lifetime overrides (CLI > config file > default).
+            let policy_args = ConnectionPolicyArgs {
+                max_connections,
+                authentication_timeout,
+                idle_session_timeout,
+                idle_in_transaction_session_timeout,
+                tcp_keepalives_idle,
+                tcp_keepalives_interval,
+                tcp_keepalives_count,
+                max_connections_warn_percent,
+            };
+
             if daemon {
                 start_server_daemon(
                     resolved_data_dir,
@@ -403,7 +582,7 @@ async fn main() -> Result<()> {
                     mysql_listen,
                     mysql_socket,
                     pg_socket_dir,
-                    max_connections,
+                    policy_args,
                 )
                 .await
             } else {
@@ -423,7 +602,7 @@ async fn main() -> Result<()> {
                     mysql_listen,
                     mysql_socket,
                     pg_socket_dir,
-                    max_connections,
+                    policy_args,
                 )
                 .await
             }
@@ -549,12 +728,13 @@ async fn start_server(
     mysql_listen: String,
     mysql_socket: Option<PathBuf>,
     pg_socket_dir: Option<PathBuf>,
-    max_connections: usize,
+    policy_args: ConnectionPolicyArgs,
 ) -> Result<()> {
     use colored::Colorize;
     use heliosdb_nano::protocol::postgres::auth::{AuthManager, AuthMethod};
     use heliosdb_nano::protocol::postgres::server::{PgServer, PgServerConfig};
     use heliosdb_nano::protocol::postgres::ssl::{SslConfig, SslMode};
+    use heliosdb_nano::protocol::postgres::timeouts::{apply_socket_options, ConnectionTimeouts};
     use heliosdb_nano::protocol::postgres::{InMemoryPasswordStore, PasswordStore, SharedPasswordStore};
     use heliosdb_nano::storage::{DumpCompressionType, DumpManager, DumpMode, DumpOptions};
     use std::net::SocketAddr;
@@ -588,6 +768,23 @@ async fn start_server(
     } else {
         db_config.storage.memory_only = false;
         db_config.storage.path = Some(data_dir.clone());
+    }
+
+    // GH#28: connection-lifetime policy — CLI > config file > default, resolved
+    // ONCE here and shared by the PostgreSQL TCP / Unix-socket listeners, the
+    // MySQL listeners and (keepalive only) the replication listener. This also
+    // makes `[server] max_connections` live: it used to be read by nothing.
+    policy_args.apply_to(&mut db_config.server);
+    db_config.server.validate_connection_policy()?;
+    let max_connections = db_config.server.max_connections;
+    let connection_policy = ConnectionTimeouts::from_server_config(&db_config.server);
+    if ConnectionTimeouts::legacy_idle_alias_in_effect(&db_config.server) {
+        tracing::warn!(
+            "[server] idle_timeout_secs = {} is deprecated and is being applied as idle_session_timeout; \
+             set [server] idle_session_timeout (PostgreSQL syntax, e.g. \"{}s\") instead",
+            db_config.server.idle_timeout_secs,
+            db_config.server.idle_timeout_secs
+        );
     }
 
     // D3: one-line durability contract, derived from the active config.
@@ -639,7 +836,8 @@ async fn start_server(
     // Build server config
     let mut pg_config = PgServerConfig::with_address(pg_addr)
         .with_auth_method(auth_method)
-        .with_max_connections(max_connections);
+        .with_max_connections(max_connections)
+        .with_timeouts(connection_policy.clone());
 
     // Configure TLS if specified
     let tls_enabled = tls_cert.is_some();
@@ -654,7 +852,43 @@ async fn start_server(
         let http_listen = ha_config.http_listen.as_deref().unwrap_or(&listen);
         println!("      - HTTP address: {http_listen}:{}", ha_config.http_port);
     }
-    println!("      - Max connections: 100");
+    println!("      - Max connections: {max_connections} (per listener)");
+    println!(
+        "      - Authentication timeout: {}",
+        banner_duration(connection_policy.authentication_timeout)
+    );
+    println!(
+        "      - Idle session timeout: {}",
+        banner_duration(connection_policy.idle_session_timeout)
+    );
+    println!(
+        "      - Idle-in-transaction timeout: {}",
+        banner_duration(connection_policy.idle_in_transaction_session_timeout)
+    );
+    println!(
+        "      - TCP keepalive: {}",
+        match &connection_policy.tcp_keepalive {
+            Some(ka) => format!(
+                "on (idle {}, interval {}, count {})",
+                if ka.idle.is_zero() {
+                    "OS default".to_string()
+                } else {
+                    banner_duration(ka.idle)
+                },
+                if ka.interval.is_zero() {
+                    "OS default".to_string()
+                } else {
+                    banner_duration(ka.interval)
+                },
+                if ka.retries == 0 {
+                    "OS default".to_string()
+                } else {
+                    ka.retries.to_string()
+                },
+            ),
+            None => "off".to_string(),
+        }
+    );
     println!("      - Authentication: {auth_display}");
     println!("      - SSL/TLS: {}", if tls_enabled { "Enabled" } else { "Disabled" });
     if dump_on_shutdown {
@@ -842,6 +1076,8 @@ async fn start_server(
         // Same per-listener cap the PostgreSQL server enforces — without it the
         // MySQL side accepts unbounded connections/tasks/fds.
         let conn_limiter = std::sync::Arc::new(tokio::sync::Semaphore::new(max_connections));
+        let policy = connection_policy.clone();
+        let utilisation_warned = std::sync::atomic::AtomicBool::new(false);
         Some(tokio::spawn(async move {
             let listener = match tokio::net::TcpListener::bind(mysql_addr).await {
                 Ok(l) => l,
@@ -854,6 +1090,10 @@ async fn start_server(
                 match listener.accept().await {
                     Ok((stream, addr)) => {
                         tracing::debug!("MySQL connection from {}", addr);
+                        // GH#28: TCP_NODELAY + SO_KEEPALIVE on every accepted socket.
+                        if let Err(e) = apply_socket_options(&stream, &policy) {
+                            tracing::warn!("Failed to apply socket options for MySQL {}: {}", addr, e);
+                        }
                         let permit = match Arc::clone(&conn_limiter).try_acquire_owned() {
                             Ok(permit) => permit,
                             Err(_) => {
@@ -866,12 +1106,26 @@ async fn start_server(
                                 continue;
                             }
                         };
+                        warn_listener_utilisation(
+                            "MySQL",
+                            &utilisation_warned,
+                            &conn_limiter,
+                            max_connections,
+                            &policy,
+                        );
                         let db_clone = Arc::clone(&mysql_db);
                         let conn_id = conn_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let conn_policy = policy.clone();
                         tokio::spawn(async move {
                             let _permit = permit;
                             if let Err(e) =
-                                heliosdb_nano::protocol::mysql::handle_mysql_connection(db_clone, stream, conn_id).await
+                                heliosdb_nano::protocol::mysql::handler::handle_mysql_connection_with_timeouts(
+                                    db_clone,
+                                    stream,
+                                    conn_id,
+                                    conn_policy,
+                                )
+                                .await
                             {
                                 tracing::debug!("MySQL connection error: {}", e);
                             }
@@ -902,6 +1156,8 @@ async fn start_server(
         let mysql_db = Arc::clone(&db);
         let conn_counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1_000_000));
         let conn_limiter = std::sync::Arc::new(tokio::sync::Semaphore::new(max_connections));
+        let policy = connection_policy.clone();
+        let utilisation_warned = std::sync::atomic::AtomicBool::new(false);
         info!("MySQL Unix socket listening on {}", path.display());
         println!("    mysql (UDS): mysql --socket={}", path.display());
         Some(tokio::spawn(async move {
@@ -925,14 +1181,26 @@ async fn start_server(
                                 continue;
                             }
                         };
+                        warn_listener_utilisation(
+                            "MySQL UDS",
+                            &utilisation_warned,
+                            &conn_limiter,
+                            max_connections,
+                            &policy,
+                        );
                         let db_clone = Arc::clone(&mysql_db);
                         let conn_id = conn_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let conn_policy = policy.clone();
                         tokio::spawn(async move {
                             let _permit = permit;
-                            if let Err(e) = heliosdb_nano::protocol::mysql::handler::handle_mysql_connection_unix(
-                                db_clone, stream, conn_id,
-                            )
-                            .await
+                            if let Err(e) =
+                                heliosdb_nano::protocol::mysql::handler::handle_mysql_connection_unix_with_timeouts(
+                                    db_clone,
+                                    stream,
+                                    conn_id,
+                                    conn_policy,
+                                )
+                                .await
                             {
                                 tracing::debug!("MySQL UDS connection error: {}", e);
                             }
@@ -966,6 +1234,7 @@ async fn start_server(
         let _ = std::fs::create_dir_all(sock_dir);
         let _ = std::fs::remove_file(&sock_path);
         let pg_db = Arc::clone(&db);
+        let policy = connection_policy.clone();
         info!("PostgreSQL Unix socket listening on {}", sock_path.display());
         println!("    psql (UDS):  psql -h {} -p {}", sock_dir.display(), port);
         Some(tokio::spawn(async move {
@@ -983,11 +1252,16 @@ async fn start_server(
                     Ok((stream, _)) => {
                         let db_clone = Arc::clone(&pg_db);
                         let conn_id = conn_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let conn_policy = policy.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = heliosdb_nano::protocol::postgres::handler::handle_connection_unix(
-                                db_clone, stream, conn_id,
-                            )
-                            .await
+                            if let Err(e) =
+                                heliosdb_nano::protocol::postgres::handler::handle_connection_unix_with_timeouts(
+                                    db_clone,
+                                    stream,
+                                    conn_id,
+                                    conn_policy,
+                                )
+                                .await
                             {
                                 tracing::debug!("PG UDS connection error: {}", e);
                             }
@@ -1205,7 +1479,7 @@ async fn start_server_daemon(
     mysql_listen: String,
     mysql_socket: Option<PathBuf>,
     pg_socket_dir: Option<PathBuf>,
-    max_connections: usize,
+    policy_args: ConnectionPolicyArgs,
 ) -> Result<()> {
     // Process management (kill -0 liveness probe, daemon re-exec) is unix-only.
     #[cfg(unix)]
@@ -1247,9 +1521,11 @@ async fn start_server_daemon(
         port.to_string(),
         "--listen".to_string(),
         listen.clone(),
-        "--max-connections".to_string(),
-        max_connections.to_string(),
     ];
+    // GH#28: --max-connections and the connection-lifetime flags are forwarded
+    // ONLY when given (previously --max-connections was always pushed, which
+    // would now clobber a config-file value in the child).
+    policy_args.push_cli_args(&mut args);
 
     if let Some(cfg) = config_path {
         args.push("--config".to_string());
@@ -1672,6 +1948,12 @@ async fn start_ha_components(
                 sync_mode,
                 max_standbys: 10,
                 heartbeat_interval: Duration::from_secs(1),
+                // GH#28: keepalive ONLY — no timeout ever reaches the
+                // replication stream (a standby is idle between WAL segments).
+                tcp_keepalive: heliosdb_nano::protocol::postgres::timeouts::ConnectionTimeouts::from_server_config(
+                    &storage.config().server,
+                )
+                .tcp_keepalive,
                 ..Default::default()
             };
 

@@ -313,6 +313,7 @@ use super::catalog::PgCatalog;
 use super::messages::{AuthenticationMessage, BackendMessage, FieldDescription, FrontendMessage, TransactionStatus};
 use super::prepared::PreparedStatementManager;
 use super::ssl::SecureConnection;
+use super::timeouts::{format_guc_duration_ms, ConnectionTimeouts, SessionActivity, GUC_DURATION_UNITS_HINT};
 use bytes::{BufMut, BytesMut};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
@@ -349,6 +350,73 @@ pub struct PgConnectionHandler<S = BufWriter<TcpStream>> {
     /// connection live in the session, not in the process-global slot, so
     /// concurrent connections get isolated transactions.
     pub(super) session_id: crate::session::SessionId,
+    /// GH#28: the listener's connection-lifetime policy (authentication /
+    /// idle deadlines, the `max_connections` it enforces). Seeded disabled by
+    /// every constructor; the server overrides it via
+    /// [`Self::with_connection_policy`] before `handle()`.
+    pub(super) policy: ConnectionPolicy,
+    /// GH#28: set once this connection has `SET` / `RESET` one of the idle
+    /// GUCs, so the default hot path (no override, `idle_* = 0`) never takes
+    /// the session lock to compute a deadline.
+    idle_guc_overridden: bool,
+}
+
+/// GH#28: what the listener decided for this connection at accept time.
+#[derive(Debug, Clone)]
+pub(super) struct ConnectionPolicy {
+    /// Timeouts / keepalive / warning policy of the listener.
+    pub(super) timeouts: ConnectionTimeouts,
+    /// The connection limit the listener enforces (what `SHOW max_connections`
+    /// answers) — `PgServerConfig::max_connections`, never a literal.
+    pub(super) max_connections: usize,
+    /// ONE absolute deadline for the whole handshake, computed when the
+    /// socket was accepted, so the server-side pre-startup reads, the TLS
+    /// accept, the startup packet and every password / SCRAM round trip
+    /// share a single `authentication_timeout` budget. `None` = compute from
+    /// `timeouts` when `handle()` starts (Unix-socket / embedder path).
+    pub(super) auth_deadline: Option<tokio::time::Instant>,
+}
+
+impl ConnectionPolicy {
+    /// Disabled timeouts, no deadline; `max_connections` from the database's
+    /// `[server]` config so `SHOW max_connections` is never a literal.
+    pub(super) fn embedded_default(database: &EmbeddedDatabase) -> Self {
+        Self {
+            timeouts: ConnectionTimeouts::disabled(),
+            max_connections: database.storage.config().server.max_connections,
+            auth_deadline: None,
+        }
+    }
+
+    /// The policy for a socket accepted NOW: the authentication deadline is
+    /// one absolute instant from this moment.
+    pub(super) fn at_accept(timeouts: ConnectionTimeouts, max_connections: usize) -> Self {
+        let auth_deadline = timeouts
+            .read_deadline(SessionActivity::Authenticating)
+            .map(|d| tokio::time::Instant::now() + d);
+        Self {
+            timeouts,
+            max_connections,
+            auth_deadline,
+        }
+    }
+}
+
+/// GH#28: result of one deadlined wait for the next frontend message.
+pub(super) enum ReadOutcome {
+    /// A complete message arrived.
+    Message(FrontendMessage),
+    /// The peer closed the connection.
+    Eof,
+    /// An idle deadline expired before ANY byte of the next message arrived.
+    /// Carries the TIMER that fired (candidate 2: `Idle` =
+    /// `idle_session_timeout`, `IdleInTransaction` =
+    /// `idle_in_transaction_session_timeout` — see
+    /// `ConnectionTimeouts::armed_timer`), not merely the state the session
+    /// was in, so the FATAL names the budget that actually ran out. The
+    /// connection must be closed — there is no continue path (the read
+    /// future was dropped).
+    Expired(SessionActivity),
 }
 
 impl<S> Drop for PgConnectionHandler<S> {
@@ -375,6 +443,7 @@ impl PgConnectionHandler<BufWriter<TcpStream>> {
         let session_id = database
             .create_wire_session("pg_wire")
             .expect("wire session creation is infallible");
+        let policy = ConnectionPolicy::embedded_default(&database);
         Self {
             stream: BufWriter::new(stream),
             database: database.clone(),
@@ -390,6 +459,8 @@ impl PgConnectionHandler<BufWriter<TcpStream>> {
             suppress_ready_for_query: false,
             awaiting_sync_after_error: false,
             session_id,
+            policy,
+            idle_guc_overridden: false,
         }
     }
 }
@@ -401,6 +472,7 @@ impl PgConnectionHandler<BufWriter<UnixStream>> {
         let session_id = database
             .create_wire_session("pg_wire")
             .expect("wire session creation is infallible");
+        let policy = ConnectionPolicy::embedded_default(&database);
         Self {
             stream: BufWriter::new(stream),
             database: database.clone(),
@@ -416,6 +488,8 @@ impl PgConnectionHandler<BufWriter<UnixStream>> {
             suppress_ready_for_query: false,
             awaiting_sync_after_error: false,
             session_id,
+            policy,
+            idle_guc_overridden: false,
         }
     }
 }
@@ -437,6 +511,23 @@ pub async fn handle_connection_unix(
     handler.handle().await
 }
 
+/// GH#28: [`handle_connection_unix`] with the listener's connection-lifetime
+/// policy (`authentication_timeout`, idle timeouts). `max_connections` for
+/// `SHOW` comes from the database's `[server]` config.
+#[cfg(unix)]
+pub async fn handle_connection_unix_with_timeouts(
+    database: Arc<EmbeddedDatabase>,
+    stream: UnixStream,
+    _connection_id: u32,
+    timeouts: ConnectionTimeouts,
+) -> Result<()> {
+    let auth_manager = Arc::new(AuthManager::new(AuthMethod::Trust));
+    let max_connections = database.storage.config().server.max_connections;
+    let mut handler = PgConnectionHandler::new_unix(stream, database, auth_manager)
+        .with_connection_policy(ConnectionPolicy::at_accept(timeouts, max_connections));
+    handler.handle().await
+}
+
 impl PgConnectionHandler<BufWriter<SecureConnection<TcpStream>>> {
     /// Create a new connection handler with SecureConnection (wrapped in BufWriter)
     pub fn new_with_stream(
@@ -453,6 +544,7 @@ impl PgConnectionHandler<BufWriter<SecureConnection<TcpStream>>> {
         let session_id = database
             .create_wire_session("pg_wire")
             .expect("wire session creation is infallible");
+        let policy = ConnectionPolicy::embedded_default(&database);
         Self {
             stream: BufWriter::new(stream),
             database: database.clone(),
@@ -468,6 +560,8 @@ impl PgConnectionHandler<BufWriter<SecureConnection<TcpStream>>> {
             suppress_ready_for_query: false,
             awaiting_sync_after_error: false,
             session_id,
+            policy,
+            idle_guc_overridden: false,
         }
     }
 }
@@ -483,6 +577,8 @@ where
     pub(super) fn new_for_tests(database: Arc<EmbeddedDatabase>, stream: S) -> Self {
         Self {
             stream,
+            policy: ConnectionPolicy::embedded_default(&database),
+            idle_guc_overridden: false,
             session_id: database
                 .create_wire_session("pg_wire_test")
                 .expect("wire session creation is infallible"),
@@ -501,23 +597,74 @@ where
         }
     }
 
+    /// GH#28: install the listener's connection-lifetime policy. Keeps every
+    /// constructor's arity unchanged (embedders call `new_with_stream`).
+    pub(super) fn with_connection_policy(mut self, policy: ConnectionPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
     /// Handle connection lifecycle
+    ///
+    /// GH#28: the startup / authentication phase runs under ONE absolute
+    /// `authentication_timeout` deadline (the instant the server computed at
+    /// accept, or — for Unix-socket / embedder handlers — now + the policy's
+    /// budget). Expiry writes NOTHING to the unauthenticated peer (fail
+    /// closed; PostgreSQL `_exit(1)`s) and returns `Ok`, so the caller drops
+    /// the handler → `Drop` → `destroy_session` → the listener's permit.
     pub async fn handle(&mut self) -> Result<()> {
         tracing::info!("New PostgreSQL connection");
 
-        // Handle startup and authentication
+        let auth_deadline = self.policy.auth_deadline.or_else(|| {
+            self.policy
+                .timeouts
+                .read_deadline(SessionActivity::Authenticating)
+                .map(|d| tokio::time::Instant::now() + d)
+        });
+        match auth_deadline {
+            Some(at) => match tokio::time::timeout_at(at, self.startup()).await {
+                Ok(result) => result?,
+                Err(_elapsed) => {
+                    // DEBUG, not higher: internet scanners produce this at volume.
+                    tracing::debug!("authentication_timeout expired during startup; closing connection");
+                    return Ok(());
+                }
+            },
+            None => self.startup().await?,
+        }
+
+        self.run_message_loop().await
+    }
+
+    /// Startup and authentication (the pre-`ReadyForQuery` half of the
+    /// connection). Bounded by the caller's `authentication_timeout`.
+    async fn startup(&mut self) -> Result<()> {
         if let Err(e) = self.handle_startup().await {
             tracing::error!("Startup failed: {}", e);
             let _ = self.send_error("FATAL", "08P01", &e.to_string(), None, None).await;
             return Err(e);
         }
+        Ok(())
+    }
 
-        // Main message loop
+    /// The main message loop. Each wait for the NEXT frontend message runs
+    /// under the idle deadline for the session's current state
+    /// (`idle_session_timeout` outside a transaction block,
+    /// `idle_in_transaction_session_timeout` inside one); statement execution
+    /// is never bounded. Expiry sends PostgreSQL's FATAL (57P05 / 25P03) under
+    /// a bound and closes — the `Drop` impl rolls back and releases the slot.
+    async fn run_message_loop(&mut self) -> Result<()> {
+        use crate::network::protocol::sqlstate;
+
         tracing::debug!("Entering main message loop");
         loop {
             tracing::trace!("Waiting for next message from client");
-            match self.read_message().await {
-                Ok(Some(msg)) => {
+            let activity = match self.transaction_status {
+                TransactionStatus::InTransaction | TransactionStatus::Failed => SessionActivity::IdleInTransaction,
+                TransactionStatus::Idle => SessionActivity::Idle,
+            };
+            match self.read_message_deadlined(activity).await {
+                Ok(ReadOutcome::Message(msg)) => {
                     tracing::debug!("Received message: {:?}", msg);
                     if self.awaiting_sync_after_error {
                         self.handle_message_while_awaiting_sync(msg).await?;
@@ -526,9 +673,40 @@ where
 
                     self.dispatch_message(msg).await?;
                 }
-                Ok(None) => {
+                Ok(ReadOutcome::Eof) => {
                     // Connection closed gracefully
                     tracing::info!("Client disconnected");
+                    break;
+                }
+                Ok(ReadOutcome::Expired(expired)) => {
+                    // `expired` is the TIMER that fired (c2), so a session
+                    // sitting in a block with only `idle_session_timeout`
+                    // configured is told 57P05, and 25P03 only when the
+                    // in-transaction budget was the one armed.
+                    let (code, message) = match expired {
+                        SessionActivity::IdleInTransaction => (
+                            sqlstate::IDLE_IN_TRANSACTION_SESSION_TIMEOUT,
+                            "terminating connection due to idle-in-transaction timeout",
+                        ),
+                        _ => (
+                            sqlstate::IDLE_SESSION_TIMEOUT,
+                            "terminating connection due to idle-session timeout",
+                        ),
+                    };
+                    tracing::info!(session_id = ?self.session_id, "{}", message);
+                    // Bounded teardown: a peer that stopped reading must not
+                    // become the new immortal await. The bound is the budget
+                    // that just expired — no new key, no magic number.
+                    let budget = self
+                        .effective_read_deadline(expired)
+                        .unwrap_or(std::time::Duration::from_secs(1));
+                    let _ = tokio::time::timeout(budget, async {
+                        // ErrorResponse only — `send_error` would append a
+                        // ReadyForQuery to a connection that is closing.
+                        let _ = self.send_error_message("FATAL", code, message, None, None).await;
+                        let _ = self.flush().await;
+                    })
+                    .await;
                     break;
                 }
                 Err(e) => {
@@ -539,6 +717,45 @@ where
         }
 
         Ok(())
+    }
+
+    /// GH#28: this connection's effective policy — the session's `SET`
+    /// overrides (if any were ever issued on this connection) layered over
+    /// the listener policy. `authentication_timeout` is never overridable.
+    pub(super) fn effective_timeouts(&self) -> ConnectionTimeouts {
+        let mut timeouts = self.policy.timeouts.clone();
+        if self.idle_guc_overridden {
+            if let Ok((idle, in_txn)) = self.database.session_timeout_gucs(self.session_id) {
+                if let Some(ms) = idle {
+                    timeouts.idle_session_timeout = std::time::Duration::from_millis(ms);
+                }
+                if let Some(ms) = in_txn {
+                    timeouts.idle_in_transaction_session_timeout = std::time::Duration::from_millis(ms);
+                }
+            }
+        }
+        timeouts
+    }
+
+    /// GH#28: how long the next wait on the peer may take in `activity`
+    /// (`None` = unbounded). Mirrors `effective_statement_timeout_ms`:
+    /// session override > listener policy.
+    fn effective_read_deadline(&self, activity: SessionActivity) -> Option<std::time::Duration> {
+        self.effective_armed_timer(activity).map(|(_, budget)| budget)
+    }
+
+    /// GH#28 (c2): which timer the next wait in `activity` arms, and its
+    /// budget (`None` = unbounded) — `ConnectionTimeouts::armed_timer` over
+    /// the EFFECTIVE policy (session override > listener). The timer named
+    /// here is what `ReadOutcome::Expired` carries on expiry.
+    pub(super) fn effective_armed_timer(
+        &self,
+        activity: SessionActivity,
+    ) -> Option<(SessionActivity, std::time::Duration)> {
+        if !self.idle_guc_overridden {
+            return self.policy.timeouts.armed_timer(activity);
+        }
+        self.effective_timeouts().armed_timer(activity)
     }
 
     /// Dispatch ONE frontend message and render any failure the way the client
@@ -790,32 +1007,81 @@ where
         }
     }
 
-    /// Read a message from the client
+    /// Read a message from the client with no deadline (`Busy`): the
+    /// password / SCRAM exchange (bounded by the caller's authentication
+    /// deadline) and the COPY drain loop (a multi-GB `COPY FROM STDIN` on a
+    /// slow uplink is executing, not idle).
+    async fn read_message(&mut self) -> Result<Option<FrontendMessage>> {
+        match self.read_message_deadlined(SessionActivity::Busy).await? {
+            ReadOutcome::Message(msg) => Ok(Some(msg)),
+            // `Busy` never arms a deadline, so `Expired` is unreachable by
+            // construction; treat it as a close rather than panic.
+            ReadOutcome::Eof | ReadOutcome::Expired(_) => Ok(None),
+        }
+    }
+
+    /// GH#28: read the next frontend message, bounding ONLY the wait for its
+    /// first byte by the idle deadline for `activity`.
+    ///
+    /// The deadline wraps ONE `stream.read()` and is armed only while nothing
+    /// of the next message has arrived (empty buffer). The FIRST byte
+    /// disarms it: PostgreSQL's idle timers measure the wait for a NEW
+    /// command and stop the moment one starts arriving, so a `Query` split
+    /// across TCP segments on a slow uplink, or a large `Bind`, is a client
+    /// talking — never an idle session. `WouldBlock` does not disarm.
+    ///
+    /// Cancellation safety: `AsyncReadExt::read` is cancel-safe (no bytes are
+    /// consumed when its future is dropped) and the future is recreated
+    /// under `timeout_at` on every iteration — never a long-lived read
+    /// `select!`ed against a timer. With the shipped defaults (`idle_* = 0`)
+    /// no deadline is armed and the path is the bare `stream.read().await`.
     // SAFETY: temp_buf[..n] slice is bounded by n from stream.read() which is <= temp_buf.len().
     #[allow(clippy::indexing_slicing)]
-    async fn read_message(&mut self) -> Result<Option<FrontendMessage>> {
+    async fn read_message_deadlined(&mut self, activity: SessionActivity) -> Result<ReadOutcome> {
         // Try to parse existing buffer first
         tracing::trace!("read_message: Checking buffer, len={}", self.buffer.len());
         if let Some(msg) = FrontendMessage::parse(&mut self.buffer)? {
             tracing::trace!("read_message: Parsed message from existing buffer");
-            return Ok(Some(msg));
+            return Ok(ReadOutcome::Message(msg));
         }
+
+        // Armed ONLY while nothing of the next message has arrived. A
+        // non-empty buffer means a partial message is in flight. Carries the
+        // TIMER being armed (c2) so expiry can name the budget that ran out.
+        let mut deadline = if self.buffer.is_empty() {
+            self.effective_armed_timer(activity)
+                .map(|(timer, d)| (timer, tokio::time::Instant::now() + d))
+        } else {
+            None
+        };
 
         // Read more data
         let mut temp_buf = vec![0u8; 4096];
         loop {
             tracing::trace!("read_message: Attempting to read from stream");
-            match self.stream.read(&mut temp_buf).await {
+            let read = match deadline {
+                Some((timer, at)) => match tokio::time::timeout_at(at, self.stream.read(&mut temp_buf)).await {
+                    Ok(read) => read,
+                    Err(_elapsed) => {
+                        tracing::debug!("read_message: {:?} deadline expired while {:?}", timer, activity);
+                        return Ok(ReadOutcome::Expired(timer));
+                    }
+                },
+                None => self.stream.read(&mut temp_buf).await,
+            };
+            match read {
                 Ok(0) => {
                     tracing::debug!("read_message: EOF received (0 bytes)");
-                    return Ok(None); // EOF
+                    return Ok(ReadOutcome::Eof); // EOF
                 }
                 Ok(n) => {
                     tracing::trace!("read_message: Read {} bytes", n);
                     self.buffer.extend_from_slice(&temp_buf[..n]);
+                    // FIRST BYTE DISARMS: the client is talking.
+                    deadline = None;
                     if let Some(msg) = FrontendMessage::parse(&mut self.buffer)? {
                         tracing::trace!("read_message: Successfully parsed message after read");
-                        return Ok(Some(msg));
+                        return Ok(ReadOutcome::Message(msg));
                     }
                     tracing::trace!("read_message: Insufficient data for complete message, continuing");
                 }
@@ -1120,6 +1386,14 @@ where
                     return Ok(());
                 }
             }
+            // GH#28: the connection-lifetime GUCs. The two idle names are
+            // stored on THIS session and take effect on the next wait;
+            // `authentication_timeout` is postmaster-scoped and is REFUSED
+            // (55P02) — never the generic ack below, which would be the same
+            // "silently acked a security-relevant SET" defect as HC4 SET ROLE.
+            if let Some(handled) = self.handle_timeout_guc_statement(trimmed, "SET").await? {
+                return Ok(handled);
+            }
             // Handle generic SET commands for client compatibility (e.g., SET client_encoding = 'UTF8').
             self.send_command_complete("SET").await?;
             self.send_ready_for_query().await?;
@@ -1157,6 +1431,16 @@ where
             if let Err(e) = self.database.set_session_current_schema(self.session_id, None) {
                 self.send_error("ERROR", "22023", &e.to_string(), None, None).await?;
                 return Ok(());
+            }
+            self.send_command_complete("RESET").await?;
+            self.send_ready_for_query().await?;
+            return Ok(());
+        } else if starts_with_icase(trimmed, "RESET ") && EmbeddedDatabase::is_timeout_guc_statement(trimmed) {
+            // GH#28: RESET idle_session_timeout / idle_in_transaction_session_timeout
+            // -> back to the listener policy for THIS session; RESET
+            // authentication_timeout is refused like SET.
+            if let Some(handled) = self.handle_timeout_guc_statement(trimmed, "RESET").await? {
+                return Ok(handled);
             }
             self.send_command_complete("RESET").await?;
             self.send_ready_for_query().await?;
@@ -1199,7 +1483,7 @@ where
                 };
                 ("search_path".to_string(), val)
             } else {
-                Self::resolve_show_parameter(param)
+                self.resolve_session_show_parameter(param)
             };
             let schema = Schema::new(vec![crate::Column::new(&col_name, crate::DataType::Text)]);
             let row = Tuple::new(vec![Value::String(value)]);
@@ -2694,7 +2978,8 @@ where
             "datestyle" => "ISO, MDY".to_string(),
             "timezone" | "time zone" => "UTC".to_string(),
             "integer_datetimes" => "on".to_string(),
-            "max_connections" => "100".to_string(),
+            // `max_connections` is answered by `resolve_session_show_parameter`
+            // from the listener's real limit (GH#28) — never a literal.
             "lc_collate" => "en_US.UTF-8".to_string(),
             "lc_ctype" => "en_US.UTF-8".to_string(),
             "search_path" => "\"$user\", public".to_string(),
@@ -2703,6 +2988,100 @@ where
             _ => String::new(),
         };
         (col, val)
+    }
+
+    /// GH#28: the `SHOW` names answered from the connection policy rather than
+    /// the static table: the three timeout GUCs and `max_connections`.
+    /// Returns the lower-cased name when `sql` is `SHOW <one of them>`.
+    pub(super) fn session_show_parameter_name(sql: &str) -> Option<String> {
+        let trimmed = sql.trim();
+        if !starts_with_icase(trimmed, "SHOW ") {
+            return None;
+        }
+        let name = trimmed
+            .get(5..)?
+            .trim()
+            .trim_end_matches(';')
+            .trim()
+            .to_ascii_lowercase();
+        if matches!(
+            name.as_str(),
+            "idle_session_timeout"
+                | "idle_in_transaction_session_timeout"
+                | "authentication_timeout"
+                | "max_connections"
+        ) {
+            Some(name)
+        } else {
+            None
+        }
+    }
+
+    /// GH#28: resolve a `SHOW` parameter to `(column, value)`, answering the
+    /// connection-lifetime GUCs from the EFFECTIVE policy (this session's
+    /// `SET` override, else the listener's) rendered like PostgreSQL
+    /// (`0`, `30s`, `10min`), `authentication_timeout` from the listener
+    /// policy and `max_connections` from the limit the listener enforces.
+    /// Everything else falls through to [`Self::resolve_show_parameter`].
+    pub(super) fn resolve_session_show_parameter(&self, param: &str) -> (String, String) {
+        let lower = param.trim().to_ascii_lowercase();
+        let value = match lower.as_str() {
+            "idle_session_timeout" => {
+                format_guc_duration_ms(self.effective_timeouts().idle_session_timeout.as_millis() as u64)
+            }
+            "idle_in_transaction_session_timeout" => format_guc_duration_ms(
+                self.effective_timeouts()
+                    .idle_in_transaction_session_timeout
+                    .as_millis() as u64,
+            ),
+            "authentication_timeout" => {
+                format_guc_duration_ms(self.policy.timeouts.authentication_timeout.as_millis() as u64)
+            }
+            "max_connections" => self.policy.max_connections.to_string(),
+            _ => return Self::resolve_show_parameter(param),
+        };
+        (lower, value)
+    }
+
+    /// GH#28: `SET` / `RESET` of a connection-lifetime GUC on the simple-query
+    /// path (the extended path delegates here). `Ok(Some(()))` when the
+    /// statement was one of ours and fully answered (CommandComplete or
+    /// ErrorResponse + ReadyForQuery already sent); `Ok(None)` otherwise.
+    async fn handle_timeout_guc_statement(&mut self, trimmed: &str, tag: &str) -> Result<Option<()>> {
+        if !EmbeddedDatabase::is_timeout_guc_statement(trimmed) {
+            return Ok(None);
+        }
+        match self.database.try_handle_session_timeout_guc(self.session_id, trimmed) {
+            Ok(Some(_)) => {
+                self.idle_guc_overridden = true;
+                self.send_command_complete(tag).await?;
+                self.send_ready_for_query().await?;
+                Ok(Some(()))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => {
+                let code = sqlstate_for_error(&e);
+                let hint = if code == crate::network::protocol::sqlstate::CANT_CHANGE_RUNTIME_PARAM {
+                    Some(
+                        "authentication_timeout is server-scoped: set it with --authentication-timeout or \
+                         [server] authentication_timeout in config.toml."
+                            .to_string(),
+                    )
+                } else if code == crate::network::protocol::sqlstate::FEATURE_NOT_SUPPORTED {
+                    // c2: `SET LOCAL` of a session-scoped timeout GUC.
+                    Some(
+                        "Use SET <name> (session scope, until RESET or disconnect) or RESET <name>; \
+                         HeliosDB does not scope these parameters to a transaction block."
+                            .to_string(),
+                    )
+                } else {
+                    Some(GUC_DURATION_UNITS_HINT.to_string())
+                };
+                // ErrorResponse + ReadyForQuery, and NO "SET" tag.
+                self.send_error("ERROR", code, &e.to_string(), None, hint).await?;
+                Ok(Some(()))
+            }
+        }
     }
 
     /// HC4: classify `SET [SESSION|LOCAL] ROLE …` and
@@ -3759,6 +4138,25 @@ fn sqlstate_for_query_execution_message(message: &str) -> &'static str {
     let lower = message.to_ascii_lowercase();
     let not_found = lower.contains("not found") || lower.contains("does not exist") || lower.contains("doesn't exist");
 
+    // GH#28: PostgreSQL's own wording for a postmaster-scoped parameter
+    // (`SET authentication_timeout`, `SET max_connections`) and for a value
+    // that does not parse as the parameter's type. Emitted by
+    // `EmbeddedDatabase::try_handle_session_timeout_guc` and
+    // `SessionSettings::set`, so every family (simple, extended, REST) agrees.
+    if lower.contains("cannot be changed now") {
+        return sqlstate::CANT_CHANGE_RUNTIME_PARAM; // 55P02
+    }
+    if lower.starts_with("invalid value for parameter") {
+        return sqlstate::INVALID_PARAMETER_VALUE; // 22023
+    }
+    // GH#28 (c2): `SET LOCAL idle_session_timeout` /
+    // `idle_in_transaction_session_timeout` is refused rather than silently
+    // widened to the session. Marker const owned by the single emitter
+    // (`EmbeddedDatabase::try_handle_session_timeout_guc`).
+    if message.contains(crate::SET_LOCAL_TIMEOUT_GUC_UNSUPPORTED) {
+        return sqlstate::FEATURE_NOT_SUPPORTED; // 0A000
+    }
+
     // Spec 03: the advisory family refuses the session-scope half on a
     // session-less execution path (REST/BaaS, MCP, the embedded funnel, the
     // REPL) because there is no connection to own or release the lock. That is
@@ -3978,6 +4376,8 @@ mod failed_transaction_state_tests {
         (
             PgConnectionHandler {
                 stream,
+                policy: ConnectionPolicy::embedded_default(&db),
+                idle_guc_overridden: false,
                 session_id: db
                     .create_wire_session("pg_wire_test")
                     .expect("wire session creation is infallible"),
@@ -4068,6 +4468,8 @@ mod show_branches_wire_tests {
         (
             PgConnectionHandler {
                 stream,
+                policy: ConnectionPolicy::embedded_default(&db),
+                idle_guc_overridden: false,
                 session_id: db
                     .create_wire_session("pg_wire_test")
                     .expect("wire session creation is infallible"),
@@ -4665,6 +5067,8 @@ mod md5_auth_wire_tests {
         (
             PgConnectionHandler {
                 stream,
+                policy: ConnectionPolicy::embedded_default(&db),
+                idle_guc_overridden: false,
                 session_id: db
                     .create_wire_session("pg_wire_test")
                     .expect("wire session creation is infallible"),

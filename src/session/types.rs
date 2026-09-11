@@ -237,6 +237,14 @@ pub struct Session {
     /// (I-USER). `None` on the embedded path, which has no login identity — a
     /// `"$user"` entry then resolves to nothing (dropped from the path).
     pub login_user: Option<String>,
+    /// GH#28: per-session `SET idle_session_timeout` override in milliseconds
+    /// (`None` = inherit the listener's `[server] idle_session_timeout`).
+    /// Lives on the session — never on the process-global `SessionSettings`
+    /// registry — so connection A's override can never close connection B.
+    pub idle_session_timeout_ms: Option<u64>,
+    /// GH#28: per-session `SET idle_in_transaction_session_timeout` override
+    /// in milliseconds (`None` = inherit the listener policy).
+    pub idle_in_transaction_session_timeout_ms: Option<u64>,
     /// Active transaction ID (None if no transaction in progress)
     pub active_txn: Option<u64>,
     /// Session creation timestamp (Unix epoch seconds)
@@ -264,6 +272,8 @@ impl Session {
             current_schema: None,
             search_path: Vec::new(),
             login_user: None,
+            idle_session_timeout_ms: None,
+            idle_in_transaction_session_timeout_ms: None,
             active_txn: None,
             created_at: now,
             last_activity: now,
