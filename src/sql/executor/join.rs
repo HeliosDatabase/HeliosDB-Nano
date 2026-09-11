@@ -185,11 +185,42 @@ fn eval_condition_on_pair(
 }
 
 impl NestedLoopJoinOperator {
+    /// `parameters` are the statement's bind values (GH#29 c7, M1). The ON
+    /// condition reaches this operator WHOLE — including a residual term such
+    /// as `AND b.k = $1`, which the key binder declines precisely because a
+    /// parameter is not a column — so its evaluator must carry them. Built
+    /// with `Evaluator::new` (an EMPTY parameter vector) through candidate 6,
+    /// which turned every parameterized residual into
+    /// `Parameter $1 not provided`.
     pub fn new(
+        left: Box<dyn PhysicalOperator>,
+        right: Box<dyn PhysicalOperator>,
+        join_type: crate::sql::JoinType,
+        on_condition: Option<crate::sql::LogicalExpr>,
+        parameters: Vec<crate::Value>,
+        timeout_ctx: Option<TimeoutContext>,
+    ) -> Result<Self> {
+        Self::with_memory_limit(
+            left,
+            right,
+            join_type,
+            on_condition,
+            parameters,
+            join_memory_limit(),
+            timeout_ctx,
+        )
+    }
+
+    /// [`Self::new`] with an explicit materialization cap, mirroring
+    /// [`HashJoinOperator::with_memory_limit`] — the seam the cap is pinned
+    /// through without touching the process-global configuration.
+    fn with_memory_limit(
         left: Box<dyn PhysicalOperator>,
         mut right: Box<dyn PhysicalOperator>,
         join_type: crate::sql::JoinType,
         on_condition: Option<crate::sql::LogicalExpr>,
+        parameters: Vec<crate::Value>,
+        memory_limit: usize,
         timeout_ctx: Option<TimeoutContext>,
     ) -> Result<Self> {
         // Build output schema by combining left and right schemas
@@ -204,7 +235,7 @@ impl NestedLoopJoinOperator {
         let output_schema = Arc::new(Schema { columns });
 
         // Create evaluator with output schema for evaluating join conditions
-        let evaluator = crate::sql::Evaluator::new(output_schema.clone());
+        let evaluator = crate::sql::Evaluator::with_parameters(output_schema.clone(), parameters);
 
         // R3.5 items 1+4: bind the ON condition once against the combined
         // schema (safe here — unlike HashJoin, NLJ evaluates the condition
@@ -213,12 +244,24 @@ impl NestedLoopJoinOperator {
         let on_condition = on_condition.map(|condition| evaluator.bind(condition));
         let condition_pair_evaluable = on_condition.as_ref().map(pair_evaluable).unwrap_or(false);
 
-        // Materialize all right tuples upfront (with timeout checking)
+        // Materialize all right tuples upfront (with timeout checking).
+        //
+        // GH#29 (c7, M3): under the SAME cap as the hash join's build side,
+        // and with the same error. Candidate 6 routes every RIGHT / FULL join
+        // carrying a residual ON term here, and this materialization was
+        // unbounded — the one shape the hash join it replaced was bounded on.
+        let mut memory_used: usize = 0;
         let mut right_tuples = Vec::new();
         while let Some(tuple) = right.next()? {
             // Check timeout during right side materialization (blocking operation)
             if let Some(ref ctx) = timeout_ctx {
                 ctx.check_timeout()?;
+            }
+            memory_used = memory_used
+                .saturating_add(HashJoinOperator::estimate_tuple_size(&tuple))
+                .saturating_add(std::mem::size_of::<bool>());
+            if memory_used > memory_limit {
+                return Err(join_memory_limit_exceeded(memory_limit));
             }
             right_tuples.push(tuple);
         }
@@ -422,6 +465,22 @@ pub struct HashJoinOperator {
     // Join specification
     join_type: crate::sql::JoinType,
     on_condition: Option<crate::sql::LogicalExpr>,
+    /// GH#29 (c7, n5): the part of the ON condition the hash keys do NOT
+    /// express, checked on each candidate pair before the pair counts as a
+    /// match. `None` for a join whose keys are the whole condition (and for
+    /// the legacy path, which re-evaluates `on_condition` itself when its
+    /// keys turn out not to cover it).
+    ///
+    /// BOUND against the combined schema at construction (GH#29 c8, m7), so
+    /// the per-pair check can read the two tuples through a borrowed
+    /// [`PairView`] instead of cloning every value of both into a combined
+    /// tuple, once per candidate pair.
+    pair_residual: Option<crate::sql::LogicalExpr>,
+    /// Can [`pair_residual`](Self::pair_residual) be evaluated against a
+    /// borrowed pair view? Decided ONCE, exactly as the nested loop decides
+    /// it for its whole condition; anything else keeps the
+    /// materialize-then-evaluate path.
+    pair_residual_on_pair: bool,
 
     // Hash table (key: join columns, value: matching tuple bucket)
     hash_table: std::collections::HashMap<JoinKey, JoinBucket>,
@@ -436,6 +495,11 @@ pub struct HashJoinOperator {
     left_evaluator: crate::sql::Evaluator,
     right_evaluator: crate::sql::Evaluator,
     direct_key_indices: Option<DirectJoinKeyIndices>,
+    /// GH#29 (c4, F1): the key expressions of every `=` term the direct
+    /// index path could not take, each operand assigned to its side ONCE at
+    /// construction and bound against that side's schema. Empty when the
+    /// direct path applies or when no term could be assigned.
+    bound_key_pairs: Vec<BoundJoinKeyPair>,
     build_side: HashJoinBuildSide,
 
     // State machine
@@ -444,8 +508,12 @@ pub struct HashJoinOperator {
     // Probe phase state
     current_left_tuple: Option<Tuple>,
     current_match_key: Option<JoinKey>,
-    current_matches: Vec<Tuple>,
     match_index: usize,
+    /// Has the probe row currently being streamed matched at least one build
+    /// tuple? Decides the LEFT / FULL NULL extension once the bucket is
+    /// exhausted (GH#29 c7, n5: candidate 6 answered that question by
+    /// deep-cloning every surviving build tuple into a `Vec` first).
+    current_match_found: bool,
     pure_equi_join: bool,
     output_projection: Option<Vec<usize>>,
 
@@ -759,6 +827,42 @@ fn collect_direct_equi_pairs<'a>(
     }
 }
 
+/// Which of a join input's columns a qualifier is matched against
+/// (GH#29 c3, M1): the alias a `FROM` entry is known by (`source_table`) or
+/// the real table name behind an aliased base table (`source_table_name`).
+/// Alias matches are tried on BOTH sides before any real-name match is
+/// considered, so `FROM t AS a JOIN (SELECT id FROM u) t ON t.id = a.id`
+/// keys `t.id` on the derived table (alias `t`), never on `a`'s column
+/// whose real table happens to be `t`.
+#[derive(Clone, Copy)]
+enum DirectJoinQualifierTier {
+    Alias,
+    RealName,
+}
+
+/// Outcome of resolving one join-key column against one join input.
+enum DirectJoinMatch {
+    None,
+    Unique(usize),
+    Ambiguous,
+}
+
+/// How a key column's qualifier and name are compared against a join
+/// input's columns (GH#29 c5, MAJOR). The per-tuple evaluator this resolver
+/// stands in for (`Schema::get_qualified_column_index`, exact `==`) tells
+/// `FROM t AS "A" JOIN t AS "a"` apart — two legal, case-distinct quoted
+/// aliases — so the EXACT pass runs first on both sides, and the ASCII
+/// case-folded pass (the leniency for unquoted / lower-cased spellings)
+/// is consulted only when the exact pass matched on NEITHER side. Through
+/// candidate 4 the folded comparison was the only one: `"a".id` matched
+/// alias `"A"` too, both operands of `ON "a".id = "A".id + 1` fitted both
+/// sides, and the natural-order guess keyed the join backwards.
+#[derive(Clone, Copy)]
+enum DirectJoinNameCase {
+    Exact,
+    IgnoreAsciiCase,
+}
+
 fn direct_join_key_side(
     expr: &crate::sql::LogicalExpr,
     left_schema: &Schema,
@@ -767,31 +871,569 @@ fn direct_join_key_side(
     let crate::sql::LogicalExpr::Column { table, name } = expr else {
         return None;
     };
-    let left = resolve_direct_join_column(left_schema, table.as_deref(), name);
-    let right = resolve_direct_join_column(right_schema, table.as_deref(), name);
-    match (left, right) {
-        (Some(idx), None) => Some(DirectJoinKeySide::Left(idx)),
-        (None, Some(idx)) => Some(DirectJoinKeySide::Right(idx)),
+    let pick = |left: DirectJoinMatch, right: DirectJoinMatch| match (left, right) {
+        (DirectJoinMatch::Unique(idx), DirectJoinMatch::None) => Some(DirectJoinKeySide::Left(idx)),
+        (DirectJoinMatch::None, DirectJoinMatch::Unique(idx)) => Some(DirectJoinKeySide::Right(idx)),
         _ => None,
+    };
+    let Some(qualifier) = table.as_deref() else {
+        let (left, right) =
+            resolve_join_column_both_sides(left_schema, right_schema, None, name, DirectJoinQualifierTier::Alias);
+        return pick(left, right);
+    };
+    // Tier 1: the qualifier names an alias on either side. Any alias match
+    // (unique or not) settles the question at this tier; the real-name tier
+    // is consulted only when no column on either side carries the alias.
+    let (left_alias, right_alias) = resolve_join_column_both_sides(
+        left_schema,
+        right_schema,
+        Some(qualifier),
+        name,
+        DirectJoinQualifierTier::Alias,
+    );
+    if !matches!(left_alias, DirectJoinMatch::None) || !matches!(right_alias, DirectJoinMatch::None) {
+        return pick(left_alias, right_alias);
     }
+    // Tier 2: the qualifier is the real name of an aliased base table.
+    let (left_real, right_real) = resolve_join_column_both_sides(
+        left_schema,
+        right_schema,
+        Some(qualifier),
+        name,
+        DirectJoinQualifierTier::RealName,
+    );
+    pick(left_real, right_real)
 }
 
-fn resolve_direct_join_column(schema: &Schema, qualifier: Option<&str>, name: &str) -> Option<usize> {
+/// Resolve one key column on BOTH inputs at one qualifier tier: the
+/// exact-case pass first; the ASCII-case-folded pass only when the exact
+/// pass matched on neither side (see [`DirectJoinNameCase`]).
+fn resolve_join_column_both_sides(
+    left_schema: &Schema,
+    right_schema: &Schema,
+    qualifier: Option<&str>,
+    name: &str,
+    tier: DirectJoinQualifierTier,
+) -> (DirectJoinMatch, DirectJoinMatch) {
+    let exact_left = resolve_direct_join_column(left_schema, qualifier, name, tier, DirectJoinNameCase::Exact);
+    let exact_right = resolve_direct_join_column(right_schema, qualifier, name, tier, DirectJoinNameCase::Exact);
+    if !matches!(exact_left, DirectJoinMatch::None) || !matches!(exact_right, DirectJoinMatch::None) {
+        return (exact_left, exact_right);
+    }
+    (
+        resolve_direct_join_column(left_schema, qualifier, name, tier, DirectJoinNameCase::IgnoreAsciiCase),
+        resolve_direct_join_column(right_schema, qualifier, name, tier, DirectJoinNameCase::IgnoreAsciiCase),
+    )
+}
+
+fn resolve_direct_join_column(
+    schema: &Schema,
+    qualifier: Option<&str>,
+    name: &str,
+    tier: DirectJoinQualifierTier,
+    case: DirectJoinNameCase,
+) -> DirectJoinMatch {
+    let same = |value: Option<&str>, expected: &str| match case {
+        DirectJoinNameCase::Exact => value == Some(expected),
+        DirectJoinNameCase::IgnoreAsciiCase => option_eq_ignore_ascii_case(value, expected),
+    };
     let mut matches = schema.columns.iter().enumerate().filter(|(_, column)| {
-        if !column.name.eq_ignore_ascii_case(name) {
+        if !same(Some(column.name.as_str()), name) {
             return false;
         }
-        qualifier.map_or(true, |q| {
-            option_eq_ignore_ascii_case(column.source_table.as_deref(), q)
-                || option_eq_ignore_ascii_case(column.source_table_name.as_deref(), q)
+        qualifier.map_or(true, |q| match tier {
+            DirectJoinQualifierTier::Alias => same(column.source_table.as_deref(), q),
+            DirectJoinQualifierTier::RealName => same(column.source_table_name.as_deref(), q),
         })
     });
-    let (idx, _) = matches.next()?;
-    matches.next().is_none().then_some(idx)
+    let Some((idx, _)) = matches.next() else {
+        return DirectJoinMatch::None;
+    };
+    if matches.next().is_some() {
+        DirectJoinMatch::Ambiguous
+    } else {
+        DirectJoinMatch::Unique(idx)
+    }
 }
 
 fn option_eq_ignore_ascii_case(value: Option<&str>, expected: &str) -> bool {
     value.is_some_and(|value| value.eq_ignore_ascii_case(expected))
+}
+
+/// One `=` term of a hash-join ON condition with each operand assigned to
+/// the join input it evaluates on and BOUND (`BoundColumn`) against that
+/// input's schema (GH#29 c4, F1). Decided once at construction, never per
+/// tuple: with `FROM u AS a JOIN (SELECT id FROM t) u ON u.id + 10 = a.id`
+/// the left input (alias `a`, real name `u`) could evaluate `u.id + 10`
+/// through the real-name fallback, so a per-tuple "natural operand, other
+/// operand on `Err`" rule keyed the left side on `u.id + 10` (a's own id)
+/// and the right side on `u.id + 10` too — the keys never met.
+#[derive(Debug, Clone)]
+struct BoundJoinKeyPair {
+    left: crate::sql::LogicalExpr,
+    right: crate::sql::LogicalExpr,
+}
+
+/// Which join inputs one key operand can be evaluated on: the operand bound
+/// against the left schema when every column it references resolves there,
+/// likewise for the right. An operand without column references (a
+/// literal) fits both — and is never keyed (GH#29 c5, m3): the hash key
+/// compares raw values with no int / float / numeric coercion, so
+/// `5 = b.price` on a NUMERIC column hashed `Int(5)` against `Numeric(5)`
+/// and matched nothing; declined, the term is re-evaluated by the
+/// coercing evaluator per candidate pair.
+struct JoinOperandFit {
+    left: Option<crate::sql::LogicalExpr>,
+    right: Option<crate::sql::LogicalExpr>,
+    has_column_refs: bool,
+    /// Did any column reference of this operand carry a QUALIFIER
+    /// (`t.c`)? GH#29 (c6, BLOCKER): the both-fit-both decline below is
+    /// about a qualifier that names a relation on both sides; an operand
+    /// spelled with bare names only fits both sides by definition, and
+    /// declining THAT is what turned every `NATURAL JOIN` / `JOIN … USING`
+    /// into a cartesian product.
+    has_qualified_refs: bool,
+}
+
+/// Assign both operands of every `=` term of `condition` to a side (see
+/// [`BoundJoinKeyPair`]). Returns the bound pairs and whether they cover
+/// the WHOLE condition: a term whose operands cannot be assigned
+/// unambiguously — or any non-equality node — is left out of the key, and
+/// the caller must then re-evaluate the full condition per candidate pair.
+fn bind_hash_join_key_pairs(
+    condition: &crate::sql::LogicalExpr,
+    left_schema: &Schema,
+    right_schema: &Schema,
+) -> (Vec<BoundJoinKeyPair>, bool) {
+    let mut pairs = Vec::new();
+    let mut covered = true;
+    collect_bound_key_pairs(condition, left_schema, right_schema, &mut pairs, &mut covered);
+    (pairs, covered)
+}
+
+fn collect_bound_key_pairs(
+    expr: &crate::sql::LogicalExpr,
+    left_schema: &Schema,
+    right_schema: &Schema,
+    pairs: &mut Vec<BoundJoinKeyPair>,
+    covered: &mut bool,
+) {
+    use crate::sql::{BinaryOperator, LogicalExpr};
+    match expr {
+        LogicalExpr::BinaryExpr {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
+            collect_bound_key_pairs(left, left_schema, right_schema, pairs, covered);
+            collect_bound_key_pairs(right, left_schema, right_schema, pairs, covered);
+        }
+        LogicalExpr::BinaryExpr {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } => match bind_join_key_term(left, right, left_schema, right_schema) {
+            Some(pair) => pairs.push(pair),
+            // The reason was traced by `bind_join_key_term`.
+            None => *covered = false,
+        },
+        _ => {
+            tracing::debug!(
+                target: "helios::join",
+                node = ?expr,
+                "hash-join ON node is not an equality; the full condition is re-evaluated per candidate pair"
+            );
+            *covered = false;
+        }
+    }
+}
+
+/// GH#29 (c5, m4): every declined key term is traced, so a hash join that
+/// degrades to per-pair re-evaluation of its ON condition is diagnosable
+/// (`RUST_LOG=helios::join=debug`).
+fn trace_declined_join_key_term(lhs: &crate::sql::LogicalExpr, rhs: &crate::sql::LogicalExpr, reason: &str) {
+    tracing::debug!(
+        target: "helios::join",
+        lhs = ?lhs,
+        rhs = ?rhs,
+        reason,
+        "hash-join key term declined; the full ON condition is re-evaluated per candidate pair"
+    );
+}
+
+/// Assign the two operands of one `lhs = rhs` term. The natural order
+/// (`lhs` on the left input, `rhs` on the right) is tried first — an
+/// unqualified name both inputs carry keeps that first-side behaviour, and
+/// it is the `NATURAL JOIN` / `JOIN … USING` lowering's own shape — then
+/// the reversed order; a term that fits neither way is declined.
+///
+/// Declined too: a term with a literal operand (GH#29 c5, m3 — the hash
+/// key does not coerce; the re-evaluation does) and a term whose operands
+/// BOTH fit BOTH sides *through a qualifier* (GH#29 c5 MAJOR, narrowed in
+/// c6 — after the exact-case pass the only legal SQL that reaches that
+/// branch is a case-folded alias collision, and guessing the natural order
+/// keyed `ON "a".id = "A".id + 1` backwards; the combined evaluator
+/// resolves it exactly).
+///
+/// A declined term is NOT dropped: `plan_join_condition` puts it in the
+/// RESIDUAL bucket, and the residual is either checked inside the join or
+/// filtered after it (GH#29 c6, m4).
+fn bind_join_key_term(
+    lhs: &crate::sql::LogicalExpr,
+    rhs: &crate::sql::LogicalExpr,
+    left_schema: &Schema,
+    right_schema: &Schema,
+) -> Option<BoundJoinKeyPair> {
+    let Some(lhs_fit) = join_operand_fit(lhs, left_schema, right_schema) else {
+        trace_declined_join_key_term(lhs, rhs, "left operand carries a node the key binder does not walk");
+        return None;
+    };
+    let Some(rhs_fit) = join_operand_fit(rhs, left_schema, right_schema) else {
+        trace_declined_join_key_term(lhs, rhs, "right operand carries a node the key binder does not walk");
+        return None;
+    };
+    if !lhs_fit.has_column_refs || !rhs_fit.has_column_refs {
+        trace_declined_join_key_term(
+            lhs,
+            rhs,
+            "an operand references no column (the hash key would not coerce a literal)",
+        );
+        return None;
+    }
+    let lhs_fits_both = lhs_fit.left.is_some() && lhs_fit.right.is_some();
+    let rhs_fits_both = rhs_fit.left.is_some() && rhs_fit.right.is_some();
+    // GH#29 (c6, BLOCKER): only a QUALIFIED double fit is an alias
+    // collision. A term whose operands carry bare names only fits both
+    // sides by construction — and that is exactly the shape the planner
+    // lowers EVERY `NATURAL JOIN` / `JOIN … USING (c)` to, unconditionally:
+    // one `=` per shared column, both operands bare. For it the natural
+    // order (lhs -> left input, rhs -> right input) is the meaning.
+    // Candidate 5 declined it, the key came out empty, and the nested-loop
+    // join then bound BOTH bare operands to the left input's slot:
+    // `left.c = left.c`, i.e. a cartesian product.
+    if lhs_fits_both && rhs_fits_both && (lhs_fit.has_qualified_refs || rhs_fit.has_qualified_refs) {
+        trace_declined_join_key_term(lhs, rhs, "both operands resolve on both inputs (alias collision)");
+        return None;
+    }
+    let JoinOperandFit {
+        left: lhs_on_left,
+        right: lhs_on_right,
+        ..
+    } = lhs_fit;
+    let JoinOperandFit {
+        left: rhs_on_left,
+        right: rhs_on_right,
+        ..
+    } = rhs_fit;
+    if let (Some(left), Some(right)) = (lhs_on_left, rhs_on_right) {
+        return Some(BoundJoinKeyPair { left, right });
+    }
+    if let (Some(left), Some(right)) = (rhs_on_left, lhs_on_right) {
+        return Some(BoundJoinKeyPair { left, right });
+    }
+    trace_declined_join_key_term(lhs, rhs, "operands fit no (left, right) assignment");
+    None
+}
+
+/// Resolve every column reference of one key operand against both inputs
+/// and bind the operand for each side it fits. `None` when the operand
+/// carries a node whose references the binder does not walk (a subquery,
+/// an aggregate or window call, a wildcard, a row marker): such a term is
+/// declined rather than keyed on a guess.
+fn join_operand_fit(
+    expr: &crate::sql::LogicalExpr,
+    left_schema: &Schema,
+    right_schema: &Schema,
+) -> Option<JoinOperandFit> {
+    use crate::sql::evaluator::map_column_refs;
+    use crate::sql::LogicalExpr;
+    if contains_operator_managed_node(expr) {
+        return None;
+    }
+    let mut left_indices: Vec<Option<usize>> = Vec::new();
+    let mut right_indices: Vec<Option<usize>> = Vec::new();
+    let mut has_qualified_refs = false;
+    let _ = map_column_refs(expr.clone(), &mut |table, name| {
+        let (left, right) = resolve_join_key_ref(table.as_deref(), &name, left_schema, right_schema);
+        has_qualified_refs |= table.is_some();
+        left_indices.push(left);
+        right_indices.push(right);
+        LogicalExpr::Column { table, name }
+    });
+    let has_column_refs = !left_indices.is_empty();
+    let bind = |indices: &[Option<usize>]| -> Option<LogicalExpr> {
+        if indices.iter().any(Option::is_none) {
+            return None;
+        }
+        // Same walker, same expression, same visiting order as above.
+        let mut next = indices.iter();
+        Some(map_column_refs(
+            expr.clone(),
+            &mut |table, name| match next.next().copied().flatten() {
+                Some(index) => LogicalExpr::BoundColumn { index, table, name },
+                None => LogicalExpr::Column { table, name },
+            },
+        ))
+    };
+    Some(JoinOperandFit {
+        left: bind(&left_indices),
+        right: bind(&right_indices),
+        has_column_refs,
+        has_qualified_refs,
+    })
+}
+
+/// Does `expr` contain a node whose column references `map_column_refs`
+/// does not descend into (or that cannot be a hash key at all)?
+fn contains_operator_managed_node(expr: &crate::sql::LogicalExpr) -> bool {
+    use crate::sql::LogicalExpr;
+    match expr {
+        LogicalExpr::Column { .. }
+        | LogicalExpr::BoundColumn { .. }
+        | LogicalExpr::Literal(_)
+        | LogicalExpr::Parameter { .. } => false,
+        LogicalExpr::BinaryExpr { left, right, .. } => {
+            contains_operator_managed_node(left) || contains_operator_managed_node(right)
+        }
+        LogicalExpr::UnaryExpr { expr, .. }
+        | LogicalExpr::Cast { expr, .. }
+        | LogicalExpr::IsNull { expr, .. }
+        | LogicalExpr::InSet { expr, .. } => contains_operator_managed_node(expr),
+        LogicalExpr::Between { expr, low, high, .. } => {
+            contains_operator_managed_node(expr)
+                || contains_operator_managed_node(low)
+                || contains_operator_managed_node(high)
+        }
+        LogicalExpr::InList { expr, list, .. } => {
+            contains_operator_managed_node(expr) || list.iter().any(contains_operator_managed_node)
+        }
+        LogicalExpr::Case {
+            expr,
+            when_then,
+            else_result,
+        } => {
+            expr.as_deref().is_some_and(contains_operator_managed_node)
+                || when_then
+                    .iter()
+                    .any(|(when, then)| contains_operator_managed_node(when) || contains_operator_managed_node(then))
+                || else_result.as_deref().is_some_and(contains_operator_managed_node)
+        }
+        LogicalExpr::ScalarFunction { args, .. } => args.iter().any(contains_operator_managed_node),
+        LogicalExpr::Tuple { items } => items.iter().any(contains_operator_managed_node),
+        LogicalExpr::ArraySubscript { array, index } => {
+            contains_operator_managed_node(array) || contains_operator_managed_node(index)
+        }
+        _ => true,
+    }
+}
+
+/// Resolve one column reference of a key operand on both inputs, with the
+/// same two tiers as [`direct_join_key_side`]: a qualifier that names an
+/// ALIAS on either side settles the question at that tier (the real-name
+/// tier is consulted only when no column on either side carries the
+/// alias); a duplicate match on a side is no match. Within a tier the
+/// exact-case pass runs first, the case-folded one only when it matched
+/// on neither side ([`DirectJoinNameCase`]). An unqualified name resolves
+/// to the first column of that name on each side, as before.
+fn resolve_join_key_ref(
+    qualifier: Option<&str>,
+    name: &str,
+    left_schema: &Schema,
+    right_schema: &Schema,
+) -> (Option<usize>, Option<usize>) {
+    let Some(qualifier) = qualifier else {
+        return (left_schema.get_column_index(name), right_schema.get_column_index(name));
+    };
+    let unique = |found: DirectJoinMatch| match found {
+        DirectJoinMatch::Unique(idx) => Some(idx),
+        DirectJoinMatch::None | DirectJoinMatch::Ambiguous => None,
+    };
+    let (left_alias, right_alias) = resolve_join_column_both_sides(
+        left_schema,
+        right_schema,
+        Some(qualifier),
+        name,
+        DirectJoinQualifierTier::Alias,
+    );
+    if !matches!(left_alias, DirectJoinMatch::None) || !matches!(right_alias, DirectJoinMatch::None) {
+        return (unique(left_alias), unique(right_alias));
+    }
+    let (left_real, right_real) = resolve_join_column_both_sides(
+        left_schema,
+        right_schema,
+        Some(qualifier),
+        name,
+        DirectJoinQualifierTier::RealName,
+    );
+    (unique(left_real), unique(right_real))
+}
+
+/// How one join's ON condition is executed, decided ONCE — before either
+/// operator is built, because the hash join's constructor consumes its
+/// build input and there is no falling back afterwards.
+///
+/// GH#29 (c6, m4): terms are bucketed by BINDABILITY, not by syntax.
+/// `collect_and_terms` sent every `BinaryExpr{op: Eq}` to the key bucket,
+/// so `sa.x = 20`, `5 = pa.pn` and `sa.x = (SELECT …)` — none of which any
+/// key binder can bind — landed there, were declined, and then appeared in
+/// NEITHER bucket: silently dropped, with `is_pure_equi_join` telling the
+/// operator the keys expressed the whole condition. A term the binder
+/// declines now goes to the residual, where it is evaluated.
+struct JoinConditionPlan {
+    /// The `=` terms whose operands the binder assigned to a side. `None`
+    /// when not one term bound: nothing to hash on.
+    equi: Option<crate::sql::LogicalExpr>,
+    /// Everything else — a non-equality term, and every `=` term the binder
+    /// declined. Never dropped.
+    residual: Option<crate::sql::LogicalExpr>,
+    /// The plain-column fast path over `equi`, when it applies.
+    direct_key_indices: Option<DirectJoinKeyIndices>,
+    /// The bound operand pairs of `equi`, when the direct path does
+    /// not apply. Bound HERE and handed to the operator (GH#29 c6, m3):
+    /// candidate 5 bound every pair twice (pre-check + constructor) and
+    /// traced every declined term twice.
+    bound_key_pairs: Vec<BoundJoinKeyPair>,
+}
+
+/// The key decision [`plan_join_condition`] made, handed to
+/// `HashJoinOperator` so it does not repeat it (GH#29 c6, m3).
+struct PreboundJoinKeys {
+    direct_key_indices: Option<DirectJoinKeyIndices>,
+    bound_key_pairs: Vec<BoundJoinKeyPair>,
+    /// Do the keys express the WHOLE `on_condition` the operator is given?
+    /// False when the operator is handed the residual too, to check on the
+    /// candidate pair before it calls the pair matched (GH#29 c6, m5).
+    keys_cover_condition: bool,
+}
+
+fn plan_join_condition(
+    condition: &crate::sql::LogicalExpr,
+    left_schema: &Schema,
+    right_schema: &Schema,
+) -> JoinConditionPlan {
+    // Fast path, and the one every PK/FK join takes: the WHOLE condition is
+    // plain `Column = Column` equalities with one operand on each side, which
+    // `build_direct_join_key_indices` covers by slot index. No term can be
+    // declined, so no term has to be bound to find that out — the per-term
+    // binder below is skipped exactly as it was before the bucketing.
+    if let Some(direct_key_indices) = build_direct_join_key_indices(condition, left_schema, right_schema) {
+        return JoinConditionPlan {
+            equi: Some(condition.clone()),
+            residual: None,
+            direct_key_indices: Some(direct_key_indices),
+            bound_key_pairs: Vec::new(),
+        };
+    }
+
+    let mut equi_parts = Vec::new();
+    let mut residual_parts = Vec::new();
+    let mut bound_key_pairs = Vec::new();
+    collect_bindable_terms(
+        condition,
+        left_schema,
+        right_schema,
+        &mut equi_parts,
+        &mut residual_parts,
+        &mut bound_key_pairs,
+    );
+    let equi = combine_with_and(equi_parts);
+    let residual = combine_with_and(residual_parts);
+    // The plain-column index path is preferred whenever it covers the equi
+    // part; the bound pairs are then unused, exactly as in the constructor.
+    let direct_key_indices = equi
+        .as_ref()
+        .and_then(|equi| build_direct_join_key_indices(equi, left_schema, right_schema));
+    if direct_key_indices.is_some() {
+        bound_key_pairs.clear();
+    }
+    JoinConditionPlan {
+        equi,
+        residual,
+        direct_key_indices,
+        bound_key_pairs,
+    }
+}
+
+/// Walk the AND chain, sending each term to the bucket that can actually
+/// execute it (see [`JoinConditionPlan`]).
+fn collect_bindable_terms(
+    expr: &crate::sql::LogicalExpr,
+    left_schema: &Schema,
+    right_schema: &Schema,
+    equi: &mut Vec<crate::sql::LogicalExpr>,
+    residual: &mut Vec<crate::sql::LogicalExpr>,
+    pairs: &mut Vec<BoundJoinKeyPair>,
+) {
+    use crate::sql::{BinaryOperator, LogicalExpr};
+    match expr {
+        LogicalExpr::BinaryExpr {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
+            collect_bindable_terms(left, left_schema, right_schema, equi, residual, pairs);
+            collect_bindable_terms(right, left_schema, right_schema, equi, residual, pairs);
+        }
+        LogicalExpr::BinaryExpr {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } => match bind_join_key_term(left, right, left_schema, right_schema) {
+            Some(pair) => {
+                pairs.push(pair);
+                equi.push(expr.clone());
+            }
+            // The reason was traced by `bind_join_key_term`.
+            None => residual.push(expr.clone()),
+        },
+        _ => residual.push(expr.clone()),
+    }
+}
+
+/// Must this condition take `NestedLoopJoinOperator`?
+///
+/// * Nothing bound (`equi` is `None`): every build row would land in ONE
+///   bucket and the probe would be O(n·m) anyway, with the hash join's
+///   per-bucket bookkeeping on top.
+/// * A residual under RIGHT / FULL: the hash join tracks unmatched build
+///   rows per key BUCKET, so once one probe row passes the residual for a
+///   bucket, the build rows of that bucket that FAILED it were dropped
+///   instead of NULL-extended (`a RIGHT JOIN b ON a.id = b.id AND b.x =
+///   b.y` lost b's `x <> y` row). The nested-loop join keeps a per-tuple
+///   matched bitmap. INNER and LEFT keep the hash join: INNER filters the
+///   residual after the join, LEFT checks it on the candidate pair.
+fn join_condition_needs_nested_loop(plan: &JoinConditionPlan, join_type: &crate::sql::JoinType) -> bool {
+    if plan.equi.is_none() {
+        tracing::debug!(
+            target: "helios::join",
+            residual = ?plan.residual,
+            "no hash-join key term could be bound; using a nested-loop join"
+        );
+        return true;
+    }
+    if plan.residual.is_some() && matches!(join_type, crate::sql::JoinType::Right | crate::sql::JoinType::Full) {
+        tracing::debug!(
+            target: "helios::join",
+            residual = ?plan.residual,
+            join_type = ?join_type,
+            "a residual ON term under an outer join that preserves the build side; using a nested-loop join"
+        );
+        return true;
+    }
+    false
+}
+
+/// [`join_condition_needs_nested_loop`] over a raw condition — the shape the
+/// unit tests pin, and the reason the two are separate functions is that the
+/// executor plans the condition once and reuses the plan.
+#[cfg(test)]
+fn hash_join_keys_need_nested_loop(
+    condition: &crate::sql::LogicalExpr,
+    join_type: &crate::sql::JoinType,
+    left_schema: &Schema,
+    right_schema: &Schema,
+) -> bool {
+    join_condition_needs_nested_loop(&plan_join_condition(condition, left_schema, right_schema), join_type)
 }
 
 fn join_input_leaf_info(plan: &crate::sql::LogicalPlan) -> Option<(&str, Option<&String>, &Schema, bool)> {
@@ -1082,34 +1724,84 @@ enum JoinState {
     Exhausted,
 }
 
-impl HashJoinOperator {
-    /// Fallback hash-join build-side memory limit, in megabytes, used when an
-    /// operator is created without an explicit limit.
-    ///
-    /// A hard 100 MB cap previously aborted large analytic joins outright with
-    /// no recourse (NANO-DEFICIENCIES A2 — e.g. a 116K ⋈ 614K join). The
-    /// default is now raised to 1 GB and is overridable at runtime via the
-    /// `HELIOSDB_HASH_JOIN_MEM_MB` environment variable (value in MB), so
-    /// operators can size it to the host without recompiling.
-    const DEFAULT_MEMORY_LIMIT_MB: usize = 1024;
+/// Fallback join materialization limit, in megabytes, used when neither the
+/// configuration nor the environment sets one.
+///
+/// A hard 100 MB cap previously aborted large analytic joins outright with no
+/// recourse (NANO-DEFICIENCIES A2 — e.g. a 116K ⋈ 614K join). The default is
+/// 1 GB.
+const DEFAULT_JOIN_MEMORY_LIMIT_MB: usize = 1024;
 
-    /// Resolve the default build-side memory limit (bytes), honoring the
-    /// `HELIOSDB_HASH_JOIN_MEM_MB` env override when set to a positive integer.
+/// `[performance] join_memory_limit_mb` / `--join-memory-limit-mb`, applied by
+/// `EmbeddedDatabase` at startup. `0` = not configured (use the default).
+/// Process-global, last config wins — the same shape as the other runtime
+/// toggles applied there (`lock_census`, `write_volume`, `copy_phase_stats`).
+static JOIN_MEMORY_LIMIT_MB: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Apply the configured join materialization limit (MB). `0` clears it back
+/// to the built-in default. See [`join_memory_limit`].
+pub(crate) fn set_join_memory_limit_mb(mb: usize) {
+    JOIN_MEMORY_LIMIT_MB.store(mb, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The cap, in BYTES, on how much a join may materialize before it is
+/// refused: the hash join's build side and — since GH#29 (c7, M3) — the
+/// nested loop's right input, which candidate 6 made reachable for every
+/// RIGHT / FULL join carrying a residual ON term and which had no cap at all.
+///
+/// Resolution order: the `HELIOSDB_HASH_JOIN_MEM_MB` environment variable
+/// (the documented runtime override, kept for compatibility), then
+/// `[performance] join_memory_limit_mb` / `--join-memory-limit-mb`, then
+/// [`DEFAULT_JOIN_MEMORY_LIMIT_MB`]. One knob, one error, both operators.
+fn join_memory_limit() -> usize {
+    resolve_join_memory_limit(
+        std::env::var("HELIOSDB_HASH_JOIN_MEM_MB").ok().as_deref(),
+        JOIN_MEMORY_LIMIT_MB.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// [`join_memory_limit`] without the two global reads, so the precedence is
+/// pinned without mutating process state a concurrently running test could
+/// observe.
+fn resolve_join_memory_limit(env_mb: Option<&str>, configured_mb: usize) -> usize {
+    env_mb
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|mb| *mb > 0)
+        .or(if configured_mb > 0 { Some(configured_mb) } else { None })
+        .unwrap_or(DEFAULT_JOIN_MEMORY_LIMIT_MB)
+        .saturating_mul(1024 * 1024)
+}
+
+/// The one refusal both join materializations raise when they hit
+/// [`join_memory_limit`] — same text, same remedies, whichever operator the
+/// planner picked (GH#29 c7, M3).
+fn join_memory_limit_exceeded(memory_limit: usize) -> Error {
+    Error::query_execution(format!(
+        "Join exceeds memory limit ({} MB). Raise it with the [performance] join_memory_limit_mb \
+         configuration key, the --join-memory-limit-mb flag or the HELIOSDB_HASH_JOIN_MEM_MB \
+         environment variable, or rewrite the query (e.g. add a more selective filter or join key).",
+        memory_limit / (1024 * 1024)
+    ))
+}
+
+impl HashJoinOperator {
+    /// Resolve the default materialization limit (bytes); see
+    /// [`join_memory_limit`].
     fn default_memory_limit() -> usize {
-        std::env::var("HELIOSDB_HASH_JOIN_MEM_MB")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .filter(|mb| *mb > 0)
-            .unwrap_or(Self::DEFAULT_MEMORY_LIMIT_MB)
-            .saturating_mul(1024 * 1024)
+        join_memory_limit()
     }
 
-    /// Create a new hash join operator with default memory limit
+    /// Create a new hash join operator with default memory limit.
+    ///
+    /// `parameters` are the statement's bind values: the combined evaluator
+    /// needs them for any part of the ON condition it re-evaluates per
+    /// candidate pair (GH#29 c7, M1).
     pub fn new(
         left: Box<dyn PhysicalOperator>,
         right: Box<dyn PhysicalOperator>,
         join_type: crate::sql::JoinType,
         on_condition: Option<crate::sql::LogicalExpr>,
+        parameters: Vec<crate::Value>,
         timeout_ctx: Option<TimeoutContext>,
     ) -> Result<Self> {
         Self::with_memory_limit(
@@ -1117,6 +1809,7 @@ impl HashJoinOperator {
             right,
             join_type,
             on_condition,
+            parameters,
             HashJoinBuildSide::Right,
             Self::default_memory_limit(),
             timeout_ctx,
@@ -1131,6 +1824,7 @@ impl HashJoinOperator {
         right: Box<dyn PhysicalOperator>,
         join_type: crate::sql::JoinType,
         on_condition: Option<crate::sql::LogicalExpr>,
+        parameters: Vec<crate::Value>,
         timeout_ctx: Option<TimeoutContext>,
     ) -> Result<Self> {
         Self::with_memory_limit(
@@ -1138,20 +1832,90 @@ impl HashJoinOperator {
             right,
             join_type,
             on_condition,
+            parameters,
             HashJoinBuildSide::Left,
             Self::default_memory_limit(),
             timeout_ctx,
         )
     }
 
-    /// Create a projected inner hash join. The projection indexes refer to the
-    /// normal combined left+right join schema, but emitted tuples contain only
-    /// those projected values. This avoids building a full combined tuple only
-    /// for a parent ProjectOperator to clone a small subset of columns.
-    fn new_projected_inner(
+    /// Create a new hash join operator with custom memory limit
+    fn with_memory_limit(
+        left: Box<dyn PhysicalOperator>,
+        right: Box<dyn PhysicalOperator>,
+        join_type: crate::sql::JoinType,
+        on_condition: Option<crate::sql::LogicalExpr>,
+        parameters: Vec<crate::Value>,
+        build_side: HashJoinBuildSide,
+        memory_limit: usize,
+        timeout_ctx: Option<TimeoutContext>,
+    ) -> Result<Self> {
+        Self::with_memory_limit_projected(
+            left,
+            right,
+            join_type,
+            on_condition,
+            parameters,
+            build_side,
+            memory_limit,
+            timeout_ctx,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// Create a hash join whose keys were already decided by
+    /// [`plan_join_condition`] (GH#29 c6, m3 + m5).
+    ///
+    /// `on_condition` is the KEYED part. `pair_residual`, when present, is the
+    /// rest of the ON condition, checked on every candidate pair BEFORE the
+    /// pair counts as a match — which is how a residual ON term under a LEFT
+    /// join is honoured without dropping the NULL-extended rows a post-join
+    /// filter would have eaten. Candidate 6 handed the operator the WHOLE
+    /// condition instead, so every candidate pair re-evaluated the equality
+    /// terms the hash lookup had already proved (GH#29 c7, n5).
+    fn new_with_keys(
+        left: Box<dyn PhysicalOperator>,
+        right: Box<dyn PhysicalOperator>,
+        join_type: crate::sql::JoinType,
+        on_condition: Option<crate::sql::LogicalExpr>,
+        pair_residual: Option<crate::sql::LogicalExpr>,
+        parameters: Vec<crate::Value>,
+        keys: PreboundJoinKeys,
+        build_side: HashJoinBuildSide,
+        timeout_ctx: Option<TimeoutContext>,
+    ) -> Result<Self> {
+        Self::with_memory_limit_projected(
+            left,
+            right,
+            join_type,
+            on_condition,
+            parameters,
+            build_side,
+            Self::default_memory_limit(),
+            timeout_ctx,
+            None,
+            None,
+            Some(keys),
+            pair_residual,
+        )
+    }
+
+    /// [`Self::new_with_keys`] for the projected inner join built by
+    /// `handle_projected_join`. The projection indexes refer to the normal
+    /// combined left+right join schema, but emitted tuples contain only those
+    /// projected values — which avoids building a full combined tuple only
+    /// for a parent `ProjectOperator` to clone a small subset of columns, and
+    /// is why this shape can serve neither a residual nor a post-join
+    /// predicate.
+    fn new_projected_inner_with_keys(
         left: Box<dyn PhysicalOperator>,
         right: Box<dyn PhysicalOperator>,
         on_condition: Option<crate::sql::LogicalExpr>,
+        parameters: Vec<crate::Value>,
+        keys: PreboundJoinKeys,
         projection: Vec<usize>,
         output_schema: Arc<Schema>,
         build_side: HashJoinBuildSide,
@@ -1162,33 +1926,13 @@ impl HashJoinOperator {
             right,
             crate::sql::JoinType::Inner,
             on_condition,
+            parameters,
             build_side,
             Self::default_memory_limit(),
             timeout_ctx,
             Some(projection),
             Some(output_schema),
-        )
-    }
-
-    /// Create a new hash join operator with custom memory limit
-    fn with_memory_limit(
-        left: Box<dyn PhysicalOperator>,
-        right: Box<dyn PhysicalOperator>,
-        join_type: crate::sql::JoinType,
-        on_condition: Option<crate::sql::LogicalExpr>,
-        build_side: HashJoinBuildSide,
-        memory_limit: usize,
-        timeout_ctx: Option<TimeoutContext>,
-    ) -> Result<Self> {
-        Self::with_memory_limit_projected(
-            left,
-            right,
-            join_type,
-            on_condition,
-            build_side,
-            memory_limit,
-            timeout_ctx,
-            None,
+            Some(keys),
             None,
         )
     }
@@ -1198,11 +1942,14 @@ impl HashJoinOperator {
         right: Box<dyn PhysicalOperator>,
         join_type: crate::sql::JoinType,
         on_condition: Option<crate::sql::LogicalExpr>,
+        parameters: Vec<crate::Value>,
         build_side: HashJoinBuildSide,
         memory_limit: usize,
         timeout_ctx: Option<TimeoutContext>,
         output_projection: Option<Vec<usize>>,
         projected_output_schema: Option<Arc<Schema>>,
+        prebound_keys: Option<PreboundJoinKeys>,
+        pair_residual: Option<crate::sql::LogicalExpr>,
     ) -> Result<Self> {
         // Build output schema by combining left and right schemas
         let left_schema = left.schema();
@@ -1216,17 +1963,54 @@ impl HashJoinOperator {
         let combined_schema = Arc::new(Schema { columns });
         let output_schema = projected_output_schema.unwrap_or_else(|| Arc::clone(&combined_schema));
 
-        let direct_key_indices = on_condition
-            .as_ref()
-            .and_then(|condition| build_direct_join_key_indices(condition, &left_schema, &right_schema));
-        let pure_equi_join = is_pure_equi_join(&on_condition);
+        // GH#29 (c4, F1): operand sides are decided here, never per tuple.
+        // A term that cannot be assigned unambiguously leaves the key, and
+        // the operator then re-evaluates the WHOLE condition on the combined
+        // tuple (`pure_equi_join == false`) — the alias-first evaluator path
+        // — instead of guessing. GH#29 (c6, m3): when the caller already
+        // planned the condition, the pairs come in with it and are not bound
+        // (nor traced) a second time.
+        let (direct_key_indices, bound_key_pairs, keys_cover_condition) = match prebound_keys {
+            Some(keys) => (keys.direct_key_indices, keys.bound_key_pairs, keys.keys_cover_condition),
+            None => {
+                let direct_key_indices = on_condition
+                    .as_ref()
+                    .and_then(|condition| build_direct_join_key_indices(condition, &left_schema, &right_schema));
+                let (pairs, covered) = match (&direct_key_indices, &on_condition) {
+                    (None, Some(condition)) => bind_hash_join_key_pairs(condition, &left_schema, &right_schema),
+                    _ => (Vec::new(), true),
+                };
+                (direct_key_indices, pairs, covered)
+            }
+        };
+        // GH#29 (c7, n5): a pair residual is, by construction, a part of the
+        // condition the keys do NOT cover.
+        let pure_equi_join = pair_residual.is_none() && keys_cover_condition && is_pure_equi_join(&on_condition);
 
-        // Create evaluator with output schema for evaluating join conditions on combined tuples
-        let evaluator = crate::sql::Evaluator::new(combined_schema);
+        // Create evaluator with output schema for evaluating join conditions
+        // on combined tuples. GH#29 (c7, M1): WITH the statement's bind
+        // values — `Evaluator::new` gave it an empty parameter vector, so
+        // `ON a.id = b.id AND b.k = $1` (whose `$1` term the key binder
+        // declines, exactly as intended) failed with `Parameter $1 not
+        // provided` instead of evaluating.
+        let evaluator = crate::sql::Evaluator::with_parameters(combined_schema, parameters.clone());
 
-        // Create separate evaluators for key extraction (left and right schemas)
-        let left_evaluator = crate::sql::Evaluator::new(left_schema);
-        let right_evaluator = crate::sql::Evaluator::new(right_schema);
+        // Create separate evaluators for key extraction (left and right
+        // schemas). These carry the bind values too: a key OPERAND may
+        // legally contain one — `ON a.id + $1 = b.id` binds (it references a
+        // column, and a parameter is not a node the binder refuses), and
+        // `extract_join_columns` evaluates that operand per tuple. Two clones
+        // of the bind vector per join CONSTRUCTION, never per tuple.
+        let left_evaluator = crate::sql::Evaluator::with_parameters(left_schema, parameters.clone());
+        let right_evaluator = crate::sql::Evaluator::with_parameters(right_schema, parameters);
+        // GH#29 (c8, m7): bind the pair residual against the combined schema
+        // once, then decide once whether it can be evaluated on a BORROWED
+        // pair — the same seam `NestedLoopJoinOperator` has used since R3.5.
+        // A residual that does not bind (an ambiguous bare name) stays a
+        // `Column` node, is not pair-evaluable, and keeps the previous
+        // materialize-then-evaluate path byte for byte.
+        let pair_residual = pair_residual.map(|residual| evaluator.bind(residual));
+        let pair_residual_on_pair = pair_residual.as_ref().map(pair_evaluable).unwrap_or(false);
         let (probe_input, mut build_input) = match build_side {
             HashJoinBuildSide::Right => (left, right),
             HashJoinBuildSide::Left => (right, left),
@@ -1237,18 +2021,21 @@ impl HashJoinOperator {
             left: probe_input,
             join_type,
             on_condition,
+            pair_residual,
+            pair_residual_on_pair,
             hash_table: std::collections::HashMap::new(),
             output_schema,
             evaluator,
             left_evaluator,
             right_evaluator,
             direct_key_indices,
+            bound_key_pairs,
             build_side,
             state: JoinState::Initial,
             current_left_tuple: None,
             current_match_key: None,
-            current_matches: Vec::new(),
             match_index: 0,
+            current_match_found: false,
             pure_equi_join,
             output_projection,
             matched_right_keys: std::collections::HashSet::new(),
@@ -1309,12 +2096,7 @@ impl HashJoinOperator {
 
             // Check memory limit
             if self.memory_used + additional_memory > self.memory_limit {
-                return Err(Error::query_execution(format!(
-                    "Hash join exceeds memory limit ({} MB). Raise it by setting the \
-                     HELIOSDB_HASH_JOIN_MEM_MB environment variable, or rewrite the query \
-                     (e.g. add a more selective filter or join key).",
-                    self.memory_limit / (1024 * 1024)
-                )));
+                return Err(join_memory_limit_exceeded(self.memory_limit));
             }
 
             // Insert into hash table (with overflow chaining). Keep the common
@@ -1372,8 +2154,8 @@ impl HashJoinOperator {
             return Ok(Some(JoinKey::from_values(key_values)));
         }
 
-        if let Some(condition) = &self.on_condition {
-            let key_values = self.extract_join_columns(condition, tuple, is_right_side)?;
+        if self.on_condition.is_some() {
+            let key_values = self.extract_join_columns(tuple, is_right_side)?;
 
             // Check if any key value is NULL - if so, this tuple will never match
             if key_values.iter().any(|v| matches!(v, crate::Value::Null)) {
@@ -1387,57 +2169,25 @@ impl HashJoinOperator {
         }
     }
 
-    /// Extract join column values from ON condition
-    fn extract_join_columns(
-        &self,
-        condition: &crate::sql::LogicalExpr,
-        tuple: &Tuple,
-        is_right_side: bool,
-    ) -> Result<Vec<crate::Value>> {
-        use crate::sql::{BinaryOperator, LogicalExpr};
-
-        // Use the appropriate evaluator based on which side's tuple we're evaluating
+    /// Extract the join key values of `tuple` for its side: one value per
+    /// bound key pair (see [`BoundJoinKeyPair`]), evaluated with the side's
+    /// own evaluator against the expression bound for that side. Through
+    /// candidate 3 this evaluated the "natural" operand with the side's
+    /// evaluator and fell back to the other operand on `Err`, per tuple —
+    /// which is exactly how `u.id + 10` evaluated on `u AS a` through the
+    /// real-name fallback instead of erroring (GH#29 c4, F1).
+    fn extract_join_columns(&self, tuple: &Tuple, is_right_side: bool) -> Result<Vec<crate::Value>> {
         let evaluator = if is_right_side {
             &self.right_evaluator
         } else {
             &self.left_evaluator
         };
-
-        match condition {
-            LogicalExpr::BinaryExpr { left, op, right } => {
-                match op {
-                    BinaryOperator::Eq => {
-                        // For ON a.x = b.x, the user may write the columns in either order:
-                        //   ON left_table.col = right_table.col
-                        //   ON right_table.col = left_table.col
-                        // First try the "natural" side (left expr for left eval, right for right),
-                        // and if that fails fall back to the other side.
-                        let (primary, fallback) = if is_right_side { (right, left) } else { (left, right) };
-                        match evaluator.evaluate(primary, tuple) {
-                            Ok(value) => Ok(vec![value]),
-                            Err(_) => {
-                                let value = evaluator.evaluate(fallback, tuple)?;
-                                Ok(vec![value])
-                            }
-                        }
-                    }
-                    BinaryOperator::And => {
-                        // Composite key: a.x = b.x AND a.y = b.y
-                        let mut values = self.extract_join_columns(left, tuple, is_right_side)?;
-                        values.extend(self.extract_join_columns(right, tuple, is_right_side)?);
-                        Ok(values)
-                    }
-                    _ => {
-                        // For non-equality joins, use empty key (fallback to full scan)
-                        Ok(vec![])
-                    }
-                }
-            }
-            _ => {
-                // For complex conditions, use empty key
-                Ok(vec![])
-            }
+        let mut values = Vec::with_capacity(self.bound_key_pairs.len());
+        for pair in &self.bound_key_pairs {
+            let expr = if is_right_side { &pair.right } else { &pair.left };
+            values.push(evaluator.evaluate(expr, tuple)?);
         }
+        Ok(values)
     }
 
     /// Probe phase: stream left side, lookup matches in hash table
@@ -1448,11 +2198,16 @@ impl HashJoinOperator {
                 ctx.check_timeout()?;
             }
 
-            // Pure equi-joins can stream directly from the hash bucket. Avoid
-            // cloning the whole match vector for every probe row.
+            // Stream the current bucket in place — no bucket is ever cloned,
+            // for a pure equi-join or for one carrying a pair residual
+            // (GH#29 c7, n5). A residual is checked HERE, on the candidate
+            // pair, which is what keeps a LEFT join's NULL-extended rows: the
+            // probe row is NULL-extended only once the whole bucket has been
+            // walked without a pair passing.
             if let Some(key) = self.current_match_key.as_ref() {
+                let mut emitted: Option<Tuple> = None;
                 if let Some(matches) = self.hash_table.get(key) {
-                    if self.match_index < matches.len() {
+                    while self.match_index < matches.len() {
                         let right_tuple = matches
                             .get(self.match_index)
                             .ok_or_else(|| Error::query_execution("Match index out of bounds"))?;
@@ -1461,29 +2216,48 @@ impl HashJoinOperator {
                             .as_ref()
                             .ok_or_else(|| Error::query_execution("Missing left tuple"))?;
                         self.match_index += 1;
-                        return Ok(Some(self.join_probe_with_build(left_tuple, right_tuple)));
+                        // GH#29 (c5, m2): an evaluation error is the
+                        // statement's error, never "no match" — through
+                        // candidate 4 `unwrap_or(false)` turned a declined
+                        // term the combined evaluator could not evaluate into
+                        // silently missing rows.
+                        if !self.pure_equi_join && !self.evaluate_probe_build_condition(left_tuple, right_tuple)? {
+                            continue;
+                        }
+                        emitted = Some(self.join_probe_with_build(left_tuple, right_tuple));
+                        break;
                     }
                 }
 
+                if let Some(tuple) = emitted {
+                    if !self.current_match_found {
+                        self.current_match_found = true;
+                        // Mark key as matched (for RIGHT/FULL joins) — once
+                        // per probe row, and only once a pair really passed.
+                        if matches!(self.join_type, crate::sql::JoinType::Right | crate::sql::JoinType::Full) {
+                            let key = key.clone();
+                            self.matched_right_keys.insert(key);
+                        }
+                    }
+                    return Ok(Some(tuple));
+                }
+
+                // Bucket exhausted.
+                let matched = self.current_match_found;
+                let left_tuple = self.current_left_tuple.take();
                 self.current_match_key = None;
-                self.current_left_tuple = None;
                 self.match_index = 0;
-            }
-
-            // If we have pending matches for current left tuple, emit them
-            if self.match_index < self.current_matches.len() {
-                let right_tuple = self
-                    .current_matches
-                    .get(self.match_index)
-                    .ok_or_else(|| Error::query_execution("Match index out of bounds"))?;
-                self.match_index += 1;
-
-                let left_tuple = self
-                    .current_left_tuple
-                    .as_ref()
-                    .ok_or_else(|| Error::query_execution("Missing left tuple"))?;
-
-                return Ok(Some(self.join_probe_with_build(left_tuple, right_tuple)));
+                self.current_match_found = false;
+                if !matched {
+                    if let Some(left_tuple) = left_tuple {
+                        // Every candidate pair failed the residual: for
+                        // LEFT/FULL this probe row is NULL-extended, exactly
+                        // as if the bucket had been empty.
+                        if matches!(self.join_type, crate::sql::JoinType::Left | crate::sql::JoinType::Full) {
+                            return Ok(Some(self.join_with_nulls_right(&left_tuple)));
+                        }
+                    }
+                }
             }
 
             // Get next left tuple
@@ -1523,8 +2297,11 @@ impl HashJoinOperator {
 
                     // Lookup in hash table
                     if let Some(matches) = self.hash_table.get(&key) {
+                        let mut found = false;
                         if self.pure_equi_join {
-                            // Mark key as matched (for RIGHT/FULL joins)
+                            // Every tuple of a non-empty bucket matches, so
+                            // the probe row is matched already: mark the key
+                            // (for RIGHT/FULL joins) once, here.
                             if matches!(self.join_type, crate::sql::JoinType::Right | crate::sql::JoinType::Full) {
                                 self.matched_right_keys.insert(key.clone());
                             }
@@ -1535,38 +2312,18 @@ impl HashJoinOperator {
                                     .ok_or_else(|| Error::query_execution("Match index out of bounds"))?;
                                 return Ok(Some(self.join_probe_with_build(&left_tuple, right_tuple)));
                             }
-
-                            self.current_left_tuple = Some(left_tuple);
-                            self.current_match_key = Some(key);
-                            self.match_index = 0;
-
-                            // Continue loop to emit first match
-                            continue;
+                            found = true;
                         }
 
-                        let filtered_matches: Vec<Tuple> = matches
-                            .iter()
-                            .filter(|right_tuple| {
-                                self.evaluate_probe_build_condition(&left_tuple, right_tuple)
-                                    .unwrap_or(false)
-                            })
-                            .cloned()
-                            .collect();
-
-                        if !filtered_matches.is_empty() {
-                            // Mark key as matched (for RIGHT/FULL joins)
-                            if matches!(self.join_type, crate::sql::JoinType::Right | crate::sql::JoinType::Full) {
-                                self.matched_right_keys.insert(key);
-                            }
-
-                            // Store matches and emit first one
-                            self.current_left_tuple = Some(left_tuple);
-                            self.current_matches = filtered_matches;
-                            self.match_index = 0;
-
-                            // Continue loop to emit first match
-                            continue;
-                        }
+                        // Hand the bucket to the streaming block above, which
+                        // emits it in place — checking the pair residual per
+                        // candidate pair when there is one, and NULL-extending
+                        // the probe row if none passes.
+                        self.current_left_tuple = Some(left_tuple);
+                        self.current_match_key = Some(key);
+                        self.match_index = 0;
+                        self.current_match_found = found;
+                        continue;
                     }
 
                     // No matches found for this left tuple
@@ -1589,11 +2346,35 @@ impl HashJoinOperator {
     /// issues with duplicate column names in the combined schema where the evaluator
     /// might find the wrong column (e.g., finding employees.id instead of departments.id).
     fn evaluate_join_condition(&self, left: &Tuple, right: &Tuple) -> Result<bool> {
+        // GH#29 (c7, n5): when the caller split the ON condition, only the
+        // RESIDUAL is evaluated here — the equality terms were proved by the
+        // hash lookup, and re-proving them per candidate pair was pure waste
+        // (and, for the `pure_equi_join` shape above, has never been done).
+        if let Some(residual) = &self.pair_residual {
+            // GH#29 (c8, m7): read the pair through a borrowed view whenever
+            // the residual allows it. `join_tuples` deep-clones every value
+            // of both tuples, and this runs once per CANDIDATE PAIR — a
+            // 1000-row bucket did 1000 full combined-tuple allocations per
+            // probe row. The nested loop has avoided exactly that since R3.5.
+            let value = if self.pair_residual_on_pair {
+                eval_condition_on_pair(&self.evaluator, residual, &PairView { left, right })?
+            } else {
+                let combined = Self::join_tuples(left, right);
+                self.evaluator.evaluate(residual, &combined)?
+            };
+            return match value {
+                crate::Value::Boolean(b) => Ok(b),
+                crate::Value::Null => Ok(false), // NULL is treated as false in join conditions
+                _ => Ok(false),
+            };
+        }
         if let Some(condition) = &self.on_condition {
             // The hash join now only receives equi-join conditions (equality predicates).
             // The hash lookup already confirmed the keys match, so skip re-evaluation
             // which can fail due to duplicate column names in the combined schema.
-            if is_pure_equi_join(&self.on_condition) {
+            // GH#29 (c4, F1): the FIELD, not the shape — a pure equi-join whose
+            // key pairs could not all be assigned a side is re-evaluated here.
+            if self.pure_equi_join {
                 return Ok(true);
             }
 
@@ -1787,11 +2568,13 @@ pub(super) fn handle_join(
         let left_op = executor.plan_to_operator(left)?;
         let right_op = executor.plan_to_operator(right)?;
         let timeout_ctx = executor.timeout_ctx();
+        let parameters = executor.parameters().to_vec();
         return Ok(Box::new(NestedLoopJoinOperator::new(
             left_op,
             right_op,
             join_type.clone(),
             on.clone(),
+            parameters,
             timeout_ctx,
         )?));
     }
@@ -1806,24 +2589,26 @@ pub(super) fn handle_join(
         && should_build_left_for_inner(left_rows, right_rows);
 
     if let Some(condition) = on {
-        let (equi_part, residual_part) = split_join_condition(condition);
         let inlj_left_rows = if matches!(join_type, crate::sql::JoinType::Inner) {
             estimate_index_nested_loop_probe_rows(executor, left).or(left_rows)
         } else {
             left_rows
         };
-        if residual_part.is_none()
+        // GH#29 (c7, n3): gate on what the index nested loop can actually
+        // EXECUTE, not on the syntax split. It probes ONE indexed column
+        // equality and has nowhere to apply a second term, so the whole ON
+        // condition must be that one plain `Column = Column` equality —
+        // `extract_equi_columns` is precisely that test, and it is the test
+        // `try_index_nested_loop_join` applies internally. Candidate 6 gated
+        // on `residual_part.is_none()`, i.e. "every term is an `=`", and so
+        // dispatched every compound all-equality ON into a call that could
+        // only decline it.
+        if extract_equi_columns(condition).is_some()
             && matches!(join_type, crate::sql::JoinType::Inner | crate::sql::JoinType::Left)
             && should_try_index_nested_loop_join(inlj_left_rows, right_rows)
             && is_plain_scan_like(right)
         {
-            if let Some(join_op) = try_index_nested_loop_join(
-                executor,
-                left,
-                right,
-                join_type,
-                equi_part.as_ref().unwrap_or(condition),
-            )? {
+            if let Some(join_op) = try_index_nested_loop_join(executor, left, right, join_type, condition)? {
                 return Ok(join_op);
             }
         }
@@ -1843,48 +2628,96 @@ pub(super) fn handle_join(
                 right_op,
                 join_type.clone(),
                 None,
+                executor.parameters().to_vec(),
                 timeout_ctx,
             )?))
         }
         Some(condition) => {
-            let (equi_part, residual_part) = split_join_condition(condition);
+            // GH#29 (c5, m2): uncorrelated subqueries in the ON condition
+            // are materialized before either operator is built — exactly as
+            // the post-join predicate path does — so a declined `=` term
+            // such as `a.x = (SELECT max(x) FROM c)` is evaluable by the
+            // hash join's combined evaluator (which has no storage) instead
+            // of erroring per candidate pair. GH#29 (c6, m1): a CORRELATED
+            // one is refused here, never silently read as NULL.
+            let condition = executor.materialize_join_subqueries(condition)?;
+            let left_schema = left_op.schema();
+            let right_schema = right_op.schema();
+            let condition_plan = plan_join_condition(&condition, &left_schema, &right_schema);
 
-            if equi_part.is_some() {
-                // Use hash join on equi-join keys
-                let mut join_op: Box<dyn PhysicalOperator> = if build_left_for_inner {
-                    Box::new(HashJoinOperator::new_build_left(
-                        left_op,
-                        right_op,
-                        join_type.clone(),
-                        equi_part,
-                        timeout_ctx,
-                    )?)
-                } else {
-                    Box::new(HashJoinOperator::new(
-                        left_op,
-                        right_op,
-                        join_type.clone(),
-                        equi_part,
-                        timeout_ctx,
-                    )?)
-                };
-
-                // Apply residual filter on top if present
-                if let Some(residual) = residual_part {
-                    join_op = Box::new(super::filter::FilterOperator::new(join_op, residual, vec![]));
-                }
-
-                Ok(join_op)
-            } else {
-                // No equi-join keys — fall back to nested loop
-                Ok(Box::new(NestedLoopJoinOperator::new(
+            if join_condition_needs_nested_loop(&condition_plan, join_type) {
+                // Nothing bound, or a residual under RIGHT / FULL — the whole
+                // (materialized) condition on a nested-loop join, which keeps
+                // a per-TUPLE matched bitmap.
+                return Ok(Box::new(NestedLoopJoinOperator::new(
                     left_op,
                     right_op,
                     join_type.clone(),
-                    on.clone(),
+                    Some(condition),
+                    executor.parameters().to_vec(),
                     timeout_ctx,
-                )?))
+                )?));
             }
+
+            let JoinConditionPlan {
+                equi,
+                residual,
+                direct_key_indices,
+                bound_key_pairs,
+            } = condition_plan;
+            let equi = equi.ok_or_else(|| Error::query_execution("hash join planned with no key"))?;
+
+            // GH#29 (c6, m5): under LEFT the residual must be checked INSIDE
+            // the join — a `FilterOperator` on top of the join sees the
+            // NULL-extended rows and drops them, which is how
+            // `na LEFT JOIN nb ON na.id = nb.id AND nb.b > 1000` returned
+            // ZERO rows instead of every `na` row NULL-extended. Under INNER
+            // (and CROSS) a post-join filter is still exactly equivalent, and
+            // is kept: it filters the residual alone instead of re-evaluating
+            // the equality terms the hash lookup already proved.
+            //
+            // GH#29 (c7, n5): the operator is handed the KEYED part plus the
+            // residual SEPARATELY. Candidate 6 handed it `condition` whole,
+            // so every candidate pair re-evaluated the equality terms the
+            // hash lookup had already proved.
+            let residual_inside_join = residual.is_some() && matches!(join_type, crate::sql::JoinType::Left);
+            let (pair_residual, post_join_residual) = if residual_inside_join {
+                (residual, None)
+            } else {
+                (None, residual)
+            };
+            let keys = PreboundJoinKeys {
+                direct_key_indices,
+                bound_key_pairs,
+                keys_cover_condition: true,
+            };
+
+            let mut join_op: Box<dyn PhysicalOperator> = Box::new(HashJoinOperator::new_with_keys(
+                left_op,
+                right_op,
+                join_type.clone(),
+                Some(equi),
+                pair_residual,
+                executor.parameters().to_vec(),
+                keys,
+                if build_left_for_inner {
+                    HashJoinBuildSide::Left
+                } else {
+                    HashJoinBuildSide::Right
+                },
+                timeout_ctx,
+            )?);
+
+            // Apply residual filter on top if present (INNER / CROSS only).
+            if let Some(residual) = post_join_residual {
+                join_op = Box::new(super::filter::FilterOperator::new(
+                    join_op,
+                    residual,
+                    executor.parameters().to_vec(),
+                ));
+            }
+
+            Ok(join_op)
         }
     }
 }
@@ -1926,6 +2759,11 @@ pub(super) fn handle_projected_join(
     if equi_part.is_none() || residual_part.is_some() {
         return Ok(None);
     }
+    // GH#29 (c7, n3): what the index nested loop below can EXECUTE — one
+    // plain `Column = Column` equality, the whole condition — decided here
+    // rather than by the syntax split, which let every compound all-equality
+    // ON into a call that could only decline it.
+    let inlj_condition = extract_equi_columns(condition).is_some();
 
     for expr in exprs {
         if !matches!(expr, crate::sql::LogicalExpr::Column { .. }) {
@@ -1939,17 +2777,12 @@ pub(super) fn handle_projected_join(
         std::env::var("HELIOS_HASHJOIN_BUILD_RIGHT").is_err() && should_build_left_for_inner(left_rows, right_rows);
 
     let inlj_left_rows = estimate_index_nested_loop_probe_rows(executor, left).or(left_rows);
-    if post_join_predicate.is_none()
+    if inlj_condition
+        && post_join_predicate.is_none()
         && should_try_index_nested_loop_join(inlj_left_rows, right_rows)
         && is_plain_scan_like(right)
     {
-        if let Some(join_op) = try_index_nested_loop_join(
-            executor,
-            left,
-            right,
-            join_type,
-            equi_part.as_ref().expect("checked above"),
-        )? {
+        if let Some(join_op) = try_index_nested_loop_join(executor, left, right, join_type, condition)? {
             let timeout_ctx = executor.timeout_ctx();
             let project_op = super::project::ProjectOperator::new(
                 join_op,
@@ -1982,6 +2815,87 @@ pub(super) fn handle_projected_join(
         columns: combined_columns,
     });
 
+    // GH#29 (c5, m2 + m4 / c6, m1 + m3 + m4): same as `handle_join` — the ON
+    // condition is materialized before either operator is built (a
+    // CORRELATED subquery is refused, not read as NULL), and its terms are
+    // bucketed by BINDABILITY, so an `=` term no key binder can bind lands
+    // in the residual instead of being silently dropped.
+    //
+    // This branch is INNER-only, so a residual is a post-join filter, which
+    // is exactly equivalent for INNER. The PROJECTED hash join emits only
+    // the projected columns, so it can serve neither a residual nor a
+    // post-join predicate; those take the generic shape below, projected the
+    // same way the index-nested-loop branch above is.
+    let timeout_ctx = executor.timeout_ctx();
+    let materialized = executor.materialize_join_subqueries(condition)?;
+    let JoinConditionPlan {
+        equi,
+        residual,
+        direct_key_indices,
+        bound_key_pairs,
+    } = plan_join_condition(&materialized, &left_schema, &right_schema);
+    let build_side = if build_left_for_inner {
+        HashJoinBuildSide::Left
+    } else {
+        HashJoinBuildSide::Right
+    };
+
+    if equi.is_none() || residual.is_some() || post_join_predicate.is_some() {
+        // GH#29 (c7, M4): when nothing bound, the nested loop is handed the
+        // WHOLE condition, so nothing may be stacked on top of it — see
+        // [`post_join_residual_filter`].
+        let residual_to_filter = post_join_residual_filter(equi.is_none(), residual);
+        let mut join_op: Box<dyn PhysicalOperator> = match equi {
+            None => Box::new(NestedLoopJoinOperator::new(
+                left_op,
+                right_op,
+                crate::sql::JoinType::Inner,
+                Some(materialized),
+                executor.parameters().to_vec(),
+                timeout_ctx.clone(),
+            )?),
+            Some(equi) => Box::new(HashJoinOperator::new_with_keys(
+                left_op,
+                right_op,
+                crate::sql::JoinType::Inner,
+                Some(equi),
+                None,
+                executor.parameters().to_vec(),
+                PreboundJoinKeys {
+                    direct_key_indices,
+                    bound_key_pairs,
+                    keys_cover_condition: true,
+                },
+                build_side,
+                timeout_ctx.clone(),
+            )?),
+        };
+        if let Some(residual) = residual_to_filter {
+            join_op = Box::new(
+                super::filter::FilterOperator::new(join_op, residual, executor.parameters().to_vec())
+                    .with_timeout(timeout_ctx.clone()),
+            );
+        }
+        if let Some(predicate) = post_join_predicate {
+            let materialized_predicate = executor.materialize_subqueries(predicate)?;
+            join_op = Box::new(
+                super::filter::FilterOperator::new(join_op, materialized_predicate, executor.parameters().to_vec())
+                    .with_timeout(timeout_ctx.clone()),
+            );
+        }
+        let project_op = super::project::ProjectOperator::new(
+            join_op,
+            exprs.to_vec(),
+            aliases.to_vec(),
+            false,
+            executor.parameters().to_vec(),
+        )
+        .with_timeout(timeout_ctx);
+        return Ok(Some(Box::new(project_op)));
+    }
+
+    let equi = equi.ok_or_else(|| Error::query_execution("projected hash join planned with no key"))?;
+
     let mut projection = Vec::with_capacity(exprs.len());
     for expr in exprs {
         let crate::sql::LogicalExpr::Column { table, name } = expr else {
@@ -2002,51 +2916,16 @@ pub(super) fn handle_projected_join(
             .collect(),
     });
 
-    let timeout_ctx = executor.timeout_ctx();
-    let build_side = if build_left_for_inner {
-        HashJoinBuildSide::Left
-    } else {
-        HashJoinBuildSide::Right
-    };
-
-    if let Some(predicate) = post_join_predicate {
-        let mut join_op: Box<dyn PhysicalOperator> = if build_left_for_inner {
-            Box::new(HashJoinOperator::new_build_left(
-                left_op,
-                right_op,
-                crate::sql::JoinType::Inner,
-                equi_part,
-                timeout_ctx.clone(),
-            )?)
-        } else {
-            Box::new(HashJoinOperator::new(
-                left_op,
-                right_op,
-                crate::sql::JoinType::Inner,
-                equi_part,
-                timeout_ctx.clone(),
-            )?)
-        };
-        let materialized_predicate = executor.materialize_subqueries(predicate)?;
-        join_op = Box::new(
-            super::filter::FilterOperator::new(join_op, materialized_predicate, executor.parameters().to_vec())
-                .with_timeout(timeout_ctx.clone()),
-        );
-        let project_op = super::project::ProjectOperator::new(
-            join_op,
-            exprs.to_vec(),
-            aliases.to_vec(),
-            false,
-            executor.parameters().to_vec(),
-        )
-        .with_timeout(timeout_ctx);
-        return Ok(Some(Box::new(project_op)));
-    }
-
-    let op = HashJoinOperator::new_projected_inner(
+    let op = HashJoinOperator::new_projected_inner_with_keys(
         left_op,
         right_op,
-        equi_part,
+        Some(equi),
+        executor.parameters().to_vec(),
+        PreboundJoinKeys {
+            direct_key_indices,
+            bound_key_pairs,
+            keys_cover_condition: true,
+        },
         projection,
         output_schema,
         build_side,
@@ -2155,6 +3034,19 @@ fn indexed_equality_predicate_is_selective(
         .is_some()
 }
 
+/// Is ANY `=` term of `condition` an indexable equality on `right`'s join
+/// column? A CARDINALITY heuristic, not a plan: it asks whether an index
+/// nested loop could be worth trying further up a left-deep chain.
+///
+/// GH#29 (c7, n2): it walks the `AND` chain. Candidate 6 removed the `And`
+/// arm from [`extract_equi_columns`] — correctly, because the INLJ can only
+/// EXECUTE one equality and silently dropped every other term — but this
+/// heuristic and [`estimate_index_nested_loop_probe_rows`] share that helper,
+/// so a left-deep chain whose inner node carried a compound ON lost INLJ
+/// eligibility for the OUTER join too, even when the outer ON was a single
+/// equality. "Is there an indexable equality on this side" is a legitimate
+/// question for a compound ON; "which single equality IS the whole condition"
+/// is not, and stays strict.
 fn right_join_key_has_index(
     executor: &Executor<'_>,
     right: &crate::sql::LogicalPlan,
@@ -2166,20 +3058,46 @@ fn right_join_key_has_index(
     let Some((right_table, right_alias, _right_schema)) = extract_scan_info(right) else {
         return false;
     };
-    let Some((left_col, right_col)) = extract_equi_columns(condition) else {
-        return false;
-    };
-    let right_join_col = if column_matches_table(&right_col, &right_table, right_alias.as_deref()) {
-        &right_col.1
-    } else if column_matches_table(&left_col, &right_table, right_alias.as_deref()) {
-        &left_col.1
-    } else {
-        return false;
-    };
-    storage
-        .art_indexes()
-        .find_column_index(&right_table, right_join_col)
-        .is_some()
+    let mut pairs = Vec::new();
+    collect_equi_column_pairs(condition, &mut pairs);
+    pairs.into_iter().any(|(left_col, right_col)| {
+        let right_join_col = if column_matches_table(&right_col, &right_table, right_alias.as_deref()) {
+            right_col.1
+        } else if column_matches_table(&left_col, &right_table, right_alias.as_deref()) {
+            left_col.1
+        } else {
+            return false;
+        };
+        storage
+            .art_indexes()
+            .find_column_index(&right_table, &right_join_col)
+            .is_some()
+    })
+}
+
+/// Every plain `Column = Column` term of an `AND` chain, in order. Used by
+/// the cardinality heuristics only (GH#29 c7, n2) — the key PLAN is built by
+/// [`plan_join_condition`], which binds each term against the real schemas.
+fn collect_equi_column_pairs(
+    condition: &crate::sql::LogicalExpr,
+    out: &mut Vec<((Option<String>, String), (Option<String>, String))>,
+) {
+    use crate::sql::{BinaryOperator, LogicalExpr};
+    match condition {
+        LogicalExpr::BinaryExpr {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
+            collect_equi_column_pairs(left, out);
+            collect_equi_column_pairs(right, out);
+        }
+        other => {
+            if let Some(pair) = extract_equi_columns(other) {
+                out.push(pair);
+            }
+        }
+    }
 }
 
 fn should_build_left_for_inner(left_rows: Option<usize>, right_rows: Option<usize>) -> bool {
@@ -2203,7 +3121,15 @@ fn should_try_index_nested_loop_join(left_rows: Option<usize>, right_rows: Optio
 fn is_plain_scan_like(plan: &crate::sql::LogicalPlan) -> bool {
     match plan {
         crate::sql::LogicalPlan::Scan { .. } => true,
-        crate::sql::LogicalPlan::Project { input, .. } => is_plain_scan_like(input),
+        // GH#29 (c2): a projection stamped with a derived-table alias is a
+        // range entry of its own, not a plain scan — its output must keep the
+        // projection AND the alias tag, which the index-nested-loop path
+        // (which reads the base scan directly) would drop.
+        crate::sql::LogicalPlan::Project {
+            input,
+            source_alias: None,
+            ..
+        } => is_plain_scan_like(input),
         _ => false,
     }
 }
@@ -2420,13 +3346,31 @@ fn extract_scan_info(plan: &crate::sql::LogicalPlan) -> Option<(String, Option<S
             ..
         } => Some((table_name.clone(), alias.clone(), schema.clone())),
         crate::sql::LogicalPlan::Filter { input, .. } => extract_scan_info(input),
-        crate::sql::LogicalPlan::Project { input, .. } => extract_scan_info(input),
+        // GH#29 (c2): see `is_plain_scan_like` — never see through a stamped
+        // derived-table projection.
+        crate::sql::LogicalPlan::Project {
+            input,
+            source_alias: None,
+            ..
+        } => extract_scan_info(input),
         _ => None,
     }
 }
 
-/// Extract column pair from a simple equi-join condition: col1 = col2
-/// Returns (table_option, column_name) for each side
+/// Extract the column pair of a join condition that is ONE equality:
+/// `col1 = col2`. Returns (table_option, column_name) for each side.
+///
+/// GH#29 (c6, m4): a compound `AND` condition is refused. The index nested
+/// loop probes the right table's ART index on this one pair and emits every
+/// row it finds — it has nowhere to apply a SECOND term — so descending into
+/// the left operand of an `AND` silently DROPPED every other term of the ON
+/// clause. `sa JOIN sb ON sa.id = sb.id AND sa.x = 20` came back with both
+/// rows; `sa LEFT JOIN sb ON sa.id = sb.id AND sa.x = (SELECT max(x) FROM sc)`
+/// came back with the wrong pairs. (On the text family the optimizer pushes
+/// most such terms into a scan, which is why only the shapes it may NOT push
+/// — anything kept on an outer join — and the whole parameterized family,
+/// which runs no optimizer passes, showed it.) A compound condition now falls
+/// through to the hash join, which keys what it can and evaluates the rest.
 fn extract_equi_columns(
     condition: &crate::sql::LogicalExpr,
 ) -> Option<((Option<String>, String), (Option<String>, String))> {
@@ -2443,12 +3387,6 @@ fn extract_equi_columns(
             }
             _ => None,
         },
-        // For compound AND conditions, try the first equality
-        LogicalExpr::BinaryExpr {
-            left,
-            op: BinaryOperator::And,
-            ..
-        } => extract_equi_columns(left),
         _ => None,
     }
 }
@@ -2461,22 +3399,23 @@ fn column_matches_table(col: &(Option<String>, String), table_name: &str, alias:
     }
 }
 
-/// Find the index of a column in a schema by optional table qualifier and column name
+/// Find the index of the INLJ left join-key column in the left input's
+/// schema by optional table qualifier and column name.
+///
+/// GH#29 c3 (M1): with a qualifier, the alias (`source_table`) match wins
+/// over the real-name (`source_table_name`) match — the same order
+/// `Schema::get_qualified_column_index` uses — and a qualifier that matches
+/// NOTHING returns `None`, so the caller declines the index nested loop
+/// (hash/NLJ resolve the key themselves) instead of guessing the first
+/// column of that name. Through candidate 2 the qualifier was matched
+/// against `source_table_name` only (which a stamped derived table never
+/// carries) and a miss fell back to the first name match — the wrong slot
+/// whenever a left-side join carried the key name twice.
 fn find_column_index(schema: &Schema, table: Option<&str>, name: &str) -> Option<usize> {
-    // Try exact match with table qualifier first
-    if let Some(tbl) = table {
-        for (i, col) in schema.columns.iter().enumerate() {
-            if col.name == name {
-                if let Some(ref src) = col.source_table_name {
-                    if src == tbl {
-                        return Some(i);
-                    }
-                }
-            }
-        }
+    match table {
+        Some(qualifier) => schema.get_qualified_column_index(Some(qualifier), name),
+        None => schema.columns.iter().position(|c| c.name == name),
     }
-    // Fall back to name-only match
-    schema.columns.iter().position(|c| c.name == name)
 }
 
 /// Split a join condition into equi-join predicates and residual filters.
@@ -2498,6 +3437,27 @@ fn split_join_condition(
     let residual = combine_with_and(residual_parts);
 
     (equi, residual)
+}
+
+/// The residual to stack as a post-join `FilterOperator` above a projected
+/// INNER join — `None` when the join operator is already carrying the WHOLE
+/// ON condition (GH#29 c7, M4).
+///
+/// `handle_projected_join` builds a `NestedLoopJoinOperator` over the whole
+/// materialized condition whenever no key term bound. `residual` is then that
+/// same condition (equi is empty, so the residual bucket holds every term),
+/// and candidate 6 stacked it AGAIN as a filter: every surviving row had the
+/// full ON condition evaluated TWICE, on the slowest operator we have.
+/// Idempotent for a deterministic predicate — but not for a non-deterministic
+/// one, and never free.
+fn post_join_residual_filter(
+    operator_carries_whole_condition: bool,
+    residual: Option<crate::sql::LogicalExpr>,
+) -> Option<crate::sql::LogicalExpr> {
+    if operator_carries_whole_condition {
+        return None;
+    }
+    residual
 }
 
 /// Check if a join condition is purely equi-join (only equality + AND).
@@ -2562,4 +3522,685 @@ fn combine_with_and(parts: Vec<crate::sql::LogicalExpr>) -> Option<crate::sql::L
         op: BinaryOperator::And,
         right: Box::new(right),
     })
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+mod gh29_c5_key_binding_tests {
+    //! GH#29 (c5): the construction-time key binder, pinned structurally —
+    //! an integration test can only see the rows, not whether they came out
+    //! of a hash bucket. Each input is a one-column schema whose `id` is
+    //! stamped with the alias (`source_table`) and the real name
+    //! (`source_table_name`) exactly as `handle_scan` stamps a base-table
+    //! scan.
+    use super::*;
+    use crate::sql::{BinaryOperator, JoinType, LogicalExpr};
+    use crate::{Column, DataType, Value};
+
+    fn input(alias: &str, real: &str) -> Schema {
+        let mut id = Column::new("id", DataType::Int4);
+        id.source_table = Some(alias.to_string());
+        id.source_table_name = Some(real.to_string());
+        Schema { columns: vec![id] }
+    }
+
+    fn col(table: Option<&str>, name: &str) -> LogicalExpr {
+        LogicalExpr::Column {
+            table: table.map(str::to_string),
+            name: name.to_string(),
+        }
+    }
+
+    fn binary(left: LogicalExpr, op: BinaryOperator, right: LogicalExpr) -> LogicalExpr {
+        LogicalExpr::BinaryExpr {
+            left: Box::new(left),
+            op,
+            right: Box::new(right),
+        }
+    }
+
+    fn plus_one(expr: LogicalExpr) -> LogicalExpr {
+        binary(expr, BinaryOperator::Plus, LogicalExpr::Literal(Value::Int4(1)))
+    }
+
+    fn eq(left: LogicalExpr, right: LogicalExpr) -> LogicalExpr {
+        binary(left, BinaryOperator::Eq, right)
+    }
+
+    fn is_bound_slot_zero(expr: &LogicalExpr) -> bool {
+        matches!(expr, LogicalExpr::BoundColumn { index: 0, .. })
+    }
+
+    #[test]
+    fn case_distinct_quoted_aliases_bind_to_their_exact_side() {
+        // FROM t AS "A" JOIN t AS "a" ON "a".id = "A".id + 1
+        let left = input("A", "t");
+        let right = input("a", "t");
+        let (pairs, covered) =
+            bind_hash_join_key_pairs(&eq(col(Some("a"), "id"), plus_one(col(Some("A"), "id"))), &left, &right);
+        assert!(covered);
+        assert_eq!(pairs.len(), 1);
+        // `"a".id` is the RIGHT input's column; `"A".id + 1` the LEFT's.
+        assert!(is_bound_slot_zero(&pairs[0].right), "{:?}", pairs[0].right);
+        assert!(
+            matches!(&pairs[0].left, LogicalExpr::BinaryExpr { left, .. } if is_bound_slot_zero(left)),
+            "{:?}",
+            pairs[0].left
+        );
+        // Reversed spelling, same assignment.
+        let (pairs, covered) =
+            bind_hash_join_key_pairs(&eq(plus_one(col(Some("A"), "id")), col(Some("a"), "id")), &left, &right);
+        assert!(covered);
+        assert_eq!(pairs.len(), 1);
+        assert!(is_bound_slot_zero(&pairs[0].right), "{:?}", pairs[0].right);
+    }
+
+    #[test]
+    fn the_unquoted_twin_still_hashes() {
+        // FROM t AS a JOIN t AS b ON b.id = a.id + 1
+        let left = input("a", "t");
+        let right = input("b", "t");
+        let condition = eq(col(Some("b"), "id"), plus_one(col(Some("a"), "id")));
+        let (pairs, covered) = bind_hash_join_key_pairs(&condition, &left, &right);
+        assert!(covered);
+        assert_eq!(pairs.len(), 1);
+        assert!(is_bound_slot_zero(&pairs[0].right), "{:?}", pairs[0].right);
+        assert!(!hash_join_keys_need_nested_loop(
+            &condition,
+            &JoinType::Inner,
+            &left,
+            &right
+        ));
+    }
+
+    #[test]
+    fn the_case_folded_pass_still_serves_an_unquoted_reference_to_a_mixed_case_alias() {
+        // Alias `"Acc"` referenced as `acc`: the exact pass matches on
+        // neither side, the folded fallback does — leniency kept, second.
+        let left = input("Acc", "t");
+        let right = input("b", "t");
+        let (pairs, covered) = bind_hash_join_key_pairs(
+            &eq(plus_one(col(Some("acc"), "id")), col(Some("b"), "id")),
+            &left,
+            &right,
+        );
+        assert!(covered);
+        assert_eq!(pairs.len(), 1);
+        assert!(is_bound_slot_zero(&pairs[0].right), "{:?}", pairs[0].right);
+    }
+
+    #[test]
+    fn a_term_whose_qualified_operands_both_fit_both_sides_is_declined() {
+        // Aliases `"Acc"` and `"ACC"` are two legal, case-distinct range
+        // entries; `acc.id` matches NEITHER exactly, so the case-folded pass
+        // resolves it on BOTH — a real alias collision. Guessing an order
+        // here is what keyed `ON "a".id = "A".id + 1` backwards.
+        let left = input("Acc", "t");
+        let right = input("ACC", "t");
+        let condition = eq(col(Some("acc"), "id"), plus_one(col(Some("acc"), "id")));
+        let (pairs, covered) = bind_hash_join_key_pairs(&condition, &left, &right);
+        assert!(!covered);
+        assert!(pairs.is_empty());
+        // Nothing to hash on: a nested-loop join, whatever the join type.
+        assert!(hash_join_keys_need_nested_loop(
+            &condition,
+            &JoinType::Inner,
+            &left,
+            &right
+        ));
+    }
+
+    #[test]
+    fn a_bare_name_both_inputs_carry_keys_left_to_right() {
+        // GH#29 (c6, BLOCKER). This is the shape the planner lowers EVERY
+        // `NATURAL JOIN` / `JOIN … USING (id)` to — both operands bare, with
+        // no qualifier on either side, whatever the inputs are. Candidate 5
+        // declined it as an "alias collision", the
+        // key came out empty, the join fell to the nested loop, and the
+        // nested loop's combined-schema binder resolved BOTH bare operands to
+        // the LEFT input's slot: `left.id = left.id`, true for every pair —
+        // a cartesian product. It must bind ONE pair, left slot to right slot.
+        let left = input("a", "t");
+        let right = input("b", "t");
+        let condition = eq(col(None, "id"), col(None, "id"));
+        let (pairs, covered) = bind_hash_join_key_pairs(&condition, &left, &right);
+        assert!(covered);
+        assert_eq!(pairs.len(), 1);
+        assert!(is_bound_slot_zero(&pairs[0].left), "{:?}", pairs[0].left);
+        assert!(is_bound_slot_zero(&pairs[0].right), "{:?}", pairs[0].right);
+        assert!(
+            !hash_join_keys_need_nested_loop(&condition, &JoinType::Inner, &left, &right),
+            "a NATURAL/USING key must never be routed to the nested loop"
+        );
+        for join_type in [JoinType::Left, JoinType::Right, JoinType::Full] {
+            assert!(
+                !hash_join_keys_need_nested_loop(&condition, &join_type, &left, &right),
+                "{join_type:?}"
+            );
+        }
+        // …and the expression spelling still binds one pair, natural order.
+        let condition = eq(col(None, "id"), plus_one(col(None, "id")));
+        let (pairs, covered) = bind_hash_join_key_pairs(&condition, &left, &right);
+        assert!(covered);
+        assert_eq!(pairs.len(), 1);
+        assert!(is_bound_slot_zero(&pairs[0].left), "{:?}", pairs[0].left);
+        assert!(
+            matches!(&pairs[0].right, LogicalExpr::BinaryExpr { left, .. } if is_bound_slot_zero(left)),
+            "{:?}",
+            pairs[0].right
+        );
+        assert!(!hash_join_keys_need_nested_loop(
+            &condition,
+            &JoinType::Inner,
+            &left,
+            &right
+        ));
+    }
+
+    #[test]
+    fn a_declined_equality_term_lands_in_the_residual_never_nowhere() {
+        // GH#29 (c6, m4): `collect_and_terms` bucketed by SYNTAX, so an `=`
+        // term no binder can bind (a literal operand, a materialized
+        // subquery) went to the key bucket, was declined there, and then
+        // appeared in NEITHER bucket — dropped, with `is_pure_equi_join`
+        // telling the operator the keys were the whole condition.
+        let left = input("a", "t");
+        let right = input("b", "t");
+        let condition = binary(
+            eq(col(Some("a"), "id"), col(Some("b"), "id")),
+            BinaryOperator::And,
+            eq(LogicalExpr::Literal(Value::Int4(5)), col(Some("b"), "id")),
+        );
+        let plan = plan_join_condition(&condition, &left, &right);
+        assert!(plan.equi.is_some(), "the column pair still keys the join");
+        let residual = plan.residual.expect("the literal term must be in the residual");
+        assert!(
+            matches!(&residual, LogicalExpr::BinaryExpr { left, op: BinaryOperator::Eq, .. }
+                if matches!(left.as_ref(), LogicalExpr::Literal(Value::Int4(5)))),
+            "{residual:?}"
+        );
+        // A non-equality term keeps going to the residual, as before.
+        let condition = binary(
+            eq(col(Some("a"), "id"), col(Some("b"), "id")),
+            BinaryOperator::And,
+            binary(
+                col(Some("b"), "id"),
+                BinaryOperator::Gt,
+                LogicalExpr::Literal(Value::Int4(5)),
+            ),
+        );
+        let plan = plan_join_condition(&condition, &left, &right);
+        assert!(plan.equi.is_some());
+        assert!(plan.residual.is_some());
+        // …and under RIGHT / FULL a residual takes the nested loop, which
+        // tracks matched build rows per TUPLE, not per key bucket.
+        assert!(join_condition_needs_nested_loop(&plan, &JoinType::Right));
+        assert!(join_condition_needs_nested_loop(&plan, &JoinType::Full));
+        assert!(!join_condition_needs_nested_loop(&plan, &JoinType::Inner));
+        assert!(!join_condition_needs_nested_loop(&plan, &JoinType::Left));
+    }
+
+    #[test]
+    fn the_index_nested_loop_never_takes_a_compound_on_condition() {
+        // GH#29 (c6, m4): `extract_equi_columns` descended into the LEFT
+        // operand of an `AND` and returned the first equality; the index
+        // nested loop then probed on that pair alone and emitted every row it
+        // found, DROPPING every other term of the ON clause.
+        let one = eq(col(Some("a"), "id"), col(Some("b"), "id"));
+        assert!(extract_equi_columns(&one).is_some());
+        let compound = binary(
+            one,
+            BinaryOperator::And,
+            eq(col(Some("a"), "x"), LogicalExpr::Literal(Value::Int4(20))),
+        );
+        assert!(
+            extract_equi_columns(&compound).is_none(),
+            "a compound ON must fall through to the hash join"
+        );
+    }
+
+    #[test]
+    fn a_literal_operand_is_never_keyed_and_right_or_full_declines_to_nested_loop() {
+        // ON a.id = b.id AND 5 = b.id
+        let left = input("a", "t");
+        let right = input("b", "t");
+        let condition = binary(
+            eq(col(Some("a"), "id"), col(Some("b"), "id")),
+            BinaryOperator::And,
+            eq(LogicalExpr::Literal(Value::Int4(5)), col(Some("b"), "id")),
+        );
+        let (pairs, covered) = bind_hash_join_key_pairs(&condition, &left, &right);
+        assert!(!covered, "the literal term leaves the key");
+        assert_eq!(pairs.len(), 1, "the column pair still hashes");
+        assert!(!hash_join_keys_need_nested_loop(
+            &condition,
+            &JoinType::Inner,
+            &left,
+            &right
+        ));
+        assert!(!hash_join_keys_need_nested_loop(
+            &condition,
+            &JoinType::Left,
+            &left,
+            &right
+        ));
+        assert!(hash_join_keys_need_nested_loop(
+            &condition,
+            &JoinType::Right,
+            &left,
+            &right
+        ));
+        assert!(hash_join_keys_need_nested_loop(
+            &condition,
+            &JoinType::Full,
+            &left,
+            &right
+        ));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+mod gh29_c7_operator_tests {
+    //! GH#29 (candidate 7): the pieces an integration test cannot see —
+    //! WHICH operator carries the condition, whether a filter is stacked on
+    //! top of one that already does, and whether the nested loop's
+    //! materialization is capped like the hash join's.
+    use super::*;
+    use crate::sql::{BinaryOperator, JoinType, LogicalExpr};
+    use crate::{Column, DataType, Value};
+
+    fn schema(name: &str, alias: &str) -> Arc<Schema> {
+        let mut column = Column::new(name, DataType::Int4);
+        column.source_table = Some(alias.to_string());
+        column.source_table_name = Some(alias.to_string());
+        Arc::new(Schema { columns: vec![column] })
+    }
+
+    fn rows(schema: &Arc<Schema>, values: &[i32]) -> Box<dyn PhysicalOperator> {
+        let tuples = values
+            .iter()
+            .map(|v| Tuple::new(vec![Value::Int4(*v)]))
+            .collect::<Vec<_>>();
+        Box::new(super::super::scan::MaterializedOperator::new(
+            tuples,
+            Arc::clone(schema),
+        ))
+    }
+
+    fn eq(left: LogicalExpr, right: LogicalExpr) -> LogicalExpr {
+        LogicalExpr::BinaryExpr {
+            left: Box::new(left),
+            op: BinaryOperator::Eq,
+            right: Box::new(right),
+        }
+    }
+
+    fn col(table: &str, name: &str) -> LogicalExpr {
+        LogicalExpr::Column {
+            table: Some(table.to_string()),
+            name: name.to_string(),
+        }
+    }
+
+    /// M3. The nested loop's right-input materialization is capped, with the
+    /// SAME error the hash join raises — candidate 6 routes every RIGHT /
+    /// FULL join carrying a residual ON term to this operator, and it had no
+    /// cap at all on a host this repo has already OOM-killed once.
+    #[test]
+    fn the_nested_loop_materialization_is_capped_like_the_hash_join_and_says_so_the_same_way() {
+        let left = schema("id", "a");
+        let right = schema("id", "b");
+        let condition = eq(col("a", "id"), col("b", "id"));
+
+        // `expect_err` would need the operator itself to be `Debug` (it owns
+        // boxed child operators), so match instead.
+        let nested_loop = match NestedLoopJoinOperator::with_memory_limit(
+            rows(&left, &[1, 2, 3, 4, 5]),
+            rows(&right, &[1, 2, 3, 4, 5]),
+            JoinType::Full,
+            Some(condition.clone()),
+            Vec::new(),
+            1, // one byte: the first build tuple already exceeds it
+            None,
+        ) {
+            Ok(_) => panic!("the nested loop must refuse to materialize past the cap"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            nested_loop.contains("Join exceeds memory limit"),
+            "nested loop: {nested_loop}"
+        );
+        assert!(
+            nested_loop.contains("join_memory_limit_mb") && nested_loop.contains("HELIOSDB_HASH_JOIN_MEM_MB"),
+            "the message must name the config key AND the env override: {nested_loop}"
+        );
+
+        let hash = match HashJoinOperator::with_memory_limit(
+            rows(&left, &[1, 2, 3, 4, 5]),
+            rows(&right, &[1, 2, 3, 4, 5]),
+            JoinType::Full,
+            Some(condition),
+            Vec::new(),
+            HashJoinBuildSide::Right,
+            1,
+            None,
+        ) {
+            Ok(_) => panic!("the hash join must refuse the same way"),
+            Err(err) => err.to_string(),
+        };
+        assert_eq!(nested_loop, hash, "one cap, one error, both operators");
+
+        // Under the cap, the same join runs.
+        let left_schema = schema("id", "a");
+        let right_schema = schema("id", "b");
+        let mut op = NestedLoopJoinOperator::with_memory_limit(
+            rows(&left_schema, &[1, 2]),
+            rows(&right_schema, &[2, 3]),
+            JoinType::Inner,
+            Some(eq(col("a", "id"), col("b", "id"))),
+            Vec::new(),
+            1024 * 1024,
+            None,
+        )
+        .expect("under the cap");
+        let mut emitted = 0;
+        while op.next().expect("next").is_some() {
+            emitted += 1;
+        }
+        assert_eq!(emitted, 1, "only id = 2 joins");
+    }
+
+    /// M3. The cap comes from the ONE configuration key
+    /// (`[performance] join_memory_limit_mb`, set by `--join-memory-limit-mb`
+    /// or the file), with the documented environment variable still winning
+    /// and no second threshold anywhere.
+    #[test]
+    fn the_join_memory_cap_comes_from_the_configuration_key() {
+        const MB: usize = 1024 * 1024;
+        assert_eq!(
+            resolve_join_memory_limit(None, 0),
+            DEFAULT_JOIN_MEMORY_LIMIT_MB * MB,
+            "nothing set: the built-in default"
+        );
+        assert_eq!(
+            resolve_join_memory_limit(None, 64),
+            64 * MB,
+            "[performance] join_memory_limit_mb / --join-memory-limit-mb"
+        );
+        assert_eq!(
+            resolve_join_memory_limit(Some("32"), 64),
+            32 * MB,
+            "HELIOSDB_HASH_JOIN_MEM_MB overrides the configured value"
+        );
+        assert_eq!(
+            resolve_join_memory_limit(Some("nonsense"), 64),
+            64 * MB,
+            "an unparseable override falls back to the configured value"
+        );
+        assert_eq!(
+            resolve_join_memory_limit(Some("0"), 0),
+            DEFAULT_JOIN_MEMORY_LIMIT_MB * MB,
+            "0 = the built-in default"
+        );
+        assert_eq!(
+            resolve_join_memory_limit(Some(""), 64),
+            64 * MB,
+            "an empty override is not a value"
+        );
+        // GH#29 (c9, m4): this test asserts the PURE resolver and nothing
+        // else. Candidate 8 parked `JOIN_MEMORY_LIMIT_MB` — a process-global
+        // (`set_join_memory_limit_mb`) read at every join construction — at
+        // 48 MB for the duration of the test, while `cargo test --lib` runs
+        // the whole binary's tests on parallel threads and every
+        // `EmbeddedDatabase` open in it stores 1024 over that global
+        // (`src/lib.rs`, `set_join_memory_limit_mb(config.performance
+        // .join_memory_limit_mb)`). That can redden this test AND, for the
+        // window it is held, any join elsewhere in the binary that
+        // materializes more than 48 MB. A concurrent unit test may not mutate
+        // a process-global other tests read — the precedent this repo already
+        // states for its own flags (`src/copy_phase_stats.rs`,
+        // `src/write_volume.rs`). The setter/reader wiring is covered where it
+        // is owned: the operators below take an EXPLICIT limit, and the
+        // configuration key reaches the global through `EmbeddedDatabase`'s
+        // own open path.
+    }
+
+    /// M3 scope (GH#29 c8, m3a). The cap is charged on EVERY nested-loop
+    /// materialization — not only the RIGHT/FULL-with-residual shape that
+    /// made candidate 6 route joins here. A LATERAL join (whose call site
+    /// hands this operator the ON condition as written, `None` for
+    /// `FROM a, LATERAL (…)`) and a THETA join (`ON a.x > b.y`, which binds
+    /// no key at all) both materialize their right input, both were
+    /// previously unbounded, and both now fail with the one error.
+    #[test]
+    fn the_cap_covers_every_nested_loop_shape_not_only_right_full_with_a_residual() {
+        let left = schema("id", "a");
+        let right = schema("id", "b");
+        let expected = join_memory_limit_exceeded(1).to_string();
+
+        // The LATERAL / cross shape: no ON condition at all.
+        let lateral = match NestedLoopJoinOperator::with_memory_limit(
+            rows(&left, &[1, 2]),
+            rows(&right, &[1, 2, 3, 4, 5]),
+            JoinType::Inner,
+            None,
+            Vec::new(),
+            1,
+            None,
+        ) {
+            Ok(_) => panic!("an uncapped LATERAL materialization is what OOM-killed this host"),
+            Err(err) => err.to_string(),
+        };
+        assert_eq!(lateral, expected, "one cap, one error");
+
+        // A theta join: an INNER join whose ON binds no key.
+        let theta = match NestedLoopJoinOperator::with_memory_limit(
+            rows(&left, &[1, 2]),
+            rows(&right, &[1, 2, 3, 4, 5]),
+            JoinType::Inner,
+            Some(LogicalExpr::BinaryExpr {
+                left: Box::new(col("a", "id")),
+                op: BinaryOperator::Gt,
+                right: Box::new(col("b", "id")),
+            }),
+            Vec::new(),
+            1,
+            None,
+        ) {
+            Ok(_) => panic!("a theta join materializes its right input too"),
+            Err(err) => err.to_string(),
+        };
+        assert_eq!(theta, expected, "one cap, one error");
+    }
+
+    /// M4. The whole ON condition is applied ONCE. When no key term bound,
+    /// `handle_projected_join` hands the nested loop the WHOLE condition —
+    /// and candidate 6 then stacked that same condition again as a
+    /// `FilterOperator`.
+    #[test]
+    fn a_projected_join_never_stacks_a_filter_over_an_operator_that_already_has_the_condition() {
+        let residual = eq(col("a", "id"), col("b", "id"));
+        assert!(
+            post_join_residual_filter(true, Some(residual.clone())).is_none(),
+            "the nested loop already carries the whole condition: nothing may be stacked on it"
+        );
+        // The hash-join branch keys part of the condition, so its residual IS
+        // stacked — that arm must not regress into dropping the term.
+        assert_eq!(
+            post_join_residual_filter(false, Some(residual.clone())),
+            Some(residual),
+            "a residual the operator does NOT carry must still be filtered"
+        );
+        assert!(post_join_residual_filter(false, None).is_none());
+    }
+
+    /// M1. Every evaluator a join operator builds for a CONDITION carries the
+    /// statement's bind values. `ON a.id = b.id AND b.id = $1` keys the first
+    /// term and leaves the second to the evaluator; with an empty parameter
+    /// vector that evaluator raised `Parameter $1 not provided`.
+    #[test]
+    fn a_parameter_in_a_join_condition_is_evaluated_not_refused() {
+        let left = schema("id", "a");
+        let right = schema("id", "b");
+        let condition = LogicalExpr::BinaryExpr {
+            left: Box::new(eq(col("a", "id"), col("b", "id"))),
+            op: BinaryOperator::And,
+            right: Box::new(eq(col("b", "id"), LogicalExpr::Parameter { index: 1 })),
+        };
+
+        // Nested loop: the whole condition, parameters threaded.
+        let mut op = NestedLoopJoinOperator::new(
+            rows(&left, &[1, 2, 3]),
+            rows(&right, &[1, 2, 3]),
+            JoinType::Inner,
+            Some(condition.clone()),
+            vec![Value::Int4(2)],
+            None,
+        )
+        .expect("nested loop builds");
+        let mut emitted = Vec::new();
+        while let Some(tuple) = op.next().expect("the `$1` term must evaluate, not error") {
+            emitted.push(tuple.values[0].clone());
+        }
+        assert_eq!(emitted, vec![Value::Int4(2)], "only id = $1 = 2 survives");
+
+        // Hash join: the keyed term hashes, the `$1` term is the pair
+        // residual — the binder declines it because a parameter is not a
+        // column, which is exactly why the evaluator has to have the values.
+        let plan = plan_join_condition(&condition, left.as_ref(), right.as_ref());
+        let mut op = HashJoinOperator::new_with_keys(
+            rows(&left, &[1, 2, 3]),
+            rows(&right, &[1, 2, 3]),
+            JoinType::Left,
+            Some(eq(col("a", "id"), col("b", "id"))),
+            Some(eq(col("b", "id"), LogicalExpr::Parameter { index: 1 })),
+            vec![Value::Int4(2)],
+            PreboundJoinKeys {
+                direct_key_indices: None,
+                bound_key_pairs: bind_hash_join_key_pairs(
+                    &eq(col("a", "id"), col("b", "id")),
+                    left.as_ref(),
+                    right.as_ref(),
+                )
+                .0,
+                keys_cover_condition: true,
+            },
+            HashJoinBuildSide::Right,
+            None,
+        )
+        .expect("hash join builds");
+        let mut emitted = Vec::new();
+        while let Some(tuple) = op.next().expect("the `$1` residual must evaluate, not error") {
+            emitted.push((tuple.values[0].clone(), tuple.values[1].clone()));
+        }
+        emitted.sort_by_key(|(l, _)| format!("{l:?}"));
+        assert_eq!(
+            emitted,
+            vec![
+                (Value::Int4(1), Value::Null),
+                (Value::Int4(2), Value::Int4(2)),
+                (Value::Int4(3), Value::Null),
+            ],
+            "LEFT: the probe rows whose only candidate fails the residual are NULL-extended, not dropped"
+        );
+        assert!(plan.equi.is_some(), "the `a.id = b.id` term keys the join");
+        assert!(
+            plan.residual.is_some(),
+            "the `$1` term is bucketed as the residual, never dropped"
+        );
+    }
+
+    /// n2. The cardinality heuristic walks the `AND` chain again — candidate
+    /// 6's strict `extract_equi_columns` blinded it to a compound ON, which
+    /// cost the OUTER join of a left-deep chain its INLJ eligibility.
+    #[test]
+    fn the_cardinality_heuristic_sees_an_equality_inside_a_compound_on() {
+        let compound = LogicalExpr::BinaryExpr {
+            left: Box::new(eq(col("a", "id"), col("b", "id"))),
+            op: BinaryOperator::And,
+            right: Box::new(eq(col("a", "x"), LogicalExpr::Literal(Value::Int4(20)))),
+        };
+        let mut pairs = Vec::new();
+        collect_equi_column_pairs(&compound, &mut pairs);
+        assert_eq!(pairs.len(), 1, "the one plain column equality of the chain");
+        assert_eq!(pairs[0].0, (Some("a".to_string()), "id".to_string()));
+        assert_eq!(pairs[0].1, (Some("b".to_string()), "id".to_string()));
+        // The strict helper the PLAN uses still refuses the compound shape:
+        // the index nested loop can execute exactly one equality.
+        assert!(extract_equi_columns(&compound).is_none());
+    }
+
+    /// m7 (GH#29 c8). The pair residual is checked through a BORROWED pair
+    /// view — the zero-copy seam the nested loop has used since R3.5 — not by
+    /// allocating a fresh combined tuple (a deep clone of every value of both
+    /// tuples) once per candidate pair. The rows are what they were, and a
+    /// residual the pair evaluator does not cover keeps the old path.
+    #[test]
+    fn a_pair_residual_is_checked_on_a_borrowed_pair_not_on_a_fresh_combined_tuple() {
+        let left = schema("id", "a");
+        let right = schema("id", "b");
+        let keyed = eq(col("a", "id"), col("b", "id"));
+        let residual = LogicalExpr::BinaryExpr {
+            left: Box::new(col("b", "id")),
+            op: BinaryOperator::Gt,
+            right: Box::new(LogicalExpr::Literal(Value::Int4(1))),
+        };
+        let keys = || PreboundJoinKeys {
+            direct_key_indices: None,
+            bound_key_pairs: bind_hash_join_key_pairs(&keyed, left.as_ref(), right.as_ref()).0,
+            keys_cover_condition: true,
+        };
+
+        let mut op = HashJoinOperator::new_with_keys(
+            rows(&left, &[1, 2, 3]),
+            rows(&right, &[1, 2, 3]),
+            JoinType::Left,
+            Some(keyed.clone()),
+            Some(residual),
+            Vec::new(),
+            keys(),
+            HashJoinBuildSide::Right,
+            None,
+        )
+        .expect("hash join builds");
+        assert!(
+            op.pair_residual_on_pair,
+            "a plain comparison residual is evaluated on the borrowed pair"
+        );
+        let mut emitted = Vec::new();
+        while let Some(tuple) = op.next().expect("next") {
+            emitted.push((tuple.values[0].clone(), tuple.values[1].clone()));
+        }
+        emitted.sort_by_key(|(l, _)| format!("{l:?}"));
+        assert_eq!(
+            emitted,
+            vec![
+                (Value::Int4(1), Value::Null),
+                (Value::Int4(2), Value::Int4(2)),
+                (Value::Int4(3), Value::Int4(3)),
+            ],
+            "LEFT: the row whose only candidate fails the residual is NULL-extended"
+        );
+
+        // A `$n` is not in the pair evaluator's supported set, so that
+        // residual keeps the materialize-then-evaluate path — and still
+        // evaluates (M1).
+        let op = HashJoinOperator::new_with_keys(
+            rows(&left, &[1, 2, 3]),
+            rows(&right, &[1, 2, 3]),
+            JoinType::Left,
+            Some(keyed.clone()),
+            Some(eq(col("b", "id"), LogicalExpr::Parameter { index: 1 })),
+            vec![Value::Int4(2)],
+            keys(),
+            HashJoinBuildSide::Right,
+            None,
+        )
+        .expect("hash join builds");
+        assert!(
+            !op.pair_residual_on_pair,
+            "a parameterized residual falls back to the combined tuple"
+        );
+    }
 }

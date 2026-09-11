@@ -3356,6 +3356,15 @@ fn value_to_mysql_string(v: &Value) -> String {
 /// Map an error message to the appropriate MySQL error code and SQL state.
 fn map_error_code(err_msg: &str) -> (u16, &'static str) {
     let lower = err_msg.to_lowercase();
+    // GH#29 (c7, n4): the refusals that are 0A000 feature_not_supported on
+    // the PostgreSQL wire are ER_NOT_SUPPORTED_YET here — MySQL spells that
+    // SQLSTATE 0A000 too. Anchored on the emitter's own const (marker-const
+    // discipline) and checked FIRST, so no wording arm below can claim it.
+    // Without this the identical statement reported 1105 / HY000 "unknown
+    // error" on the MySQL listener.
+    if err_msg.contains(crate::sql::scope::CORRELATED_JOIN_SUBQUERY_UNSUPPORTED) {
+        return (1235, "0A000"); // ER_NOT_SUPPORTED_YET
+    }
     if lower.contains("serialization failure") || lower.contains("deadlock") {
         // ER_LOCK_DEADLOCK — clients retry the transaction. Covers both the
         // R0.2 first-committer-wins conflict ("serialization failure: ...")
@@ -3670,6 +3679,18 @@ mod tests {
         let (code, state) = map_error_code("duplicate key value violates unique constraint");
         assert_eq!(code, 1062);
         assert_eq!(state, "23000");
+    }
+
+    /// GH#29 (c7, n4): the refusal the PostgreSQL classifier maps to 0A000
+    /// must not degrade to 1105 / HY000 "unknown error" on the MySQL wire.
+    #[test]
+    fn test_map_error_code_correlated_join_subquery_is_not_supported_yet() {
+        let (code, state) = map_error_code(
+            "Query execution error: correlated subquery in JOIN ... ON is not supported; \
+             rewrite it as a join or a subquery in WHERE",
+        );
+        assert_eq!(code, 1235, "ER_NOT_SUPPORTED_YET");
+        assert_eq!(state, "0A000");
     }
 
     #[test]

@@ -120,7 +120,59 @@ Full recipes: `.claude/skills/heliosdb-nano-mcp/SKILL.md`.
   transaction; take a dump or a branch before a destructive migration.
 - Introspection: `information_schema.*`, `pg_class`, `sqlite_master`,
   `PRAGMA table_info(t)`, REPL `\d [table]` / `\dt`.
-- JSONB operators `->`, `->>`, `@>`, `?`; FTS via `to_tsvector @@ to_tsquery`
+- Text collation is **C (byte order)** on every surface — the engine compares
+  `TEXT` values as raw UTF-8 bytes (`Value` comparison in `src/sql/evaluator.rs`),
+  and no surface applies a locale: `ORDER BY`,
+  `<`/`>`, `BETWEEN`, `DISTINCT`, `GROUP BY`, index order and `UNIQUE` all
+  compare `TEXT`/`VARCHAR`/`CHAR` as raw UTF-8 bytes. All upper-case ASCII sorts
+  before all lower-case (`'Zebra' < 'apple'`) and every non-ASCII character
+  sorts after every ASCII one: `ORDER BY name` over `Apple, apple, Zebra,
+  banana, Ápple` returns `Apple, Zebra, apple, banana, Ápple`, not the locale
+  order an ORM user expects. `COLLATE` is not implemented — no per-column,
+  per-index or per-query collation and no ICU; a `COLLATE` clause on the MySQL
+  wire is stripped by the DDL translator (`src/protocol/mysql/translator.rs`).
+  `pg_database.datcollate` reports `C.UTF-8` (the registry-backed view in
+  `src/sql/phase3/system_views.rs`). For locale
+  ordering, sort in the application or store and order by a normalised sort key
+  (e.g. an extra `name_sort` column holding `lower(name)`).
+- Identifier resolution follows PostgreSQL: an unquoted identifier folds to
+  lower case, a quoted one is preserved, so `FROM t AS T1` declares the alias
+  `t1` and `T1.id` / `"t1".id` refer to it while `"T1".id` does not. A
+  qualifier naming nothing in `FROM` is an error (`42P01 missing FROM-clause
+  entry for table "bogus"`) — `SELECT bogus.*` never expands to the whole row;
+  a column that does not exist is `42703` whether or not the query returns
+  rows, in `SELECT`, `WHERE`, `JOIN … ON`, `GROUP BY`, `HAVING`, `ORDER BY`
+  and `RETURNING`, and a view or prepared statement with such a reference is
+  refused when it is defined. Sub-selects, CTEs and views in `FROM` resolve
+  through their alias, also next to a base table that carries the same column
+  names (`FROM t JOIN (SELECT id FROM t) s ON s.id = t.id`, `SELECT s.* FROM
+  (…) s JOIN t …`), and a column-alias list renames the output (`FROM (…) AS
+  s(a, b)`, `(VALUES …) AS v(id, name)`; a list longer than the output is
+  `42P10`). `UPDATE … FROM s` / `DELETE … USING s` entries are in scope for
+  `SET` / `WHERE`, though the DML executor still evaluates against the target
+  row only. `UPDATE … SET col = DEFAULT` applies the column's declared default
+  (NULL when none); `GROUP BY <output alias>` groups by that item's
+  expression (a FROM column of the same name wins), while `HAVING` never
+  accepts an output alias (`42703`). A materialized view may reference a
+  sub-select or view through its alias (`SELECT sum(s.x) FROM (…) s`,
+  `SELECT v.id FROM myview v`): the reference is rewritten to the bare column
+  name before the plan is stored, so `REFRESH` works after a restart.
+  Divergences: Nano also accepts the real table name while an alias is in
+  scope (`SELECT t.id FROM t AS t1` works; PostgreSQL raises 42P01); refuses
+  with `42702` a qualified reference to a name a sub-select's output carries
+  twice (`s.id` over `SELECT a.id, b.id …`, and `s.*` over it — every other
+  `s.col` resolves; alias the inner columns, or rename them positionally with
+  `AS s(w, x, y, z)`); refuses with `0A000` a materialized view whose
+  alias-qualified reference is to a bare name another entry of the same join
+  also carries (its stored plan cannot carry the alias — alias the column
+  inside the sub-select and reference it unqualified); and keeps an output
+  alias's case in the RowDescription (`AS Total` describes `Total`) while
+  `ORDER BY total` still finds it.
+- JSONB operators: `->`, `->>`, `#>`, `#>>`, `@>`, `<@`, `?|`, `?&`. The bare
+  `?` key-existence operator is **not available**: every `?` outside a
+  string/identifier/comment is consumed as a SQLite-style positional
+  placeholder before the parser sees it (`?|` and `?&` are exempt). Spell the
+  single-key test `col ?| ARRAY['key']`. FTS via `to_tsvector @@ to_tsquery`
   + `ts_rank_cd` (BM25-backed).
 
 ## Vector search

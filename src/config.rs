@@ -1300,10 +1300,34 @@ pub struct PerformanceConfig {
     /// `0` = a single chunk. Default 1000.
     #[serde(default = "default_insert_select_txn_batch_rows")]
     pub insert_select_txn_batch_rows: usize,
+    /// Memory ONE join may materialize before the query is refused, in
+    /// megabytes (GH#29 c7, M3). Covers exactly two materializations: the hash
+    /// join's build side, and the right input of every nested-loop join — a
+    /// RIGHT / FULL join whose ON carries a residual term, a LATERAL join, a
+    /// theta join (`ON a.x > b.y`) and any ON clause no key term binds. Both
+    /// had no cap at all; a query over a right input larger than this limit
+    /// that used to complete (slowly) is now refused, with a message naming
+    /// this key (GH#29 c8, m3).
+    ///
+    /// NOT covered, and stated so this is not read as a whole-engine memory
+    /// bound (GH#29 c9, m5): the INDEX nested loop buffers its whole join
+    /// RESULT with no cap and no accounting, so an index-eligible join with a
+    /// large output can still grow unbounded whatever this key says.
+    ///
+    /// Process-global (last config wins), applied by `EmbeddedDatabase` at
+    /// startup. `--join-memory-limit-mb` wins over this; the
+    /// `HELIOSDB_HASH_JOIN_MEM_MB` environment variable wins over both.
+    /// `0` = use the built-in default. Default 1024 (1 GB).
+    #[serde(default = "default_join_memory_limit_mb")]
+    pub join_memory_limit_mb: usize,
 }
 
 fn default_insert_select_txn_batch_rows() -> usize {
     1000
+}
+
+fn default_join_memory_limit_mb() -> usize {
+    1024
 }
 
 impl Default for PerformanceConfig {
@@ -1317,6 +1341,7 @@ impl Default for PerformanceConfig {
             write_volume_stats: false,
             copy_phase_stats: false,
             insert_select_txn_batch_rows: default_insert_select_txn_batch_rows(),
+            join_memory_limit_mb: default_join_memory_limit_mb(),
         }
     }
 }

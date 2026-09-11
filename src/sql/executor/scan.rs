@@ -3208,6 +3208,7 @@ mod tests {
             aliases: vec!["k".to_string(), "note".to_string()],
             distinct: false,
             distinct_on: None,
+            source_alias: None,
         };
 
         assert_eq!(
@@ -3236,6 +3237,7 @@ mod tests {
             aliases: vec!["id".to_string()],
             distinct: false,
             distinct_on: None,
+            source_alias: None,
         };
 
         assert!(compute_scan_decode_hints(&plan).is_empty());
@@ -3255,6 +3257,7 @@ mod tests {
             aliases: vec!["k".to_string()],
             distinct: false,
             distinct_on: None,
+            source_alias: None,
         };
 
         assert!(compute_scan_decode_hints(&plan).is_empty());
@@ -3296,6 +3299,7 @@ mod tests {
             aliases: vec!["k".to_string()],
             distinct: false,
             distinct_on: None,
+            source_alias: None,
         };
 
         assert_eq!(compute_scan_prefix_hint(&plan), Some(("w".to_string(), 2)));

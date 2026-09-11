@@ -395,6 +395,7 @@ impl ExplainPlanner {
                 aliases,
                 distinct,
                 distinct_on,
+                ..
             } => {
                 let input_node = self.plan_to_node(input)?;
 

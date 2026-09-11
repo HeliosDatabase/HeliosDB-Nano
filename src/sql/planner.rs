@@ -35,7 +35,7 @@ fn convert_constraint_enforcement(characteristics: Option<&ConstraintCharacteris
     }
 }
 use super::phase3::materialized_views::MaterializedViewParser;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -74,8 +74,11 @@ pub struct Planner<'a> {
     catalog: Option<&'a Catalog<'a>>,
     /// Original SQL for time-travel AS OF parsing
     original_sql: Option<String>,
-    /// CTE schemas in scope (name -> schema) - uses RefCell for interior mutability
-    cte_schemas: RefCell<HashMap<String, Arc<Schema>>>,
+    /// CTE schemas in scope (name -> (schema, wildcard-expanded output list))
+    /// - uses RefCell for interior mutability. The flag travels with the
+    /// schema so the two can never disagree; see
+    /// `scope::RangeEntry::wildcard_output` for what it decides (GH#29 c11).
+    cte_schemas: RefCell<HashMap<String, (Arc<Schema>, bool)>>,
     /// Named window definitions in scope (name -> WindowSpec) from WINDOW clause
     named_windows: RefCell<HashMap<String, sqlparser::ast::WindowSpec>>,
     /// Session `search_path` current schema (the first non-`public`,
@@ -100,6 +103,26 @@ pub struct Planner<'a> {
     /// stack. Empty for a top-level statement; each nested view-expansion planner
     /// inherits the parent's chain plus the view it is about to expand.
     view_expansion_stack: Vec<String>,
+    /// GH#29: the range-table stack, innermost query level last. Pushed by
+    /// [`Self::query_to_plan`] (and by the DML planners for their target
+    /// table), filled by [`Self::table_factor_to_plan`] while the FROM clause
+    /// is planned, reset at the start of [`Self::select_to_plan`] so each side
+    /// of a UNION sees only its own FROM, and popped by `ScopeGuard::drop` so
+    /// `?` early returns unwind it. Every column reference the planner lowers
+    /// is resolved against it (see `sql::scope`); an empty stack means "no
+    /// scope on this planning path" and lowers the reference exactly as
+    /// before. Never pushed by the catalog-less planner (`Planner::new`), whose
+    /// placeholder schemas could not answer honestly.
+    scopes: RefCell<super::scope::ScopeStack>,
+    /// GH#29 (c11, M1): set by [`Self::table_factor_to_plan_inner`] on the
+    /// success path when the FROM item it just planned is a CTE, view or
+    /// derived table whose select list is a WILDCARD, and TAKEN (cleared) by
+    /// [`Self::table_factor_to_plan`] one line later, which hands it to
+    /// [`Self::record_range_entry`]. A `Cell`, not a stack: a nested factor
+    /// planned inside this one (a view inside a derived table's body) sets and
+    /// clears the flag through its OWN `table_factor_to_plan` before this
+    /// branch sets its own, so nothing can leak outward.
+    wildcard_output_of_last_factor: Cell<bool>,
 }
 
 impl<'a> Planner<'a> {
@@ -113,6 +136,8 @@ impl<'a> Planner<'a> {
             current_schema: None,
             search_path: Vec::new(),
             view_expansion_stack: Vec::new(),
+            scopes: RefCell::new(super::scope::ScopeStack::default()),
+            wildcard_output_of_last_factor: Cell::new(false),
         }
     }
 
@@ -126,6 +151,8 @@ impl<'a> Planner<'a> {
             current_schema: None,
             search_path: Vec::new(),
             view_expansion_stack: Vec::new(),
+            scopes: RefCell::new(super::scope::ScopeStack::default()),
+            wildcard_output_of_last_factor: Cell::new(false),
         }
     }
 
@@ -161,17 +188,673 @@ impl<'a> Planner<'a> {
 
     /// Check if a name is a CTE in scope
     fn get_cte_schema(&self, name: &str) -> Option<Arc<Schema>> {
-        self.cte_schemas.borrow().get(name).cloned()
+        self.cte_schemas
+            .borrow()
+            .get(name)
+            .map(|(schema, _)| Arc::clone(schema))
     }
 
-    /// Add a CTE to scope
-    fn add_cte(&self, name: String, schema: Arc<Schema>) {
-        self.cte_schemas.borrow_mut().insert(name, schema);
+    /// GH#29 (c11): was this CTE's output column list produced by a WILDCARD?
+    /// `false` for a name that is not a CTE in scope — the caller has already
+    /// established that it is one.
+    fn cte_output_is_wildcard(&self, name: &str) -> bool {
+        self.cte_schemas
+            .borrow()
+            .get(name)
+            .map(|(_, wildcard)| *wildcard)
+            .unwrap_or(false)
+    }
+
+    /// Add a CTE to scope. `wildcard_output` records whether its select list
+    /// is a wildcard (GH#29 c11); the placeholder schemas a RECURSIVE CTE
+    /// pre-registers pass `false` and are overwritten by the real body below.
+    fn add_cte(&self, name: String, schema: Arc<Schema>, wildcard_output: bool) {
+        self.cte_schemas.borrow_mut().insert(name, (schema, wildcard_output));
+    }
+
+    /// GH#29 (c11, M1): record whether the FROM item just planned has a
+    /// wildcard-expanded output list (see
+    /// [`Self::wildcard_output_of_last_factor`]). An ASSIGNMENT, not a
+    /// set-if-true: the item's own answer is the last word, whatever a factor
+    /// nested inside its body left behind. Called only on a success path, so
+    /// an error cannot leave the flag set for the next factor.
+    fn set_wildcard_output_of_factor(&self, wildcard_output: bool) {
+        self.wildcard_output_of_last_factor.set(wildcard_output);
+    }
+
+    /// Read and CLEAR the flag [`Self::set_wildcard_output_of_factor`] sets.
+    fn take_wildcard_output_of_factor(&self) -> bool {
+        self.wildcard_output_of_last_factor.replace(false)
+    }
+
+    /// GH#29 (c11, M1): does this query's output column LIST come from a
+    /// wildcard rather than from written-out columns? `SELECT *` and
+    /// `SELECT a.*` both count: in either spelling the engine, not the author,
+    /// decided how many columns of each name the output carries, so a repeated
+    /// name is not proof that the author named two different columns. A set
+    /// operation takes its output names from its LEFT side (PostgreSQL), so
+    /// that is the side consulted.
+    fn query_output_is_wildcard(query: &Query) -> bool {
+        Self::set_expr_output_is_wildcard(query.body.as_ref())
+    }
+
+    fn set_expr_output_is_wildcard(set_expr: &SetExpr) -> bool {
+        match set_expr {
+            SetExpr::Select(select) => select
+                .projection
+                .iter()
+                .any(|item| matches!(item, SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..))),
+            SetExpr::Query(q) => Self::set_expr_output_is_wildcard(q.body.as_ref()),
+            SetExpr::SetOperation { left, .. } => Self::set_expr_output_is_wildcard(left),
+            _ => false,
+        }
+    }
+
+    /// GH#29 (c11, M1): the same question for a parsed VIEW body, which is a
+    /// whole statement. Anything but a query has no select list.
+    fn statement_output_is_wildcard(stmt: &Statement) -> bool {
+        match stmt {
+            Statement::Query(query) => Self::query_output_is_wildcard(query),
+            _ => false,
+        }
     }
 
     /// Clear all CTEs from scope
     fn clear_ctes(&self) {
         self.cte_schemas.borrow_mut().clear();
+    }
+
+    // ------------------------------------------------------------------
+    // GH#29: plan-time name resolution (see `sql::scope` for the contract)
+    // ------------------------------------------------------------------
+
+    /// Push a range-table level for the query about to be planned. The
+    /// catalog-less planner pushes nothing (its placeholder schemas could not
+    /// answer honestly), so every reference stays `Unscoped` there.
+    fn push_scope(&self) -> super::scope::ScopeGuard<'_> {
+        super::scope::ScopeGuard::push(&self.scopes, self.catalog.is_some())
+    }
+
+    /// Forget the innermost level's entries: each side of a set operation
+    /// resolves against its own FROM only.
+    fn reset_top_scope(&self) {
+        self.scopes.borrow_mut().clear_top();
+    }
+
+    /// Resolve `qualifier.column` (or a bare `column`) against the scope stack.
+    fn resolve_column(
+        &self,
+        qualifier: Option<&str>,
+        column: &str,
+        extra_names: &[String],
+    ) -> super::scope::Resolution {
+        self.scopes.borrow().resolve(qualifier, column, extra_names)
+    }
+
+    /// Every name a `TableFactor::Table` reference can be spelled with once it
+    /// has resolved to `key`: the key itself, its bare last component (so
+    /// `t.c` reaches `FROM s.t`), the last identifier as written (so a
+    /// `_hdb_code.symbols`-style dealiased key still answers to `symbols.c`)
+    /// and the flat non-table collapse a view is stored under.
+    fn table_reference_names(name: &sqlparser::ast::ObjectName, key: &str) -> Vec<String> {
+        let mut names: Vec<String> = vec![key.to_string(), Self::split_schema_key(key).1];
+        if let Some(last) = name.0.last() {
+            names.push(Self::normalize_ident(last));
+        }
+        names.push(Self::normalize_nontable_name(name));
+        names
+    }
+
+    /// Record the range entry for a FROM item just planned. One place, after
+    /// every return path of [`Self::table_factor_to_plan_inner`], so no FROM
+    /// shape can be forgotten. A parenthesised join records nothing itself —
+    /// its inner factors were recorded by the recursion.
+    ///
+    /// `wildcard_output` says whether this item's output column list was
+    /// expanded from a wildcard (GH#29 c11, M1); it decides whether a name the
+    /// entry carries twice makes a written reference 42702 — see
+    /// `scope::RangeEntry::duplicate_is_ambiguous`.
+    fn record_range_entry(&self, table_factor: &TableFactor, plan: &LogicalPlan, wildcard_output: bool) {
+        use super::scope::RangeEntry;
+        if self.catalog.is_none() {
+            return;
+        }
+        let ast_names: Vec<String> = match table_factor {
+            TableFactor::Table { name, .. } => Self::table_reference_names(name, &Self::normalize_object_name(name)),
+            _ => Vec::new(),
+        };
+        let ast_alias: Option<String> = match table_factor {
+            TableFactor::Table { alias, .. }
+            | TableFactor::Derived { alias, .. }
+            | TableFactor::TableFunction { alias, .. }
+            | TableFactor::UNNEST { alias, .. } => alias.as_ref().map(|a| Self::normalize_ident(&a.name)),
+            _ => None,
+        };
+        let entry = match plan {
+            // Base table, CTE or system view: `handle_scan` stamps
+            // `source_table = alias.unwrap_or(table_name)` at runtime.
+            LogicalPlan::Scan { table_name, alias, .. } => {
+                let mut real: Vec<String> = vec![table_name.clone(), Self::split_schema_key(table_name).1];
+                real.extend(ast_names);
+                match alias {
+                    Some(a) => RangeEntry::new(vec![a.clone()], real, Some(a.clone()), plan.schema()),
+                    None => RangeEntry::new(real, Vec::new(), Some(table_name.clone()), plan.schema()),
+                }
+            }
+            // Table function: `build_table_function_schema` stamps
+            // `source_table = alias.unwrap_or(function_name)`.
+            LogicalPlan::TableFunction {
+                function_name, alias, ..
+            } => match alias {
+                Some(a) => RangeEntry::new(
+                    vec![a.clone()],
+                    vec![function_name.clone()],
+                    Some(a.clone()),
+                    plan.schema(),
+                ),
+                None => RangeEntry::new(
+                    vec![function_name.clone()],
+                    Vec::new(),
+                    Some(function_name.clone()),
+                    plan.schema(),
+                ),
+            },
+            // A derived table or an expanded view. GH#29 (c2): its root
+            // `Project` carries `source_alias` (see `stamp_derived_plan`), so
+            // the runtime qualifier is that alias — `SourceAliasOperator`
+            // stamps it on the executor's schema exactly as `handle_scan`
+            // stamps a base table's. Only an UNALIASED sub-select stays
+            // unstamped (runtime qualifier `None`); a written reference to a
+            // name the entry's WRITTEN-OUT select list carries twice is
+            // refused with 42702 by the scope (c3, m3; c11 M1 exempts a
+            // duplicate a wildcard expanded), every other column resolves
+            // through the alias.
+            _ => {
+                let stamped: Option<String> = match plan {
+                    LogicalPlan::Project { source_alias, .. } => source_alias.clone(),
+                    _ => None,
+                };
+                match table_factor {
+                    TableFactor::Derived { .. } => {
+                        RangeEntry::new(ast_alias.into_iter().collect(), Vec::new(), stamped, plan.schema())
+                    }
+                    TableFactor::Table { .. } => match ast_alias {
+                        Some(a) => RangeEntry::new(vec![a], ast_names, stamped, plan.schema()),
+                        None => RangeEntry::new(ast_names, Vec::new(), stamped, plan.schema()),
+                    },
+                    _ => return,
+                }
+            }
+        };
+        self.scopes
+            .borrow_mut()
+            .record(entry.with_wildcard_output(wildcard_output));
+    }
+
+    /// Push a one-entry scope for a DML target (`UPDATE t AS x`, `DELETE FROM
+    /// t`) so the WHERE / SET expressions — and any correlated subquery inside
+    /// them — resolve the target by alias, key or bare name. The runtime
+    /// qualifier is the resolved key, which is what
+    /// `Schema::with_source_table_name` stamps on the DML evaluator's schema.
+    /// A target whose schema the catalog cannot supply (the executor reports
+    /// that itself) is recorded opaque, so no reference to it is refused here.
+    fn record_dml_target(&self, relation: &TableFactor, key: &str) {
+        use super::scope::RangeEntry;
+        let Some(catalog) = self.catalog else {
+            return;
+        };
+        let TableFactor::Table { name, alias, .. } = relation else {
+            return;
+        };
+        let real = Self::table_reference_names(name, key);
+        let schema = Arc::new(
+            catalog
+                .get_table_schema(key)
+                .unwrap_or_else(|_| Schema { columns: vec![] }),
+        );
+        let entry = match alias {
+            Some(a) => RangeEntry::new(
+                vec![Self::normalize_ident(&a.name)],
+                real,
+                Some(key.to_string()),
+                schema,
+            ),
+            None => RangeEntry::new(real, Vec::new(), Some(key.to_string()), schema),
+        };
+        self.scopes.borrow_mut().record(entry);
+    }
+
+    /// GH#29 (c4, F2): the range entry an INSERT's `ON CONFLICT DO UPDATE`
+    /// clause resolves against — the target table by its alias (`INSERT INTO
+    /// t AS x …`) or by every name the reference can be spelled with, with
+    /// the catalog schema — exactly what [`Self::record_dml_target`] records
+    /// for UPDATE / DELETE. `EXCLUDED` is a pseudo-relation lowered before
+    /// the scope is consulted (see `expr_to_logical`), never an entry.
+    fn record_insert_target(
+        &self,
+        name: &sqlparser::ast::ObjectName,
+        alias: Option<&sqlparser::ast::Ident>,
+        key: &str,
+    ) {
+        use super::scope::RangeEntry;
+        let Some(catalog) = self.catalog else {
+            return;
+        };
+        let real = Self::table_reference_names(name, key);
+        let schema = Arc::new(
+            catalog
+                .get_table_schema(key)
+                .unwrap_or_else(|_| Schema { columns: vec![] }),
+        );
+        let entry = match alias {
+            Some(a) => RangeEntry::new(vec![Self::normalize_ident(a)], real, Some(key.to_string()), schema),
+            None => RangeEntry::new(real, Vec::new(), Some(key.to_string()), schema),
+        };
+        self.scopes.borrow_mut().record(entry);
+    }
+
+    /// GH#29 (c4, F2): `EXCLUDED.<col>` names a column of the INSERT target;
+    /// any other name is 42703 at plan time. The executor's
+    /// `resolve_excluded_refs` substitutes the proposed row's values by name
+    /// and left an unknown one to fail per CONFLICTING row — never when no
+    /// row conflicts. Skipped when the catalog cannot supply the target's
+    /// schema (the executor reports the missing table).
+    fn refuse_unknown_excluded_columns(&self, exprs: &[LogicalExpr], table_name: &str) -> Result<()> {
+        let Some(catalog) = self.catalog else {
+            return Ok(());
+        };
+        let Ok(schema) = catalog.get_table_schema(table_name) else {
+            return Ok(());
+        };
+        for expr in exprs {
+            let mut failure: Option<Error> = None;
+            let _ = super::evaluator::map_column_refs(expr.clone(), &mut |table, name| {
+                if failure.is_none()
+                    && table.as_deref().is_some_and(|q| q.eq_ignore_ascii_case("excluded"))
+                    && !schema.columns.iter().any(|c| c.name.eq_ignore_ascii_case(&name))
+                {
+                    failure = Some(super::scope::undefined_column(Some("excluded"), &name));
+                }
+                LogicalExpr::Column { table, name }
+            });
+            if let Some(err) = failure {
+                return Err(err);
+            }
+        }
+        Ok(())
+    }
+
+    /// The qualifiers a DML statement's RETURNING list may use for its target
+    /// (alias, resolved key, bare component), normalised. `None` for a target
+    /// shape the DML planner rejects anyway.
+    fn dml_target_names(&self, relation: &TableFactor) -> Option<Vec<String>> {
+        let TableFactor::Table { name, alias, .. } = relation else {
+            return None;
+        };
+        let key = self.resolve_table_ref(name);
+        let mut names = Self::table_reference_names(name, &key);
+        if let Some(a) = alias {
+            names.push(Self::normalize_ident(&a.name));
+        }
+        Some(names)
+    }
+
+    /// GH#29 (candidate 2): make a derived table's or an expanded view's
+    /// output answer to its range-table alias AT RUNTIME, and honour a
+    /// column-alias list (`FROM (…) AS s(a, b)`, `(VALUES …) AS v(id, name)`).
+    ///
+    /// The sub-plan's root `Project` gets `source_alias = Some(alias)` in
+    /// place (its shape is unchanged); any other root (`Sort`, `Limit`,
+    /// `Union`, `Aggregate`, `With`, …) is wrapped in an identity projection
+    /// that carries the stamp. [`LogicalPlan::schema`] and the executor's
+    /// `SourceAliasOperator` then tag every output column with
+    /// `source_table = alias`, so `s.id` resolves at runtime through the same
+    /// `get_qualified_column_index` lookup a base table's `t.id` uses — no
+    /// longer rewritten to the bare `id` and refused when `t` also has one.
+    ///
+    /// A column-alias list renames the first `n` output columns positionally;
+    /// a shorter list keeps the remaining inner names (PostgreSQL). A list
+    /// longer than the output is `42P10`. Names in the list are folded like
+    /// every other identifier (`s(A)` declares `a`, `s("A")` declares `A`).
+    ///
+    /// Duplicate output names (`SELECT a.id, b.id FROM …`, `SELECT * FROM a
+    /// JOIN b …`) are no obstacle (GH#29 c3, m3/m4): a root `Project` is
+    /// stamped in place — its `aliases` vector is positional, so a
+    /// column-alias list renames it positionally too and no by-name step is
+    /// involved — and any other root is wrapped in a projection that reads
+    /// its input POSITIONALLY (`LogicalExpr::BoundColumn`) instead of by
+    /// name, so a repeated name cannot make two output slots read the same
+    /// input column. The scope then refuses (42702) only a qualified
+    /// reference to a name the entry carries twice; every other column of
+    /// the entry resolves through the alias.
+    fn stamp_derived_plan(plan: LogicalPlan, alias: &str, column_list: &[String]) -> Result<LogicalPlan> {
+        let schema = plan.schema();
+        let inner_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+        if column_list.len() > inner_names.len() {
+            return Err(super::scope::derived_column_list_too_long(
+                alias,
+                inner_names.len(),
+                column_list.len(),
+            ));
+        }
+        let has_duplicates = inner_names
+            .iter()
+            .enumerate()
+            .any(|(i, n)| inner_names.iter().take(i).any(|earlier| earlier == n));
+        let output_names: Vec<String> = column_list
+            .iter()
+            .cloned()
+            .chain(inner_names.iter().skip(column_list.len()).cloned())
+            .collect();
+        match plan {
+            LogicalPlan::Project {
+                input,
+                exprs,
+                aliases,
+                distinct,
+                distinct_on,
+                source_alias: None,
+            } if aliases.len() == output_names.len() => Ok(LogicalPlan::Project {
+                input,
+                exprs,
+                aliases: output_names,
+                distinct,
+                distinct_on,
+                source_alias: Some(alias.to_string()),
+            }),
+            other => Ok(LogicalPlan::Project {
+                input: Box::new(other),
+                exprs: inner_names
+                    .iter()
+                    .enumerate()
+                    .map(|(index, name)| {
+                        if has_duplicates {
+                            // Positional: the wrapper's input IS the plan the
+                            // index was taken from (a Sort / Limit / Union /
+                            // Aggregate / With root; never a Scan the
+                            // projection-pruning rule could narrow).
+                            LogicalExpr::BoundColumn {
+                                index,
+                                table: None,
+                                name: name.clone(),
+                            }
+                        } else {
+                            LogicalExpr::Column {
+                                table: None,
+                                name: name.clone(),
+                            }
+                        }
+                    })
+                    .collect(),
+                aliases: output_names,
+                distinct: false,
+                distinct_on: None,
+                source_alias: Some(alias.to_string()),
+            }),
+        }
+    }
+
+    /// GH#29 (c2, 4b): a bare `ORDER BY` key that names no FROM column and no
+    /// output column exactly, but exactly one output column case-insensitively
+    /// (`ORDER BY total` against `AS Total`), is rewritten to that column's
+    /// name so the Sort placed above the projection finds it. Anything else —
+    /// a FROM column, an exact output name, no match, two matches, an
+    /// unscoped planning path — is returned untouched.
+    fn fold_sort_key_to_output_alias(&self, expr: LogicalExpr, output_schema: &Schema) -> LogicalExpr {
+        use super::scope::Resolution;
+        let LogicalExpr::Column { table: None, name } = &expr else {
+            return expr;
+        };
+        if output_schema.get_column_index(name).is_some()
+            || !matches!(self.resolve_column(None, name, &[]), Resolution::UndefinedColumn)
+        {
+            return expr;
+        }
+        let mut candidates = output_schema
+            .columns
+            .iter()
+            .filter(|c| c.name.eq_ignore_ascii_case(name));
+        match (candidates.next(), candidates.next()) {
+            (Some(column), None) => LogicalExpr::Column {
+                table: None,
+                name: column.name.clone(),
+            },
+            _ => expr,
+        }
+    }
+
+    /// An output column name plus its case-folded spelling, de-duplicated —
+    /// the two spellings a bare reference can arrive as (`ORDER BY total`
+    /// folds to `total`; `ORDER BY "Total"` stays `Total`). PostgreSQL folds
+    /// the alias at parse time; Nano keeps the alias as written for the
+    /// RowDescription and folds only here, for resolution (GH#29 c2, 4b).
+    fn push_output_name(names: &mut Vec<String>, name: &str) {
+        for candidate in [name.to_string(), name.to_lowercase()] {
+            if !names.contains(&candidate) {
+                names.push(candidate);
+            }
+        }
+    }
+
+    /// Refuse every UNQUALIFIED column reference in `exprs` that no range entry
+    /// (and no name in `extra_names`, e.g. the projection's output aliases for
+    /// ORDER BY / GROUP BY / HAVING) can satisfy — 42703, at plan time,
+    /// regardless of how many rows the query would return. Walks the same node
+    /// set as the evaluator's binder (`map_column_refs`): sub-plans, aggregate
+    /// and window arguments resolve in their own operators and are not
+    /// descended into. Qualified references were already resolved when they
+    /// were lowered. A no-op with no scope pushed.
+    fn refuse_unresolved(&self, exprs: &[LogicalExpr], extra_names: &[String]) -> Result<()> {
+        use super::scope::Resolution;
+        if self.catalog.is_none() || self.scopes.borrow().is_empty() {
+            return Ok(());
+        }
+        for expr in exprs {
+            let mut failure: Option<Error> = None;
+            let _ = super::evaluator::map_column_refs(expr.clone(), &mut |table, name| {
+                if failure.is_none() && table.is_none() {
+                    match self.resolve_column(None, &name, extra_names) {
+                        Resolution::UndefinedColumn => {
+                            failure = Some(super::scope::undefined_column(None, &name));
+                        }
+                        // A bare name one derived entry carries twice
+                        // (`SELECT id FROM (SELECT a.id, b.id …) s`) — 42702,
+                        // never the first slot.
+                        Resolution::Ambiguous => failure = Some(super::scope::ambiguous_column(&name)),
+                        _ => {}
+                    }
+                }
+                LogicalExpr::Column { table, name }
+            });
+            if let Some(err) = failure {
+                return Err(err);
+            }
+        }
+        Ok(())
+    }
+
+    /// GH#29 (c3, m2): a bare `GROUP BY` key that names no FROM column but an
+    /// explicit `expr AS alias` of the select list — exactly, or exactly one
+    /// case-insensitively (`GROUP BY grp` against `AS Grp`) — is replaced by
+    /// that item's EXPRESSION, which is what PostgreSQL groups by when a
+    /// GROUP BY key resolves to an output-column name. The key is folded to
+    /// the expression, not to the alias: the aggregate runs over the FROM
+    /// input, where the alias does not exist (candidate 2 lowered the key
+    /// unchanged and missed at runtime). A FROM column of the same name wins
+    /// (PostgreSQL); two matching aliases are 42702; an alias whose
+    /// expression is itself an aggregate or window call cannot be grouped
+    /// by; anything else is returned untouched for `refuse_unresolved`.
+    fn fold_group_key_to_select_expr(&self, key: LogicalExpr, items: &[SelectItem]) -> Result<LogicalExpr> {
+        use super::scope::Resolution;
+        let LogicalExpr::Column { table: None, name } = &key else {
+            return Ok(key);
+        };
+        if !matches!(self.resolve_column(None, name, &[]), Resolution::UndefinedColumn) {
+            return Ok(key);
+        }
+        let mut exact: Vec<&Expr> = Vec::new();
+        let mut folded: Vec<&Expr> = Vec::new();
+        for item in items {
+            if let SelectItem::ExprWithAlias { expr, alias } = item {
+                if alias.value == *name {
+                    exact.push(expr);
+                } else if alias.quote_style.is_none() && alias.value.eq_ignore_ascii_case(name) {
+                    folded.push(expr);
+                }
+            }
+        }
+        let candidates = if exact.is_empty() { folded } else { exact };
+        match candidates.as_slice() {
+            [] => Ok(key),
+            [expr] => {
+                let expr = self.expr_to_logical(expr)?;
+                if matches!(
+                    expr,
+                    LogicalExpr::AggregateFunction { .. } | LogicalExpr::WindowFunction { .. }
+                ) {
+                    return Err(Error::query_execution(format!(
+                        "aggregate functions are not allowed in GROUP BY (output column \"{name}\")"
+                    )));
+                }
+                Ok(expr)
+            }
+            _ => Err(super::scope::ambiguous_column(name)),
+        }
+    }
+
+    /// Expand `q.*` against the range table: exactly the columns of the entry
+    /// `q` names, each emitted with that entry's runtime qualifier. A
+    /// qualifier naming nothing in FROM is refused with 42P01 — never widened
+    /// to the whole row. With no scope pushed the pre-GH#29 expansion is kept
+    /// (`expand_qualified_wildcard_unscoped`), which cannot be reached from
+    /// `select_to_plan` on a catalog-backed planner.
+    fn expand_qualified_wildcard(
+        &self,
+        object_name: &ObjectName,
+        input: &LogicalPlan,
+    ) -> Result<Vec<(LogicalExpr, String)>> {
+        use super::scope::EntryLookup;
+        let last = object_name
+            .0
+            .last()
+            .map(Self::normalize_ident)
+            .ok_or_else(|| Error::query_execution("Empty qualified wildcard"))?;
+        let candidates: Vec<String> = vec![last.clone(), Self::normalize_object_name(object_name)];
+        let lookup = self.scopes.borrow().find_entry_any(&candidates);
+        match lookup {
+            EntryLookup::Unscoped => Ok(Self::expand_qualified_wildcard_unscoped(object_name, input)),
+            EntryLookup::Missing => Err(super::scope::missing_from_clause_entry(&last)),
+            EntryLookup::Duplicate => Err(super::scope::duplicate_range_entry(&last)),
+            EntryLookup::Found { level, position } => {
+                let scopes = self.scopes.borrow();
+                let entry = scopes
+                    .entry(level, position)
+                    .ok_or_else(|| super::scope::missing_from_clause_entry(&last))?;
+                if entry.is_opaque() {
+                    return Err(super::scope::wildcard_over_opaque_entry(&last));
+                }
+                let mut out: Vec<(LogicalExpr, String)> = Vec::with_capacity(entry.schema.columns.len());
+                for column in &entry.schema.columns {
+                    if entry.runtime_qualifier.is_none() && !scopes.unqualified_is_unique(level, position, &column.name)
+                    {
+                        return Err(super::scope::ambiguous_column(&column.name));
+                    }
+                    // GH#29 (c3, m3): `s.*` over an entry that carries a name
+                    // twice would emit `s.id` twice and read the first slot
+                    // for both — refused like the written `s.id` is.
+                    if entry.has_duplicate_column(&column.name) {
+                        return Err(super::scope::ambiguous_column(&column.name));
+                    }
+                    out.push((
+                        LogicalExpr::Column {
+                            table: entry.runtime_qualifier.clone(),
+                            name: column.name.clone(),
+                        },
+                        column.name.clone(),
+                    ));
+                }
+                Ok(out)
+            }
+        }
+    }
+
+    /// The pre-GH#29 `q.*` expansion, byte-identical, reachable only when no
+    /// scope is pushed: match `source_table_name` case-insensitively and fall
+    /// back to EVERY input column. Kept for the catalog-less planner only.
+    fn expand_qualified_wildcard_unscoped(object_name: &ObjectName, input: &LogicalPlan) -> Vec<(LogicalExpr, String)> {
+        let qualifier = object_name
+            .0
+            .iter()
+            .map(|i| i.value.clone())
+            .collect::<Vec<_>>()
+            .join(".");
+        let schema = input.schema();
+        let mut out: Vec<(LogicalExpr, String)> = Vec::new();
+        for column in &schema.columns {
+            let col_table = column.source_table_name.as_deref().unwrap_or("");
+            if col_table.eq_ignore_ascii_case(&qualifier) || column.name.starts_with(&format!("{}.", qualifier)) {
+                out.push((
+                    LogicalExpr::Column {
+                        table: Some(qualifier.clone()),
+                        name: column.name.clone(),
+                    },
+                    column.name.clone(),
+                ));
+            }
+        }
+        if out.is_empty() {
+            for column in &schema.columns {
+                out.push((
+                    LogicalExpr::Column {
+                        table: None,
+                        name: column.name.clone(),
+                    },
+                    column.name.clone(),
+                ));
+            }
+        }
+        out
+    }
+
+    /// RETURNING (GH#23's stated residual): a qualifier in a DML RETURNING
+    /// item must name the statement's own target — by alias, key or bare
+    /// component — or be `EXCLUDED` (which `returning::ReturningProjection::bind`
+    /// refuses itself, 42P01). Anything else is `missing FROM-clause entry`
+    /// (42P01) at plan time instead of resolving by bare name to the target's
+    /// column. `target == None` (a target shape the DML planner rejects
+    /// anyway) refuses nothing.
+    fn check_returning_qualifier(qualifier: &str, target: Option<&[String]>) -> Result<()> {
+        let Some(names) = target else {
+            return Ok(());
+        };
+        if qualifier == "excluded" || names.iter().any(|n| n == qualifier) {
+            Ok(())
+        } else {
+            Err(super::scope::missing_from_clause_entry(qualifier))
+        }
+    }
+
+    /// [`Self::check_returning_qualifier`] over every qualified `Column` leaf of
+    /// a lowered RETURNING expression (`RETURNING bogus.n + 1`, `x."n" AS c`).
+    fn check_returning_expr_qualifiers(expr: &LogicalExpr, target: Option<&[String]>) -> Result<()> {
+        if target.is_none() {
+            return Ok(());
+        }
+        let mut failure: Option<Error> = None;
+        let _ = super::evaluator::map_column_refs(expr.clone(), &mut |table, name| {
+            if failure.is_none() {
+                if let Some(q) = table.as_deref() {
+                    if let Err(e) = Self::check_returning_qualifier(q, target) {
+                        failure = Some(e);
+                    }
+                }
+            }
+            LogicalExpr::Column { table, name }
+        });
+        match failure {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
     }
 
     /// Look up a named window definition by name
@@ -927,14 +1610,26 @@ impl<'a> Planner<'a> {
                 // NOT NULL error). No columns are provided, so every
                 // slot goes through the "omitted" path.
                 let source_opt = insert.source;
-                // Extract RETURNING clause if present
+                // Extract RETURNING clause if present. GH#29: the RETURNING list
+                // may qualify columns by the target's name only (no alias on
+                // INSERT).
+                let insert_target: Vec<String> = Self::table_reference_names(&insert.table_name, &table_name);
                 let returning = insert
                     .returning
                     .as_ref()
-                    .map(|ret_items| self.convert_returning(ret_items))
+                    .map(|ret_items| self.convert_returning(ret_items, Some(insert_target.as_slice())))
                     .transpose()?;
-                // Extract ON CONFLICT clause if present
-                let on_conflict = self.convert_on_conflict(&insert.on, &table_name)?;
+                // Extract ON CONFLICT clause if present. GH#29 (c4, F2): the
+                // DO UPDATE assignments and WHERE resolve against the target
+                // (by alias or name) at plan time, like UPDATE's own SET /
+                // WHERE, so `SET v = t.nosuch` is 42703 whether or not a row
+                // ever conflicts. The scope is popped before the source query
+                // is planned: an INSERT source cannot see its target.
+                let on_conflict = {
+                    let _scope = self.push_scope();
+                    self.record_insert_target(&insert.table_name, insert.table_alias.as_ref(), &table_name);
+                    self.convert_on_conflict(&insert.on, &table_name)?
+                };
                 match source_opt {
                     Some(source) => self.insert_to_plan(table_name, columns, source, returning, on_conflict),
                     None => Ok(LogicalPlan::Insert {
@@ -1132,16 +1827,19 @@ impl<'a> Planner<'a> {
             Statement::Update {
                 table,
                 assignments,
+                from,
                 selection,
                 returning,
                 ..
             } => {
-                // Extract RETURNING clause if present
+                // Extract RETURNING clause if present (GH#29: qualifiers must
+                // name the target — alias, key or bare component).
+                let update_target = self.dml_target_names(&table.relation);
                 let returning_items = returning
                     .as_ref()
-                    .map(|ret_items| self.convert_returning(ret_items))
+                    .map(|ret_items| self.convert_returning(ret_items, update_target.as_deref()))
                     .transpose()?;
-                self.update_to_plan(table, assignments, selection, returning_items)
+                self.update_to_plan(table, assignments, from.as_ref(), selection, returning_items)
             }
             Statement::Delete(delete_stmt) => {
                 // Extract table from FromTable enum
@@ -1165,13 +1863,20 @@ impl<'a> Planner<'a> {
                             .clone()
                     }
                 };
-                // Extract RETURNING clause if present
+                // Extract RETURNING clause if present (GH#29: qualifiers must
+                // name the target — alias, key or bare component).
+                let delete_target = self.dml_target_names(&table.relation);
                 let returning = delete_stmt
                     .returning
                     .as_ref()
-                    .map(|ret_items| self.convert_returning(ret_items))
+                    .map(|ret_items| self.convert_returning(ret_items, delete_target.as_deref()))
                     .transpose()?;
-                self.delete_to_plan(table, delete_stmt.selection.clone(), returning)
+                self.delete_to_plan(
+                    table,
+                    delete_stmt.using.as_deref(),
+                    delete_stmt.selection.clone(),
+                    returning,
+                )
             }
             Statement::CreateIndex(create_index) => {
                 // Extract table name (the index NAME below stays a plain
@@ -2177,6 +2882,10 @@ impl<'a> Planner<'a> {
         let SetExpr::SetOperation { left, .. } = query.body.as_ref() else {
             return Ok(None);
         };
+        // GH#29: the anchor is planned outside `query_to_plan`, so give it its
+        // own throwaway range-table level instead of letting `select_to_plan`
+        // reset the enclosing query's.
+        let _scope = self.push_scope();
         let anchor_plan = self.set_expr_to_plan((**left).clone())?;
         Ok(Some(anchor_plan.schema()))
     }
@@ -2214,6 +2923,10 @@ impl<'a> Planner<'a> {
 
     /// Convert a Query to a logical plan
     fn query_to_plan(&self, query: Query) -> Result<LogicalPlan> {
+        // GH#29: one range-table level per query level. Pushed HERE rather
+        // than in `select_to_plan` because ORDER BY is planned below, after
+        // the set expression, and must see the same FROM scope.
+        let _scope = self.push_scope();
         // Handle WITH clause (CTEs)
         let (cte_plans, is_recursive) = if let Some(with_clause) = query.with {
             // Oracle infers recursion and omits the RECURSIVE keyword; Postgres/
@@ -2247,6 +2960,10 @@ impl<'a> Planner<'a> {
                 // so that the recursive reference can resolve
                 let column_aliases: Vec<String> = cte.alias.columns.iter().map(|col| col.name.value.clone()).collect();
 
+                // GH#29 (c11, M1): the CTE body's select-list shape, read
+                // before the query is consumed by the planner below.
+                let cte_output_is_wildcard = Self::query_output_is_wildcard(&cte.query);
+
                 if is_recursive && !column_aliases.is_empty() {
                     // Use the explicit column aliases with Int8 as placeholder type
                     // (works for numeric recursion like n+1)
@@ -2256,10 +2973,10 @@ impl<'a> Planner<'a> {
                             .map(|name| Column::new(name, DataType::Int8))
                             .collect(),
                     ));
-                    self.add_cte(cte_name.clone(), schema);
+                    self.add_cte(cte_name.clone(), schema, cte_output_is_wildcard);
                 } else if is_recursive {
                     if let Some(schema) = self.infer_recursive_cte_anchor_schema(&cte.query)? {
-                        self.add_cte(cte_name.clone(), schema);
+                        self.add_cte(cte_name.clone(), schema, cte_output_is_wildcard);
                     }
                 }
 
@@ -2298,7 +3015,7 @@ impl<'a> Planner<'a> {
                     None
                 };
 
-                self.add_cte(cte_name.clone(), cte_schema);
+                self.add_cte(cte_name.clone(), cte_schema, cte_output_is_wildcard);
                 ctes.push((cte_name, Box::new(cte_plan), aliases));
             }
             (ctes, is_recursive)
@@ -2335,6 +3052,13 @@ impl<'a> Planner<'a> {
                 }
                 _ => Vec::new(),
             };
+            // GH#29: the query's output column names (projection aliases, or
+            // the left side's names for a set operation) are legal sort keys
+            // in addition to the FROM scope (`ORDER BY total`).
+            let mut order_by_extra_names: Vec<String> = Vec::new();
+            for column in &output_schema.columns {
+                Self::push_output_name(&mut order_by_extra_names, &column.name);
+            }
 
             let exprs: Result<Vec<_>> = order_by
                 .exprs
@@ -2362,6 +3086,18 @@ impl<'a> Planner<'a> {
                         }
                     }
                     let logical_expr = self.expr_to_logical(&order_by_expr.expr)?;
+                    // GH#29 (c2, 4b): `SELECT count(*) AS Total … ORDER BY
+                    // total`. PostgreSQL folds the alias at parse time, so
+                    // the key meets it; Nano keeps the alias as written for
+                    // the RowDescription, so the KEY is folded up to the
+                    // alias instead (only when the FROM scope has no such
+                    // column and exactly one output column matches).
+                    let logical_expr = self.fold_sort_key_to_output_alias(logical_expr, &output_schema);
+                    // GH#29 (V3): a bare sort key must be an output column of
+                    // the query or a column of its FROM scope — 42703 at plan
+                    // time otherwise. Checked BEFORE the aggregate rewrite
+                    // below turns keys into `group_N` / `agg_N`.
+                    self.refuse_unresolved(std::slice::from_ref(&logical_expr), &order_by_extra_names)?;
 
                     // Grouped plans: rewrite the sort key with the SAME helper the
                     // select list uses (`rewrite_expr_replace_aggregates`), so group
@@ -2500,6 +3236,7 @@ impl<'a> Planner<'a> {
                 aliases: aliases.clone(),
                 distinct: false,
                 distinct_on: None,
+                source_alias: None,
             };
             combined = Some(match combined {
                 None => project,
@@ -2515,6 +3252,8 @@ impl<'a> Planner<'a> {
 
     /// Convert a SELECT to a logical plan
     fn select_to_plan(&self, select: Select) -> Result<LogicalPlan> {
+        // GH#29: each side of a set operation resolves against its own FROM.
+        self.reset_top_scope();
         // Start with FROM clause
         let mut plan = if select.from.is_empty() {
             // SELECT without FROM (like SELECT 1+1)
@@ -2549,6 +3288,8 @@ impl<'a> Planner<'a> {
         // Add WHERE clause as Filter
         if let Some(predicate) = select.selection {
             let filter_expr = self.expr_to_logical(&predicate)?;
+            // GH#29 (V2): an unknown column in WHERE is 42703 at plan time.
+            self.refuse_unresolved(std::slice::from_ref(&filter_expr), &[])?;
             plan = LogicalPlan::Filter {
                 input: Box::new(plan),
                 predicate: filter_expr,
@@ -2626,10 +3367,24 @@ impl<'a> Planner<'a> {
             } else {
                 vec![]
             };
+            // GH#29 (V3, c3 m2): a GROUP BY key may name a FROM column or an
+            // explicit select-list alias (`SELECT a + b AS s … GROUP BY s`,
+            // `SELECT v AS Grp … GROUP BY grp`); an alias key is folded to
+            // the item's expression here, so what reaches the aggregate is
+            // always a FROM-scope expression, and anything else is 42703 at
+            // plan time. HAVING may NOT name an output alias (PostgreSQL):
+            // 42703 at plan time, never a runtime miss.
+            let group_by: Vec<LogicalExpr> = group_by
+                .into_iter()
+                .map(|key| self.fold_group_key_to_select_expr(key, &select.projection))
+                .collect::<Result<Vec<_>>>()?;
+            self.refuse_unresolved(&group_by, &[])?;
 
             // Extract HAVING clause if present
             let having = if let Some(having_expr) = &select.having {
-                Some(self.expr_to_logical(having_expr)?)
+                let having_logical = self.expr_to_logical(having_expr)?;
+                self.refuse_unresolved(std::slice::from_ref(&having_logical), &[])?;
+                Some(having_logical)
             } else {
                 None
             };
@@ -2647,7 +3402,7 @@ impl<'a> Planner<'a> {
             //   - AggregateFunction nodes become Column refs to agg_N
             //   - Column refs matching GROUP BY become Column refs to group_N
             // This allows expressions like SUM(a) + SUM(b), CAST(AVG(x) AS INT), etc.
-            let (_proj_exprs, aliases) = self.select_items_to_exprs(&select.projection, &plan)?;
+            let (_proj_exprs, aliases, _from_wildcard) = self.select_items_to_exprs(&select.projection, &plan)?;
             let distinct = select.distinct.is_some();
 
             // Build rewritten projection expressions for each SELECT item
@@ -2656,6 +3411,9 @@ impl<'a> Planner<'a> {
                 match item {
                     SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
                         let logical = self.expr_to_logical(expr)?;
+                        // GH#29 (V1): validated BEFORE the rewrite turns
+                        // references into `group_N` / `agg_N`.
+                        self.refuse_unresolved(std::slice::from_ref(&logical), &[])?;
                         let rewritten = Self::rewrite_expr_replace_aggregates(&logical, &aggr_exprs, &group_by);
                         output_exprs.push(rewritten);
                     }
@@ -2674,9 +3432,15 @@ impl<'a> Planner<'a> {
                             });
                         }
                     }
-                    _ => {
-                        // Unsupported select item in aggregate context — pass through
-                        output_exprs.push(LogicalExpr::Literal(Value::Null));
+                    SelectItem::QualifiedWildcard(object_name, _) => {
+                        // GH#29: `a.*` under GROUP BY expands to a's columns
+                        // (previously it fell into a catch-all that emitted ONE
+                        // NULL against N aliases). Each expanded column is
+                        // rewritten exactly as a written column would be; a
+                        // non-grouped column then fails as a written one does.
+                        for (expanded, _name) in self.expand_qualified_wildcard(object_name, &plan)? {
+                            output_exprs.push(Self::rewrite_expr_replace_aggregates(&expanded, &aggr_exprs, &group_by));
+                        }
                     }
                 }
             }
@@ -2687,10 +3451,35 @@ impl<'a> Planner<'a> {
                 aliases,
                 distinct,
                 distinct_on: None,
+                source_alias: None,
             };
         } else {
             // No aggregates - just add projection (SELECT columns)
-            let (exprs, aliases) = self.select_items_to_exprs(&select.projection, &plan)?;
+            let (exprs, aliases, from_wildcard) = self.select_items_to_exprs(&select.projection, &plan)?;
+            // GH#29 (V1): an unknown column in the select list is 42703 at
+            // plan time — the sprinter root: `SELECT nosuch FROM empty_table`
+            // used to return Ok with zero rows because resolution only
+            // happened per row.
+            //
+            // GH#29 (c10): a reference a BARE `*` manufactured is NOT checked.
+            // `*` names no column, so it cannot be an unknown one; and the
+            // names it expands to are by construction the input's own. The
+            // only verdict it could draw is the 42702 a range entry carrying
+            // one name twice earns — which this engine manufactures for itself,
+            // because it does not merge the shared output column of a
+            // `NATURAL`/`USING` join (it projects `(id, a, id, b)` where
+            // PostgreSQL projects `(id, a, b)`, tracked separately). That made
+            // `SELECT * FROM j NATURAL JOIN c`, `j` a CTE / view / derived
+            // table over another `NATURAL`/`USING` join, refused 42702 —
+            // ordinary working PostgreSQL, refused over an artifact of our own
+            // output shape. A WRITTEN `id` over such an entry is still 42702,
+            // and so is `j.*`, which would emit the name twice under a
+            // qualifier that can only read the first slot.
+            for (expr, expanded) in exprs.iter().zip(from_wildcard.iter().copied()) {
+                if !expanded {
+                    self.refuse_unresolved(std::slice::from_ref(expr), &[])?;
+                }
+            }
 
             // Handle DISTINCT and DISTINCT ON
             let (distinct, distinct_on) = match &select.distinct {
@@ -2710,6 +3499,7 @@ impl<'a> Planner<'a> {
                 aliases,
                 distinct,
                 distinct_on,
+                source_alias: None,
             };
         }
 
@@ -2740,72 +3530,41 @@ impl<'a> Planner<'a> {
                 _ => return Err(Error::query_execution("Join type not supported")),
             };
 
-            // Check for NATURAL join - auto-generate ON clause from common columns
-            let is_natural = matches!(
-                &join.join_operator,
-                JoinOperator::Inner(JoinConstraint::Natural)
-                    | JoinOperator::LeftOuter(JoinConstraint::Natural)
-                    | JoinOperator::RightOuter(JoinConstraint::Natural)
-                    | JoinOperator::FullOuter(JoinConstraint::Natural)
-            );
+            // GH#29 (c6 half 1, kept by c10): `NATURAL JOIN` and
+            // `JOIN … USING (…)` are lowered to one equality per shared
+            // column, BOTH operands UNQUALIFIED. `USING` was not lowered at
+            // all before this (it fell to `_ => None`, i.e. a cross join).
+            // What makes the generated term an equi join is the key binder's
+            // rule that an all-unqualified `=` term is assigned in the
+            // natural order — lhs to the left input, rhs to the right
+            // (`bind_join_key_term`); candidate 5 declined that shape as an
+            // alias collision, the key came out empty and both bare operands
+            // then resolved to the LEFT input's slot, i.e. the tautology
+            // `left.id = left.id` and a cartesian product.
+            let constraint = match &join.join_operator {
+                JoinOperator::Inner(constraint)
+                | JoinOperator::LeftOuter(constraint)
+                | JoinOperator::RightOuter(constraint)
+                | JoinOperator::FullOuter(constraint) => Some(constraint),
+                _ => None,
+            };
 
-            let on = if is_natural {
-                // Find common columns between left and right schemas
-                let left_schema = plan.schema();
-                let right_schema = right.schema();
-
-                let common_columns: Vec<String> = left_schema
-                    .columns
-                    .iter()
-                    .filter_map(|lc| {
-                        if right_schema.columns.iter().any(|rc| rc.name == lc.name) {
-                            Some(lc.name.clone())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-
-                if common_columns.is_empty() {
-                    return Err(Error::query_execution(
-                        "NATURAL JOIN requires at least one common column between tables",
-                    ));
+            let on = match constraint {
+                Some(JoinConstraint::On(expr)) => {
+                    let on_expr = self.expr_to_logical(expr)?;
+                    // GH#29 (V1): both sides are in scope by now.
+                    self.refuse_unresolved(std::slice::from_ref(&on_expr), &[])?;
+                    Some(on_expr)
                 }
-
-                // Build AND of all column equalities: l.col1 = r.col1 AND l.col2 = r.col2 ...
-                let mut condition: Option<LogicalExpr> = None;
-                for col_name in common_columns {
-                    let eq_expr = LogicalExpr::BinaryExpr {
-                        left: Box::new(LogicalExpr::Column {
-                            table: None,
-                            name: col_name.clone(),
-                        }),
-                        op: super::BinaryOperator::Eq,
-                        right: Box::new(LogicalExpr::Column {
-                            table: None,
-                            name: col_name,
-                        }),
-                    };
-
-                    condition = Some(match condition {
-                        Some(cond) => LogicalExpr::BinaryExpr {
-                            left: Box::new(cond),
-                            op: super::BinaryOperator::And,
-                            right: Box::new(eq_expr),
-                        },
-                        None => eq_expr,
-                    });
+                Some(JoinConstraint::Natural) => {
+                    let names = Self::natural_join_columns(&plan, &right)?;
+                    Self::common_column_join_condition(&names)
                 }
-
-                condition
-            } else {
-                match &join.join_operator {
-                    JoinOperator::Inner(JoinConstraint::On(expr))
-                    | JoinOperator::LeftOuter(JoinConstraint::On(expr))
-                    | JoinOperator::RightOuter(JoinConstraint::On(expr))
-                    | JoinOperator::FullOuter(JoinConstraint::On(expr)) => Some(self.expr_to_logical(expr)?),
-                    _ => None,
+                Some(JoinConstraint::Using(idents)) => {
+                    let names = Self::using_join_columns(&plan, &right, idents)?;
+                    Self::common_column_join_condition(&names)
                 }
+                Some(JoinConstraint::None) | None => None,
             };
 
             plan = LogicalPlan::Join {
@@ -2818,6 +3577,119 @@ impl<'a> Planner<'a> {
         }
 
         Ok(plan)
+    }
+
+    /// Column names a `NATURAL` join equates: every name the two inputs
+    /// share, in the left input's order, each name once (GH#29 c6).
+    fn natural_join_columns(left: &LogicalPlan, right: &LogicalPlan) -> Result<Vec<(String, String)>> {
+        let left_schema = left.schema();
+        let right_schema = right.schema();
+        let mut names: Vec<(String, String)> = Vec::new();
+        for column in &left_schema.columns {
+            if right_schema.columns.iter().any(|rc| rc.name == column.name)
+                && !names.iter().any(|(left_name, _)| *left_name == column.name)
+            {
+                names.push((column.name.clone(), column.name.clone()));
+            }
+        }
+        if names.is_empty() {
+            return Err(Error::query_execution(
+                "NATURAL JOIN requires at least one common column between tables",
+            ));
+        }
+        Ok(names)
+    }
+
+    /// Column names a `JOIN … USING (…)` equates, in the order written, each
+    /// once, paired with the spelling each side actually carries (GH#29 c6).
+    /// A name either side does not carry is 42703, as in PostgreSQL.
+    fn using_join_columns(
+        left: &LogicalPlan,
+        right: &LogicalPlan,
+        idents: &[sqlparser::ast::Ident],
+    ) -> Result<Vec<(String, String)>> {
+        let left_schema = left.schema();
+        let right_schema = right.schema();
+        let mut names: Vec<(String, String)> = Vec::new();
+        for ident in idents {
+            let written = Self::normalize_ident(ident);
+            let (Some(left_name), Some(right_name)) = (
+                Self::schema_column_spelling(&left_schema, &written),
+                Self::schema_column_spelling(&right_schema, &written),
+            ) else {
+                return Err(super::scope::undefined_column(None, &written));
+            };
+            if !names.iter().any(|(existing, _)| *existing == left_name) {
+                names.push((left_name, right_name));
+            }
+        }
+        if names.is_empty() {
+            return Err(Error::query_execution("JOIN ... USING requires at least one column"));
+        }
+        Ok(names)
+    }
+
+    /// The spelling `schema` carries for `name`: the exact match first, then
+    /// the ASCII-case-folded one (a column declared with a quoted mixed-case
+    /// name, referenced unquoted).
+    fn schema_column_spelling(schema: &Schema, name: &str) -> Option<String> {
+        schema
+            .columns
+            .iter()
+            .find(|column| column.name == name)
+            .or_else(|| {
+                schema
+                    .columns
+                    .iter()
+                    .find(|column| column.name.eq_ignore_ascii_case(name))
+            })
+            .map(|column| column.name.clone())
+    }
+
+    /// `c = c AND …` for the shared columns of a `NATURAL` join or a
+    /// `JOIN … USING (…)`: one equality per shared column, BOTH operands
+    /// UNQUALIFIED (GH#29 c10).
+    ///
+    /// Bare operands ARE the design. `bind_join_key_term`
+    /// (`crate::sql::executor::join`) assigns an `=` term whose operands are
+    /// all unqualified in the NATURAL order — left operand to the left input,
+    /// right operand to the right input — which is exactly this term's
+    /// meaning, and that is what makes a `NATURAL`/`USING` join an equi join
+    /// instead of the cartesian product candidate 5 produced.
+    ///
+    /// Candidate 6 additionally QUALIFIED each operand with the relation it
+    /// came from. That design is REMOVED. Because this engine does not merge
+    /// the shared output column of a `NATURAL`/`USING` join — it projects
+    /// `(id, a, id, b)` where PostgreSQL projects `(id, a, b)`, a separate
+    /// contract move — every site downstream then had to re-derive WHICH
+    /// duplicate was the merged one, and each such site either refused legal
+    /// SQL (a CTE, view or derived table over a `NATURAL` join) or keyed the
+    /// wrong contributor. With bare operands nothing downstream has a
+    /// qualifier to interpret.
+    fn common_column_join_condition(names: &[(String, String)]) -> Option<LogicalExpr> {
+        let mut condition: Option<LogicalExpr> = None;
+        for (left_name, right_name) in names {
+            let eq_expr = LogicalExpr::BinaryExpr {
+                left: Box::new(LogicalExpr::Column {
+                    table: None,
+                    name: left_name.clone(),
+                }),
+                op: super::BinaryOperator::Eq,
+                right: Box::new(LogicalExpr::Column {
+                    table: None,
+                    name: right_name.clone(),
+                }),
+            };
+            condition = Some(match condition {
+                Some(cond) => LogicalExpr::BinaryExpr {
+                    left: Box::new(cond),
+                    op: super::BinaryOperator::And,
+                    right: Box::new(eq_expr),
+                },
+                None => eq_expr,
+            });
+        }
+        condition
     }
 
     /// Extract function arguments from `TableFunctionArgs` to `Vec<LogicalExpr>`
@@ -2850,8 +3722,24 @@ impl<'a> Planner<'a> {
         matches!(name.to_lowercase().as_str(), "generate_series" | "unnest")
     }
 
-    /// Convert a TableFactor to a plan
+    /// Convert a TableFactor to a plan and record its range entry (GH#29).
+    /// The wrapper runs after whichever return path of the inner function
+    /// produced the plan, so every FROM shape is recorded in one place.
     fn table_factor_to_plan(&self, table_factor: &TableFactor) -> Result<LogicalPlan> {
+        let plan = self.table_factor_to_plan_inner(table_factor)?;
+        // TAKE, never peek: the flag is cleared here so the next FROM item of
+        // the same clause cannot inherit it (GH#29 c11, M1).
+        let wildcard_output = self.take_wildcard_output_of_factor();
+        self.record_range_entry(table_factor, &plan, wildcard_output);
+        Ok(plan)
+    }
+
+    /// The body of [`Self::table_factor_to_plan`]. Table aliases are
+    /// normalised where they are declared (`FROM t AS T1` declares `t1`, a
+    /// quoted alias is kept as written) so the reference `T1.id`, which the
+    /// planner already case-folds, can meet them with an exact compare.
+    /// COLUMN aliases (`g(i)`) are NOT folded: they are RowDescription names.
+    fn table_factor_to_plan_inner(&self, table_factor: &TableFactor) -> Result<LogicalPlan> {
         match table_factor {
             TableFactor::Table { name, alias, args, .. } => {
                 let table_name = self.resolve_table_ref(name);
@@ -2862,7 +3750,7 @@ impl<'a> Planner<'a> {
                     let lower_name = table_name.to_lowercase();
                     if Self::is_table_function(&lower_name) {
                         let logical_args = self.extract_table_function_args(tf_args)?;
-                        let table_alias = alias.as_ref().map(|a| a.name.value.clone());
+                        let table_alias = alias.as_ref().map(|a| Self::normalize_ident(&a.name));
                         // Priority #6: `FROM generate_series(1, 10) g(i)`
                         // parses as this Table-with-args shape (not
                         // TableFactor::TableFunction), so the column alias
@@ -2884,7 +3772,11 @@ impl<'a> Planner<'a> {
                 if let Some(cte_schema) = self.get_cte_schema(&table_name) {
                     // This is a CTE reference - create a Scan with the CTE schema
                     // The executor will handle looking up the CTE data
-                    let table_alias = alias.as_ref().map(|a| a.name.value.clone());
+                    let table_alias = alias.as_ref().map(|a| Self::normalize_ident(&a.name));
+                    // GH#29 (c11, M1): carry the CTE's select-list shape to the
+                    // range entry. Read from the SAME map the schema came from,
+                    // so the two can never disagree.
+                    self.set_wildcard_output_of_factor(self.cte_output_is_wildcard(&table_name));
                     return Ok(LogicalPlan::Scan {
                         table_name,
                         alias: table_alias,
@@ -2918,7 +3810,7 @@ impl<'a> Planner<'a> {
                             .cloned()
                             .unwrap_or_else(|| Schema { columns: vec![] }),
                     );
-                    let table_alias = alias.as_ref().map(|a| a.name.value.clone());
+                    let table_alias = alias.as_ref().map(|a| Self::normalize_ident(&a.name));
                     return Ok(LogicalPlan::Scan {
                         table_name,
                         alias: table_alias,
@@ -2991,11 +3883,26 @@ impl<'a> Planner<'a> {
                         let view_planner = Planner::with_catalog(catalog)
                             .with_current_schema(view_metadata.creator_schema.clone())
                             .with_view_expansion_stack(next_stack);
+                        // GH#29 (c11, M1): read the view BODY's select-list
+                        // shape before the statement is consumed.
+                        let view_output_is_wildcard = Self::statement_output_is_wildcard(&stmt);
                         let view_plan = view_planner.statement_to_plan(stmt)?;
 
-                        // If there's an alias, wrap in a subquery with alias
-                        // For now, just return the expanded plan
-                        return Ok(view_plan);
+                        // GH#29 (c2): the expanded body answers to the view's
+                        // alias — or its bare name — at runtime, exactly like a
+                        // derived table (`stamp_derived_plan`), so `v.id` next
+                        // to a base table that also has an `id` resolves.
+                        let known_as = match alias {
+                            Some(a) => Self::normalize_ident(&a.name),
+                            None => name
+                                .0
+                                .last()
+                                .map(Self::normalize_ident)
+                                .unwrap_or_else(|| view_key.clone()),
+                        };
+                        let stamped = Self::stamp_derived_plan(view_plan, &known_as, &[])?;
+                        self.set_wildcard_output_of_factor(view_output_is_wildcard);
+                        return Ok(stamped);
                     }
                 }
 
@@ -3025,7 +3932,7 @@ impl<'a> Planner<'a> {
                 let as_of = self.parse_as_of_for_table(&table_name)?;
 
                 // Extract alias if present
-                let table_alias = alias.as_ref().map(|a| a.name.value.clone());
+                let table_alias = alias.as_ref().map(|a| Self::normalize_ident(&a.name));
 
                 Ok(LogicalPlan::Scan {
                     table_name,
@@ -3042,14 +3949,30 @@ impl<'a> Planner<'a> {
             } => {
                 // Handle subqueries in FROM clause: SELECT * FROM (SELECT ...) AS sub
                 // Also handles LATERAL: SELECT * FROM t, LATERAL (SELECT ... WHERE t.id = ...)
+                let subquery_output_is_wildcard = Self::query_output_is_wildcard(subquery);
                 let subquery_plan = self.query_to_plan(*subquery.clone())?;
-
-                // If there's an alias, we could wrap this but for now just return the plan
-                // The LATERAL flag is handled at the join level
-                let _ = alias; // Alias is used for column qualification but schema already has names
                 let _ = lateral; // LATERAL is tracked at the join level
 
-                Ok(subquery_plan)
+                // GH#29 (c2): the sub-select's output is known by its alias at
+                // runtime (`stamp_derived_plan`), and a column-alias list
+                // (`AS s(a, b)`) renames its columns instead of being dropped
+                // (v4.31.1) or refused (candidate 1). The range entry itself
+                // is recorded by `table_factor_to_plan`.
+                //
+                // GH#29 (c11, M1): the sub-select's own select-list shape is
+                // noted AFTER its body is planned — the body's own FROM items
+                // each set and cleared the flag through their own
+                // `table_factor_to_plan`, so this assignment is the last word.
+                let stamped = match alias {
+                    Some(a) => {
+                        let column_list: Vec<String> =
+                            a.columns.iter().map(|c| Self::normalize_ident(&c.name)).collect();
+                        Self::stamp_derived_plan(subquery_plan, &Self::normalize_ident(&a.name), &column_list)?
+                    }
+                    None => subquery_plan,
+                };
+                self.set_wildcard_output_of_factor(subquery_output_is_wildcard);
+                Ok(stamped)
             }
             TableFactor::TableFunction { expr, alias } => {
                 // Handle TABLE(expr) syntax
@@ -3078,7 +4001,7 @@ impl<'a> Planner<'a> {
                                     }
                                 }
                             }
-                            let table_alias = alias.as_ref().map(|a| a.name.value.clone());
+                            let table_alias = alias.as_ref().map(|a| Self::normalize_ident(&a.name));
                             let column_alias = alias
                                 .as_ref()
                                 .and_then(|a| a.columns.first())
@@ -3108,7 +4031,7 @@ impl<'a> Planner<'a> {
                 for expr in array_exprs {
                     logical_args.push(self.expr_to_logical(expr)?);
                 }
-                let table_alias = alias.as_ref().map(|a| a.name.value.clone());
+                let table_alias = alias.as_ref().map(|a| Self::normalize_ident(&a.name));
                 let column_alias = alias
                     .as_ref()
                     .and_then(|a| a.columns.first())
@@ -3234,9 +4157,10 @@ impl<'a> Planner<'a> {
         &self,
         items: &[SelectItem],
         input: &LogicalPlan,
-    ) -> Result<(Vec<LogicalExpr>, Vec<String>)> {
+    ) -> Result<(Vec<LogicalExpr>, Vec<String>, Vec<bool>)> {
         let mut exprs = Vec::new();
         let mut aliases = Vec::new();
+        let mut from_wildcard = Vec::new();
 
         for item in items {
             match item {
@@ -3246,11 +4170,13 @@ impl<'a> Planner<'a> {
                     let alias = self.extract_expr_alias(expr, exprs.len());
                     exprs.push(logical_expr);
                     aliases.push(alias);
+                    from_wildcard.push(false);
                 }
                 SelectItem::ExprWithAlias { expr, alias } => {
                     let logical_expr = self.expr_to_logical(expr)?;
                     exprs.push(logical_expr);
                     aliases.push(alias.value.clone());
+                    from_wildcard.push(false);
                 }
                 SelectItem::Wildcard(_) => {
                     // Expand wildcard to all columns from input schema
@@ -3261,42 +4187,17 @@ impl<'a> Planner<'a> {
                             name: column.name.clone(),
                         });
                         aliases.push(column.name.clone());
+                        from_wildcard.push(true);
                     }
                 }
                 SelectItem::QualifiedWildcard(object_name, _) => {
-                    // Expand alias.* or table.* to all columns from that table
-                    let qualifier = object_name
-                        .0
-                        .iter()
-                        .map(|i| i.value.clone())
-                        .collect::<Vec<_>>()
-                        .join(".");
-                    let schema = input.schema();
-                    let mut matched = false;
-                    for column in &schema.columns {
-                        // Match by source_table_name (alias or real table name)
-                        let col_table = column.source_table_name.as_deref().unwrap_or("");
-                        if col_table.eq_ignore_ascii_case(&qualifier)
-                            || column.name.starts_with(&format!("{}.", qualifier))
-                        {
-                            exprs.push(LogicalExpr::Column {
-                                table: Some(qualifier.clone()),
-                                name: column.name.clone(),
-                            });
-                            aliases.push(column.name.clone());
-                            matched = true;
-                        }
-                    }
-                    // If no columns matched by source_table, expand ALL columns
-                    // (fallback for when source_table isn't set)
-                    if !matched {
-                        for column in &schema.columns {
-                            exprs.push(LogicalExpr::Column {
-                                table: None,
-                                name: column.name.clone(),
-                            });
-                            aliases.push(column.name.clone());
-                        }
+                    // GH#29: `alias.*` / `table.*` expands to exactly that range
+                    // entry's columns; an unknown qualifier is 42P01, never
+                    // widened to every column of the input.
+                    for (expr, name) in self.expand_qualified_wildcard(object_name, input)? {
+                        exprs.push(expr);
+                        aliases.push(name);
+                        from_wildcard.push(false);
                     }
                 } // SelectItem is exhaustive across the four variants
                   // above — the explicit fallback was for a pre-0.53
@@ -3306,7 +4207,7 @@ impl<'a> Planner<'a> {
             }
         }
 
-        Ok((exprs, aliases))
+        Ok((exprs, aliases, from_wildcard))
     }
 
     /// Extract a meaningful alias from an expression
@@ -3474,6 +4375,7 @@ impl<'a> Planner<'a> {
                 aliases,
                 distinct,
                 distinct_on,
+                source_alias,
             } if !distinct && distinct_on.is_none() => {
                 let input_schema = Self::runtime_stamped_schema(&input);
                 if Self::order_by_resolves_against_schema(&exprs, &input_schema) {
@@ -3483,6 +4385,7 @@ impl<'a> Planner<'a> {
                         aliases,
                         distinct,
                         distinct_on,
+                        source_alias,
                     };
                 }
 
@@ -3493,6 +4396,7 @@ impl<'a> Planner<'a> {
                         aliases,
                         distinct,
                         distinct_on,
+                        source_alias,
                     }),
                     exprs,
                     asc,
@@ -4220,10 +5124,37 @@ impl<'a> Planner<'a> {
                             .last()
                             .ok_or_else(|| Error::query_execution("Empty compound identifier"))?,
                     );
-                    Ok(LogicalExpr::Column {
-                        table: Some(table_alias),
-                        name: column_name,
-                    })
+                    // Pseudo-relations with their own resolution paths: EXCLUDED
+                    // (`resolve_excluded_refs`), NEW / OLD (the trigger row
+                    // context in the evaluator). Never range-table entries.
+                    if matches!(table_alias.as_str(), "excluded" | "new" | "old") {
+                        return Ok(LogicalExpr::Column {
+                            table: Some(table_alias),
+                            name: column_name,
+                        });
+                    }
+                    // GH#29: resolve the qualifier against the FROM scope at
+                    // plan time and rewrite it to the qualifier the runtime
+                    // schema carries. No scope pushed ⇒ lowered as before.
+                    use super::scope::Resolution;
+                    match self.resolve_column(Some(&table_alias), &column_name, &[]) {
+                        Resolution::Unscoped => Ok(LogicalExpr::Column {
+                            table: Some(table_alias),
+                            name: column_name,
+                        }),
+                        Resolution::Resolved { qualifier } => Ok(LogicalExpr::Column {
+                            table: qualifier,
+                            name: column_name,
+                        }),
+                        Resolution::UndefinedColumn => {
+                            Err(super::scope::undefined_column(Some(&table_alias), &column_name))
+                        }
+                        Resolution::MissingFromClauseEntry => {
+                            Err(super::scope::missing_from_clause_entry(&table_alias))
+                        }
+                        Resolution::DuplicateAlias => Err(super::scope::duplicate_range_entry(&table_alias)),
+                        Resolution::Ambiguous => Err(super::scope::ambiguous_column(&column_name)),
+                    }
                 } else {
                     let column_name = Self::normalize_ident(
                         idents
@@ -6513,11 +7444,20 @@ impl<'a> Planner<'a> {
         Ok(options)
     }
 
-    /// Convert UPDATE statement to logical plan
+    /// Convert UPDATE statement to logical plan.
+    ///
+    /// GH#29 (c2): `from` is the statement's `FROM` list (`UPDATE t SET v =
+    /// s.v FROM s WHERE s.id = t.id`). Its entries are planned for their
+    /// range entries only — they are in scope for `SET` and `WHERE` exactly
+    /// as in PostgreSQL — while the DML executor keeps evaluating against the
+    /// target's row as it always did (no join support in the DML executor;
+    /// unchanged from v4.31.1). Without this, candidate 1 refused the
+    /// statement at plan time with `42P01` for `s`.
     fn update_to_plan(
         &self,
         table: sqlparser::ast::TableWithJoins,
         assignments: Vec<sqlparser::ast::Assignment>,
+        from: Option<&TableWithJoins>,
         selection: Option<Expr>,
         returning: Option<Vec<ReturningItem>>,
     ) -> Result<LogicalPlan> {
@@ -6530,6 +7470,14 @@ impl<'a> Planner<'a> {
                 ))
             }
         };
+        // GH#29: the target (by alias, key or bare name) is the one range
+        // entry the SET / WHERE expressions and their correlated subqueries
+        // may reference; popped when this function returns.
+        let _scope = self.push_scope();
+        self.record_dml_target(&table.relation, &table_name);
+        if let Some(from) = from {
+            self.table_with_joins_to_plan(from)?;
+        }
 
         // Convert assignments to (column_name, value_expr) pairs
         let assignments: Result<Vec<_>> = assignments
@@ -6545,14 +7493,36 @@ impl<'a> Planner<'a> {
                         .join("."),
                     _ => return Err(Error::query_execution("Complex assignment targets not supported")),
                 };
-                let value_expr = self.expr_to_logical(&assignment.value)?;
+                // GH#29 (c3, m1): `SET col = DEFAULT`. sqlparser hands the
+                // bare keyword over as an unquoted `Identifier("DEFAULT")`
+                // (as in the INSERT VALUES path); it is the column's declared
+                // default — NULL when there is none — never a column named
+                // `default`.
+                let value_expr = match &assignment.value {
+                    Expr::Identifier(ident)
+                        if ident.quote_style.is_none() && ident.value.eq_ignore_ascii_case("DEFAULT") =>
+                    {
+                        self.column_default_for_update(&table_name, &column_name)?
+                    }
+                    other => self.expr_to_logical(other)?,
+                };
+                // GH#29 (c2, FIX 1): an unknown column in a SET value is 42703
+                // at plan time — on an EMPTY table too, where the executor
+                // never evaluates it.
+                self.refuse_unresolved(std::slice::from_ref(&value_expr), &[])?;
+                // GH#29 (c5, m6): arithmetic on a text column is 42883 at
+                // plan time — for a missing row too.
+                self.refuse_text_arithmetic_on_target(&table_name, &value_expr)?;
                 Ok((column_name, value_expr))
             })
             .collect();
 
         // Convert WHERE clause if present
         let selection = if let Some(expr) = selection {
-            Some(self.expr_to_logical(&expr)?)
+            let predicate = self.expr_to_logical(&expr)?;
+            // GH#29 (c2, FIX 1): same for the WHERE clause.
+            self.refuse_unresolved(std::slice::from_ref(&predicate), &[])?;
+            Some(predicate)
         } else {
             None
         };
@@ -6563,6 +7533,105 @@ impl<'a> Planner<'a> {
             selection,
             returning,
         })
+    }
+
+    /// The expression `UPDATE … SET column = DEFAULT` assigns (GH#29 c3, m1):
+    /// the column's declared default as the catalog stores it (a serialized
+    /// `LogicalExpr`, the same one INSERT applies), or `NULL` when the column
+    /// has none — PostgreSQL's behaviour. Substituted at plan time, so every
+    /// DML executor family evaluates it like any other SET value (per row,
+    /// then auto-cast to the column's type). An unknown target column is
+    /// 42703. Without a catalog (unit-test planners) the `DefaultValue`
+    /// marker is emitted and refused by the evaluator; a target whose schema
+    /// the catalog cannot supply is left to the executor's own table-not-found
+    /// report, exactly like `record_dml_target`.
+    fn column_default_for_update(&self, table_name: &str, column_name: &str) -> Result<LogicalExpr> {
+        let Some(catalog) = self.catalog else {
+            return Ok(LogicalExpr::DefaultValue);
+        };
+        let Ok(schema) = catalog.get_table_schema(table_name) else {
+            return Ok(LogicalExpr::DefaultValue);
+        };
+        let column = schema
+            .columns
+            .iter()
+            .find(|c| c.name == column_name)
+            .or_else(|| schema.columns.iter().find(|c| c.name.eq_ignore_ascii_case(column_name)))
+            .ok_or_else(|| super::scope::undefined_column(None, column_name))?;
+        match &column.default_expr {
+            Some(json) => serde_json::from_str::<LogicalExpr>(json).map_err(|e| {
+                Error::query_execution(format!("cannot apply the DEFAULT of column \"{}\": {e}", column.name))
+            }),
+            None => Ok(LogicalExpr::Literal(Value::Null)),
+        }
+    }
+
+    /// GH#29 (c5, m6): `UPDATE t SET v = v + 1` where `v` is a text-typed
+    /// column of the target is `operator does not exist: text + integer`
+    /// (42883) in PostgreSQL, at plan time. The evaluator refuses it too
+    /// (`arithmetic_add` and friends have no String arm) — but only per
+    /// MATCHED row, so on a missing key the statement answered `Ok(0)`.
+    /// Exactly that shape — an arithmetic operator between a bare or
+    /// target-qualified text column of the target and a numeric literal —
+    /// is refused before any row is looked up. Every other operand shape
+    /// keeps its runtime behaviour; a target whose schema the catalog cannot
+    /// supply is left to the executor's table-not-found report.
+    fn refuse_text_arithmetic_on_target(&self, table_name: &str, value: &LogicalExpr) -> Result<()> {
+        let Some(catalog) = self.catalog else {
+            return Ok(());
+        };
+        let LogicalExpr::BinaryExpr { left, op, right } = value else {
+            return Ok(());
+        };
+        let symbol = match op {
+            BinaryOperator::Plus => "+",
+            BinaryOperator::Minus => "-",
+            BinaryOperator::Multiply => "*",
+            BinaryOperator::Divide => "/",
+            BinaryOperator::Modulo => "%",
+            _ => return Ok(()),
+        };
+        let (column_on_left, (table, name), literal) = match (left.as_ref(), right.as_ref()) {
+            (LogicalExpr::Column { table, name }, LogicalExpr::Literal(literal)) => (true, (table, name), literal),
+            (LogicalExpr::Literal(literal), LogicalExpr::Column { table, name }) => (false, (table, name), literal),
+            _ => return Ok(()),
+        };
+        // A qualified reference was rewritten to the runtime qualifier (the
+        // resolved key) when it was lowered; any other qualifier names an
+        // `UPDATE … FROM` entry, whose columns are not this check's.
+        if table.as_deref().is_some_and(|qualifier| qualifier != table_name) {
+            return Ok(());
+        }
+        let literal_type = match literal {
+            Value::Int2(_) => "smallint",
+            Value::Int4(_) => "integer",
+            Value::Int8(_) => "bigint",
+            Value::Float4(_) => "real",
+            Value::Float8(_) => "double precision",
+            Value::Numeric(_) => "numeric",
+            _ => return Ok(()),
+        };
+        let Ok(schema) = catalog.get_table_schema(table_name) else {
+            return Ok(());
+        };
+        let Some(column) = schema.columns.iter().find(|c| c.name == *name) else {
+            return Ok(());
+        };
+        let column_type = match column.data_type {
+            DataType::Text => "text",
+            DataType::Varchar(_) => "character varying",
+            DataType::Char(_) => "character",
+            _ => return Ok(()),
+        };
+        let (lhs, rhs) = if column_on_left {
+            (column_type, literal_type)
+        } else {
+            (literal_type, column_type)
+        };
+        Err(Error::query_execution(format!(
+            "{}{lhs} {symbol} {rhs}",
+            super::scope::UNDEFINED_OPERATOR
+        )))
     }
 
     /// Convert RETURNING clause SelectItems to ReturningItems
@@ -6599,7 +7668,20 @@ impl<'a> Planner<'a> {
     /// not mix `*` with an unnameable expression (`*` expands to N columns at
     /// projection time, in `EmbeddedDatabase::returning_schema`, and only the
     /// `col_<n>` last-resort fallback reads the ordinal at all).
-    fn convert_returning(&self, items: &[sqlparser::ast::SelectItem]) -> Result<Vec<ReturningItem>> {
+    ///
+    /// GH#29: `target` is the set of qualifiers that name the statement's own
+    /// target (alias, resolved key, bare component — see
+    /// [`Self::dml_target_names`]). A qualifier outside that set — `RETURNING
+    /// bogus."n"`, `bogus.*`, `bogus.n + 1` — is refused with 42P01 here, at
+    /// plan time, instead of resolving by bare name to the target's column.
+    /// The LOWERING is unchanged, so `sql::returning::ReturningProjection::bind`
+    /// stays the one binder (it refuses an unknown column, `EXCLUDED`,
+    /// aggregates and window calls).
+    fn convert_returning(
+        &self,
+        items: &[sqlparser::ast::SelectItem],
+        target: Option<&[String]>,
+    ) -> Result<Vec<ReturningItem>> {
         items
             .iter()
             .enumerate()
@@ -6652,6 +7734,12 @@ impl<'a> Planner<'a> {
                     //     (`id`) carrying NULL for the primary key, with no
                     //     error anywhere.
                     sqlparser::ast::SelectItem::UnnamedExpr(sqlparser::ast::Expr::CompoundIdentifier(parts)) => {
+                        // GH#29: the qualifier must name the target (or EXCLUDED).
+                        if parts.len() >= 2 {
+                            if let Some(qualifier) = parts.get(parts.len() - 2) {
+                                Self::check_returning_qualifier(&Self::normalize_ident(qualifier), target)?;
+                            }
+                        }
                         match parts.last() {
                             Some(last) => Ok(ReturningItem::Column(Self::normalize_ident(last))),
                             // sqlparser never builds an empty CompoundIdentifier;
@@ -6663,6 +7751,7 @@ impl<'a> Planner<'a> {
                         // Expression without alias — named exactly as the SELECT
                         // projection list names the same expression.
                         let logical_expr = self.expr_to_logical(expr)?;
+                        Self::check_returning_expr_qualifiers(&logical_expr, target)?;
                         let alias = self.extract_expr_alias(expr, index);
                         Ok(ReturningItem::Expression {
                             expr: logical_expr,
@@ -6671,14 +7760,24 @@ impl<'a> Planner<'a> {
                     }
                     sqlparser::ast::SelectItem::ExprWithAlias { expr, alias } => {
                         let logical_expr = self.expr_to_logical(expr)?;
+                        Self::check_returning_expr_qualifiers(&logical_expr, target)?;
                         Ok(ReturningItem::Expression {
                             expr: logical_expr,
                             alias: alias.value.clone(),
                         })
                     }
                     sqlparser::ast::SelectItem::QualifiedWildcard(name, _) => {
-                        // table.* - treat as wildcard (single-table DML context)
-                        let _ = name;
+                        // `t.*` — the whole target row, once the qualifier is
+                        // known to name the target (GH#29): `bogus.*` is 42P01.
+                        if let Some(last) = name.0.last() {
+                            let bare = Self::normalize_ident(last);
+                            let qualified = Self::normalize_object_name(name);
+                            if Self::check_returning_qualifier(&bare, target).is_err()
+                                && Self::check_returning_qualifier(&qualified, target).is_err()
+                            {
+                                return Err(super::scope::missing_from_clause_entry(&bare));
+                            }
+                        }
                         Ok(ReturningItem::Wildcard)
                     }
                 }
@@ -6866,6 +7965,17 @@ impl<'a> Planner<'a> {
                         .as_ref()
                         .map(|expr| self.expr_to_logical(expr))
                         .transpose()?;
+                    // GH#29 (c4, F2): an unknown column in a SET value or the
+                    // WHERE is 42703 at plan time — qualified ones resolved
+                    // when lowered (the INSERT target is in scope), bare ones
+                    // here, EXCLUDED ones against the target's columns.
+                    let exprs: Vec<LogicalExpr> = assignments
+                        .iter()
+                        .map(|(_, expr)| expr.clone())
+                        .chain(selection.iter().cloned())
+                        .collect();
+                    self.refuse_unresolved(&exprs, &[])?;
+                    self.refuse_unknown_excluded_columns(&exprs, table_name)?;
                     Ok(Some(OnConflictAction::DoUpdate {
                         assignments,
                         selection,
@@ -6883,6 +7993,11 @@ impl<'a> Planner<'a> {
                         Ok((col_name, expr))
                     })
                     .collect::<Result<Vec<_>>>()?;
+                // GH#29 (c4, F2): same plan-time refusal as the PostgreSQL
+                // spelling (`VALUES(col)` is a function over a target column).
+                let exprs: Vec<LogicalExpr> = assign_pairs.iter().map(|(_, expr)| expr.clone()).collect();
+                self.refuse_unresolved(&exprs, &[])?;
+                self.refuse_unknown_excluded_columns(&exprs, table_name)?;
                 // MySQL's `ON DUPLICATE KEY UPDATE` names no constraint and
                 // genuinely means "any unique key" — no arbiter.
                 Ok(Some(OnConflictAction::DoUpdate {
@@ -6898,10 +8013,15 @@ impl<'a> Planner<'a> {
         }
     }
 
-    /// Convert DELETE statement to logical plan
+    /// Convert DELETE statement to logical plan.
+    ///
+    /// GH#29 (c2): `using` is the statement's `USING` list (`DELETE FROM t
+    /// USING s WHERE s.id = t.id`), in scope for `WHERE` like `UPDATE … FROM`
+    /// (see [`Self::update_to_plan`]).
     fn delete_to_plan(
         &self,
         table: sqlparser::ast::TableWithJoins,
+        using: Option<&[TableWithJoins]>,
         selection: Option<Expr>,
         returning: Option<Vec<ReturningItem>>,
     ) -> Result<LogicalPlan> {
@@ -6914,10 +8034,21 @@ impl<'a> Planner<'a> {
                 ))
             }
         };
+        // GH#29: see `update_to_plan` — the target is the one range entry in
+        // scope for the WHERE clause and its correlated subqueries.
+        let _scope = self.push_scope();
+        self.record_dml_target(&table.relation, &table_name);
+        for item in using.unwrap_or(&[]) {
+            self.table_with_joins_to_plan(item)?;
+        }
 
         // Convert WHERE clause if present
         let selection = if let Some(expr) = selection {
-            Some(self.expr_to_logical(&expr)?)
+            let predicate = self.expr_to_logical(&expr)?;
+            // GH#29 (c2, FIX 1): an unknown column in WHERE is 42703 at plan
+            // time — on an EMPTY table too.
+            self.refuse_unresolved(std::slice::from_ref(&predicate), &[])?;
+            Some(predicate)
         } else {
             None
         };
@@ -7289,6 +8420,43 @@ fn regtype_label_to_oid(label: &str) -> i32 {
 mod tests {
     use super::*;
     use crate::sql::Parser;
+
+    /// GH#29 (c10). The `NATURAL` / `USING` lowering emits BOTH operands
+    /// UNQUALIFIED — one `=` per shared column, ANDed left to right — exactly
+    /// as origin/main emitted for `NATURAL`. The qualification design
+    /// candidate 6 layered on top is removed, so nothing downstream has a
+    /// qualifier to interpret; what makes the term an equi join is the key
+    /// binder's rule that an all-unqualified `=` term is assigned in the
+    /// natural order (`bind_join_key_term`, `sql::executor::join`).
+    #[test]
+    fn the_natural_and_using_lowering_emits_bare_operands() {
+        let bare = |name: &str| LogicalExpr::Column {
+            table: None,
+            name: name.to_string(),
+        };
+        let eq = |left: LogicalExpr, right: LogicalExpr| LogicalExpr::BinaryExpr {
+            left: Box::new(left),
+            op: BinaryOperator::Eq,
+            right: Box::new(right),
+        };
+        // `USING (id, k)` where the right side spells the second column `K`:
+        // each operand keeps the spelling ITS OWN side carries.
+        let names = vec![("id".to_string(), "id".to_string()), ("k".to_string(), "K".to_string())];
+        assert_eq!(
+            Planner::common_column_join_condition(&names).expect("one term per shared column"),
+            LogicalExpr::BinaryExpr {
+                left: Box::new(eq(bare("id"), bare("id"))),
+                op: BinaryOperator::And,
+                right: Box::new(eq(bare("k"), bare("K"))),
+            },
+            "both operands bare, one `=` per shared column, ANDed left to right"
+        );
+        assert_eq!(
+            Planner::common_column_join_condition(&[]),
+            None,
+            "no shared column, no term"
+        );
+    }
 
     #[test]
     fn schema_qualified_names_collapse_to_bare_table() {
