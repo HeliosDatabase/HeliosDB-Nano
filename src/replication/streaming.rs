@@ -31,6 +31,7 @@ use super::transport::{
 use super::wal_replicator::{Lsn, WalEntry, WalEntryType};
 use super::wal_store::{BatchRequest, WalStore};
 use super::{ReplicationError, Result};
+use crate::protocol::postgres::timeouts::{apply_tcp_keepalive, TcpKeepaliveSettings};
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -60,6 +61,11 @@ pub struct StreamingServerConfig {
     pub max_standbys: usize,
     /// Heartbeat interval
     pub heartbeat_interval: Duration,
+    /// GH#28: TCP keepalive for accepted standby sockets (`Some(all-zero)` =
+    /// `SO_KEEPALIVE` on with OS timers; `None` = untouched). Keepalive ONLY —
+    /// no idle deadline ever reaches the replication stream: a standby is
+    /// legitimately idle between WAL segments.
+    pub tcp_keepalive: Option<TcpKeepaliveSettings>,
 }
 
 impl Default for StreamingServerConfig {
@@ -72,6 +78,7 @@ impl Default for StreamingServerConfig {
             failover_config: FailoverConfig::default(),
             max_standbys: 10,
             heartbeat_interval: HEARTBEAT_INTERVAL,
+            tcp_keepalive: Some(TcpKeepaliveSettings::default()),
         }
     }
 }
@@ -176,6 +183,12 @@ impl StreamingServer {
                             if standbys_count >= self.config.max_standbys {
                                 tracing::warn!("Rejecting connection from {} - max standbys reached", addr);
                                 continue;
+                            }
+
+                            // GH#28: half-open standby sockets are reaped by the
+                            // kernel. Never fatal.
+                            if let Err(e) = apply_tcp_keepalive(&stream, &self.config.tcp_keepalive) {
+                                tracing::warn!("Failed to enable TCP keepalive for standby {}: {}", addr, e);
                             }
 
                             let conn = ReplicationConnection::from_stream(stream, addr);

@@ -253,8 +253,55 @@ port = 5432
 # started by `heliosdb-nano start`, and this value is never read at startup.
 oracle_port = 1521
 
-# Maximum concurrent connections
+# Maximum concurrent connections PER LISTENER (the PostgreSQL TCP, MySQL TCP
+# and MySQL Unix-socket listeners each get their own limit of this size).
+# `--max-connections` on the command line wins over this key. When a listener
+# is full the server accepts the TCP connection and closes it immediately
+# (no PostgreSQL error packet), logging
+# `Connection limit reached (N), rejecting <addr>` at WARN.
 max_connections = 100
+
+# Log a WARN (once per crossing) when in-use connections on a listener reach
+# this percentage of max_connections. 0 disables; values above 100 are an error.
+max_connections_warn_percent = 80
+
+# --- Connection lifetime (PostgreSQL names, units and defaults) ---------------
+# Durations use PostgreSQL syntax: a bare integer in the parameter's PostgreSQL
+# base unit, or an integer followed by us|ms|s|min|h|d. "0" disables. The same
+# token works on the command line (--authentication-timeout ...) and in SET.
+
+# Bound on the WHOLE client handshake (startup packet, TLS, password / SCRAM).
+# A socket that never completes authentication — an internet scanner — is
+# closed and its connection slot released. Bare integer = SECONDS. Default 60s
+# (PostgreSQL); "0" disables. Server-scoped: `SET authentication_timeout` is
+# refused with SQLSTATE 55P02.
+authentication_timeout = "60s"
+
+# Close an authenticated session that is idle OUTSIDE a transaction for longer
+# than this (FATAL 57P05 idle_session_timeout). Bare integer = MILLISECONDS.
+# Default "0" = disabled, as in PostgreSQL. Sessions may override it with
+# `SET idle_session_timeout = '10min'`. Never fires on a busy connection: it
+# bounds only the wait for the next client message.
+idle_session_timeout = "0"
+
+# Close a session that is idle INSIDE a transaction block for longer than this
+# (FATAL 25P03 idle_in_transaction_session_timeout; the transaction is rolled
+# back). Bare integer = MILLISECONDS. Default "0" = disabled. Inside a block the
+# SHORTER of this and idle_session_timeout applies (a session sitting in a
+# transaction never outlives one sitting idle). Sessions may override it with SET.
+idle_in_transaction_session_timeout = "0"
+
+# TCP keepalive on every accepted PostgreSQL / MySQL / replication socket, so
+# half-open peers are reaped by the kernel. SO_KEEPALIVE is always on; these
+# tune the timers (bare integer = SECONDS; "0" / 0 = operating-system default).
+tcp_keepalives_idle = "0"
+tcp_keepalives_interval = "0"
+tcp_keepalives_count = 0
+
+# DEPRECATED: use idle_session_timeout above. Honoured as idle_session_timeout
+# only when idle_session_timeout is "0" AND this value was explicitly changed
+# from its untouched default of 300 (a WARN names the new key).
+# idle_timeout_secs = 300
 
 # Maximum rows buffered in memory while decoding a single COPY ... FROM STDIN
 # stream. The wire decoder parses each CopyData frame into typed rows and drops

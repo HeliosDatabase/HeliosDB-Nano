@@ -332,6 +332,8 @@ pub mod sqlstate {
     pub const SCHEMA_AND_DATA_STATEMENT_MIXING_NOT_SUPPORTED: &str = "25007";
     pub const NO_ACTIVE_SQL_TRANSACTION: &str = "25P01";
     pub const IN_FAILED_SQL_TRANSACTION: &str = "25P02";
+    /// GH#28: `idle_in_transaction_session_timeout` fired (FATAL, then close).
+    pub const IDLE_IN_TRANSACTION_SESSION_TIMEOUT: &str = "25P03";
 
     // Class 26 - Invalid SQL Statement Name
     pub const INVALID_SQL_STATEMENT_NAME: &str = "26000";
@@ -466,6 +468,8 @@ pub mod sqlstate {
     pub const CRASH_SHUTDOWN: &str = "57P02";
     pub const CANNOT_CONNECT_NOW: &str = "57P03";
     pub const DATABASE_DROPPED: &str = "57P04";
+    /// GH#28: `idle_session_timeout` fired (FATAL, then close).
+    pub const IDLE_SESSION_TIMEOUT: &str = "57P05";
 
     // Class 58 - System Error
     pub const SYSTEM_ERROR: &str = "58000";

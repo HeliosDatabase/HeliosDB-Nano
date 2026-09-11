@@ -10076,3 +10076,726 @@ fn gh23_c3_returning_aggregate_and_window_classify_as_42803_and_42p20() {
     let unrelated = crate::Error::query_execution("Unknown scalar function: 'aggregate_me'");
     assert_eq!(super::handler::sqlstate_for_error(&unrelated), "42883");
 }
+// ---- GH#28 ----
+// ===========================================================================
+// GH #28 — the wire half: the timeout GUCs do not exist on the PostgreSQL
+// SHOW/SET arms, and the SHOW table is a hardcoded lie.
+//
+// APPEND these functions to src/protocol/postgres/wire_tests.rs. They use only
+// helpers that already live in that file: `test_handler` (:17), `drain` (:23),
+// `parse_messages` (:37), `command_tags` (:521) and `first_data_row_text`
+// (:542). No new `use` statements are required.
+//
+// Expected on the CURRENT tree (v4.31.1):
+//   gh28_wire_control_show_server_version_answers            PASS  (control)
+//   gh28_wire_control_show_helios_fast_autocommit_answers    PASS  (control)
+//   gh28_wire_show_idle_session_timeout_is_answered          FAIL
+//   gh28_wire_show_idle_in_transaction_timeout_is_answered   FAIL
+//   gh28_wire_set_show_idle_session_timeout_roundtrip        FAIL
+//   gh28_wire_set_authentication_timeout_is_refused          FAIL
+// ===========================================================================
+
+/// CONTROL. `resolve_show_parameter` (src/protocol/postgres/handler.rs:2620)
+/// answers the parameters it knows about. If this fails, the SHOW arm itself is
+/// broken and the #28 assertions below mean nothing.
+#[tokio::test]
+async fn gh28_wire_control_show_server_version_answers() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+
+    handler.handle_single_query("SHOW server_version").await.unwrap();
+    let v = first_data_row_text(&drain(&mut client).await).expect("SHOW server_version row");
+    assert!(!v.is_empty(), "control: SHOW server_version must answer a value");
+}
+
+/// CONTROL. A GUC that IS wired end-to-end on the wire (item 9's
+/// `helios.fast_autocommit`, handler.rs:1046-1060 / :1176-1183) round-trips
+/// through SET and SHOW. This is the exact shape the three timeout GUCs must
+/// acquire — so a failure below is "not implemented", not "impossible here".
+#[tokio::test]
+async fn gh28_wire_control_show_helios_fast_autocommit_answers() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+
+    handler
+        .handle_single_query("SET helios.fast_autocommit = on")
+        .await
+        .unwrap();
+    let _ = drain(&mut client).await;
+    handler
+        .handle_single_query("SHOW helios.fast_autocommit")
+        .await
+        .unwrap();
+    assert_eq!(
+        first_data_row_text(&drain(&mut client).await).as_deref(),
+        Some("on"),
+        "control: an end-to-end wire GUC round-trips through SET and SHOW"
+    );
+}
+
+/// GH #28 ask 1. `SHOW idle_session_timeout` currently falls into
+/// `resolve_show_parameter`'s `_ => String::new()` catch-all
+/// (src/protocol/postgres/handler.rs:2638) and hands the client a DataRow
+/// containing an empty string — a client cannot distinguish "unsupported" from
+/// "set to nothing". The setting must be answered with the effective value.
+#[tokio::test]
+async fn gh28_wire_show_idle_session_timeout_is_answered() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+
+    handler.handle_single_query("SHOW idle_session_timeout").await.unwrap();
+    let v = first_data_row_text(&drain(&mut client).await).expect("SHOW returned no DataRow");
+    assert!(
+        !v.trim().is_empty(),
+        "GH #28: SHOW idle_session_timeout answered {v:?}. The wire SHOW arm \
+         (handler.rs:1164-1207) never consults SessionSettings and \
+         resolve_show_parameter has no entry for it (handler.rs:2620-2641)."
+    );
+}
+
+/// Same for the in-transaction variant.
+#[tokio::test]
+async fn gh28_wire_show_idle_in_transaction_timeout_is_answered() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+
+    handler
+        .handle_single_query("SHOW idle_in_transaction_session_timeout")
+        .await
+        .unwrap();
+    let v = first_data_row_text(&drain(&mut client).await).expect("SHOW returned no DataRow");
+    assert!(
+        !v.trim().is_empty(),
+        "GH #28: SHOW idle_in_transaction_session_timeout answered {v:?}"
+    );
+}
+
+/// GH #28 ask 1, the write half. The generic wire `SET` arm acks anything it
+/// does not recognise with a bare `CommandComplete(\"SET\")`
+/// (handler.rs:1122-1124), so `SET idle_session_timeout = '30s'` currently
+/// succeeds and does nothing at all.
+#[tokio::test]
+async fn gh28_wire_set_show_idle_session_timeout_roundtrip() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+
+    handler
+        .handle_single_query("SET idle_session_timeout = '30s'")
+        .await
+        .unwrap();
+    let out = drain(&mut client).await;
+    assert!(
+        command_tags(&out).iter().any(|t| t == "SET"),
+        "SET idle_session_timeout must ack with a SET tag, got {:?}",
+        command_tags(&out)
+    );
+
+    handler.handle_single_query("SHOW idle_session_timeout").await.unwrap();
+    let v = first_data_row_text(&drain(&mut client).await).expect("SHOW returned no DataRow");
+    assert!(
+        v.contains("30"),
+        "GH #28: SET idle_session_timeout = '30s' was acked but SHOW returned \
+         {v:?} — the generic CommandComplete(\"SET\") at handler.rs:1122-1124 \
+         swallowed it, exactly like the HC4 `SET ROLE` defect."
+    );
+}
+
+/// GH #28 ask 2, FAIL-CLOSED. `authentication_timeout` is postmaster-scoped in
+/// PostgreSQL: a session must not be able to lengthen its own authentication
+/// window. Today the generic SET arm acks it silently, which is the same
+/// "false security claim" the HC4 `SET ROLE` fix (handler.rs:1075-1090) already
+/// ruled unacceptable in this repo. It must produce an ErrorResponse.
+#[tokio::test]
+async fn gh28_wire_set_authentication_timeout_is_refused() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+
+    // The handler reports statement errors as an ErrorResponse frame and still
+    // returns Ok — same convention as `helios_fast_autocommit_set_show_roundtrip`.
+    handler
+        .handle_single_query("SET authentication_timeout = '5s'")
+        .await
+        .unwrap();
+    let out = drain(&mut client).await;
+    assert!(
+        parse_messages(&out).iter().any(|(t, _)| *t == b'E'),
+        "GH #28: `SET authentication_timeout = '5s'` produced no ErrorResponse \
+         (frames: {:?}). A postmaster-scoped, security-relevant setting must be \
+         refused, never acked with a no-op.",
+        parse_messages(&out).iter().map(|(t, _)| *t as char).collect::<Vec<_>>()
+    );
+    assert!(
+        !command_tags(&out).iter().any(|t| t == "SET"),
+        "a refused SET must not also emit a SET CommandComplete"
+    );
+}
+
+// ---- GH#28 (candidate 1) ----
+// Connection-lifetime GUCs on the in-crate wire handler (no socket, no
+// listener policy: `new_for_tests` seeds a DISABLED policy, so every value
+// below is the PostgreSQL "off" rendering unless a SET changed it).
+
+/// `SHOW idle_session_timeout` answers the effective value (`"0"` = disabled),
+/// not the empty-string catch-all.
+#[tokio::test]
+async fn gh28_c1_wire_show_idle_session_timeout_answers_disabled_as_zero() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+
+    handler.handle_single_query("SHOW idle_session_timeout").await.unwrap();
+    let v = first_data_row_text(&drain(&mut client).await).expect("SHOW returned no DataRow");
+    assert_eq!(v, "0", "PostgreSQL renders a disabled idle_session_timeout as \"0\"");
+
+    handler
+        .handle_single_query("SHOW idle_in_transaction_session_timeout")
+        .await
+        .unwrap();
+    let v = first_data_row_text(&drain(&mut client).await).expect("SHOW returned no DataRow");
+    assert_eq!(v, "0");
+
+    handler
+        .handle_single_query("SHOW authentication_timeout")
+        .await
+        .unwrap();
+    let v = first_data_row_text(&drain(&mut client).await).expect("SHOW returned no DataRow");
+    assert_eq!(v, "0", "the test handler's policy is disabled");
+}
+
+/// `SHOW max_connections` answers the database's `[server] max_connections`
+/// (the seed of a handler with no listener), never a literal.
+#[tokio::test]
+async fn gh28_c1_wire_show_max_connections_is_not_a_literal() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let expected = db.storage.config().server.max_connections.to_string();
+    let (mut handler, mut client) = test_handler(db);
+
+    handler.handle_single_query("SHOW max_connections").await.unwrap();
+    let v = first_data_row_text(&drain(&mut client).await).expect("SHOW returned no DataRow");
+    assert_eq!(v, expected);
+}
+
+/// SET (PostgreSQL syntax: bare ms, `'30s'`, `'5min'`) sticks on THIS session,
+/// SHOW renders it like PostgreSQL, and RESET returns to the policy value.
+#[tokio::test]
+async fn gh28_c1_wire_set_show_reset_idle_session_timeout_roundtrip() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+
+    for (set, shown) in [
+        ("SET idle_session_timeout = '30s'", "30s"),
+        ("SET idle_session_timeout = 45000", "45s"),
+        ("SET idle_session_timeout TO '5min'", "5min"),
+        ("SET idle_in_transaction_session_timeout = '1500ms'", "1500ms"),
+    ] {
+        handler.handle_single_query(set).await.unwrap();
+        let out = drain(&mut client).await;
+        assert!(
+            command_tags(&out).iter().any(|t| t == "SET"),
+            "{set}: expected a SET tag, got {:?}",
+            command_tags(&out)
+        );
+        let name = if set.contains("in_transaction") {
+            "idle_in_transaction_session_timeout"
+        } else {
+            "idle_session_timeout"
+        };
+        handler.handle_single_query(&format!("SHOW {name}")).await.unwrap();
+        let v = first_data_row_text(&drain(&mut client).await).expect("SHOW returned no DataRow");
+        assert_eq!(v, shown, "{set}");
+    }
+
+    handler.handle_single_query("RESET idle_session_timeout").await.unwrap();
+    let out = drain(&mut client).await;
+    assert!(
+        command_tags(&out).iter().any(|t| t == "RESET"),
+        "{:?}",
+        command_tags(&out)
+    );
+    handler.handle_single_query("SHOW idle_session_timeout").await.unwrap();
+    let v = first_data_row_text(&drain(&mut client).await).expect("SHOW returned no DataRow");
+    assert_eq!(v, "0", "RESET must return to the listener policy (disabled here)");
+}
+
+/// An unparsable duration is refused with 22023 and a units HINT — and no
+/// SET tag.
+#[tokio::test]
+async fn gh28_c1_wire_set_idle_session_timeout_bad_value_is_22023() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+
+    handler
+        .handle_single_query("SET idle_session_timeout = 'banana'")
+        .await
+        .unwrap();
+    let out = drain(&mut client).await;
+    let err = parse_messages(&out)
+        .into_iter()
+        .find(|(t, _)| *t == b'E')
+        .expect("an ErrorResponse");
+    let payload = String::from_utf8_lossy(&err.1).to_string();
+    assert!(payload.contains("C22023"), "expected SQLSTATE 22023, got {payload:?}");
+    assert!(
+        payload.contains("invalid value for parameter \"idle_session_timeout\""),
+        "PostgreSQL wording expected, got {payload:?}"
+    );
+    assert!(payload.contains("Valid units"), "units HINT expected, got {payload:?}");
+    assert!(!command_tags(&out).iter().any(|t| t == "SET"));
+    // The bad SET must not have changed anything.
+    handler.handle_single_query("SHOW idle_session_timeout").await.unwrap();
+    let v = first_data_row_text(&drain(&mut client).await).expect("SHOW returned no DataRow");
+    assert_eq!(v, "0");
+}
+
+/// `authentication_timeout` is postmaster-scoped: SET and RESET are refused
+/// with 55P02 cant_change_runtime_param, never the generic ack.
+#[tokio::test]
+async fn gh28_c1_wire_set_and_reset_authentication_timeout_are_55p02() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+
+    for (sql, tag) in [
+        ("SET authentication_timeout = '5s'", "SET"),
+        ("RESET authentication_timeout", "RESET"),
+    ] {
+        handler.handle_single_query(sql).await.unwrap();
+        let out = drain(&mut client).await;
+        let err = parse_messages(&out)
+            .into_iter()
+            .find(|(t, _)| *t == b'E')
+            .unwrap_or_else(|| panic!("{sql}: expected an ErrorResponse"));
+        let payload = String::from_utf8_lossy(&err.1).to_string();
+        assert!(
+            payload.contains("C55P02"),
+            "{sql}: expected SQLSTATE 55P02, got {payload:?}"
+        );
+        assert!(
+            payload.contains("parameter \"authentication_timeout\" cannot be changed now"),
+            "{sql}: PostgreSQL wording expected, got {payload:?}"
+        );
+        assert!(
+            !command_tags(&out).iter().any(|t| t == tag),
+            "{sql}: a refused statement must not also emit a {tag} CommandComplete"
+        );
+        // ...and the session is still usable (ReadyForQuery followed).
+        assert!(
+            out.contains(&b'Z'),
+            "{sql}: ReadyForQuery must follow the ErrorResponse"
+        );
+    }
+}
+
+/// The extended protocol: Describe advertises one TEXT column for the timeout
+/// SHOW names, and Execute emits a DataRow + `SHOW` tag; SET delegates to the
+/// simple arm (sticks / refused) instead of reaching the params planner.
+#[tokio::test]
+async fn gh28_c1_extended_show_and_set_timeout_gucs() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+
+    // SET over the extended path sticks.
+    handler
+        .handle_parse_extended("s_set".into(), "SET idle_session_timeout = '30s'".into(), vec![])
+        .await
+        .unwrap();
+    handler
+        .handle_bind_extended("p_set".into(), "s_set".into(), vec![], vec![], vec![])
+        .await
+        .unwrap();
+    handler.handle_execute_extended("p_set".into(), 0).await.unwrap();
+    let out = drain(&mut client).await;
+    assert!(
+        command_tags(&out).iter().any(|t| t == "SET"),
+        "{:?}",
+        command_tags(&out)
+    );
+
+    // SHOW over the extended path: RowDescription at Describe, DataRow at Execute.
+    handler
+        .handle_parse_extended("s_show".into(), "SHOW idle_session_timeout".into(), vec![])
+        .await
+        .unwrap();
+    handler
+        .handle_describe_extended(super::messages::DescribeTarget::Statement, "s_show".into())
+        .await
+        .unwrap();
+    let described = drain(&mut client).await;
+    assert!(
+        parse_messages(&described).iter().any(|(t, _)| *t == b'T'),
+        "Describe must send a RowDescription (not NoData) for SHOW idle_session_timeout"
+    );
+    handler
+        .handle_bind_extended("p_show".into(), "s_show".into(), vec![], vec![], vec![])
+        .await
+        .unwrap();
+    handler.handle_execute_extended("p_show".into(), 0).await.unwrap();
+    let out = drain(&mut client).await;
+    assert_eq!(first_data_row_text(&out).as_deref(), Some("30s"));
+    assert!(
+        command_tags(&out).iter().any(|t| t == "SHOW"),
+        "{:?}",
+        command_tags(&out)
+    );
+    assert!(
+        !parse_messages(&out).iter().any(|(t, _)| *t == b'T'),
+        "Execute must not repeat the RowDescription"
+    );
+
+    // Refused over the extended path too.
+    handler
+        .handle_parse_extended("s_auth".into(), "SET authentication_timeout = '5s'".into(), vec![])
+        .await
+        .unwrap();
+    handler
+        .handle_bind_extended("p_auth".into(), "s_auth".into(), vec![], vec![], vec![])
+        .await
+        .unwrap();
+    handler.handle_execute_extended("p_auth".into(), 0).await.unwrap();
+    let out = drain(&mut client).await;
+    assert!(parse_messages(&out).iter().any(|(t, _)| *t == b'E'));
+    assert!(!command_tags(&out).iter().any(|t| t == "SET"));
+}
+
+/// The three SQLSTATE mappings this feature adds.
+#[test]
+fn gh28_c1_sqlstate_mappings() {
+    let e = crate::Error::query_execution("parameter \"authentication_timeout\" cannot be changed now");
+    assert_eq!(super::handler::sqlstate_for_error(&e), "55P02");
+    let e = crate::Error::query_execution("invalid value for parameter \"idle_session_timeout\": \"banana\"");
+    assert_eq!(super::handler::sqlstate_for_error(&e), "22023");
+}
+
+/// Embedded / params families: the registry answers all three names, SET of
+/// the idle names is validated (fail closed) and `authentication_timeout` is
+/// read-only there too.
+#[test]
+fn gh28_c1_registry_families_validate_and_refuse() {
+    let db = EmbeddedDatabase::new_in_memory().unwrap();
+    assert!(db.execute("SET idle_session_timeout = 'banana'").is_err());
+    assert!(db.execute_params("SET idle_session_timeout = 'banana'", &[]).is_err());
+    db.execute("SET idle_session_timeout = '30s'").unwrap();
+    let rows = db.query_params("SHOW idle_session_timeout", &[]).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(db.execute("RESET authentication_timeout").is_err());
+    assert!(db.execute_params("SET authentication_timeout = 0", &[]).is_err());
+}
+
+// ---- GH#28 (candidate 2) ----
+// Fix 1: the params-family registry hook is narrowed so an extended-protocol
+// `SET` of an ordinary registry GUC can never reach the process-global
+// registry; fix 2: the FATAL on expiry names the timer whose budget ran out;
+// fix 4: `SET LOCAL` of the idle GUCs is refused, `TO DEFAULT` clears.
+
+/// Connection A issues `SET statement_timeout = 1` (and `SET bulk_load_mode =
+/// on`) over the EXTENDED protocol — the path psycopg3 / JDBC / sqlx /
+/// node-postgres use. The process-global `SessionSettings` registry (read by
+/// `effective_statement_timeout_ms` on EVERY executor run) must be untouched,
+/// connection B's next statement must still succeed, and A's statement must
+/// produce the same outcome as on main: an error, no `SET` tag (the planner
+/// has no `SetVariable` arm; candidate 1 had widened this into a
+/// cross-session lever).
+#[tokio::test]
+async fn gh28_c2_extended_set_of_a_registry_guc_never_crosses_sessions() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    db.execute("CREATE TABLE gh28_c2_rows (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    for i in 0..64 {
+        db.execute(&format!("INSERT INTO gh28_c2_rows VALUES ({i}, 'row {i}')"))
+            .unwrap();
+    }
+    assert!(
+        db.session_settings.statement_timeout().is_none(),
+        "precondition: no process-wide statement_timeout"
+    );
+    assert!(!db.storage.is_bulk_load_mode(), "precondition: bulk load off");
+
+    let (mut a, mut a_client) = test_handler(Arc::clone(&db));
+    let (mut b, mut b_client) = test_handler(Arc::clone(&db));
+
+    for (i, sql) in ["SET statement_timeout = 1", "SET bulk_load_mode = 'on'"]
+        .into_iter()
+        .enumerate()
+    {
+        let stmt = format!("s_c2_{i}");
+        let portal = format!("p_c2_{i}");
+        a.handle_parse_extended(stmt.clone(), sql.to_string(), vec![])
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: Parse must succeed (sqlparser SetVariable): {e}"));
+        a.handle_bind_extended(portal.clone(), stmt, vec![], vec![], vec![])
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: Bind: {e}"));
+        let outcome = a.handle_execute_extended(portal, 0).await;
+        let out = drain(&mut a_client).await;
+        let errored = outcome.is_err() || parse_messages(&out).iter().any(|(t, _)| *t == b'E');
+        assert!(
+            errored,
+            "{sql}: over the extended protocol this must keep ERRORING exactly as on main \
+             (it must never be silently acked into the process-global registry); got {:?}",
+            command_tags(&out)
+        );
+        assert!(
+            !command_tags(&out).iter().any(|t| t == "SET"),
+            "{sql}: no SET tag may be emitted"
+        );
+    }
+
+    // The ONE process-global registry was never written.
+    assert!(
+        db.session_settings.statement_timeout().is_none(),
+        "SET statement_timeout over the extended protocol leaked into the process-global registry"
+    );
+    assert!(
+        !db.storage.is_bulk_load_mode(),
+        "SET bulk_load_mode over the extended protocol flipped the engine-wide bulk flag"
+    );
+
+    // Connection B is not impacted: its statement runs and returns rows.
+    b.handle_single_query("SELECT count(*) FROM gh28_c2_rows")
+        .await
+        .unwrap();
+    let out = drain(&mut b_client).await;
+    assert!(
+        !parse_messages(&out).iter().any(|(t, _)| *t == b'E'),
+        "connection B's SELECT must not fail after A's SET: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    assert_eq!(first_data_row_text(&out).as_deref(), Some("64"));
+
+    // Positive control for the narrowing: SHOW still reaches the registry from
+    // the params family (a read), and the timeout GUCs still land on A's
+    // SESSION over the same extended path — never the registry.
+    a.handle_parse_extended("s_c2_idle".into(), "SET idle_session_timeout = '30s'".into(), vec![])
+        .await
+        .unwrap();
+    a.handle_bind_extended("p_c2_idle".into(), "s_c2_idle".into(), vec![], vec![], vec![])
+        .await
+        .unwrap();
+    a.handle_execute_extended("p_c2_idle".into(), 0).await.unwrap();
+    let out = drain(&mut a_client).await;
+    assert!(
+        command_tags(&out).iter().any(|t| t == "SET"),
+        "{:?}",
+        command_tags(&out)
+    );
+    b.handle_single_query("SHOW idle_session_timeout").await.unwrap();
+    let v = first_data_row_text(&drain(&mut b_client).await).expect("SHOW returned no DataRow");
+    assert_eq!(v, "0", "A's SET idle_session_timeout must not be visible on B");
+    let registry = db.query_params("SHOW idle_session_timeout", &[]).unwrap();
+    assert_eq!(registry.len(), 1, "params-family SHOW still answers from the registry");
+}
+
+/// Fix 2: the timer reported on expiry is the one whose budget ran out. With
+/// only `idle_session_timeout` set, a session sitting inside a transaction
+/// block is closed by the idle-SESSION budget (57P05), not 25P03; when both
+/// are set the min-of-both rule names the shorter one.
+#[tokio::test]
+async fn gh28_c2_expiring_timer_is_named_by_the_budget_that_fired() {
+    use super::timeouts::SessionActivity::{Idle, IdleInTransaction};
+    use std::time::Duration;
+
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+
+    // Nothing configured: nothing armed in either state.
+    assert_eq!(handler.effective_armed_timer(Idle), None);
+    assert_eq!(handler.effective_armed_timer(IdleInTransaction), None);
+
+    handler
+        .handle_single_query("SET idle_session_timeout = '2s'")
+        .await
+        .unwrap();
+    drain(&mut client).await;
+    assert_eq!(
+        handler.effective_armed_timer(IdleInTransaction),
+        Some((Idle, Duration::from_secs(2))),
+        "only idle_session_timeout is configured: inside a block it is STILL that budget \
+         (57P05) that fires"
+    );
+    assert_eq!(
+        handler.effective_armed_timer(Idle),
+        Some((Idle, Duration::from_secs(2)))
+    );
+
+    handler
+        .handle_single_query("SET idle_in_transaction_session_timeout = '1s'")
+        .await
+        .unwrap();
+    drain(&mut client).await;
+    assert_eq!(
+        handler.effective_armed_timer(IdleInTransaction),
+        Some((IdleInTransaction, Duration::from_secs(1))),
+        "both set, in-transaction shorter: 25P03 is the one armed"
+    );
+
+    handler
+        .handle_single_query("SET idle_in_transaction_session_timeout = '3s'")
+        .await
+        .unwrap();
+    drain(&mut client).await;
+    assert_eq!(
+        handler.effective_armed_timer(IdleInTransaction),
+        Some((Idle, Duration::from_secs(2))),
+        "both set, idle-session shorter: 57P05 is the one armed"
+    );
+
+    handler.handle_single_query("RESET idle_session_timeout").await.unwrap();
+    drain(&mut client).await;
+    assert_eq!(
+        handler.effective_armed_timer(IdleInTransaction),
+        Some((IdleInTransaction, Duration::from_secs(3)))
+    );
+    assert_eq!(handler.effective_armed_timer(Idle), None);
+}
+
+/// Fix 4: `SET LOCAL` of the two idle GUCs is refused (0A000, no SET tag,
+/// session still usable, override unchanged) instead of being silently
+/// widened to the session; `SET <name> TO DEFAULT` clears the override like
+/// `RESET`. Same answers over the extended protocol.
+#[tokio::test]
+async fn gh28_c2_wire_set_local_is_refused_and_to_default_clears() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let (mut handler, mut client) = test_handler(db);
+
+    handler
+        .handle_single_query("SET idle_session_timeout = '30s'")
+        .await
+        .unwrap();
+    drain(&mut client).await;
+
+    for sql in [
+        "SET LOCAL idle_session_timeout = '1s'",
+        "SET LOCAL idle_in_transaction_session_timeout TO '1s'",
+        "set local idle_session_timeout to default",
+    ] {
+        handler.handle_single_query(sql).await.unwrap();
+        let out = drain(&mut client).await;
+        let err = parse_messages(&out)
+            .into_iter()
+            .find(|(t, _)| *t == b'E')
+            .unwrap_or_else(|| panic!("{sql}: expected an ErrorResponse"));
+        let payload = String::from_utf8_lossy(&err.1).to_string();
+        assert!(
+            payload.contains("C0A000"),
+            "{sql}: expected SQLSTATE 0A000, got {payload:?}"
+        );
+        assert!(
+            payload.contains("SET LOCAL is not supported for parameter"),
+            "{sql}: clear wording expected, got {payload:?}"
+        );
+        assert!(
+            !command_tags(&out).iter().any(|t| t == "SET"),
+            "{sql}: a refused SET LOCAL must not also emit a SET tag"
+        );
+        assert!(out.contains(&b'Z'), "{sql}: ReadyForQuery must follow");
+    }
+    // The refused statements changed nothing.
+    handler.handle_single_query("SHOW idle_session_timeout").await.unwrap();
+    let v = first_data_row_text(&drain(&mut client).await).expect("SHOW returned no DataRow");
+    assert_eq!(v, "30s");
+
+    // SET LOCAL of the postmaster-scoped name stays 55P02 (checked first).
+    handler
+        .handle_single_query("SET LOCAL authentication_timeout = '5s'")
+        .await
+        .unwrap();
+    let out = drain(&mut client).await;
+    let payload = parse_messages(&out)
+        .into_iter()
+        .find(|(t, _)| *t == b'E')
+        .map(|(_, p)| String::from_utf8_lossy(&p).to_string())
+        .expect("an ErrorResponse");
+    assert!(payload.contains("C55P02"), "{payload:?}");
+
+    // TO DEFAULT clears the session override (was 22023 on candidate 1).
+    for (name, set_default) in [
+        ("idle_session_timeout", "SET idle_session_timeout TO DEFAULT"),
+        (
+            "idle_in_transaction_session_timeout",
+            "SET idle_in_transaction_session_timeout = DEFAULT",
+        ),
+    ] {
+        handler
+            .handle_single_query(&format!("SET {name} = '45s'"))
+            .await
+            .unwrap();
+        drain(&mut client).await;
+        handler.handle_single_query(set_default).await.unwrap();
+        let out = drain(&mut client).await;
+        assert!(
+            !parse_messages(&out).iter().any(|(t, _)| *t == b'E'),
+            "{set_default}: must not error: {:?}",
+            String::from_utf8_lossy(&out)
+        );
+        assert!(
+            command_tags(&out).iter().any(|t| t == "SET"),
+            "{set_default}: expected a SET tag, got {:?}",
+            command_tags(&out)
+        );
+        handler.handle_single_query(&format!("SHOW {name}")).await.unwrap();
+        let v = first_data_row_text(&drain(&mut client).await).expect("SHOW returned no DataRow");
+        assert_eq!(
+            v, "0",
+            "{set_default}: must return to the listener policy (disabled here)"
+        );
+    }
+
+    // Extended protocol: same refusal, same code.
+    handler
+        .handle_parse_extended(
+            "s_c2_local".into(),
+            "SET LOCAL idle_session_timeout = '1s'".into(),
+            vec![],
+        )
+        .await
+        .unwrap();
+    handler
+        .handle_bind_extended("p_c2_local".into(), "s_c2_local".into(), vec![], vec![], vec![])
+        .await
+        .unwrap();
+    handler.handle_execute_extended("p_c2_local".into(), 0).await.unwrap();
+    let out = drain(&mut client).await;
+    let payload = parse_messages(&out)
+        .into_iter()
+        .find(|(t, _)| *t == b'E')
+        .map(|(_, p)| String::from_utf8_lossy(&p).to_string())
+        .expect("extended SET LOCAL: an ErrorResponse");
+    assert!(payload.contains("C0A000"), "{payload:?}");
+    assert!(!command_tags(&out).iter().any(|t| t == "SET"));
+}
+
+/// The 0A000 mapping fix 4 adds, anchored on the emitter's marker const.
+#[test]
+fn gh28_c2_set_local_classifies_as_0a000() {
+    let e = crate::Error::query_execution(format!(
+        "{} \"idle_session_timeout\": …",
+        crate::SET_LOCAL_TIMEOUT_GUC_UNSUPPORTED
+    ));
+    assert_eq!(super::handler::sqlstate_for_error(&e), "0A000");
+}
+
+/// Embedded / params families (session-less): the narrowed hook still answers
+/// `SHOW` and the three timeout GUCs from the registry, and every other `SET`
+/// keeps failing on the params path exactly as on main — the registry is
+/// never written by it.
+#[test]
+fn gh28_c2_params_family_hook_is_narrowed_to_show_and_timeout_gucs() {
+    let db = EmbeddedDatabase::new_in_memory().unwrap();
+    assert!(db.session_settings.statement_timeout().is_none());
+    assert!(
+        db.execute_params("SET statement_timeout = 1", &[]).is_err(),
+        "an ordinary registry GUC must keep erroring on the params path"
+    );
+    assert!(db.execute_params("SET bulk_load_mode = 'on'", &[]).is_err());
+    assert!(db.session_settings.statement_timeout().is_none());
+    assert!(!db.storage.is_bulk_load_mode());
+    // Still answered: SHOW (a read) and the three timeout GUCs.
+    assert_eq!(db.query_params("SHOW statement_timeout", &[]).unwrap().len(), 1);
+    db.execute_params("SET idle_session_timeout = '30s'", &[]).unwrap();
+    assert!(db.execute_params("SET authentication_timeout = 0", &[]).is_err());
+    db.execute_params("RESET idle_session_timeout", &[]).unwrap();
+    // The text family is untouched by the narrowing.
+    db.execute("SET statement_timeout = 5000").unwrap();
+    assert_eq!(
+        db.session_settings.statement_timeout(),
+        Some(std::time::Duration::from_millis(5000))
+    );
+}

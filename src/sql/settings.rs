@@ -99,6 +99,18 @@ impl SessionSettings {
         settings.insert("statement_timeout".to_string(), SettingValue::Duration(0)); // 0 = unlimited
         settings.insert("query_timeout".to_string(), SettingValue::Duration(0)); // 0 = unlimited
 
+        // GH#28: connection-lifetime GUCs (PostgreSQL names and defaults).
+        // Registered so the embedded / params executor families answer
+        // `SHOW` and validate `SET`; the wire listeners enforce the timeouts
+        // from their per-connection policy, never from this process-global
+        // registry (see `crate::protocol::postgres::timeouts`).
+        settings.insert("idle_session_timeout".to_string(), SettingValue::Duration(0)); // 0 = disabled
+        settings.insert(
+            "idle_in_transaction_session_timeout".to_string(),
+            SettingValue::Duration(0),
+        ); // 0 = disabled
+        settings.insert("authentication_timeout".to_string(), SettingValue::Duration(60_000)); // server-scoped
+
         // Optimizer settings
         settings.insert("optimizer".to_string(), SettingValue::Boolean(true));
         settings.insert("enable_seqscan".to_string(), SettingValue::Boolean(true));
@@ -176,7 +188,12 @@ impl SessionSettings {
 
         // Check if setting is read-only
         if Self::is_read_only(&normalized_name) {
-            return Err(Error::query_execution(format!("Setting '{}' is read-only", name)));
+            // PostgreSQL wording for a postmaster-scoped parameter
+            // (SQLSTATE 55P02 cant_change_runtime_param on the wire).
+            return Err(Error::query_execution(format!(
+                "parameter \"{}\" cannot be changed now",
+                normalized_name
+            )));
         }
 
         // Validate setting value
@@ -205,12 +222,30 @@ impl SessionSettings {
 
     /// Check if a setting is read-only
     fn is_read_only(name: &str) -> bool {
-        matches!(name, "server_version" | "server_encoding" | "max_connections" | "port")
+        // `authentication_timeout` (GH#28) is postmaster-scoped in PostgreSQL:
+        // a session lengthening its own authentication window would be a
+        // security regression, so it fails closed like `max_connections`.
+        matches!(
+            name,
+            "server_version" | "server_encoding" | "max_connections" | "port" | "authentication_timeout"
+        )
     }
 
     /// Validate setting value
     fn validate_setting(name: &str, value: &SettingValue) -> Result<()> {
         match name {
+            // GH#28: PostgreSQL GUC duration syntax (bare integer = ms, or
+            // `<n>us|ms|s|min|h|d`). Fail closed — a stored `'banana'` would
+            // otherwise be a silent lie on `SHOW`.
+            "idle_session_timeout" | "idle_in_transaction_session_timeout" => {
+                let raw = value.as_string();
+                if crate::protocol::postgres::timeouts::parse_guc_duration_ms(&raw, 1).is_err() {
+                    return Err(Error::query_execution(format!(
+                        "invalid value for parameter \"{}\": \"{}\"",
+                        name, raw
+                    )));
+                }
+            }
             "transaction_isolation" => {
                 if let Some(s) = match value {
                     SettingValue::String(s) => Some(s.as_str()),
@@ -285,7 +320,10 @@ impl SessionSettings {
         let normalized_name = name.to_lowercase();
 
         if Self::is_read_only(&normalized_name) {
-            return Err(Error::query_execution(format!("Setting '{}' is read-only", name)));
+            return Err(Error::query_execution(format!(
+                "parameter \"{}\" cannot be changed now",
+                normalized_name
+            )));
         }
 
         // Get default value

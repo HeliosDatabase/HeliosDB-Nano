@@ -324,6 +324,7 @@ impl Config {
 
     /// Validate all configuration sections
     pub fn validate(&self) -> crate::Result<()> {
+        self.server.validate_connection_policy()?;
         self.session.validate()?;
         self.locks.validate()?;
         self.dump.validate()?;
@@ -633,8 +634,26 @@ pub fn parse_retention_duration_secs(raw: &str) -> crate::Result<u64> {
         .ok_or_else(|| crate::Error::config(format!("storage.version_retention '{}' overflows u64 seconds", raw)))
 }
 
+/// The untouched default of the deprecated `[server] idle_timeout_secs` key.
+/// `ConnectionTimeouts::from_server_config` honours that key as
+/// `idle_session_timeout` ONLY when it was explicitly changed from this value —
+/// the default must not start closing idle sessions on upgrade (GH#28).
+pub const LEGACY_IDLE_TIMEOUT_SECS_DEFAULT: u64 = 300;
+
 fn default_idle_timeout_secs() -> u64 {
-    300 // 5 minutes
+    LEGACY_IDLE_TIMEOUT_SECS_DEFAULT // 5 minutes
+}
+
+fn default_authentication_timeout() -> String {
+    "60s".to_string() // PostgreSQL default
+}
+
+fn default_guc_duration_off() -> String {
+    "0".to_string() // 0 = disabled / OS default (PostgreSQL semantics)
+}
+
+fn default_max_connections_warn_percent() -> u8 {
+    80
 }
 
 fn default_copy_max_buffered_rows() -> usize {
@@ -1109,9 +1128,55 @@ pub struct ServerConfig {
     pub oracle_port: Option<u16>,
     /// Maximum connections
     pub max_connections: usize,
-    /// Idle connection timeout in seconds (0 = no timeout, default 300s = 5 min)
+    /// DEPRECATED (GH#28): use `idle_session_timeout`. Honoured as
+    /// `idle_session_timeout` only when that key is unset ("0") AND this value
+    /// was explicitly changed from its untouched default of 300 — the default
+    /// must not start closing idle sessions on upgrade. A WARN names the new
+    /// key when the alias is in effect.
     #[serde(default = "default_idle_timeout_secs")]
     pub idle_timeout_secs: u64,
+    /// GH#28 — PostgreSQL `authentication_timeout`: bound on the WHOLE client
+    /// handshake (startup packet, TLS, password / SCRAM). A socket that never
+    /// completes authentication is closed and its connection slot released.
+    /// PostgreSQL GUC syntax; a bare integer is SECONDS. Default "60s";
+    /// "0" disables (a Nano extension — PostgreSQL's minimum is 1s).
+    /// Server-scoped: `SET authentication_timeout` is refused (55P02).
+    #[serde(default = "default_authentication_timeout")]
+    pub authentication_timeout: String,
+    /// GH#28 — PostgreSQL `idle_session_timeout`: close an authenticated
+    /// session idle outside a transaction for longer than this (FATAL 57P05).
+    /// PostgreSQL GUC syntax; a bare integer is MILLISECONDS. Default "0" =
+    /// disabled, as in PostgreSQL. User-settable per session via `SET`.
+    #[serde(default = "default_guc_duration_off")]
+    pub idle_session_timeout: String,
+    /// GH#28 — PostgreSQL `idle_in_transaction_session_timeout`: close a
+    /// session idle INSIDE a transaction block for longer than this (FATAL
+    /// 25P03, transaction rolled back). Bare integer = milliseconds. Default
+    /// "0" = disabled. Inside a transaction the SHORTER of this and
+    /// `idle_session_timeout` applies. User-settable per session via `SET`.
+    #[serde(default = "default_guc_duration_off")]
+    pub idle_in_transaction_session_timeout: String,
+    /// GH#28 — PostgreSQL `tcp_keepalives_idle`: seconds of inactivity before
+    /// the kernel sends the first keepalive probe on an accepted socket. "0" =
+    /// operating-system default. `SO_KEEPALIVE` itself is always enabled on
+    /// the PostgreSQL, MySQL and replication listeners (as in PostgreSQL), so
+    /// half-open peers are reaped by the kernel even at "0".
+    #[serde(default = "default_guc_duration_off")]
+    pub tcp_keepalives_idle: String,
+    /// GH#28 — PostgreSQL `tcp_keepalives_interval`: seconds between keepalive
+    /// probes. "0" = operating-system default.
+    #[serde(default = "default_guc_duration_off")]
+    pub tcp_keepalives_interval: String,
+    /// GH#28 — PostgreSQL `tcp_keepalives_count`: probes sent before a
+    /// connection is declared dead. 0 = operating-system default. Honoured on
+    /// Linux, Android, the BSDs, macOS/iOS and Windows; ignored elsewhere.
+    #[serde(default)]
+    pub tcp_keepalives_count: u32,
+    /// GH#28 — log a WARN (once per crossing) when in-use connections on a
+    /// listener reach this percentage of `max_connections`. 0 disables; values
+    /// above 100 are a configuration error.
+    #[serde(default = "default_max_connections_warn_percent")]
+    pub max_connections_warn_percent: u8,
     /// Maximum number of rows buffered in memory while decoding a single
     /// `COPY … FROM STDIN` stream before the server aborts the copy with a clean
     /// error and zero rows applied (0 = unlimited). Bounds peak RSS on very large
@@ -1143,12 +1208,54 @@ impl Default for ServerConfig {
             oracle_port: Some(1521), // Enable Oracle protocol by default
             max_connections: 100,
             idle_timeout_secs: default_idle_timeout_secs(),
+            authentication_timeout: default_authentication_timeout(),
+            idle_session_timeout: default_guc_duration_off(),
+            idle_in_transaction_session_timeout: default_guc_duration_off(),
+            tcp_keepalives_idle: default_guc_duration_off(),
+            tcp_keepalives_interval: default_guc_duration_off(),
+            tcp_keepalives_count: 0,
+            max_connections_warn_percent: default_max_connections_warn_percent(),
             copy_max_buffered_rows: default_copy_max_buffered_rows(),
             copy_max_record_bytes: default_copy_max_record_bytes(),
             tls_enabled: false,
             tls_cert_path: None,
             tls_key_path: None,
         }
+    }
+}
+
+impl ServerConfig {
+    /// GH#28: validate the connection-lifetime keys. Every duration must be
+    /// PostgreSQL GUC syntax and `max_connections_warn_percent` must be
+    /// 0..=100. Called from [`Config::validate`] and explicitly by
+    /// `heliosdb-nano start` after the CLI overrides are merged.
+    pub fn validate_connection_policy(&self) -> crate::Result<()> {
+        use crate::protocol::postgres::timeouts::parse_guc_duration_ms;
+        for (key, raw, bare_unit_ms) in [
+            ("authentication_timeout", &self.authentication_timeout, 1_000u64),
+            ("idle_session_timeout", &self.idle_session_timeout, 1),
+            (
+                "idle_in_transaction_session_timeout",
+                &self.idle_in_transaction_session_timeout,
+                1,
+            ),
+            ("tcp_keepalives_idle", &self.tcp_keepalives_idle, 1_000),
+            ("tcp_keepalives_interval", &self.tcp_keepalives_interval, 1_000),
+        ] {
+            if parse_guc_duration_ms(raw, bare_unit_ms).is_err() {
+                return Err(crate::Error::config(format!(
+                    "invalid value for [server] {key} = \"{raw}\": expected a PostgreSQL duration \
+                     (integer, or integer followed by us|ms|s|min|h|d; 0 disables)"
+                )));
+            }
+        }
+        if self.max_connections_warn_percent > 100 {
+            return Err(crate::Error::config(format!(
+                "[server] max_connections_warn_percent = {} is out of range (0 disables, max 100)",
+                self.max_connections_warn_percent
+            )));
+        }
+        Ok(())
     }
 }
 

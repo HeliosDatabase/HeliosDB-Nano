@@ -128,6 +128,39 @@ Three servers start on one process:
 | MySQL Unix socket | `/tmp/heliosdb-mysql.sock` (configurable) | `mysql --socket=…`, PHP `mysqli`, WordPress |
 | REST / HTTP | 8080 | `curl`, fetch, any HTTP client |
 
+### Connection limits and timeouts
+
+Each listener (PostgreSQL TCP, MySQL TCP, MySQL Unix socket) enforces its own
+`--max-connections` / `[server] max_connections` ceiling (default **100**; the
+flag wins over the config file). When a listener is full the server **accepts
+the TCP connection and closes it immediately** — no PostgreSQL error packet is
+sent — and logs `Connection limit reached (N), rejecting <addr>` at WARN. A
+WARN is also logged once each time utilisation crosses
+`--max-connections-warn-percent` / `[server] max_connections_warn_percent`
+(default 80; 0 disables). `SHOW max_connections` reports the effective limit.
+
+Connection lifetimes follow PostgreSQL's names, units and defaults. Values use
+PostgreSQL duration syntax — a bare integer in the parameter's PostgreSQL base
+unit, or an integer with `us`, `ms`, `s`, `min`, `h` or `d`; `0` disables — and
+the same token works on the CLI, in `config.toml`, and in `SET` / `SHOW`:
+
+| Parameter | Default | Scope | Effect |
+|-----------|---------|-------|--------|
+| `authentication_timeout` (bare = seconds) | `60s` | server (`SET` refused, 55P02) | A socket that has not finished the handshake — startup packet, TLS, password / SCRAM — is closed and its slot released. This is what stops an internet scanner from holding a connection slot forever. |
+| `idle_session_timeout` (bare = ms) | `0` (off) | session (`SET` / `RESET`) | An authenticated session idle outside a transaction is closed with `FATAL 57P05 terminating connection due to idle-session timeout`. |
+| `idle_in_transaction_session_timeout` (bare = ms) | `0` (off) | session (`SET` / `RESET`) | A session idle inside a transaction block is closed with `FATAL 25P03`; the transaction is rolled back. Inside a block the shorter of the two idle limits applies. |
+| `tcp_keepalives_idle` / `tcp_keepalives_interval` (bare = seconds), `tcp_keepalives_count` | `0` (OS default) | server | `SO_KEEPALIVE` is always on for accepted PostgreSQL, MySQL and replication sockets, so half-open peers are reaped by the kernel; these tune the timers. |
+
+The two idle timeouts ship **disabled**, exactly as in PostgreSQL — the
+availability fix for dead sockets is `authentication_timeout` (on by default)
+plus TCP keepalive. A timeout never fires on a busy connection: it bounds only
+the wait for the *next* client message, and the first byte of a message
+disarms it. Replication connections are never subject to a timeout. CLI flags:
+`--authentication-timeout`, `--idle-session-timeout`,
+`--idle-in-transaction-session-timeout`, `--tcp-keepalives-idle`,
+`--tcp-keepalives-interval`, `--tcp-keepalives-count`,
+`--max-connections-warn-percent`.
+
 ## Triple Compatibility — Same Data, Any Client
 
 Start the server once, then connect from any of the three interfaces. They all read and write the same tables.

@@ -64,6 +64,9 @@ sqlparser = { version = "0.53", features = ["visitor"] }
 
 # Async Runtime
 tokio = { version = "1.40", features = ["full"] }
+# GH#28: SO_KEEPALIVE on accepted sockets (already a tokio transitive; `all` declared
+# explicitly so `with_retries` does not depend on feature unification).
+socket2 = { version = "0.6", features = ["all"] }
 async-trait = "0.1"
 # default-features = false drops native-tls (-> openssl-sys, banned in deny.toml
 # and absent from manylinux wheel builds); rustls-tls-native-roots keeps the

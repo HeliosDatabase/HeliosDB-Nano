@@ -23,6 +23,7 @@ use tracing::{debug, error, info, warn};
 
 use regex::Regex;
 
+use crate::protocol::postgres::timeouts::{ConnectionTimeouts, SessionActivity};
 use crate::{EmbeddedDatabase, Tuple, Value};
 
 // ============================================================================
@@ -313,6 +314,51 @@ async fn read_packet<S: AsyncRead + Unpin>(stream: &mut S) -> Result<(u8, Bytes)
     let mut payload = vec![0u8; len];
     stream.read_exact(&mut payload).await?;
     Ok((seq, Bytes::from(payload)))
+}
+
+/// GH#28 (candidate 2): [`read_packet`] with the idle deadline armed ONLY
+/// around the wait for the packet's FIRST byte — the same first-byte-disarms
+/// rule as the PostgreSQL handler's `read_message_deadlined`. Once a byte has
+/// arrived the client is talking, not idle: the rest of the header and the
+/// whole payload are read without a deadline, so a large `COM_QUERY` arriving
+/// slowly is never killed mid-message by an idle timeout.
+///
+/// `Ok(None)` = the deadline expired before any byte arrived; the caller must
+/// close the connection (nothing was consumed — `AsyncReadExt::read` is
+/// cancel-safe). `deadline == None` = wait forever (byte-identical to
+/// [`read_packet`] apart from the split first read).
+async fn read_packet_deadlined<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    deadline: Option<std::time::Duration>,
+) -> Result<Option<(u8, Bytes)>> {
+    let mut hdr = [0u8; 4];
+    let (first, rest) = hdr.split_at_mut(1);
+    let first_read = match deadline {
+        Some(budget) => match tokio::time::timeout(budget, stream.read(first)).await {
+            Ok(read) => read,
+            Err(_elapsed) => return Ok(None),
+        },
+        None => stream.read(first).await,
+    };
+    match first_read {
+        Ok(0) => return Err(MySqlError::ConnectionClosed),
+        Ok(_) => {}
+        Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Err(MySqlError::ConnectionClosed),
+        Err(e) => return Err(MySqlError::Io(e)),
+    }
+    // FIRST BYTE DISARMS: the remainder of this packet is read untimed.
+    stream.read_exact(rest).await.map_err(|e| {
+        if e.kind() == ErrorKind::UnexpectedEof {
+            MySqlError::ConnectionClosed
+        } else {
+            MySqlError::Io(e)
+        }
+    })?;
+    let len = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], 0]) as usize;
+    let seq = hdr[3];
+    let mut payload = vec![0u8; len];
+    stream.read_exact(&mut payload).await?;
+    Ok(Some((seq, Bytes::from(payload))))
 }
 
 /// Write one MySQL packet.
@@ -894,7 +940,15 @@ pub struct MySqlHandler<S: AsyncRead + AsyncWrite + Unpin + Send> {
     /// Per-connection database session (R0.1): transactions opened by this
     /// connection live in the session, not in the process-global slot.
     session_id: crate::session::SessionId,
+    /// GH#28: the listener's connection-lifetime policy (authentication and
+    /// idle deadlines). Disabled unless the listener installs one.
+    timeouts: ConnectionTimeouts,
 }
+
+/// GH#28: MySQL's own wording (ER_CLIENT_INTERACTION_TIMEOUT, 4031) for a
+/// server-side idle disconnect.
+const MYSQL_IDLE_DISCONNECT_MESSAGE: &str = "The client was disconnected by the server because of inactivity. \
+                                             See wait_timeout and interactive_timeout for configuring this behavior.";
 
 impl<S: AsyncRead + AsyncWrite + Unpin + Send> Drop for MySqlHandler<S> {
     fn drop(&mut self) {
@@ -935,6 +989,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
             last_row_count: 0,
             last_insert_id: 0,
             session_id,
+            timeouts: ConnectionTimeouts::disabled(),
         }
     }
 
@@ -967,23 +1022,83 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
     // ------------------------------------------------------------------
 
     /// Accept a MySQL client, perform handshake + auth, then enter the
-    /// command loop.
+    /// command loop. No connection-lifetime deadlines (the pre-GH#28
+    /// behaviour; embedders and tests). Listeners use
+    /// [`Self::handle_connection_with_timeouts`].
     pub async fn handle_connection(database: Arc<EmbeddedDatabase>, stream: S, connection_id: u32) -> Result<()> {
+        Self::handle_connection_with_timeouts(database, stream, connection_id, ConnectionTimeouts::disabled()).await
+    }
+
+    /// GH#28: [`Self::handle_connection`] under the listener's policy. The
+    /// handshake + authentication runs under ONE absolute
+    /// `authentication_timeout` deadline (expiry: write nothing, return `Ok`,
+    /// the `Drop` impl releases the session and the caller its permit); each
+    /// wait for the next command is bounded by `idle_session_timeout` /
+    /// `idle_in_transaction_session_timeout` (expiry: ERR 4031 under the same
+    /// bound, then close). Statement execution is never bounded.
+    pub async fn handle_connection_with_timeouts(
+        database: Arc<EmbeddedDatabase>,
+        stream: S,
+        connection_id: u32,
+        timeouts: ConnectionTimeouts,
+    ) -> Result<()> {
         let mut handler = Self::new(database, stream, connection_id);
+        handler.timeouts = timeouts;
         info!("New MySQL connection: id={}", connection_id);
 
-        // Handshake
-        handler.send_handshake().await?;
-        let hs = handler.receive_handshake_response().await?;
+        // Handshake + authenticate under one absolute deadline.
+        let auth_deadline = handler
+            .timeouts
+            .read_deadline(SessionActivity::Authenticating)
+            .map(|d| tokio::time::Instant::now() + d);
+        match auth_deadline {
+            Some(at) => match tokio::time::timeout_at(at, handler.handshake_and_authenticate()).await {
+                Ok(result) => result?,
+                Err(_elapsed) => {
+                    // DEBUG, not higher: scanners produce this at volume.
+                    debug!(
+                        "MySQL connection {}: authentication_timeout expired during handshake; closing",
+                        connection_id
+                    );
+                    return Ok(());
+                }
+            },
+            None => handler.handshake_and_authenticate().await?,
+        }
 
-        // Authenticate (trust-based for Nano — accept any non-empty creds)
-        handler.authenticate(&hs)?;
-        handler.send_ok(0, 0).await?;
-
-        // Command loop
+        // Command loop. The idle deadline bounds ONLY the wait for the first
+        // byte of the next command packet (c2: first byte disarms, like the
+        // PostgreSQL path) — never the rest of a packet already arriving, and
+        // never statement execution.
         loop {
             handler.reset_seq();
-            match handler.receive_command().await {
+            let activity = if handler.in_transaction {
+                SessionActivity::IdleInTransaction
+            } else {
+                SessionActivity::Idle
+            };
+            let budget = handler.timeouts.read_deadline(activity);
+            let received = match handler.receive_command_deadlined(budget).await {
+                Ok(Some(received)) => Ok(received),
+                Ok(None) => {
+                    info!(
+                        "MySQL connection {} closed: idle for longer than the configured {:?} timeout",
+                        connection_id, activity
+                    );
+                    // Bounded teardown: a peer that stopped reading must
+                    // not become the new immortal await. The bound is the
+                    // budget that just expired (`None` is unreachable here:
+                    // an unarmed wait never expires).
+                    let _ = tokio::time::timeout(
+                        budget.unwrap_or(std::time::Duration::from_secs(1)),
+                        handler.send_error(4031, "HY000", MYSQL_IDLE_DISCONNECT_MESSAGE),
+                    )
+                    .await;
+                    break;
+                }
+                Err(e) => Err(e),
+            };
+            match received {
                 Ok((cmd, payload)) => {
                     if let Err(e) = handler.dispatch_command(cmd, payload).await {
                         match e {
@@ -1016,6 +1131,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
     // ------------------------------------------------------------------
     // Handshake
     // ------------------------------------------------------------------
+
+    /// Handshake + (trust) authentication + the first OK packet — the whole
+    /// pre-authentication exchange, bounded as ONE unit by the caller.
+    async fn handshake_and_authenticate(&mut self) -> Result<()> {
+        self.send_handshake().await?;
+        let hs = self.receive_handshake_response().await?;
+        // Authenticate (trust-based for Nano — accept any non-empty creds)
+        self.authenticate(&hs)?;
+        self.send_ok(0, 0).await?;
+        Ok(())
+    }
 
     async fn send_handshake(&mut self) -> Result<()> {
         let mut p = BytesMut::new();
@@ -1100,7 +1226,24 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
     // ------------------------------------------------------------------
 
     async fn receive_command(&mut self) -> Result<(Command, Bytes)> {
-        let (seq, mut payload) = read_packet(&mut self.stream).await?;
+        match self.receive_command_deadlined(None).await? {
+            Some(received) => Ok(received),
+            // An unarmed wait never expires; treat the impossible as a close
+            // rather than panic.
+            None => Err(MySqlError::ConnectionClosed),
+        }
+    }
+
+    /// GH#28 (c2): receive the next command, bounding ONLY the wait for its
+    /// first byte by `deadline` (see [`read_packet_deadlined`]). `Ok(None)` =
+    /// the deadline expired before any byte arrived.
+    async fn receive_command_deadlined(
+        &mut self,
+        deadline: Option<std::time::Duration>,
+    ) -> Result<Option<(Command, Bytes)>> {
+        let Some((seq, mut payload)) = read_packet_deadlined(&mut self.stream, deadline).await? else {
+            return Ok(None);
+        };
         self.seq = seq.wrapping_add(1);
 
         if payload.is_empty() {
@@ -1111,7 +1254,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
         let command = Command::from_u8(cmd_byte).ok_or(MySqlError::Unsupported(cmd_byte))?;
 
         debug!("Received {:?}", command);
-        Ok((command, payload))
+        Ok(Some((command, payload)))
     }
 
     async fn dispatch_command(&mut self, cmd: Command, payload: Bytes) -> Result<()> {
@@ -3393,6 +3536,17 @@ pub async fn handle_mysql_connection(
     MySqlHandler::handle_connection(database, stream, connection_id).await
 }
 
+/// GH#28: [`handle_mysql_connection`] under the listener's connection-lifetime
+/// policy (`authentication_timeout`, idle timeouts).
+pub async fn handle_mysql_connection_with_timeouts(
+    database: Arc<EmbeddedDatabase>,
+    stream: TcpStream,
+    connection_id: u32,
+    timeouts: ConnectionTimeouts,
+) -> Result<()> {
+    MySqlHandler::handle_connection_with_timeouts(database, stream, connection_id, timeouts).await
+}
+
 /// Accept and fully handle one MySQL client connection over a Unix domain
 /// socket — used for local / embedded deployments such as WordPress + PHP
 /// mysqli talking to `/var/run/mysqld/mysqld.sock`.
@@ -3403,6 +3557,18 @@ pub async fn handle_mysql_connection_unix(
     connection_id: u32,
 ) -> Result<()> {
     MySqlHandler::handle_connection(database, stream, connection_id).await
+}
+
+/// GH#28: [`handle_mysql_connection_unix`] under the listener's
+/// connection-lifetime policy.
+#[cfg(unix)]
+pub async fn handle_mysql_connection_unix_with_timeouts(
+    database: Arc<EmbeddedDatabase>,
+    stream: UnixStream,
+    connection_id: u32,
+    timeouts: ConnectionTimeouts,
+) -> Result<()> {
+    MySqlHandler::handle_connection_with_timeouts(database, stream, connection_id, timeouts).await
 }
 
 // ============================================================================
@@ -3623,5 +3789,54 @@ mod tests {
         assert_eq!(datatype_to_mysql(&crate::DataType::Uuid), "char(36)");
         assert_eq!(datatype_to_mysql(&crate::DataType::Bytea), "longblob");
         assert_eq!(datatype_to_mysql(&crate::DataType::Timestamp), "datetime");
+    }
+
+    // ---- GH#28 (candidate 2): first byte disarms the MySQL idle deadline ----
+
+    /// A packet whose first byte arrives inside the budget but whose remainder
+    /// trickles in well AFTER the budget must be read whole — the idle
+    /// deadline bounds only the wait for the first byte.
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    async fn gh28_c2_mysql_partially_received_packet_survives_the_idle_deadline() {
+        let (mut server, mut client) = tokio::io::duplex(1024);
+        let budget = std::time::Duration::from_millis(100);
+        let writer = tokio::spawn(async move {
+            // Header byte 0 (length low byte) arrives immediately …
+            client.write_all(&[5u8]).await.unwrap();
+            // … the rest of the header and the payload only after 3x budget.
+            tokio::time::sleep(budget * 3).await;
+            client.write_all(&[0u8, 0u8, 7u8]).await.unwrap();
+            tokio::time::sleep(budget * 2).await;
+            client.write_all(b"hello").await.unwrap();
+            client
+        });
+        let got = read_packet_deadlined(&mut server, Some(budget))
+            .await
+            .expect("no I/O error")
+            .expect("the packet must not be killed once its first byte has arrived");
+        assert_eq!(got.0, 7, "sequence id");
+        assert_eq!(got.1.as_ref(), b"hello");
+        let _client = writer.await.unwrap();
+    }
+
+    /// A peer that sends NOTHING is closed at the budget (`Ok(None)`), and a
+    /// disabled deadline (`None`) never expires.
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    async fn gh28_c2_mysql_silent_peer_expires_at_the_budget_only_when_armed() {
+        let (mut server, client) = tokio::io::duplex(1024);
+        let budget = std::time::Duration::from_millis(100);
+        let started = tokio::time::Instant::now();
+        let got = read_packet_deadlined(&mut server, Some(budget))
+            .await
+            .expect("no I/O error");
+        assert!(got.is_none(), "a silent peer must expire");
+        assert!(started.elapsed() >= budget, "expired early: {:?}", started.elapsed());
+
+        // Unarmed: still waiting well past the budget (the read is pending).
+        let unarmed = tokio::time::timeout(budget * 3, read_packet_deadlined(&mut server, None)).await;
+        assert!(unarmed.is_err(), "an unarmed wait must not expire on its own");
+        drop(client);
     }
 }

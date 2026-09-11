@@ -1385,6 +1385,14 @@ enum DbSettingStatement {
     Reset { name: String },
 }
 
+/// GH#28 (c2): marker text of the error raised for `SET LOCAL` of a
+/// session-scoped connection-lifetime GUC. The wire layer maps a message
+/// containing it to SQLSTATE 0A000 feature_not_supported (see
+/// `protocol::postgres::handler::sqlstate_for_query_execution_message`);
+/// owned by the single emitter (`try_handle_session_timeout_guc`) so the two
+/// cannot drift.
+pub(crate) const SET_LOCAL_TIMEOUT_GUC_UNSUPPORTED: &str = "SET LOCAL is not supported for parameter";
+
 impl EmbeddedDatabase {
     #[allow(clippy::expect_used)] // Safety: cache size is a non-zero compile-time constant.
     fn new_spec_cache<V: Clone>() -> std::sync::Arc<sharded_lru::ShardedLruCache<String, V>> {
@@ -1761,6 +1769,44 @@ impl EmbeddedDatabase {
             }
             _ => Ok(None),
         }
+    }
+
+    /// GH#28 (candidate 2): the params family's registry hook, NARROWED.
+    ///
+    /// `SessionSettings` is ONE process-global registry (`self.session_settings`)
+    /// and `effective_statement_timeout_ms` reads it on every executor run, so
+    /// a `SET statement_timeout = 1` or `SET bulk_load_mode = on` that lands
+    /// there from an extended-protocol client (psycopg3 / JDBC / sqlx /
+    /// node-postgres all reach `execute_params_for_session`, never the simple
+    /// path) would change it for EVERY session — a cross-session
+    /// denial-of-service lever. Before GH#28 those statements ERRORED on the
+    /// params path (the planner has no `SetVariable` arm); they must keep
+    /// doing so.
+    ///
+    /// The registry is therefore consulted only for
+    /// * `SHOW <name>` — a read; and
+    /// * `SET` / `RESET` of the three connection-lifetime GUCs
+    ///   (`idle_session_timeout`, `idle_in_transaction_session_timeout`,
+    ///   `authentication_timeout`) — validated, `authentication_timeout`
+    ///   read-only, and informational for a session-less embedded caller. A
+    ///   wire session never gets here with one of them: the `_for_session`
+    ///   wrappers intercept them first and store the value on THAT session
+    ///   (`try_handle_session_timeout_guc`).
+    ///
+    /// Every other `SET` / `RESET` falls through to the planner exactly as on
+    /// main. A `&str`-prefix check that bails in nanoseconds on anything that
+    /// is not `SET` / `SHOW` / `RESET`.
+    fn try_handle_params_family_setting_statement(
+        &self,
+        sql: &str,
+    ) -> Result<Option<(Vec<Tuple>, std::sync::Arc<Schema>)>> {
+        match Self::parse_db_setting_statement(sql) {
+            Some(DbSettingStatement::Show { .. }) => {}
+            Some(DbSettingStatement::Set { ref name, .. }) | Some(DbSettingStatement::Reset { ref name })
+                if Self::is_timeout_guc_name(name) => {}
+            _ => return Ok(None),
+        }
+        self.try_handle_db_setting_statement_with_schema(sql)
     }
 
     fn try_handle_db_setting_statement_with_schema(
@@ -14621,6 +14667,17 @@ impl EmbeddedDatabase {
         // Spec 03: advisory-lock owner for a params-family statement with no
         // session. A no-op under `execute_params_for_session_inner`.
         let _advisory = self.embedded_advisory_context_guard(sql);
+        // GH#28: the params family answers `SHOW <setting>` and `SET` /
+        // `RESET` of the three connection-lifetime GUCs from the registry —
+        // and NOTHING else (candidate 2: every other `SET` keeps erroring in
+        // the planner, because the registry is process-global; see
+        // `try_handle_params_family_setting_statement`). A `&str`-prefix
+        // check that bails in nanoseconds on anything else; on the wire path
+        // the `_for_session` wrapper has already consumed every session-scoped
+        // statement before reaching here.
+        if let Some((rows, _schema)) = self.try_handle_params_family_setting_statement(sql)? {
+            return Ok(rows.len() as u64);
+        }
         // These param fast paths resolve the target table from the SQL text
         // (bare) or from SQL-keyed spec caches that are shared across sessions,
         // so under a non-`public` `search_path` they would touch the wrong
@@ -18593,6 +18650,121 @@ impl EmbeddedDatabase {
         }
     }
 
+    /// GH#28: the three PostgreSQL connection-lifetime GUC names.
+    fn is_timeout_guc_name(name: &str) -> bool {
+        matches!(
+            name,
+            "idle_session_timeout" | "idle_in_transaction_session_timeout" | "authentication_timeout"
+        )
+    }
+
+    /// GH#28 (c2): true when the statement is spelled `SET LOCAL …`.
+    /// `parse_db_setting_statement` deliberately erases the scope word, so the
+    /// callers that must distinguish transaction scope ask here.
+    fn set_statement_is_local(sql: &str) -> bool {
+        strip_prefix_icase(sql.trim(), "SET ")
+            .map(|rest| starts_with_icase(rest.trim_start(), "LOCAL "))
+            .unwrap_or(false)
+    }
+
+    /// GH#28: true for `SET` / `RESET` of one of the three timeout GUCs — the
+    /// predicate the extended-protocol Execute uses to delegate the statement
+    /// to the simple-query arm (one implementation of the rule, like the HC4
+    /// `SET ROLE` precedent).
+    pub(crate) fn is_timeout_guc_statement(sql: &str) -> bool {
+        match Self::parse_db_setting_statement(sql) {
+            Some(DbSettingStatement::Set { name, .. }) | Some(DbSettingStatement::Reset { name }) => {
+                Self::is_timeout_guc_name(&name)
+            }
+            _ => false,
+        }
+    }
+
+    /// GH#28: intercept `SET` / `RESET` of the connection-lifetime GUCs for a
+    /// wire session. Modelled on [`Self::try_handle_session_search_path`].
+    ///
+    /// * `idle_session_timeout` / `idle_in_transaction_session_timeout` are
+    ///   user-settable in PostgreSQL: the value (PostgreSQL GUC syntax, bare
+    ///   integer = milliseconds) is stored on THIS session — never on the
+    ///   process-global `SessionSettings` registry, where connection A's
+    ///   override would close connection B — and takes effect on the very
+    ///   next wait. `RESET` clears the override (back to the listener policy).
+    /// * `authentication_timeout` is postmaster-scoped: `SET` and `RESET` are
+    ///   refused with `parameter "authentication_timeout" cannot be changed
+    ///   now` (SQLSTATE 55P02 on the wire). A session must never be able to
+    ///   lengthen its own authentication window.
+    /// * `SET LOCAL` (candidate 2): PostgreSQL scopes it to the current
+    ///   transaction block. `Session` tracks no transaction-scoped GUC state
+    ///   (the existing `SET LOCAL synchronous_commit` / `helios.*` handling
+    ///   silently widens to the session — a documented simplification not
+    ///   repeated for a timer that closes connections), so it is REFUSED
+    ///   with [`SET_LOCAL_TIMEOUT_GUC_UNSUPPORTED`] (SQLSTATE 0A000 on the
+    ///   wire) rather than silently made session-wide.
+    /// * `SET <name> TO DEFAULT` (candidate 2) clears the session override
+    ///   exactly like `RESET <name>` (PostgreSQL semantics).
+    ///
+    /// Returns `Some(0)` when handled, `None` for any other statement.
+    pub(crate) fn try_handle_session_timeout_guc(
+        &self,
+        session_id: crate::session::SessionId,
+        sql: &str,
+    ) -> Result<Option<u64>> {
+        let statement = match Self::parse_db_setting_statement(sql) {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        let (name, value) = match &statement {
+            DbSettingStatement::Set { name, value } if Self::is_timeout_guc_name(name) => {
+                (name.as_str(), Some(value.as_str()))
+            }
+            DbSettingStatement::Reset { name } if Self::is_timeout_guc_name(name) => (name.as_str(), None),
+            _ => return Ok(None),
+        };
+        if name == "authentication_timeout" {
+            return Err(Error::query_execution(
+                "parameter \"authentication_timeout\" cannot be changed now",
+            ));
+        }
+        if value.is_some() && Self::set_statement_is_local(sql) {
+            return Err(Error::query_execution(format!(
+                "{} \"{}\": HeliosDB keeps no transaction-scoped GUC state, so the override would \
+                 silently outlive the transaction block; use SET {} (session scope) or RESET {}",
+                SET_LOCAL_TIMEOUT_GUC_UNSUPPORTED, name, name, name
+            )));
+        }
+        let ms = match value {
+            // `SET <name> TO DEFAULT` == `RESET <name>`: back to the listener
+            // policy. (The statement parser has already stripped quotes.)
+            Some(raw) if raw.eq_ignore_ascii_case("default") => None,
+            Some(raw) => Some(
+                crate::protocol::postgres::timeouts::parse_guc_duration_ms(raw, 1).map_err(|bad| {
+                    Error::query_execution(format!("invalid value for parameter \"{}\": \"{}\"", name, bad))
+                })?,
+            ),
+            None => None,
+        };
+        let session_lock = self.session_manager.get_session(session_id)?;
+        let mut session = session_lock.write();
+        if name == "idle_session_timeout" {
+            session.idle_session_timeout_ms = ms;
+        } else {
+            session.idle_in_transaction_session_timeout_ms = ms;
+        }
+        Ok(Some(0))
+    }
+
+    /// GH#28: this session's raw `(idle_session_timeout, idle_in_transaction_session_timeout)`
+    /// overrides in milliseconds (`None` = inherit the listener policy). One
+    /// lock read for both.
+    pub fn session_timeout_gucs(&self, session_id: crate::session::SessionId) -> Result<(Option<u64>, Option<u64>)> {
+        let session_lock = self.session_manager.get_session(session_id)?;
+        let session = session_lock.read();
+        Ok((
+            session.idle_session_timeout_ms,
+            session.idle_in_transaction_session_timeout_ms,
+        ))
+    }
+
     /// Touch session stats and, for READ COMMITTED, refresh the open
     /// transaction's snapshot so the next statement sees the latest commits.
     fn touch_session_for_statement(&self, session_id: crate::session::SessionId) -> Result<()> {
@@ -19015,6 +19187,12 @@ impl EmbeddedDatabase {
         if let Some(handled) = self.try_handle_session_search_path(session_id, sql)? {
             return Ok(handled);
         }
+        // GH#28 (c2): the connection-lifetime GUCs land on THIS session —
+        // never on the process-global registry `execute_params_inner` would
+        // otherwise consult for them.
+        if let Some(handled) = self.try_handle_session_timeout_guc(session_id, sql)? {
+            return Ok(handled);
+        }
         // `SET CONSTRAINTS` arms transaction-scoped FK deferral (see
         // `execute_for_session`) — arm it before the in-transaction planner,
         // which has no grammar for it.
@@ -19078,6 +19256,12 @@ impl EmbeddedDatabase {
         // (extended protocol / params family — the shape Prisma's psycopg3-style
         // clients send).
         let _advisory = self.advisory_context_guard(session_id, sql);
+        // GH#28 (c2): a `SET` / `RESET` of a connection-lifetime GUC arriving
+        // through the query-shaped route (MySQL COM_STMT_EXECUTE) is stored
+        // on THIS session, never on the process-global registry.
+        if self.try_handle_session_timeout_guc(session_id, sql)?.is_some() {
+            return Ok(Vec::new());
+        }
         let _schema_override = self.session_schema_override_guard(session_id);
         if !self.session_transactions.contains_key(&session_id) {
             return self.query_params_inner(sql, params, plan_override);
@@ -19340,6 +19524,15 @@ impl EmbeddedDatabase {
         let sql: &str = &rewritten_owned;
         #[cfg(not(feature = "code-graph"))]
         let sql: &str = sql;
+        // GH#28: `SHOW <registered setting>` (and `SET` / `RESET` of the three
+        // connection-lifetime GUCs ONLY — candidate 2, see
+        // `try_handle_params_family_setting_statement`) from the params family
+        // — the entry point the REST layer and every server-side binding
+        // driver reach. Same registry as the text family; a prefix check that
+        // costs nothing on a SELECT.
+        if let Some((rows, _schema)) = self.try_handle_params_family_setting_statement(sql)? {
+            return Ok(rows);
+        }
         let start = std::time::Instant::now();
 
         if let Some(result) = self.try_fast_select_params(sql, params) {

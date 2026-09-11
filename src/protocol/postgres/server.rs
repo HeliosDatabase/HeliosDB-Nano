@@ -4,11 +4,14 @@
 //! connections and spawns handlers for each connection.
 
 use super::auth::{AuthManager, AuthMethod};
-use super::handler::PgConnectionHandler;
+use super::handler::{ConnectionPolicy, PgConnectionHandler};
 use super::ssl::{SecureConnection, SslConfig, SslMode, SslNegotiator};
+use super::timeouts::ConnectionTimeouts;
 use crate::{EmbeddedDatabase, Error, Result};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use tokio::io::BufWriter;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 
@@ -26,6 +29,10 @@ pub struct PgServerConfig {
     pub max_connections: usize,
     /// SSL/TLS configuration (optional)
     pub ssl_config: Option<SslConfig>,
+    /// GH#28: connection-lifetime policy (`authentication_timeout`,
+    /// `idle_session_timeout`, `idle_in_transaction_session_timeout`, TCP
+    /// keepalive, utilisation warning). PostgreSQL defaults.
+    pub timeouts: ConnectionTimeouts,
 }
 
 impl Default for PgServerConfig {
@@ -35,6 +42,7 @@ impl Default for PgServerConfig {
             auth_method: AuthMethod::Trust,
             max_connections: 100,
             ssl_config: None,
+            timeouts: ConnectionTimeouts::default(),
         }
     }
 }
@@ -60,6 +68,12 @@ impl PgServerConfig {
         self
     }
 
+    /// GH#28: set the connection-lifetime policy.
+    pub fn with_timeouts(mut self, timeouts: ConnectionTimeouts) -> Self {
+        self.timeouts = timeouts;
+        self
+    }
+
     /// Set SSL configuration
     pub fn with_ssl(mut self, ssl_config: SslConfig) -> Self {
         self.ssl_config = Some(ssl_config);
@@ -81,6 +95,10 @@ pub struct PgServer {
     auth_manager: Arc<AuthManager>,
     ssl_negotiator: Option<Arc<SslNegotiator>>,
     connection_limiter: Arc<Semaphore>,
+    /// GH#28: edge trigger for the utilisation WARN — `true` while in-use
+    /// connections are at or above `max_connections_warn_percent`, so the
+    /// line is logged once per crossing, never once per accept.
+    utilisation_warned: AtomicBool,
 }
 
 impl PgServer {
@@ -122,6 +140,7 @@ impl PgServer {
             auth_manager,
             ssl_negotiator,
             connection_limiter,
+            utilisation_warned: AtomicBool::new(false),
         })
     }
 
@@ -158,7 +177,29 @@ impl PgServer {
             auth_manager: Arc::new(auth_manager),
             ssl_negotiator,
             connection_limiter,
+            utilisation_warned: AtomicBool::new(false),
         })
+    }
+
+    /// GH#28: WARN once when in-use connections cross
+    /// `max_connections_warn_percent` of `max_connections`, and re-arm when
+    /// utilisation drops back below it. `Semaphore::available_permits()` is
+    /// the single source of truth — no side counter.
+    fn maybe_warn_utilisation(&self) {
+        let max = self.config.max_connections;
+        let in_use = max.saturating_sub(self.connection_limiter.available_permits());
+        let over = self.config.timeouts.should_warn_utilisation(in_use, max);
+        if self.utilisation_warned.swap(over, Ordering::Relaxed) != over && over {
+            tracing::warn!(
+                "connection utilisation {}/{} ({}%) is at or above [server] max_connections_warn_percent = {}; \
+                 new connections are refused at {} (raise --max-connections / [server] max_connections)",
+                in_use,
+                max,
+                in_use.saturating_mul(100) / max.max(1),
+                self.config.timeouts.connection_warn_threshold_percent,
+                max
+            );
+        }
     }
 
     /// Start the server and listen for connections
@@ -181,9 +222,10 @@ impl PgServer {
         loop {
             match listener.accept().await {
                 Ok((stream, addr)) => {
-                    // Disable Nagle's algorithm for low-latency query responses
-                    if let Err(e) = stream.set_nodelay(true) {
-                        tracing::warn!("Failed to set TCP_NODELAY for {}: {}", addr, e);
+                    // TCP_NODELAY (low-latency responses) + SO_KEEPALIVE (GH#28:
+                    // half-open peers are reaped by the kernel). Never fatal.
+                    if let Err(e) = super::timeouts::apply_socket_options(&stream, &self.config.timeouts) {
+                        tracing::warn!("Failed to apply socket options for {}: {}", addr, e);
                     }
 
                     // Enforce max_connections via semaphore
@@ -201,15 +243,25 @@ impl PgServer {
                     };
 
                     tracing::debug!("Accepted connection from {}", addr);
+                    self.maybe_warn_utilisation();
 
                     let database = Arc::clone(&self.database);
                     let auth_manager = Arc::clone(&self.auth_manager);
                     let ssl_negotiator = self.ssl_negotiator.clone();
+                    // GH#28: ONE absolute authentication deadline, computed here
+                    // and shared by the pre-startup reads, the TLS accept and the
+                    // handler's startup / password / SCRAM round trips.
+                    let policy = ConnectionPolicy::at_accept(self.config.timeouts.clone(), self.config.max_connections);
 
-                    // Spawn a new task for each connection (permit released on drop)
+                    // Spawn a new task for each connection. `_permit` is declared
+                    // FIRST so it drops LAST — after the handler's `Drop` has
+                    // rolled back and released the session — and it is never
+                    // cloned or moved: the slot is released exactly once.
                     tokio::spawn(async move {
                         let _permit = permit;
-                        if let Err(e) = Self::handle_connection(stream, database, auth_manager, ssl_negotiator).await {
+                        if let Err(e) =
+                            Self::handle_connection(stream, database, auth_manager, ssl_negotiator, policy).await
+                        {
                             tracing::error!("Connection error from {}: {}", addr, e);
                         }
                     });
@@ -226,12 +278,48 @@ impl PgServer {
     }
 
     /// Handle a single connection with optional SSL/TLS
+    ///
+    /// GH#28: the whole pre-authentication region — both header reads, the
+    /// SSL answer and the TLS handshake — runs under the ONE absolute
+    /// `authentication_timeout` deadline computed at accept; the same instant
+    /// then bounds startup / password / SCRAM inside `handler.handle()`. On
+    /// expiry NOTHING is written to the unauthenticated peer (fail closed;
+    /// PostgreSQL `_exit(1)`s), the half-built stream is dropped and the
+    /// permit goes with the task. No code path resumes the stream after an
+    /// expiry: `read_exact` / TLS accept / `write_all` are not cancel-safe.
     async fn handle_connection(
+        stream: TcpStream,
+        database: Arc<EmbeddedDatabase>,
+        auth_manager: Arc<AuthManager>,
+        ssl_negotiator: Option<Arc<SslNegotiator>>,
+        policy: ConnectionPolicy,
+    ) -> Result<()> {
+        let auth_deadline = policy.auth_deadline;
+        let negotiate = Self::negotiate(stream, database, auth_manager, ssl_negotiator, policy);
+        let mut handler = match auth_deadline {
+            Some(at) => match tokio::time::timeout_at(at, negotiate).await {
+                Ok(negotiated) => negotiated?,
+                Err(_elapsed) => {
+                    // DEBUG, not higher: internet scanners produce this at volume.
+                    tracing::debug!("authentication_timeout expired before startup completed; closing");
+                    return Ok(());
+                }
+            },
+            None => negotiate.await?,
+        };
+        handler.handle().await
+    }
+
+    /// Pre-startup negotiation: read the 8-byte request header, answer /
+    /// perform SSL, and build the handler for the resulting stream (plain or
+    /// TLS). All three outcomes yield the same handler type.
+    async fn negotiate(
         mut stream: TcpStream,
         database: Arc<EmbeddedDatabase>,
         auth_manager: Arc<AuthManager>,
         ssl_negotiator: Option<Arc<SslNegotiator>>,
-    ) -> Result<()> {
+        policy: ConnectionPolicy,
+    ) -> Result<PgConnectionHandler<BufWriter<SecureConnection<TcpStream>>>> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         // Read message length
@@ -267,13 +355,13 @@ impl PgServer {
                             .map_err(|e| Error::network(format!("TLS handshake failed: {}", e)))?;
 
                         let secure_conn = SecureConnection::Tls(tls_stream);
-                        let mut handler = PgConnectionHandler::new_with_stream(
+                        let handler = PgConnectionHandler::new_with_stream(
                             secure_conn,
                             database,
                             auth_manager,
                             None, // TLS stream starts fresh
                         );
-                        return handler.handle().await;
+                        return Ok(handler.with_connection_policy(policy));
                     }
                 } else if negotiator.is_required() {
                     return Err(Error::network("SSL is required but was rejected"));
@@ -297,8 +385,8 @@ impl PgServer {
             // We haven't consumed any of THAT message yet.
             // So initial_data should be None for the handler.
             let secure_conn = SecureConnection::Plain(stream);
-            let mut handler = PgConnectionHandler::new_with_stream(secure_conn, database, auth_manager, None);
-            return handler.handle().await;
+            let handler = PgConnectionHandler::new_with_stream(secure_conn, database, auth_manager, None);
+            return Ok(handler.with_connection_policy(policy));
         }
 
         // Plain connection with potentially consumed startup header
@@ -307,9 +395,8 @@ impl PgServer {
         initial_data.extend_from_slice(&code_buf);
 
         let secure_conn = SecureConnection::Plain(stream);
-        let mut handler =
-            PgConnectionHandler::new_with_stream(secure_conn, database, auth_manager, Some(&initial_data));
-        handler.handle().await
+        let handler = PgConnectionHandler::new_with_stream(secure_conn, database, auth_manager, Some(&initial_data));
+        Ok(handler.with_connection_policy(policy))
     }
 
     /// Get server configuration
@@ -348,6 +435,12 @@ impl PgServerBuilder {
     /// Set maximum connections
     pub fn max_connections(mut self, max: usize) -> Self {
         self.config.max_connections = max;
+        self
+    }
+
+    /// GH#28: set the connection-lifetime policy.
+    pub fn timeouts(mut self, timeouts: ConnectionTimeouts) -> Self {
+        self.config.timeouts = timeouts;
         self
     }
 
