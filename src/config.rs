@@ -434,6 +434,26 @@ pub struct StorageConfig {
     /// INSERT/UPDATE/DELETE, including a per-statement fsync.
     #[serde(default)]
     pub logical_wal_per_statement: bool,
+    /// GH#35: advance the logical-WAL checkpoint to `current_lsn` at a CLEAN
+    /// close, after the row counters and the index snapshots are durable. A
+    /// store that closed cleanly then leaves nothing the next open could
+    /// mistake for redo. Default: true.
+    #[serde(default = "default_true")]
+    pub wal_checkpoint_on_close: bool,
+    /// GH#35: advance the logical-WAL checkpoint every N appended entries
+    /// (0 disables). This bounds the crash window: a process killed without
+    /// running `Drop` leaves at most this many entries above the checkpoint.
+    /// Default: 1000.
+    #[serde(default = "default_wal_checkpoint_interval_entries")]
+    pub wal_checkpoint_interval_entries: u64,
+    /// GH#35: advance the logical-WAL checkpoint at most this many seconds
+    /// after the previous one (0 disables). Default: 30.
+    #[serde(default = "default_wal_checkpoint_interval_secs")]
+    pub wal_checkpoint_interval_secs: u64,
+    /// GH#35: what open-time recovery does with a destructive DDL entry above
+    /// the checkpoint. See [`DestructiveDdlReplay`]. Default: `Refuse`.
+    #[serde(default)]
+    pub wal_replay_destructive_ddl: DestructiveDdlReplay,
     /// R1.3: fsync the RocksDB WriteBatch at transaction COMMIT, making
     /// commits power-loss durable. RocksDB's leader/follower write groups
     /// amortize one fsync across concurrent committers, so durable-commit
@@ -524,6 +544,18 @@ fn default_slow_query_threshold() -> Option<u64> {
     Some(1000)
 }
 
+fn default_true() -> bool {
+    true
+}
+
+fn default_wal_checkpoint_interval_entries() -> u64 {
+    1000
+}
+
+fn default_wal_checkpoint_interval_secs() -> u64 {
+    30
+}
+
 fn default_snapshot_schema_evolution() -> SnapshotSchemaEvolution {
     SnapshotSchemaEvolution::NullPad
 }
@@ -537,6 +569,54 @@ fn default_snapshot_schema_evolution() -> SnapshotSchemaEvolution {
 ///
 /// The `"versioned"` value (Stage 2: resolve the schema as-of the snapshot) is
 /// reserved and rejected at config parse until implemented.
+/// GH#35: what OPEN-TIME RECOVERY does with a destructive DDL entry
+/// (`DropTable`, `Truncate`, `RenameTable`) that sits strictly above the
+/// durable `wal:checkpoint`.
+///
+/// Open recovery cannot tell an entry whose effect is already in the store
+/// (history) from one whose data write was lost (genuine redo); a clean close
+/// and a crash are indistinguishable at open. Re-executing history destroys
+/// live rows — the GH#35 data-loss reproduction — while skipping genuine redo
+/// loses at most an operation the client was never told had committed.
+///
+/// * `"refuse"` (default) — skip the entry, log an ERROR naming the table, the
+///   LSN and the data directory, and leave the store intact. An operator can
+///   re-issue a legitimate post-crash DROP/RENAME; applying it can destroy
+///   rows irreversibly.
+/// * `"warn"` — today's behaviour: WARN with the current row count, then
+///   apply.
+/// * `"apply"` — apply silently, for a deliberate operator-driven redo.
+///
+/// Standby replication is NOT affected: a standby applying the primary's
+/// `DROP TABLE` of a populated table is normal and stays silent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DestructiveDdlReplay {
+    #[default]
+    Refuse,
+    Warn,
+    Apply,
+}
+
+impl<'de> Deserialize<'de> for DestructiveDdlReplay {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        match raw.as_str() {
+            "refuse" => Ok(DestructiveDdlReplay::Refuse),
+            "warn" => Ok(DestructiveDdlReplay::Warn),
+            "apply" => Ok(DestructiveDdlReplay::Apply),
+            other => Err(serde::de::Error::custom(format!(
+                "invalid storage.wal_replay_destructive_ddl '{}': expected \"refuse\", \"warn\" \
+                 or \"apply\"",
+                other
+            ))),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SnapshotSchemaEvolution {
@@ -683,6 +763,10 @@ impl Default for StorageConfig {
             serializable_policy: SerializablePolicy::Warn,
             slow_query_threshold_ms: Some(1000), // 1 second default
             logical_wal_per_statement: false,    // rely on RocksDB WAL at commit (see field docs)
+            wal_checkpoint_on_close: true,       // GH#35: a clean close leaves nothing to redo
+            wal_checkpoint_interval_entries: 1000,
+            wal_checkpoint_interval_secs: 30,
+            wal_replay_destructive_ddl: DestructiveDdlReplay::Refuse,
             durable_commit: false,
             // W3.5 Stage 1 on by default: turn the pre-ALTER-snapshot arity
             // error into isolation-preserving NULL-padded rows. `"strict"`

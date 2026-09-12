@@ -140,6 +140,42 @@ slow_query_threshold_ms = 1000
 # than write latency.
 durable_commit = false
 
+# GH#35 — logical-WAL checkpointing and destructive-DDL replay policy.
+#
+# The logical WAL records DDL (and, with logical_wal_per_statement, DML) in
+# the same RocksDB store as the data it describes. The durable `wal:checkpoint`
+# marker says "every entry at or below this LSN is already applied; never
+# replay it again". These four knobs control how that marker advances and what
+# open-time recovery does with the entries above it.
+
+# Advance the checkpoint at a CLEAN close, after the row counters and index
+# snapshots are durable. A store that closed cleanly then leaves nothing the
+# next open could mistake for redo. Default true.
+wal_checkpoint_on_close = true
+
+# Advance the checkpoint every N appended logical-WAL entries (0 disables).
+# This bounds the crash window: a process killed without running its clean
+# close leaves at most this many entries above the checkpoint. Default 1000.
+wal_checkpoint_interval_entries = 1000
+
+# Advance the checkpoint at most this many seconds after the previous one
+# (0 disables). Default 30.
+wal_checkpoint_interval_secs = 30
+
+# What OPEN-TIME RECOVERY does with a destructive DDL entry (DropTable,
+# Truncate, RenameTable) that sits above the checkpoint. Open recovery cannot
+# tell an entry whose effect is already in the store (history) from one whose
+# data write was lost (genuine redo); re-executing history deletes live rows.
+#   "refuse" = default, fail closed: skip the entry, log an ERROR naming the
+#              table, the row count and the data directory, leave the store
+#              intact. An operator can re-issue a legitimate post-crash DROP;
+#              applying a stale one destroys rows irreversibly.
+#   "warn"   = log today's WARNING with the current row count, then apply.
+#   "apply"  = apply silently, for a deliberate operator-driven redo.
+# Standby replication is never affected: a standby applying the primary's
+# DROP TABLE is normal.
+wal_replay_destructive_ddl = "refuse"
+
 # How a snapshot / AS OF read decodes rows written under an OLDER schema than
 # the current catalog (after ALTER ADD/DROP COLUMN). A version-resolved
 # (open-snapshot / AS OF) or branch-forked read can surface a pre-ALTER tuple
