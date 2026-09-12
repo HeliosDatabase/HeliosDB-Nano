@@ -6,6 +6,44 @@ use super::{PhysicalOperator, TimeoutContext};
 use crate::{Result, Schema, Tuple};
 use std::sync::Arc;
 
+/// GH#29: a pass-through that re-tags its input's output schema with the
+/// range-table alias a derived table or expanded view is known by
+/// (`LogicalPlan::Project::source_alias`). Tuples are forwarded untouched;
+/// only `schema()` changes — every column carries `source_table = alias`
+/// (and no `source_table_name`), which is exactly what `handle_scan` stamps
+/// for a base table, so `Schema::get_qualified_column_index(Some(alias), c)`
+/// resolves `s.c` at runtime even when another join input carries a `c`.
+/// Applied by `Executor::plan_to_operator` AFTER whichever path built the
+/// projection's operator, so the fast paths need no knowledge of it.
+pub struct SourceAliasOperator {
+    input: Box<dyn PhysicalOperator>,
+    schema: Arc<Schema>,
+}
+
+impl SourceAliasOperator {
+    pub fn new(input: Box<dyn PhysicalOperator>, alias: &str) -> Self {
+        let mut schema = (*input.schema()).clone();
+        for column in &mut schema.columns {
+            column.source_table = Some(alias.to_string());
+            column.source_table_name = None;
+        }
+        Self {
+            input,
+            schema: Arc::new(schema),
+        }
+    }
+}
+
+impl PhysicalOperator for SourceAliasOperator {
+    fn next(&mut self) -> Result<Option<Tuple>> {
+        self.input.next()
+    }
+
+    fn schema(&self) -> Arc<Schema> {
+        self.schema.clone()
+    }
+}
+
 /// Project operator
 ///
 /// Evaluates expressions to produce output columns.

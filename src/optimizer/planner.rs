@@ -234,6 +234,7 @@ impl Planner {
                 aliases,
                 distinct: _,
                 distinct_on: _,
+                source_alias: _,
             } => {
                 if self.verbose {
                     debug!("Planning: Projection ({} columns)", exprs.len());

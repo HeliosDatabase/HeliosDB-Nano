@@ -474,11 +474,17 @@ All PostgreSQL types plus MySQL type aliases (automatically translated):
 | `REAL` / `DOUBLE PRECISION` | `FLOAT4`/`FLOAT8`, `FLOAT(N)` |
 | `NUMERIC(p,s)` | `DECIMAL(p,s)` |
 | `TEXT` | `VARCHAR(n)`, `LONGTEXT`, `MEDIUMTEXT`, `TINYTEXT` |
+| `CHAR(n)` / `CHARACTER(n)` | fixed length, blank-padded (`bpchar`, OID 1042) |
 | `BYTEA` | `BLOB`, `LONGBLOB`, `MEDIUMBLOB` |
 | `TIMESTAMP` | `DATETIME` |
 | `SERIAL` / `BIGSERIAL` | `INT AUTO_INCREMENT`, `BIGINT AUTO_INCREMENT` |
 | `UUID`, `JSON`, `JSONB`, `VECTOR(n)`, `ARRAY` | — |
 | `TSVECTOR`, `TSQUERY` | stored as JSON arrays of normalised tokens |
+
+Text comparison and ordering use C (byte-order) collation — all upper-case ASCII sorts before
+all lower-case, non-ASCII after ASCII — and `COLLATE` is not implemented (the MySQL DDL
+translator, `src/protocol/mysql/translator.rs`, strips a `COLLATE` clause; `pg_database.datcollate`
+reports `C.UTF-8`). See the SQL dialect notes in `docs/llms.txt`.
 
 ## Features at a Glance
 

@@ -246,6 +246,7 @@ impl Optimizer {
                 aliases,
                 distinct,
                 distinct_on,
+                source_alias,
             } => {
                 let optimized_input = self.optimize_recursive_inner(*input, depth)?;
                 LogicalPlan::Project {
@@ -254,6 +255,7 @@ impl Optimizer {
                     aliases,
                     distinct,
                     distinct_on,
+                    source_alias,
                 }
             }
             LogicalPlan::Join {
