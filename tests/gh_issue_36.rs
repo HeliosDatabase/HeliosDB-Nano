@@ -107,6 +107,14 @@ fn config_for(dir: &Path) -> Config {
     // check only `is_replaying` and `wal.is_some()`); it is left at its default
     // so these tests describe the DEFAULT configuration, not an opt-in one.
     c.storage.logical_wal_per_statement = false;
+    // This harness READS the retained entries of a closed store. GH#35's
+    // close-time logical-WAL checkpoint (default on) advances the checkpoint
+    // and reclaims exactly those entries, and its periodic triggers can do the
+    // same mid-test, so both are disabled here. The close-time behaviour itself
+    // is covered by tests/gh_issue_35.rs.
+    c.storage.wal_checkpoint_on_close = false;
+    c.storage.wal_checkpoint_interval_entries = 0;
+    c.storage.wal_checkpoint_interval_secs = 0;
     c
 }
 
