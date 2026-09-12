@@ -317,6 +317,7 @@ fn demo_selection_pushdown(optimizer: &Optimizer, schema: Arc<Schema>) {
         aliases: vec!["id".to_string(), "name".to_string(), "age".to_string()],
         distinct: false,
         distinct_on: None,
+        source_alias: None,
     };
 
     let filter = LogicalPlan::Filter {
@@ -376,6 +377,7 @@ fn demo_projection_pruning(optimizer: &Optimizer, schema: Arc<Schema>) {
         aliases: vec!["name".to_string()],
         distinct: false,
         distinct_on: None,
+        source_alias: None,
     };
 
     let before_cost = optimizer.cost_estimator().estimate_cost(&project).unwrap_or(0.0);

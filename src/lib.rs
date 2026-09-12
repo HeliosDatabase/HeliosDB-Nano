@@ -4830,6 +4830,416 @@ impl EmbeddedDatabase {
         schema.columns.iter().map(|c| c.name.clone()).collect()
     }
 
+    /// Shared `CREATE TABLE` body for BOTH executor families (sprinter
+    /// 15bfe577751a). The text family's arm and the parameterized /
+    /// extended-protocol funnel now run this one function, so `CREATE TABLE …
+    /// CHAR(n)`, FK-target validation (42P01 / 42703 / 42704 / 42830) and
+    /// constraint registration cannot diverge by client. Until this existed,
+    /// every driver that binds server-side (psycopg3, JDBC, sqlx, Npgsql,
+    /// Prisma) got `XX000 Operator not yet implemented: CreateTable`.
+    ///
+    /// `original_sql` carries the statement text for the `PARTITION OF`
+    /// child-registry lookup (the plan is a flattened standalone `CREATE TABLE`
+    /// by the time it reaches either family); `None` skips only that Stage-0
+    /// registry write, which is strictly more than the previous behaviour (a
+    /// hard error).
+
+    /// Shared `ALTER TABLE` multi-operation body for BOTH executor families
+    /// (sprinter 15bfe577751a): `ADD COLUMN … REFERENCES` is planned as
+    /// `[AddColumn, AddForeignKey]`, so the shorthand reaches this body on
+    /// every client. GH#27's atomicity rule lives here once — EVERY foreign-key
+    /// target is validated before the FIRST sub-operation mutates anything,
+    /// because DDL is not transactional and a half-applied statement is what
+    /// PostgreSQL never produces.
+    fn execute_alter_table_multi(&self, operations: &[sql::LogicalPlan]) -> Result<u64> {
+        // GH#27: validate EVERY foreign-key target before the FIRST
+        // sub-operation mutates anything. DDL is not transactional
+        // here and the sub-plans run in order, so without this pass
+        // `ADD COLUMN p INT REFERENCES nosuch(id)` (planned as
+        // `[AddColumn, AddForeignKey]`) would add the column and THEN
+        // report 42P01 — a half-applied statement PostgreSQL never
+        // produces. Parent-side only: the referencing column may be
+        // the one an earlier sub-op is about to add. The hand-written
+        // `ADD COLUMN a INT, ADD FOREIGN KEY (a) REFERENCES p(id)`
+        // gets the same atomicity for free.
+        {
+            let catalog = self.storage.catalog();
+            for sub_plan in operations {
+                if let sql::LogicalPlan::AlterTableAddForeignKey {
+                    table_name,
+                    columns,
+                    references_table,
+                    references_columns,
+                    ..
+                } = sub_plan
+                {
+                    catalog.get_table_schema(table_name)?;
+                    Self::validate_fk_reference(&catalog, references_table, columns, references_columns)?;
+                }
+            }
+        }
+        let mut total_rows = 0u64;
+        for sub_plan in operations {
+            total_rows += self.execute_alter_table_op(sub_plan)?;
+        }
+        Ok(total_rows)
+    }
+
+    fn execute_create_table_plan(&self, plan: &sql::LogicalPlan, original_sql: Option<&str>) -> Result<u64> {
+        let (name, columns, constraints, if_not_exists) = match plan {
+            sql::LogicalPlan::CreateTable {
+                name,
+                columns,
+                constraints,
+                if_not_exists,
+                ..
+            } => (name, columns, constraints, if_not_exists),
+            other => {
+                return Err(Error::internal(format!(
+                    "execute_create_table_plan called with a non-CREATE-TABLE plan: {other:?}"
+                )))
+            }
+        };
+        // Handle IF NOT EXISTS: silently succeed when table already exists
+        if *if_not_exists && self.storage.catalog().table_exists(name).unwrap_or(false) {
+            return Ok(0);
+        }
+
+        let schema_columns: Vec<Column> = columns
+            .iter()
+            .map(|col_def| {
+                // Serialize default expression to JSON for storage
+                let default_expr = Self::serialize_default_expr(&col_def.default);
+
+                Column {
+                    name: col_def.name.clone(),
+                    data_type: col_def.data_type.clone(),
+                    nullable: !col_def.not_null,
+                    primary_key: col_def.primary_key,
+                    source_table: None,
+                    source_table_name: None,
+                    default_expr,
+                    unique: col_def.unique,
+                    storage_mode: col_def.storage_mode,
+                }
+            })
+            .collect();
+
+        let schema = Schema::new(schema_columns);
+        let catalog = self.storage.catalog();
+
+        // FOREIGN KEY targets are validated BEFORE the table is created
+        // (42P01 / 42703). Deliberately not in the constraint loop
+        // below: that runs AFTER `create_table`, so a rejected
+        // constraint would leave the table itself behind — a
+        // half-created relation PostgreSQL never produces. A
+        // SELF-reference is resolved against the columns being declared
+        // here, since the table does not exist yet at this point.
+        Self::validate_create_table_fk_targets(&catalog, name, columns, constraints)?;
+
+        // Log to WAL for replication before creating (schema will be moved)
+        if let Err(e) = self.storage.log_create_table(name, &schema) {
+            tracing::warn!("Failed to log CREATE TABLE to WAL: {}", e);
+        }
+
+        catalog.create_table(name, schema)?;
+
+        // KanttBan #23 (v3.31.1 phase 2): persist the list of
+        // IDENTITY / SERIAL columns to a side-table so
+        // pg_sequences / pg_attrdef / information_schema.columns
+        // can surface them to drizzle-kit's introspection.
+        let identity_cols: Vec<String> = columns
+            .iter()
+            .filter(|c| c.is_identity)
+            .map(|c| c.name.clone())
+            .collect();
+        if !identity_cols.is_empty() {
+            catalog.register_identity_columns(name, &identity_cols)?;
+        }
+
+        // Round-3 PARTITION BY Stage-0: if this CREATE was a
+        // `… PARTITION OF parent` child, record the parent→child
+        // dependency so a later `DROP TABLE parent` cascades to its
+        // partition children (PostgreSQL parity). Re-derived from the
+        // ORIGINAL SQL exactly as the planner does (`extract_partition_of`
+        // + session-aware `resolve_partition_name`), and keyed on the
+        // SAME resolved names that key the catalog — so a schema-scoped
+        // `s.parent`/`s.child` resolves to the same qualified keys the
+        // tables are stored under. A plain, non-partition CREATE returns
+        // `None`
+        // here → no registry write (zero cost). This runs only after
+        // `create_table` above succeeded (the `?` short-circuits a
+        // duplicate-name / bad-DDL failure before we reach this point).
+        //
+        // COVERAGE CONSTRAINT (review-pinned): this arm is reached by
+        // embedded execute()/execute_batch and the PG/MySQL SIMPLE-query
+        // wire path. The EXTENDED/parameterized route has NO CreateTable
+        // handler today (executor default arm errors on every CREATE),
+        // so no child can be created — and thus none can miss
+        // registration — over Parse/Bind/Execute. If executor CreateTable
+        // support is ever added, it MUST register partition children the
+        // same way, or parent DROPs will orphan extended-created
+        // children. Stage-0 semantics also pinned here: DDL is
+        // non-transactional (ROLLBACK keeps both the child and its
+        // registry entry — consistent), and dump/restore flattens
+        // children to standalone CREATEs (a restored setup does not
+        // cascade-drop; Stage 1 owns the durable partition catalog).
+        if let Some(spec) = original_sql.and_then(sql::Parser::extract_partition_of) {
+            // Resolve the parent through the SAME session-aware
+            // resolution that produced the child's key `name`: a bare
+            // `parent` under `SET search_path TO s` registers under
+            // `s.parent` (the parent's real key), NOT the bare key.
+            // Without this the registry keys the child under bare
+            // `parent` while `DROP TABLE parent` resolves to `s.parent`,
+            // finds no children, skips the cascade and orphans them
+            // (foreign_key corpus fkpart6: the re-created child then
+            // collides with the survivor). Reuse the planner
+            // `resolve_table_ref` two-probe via `resolve_partition_name`
+            // — never a second resolution reimplementation.
+            let parent = sql::Planner::with_catalog(&catalog)
+                .with_current_schema(self.current_schema())
+                .with_search_path(self.current_search_path())
+                .resolve_partition_name(&spec.parent);
+            catalog.register_partition_child(&parent, name)?;
+        }
+
+        // Save table constraints if any
+        if !constraints.is_empty() {
+            let mut table_constraints = sql::TableConstraints::new();
+            for constraint in constraints {
+                match constraint {
+                    sql::logical_plan::TableConstraint::ForeignKey {
+                        name: fk_name,
+                        columns: fk_cols,
+                        references_table,
+                        references_columns,
+                        on_delete,
+                        on_update,
+                        deferrable,
+                        initially_deferred,
+                        enforcement,
+                    } => {
+                        // Dedup auto-generated names against the FKs already
+                        // staged on THIS table in this CREATE TABLE: the schema
+                        // no longer participates in the name, so two FKs to
+                        // like-named tables in different schemas would otherwise
+                        // collide (see `generate_unique_name`).
+                        let existing_fk_names: Vec<String> =
+                            table_constraints.foreign_keys.iter().map(|f| f.name.clone()).collect();
+                        // `REFERENCES parent` with no column list binds to
+                        // the parent's PRIMARY KEY (PostgreSQL parity).
+                        // Default it HERE, against the already-resolved
+                        // `references_table` key, so the persisted metadata
+                        // carries the real referenced columns — enforcement
+                        // then probes the parent's PK-column index in the
+                        // right key-space instead of an empty list (which
+                        // degraded to "any parent row exists" and printed a
+                        // malformed `parent()` violation message).
+                        //
+                        // The targets were validated (42P01 / 42703 /
+                        // 42704 / 42830) before `catalog.create_table` ran — see
+                        // `validate_create_table_fk_targets` — so this
+                        // cannot fail here. A SELF-reference resolves
+                        // against the table's OWN key: under a non-
+                        // `public` search_path the planner left the
+                        // parent bare (`emp`, not `s.emp`), which the
+                        // catalog cannot look up (see `fk_targets_self`).
+                        let pk_source = if Self::fk_targets_self(name, references_table) {
+                            name.as_str()
+                        } else {
+                            references_table.as_str()
+                        };
+                        let references_columns =
+                            Self::resolve_fk_referenced_columns(&catalog, pk_source, references_columns)?;
+                        let fk = sql::ForeignKeyConstraint::new(
+                            fk_name.clone().unwrap_or_else(|| {
+                                sql::ForeignKeyConstraint::generate_unique_name(
+                                    name,
+                                    fk_cols,
+                                    references_table,
+                                    &existing_fk_names,
+                                )
+                            }),
+                            name.clone(),
+                            fk_cols.clone(),
+                            references_table.clone(),
+                            references_columns,
+                        );
+                        let fk = if let Some(action) = on_delete {
+                            fk.on_delete(convert_logical_referential_action(action))
+                        } else {
+                            fk
+                        };
+                        let fk = if let Some(action) = on_update {
+                            fk.on_update(convert_logical_referential_action(action))
+                        } else {
+                            fk
+                        };
+                        let fk = if *deferrable {
+                            fk.deferrable(*initially_deferred)
+                        } else {
+                            fk
+                        };
+                        let fk = fk.with_enforcement(*enforcement);
+                        table_constraints.add_foreign_key(fk);
+                    }
+                    sql::logical_plan::TableConstraint::PrimaryKey {
+                        name: pk_name,
+                        columns: pk_cols,
+                    } => {
+                        table_constraints.add_unique(sql::UniqueConstraint::new(
+                            pk_name.clone().unwrap_or_else(|| format!("{}_pkey", name)),
+                            name.clone(),
+                            pk_cols.clone(),
+                            true,
+                        ));
+                    }
+                    sql::logical_plan::TableConstraint::Unique {
+                        name: uq_name,
+                        columns: uq_cols,
+                    } => {
+                        table_constraints.add_unique(sql::UniqueConstraint::new(
+                            uq_name.clone().unwrap_or_else(|| format!("{}_unique", name)),
+                            name.clone(),
+                            uq_cols.clone(),
+                            false,
+                        ));
+                    }
+                    sql::logical_plan::TableConstraint::Check {
+                        name: ck_name,
+                        expression,
+                    } => {
+                        table_constraints.add_check(sql::CheckConstraint::new(
+                            ck_name.clone().unwrap_or_else(|| format!("{}_check", name)),
+                            name.clone(),
+                            serde_json::to_string(expression).unwrap_or_default(),
+                        ));
+                    }
+                }
+            }
+            catalog.save_table_constraints(name, &table_constraints)?;
+            // A composite `UNIQUE (a, b)` needs an ART index to be
+            // enforced by anything, and `Catalog::create_table` cannot
+            // create it: it only sees `Schema`, and a table-level
+            // constraint lives here in `TableConstraints`. Same helper
+            // `rebuild_all_indexes` calls at open, so create-time and
+            // reopen-time agree.
+            //
+            // FAIL CLOSED. The index IS the enforcement, so a declared
+            // constraint that could not be installed is a constraint
+            // that does not exist; reporting CREATE TABLE success would
+            // hand back a table whose UNIQUE silently accepts
+            // duplicates — the reported defect. Registration mints its
+            // own key with a free-name fallback, so this is unreachable
+            // short of a genuine structural failure; when it does fire,
+            // the statement must leave NO table behind.
+            //
+            // `catalog.drop_table` rather than a bespoke teardown: it
+            // emits the compensating `DropTable` WAL record a standby
+            // that already applied `CreateTable` needs, and clears the
+            // ART indexes, the `meta:index:` definitions, the schema,
+            // the counter, the compression keys, the triggers and the
+            // rows. It does not own the constraint record, so that is
+            // deleted after it (which also invalidates the memoised
+            // constraint set — otherwise the next `CREATE TABLE` of
+            // this name is handed the dead one).
+            if let Err(e) = catalog.register_unique_constraint_indexes(name, &table_constraints) {
+                if let Err(unwind) = catalog.drop_table(name) {
+                    tracing::warn!(
+                        "CREATE TABLE '{}' unwind: failed to drop the half-created table: {}",
+                        name,
+                        unwind
+                    );
+                }
+                if let Err(unwind) = catalog.delete_table_constraints(name) {
+                    tracing::warn!(
+                        "CREATE TABLE '{}' unwind: failed to delete the constraint record: {}",
+                        name,
+                        unwind
+                    );
+                }
+                return Err(e);
+            }
+        }
+
+        // Also add column-level UNIQUE and PRIMARY KEY constraints
+        // These are stored in ColumnDef but need to be in table_constraints for enforcement
+        let catalog = self.storage.catalog();
+        let mut col_constraints = sql::TableConstraints::new();
+        let mut has_col_constraints = false;
+
+        for col_def in columns {
+            if col_def.primary_key {
+                col_constraints.add_unique(sql::UniqueConstraint::new(
+                    format!("{}_{}_pkey", name, col_def.name),
+                    name.clone(),
+                    vec![col_def.name.clone()],
+                    true, // is_primary_key
+                ));
+                has_col_constraints = true;
+            } else if col_def.unique {
+                // ONE SQL declaration, ONE constraint record.
+                //
+                // The planner propagates a single-column table-level
+                // `UNIQUE (u)` into `col_def.unique` (MySQL
+                // `UNIQUE KEY` / SHOW INDEX parity), so synthesising
+                // `{t}_{col}_unique` unconditionally minted a SECOND
+                // record for a constraint the user wrote once. Dropping
+                // the constraint by its own name then retired only one
+                // of the two claims and the rule survived — the index
+                // stayed, duplicates stayed rejected, and the reopen
+                // rebuild resurrected it (Sprinter 3441d3e21453).
+                //
+                // Skipped only when a table-level `UNIQUE` staged in
+                // THIS statement already covers exactly this one
+                // column, so a genuinely declared inline `UNIQUE` — the
+                // overwhelmingly common case, where no table-level
+                // constraint exists at all — still gets its record. The
+                // residual divergence from PostgreSQL is the rare
+                // `CREATE TABLE t (v INT UNIQUE, UNIQUE (v))`, which
+                // records one constraint here and two there; the rule
+                // is enforced either way, and what the catalog shows is
+                // exactly what `DROP CONSTRAINT` can retire.
+                let covered_by_table_level = constraints.iter().any(|c| {
+                    matches!(
+                        c,
+                        sql::logical_plan::TableConstraint::Unique { columns: uq_cols, .. }
+                            if uq_cols.len() == 1
+                                && uq_cols[0].eq_ignore_ascii_case(&col_def.name)
+                    )
+                });
+                if covered_by_table_level {
+                    continue;
+                }
+                col_constraints.add_unique(sql::UniqueConstraint::new(
+                    format!("{}_{}_unique", name, col_def.name),
+                    name.clone(),
+                    vec![col_def.name.clone()],
+                    false, // is_primary_key
+                ));
+                has_col_constraints = true;
+            }
+        }
+
+        if has_col_constraints {
+            // Merge with existing table constraints
+            if let Ok(existing) = catalog.load_table_constraints(name) {
+                for fk in existing.foreign_keys {
+                    col_constraints.foreign_keys.push(fk);
+                }
+                for check in existing.check_constraints {
+                    col_constraints.check_constraints.push(check);
+                }
+                for unique in existing.unique_constraints {
+                    col_constraints.unique_constraints.push(unique);
+                }
+            }
+            catalog.save_table_constraints(name, &col_constraints)?;
+        }
+
+        Ok(1)
+    }
+
     fn execute_in_transaction_inner(
         &self,
         sql: &str,
@@ -5045,352 +5455,7 @@ impl EmbeddedDatabase {
 
         // Execute plan based on type
         match &plan {
-            sql::LogicalPlan::CreateTable {
-                name,
-                columns,
-                constraints,
-                if_not_exists,
-                ..
-            } => {
-                // Handle IF NOT EXISTS: silently succeed when table already exists
-                if *if_not_exists && self.storage.catalog().table_exists(name).unwrap_or(false) {
-                    return Ok(0);
-                }
-
-                let schema_columns: Vec<Column> = columns
-                    .iter()
-                    .map(|col_def| {
-                        // Serialize default expression to JSON for storage
-                        let default_expr = Self::serialize_default_expr(&col_def.default);
-
-                        Column {
-                            name: col_def.name.clone(),
-                            data_type: col_def.data_type.clone(),
-                            nullable: !col_def.not_null,
-                            primary_key: col_def.primary_key,
-                            source_table: None,
-                            source_table_name: None,
-                            default_expr,
-                            unique: col_def.unique,
-                            storage_mode: col_def.storage_mode,
-                        }
-                    })
-                    .collect();
-
-                let schema = Schema::new(schema_columns);
-                let catalog = self.storage.catalog();
-
-                // FOREIGN KEY targets are validated BEFORE the table is created
-                // (42P01 / 42703). Deliberately not in the constraint loop
-                // below: that runs AFTER `create_table`, so a rejected
-                // constraint would leave the table itself behind — a
-                // half-created relation PostgreSQL never produces. A
-                // SELF-reference is resolved against the columns being declared
-                // here, since the table does not exist yet at this point.
-                Self::validate_create_table_fk_targets(&catalog, name, columns, constraints)?;
-
-                // Log to WAL for replication before creating (schema will be moved)
-                if let Err(e) = self.storage.log_create_table(name, &schema) {
-                    tracing::warn!("Failed to log CREATE TABLE to WAL: {}", e);
-                }
-
-                catalog.create_table(name, schema)?;
-
-                // KanttBan #23 (v3.31.1 phase 2): persist the list of
-                // IDENTITY / SERIAL columns to a side-table so
-                // pg_sequences / pg_attrdef / information_schema.columns
-                // can surface them to drizzle-kit's introspection.
-                let identity_cols: Vec<String> = columns
-                    .iter()
-                    .filter(|c| c.is_identity)
-                    .map(|c| c.name.clone())
-                    .collect();
-                if !identity_cols.is_empty() {
-                    catalog.register_identity_columns(name, &identity_cols)?;
-                }
-
-                // Round-3 PARTITION BY Stage-0: if this CREATE was a
-                // `… PARTITION OF parent` child, record the parent→child
-                // dependency so a later `DROP TABLE parent` cascades to its
-                // partition children (PostgreSQL parity). Re-derived from the
-                // ORIGINAL SQL exactly as the planner does (`extract_partition_of`
-                // + session-aware `resolve_partition_name`), and keyed on the
-                // SAME resolved names that key the catalog — so a schema-scoped
-                // `s.parent`/`s.child` resolves to the same qualified keys the
-                // tables are stored under. A plain, non-partition CREATE returns
-                // `None`
-                // here → no registry write (zero cost). This runs only after
-                // `create_table` above succeeded (the `?` short-circuits a
-                // duplicate-name / bad-DDL failure before we reach this point).
-                //
-                // COVERAGE CONSTRAINT (review-pinned): this arm is reached by
-                // embedded execute()/execute_batch and the PG/MySQL SIMPLE-query
-                // wire path. The EXTENDED/parameterized route has NO CreateTable
-                // handler today (executor default arm errors on every CREATE),
-                // so no child can be created — and thus none can miss
-                // registration — over Parse/Bind/Execute. If executor CreateTable
-                // support is ever added, it MUST register partition children the
-                // same way, or parent DROPs will orphan extended-created
-                // children. Stage-0 semantics also pinned here: DDL is
-                // non-transactional (ROLLBACK keeps both the child and its
-                // registry entry — consistent), and dump/restore flattens
-                // children to standalone CREATEs (a restored setup does not
-                // cascade-drop; Stage 1 owns the durable partition catalog).
-                if let Some(spec) = sql::Parser::extract_partition_of(sql) {
-                    // Resolve the parent through the SAME session-aware
-                    // resolution that produced the child's key `name`: a bare
-                    // `parent` under `SET search_path TO s` registers under
-                    // `s.parent` (the parent's real key), NOT the bare key.
-                    // Without this the registry keys the child under bare
-                    // `parent` while `DROP TABLE parent` resolves to `s.parent`,
-                    // finds no children, skips the cascade and orphans them
-                    // (foreign_key corpus fkpart6: the re-created child then
-                    // collides with the survivor). Reuse the planner
-                    // `resolve_table_ref` two-probe via `resolve_partition_name`
-                    // — never a second resolution reimplementation.
-                    let parent = sql::Planner::with_catalog(&catalog)
-                        .with_current_schema(self.current_schema())
-                        .with_search_path(self.current_search_path())
-                        .resolve_partition_name(&spec.parent);
-                    catalog.register_partition_child(&parent, name)?;
-                }
-
-                // Save table constraints if any
-                if !constraints.is_empty() {
-                    let mut table_constraints = sql::TableConstraints::new();
-                    for constraint in constraints {
-                        match constraint {
-                            sql::logical_plan::TableConstraint::ForeignKey {
-                                name: fk_name,
-                                columns: fk_cols,
-                                references_table,
-                                references_columns,
-                                on_delete,
-                                on_update,
-                                deferrable,
-                                initially_deferred,
-                                enforcement,
-                            } => {
-                                // Dedup auto-generated names against the FKs already
-                                // staged on THIS table in this CREATE TABLE: the schema
-                                // no longer participates in the name, so two FKs to
-                                // like-named tables in different schemas would otherwise
-                                // collide (see `generate_unique_name`).
-                                let existing_fk_names: Vec<String> =
-                                    table_constraints.foreign_keys.iter().map(|f| f.name.clone()).collect();
-                                // `REFERENCES parent` with no column list binds to
-                                // the parent's PRIMARY KEY (PostgreSQL parity).
-                                // Default it HERE, against the already-resolved
-                                // `references_table` key, so the persisted metadata
-                                // carries the real referenced columns — enforcement
-                                // then probes the parent's PK-column index in the
-                                // right key-space instead of an empty list (which
-                                // degraded to "any parent row exists" and printed a
-                                // malformed `parent()` violation message).
-                                //
-                                // The targets were validated (42P01 / 42703 /
-                                // 42704 / 42830) before `catalog.create_table` ran — see
-                                // `validate_create_table_fk_targets` — so this
-                                // cannot fail here. A SELF-reference resolves
-                                // against the table's OWN key: under a non-
-                                // `public` search_path the planner left the
-                                // parent bare (`emp`, not `s.emp`), which the
-                                // catalog cannot look up (see `fk_targets_self`).
-                                let pk_source = if Self::fk_targets_self(name, references_table) {
-                                    name.as_str()
-                                } else {
-                                    references_table.as_str()
-                                };
-                                let references_columns =
-                                    Self::resolve_fk_referenced_columns(&catalog, pk_source, references_columns)?;
-                                let fk = sql::ForeignKeyConstraint::new(
-                                    fk_name.clone().unwrap_or_else(|| {
-                                        sql::ForeignKeyConstraint::generate_unique_name(
-                                            name,
-                                            fk_cols,
-                                            references_table,
-                                            &existing_fk_names,
-                                        )
-                                    }),
-                                    name.clone(),
-                                    fk_cols.clone(),
-                                    references_table.clone(),
-                                    references_columns,
-                                );
-                                let fk = if let Some(action) = on_delete {
-                                    fk.on_delete(convert_logical_referential_action(action))
-                                } else {
-                                    fk
-                                };
-                                let fk = if let Some(action) = on_update {
-                                    fk.on_update(convert_logical_referential_action(action))
-                                } else {
-                                    fk
-                                };
-                                let fk = if *deferrable {
-                                    fk.deferrable(*initially_deferred)
-                                } else {
-                                    fk
-                                };
-                                let fk = fk.with_enforcement(*enforcement);
-                                table_constraints.add_foreign_key(fk);
-                            }
-                            sql::logical_plan::TableConstraint::PrimaryKey {
-                                name: pk_name,
-                                columns: pk_cols,
-                            } => {
-                                table_constraints.add_unique(sql::UniqueConstraint::new(
-                                    pk_name.clone().unwrap_or_else(|| format!("{}_pkey", name)),
-                                    name.clone(),
-                                    pk_cols.clone(),
-                                    true,
-                                ));
-                            }
-                            sql::logical_plan::TableConstraint::Unique {
-                                name: uq_name,
-                                columns: uq_cols,
-                            } => {
-                                table_constraints.add_unique(sql::UniqueConstraint::new(
-                                    uq_name.clone().unwrap_or_else(|| format!("{}_unique", name)),
-                                    name.clone(),
-                                    uq_cols.clone(),
-                                    false,
-                                ));
-                            }
-                            sql::logical_plan::TableConstraint::Check {
-                                name: ck_name,
-                                expression,
-                            } => {
-                                table_constraints.add_check(sql::CheckConstraint::new(
-                                    ck_name.clone().unwrap_or_else(|| format!("{}_check", name)),
-                                    name.clone(),
-                                    serde_json::to_string(expression).unwrap_or_default(),
-                                ));
-                            }
-                        }
-                    }
-                    catalog.save_table_constraints(name, &table_constraints)?;
-                    // A composite `UNIQUE (a, b)` needs an ART index to be
-                    // enforced by anything, and `Catalog::create_table` cannot
-                    // create it: it only sees `Schema`, and a table-level
-                    // constraint lives here in `TableConstraints`. Same helper
-                    // `rebuild_all_indexes` calls at open, so create-time and
-                    // reopen-time agree.
-                    //
-                    // FAIL CLOSED. The index IS the enforcement, so a declared
-                    // constraint that could not be installed is a constraint
-                    // that does not exist; reporting CREATE TABLE success would
-                    // hand back a table whose UNIQUE silently accepts
-                    // duplicates — the reported defect. Registration mints its
-                    // own key with a free-name fallback, so this is unreachable
-                    // short of a genuine structural failure; when it does fire,
-                    // the statement must leave NO table behind.
-                    //
-                    // `catalog.drop_table` rather than a bespoke teardown: it
-                    // emits the compensating `DropTable` WAL record a standby
-                    // that already applied `CreateTable` needs, and clears the
-                    // ART indexes, the `meta:index:` definitions, the schema,
-                    // the counter, the compression keys, the triggers and the
-                    // rows. It does not own the constraint record, so that is
-                    // deleted after it (which also invalidates the memoised
-                    // constraint set — otherwise the next `CREATE TABLE` of
-                    // this name is handed the dead one).
-                    if let Err(e) = catalog.register_unique_constraint_indexes(name, &table_constraints) {
-                        if let Err(unwind) = catalog.drop_table(name) {
-                            tracing::warn!(
-                                "CREATE TABLE '{}' unwind: failed to drop the half-created table: {}",
-                                name,
-                                unwind
-                            );
-                        }
-                        if let Err(unwind) = catalog.delete_table_constraints(name) {
-                            tracing::warn!(
-                                "CREATE TABLE '{}' unwind: failed to delete the constraint record: {}",
-                                name,
-                                unwind
-                            );
-                        }
-                        return Err(e);
-                    }
-                }
-
-                // Also add column-level UNIQUE and PRIMARY KEY constraints
-                // These are stored in ColumnDef but need to be in table_constraints for enforcement
-                let catalog = self.storage.catalog();
-                let mut col_constraints = sql::TableConstraints::new();
-                let mut has_col_constraints = false;
-
-                for col_def in columns {
-                    if col_def.primary_key {
-                        col_constraints.add_unique(sql::UniqueConstraint::new(
-                            format!("{}_{}_pkey", name, col_def.name),
-                            name.clone(),
-                            vec![col_def.name.clone()],
-                            true, // is_primary_key
-                        ));
-                        has_col_constraints = true;
-                    } else if col_def.unique {
-                        // ONE SQL declaration, ONE constraint record.
-                        //
-                        // The planner propagates a single-column table-level
-                        // `UNIQUE (u)` into `col_def.unique` (MySQL
-                        // `UNIQUE KEY` / SHOW INDEX parity), so synthesising
-                        // `{t}_{col}_unique` unconditionally minted a SECOND
-                        // record for a constraint the user wrote once. Dropping
-                        // the constraint by its own name then retired only one
-                        // of the two claims and the rule survived — the index
-                        // stayed, duplicates stayed rejected, and the reopen
-                        // rebuild resurrected it (Sprinter 3441d3e21453).
-                        //
-                        // Skipped only when a table-level `UNIQUE` staged in
-                        // THIS statement already covers exactly this one
-                        // column, so a genuinely declared inline `UNIQUE` — the
-                        // overwhelmingly common case, where no table-level
-                        // constraint exists at all — still gets its record. The
-                        // residual divergence from PostgreSQL is the rare
-                        // `CREATE TABLE t (v INT UNIQUE, UNIQUE (v))`, which
-                        // records one constraint here and two there; the rule
-                        // is enforced either way, and what the catalog shows is
-                        // exactly what `DROP CONSTRAINT` can retire.
-                        let covered_by_table_level = constraints.iter().any(|c| {
-                            matches!(
-                                c,
-                                sql::logical_plan::TableConstraint::Unique { columns: uq_cols, .. }
-                                    if uq_cols.len() == 1
-                                        && uq_cols[0].eq_ignore_ascii_case(&col_def.name)
-                            )
-                        });
-                        if covered_by_table_level {
-                            continue;
-                        }
-                        col_constraints.add_unique(sql::UniqueConstraint::new(
-                            format!("{}_{}_unique", name, col_def.name),
-                            name.clone(),
-                            vec![col_def.name.clone()],
-                            false, // is_primary_key
-                        ));
-                        has_col_constraints = true;
-                    }
-                }
-
-                if has_col_constraints {
-                    // Merge with existing table constraints
-                    if let Ok(existing) = catalog.load_table_constraints(name) {
-                        for fk in existing.foreign_keys {
-                            col_constraints.foreign_keys.push(fk);
-                        }
-                        for check in existing.check_constraints {
-                            col_constraints.check_constraints.push(check);
-                        }
-                        for unique in existing.unique_constraints {
-                            col_constraints.unique_constraints.push(unique);
-                        }
-                    }
-                    catalog.save_table_constraints(name, &col_constraints)?;
-                }
-
-                Ok(1)
-            }
+            sql::LogicalPlan::CreateTable { .. } => self.execute_create_table_plan(&plan, Some(sql)),
             // Sibling of the CreateTable arm above: the text family's CTAS
             // entry point (embedded `execute()` / `execute_batch`, the psql
             // simple-query path, all MySQL wire).
@@ -7597,39 +7662,7 @@ impl EmbeddedDatabase {
                 constraint_name,
                 if_exists,
             } => self.alter_table_drop_constraint(table_name, constraint_name, *if_exists),
-            sql::LogicalPlan::AlterTableMulti { operations } => {
-                // GH#27: validate EVERY foreign-key target before the FIRST
-                // sub-operation mutates anything. DDL is not transactional
-                // here and the sub-plans run in order, so without this pass
-                // `ADD COLUMN p INT REFERENCES nosuch(id)` (planned as
-                // `[AddColumn, AddForeignKey]`) would add the column and THEN
-                // report 42P01 — a half-applied statement PostgreSQL never
-                // produces. Parent-side only: the referencing column may be
-                // the one an earlier sub-op is about to add. The hand-written
-                // `ADD COLUMN a INT, ADD FOREIGN KEY (a) REFERENCES p(id)`
-                // gets the same atomicity for free.
-                {
-                    let catalog = self.storage.catalog();
-                    for sub_plan in operations {
-                        if let sql::LogicalPlan::AlterTableAddForeignKey {
-                            table_name,
-                            columns,
-                            references_table,
-                            references_columns,
-                            ..
-                        } = sub_plan
-                        {
-                            catalog.get_table_schema(table_name)?;
-                            Self::validate_fk_reference(&catalog, references_table, columns, references_columns)?;
-                        }
-                    }
-                }
-                let mut total_rows = 0u64;
-                for sub_plan in operations {
-                    total_rows += self.execute_alter_table_op(sub_plan)?;
-                }
-                Ok(total_rows)
-            }
+            sql::LogicalPlan::AlterTableMulti { operations } => self.execute_alter_table_multi(operations),
             sql::LogicalPlan::Savepoint { ref name } => {
                 let write_set_snapshot = txn.savepoint_snapshot();
                 let art_undo_len = self.art_undo_len_for(txn);
@@ -8114,6 +8147,12 @@ impl EmbeddedDatabase {
         // global (last config wins); zero-cost when off (one relaxed load per
         // phase boundary — see `copy_phase_stats`).
         copy_phase_stats::set_enabled(config.performance.copy_phase_stats);
+
+        // GH#29 (c7, M3): apply the join materialization cap. Process-global
+        // (last config wins); read once per join operator construction, never
+        // per tuple. `HELIOSDB_HASH_JOIN_MEM_MB` still overrides it at
+        // runtime — see `sql::executor::join::join_memory_limit`.
+        crate::sql::executor::join::set_join_memory_limit_mb(config.performance.join_memory_limit_mb);
 
         // See `new_with_config`: seed from storage, not 0.
         let initial_schema_generation = storage.schema_generation();
@@ -12683,6 +12722,25 @@ impl EmbeddedDatabase {
         // a literal with no valid key for the PK column's type (GH#15).
         let pk_value = Self::fast_parse_pk_probe_value(pk_val_str, &spec.pk_data_type)?;
 
+        // GH#29 (c4, F2): classify the SET value BEFORE touching the row. This
+        // path skips the parser, so it is the one UPDATE family that never
+        // ran the planner's plan-time column resolution; through candidate 3
+        // it looked the row up first and answered `Ok(0)` for a missing key —
+        // `UPDATE t SET v = nosuch WHERE id = 99`, or any key on an empty
+        // table — without ever looking at the value. A value that is neither
+        // a whole literal nor `<set column> <op> <number>` yields to the
+        // planner, which refuses an unknown column (42703) regardless of row
+        // count. A literal with trailing text (`SET x = 5 junk`) is not a
+        // literal either.
+        let literal_value = Self::fast_parse_one_value(set_val_str, &spec.set_data_type)
+            .and_then(|(val, rest)| rest.trim().is_empty().then_some(val));
+        if literal_value.is_none()
+            && !Self::fast_simple_expr_shape_supported(set_val_str, &spec.set_col_name, &spec.set_data_type)
+        {
+            tracing::debug!(target: "helios::fastpath", reason = "lit-update:set-expr-unsupported", "fast-update bail");
+            return None; // Complex expression — fall through to normal path
+        }
+
         // Look up the existing row by PK (needed for both literal and expression SET)
         let existing_row =
             match self
@@ -12700,12 +12758,10 @@ impl EmbeddedDatabase {
             return None; // No row_id — can't do fast update
         }
 
-        // Parse SET value: try literal first, then simple expression (col +/- literal).
-        // A literal with trailing text (`SET x = 5 junk`) is not a literal —
-        // fall through to the expression/planner paths.
-        let new_value = if let Some(val) = Self::fast_parse_one_value(set_val_str, &spec.set_data_type)
-            .and_then(|(val, rest)| rest.trim().is_empty().then_some(val))
-        {
+        // The literal, else the self-arithmetic over the existing row (an
+        // operand that does not fit the column's type still yields to the
+        // planner).
+        let new_value = if let Some(val) = literal_value {
             val
         } else if let Some(val) =
             Self::fast_eval_simple_expr(set_val_str, &spec.set_col_name, spec.set_col_idx, &existing_row)
@@ -13924,6 +13980,36 @@ impl EmbeddedDatabase {
         }
     }
 
+    /// The structural half of [`Self::fast_eval_simple_expr`], decidable
+    /// without a row (GH#29 c4, F2): `<set column> <+|-|*> <number>` and
+    /// nothing else. An identifier, a qualified column or a function call
+    /// is not this path's to evaluate, so the caller yields to the planner
+    /// BEFORE looking the row up — the planner, not a missing row, answers.
+    /// The SET column must also be one of the types `fast_eval_simple_expr`
+    /// can evaluate (GH#29 c5, m6): on a TEXT column `v + 1` passed the
+    /// shape check, found no row and answered `Ok(0)` where PostgreSQL
+    /// raises 42883 — the planner now refuses it regardless of row count.
+    fn fast_simple_expr_shape_supported(expr: &str, col_name: &str, set_data_type: &DataType) -> bool {
+        if !matches!(
+            set_data_type,
+            DataType::Int2 | DataType::Int4 | DataType::Int8 | DataType::Float4 | DataType::Float8
+        ) {
+            return false;
+        }
+        let Some(after_col) = expr.trim().strip_prefix(col_name) else {
+            return false;
+        };
+        let after_col = after_col.trim_start();
+        let Some(op) = after_col.chars().next() else {
+            return false;
+        };
+        if !matches!(op, '+' | '-' | '*') {
+            return false;
+        }
+        let operand = after_col.get(op.len_utf8()..).map(str::trim).unwrap_or("");
+        !operand.is_empty() && operand.parse::<f64>().is_ok()
+    }
+
     /// Evaluate simple expressions like `col + 0.01`, `col - 5`, `col * 2`, `col || 'suffix'`
     /// Returns None for anything more complex.
     fn fast_eval_simple_expr(expr: &str, col_name: &str, col_idx: usize, row: &Tuple) -> Option<Value> {
@@ -14714,7 +14800,7 @@ impl EmbeddedDatabase {
             }
         }
 
-        let (count, _tuples) = self.execute_plan_with_params(&plan, params, None)?;
+        let (count, _tuples) = self.execute_plan_with_params_with_sql(&plan, params, None, Some(sql))?;
         Ok(count)
     }
 
@@ -14992,7 +15078,20 @@ impl EmbeddedDatabase {
         params: &[Value],
         session_txn: Option<&storage::Transaction>,
     ) -> Result<(u64, Vec<Tuple>)> {
-        let result = self.execute_plan_with_params_inner(plan, params, session_txn);
+        self.execute_plan_with_params_with_sql(plan, params, session_txn, None)
+    }
+
+    /// [`Self::execute_plan_with_params`] carrying the statement text, so a DDL
+    /// arm that needs it (the `PARTITION OF` child registry) runs on the params
+    /// family exactly as on the text family.
+    fn execute_plan_with_params_with_sql(
+        &self,
+        plan: &sql::LogicalPlan,
+        params: &[Value],
+        session_txn: Option<&storage::Transaction>,
+        original_sql: Option<&str>,
+    ) -> Result<(u64, Vec<Tuple>)> {
+        let result = self.execute_plan_with_params_inner(plan, params, session_txn, original_sql);
         // Invalidate the result cache on any successful mutating plan.
         // Without this, an earlier `SELECT ... WHERE col = 'v'` that
         // returned `[]` (e.g. a login probe before register) is served
@@ -15022,6 +15121,7 @@ impl EmbeddedDatabase {
         plan: &sql::LogicalPlan,
         params: &[Value],
         session_txn: Option<&storage::Transaction>,
+        original_sql: Option<&str>,
     ) -> Result<(u64, Vec<Tuple>)> {
         // Invalidate SQL metadata caches on DDL that reaches the executor
         // through the parameterized / extended-protocol funnel. This is the
@@ -15087,24 +15187,25 @@ impl EmbeddedDatabase {
             // and `ADD CONSTRAINT … UNIQUE` is one of the statements Prisma
             // emits. The three constraint arms therefore route here explicitly;
             // widening the rest of ALTER to this family is a separate change.
-            sql::LogicalPlan::AlterTableAddUnique {
-                table_name,
-                constraint_name,
-                columns,
-            } => Ok((
-                self.alter_table_add_unique(table_name, constraint_name, columns)?,
-                Vec::new(),
-            )),
-            sql::LogicalPlan::AlterTableDropConstraint {
-                table_name,
-                constraint_name,
-                if_exists,
-            } => Ok((
-                self.alter_table_drop_constraint(table_name, constraint_name, *if_exists)?,
-                Vec::new(),
-            )),
-            sql::LogicalPlan::AlterTableAddForeignKey { .. } => {
-                Ok((self.alter_table_add_foreign_key(plan)?, Vec::new()))
+            // DDL over the extended protocol (sprinter 15bfe577751a): CREATE
+            // TABLE and every ALTER TABLE form route to the SAME bodies the
+            // text family runs. Previously they fell through to the executor
+            // catch-all and hard-errored `XX000 Operator not yet implemented`,
+            // so a migration tool that binds server-side could not create or
+            // alter a table at all.
+            sql::LogicalPlan::CreateTable { .. } => {
+                Ok((self.execute_create_table_plan(plan, original_sql)?, Vec::new()))
+            }
+            sql::LogicalPlan::AlterTableAddColumn { .. }
+            | sql::LogicalPlan::AlterTableDropColumn { .. }
+            | sql::LogicalPlan::AlterTableRenameColumn { .. }
+            | sql::LogicalPlan::AlterTableAlterColumnNullability { .. }
+            | sql::LogicalPlan::AlterTableAddUnique { .. }
+            | sql::LogicalPlan::AlterTableDropConstraint { .. }
+            | sql::LogicalPlan::AlterTableAddForeignKey { .. }
+            | sql::LogicalPlan::AlterTableRename { .. } => Ok((self.execute_alter_table_op(plan)?, Vec::new())),
+            sql::LogicalPlan::AlterTableMulti { operations } => {
+                Ok((self.execute_alter_table_multi(operations)?, Vec::new()))
             }
             sql::LogicalPlan::Insert {
                 table_name,
@@ -19218,7 +19319,7 @@ impl EmbeddedDatabase {
         if let Some(result) = self.try_session_txn_fast_insert_params(sql, &plan, params, &txn) {
             return result;
         }
-        let (count, _tuples) = self.execute_plan_with_params(&plan, params, Some(&txn))?;
+        let (count, _tuples) = self.execute_plan_with_params_with_sql(&plan, params, Some(&txn), Some(sql))?;
         Ok(count)
     }
 
@@ -22853,6 +22954,7 @@ impl EmbeddedDatabase {
                 aliases,
                 distinct,
                 distinct_on,
+                source_alias,
             } => LogicalPlan::Project {
                 input: Box::new(Self::bind_outer_refs_in_plan(
                     input,
@@ -22867,6 +22969,7 @@ impl EmbeddedDatabase {
                 aliases: aliases.clone(),
                 distinct: *distinct,
                 distinct_on: distinct_on.clone(),
+                source_alias: source_alias.clone(),
             },
             LogicalPlan::Limit {
                 input,
@@ -23146,12 +23249,14 @@ impl EmbeddedDatabase {
                 aliases,
                 distinct,
                 distinct_on,
+                source_alias,
             } => Ok(sql::LogicalPlan::Project {
                 input: Box::new(self.apply_rls_to_plan_recursive(*input)?),
                 exprs,
                 aliases,
                 distinct,
                 distinct_on,
+                source_alias,
             }),
 
             sql::LogicalPlan::Aggregate {

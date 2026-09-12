@@ -353,6 +353,22 @@ parallel_query = true
 # transient per-chunk buffer; 0 = a single chunk. Default 1000.
 insert_select_txn_batch_rows = 1000
 
+# Memory ONE join may materialize before the query is refused, in megabytes.
+# Covers exactly two materializations: the hash join's BUILD SIDE, and the
+# RIGHT INPUT of every nested-loop join — a RIGHT/FULL join whose ON clause
+# carries a non-key term, a LATERAL join, a theta join (`ON a.x > b.y`), and
+# any ON clause no key term binds. Both were previously UNBOUNDED, so a query
+# over a right input larger than this limit that used to complete (slowly) is
+# now refused — raise the limit for it. Exceeding it fails the query with a
+# message naming this key.
+# NOT covered yet, and stated so this key is not read as a whole-engine memory
+# bound: the INDEX nested loop buffers its entire join RESULT with no cap and
+# no accounting, so an index-eligible join with a large output can still grow
+# until the host runs out of memory regardless of this setting.
+# CLI --join-memory-limit-mb wins over this; the HELIOSDB_HASH_JOIN_MEM_MB
+# environment variable wins over both. 0 = use the default. Default 1024 (1 GB).
+join_memory_limit_mb = 1024
+
 # Read-hot-path lock-contention census (diagnostic; W3.1 plateau attribution).
 # When enabled, per-query acquisitions of the plan/parse/result cache shard
 # mutexes, the ART index registry, and the prepared-statement fast-select

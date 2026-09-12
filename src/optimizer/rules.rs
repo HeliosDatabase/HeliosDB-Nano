@@ -55,8 +55,36 @@ impl SelectionPushdownRule {
             aliases,
             distinct,
             distinct_on,
+            source_alias,
         } = *project
         {
+            // GH#29: a derived table / view is known by `source_alias` ABOVE
+            // this projection (`s.x` resolves at runtime through the stamp),
+            // but below it the qualifier names nothing. Drop exactly that
+            // qualifier before the alias rewrite so `s.x = 1` is pushed as
+            // `x = 1` and then mapped to the underlying expression like an
+            // unqualified reference; any other qualifier is left alone.
+            let filter_pred = match source_alias.as_deref() {
+                Some(alias) => Self::strip_source_alias_qualifier(filter_pred, alias),
+                None => filter_pred,
+            };
+            // GH#29 (c3, m5): a projection that computes a WINDOW function
+            // (`… row_number() OVER (…) AS rn …`) is a barrier: pushing ANY
+            // predicate below it changes the window's input — a predicate on
+            // the alias would substitute the window call into a per-row
+            // filter where it has no meaning, and a predicate on a plain
+            // column would renumber the rows PostgreSQL numbers over the whole
+            // sub-select. A predicate naming an alias whose expression is an
+            // aggregate call, and a DISTINCT / DISTINCT ON projection, are
+            // left alone as well. The filter then runs above the projection,
+            // on its output.
+            if distinct
+                || distinct_on.is_some()
+                || exprs.iter().any(Self::contains_window_call)
+                || Self::predicate_names_aggregate_alias(&filter_pred, &exprs, &aliases)
+            {
+                return Ok(None);
+            }
             // Rewrite the filter predicate: replace column references that use
             // projection aliases with the underlying projection expressions.
             // This ensures the predicate is valid against the input schema
@@ -77,9 +105,102 @@ impl SelectionPushdownRule {
                 aliases,
                 distinct,
                 distinct_on,
+                source_alias,
             }))
         } else {
             Ok(None)
+        }
+    }
+
+    /// GH#29: turn `alias.col` into the bare `col` for every column reference
+    /// of `pred` whose qualifier is exactly `alias` (the `source_alias` of the
+    /// projection the predicate is being pushed through). Uses the shared
+    /// column walker, so sub-plans and aggregate/window arguments are left
+    /// untouched, exactly like the alias rewrite below.
+    fn strip_source_alias_qualifier(pred: LogicalExpr, alias: &str) -> LogicalExpr {
+        crate::sql::evaluator::map_column_refs(pred, &mut |table, name| match table {
+            Some(ref q) if q == alias => LogicalExpr::Column { table: None, name },
+            other => LogicalExpr::Column { table: other, name },
+        })
+    }
+
+    /// GH#29 (c3, m5): does any bare column reference of `pred` name a
+    /// projection alias whose expression contains an aggregate call? Such a
+    /// reference must stay above the projection.
+    fn predicate_names_aggregate_alias(pred: &LogicalExpr, exprs: &[LogicalExpr], aliases: &[String]) -> bool {
+        let mut hit = false;
+        let _ = crate::sql::evaluator::map_column_refs(pred.clone(), &mut |table, name| {
+            if table.is_none() {
+                if let Some(idx) = aliases.iter().position(|a| *a == name) {
+                    if exprs.get(idx).is_some_and(Self::contains_operator_managed_call) {
+                        hit = true;
+                    }
+                }
+            }
+            LogicalExpr::Column { table, name }
+        });
+        hit
+    }
+
+    /// Is there a window call anywhere inside `expr`?
+    fn contains_window_call(expr: &LogicalExpr) -> bool {
+        match expr {
+            LogicalExpr::WindowFunction { .. } => true,
+            other => Self::walk_children_any(other, Self::contains_window_call),
+        }
+    }
+
+    /// Is there a window or aggregate call anywhere inside `expr`?
+    fn contains_operator_managed_call(expr: &LogicalExpr) -> bool {
+        match expr {
+            LogicalExpr::AggregateFunction { .. } | LogicalExpr::WindowFunction { .. } => true,
+            other => Self::walk_children_any(other, Self::contains_operator_managed_call),
+        }
+    }
+
+    /// `any` over the scalar children of `expr` (sub-plans are separate
+    /// scopes and are not descended into); the window / aggregate arms are
+    /// the callers' own.
+    fn walk_children_any(expr: &LogicalExpr, pred: fn(&LogicalExpr) -> bool) -> bool {
+        match expr {
+            LogicalExpr::AggregateFunction { args, .. } | LogicalExpr::ScalarFunction { args, .. } => {
+                args.iter().any(pred)
+            }
+            LogicalExpr::WindowFunction {
+                args,
+                partition_by,
+                order_by,
+                ..
+            } => args.iter().any(pred) || partition_by.iter().any(pred) || order_by.iter().any(|(e, _)| pred(e)),
+            LogicalExpr::BinaryExpr { left, right, .. } => pred(left) || pred(right),
+            LogicalExpr::UnaryExpr { expr, .. }
+            | LogicalExpr::Cast { expr, .. }
+            | LogicalExpr::IsNull { expr, .. }
+            | LogicalExpr::InSet { expr, .. } => pred(expr),
+            LogicalExpr::Between { expr, low, high, .. } => pred(expr) || pred(low) || pred(high),
+            LogicalExpr::InList { expr, list, .. } => pred(expr) || list.iter().any(pred),
+            LogicalExpr::Case {
+                expr,
+                when_then,
+                else_result,
+            } => {
+                expr.as_deref().is_some_and(pred)
+                    || when_then.iter().any(|(when, then)| pred(when) || pred(then))
+                    || else_result.as_deref().is_some_and(pred)
+            }
+            LogicalExpr::Tuple { items } => items.iter().any(pred),
+            LogicalExpr::ArraySubscript { array, index } => pred(array) || pred(index),
+            LogicalExpr::Column { .. }
+            | LogicalExpr::BoundColumn { .. }
+            | LogicalExpr::Literal(_)
+            | LogicalExpr::ScalarSubquery { .. }
+            | LogicalExpr::InSubquery { .. }
+            | LogicalExpr::Exists { .. }
+            | LogicalExpr::DefaultValue
+            | LogicalExpr::Wildcard
+            | LogicalExpr::Parameter { .. }
+            | LogicalExpr::NewRow { .. }
+            | LogicalExpr::OldRow { .. } => false,
         }
     }
 
@@ -251,6 +372,18 @@ impl SelectionPushdownRule {
                     continue;
                 }
 
+                // GH#29 (c7, M2b): the same guard as in
+                // `JoinPredicatePushdownRule` — a conjunct that MIXES a bare
+                // column reference with a qualified one cannot be attributed
+                // to one side either, and pushing it changes what the bare
+                // name resolves to (`WHERE name = b.other` pushed into `b`
+                // reads b's own `name`). Conservative: it stays above the
+                // join, where it always meant what it says.
+                if Self::has_unqualified_column_ref(&conjunct) {
+                    remaining_preds.push(conjunct);
+                    continue;
+                }
+
                 let touches_left = refs.iter().any(|r| left_tables.contains(r));
                 let touches_right = refs.iter().any(|r| right_tables.contains(r));
 
@@ -335,7 +468,18 @@ impl SelectionPushdownRule {
                 }
             }
             LogicalPlan::Filter { input, .. } => Self::collect_table_refs_inner(input, refs),
-            LogicalPlan::Project { input, .. } => Self::collect_table_refs_inner(input, refs),
+            LogicalPlan::Project {
+                input, source_alias, ..
+            } => {
+                // GH#29: a derived table / view is a range entry of its own,
+                // named by its alias, so `s.x = 1` can be pushed to its side of
+                // a join (and then through the projection, see
+                // `strip_source_alias_qualifier`).
+                if let Some(alias) = source_alias {
+                    refs.insert(alias.clone());
+                }
+                Self::collect_table_refs_inner(input, refs);
+            }
             LogicalPlan::Join { left, right, .. } => {
                 Self::collect_table_refs_inner(left, refs);
                 Self::collect_table_refs_inner(right, refs);
@@ -352,6 +496,73 @@ impl SelectionPushdownRule {
         let mut refs = HashSet::new();
         Self::extract_column_table_refs_inner(expr, &mut refs);
         refs
+    }
+
+    /// Does `expr` reference any column WITHOUT a table qualifier?
+    ///
+    /// A conjunct that does cannot be attributed to one side of a join by
+    /// [`Self::extract_column_table_refs`] alone (which collects qualifiers
+    /// and is therefore blind to a bare name), so it must not be pushed —
+    /// see the call site in [`JoinPredicatePushdownRule`] (GH#29 c7, M2b).
+    /// Walks the same node set as `extract_column_table_refs_inner`; a node
+    /// neither of them descends into is not pushable anyway (the rule's
+    /// `_ => keep_on` arms), so the two stay in step.
+    pub(crate) fn has_unqualified_column_ref(expr: &LogicalExpr) -> bool {
+        let mut found = false;
+        Self::has_unqualified_column_ref_inner(expr, &mut found);
+        found
+    }
+
+    fn has_unqualified_column_ref_inner(expr: &LogicalExpr, found: &mut bool) {
+        if *found {
+            return;
+        }
+        match expr {
+            LogicalExpr::Column { table: None, .. } | LogicalExpr::Wildcard => *found = true,
+            LogicalExpr::Column { table: Some(_), .. } => {}
+            LogicalExpr::BinaryExpr { left, right, .. } => {
+                Self::has_unqualified_column_ref_inner(left, found);
+                Self::has_unqualified_column_ref_inner(right, found);
+            }
+            LogicalExpr::UnaryExpr { expr, .. } | LogicalExpr::IsNull { expr, .. } => {
+                Self::has_unqualified_column_ref_inner(expr, found);
+            }
+            LogicalExpr::InList { expr, list, .. } => {
+                Self::has_unqualified_column_ref_inner(expr, found);
+                for item in list {
+                    Self::has_unqualified_column_ref_inner(item, found);
+                }
+            }
+            LogicalExpr::InSet { expr, .. } => Self::has_unqualified_column_ref_inner(expr, found),
+            LogicalExpr::Between { expr, low, high, .. } => {
+                Self::has_unqualified_column_ref_inner(expr, found);
+                Self::has_unqualified_column_ref_inner(low, found);
+                Self::has_unqualified_column_ref_inner(high, found);
+            }
+            LogicalExpr::Case {
+                expr,
+                when_then,
+                else_result,
+            } => {
+                if let Some(op) = expr {
+                    Self::has_unqualified_column_ref_inner(op, found);
+                }
+                for (w, t) in when_then {
+                    Self::has_unqualified_column_ref_inner(w, found);
+                    Self::has_unqualified_column_ref_inner(t, found);
+                }
+                if let Some(e) = else_result {
+                    Self::has_unqualified_column_ref_inner(e, found);
+                }
+            }
+            LogicalExpr::Cast { expr, .. } => Self::has_unqualified_column_ref_inner(expr, found),
+            LogicalExpr::ScalarFunction { args, .. } | LogicalExpr::AggregateFunction { args, .. } => {
+                for arg in args {
+                    Self::has_unqualified_column_ref_inner(arg, found);
+                }
+            }
+            _ => {} // Literals, parameters, subqueries, row markers…
+        }
     }
 
     fn extract_column_table_refs_inner(expr: &LogicalExpr, refs: &mut HashSet<String>) {
@@ -608,6 +819,7 @@ impl ProjectionPruningRule {
         input: Box<LogicalPlan>,
         exprs: Vec<LogicalExpr>,
         aliases: Vec<String>,
+        source_alias: Option<String>,
     ) -> Result<Option<LogicalPlan>> {
         // Collect columns actually used
         let mut used_columns = HashSet::new();
@@ -653,6 +865,7 @@ impl ProjectionPruningRule {
                     aliases,
                     distinct: false,
                     distinct_on: None,
+                    source_alias,
                 }));
             }
         }
@@ -678,7 +891,8 @@ impl OptimizationRule for ProjectionPruningRule {
                 aliases,
                 distinct: false,
                 distinct_on: None,
-            } => self.prune_projection(input, exprs, aliases),
+                source_alias,
+            } => self.prune_projection(input, exprs, aliases, source_alias),
             _ => Ok(None),
         }
     }
@@ -1051,6 +1265,7 @@ impl ConstantFoldingRule {
                 aliases,
                 distinct,
                 distinct_on,
+                source_alias,
             } => {
                 let folded_exprs: Result<Vec<_>> = exprs.into_iter().map(|e| Self::fold_expr(e)).collect();
                 Ok(LogicalPlan::Project {
@@ -1059,6 +1274,7 @@ impl ConstantFoldingRule {
                     aliases,
                     distinct,
                     distinct_on,
+                    source_alias,
                 })
             }
             other => Ok(other),
@@ -1465,6 +1681,28 @@ impl JoinPredicatePushdownRule {
                         continue;
                     }
 
+                    // GH#29 (c7, M2b): a conjunct that MIXES a qualified ref
+                    // with a bare one cannot be classified either — and a
+                    // pushed conjunct is REMOVED from the ON clause, so
+                    // misclassifying one deletes a join predicate outright.
+                    // `extract_column_table_refs` sees qualified refs only, so
+                    // `ON id = b.id` looked right-only, was pushed whole into
+                    // `b` (where the bare `id` then resolved to b's own column,
+                    // a tautology), and the join was left with NO condition: a
+                    // cartesian product. A rule must move a term or leave it
+                    // alone, never drop it.
+                    //
+                    // The generated `NATURAL` / `USING` term is NOT this
+                    // shape: both of its operands are bare, so it is kept on
+                    // the join by the `refs.is_empty()` guard above. (Candidate
+                    // 6 qualified one operand and produced exactly the mixed
+                    // shape; candidate 10 removed that.) This guard is for the
+                    // HAND-WRITTEN mixed spelling, which is legal SQL.
+                    if SelectionPushdownRule::has_unqualified_column_ref(&conjunct) {
+                        keep_on.push(conjunct);
+                        continue;
+                    }
+
                     let touches_left = refs.iter().any(|r| left_tables.contains(r));
                     let touches_right = refs.iter().any(|r| right_tables.contains(r));
 
@@ -1551,12 +1789,14 @@ impl JoinPredicatePushdownRule {
                 aliases,
                 distinct,
                 distinct_on,
+                source_alias,
             } => LogicalPlan::Project {
                 input: Box::new(Self::rewrite(*input)),
                 exprs,
                 aliases,
                 distinct,
                 distinct_on,
+                source_alias,
             },
             LogicalPlan::Sort { input, exprs, asc } => LogicalPlan::Sort {
                 input: Box::new(Self::rewrite(*input)),
@@ -2024,6 +2264,54 @@ mod tests {
         );
     }
 
+    /// GH#29 (c7, M2b). A conjunct that mixes a BARE column reference with a
+    /// qualified one cannot be attributed to one side — `extract_column_table_refs`
+    /// sees qualifiers only — and pushing it DELETES it from the ON clause.
+    /// `ON id = b.id` looked right-only, was pushed whole into `b` (where the
+    /// bare `id` resolved to b's own column: a tautology), and the join was
+    /// left with no condition at all: a cartesian product. This is the
+    /// HAND-WRITTEN spelling: the generated `NATURAL` / `USING` term has TWO
+    /// bare operands and is kept on the join by the older `refs.is_empty()`
+    /// guard. (Candidate 6's lowering qualified one operand and did produce
+    /// the mixed shape; candidate 10 removed that lowering.)
+    #[test]
+    fn jpp_never_pushes_a_conjunct_carrying_a_bare_column_reference() {
+        let rule = JoinPredicatePushdownRule::new();
+        let estimator = CostEstimator::new(StatsCatalog::new());
+        let bare = LogicalExpr::Column {
+            table: None,
+            name: "id".to_string(),
+        };
+        let on = binary(bare.clone(), BinaryOperator::Eq, col("r", "id"));
+        let plan = make_join(make_scan("l"), make_scan("r"), Some(on.clone()), JoinType::Inner);
+        assert!(
+            rule.apply(plan, &estimator).unwrap().is_none(),
+            "a half-qualified conjunct must be left on the join, not pushed"
+        );
+        // …and the same in an AND chain: the pushable half moves, the
+        // half-qualified equality STAYS.
+        let mixed = binary(
+            on,
+            BinaryOperator::And,
+            binary(col("r", "name"), BinaryOperator::Eq, lit_str("alice")),
+        );
+        let plan = make_join(make_scan("l"), make_scan("r"), Some(mixed), JoinType::Inner);
+        let result = rule
+            .apply(plan, &estimator)
+            .unwrap()
+            .expect("the literal term is pushable");
+        if let LogicalPlan::Join { right, on, .. } = result {
+            assert!(matches!(*right, LogicalPlan::Filter { .. }), "the literal term moved");
+            let kept = on.expect("the join must KEEP the half-qualified equality");
+            assert!(
+                SelectionPushdownRule::has_unqualified_column_ref(&kept),
+                "the kept conjunct is the half-qualified one: {kept:?}"
+            );
+        } else {
+            panic!("expected Join");
+        }
+    }
+
     /// Mixed: equi-join key AND right-only constant → split, push the constant.
     #[test]
     fn jpp_splits_mixed_predicate() {
@@ -2144,6 +2432,7 @@ mod tests {
             aliases: vec!["id".to_string()],
             distinct: false,
             distinct_on: None,
+            source_alias: None,
         };
 
         let result = rule.apply(project, &estimator).unwrap().expect("should rewrite");
@@ -2172,6 +2461,7 @@ mod tests {
             aliases: vec!["id".to_string()],
             distinct: false,
             distinct_on: None,
+            source_alias: None,
         };
         assert!(!rule.is_applicable(&project));
     }
