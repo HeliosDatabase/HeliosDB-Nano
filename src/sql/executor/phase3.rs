@@ -371,6 +371,15 @@ fn handle_create_materialized_view(
     // the raw plan undercounts aggregates at scale. Materialize AND persist the
     // optimized plan so REFRESH stays correct too.
     let optimized_query = optimize_view_query(query)?;
+    // GH#29 (c3): the plan is persisted below as bincode, which cannot carry
+    // `Project::source_alias` (the stamp a derived table's / view's alias
+    // resolves through at runtime). Rewrite it first so it needs no stamp —
+    // every unshadowed `alias.col` becomes the bare `col`, every stamp is
+    // cleared — and refuse (0A000, workaround named) only the shadowed shape
+    // the rewrite cannot express. The SAME rewritten plan is materialized
+    // below and stored, so CREATE and REFRESH execute byte-identical plans:
+    // a shape the rewrite gets wrong fails here, never at a later refresh.
+    let optimized_query = optimized_query.destamp_source_aliases()?;
     // Materialize against the current (branch-aware) view via a FRESH executor — NOT
     // the CREATE statement's executor/transaction. Issue #2 / Quirk J: the inherited
     // transaction's snapshot under-counts at scale (COUNT(DISTINCT) materialized as 4
