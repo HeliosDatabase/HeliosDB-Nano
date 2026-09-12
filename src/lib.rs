@@ -869,6 +869,23 @@ impl Drop for EmbeddedDatabase {
             tracing::debug!("skipping index snapshot checkpoint: transaction still open at drop");
         }
 
+        // GH#35 (A2): advance the durable logical-WAL checkpoint at a CLEAN
+        // close, after the row counters and index snapshots above are durable.
+        // Every entry a session wrote is already applied by the time this runs,
+        // so leaving it above the checkpoint only gives the next open history
+        // it cannot tell apart from redo — the GH#35 data-loss shape. Skipped
+        // with a transaction still open (its write set is not committed data)
+        // and on `clone_for_trigger()` clones (the last-owner gate below), so a
+        // trigger firing mid-statement can never checkpoint.
+        if !txn_open
+            && self.storage.wal_checkpoint_on_close()
+            && std::sync::Arc::strong_count(&self.auto_refresh_worker) == 1
+        {
+            if let Err(e) = self.storage.checkpoint_logical_wal() {
+                tracing::warn!("logical WAL checkpoint at close failed: {}", e);
+            }
+        }
+
         // Signal the auto-refresh worker to stop (non-blocking).
         //
         // LAST-OWNER GATE — do not remove. `Drop` runs for EVERY value of this struct,
