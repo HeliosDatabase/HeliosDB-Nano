@@ -367,6 +367,16 @@ pub struct WriteAheadLog {
     /// disabled. `wal:entries:` values are row images and are sealed with it;
     /// see the value codec above.
     key_manager: Option<Arc<KeyManager>>,
+    /// GH#35 (A3): advance the durable checkpoint every N appends (0 =
+    /// disabled). Bounds the crash window: a process killed without running
+    /// `Drop` leaves at most this many entries above the checkpoint.
+    checkpoint_interval_entries: u64,
+    /// GH#35 (A3): advance the checkpoint at most this often (0 = disabled).
+    checkpoint_interval_secs: u64,
+    /// Appends issued since the last periodic checkpoint.
+    appends_since_checkpoint: AtomicU64,
+    /// Epoch seconds of the last periodic checkpoint (lock-free time check).
+    last_checkpoint_epoch_secs: AtomicU64,
 }
 
 impl WriteAheadLog {
@@ -435,6 +445,12 @@ impl WriteAheadLog {
             commit_thread: commit_thread.clone(),
             batch_timeout,
             key_manager,
+            // GH#35 (A3) is OFF until the engine installs its policy below;
+            // see `with_checkpoint_policy`.
+            checkpoint_interval_entries: 0,
+            checkpoint_interval_secs: 0,
+            appends_since_checkpoint: AtomicU64::new(0),
+            last_checkpoint_epoch_secs: AtomicU64::new(Self::now_epoch_secs()),
         };
 
         // Start group commit thread if in GroupCommit mode
@@ -470,6 +486,59 @@ impl WriteAheadLog {
         }
 
         Ok(wal)
+    }
+
+    /// GH#35 (A3): install the periodic-checkpoint policy. Called by the
+    /// engine right after open with `StorageConfig::wal_checkpoint_interval_*`.
+    /// Either argument at 0 disables that trigger; both at 0 disables A3.
+    pub fn with_checkpoint_policy(mut self, entries: u64, secs: u64) -> Self {
+        self.checkpoint_interval_entries = entries;
+        self.checkpoint_interval_secs = secs;
+        self
+    }
+
+    fn now_epoch_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
+    /// GH#35 (A3): after an append, advance the durable checkpoint when the
+    /// configured entry or time threshold is due.
+    ///
+    /// Safety: an append is issued just before its operation's data write, so
+    /// `current_lsn` may name an operation still in flight. Advancing past it
+    /// is deliberate and bounded — the caller is not told the statement
+    /// succeeded until its data write returns, so the only thing a crash can
+    /// lose here is an operation the client never saw acknowledged, whereas
+    /// leaving history above the checkpoint is what destroys live rows. The
+    /// destructive-replay policy (`wal_replay_destructive_ddl`) is the
+    /// fail-closed backstop for the same window.
+    fn maybe_advance_checkpoint(&self) {
+        if self.checkpoint_interval_entries == 0 && self.checkpoint_interval_secs == 0 {
+            return;
+        }
+        let appends = self.appends_since_checkpoint.fetch_add(1, Ordering::AcqRel) + 1;
+        let due_by_entries = self.checkpoint_interval_entries > 0 && appends >= self.checkpoint_interval_entries;
+        let due_by_time = self.checkpoint_interval_secs > 0
+            && Self::now_epoch_secs().saturating_sub(self.last_checkpoint_epoch_secs.load(Ordering::Acquire))
+                >= self.checkpoint_interval_secs;
+        if !due_by_entries && !due_by_time {
+            return;
+        }
+        let lsn = self.current_lsn();
+        if lsn == 0 {
+            return;
+        }
+        match self.truncate_to_checkpoint(lsn) {
+            Ok(_) => {
+                self.appends_since_checkpoint.store(0, Ordering::Release);
+                self.last_checkpoint_epoch_secs
+                    .store(Self::now_epoch_secs(), Ordering::Release);
+            }
+            Err(e) => warn!("logical WAL periodic checkpoint at LSN {} failed: {}", lsn, e),
+        }
     }
 
     /// Recover the last LSN from the database
@@ -539,6 +608,9 @@ impl WriteAheadLog {
         // Broadcast to standbys (and, in sync/semi-sync mode, wait for first ACK).
         Self::broadcast_after_append(lsn, &entry.operation);
 
+        // GH#35 (A3): periodic checkpoint advancement.
+        self.maybe_advance_checkpoint();
+
         debug!("Appended WAL entry with LSN {}", lsn);
         Ok(lsn)
     }
@@ -606,6 +678,9 @@ impl WriteAheadLog {
         // P0#2 fix: still broadcast to HA standbys (and honor sync/semi-sync ACK).
         // The nosync path only skips the local fsync — it must NOT skip replication.
         Self::broadcast_after_append(lsn, &entry.operation);
+
+        // GH#35 (A3): periodic checkpoint advancement.
+        self.maybe_advance_checkpoint();
 
         Ok(lsn)
     }
@@ -681,6 +756,9 @@ impl WriteAheadLog {
         // uses (P0#2: the nosync arm above must not have skipped replication).
         Self::broadcast_after_batch(entries.iter().map(|e| (e.lsn, &e.operation)));
 
+        // GH#35 (A3): periodic checkpoint advancement.
+        self.maybe_advance_checkpoint();
+
         debug!("Appended WAL batch: {} entries, LSN {}", lsns.len(), highest_lsn);
         Ok(lsns)
     }
@@ -736,10 +814,15 @@ impl WriteAheadLog {
         }
 
         // Wait for batch commit to complete
-        match rx.recv() {
+        let result = match rx.recv() {
             Ok(result) => result,
             Err(e) => Err(Error::storage(format!("Group commit failed: {}", e))),
+        };
+        if result.is_ok() {
+            // GH#35 (A3): periodic checkpoint advancement.
+            self.maybe_advance_checkpoint();
         }
+        result
     }
 
     /// Flush WAL to disk
@@ -888,6 +971,27 @@ impl WriteAheadLog {
         }
 
         batch.put(Self::CHECKPOINT_KEY, up_to_lsn.to_le_bytes());
+
+        // Keep the LSN counter monotonic across sessions: the checkpoint is a
+        // floor, so the next session's first append must be > up_to_lsn or it
+        // is born BELOW the checkpoint and every future replay skips it. This
+        // matters because `current_lsn` also advances on commit-only
+        // increments (`increment_lsn`, no entry written), so the durable
+        // `wal:last_lsn` can trail the checkpoint target by the number of
+        // commits that issued no logical entry.
+        let durable_last = match self.db.get(b"wal:last_lsn") {
+            Ok(Some(bytes)) => {
+                let mut buf = [0u8; 8];
+                if bytes.len() == 8 {
+                    buf.copy_from_slice(&bytes);
+                }
+                u64::from_le_bytes(buf)
+            }
+            _ => 0,
+        };
+        if up_to_lsn > durable_last {
+            batch.put(b"wal:last_lsn", up_to_lsn.to_le_bytes());
+        }
 
         let mut sync_opts = WriteOptions::default();
         sync_opts.set_sync(true);

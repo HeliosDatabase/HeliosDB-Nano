@@ -68,6 +68,14 @@ fn config_for(dir: &Path, logical_wal_per_statement: bool) -> Config {
     c.storage.memory_only = false;
     c.storage.wal_enabled = true;
     c.storage.logical_wal_per_statement = logical_wal_per_statement;
+    // These tests hand-construct the pre-fix on-disk states (retained entries
+    // above an absent or planted checkpoint) by writing to a CLOSED store, so
+    // the GH#35 close-time checkpoint — which would reclaim exactly those
+    // entries — and the periodic triggers are disabled here. The close-time
+    // behavior itself is covered by tests/gh_issue_35.rs.
+    c.storage.wal_checkpoint_on_close = false;
+    c.storage.wal_checkpoint_interval_entries = 0;
+    c.storage.wal_checkpoint_interval_secs = 0;
     c
 }
 

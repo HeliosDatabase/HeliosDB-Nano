@@ -1796,6 +1796,11 @@ pub struct StorageEngine {
     statistics_cache: Arc<crate::storage::StatisticsCache>,
     /// Replay flag to skip WAL logging during recovery
     is_replaying: Arc<AtomicBool>,
+    /// GH#35: true ONLY while `replay_wal_after` re-executes the retained log
+    /// at OPEN. Distinct from `is_replaying`, which `apply_replicated_operation`
+    /// also sets: a standby applying the primary's DROP of a populated table is
+    /// normal and must not be refused by the destructive-replay policy.
+    is_open_recovery: Arc<AtomicBool>,
     /// Change log for sync protocol (v2.3)
     #[cfg(feature = "sync-experimental")]
     change_log: Option<Arc<RwLock<crate::sync::ChangeLogImpl>>>,
@@ -2245,6 +2250,12 @@ impl StorageEngine {
             // carries the engine's key manager and seals them itself.
             match WriteAheadLog::open_with_key_manager(Arc::clone(&db), sync_mode, key_manager.clone()) {
                 Ok(wal) => {
+                    // GH#35 (A3): bound the crash window with periodic
+                    // checkpoint advancement.
+                    let wal = wal.with_checkpoint_policy(
+                        config.storage.wal_checkpoint_interval_entries,
+                        config.storage.wal_checkpoint_interval_secs,
+                    );
                     info!("WAL initialized successfully");
                     Some(Arc::new(RwLock::new(wal)))
                 }
@@ -2353,6 +2364,7 @@ impl StorageEngine {
             stats,
             statistics_cache,
             is_replaying: Arc::new(AtomicBool::new(false)),
+            is_open_recovery: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "sync-experimental")]
             change_log,
             #[cfg(feature = "sync-experimental")]
@@ -2625,6 +2637,12 @@ impl StorageEngine {
                                                 // Carries the key manager for the same reason the on-disk open does.
             match WriteAheadLog::open_with_key_manager(Arc::clone(&db), sync_mode, key_manager.clone()) {
                 Ok(wal) => {
+                    // GH#35 (A3): bound the crash window with periodic
+                    // checkpoint advancement.
+                    let wal = wal.with_checkpoint_policy(
+                        config.storage.wal_checkpoint_interval_entries,
+                        config.storage.wal_checkpoint_interval_secs,
+                    );
                     debug!("WAL initialized for in-memory storage");
                     Some(Arc::new(RwLock::new(wal)))
                 }
@@ -2714,6 +2732,7 @@ impl StorageEngine {
             stats,
             statistics_cache,
             is_replaying: Arc::new(AtomicBool::new(false)),
+            is_open_recovery: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "sync-experimental")]
             change_log,
             #[cfg(feature = "sync-experimental")]
@@ -10227,10 +10246,109 @@ impl StorageEngine {
     /// time uses the checkpoint instead; see
     /// [`StorageEngine::recover_wal_at_open`] for why replaying an
     /// already-checkpointed entry is not redo but a re-execution of history.
+    /// GH#35 (A1): advance the durable logical-WAL checkpoint to the current
+    /// LSN and reclaim every entry at or below it.
+    ///
+    /// Truthful because the logical WAL lives in the SAME RocksDB as the
+    /// `data:` keys it describes: once RocksDB has committed both, the entry
+    /// IS applied (see the reasoning on `recover_wal_at_open`). Returns the
+    /// number of entries reclaimed; `Ok(0)` when there is no WAL or nothing
+    /// has ever been appended.
+    pub fn checkpoint_logical_wal(&self) -> Result<usize> {
+        let Some(wal) = &self.wal else { return Ok(0) };
+        let wal = wal.read();
+        let lsn = wal.current_lsn();
+        if lsn == 0 {
+            return Ok(0);
+        }
+        wal.truncate_to_checkpoint(lsn)
+    }
+
+    /// GH#35 (A2): whether a clean close advances the checkpoint.
+    pub fn wal_checkpoint_on_close(&self) -> bool {
+        self.config.storage.wal_checkpoint_on_close
+    }
+
+    /// GH#35 (Half B): should this OPEN-TIME RECOVERY entry be SKIPPED?
+    ///
+    /// `DropTable` / `Truncate` / `RenameTable` are destructive when replayed
+    /// as history: open recovery cannot tell an entry whose effect is already
+    /// in the store from one whose data write was lost, and re-executing the
+    /// former deletes live rows. `storage.wal_replay_destructive_ddl` decides:
+    /// `refuse` (default) skips and logs an ERROR, `warn` logs today's warning
+    /// and applies, `apply` is silent. Standby replication never reaches this
+    /// (see `is_open_recovery`).
+    fn destructive_replay_is_refused(&self, operation: &WalOperation) -> bool {
+        let destructive = matches!(
+            operation,
+            WalOperation::DropTable { .. } | WalOperation::Truncate { .. } | WalOperation::RenameTable { .. }
+        );
+        if !destructive || !self.is_open_recovery.load(Ordering::Acquire) {
+            return false;
+        }
+        match self.config.storage.wal_replay_destructive_ddl {
+            crate::config::DestructiveDdlReplay::Apply => false,
+            crate::config::DestructiveDdlReplay::Warn => {
+                self.warn_if_replayed_ddl_destroys_rows(operation);
+                false
+            }
+            crate::config::DestructiveDdlReplay::Refuse => {
+                let (verb, table, rows) = match operation {
+                    WalOperation::DropTable { table } => ("DROP TABLE", table.as_str(), self.count_data_rows(table)),
+                    WalOperation::Truncate { table } => ("TRUNCATE", table.as_str(), self.count_data_rows(table)),
+                    WalOperation::RenameTable { new_table, .. } => (
+                        "ALTER TABLE ... RENAME",
+                        new_table.as_str(),
+                        self.count_data_rows(new_table),
+                    ),
+                    _ => return false,
+                };
+                error!(
+                    "REFUSING to replay destructive DDL from the logical WAL: '{} {}' sits above \
+                     the durable checkpoint and may already be applied; the store currently holds \
+                     {} row(s) that history does not account for. Nothing was changed. Data \
+                     directory: {}. If this entry is genuine post-crash redo, set \
+                     storage.wal_replay_destructive_ddl = \"warn\" or \"apply\" and restart.",
+                    verb,
+                    table,
+                    rows,
+                    self.config
+                        .storage
+                        .path
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "<in-memory>".to_string())
+                );
+                true
+            }
+        }
+    }
+
+    /// Bounded `data:{table}:` key count for the destructive-replay diagnostic.
+    fn count_data_rows(&self, table: &str) -> usize {
+        const COUNT_CAP: usize = 100_000;
+        let prefix = format!("data:{}:", table).into_bytes();
+        let mut rows = 0usize;
+        for item in self.db.prefix_iterator(prefix.as_slice()) {
+            let Ok((key, _)) = item else { break };
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            rows += 1;
+            if rows >= COUNT_CAP {
+                break;
+            }
+        }
+        rows
+    }
+
     pub fn replay_wal_after(&self, after_lsn: u64) -> Result<usize> {
         if let Some(wal) = &self.wal {
             // Set replay flag to skip WAL logging during recovery
             self.is_replaying.store(true, Ordering::Release);
+            // GH#35: mark OPEN-time recovery specifically, so the destructive
+            // DDL policy can never fire on a replicated apply.
+            self.is_open_recovery.store(true, Ordering::Release);
 
             let wal = wal.read();
             // Clear the replay flag on the error path too: leaving it set would
@@ -10239,6 +10357,7 @@ impl StorageEngine {
                 Ok(entries) => entries,
                 Err(e) => {
                     self.is_replaying.store(false, Ordering::Release);
+                    self.is_open_recovery.store(false, Ordering::Release);
                     return Err(e);
                 }
             };
@@ -10247,6 +10366,7 @@ impl StorageEngine {
             if count == 0 {
                 info!("No WAL entries to replay");
                 self.is_replaying.store(false, Ordering::Release);
+                self.is_open_recovery.store(false, Ordering::Release);
                 return Ok(0);
             }
 
@@ -10321,6 +10441,7 @@ impl StorageEngine {
                         // Don't fail the entire replay unless errors are catastrophic
                         if error_count > count / 10 {
                             self.is_replaying.store(false, Ordering::Release);
+                            self.is_open_recovery.store(false, Ordering::Release);
                             return Err(Error::storage(format!(
                                 "Too many errors during WAL replay: {}/{}",
                                 error_count, count
@@ -10344,6 +10465,7 @@ impl StorageEngine {
 
             // Clear replay flag
             self.is_replaying.store(false, Ordering::Release);
+            self.is_open_recovery.store(false, Ordering::Release);
 
             Ok(replayed_count)
         } else {
@@ -10366,6 +10488,10 @@ impl StorageEngine {
 
     /// Apply a single WAL operation to restore database state
     fn apply_wal_operation(&self, operation: WalOperation) -> Result<()> {
+        // GH#35 (Half B): fail closed on destructive DDL during open recovery.
+        if self.destructive_replay_is_refused(&operation) {
+            return Ok(());
+        }
         // Log the operation type for debugging
         info!(
             "apply_wal_operation: Processing {:?}",
@@ -10893,6 +11019,12 @@ impl StorageEngine {
     }
 
     fn apply_wal_operation_to_batch(&self, operation: &WalOperation, batch: &mut WriteBatch) -> Result<bool> {
+        // GH#35 (Half B): the DropTable/Truncate arm delegates to
+        // `apply_wal_operation` (which checks), but the RenameTable arm below
+        // applies directly — guard both here so the two drivers cannot drift.
+        if self.destructive_replay_is_refused(operation) {
+            return Ok(false);
+        }
         match operation {
             WalOperation::Insert { table, key, tuple } => {
                 // Use the original key for idempotent replay (RocksDB put overwrites).
