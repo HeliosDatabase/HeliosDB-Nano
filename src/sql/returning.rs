@@ -126,8 +126,11 @@ impl ReturningProjection {
     /// alias `x.c`) resolves by the bare column name — the rule
     /// `Planner::convert_returning` already applies to the unaliased spelling:
     /// in a single-table DML RETURNING list the qualifier cannot select a
-    /// different column. Tightening that (refusing an unknown qualifier) is
-    /// GH#29's family and belongs in this function when it lands.
+    /// different column. Since GH#29 the qualifier is CHECKED upstream, in
+    /// `Planner::convert_returning`: one that names neither the target (by
+    /// alias, resolved key or bare component) nor `EXCLUDED` is refused there
+    /// with 42P01 (`missing FROM-clause entry`), so by the time an item reaches
+    /// this binder every qualifier it carries is the target's own.
     pub(crate) fn bind(table_schema: &Schema, items: &[ReturningItem]) -> Result<Self> {
         Self::bind_with_parameters(table_schema, items, &[])
     }

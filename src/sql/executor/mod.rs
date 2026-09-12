@@ -933,6 +933,7 @@ impl<'a> Executor<'a> {
                 aliases,
                 distinct,
                 distinct_on,
+                source_alias: None,
                 ..
             } => {
                 if let LogicalPlan::Sort {
@@ -1393,6 +1394,7 @@ impl<'a> Executor<'a> {
                 aliases,
                 distinct: false,
                 distinct_on: None,
+                source_alias: None,
             } if matches!(inner.as_ref(), LogicalPlan::Sort { .. }) => {
                 (Some((exprs.as_slice(), aliases.as_slice())), inner.as_ref())
             }
@@ -1701,6 +1703,7 @@ impl<'a> Executor<'a> {
                 aliases,
                 distinct: false,
                 distinct_on: None,
+                source_alias: None,
             } => {
                 let scan_input = match input.as_ref() {
                     LogicalPlan::Sort { input, .. } => input.as_ref(),
@@ -1935,6 +1938,37 @@ impl<'a> Executor<'a> {
     /// This allows the evaluator to handle IN expressions without needing
     /// access to the storage engine.
     pub(crate) fn materialize_subqueries(&self, expr: &crate::sql::LogicalExpr) -> Result<crate::sql::LogicalExpr> {
+        self.materialize_subqueries_inner(expr, false)
+    }
+
+    /// [`Self::materialize_subqueries`] for a JOIN's ON condition (GH#29 c6,
+    /// m1). Identical, except that a scalar subquery the engine cannot
+    /// execute here — a CORRELATED one — is REFUSED instead of standing in as
+    /// NULL. Substituting NULL turns `a JOIN b ON a.id = b.id AND a.x =
+    /// (SELECT max(x) FROM c WHERE c.k = a.k)` into a condition that is never
+    /// true: silently zero rows, where the engine used to raise the
+    /// evaluator's error. Silent wrong rows are never acceptable; the
+    /// drizzle-compatibility fallback stays on every other path.
+    ///
+    /// GH#29 (c7, M5): the refusal is keyed on CORRELATION, detected
+    /// structurally by [`scalar_subquery_is_correlated`], not on "this
+    /// subquery failed while we were building a join". Candidate 6 keyed it
+    /// on the flag, so EVERY failure of a scalar subquery in an ON condition
+    /// — a missing table (42P01), a division by zero, a type error — was
+    /// reported as `0A000 correlated subquery in JOIN ... ON is not
+    /// supported` with the real diagnostic discarded into a debug trace.
+    pub(crate) fn materialize_join_subqueries(
+        &self,
+        expr: &crate::sql::LogicalExpr,
+    ) -> Result<crate::sql::LogicalExpr> {
+        self.materialize_subqueries_inner(expr, true)
+    }
+
+    fn materialize_subqueries_inner(
+        &self,
+        expr: &crate::sql::LogicalExpr,
+        refuse_correlated_scalar: bool,
+    ) -> Result<crate::sql::LogicalExpr> {
         use crate::sql::LogicalExpr;
 
         match expr {
@@ -1954,7 +1988,7 @@ impl<'a> Executor<'a> {
                 let results = subquery_executor.execute(subquery)?;
 
                 // Materialize the inner expression as well
-                let materialized_inner = self.materialize_subqueries(inner_expr)?;
+                let materialized_inner = self.materialize_subqueries_inner(inner_expr, refuse_correlated_scalar)?;
 
                 // Use HashSet for large IN lists (O(1) lookup instead of O(N) linear scan)
                 if results.len() > 16 {
@@ -2006,6 +2040,20 @@ impl<'a> Executor<'a> {
                 // ON-clause is false → no match).
                 let results = match subquery_executor.execute(subquery) {
                     Ok(r) => r,
+                    // GH#29 (c6, m1 / c7, M5): in a JOIN's ON condition the
+                    // NULL stand-in is a silent wrong answer (the term is
+                    // never true, so the join loses rows with no diagnostic).
+                    // A CORRELATED subquery — one referencing a column no
+                    // scope inside it provides — is refused with the SQLSTATE
+                    // the missing feature deserves; every OTHER failure
+                    // propagates with its own message and SQLSTATE.
+                    Err(e) if refuse_correlated_scalar => {
+                        if scalar_subquery_is_correlated(subquery) {
+                            tracing::debug!("Correlated scalar subquery in a JOIN ... ON condition failed ({e})");
+                            return Err(crate::sql::scope::correlated_join_subquery_unsupported());
+                        }
+                        return Err(e);
+                    }
                     Err(e) => {
                         tracing::debug!("Correlated scalar subquery failed ({e}); falling back to NULL");
                         Vec::new()
@@ -2058,16 +2106,16 @@ impl<'a> Executor<'a> {
             }
             // Recursively process compound expressions
             LogicalExpr::BinaryExpr { left, op, right } => Ok(LogicalExpr::BinaryExpr {
-                left: Box::new(self.materialize_subqueries(left)?),
+                left: Box::new(self.materialize_subqueries_inner(left, refuse_correlated_scalar)?),
                 op: *op,
-                right: Box::new(self.materialize_subqueries(right)?),
+                right: Box::new(self.materialize_subqueries_inner(right, refuse_correlated_scalar)?),
             }),
             LogicalExpr::UnaryExpr { op, expr: inner } => Ok(LogicalExpr::UnaryExpr {
                 op: *op,
-                expr: Box::new(self.materialize_subqueries(inner)?),
+                expr: Box::new(self.materialize_subqueries_inner(inner, refuse_correlated_scalar)?),
             }),
             LogicalExpr::IsNull { expr: inner, is_null } => Ok(LogicalExpr::IsNull {
-                expr: Box::new(self.materialize_subqueries(inner)?),
+                expr: Box::new(self.materialize_subqueries_inner(inner, refuse_correlated_scalar)?),
                 is_null: *is_null,
             }),
             LogicalExpr::Between {
@@ -2076,9 +2124,9 @@ impl<'a> Executor<'a> {
                 high,
                 negated,
             } => Ok(LogicalExpr::Between {
-                expr: Box::new(self.materialize_subqueries(inner)?),
-                low: Box::new(self.materialize_subqueries(low)?),
-                high: Box::new(self.materialize_subqueries(high)?),
+                expr: Box::new(self.materialize_subqueries_inner(inner, refuse_correlated_scalar)?),
+                low: Box::new(self.materialize_subqueries_inner(low, refuse_correlated_scalar)?),
+                high: Box::new(self.materialize_subqueries_inner(high, refuse_correlated_scalar)?),
                 negated: *negated,
             }),
             LogicalExpr::InList {
@@ -2086,10 +2134,12 @@ impl<'a> Executor<'a> {
                 list,
                 negated,
             } => {
-                let materialized_list: Result<Vec<LogicalExpr>> =
-                    list.iter().map(|e| self.materialize_subqueries(e)).collect();
+                let materialized_list: Result<Vec<LogicalExpr>> = list
+                    .iter()
+                    .map(|e| self.materialize_subqueries_inner(e, refuse_correlated_scalar))
+                    .collect();
                 Ok(LogicalExpr::InList {
-                    expr: Box::new(self.materialize_subqueries(inner)?),
+                    expr: Box::new(self.materialize_subqueries_inner(inner, refuse_correlated_scalar)?),
                     list: materialized_list?,
                     negated: *negated,
                 })
@@ -2100,16 +2150,25 @@ impl<'a> Executor<'a> {
                 else_result,
             } => {
                 let materialized_operand = if let Some(op) = operand {
-                    Some(Box::new(self.materialize_subqueries(op)?))
+                    Some(Box::new(
+                        self.materialize_subqueries_inner(op, refuse_correlated_scalar)?,
+                    ))
                 } else {
                     None
                 };
                 let materialized_when_then: Result<Vec<(LogicalExpr, LogicalExpr)>> = when_then
                     .iter()
-                    .map(|(w, t)| Ok((self.materialize_subqueries(w)?, self.materialize_subqueries(t)?)))
+                    .map(|(w, t)| {
+                        Ok((
+                            self.materialize_subqueries_inner(w, refuse_correlated_scalar)?,
+                            self.materialize_subqueries_inner(t, refuse_correlated_scalar)?,
+                        ))
+                    })
                     .collect();
                 let materialized_else = if let Some(e) = else_result {
-                    Some(Box::new(self.materialize_subqueries(e)?))
+                    Some(Box::new(
+                        self.materialize_subqueries_inner(e, refuse_correlated_scalar)?,
+                    ))
                 } else {
                     None
                 };
@@ -3401,8 +3460,30 @@ impl<'a> Executor<'a> {
         Some((lower, upper))
     }
 
-    /// Convert a logical plan to a physical operator
+    /// Convert a logical plan to a physical operator.
+    ///
+    /// GH#29: a projection that carries a `source_alias` (a derived table or
+    /// an expanded view known by that alias in `FROM`) is built by whichever
+    /// path `plan_to_operator_inner` picks and then wrapped in a
+    /// [`project::SourceAliasOperator`], which re-tags the output schema with
+    /// the alias. Done here, once, above every construction path, so the
+    /// direct-scan / top-k / hash-join fast paths need no knowledge of it and
+    /// the planner's `LogicalPlan::schema()` stamp and the executor's runtime
+    /// schema cannot disagree.
     pub(crate) fn plan_to_operator(&mut self, plan: &LogicalPlan) -> Result<Box<dyn PhysicalOperator>> {
+        let operator = self.plan_to_operator_inner(plan)?;
+        match plan {
+            LogicalPlan::Project {
+                source_alias: Some(alias),
+                ..
+            } => Ok(Box::new(project::SourceAliasOperator::new(operator, alias))),
+            _ => Ok(operator),
+        }
+    }
+
+    /// The body of [`Self::plan_to_operator`] (every recursive call goes
+    /// through the wrapper, so nested stamped projections are re-tagged too).
+    fn plan_to_operator_inner(&mut self, plan: &LogicalPlan) -> Result<Box<dyn PhysicalOperator>> {
         match plan {
             LogicalPlan::Scan { .. } => scan::handle_scan(self, plan),
             LogicalPlan::FilteredScan {
@@ -3483,6 +3564,7 @@ impl<'a> Executor<'a> {
                 aliases,
                 distinct,
                 distinct_on,
+                ..
             } => {
                 use crate::sql::LogicalExpr;
 
@@ -5390,4 +5472,352 @@ fn handle_create_extension<'a>(
         vec![],
         Arc::new(Schema { columns: vec![] }),
     )))
+}
+
+/// Does this scalar subquery's plan reference a relation no scope INSIDE it
+/// provides — i.e. is it CORRELATED with the enclosing query (GH#29 c7, M5)?
+///
+/// Structural, and deliberately conservative in one direction only: it may
+/// answer `false` for a correlation it cannot see, never `true` for a
+/// subquery that is self-contained. Two rules make that hold:
+///
+/// * every relation of every level of the subquery counts as available
+///   (its own scans, table functions, CTEs, derived-table aliases, and the
+///   same for any subquery nested inside it), so an inner reference is never
+///   mistaken for an outer one;
+/// * only a QUALIFIED reference is evidence. A bare name cannot be told apart
+///   from a projection's own synthesized output (`agg_0` for an aggregate)
+///   without re-running name resolution, so a bare outer reference simply
+///   keeps the subquery's own error instead of being claimed as a
+///   correlation.
+///
+/// The caller uses it to decide WHICH refusal a failed materialization earns:
+/// the 0A000 "correlated subquery in JOIN ... ON is not supported" for a
+/// reference that is demonstrably outer, or the subquery's own error — its
+/// own message and its own SQLSTATE — for everything else.
+pub(crate) fn scalar_subquery_is_correlated(subquery: &crate::sql::LogicalPlan) -> bool {
+    let mut relations: std::collections::HashSet<String> = std::collections::HashSet::new();
+    collect_plan_relations(subquery, &mut relations);
+
+    let mut qualifiers: Vec<String> = Vec::new();
+    collect_plan_qualifiers(subquery, &mut qualifiers);
+
+    // GH#29 (c9, m6): the qualifier is compared AS WRITTEN (case-folded), not
+    // pushed through `normalized_relation_key`. The relation set already holds
+    // BOTH spellings of every scanned relation, so normalizing the lookup key
+    // too only widened "self-contained": it made the full-key entry
+    // unreachable (every lookup key was already bare) and read a genuinely
+    // OUTER `other.mc.k` as in-scope because its bare tail matched an inner
+    // scan.
+    qualifiers
+        .iter()
+        .any(|qualifier| !relations.contains(&qualifier.to_ascii_lowercase()))
+}
+
+/// One relation spelling, comparable with another (GH#29 c8, m4).
+///
+/// A `Scan`'s `table_name` is the RESOLVED storage key, which
+/// [`crate::sql::Planner::schema_qualified_key`] writes as `schema.table`
+/// outside `public` / `pg_catalog`, while a column qualifier in the very same
+/// subquery is the BARE relation name (`mc.k` over `FROM analytics.mc`).
+/// Comparing the two spellings verbatim reported a self-contained subquery as
+/// correlated, which is exactly the misdiagnosis M5 removed: the real error
+/// was replaced by the `0A000` refusal.
+fn normalized_relation_key(name: &str) -> String {
+    crate::sql::Planner::split_schema_key(name).1.to_ascii_lowercase()
+}
+
+/// Both spellings of a scanned relation: the key as the plan carries it and
+/// the bare relation name. See [`normalized_relation_key`].
+fn insert_relation_spellings(name: &str, relations: &mut std::collections::HashSet<String>) {
+    relations.insert(name.to_ascii_lowercase());
+    relations.insert(normalized_relation_key(name));
+}
+
+/// Every relation name / alias any level of `plan` brings into scope.
+/// See [`scalar_subquery_is_correlated`].
+fn collect_plan_relations(plan: &crate::sql::LogicalPlan, relations: &mut std::collections::HashSet<String>) {
+    use crate::sql::LogicalPlan;
+    match plan {
+        LogicalPlan::Scan { table_name, alias, .. } => {
+            insert_relation_spellings(table_name, relations);
+            if let Some(alias) = alias {
+                insert_relation_spellings(alias, relations);
+            }
+        }
+        LogicalPlan::FilteredScan {
+            table_name,
+            alias,
+            predicate,
+            ..
+        } => {
+            insert_relation_spellings(table_name, relations);
+            if let Some(alias) = alias {
+                insert_relation_spellings(alias, relations);
+            }
+            // Symmetric with `collect_plan_qualifiers`, which reads this
+            // predicate: a subquery pushed into a scan brings its own scope.
+            if let Some(predicate) = predicate {
+                collect_expr_relations(predicate, relations);
+            }
+        }
+        LogicalPlan::TableFunction {
+            function_name,
+            alias,
+            args,
+            ..
+        } => {
+            relations.insert(function_name.to_ascii_lowercase());
+            if let Some(alias) = alias {
+                relations.insert(alias.to_ascii_lowercase());
+            }
+            for arg in args {
+                collect_expr_relations(arg, relations);
+            }
+        }
+        LogicalPlan::Project {
+            input,
+            exprs,
+            source_alias,
+            ..
+        } => {
+            if let Some(source_alias) = source_alias {
+                relations.insert(source_alias.to_ascii_lowercase());
+            }
+            for expr in exprs {
+                collect_expr_relations(expr, relations);
+            }
+            collect_plan_relations(input, relations);
+        }
+        LogicalPlan::Filter { input, predicate } => {
+            collect_expr_relations(predicate, relations);
+            collect_plan_relations(input, relations);
+        }
+        LogicalPlan::Aggregate {
+            input,
+            group_by,
+            aggr_exprs,
+            having,
+        } => {
+            for expr in group_by.iter().chain(aggr_exprs.iter()) {
+                collect_expr_relations(expr, relations);
+            }
+            if let Some(having) = having {
+                collect_expr_relations(having, relations);
+            }
+            collect_plan_relations(input, relations);
+        }
+        LogicalPlan::Sort { input, exprs, .. } => {
+            for expr in exprs {
+                collect_expr_relations(expr, relations);
+            }
+            collect_plan_relations(input, relations);
+        }
+        LogicalPlan::Limit { input, .. } => collect_plan_relations(input, relations),
+        LogicalPlan::Join { left, right, on, .. } => {
+            if let Some(on) = on {
+                collect_expr_relations(on, relations);
+            }
+            collect_plan_relations(left, relations);
+            collect_plan_relations(right, relations);
+        }
+        LogicalPlan::Union { left, right, .. }
+        | LogicalPlan::Intersect { left, right, .. }
+        | LogicalPlan::Except { left, right, .. } => {
+            collect_plan_relations(left, relations);
+            collect_plan_relations(right, relations);
+        }
+        LogicalPlan::With { ctes, query, .. } => {
+            for (name, cte, _) in ctes {
+                relations.insert(name.to_ascii_lowercase());
+                collect_plan_relations(cte, relations);
+            }
+            collect_plan_relations(query, relations);
+        }
+        // No FROM scope of its own; a reference inside it is judged against
+        // the levels that do have one.
+        _ => {}
+    }
+}
+
+/// The relations of every sub-plan reachable through `expr` (a scalar, `IN`
+/// or `EXISTS` subquery brings its own FROM scope).
+fn collect_expr_relations(expr: &crate::sql::LogicalExpr, relations: &mut std::collections::HashSet<String>) {
+    walk_expr_subplans(expr, &mut |plan| collect_plan_relations(plan, relations));
+}
+
+/// Every QUALIFIED column reference in every expression of `plan`, at every
+/// level. See [`scalar_subquery_is_correlated`].
+fn collect_plan_qualifiers(plan: &crate::sql::LogicalPlan, qualifiers: &mut Vec<String>) {
+    use crate::sql::LogicalPlan;
+    match plan {
+        LogicalPlan::FilteredScan {
+            predicate: Some(predicate),
+            ..
+        } => collect_expr_qualifiers(predicate, qualifiers),
+        LogicalPlan::Filter { input, predicate } => {
+            collect_expr_qualifiers(predicate, qualifiers);
+            collect_plan_qualifiers(input, qualifiers);
+        }
+        LogicalPlan::Project {
+            input,
+            exprs,
+            distinct_on,
+            ..
+        } => {
+            for expr in exprs {
+                collect_expr_qualifiers(expr, qualifiers);
+            }
+            if let Some(distinct_on) = distinct_on {
+                for expr in distinct_on {
+                    collect_expr_qualifiers(expr, qualifiers);
+                }
+            }
+            collect_plan_qualifiers(input, qualifiers);
+        }
+        LogicalPlan::Aggregate {
+            input,
+            group_by,
+            aggr_exprs,
+            having,
+        } => {
+            for expr in group_by.iter().chain(aggr_exprs.iter()) {
+                collect_expr_qualifiers(expr, qualifiers);
+            }
+            if let Some(having) = having {
+                collect_expr_qualifiers(having, qualifiers);
+            }
+            collect_plan_qualifiers(input, qualifiers);
+        }
+        LogicalPlan::Sort { input, exprs, .. } => {
+            for expr in exprs {
+                collect_expr_qualifiers(expr, qualifiers);
+            }
+            collect_plan_qualifiers(input, qualifiers);
+        }
+        LogicalPlan::Limit { input, .. } => collect_plan_qualifiers(input, qualifiers),
+        LogicalPlan::Join { left, right, on, .. } => {
+            if let Some(on) = on {
+                collect_expr_qualifiers(on, qualifiers);
+            }
+            collect_plan_qualifiers(left, qualifiers);
+            collect_plan_qualifiers(right, qualifiers);
+        }
+        LogicalPlan::Union { left, right, .. }
+        | LogicalPlan::Intersect { left, right, .. }
+        | LogicalPlan::Except { left, right, .. } => {
+            collect_plan_qualifiers(left, qualifiers);
+            collect_plan_qualifiers(right, qualifiers);
+        }
+        LogicalPlan::With { ctes, query, .. } => {
+            for (_, cte, _) in ctes {
+                collect_plan_qualifiers(cte, qualifiers);
+            }
+            collect_plan_qualifiers(query, qualifiers);
+        }
+        LogicalPlan::TableFunction { args, .. } => {
+            for arg in args {
+                collect_expr_qualifiers(arg, qualifiers);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Every qualifier of every column reference of one expression, descending
+/// into the sub-plans of nested subqueries (whose own relations are in the
+/// available set, so a reference resolved there is not a correlation).
+fn collect_expr_qualifiers(expr: &crate::sql::LogicalExpr, qualifiers: &mut Vec<String>) {
+    use crate::sql::LogicalExpr;
+    if let LogicalExpr::Column { table: Some(table), .. } = expr {
+        qualifiers.push(table.clone());
+    }
+    walk_expr_children(expr, &mut |child| collect_expr_qualifiers(child, qualifiers));
+    walk_expr_subplans(expr, &mut |plan| collect_plan_qualifiers(plan, qualifiers));
+}
+
+/// Apply `visit` to every directly nested expression of `expr`. The one place
+/// the `LogicalExpr` shape is walked for [`scalar_subquery_is_correlated`].
+fn walk_expr_children(expr: &crate::sql::LogicalExpr, visit: &mut dyn FnMut(&crate::sql::LogicalExpr)) {
+    use crate::sql::LogicalExpr;
+    match expr {
+        LogicalExpr::BinaryExpr { left, right, .. } => {
+            visit(left.as_ref());
+            visit(right.as_ref());
+        }
+        LogicalExpr::UnaryExpr { expr, .. }
+        | LogicalExpr::IsNull { expr, .. }
+        | LogicalExpr::Cast { expr, .. }
+        | LogicalExpr::InSet { expr, .. }
+        | LogicalExpr::InSubquery { expr, .. } => visit(expr.as_ref()),
+        LogicalExpr::Between { expr, low, high, .. } => {
+            visit(expr.as_ref());
+            visit(low.as_ref());
+            visit(high.as_ref());
+        }
+        LogicalExpr::InList { expr, list, .. } => {
+            visit(expr.as_ref());
+            for item in list {
+                visit(item);
+            }
+        }
+        LogicalExpr::Case {
+            expr,
+            when_then,
+            else_result,
+        } => {
+            if let Some(expr) = expr {
+                visit(expr.as_ref());
+            }
+            for (when, then) in when_then {
+                visit(when);
+                visit(then);
+            }
+            if let Some(else_result) = else_result {
+                visit(else_result.as_ref());
+            }
+        }
+        LogicalExpr::ScalarFunction { args, .. } | LogicalExpr::AggregateFunction { args, .. } => {
+            for arg in args {
+                visit(arg);
+            }
+        }
+        LogicalExpr::WindowFunction {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            for expr in args.iter().chain(partition_by.iter()) {
+                visit(expr);
+            }
+            for (expr, _) in order_by {
+                visit(expr);
+            }
+        }
+        LogicalExpr::Tuple { items } => {
+            for item in items {
+                visit(item);
+            }
+        }
+        LogicalExpr::ArraySubscript { array, index } => {
+            visit(array.as_ref());
+            visit(index.as_ref());
+        }
+        // Leaves: literals, parameters, column references, wildcards, bound
+        // columns, row markers, the DEFAULT placeholder — and the subquery
+        // nodes, whose CHILD is a plan (see `walk_expr_subplans`).
+        _ => {}
+    }
+}
+
+/// Apply `visit` to every sub-PLAN reachable through `expr`, at any depth.
+fn walk_expr_subplans(expr: &crate::sql::LogicalExpr, visit: &mut dyn FnMut(&crate::sql::LogicalPlan)) {
+    use crate::sql::LogicalExpr;
+    match expr {
+        LogicalExpr::ScalarSubquery { subquery } | LogicalExpr::Exists { subquery, .. } => visit(subquery.as_ref()),
+        LogicalExpr::InSubquery { subquery, .. } => visit(subquery.as_ref()),
+        _ => {}
+    }
+    walk_expr_children(expr, &mut |child| walk_expr_subplans(child, visit));
 }
