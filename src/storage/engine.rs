@@ -3478,7 +3478,11 @@ impl StorageEngine {
         // Also skip for metadata keys (meta:*) since DDL operations handle their own WAL logging
         if !self.is_replaying.load(Ordering::Acquire) {
             let key_str = std::str::from_utf8(key).unwrap_or("");
-            let is_metadata_key = key_str.starts_with("meta:");
+            // `meta:` records handle their own logging, and `__`-prefixed
+            // internal keys (`__view_metadata__…`) are catalog records, not
+            // rows: logging them produced a bogus `Delete { table: "unknown" }`
+            // in the CDC stream (GH#36).
+            let is_metadata_key = key_str.starts_with("meta:") || key_str.starts_with("__");
 
             if !is_metadata_key {
                 if let Some(wal) = &self.wal {
@@ -10190,6 +10194,90 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// GH#36: log a full-schema replacement from a column-shape ALTER TABLE.
+    pub fn log_alter_table_schema(&self, table: &str, schema: &[u8]) -> Result<()> {
+        if self.is_replaying.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(());
+        }
+        if let Some(wal) = &self.wal {
+            let wal = wal.read();
+            wal.append(WalOperation::AlterTableSchema {
+                table: table.to_string(),
+                schema: schema.to_vec(),
+            })?;
+        }
+        Ok(())
+    }
+
+    /// GH#36: log a plain `CREATE [OR REPLACE] VIEW`.
+    pub fn log_create_view(&self, name: &str, definition: &[u8]) -> Result<()> {
+        if self.is_replaying.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(());
+        }
+        if let Some(wal) = &self.wal {
+            let wal = wal.read();
+            wal.append(WalOperation::CreateView {
+                name: name.to_string(),
+                definition: definition.to_vec(),
+            })?;
+        }
+        Ok(())
+    }
+
+    /// GH#36: log a plain `DROP VIEW`.
+    pub fn log_drop_view(&self, name: &str) -> Result<()> {
+        if self.is_replaying.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(());
+        }
+        if let Some(wal) = &self.wal {
+            let wal = wal.read();
+            wal.append(WalOperation::DropView { name: name.to_string() })?;
+        }
+        Ok(())
+    }
+
+    /// GH#36: log a `CREATE SEQUENCE` definition.
+    pub fn log_create_sequence(&self, name: &str, definition: &[u8]) -> Result<()> {
+        if self.is_replaying.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(());
+        }
+        if let Some(wal) = &self.wal {
+            let wal = wal.read();
+            wal.append(WalOperation::CreateSequence {
+                name: name.to_string(),
+                definition: definition.to_vec(),
+            })?;
+        }
+        Ok(())
+    }
+
+    /// GH#36: log an `ALTER SEQUENCE` definition.
+    pub fn log_alter_sequence(&self, name: &str, definition: &[u8]) -> Result<()> {
+        if self.is_replaying.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(());
+        }
+        if let Some(wal) = &self.wal {
+            let wal = wal.read();
+            wal.append(WalOperation::AlterSequence {
+                name: name.to_string(),
+                definition: definition.to_vec(),
+            })?;
+        }
+        Ok(())
+    }
+
+    /// GH#36: log a `DROP SEQUENCE`.
+    pub fn log_drop_sequence(&self, name: &str) -> Result<()> {
+        if self.is_replaying.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(());
+        }
+        if let Some(wal) = &self.wal {
+            let wal = wal.read();
+            wal.append(WalOperation::DropSequence { name: name.to_string() })?;
+        }
+        Ok(())
+    }
+
     /// Replay WAL for crash recovery with optimizations
     ///
     /// This should be called during engine startup to recover from crashes.
@@ -10717,17 +10805,17 @@ impl StorageEngine {
             }
 
             WalOperation::CreateMaterializedView { name, definition } => {
-                // Store materialized view definition for replication
+                // GH#36: restore through the catalog so the metadata lands under
+                // the key the reader actually consults (`meta:mv:<name>`), not
+                // the stale `meta:matview:` key this arm used to write.
                 info!("Replayed create materialized view: name={}", name);
-                let key = format!("meta:matview:{}", name).into_bytes();
-                self.put(&key, &definition)?;
+                self.mv_catalog().restore_view_from_wal(&name, &definition)?;
                 Ok(())
             }
 
             WalOperation::DropMaterializedView { name } => {
                 info!("Replayed drop materialized view: name={}", name);
-                let key = format!("meta:matview:{}", name).into_bytes();
-                self.delete(&key)?;
+                self.mv_catalog().drop_view_from_wal(&name)?;
                 Ok(())
             }
 
@@ -10746,15 +10834,19 @@ impl StorageEngine {
             }
 
             WalOperation::AddConstraint { table, constraint } => {
-                // Store constraint for replication
+                // GH#36: the blob is the table's COMPLETE TableConstraints set.
+                // Persist it under the real constraint key and re-register the
+                // UNIQUE ART indexes, exactly as open-time rebuild does —
+                // otherwise the replica records the rule and does not enforce it.
                 info!("Replayed add constraint on table: {}", table);
-                // Generate a unique key for this constraint
-                let timestamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_micros();
-                let key = format!("meta:constraint:{}:{}", table, timestamp).into_bytes();
-                self.put(&key, &constraint)?;
+                let catalog = Catalog::new(self);
+                match bincode::deserialize::<crate::sql::TableConstraints>(&constraint) {
+                    Ok(constraints) => {
+                        catalog.save_table_constraints(&table, &constraints)?;
+                        catalog.register_unique_constraint_indexes(&table, &constraints)?;
+                    }
+                    Err(e) => warn!("Failed to deserialize constraints for table {}: {}", table, e),
+                }
                 Ok(())
             }
 
@@ -10763,10 +10855,44 @@ impl StorageEngine {
                     "Replayed drop constraint: table={}, constraint={}",
                     table, constraint_name
                 );
-                // Delete constraint metadata
-                let prefix = format!("meta:constraint:{}:", table);
-                // For now, we can't easily identify the exact key without the constraint data
-                // Just log and return success - the constraint was removed on primary
+                // GH#36: route through the catalog so the ART index backing the
+                // constraint is dropped with the record (the old arm did nothing).
+                Catalog::new(self).drop_constraint(&table, &constraint_name)?;
+                Ok(())
+            }
+
+            WalOperation::AlterTableSchema { table, schema } => {
+                info!("Replayed alter table schema: table={}", table);
+                match bincode::deserialize::<crate::Schema>(&schema) {
+                    Ok(new_schema) => {
+                        Catalog::new(self).update_table_schema(&table, &new_schema)?;
+                    }
+                    Err(e) => warn!("Failed to deserialize schema for table {}: {}", table, e),
+                }
+                Ok(())
+            }
+
+            WalOperation::CreateView { name, definition } => {
+                info!("Replayed create view: name={}", name);
+                self.view_catalog().restore_view_from_wal(&name, &definition)?;
+                Ok(())
+            }
+
+            WalOperation::DropView { name } => {
+                info!("Replayed drop view: name={}", name);
+                self.view_catalog().drop_view_from_wal(&name)?;
+                Ok(())
+            }
+
+            WalOperation::CreateSequence { name, definition } | WalOperation::AlterSequence { name, definition } => {
+                info!("Replayed sequence definition: name={}", name);
+                Catalog::new(self).restore_sequence_from_wal(&name, &definition)?;
+                Ok(())
+            }
+
+            WalOperation::DropSequence { name } => {
+                info!("Replayed drop sequence: name={}", name);
+                Catalog::new(self).drop_sequence(&name)?;
                 Ok(())
             }
 
@@ -10997,7 +11123,13 @@ impl StorageEngine {
             | WalOperation::DropMaterializedView { .. }
             | WalOperation::RefreshMaterializedView { .. }
             | WalOperation::AddConstraint { .. }
-            | WalOperation::DropConstraint { .. } => {
+            | WalOperation::DropConstraint { .. }
+            | WalOperation::AlterTableSchema { .. }
+            | WalOperation::CreateView { .. }
+            | WalOperation::DropView { .. }
+            | WalOperation::CreateSequence { .. }
+            | WalOperation::AlterSequence { .. }
+            | WalOperation::DropSequence { .. } => {
                 // Belt and braces under destructive replayed DDL — see the
                 // helper. No-op for every variant except DropTable/Truncate.
                 self.warn_if_replayed_ddl_destroys_rows(operation);

@@ -1201,6 +1201,17 @@ impl<'a> Catalog<'a> {
 
         self.storage.put(&key, &value)?;
 
+        // GH#36: represent the schema replacement in the logical WAL. Every
+        // column-shape ALTER (ADD/DROP/RENAME COLUMN, ALTER COLUMN … DROP NOT
+        // NULL) funnels through here on BOTH executor families — including the
+        // text family's inlined arms, which never reach
+        // `EmbeddedDatabase::execute_alter_table_op` — so this one emitter
+        // covers them all. The blob is the complete new Schema, so replay is
+        // idempotent; `is_replaying` keeps the replay arm from re-emitting.
+        if let Err(e) = self.storage.log_alter_table_schema(table_name, &value) {
+            tracing::warn!("Failed to log schema change for '{}' to WAL: {}", table_name, e);
+        }
+
         // Update in-memory schema cache
         self.storage.cache_schema(table_name, schema.clone());
 
@@ -3193,14 +3204,38 @@ impl<'a> Catalog<'a> {
     /// first. Definition durability rides the normal post-statement barrier
     /// (like enum/identity); a lost CREATE means the sequence is *absent* on
     /// restart, never a duplicate value.
-    pub fn save_sequence(&self, def: &PersistedSequence) -> Result<()> {
-        let key = Self::sequence_def_key(&def.name);
+    /// GH#36: the exact tagged frame `save_sequence` persists, factored out so
+    /// the logical-WAL emitter writes the identical bytes a replica restores.
+    fn encode_sequence_def(def: &PersistedSequence) -> Result<Vec<u8>> {
         let body = bincode::serialize(def)
             .map_err(|e| Error::storage(format!("Failed to serialize sequence definition: {}", e)))?;
         let mut value = Vec::with_capacity(SEQ_DEF_MAGIC.len() + 1 + body.len());
         value.extend_from_slice(SEQ_DEF_MAGIC);
         value.push(SEQ_DEF_FORMAT_VERSION);
         value.extend_from_slice(&body);
+        Ok(value)
+    }
+
+    /// GH#36: emit the logical-WAL entry for a sequence-definition change.
+    /// `alter` distinguishes ALTER SEQUENCE from CREATE SEQUENCE; replay treats
+    /// both as an idempotent definition write.
+    pub fn log_sequence_definition(&self, def: &PersistedSequence, alter: bool) -> Result<()> {
+        let frame = Self::encode_sequence_def(def)?;
+        if alter {
+            self.storage.log_alter_sequence(&def.name, &frame)
+        } else {
+            self.storage.log_create_sequence(&def.name, &frame)
+        }
+    }
+
+    /// GH#36: restore a sequence definition from a replicated WAL entry.
+    pub fn restore_sequence_from_wal(&self, name: &str, definition: &[u8]) -> Result<()> {
+        self.storage.put(&Self::sequence_def_key(name), definition)
+    }
+
+    pub fn save_sequence(&self, def: &PersistedSequence) -> Result<()> {
+        let key = Self::sequence_def_key(&def.name);
+        let value = Self::encode_sequence_def(def)?;
         self.storage.put(&key, &value)
     }
 
@@ -4141,6 +4176,14 @@ impl<'a> Catalog<'a> {
         let value = bincode::serialize(constraints)
             .map_err(|e| Error::storage(format!("Failed to serialize table constraints: {}", e)))?;
         self.storage.put(&key, &value)?;
+        // GH#36: represent the constraint set in the logical WAL. The blob is
+        // the COMPLETE TableConstraints set, so replaying it is idempotent and
+        // covers ADD CONSTRAINT, DROP CONSTRAINT (which re-saves the reduced
+        // set) and the constraint half of CREATE TABLE, on both executor
+        // families, through this one funnel.
+        if let Err(e) = self.storage.log_add_constraint(table_name, &value) {
+            tracing::warn!("Failed to log table constraints for '{}' to WAL: {}", table_name, e);
+        }
         self.storage.cache_table_constraints(table_name, constraints.clone());
         self.storage.clear_referencing_fk_cache();
         Ok(())

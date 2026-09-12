@@ -4204,6 +4204,10 @@ impl<'a> Executor<'a> {
                 // genuinely new; an existing high-water is preserved.
                 let already_exists = storage.catalog().sequence_exists(name)?;
                 storage.catalog().save_sequence(&def)?;
+                // GH#36: represent the definition change in the logical WAL.
+                if let Err(e) = storage.catalog().log_sequence_definition(&def, false) {
+                    tracing::warn!("Failed to log CREATE SEQUENCE '{}' to WAL: {}", name, e);
+                }
                 if !already_exists {
                     storage.catalog().save_sequence_state(
                         name,
@@ -4337,6 +4341,10 @@ impl<'a> Executor<'a> {
                 }
 
                 catalog.save_sequence(&def)?;
+                // GH#36: represent the definition change in the logical WAL.
+                if let Err(e) = catalog.log_sequence_definition(&def, true) {
+                    tracing::warn!("Failed to log ALTER SEQUENCE '{}' to WAL: {}", action.name, e);
+                }
 
                 // RESTART rewrites the durable high-water (acts like
                 // setval(., false) to the restart point): the next nextval
@@ -4388,6 +4396,10 @@ impl<'a> Executor<'a> {
                     return Err(Error::query_execution(format!("sequence \"{name}\" does not exist")));
                 }
                 catalog.drop_sequence(name)?;
+                // GH#36: represent the drop in the logical WAL.
+                if let Err(e) = storage.log_drop_sequence(name) {
+                    tracing::warn!("Failed to log DROP SEQUENCE '{}' to WAL: {}", name, e);
+                }
                 crate::sql::sequences::invalidate_cache(name);
                 Ok(Box::new(
                     ScanOperator::new(

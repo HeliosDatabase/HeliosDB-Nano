@@ -731,6 +731,15 @@ fn handle_refresh_materialized_view(
         }
     }
 
+    // GH#36: represent the refresh in the logical WAL. The refreshed ROWS arrive
+    // through the ordinary DML entries; this entry is what tells a replica the
+    // view was refreshed at all.
+    if let Some(storage) = executor.storage() {
+        if let Err(e) = storage.log_refresh_materialized_view(name, concurrent, incremental_requested) {
+            tracing::warn!("Failed to log REFRESH MATERIALIZED VIEW '{}' to WAL: {}", name, e);
+        }
+    }
+
     // Return empty result set
     Ok(Box::new(ScanOperator::new(
         "".to_string(),

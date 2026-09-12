@@ -570,6 +570,14 @@ impl HAStateRegistry {
             WalOperation::AddConstraint { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
             WalOperation::DropConstraint { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
 
+            // GH#36: the remaining schema-changing DDL.
+            WalOperation::AlterTableSchema { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
+            WalOperation::CreateView { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
+            WalOperation::DropView { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
+            WalOperation::CreateSequence { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
+            WalOperation::AlterSequence { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
+            WalOperation::DropSequence { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
+
             // Transaction control
             WalOperation::Begin { .. } => (WalEntryType::TxBegin, serialize_operation(operation)),
             WalOperation::Commit { .. } => (WalEntryType::TxCommit, serialize_operation(operation)),

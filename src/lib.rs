@@ -7738,6 +7738,13 @@ impl EmbeddedDatabase {
                     rows = count,
                     "TRUNCATE staged row deletes in txn"
                 );
+                // GH#36: represent the TRUNCATE in the logical WAL. The params
+                // family already logs through `ddl::handle_truncate`; this
+                // inlined text arm did not, so an HA standby never learned of a
+                // psql/embedded TRUNCATE (asymmetric coverage).
+                if let Err(e) = self.storage.log_truncate(table_name) {
+                    tracing::warn!("Failed to log TRUNCATE '{}' to WAL: {}", table_name, e);
+                }
                 Ok(0)
             }
             sql::LogicalPlan::CreateDatabase { name, if_not_exists } => {
