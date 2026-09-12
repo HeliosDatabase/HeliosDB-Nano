@@ -6172,7 +6172,6 @@ async fn gh27_a_self_referencing_foreign_key_still_succeeds_on_the_wire() {
 /// then route through `validate_create_table_fk_targets` exactly as the text
 /// family does.
 #[tokio::test]
-#[ignore = "adjacent gap: extended-protocol CREATE TABLE is unimplemented (XX000), see src/lib.rs:5072"]
 async fn gh27_adjacent_gap_extended_protocol_create_table_should_report_42p01() {
     // NOTE (adversarial review): this MUST drive Parse/Bind/Execute/Sync through
     // `dispatch_message`, not through `handle_*_extended` directly.

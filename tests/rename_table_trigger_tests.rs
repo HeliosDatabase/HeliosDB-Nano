@@ -120,66 +120,45 @@ fn setup(db: &EmbeddedDatabase) {
 /// the params family for free the moment that arm exists.
 #[test]
 fn rename_moves_the_persisted_trigger_records() {
-    let db = EmbeddedDatabase::new_in_memory().expect("in-memory db");
-    setup(&db);
+    // BOTH executor families (sprinter 15bfe577751a): the params family now
+    // routes `ALTER TABLE … RENAME` through the same `execute_alter_table_op`
+    // body the text family runs, so the persisted trigger records move on every
+    // client, not only psql. This test replaced
+    // `alter_table_rename_is_still_unimplemented_on_the_params_family`, whose
+    // own note said to delete it and loop this one when the gap closed.
+    for params_family in [false, true] {
+        let db = EmbeddedDatabase::new_in_memory().expect("in-memory db");
+        setup(&db);
 
-    assert_eq!(
-        persisted_trigger_tables(&db),
-        vec!["ren_a".to_string()],
-        "sanity: the definition must be persisted under the original name"
-    );
-    assert_eq!(
-        persisted_recipe_tables(&db),
-        vec!["ren_a".to_string()],
-        "sanity: the recipe must be persisted under the original name"
-    );
+        assert_eq!(
+            persisted_trigger_tables(&db),
+            vec!["ren_a".to_string()],
+            "sanity: the definition must be persisted under the original name"
+        );
+        assert_eq!(
+            persisted_recipe_tables(&db),
+            vec!["ren_a".to_string()],
+            "sanity: the recipe must be persisted under the original name"
+        );
 
-    db.execute("ALTER TABLE ren_a RENAME TO ren_b").expect("rename");
+        if params_family {
+            db.execute_params("ALTER TABLE ren_a RENAME TO ren_b", &[])
+                .expect("params-family rename");
+        } else {
+            db.execute("ALTER TABLE ren_a RENAME TO ren_b").expect("rename");
+        }
 
-    assert_eq!(
-        persisted_trigger_tables(&db),
-        vec!["ren_b".to_string()],
-        "*** STRANDED *** the trigger definition stayed under the old table name"
-    );
-    assert_eq!(
-        persisted_recipe_tables(&db),
-        vec!["ren_b".to_string()],
-        "*** STRANDED *** the rewrite recipe stayed under the old table name"
-    );
-}
-
-/// PINS A KNOWN GAP, not the fix. `ALTER TABLE … RENAME TO` is handled only in the
-/// text family's plan match; the params family (PG extended protocol — psycopg,
-/// JDBC, sqlx, node-postgres, and every REST write) reaches
-/// `Executor::plan_to_operator`, which has no `AlterTableRename` arm.
-///
-/// It fails LOUDLY, which is why this is a separate item and not folded in here.
-/// If this test starts failing because the rename succeeded, the parity gap has
-/// been closed: delete this test and extend `rename_moves_the_persisted_trigger_records`
-/// to loop over both families instead.
-#[test]
-fn alter_table_rename_is_still_unimplemented_on_the_params_family() {
-    let db = EmbeddedDatabase::new_in_memory().expect("in-memory db");
-    db.execute("CREATE TABLE pf_a (id INT, tag TEXT)").unwrap();
-
-    // Today this is `Operator not yet implemented: AlterTableRename` from
-    // `Executor::plan_to_operator`'s catch-all. The exact wording is not pinned
-    // here — only that the statement does not silently claim to have worked.
-    db.execute_params("ALTER TABLE pf_a RENAME TO pf_b", &[]).expect_err(
-        "ALTER TABLE … RENAME TO now works on the params family — the parity gap is closed; \
-         delete this test and cover both families in rename_moves_the_persisted_trigger_records",
-    );
-
-    // The table is untouched under its original name — a failed rename must not
-    // half-apply.
-    assert!(
-        db.query("SELECT id FROM pf_a", &[]).is_ok(),
-        "the failed params-family rename damaged the table"
-    );
-    assert!(
-        db.query("SELECT id FROM pf_b", &[]).is_err(),
-        "the params-family rename partially applied: the new name exists"
-    );
+        assert_eq!(
+            persisted_trigger_tables(&db),
+            vec!["ren_b".to_string()],
+            "*** STRANDED *** the trigger definition stayed under the old table name"
+        );
+        assert_eq!(
+            persisted_recipe_tables(&db),
+            vec!["ren_b".to_string()],
+            "*** STRANDED *** the rewrite recipe stayed under the old table name"
+        );
+    }
 }
 
 /// A rename must not invent, duplicate or lose records: exactly one definition and

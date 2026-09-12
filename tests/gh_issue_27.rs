@@ -592,26 +592,39 @@ fn alter_table_add_column_with_an_inline_reference_is_validated_and_kept() {
     );
 }
 
-/// Characterization of the SECOND gap, so the test above cannot be misread as
-/// covering it: `ALTER TABLE … ADD COLUMN` never reaches an executor on the
-/// params/extended family. It errors — it does NOT silently accept — so it is
-/// not #27's defect, but it does mean the fix for the test above must land on
-/// the shared body, not only in the text arm.
+/// PARITY — the gap this test used to pin is CLOSED (sprinter 15bfe577751a):
+/// the params / extended family now routes `ALTER TABLE … ADD COLUMN` through
+/// the shared body, so the `ADD COLUMN … REFERENCES` shorthand is validated
+/// and the constraint is kept on every client.
 ///
-/// Passes before AND after any #27 change (it asserts only "this errors, and
-/// not with a foreign-key diagnostic").
+/// (a) a dangling parent is rejected at DDL time with 42P01, and
+/// (b) with a real parent the constraint is CREATED and ENFORCED.
 #[test]
-fn add_column_is_not_reachable_on_the_params_family_at_all() {
+fn add_column_is_reachable_on_the_params_family_and_validated() {
+    // (a) A dangling parent must be rejected at DDL time, like CREATE TABLE.
     let db = fresh_db();
     db.execute("CREATE TABLE gh27_acx (id INT PRIMARY KEY)").unwrap();
+    let err = must_reject(
+        &db,
+        "ALTER TABLE gh27_acx ADD COLUMN p INT REFERENCES gh27_acxp_missing(id)",
+        true,
+    );
+    assert_undefined_table(&err, "gh27_acxp_missing");
+
+    // (b) With a real parent the constraint must be CREATED and ENFORCED.
+    let db = fresh_db();
     db.execute("CREATE TABLE gh27_acxp (id INT PRIMARY KEY)").unwrap();
-    let err = db
-        .execute_params("ALTER TABLE gh27_acx ADD COLUMN p INT REFERENCES gh27_acxp(id)", &[])
-        .err()
-        .expect("ALTER TABLE ADD COLUMN is unimplemented on the params family");
+    db.execute("CREATE TABLE gh27_acx (id INT PRIMARY KEY)").unwrap();
+    db.execute_params("ALTER TABLE gh27_acx ADD COLUMN p INT REFERENCES gh27_acxp(id)", &[])
+        .expect("a LEGAL params-family ADD COLUMN … REFERENCES must be accepted");
+
+    db.execute("INSERT INTO gh27_acxp VALUES (1)").unwrap();
+    db.execute_params("INSERT INTO gh27_acx VALUES (1, 1)", &[])
+        .expect("a satisfied FK must insert");
     assert!(
-        err.to_string().to_ascii_lowercase().contains("not yet implemented"),
-        "expected the executor catch-all (src/sql/executor/mod.rs:4952), got: {err}"
+        db.execute_params("INSERT INTO gh27_acx VALUES (2, 99)", &[]).is_err(),
+        "*** UNENFORCEABLE CONSTRAINT *** the params-family ADD COLUMN … REFERENCES \
+         was silently discarded"
     );
 }
 
@@ -641,36 +654,26 @@ fn add_column_with_a_reference_succeeds_and_adds_a_usable_column() {
 }
 
 // ===========================================================================
-// 6. The PARAMS family and CREATE TABLE — characterization, not a claim.
+// 6. The PARAMS family and CREATE TABLE — parity, now CLOSED.
 //
 // `execute_params("CREATE TABLE …")` (and therefore Parse/Bind/Execute of a
-// CREATE TABLE over the extended protocol) does NOT reach the CreateTable arm
-// at all: `execute_plan_with_params_inner` (src/lib.rs:14961-16383) has no
-// `CreateTable` arm, so the plan falls to the catch-all at src/lib.rs:16384 →
-// `Executor::plan_to_operator` → the default arm at
-// src/sql/executor/mod.rs:4952 (`Operator not yet implemented: CreateTable`).
-// The engine itself records this at src/lib.rs:5072-5079 ("The
-// EXTENDED/parameterized route has NO CreateTable handler today").
-//
-// So issue #27's *silent acceptance* cannot happen on that family — the
-// statement errors. What this test pins is exactly that: the params family
-// must NEVER silently accept a dangling FK. The SQLSTATE it reports today is
-// XX000, not 42P01; that is an ADJACENT defect (extended-protocol CREATE TABLE
-// is unimplemented), tracked separately — see the wire-test file's ignored
-// `gh27_adjacent_gap_*` case.
+// CREATE TABLE over the extended protocol) now routes through the SAME
+// `execute_create_table_plan` body the text family runs (sprinter
+// 15bfe577751a), so the params family reports PostgreSQL's own SQLSTATE for a
+// dangling FK — 42P01, not the old `XX000 Operator not yet implemented`.
 // ===========================================================================
 
 #[test]
 fn the_params_family_never_silently_accepts_a_dangling_foreign_key() {
     let db = fresh_db();
-    assert!(
-        db.execute_params(
+    let err = db
+        .execute_params(
             "CREATE TABLE gh27_pf (id INT PRIMARY KEY, p INT REFERENCES gh27_pf_missing(id))",
-            &[]
+            &[],
         )
-        .is_err(),
-        "*** UNENFORCEABLE CONSTRAINT ACCEPTED *** the params family accepted a FK to a missing table"
-    );
+        .err()
+        .expect("*** UNENFORCEABLE CONSTRAINT ACCEPTED *** the params family accepted a FK to a missing table");
+    assert_undefined_table(&err.to_string(), "gh27_pf_missing");
     assert!(
         !table_exists(&db, "gh27_pf"),
         "the rejected params-family CREATE TABLE left a table behind"
