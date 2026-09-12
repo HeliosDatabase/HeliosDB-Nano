@@ -141,6 +141,26 @@ pub enum WalOperation {
     /// decodable. Without this entry, replay re-applies CreateTable+Inserts
     /// for the old name and resurrects the renamed-away table.
     RenameTable { old_table: String, new_table: String },
+
+    // === GH#36: the remaining schema-changing DDL =========================
+    // APPENDED AT THE END for the same bincode-discriminant reason as
+    // `RenameTable` above: inserting a variant mid-enum silently reinterprets
+    // every retained entry in every existing store.
+    /// A full-schema replacement from `ALTER TABLE … ADD/DROP/RENAME COLUMN`
+    /// or `ALTER COLUMN … DROP NOT NULL`. The blob is the complete new
+    /// `Schema` (bincode), not a delta, so replay is idempotent.
+    AlterTableSchema { table: String, schema: Vec<u8> },
+    /// A plain view definition (`ViewMetadata`, bincode).
+    CreateView { name: String, definition: Vec<u8> },
+    /// Drop a plain view.
+    DropView { name: String },
+    /// A sequence definition, exactly the tagged frame `Catalog::save_sequence`
+    /// persists (`SEQ_DEF_MAGIC` + version + bincode).
+    CreateSequence { name: String, definition: Vec<u8> },
+    /// An altered sequence definition (same tagged frame).
+    AlterSequence { name: String, definition: Vec<u8> },
+    /// Drop a sequence (definition + durable state).
+    DropSequence { name: String },
 }
 
 /// WAL entry with metadata

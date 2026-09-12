@@ -137,6 +137,11 @@ impl<'a> ViewCatalog<'a> {
             .map_err(|e| Error::storage(format!("Failed to serialize view metadata: {}", e)))?;
 
         self.storage.put(&key, &value)?;
+        // GH#36: represent the view in the logical WAL, or a replica never
+        // learns it exists.
+        if let Err(e) = self.storage.log_create_view(&metadata.view_name, &value) {
+            tracing::warn!("Failed to log CREATE VIEW '{}' to WAL: {}", metadata.view_name, e);
+        }
         tracing::info!("Created view '{}'", metadata.view_name);
 
         Ok(())
@@ -178,8 +183,28 @@ impl<'a> ViewCatalog<'a> {
         }
 
         self.storage.delete(&key)?;
+        // GH#36: represent the drop; without this the metadata delete reached
+        // `StorageEngine::delete`, which (for a non-`meta:` key) logged a bogus
+        // `Delete { table: "unknown" }` row operation into the CDC stream.
+        if let Err(e) = self.storage.log_drop_view(view_name) {
+            tracing::warn!("Failed to log DROP VIEW '{}' to WAL: {}", view_name, e);
+        }
         tracing::info!("Dropped view '{}'", view_name);
 
+        Ok(())
+    }
+
+    /// GH#36: restore a plain view definition from a replicated WAL entry.
+    pub fn restore_view_from_wal(&self, view_name: &str, definition: &[u8]) -> Result<()> {
+        self.storage.put(&Self::view_key(view_name), definition)
+    }
+
+    /// GH#36: drop a view during replay, tolerating an already-absent record.
+    pub fn drop_view_from_wal(&self, view_name: &str) -> Result<()> {
+        let key = Self::view_key(view_name);
+        if self.storage.get(&key)?.is_some() {
+            self.storage.delete(&key)?;
+        }
         Ok(())
     }
 
