@@ -163,6 +163,17 @@ impl<'a> MaterializedViewCatalog<'a> {
 
         self.storage.put(&key, &value)?;
 
+        // GH#36: represent the view in the logical WAL. Without this the log
+        // held only `CreateTable(__mv_<name>)` for the backing table, so a
+        // replica held an orphan table and no materialized view.
+        if let Err(e) = self.storage.log_create_materialized_view(&metadata.view_name, &value) {
+            tracing::warn!(
+                "Failed to log CREATE MATERIALIZED VIEW '{}' to WAL: {}",
+                metadata.view_name,
+                e
+            );
+        }
+
         // W1.3: this name now resolves as a materialized view; bump so the
         // existence cache reclassifies it (fast paths must bail on it).
         self.storage.bump_schema_generation();
@@ -203,6 +214,32 @@ impl<'a> MaterializedViewCatalog<'a> {
         self.storage.put(&key, &value)
     }
 
+    /// GH#36: restore a materialized view definition from a replicated WAL
+    /// entry. Writes the key the reader actually consults (`meta:mv:<name>`)
+    /// and reclassifies the name.
+    pub fn restore_view_from_wal(&self, view_name: &str, definition: &[u8]) -> Result<()> {
+        self.storage.put(&Self::mv_metadata_key(view_name), definition)?;
+        self.storage.bump_schema_generation();
+        Ok(())
+    }
+
+    /// GH#36: drop a materialized view during replay, tolerating an
+    /// already-absent record and an already-dropped backing table.
+    pub fn drop_view_from_wal(&self, view_name: &str) -> Result<()> {
+        let key = Self::mv_metadata_key(view_name);
+        if self.storage.get(&key)?.is_some() {
+            self.storage.delete(&key)?;
+        }
+        let data_table = Self::mv_data_table_name(view_name);
+        let catalog = self.storage.catalog();
+        if catalog.table_exists(&data_table)? {
+            catalog.drop_table(&data_table)?;
+        }
+        self.storage.invalidate_schema_cache(view_name);
+        self.storage.bump_schema_generation();
+        Ok(())
+    }
+
     /// Drop a materialized view from the catalog
     pub fn drop_view(&self, view_name: &str) -> Result<()> {
         tracing::info!("Dropping materialized view '{}'", view_name);
@@ -217,6 +254,12 @@ impl<'a> MaterializedViewCatalog<'a> {
         // Delete metadata
         let key = Self::mv_metadata_key(view_name);
         self.storage.delete(&key)?;
+
+        // GH#36: represent the drop. The backing table's own `DropTable` entry
+        // comes from `Catalog::drop_table`; this names the VIEW.
+        if let Err(e) = self.storage.log_drop_materialized_view(view_name) {
+            tracing::warn!("Failed to log DROP MATERIALIZED VIEW '{}' to WAL: {}", view_name, e);
+        }
 
         // Delete the data table (MV results are stored as a regular table)
         let data_table = Self::mv_data_table_name(view_name);
