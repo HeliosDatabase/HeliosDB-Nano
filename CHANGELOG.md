@@ -5,7 +5,55 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [4.32.0] - 2026-09-12
+
+### Added — connection lifecycle: authentication and idle timeouts, TCP keepalive, and a documented connection limit (GH#28)
+
+A long-running instance ran out of connections with one legitimate client: 99 of its 100 slots were
+held by internet scanners that had opened a socket and never spoken. Nothing reaped them. The server
+now enforces PostgreSQL's names, units and defaults, as `[server]` config keys and `heliosdb-nano
+start` flags:
+
+* `authentication_timeout` (default 60 s) — one absolute deadline taken at accept covers the whole
+  pre-auth path: the SSL request, the TLS handshake, the startup packet, password and SCRAM
+  exchanges. A socket that never authenticates is closed without a word.
+* `idle_session_timeout` and `idle_in_transaction_session_timeout` (default 0 = disabled) — the
+  deadline wraps exactly one socket read, armed only while waiting for the FIRST byte of the next
+  message and disarmed the moment a byte arrives, so a large message arriving slowly is never cut
+  mid-frame and a running statement is never under a timer. Expiry sends FATAL 57P05 / 25P03 under a
+  bounded write and rolls the transaction back.
+* `tcp_keepalives_idle` / `_interval` / `_count` (0 = OS default) on every accepted socket —
+  PostgreSQL, MySQL and the replication stream — so half-open connections are reaped by the kernel.
+* `max_connections` is now documented (README, `config.example.toml`, `--help`) including the
+  accept-then-close rejection, is actually read from the config file (the flag still wins), and
+  `max_connections_warn_percent` (default 80) logs one edge-triggered WARN when utilisation crosses
+  it. The connection slot is an owned semaphore permit that is released exactly once on every exit
+  path.
+
+`SHOW` answers for all four parameters on both protocols. `SET` / `RESET` of the two idle timeouts
+land on THIS session (`SET LOCAL` scopes to the transaction; `TO DEFAULT` clears);
+`authentication_timeout` and `max_connections` are refused with 55P02. `idle_timeout_secs` survives
+as a deprecated alias with a warning.
+
+### Fixed — `RETURNING` typed every column as text and silently returned NULL for a qualified column (GH#23)
+
+Every `INSERT/UPDATE/DELETE … RETURNING` described every field as OID 25 on both protocols —
+booleans arrived as `t`/`f`, integers as `0`, timestamps as bare strings — so Prisma raised P2023 on
+every create and update, while a plain `SELECT` of the same columns was typed correctly. Underneath
+it, `RETURNING Typed."n" AS "cnt"` returned NULL for a NOT NULL column: the qualifier missed
+`Schema::get_qualified_column_index` and `project_returning_columns` substituted `Value::Null` on any
+evaluation error.
+
+`ReturningProjection::bind` now resolves every reference once, before the first row is written, on
+both executor families; an unknown name is 42703, an `EXCLUDED` qualifier outside `ON CONFLICT DO
+UPDATE` is 42P01, an aggregate is 42803 and a window function 42P20, as PostgreSQL does. One
+`wire_plan` decides the type OID, size, per-column format and text form, so RowDescription and
+DataRow derive from the same plan; binary encoding is by the declared type, and a value the declared
+type cannot carry is refused with 22P03 rather than sent as wrong-width bytes. TIMESTAMPTZ is now a
+distinct type (1184) with its `+00` text form, which made a pre-existing input bug loud: a literal's
+offset was parsed and dropped, so `10:00+02` was stored as 10:00 UTC. It now converts to the UTC
+instant on every path. `round/floor/ceil` infer their argument's type, and the standard spellings
+`FLOOR(x)` / `CEIL(x)` now plan (they failed as "not yet supported").
 
 ### Fixed — `ALTER TABLE … ADD COLUMN … REFERENCES` silently discarded the foreign key (GH#27, residual)
 
@@ -31,6 +79,33 @@ a referencing/referenced column-count mismatch is rejected with `42830 number of
 referenced columns for foreign key disagree`. The first is `42704 undefined_object`, the second `42830 invalid_foreign_key`, on the
 PostgreSQL wire and `1215 ER_CANNOT_ADD_FOREIGN` on the MySQL wire. Both executor families
 (simple and extended protocol) report the same codes.
+
+### Fixed — UNIQUE constraints could be silently unenforced in two more spellings (GH#21, GH#24)
+
+v4.31.0 fixed the column-level form of this bug. The same fail-open survived for `CONSTRAINT ux
+UNIQUE (a, b)` on a second table when any earlier table already used the constraint name `ux`, and
+for two unnamed table-level `UNIQUE (...)` constraints on one table whose synthesised names
+coincided. The catalog handed the user's constraint name to the ART index manager, which uses it
+verbatim as the key of a database-global map; a collision returned `IndexAlreadyExists`, the caller
+swallowed it at debug level, the CREATE succeeded, `\d` showed the constraint, and nothing enforced
+it.
+
+Constraint-backed indexes now get a minted key (`{table}_{cols}_key`, falling back to the smallest
+free suffix) while the user's constraint name rides along as a label, so `23505` text and Prisma's
+P2002 target still name the constraint the user wrote. Registration is fail-closed on the DDL path:
+a CREATE TABLE / ADD CONSTRAINT that cannot install a declared constraint errors and unwinds.
+`DROP CONSTRAINT` retires the whole rule by column set, and the planner-propagated `ColumnDef.unique`
+flag is cleared, so one SQL declaration no longer leaves two claims and a phantom index. At open, an
+unresolvable constraint keeps the log-and-continue behaviour deliberately, because `RENAME COLUMN` /
+`DROP COLUMN` still do not update constraint records (sprinter 0f258ed23d13) and a write-block there
+would brick any table whose column was ever renamed.
+
+### Tests — GH#22, GH#25, GH#26 and GH#30 pinned as permanent regression suites
+
+The four issues verified fixed on main — `INSERT … ON CONFLICT DO UPDATE` inserting a duplicate,
+BYTEA over the PostgreSQL extended protocol, the `pg_advisory_lock` family, and parameterized
+`RETURNING` inside `BEGIN … ROLLBACK` — now have repro suites in `tests/` and on the wire, so a
+future regression fails the gate instead of going unnoticed.
 
 ## [4.31.1] - 2026-09-07
 
