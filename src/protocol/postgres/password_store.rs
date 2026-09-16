@@ -31,6 +31,7 @@ use parking_lot::RwLock;
 use rand::Rng;
 use std::collections::HashMap;
 use std::sync::Arc;
+use zeroize::Zeroizing;
 
 use super::auth::{prepare_scram_credentials, scram_client_key, scram_salted_password, scram_stored_key};
 
@@ -123,6 +124,56 @@ pub trait PasswordStore: Send + Sync {
     /// Get SCRAM credentials for a user
     fn get_credentials(&self, username: &str) -> Option<ScramCredentials>;
 
+    /// Iteration count advertised for the synthetic challenge served to an
+    /// ABSENT user (HDB-001).
+    ///
+    /// # Homogeneity contract — read this before returning imported verifiers
+    ///
+    /// The synthetic challenge for a name that does not exist advertises
+    /// EXACTLY this iteration count and a 16-byte salt (the shape
+    /// [`ScramCredentials::from_password`] produces). Uniformity therefore
+    /// requires that *every* verifier this backend hands back from
+    /// [`PasswordStore::get_credentials`] use that same iteration count and a
+    /// 16-byte salt.
+    ///
+    /// A backend holding verifiers of other shapes — typically ones imported
+    /// from another system, PostgreSQL's own `pg_authid.rolpassword` included,
+    /// which may carry 4096 iterations and a salt of some other length — leaks
+    /// account existence through the `i=` and `s=` fields of the
+    /// server-first-message: an attacker who sees a non-default shape knows the
+    /// name is real, and one who sees the default shape for a name whose
+    /// neighbours are all non-default knows it is not. Such a backend MUST
+    /// normalise: re-derive each verifier at the account's next successful
+    /// login (with [`ScramCredentials::from_password`] at this count), or
+    /// re-create the accounts, before it can claim the HDB-001 property.
+    ///
+    /// Returning a count that this backend does not actually derive new
+    /// credentials with has the same effect and is equally unsafe.
+    fn default_scram_iterations(&self) -> u32 {
+        super::auth::DEFAULT_SCRAM_ITERATIONS
+    }
+
+    /// Stable secret used to derive the synthetic credentials absent users are
+    /// challenged with (HDB-001).
+    ///
+    /// A PERSISTENT backend should keep a cryptographically random 32-byte
+    /// secret beside its credential data and return it here, so the synthetic
+    /// salt for a given name survives a restart — a salt that changes per
+    /// process is itself an account oracle. Ephemeral backends can keep the
+    /// default and receive a random secret for the wrapper's lifetime. An owner
+    /// that stores the secret elsewhere can pass it to
+    /// [`SharedPasswordStore::with_mock_authentication_secret`] instead. Never
+    /// derive it from a public identifier.
+    ///
+    /// In short: a PERSISTENT backend must supply the secret; an EPHEMERAL one
+    /// (whose credentials die with the process anyway) needs nothing here.
+    /// There is deliberately no way to ask a `dyn PasswordStore` which it is —
+    /// the backend is the only thing that knows, so this is a documented
+    /// contract, not a runtime check.
+    fn scram_mock_authentication_secret(&self) -> Option<[u8; 32]> {
+        None
+    }
+
     /// Add or update a user with a password
     fn add_user(&mut self, username: &str, password: &str) -> Result<()>;
 
@@ -197,6 +248,10 @@ impl PasswordStore for InMemoryPasswordStore {
         self.users.read().get(username).cloned()
     }
 
+    fn default_scram_iterations(&self) -> u32 {
+        self.default_iterations
+    }
+
     fn add_user(&mut self, username: &str, password: &str) -> Result<()> {
         let credentials = ScramCredentials::from_password(username.to_string(), password, self.default_iterations);
 
@@ -232,13 +287,94 @@ impl PasswordStore for InMemoryPasswordStore {
 #[derive(Clone)]
 pub struct SharedPasswordStore {
     inner: Arc<RwLock<Box<dyn PasswordStore>>>,
+    /// Secret behind the synthetic credentials absent users are challenged
+    /// with. Taken from the backend when it persists one, otherwise random for
+    /// this wrapper's lifetime.
+    mock_authentication_secret: Arc<Zeroizing<[u8; 32]>>,
 }
 
 impl SharedPasswordStore {
     /// Create a new shared password store
     pub fn new<T: PasswordStore + 'static>(store: T) -> Self {
+        let secret = store
+            .scram_mock_authentication_secret()
+            .unwrap_or_else(|| rand::thread_rng().gen());
+        Self::with_mock_authentication_secret(store, secret)
+    }
+
+    /// Share a password backend with an explicit mock-authentication secret.
+    ///
+    /// Prefer [`Self::new`] when the backend implements
+    /// [`PasswordStore::scram_mock_authentication_secret`]. This form is for an
+    /// owner that persists the secret separately. Keep it private; never derive
+    /// it from a public identifier.
+    pub fn with_mock_authentication_secret<T: PasswordStore + 'static>(store: T, secret: [u8; 32]) -> Self {
         Self {
             inner: Arc::new(RwLock::new(Box::new(store))),
+            mock_authentication_secret: Arc::new(Zeroizing::new(secret)),
+        }
+    }
+
+    /// Pick the SCRAM credential to challenge `username` with, WITHOUT an early
+    /// "user not found" failure (HDB-001).
+    ///
+    /// An absent account is challenged with a DETERMINISTIC synthetic
+    /// credential derived from this store's mock-authentication secret, so the
+    /// exchange has the same shape as a real account's: the same message
+    /// sequence, the same salt length and iteration count, and the same salt on
+    /// every attempt (a fresh random salt per attempt would itself be an
+    /// oracle). The returned boolean is a MANDATORY-REJECTION flag, not proof
+    /// validity: when it is set the caller must fail the login even if the
+    /// client's proof verifies against the synthetic credential.
+    pub(crate) fn credentials_for_scram(&self, username: &str) -> (ScramCredentials, bool) {
+        let (lookup, policy_iterations) = {
+            let store = self.inner.read();
+            (store.get_credentials(username), store.default_scram_iterations())
+        };
+
+        let derive = |domain: &[u8], output_len: usize| -> Vec<u8> {
+            let mut output = Vec::with_capacity(output_len);
+            let mut counter = 0u32;
+            while output.len() < output_len {
+                let mut input = Vec::with_capacity(domain.len() + username.len() + 6);
+                input.extend_from_slice(domain);
+                input.push(0);
+                input.extend_from_slice(username.as_bytes());
+                input.push(0);
+                input.extend_from_slice(&counter.to_be_bytes());
+                let block = Zeroizing::new(super::auth::scram_hmac_sha256(
+                    self.mock_authentication_secret.as_slice(),
+                    &input,
+                ));
+                let needed = output_len - output.len();
+                output.extend(block.iter().take(needed).copied());
+                // 32 bytes of output need one block, so the counter cannot
+                // overflow for any length this function is called with.
+                counter += 1;
+            }
+            output
+        };
+
+        // Built UNCONDITIONALLY, before the lookup result is consulted: the
+        // absent-user path must not be distinguishable by the work it skips.
+        // The 16-byte salt is the same length `ScramCredentials::from_password`
+        // generates, so real and synthetic advertise the same shape.
+        let client_key = Zeroizing::new(derive(b"client", 32));
+        let synthetic = ScramCredentials {
+            username: username.to_owned(),
+            salt: derive(b"salt", 16),
+            iterations: if policy_iterations == 0 {
+                super::auth::DEFAULT_SCRAM_ITERATIONS
+            } else {
+                policy_iterations
+            },
+            stored_key: super::auth::scram_h(&client_key),
+            server_key: derive(b"server", 32),
+        };
+
+        match lookup {
+            Some(real) => (real, false),
+            None => (synthetic, true),
         }
     }
 
@@ -277,6 +413,58 @@ impl SharedPasswordStore {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// A backend that persists its own mock-authentication secret, overriding
+    /// ONLY the two new defaulted trait methods.
+    struct PersistentTestStore {
+        inner: InMemoryPasswordStore,
+        secret: [u8; 32],
+        policy_iterations: u32,
+    }
+
+    impl PersistentTestStore {
+        fn new(secret: [u8; 32], policy_iterations: u32) -> Self {
+            Self {
+                inner: InMemoryPasswordStore::with_iterations(policy_iterations),
+                secret,
+                policy_iterations,
+            }
+        }
+    }
+
+    impl PasswordStore for PersistentTestStore {
+        fn get_credentials(&self, username: &str) -> Option<ScramCredentials> {
+            self.inner.get_credentials(username)
+        }
+
+        fn default_scram_iterations(&self) -> u32 {
+            self.policy_iterations
+        }
+
+        fn scram_mock_authentication_secret(&self) -> Option<[u8; 32]> {
+            Some(self.secret)
+        }
+
+        fn add_user(&mut self, username: &str, password: &str) -> Result<()> {
+            self.inner.add_user(username, password)
+        }
+
+        fn remove_user(&mut self, username: &str) -> Result<bool> {
+            self.inner.remove_user(username)
+        }
+
+        fn update_password(&mut self, username: &str, new_password: &str) -> Result<()> {
+            self.inner.update_password(username, new_password)
+        }
+
+        fn user_exists(&self, username: &str) -> bool {
+            self.inner.user_exists(username)
+        }
+
+        fn list_users(&self) -> Vec<String> {
+            self.inner.list_users()
+        }
+    }
 
     #[test]
     fn test_scram_credentials_from_password() {
@@ -377,6 +565,91 @@ mod tests {
         // Test cloning
         let store2 = store.clone();
         assert!(store2.user_exists("alice"));
+    }
+
+    #[test]
+    fn synthetic_scram_credentials_are_stable_and_always_rejected() {
+        let secret = [0x5a; 32];
+        let first =
+            SharedPasswordStore::with_mock_authentication_secret(InMemoryPasswordStore::with_iterations(8192), secret);
+        // A second wrapper over the same persisted secret stands in for a restart.
+        let second =
+            SharedPasswordStore::with_mock_authentication_secret(InMemoryPasswordStore::with_iterations(8192), secret);
+
+        let (missing_a, must_fail_a) = first.credentials_for_scram("missing");
+        let (missing_b, must_fail_b) = first.credentials_for_scram("missing");
+        let (missing_after_restart, must_fail_after_restart) = second.credentials_for_scram("missing");
+        let (other, must_fail_other) = first.credentials_for_scram("other");
+
+        assert!(must_fail_a && must_fail_b && must_fail_after_restart && must_fail_other);
+        assert_eq!(missing_a.salt, missing_b.salt, "a per-attempt salt is itself an oracle");
+        assert_eq!(
+            missing_a.salt, missing_after_restart.salt,
+            "the salt must survive a restart"
+        );
+        assert_ne!(
+            missing_a.salt, other.salt,
+            "one shared salt identifies every unknown account"
+        );
+        assert_eq!(
+            missing_a.salt.len(),
+            16,
+            "synthetic salts must have the real salt's length"
+        );
+        assert_eq!(
+            missing_a.iterations, 8192,
+            "the store's iteration policy must be advertised"
+        );
+        assert_eq!(missing_a.stored_key.len(), 32);
+        assert_eq!(missing_a.server_key.len(), 32);
+        assert_eq!(missing_a.username, "missing");
+
+        // stored_key == H(HMAC(secret, "client\0missing\0" || 0u32))
+        let mut client_input = b"client\0missing\0".to_vec();
+        client_input.extend_from_slice(&0_u32.to_be_bytes());
+        let expected_client_key = super::super::auth::scram_hmac_sha256(&secret, &client_input);
+        assert_eq!(missing_a.stored_key, super::super::auth::scram_h(&expected_client_key));
+    }
+
+    #[test]
+    fn real_scram_credentials_keep_their_stored_values() {
+        let store = SharedPasswordStore::with_mock_authentication_secret(InMemoryPasswordStore::new(), [0x33; 32]);
+        store.add_user("alice", "correct-password").unwrap();
+        let stored = store.get_credentials("alice").unwrap();
+
+        let (selected, must_fail) = store.credentials_for_scram("alice");
+
+        assert!(!must_fail);
+        assert_eq!(selected.username, stored.username);
+        assert_eq!(selected.salt, stored.salt);
+        assert_eq!(selected.iterations, stored.iterations);
+        assert_eq!(selected.stored_key, stored.stored_key);
+        assert_eq!(selected.server_key, stored.server_key);
+    }
+
+    #[test]
+    fn persistent_backend_secret_is_used_by_the_default_constructor() {
+        let secret = [0x91; 32];
+        let before_restart = SharedPasswordStore::new(PersistentTestStore::new(secret, 8192));
+        let after_restart = SharedPasswordStore::new(PersistentTestStore::new(secret, 8192));
+
+        let (before, before_must_fail) = before_restart.credentials_for_scram("missing");
+        let (after, after_must_fail) = after_restart.credentials_for_scram("missing");
+
+        assert!(before_must_fail && after_must_fail);
+        assert_eq!(before.salt, after.salt);
+        assert_eq!(before.stored_key, after.stored_key);
+        assert_eq!(before.server_key, after.server_key);
+        assert_eq!(before.iterations, 8192);
+
+        // Without a persisted secret the wrapper picks a random one, so two
+        // wrappers over the same ephemeral backend must NOT agree.
+        let ephemeral_a = SharedPasswordStore::new(InMemoryPasswordStore::new());
+        let ephemeral_b = SharedPasswordStore::new(InMemoryPasswordStore::new());
+        assert_ne!(
+            ephemeral_a.credentials_for_scram("missing").0.salt,
+            ephemeral_b.credentials_for_scram("missing").0.salt
+        );
     }
 
     #[test]

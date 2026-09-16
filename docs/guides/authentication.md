@@ -100,6 +100,41 @@ include a SHA-256-derived `StoredKey` + `ServerKey` per user.
 SCRAM-SHA-256 verifies the client proof against `StoredKey` without
 ever transmitting the password.
 
+### Custom password stores
+
+Everything in this subsection is about the PostgreSQL-wire listener; the
+MySQL-wire listener currently accepts any credentials (trust) whatever `--auth`
+says, and is tracked separately.
+
+A name that does not exist completes the *same* SCRAM exchange as one that
+does — challenge, proof, and then the identical `28P01 password
+authentication failed for user "..."` — so the wire never reveals which
+accounts exist. Unknown users are challenged with deterministic *synthetic*
+credentials, and a proof matching them is still rejected.
+
+A **persistent** `PasswordStore` should keep a cryptographically random
+32-byte secret beside its credential data and return it from
+`scram_mock_authentication_secret()` (or hand it to
+`SharedPasswordStore::with_mock_authentication_secret()`), so the synthetic
+salt for a given name does not change across restarts — a salt that changes
+per process is itself an account oracle. **Ephemeral** stores (whose
+credentials die with the process anyway) need nothing: the wrapper generates
+a random secret for its own lifetime.
+
+**All verifiers in one backend must have the same shape.** The synthetic
+challenge served for an absent name advertises exactly what
+`default_scram_iterations()` returns and a **16-byte salt** — the shape
+`ScramCredentials::from_password()` produces. Every credential the backend
+returns from `get_credentials()` must therefore use that same iteration count
+and a 16-byte salt. A store holding verifiers **imported** from another
+system (PostgreSQL's `pg_authid.rolpassword`, an LDAP export, an older Nano
+deployment with a different `--scram-iterations`) hands the attacker the
+oracle back through `i=` and `s=`: any name whose challenge deviates from the
+house shape is a name that exists. Normalise before relying on this property
+— re-derive each verifier at the account's next successful login, or re-create
+the accounts — and return the count you really derive with, not an aspirational
+one.
+
 ## TLS
 
 PG-wire TLS is negotiated via the standard SSLRequest pre-handshake.

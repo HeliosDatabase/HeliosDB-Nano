@@ -308,7 +308,7 @@ mod txn_control_classifier_tests {
     }
 }
 
-use super::auth::{AuthManager, AuthMethod, ScramAuthState};
+use super::auth::{AuthManager, AuthMethod, ScramAuthState, ScramProofError};
 use super::catalog::PgCatalog;
 use super::messages::{AuthenticationMessage, BackendMessage, FieldDescription, FrontendMessage, TransactionStatus};
 use super::prepared::PreparedStatementManager;
@@ -320,6 +320,57 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 use tokio::net::TcpStream;
 #[cfg(unix)]
 use tokio::net::UnixStream;
+
+/// Why startup/authentication failed, carrying the SQLSTATE the client is
+/// entitled to see (HDB-001).
+///
+/// Every credential rejection — cleartext, md5 and SCRAM alike, for a name that
+/// exists and for one that does not — is `InvalidPassword` and reaches the wire
+/// as PostgreSQL's own 28P01 `password authentication failed for user "..."`.
+/// Only genuinely malformed protocol input stays 08P01.
+#[derive(Debug)]
+enum StartupError {
+    Protocol(Error),
+    /// The BARE wire message, e.g. `password authentication failed for user
+    /// "alice"`. It is kept as a `String` rather than an `Error` because
+    /// `Error::authentication` is an `Error::Protocol` whose `Display` prepends
+    /// `Protocol error: `; carrying the error itself would ship that prefix to
+    /// the client, which no PostgreSQL server emits.
+    InvalidPassword(String),
+}
+
+impl StartupError {
+    /// `(error to log and return, SQLSTATE, EXACT message to put on the wire)`.
+    ///
+    /// The wire message is split out from the error deliberately: the log wants
+    /// the full typed error, the client must see PostgreSQL's own text and
+    /// nothing else.
+    fn into_wire_error(self) -> (Error, &'static str, String) {
+        match self {
+            Self::Protocol(error) => {
+                let wire_message = error.to_string();
+                (
+                    error,
+                    crate::network::protocol::sqlstate::PROTOCOL_VIOLATION,
+                    wire_message,
+                )
+            }
+            Self::InvalidPassword(wire_message) => (
+                Error::authentication(wire_message.clone()),
+                crate::network::protocol::sqlstate::INVALID_PASSWORD,
+                wire_message,
+            ),
+        }
+    }
+}
+
+impl From<Error> for StartupError {
+    fn from(error: Error) -> Self {
+        Self::Protocol(error)
+    }
+}
+
+type StartupResult<T> = std::result::Result<T, StartupError>;
 
 /// PostgreSQL connection handler
 ///
@@ -342,6 +393,21 @@ pub struct PgConnectionHandler<S = BufWriter<TcpStream>> {
     /// multi-statement simple query dispatch to emit a single trailing
     /// ReadyForQuery after the whole `;`-separated batch.
     pub(super) suppress_ready_for_query: bool,
+    /// HDB-004: set by [`Self::send_error_message`] — the ONE place an
+    /// `ErrorResponse` is built — whenever this connection puts an error on the
+    /// wire, at any severity. A statement that answers its own error inline
+    /// (`send_error(…)` then `return Ok(())`) is indistinguishable from a
+    /// successful one to the multi-statement simple-query loop without it, and
+    /// the loop would keep executing the rest of the message; PostgreSQL
+    /// abandons every remaining statement after the first error. Cleared at the
+    /// start of each batch.
+    statement_error_reported: bool,
+    /// HDB-004: true while the session transaction that the multi-statement
+    /// simple-query loop opened for the batch — PostgreSQL's *implicit
+    /// transaction block* — is live. The wire-visible `transaction_status`
+    /// deliberately stays `Idle` for it: PostgreSQL also reports `I` in
+    /// ReadyForQuery throughout an implicit block.
+    implicit_transaction: bool,
     /// Extended-query protocol requires ErrorResponse, then discarding input
     /// until Sync, then ReadyForQuery. Sending ReadyForQuery early can make
     /// drivers close or wedge the connection after an Execute-time error.
@@ -457,6 +523,8 @@ impl PgConnectionHandler<BufWriter<TcpStream>> {
             scram_state: None,
             write_buf: BytesMut::with_capacity(4096),
             suppress_ready_for_query: false,
+            statement_error_reported: false,
+            implicit_transaction: false,
             awaiting_sync_after_error: false,
             session_id,
             policy,
@@ -486,6 +554,8 @@ impl PgConnectionHandler<BufWriter<UnixStream>> {
             scram_state: None,
             write_buf: BytesMut::with_capacity(4096),
             suppress_ready_for_query: false,
+            statement_error_reported: false,
+            implicit_transaction: false,
             awaiting_sync_after_error: false,
             session_id,
             policy,
@@ -558,6 +628,8 @@ impl PgConnectionHandler<BufWriter<SecureConnection<TcpStream>>> {
             scram_state: None,
             write_buf: BytesMut::with_capacity(4096),
             suppress_ready_for_query: false,
+            statement_error_reported: false,
+            implicit_transaction: false,
             awaiting_sync_after_error: false,
             session_id,
             policy,
@@ -593,6 +665,8 @@ where
             scram_state: None,
             write_buf: BytesMut::with_capacity(4096),
             suppress_ready_for_query: false,
+            statement_error_reported: false,
+            implicit_transaction: false,
             awaiting_sync_after_error: false,
         }
     }
@@ -639,9 +713,21 @@ where
     /// Startup and authentication (the pre-`ReadyForQuery` half of the
     /// connection). Bounded by the caller's `authentication_timeout`.
     async fn startup(&mut self) -> Result<()> {
-        if let Err(e) = self.handle_startup().await {
-            tracing::error!("Startup failed: {}", e);
-            let _ = self.send_error("FATAL", "08P01", &e.to_string(), None, None).await;
+        if let Err(startup_error) = self.handle_startup().await {
+            let (e, code, wire_message) = startup_error.into_wire_error();
+            if code == crate::network::protocol::sqlstate::INVALID_PASSWORD {
+                // A credential rejection carries the client-chosen user name;
+                // keep it out of the ERROR log (scanners produce these at
+                // volume) and Debug-escape it so it cannot forge log lines.
+                tracing::debug!(reason = ?wire_message, "Startup rejected");
+            } else {
+                tracing::error!("Startup failed: {}", e);
+            }
+            // ErrorResponse ONLY — no ReadyForQuery. A FATAL during startup
+            // ends the connection; PostgreSQL never sends `Z` after it, and a
+            // client that sees one may believe the session is usable.
+            let _ = self.send_error_message("FATAL", code, &wire_message, None, None).await;
+            let _ = self.flush().await;
             return Err(e);
         }
         Ok(())
@@ -811,7 +897,7 @@ where
     /// Handle startup sequence
     // SAFETY: Buffer indices [0..3] are guarded by self.buffer.len() >= 4 check.
     #[allow(clippy::indexing_slicing)]
-    async fn handle_startup(&mut self) -> Result<()> {
+    async fn handle_startup(&mut self) -> StartupResult<()> {
         // Check if we have initial data in the buffer (passed from server after reading 8 bytes)
         // This happens when client sends StartupMessage directly without SSLRequest
         let len_buf: [u8; 4];
@@ -839,7 +925,8 @@ where
                 "Invalid startup message length {} (max {})",
                 len as i64,
                 super::messages::MAX_STARTUP_MESSAGE_LEN
-            )));
+            ))
+            .into());
         }
 
         // Calculate how many bytes we still need to read
@@ -883,9 +970,7 @@ where
             // we still validate that fallback.
             if let Some(requested) = params.get("database").cloned().or_else(|| params.get("user").cloned()) {
                 if !self.database.database_name_is_valid(&requested) {
-                    return Err(Error::authentication(format!(
-                        "database \"{requested}\" does not exist"
-                    )));
+                    return Err(Error::authentication(format!("database \"{requested}\" does not exist")).into());
                 }
             }
 
@@ -902,19 +987,21 @@ where
 
                     // Wait for password message
                     if let Some(FrontendMessage::PasswordMessage { password }) = self.read_message().await? {
+                        // Owned: the uniform rejection below needs the name
+                        // after `&mut self` has been reborrowed for the reply.
                         let username = self
                             .username
-                            .as_ref()
+                            .clone()
                             .ok_or_else(|| Error::authentication("No username provided"))?;
 
-                        if self.auth_manager.verify_cleartext(username, &password)? {
+                        if self.auth_manager.verify_cleartext(&username, &password)? {
                             self.authenticated = true;
                             self.send_auth_ok().await?;
                         } else {
-                            return Err(Error::authentication("Invalid password"));
+                            return Err(Self::password_rejection(&username));
                         }
                     } else {
-                        return Err(Error::protocol("Expected password message"));
+                        return Err(Error::protocol("Expected password message").into());
                     }
                 }
                 AuthMethod::Md5 => {
@@ -934,19 +1021,21 @@ where
 
                     // Wait for password message
                     if let Some(FrontendMessage::PasswordMessage { password }) = self.read_message().await? {
+                        // Owned: the uniform rejection below needs the name
+                        // after `&mut self` has been reborrowed for the reply.
                         let username = self
                             .username
-                            .as_ref()
+                            .clone()
                             .ok_or_else(|| Error::authentication("No username provided"))?;
 
-                        if self.auth_manager.verify_md5_response(username, &password, &salt)? {
+                        if self.auth_manager.verify_md5_response(&username, &password, &salt)? {
                             self.authenticated = true;
                             self.send_auth_ok().await?;
                         } else {
-                            return Err(Error::authentication("Invalid password"));
+                            return Err(Self::password_rejection(&username));
                         }
                     } else {
-                        return Err(Error::protocol("Expected password message"));
+                        return Err(Error::protocol("Expected password message").into());
                     }
                 }
                 AuthMethod::ScramSha256 => {
@@ -1003,8 +1092,25 @@ where
 
             Ok(())
         } else {
-            Err(Error::protocol("Expected startup message"))
+            Err(Error::protocol("Expected startup message").into())
         }
+    }
+
+    /// PostgreSQL's uniform credential rejection (HDB-001).
+    ///
+    /// Identical for every password method and for every reason a credential
+    /// can fail — wrong password, no stored password, and a name that does not
+    /// exist at all. The user name is PostgreSQL's own wording and is echoed
+    /// back from the startup packet the client itself sent, so it discloses
+    /// nothing the peer did not already know.
+    ///
+    /// The message is the BARE PostgreSQL text: it goes on the wire verbatim,
+    /// with no `Protocol error: ` prefix in front of it.
+    fn password_rejection(username: &str) -> StartupError {
+        // PostgreSQL truncates names to NAMEDATALEN-1 (63) characters; doing
+        // the same bounds what a client can make the server echo back.
+        let shown: String = username.chars().take(63).collect();
+        StartupError::InvalidPassword(format!("password authentication failed for user \"{shown}\""))
     }
 
     /// Read a message from the client with no deadline (`Busy`): the
@@ -1173,19 +1279,135 @@ where
             return self.handle_single_query(query).await;
         }
 
-        // Multi-statement simple query. Each inner statement calls the
-        // per-statement handler, which sends its own ReadyForQuery. We
-        // swallow all but the last RFQ via the per-connection flag so the
-        // client sees the PostgreSQL-correct single trailing RFQ.
+        // Multi-statement simple query. A `Q` message carrying several
+        // statements has two properties in PostgreSQL that this loop must
+        // reproduce (protocol-flow, "Multiple Statements in a Simple Query"):
+        //
+        //   1. the whole message runs as ONE implicit transaction block unless
+        //      it contains explicit transaction control of its own, so a
+        //      failure anywhere undoes every statement before it; and
+        //   2. the first error ABANDONS the rest of the message.
+        //
+        // Neither held before HDB-004: every statement autocommitted, and the
+        // loop stopped only on `Err` — so every path that answers its own
+        // error inline (`send_error(…)` then `return Ok(())`: all the COPY
+        // error paths, the `SET` arms, …) let the batch run on. A statement
+        // that reported its own error is detected through
+        // `statement_error_reported`, which `send_error_message` sets.
+        //
+        // Every inner ReadyForQuery is suppressed, the LAST statement's
+        // included: the single trailing one is emitted here (or, for a failed
+        // batch, by `dispatch_message`'s `send_error_for_query`, which clears
+        // the flag itself).
+        self.statement_error_reported = false;
         self.suppress_ready_for_query = true;
-        let last_idx = statements.len() - 1;
-        for (i, stmt) in statements.iter().enumerate() {
-            if i == last_idx {
-                self.suppress_ready_for_query = false;
+        let mut outcome: Result<()> = Ok(());
+        for stmt in &statements {
+            if let Err(e) = self.open_implicit_block_if_needed(stmt).await {
+                self.abort_implicit_block();
+                outcome = Err(e);
+                break;
             }
-            self.handle_single_query(stmt).await?;
+            match self.handle_single_query(stmt).await {
+                Ok(()) if !self.statement_error_reported => {}
+                // The statement already put its ErrorResponse on the wire; the
+                // batch owes the client nothing but the trailing ReadyForQuery.
+                Ok(()) => {
+                    self.abort_implicit_block();
+                    break;
+                }
+                Err(e) => {
+                    self.abort_implicit_block();
+                    outcome = Err(e);
+                    break;
+                }
+            }
+        }
+        if outcome.is_ok() && !self.statement_error_reported {
+            outcome = self.close_implicit_block();
         }
         self.suppress_ready_for_query = false;
+        match outcome {
+            // `dispatch_message` renders this as ErrorResponse + ReadyForQuery.
+            Err(e) => Err(e),
+            Ok(()) => self.send_ready_for_query().await,
+        }
+    }
+
+    /// HDB-004: open the batch-owned implicit transaction block in front of
+    /// `stmt`, if the batch does not already have one and the session is not
+    /// already inside an explicit transaction.
+    ///
+    /// A leading `BEGIN` is skipped on purpose: it opens its own explicit
+    /// block, and pre-opening an implicit one in front of it would turn the
+    /// client's BEGIN into a "there is already a transaction in progress"
+    /// warning.
+    ///
+    /// The block is also opened LAZILY — in front of the first statement that
+    /// [`statement_can_write_data`], not in front of the first statement full
+    /// stop. A block opened for `SELECT 1; SELECT 2` would clear the result
+    /// cache, raise the process-wide `session_txn_count` that gates other
+    /// sessions' autocommit fast paths, and, for a SERIALIZABLE session under
+    /// `storage.serializable_policy = "error"`, fail the read-only batch
+    /// outright — all to protect statements that cannot write. Once the block
+    /// is open it stays open for the rest of the message.
+    async fn open_implicit_block_if_needed(&mut self, stmt: &str) -> Result<()> {
+        let trimmed = stmt.trim();
+        if self.implicit_transaction
+            || self.transaction_status != TransactionStatus::Idle
+            || trimmed.is_empty()
+            || classify_transaction_control(trimmed) == Some(TxnControl::Begin)
+            || !statement_can_write_data(trimmed)
+            || self.database.session_in_transaction(self.session_id)
+        {
+            return Ok(());
+        }
+        self.database.begin_transaction_for_session(self.session_id)?;
+        self.implicit_transaction = true;
+        // BEGIN can queue a session notice (the SERIALIZABLE "warn" policy
+        // says so in every other path). The engine cannot write to the wire, so
+        // an undrained notice would reach the server log and nobody else.
+        self.emit_pending_session_notices().await?;
+        Ok(())
+    }
+
+    /// HDB-004: discard the implicit block after a failed statement.
+    ///
+    /// Deliberately never touches `transaction_status`: an error inside an
+    /// EXPLICIT block that the same batch opened has already moved it to
+    /// `Failed` through `mark_transaction_failed_after_error`, and the client
+    /// must see `E` in ReadyForQuery and issue its own ROLLBACK, exactly as
+    /// PostgreSQL requires.
+    fn abort_implicit_block(&mut self) {
+        if !self.implicit_transaction {
+            return;
+        }
+        self.implicit_transaction = false;
+        if self.database.session_in_transaction(self.session_id) {
+            if let Err(e) = self.database.rollback_transaction_for_session(self.session_id) {
+                tracing::warn!("rolling back the implicit transaction block failed: {e}");
+            }
+        }
+    }
+
+    /// HDB-004: commit the implicit block at the end of a batch in which every
+    /// statement succeeded. A failing commit rolls the block back and is
+    /// returned to the caller, which renders it as the batch's single
+    /// ErrorResponse (`transaction_status` is `Idle`, so ReadyForQuery reports
+    /// `I`).
+    fn close_implicit_block(&mut self) -> Result<()> {
+        if !self.implicit_transaction {
+            return Ok(());
+        }
+        self.implicit_transaction = false;
+        if let Err(e) = self.database.commit_transaction_for_session(self.session_id) {
+            if self.database.session_in_transaction(self.session_id) {
+                if let Err(rollback) = self.database.rollback_transaction_for_session(self.session_id) {
+                    tracing::warn!("rolling back after a failed implicit-block commit failed: {rollback}");
+                }
+            }
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -1229,6 +1451,15 @@ where
         // here, before the normal parse/plan path (item 2c). parse_copy returns
         // None for any non-STDIN/STDOUT SQL, so everything else falls through.
         if let Some(copy_stmt) = super::copy::parse_copy(query) {
+            // HDB-004: this dispatch runs BEFORE the generic aborted-block
+            // guard further down, so COPY used to be the one statement a
+            // failed transaction block still accepted — the server answered
+            // CopyInResponse and the client happily streamed a whole file at a
+            // block that had already given up. Apply the same 25P02 here, and
+            // never send CopyInResponse.
+            if self.transaction_status == TransactionStatus::Failed {
+                return self.send_failed_transaction_error().await;
+            }
             return self.handle_copy(copy_stmt).await;
         }
 
@@ -1243,9 +1474,40 @@ where
             // Supported: BEGIN [TRANSACTION] [ISOLATION LEVEL {READ UNCOMMITTED | READ COMMITTED | REPEATABLE READ | SERIALIZABLE}]
             let isolation_level = Self::parse_isolation_level(trimmed);
 
-            // Check if already in a transaction - PostgreSQL behavior is to warn but continue
-            if self.transaction_status == TransactionStatus::InTransaction {
-                // Send warning like PostgreSQL does
+            // HDB-004: BEGIN inside the implicit block that a multi-statement
+            // simple query opened CONVERTS that block into the client's
+            // explicit one, exactly as PostgreSQL does — no warning, and no
+            // second `begin_transaction_for_session` (the session transaction
+            // is already open). Everything the batch already wrote now belongs
+            // to the explicit block and lives or dies with its COMMIT/ROLLBACK.
+            if self.implicit_transaction {
+                // …but an isolation level CANNOT be applied retroactively: the
+                // block already holds a snapshot taken at another level, and
+                // silently ignoring the request would hand the client a
+                // transaction that is not the one it asked for. PostgreSQL
+                // answers 25001 here for exactly this reason ("a query has
+                // already run in this transaction"), and the batch aborts, so
+                // the implicit block rolls back through the normal machinery.
+                //
+                // Because the block is opened lazily, a read-only prelude keeps
+                // working: `SELECT 1; BEGIN ISOLATION LEVEL SERIALIZABLE; …`
+                // has no block open at the BEGIN, so the BEGIN takes the
+                // ordinary path below and the level is honoured.
+                if isolation_level.is_some() {
+                    return self
+                        .send_error(
+                            "ERROR",
+                            "25001",
+                            "SET TRANSACTION ISOLATION LEVEL must be called before any query",
+                            None,
+                            None,
+                        )
+                        .await;
+                }
+                self.implicit_transaction = false;
+                self.transaction_status = TransactionStatus::InTransaction;
+            } else if self.transaction_status == TransactionStatus::InTransaction {
+                // Already in a transaction — PostgreSQL warns but continues.
                 self.send_message(BackendMessage::NoticeResponse {
                     severity: "WARNING".to_string(),
                     code: "25001".to_string(),
@@ -1554,6 +1816,13 @@ where
                     message: "there is no transaction in progress".to_string(),
                 })
                 .await?;
+                // HDB-004: PostgreSQL emits that warning for a COMMIT inside an
+                // implicit block AND commits the block — the statements before
+                // it stay committed no matter what the rest of the message
+                // does. `closed_a_transaction` stays false on purpose: no
+                // EXPLICIT block was closed, so `AND CHAIN` does not apply, and
+                // the next statement of the batch opens a fresh implicit block.
+                self.close_implicit_block()?;
             }
             // `AND CHAIN` must open the next transaction immediately, or the
             // statements that follow would silently autocommit — the exact
@@ -1589,6 +1858,9 @@ where
                     message: "there is no transaction in progress".to_string(),
                 })
                 .await?;
+                // HDB-004: the COMMIT arm's mirror image — warn, and discard
+                // the implicit block a multi-statement simple query opened.
+                self.abort_implicit_block();
             }
             self.transaction_status = if chain && closed_a_transaction {
                 self.database.begin_transaction_for_session(self.session_id)?;
@@ -1615,6 +1887,10 @@ where
                     {
                         self.database.rollback_transaction_for_session(self.session_id)?;
                     }
+                    // HDB-004: a pool's reset must also discard the implicit
+                    // block of the batch it is part of, or the next client to
+                    // get this connection inherits an open transaction.
+                    self.abort_implicit_block();
                     self.transaction_status = TransactionStatus::Idle;
                     self.prepared_statements.clear_all()?;
                     // Spec 03: PostgreSQL documents `DISCARD ALL` as equivalent
@@ -1654,15 +1930,7 @@ where
         }
 
         if self.transaction_status == TransactionStatus::Failed {
-            self.send_error(
-                "ERROR",
-                "25P02",
-                "current transaction is aborted, commands ignored until end of transaction block",
-                None,
-                Some("Use ROLLBACK to clear the failed transaction state".to_string()),
-            )
-            .await?;
-            return Ok(());
+            return self.send_failed_transaction_error().await;
         }
 
         // Transparent write forwarding for standbys (HeliosProxy feature)
@@ -1946,7 +2214,7 @@ where
     /// Handle SCRAM-SHA-256 authentication flow
     // SAFETY: parts[1] and parts[2] are guarded by parts.len() >= 3 check.
     #[allow(clippy::indexing_slicing)]
-    async fn handle_scram_authentication(&mut self) -> Result<()> {
+    async fn handle_scram_authentication(&mut self) -> StartupResult<()> {
         // Send AuthenticationSASL with SCRAM-SHA-256 mechanism
         self.send_message(BackendMessage::Authentication(AuthenticationMessage::ScramSha256))
             .await?;
@@ -1962,7 +2230,7 @@ where
             Some(FrontendMessage::SaslInitialResponse { mechanism: _, data }) => String::from_utf8(data)
                 .map_err(|e| Error::protocol(format!("SCRAM client-first-message not UTF-8: {}", e)))?,
             Some(FrontendMessage::PasswordMessage { password }) => password,
-            _ => return Err(Error::protocol("Expected SASL initial response")),
+            _ => return Err(Error::protocol("Expected SASL initial response").into()),
         };
 
         tracing::debug!("Received client-first-message: {}", client_first);
@@ -1991,9 +2259,15 @@ where
             .password_store()
             .ok_or_else(|| Error::authentication("SCRAM password store not configured"))?;
 
-        let credentials = password_store
-            .get_credentials(username)
-            .ok_or_else(|| Error::authentication("User not found"))?;
+        // HDB-001: NEVER fail early for an unknown name. PostgreSQL's mock
+        // authentication — an absent account is challenged with a deterministic
+        // synthetic credential derived from the store's mock-authentication
+        // secret, so `AuthenticationSASL` -> `AuthenticationSASLContinue` ->
+        // uniform 28P01 is the exchange for every failure. `must_fail` is a
+        // mandatory-rejection flag, NOT proof validity: it is honoured after
+        // verification runs, so even a proof forged against the synthetic
+        // credential cannot authenticate a name that does not exist.
+        let (credentials, must_fail) = password_store.credentials_for_scram(username);
 
         // Create SCRAM state FROM THE STORED CREDENTIAL's salt and iteration
         // count (GH#20). `ScramAuthState::new` generates a fresh random salt per
@@ -2043,7 +2317,7 @@ where
             Some(FrontendMessage::SaslResponse { data }) => String::from_utf8(data)
                 .map_err(|e| Error::protocol(format!("SCRAM client-final-message not UTF-8: {}", e)))?,
             Some(FrontendMessage::PasswordMessage { password }) => password,
-            _ => return Err(Error::protocol("Expected SASL response")),
+            _ => return Err(Error::protocol("Expected SASL response").into()),
         };
 
         tracing::debug!("Received client-final-message: {}", client_final);
@@ -2052,7 +2326,7 @@ where
         // Format: c=channel-binding,r=nonce,p=proof
         let final_parts: Vec<&str> = client_final.split(',').collect();
         if final_parts.len() < 3 {
-            return Err(Error::protocol("Invalid SCRAM client-final-message"));
+            return Err(Error::protocol("Invalid SCRAM client-final-message").into());
         }
 
         // Extract proof
@@ -2069,13 +2343,34 @@ where
             final_parts.iter().filter(|p| !p.starts_with("p=")).copied().collect();
         let client_final_without_proof = client_final_without_proof.join(",");
 
-        // Verify client proof and get server signature
-        let server_signature = scram_state.verify_client_proof(
+        // Verify the proof BEFORE consulting `must_fail`, so an absent account
+        // does the same cryptographic work as a present one. (Source ordering
+        // is not claimed as a constant-time guarantee.)
+        let proof_result = scram_state.verify_client_proof_classified(
             client_proof_b64,
             &client_final_without_proof,
             &credentials.stored_key,
             &credentials.server_key,
-        )?;
+        );
+        let server_signature = match proof_result {
+            Ok(signature) if !must_fail => signature,
+            // A genuinely malformed client-final-message stays a protocol
+            // violation; it is decided before any credential is consulted, so
+            // it is identical for known and unknown names.
+            Err(ScramProofError::Malformed(message)) => return Err(Error::protocol(message).into()),
+            // Everything else — a bad proof, or a good proof against a
+            // synthetic credential — is the ONE uniform credential rejection.
+            // The real reason is debug-logged only; it never reaches the wire.
+            other => {
+                tracing::debug!(
+                    user = %username,
+                    unknown_user = must_fail,
+                    proof_verified = other.is_ok(),
+                    "SCRAM authentication rejected"
+                );
+                return Err(Self::password_rejection(username));
+            }
+        };
 
         tracing::info!("SCRAM authentication successful for user: {}", username);
 
@@ -2359,9 +2654,21 @@ where
         // R-B4: route the generic fallback through the SESSION so that COPY
         // inside `BEGIN … ROLLBACK` participates in the transaction (previously
         // it used the session-unaware `execute()` and leaked rows on rollback).
-        // Outside a transaction `execute_for_session` autocommits per chunk,
-        // matching the prior behavior.
+        // HDB-004: outside a session transaction `execute_for_session` used to
+        // AUTOCOMMIT EVERY 500-ROW CHUNK, so a COPY that failed at row 501 or
+        // beyond left the earlier chunks permanently committed — the
+        // `copy_bulk_insert` fast path above is all-or-nothing, and the
+        // fallback (triggers, dictionary/CAS columns, deferred FKs …) silently
+        // was not. Give the whole chunk loop ONE session transaction of its own
+        // so every COPY is atomic whichever path serves it. When a session
+        // transaction is already open — an explicit `BEGIN`, or the implicit
+        // block of a multi-statement simple query — the COPY keeps
+        // participating in it and that owner decides the outcome.
         const BATCH: usize = 500;
+        let copy_owns_txn = !self.database.session_in_transaction(self.session_id);
+        if copy_owns_txn {
+            self.database.begin_transaction_for_session(self.session_id)?;
+        }
         // W3.2: attribute this generic COPY fallback to the `copy` write-volume
         // class. copy_bulk_insert declined the fast batch (constrained /
         // columnar / trigger / session-transaction shape), so each chunk is
@@ -2374,7 +2681,7 @@ where
         // (`execute_for_session` does not await), so the guard is dropped before
         // any `.await` below — no cross-thread thread-local hazard; the error is
         // captured and reported after the guard drops.
-        let copy_fallback_err = {
+        let mut copy_fallback_err = {
             let _wv = crate::write_volume::stmt_scope(crate::write_volume::StmtClass::Copy);
             let mut err = None;
             for chunk in rows.chunks(BATCH) {
@@ -2387,6 +2694,21 @@ where
             }
             err
         };
+        // HDB-004: close the transaction this COPY opened — commit when every
+        // chunk landed, roll back otherwise (and roll back a failed commit too,
+        // so the session never keeps a half-finished transaction).
+        if copy_owns_txn {
+            if copy_fallback_err.is_none() {
+                if let Err(e) = self.database.commit_transaction_for_session(self.session_id) {
+                    copy_fallback_err = Some(e);
+                }
+            }
+            if copy_fallback_err.is_some() && self.database.session_in_transaction(self.session_id) {
+                if let Err(e) = self.database.rollback_transaction_for_session(self.session_id) {
+                    tracing::warn!("rolling back a failed COPY fallback transaction failed: {e}");
+                }
+            }
+        }
         if let Some(e) = copy_fallback_err {
             return self
                 .send_error("ERROR", "XX000", &format!("COPY insert failed: {e}"), None, None)
@@ -2766,6 +3088,11 @@ where
         detail: Option<String>,
         hint: Option<String>,
     ) -> Result<()> {
+        // HDB-004: the ONE place an ErrorResponse is built, and therefore the
+        // one place that can tell the multi-statement simple-query loop that
+        // this statement already reported an error — even though it is about to
+        // return `Ok(())`. See `handle_query`.
+        self.statement_error_reported = true;
         self.send_message(BackendMessage::ErrorResponse {
             severity: severity.to_string(),
             code: code.to_string(),
@@ -2774,6 +3101,20 @@ where
             hint,
             position: None,
         })
+        .await
+    }
+
+    /// HDB-004: the simple-query `25P02` answer for a statement issued inside
+    /// an aborted transaction block. Shared by the generic guard in
+    /// `handle_single_query` and by the COPY dispatch, which runs before it.
+    async fn send_failed_transaction_error(&mut self) -> Result<()> {
+        self.send_error(
+            "ERROR",
+            "25P02",
+            "current transaction is aborted, commands ignored until end of transaction block",
+            None,
+            Some("Use ROLLBACK to clear the failed transaction state".to_string()),
+        )
         .await
     }
 
@@ -3504,6 +3845,271 @@ fn pg_stmt_is_only_comment(stmt: &str) -> bool {
         }
     }
     true
+}
+
+/// Skip the leading `-- …` / `/* … */` comments of a statement so the first
+/// real keyword can be read.
+///
+/// Block comments are matched NON-recursively (PostgreSQL nests them). The
+/// failure mode of that simplification is benign: a nested comment leaves the
+/// scan inside the comment text, where an unrecognised first word classifies as
+/// "may write" — i.e. it falls back to opening the implicit block, the
+/// behaviour that was unconditional before this classifier existed.
+fn pg_skip_leading_comments(stmt: &str) -> &str {
+    let mut rest = stmt.trim_start();
+    loop {
+        if let Some(after) = rest.strip_prefix("--") {
+            rest = match after.find('\n') {
+                Some(newline) => after.get(newline + 1..).unwrap_or(""),
+                // A `-- …` comment with no newline is the whole statement.
+                None => "",
+            };
+        } else if let Some(after) = rest.strip_prefix("/*") {
+            rest = match after.find("*/") {
+                Some(close) => after.get(close + 2..).unwrap_or(""),
+                // Unterminated: nothing after it can be a keyword.
+                None => "",
+            };
+        } else {
+            return rest;
+        }
+        rest = rest.trim_start();
+    }
+}
+
+#[inline]
+fn pg_is_identifier_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
+}
+
+/// Case-insensitive whole-word search. `upper` must already be
+/// `to_ascii_uppercase`d; `word` must be an uppercase ASCII keyword.
+///
+/// Word boundaries are what make this usable on raw SQL text: `INSERTED_AT`
+/// must not read as `INSERT`, and `INTO` must not match inside `INTOLERANT`.
+fn pg_contains_keyword(upper: &str, word: &str) -> bool {
+    let bytes = upper.as_bytes();
+    let mut from = 0usize;
+    while let Some(rest) = upper.get(from..) {
+        let Some(offset) = rest.find(word) else {
+            return false;
+        };
+        let at = from + offset;
+        let before_ok = at == 0 || bytes.get(at - 1).map_or(true, |b| !pg_is_identifier_byte(*b));
+        let after_ok = bytes.get(at + word.len()).map_or(true, |b| !pg_is_identifier_byte(*b));
+        if before_ok && after_ok {
+            return true;
+        }
+        // `word` is ASCII and matched at a char boundary, so skipping the whole
+        // match keeps `from` on a boundary.
+        from = at + word.len();
+    }
+    false
+}
+
+/// HDB-004 (fix pass): can this statement write table data?
+///
+/// The implicit transaction block a multi-statement simple query opens is not
+/// free — it clears the result cache, it raises the process-wide
+/// `session_txn_count` that gates OTHER sessions' autocommit fast paths, and,
+/// under `storage.serializable_policy = "error"`, it can FAIL outright for a
+/// session that asked for SERIALIZABLE. Opening it in front of `SELECT 1` buys
+/// nothing: a statement that cannot write has nothing to roll back, and the
+/// batch's atomicity is decided entirely by the statements that can.
+///
+/// So the block is opened lazily, in front of the first statement that might
+/// write; once open it stays open for the rest of the message.
+///
+/// The classifier is deliberately asymmetric: FALSE is only returned for shapes
+/// that are known not to write table data, and anything unrecognised answers
+/// TRUE (open the block). A false TRUE costs a transaction that had nothing to
+/// do; a false FALSE would silently leave a write outside the block — the bug
+/// this whole item is about.
+///
+/// DDL (`CREATE` / `ALTER` / `DROP`) answers FALSE because it is NOT
+/// transactional in this engine: it auto-commits even inside a session
+/// transaction (`test_ddl_in_transaction_rollback_is_not_undone`), so the block
+/// could never undo it anyway.
+fn statement_can_write_data(stmt: &str) -> bool {
+    let trimmed = pg_skip_leading_comments(stmt).trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    // BEGIN / COMMIT / ROLLBACK / ROLLBACK TO SAVEPOINT — the boundaries
+    // themselves never write rows. (`open_implicit_block_if_needed` keeps its
+    // own explicit BEGIN check: that one is about ownership, not writes.)
+    if classify_transaction_control(trimmed).is_some() {
+        return false;
+    }
+    let keyword = trimmed
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .find(|word| !word.is_empty())
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    let upper = trimmed.to_ascii_uppercase();
+    match keyword.as_str() {
+        // `SELECT … INTO new_table` writes; every other SELECT reads.
+        // `SELECT … INTO t` writes; `pg_advisory_xact_lock(k)` must live until
+        // the end of the message (transaction scope), so it opens the block too.
+        "SELECT" => pg_contains_keyword(&upper, "INTO") || upper.contains("ADVISORY_XACT_LOCK"),
+        // A CTE is a write if its body is (`WITH x AS (…) INSERT …`, or the
+        // data-modifying-CTE form `WITH x AS (DELETE … RETURNING *) SELECT …`).
+        "WITH" => {
+            pg_contains_keyword(&upper, "INTO")
+                || pg_contains_keyword(&upper, "INSERT")
+                || pg_contains_keyword(&upper, "UPDATE")
+                || pg_contains_keyword(&upper, "DELETE")
+                || pg_contains_keyword(&upper, "MERGE")
+        }
+        // Plain `EXPLAIN` only plans — but `EXPLAIN ANALYZE` RUNS the inner
+        // statement in this engine (`sql::executor::explain::execute_for_analyze`),
+        // so `EXPLAIN ANALYZE INSERT …` is a write and must not be left outside
+        // the block. Any EXPLAIN ANALYZE opens it; the read-only ones pay a
+        // transaction with nothing to do, which is the safe direction.
+        "EXPLAIN" => pg_contains_keyword(&upper, "ANALYZE"),
+        // Plain DDL auto-commits in this engine, but `CREATE TABLE … AS SELECT`
+        // and `CREATE MATERIALIZED VIEW … AS SELECT` populate rows, and the
+        // CTAS executor joins an open session transaction — so they open one.
+        "CREATE" => pg_contains_keyword(&upper, "SELECT"),
+        // Read-only, session-local, or non-transactional by nature.
+        "SHOW" | "SET" | "RESET" | "VALUES" | "TABLE" | "DISCARD" | "VACUUM" | "ANALYZE" | "REINDEX" | "CHECKPOINT"
+        | "PREPARE" | "DEALLOCATE" | "LISTEN" | "UNLISTEN" | "NOTIFY" | "COMMENT" | "GRANT" | "REVOKE" | "ALTER"
+        | "DROP" | "SAVEPOINT" | "RELEASE" => false,
+        // INSERT / UPDATE / DELETE / MERGE / TRUNCATE / COPY / CALL / DO /
+        // REFRESH / LOCK / EXECUTE — and anything this classifier has never
+        // heard of.
+        _ => true,
+    }
+}
+
+#[cfg(test)]
+mod statement_write_classifier_tests {
+    //! HDB-004 fix pass. The rule that decides whether a statement is worth an
+    //! implicit transaction block. Every FALSE here is a promise that the
+    //! statement cannot write table data.
+    use super::statement_can_write_data as can_write;
+
+    #[test]
+    fn ctas_and_advisory_xact_locks_open_a_block_but_plain_ddl_does_not() {
+        for sql in [
+            "CREATE TABLE staging AS SELECT * FROM orders",
+            "create materialized view mv as select 1",
+            "SELECT pg_advisory_xact_lock(72707369)",
+            "SELECT pg_try_advisory_xact_lock(1)",
+            "SELECT * INTO copy_t FROM t",
+        ] {
+            assert!(can_write(sql), "{sql:?} must open the implicit block");
+        }
+        for sql in [
+            "CREATE TABLE t (id INT)",
+            "CREATE INDEX i ON t (id)",
+            "CREATE VIEW v AS TABLE t",
+            "SELECT pg_advisory_lock(1)",
+        ] {
+            assert!(!can_write(sql), "{sql:?} must not open the implicit block");
+        }
+    }
+
+    #[test]
+    fn read_only_and_non_transactional_statements_do_not_open_a_block() {
+        for sql in [
+            "SELECT 1",
+            "select count(*) from items",
+            "  SELECT * FROM t WHERE name = 'x'  ",
+            "WITH c AS (SELECT 1) SELECT * FROM c",
+            "SHOW search_path",
+            "SET application_name = 'hdb004'",
+            "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+            "RESET ALL",
+            "EXPLAIN SELECT 1",
+            "EXPLAIN INSERT INTO items VALUES (1)",
+            "VALUES (1), (2)",
+            "TABLE items",
+            "DISCARD ALL",
+            "VACUUM",
+            "ANALYZE items",
+            "REINDEX TABLE items",
+            "CHECKPOINT",
+            "PREPARE p AS SELECT 1",
+            "DEALLOCATE p",
+            "LISTEN chan",
+            "UNLISTEN chan",
+            "NOTIFY chan",
+            "COMMENT ON TABLE items IS 'x'",
+            "GRANT SELECT ON items TO alice",
+            "REVOKE SELECT ON items FROM alice",
+            "CREATE TABLE t (id INT)",
+            "ALTER TABLE t ADD COLUMN b INT",
+            "DROP TABLE t",
+            "SAVEPOINT sp1",
+            "RELEASE SAVEPOINT sp1",
+            "BEGIN",
+            "START TRANSACTION",
+            "COMMIT",
+            "END",
+            "ROLLBACK",
+            "ABORT",
+            "ROLLBACK TO SAVEPOINT sp1",
+            "",
+            "   ",
+            "-- just a comment",
+        ] {
+            assert!(!can_write(sql), "`{sql}` must NOT open an implicit block");
+        }
+    }
+
+    #[test]
+    fn anything_that_can_write_opens_the_block() {
+        for sql in [
+            "INSERT INTO items VALUES (1)",
+            "insert into items values (1)",
+            "UPDATE items SET id = 2",
+            "DELETE FROM items",
+            "MERGE INTO items USING src ON src.id = items.id WHEN MATCHED THEN DELETE",
+            "TRUNCATE items",
+            "COPY items FROM STDIN",
+            "CALL do_work()",
+            "DO $$ BEGIN INSERT INTO items VALUES (1); END $$",
+            "REFRESH MATERIALIZED VIEW mv",
+            "LOCK TABLE items",
+            "EXECUTE p",
+            // SELECT INTO and the data-modifying CTE forms.
+            "SELECT * INTO backup FROM items",
+            "select id into backup from items",
+            "WITH c AS (SELECT 1) INSERT INTO items SELECT * FROM c",
+            "WITH gone AS (DELETE FROM items RETURNING id) SELECT count(*) FROM gone",
+            "WITH c AS (UPDATE items SET id = 1 RETURNING id) SELECT * FROM c",
+            // EXPLAIN ANALYZE executes the inner statement here, so it is a
+            // write whenever the inner statement is (and harmlessly opens the
+            // block when it is not).
+            "EXPLAIN ANALYZE INSERT INTO items VALUES (1)",
+            "explain analyze select 1",
+            // Unknown: the classifier fails OPEN, never silently outside the
+            // block.
+            "FROBNICATE items",
+        ] {
+            assert!(can_write(sql), "`{sql}` MUST open an implicit block");
+        }
+    }
+
+    #[test]
+    fn leading_comments_do_not_hide_the_keyword() {
+        assert!(can_write("-- pgbouncer prelude\nINSERT INTO items VALUES (1)"));
+        assert!(can_write("/* app: web */ UPDATE items SET id = 1"));
+        assert!(!can_write("-- pgbouncer prelude\nSELECT 1"));
+        assert!(!can_write("/* app: web */ SELECT 1"));
+        assert!(!can_write("/* a */ -- b\n   SELECT 1"));
+    }
+
+    #[test]
+    fn identifiers_that_merely_contain_a_keyword_are_not_writes() {
+        // The word-boundary guard: without it every one of these would open a
+        // useless block (and `INTO`-in-a-name would misclassify a plain read).
+        assert!(!can_write("SELECT inserted_at FROM items"));
+        assert!(!can_write("SELECT * FROM update_log"));
+        assert!(!can_write("WITH c AS (SELECT deleted_at FROM items) SELECT * FROM c"));
+        assert!(!can_write("SELECT intolerant FROM items"));
+    }
 }
 
 /// Detect `DO $$ … $$` / `DO [LANGUAGE plpgsql] $tag$ … $tag$;` blocks
@@ -4464,6 +5070,8 @@ mod failed_transaction_state_tests {
                 scram_state: None,
                 write_buf: BytesMut::with_capacity(4096),
                 suppress_ready_for_query: false,
+                statement_error_reported: false,
+                implicit_transaction: false,
                 awaiting_sync_after_error: false,
             },
             client,
@@ -4556,6 +5164,8 @@ mod show_branches_wire_tests {
                 scram_state: None,
                 write_buf: BytesMut::with_capacity(4096),
                 suppress_ready_for_query: false,
+                statement_error_reported: false,
+                implicit_transaction: false,
                 awaiting_sync_after_error: false,
             },
             client,
@@ -5187,6 +5797,8 @@ mod md5_auth_wire_tests {
                 scram_state: None,
                 write_buf: BytesMut::with_capacity(4096),
                 suppress_ready_for_query: false,
+                statement_error_reported: false,
+                implicit_transaction: false,
                 awaiting_sync_after_error: false,
             },
             client,

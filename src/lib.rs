@@ -2646,6 +2646,148 @@ impl EmbeddedDatabase {
         Ok(Some(0))
     }
 
+    /// Every pre-parse utility interceptor of [`execute`](Self::execute), in
+    /// ONE funnel so the autocommit path and the in-session-transaction path
+    /// cannot drift.
+    ///
+    /// sqlparser has no grammar for any of these statements (`VACUUM`,
+    /// `REINDEX …`, `CREATE`/`DROP DOMAIN`, `CREATE TABLESPACE`,
+    /// `RESET name|ALL`, `ALTER TABLE … ATTACH/DETACH PARTITION`, plus the
+    /// db-setting / FK-setting / `SET CONSTRAINTS` / trace families), so
+    /// `execute()` has always intercepted them BEFORE parsing. The
+    /// in-transaction branch of `execute_for_session` goes straight to the
+    /// sqlparser-first `execute_in_transaction_no_fast_path`, so every one of
+    /// them used to fail inside a session transaction — an explicit `BEGIN`,
+    /// and (since the implicit block around a multi-statement simple query)
+    /// the far more common `INSERT …; VACUUM` shape. Both paths call this now.
+    ///
+    /// None of these statements touches table data, so handling one outside the
+    /// transaction's write set is correct: it neither commits nor closes the
+    /// open transaction.
+    ///
+    /// `Ok(Some(n))` — handled, `n` is the affected-row count to report;
+    /// `Ok(None)` — not a utility statement, carry on to the parser.
+    fn try_handle_utility_statement(&self, sql: &str) -> Result<Option<u64>> {
+        if let Some(count) = self.try_handle_trace_execute(sql)? {
+            return Ok(Some(count));
+        }
+
+        if let Some((_rows, _columns)) = self.try_handle_db_setting_statement_with_schema(sql)? {
+            return Ok(Some(0));
+        }
+
+        if let Some(count) = self.try_handle_fk_setting(sql)? {
+            return Ok(Some(count));
+        }
+
+        // `SET CONSTRAINTS … DEFERRED|IMMEDIATE` — arm/disarm transaction-scoped
+        // FK deferral (sqlparser has no grammar for it; a no-op before).
+        if let Some(count) = self.try_handle_set_constraints(sql)? {
+            return Ok(Some(count));
+        }
+
+        // R4.3: VACUUM VERSIONS — manual MVCC version-history collection.
+        if let Some(count) = self.try_handle_vacuum_versions(sql)? {
+            return Ok(Some(count));
+        }
+
+        // Priority #5: standard PostgreSQL VACUUM (bare/ANALYZE/FULL/...).
+        if let Some(count) = self.try_handle_vacuum_statement(sql)? {
+            return Ok(Some(count));
+        }
+
+        // Priority #7: CREATE TABLESPACE accept-and-ignore no-op.
+        if let Some(count) = self.try_handle_create_tablespace_statement(sql)? {
+            return Ok(Some(count));
+        }
+
+        // Round-2: standard PostgreSQL RESET name / RESET ALL no-op (after
+        // the specific SET/RESET handlers above have had first refusal).
+        if let Some(count) = self.try_handle_reset_statement(sql)? {
+            return Ok(Some(count));
+        }
+
+        // Round-2: PostgreSQL REINDEX … no-op.
+        if let Some(count) = self.try_handle_reindex_statement(sql)? {
+            return Ok(Some(count));
+        }
+
+        // Round-2: PostgreSQL CREATE DOMAIN / DROP DOMAIN no-op.
+        if let Some(count) = self.try_handle_domain_ddl_statement(sql)? {
+            return Ok(Some(count));
+        }
+
+        // Round-3: PostgreSQL ALTER TABLE/INDEX ATTACH/DETACH PARTITION no-op.
+        if let Some(count) = self.try_handle_partition_attach_detach(sql)? {
+            return Ok(Some(count));
+        }
+
+        Ok(None)
+    }
+
+    /// The result-set twin of
+    /// [`try_handle_utility_statement`](Self::try_handle_utility_statement):
+    /// the subset of `query_with_schema`'s pre-parse interceptors that is pure
+    /// (no session/global state set up earlier in that function, no rewritten
+    /// SQL, no row-producing DML), hoisted so the in-transaction branch of
+    /// `query_with_schema_for_session` gets the same surface.
+    ///
+    /// Deliberately EXCLUDES the two interceptors that sit above it in
+    /// `query_with_schema` and stay inline there: the db-setting family
+    /// (`SET`/`SHOW`, which the session paths resolve per-session before ever
+    /// reaching here) and the prepared-statement family (`EXECUTE` runs real
+    /// DML, which inside a session transaction must go through the transaction,
+    /// not around it).
+    fn try_handle_utility_query(&self, sql: &str) -> Result<Option<(Vec<Tuple>, std::sync::Arc<Schema>)>> {
+        // R4.3: VACUUM VERSIONS over the result-set surface (REPL/wire
+        // protocols) — one row with the reclaimed version count.
+        if sql::Parser::is_vacuum_versions(sql) {
+            let collected = self.storage.vacuum_versions()?;
+            let row = Tuple {
+                values: vec![Value::Int8(collected as i64)],
+                row_id: None,
+                branch_id: None,
+            };
+            return Ok(Some((
+                vec![row],
+                Self::typed_result_schema("versions_collected", DataType::Int8),
+            )));
+        }
+
+        // Priority #5: standard PostgreSQL VACUUM over the result-set
+        // surface (REPL/wire protocols) — command-tag-only, no rows.
+        if let Some(_count) = self.try_handle_vacuum_statement(sql)? {
+            return Ok(Some((Vec::new(), Self::empty_result_schema())));
+        }
+
+        // Priority #7: CREATE TABLESPACE accept-and-ignore no-op.
+        if let Some(_count) = self.try_handle_create_tablespace_statement(sql)? {
+            return Ok(Some((Vec::new(), Self::empty_result_schema())));
+        }
+
+        // Round-2: standard PostgreSQL RESET name / RESET ALL no-op.
+        if let Some(_count) = self.try_handle_reset_statement(sql)? {
+            return Ok(Some((Vec::new(), Self::empty_result_schema())));
+        }
+
+        // Round-2: PostgreSQL REINDEX … no-op.
+        if let Some(_count) = self.try_handle_reindex_statement(sql)? {
+            return Ok(Some((Vec::new(), Self::empty_result_schema())));
+        }
+
+        // Round-2: PostgreSQL CREATE DOMAIN / DROP DOMAIN no-op.
+        if let Some(_count) = self.try_handle_domain_ddl_statement(sql)? {
+            return Ok(Some((Vec::new(), Self::empty_result_schema())));
+        }
+
+        // Round-3: PostgreSQL ALTER TABLE/INDEX ATTACH/DETACH PARTITION no-op.
+        if let Some(_count) = self.try_handle_partition_attach_detach(sql)? {
+            return Ok(Some((Vec::new(), Self::empty_result_schema())));
+        }
+
+        Ok(None)
+    }
+
     /// R4.3: run a full MVCC version-GC pass (the library twin of the
     /// `VACUUM VERSIONS` SQL statement). Returns reclaimed version count.
     pub fn vacuum_versions(&self) -> Result<u64> {
@@ -8990,57 +9132,10 @@ impl EmbeddedDatabase {
 
         let start = std::time::Instant::now();
 
-        if let Some(count) = self.try_handle_trace_execute(sql)? {
-            return Ok(count);
-        }
-
-        if let Some((_rows, _columns)) = self.try_handle_db_setting_statement_with_schema(sql)? {
-            return Ok(0);
-        }
-
-        if let Some(count) = self.try_handle_fk_setting(sql)? {
-            return Ok(count);
-        }
-
-        // `SET CONSTRAINTS … DEFERRED|IMMEDIATE` — arm/disarm transaction-scoped
-        // FK deferral (sqlparser has no grammar for it; a no-op before).
-        if let Some(count) = self.try_handle_set_constraints(sql)? {
-            return Ok(count);
-        }
-
-        // R4.3: VACUUM VERSIONS — manual MVCC version-history collection.
-        if let Some(count) = self.try_handle_vacuum_versions(sql)? {
-            return Ok(count);
-        }
-
-        // Priority #5: standard PostgreSQL VACUUM (bare/ANALYZE/FULL/...).
-        if let Some(count) = self.try_handle_vacuum_statement(sql)? {
-            return Ok(count);
-        }
-
-        // Priority #7: CREATE TABLESPACE accept-and-ignore no-op.
-        if let Some(count) = self.try_handle_create_tablespace_statement(sql)? {
-            return Ok(count);
-        }
-
-        // Round-2: standard PostgreSQL RESET name / RESET ALL no-op (after
-        // the specific SET/RESET handlers above have had first refusal).
-        if let Some(count) = self.try_handle_reset_statement(sql)? {
-            return Ok(count);
-        }
-
-        // Round-2: PostgreSQL REINDEX … no-op.
-        if let Some(count) = self.try_handle_reindex_statement(sql)? {
-            return Ok(count);
-        }
-
-        // Round-2: PostgreSQL CREATE DOMAIN / DROP DOMAIN no-op.
-        if let Some(count) = self.try_handle_domain_ddl_statement(sql)? {
-            return Ok(count);
-        }
-
-        // Round-3: PostgreSQL ALTER TABLE/INDEX ATTACH/DETACH PARTITION no-op.
-        if let Some(count) = self.try_handle_partition_attach_detach(sql)? {
+        // Every pre-parse utility interceptor, in one shared funnel so this
+        // autocommit path and the in-session-transaction paths
+        // (`execute_for_session`, `execute_returning_for_session`) cannot drift.
+        if let Some(count) = self.try_handle_utility_statement(sql)? {
             return Ok(count);
         }
 
@@ -17341,50 +17436,11 @@ impl EmbeddedDatabase {
             }
         }
 
-        // R4.3: VACUUM VERSIONS over the result-set surface (REPL/wire
-        // protocols) — one row with the reclaimed version count.
-        if sql::Parser::is_vacuum_versions(sql) {
-            let collected = self.storage.vacuum_versions()?;
-            let row = Tuple {
-                values: vec![Value::Int8(collected as i64)],
-                row_id: None,
-                branch_id: None,
-            };
-            return Ok((
-                vec![row],
-                Self::typed_result_schema("versions_collected", DataType::Int8),
-            ));
-        }
-
-        // Priority #5: standard PostgreSQL VACUUM over the result-set
-        // surface (REPL/wire protocols) — command-tag-only, no rows.
-        if let Some(_count) = self.try_handle_vacuum_statement(sql)? {
-            return Ok((Vec::new(), Self::empty_result_schema()));
-        }
-
-        // Priority #7: CREATE TABLESPACE accept-and-ignore no-op.
-        if let Some(_count) = self.try_handle_create_tablespace_statement(sql)? {
-            return Ok((Vec::new(), Self::empty_result_schema()));
-        }
-
-        // Round-2: standard PostgreSQL RESET name / RESET ALL no-op.
-        if let Some(_count) = self.try_handle_reset_statement(sql)? {
-            return Ok((Vec::new(), Self::empty_result_schema()));
-        }
-
-        // Round-2: PostgreSQL REINDEX … no-op.
-        if let Some(_count) = self.try_handle_reindex_statement(sql)? {
-            return Ok((Vec::new(), Self::empty_result_schema()));
-        }
-
-        // Round-2: PostgreSQL CREATE DOMAIN / DROP DOMAIN no-op.
-        if let Some(_count) = self.try_handle_domain_ddl_statement(sql)? {
-            return Ok((Vec::new(), Self::empty_result_schema()));
-        }
-
-        // Round-3: PostgreSQL ALTER TABLE/INDEX ATTACH/DETACH PARTITION no-op.
-        if let Some(_count) = self.try_handle_partition_attach_detach(sql)? {
-            return Ok((Vec::new(), Self::empty_result_schema()));
+        // The pure pre-parse utility interceptors, in one shared funnel so this
+        // autocommit path and the in-session-transaction branch of
+        // `query_with_schema_for_session` cannot drift.
+        if let Some(result) = self.try_handle_utility_query(sql)? {
+            return Ok(result);
         }
 
         // Under a non-`public` `search_path`, bare names resolve against a
@@ -19038,6 +19094,19 @@ impl EmbeddedDatabase {
             return Ok(0);
         }
 
+        // Pre-parse utility statements (VACUUM, REINDEX, CREATE/DROP DOMAIN,
+        // CREATE TABLESPACE, RESET name|ALL, ATTACH/DETACH PARTITION, the
+        // db-setting family): sqlparser has no grammar for any of them, and the
+        // in-transaction path below is sqlparser-first, so without this funnel
+        // each one fails inside a session transaction — an explicit `BEGIN`, or
+        // the implicit block a multi-statement simple query opens. None of them
+        // writes table data, so none of them disturbs the open transaction.
+        // Every handler this funnel can reach is either idempotent or already
+        // returned early above (`SET CONSTRAINTS`, `search_path`).
+        if let Some(count) = self.try_handle_utility_statement(sql)? {
+            return Ok(count);
+        }
+
         let start = std::time::Instant::now();
         self.touch_session_for_statement(session_id)?;
         let slot = self
@@ -19083,6 +19152,13 @@ impl EmbeddedDatabase {
         let _schema_override = self.session_schema_override_guard(session_id);
         if !self.session_transactions.contains_key(&session_id) {
             return self.query_with_schema(sql);
+        }
+
+        // Same funnel as the autocommit delegate above: a utility statement
+        // routed through the result-set surface inside a session transaction
+        // would otherwise reach the sqlparser-first planner and fail.
+        if let Some(result) = self.try_handle_utility_query(sql)? {
+            return Ok(result);
         }
 
         let start = std::time::Instant::now();
@@ -19147,6 +19223,12 @@ impl EmbeddedDatabase {
         if !self.session_transactions.contains_key(&session_id) {
             let _sync_override = self.session_durability_override_guard(session_id);
             return self.execute_returning(sql);
+        }
+
+        // Pre-parse utility statements inside an open session transaction (see
+        // `execute_for_session`). A utility statement never returns rows.
+        if let Some(count) = self.try_handle_utility_statement(sql)? {
+            return Ok((count, Vec::new()));
         }
 
         self.touch_session_for_statement(session_id)?;

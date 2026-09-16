@@ -5,6 +5,90 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.33.0] - 2026-09-16
+
+Two more findings from the HeliosDB Nano 4.31.1 security report (HDB-001, HDB-004), plus the engine
+fix their review surfaced.
+
+### Fixed — SECURITY: SCRAM and password authentication disclosed whether an account exists (HDB-001)
+
+An unauthenticated PostgreSQL-wire client could enumerate accounts. The SCRAM-SHA-256 handler
+looked the user up before issuing the challenge: an unknown name got `AuthenticationSASL` followed by
+FATAL 08P01 "User not found", while a wrong password for a real account got the full
+`AuthenticationSASLContinue` exchange first. The cleartext method leaked the same fact through
+timing: a real account cost a full PBKDF2 derivation, an unknown one a single SHA-256.
+
+Unknown names now complete PostgreSQL-style *mock authentication*. The password store derives a
+deterministic synthetic credential for the name (16-byte salt, the store's iteration count, stored
+and server keys) from a private 32-byte secret, the ordinary proof verification runs against it, and
+the result is rejected even if the proof happens to match. Every credential failure — SCRAM,
+cleartext and md5, known or unknown name — now answers the same
+`28P01 password authentication failed for user "..."` (PostgreSQL's SQLSTATE and wording, no
+`Protocol error:` prefix); only malformed protocol input stays 08P01. A FATAL startup error is no
+longer followed by a ReadyForQuery. Cleartext verification runs the same PBKDF2 for every name.
+
+For custom `PasswordStore` implementations the trait gained two defaulted methods:
+`default_scram_iterations()` and `scram_mock_authentication_secret()`. A persistent backend should
+store a random 32-byte secret beside its credentials and return it (or pass it to
+`SharedPasswordStore::with_mock_authentication_secret`) so the synthetic salt for a name does not
+change across restarts; every stored verifier must use the default iteration count and a 16-byte
+salt, or imported credentials re-open the oracle through the SCRAM `i=`/`s=` fields
+(docs/guides/authentication.md).
+
+### Fixed — SECURITY: a multi-statement simple query continued after a COPY error and committed statement by statement (HDB-004)
+
+One simple-query message `INSERT INTO items VALUES (1); COPY missing_table FROM STDIN; INSERT INTO
+items VALUES (2)` reported the COPY error and then executed the last INSERT, and both rows stayed
+committed. The batch loop stopped only when a statement returned an error value, while every path
+that answered its own error inline — all COPY error paths, the `SET` arms — returned success, and
+each statement autocommitted on its own.
+
+A multi-statement message is now abandoned at the first error, whether the statement propagated it
+or answered it inline, and exactly one ReadyForQuery ends the message. The statements run in a
+session-owned implicit transaction block, as PostgreSQL documents: it opens lazily in front of the
+first statement that can write table data, commits when the message ends, and rolls back on any
+error, so the batch above leaves zero rows. `BEGIN` inside the block converts it into the client's
+explicit transaction; `COMMIT`/`ROLLBACK` inside the message end the block (with PostgreSQL's
+"there is no transaction in progress" warning) and later statements start a new one;
+`BEGIN ISOLATION LEVEL ...` after a statement has already run answers 25001. Read-only or `SET`-only
+messages open no transaction. DDL is still non-transactional in this engine, so a `CREATE TABLE`
+inside a rolled-back message survives while the DML around it is undone.
+
+`COPY` inside an aborted transaction block now answers 25P02 without a CopyInResponse, and the
+generic `COPY FROM STDIN` fallback (triggers, dictionary/CAS columns, deferred constraints) runs all
+its chunks in one transaction, so a failure past row 500 no longer leaves earlier chunks committed.
+That fallback now stages the whole COPY in the transaction write set before commit, roughly doubling
+its peak memory; the typed fast path is unchanged.
+
+### Fixed — utility statements failed inside any session transaction
+
+`VACUUM`, `VACUUM ANALYZE`, `REINDEX ...`, `CREATE`/`DROP DOMAIN`, `CREATE TABLESPACE`,
+`RESET name|ALL`, `ALTER TABLE ... ATTACH/DETACH PARTITION` and the database-setting family are
+handled before parsing on the autocommit path, but the in-transaction path parsed first and rejected
+them, so `BEGIN; VACUUM` failed — and with the implicit block above, `INSERT ...; VACUUM` in one
+message would have too. Both paths now share one pre-parse funnel; the statements run as the same
+no-ops and neither commit nor close the open transaction.
+
+### Known limitations recorded by this release
+
+* The PostgreSQL-wire startup still validates the requested database/tenant name before
+  authentication, so a name that is not a tenant is refused without a challenge (libpq defaults the
+  database name to the user name). PostgreSQL checks it after authentication. Tracked separately.
+* The MySQL-wire listener authenticates with trust regardless of `--auth`. Tracked separately.
+* `CALL` runs its procedure body outside the enclosing session transaction (explicit or implicit),
+  so its writes are not undone by a rollback. Pre-existing; tracked separately.
+* A client that opens a transaction (explicitly, or via a writing multi-statement message) and then
+  stalls inside `COPY FROM STDIN` holds it with no deadline, as in PostgreSQL. Tracked with the
+  process-wide session-transaction gate on the autocommit fast paths.
+
+### Regression coverage
+
+`tests/security_hdb_001.rs` (real TCP + `PgConnectionHandler`, SCRAM and cleartext),
+`tests/security_hdb_004.rs` (tokio-postgres batches plus a raw-wire COPY client, 14 cases),
+`tests/session_txn_utility_statements.rs`, and unit tests for the synthetic credential derivation,
+the cleartext path, and the write-statement classifier. All were observed failing on the unfixed
+tree first.
+
 ## [4.32.1] - 2026-09-16
 
 Three findings from the HeliosDB Nano 4.31.1 security and correctness report (HDB-006, HDB-007, HDB-010).

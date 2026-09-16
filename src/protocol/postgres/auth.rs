@@ -221,15 +221,20 @@ impl AuthManager {
 
     /// Verify clear-text password
     pub fn verify_cleartext(&self, username: &str, password: &str) -> Result<bool> {
-        // If using SCRAM store, verify through that
+        // If using SCRAM store, verify through that.
+        //
+        // HDB-001: go through the SAME mock-authentication credential the SCRAM
+        // path uses. The previous shape answered an absent name with one
+        // SHA-256 while a present one paid a full PBKDF2 (>= 4096 iterations) —
+        // a difference of milliseconds that any unauthenticated peer can time,
+        // so the "still do hash to prevent timing attacks" comment it carried
+        // was simply wrong. `credentials_for_scram` always returns a credential
+        // (synthetic for an absent name), so the PBKDF2 is paid either way, and
+        // `must_fail` rejects the synthetic one even if the proof matches it.
         if let Some(ref store) = self.password_store {
-            if let Some(creds) = store.get_credentials(username) {
-                return Ok(creds.verify_password(password));
-            } else {
-                // User not found - still do hash to prevent timing attacks
-                let _ = Self::hash_password(password);
-                return Ok(false);
-            }
+            let (credentials, must_fail) = store.credentials_for_scram(username);
+            let verified = credentials.verify_password(password);
+            return Ok(verified && !must_fail);
         }
 
         // Legacy verification
@@ -311,6 +316,16 @@ pub struct ScramAuthState {
     iteration_count: u32,
     client_first_message_bare: String,
     server_first_message: String,
+}
+
+/// Internal classification used by the wire handler to distinguish malformed
+/// SCRAM input from a well-formed proof that does not match the credential.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ScramProofError {
+    /// The client proof is not a canonical 32-byte SCRAM-SHA-256 proof.
+    Malformed(String),
+    /// The proof is well formed but does not match the stored key.
+    Invalid,
 }
 
 impl ScramAuthState {
@@ -413,9 +428,36 @@ impl ScramAuthState {
         stored_key: &[u8],
         server_key: &[u8],
     ) -> Result<Vec<u8>> {
+        self.verify_client_proof_classified(
+            client_proof_b64,
+            client_final_message_without_proof,
+            stored_key,
+            server_key,
+        )
+        .map_err(|error| match error {
+            ScramProofError::Malformed(message) => Error::protocol(message),
+            ScramProofError::Invalid => Error::authentication("Invalid password"),
+        })
+    }
+
+    /// Same verification as [`Self::verify_client_proof`], but reporting WHY it
+    /// failed so the wire handler can keep a malformed message a protocol
+    /// violation while every credential failure stays one uniform response.
+    pub(crate) fn verify_client_proof_classified(
+        &self,
+        client_proof_b64: &str,
+        client_final_message_without_proof: &str,
+        stored_key: &[u8],
+        server_key: &[u8],
+    ) -> std::result::Result<Vec<u8>, ScramProofError> {
         // Decode client proof from base64
         let client_proof = base64_decode(client_proof_b64)
-            .map_err(|e| Error::authentication(format!("Invalid client proof encoding: {}", e)))?;
+            .map_err(|_| ScramProofError::Malformed("Invalid SCRAM client proof encoding".to_string()))?;
+        if client_proof.len() != 32 {
+            return Err(ScramProofError::Malformed(
+                "Invalid SCRAM-SHA-256 client proof length".to_string(),
+            ));
+        }
 
         // Build auth message: client-first-message-bare + "," + server-first-message + "," + client-final-message-without-proof
         let auth_message = format!(
@@ -438,7 +480,7 @@ impl ScramAuthState {
 
         // Constant-time comparison to prevent timing attacks
         if !constant_time_compare(&computed_stored_key, stored_key) {
-            return Err(Error::authentication("Invalid password"));
+            return Err(ScramProofError::Invalid);
         }
 
         // Calculate server signature: HMAC(ServerKey, AuthMessage)
@@ -589,6 +631,35 @@ mod tests {
 
         assert!(auth.verify_cleartext("test_user", "test_pass").unwrap());
         assert!(!auth.verify_cleartext("test_user", "wrong_pass").unwrap());
+    }
+
+    /// HDB-001 (cleartext arm): a password-store-backed `AuthManager` must
+    /// answer an absent name exactly as it answers a wrong password — same
+    /// `Ok(false)`, and the same PBKDF2 work, because both now run against a
+    /// credential (real or synthetic). Before the fix the absent name cost one
+    /// SHA-256 while a real one cost >= 4096 PBKDF2 iterations, which is a
+    /// timing oracle for account existence.
+    #[test]
+    fn cleartext_verification_is_uniform_for_absent_and_wrong_passwords() {
+        let store = SharedPasswordStore::new(InMemoryPasswordStore::new());
+        store.add_user("alice", "correct-password").unwrap();
+        let auth = AuthManager::with_password_store(AuthMethod::CleartextPassword, store);
+
+        assert!(
+            auth.verify_cleartext("alice", "correct-password").unwrap(),
+            "the right password must still authenticate"
+        );
+        assert!(
+            !auth.verify_cleartext("alice", "wrong-password").unwrap(),
+            "a wrong password must be rejected"
+        );
+        assert!(
+            !auth.verify_cleartext("missing-user", "correct-password").unwrap(),
+            "an absent name must be rejected"
+        );
+        // The synthetic credential is a mandatory rejection, not a password:
+        // nothing can be presented for an absent name that authenticates.
+        assert!(!auth.verify_cleartext("missing-user", "").unwrap());
     }
 
     #[test]
