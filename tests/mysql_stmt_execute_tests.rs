@@ -645,3 +645,213 @@ async fn zero_param_prepared_select_still_works() {
     assert_eq!(cols, vec!["id"]);
     assert_eq!(rows, vec![vec![WireValue::Int(11)]]);
 }
+
+// ---------------------------------------------------------------------------
+// HDB-007 — COM_QUERY (text protocol) client + regression tests
+//
+// The MySQL→PostgreSQL translator used to run its regex passes over the whole
+// statement, so MySQL syntax *inside* a string literal was rewritten before the
+// engine ever saw it: `'TINYINT(1)'` was stored as `'BOOLEAN'`, `'WHERE 1=1 AND
+// x'` lost its tautology, and so on. These tests drive the real wire path.
+// ---------------------------------------------------------------------------
+
+const COM_QUERY: u8 = 0x03;
+
+/// One text-protocol result row; `None` is SQL NULL.
+type TextRow = Vec<Option<String>>;
+
+/// Quote a payload as a single-quoted SQL literal, escaping `'` as `''` the
+/// way a MySQL client (or PyMySQL's client-side interpolation) does.
+fn quote_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+/// The proof-of-concept payloads captured on the wire for HDB-007.
+const HDB007_PAYLOADS: [&str; 5] = [
+    "TINYINT(1)",
+    "SELECT * LIMIT 5, 10",
+    "a AUTO_INCREMENT b",
+    "IFNULL(a,b)",
+    "WHERE 1=1 AND x",
+];
+
+impl MySqlTestClient {
+    /// Send a COM_QUERY and return the first response packet.
+    async fn query_raw(&mut self, sql: &str) -> Vec<u8> {
+        let mut p = vec![COM_QUERY];
+        p.extend_from_slice(sql.as_bytes());
+        self.write_packet(0, &p).await;
+        let (_seq, first) = self.read_packet().await;
+        first
+    }
+
+    /// COM_QUERY expecting an OK packet; returns the affected-row count.
+    async fn query_ok(&mut self, sql: &str) -> u64 {
+        let first = self.query_raw(sql).await;
+        assert_eq!(
+            first[0],
+            0x00,
+            "expected OK for `{sql}`, got: {:?}",
+            String::from_utf8_lossy(&first)
+        );
+        let mut pos = 1;
+        read_lenenc(&first, &mut pos) // affected rows
+    }
+
+    /// COM_QUERY expecting a text result set; returns (column names, rows).
+    async fn query_text(&mut self, sql: &str) -> (Vec<String>, Vec<TextRow>) {
+        let first = self.query_raw(sql).await;
+        assert_ne!(
+            first[0],
+            0xFF,
+            "server error for `{sql}`: {:?}",
+            String::from_utf8_lossy(&first)
+        );
+        assert_ne!(first[0], 0x00, "expected a result set for `{sql}`, got an OK packet");
+
+        let mut pos = 0;
+        let ncols = read_lenenc(&first, &mut pos) as usize;
+
+        // Column definitions (only the name is interesting here).
+        let mut names = Vec::with_capacity(ncols);
+        for _ in 0..ncols {
+            let (_s, def) = self.read_packet().await;
+            let mut dp = 0;
+            let _catalog = read_lenenc_slice(&def, &mut dp);
+            let _schema = read_lenenc_slice(&def, &mut dp);
+            let _table = read_lenenc_slice(&def, &mut dp);
+            let _org_table = read_lenenc_slice(&def, &mut dp);
+            let name = read_lenenc_slice(&def, &mut dp);
+            names.push(String::from_utf8_lossy(name).into_owned());
+        }
+
+        // EOF after defs (we do not set CLIENT_DEPRECATE_EOF).
+        let (_s, eof) = self.read_packet().await;
+        assert_eq!(eof[0], 0xFE, "expected EOF after column defs");
+
+        // Text rows (length-encoded strings, 0xFB = NULL) until EOF.
+        let mut rows: Vec<TextRow> = Vec::new();
+        loop {
+            let (_s, pkt) = self.read_packet().await;
+            if pkt[0] == 0xFE && pkt.len() < 9 {
+                break;
+            }
+            let mut vp = 0;
+            let mut row: TextRow = Vec::with_capacity(ncols);
+            for _ in 0..ncols {
+                if pkt[vp] == 0xFB {
+                    vp += 1;
+                    row.push(None);
+                } else {
+                    let value = read_lenenc_slice(&pkt, &mut vp);
+                    row.push(Some(String::from_utf8_lossy(value).into_owned()));
+                }
+            }
+            rows.push(row);
+        }
+
+        (names, rows)
+    }
+}
+
+#[tokio::test]
+async fn hdb007_com_query_preserves_literal_payloads() {
+    let db = test_db();
+    let mut client = MySqlTestClient::connect(Arc::clone(&db)).await;
+
+    client
+        .query_ok("CREATE TABLE hdb007_literals (id INT PRIMARY KEY, payload TEXT)")
+        .await;
+
+    for (i, payload) in HDB007_PAYLOADS.into_iter().enumerate() {
+        let sql = format!(
+            "INSERT INTO hdb007_literals (id, payload) VALUES ({}, {})",
+            i + 1,
+            quote_literal(payload)
+        );
+        let affected = client.query_ok(&sql).await;
+        assert_eq!(affected, 1, "insert of `{payload}` must affect one row");
+    }
+
+    // 1. Read back through the embedded API (no MySQL codec involved).
+    let read_back = "SELECT payload FROM hdb007_literals ORDER BY id";
+    let rows = db.query(read_back, &[]).unwrap();
+    assert_eq!(rows.len(), HDB007_PAYLOADS.len());
+    for (row, payload) in rows.iter().zip(HDB007_PAYLOADS) {
+        assert_eq!(
+            row.values[0],
+            Value::String(payload.into()),
+            "payload was rewritten on the way in: {payload}"
+        );
+    }
+
+    // 2. Read back over the wire.
+    let (cols, wire_rows) = client.query_text(read_back).await;
+    assert_eq!(cols, vec!["payload"]);
+    let got: Vec<String> = wire_rows
+        .into_iter()
+        .map(|row| row[0].clone().unwrap_or_default())
+        .collect();
+    let expected: Vec<String> = HDB007_PAYLOADS.into_iter().map(String::from).collect();
+    assert_eq!(got, expected, "payloads must come back byte-identical");
+}
+
+#[tokio::test]
+async fn hdb007_prepared_text_literal_and_bound_param_both_survive() {
+    let db = test_db();
+    let mut client = MySqlTestClient::connect(Arc::clone(&db)).await;
+
+    client
+        .query_ok("CREATE TABLE hdb007_prepared (id INT PRIMARY KEY, bound TEXT, lit TEXT)")
+        .await;
+
+    // COM_STMT_PREPARE translates the statement text, so the literal here took
+    // the same rewrite the COM_QUERY path did ('LIMIT 5, 10' → 'LIMIT 10 OFFSET 5').
+    let (stmt, n) = client
+        .prepare("INSERT INTO hdb007_prepared VALUES (?, ?, 'LIMIT 5, 10')")
+        .await;
+    assert_eq!(n, 2, "only the two `?` are parameters");
+
+    let affected = client
+        .execute_ok(stmt, &[BinParam::Long(1), BinParam::Str("IFNULL(a,b)")])
+        .await;
+    assert_eq!(affected, 1);
+
+    let rows = db.query("SELECT bound, lit FROM hdb007_prepared", &[]).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].values[0],
+        Value::String("IFNULL(a,b)".into()),
+        "bound parameter must not be translated"
+    );
+    assert_eq!(
+        rows[0].values[1],
+        Value::String("LIMIT 5, 10".into()),
+        "literal inside the prepared text must not be translated"
+    );
+}
+
+#[tokio::test]
+async fn hdb007_mysql_syntax_outside_literals_still_translates() {
+    let db = test_db();
+    let mut client = MySqlTestClient::connect(Arc::clone(&db)).await;
+
+    // AUTO_INCREMENT and TINYINT(1) outside any literal must still translate.
+    client
+        .query_ok("CREATE TABLE hdb007_ddl (id INT AUTO_INCREMENT PRIMARY KEY, flag TINYINT(1), note TEXT)")
+        .await;
+
+    let affected = client
+        .query_ok("INSERT INTO hdb007_ddl (flag, note) VALUES (1, 'TINYINT(1)')")
+        .await;
+    assert_eq!(affected, 1);
+
+    // `LIMIT 0, 1` outside the literal must still become LIMIT 1 OFFSET 0.
+    let (_cols, rows) = client.query_text("SELECT note FROM hdb007_ddl LIMIT 0, 1").await;
+    assert_eq!(rows.len(), 1, "MySQL LIMIT offset,count must still translate");
+    assert_eq!(
+        rows[0][0].as_deref(),
+        Some("TINYINT(1)"),
+        "the stored literal must be the MySQL text, not BOOLEAN"
+    );
+}

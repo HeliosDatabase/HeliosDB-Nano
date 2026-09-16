@@ -6,6 +6,7 @@
 #![allow(unreachable_patterns)]
 
 use super::cost::{ColumnStats, CostEstimator};
+use crate::sql::evaluator::Evaluator;
 use crate::sql::logical_plan::{BinaryOperator, LogicalExpr, LogicalPlan};
 use crate::Result;
 use std::collections::HashSet;
@@ -1156,6 +1157,45 @@ impl ConstantFoldingRule {
         Self
     }
 
+    /// Wrap the `i64` result of an `Int4 op Int4` fold exactly as the runtime
+    /// evaluator does.
+    ///
+    /// The runtime arms — `Evaluator::arithmetic_add` (src/sql/evaluator.rs:4238),
+    /// `arithmetic_subtract` (:4405), `arithmetic_multiply` (:4576) and
+    /// `arithmetic_divide` (:4716) — all share one shape: widen both operands to
+    /// `i64`, apply the operator, then narrow back to `Int4` when the result fits
+    /// and keep `Int8` when it does not. Folding must produce the same value for
+    /// the same operands, so it computes in `i64` too. Two `i32` operands can
+    /// never overflow an `i64` under `+ - * /` (|i32 * i32| <= 2^62), so the
+    /// widened arithmetic is total and the fold cannot fail at plan time.
+    fn int4_arith_literal(result: i64) -> LogicalExpr {
+        match i32::try_from(result) {
+            Ok(narrowed) => LogicalExpr::Literal(crate::Value::Int4(narrowed)),
+            Err(_) => LogicalExpr::Literal(crate::Value::Int8(result)),
+        }
+    }
+
+    /// Wrap the result of a folded comparison.
+    ///
+    /// SQL comparisons are three-valued, so `compare_values` answers `NULL`
+    /// whenever either operand is NULL. A bare `NULL` literal, however, infers
+    /// as TEXT, while `LogicalExpr::Cast` yields its own `data_type`
+    /// (src/sql/type_inference.rs:198) — and PostgreSQL clients expect a
+    /// comparison column to be described as `bool`. So a NULL comparison result
+    /// is wrapped in a Boolean cast, which `Evaluator::cast_value`
+    /// (src/sql/evaluator.rs:5511) evaluates straight back to `Value::Null`
+    /// because it short-circuits NULL for every target type.
+    fn comparison_literal(value: crate::Value) -> LogicalExpr {
+        if matches!(&value, crate::Value::Null) {
+            LogicalExpr::Cast {
+                expr: Box::new(LogicalExpr::Literal(crate::Value::Null)),
+                data_type: crate::DataType::Boolean,
+            }
+        } else {
+            LogicalExpr::Literal(value)
+        }
+    }
+
     /// Try to fold an expression to a constant
     fn fold_expr(expr: LogicalExpr) -> Result<LogicalExpr> {
         match expr {
@@ -1167,35 +1207,48 @@ impl ConstantFoldingRule {
                 // If both sides are literals, try to evaluate
                 if let (LogicalExpr::Literal(left_val), LogicalExpr::Literal(right_val)) = (&left, &right) {
                     match op {
+                        // Arithmetic: the crate builds with overflow-checks, so folding in
+                        // `i32` aborted the process on `2147483647 + 1`. Widen to `i64` and
+                        // narrow exactly as the runtime arms do (`int4_arith_literal`).
                         BinaryOperator::Plus => {
                             if let (crate::Value::Int4(l), crate::Value::Int4(r)) = (left_val, right_val) {
-                                return Ok(LogicalExpr::Literal(crate::Value::Int4(l + r)));
+                                return Ok(Self::int4_arith_literal(i64::from(*l) + i64::from(*r)));
                             }
                         }
                         BinaryOperator::Minus => {
                             if let (crate::Value::Int4(l), crate::Value::Int4(r)) = (left_val, right_val) {
-                                return Ok(LogicalExpr::Literal(crate::Value::Int4(l - r)));
+                                return Ok(Self::int4_arith_literal(i64::from(*l) - i64::from(*r)));
                             }
                         }
                         BinaryOperator::Multiply => {
                             if let (crate::Value::Int4(l), crate::Value::Int4(r)) = (left_val, right_val) {
-                                return Ok(LogicalExpr::Literal(crate::Value::Int4(l * r)));
+                                return Ok(Self::int4_arith_literal(i64::from(*l) * i64::from(*r)));
                             }
                         }
                         BinaryOperator::Divide => {
                             if let (crate::Value::Int4(l), crate::Value::Int4(r)) = (left_val, right_val) {
+                                // `x / 0` stays unfolded so the runtime raises "Division by
+                                // zero" only if execution actually reaches the expression.
                                 if *r != 0 {
-                                    return Ok(LogicalExpr::Literal(crate::Value::Int4(l / r)));
+                                    return Ok(Self::int4_arith_literal(i64::from(*l) / i64::from(*r)));
                                 }
                             }
                         }
+                        // Comparisons: `Value`'s derived `PartialEq` is Rust equality, not SQL
+                        // (`NULL = NULL` was TRUE, `1 = NULL` FALSE, `1 = 1.0` FALSE). Delegate
+                        // to the very function the runtime uses so a fold cannot disagree with
+                        // an unfolded evaluation of the same operands.
                         BinaryOperator::Eq => {
-                            let result = left_val == right_val;
-                            return Ok(LogicalExpr::Literal(crate::Value::Boolean(result)));
+                            // Err (an incomparable pair) leaves the expression unfolded: the
+                            // runtime then raises the error only if execution reaches it.
+                            if let Ok(v) = Evaluator::compare_values(left_val, right_val, |o| o.is_eq()) {
+                                return Ok(Self::comparison_literal(v));
+                            }
                         }
                         BinaryOperator::NotEq => {
-                            let result = left_val != right_val;
-                            return Ok(LogicalExpr::Literal(crate::Value::Boolean(result)));
+                            if let Ok(v) = Evaluator::compare_values(left_val, right_val, |o| o.is_ne()) {
+                                return Ok(Self::comparison_literal(v));
+                            }
                         }
                         BinaryOperator::And => {
                             if let (crate::Value::Boolean(l), crate::Value::Boolean(r)) = (left_val, right_val) {
@@ -1230,7 +1283,14 @@ impl ConstantFoldingRule {
                         }
                         crate::sql::logical_plan::UnaryOperator::Minus => {
                             if let crate::Value::Int4(i) = val {
-                                return Ok(LogicalExpr::Literal(crate::Value::Int4(-i)));
+                                // `-i32::MIN` overflows. The runtime
+                                // (`Evaluator::evaluate_unary_op`, src/sql/evaluator.rs:3630)
+                                // answers Err("integer overflow: INT negation"); folding leaves
+                                // the expression alone so that error is raised at run time
+                                // instead of aborting the planner.
+                                if let Some(negated) = i.checked_neg() {
+                                    return Ok(LogicalExpr::Literal(crate::Value::Int4(negated)));
+                                }
                             }
                         }
                         crate::sql::logical_plan::UnaryOperator::Plus => {
@@ -2002,6 +2062,181 @@ mod tests {
         let folded = ConstantFoldingRule::fold_expr(expr).unwrap();
 
         assert!(matches!(folded, LogicalExpr::Literal(Value::Boolean(false))));
+    }
+
+    /// Fold `expr`, turning an overflow panic from a regressed fold into a test
+    /// failure instead of an aborted test process. The pre-fix code did raw `i32`
+    /// arithmetic and the crate builds with overflow-checks, so `2147483647 + 1`
+    /// unwound at PLAN time (embedded/REPL mode: exit 101).
+    fn fold_without_panicking(expr: LogicalExpr, what: &str) -> LogicalExpr {
+        let fold = std::panic::AssertUnwindSafe(|| ConstantFoldingRule::fold_expr(expr));
+        std::panic::catch_unwind(fold)
+            .unwrap_or_else(|_| panic!("constant folding {what} panicked at plan time"))
+            .unwrap()
+    }
+
+    fn lit_binary(left: Value, op: BinaryOperator, right: Value) -> LogicalExpr {
+        LogicalExpr::BinaryExpr {
+            left: Box::new(LogicalExpr::Literal(left)),
+            op,
+            right: Box::new(LogicalExpr::Literal(right)),
+        }
+    }
+
+    fn unary_minus(value: Value) -> LogicalExpr {
+        LogicalExpr::UnaryExpr {
+            op: UnaryOperator::Minus,
+            expr: Box::new(LogicalExpr::Literal(value)),
+        }
+    }
+
+    /// HDB-006. `Int4 op Int4` folded with raw `i32` arithmetic, so any overflowing
+    /// literal expression killed the planner. The fold must mirror the runtime arms
+    /// (`Evaluator::arithmetic_add` src/sql/evaluator.rs:4238, `arithmetic_subtract`
+    /// :4405, `arithmetic_multiply` :4576): widen to `i64`, narrow back to `Int4`
+    /// only when the result fits, otherwise answer `Int8`.
+    #[test]
+    fn test_constant_folding_int4_overflow_matches_runtime_promotion() {
+        let cases = [
+            (i32::MAX, BinaryOperator::Plus, 1, Value::Int8(2_147_483_648)),
+            (i32::MIN, BinaryOperator::Minus, 1, Value::Int8(-2_147_483_649)),
+            (1_073_741_824, BinaryOperator::Multiply, 2, Value::Int8(2_147_483_648)),
+            (
+                i32::MAX,
+                BinaryOperator::Multiply,
+                i32::MAX,
+                Value::Int8(4_611_686_014_132_420_609),
+            ),
+        ];
+
+        for (l, op, r, expected) in cases {
+            let what = format!("{l} {op:?} {r}");
+            let folded = fold_without_panicking(lit_binary(Value::Int4(l), op, Value::Int4(r)), &what);
+            assert_eq!(folded, LogicalExpr::Literal(expected), "{what}");
+        }
+
+        // In-range arithmetic still folds to Int4, exactly as the runtime narrows it.
+        let in_range = lit_binary(Value::Int4(2), BinaryOperator::Plus, Value::Int4(3));
+        assert_eq!(
+            fold_without_panicking(in_range, "2 + 3"),
+            LogicalExpr::Literal(Value::Int4(5))
+        );
+    }
+
+    /// HDB-006. `i32::MIN / -1` overflows in `i32`; the runtime's `arithmetic_divide`
+    /// Int4/Int4 arm (src/sql/evaluator.rs:4716) computes in `i64` and narrows, so it
+    /// yields `Int8(2147483648)`. `x / 0` must stay unfolded so the runtime — not the
+    /// planner — raises "Division by zero".
+    #[test]
+    fn test_constant_folding_division_matches_runtime() {
+        let min_over_minus_one = lit_binary(Value::Int4(i32::MIN), BinaryOperator::Divide, Value::Int4(-1));
+        assert_eq!(
+            fold_without_panicking(min_over_minus_one, "i32::MIN / -1"),
+            LogicalExpr::Literal(Value::Int8(2_147_483_648)),
+            "arithmetic_divide's Int4/Int4 arm widens to i64 and keeps Int8 when the result \
+             does not fit i32, so i32::MIN / -1 is Int8(2147483648)"
+        );
+
+        let div_by_zero = lit_binary(Value::Int4(1), BinaryOperator::Divide, Value::Int4(0));
+        assert_eq!(
+            ConstantFoldingRule::fold_expr(div_by_zero.clone()).unwrap(),
+            div_by_zero,
+            "1 / 0 must stay a BinaryExpr so the runtime raises Division by zero"
+        );
+    }
+
+    /// HDB-006. `-(i32::MIN)` overflows. The runtime (`Evaluator::evaluate_unary_op`,
+    /// src/sql/evaluator.rs:3630) answers Err("integer overflow: INT negation") via
+    /// `checked_neg`, so the fold must leave the expression alone rather than abort.
+    #[test]
+    fn test_constant_folding_unary_minus_overflow_stays_unfolded() {
+        let min = unary_minus(Value::Int4(i32::MIN));
+        assert_eq!(
+            fold_without_panicking(min.clone(), "-(i32::MIN)"),
+            min,
+            "-(i32::MIN) must stay a UnaryExpr so the runtime raises the negation overflow"
+        );
+
+        assert_eq!(
+            fold_without_panicking(unary_minus(Value::Int4(5)), "-(5)"),
+            LogicalExpr::Literal(Value::Int4(-5))
+        );
+    }
+
+    /// HDB-010. `Eq`/`NotEq` folded with `Value`'s DERIVED `PartialEq` — Rust
+    /// equality, not SQL — so `NULL = NULL` was TRUE and `1 = NULL` FALSE. SQL is
+    /// three-valued: `Evaluator::compare_values` (src/sql/evaluator.rs:3786) answers
+    /// NULL when either side is NULL. The folded expression must evaluate to NULL AND
+    /// still be described as `bool`, hence the Boolean cast — a bare NULL literal
+    /// infers as TEXT, while a Cast yields its own type (src/sql/type_inference.rs:198).
+    #[test]
+    fn test_constant_folding_null_comparison_is_boolean_typed_null() {
+        use crate::sql::TypeInference;
+
+        let empty_schema = Schema::new(Vec::new());
+        let boolean_null = LogicalExpr::Cast {
+            expr: Box::new(LogicalExpr::Literal(Value::Null)),
+            data_type: DataType::Boolean,
+        };
+        let null_pairs = [
+            (Value::Null, Value::Null),
+            (Value::Null, Value::Int4(1)),
+            (Value::Int4(1), Value::Null),
+        ];
+
+        for op in [BinaryOperator::Eq, BinaryOperator::NotEq] {
+            for (left, right) in &null_pairs {
+                let expr = lit_binary(left.clone(), op, right.clone());
+                let folded = ConstantFoldingRule::fold_expr(expr).unwrap();
+                assert_eq!(folded, boolean_null, "{left:?} {op:?} {right:?}");
+                assert_eq!(
+                    folded.infer_type(&empty_schema).unwrap(),
+                    DataType::Boolean,
+                    "a comparison column must be described as bool, not text"
+                );
+            }
+        }
+    }
+
+    /// HDB-010. Derived `PartialEq` made `Int4(1) = Numeric("1.0")` FALSE, while the
+    /// runtime coerces across numeric types (`compare_values`' Int4/Numeric arm,
+    /// src/sql/evaluator.rs:3880) and answers TRUE.
+    #[test]
+    fn test_constant_folding_cross_type_equality_matches_runtime() {
+        let numeric = Value::Numeric("1.0".to_string());
+        let eq = lit_binary(Value::Int4(1), BinaryOperator::Eq, numeric.clone());
+        let ne = lit_binary(Value::Int4(1), BinaryOperator::NotEq, numeric);
+
+        assert_eq!(
+            ConstantFoldingRule::fold_expr(eq).unwrap(),
+            LogicalExpr::Literal(Value::Boolean(true))
+        );
+        assert_eq!(
+            ConstantFoldingRule::fold_expr(ne).unwrap(),
+            LogicalExpr::Literal(Value::Boolean(false))
+        );
+    }
+
+    /// A non-NULL comparison still folds to a plain boolean literal — the Boolean cast
+    /// is only for the three-valued NULL result. `compare_values` has a Boolean/Boolean
+    /// arm (src/sql/evaluator.rs:3992).
+    #[test]
+    fn test_constant_folding_boolean_equality_still_folds() {
+        let expr = lit_binary(Value::Boolean(true), BinaryOperator::Eq, Value::Boolean(true));
+        assert_eq!(
+            ConstantFoldingRule::fold_expr(expr).unwrap(),
+            LogicalExpr::Literal(Value::Boolean(true))
+        );
+    }
+
+    /// HDB-010. A pair `compare_values` cannot order falls through to its trailing arm
+    /// (src/sql/evaluator.rs:4124, "Cannot compare …"). Folding must then leave the
+    /// expression alone: a plan-time error would reject a whole statement whose
+    /// comparison may never be evaluated.
+    #[test]
+    fn test_constant_folding_incomparable_pair_stays_unfolded() {
+        let expr = lit_binary(Value::Int4(1), BinaryOperator::Eq, Value::Vector(Vec::new()));
+        assert_eq!(ConstantFoldingRule::fold_expr(expr.clone()).unwrap(), expr);
     }
 
     #[test]

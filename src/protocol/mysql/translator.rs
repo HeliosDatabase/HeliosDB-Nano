@@ -4,27 +4,45 @@
 //! This enables WordPress and other MySQL applications to work with HeliosDB Nano.
 
 use regex::Regex;
+use std::collections::HashMap;
 use std::sync::OnceLock;
 
 /// Initialize a static regex pattern.
 ///
 /// All patterns are compile-time string literals; invalid patterns cause
 /// immediate startup failure (fail-fast), posing zero runtime risk.
+///
+/// The one non-standard escape is `\i`, which expands to [`IDENT_SLOT`]: an
+/// identifier-name slot that also accepts a masking placeholder (HDB-007).
+/// `\i` is not a valid `regex` escape, so it can never collide with a real
+/// pattern.
 #[allow(clippy::expect_used)]
 fn init_regex(pattern: &str) -> Regex {
-    Regex::new(pattern).expect("static regex pattern must be valid")
+    Regex::new(&pattern.replace(r"\i", IDENT_SLOT)).expect("static regex pattern must be valid")
 }
 
 /// Translate MySQL SQL to PostgreSQL-compatible SQL.
+///
+/// Every pass after `translate_backticks` is a `Regex::replace_all` over the
+/// whole statement, so on its own it would happily rewrite MySQL keywords that
+/// appear *inside* string literals, quoted identifiers or comments — HDB-007:
+/// `INSERT INTO t VALUES ('TINYINT(1)')` used to store `BOOLEAN`, and
+/// `'WHERE 1=1 AND x'` used to lose its tautology.  Those regions are therefore
+/// masked with an opaque placeholder before the regex passes run and restored
+/// verbatim afterwards (see `mask_protected_regions`).
 pub fn translate(sql: &str) -> String {
-    let mut result = sql.to_string();
+    // Backslash escapes MUST be processed first — before masking and backtick
+    // translation — so we can distinguish backslash-escaped quotes inside string
+    // literals from identifier delimiters.  Afterwards every literal is `'…'`
+    // with `''` doubling and no backslash-escaped quote.
+    let normalized = translate_backslash_escapes(sql);
 
-    // Apply transformations in order.
-    // Backslash escapes MUST be processed first — before backtick translation
-    // — so we can distinguish backslash-escaped quotes inside string literals
-    // from identifier delimiters.
-    result = translate_backslash_escapes(&result);
-    result = translate_backticks(&result);
+    // Hide string literals, quoted identifiers and comments from the regex
+    // passes; `regions` keeps their exact bytes for the final restore.
+    let (masked, regions) = mask_protected_regions(&normalized);
+
+    // Apply transformations in order, on the masked text.
+    let mut result = translate_backticks(&masked);
     result = translate_types(&result);
     result = translate_auto_increment(&result);
     result = translate_charset_collation(&result);
@@ -38,7 +56,7 @@ pub fn translate(sql: &str) -> String {
     result = translate_alter_table_keys(&result);
     result = translate_misc(&result);
 
-    result
+    unmask_protected_regions(&result, &regions)
 }
 
 // ---------------------------------------------------------------------------
@@ -60,96 +78,120 @@ pub fn translate(sql: &str) -> String {
 ///   `\t` → tab
 ///   `\0` → NUL  (stripped — Postgres can't store NUL in text)
 ///   `\'` left unchanged (already handled by the SQL parser as `''`)
+///
+/// Comments (`--`, `#`, `/* … */`, `/*! … */`) and backtick-quoted identifiers
+/// are copied through byte-for-byte: an apostrophe inside one of them is part
+/// of that region, and must not open a phantom string literal that then
+/// "closes" on the next *real* quote — which used to escape-process the
+/// following literal's bytes (`` `it's_col` = 'a = "b" c' `` came back as
+/// `'a = 'b' c'`).  What counts as a comment is [`comment_len`], the same rule
+/// `mask_protected_regions` applies one step later.
 fn translate_backslash_escapes(sql: &str) -> String {
     let mut out = String::with_capacity(sql.len());
-    let mut chars = sql.chars().peekable();
+    let mut cursor = 0usize;
+    // The character immediately before `cursor` (`None` at the start), which is
+    // what `comment_len` needs to tell `<#>` from the start of a `#` comment.
+    let mut prev: Option<char> = None;
 
-    while let Some(ch) = chars.next() {
-        if ch == '\'' {
+    while cursor < sql.len() {
+        let rest = &sql[cursor..];
+        let ch = first_char(rest);
+
+        // Bytes consumed by this step; every arm consumes at least one.
+        let consumed = if let Some(comment) = comment_len(rest, prev) {
+            // Comment (executable ones included): copied through untouched.
+            out.push_str(&rest[..comment]);
+            comment
+        } else if ch == '`' {
+            // Backtick-quoted identifier: copied through untouched; the
+            // delimiters are stripped later by `translate_backticks`.
+            let (_, ident_len, _) = scan_quoted_region(rest, '`', false);
+            out.push_str(&rest[..ident_len]);
+            ident_len
+        } else if ch == '\'' {
             // Enter single-quoted string literal
             out.push('\'');
-            process_string_interior(&mut out, &mut chars, '\'');
+            ch.len_utf8() + process_string_interior(&mut out, &rest[1..], '\'')
         } else if ch == '"' && looks_like_mysql_string_context(&out) {
             // MySQL double-quoted string literal (not an identifier).
             // Convert to single-quoted for PostgreSQL compatibility.
             // Context check: after VALUES(, SET =, etc. — not after FROM/TABLE/INTO
             out.push('\'');
-            process_string_interior(&mut out, &mut chars, '"');
+            ch.len_utf8() + process_string_interior(&mut out, &rest[1..], '"')
         } else {
             out.push(ch);
-        }
+            ch.len_utf8()
+        };
+
+        prev = rest[..consumed].chars().next_back();
+        cursor += consumed;
     }
 
     out
 }
 
 /// Process the interior of a string literal (single or double-quoted).
-/// Handles backslash escapes and outputs content between the open/close quotes.
-fn process_string_interior(out: &mut String, chars: &mut std::iter::Peekable<std::str::Chars<'_>>, quote_char: char) {
-    loop {
-        match chars.next() {
-            Some('\\') => {
-                match chars.peek() {
-                    Some('"') => {
-                        out.push('"');
-                        chars.next();
-                    }
-                    Some('\\') => {
-                        out.push('\\');
-                        chars.next();
-                    }
-                    Some('n') => {
-                        out.push('\n');
-                        chars.next();
-                    }
-                    Some('r') => {
-                        out.push('\r');
-                        chars.next();
-                    }
-                    Some('t') => {
-                        out.push('\t');
-                        chars.next();
-                    }
-                    Some('0') => {
-                        chars.next(); // strip NUL
-                    }
-                    Some('\'') => {
-                        // \' → '' for PG
-                        out.push('\'');
-                        out.push('\'');
-                        chars.next();
-                    }
-                    _ => {
-                        out.push('\\');
-                    }
-                }
-            }
-            Some(c) if c == quote_char => {
-                // Check for doubled escape ('' or "")
-                if chars.peek() == Some(&quote_char) {
-                    if quote_char == '\'' {
-                        out.push('\'');
-                        out.push('\'');
-                    } else {
-                        // "" inside double-quoted string → single " in output
-                        out.push('"');
-                    }
-                    chars.next();
-                } else {
-                    // End of string — always close with single quote (PG style)
-                    out.push('\'');
-                    break;
-                }
-            }
-            Some('\'') if quote_char == '"' => {
-                // Single quote inside a double-quoted string → escape for PG
-                out.push('\'');
-                out.push('\'');
-            }
-            Some(c) => out.push(c),
-            None => break,
+///
+/// `rest` starts immediately *after* the opening delimiter.  Handles backslash
+/// escapes, writes the PostgreSQL spelling of the content (and of the closing
+/// quote) to `out`, and returns the number of bytes of `rest` consumed —
+/// including the closing delimiter when there is one, or all of `rest` for an
+/// unterminated literal.
+fn process_string_interior(out: &mut String, rest: &str, quote_char: char) -> usize {
+    let mut cursor = 0usize;
+
+    while cursor < rest.len() {
+        let ch = first_char(&rest[cursor..]);
+        let ch_len = ch.len_utf8();
+        let after = &rest[cursor + ch_len..];
+
+        if ch == '\\' {
+            // `(replacement, extra bytes consumed after the backslash)`; every
+            // recognised escape character is one ASCII byte.
+            let (replacement, extra): (&str, usize) = match after.chars().next() {
+                Some('"') => ("\"", 1),
+                Some('\\') => ("\\", 1),
+                Some('n') => ("\n", 1),
+                Some('r') => ("\r", 1),
+                Some('t') => ("\t", 1),
+                Some('0') => ("", 1),    // strip NUL
+                Some('\'') => ("''", 1), // \' → '' for PG
+                _ => ("\\", 0),          // not an escape (or end of input)
+            };
+            out.push_str(replacement);
+            cursor += ch_len + extra;
+            continue;
         }
+
+        if ch == quote_char {
+            // Check for doubled escape ('' or "")
+            if after.starts_with(quote_char) {
+                if quote_char == '\'' {
+                    out.push_str("''");
+                } else {
+                    // "" inside double-quoted string → single " in output
+                    out.push('"');
+                }
+                cursor += ch_len * 2;
+                continue;
+            }
+            // End of string — always close with single quote (PG style)
+            out.push('\'');
+            return cursor + ch_len;
+        }
+
+        if ch == '\'' && quote_char == '"' {
+            // Single quote inside a double-quoted string → escape for PG
+            out.push_str("''");
+            cursor += ch_len;
+            continue;
+        }
+
+        out.push(ch);
+        cursor += ch_len;
     }
+
+    cursor
 }
 
 /// Heuristic: does the current output context suggest a string value (not an identifier)?
@@ -168,6 +210,301 @@ fn looks_like_mysql_string_context(out: &str) -> bool {
         || trimmed.to_uppercase().ends_with("WHERE")
         || trimmed.to_uppercase().ends_with("AND")
         || trimmed.to_uppercase().ends_with("OR")
+}
+
+// ---------------------------------------------------------------------------
+// 0b. Protected-region masking (HDB-007)
+// ---------------------------------------------------------------------------
+
+/// Opening sentinel of a masked-region placeholder.
+const PLACEHOLDER_OPEN: char = '\u{E000}';
+/// Closing sentinel of a masked-region placeholder.
+const PLACEHOLDER_CLOSE: char = '\u{E001}';
+/// Code point of placeholder digit `0`; decimal digit `d` is `BASE + d`.
+const PLACEHOLDER_DIGIT_BASE: u32 = 0xE010;
+/// One past the last placeholder digit code point.
+const PLACEHOLDER_DIGIT_END: u32 = PLACEHOLDER_DIGIT_BASE + 10;
+
+/// Character class for a slot that holds an identifier *name*.
+///
+/// A backtick-quoted identifier is masked (so `` `TINYINT` `` is not rewritten
+/// to `SMALLINT`), which leaves a placeholder where `\w+` used to match the
+/// bare name.  The few patterns that must still recognise such a name — the
+/// `KEY` / `UNIQUE KEY` / `ADD KEY` index names, the multi-table `DELETE`
+/// table and alias names, and `VALUES(col)` inside `ON DUPLICATE KEY UPDATE` —
+/// use this class instead of `\w`, so `` KEY `post_name` (`post_name`(191)) ``
+/// is still stripped after masking.  Nothing else opts in: every other pattern
+/// keeps plain `\w`/`\b`, which private-use code points never match.
+const IDENT_SLOT: &str = r"[\w\x{E000}-\x{E01F}]";
+
+/// Is `ch` one of the private-use code points the placeholder encoding owns?
+fn is_placeholder_char(ch: char) -> bool {
+    let cp = u32::from(ch);
+    ch == PLACEHOLDER_OPEN || ch == PLACEHOLDER_CLOSE || (PLACEHOLDER_DIGIT_BASE..PLACEHOLDER_DIGIT_END).contains(&cp)
+}
+
+/// First character of `rest`.
+///
+/// Every caller holds `!rest.is_empty()` from its own loop guard, so the
+/// fallback is unreachable; and were it reached, `\0` is copied through
+/// exactly like any other character.
+fn first_char(rest: &str) -> char {
+    rest.chars().next().unwrap_or('\0')
+}
+
+/// Length of the comment that starts at the beginning of `rest`, if any.
+///
+/// `--` and `#` run to the end of the line (the newline is not part of the
+/// comment); `/* … */` runs through the closing `*/` (or to the end of input,
+/// for an unterminated comment).  A `#` is a comment marker only when it is
+/// not the `#` of `<#>`, `#>`, `#>>` or `#-` — PostgreSQL operators (vector
+/// negative inner product and the JSON path operators) that Nano also accepts
+/// over the MySQL wire; `prev` is the character before `rest`, if any.
+///
+/// This is the single definition of "comment" shared by
+/// `translate_backslash_escapes` (which copies comments through untouched) and
+/// `mask_protected_regions` (which hides them from the regex passes), so the
+/// two can never disagree about where a comment starts or ends.
+fn comment_len(rest: &str, prev: Option<char>) -> Option<usize> {
+    if let Some(tail) = rest.strip_prefix("/*") {
+        return Some(tail.find("*/").map_or(rest.len(), |end| 2 + end + 2));
+    }
+
+    let line_comment = match rest.strip_prefix('#') {
+        Some(tail) => prev != Some('<') && !matches!(tail.chars().next(), Some('>' | '-')),
+        None => rest.starts_with("--"),
+    };
+
+    line_comment.then(|| rest.find('\n').unwrap_or(rest.len()))
+}
+
+/// Append the placeholder for region `index` to `out`.
+///
+/// Encoding: `U+E000`, the decimal index with digit `d` written as
+/// `U+E010 + d`, then `U+E001`.  Every code point lives in the Unicode
+/// private-use area, which the `regex` crate treats as neither `\w`, `\d` nor
+/// `\s` (and which is therefore not `\b`-relevant either).  No translation
+/// pattern below can match into, across, or on the digits of a placeholder,
+/// while patterns that key off the *surrounding* quote — `GROUP_CONCAT(… SEPARATOR
+/// '([^']*)')`, `\bBINARY\s+(')` — still see that quote.
+fn push_placeholder(out: &mut String, index: usize) {
+    out.push(PLACEHOLDER_OPEN);
+    for digit in index.to_string().chars() {
+        // `to_string` only ever yields ASCII digits, so the fallback is dead.
+        let value = digit.to_digit(10).unwrap_or(0);
+        if let Some(encoded) = char::from_u32(PLACEHOLDER_DIGIT_BASE + value) {
+            out.push(encoded);
+        }
+    }
+    out.push(PLACEHOLDER_CLOSE);
+}
+
+/// Store `content` as the next protected region and write its placeholder,
+/// wrapped in `open`/`close` when the region keeps its delimiters.
+///
+/// Regions are interned: a second occurrence of the same bytes reuses the
+/// first occurrence's index, so two spellings of one backtick-quoted alias
+/// (`` `t` `` in `AS `t`` and in `ON `t`.term_id`) stay textually equal on the
+/// masked text — `translate_multi_table_delete` compares them with
+/// `eq_ignore_ascii_case` and `table1 != table2`.
+fn push_masked_region(
+    out: &mut String,
+    regions: &mut Vec<String>,
+    interned: &mut HashMap<String, usize>,
+    open: Option<char>,
+    close: Option<char>,
+    content: &str,
+) {
+    let index = match interned.get(content) {
+        Some(index) => *index,
+        None => {
+            let index = regions.len();
+            regions.push(content.to_string());
+            interned.insert(content.to_string(), index);
+            index
+        }
+    };
+    if let Some(delim) = open {
+        out.push(delim);
+    }
+    push_placeholder(out, index);
+    if let Some(delim) = close {
+        out.push(delim);
+    }
+}
+
+/// Scan the quoted region that starts at the beginning of `rest`.
+///
+/// `rest` must start with `quote`.  Returns the interior (delimiters
+/// excluded), the byte length of the whole region and whether a closing
+/// delimiter was found.  With `doubling`, a doubled delimiter (`''` / `""`)
+/// belongs to the interior instead of closing the region — note that a
+/// backslash is *not* an escape here: `translate_backslash_escapes` has
+/// already turned `\'` into `''` and `\\` into `\`, so a literal may
+/// legitimately end with a backslash (`'a\'`).  Backticks do not double,
+/// which reproduces `translate_backticks`, which simply drops every backtick.
+fn scan_quoted_region(rest: &str, quote: char, doubling: bool) -> (&str, usize, bool) {
+    let quote_len = quote.len_utf8();
+    let mut cursor = quote_len;
+
+    while cursor < rest.len() {
+        let ch = first_char(&rest[cursor..]);
+        if ch == quote {
+            if doubling && rest[cursor + quote_len..].starts_with(quote) {
+                cursor += quote_len * 2;
+                continue;
+            }
+            return (&rest[quote_len..cursor], cursor + quote_len, true);
+        }
+        cursor += ch.len_utf8();
+    }
+
+    // Unterminated region: mask through the end of the input, keeping the opener.
+    (&rest[quote_len..], rest.len(), false)
+}
+
+/// Replace every region whose bytes must survive translation untouched with an
+/// opaque placeholder, returning the masked SQL and the region contents.
+///
+/// Grammar (one left-to-right scan, so the first opener wins: a comment marker
+/// inside a literal is literal text, a quote inside a comment is comment text):
+///
+/// | region | opens | closes |
+/// |---|---|---|
+/// | string literal | `'` | `'` not followed by `'` |
+/// | quoted identifier | `"` | `"` not followed by `"` |
+/// | backtick identifier | `` ` `` | `` ` `` |
+/// | line comment | `--` or `#` | end of line |
+/// | block comment | `/*` | `*/` |
+///
+/// Comments are exactly what [`comment_len`] says they are — in particular a
+/// `#` that belongs to the `<#>`, `#>`, `#>>` or `#-` operators is *not* a
+/// comment marker, so `emb <#> '[1,2,3]' LIMIT 0, 10` keeps its LIMIT.
+///
+/// `/*! … */` executable comments are the one exception: they are copied
+/// through unmasked *and unscanned*, so `EXEC_COMMENT_RE` in `translate_misc`
+/// keeps stripping them exactly as before.  Quoted regions keep their
+/// delimiters (patterns such as `\bBINARY\s+(')` still need to see them);
+/// comments are replaced by a bare placeholder and restored in full.
+///
+/// An unterminated literal / identifier / comment is masked through the end of
+/// the input (the opening delimiter is kept); nothing panics.  A stray
+/// placeholder code point in the client's SQL is masked as a one-character
+/// region of its own, so outside an unterminated `/*!` hint (copied through
+/// unscanned, after which the statement is unparsable anyway) the masked text
+/// only contains placeholders this function emitted.
+fn mask_protected_regions(sql: &str) -> (String, Vec<String>) {
+    let mut out = String::with_capacity(sql.len());
+    let mut regions: Vec<String> = Vec::new();
+    let mut interned: HashMap<String, usize> = HashMap::new();
+    let mut cursor = 0usize;
+    // The character immediately before `cursor` (`None` at the start), which is
+    // what `comment_len` needs to tell `<#>` from the start of a `#` comment.
+    let mut prev: Option<char> = None;
+
+    while cursor < sql.len() {
+        let rest = &sql[cursor..];
+        let ch = first_char(rest);
+
+        // Bytes consumed by this step; every arm consumes at least one.
+        let consumed = if rest.starts_with("/*!") {
+            // `/*! … */` — executable comment: stays visible to translate_misc.
+            let len = rest[3..].find("*/").map_or(rest.len(), |end| 3 + end + 2);
+            out.push_str(&rest[..len]);
+            len
+        } else if let Some(len) = comment_len(rest, prev) {
+            // `/* … */` block comment, or a `-- …` / `# …` line comment (the
+            // downstream parser treats `--` as a comment whatever follows it,
+            // so we do too).
+            push_masked_region(&mut out, &mut regions, &mut interned, None, None, &rest[..len]);
+            len
+        } else if ch == '\'' || ch == '"' || ch == '`' {
+            // String literal / quoted identifier / backtick identifier.
+            let (interior, len, closed) = scan_quoted_region(rest, ch, ch != '`');
+            let close = if closed { Some(ch) } else { None };
+            push_masked_region(&mut out, &mut regions, &mut interned, Some(ch), close, interior);
+            len
+        } else if is_placeholder_char(ch) {
+            // A stray placeholder code point from the client.
+            let len = ch.len_utf8();
+            push_masked_region(&mut out, &mut regions, &mut interned, None, None, &rest[..len]);
+            len
+        } else {
+            out.push(ch);
+            ch.len_utf8()
+        };
+
+        prev = rest[..consumed].chars().next_back();
+        cursor += consumed;
+    }
+
+    (out, regions)
+}
+
+/// Restore the regions `mask_protected_regions` hid.
+///
+/// A placeholder may appear more than once (a pattern copied a capture, as the
+/// multi-table `DELETE` rewrite does) or not at all (`ENUM('a','b')` collapses
+/// to `TEXT`); both are fine.  Anything that is not a well-formed placeholder
+/// for a known region is copied through verbatim, and restored text is never
+/// re-scanned, so a region whose contents themselves contain placeholder code
+/// points comes back byte-for-byte.
+fn unmask_protected_regions(masked: &str, regions: &[String]) -> String {
+    let mut out = String::with_capacity(masked.len());
+    let mut cursor = 0usize;
+
+    while cursor < masked.len() {
+        let rest = &masked[cursor..];
+        let ch = first_char(rest);
+        if ch != PLACEHOLDER_OPEN {
+            out.push(ch);
+            cursor += ch.len_utf8();
+            continue;
+        }
+
+        let mut scan = ch.len_utf8();
+        let mut index: u32 = 0;
+        let mut digits = 0usize;
+        let mut decoded = false;
+
+        while scan < rest.len() {
+            let next = first_char(&rest[scan..]);
+            let cp = u32::from(next);
+            if (PLACEHOLDER_DIGIT_BASE..PLACEHOLDER_DIGIT_END).contains(&cp) {
+                let digit = cp - PLACEHOLDER_DIGIT_BASE;
+                let Some(widened) = index.checked_mul(10).and_then(|scaled| scaled.checked_add(digit)) else {
+                    break;
+                };
+                index = widened;
+                digits += 1;
+                scan += next.len_utf8();
+            } else if next == PLACEHOLDER_CLOSE {
+                scan += next.len_utf8();
+                decoded = digits > 0;
+                break;
+            } else {
+                break;
+            }
+        }
+
+        let region = if decoded {
+            usize::try_from(index).ok().and_then(|i| regions.get(i))
+        } else {
+            None
+        };
+
+        if let Some(text) = region {
+            out.push_str(text);
+            cursor += scan;
+            continue;
+        }
+
+        // Not a placeholder we emitted — copy the sentinel and carry on.
+        out.push(ch);
+        cursor += ch.len_utf8();
+    }
+
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -407,7 +744,9 @@ fn translate_on_duplicate_key(sql: &str) -> String {
 /// Replace `VALUES(column_name)` references with `EXCLUDED.column_name`.
 fn translate_values_refs(clause: &str) -> String {
     static VALUES_REF_RE: OnceLock<Regex> = OnceLock::new();
-    let re = VALUES_REF_RE.get_or_init(|| init_regex(r"(?i)\bVALUES\s*\(\s*(\w+)\s*\)"));
+    // `\i` (not `\w`): the column may have arrived backtick-quoted and is then a
+    // masked placeholder by the time this pass runs.
+    let re = VALUES_REF_RE.get_or_init(|| init_regex(r"(?i)\bVALUES\s*\(\s*(\i+)\s*\)"));
     re.replace_all(clause, "EXCLUDED.$1").to_string()
 }
 
@@ -608,9 +947,11 @@ fn split_top_level_commas(s: &str) -> Vec<&str> {
 fn translate_multi_table_delete(sql: &str) -> String {
     // Match: DELETE <alias1>[, <alias2>...] FROM <table_spec> [JOIN ...] [WHERE ...]
     static MULTI_DEL_RE: OnceLock<Regex> = OnceLock::new();
+    // Table and alias names use `\i` (not `\w`): backtick-quoted names are
+    // masked placeholders by the time this pass runs.
     let re = MULTI_DEL_RE.get_or_init(|| {
         init_regex(
-            r"(?i)^(\s*DELETE)\s+\w+(?:\s*,\s*\w+)*\s+FROM\s+(\w+)\s+(?:AS\s+)?(\w+)\s+((?:INNER\s+)?JOIN\s+(\w+)\s+(?:AS\s+)?(\w+)\s+ON\s+(.+?))\s+(WHERE\s+.+)$"
+            r"(?i)^(\s*DELETE)\s+\i+(?:\s*,\s*\i+)*\s+FROM\s+(\i+)\s+(?:AS\s+)?(\i+)\s+((?:INNER\s+)?JOIN\s+(\i+)\s+(?:AS\s+)?(\i+)\s+ON\s+(.+?))\s+(WHERE\s+.+)$"
         )
     });
 
@@ -664,7 +1005,7 @@ fn translate_multi_table_delete(sql: &str) -> String {
     static COMMA_DEL_RE: OnceLock<Regex> = OnceLock::new();
     let comma_re = COMMA_DEL_RE.get_or_init(|| {
         init_regex(
-            r"(?is)^\s*DELETE\s+(\w+)\s*,\s*(\w+)\s+FROM\s+(\w+)\s+(?:AS\s+)?(\w+)\s*,\s*(\w+)\s+(?:AS\s+)?(\w+)\s+(WHERE\s+.+)$"
+            r"(?is)^\s*DELETE\s+(\i+)\s*,\s*(\i+)\s+FROM\s+(\i+)\s+(?:AS\s+)?(\i+)\s*,\s*(\i+)\s+(?:AS\s+)?(\i+)\s+(WHERE\s+.+)$"
         )
     });
 
@@ -757,7 +1098,9 @@ fn translate_key_indexes(sql: &str) -> String {
     // Captures: the comma prefix, the column list (with optional prefix lengths).
     // Group 1 = column parenthesised list (may contain nested parens for prefix lengths).
     static UNIQUE_KEY_RE: OnceLock<Regex> = OnceLock::new();
-    let re = UNIQUE_KEY_RE.get_or_init(|| init_regex(r"(?im),\s*UNIQUE\s+KEY\s+\w+\s*\(((?:[^()]*\([^)]*\))*[^)]*)\)"));
+    // The index name uses `\i` (not `\w`): WordPress spells it
+    // ``UNIQUE KEY `option_name` (...)``, which masking turns into a placeholder.
+    let re = UNIQUE_KEY_RE.get_or_init(|| init_regex(r"(?im),\s*UNIQUE\s+KEY\s+\i+\s*\(((?:[^()]*\([^)]*\))*[^)]*)\)"));
 
     let mut s = re
         .replace_all(sql, |caps: &regex::Captures<'_>| {
@@ -770,7 +1113,7 @@ fn translate_key_indexes(sql: &str) -> String {
 
     // Step 2: Remove plain (non-unique) KEY definitions.
     static KEY_LINE_RE: OnceLock<Regex> = OnceLock::new();
-    let re = KEY_LINE_RE.get_or_init(|| init_regex(r"(?im),\s*KEY\s+\w+\s*\((?:[^()]*\([^)]*\))*[^)]*\)"));
+    let re = KEY_LINE_RE.get_or_init(|| init_regex(r"(?im),\s*KEY\s+\i+\s*\((?:[^()]*\([^)]*\))*[^)]*\)"));
 
     s = re.replace_all(&s, "").to_string();
 
@@ -806,7 +1149,7 @@ fn translate_alter_table_keys(sql: &str) -> String {
     // Match: ALTER TABLE t ADD [UNIQUE] KEY|INDEX name (cols)
     static ALTER_KEY_RE: OnceLock<Regex> = OnceLock::new();
     let re = ALTER_KEY_RE
-        .get_or_init(|| init_regex(r"(?i)\bADD\s+(?:UNIQUE\s+)?(?:KEY|INDEX)\s+\w+\s*\((?:[^()]*\([^)]*\))*[^)]*\)"));
+        .get_or_init(|| init_regex(r"(?i)\bADD\s+(?:UNIQUE\s+)?(?:KEY|INDEX)\s+\i+\s*\((?:[^()]*\([^)]*\))*[^)]*\)"));
     if re.is_match(sql) {
         // Convert to no-op (silently succeed)
         return String::new();
@@ -1321,6 +1664,313 @@ mod tests {
         assert!(
             result.contains("BIGSERIAL"),
             "AUTO_INCREMENT should become BIGSERIAL: {result}"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // HDB-007: string literals, quoted identifiers and comments must not be
+    // rewritten by the MySQL→PostgreSQL passes.
+    // ---------------------------------------------------------------------
+
+    /// `INSERT INTO t VALUES ('<payload>')` with the payload escaped the way a
+    /// MySQL client escapes it (`'` → `''`).
+    fn insert_literal(payload: &str) -> String {
+        format!("INSERT INTO t VALUES ('{}')", payload.replace('\'', "''"))
+    }
+
+    #[test]
+    fn test_hdb007_literal_payloads_survive_verbatim() {
+        // Every one of these was rewritten inside the literal before HDB-007:
+        // 'TINYINT(1)' → 'BOOLEAN', 'WHERE 1=1 AND x' → 'WHERE x', …
+        let payloads = [
+            "TINYINT(1)",
+            "SELECT * LIMIT 5, 10",
+            "a AUTO_INCREMENT b",
+            "IFNULL(a,b)",
+            "WHERE 1=1 AND x",
+            "ON DUPLICATE KEY UPDATE x",
+            "DATE_SUB(NOW(), INTERVAL 1 DAY)",
+            "GROUP_CONCAT(x SEPARATOR ',')",
+            "ENGINE=InnoDB DEFAULT CHARSET=utf8",
+            "/*! hint */",
+            "-- not a comment",
+            "it's",
+            "IF(a,b,c)",
+            "STRAIGHT_JOIN",
+            "BINARY 'x'",
+        ];
+
+        for payload in payloads {
+            let sql = insert_literal(payload);
+            let result = translate(&sql);
+            assert_eq!(result, sql, "payload must survive byte-identical: {payload}");
+        }
+    }
+
+    #[test]
+    fn test_hdb007_escaped_quote_literal_then_on_duplicate_key() {
+        let sql = "INSERT INTO t VALUES ('it''s TINYINT(1)') ON DUPLICATE KEY UPDATE v = VALUES(v)";
+        let result = translate(sql);
+        assert!(
+            result.contains("'it''s TINYINT(1)'"),
+            "literal with a doubled quote must be intact: {result}"
+        );
+        assert!(
+            !result.contains("BOOLEAN"),
+            "TINYINT(1) inside the literal must not be translated: {result}"
+        );
+        assert!(
+            result.contains("ON CONFLICT DO UPDATE SET v = EXCLUDED.v"),
+            "MySQL syntax outside the literal must still translate: {result}"
+        );
+    }
+
+    #[test]
+    fn test_hdb007_mysql_backslash_escapes_still_normalized() {
+        // Unchanged behaviour, now asserted: \' becomes '' and \\ becomes \.
+        let sql = r"INSERT INTO t VALUES ('it\'s a \\ path')";
+        assert_eq!(translate(sql), r"INSERT INTO t VALUES ('it''s a \ path')");
+    }
+
+    #[test]
+    fn test_hdb007_literal_ending_in_backslash_then_backtick_identifier() {
+        // After escape normalisation the literal is 'a\' — a literal that ends
+        // with a backslash. The masker must still close it there, so the
+        // backtick-quoted identifier that follows stays an identifier.
+        let sql = r"SELECT 'a\\' AS x, `TINYINT` FROM t";
+        let result = translate(sql);
+        assert_eq!(result, r"SELECT 'a\' AS x, TINYINT FROM t", "got: {result}");
+        assert!(
+            !result.contains("SMALLINT"),
+            "a quoted identifier must not be type-translated: {result}"
+        );
+        assert!(!result.contains('`'), "backticks must be stripped: {result}");
+    }
+
+    #[test]
+    fn test_hdb007_double_quoted_identifier_not_rewritten() {
+        let sql = "SELECT \"LIMIT\", \"tinyint\" FROM t LIMIT 5, 10";
+        let result = translate(sql);
+        assert!(
+            result.contains("\"LIMIT\""),
+            "double-quoted identifier must be intact: {result}"
+        );
+        // `"tinyint"` follows a comma, so the pre-existing MySQL double-quote
+        // heuristic in translate_backslash_escapes re-quotes it as 'tinyint';
+        // either way its contents must not be rewritten to SMALLINT.
+        assert!(result.contains("tinyint"), "quoted name must survive: {result}");
+        assert!(
+            !result.to_uppercase().contains("SMALLINT"),
+            "quoted name must not be type-translated: {result}"
+        );
+        assert!(
+            result.ends_with("LIMIT 10 OFFSET 5"),
+            "the LIMIT outside the quotes must still translate: {result}"
+        );
+    }
+
+    #[test]
+    fn test_hdb007_comments_are_not_translated() {
+        for sql in [
+            "SELECT 1 -- TINYINT(1) LIMIT 5, 10",
+            "SELECT 1 # AUTO_INCREMENT",
+            "SELECT 1 /* AUTO_INCREMENT */ , 2",
+        ] {
+            assert_eq!(translate(sql), sql, "comment text must survive: {sql}");
+        }
+
+        // Executable comments keep their existing behaviour: stripped whole.
+        let result = translate("SELECT /*! STRAIGHT_JOIN */ 1");
+        assert!(!result.contains("/*!"), "executable comment must be stripped: {result}");
+        assert!(
+            !result.contains("STRAIGHT_JOIN"),
+            "executable comment body must be stripped: {result}"
+        );
+    }
+
+    #[test]
+    fn test_hdb007_group_concat_separator_literal_preserved() {
+        let sql = "SELECT GROUP_CONCAT(name SEPARATOR ' AUTO_INCREMENT ') FROM t";
+        let result = translate(sql);
+        assert!(
+            result.contains("STRING_AGG(name, ' AUTO_INCREMENT ')"),
+            "separator literal must not be rewritten: {result}"
+        );
+    }
+
+    #[test]
+    fn test_hdb007_if_function_with_comma_inside_literal() {
+        let sql = "SELECT IF(a, 'x,y', 'z') FROM t";
+        let result = translate(sql);
+        assert!(
+            result.contains("CASE WHEN a THEN 'x,y' ELSE 'z' END"),
+            "comma inside a literal must not split the IF arguments: {result}"
+        );
+    }
+
+    #[test]
+    fn test_hdb007_unterminated_literal_does_not_panic() {
+        let result = translate("SELECT 'abc");
+        assert!(result.starts_with("SELECT '"), "unterminated literal: {result}");
+        assert!(result.contains("abc"), "unterminated literal body: {result}");
+    }
+
+    #[test]
+    fn test_hdb007_literal_containing_placeholder_code_points() {
+        // A client may send the private-use code points the masker uses.
+        let sql = "INSERT INTO t VALUES ('\u{E000}\u{E010}\u{E001} and \u{E001}\u{E011} plain')";
+        assert_eq!(translate(sql), sql, "placeholder code points must round-trip");
+    }
+
+    #[test]
+    fn test_hdb007_stray_placeholder_outside_literal_is_copied_through() {
+        let sql = "SELECT 'x', col\u{E000}\u{E010}\u{E001} FROM t";
+        assert_eq!(
+            translate(sql),
+            sql,
+            "a forged placeholder must never be substituted with a region"
+        );
+    }
+
+    #[test]
+    fn test_hdb007_wordpress_option_value_preserved() {
+        let sql = r#"INSERT INTO `wp_options` (`option_name`, `option_value`, `autoload`) VALUES ('_transient_timeout_x', 'a:2:{s:10:"LIMIT 0, 1";s:8:"DATETIME";}', 'yes') ON DUPLICATE KEY UPDATE `option_value` = VALUES(`option_value`)"#;
+        let result = translate(sql);
+        assert!(
+            result.contains(r#"'a:2:{s:10:"LIMIT 0, 1";s:8:"DATETIME";}'"#),
+            "serialized option_value must be byte-identical: {result}"
+        );
+        assert!(!result.contains('`'), "backticks must be stripped: {result}");
+        assert!(
+            result.contains("ON CONFLICT DO UPDATE SET option_value = EXCLUDED.option_value"),
+            "the upsert clause must still translate through masked identifiers: {result}"
+        );
+    }
+
+    #[test]
+    fn test_hdb007_syntax_outside_literals_still_translates() {
+        let sql = "CREATE TABLE t (id INT AUTO_INCREMENT PRIMARY KEY, flag TINYINT(1), \
+                   note TEXT DEFAULT 'TINYINT(1) LIMIT 5, 10')";
+        let result = translate(sql);
+        assert!(result.contains("id SERIAL PRIMARY KEY"), "AUTO_INCREMENT: {result}");
+        assert!(result.contains("flag BOOLEAN"), "TINYINT(1) column: {result}");
+        assert!(
+            result.contains("'TINYINT(1) LIMIT 5, 10'"),
+            "the DEFAULT literal must be untouched: {result}"
+        );
+    }
+
+    #[test]
+    fn test_hdb007_hash_operators_are_not_comments() {
+        // `<#>` (vector negative inner product) and the JSON path operators
+        // `#>`, `#>>` and `#-` all contain a `#` that is NOT a comment marker:
+        // masking it as one swallowed the rest of the statement, so the trailing
+        // `LIMIT offset, count` stopped being rewritten.
+        fn check_operator(sql: &str, operator: &str, limit: &str) {
+            let result = translate(sql);
+            assert!(result.contains(operator), "operator must survive: {sql} -> {result}");
+            assert!(result.contains(limit), "LIMIT must translate: {sql} -> {result}");
+        }
+
+        let vector = "SELECT id FROM docs ORDER BY emb <#> '[1,2,3]' LIMIT 0, 10";
+        let json_get = "SELECT j #> '{a}' FROM t LIMIT 5, 10";
+        let json_text = "SELECT j #>> '{a}' FROM t LIMIT 5, 10";
+        let json_delete = "SELECT j #- '{a}' FROM t LIMIT 5, 10";
+
+        check_operator(vector, "<#> '[1,2,3]'", "LIMIT 10 OFFSET 0");
+        check_operator(json_get, "#> '{a}'", "LIMIT 10 OFFSET 5");
+        check_operator(json_text, "#>> '{a}'", "LIMIT 10 OFFSET 5");
+        check_operator(json_delete, "#- '{a}'", "LIMIT 10 OFFSET 5");
+    }
+
+    #[test]
+    fn test_hdb007_hash_comment_still_masked() {
+        // A real `#` line comment is still a comment: nothing inside it is
+        // translated, and the statement comes back byte-for-byte.
+        let sql = "SELECT 1 # TINYINT(1) LIMIT 5, 10";
+        assert_eq!(translate(sql), sql, "`#` comment text must survive verbatim");
+    }
+
+    #[test]
+    fn test_hdb007_backtick_identifier_with_apostrophe_does_not_open_a_string() {
+        // The apostrophe in the identifier used to open a phantom string in
+        // `translate_backslash_escapes`, which then "closed" on the real
+        // literal's opening quote — so the payload came back as `'a = 'b' c'`.
+        let sql = r#"UPDATE t SET `it's_col` = 'a = "b" c' WHERE id = 1"#;
+        let result = translate(sql);
+        assert!(
+            result.contains(r#"'a = "b" c'"#),
+            "the literal payload must be byte-identical: {result}"
+        );
+        assert!(result.contains("it's_col"), "identifier name must survive: {result}");
+        assert!(!result.contains('`'), "backticks must be stripped: {result}");
+    }
+
+    #[test]
+    fn test_hdb007_comment_with_quotes_is_untouched_by_escape_pass() {
+        // `"bye"` used to be re-quoted to `'bye'` by the escape pass, because
+        // the apostrophe-free comment still followed the `AND` heuristic.
+        let line = r#"SELECT 1 -- say "hi" AND "bye""#;
+        assert_eq!(translate(line), line, "line-comment text must survive verbatim");
+
+        // A block comment is copied through untouched, while a real literal
+        // outside it is still escape-normalised.
+        let block = r#"SELECT 1 /* it's "x" \n */ , 'y\\z'"#;
+        let result = translate(block);
+        assert!(
+            result.contains(r#"/* it's "x" \n */"#),
+            "block-comment bytes must be untouched: {result}"
+        );
+        assert!(
+            result.contains(r"'y\z'"),
+            "a real literal is still escape-normalised: {result}"
+        );
+    }
+
+    #[test]
+    fn test_hdb007_executable_comment_with_apostrophe() {
+        // `/*! … */` is a comment to the escape pass (copied through untouched)
+        // and still visible to `translate_misc`, which strips it whole.
+        let sql = "SELECT /*! it's */ 1 LIMIT 5, 10";
+        let result = translate(sql);
+        assert!(!result.contains("/*!"), "executable comment must be stripped: {result}");
+        assert!(
+            !result.contains("it's"),
+            "executable comment body must be stripped: {result}"
+        );
+        assert!(
+            result.contains("LIMIT 10 OFFSET 5"),
+            "the LIMIT after it must still translate: {result}"
+        );
+    }
+
+    #[test]
+    fn test_hdb007_backticked_aliases_in_multi_table_delete_still_resolve() {
+        // Review finding on the fix pass: every occurrence of `t` used to get its own
+        // placeholder, so `extract_join_columns` no longer saw the alias twice and fell
+        // back to `id`; the comma form emitted two DELETEs for one table.
+        let sql = "DELETE `t`, `tt` FROM wp_terms AS `t` INNER JOIN wp_term_taxonomy AS `tt` \
+                   ON `t`.term_id = `tt`.term_id WHERE `tt`.taxonomy = 'nav_menu'";
+        let result = translate(sql);
+        let parts: Vec<&str> = result.split(';').collect();
+        assert_eq!(parts.len(), 2, "two DELETE statements: {result}");
+        assert!(
+            parts[0].contains("DELETE FROM wp_terms WHERE term_id IN (SELECT t.term_id FROM"),
+            "join column must resolve through the backticked alias: {result}"
+        );
+        assert!(
+            parts[1].contains("DELETE FROM wp_term_taxonomy WHERE term_id IN (SELECT tt.term_id FROM"),
+            "second target must resolve the same way: {result}"
+        );
+        assert!(!result.contains('`'), "backticks stripped: {result}");
+        assert!(result.contains("'nav_menu'"), "literal intact: {result}");
+
+        let same_table = "DELETE a, b FROM `wp_options` a, `wp_options` b WHERE a.option_name = b.option_name";
+        let result = translate(same_table);
+        assert_eq!(
+            result.matches("DELETE FROM").count(),
+            1,
+            "one table quoted twice is still one target: {result}"
         );
     }
 }

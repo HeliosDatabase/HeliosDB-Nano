@@ -5,6 +5,86 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.32.1] - 2026-09-16
+
+Three findings from the HeliosDB Nano 4.31.1 security and correctness report (HDB-006, HDB-007, HDB-010).
+
+### Fixed — SECURITY: a constant integer expression could terminate an embedded process (HDB-006)
+
+`SELECT 2147483647 + 1` aborted the process. The optimizer's constant-folding rule evaluated
+`literal op literal` with raw `i32` arithmetic, and the crate builds with overflow checks on, so the
+fold panicked at plan time: an embedded library or REPL process exited with code 101, and a
+PostgreSQL-wire server only survived because its per-statement panic guard caught the unwind and
+answered an internal error. `1073741824 * 2`, `-2147483647 - 2`, `2147483647 * 2147483647`,
+`(-2147483647 - 1) / -1` and `-(-2147483647 - 1)` all aborted the same way. Any caller able to
+submit SQL to an embedded deployment could stop the host process.
+
+Constant folding now computes exactly what the runtime evaluator computes for the same operands, and
+leaves any case it cannot represent unfolded so execution raises its usual error only if the
+expression is actually reached:
+
+* `+`, `-`, `*` and `/` over two `INT` literals widen to 64-bit and narrow back to `INT` when the
+  result fits, otherwise the literal becomes `BIGINT` — the same promotion the evaluator applies to
+  `col + col`, so `SELECT 2147483647 + 1` and `SELECT a + b FROM t` now answer the same
+  `2147483648`. (PostgreSQL raises `22003` here; Nano's runtime promotion is unchanged by this
+  release and is the behaviour the fold now matches.)
+* `x / 0` stays unfolded and raises "Division by zero" at execution.
+* `-(-2147483648)` stays unfolded and raises the evaluator's "integer overflow: INT negation".
+
+### Fixed — SECURITY: MySQL-protocol syntax translation rewrote the contents of string literals (HDB-007)
+
+Data sent through the MySQL listener was silently altered before storage. The MySQL-to-PostgreSQL
+translator applies its keyword rewrites with regular expressions over the whole statement text, and
+only the backslash-escape and backtick passes knew where string literals were. Every later pass
+rewrote keywords inside literals, quoted identifiers and comments — captured on the wire with a
+stock MySQL client: `'TINYINT(1)'` was stored as `BOOLEAN`, `'SELECT * LIMIT 5, 10'` as
+`SELECT * LIMIT 10 OFFSET 5`, `'a AUTO_INCREMENT b'` as `a b`, `'IFNULL(a,b)'` as `COALESCE(a,b)`,
+`'WHERE 1=1 AND x'` as `WHERE x`, and a literal containing `INTERVAL n unit` inside a
+`DATE_ADD(...)` shape could come back with unbalanced quotes. Text-mode clients (PHP `mysqli`,
+PyMySQL, WordPress) interpolate every value into the statement, so ordinary parameterised inserts
+were affected. The binary prepared-statement path binds decoded parameters separately and was not
+affected.
+
+The translator now masks every string literal, double-quoted identifier, backtick identifier and
+comment with an opaque placeholder made of private-use code points (which no rewrite pattern can
+match into, across or through), runs the existing rewrite passes on the masked text, and restores
+the regions byte-for-byte. `/*! ... */` executable comments are still stripped; MySQL syntax
+outside literals (`LIMIT o, n`, `AUTO_INCREMENT`, `TINYINT(1)`, `ON DUPLICATE KEY UPDATE`,
+`GROUP_CONCAT(... SEPARATOR '...')`, WordPress `KEY`/`UNIQUE KEY` index lines with backtick-quoted
+names) translates exactly as before. A literal that ends in a backslash no longer swallows the rest
+of the statement, an unterminated literal never panics, and private-use code points in a client's SQL
+are masked as data rather than decoded (an unterminated `/*!` hint is the one place they pass through
+unscanned, after which the statement is unparsable anyway). The
+backslash-escape pass that runs first now also copies comments and backtick identifiers through
+untouched, so an apostrophe inside `` `it's_col` `` or inside `-- a comment` can no longer open a
+phantom string that swallows the next real literal. A `#` starts a MySQL line comment only when it
+is not the `#` of the `<#>`, `#>`, `#>>` or `#-` operators, which keep working over the MySQL
+listener.
+
+### Fixed — constant folding applied Rust equality instead of SQL three-valued logic (HDB-010)
+
+`SELECT NULL = NULL` returned TRUE, `SELECT 1 = NULL` FALSE, `SELECT 1 <> NULL` TRUE and
+`SELECT 1 = 1.0` FALSE, while the same comparisons over columns answered NULL, NULL, NULL and TRUE.
+The folding rule compared literal `Value`s with the derived `PartialEq`. A constant predicate in a
+`WHERE`, `CHECK` or policy expression could therefore keep or drop every row wrongly.
+
+`=` and `<>` between two literals now fold through the evaluator's own comparison routine, so they
+answer NULL when either side is NULL and coerce across numeric types exactly as the runtime does. A
+NULL result keeps its BOOLEAN type on the wire (it is folded as `CAST(NULL AS BOOLEAN)`, not as a
+bare text NULL). A literal pair the evaluator cannot compare is left unfolded so the runtime raises
+its error only if execution reaches the expression — previously such a pair folded to a meaningless
+TRUE/FALSE.
+
+### Security — dependencies
+
+* `rustls` 0.23.36 → 0.23.45 (RUSTSEC-2026-0285: TLS 1.3 handshake messages accepted at the wrong
+  encryption level; the transcript stayed authenticated, so no handshake could be altered), with
+  `rustls-webpki` 0.103.15 and `aws-lc-sys` 0.45.0. `cargo deny check advisories` is clean again.
+
+Regression coverage: `tests/security_hdb_006.rs`, `tests/security_hdb_010.rs`, the `hdb007_*`
+MySQL-wire tests in `tests/mysql_stmt_execute_tests.rs`, and unit tests beside each rule and the
+translator. Every test was observed failing on the unfixed tree before the fix was applied.
+
 ## [4.32.0] - 2026-09-12
 
 ### Added — connection lifecycle: authentication and idle timeouts, TCP keepalive, and a documented connection limit (GH#28)

@@ -670,8 +670,8 @@ impl Evaluator {
                 }
 
                 // value BETWEEN low AND high is equivalent to: value >= low AND value <= high
-                let gte_low = self.compare_values(&value, &low_value, |ord| ord != std::cmp::Ordering::Less)?;
-                let lte_high = self.compare_values(&value, &high_value, |ord| ord != std::cmp::Ordering::Greater)?;
+                let gte_low = Self::compare_values(&value, &low_value, |ord| ord != std::cmp::Ordering::Less)?;
+                let lte_high = Self::compare_values(&value, &high_value, |ord| ord != std::cmp::Ordering::Greater)?;
 
                 // Both comparisons must be true for value to be in range
                 let in_range = matches!(gte_low, Value::Boolean(true)) && matches!(lte_high, Value::Boolean(true));
@@ -3518,14 +3518,14 @@ impl Evaluator {
         match op {
             // Comparison operators with type coercion
             // Use compare_values for Eq/NotEq to handle cross-type comparisons (e.g., 1 = 1.0)
-            BinaryOperator::Eq => self.compare_values(left, right, |cmp| cmp.is_eq()),
-            BinaryOperator::NotEq => self.compare_values(left, right, |cmp| cmp.is_ne()),
+            BinaryOperator::Eq => Self::compare_values(left, right, |cmp| cmp.is_eq()),
+            BinaryOperator::NotEq => Self::compare_values(left, right, |cmp| cmp.is_ne()),
             BinaryOperator::IsDistinctFrom => self.evaluate_is_distinct_from(left, right, true),
             BinaryOperator::IsNotDistinctFrom => self.evaluate_is_distinct_from(left, right, false),
-            BinaryOperator::Lt => self.compare_values(left, right, |cmp| cmp.is_lt()),
-            BinaryOperator::LtEq => self.compare_values(left, right, |cmp| cmp.is_le()),
-            BinaryOperator::Gt => self.compare_values(left, right, |cmp| cmp.is_gt()),
-            BinaryOperator::GtEq => self.compare_values(left, right, |cmp| cmp.is_ge()),
+            BinaryOperator::Lt => Self::compare_values(left, right, |cmp| cmp.is_lt()),
+            BinaryOperator::LtEq => Self::compare_values(left, right, |cmp| cmp.is_le()),
+            BinaryOperator::Gt => Self::compare_values(left, right, |cmp| cmp.is_gt()),
+            BinaryOperator::GtEq => Self::compare_values(left, right, |cmp| cmp.is_ge()),
 
             // Logical operators - SQL three-valued logic for NULL
             BinaryOperator::And => Self::three_valued_and(left, right),
@@ -3713,7 +3713,7 @@ impl Evaluator {
                 }
             }
 
-            let eq = self.compare_values(&l_val, &r_val, |c| c.is_eq())?;
+            let eq = Self::compare_values(&l_val, &r_val, |c| c.is_eq())?;
             let is_eq = matches!(eq, Value::Boolean(true));
             if is_eq {
                 continue;
@@ -3723,10 +3723,10 @@ impl Evaluator {
             return match op {
                 Op::Eq => Ok(Value::Boolean(false)),
                 Op::NotEq => Ok(Value::Boolean(true)),
-                Op::Lt => self.compare_values(&l_val, &r_val, |c| c.is_lt()),
-                Op::LtEq => self.compare_values(&l_val, &r_val, |c| c.is_lt()),
-                Op::Gt => self.compare_values(&l_val, &r_val, |c| c.is_gt()),
-                Op::GtEq => self.compare_values(&l_val, &r_val, |c| c.is_gt()),
+                Op::Lt => Self::compare_values(&l_val, &r_val, |c| c.is_lt()),
+                Op::LtEq => Self::compare_values(&l_val, &r_val, |c| c.is_lt()),
+                Op::Gt => Self::compare_values(&l_val, &r_val, |c| c.is_gt()),
+                Op::GtEq => Self::compare_values(&l_val, &r_val, |c| c.is_gt()),
                 _ => Err(Error::query_execution(format!(
                     "Operator {:?} not supported on row constructors",
                     op
@@ -3783,7 +3783,7 @@ impl Evaluator {
     }
 
     /// Compare two values using a comparison function
-    fn compare_values<F>(&self, left: &Value, right: &Value, cmp: F) -> Result<Value>
+    pub(crate) fn compare_values<F>(left: &Value, right: &Value, cmp: F) -> Result<Value>
     where
         F: FnOnce(std::cmp::Ordering) -> bool,
     {
