@@ -22,11 +22,7 @@
 #![allow(elided_lifetimes_in_paths)]
 
 use crate::{Error, Result};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig;
-use rustls_pemfile::{certs, pkcs8_private_keys, rsa_private_keys};
-use std::fs::File;
-use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -184,65 +180,8 @@ impl SslNegotiator {
 
     /// Load TLS configuration from certificates
     fn load_tls_config(config: &SslConfig) -> Result<TlsAcceptor> {
-        // Load server certificate
-        let cert_file = File::open(&config.cert_path).map_err(|e| {
-            Error::io(format!(
-                "Failed to open certificate {}: {}",
-                config.cert_path.display(),
-                e
-            ))
-        })?;
-        let mut cert_reader = BufReader::new(cert_file);
-        let certs_iter = certs(&mut cert_reader);
-        let certs: Vec<CertificateDer> = certs_iter
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| Error::io(format!("Failed to parse certificate: {}", e)))?;
-
-        if certs.is_empty() {
-            return Err(Error::io("No certificates found in certificate file"));
-        }
-
-        // Load private key
-        let key_file = File::open(&config.key_path).map_err(|e| {
-            Error::io(format!(
-                "Failed to open private key {}: {}",
-                config.key_path.display(),
-                e
-            ))
-        })?;
-        let mut key_reader = BufReader::new(key_file);
-
-        // Try PKCS#8 first, then RSA
-        let private_key = {
-            let pkcs8_keys_iter = pkcs8_private_keys(&mut key_reader);
-            let mut pkcs8_keys: Vec<_> = pkcs8_keys_iter
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(|e| Error::io(format!("Failed to parse PKCS#8 key: {}", e)))?;
-
-            if !pkcs8_keys.is_empty() {
-                PrivateKeyDer::Pkcs8(pkcs8_keys.remove(0))
-            } else {
-                // Try RSA format
-                let key_file = File::open(&config.key_path).map_err(|e| {
-                    Error::io(format!(
-                        "Failed to open private key {}: {}",
-                        config.key_path.display(),
-                        e
-                    ))
-                })?;
-                let mut key_reader = BufReader::new(key_file);
-                let rsa_keys_iter = rsa_private_keys(&mut key_reader);
-                let mut rsa_keys: Vec<_> = rsa_keys_iter
-                    .collect::<std::result::Result<Vec<_>, _>>()
-                    .map_err(|e| Error::io(format!("Failed to parse RSA key: {}", e)))?;
-
-                if rsa_keys.is_empty() {
-                    return Err(Error::io("No private keys found in key file"));
-                }
-
-                PrivateKeyDer::Pkcs1(rsa_keys.remove(0))
-            }
-        };
+        let (certs, private_key) =
+            crate::protocol::tls_provider::load_cert_and_key(&config.cert_path, &config.key_path, "PostgreSQL TLS")?;
 
         // Build TLS server configuration, using an explicit PQ-aware
         // CryptoProvider (aws-lc-rs-backed) instead of the implicit

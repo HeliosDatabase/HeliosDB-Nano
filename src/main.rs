@@ -139,20 +139,10 @@ fn warn_listener_utilisation(
     max: usize,
     policy: &heliosdb_nano::protocol::postgres::timeouts::ConnectionTimeouts,
 ) {
-    let in_use = max.saturating_sub(limiter.available_permits());
-    let over = policy.should_warn_utilisation(in_use, max);
-    if warned.swap(over, std::sync::atomic::Ordering::Relaxed) != over && over {
-        tracing::warn!(
-            "{} connection utilisation {}/{} ({}%) is at or above [server] max_connections_warn_percent = {}; \
-             new connections are refused at {} (raise --max-connections / [server] max_connections)",
-            listener,
-            in_use,
-            max,
-            in_use.saturating_mul(100) / max.max(1),
-            policy.connection_warn_threshold_percent,
-            max
-        );
-    }
+    // Shared with `PgServer::maybe_warn_utilisation` /
+    // `MysqlServer::maybe_warn_utilisation` — see
+    // `ConnectionTimeouts::maybe_warn_utilisation`.
+    policy.maybe_warn_utilisation(listener, warned, limiter, max);
 }
 
 /// GH#28: render a policy duration for the startup banner (`0` = disabled).

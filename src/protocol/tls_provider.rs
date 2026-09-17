@@ -19,6 +19,12 @@
 //! classical-only provider is the same provider with the hybrid group
 //! filtered out of the key-exchange group list.
 
+use crate::{Error, Result};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls_pemfile::{certs, pkcs8_private_keys, rsa_private_keys};
+use std::fs::File;
+use std::io::BufReader;
+use std::path::Path;
 use std::sync::Arc;
 
 /// Build an explicit `rustls` `CryptoProvider`.
@@ -46,6 +52,67 @@ pub fn pq_capable_provider(post_quantum: bool) -> Arc<rustls::crypto::CryptoProv
         kx_groups: classical_kx_groups,
         ..provider
     })
+}
+
+/// Load a PEM certificate chain and private key from disk, shared by the
+/// PostgreSQL and MySQL TLS listeners.
+///
+/// Tries PKCS#8 first, then falls back to RSA (PKCS#1) — reopening the key
+/// file for the fallback pass since `pkcs8_private_keys` may have already
+/// consumed the reader. `label` (e.g. `"PostgreSQL TLS"` / `"MySQL TLS"`) is
+/// folded into error messages so failures stay attributable to the right
+/// listener.
+pub fn load_cert_and_key(
+    cert_path: &Path,
+    key_path: &Path,
+    label: &str,
+) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+    // Load server certificate chain.
+    let cert_file = File::open(cert_path)
+        .map_err(|e| Error::io(format!("Failed to open {} certificate {}: {}", label, cert_path.display(), e)))?;
+    let mut cert_reader = BufReader::new(cert_file);
+    let certs_iter = certs(&mut cert_reader);
+    let certs: Vec<CertificateDer<'static>> = certs_iter
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| Error::io(format!("Failed to parse {} certificate: {}", label, e)))?;
+
+    if certs.is_empty() {
+        return Err(Error::io(format!("No certificates found in {} certificate file", label)));
+    }
+
+    // Load private key — PKCS#8 first, then RSA.
+    let key_file = File::open(key_path)
+        .map_err(|e| Error::io(format!("Failed to open {} private key {}: {}", label, key_path.display(), e)))?;
+    let mut key_reader = BufReader::new(key_file);
+
+    let private_key = {
+        let pkcs8_keys_iter = pkcs8_private_keys(&mut key_reader);
+        let mut pkcs8_keys: Vec<_> = pkcs8_keys_iter
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::io(format!("Failed to parse PKCS#8 key: {}", e)))?;
+
+        if !pkcs8_keys.is_empty() {
+            PrivateKeyDer::Pkcs8(pkcs8_keys.remove(0))
+        } else {
+            // Reopen: `pkcs8_private_keys` may have consumed the reader.
+            let key_file = File::open(key_path).map_err(|e| {
+                Error::io(format!("Failed to open {} private key {}: {}", label, key_path.display(), e))
+            })?;
+            let mut key_reader = BufReader::new(key_file);
+            let rsa_keys_iter = rsa_private_keys(&mut key_reader);
+            let mut rsa_keys: Vec<_> = rsa_keys_iter
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| Error::io(format!("Failed to parse RSA key: {}", e)))?;
+
+            if rsa_keys.is_empty() {
+                return Err(Error::io(format!("No private keys found in {} key file", label)));
+            }
+
+            PrivateKeyDer::Pkcs1(rsa_keys.remove(0))
+        }
+    };
+
+    Ok((certs, private_key))
 }
 
 #[cfg(test)]

@@ -12,11 +12,7 @@
 //! from this module. No ALPN is needed for the MySQL wire protocol.
 
 use crate::{Error, Result};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig;
-use rustls_pemfile::{certs, pkcs8_private_keys, rsa_private_keys};
-use std::fs::File;
-use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio_rustls::TlsAcceptor;
@@ -90,77 +86,34 @@ impl MysqlSslConfig {
 /// response.
 pub struct MysqlSslNegotiator {
     config: MysqlSslConfig,
-    acceptor: TlsAcceptor,
+    /// `None` iff `config.enabled` is `false` — a disabled negotiator never
+    /// touches the filesystem or holds a live TLS acceptor, regardless of
+    /// caller discipline. `MysqlServer` only keeps a negotiator around
+    /// (`Option<Arc<MysqlSslNegotiator>>`) when TLS is actually offered, so
+    /// `acceptor()` is only ever called on an enabled one.
+    acceptor: Option<TlsAcceptor>,
 }
 
 impl MysqlSslNegotiator {
-    /// Create a new MySQL TLS negotiator. Fails if `config.enabled` is false
-    /// — callers should only construct this when TLS is actually configured.
+    /// Create a new MySQL TLS negotiator.
+    ///
+    /// When `config.enabled` is `false` this returns immediately without
+    /// loading certificates/keys or building a TLS acceptor.
     pub fn new(config: MysqlSslConfig) -> Result<Self> {
         config.validate()?;
+        if !config.enabled {
+            return Ok(Self { config, acceptor: None });
+        }
         let acceptor = Self::load_tls_config(&config)?;
-        Ok(Self { config, acceptor })
+        Ok(Self {
+            config,
+            acceptor: Some(acceptor),
+        })
     }
 
     fn load_tls_config(config: &MysqlSslConfig) -> Result<TlsAcceptor> {
-        // Load server certificate
-        let cert_file = File::open(&config.cert_path).map_err(|e| {
-            Error::io(format!(
-                "Failed to open MySQL TLS certificate {}: {}",
-                config.cert_path.display(),
-                e
-            ))
-        })?;
-        let mut cert_reader = BufReader::new(cert_file);
-        let certs_iter = certs(&mut cert_reader);
-        let certs: Vec<CertificateDer<'_>> = certs_iter
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| Error::io(format!("Failed to parse MySQL TLS certificate: {}", e)))?;
-
-        if certs.is_empty() {
-            return Err(Error::io("No certificates found in MySQL TLS certificate file"));
-        }
-
-        // Load private key — PKCS#8 first, then RSA (same fallback order as
-        // the PostgreSQL loader).
-        let key_file = File::open(&config.key_path).map_err(|e| {
-            Error::io(format!(
-                "Failed to open MySQL TLS private key {}: {}",
-                config.key_path.display(),
-                e
-            ))
-        })?;
-        let mut key_reader = BufReader::new(key_file);
-
-        let private_key = {
-            let pkcs8_keys_iter = pkcs8_private_keys(&mut key_reader);
-            let mut pkcs8_keys: Vec<_> = pkcs8_keys_iter
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(|e| Error::io(format!("Failed to parse PKCS#8 key: {}", e)))?;
-
-            if !pkcs8_keys.is_empty() {
-                PrivateKeyDer::Pkcs8(pkcs8_keys.remove(0))
-            } else {
-                let key_file = File::open(&config.key_path).map_err(|e| {
-                    Error::io(format!(
-                        "Failed to open MySQL TLS private key {}: {}",
-                        config.key_path.display(),
-                        e
-                    ))
-                })?;
-                let mut key_reader = BufReader::new(key_file);
-                let rsa_keys_iter = rsa_private_keys(&mut key_reader);
-                let mut rsa_keys: Vec<_> = rsa_keys_iter
-                    .collect::<std::result::Result<Vec<_>, _>>()
-                    .map_err(|e| Error::io(format!("Failed to parse RSA key: {}", e)))?;
-
-                if rsa_keys.is_empty() {
-                    return Err(Error::io("No private keys found in MySQL TLS key file"));
-                }
-
-                PrivateKeyDer::Pkcs1(rsa_keys.remove(0))
-            }
-        };
+        let (certs, private_key) =
+            crate::protocol::tls_provider::load_cert_and_key(&config.cert_path, &config.key_path, "MySQL TLS")?;
 
         // Explicit PQ-aware CryptoProvider — same shared helper as Postgres.
         let provider = crate::protocol::tls_provider::pq_capable_provider(config.post_quantum);
@@ -175,9 +128,14 @@ impl MysqlSslNegotiator {
         Ok(TlsAcceptor::from(Arc::new(tls_config)))
     }
 
-    /// The TLS acceptor used to upgrade a connection.
+    /// The TLS acceptor used to upgrade a connection. Panics if `config.enabled`
+    /// was `false` at construction — callers must only hold onto a
+    /// negotiator (e.g. as `Option<Arc<MysqlSslNegotiator>>`) when TLS is
+    /// actually offered.
     pub fn acceptor(&self) -> &TlsAcceptor {
-        &self.acceptor
+        self.acceptor
+            .as_ref()
+            .expect("MysqlSslNegotiator::acceptor() called on a disabled negotiator")
     }
 
     /// The configuration this negotiator was built from.

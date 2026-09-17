@@ -1036,49 +1036,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
     // Construction
     // ------------------------------------------------------------------
 
-    fn new(database: Arc<EmbeddedDatabase>, stream: S, connection_id: u32) -> Self {
-        let mut auth_seed = [0u8; 20];
-        use rand::Rng;
-        rand::thread_rng().fill(&mut auth_seed);
-
-        let session_id = database
-            .create_wire_session("mysql_wire")
-            .expect("wire session creation is infallible");
-        Self {
-            database,
-            stream,
-            seq: 0,
-            connection_id,
-            capabilities: CapabilityFlags::server_default(false),
-            status_flags: StatusFlags::default_flags(),
-            character_set: UTF8MB4_GENERAL_CI,
-            auth_seed,
-            auth_plugin: "mysql_native_password".into(),
-            username: None,
-            current_database: None,
-            in_transaction: false,
-            prepared_statements: HashMap::new(),
-            next_stmt_id: 1,
-            last_row_count: 0,
-            last_insert_id: 0,
-            session_id,
-            timeouts: ConnectionTimeouts::disabled(),
-            tls_enabled: false,
-        }
-    }
-
-    /// Construct a handler whose HandshakeV10 greeting has ALREADY been sent
-    /// and whose `HandshakeResponse41` has ALREADY been read (and, for a TLS
-    /// upgrade, re-read over the now-encrypted stream) by
-    /// `protocol::mysql::server::MysqlServer::negotiate` — the same
-    /// `auth_seed` / `capabilities` / `character_set` / `status_flags` /
-    /// `auth_plugin` used to build that already-sent greeting must be passed
-    /// in here so the handler's own state matches what the client saw.
-    /// `seq` is the NEXT sequence number the handler should use (one past the
-    /// client's `HandshakeResponse41`). Call [`Self::finish_handshake`]
-    /// immediately after construction to complete authentication.
+    /// Shared inner constructor: everything both [`Self::new`] and
+    /// [`Self::new_pre_negotiated`] set up identically — session creation,
+    /// prepared-statement/transaction/counter state, and the disabled
+    /// timeouts a caller may later override via [`Self::set_timeouts`]. Only
+    /// the handshake-related fields (`seq`, `auth_seed`, `capabilities`,
+    /// `character_set`, `status_flags`, `auth_plugin`, `tls_enabled`) differ
+    /// between the two call sites and are taken as arguments.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new_pre_negotiated(
+    fn new_inner(
         database: Arc<EmbeddedDatabase>,
         stream: S,
         connection_id: u32,
@@ -1114,6 +1080,62 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
             timeouts: ConnectionTimeouts::disabled(),
             tls_enabled,
         }
+    }
+
+    fn new(database: Arc<EmbeddedDatabase>, stream: S, connection_id: u32) -> Self {
+        let mut auth_seed = [0u8; 20];
+        use rand::Rng;
+        rand::thread_rng().fill(&mut auth_seed);
+
+        Self::new_inner(
+            database,
+            stream,
+            connection_id,
+            0,
+            auth_seed,
+            CapabilityFlags::server_default(false),
+            UTF8MB4_GENERAL_CI,
+            StatusFlags::default_flags(),
+            "mysql_native_password".into(),
+            false,
+        )
+    }
+
+    /// Construct a handler whose HandshakeV10 greeting has ALREADY been sent
+    /// and whose `HandshakeResponse41` has ALREADY been read (and, for a TLS
+    /// upgrade, re-read over the now-encrypted stream) by
+    /// `protocol::mysql::server::MysqlServer::negotiate` — the same
+    /// `auth_seed` / `capabilities` / `character_set` / `status_flags` /
+    /// `auth_plugin` used to build that already-sent greeting must be passed
+    /// in here so the handler's own state matches what the client saw.
+    /// `seq` is the NEXT sequence number the handler should use (one past the
+    /// client's `HandshakeResponse41`). Call [`Self::finish_handshake`]
+    /// immediately after construction to complete authentication.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_pre_negotiated(
+        database: Arc<EmbeddedDatabase>,
+        stream: S,
+        connection_id: u32,
+        seq: u8,
+        auth_seed: [u8; 20],
+        capabilities: CapabilityFlags,
+        character_set: u8,
+        status_flags: StatusFlags,
+        auth_plugin: String,
+        tls_enabled: bool,
+    ) -> Self {
+        Self::new_inner(
+            database,
+            stream,
+            connection_id,
+            seq,
+            auth_seed,
+            capabilities,
+            character_set,
+            status_flags,
+            auth_plugin,
+            tls_enabled,
+        )
     }
 
     /// GH#28: install the listener's connection-lifetime policy after

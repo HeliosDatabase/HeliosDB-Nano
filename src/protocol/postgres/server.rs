@@ -9,7 +9,7 @@ use super::ssl::{SecureConnection, SslConfig, SslMode, SslNegotiator};
 use super::timeouts::ConnectionTimeouts;
 use crate::{EmbeddedDatabase, Error, Result};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::io::BufWriter;
 use tokio::net::{TcpListener, TcpStream};
@@ -186,20 +186,12 @@ impl PgServer {
     /// utilisation drops back below it. `Semaphore::available_permits()` is
     /// the single source of truth — no side counter.
     fn maybe_warn_utilisation(&self) {
-        let max = self.config.max_connections;
-        let in_use = max.saturating_sub(self.connection_limiter.available_permits());
-        let over = self.config.timeouts.should_warn_utilisation(in_use, max);
-        if self.utilisation_warned.swap(over, Ordering::Relaxed) != over && over {
-            tracing::warn!(
-                "connection utilisation {}/{} ({}%) is at or above [server] max_connections_warn_percent = {}; \
-                 new connections are refused at {} (raise --max-connections / [server] max_connections)",
-                in_use,
-                max,
-                in_use.saturating_mul(100) / max.max(1),
-                self.config.timeouts.connection_warn_threshold_percent,
-                max
-            );
-        }
+        self.config.timeouts.maybe_warn_utilisation(
+            "PostgreSQL",
+            &self.utilisation_warned,
+            &self.connection_limiter,
+            self.config.max_connections,
+        );
     }
 
     /// Start the server and listen for connections
