@@ -112,7 +112,22 @@ impl SessionManager {
         self.enforce_quota(&user.id, &self.quota)?;
 
         // Create new session
-        let session = Session::new(user.id, isolation);
+        let mut session = Session::new(user.id, isolation);
+        // HDB-009: the name this session was opened under IS its SQL identity —
+        // what `current_user` / `session_user` / `current_role` and
+        // `current_setting('session_authorization')` report, and what a
+        // `"$user"` `search_path` entry expands to. This is the quota-checked
+        // embedded API (`EmbeddedDatabase::create_session`), whose caller has
+        // already decided who the user is. `create_session_unchecked` below
+        // deliberately does NOT do this.
+        //
+        // NOT reached by the REST / Supabase / MCP surfaces: `api::auth_bridge`
+        // and `api::supabase::auth` have their OWN `create_session(&AuthUser)`
+        // (a JWT minter, nothing to do with this manager), and their executors
+        // run SQL through the session-less `execute()` / `query()` funnels — so
+        // an authenticated BaaS request still evaluates `current_user` as the
+        // service user. Filed separately; nothing here changes that.
+        session.set_login(Some(user.name.clone()));
         let session_id = session.id;
 
         // Register session
@@ -128,6 +143,16 @@ impl SessionManager {
     /// authenticate every connection as the same database user; their
     /// connection count is already bounded by the server's `max_connections`
     /// semaphore, so the per-user quota (default 10) must not apply.
+    ///
+    /// HDB-009: unlike [`Self::create_session`] (the quota-checked EMBEDDED
+    /// API — not the REST/Supabase bridges, which mint their own sessions and
+    /// run SQL session-less), this deliberately leaves `login_user` unset. The
+    /// `user` here is the LISTENER's placeholder name
+    /// (`create_wire_session("pg_wire")`), minted before the client has proved
+    /// anything; the wire handlers publish the AUTHENTICATED name themselves
+    /// once authentication succeeds
+    /// (`EmbeddedDatabase::set_session_login_user`). A connection that never
+    /// gets that far must never acquire a SQL identity.
     pub fn create_session_unchecked(&self, user: &User, isolation: IsolationLevel) -> Result<SessionId> {
         let session = Session::new(user.id, isolation);
         let session_id = session.id;

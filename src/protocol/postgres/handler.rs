@@ -955,11 +955,20 @@ where
 
             self.username = params.get("user").cloned();
 
-            // Thread the login role onto the session so a `"$user"` search_path
-            // entry expands to this user's schema (I-USER).
-            let _ = self
-                .database
-                .set_session_login_user(self.session_id, self.username.clone());
+            // PostgreSQL requires the `user` startup parameter and refuses the
+            // connection without it (08P01), so Nano does too. This runs BEFORE
+            // the database-name check below, which falls back to this very
+            // parameter.
+            //
+            // HDB-009: the login role used to be threaded onto the session
+            // right here — BEFORE authentication — so a connection that then
+            // failed its password check had already written a SQL identity onto
+            // a reusable engine session. It is published after the auth match
+            // instead (see below); `"$user"` search_path expansion (I-USER)
+            // still works because no statement can run before that point.
+            if !self.username.as_deref().is_some_and(|user| !user.is_empty()) {
+                return Err(Error::protocol("no PostgreSQL user name specified in startup packet").into());
+            }
 
             // Bug 5 — validate the requested database name. Reject
             // unknown names rather than silently routing every
@@ -1043,6 +1052,21 @@ where
                     self.handle_scram_authentication().await?;
                 }
             }
+
+            // HDB-009: publish the AUTHENTICATED principal onto the session —
+            // only here, on the success path every arm of the match above falls
+            // through to. This name is what `current_user`, `session_user`,
+            // `current_role`, `current_setting('session_authorization')` and
+            // `SHOW session_authorization` answer for this connection, what
+            // keys its result-cache entries, and what a `"$user"` search_path
+            // entry expands to. A rejected credential returns above and never
+            // reaches this line. Trust mode publishes the client-supplied name
+            // as sent, exactly as PostgreSQL does — truncated, as PostgreSQL
+            // also does, to the 63-byte identifier limit
+            // (`Session::LOGIN_NAME_MAX_BYTES`), because on a trust listener
+            // the name is chosen by the client and is now cloned per statement.
+            self.database
+                .set_session_login_user(self.session_id, self.username.clone())?;
 
             // Send parameter status messages
             self.send_parameter_status(
@@ -1801,7 +1825,20 @@ where
             // active (PostgreSQL warns but succeeds).
             let mut closed_a_transaction = false;
             if self.transaction_status == TransactionStatus::InTransaction {
-                self.database.commit_transaction_for_session(self.session_id)?;
+                // HDB-008: the ENGINE can now refuse this COMMIT — either the
+                // deferred-FK check fails, or the engine marked the transaction
+                // aborted on an error path that never reached
+                // `mark_transaction_failed_after_error` (so this handler still
+                // believes it is `InTransaction`). Both have already ENDED the
+                // transaction in the engine, so the connection must not be left
+                // reporting `InTransaction` on the next ReadyForQuery — the
+                // client would think it still had a block open.
+                if let Err(e) = self.database.commit_transaction_for_session(self.session_id) {
+                    if !self.database.session_in_transaction(self.session_id) {
+                        self.transaction_status = TransactionStatus::Idle;
+                    }
+                    return Err(e);
+                }
                 closed_a_transaction = true;
             } else if self.transaction_status == TransactionStatus::Failed {
                 self.rollback_failed_transaction_for_recovery()?;
@@ -1929,6 +1966,39 @@ where
             return Ok(());
         }
 
+        // HDB-008: `ROLLBACK TO SAVEPOINT` is the ONE statement PostgreSQL lets
+        // a client run inside an aborted transaction block — it is how a client
+        // recovers a failed block WITHOUT discarding the work that preceded the
+        // savepoint. The blanket 25P02 guard below refused it too, so a wire
+        // client had no way back and the savepoint was useless exactly when it
+        // mattered. On success the block is usable again (`InTransaction`); on
+        // failure (an unknown savepoint name) it stays `Failed` and the error
+        // propagates to the dispatcher, which renders ErrorResponse +
+        // ReadyForQuery. The command tag is whatever the ordinary
+        // `InTransaction` path produces for this statement, so the two routes
+        // cannot drift.
+        if self.transaction_status == TransactionStatus::Failed && txn_control == Some(TxnControl::RollbackToSavepoint)
+        {
+            let affected = self.database.execute_for_session(self.session_id, trimmed)?;
+            // Ask the ENGINE whether a transaction survived, never assume it.
+            // `execute_for_session` falls through to the session-less
+            // `execute()` when this session has no transaction, and that path
+            // resolves the PROCESS-WIDE savepoint stack — so an `Ok` here is
+            // not by itself proof that this connection is back inside a block.
+            // Believing it marked the connection `InTransaction` with no
+            // engine transaction behind it, and every later write silently
+            // autocommitted while the client was told it was in a transaction.
+            self.transaction_status = if self.database.session_in_transaction(self.session_id) {
+                TransactionStatus::InTransaction
+            } else {
+                TransactionStatus::Idle
+            };
+            let tag = self.get_command_tag(trimmed, affected);
+            self.send_command_complete(&tag).await?;
+            self.send_ready_for_query().await?;
+            return Ok(());
+        }
+
         if self.transaction_status == TransactionStatus::Failed {
             return self.send_failed_transaction_error().await;
         }
@@ -2047,17 +2117,26 @@ where
         };
 
         if is_select || is_show_branches {
-            // The shared result/plan caches are keyed by SQL text only and hold
-            // public-schema resolutions only; a session with a non-`public`
-            // search_path must resolve through `query_with_columns_for_session`
-            // (which installs its per-session schema), never this shared read.
+            // The shared result/plan caches hold public-schema resolutions
+            // only; a session with a non-`public` search_path must resolve
+            // through `query_with_columns_for_session` (which installs its
+            // per-session schema), never this shared read.
+            //
+            // HDB-009: the result cache is keyed by SQL text AND tagged with
+            // the principal that computed the entry, so the probe has to run
+            // with THIS session's identity installed — hence the `_for_session`
+            // wrapper, which installs and drops the (`!Send`) guard inside one
+            // synchronous call. Probing untagged both served a session-less
+            // answer to an authenticated client and could never hit on a
+            // wire-only server.
             let cached_query = if is_show_branches
                 || self.database.session_in_transaction(self.session_id)
                 || self.database.session_schema_active(self.session_id)
             {
                 None
             } else {
-                self.database.try_cached_query_with_schema(query)
+                self.database
+                    .try_cached_query_with_schema_for_session(self.session_id, query)
             };
             if let Some((cached_results, plan_schema)) = cached_query {
                 let schema = Self::result_schema_for_rows(&plan_schema, cached_results.as_slice());
@@ -2637,7 +2716,14 @@ where
         // we fall through to the generic SQL path below with identical
         // semantics.
         if !self.database.session_in_transaction(self.session_id) {
-            match self.database.copy_bulk_insert(&copy.table, &copy.columns, &rows) {
+            // HDB-009: `_for_session`, so a `DEFAULT current_user` column this
+            // path evaluates itself records THIS connection's login — the
+            // generic fallback below already did (it goes through
+            // `execute_for_session`), and the two must not disagree.
+            match self
+                .database
+                .copy_bulk_insert_for_session(self.session_id, &copy.table, &copy.columns, &rows)
+            {
                 Some(Ok(_)) => {
                     self.send_command_complete(&format!("COPY {total}")).await?;
                     return self.send_ready_for_query().await;
@@ -3027,6 +3113,18 @@ where
             if let Err(e) = self.database.execute_for_session(self.session_id, stmt) {
                 if pg_exception_matches(&exception_codes, &e.to_string()) {
                     tracing::debug!("DO block: caught {:?} via EXCEPTION clause; continuing", e.to_string());
+                    // HDB-008: the EXCEPTION clause swallows the error, so the
+                    // client never sees an ErrorResponse — but if this session
+                    // has an open explicit transaction the engine has already
+                    // marked it aborted, and every later statement in the
+                    // client's migration would fail 25P02 until COMMIT answered
+                    // ROLLBACK. A caught exception is a statement-level
+                    // recovery, exactly the MySQL case, so undo the mark here.
+                    // ⚠️ Same caveat as the MySQL path: rows the FAILED
+                    // statement had already staged before it failed are NOT
+                    // discarded — the engine has no per-statement undo point,
+                    // so only ROLLBACK / ROLLBACK TO SAVEPOINT removes them.
+                    let _ = self.database.clear_session_transaction_failure(self.session_id);
                     continue;
                 }
                 self.suppress_ready_for_query = prev;
@@ -3175,7 +3273,7 @@ where
         self.send_error_message(
             "ERROR",
             "25P02",
-            "current transaction is aborted, commands ignored until end of transaction block",
+            crate::error::IN_FAILED_TRANSACTION_MESSAGE,
             None,
             Some("Use ROLLBACK to clear the failed transaction state".to_string()),
         )
@@ -3291,6 +3389,24 @@ where
             "GRANT".to_string()
         } else if starts_with_icase(trimmed, "REVOKE") {
             "REVOKE".to_string()
+        // HDB-008: the savepoint family. PostgreSQL tags these `SAVEPOINT`,
+        // `RELEASE` and — for `ROLLBACK TO [SAVEPOINT] n` — `ROLLBACK`; all
+        // three fell through to `OK 0`, which is not a tag any PostgreSQL
+        // client has ever seen. `ROLLBACK TO SAVEPOINT` is now the sanctioned
+        // way out of an aborted block (the recovery arm in
+        // `handle_single_query` sends this tag), so it is the one a driver is
+        // most likely to read. The classifier, not a prefix test, decides the
+        // last one: `ROLLBACK` on its own is a transaction BOUNDARY and never
+        // reaches here.
+        } else if matches!(
+            classify_transaction_control(trimmed),
+            Some(TxnControl::RollbackToSavepoint)
+        ) {
+            "ROLLBACK".to_string()
+        } else if starts_with_icase(trimmed, "SAVEPOINT ") {
+            "SAVEPOINT".to_string()
+        } else if starts_with_icase(trimmed, "RELEASE ") {
+            "RELEASE".to_string()
         } else {
             format!("OK {}", affected)
         }
@@ -3331,9 +3447,11 @@ where
         (col, val)
     }
 
-    /// GH#28: the `SHOW` names answered from the connection policy rather than
-    /// the static table: the three timeout GUCs and `max_connections`.
-    /// Returns the lower-cased name when `sql` is `SHOW <one of them>`.
+    /// The `SHOW` names answered per CONNECTION rather than from the static
+    /// table: the three timeout GUCs and `max_connections` (GH#28), plus
+    /// `session_authorization` and `role` (HDB-009), which depend on who this
+    /// connection authenticated as. Returns the lower-cased name when `sql` is
+    /// `SHOW <one of them>`.
     pub(super) fn session_show_parameter_name(sql: &str) -> Option<String> {
         let trimmed = sql.trim();
         if !starts_with_icase(trimmed, "SHOW ") {
@@ -3351,6 +3469,8 @@ where
                 | "idle_in_transaction_session_timeout"
                 | "authentication_timeout"
                 | "max_connections"
+                | "session_authorization"
+                | "role"
         ) {
             Some(name)
         } else {
@@ -3379,9 +3499,35 @@ where
                 format_guc_duration_ms(self.policy.timeouts.authentication_timeout.as_millis() as u64)
             }
             "max_connections" => self.policy.max_connections.to_string(),
+            // HDB-009: identity reporting, answered per SESSION. The static
+            // table cannot answer these — it has no idea who this connection
+            // is — and used to return an empty string for both.
+            // `SHOW session_authorization` is what psql's `\conninfo`,
+            // SQLAlchemy and Npgsql probe, and it must agree with
+            // `current_user`.
+            "session_authorization" => self.session_login_identity(),
+            // PostgreSQL's value when no `SET ROLE` is in effect, which is
+            // always here: `SET ROLE` / `SET SESSION AUTHORIZATION` stay
+            // REFUSED (0A000, HC4). Identity switching is not implemented, and
+            // reporting a switched role would be a security lie.
+            "role" => "none".to_string(),
             _ => return Self::resolve_show_parameter(param),
         };
         (lower, value)
+    }
+
+    /// This connection's SQL identity for the reporting surfaces (HDB-009): the
+    /// authenticated login name published onto the session at the end of
+    /// startup, or the documented service user when the session carries none —
+    /// an embedder-constructed handler, or the in-crate test harness, neither of
+    /// which authenticates anybody.
+    fn session_login_identity(&self) -> String {
+        self.database
+            .session_login_user(self.session_id)
+            .ok()
+            .flatten()
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "heliosdb".to_string())
     }
 
     /// GH#28: `SET` / `RESET` of a connection-lifetime GUC on the simple-query
@@ -4573,6 +4719,14 @@ pub(crate) fn sqlstate_for_error(error: &Error) -> &'static str {
                 // LockManager aborts the victim with "Deadlock detected for
                 // transaction N" (storage/lock_manager.rs).
                 sqlstate::DEADLOCK_DETECTED // 40P01
+            } else if lower.starts_with("current transaction is aborted") {
+                // HDB-008: the engine's aborted-transaction refusals — both the
+                // 25P02 statement refusal (`Error::in_failed_transaction`) and
+                // the embedded COMMIT refusal
+                // (`Error::commit_of_failed_transaction`). Anchored on the
+                // prefix the two shared consts in `src/error.rs` both start
+                // with, not on a bare substring.
+                sqlstate::IN_FAILED_SQL_TRANSACTION // 25P02
             } else {
                 sqlstate::INVALID_TRANSACTION_STATE // 25000
             }

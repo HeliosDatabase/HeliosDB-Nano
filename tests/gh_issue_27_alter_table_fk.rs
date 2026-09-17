@@ -593,6 +593,11 @@ fn the_list_less_dangling_reference_is_rejected_inside_an_explicit_transaction()
     db.execute("BEGIN").unwrap();
     let err = must_reject(&db, "ALTER TABLE tx_c ADD FOREIGN KEY (p) REFERENCES tx_nosuch", false);
     assert_undefined_table(&err, "tx_nosuch");
+    // HDB-008: the rejected ALTER aborted the block, so every later statement
+    // in it is refused with 25P02. Start a fresh block for the second probe so
+    // it is judged on its own merits.
+    let _ = db.execute("ROLLBACK");
+    db.execute("BEGIN").unwrap();
     let err = must_reject(&db, "ALTER TABLE tx_c ADD COLUMN q INT REFERENCES tx_nosuch(id)", false);
     assert_undefined_table(&err, "tx_nosuch");
     let _ = db.execute("ROLLBACK");

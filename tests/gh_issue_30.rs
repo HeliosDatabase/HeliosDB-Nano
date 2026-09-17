@@ -453,6 +453,12 @@ fn savepoint_rollback_frees_the_primary_key_it_took() {
         &[Value::Int4(2), Value::Int4(22)],
     )
     .unwrap_or_else(|e| panic!("*** GH#30: the key freed by ROLLBACK TO SAVEPOINT was still occupied: {e} ***"));
+    // The probe below is a deliberate duplicate-key error inside the block.
+    // HDB-008: any error aborts the transaction, so fence the probe with its
+    // own savepoint and recover from it before the COMMIT that this test is
+    // really about.
+    db.execute_for_session(sid, "SAVEPOINT overshoot_probe")
+        .expect("probe savepoint");
     let overshoot = db.execute_params_returning_for_session(
         sid,
         "INSERT INTO ints (id, v) VALUES ($1, $2) RETURNING id",
@@ -462,6 +468,8 @@ fn savepoint_rollback_frees_the_primary_key_it_took() {
         overshoot.is_err(),
         "the pre-savepoint key must STILL be taken — ROLLBACK TO SAVEPOINT drained too far"
     );
+    db.execute_for_session(sid, "ROLLBACK TO SAVEPOINT overshoot_probe")
+        .expect("recover from the probe");
 
     db.commit_transaction_for_session(sid).expect("commit");
     assert_eq!(row_count(&db, sid, "ints"), 2, "ids 1 and 2 must both be committed");

@@ -331,7 +331,7 @@ pub use crypto::{
     NonceTracker, TimestampValidator, ZeroKnowledgeSession, ZkeConfig, ZkeDerivedKeys, ZkeKeyDerivation,
     ZkeRequestContext,
 };
-pub use error::{Error, Result};
+pub use error::{Error, Result, COMMIT_OF_FAILED_TRANSACTION_MESSAGE, IN_FAILED_TRANSACTION_MESSAGE};
 pub use storage::StorageEngine;
 pub use types::{
     AgentMessage, AgentSession, Column, ColumnStorageMode, DataType, DocumentData, DocumentMetadata, Schema, Tuple,
@@ -478,6 +478,22 @@ thread_local! {
     /// active `search_path` yields to the planner two-probe without lock or
     /// borrow traffic.
     static SESSION_SCHEMA_OVERRIDE_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The login identity of the session whose statement is running on THIS
+    /// thread (HDB-009), installed for the duration of ONE synchronous
+    /// statement by every session entry point (see
+    /// `EmbeddedDatabase::session_login_user_override_guard`).
+    ///
+    /// The expression evaluator that serves `current_user` / `session_user` /
+    /// `current_role` and `current_setting('session_authorization')` is
+    /// storage-less AND session-less, so — exactly like the `search_path`
+    /// override above and the advisory-lock context — the authenticated name
+    /// can only reach it through a per-statement thread-local. `None` (nothing
+    /// installed) means the caller has no login identity at all: the embedded
+    /// `query()` / `execute()` funnels, which answer with the documented
+    /// service user. `Arc<str>` rather than `String` so installing one costs a
+    /// single atomic increment on a path that runs for every statement.
+    static SESSION_LOGIN_USER_OVERRIDE: std::cell::RefCell<Option<std::sync::Arc<str>>> =
+        const { std::cell::RefCell::new(None) };
     /// True while THIS thread holds the global `current_transaction`
     /// `parking_lot::Mutex` **across** statement execution — i.e. inside
     /// `execute()`'s in-transaction branch.
@@ -538,6 +554,40 @@ impl Drop for SessionSchemaOverrideGuard {
     }
 }
 
+/// RAII installer for the per-statement SQL session identity
+/// (`SESSION_LOGIN_USER_OVERRIDE`, HDB-009).
+///
+/// Restores the PREVIOUS value on `Drop` — including on an unwinding panic —
+/// rather than clearing unconditionally, exactly like [`GlobalTxnLockMarker`].
+/// That matters because the engine re-enters itself on the SAME worker thread:
+/// a SQL UDF body, a trigger's row hook and `CALL` all run through a nested
+/// `query()` / `execute()`, and a nested guard that cleared the slot would
+/// leave the REST of the outer statement answering `current_user` with the
+/// service user. Nothing may be installed across an `.await`; every session
+/// entry point that installs one is synchronous.
+///
+/// The `PhantomData<*const ()>` makes that rule STRUCTURAL rather than a
+/// comment: a raw pointer is not `Send`, so the guard is not `Send`, so no
+/// `async fn` can hold one across a `.await` and restore another connection's
+/// identity onto a worker thread it has since migrated to.
+struct SessionLoginUserOverrideGuard(Option<std::sync::Arc<str>>, std::marker::PhantomData<*const ()>);
+
+impl SessionLoginUserOverrideGuard {
+    fn install(login_user: std::sync::Arc<str>) -> Self {
+        Self(
+            SESSION_LOGIN_USER_OVERRIDE.with(|c| c.borrow_mut().replace(login_user)),
+            std::marker::PhantomData,
+        )
+    }
+}
+
+impl Drop for SessionLoginUserOverrideGuard {
+    fn drop(&mut self) {
+        let previous = self.0.take();
+        SESSION_LOGIN_USER_OVERRIDE.with(|c| *c.borrow_mut() = previous);
+    }
+}
+
 /// The calling thread's effective `search_path` current schema, as seen by the
 /// storage-less expression evaluator serving `current_schema()` /
 /// `current_schemas()`. Reads the per-statement thread-local override that BOTH
@@ -557,6 +607,36 @@ pub(crate) fn session_current_schema_tls() -> Option<String> {
 /// report the ordered array.
 pub(crate) fn session_search_path_tls() -> Vec<String> {
     SESSION_SEARCH_PATH.with(|c| c.borrow().clone())
+}
+
+/// The calling thread's SQL session identity: the login name the connection
+/// authenticated with (HDB-009). This is what `current_user`, `session_user`,
+/// `current_role` and `current_setting('session_authorization')` report, and
+/// what the shared result cache tags its entries with (see [`CachedRows`]).
+///
+/// `None` means no login identity is installed on this thread — the
+/// session-less embedded API, and any engine-internal caller — in which case
+/// every reader falls back to the documented service user `heliosdb`. Cloning
+/// the `Arc<str>` is one atomic increment, no allocation.
+pub(crate) fn session_login_user_tls() -> Option<std::sync::Arc<str>> {
+    SESSION_LOGIN_USER_OVERRIDE.with(|c| c.borrow().clone())
+}
+
+/// True when the calling thread's SQL session identity is exactly `other`
+/// (`None` == no identity installed), compared by CONTENT.
+///
+/// The result-cache probes ask this question on every cached read, so unlike
+/// [`session_login_user_tls`] it borrows the thread-local instead of cloning
+/// out of it: no refcount traffic, no allocation, nothing to drop. That is the
+/// whole reason the caches tag the cached VALUE with its principal rather than
+/// composing the principal into the key — a key composition would have to build
+/// a fresh `String` per probe, on the hottest wire path there is.
+pub(crate) fn session_login_user_is(other: Option<&str>) -> bool {
+    SESSION_LOGIN_USER_OVERRIDE.with(|c| match (c.borrow().as_deref(), other) {
+        (None, None) => true,
+        (Some(installed), Some(other)) => installed == other,
+        _ => false,
+    })
 }
 
 /// A PostgreSQL-style notice the engine raised for a session, waiting to be
@@ -587,6 +667,31 @@ pub(crate) const SERIALIZABLE_IS_SNAPSHOT_ISOLATION: &str =
     "SERIALIZABLE is served as SNAPSHOT ISOLATION: HeliosDB-Nano performs no read-set validation \
      (no SSI), so this transaction behaves exactly like REPEATABLE READ and WRITE SKEW is NOT \
      prevented — two transactions may each read rows the other then modifies, and both commit.";
+
+/// One shared result-cache entry: the rows, tagged with the principal they
+/// were computed for (HDB-009).
+///
+/// The cache is keyed on SQL text alone, exactly as it always was. A statement
+/// whose answer depends on WHO is asking — `SELECT current_user`, a view or a
+/// SQL UDF that hides one of the identity functions, a `WHERE owner =
+/// current_user` predicate — would otherwise be computed once for the first
+/// principal and served verbatim to every later one. Tagging the VALUE closes
+/// that without touching the key: a probe whose installed identity does not
+/// match the tag is a MISS (and the next publish overwrites the entry), so
+/// nobody is ever served another principal's rows.
+///
+/// Why not compose the principal into the key: the key would have to be built
+/// as an owned `String` on every probe, hit or miss, on the hottest wire path —
+/// where the whole point of `hot_result_cache_entry` is that a repeated SELECT
+/// allocates nothing. Comparing a tag costs one thread-local borrow and a
+/// string compare (see [`session_login_user_is`]).
+struct CachedRows {
+    /// The login identity installed when these rows were computed; `None` for a
+    /// session-less caller (the embedded funnels).
+    login: Option<std::sync::Arc<str>>,
+    /// The rows themselves, shared with every reader that hits this entry.
+    rows: std::sync::Arc<Vec<Tuple>>,
+}
 
 pub struct EmbeddedDatabase {
     /// Storage engine (public for REPL access)
@@ -681,8 +786,13 @@ pub struct EmbeddedDatabase {
     plan_cache: std::sync::Arc<sharded_lru::ShardedLruCache<String, std::sync::Arc<sql::LogicalPlan>>>,
     /// Parse cache: SQL string → AST Statement (sharded LRU, skips SQL parsing for repeated queries)
     parse_cache: std::sync::Arc<sharded_lru::ShardedLruCache<String, sqlparser::ast::Statement>>,
-    /// Query result cache: SQL string → cached results (invalidated on DML per-table)
-    result_cache: std::sync::Arc<sharded_lru::ShardedLruCache<String, std::sync::Arc<Vec<Tuple>>>>,
+    /// Query result cache: SQL text → cached results (invalidated on DML
+    /// per-table). Each entry carries the principal it was computed for and a
+    /// probe under a different identity misses (HDB-009, see [`CachedRows`]),
+    /// so one principal's rows can never be served to another — including when
+    /// the identity is hidden inside a view or a UDF and the SQL text is
+    /// byte-identical.
+    result_cache: std::sync::Arc<sharded_lru::ShardedLruCache<String, std::sync::Arc<CachedRows>>>,
     /// Fast DML invalidation gate; avoids taking the result-cache mutex when
     /// no query has populated it since the last invalidation.
     result_cache_nonempty: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -712,9 +822,22 @@ pub struct EmbeddedDatabase {
     /// performs — so comparing it before serving cached rows closes the hole for ANY
     /// out-of-handle catalog change, not just MV refresh.
     seen_schema_generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    /// Last result-cache entry served. Hot repeated SELECTs avoid touching the
-    /// sharded LRU on every call; cleared by the same invalidation gate.
-    hot_result_cache_entry: std::sync::Arc<parking_lot::RwLock<Option<(String, std::sync::Arc<Vec<Tuple>>)>>>,
+    /// Last result-cache entry served: `(principal, SQL text, rows)`, carrying
+    /// its principal exactly like `result_cache` (HDB-009). Hot repeated
+    /// SELECTs avoid touching the sharded LRU on every call; cleared by the same
+    /// invalidation gate. Probing it is allocation-free — the SQL is compared by
+    /// `&str` and the principal by [`session_login_user_is`].
+    ///
+    /// It is ONE global slot, and `result_cache` keeps one entry per SQL text,
+    /// so N principals running byte-identical SQL now evict each other where a
+    /// single entry used to serve all of them. That is a HIT-RATE property
+    /// only — an entry belonging to another principal is a miss and the query
+    /// is recomputed, never answered wrongly — and it is the price of the
+    /// alternative being an owned cache key built on every probe. A
+    /// single-principal workload (which is every measured benchmark, and most
+    /// deployments) is byte-identical to before.
+    hot_result_cache_entry:
+        std::sync::Arc<parking_lot::RwLock<Option<(Option<std::sync::Arc<str>>, String, std::sync::Arc<Vec<Tuple>>)>>>,
     /// Fingerprint of the most recent literal fast PK lookup. Used to avoid
     /// filling the result cache with one-off point lookups while still caching
     /// repeated hot-key queries after the second consecutive hit.
@@ -2363,10 +2486,12 @@ impl EmbeddedDatabase {
     /// R1.1 (ROADMAP_V5 §1.1 Residual, "the result cache is not tenant-keyed"):
     /// never populate the shared result cache while a tenant context is active.
     ///
-    /// Both `result_cache` and `hot_result_cache_entry` are keyed on SQL text
-    /// alone, with no tenant/user component, so rows filtered for one context
-    /// would be served verbatim to a later reader in a different — or no —
-    /// context. Keying the cache by tenant would not fix it: visibility is
+    /// `result_cache` and `hot_result_cache_entry` are keyed on the SQL text
+    /// and tagged with the session's login identity (HDB-009, see
+    /// [`CachedRows`]), but carry no TENANT component, so rows filtered for one
+    /// context would be served verbatim to a later reader in a different — or
+    /// no — context.
+    /// Keying the cache by tenant would not fix it: visibility is
     /// determined by the whole `TenantContext`, not `tenant_id` (a policy may
     /// read `current_setting('app.current_user')` from `user_id`, and `roles`
     /// exists for policies to grow into — see
@@ -2393,9 +2518,16 @@ impl EmbeddedDatabase {
         if self.result_cache_epoch() != cache_epoch {
             return;
         }
+        let login = session_login_user_tls();
         let cached = std::sync::Arc::new(results.to_vec());
-        self.result_cache.put(sql.to_string(), std::sync::Arc::clone(&cached));
-        *self.hot_result_cache_entry.write() = Some((sql.to_string(), cached));
+        self.result_cache.put(
+            sql.to_string(),
+            std::sync::Arc::new(CachedRows {
+                login: login.clone(),
+                rows: std::sync::Arc::clone(&cached),
+            }),
+        );
+        *self.hot_result_cache_entry.write() = Some((login, sql.to_string(), cached));
         self.result_cache_nonempty
             .store(true, std::sync::atomic::Ordering::Release);
     }
@@ -2412,9 +2544,18 @@ impl EmbeddedDatabase {
             return Some(cached);
         }
 
-        let cached = self.result_cache.get(sql)?;
-        *self.hot_result_cache_entry.write() = Some((sql.to_string(), std::sync::Arc::clone(&cached)));
-        Some(cached)
+        // HDB-009: an entry computed under a DIFFERENT principal is a miss, not
+        // a hit — and is left in place for its own principal rather than being
+        // removed, so two principals alternating on the same SQL each keep
+        // re-publishing rather than serving each other's rows.
+        let entry = self.result_cache.get(sql)?;
+        if !session_login_user_is(entry.login.as_deref()) {
+            return None;
+        }
+        let rows = std::sync::Arc::clone(&entry.rows);
+        *self.hot_result_cache_entry.write() =
+            Some((entry.login.clone(), sql.to_string(), std::sync::Arc::clone(&rows)));
+        Some(rows)
     }
 
     /// R1.1: same gate as `cached_query_result`. This needs its own check
@@ -2426,10 +2567,15 @@ impl EmbeddedDatabase {
             return None;
         }
         self.reconcile_result_cache_with_storage();
+        // Allocation-free probe: the SQL is compared as `&str` and the
+        // principal through the thread-local, so the pre-HDB-009 hot path
+        // (`hot_sql == sql`, nothing allocated) is preserved exactly.
         self.hot_result_cache_entry
             .read()
             .as_ref()
-            .and_then(|(hot_sql, rows)| (hot_sql == sql).then(|| std::sync::Arc::clone(rows)))
+            .and_then(|(login, hot_sql, rows)| {
+                (hot_sql == sql && session_login_user_is(login.as_deref())).then(|| std::sync::Arc::clone(rows))
+            })
     }
 
     /// Drop cached query results if the storage catalog changed since the last cache
@@ -2497,6 +2643,158 @@ impl EmbeddedDatabase {
     fn is_transaction_control(sql: &str) -> bool {
         crate::protocol::postgres::handler::classify_transaction_control(sql)
             .is_some_and(crate::protocol::postgres::handler::TxnControl::is_boundary)
+    }
+
+    /// HDB-008 guard: refuse everything except the recovery statements while
+    /// `txn` is in the aborted SQL state.
+    ///
+    /// NOTHING that transaction control classifies is ever refused:
+    ///
+    /// * `BEGIN` / `COMMIT` / `ROLLBACK` (`TxnControl::is_boundary`) END the
+    ///   block, and refusing them is how a caller gets WEDGED — the text
+    ///   family intercepts them with [`is_transaction_control`] long before
+    ///   this guard, but the params family (`execute_params("COMMIT")`) has no
+    ///   such interception and reaches the executor's plan arms, so without
+    ///   this carve-out a params-only caller had no way out of an aborted
+    ///   transaction at all. `COMMIT` then rolls the block back and returns
+    ///   [`Error::commit_of_failed_transaction`], `ROLLBACK` succeeds, and
+    ///   `BEGIN` keeps its ordinary "Transaction already active" error.
+    /// * `ROLLBACK TO SAVEPOINT` is the one ordinary statement PostgreSQL
+    ///   permits inside an aborted block: it is the only way back to a usable
+    ///   transaction without discarding the work that preceded the savepoint.
+    ///
+    /// [`is_transaction_control`]: Self::is_transaction_control
+    fn refuse_if_transaction_failed(txn: &storage::Transaction, sql: &str) -> Result<()> {
+        if !txn.is_sql_aborted() {
+            return Ok(());
+        }
+        if crate::protocol::postgres::handler::classify_transaction_control(sql).is_some() {
+            return Ok(());
+        }
+        Err(Error::in_failed_transaction())
+    }
+
+    /// Does this statement spell `ROLLBACK [WORK|TRANSACTION] TO [SAVEPOINT] n`?
+    /// One classifier, shared with the wire handlers (see
+    /// [`is_transaction_control`](Self::is_transaction_control)).
+    fn is_rollback_to_savepoint(sql: &str) -> bool {
+        matches!(
+            crate::protocol::postgres::handler::classify_transaction_control(sql),
+            Some(crate::protocol::postgres::handler::TxnControl::RollbackToSavepoint)
+        )
+    }
+
+    /// HDB-008 boundary: run ONE statement (parse + plan + execute) inside an
+    /// open transaction and record its outcome on that transaction.
+    ///
+    /// * refuses the statement outright when the transaction is already
+    ///   aborted (`refuse_if_transaction_failed`), so nothing is parsed,
+    ///   planned or executed and the refusal is cheap;
+    /// * any `Err` — a parse error, a planning error, a constraint violation,
+    ///   an executor failure — marks the transaction aborted;
+    /// * an `Ok` from `ROLLBACK TO SAVEPOINT` clears the mark.
+    ///
+    /// This is deliberately applied at the ENTRY POINTS and never inside
+    /// `execute_in_transaction_no_fast_path`: that function re-enters itself
+    /// for `CREATE SCHEMA` elements, trigger bodies and UDF bodies, and a
+    /// compensating cleanup statement issued after an inner failure must not
+    /// be refused by a mark the failure it is cleaning up has just set.
+    fn run_statement_in_transaction<T>(
+        &self,
+        txn: &storage::Transaction,
+        sql: &str,
+        body: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        Self::refuse_if_transaction_failed(txn, sql)?;
+        let result = body();
+        match &result {
+            Err(_) => txn.mark_sql_aborted(),
+            Ok(_) if Self::is_rollback_to_savepoint(sql) => txn.clear_sql_aborted(),
+            Ok(_) => {}
+        }
+        result
+    }
+
+    /// HDB-008: refuse a statement for a SESSION whose transaction is already
+    /// aborted, without holding a borrow of that transaction.
+    ///
+    /// The session entry points call `touch_session_for_statement` (which takes
+    /// the slot's WRITE lock to refresh a READ COMMITTED snapshot) before they
+    /// borrow the transaction for the statement, so the statement's long-lived
+    /// read borrow cannot be taken ahead of it — `parking_lot::RwLock` is not
+    /// upgradeable and the same thread would deadlock on itself. This
+    /// short-lived probe can, which is what makes a refused statement cheap: no
+    /// snapshot refresh, no plan-cache lookup, no parse.
+    ///
+    /// `run_statement_in_transaction` re-checks the same condition around the
+    /// execution itself; this only moves the refusal earlier.
+    fn refuse_session_statement_if_failed(&self, slot: &SessionTxnSlot, sql: &str) -> Result<()> {
+        let guard = slot.read();
+        match guard.as_ref() {
+            Some(txn) => Self::refuse_if_transaction_failed(txn, sql),
+            None => Ok(()),
+        }
+    }
+
+    /// HDB-008 boundary for the entry points that resolve the GLOBAL
+    /// `current_transaction` slot deep inside execution rather than holding it
+    /// across the statement (the params family, `query_with_schema`).
+    ///
+    /// Same contract as
+    /// [`run_statement_in_transaction`](Self::run_statement_in_transaction),
+    /// but the transaction is looked up twice — once to refuse, once to record
+    /// — and the mutex is NEVER held across `body`, because the arms inside
+    /// `execute_plan_with_params_inner` take it themselves and
+    /// `parking_lot::Mutex` is not reentrant.
+    ///
+    /// Two fast-outs keep this free on every path that is not a text `BEGIN`:
+    /// `global_txn_active` (the same lock-free flag every other global-slot
+    /// caller reads) and `GLOBAL_TXN_LOCK_HELD`, which marks a re-entry from
+    /// inside `execute()`'s in-transaction branch — that branch already owns
+    /// the boundary for its statement, and locking here would deadlock.
+    fn run_global_statement<T>(&self, sql: &str, body: impl FnOnce() -> Result<T>) -> Result<T> {
+        if !self.global_txn_active.load(std::sync::atomic::Ordering::Acquire)
+            || GLOBAL_TXN_LOCK_HELD.with(|held| held.get())
+        {
+            return body();
+        }
+        {
+            let guard = self.current_transaction.lock();
+            if let Some(txn) = guard.as_ref() {
+                Self::refuse_if_transaction_failed(txn, sql)?;
+            }
+        }
+        let result = body();
+        // HDB-008: a BOUNDARY statement (`BEGIN` / `COMMIT` / `ROLLBACK`) is
+        // never recorded. The params family has no transaction-control
+        // interception, so `execute_params("COMMIT")` really does arrive here
+        // — and by the time `body()` returns, the transaction this boundary
+        // was recording for is either gone (COMMIT/ROLLBACK) or untouched
+        // (`BEGIN` inside an open transaction, which errors with "Transaction
+        // already active"). Recording either outcome would mark the WRONG
+        // transaction: a `COMMIT` of an aborted block returns `Err`, and
+        // marking on that `Err` would abort whatever occupies the slot next.
+        let control = crate::protocol::postgres::handler::classify_transaction_control(sql);
+        if control.is_some_and(crate::protocol::postgres::handler::TxnControl::is_boundary) {
+            return result;
+        }
+        let record_err = result.is_err();
+        if record_err
+            || matches!(
+                control,
+                Some(crate::protocol::postgres::handler::TxnControl::RollbackToSavepoint)
+            )
+        {
+            let guard = self.current_transaction.lock();
+            if let Some(txn) = guard.as_ref() {
+                if record_err {
+                    txn.mark_sql_aborted();
+                } else {
+                    txn.clear_sql_aborted();
+                }
+            }
+        }
+        result
     }
 
     /// Handle transaction control statements (BEGIN, COMMIT/END, ROLLBACK/ABORT)
@@ -3224,6 +3522,19 @@ impl EmbeddedDatabase {
 
     fn commit_internal_locked(&self) -> Result<()> {
         let mut txn_ref = self.current_transaction.lock();
+        // HDB-008: a COMMIT of an ABORTED transaction rolls back and reports
+        // the failure. Checked first, before deferred-FK validation and before
+        // anything is written: PostgreSQL never commits a failed transaction
+        // block, and on the embedded API a silent `Ok` here is precisely the
+        // reported bug — the caller believes the work was committed when the
+        // engine has thrown it away. The PostgreSQL wire still answers such a
+        // COMMIT with the `ROLLBACK` command tag and no error (the handler's
+        // own Failed state), which is PostgreSQL-exact for a client that CAN
+        // read a command tag.
+        if txn_ref.as_ref().is_some_and(storage::Transaction::is_sql_aborted) {
+            self.abort_global_slot_locked(&mut txn_ref)?;
+            return Err(Error::commit_of_failed_transaction());
+        }
         // Deferred-FK validation runs BEFORE the durable commit. A failure here
         // ABORTS the transaction — PostgreSQL rolls back a COMMIT that trips a
         // deferred constraint — rather than leaving the slot occupied (which
@@ -3297,6 +3608,20 @@ impl EmbeddedDatabase {
 
     fn rollback_internal_locked(&self) -> Result<()> {
         let mut txn_ref = self.current_transaction.lock();
+        self.abort_global_slot_locked(&mut txn_ref)
+    }
+
+    /// The ROLLBACK sequence for the global slot, applied to a guard the
+    /// caller already holds.
+    ///
+    /// Factored out of `rollback_internal_locked` (its only behaviour) so that
+    /// HDB-008's `COMMIT`-of-an-aborted-transaction path in
+    /// `commit_internal_locked` performs EXACTLY the same steps in exactly the
+    /// same order rather than a hand-copied approximation of them. ROLLBACK
+    /// deliberately does not clear `self.savepoints` — the savepoint stack is
+    /// process-wide, a pre-existing limitation documented in the README — so
+    /// neither does this.
+    fn abort_global_slot_locked(&self, txn_ref: &mut Option<storage::Transaction>) -> Result<()> {
         if let Some(txn) = txn_ref.take() {
             // ORDER: replay the eager ART index undo BEFORE the fast-out is
             // cleared and before `txn` is dropped (dropping it also clears this
@@ -9165,7 +9490,17 @@ impl EmbeddedDatabase {
                 // `execute()`/`query()`, and both re-take this same NON-reentrant
                 // `parking_lot::Mutex`. See `GLOBAL_TXN_LOCK_HELD`.
                 let _global_txn_marker = GlobalTxnLockMarker::set();
-                (self.execute_in_transaction_no_fast_path(sql, txn_ref), true)
+                // HDB-008: the failed-transaction boundary for the text family
+                // under a global `BEGIN`. Parse, plan and execute all happen
+                // inside `execute_in_transaction_no_fast_path`, so wrapping it
+                // here makes a parse error abort the transaction just as a
+                // constraint violation does.
+                (
+                    self.run_statement_in_transaction(txn_ref, sql, || {
+                        self.execute_in_transaction_no_fast_path(sql, txn_ref)
+                    }),
+                    true,
+                )
             } else {
                 drop(txn_lock);
                 if let Some(result) = self.try_autocommit_fast_insert(sql) {
@@ -9483,6 +9818,36 @@ impl EmbeddedDatabase {
     /// HA/logical-WAL requirement, or a constraint shape whose *timing* the
     /// batch path does not replicate (DEFERRED / AUDIT FK validation — see
     /// `copy_batch_constraints_eligible`).
+    /// HDB-009: [`Self::copy_bulk_insert`] run under THIS session's SQL identity.
+    ///
+    /// The COPY fast path evaluates column DEFAULTs itself
+    /// (`materialize_copy_tuple` → `apply_defaults_and_check_not_null`), so a
+    /// `DEFAULT current_user` column is stamped right there — but the PG-wire
+    /// handler calls the fast path directly, OUTSIDE every `_for_session` entry
+    /// point, so no identity was installed and a fast-path COPY recorded the
+    /// service user. The generic COPY fallback routes through
+    /// `execute_for_session` and recorded the real login, so one table got
+    /// different owners depending on an internal fast-path decision (adding a
+    /// trigger was enough to flip it) — worse for an audit column than a
+    /// uniform lie, because it looks right most of the time.
+    ///
+    /// Installing the guard HERE rather than in the handler keeps the whole
+    /// thing synchronous: the guard is created and dropped inside this call and
+    /// can never be held across the handler's `.await`.
+    pub(crate) fn copy_bulk_insert_for_session(
+        &self,
+        session_id: crate::session::SessionId,
+        table_name: &str,
+        columns: &[String],
+        rows: &[Vec<Option<String>>],
+    ) -> Option<Result<u64>> {
+        let _identity_override = match self.session_login_user_override_guard(session_id) {
+            Ok(guard) => guard,
+            Err(e) => return Some(Err(e)),
+        };
+        self.copy_bulk_insert(table_name, columns, rows)
+    }
+
     pub(crate) fn copy_bulk_insert(
         &self,
         table_name: &str,
@@ -14865,6 +15230,22 @@ impl EmbeddedDatabase {
         params: &[Value],
         plan_override: Option<&std::sync::Arc<sql::LogicalPlan>>,
     ) -> Result<u64> {
+        // HDB-008: the params family resolves the GLOBAL `current_transaction`
+        // slot deep inside `execute_plan_with_params_inner`'s DML arms, so the
+        // failed-transaction boundary is applied here, at the entry point,
+        // where parse and plan errors are still inside it. Free (one atomic
+        // load) whenever no text-`BEGIN` transaction is open.
+        self.run_global_statement(sql, || self.execute_params_inner_unguarded(sql, params, plan_override))
+    }
+
+    /// The body of [`execute_params_inner`](Self::execute_params_inner),
+    /// inside the HDB-008 boundary.
+    fn execute_params_inner_unguarded(
+        &self,
+        sql: &str,
+        params: &[Value],
+        plan_override: Option<&std::sync::Arc<sql::LogicalPlan>>,
+    ) -> Result<u64> {
         // Reflect an embedded `SET search_path` into the evaluator's thread-local
         // (see `embedded_current_schema_guard`). Free on the default path; a
         // no-op when a wire session already installed its own override.
@@ -14930,6 +15311,20 @@ impl EmbeddedDatabase {
     /// transaction when one exists. Other statements fall back to the exact
     /// per-row `execute_params` behavior.
     pub fn execute_many_params(&self, sql: &str, rows: &[Vec<Value>]) -> Result<u64> {
+        // HDB-008: the batch fast path (`try_fast_insert_many_params`) stages
+        // straight into the GLOBAL `current_transaction` slot, so this is a
+        // full in-transaction execution site and needs the failed-transaction
+        // boundary like every other one. Without it the reported bug survived
+        // verbatim on a public entry point (and on the Python binding, whose
+        // `execute_many` routes here): a duplicate key inside a batch left the
+        // transaction unmarked and the next `COMMIT` committed the partial
+        // work. One atomic load whenever no text-`BEGIN` transaction is open.
+        self.run_global_statement(sql, || self.execute_many_params_inner(sql, rows))
+    }
+
+    /// The body of [`execute_many_params`](Self::execute_many_params), inside
+    /// the HDB-008 boundary.
+    fn execute_many_params_inner(&self, sql: &str, rows: &[Vec<Value>]) -> Result<u64> {
         if rows.is_empty() {
             return Ok(0);
         }
@@ -14995,6 +15390,15 @@ impl EmbeddedDatabase {
     /// # }
     /// ```
     pub fn execute_params_returning(&self, sql: &str, params: &[Value]) -> Result<(u64, Vec<Tuple>)> {
+        // HDB-008: the params-family `RETURNING` entry point, inside the
+        // failed-transaction boundary (see `execute_params_inner`).
+        self.run_global_statement(sql, || self.execute_params_returning_inner(sql, params))
+    }
+
+    /// The body of
+    /// [`execute_params_returning`](Self::execute_params_returning), inside
+    /// the HDB-008 boundary.
+    fn execute_params_returning_inner(&self, sql: &str, params: &[Value]) -> Result<(u64, Vec<Tuple>)> {
         // Reflect an embedded `SET search_path` into the evaluator's thread-local
         // so RETURNING `current_schema()` sees the right schema (see
         // `embedded_current_schema_guard`). Free on the default path.
@@ -16923,18 +17327,31 @@ impl EmbeddedDatabase {
         }
 
         if Self::is_prepared_statement_sql(sql) {
-            if let Some((rows, _columns)) = self.try_handle_prepared_statement_sql_fast_with_schema(sql)? {
-                self.log_slow_query(sql, start.elapsed(), rows.len() as u64);
-                return Ok(rows);
-            }
-            let (statement, _) = self.parse_cached(sql)?;
-            let catalog = self.storage.catalog();
-            let planner = sql::Planner::with_catalog(&catalog)
-                .with_sql(sql.to_string())
-                .with_current_schema(self.current_schema())
-                .with_search_path(self.current_search_path());
-            let plan = planner.statement_to_plan(statement)?;
-            if let Some((rows, _columns)) = self.try_handle_prepared_query_plan_with_schema(&plan)? {
+            // HDB-008: `PREPARE` / `EXECUTE` / `DEALLOCATE` are dispatched
+            // HERE, ahead of the in-transaction branch below, and the
+            // `EXECUTE` arm attaches the global `current_transaction` itself
+            // (`execute_plan_with_params` / `query_plan_with_params`). Without
+            // this boundary an `EXECUTE ins(1)` inside an aborted block was
+            // neither refused nor recorded — the same class of hole as the
+            // batch path, on the SQL surface every ORM's
+            // `PREPARE`/`EXECUTE` emulation uses.
+            let handled = self.run_global_statement(sql, || -> Result<Option<Vec<Tuple>>> {
+                if let Some((rows, _columns)) = self.try_handle_prepared_statement_sql_fast_with_schema(sql)? {
+                    return Ok(Some(rows));
+                }
+                let (statement, _) = self.parse_cached(sql)?;
+                let catalog = self.storage.catalog();
+                let planner = sql::Planner::with_catalog(&catalog)
+                    .with_sql(sql.to_string())
+                    .with_current_schema(self.current_schema())
+                    .with_search_path(self.current_search_path());
+                let plan = planner.statement_to_plan(statement)?;
+                if let Some((rows, _columns)) = self.try_handle_prepared_query_plan_with_schema(&plan)? {
+                    return Ok(Some(rows));
+                }
+                Ok(None)
+            })?;
+            if let Some(rows) = handled {
                 self.log_slow_query(sql, start.elapsed(), rows.len() as u64);
                 return Ok(rows);
             }
@@ -16953,18 +17370,24 @@ impl EmbeddedDatabase {
         if self.global_txn_active.load(std::sync::atomic::Ordering::Acquire) {
             let txn_lock = self.current_transaction.lock();
             if let Some(txn_ref) = txn_lock.as_ref() {
-                // Parse and execute through transaction-aware executor
-                let (statement, _) = self.parse_cached(sql)?;
-                let catalog = self.storage.catalog();
-                let planner = sql::Planner::with_catalog(&catalog)
-                    .with_sql(sql.to_string())
-                    .with_current_schema(self.current_schema())
-                    .with_search_path(self.current_search_path());
-                let plan = planner.statement_to_plan(statement)?;
-                // R1.2 (Hole 5a): this branch hand-rolled its own executor and
-                // never applied RLS, so the FIRST read inside a SQL-text `BEGIN`
-                // saw every row — no cache state or query shape required.
-                let results = self.query_plan_with_params(&plan, &[], Some(txn_ref))?;
+                // HDB-008: parse + plan + execute inside the failed-transaction
+                // boundary, so a read issued after an earlier failure in this
+                // `BEGIN` block is refused with 25P02 and a planning error
+                // aborts the transaction.
+                let results = self.run_statement_in_transaction(txn_ref, sql, || {
+                    // Parse and execute through transaction-aware executor
+                    let (statement, _) = self.parse_cached(sql)?;
+                    let catalog = self.storage.catalog();
+                    let planner = sql::Planner::with_catalog(&catalog)
+                        .with_sql(sql.to_string())
+                        .with_current_schema(self.current_schema())
+                        .with_search_path(self.current_search_path());
+                    let plan = planner.statement_to_plan(statement)?;
+                    // R1.2 (Hole 5a): this branch hand-rolled its own executor and
+                    // never applied RLS, so the FIRST read inside a SQL-text `BEGIN`
+                    // saw every row — no cache state or query shape required.
+                    self.query_plan_with_params(&plan, &[], Some(txn_ref))
+                })?;
                 self.log_slow_query(sql, start.elapsed(), results.len() as u64);
                 return Ok(results);
             }
@@ -17277,6 +17700,44 @@ impl EmbeddedDatabase {
         Some((cached_results, columns))
     }
 
+    /// HDB-009: [`Self::try_cached_query_with_schema`] probed under THIS
+    /// session's SQL identity.
+    ///
+    /// Every entry in the shared result cache is tagged with the principal that
+    /// computed it (`CachedRows::login`), and the tag is compared against the
+    /// per-statement thread-local that the `_for_session` entry points install.
+    /// The PostgreSQL simple-query handler's own top-level probe sits OUTSIDE
+    /// all of them, so it ran with no principal installed and could match only
+    /// `None`-tagged entries — the ones computed session-less. Two consequences,
+    /// both closed here:
+    ///
+    ///   * correctness — on a handle shared with a session-less surface (the
+    ///     REST data API, MCP, or an embedder's own `db.query()`; `main.rs`
+    ///     hands ONE `Arc<EmbeddedDatabase>` to both `PgServer` and
+    ///     `ApiServer::from_config`, so that is the shipped server layout) an
+    ///     answer computed as `heliosdb` was served verbatim to an
+    ///     authenticated wire client;
+    ///   * performance — on a wire-only server every cache WRITE goes through a
+    ///     `_for_session` entry point and is therefore tagged `Some(login)`, so
+    ///     an untagged probe could never hit and every wire `SELECT` fell
+    ///     through to the full `query_with_schema_for_session` prologue.
+    ///
+    /// Installing the guard HERE rather than in the handler keeps the whole
+    /// thing synchronous: it is created and dropped inside this call and can
+    /// never be held across the handler's `.await` (the guard is `!Send`).
+    /// Same shape as [`Self::copy_bulk_insert_for_session`].
+    ///
+    /// A session-lookup failure is a probe MISS, not an error — this is a cache
+    /// fast path, and the caller's slow path reports the real error.
+    pub(crate) fn try_cached_query_with_schema_for_session(
+        &self,
+        session_id: crate::session::SessionId,
+        sql: &str,
+    ) -> Option<(std::sync::Arc<Vec<Tuple>>, std::sync::Arc<Schema>)> {
+        let _identity_override = self.session_login_user_override_guard(session_id).ok()?;
+        self.try_cached_query_with_schema(sql)
+    }
+
     /// A2: is query normalization enabled? Read once from
     /// `NANO_DISABLE_QUERY_NORMALIZATION` (the runtime kill switch) and cached.
     fn query_normalization_enabled() -> bool {
@@ -17431,7 +17892,13 @@ impl EmbeddedDatabase {
         }
 
         if Self::is_prepared_statement_sql(sql) {
-            if let Some(result) = self.try_handle_prepared_statement_sql_fast_with_schema(sql)? {
+            // HDB-008: same boundary as `query()`'s prepared-statement arm —
+            // this dispatch runs ahead of everything that consults the global
+            // transaction, and its `EXECUTE` arm attaches that transaction
+            // itself.
+            if let Some(result) =
+                self.run_global_statement(sql, || self.try_handle_prepared_statement_sql_fast_with_schema(sql))?
+            {
                 return Ok(result);
             }
         }
@@ -18051,6 +18518,26 @@ impl EmbeddedDatabase {
             return Err(Error::transaction("Session has no active transaction to commit"));
         }
 
+        // HDB-008: a COMMIT of an ABORTED session transaction rolls back and
+        // reports the failure — the session twin of the global-slot check in
+        // `commit_internal_locked`. Inspected BEFORE the slot is removed, so
+        // the rollback below still finds it. The session write lock is dropped
+        // first because `rollback_transaction_for_session_inner` re-takes it;
+        // the outer `commit_transaction_for_session` releases this session's
+        // transaction-scope advisory locks on every exit, this one included.
+        let sql_aborted = match self.session_txn_slot(session_id) {
+            Some(slot) => {
+                let guard = slot.read();
+                guard.as_ref().is_some_and(storage::Transaction::is_sql_aborted)
+            }
+            None => false,
+        };
+        if sql_aborted {
+            drop(session);
+            self.rollback_transaction_for_session_inner(session_id)?;
+            return Err(Error::commit_of_failed_transaction());
+        }
+
         // Retrieve and commit transaction with a FRESH commit timestamp.
         // The slot's write lock waits out any statement still borrowing the
         // transaction; the DashMap shard guard itself is released by the
@@ -18225,6 +18712,10 @@ impl EmbeddedDatabase {
     pub fn execute_in_session(&self, session_id: crate::session::SessionId, sql: &str) -> Result<u64> {
         // Spec 03: this session owns any advisory lock the statement takes.
         let _advisory = self.advisory_context_guard(session_id, sql);
+        // HDB-009: this session's login identity answers `current_user` and
+        // keys the result cache for everything below, including every early
+        // return.
+        let _identity_override = self.session_login_user_override_guard(session_id)?;
         // R1.3-p2: session-scoped SET/RESET synchronous_commit. Must run
         // BEFORE the session write lock below (the handler re-locks it).
         if let Some(handled) = self.try_handle_session_synchronous_commit(session_id, sql)? {
@@ -18240,6 +18731,9 @@ impl EmbeddedDatabase {
 
         // Check if session has an active transaction
         if let Some(slot) = self.session_txn_slot(session_id) {
+            // HDB-008: refuse before the snapshot refresh below, so a statement
+            // sent into an already-aborted transaction costs one atomic load.
+            self.refuse_session_statement_if_failed(&slot, sql)?;
             // For READ COMMITTED, each statement gets a fresh snapshot.
             // Hold the slot's write lock only briefly for the mutable refresh.
             if session.isolation_level == crate::session::IsolationLevel::ReadCommitted {
@@ -18255,8 +18749,10 @@ impl EmbeddedDatabase {
                 .map_err(|_| Error::transaction("Session transaction disappeared during execute"))?;
 
             // Skip fast paths for session transactions — writes must go through
-            // the transaction write set for proper isolation and rollback support
-            self.execute_in_transaction_no_fast_path(sql, &txn)
+            // the transaction write set for proper isolation and rollback support.
+            // HDB-008: inside the failed-transaction boundary, so this
+            // statement's failure aborts the session transaction.
+            self.run_statement_in_transaction(&txn, sql, || self.execute_in_transaction_no_fast_path(sql, &txn))
         } else {
             // Implicit transaction — skip fast paths since session-based execution
             // requires MVCC versioning for proper isolation across sessions
@@ -18357,6 +18853,8 @@ impl EmbeddedDatabase {
         // installed before the `self.query(...)` delegate below so the shared
         // funnel does not re-attribute the lock to the embedded handle.
         let _advisory = self.advisory_context_guard(session_id, sql);
+        // HDB-009: identity for `current_user` and the result-cache key.
+        let _identity_override = self.session_login_user_override_guard(session_id)?;
         let session_lock = self.session_manager.get_session(session_id)?;
         let mut session = session_lock.write();
         session.touch();
@@ -18364,6 +18862,9 @@ impl EmbeddedDatabase {
 
         // Check if session has an active transaction
         if let Some(slot) = self.session_txn_slot(session_id) {
+            // HDB-008: refuse before the snapshot refresh below (see
+            // `execute_in_session`).
+            self.refuse_session_statement_if_failed(&slot, sql)?;
             // For READ COMMITTED, each statement gets a fresh snapshot.
             // Hold the slot's write lock only briefly for the mutable refresh.
             if session.isolation_level == crate::session::IsolationLevel::ReadCommitted {
@@ -18377,21 +18878,25 @@ impl EmbeddedDatabase {
             let txn = parking_lot::RwLockReadGuard::try_map(slot.read(), |t| t.as_ref())
                 .map_err(|_| Error::transaction("Session transaction disappeared during query"))?;
 
-            // Parse SQL with cache
-            let (statement, _) = self.parse_cached(sql)?;
+            // HDB-008: parse + plan + execute inside the failed-transaction
+            // boundary, so a planning error aborts the session transaction.
+            self.run_statement_in_transaction(&txn, sql, || {
+                // Parse SQL with cache
+                let (statement, _) = self.parse_cached(sql)?;
 
-            // Create logical plan with catalog access and original SQL for time-travel parsing
-            let catalog = self.storage.catalog();
-            let planner = sql::Planner::with_catalog(&catalog)
-                .with_sql(sql.to_string())
-                .with_current_schema(self.current_schema())
-                .with_search_path(self.current_search_path());
-            let plan = planner.statement_to_plan(statement)?;
+                // Create logical plan with catalog access and original SQL for time-travel parsing
+                let catalog = self.storage.catalog();
+                let planner = sql::Planner::with_catalog(&catalog)
+                    .with_sql(sql.to_string())
+                    .with_current_schema(self.current_schema())
+                    .with_search_path(self.current_search_path());
+                let plan = planner.statement_to_plan(statement)?;
 
-            // Execute plan with transaction context.
-            // R1.2 (Hole 5g): the third, older session-query entry point had the
-            // same hand-rolled, RLS-blind executor as 5c/5e.
-            self.query_plan_with_params(&plan, &[], Some(&txn))
+                // Execute plan with transaction context.
+                // R1.2 (Hole 5g): the third, older session-query entry point had the
+                // same hand-rolled, RLS-blind executor as 5c/5e.
+                self.query_plan_with_params(&plan, &[], Some(&txn))
+            })
         } else {
             self.query(sql, _params)
         }
@@ -18408,6 +18913,36 @@ impl EmbeddedDatabase {
     /// True if this session currently has an open explicit transaction.
     pub fn session_in_transaction(&self, session_id: crate::session::SessionId) -> bool {
         self.session_transactions.contains_key(&session_id)
+    }
+
+    /// HDB-008 (MySQL listener, and the PG-wire `DO … EXCEPTION` recovery arm): undo the failed-transaction mark on this session's
+    /// transaction, if it has one.
+    ///
+    /// The engine's contract is PostgreSQL's — a statement error aborts the
+    /// whole block — and the embedded API, the REPL and the PostgreSQL wire
+    /// all keep it. **MySQL's contract is different**: InnoDB rolls back only
+    /// the failed STATEMENT, and the transaction stays open and committable.
+    /// WordPress, PHP and every MySQL driver are written against that, so the
+    /// MySQL listener clears the mark after it has reported the error and
+    /// keeps MySQL's statement-level semantics.
+    ///
+    /// A no-op when the session has no transaction (autocommit), and it never
+    /// touches the global embedded slot or any other session.
+    ///
+    /// ⚠️ Pre-existing gap, unchanged by this: rows the FAILED statement had
+    /// already staged before it failed (a multi-row `INSERT` that violates a
+    /// constraint on its third row) stay in the write set — the engine has no
+    /// per-statement undo point, so only `ROLLBACK` or
+    /// `ROLLBACK TO SAVEPOINT` removes them. MySQL would have discarded just
+    /// that statement's rows.
+    pub(crate) fn clear_session_transaction_failure(&self, session_id: crate::session::SessionId) -> Result<()> {
+        if let Some(slot) = self.session_txn_slot(session_id) {
+            let guard = slot.read();
+            if let Some(txn) = guard.as_ref() {
+                txn.clear_sql_aborted();
+            }
+        }
+        Ok(())
     }
 
     /// W3.3 autocommit statement-retry policy (from `[locks]` config). Read by
@@ -18600,15 +19135,23 @@ impl EmbeddedDatabase {
         Ok(value)
     }
 
-    /// Store this session's login role/username (wire startup `user` param), used
-    /// to expand the `"$user"` `search_path` entry (I-USER).
+    /// Publish this session's login role/username — the wire startup `user`
+    /// parameter (PG) or handshake user (MySQL), AFTER authentication has
+    /// succeeded. It becomes the session's SQL identity (HDB-009) and the
+    /// expansion of a `"$user"` `search_path` entry (I-USER).
+    ///
+    /// Delegates to [`crate::session::Session::set_login`], which writes both
+    /// the `String` and the interned `Arc<str>` form and truncates the name to
+    /// PostgreSQL's 63-byte identifier limit — both listeners default to trust,
+    /// so this name is client-asserted, and it is cloned per statement and
+    /// compared on every result-cache probe.
     pub(crate) fn set_session_login_user(
         &self,
         session_id: crate::session::SessionId,
         login_user: Option<String>,
     ) -> Result<()> {
         let session_lock = self.session_manager.get_session(session_id)?;
-        session_lock.write().login_user = login_user;
+        session_lock.write().set_login(login_user);
         Ok(())
     }
 
@@ -18655,6 +19198,47 @@ impl EmbeddedDatabase {
             }
             _ => None,
         }
+    }
+
+    /// Install THIS session's login identity as the thread-local
+    /// `current_user` / `session_user` / `current_role` /
+    /// `current_setting('session_authorization')` value for the duration of one
+    /// statement (HDB-009).
+    ///
+    /// The evaluator that answers those functions is storage-less and
+    /// session-less (see `crate::session_login_user_tls`), so this per-statement
+    /// thread-local is the ONLY way the authenticated name reaches SQL — the
+    /// same mechanism `session_schema_override_guard` uses for `search_path`
+    /// and `advisory_context_guard` uses for lock ownership. It is also what
+    /// makes the shared result cache principal-aware ([`CachedRows`]), so it
+    /// must be installed BEFORE any cache lookup — i.e. as the first
+    /// statement-scoped guard of every session entry point, ahead of every
+    /// early return.
+    ///
+    /// Returns `None` — no guard, no thread-local write — when the session has
+    /// no login identity: every `create_wire_session` handle that has not
+    /// authenticated yet, and every embedded caller that never named a user. An
+    /// empty name counts as no identity rather than becoming an empty
+    /// `current_user`.
+    ///
+    /// PERF: one session read-lock and one `Arc` refcount increment per
+    /// statement — no allocation and no copy of the name. That is why the
+    /// session stores the identity pre-interned as `Session.login_identity`
+    /// alongside the `String` the `search_path` expansion reads; building an
+    /// `Arc<str>` from the `String` here would have meant a fresh heap
+    /// allocation plus a memcpy on every statement of every wire connection.
+    /// The value cannot be cached on the handle: one `EmbeddedDatabase` serves
+    /// every connection, and the identity is per SESSION, not per handle.
+    fn session_login_user_override_guard(
+        &self,
+        session_id: crate::session::SessionId,
+    ) -> Result<Option<SessionLoginUserOverrideGuard>> {
+        let session_lock = self.session_manager.get_session(session_id)?;
+        let login_user = match session_lock.read().login_identity.as_ref() {
+            Some(name) if !name.is_empty() => std::sync::Arc::clone(name),
+            _ => return Ok(None),
+        };
+        Ok(Some(SessionLoginUserOverrideGuard::install(login_user)))
     }
 
     /// Install THIS embedded connection's `search_path` schema as the
@@ -19053,6 +19637,8 @@ impl EmbeddedDatabase {
     pub fn execute_for_session(&self, session_id: crate::session::SessionId, sql: &str) -> Result<u64> {
         // Spec 03: this connection owns any advisory lock the statement takes.
         let _advisory = self.advisory_context_guard(session_id, sql);
+        // HDB-009: identity for `current_user` and the result-cache key.
+        let _identity_override = self.session_login_user_override_guard(session_id)?;
         if Self::is_transaction_control(sql) {
             return self.handle_transaction_control_for_session(session_id, sql);
         }
@@ -19108,15 +19694,21 @@ impl EmbeddedDatabase {
         }
 
         let start = std::time::Instant::now();
-        self.touch_session_for_statement(session_id)?;
         let slot = self
             .session_txn_slot(session_id)
             .ok_or_else(|| Error::transaction("Session transaction disappeared during execute"))?;
+        // HDB-008: refuse BEFORE `touch_session_for_statement` (which takes the
+        // slot's write lock to refresh the snapshot), so a statement sent into
+        // an aborted transaction is rejected for the price of one atomic load.
+        self.refuse_session_statement_if_failed(&slot, sql)?;
+        self.touch_session_for_statement(session_id)?;
         let txn = parking_lot::RwLockReadGuard::try_map(slot.read(), |t| t.as_ref())
             .map_err(|_| Error::transaction("Session transaction disappeared during execute"))?;
         // Result-cache invalidation is deferred to COMMIT, mirroring the
         // global-slot in-transaction arm of `execute()`.
-        let result = self.execute_in_transaction_no_fast_path(sql, &txn);
+        // HDB-008: inside the failed-transaction boundary.
+        let result =
+            self.run_statement_in_transaction(&txn, sql, || self.execute_in_transaction_no_fast_path(sql, &txn));
         let rows = result.as_ref().copied().unwrap_or(0);
         self.log_slow_query(sql, start.elapsed(), rows);
         result
@@ -19147,6 +19739,8 @@ impl EmbeddedDatabase {
         // Installed before the autocommit delegate below, so the shared funnel
         // does not re-attribute the lock to the embedded handle.
         let _advisory = self.advisory_context_guard(session_id, sql);
+        // HDB-009: identity for `current_user` and the result-cache key.
+        let _identity_override = self.session_login_user_override_guard(session_id)?;
         // Resolve bare names against THIS session's schema for both the
         // autocommit delegate and the in-transaction planner below.
         let _schema_override = self.session_schema_override_guard(session_id);
@@ -19162,34 +19756,38 @@ impl EmbeddedDatabase {
         }
 
         let start = std::time::Instant::now();
-        self.touch_session_for_statement(session_id)?;
         let slot = self
             .session_txn_slot(session_id)
             .ok_or_else(|| Error::transaction("Session transaction disappeared during query"))?;
+        // HDB-008: refuse before `touch_session_for_statement` (see
+        // `execute_for_session`).
+        self.refuse_session_statement_if_failed(&slot, sql)?;
+        self.touch_session_for_statement(session_id)?;
         let txn = parking_lot::RwLockReadGuard::try_map(slot.read(), |t| t.as_ref())
             .map_err(|_| Error::transaction("Session transaction disappeared during query"))?;
 
-        let (statement, _) = self.parse_cached(sql)?;
-        let catalog = self.storage.catalog();
-        let planner = sql::Planner::with_catalog(&catalog)
-            .with_sql(sql.to_string())
-            .with_current_schema(self.current_schema())
-            .with_search_path(self.current_search_path());
-        let plan = planner.statement_to_plan(statement)?;
+        // HDB-008: parse + plan + execute inside the failed-transaction
+        // boundary.
+        let result = self.run_statement_in_transaction(&txn, sql, || {
+            let (statement, _) = self.parse_cached(sql)?;
+            let catalog = self.storage.catalog();
+            let planner = sql::Planner::with_catalog(&catalog)
+                .with_sql(sql.to_string())
+                .with_current_schema(self.current_schema())
+                .with_search_path(self.current_search_path());
+            let plan = planner.statement_to_plan(statement)?;
 
-        // `SELECT … INTO t` inside an open session transaction is still a
-        // WRITE; hand it to the CTAS executor with this session's transaction
-        // attached rather than to the read path.
-        if let Some(result) = self.try_execute_create_table_as_plan(&plan, Some(&txn)) {
-            if let Ok((rows, _)) = &result {
-                self.log_slow_query(sql, start.elapsed(), rows.len() as u64);
+            // `SELECT … INTO t` inside an open session transaction is still a
+            // WRITE; hand it to the CTAS executor with this session's transaction
+            // attached rather than to the read path.
+            if let Some(result) = self.try_execute_create_table_as_plan(&plan, Some(&txn)) {
+                return result;
             }
-            return result;
-        }
 
-        // R1.2 (Hole 5c): the wire simple-query path inside an open session
-        // transaction built its own executor and skipped RLS entirely.
-        let result = self.query_plan_with_params_with_schema(&plan, &[], Some(&txn));
+            // R1.2 (Hole 5c): the wire simple-query path inside an open session
+            // transaction built its own executor and skipped RLS entirely.
+            self.query_plan_with_params_with_schema(&plan, &[], Some(&txn))
+        });
         if let Ok((rows, _)) = &result {
             self.log_slow_query(sql, start.elapsed(), rows.len() as u64);
         }
@@ -19204,6 +19802,8 @@ impl EmbeddedDatabase {
     ) -> Result<(u64, Vec<Tuple>)> {
         // Spec 03: this connection owns any advisory lock the statement takes.
         let _advisory = self.advisory_context_guard(session_id, sql);
+        // HDB-009: identity for `current_user` and the result-cache key.
+        let _identity_override = self.session_login_user_override_guard(session_id)?;
         if Self::is_transaction_control(sql) {
             let count = self.handle_transaction_control_for_session(session_id, sql)?;
             return Ok((count, Vec::new()));
@@ -19231,14 +19831,20 @@ impl EmbeddedDatabase {
             return Ok((count, Vec::new()));
         }
 
-        self.touch_session_for_statement(session_id)?;
         let slot = self
             .session_txn_slot(session_id)
             .ok_or_else(|| Error::transaction("Session transaction disappeared during execute"))?;
+        // HDB-008: refuse before `touch_session_for_statement` (see
+        // `execute_for_session`).
+        self.refuse_session_statement_if_failed(&slot, sql)?;
+        self.touch_session_for_statement(session_id)?;
         let txn = parking_lot::RwLockReadGuard::try_map(slot.read(), |t| t.as_ref())
             .map_err(|_| Error::transaction("Session transaction disappeared during execute"))?;
-        let plan = self.parameterized_plan_cached(sql)?;
-        let out = self.execute_plan_with_params(&plan, &[], Some(&txn));
+        // HDB-008: plan + execute inside the failed-transaction boundary.
+        let out = self.run_statement_in_transaction(&txn, sql, || {
+            let plan = self.parameterized_plan_cached(sql)?;
+            self.execute_plan_with_params(&plan, &[], Some(&txn))
+        });
 
         #[cfg(feature = "code-graph")]
         if out.is_ok() {
@@ -19296,6 +19902,8 @@ impl EmbeddedDatabase {
         // `execute_params_returning` finds a context already present and keeps
         // this connection as the owner.
         let _advisory = self.advisory_context_guard(session_id, sql);
+        // HDB-009: identity for `current_user` and the result-cache key.
+        let _identity_override = self.session_login_user_override_guard(session_id)?;
         // The interceptor prologue is the simple-protocol twin's: a driver that
         // binds parameters reaches Execute for EVERY statement it sends, so this
         // entry point must recognise the same session-owned classes rather than
@@ -19326,20 +19934,26 @@ impl EmbeddedDatabase {
             return self.execute_params_returning(sql, params);
         }
 
-        self.touch_session_for_statement(session_id)?;
         let slot = self
             .session_txn_slot(session_id)
             .ok_or_else(|| Error::transaction("Session transaction disappeared during execute"))?;
+        // HDB-008: refuse before `touch_session_for_statement` (see
+        // `execute_for_session`).
+        self.refuse_session_statement_if_failed(&slot, sql)?;
+        self.touch_session_for_statement(session_id)?;
         let txn = parking_lot::RwLockReadGuard::try_map(slot.read(), |t| t.as_ref())
             .map_err(|_| Error::transaction("Session transaction disappeared during execute"))?;
-        let plan = self.parameterized_plan_cached(sql)?;
         // `Some(&txn)`: the whole point. Every DML arm of
         // `execute_plan_with_params_inner` prefers this transaction over the
         // global slot, so the rows are staged in the session's write set and
         // `ReturningProjection::project` runs over the tuple that transaction just
         // produced — visible to this session, invisible to others until COMMIT,
         // and discarded by ROLLBACK / ROLLBACK TO SAVEPOINT.
-        let out = self.execute_plan_with_params(&plan, params, Some(&txn));
+        // HDB-008: plan + execute inside the failed-transaction boundary.
+        let out = self.run_statement_in_transaction(&txn, sql, || {
+            let plan = self.parameterized_plan_cached(sql)?;
+            self.execute_plan_with_params(&plan, params, Some(&txn))
+        });
 
         #[cfg(feature = "code-graph")]
         if out.is_ok() {
@@ -19382,6 +19996,8 @@ impl EmbeddedDatabase {
         // Spec 03: this connection owns any advisory lock the statement takes
         // (extended protocol / params family).
         let _advisory = self.advisory_context_guard(session_id, sql);
+        // HDB-009: identity for `current_user` and the result-cache key.
+        let _identity_override = self.session_login_user_override_guard(session_id)?;
         if Self::is_transaction_control(sql) {
             return self.handle_transaction_control_for_session(session_id, sql);
         }
@@ -19412,21 +20028,28 @@ impl EmbeddedDatabase {
             return self.execute_params_inner(sql, params, plan_override);
         }
 
-        self.touch_session_for_statement(session_id)?;
         let slot = self
             .session_txn_slot(session_id)
             .ok_or_else(|| Error::transaction("Session transaction disappeared during execute"))?;
+        // HDB-008: refuse before `touch_session_for_statement` (see
+        // `execute_for_session`).
+        self.refuse_session_statement_if_failed(&slot, sql)?;
+        self.touch_session_for_statement(session_id)?;
         let txn = parking_lot::RwLockReadGuard::try_map(slot.read(), |t| t.as_ref())
             .map_err(|_| Error::transaction("Session transaction disappeared during execute"))?;
-        let plan = match plan_override {
-            Some(p) => std::sync::Arc::clone(p),
-            None => self.parameterized_plan_cached(sql)?,
-        };
-        if let Some(result) = self.try_session_txn_fast_insert_params(sql, &plan, params, &txn) {
-            return result;
-        }
-        let (count, _tuples) = self.execute_plan_with_params_with_sql(&plan, params, Some(&txn), Some(sql))?;
-        Ok(count)
+        // HDB-008: plan + fast path + execute inside the failed-transaction
+        // boundary.
+        self.run_statement_in_transaction(&txn, sql, || {
+            let plan = match plan_override {
+                Some(p) => std::sync::Arc::clone(p),
+                None => self.parameterized_plan_cached(sql)?,
+            };
+            if let Some(result) = self.try_session_txn_fast_insert_params(sql, &plan, params, &txn) {
+                return result;
+            }
+            let (count, _tuples) = self.execute_plan_with_params_with_sql(&plan, params, Some(&txn), Some(sql))?;
+            Ok(count)
+        })
     }
 
     /// `query_params` for a wire session (extended-protocol SELECT, plus the
@@ -19463,6 +20086,8 @@ impl EmbeddedDatabase {
         // (extended protocol / params family — the shape Prisma's psycopg3-style
         // clients send).
         let _advisory = self.advisory_context_guard(session_id, sql);
+        // HDB-009: identity for `current_user` and the result-cache key.
+        let _identity_override = self.session_login_user_override_guard(session_id)?;
         // GH#28 (c2): a `SET` / `RESET` of a connection-lifetime GUC arriving
         // through the query-shaped route (MySQL COM_STMT_EXECUTE) is stored
         // on THIS session, never on the process-global registry.
@@ -19474,33 +20099,39 @@ impl EmbeddedDatabase {
             return self.query_params_inner(sql, params, plan_override);
         }
 
-        self.touch_session_for_statement(session_id)?;
         let slot = self
             .session_txn_slot(session_id)
             .ok_or_else(|| Error::transaction("Session transaction disappeared during query"))?;
+        // HDB-008: refuse before `touch_session_for_statement` (see
+        // `execute_for_session`).
+        self.refuse_session_statement_if_failed(&slot, sql)?;
+        self.touch_session_for_statement(session_id)?;
         let txn = parking_lot::RwLockReadGuard::try_map(slot.read(), |t| t.as_ref())
             .map_err(|_| Error::transaction("Session transaction disappeared during query"))?;
-        let plan = match plan_override {
-            Some(p) => std::sync::Arc::clone(p),
-            None => self.parameterized_plan_cached(sql)?,
-        };
+        // HDB-008: plan + execute inside the failed-transaction boundary.
+        self.run_statement_in_transaction(&txn, sql, || {
+            let plan = match plan_override {
+                Some(p) => std::sync::Arc::clone(p),
+                None => self.parameterized_plan_cached(sql)?,
+            };
 
-        if matches!(
-            &*plan,
-            sql::LogicalPlan::Insert { .. }
-                | sql::LogicalPlan::InsertSelect { .. }
-                | sql::LogicalPlan::Update { .. }
-                | sql::LogicalPlan::Delete { .. }
-                // CTAS is a WRITE that arrives through query-shaped routes
-                // (`SELECT … INTO t`): it must be delegated to the write
-                // executor, never to the read path.
-                | sql::LogicalPlan::CreateTableAs { .. }
-        ) {
-            let (_count, returned) = self.execute_plan_with_params(&plan, params, Some(&txn))?;
-            return Ok(returned);
-        }
+            if matches!(
+                &*plan,
+                sql::LogicalPlan::Insert { .. }
+                    | sql::LogicalPlan::InsertSelect { .. }
+                    | sql::LogicalPlan::Update { .. }
+                    | sql::LogicalPlan::Delete { .. }
+                    // CTAS is a WRITE that arrives through query-shaped routes
+                    // (`SELECT … INTO t`): it must be delegated to the write
+                    // executor, never to the read path.
+                    | sql::LogicalPlan::CreateTableAs { .. }
+            ) {
+                let (_count, returned) = self.execute_plan_with_params(&plan, params, Some(&txn))?;
+                return Ok(returned);
+            }
 
-        self.query_plan_with_params(&plan, params, Some(&txn))
+            self.query_plan_with_params(&plan, params, Some(&txn))
+        })
     }
 
     /// `query_params_with_columns` for a wire session — the column-aware,
@@ -19529,63 +20160,71 @@ impl EmbeddedDatabase {
     ) -> Result<(Vec<Tuple>, std::sync::Arc<Schema>)> {
         // Spec 03: this connection owns any advisory lock the statement takes.
         let _advisory = self.advisory_context_guard(session_id, sql);
+        // HDB-009: identity for `current_user` and the result-cache key.
+        let _identity_override = self.session_login_user_override_guard(session_id)?;
         let _schema_override = self.session_schema_override_guard(session_id);
         if !self.session_transactions.contains_key(&session_id) {
             return self.query_params_with_schema(sql, params);
         }
 
-        self.touch_session_for_statement(session_id)?;
         let slot = self
             .session_txn_slot(session_id)
             .ok_or_else(|| Error::transaction("Session transaction disappeared during query"))?;
+        // HDB-008: refuse before `touch_session_for_statement` (see
+        // `execute_for_session`).
+        self.refuse_session_statement_if_failed(&slot, sql)?;
+        self.touch_session_for_statement(session_id)?;
         let txn = parking_lot::RwLockReadGuard::try_map(slot.read(), |t| t.as_ref())
             .map_err(|_| Error::transaction("Session transaction disappeared during query"))?;
-        let plan = self.parameterized_plan_cached(sql)?;
+        // HDB-008: plan + execute inside the failed-transaction boundary.
+        self.run_statement_in_transaction(&txn, sql, || {
+            let plan = self.parameterized_plan_cached(sql)?;
 
-        if matches!(
-            &*plan,
-            sql::LogicalPlan::Insert { .. }
-                | sql::LogicalPlan::InsertSelect { .. }
-                | sql::LogicalPlan::Update { .. }
-                | sql::LogicalPlan::Delete { .. }
-                // CTAS is a WRITE that arrives through query-shaped routes
-                // (`SELECT … INTO t`): it must be delegated to the write
-                // executor, never to the read path.
-                | sql::LogicalPlan::CreateTableAs { .. }
-        ) {
-            let columns = match &*plan {
-                sql::LogicalPlan::Insert {
-                    table_name,
-                    returning: Some(items),
-                    ..
-                }
-                | sql::LogicalPlan::InsertSelect {
-                    table_name,
-                    returning: Some(items),
-                    ..
-                }
-                | sql::LogicalPlan::Update {
-                    table_name,
-                    returning: Some(items),
-                    ..
-                }
-                | sql::LogicalPlan::Delete {
-                    table_name,
-                    returning: Some(items),
-                    ..
-                } => {
-                    let schema = self.storage.catalog().get_table_schema(table_name)?;
-                    std::sync::Arc::new(Self::returning_schema(&schema, items)?)
-                }
-                _ => Self::empty_result_schema(),
-            };
-            let (_count, returned) = self.execute_plan_with_params(&plan, params, Some(&txn))?;
-            return Ok((returned, columns));
-        }
+            if matches!(
+                &*plan,
+                sql::LogicalPlan::Insert { .. }
+                    | sql::LogicalPlan::InsertSelect { .. }
+                    | sql::LogicalPlan::Update { .. }
+                    | sql::LogicalPlan::Delete { .. }
+                    // CTAS is a WRITE that arrives through query-shaped routes
+                    // (`SELECT … INTO t`): it must be delegated to the write
+                    // executor, never to the read path.
+                    | sql::LogicalPlan::CreateTableAs { .. }
+            ) {
+                let columns = match &*plan {
+                    sql::LogicalPlan::Insert {
+                        table_name,
+                        returning: Some(items),
+                        ..
+                    }
+                    | sql::LogicalPlan::InsertSelect {
+                        table_name,
+                        returning: Some(items),
+                        ..
+                    }
+                    | sql::LogicalPlan::Update {
+                        table_name,
+                        returning: Some(items),
+                        ..
+                    }
+                    | sql::LogicalPlan::Delete {
+                        table_name,
+                        returning: Some(items),
+                        ..
+                    } => {
+                        let schema = self.storage.catalog().get_table_schema(table_name)?;
+                        std::sync::Arc::new(Self::returning_schema(&schema, items)?)
+                    }
+                    _ => Self::empty_result_schema(),
+                };
+                let (_count, returned) = self.execute_plan_with_params(&plan, params, Some(&txn))?;
+                return Ok((returned, columns));
+            }
 
-        // R1.2 (Hole 5e): MySQL binary `COM_STMT_EXECUTE` inside an open session
-        // transaction skipped RLS the same way the simple-query path did.
-        self.query_plan_with_params_with_schema(&plan, params, Some(&txn))
+            // R1.2 (Hole 5e): MySQL binary `COM_STMT_EXECUTE` inside an open session
+            // transaction skipped RLS the same way the simple-query path did.
+            self.query_plan_with_params_with_schema(&plan, params, Some(&txn))
+        })
     }
 
     /// Session-transaction variant of the parameterized fast INSERT path:
@@ -19710,6 +20349,21 @@ impl EmbeddedDatabase {
     /// *pre-RLS* plan; RLS is still applied per execution below, exactly
     /// as on the no-override path.
     fn query_params_inner(
+        &self,
+        sql: &str,
+        params: &[Value],
+        plan_override: Option<&std::sync::Arc<sql::LogicalPlan>>,
+    ) -> Result<Vec<Tuple>> {
+        // HDB-008: see `execute_params_inner` — the read half of the same
+        // boundary. `query_plan_with_params` attaches the global transaction
+        // itself, so the statement genuinely runs inside it and its failure
+        // must abort it.
+        self.run_global_statement(sql, || self.query_params_inner_unguarded(sql, params, plan_override))
+    }
+
+    /// The body of [`query_params_inner`](Self::query_params_inner), inside
+    /// the HDB-008 boundary.
+    fn query_params_inner_unguarded(
         &self,
         sql: &str,
         params: &[Value],
@@ -19934,6 +20588,21 @@ impl EmbeddedDatabase {
         sql: &str,
         params: &[Value],
     ) -> Result<(Vec<Tuple>, std::sync::Arc<Schema>)> {
+        // HDB-008: column-aware params read, inside the failed-transaction
+        // boundary (see `execute_params_inner`). Its tail attaches the global
+        // `current_transaction` to the executor, so it really does run inside
+        // an open text `BEGIN`.
+        self.run_global_statement(sql, || self.query_params_with_schema_inner(sql, params))
+    }
+
+    /// The body of
+    /// [`query_params_with_schema`](Self::query_params_with_schema), inside
+    /// the HDB-008 boundary.
+    fn query_params_with_schema_inner(
+        &self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<(Vec<Tuple>, std::sync::Arc<Schema>)> {
         // Spec 03: advisory-lock owner for a params-family statement with no
         // session. A no-op under `query_params_with_columns_for_session`.
         let _advisory = self.embedded_advisory_context_guard(sql);
@@ -20059,6 +20728,18 @@ impl EmbeddedDatabase {
     /// # }
     /// ```
     ///
+    /// # Failed transactions (HDB-008)
+    ///
+    /// An error in ANY statement inside this transaction aborts the whole
+    /// transaction, exactly as PostgreSQL does. Every later statement is then
+    /// refused with SQLSTATE 25P02
+    /// (`current transaction is aborted, commands ignored until end of
+    /// transaction block`) until the block ends, and
+    /// [`commit`](Self::commit) rolls back and returns an error instead of
+    /// committing partial work. [`rollback`](Self::rollback) always succeeds;
+    /// `ROLLBACK TO SAVEPOINT s` is the one statement allowed through and
+    /// recovers the transaction, keeping the work that preceded the savepoint.
+    ///
     /// # Errors
     ///
     /// Returns an error if a transaction is already active.
@@ -20084,6 +20765,17 @@ impl EmbeddedDatabase {
     /// # Ok(())
     /// # }
     /// ```
+    ///
+    /// # Failed transactions (HDB-008)
+    ///
+    /// If any statement inside the transaction failed, this rolls the
+    /// transaction BACK and returns
+    /// [`Error::commit_of_failed_transaction`] — nothing is committed.
+    /// PostgreSQL answers such a `COMMIT` on the wire with the `ROLLBACK`
+    /// command tag and no error (and the PG wire handler still does); an
+    /// embedded caller has no command tag to read, so a silent `Ok` here would
+    /// be indistinguishable from a real commit. Use
+    /// [`Error::is_failed_transaction`] to recognise it.
     ///
     /// # Errors
     ///
@@ -23590,7 +24282,23 @@ impl Transaction<'_> {
     ///
     /// Atomically applies all buffered writes to the database.
     /// After commit, the transaction is consumed and cannot be used.
+    ///
+    /// # Failed transactions (HDB-008)
+    ///
+    /// If any statement run through this handle failed, the transaction is
+    /// ABORTED: this rolls it back and returns
+    /// [`Error::commit_of_failed_transaction`] rather than committing the
+    /// statements that happened to succeed. Statements issued after the
+    /// failure are refused with SQLSTATE 25P02 until the handle is committed
+    /// or rolled back.
     pub fn commit(self) -> Result<()> {
+        // HDB-008: a statement inside this transaction failed, so there is
+        // nothing to commit — roll back and say so. Same contract as
+        // `EmbeddedDatabase::commit`; see `Transaction::mark_sql_aborted`.
+        if self.tx.is_sql_aborted() {
+            self.tx.rollback()?;
+            return Err(Error::commit_of_failed_transaction());
+        }
         // R0.2: fresh commit timestamp (see commit_internal).
         // R1.3-p2: commit runs the row-cache fence itself when wired.
         let written = if self.tx.has_row_cache() {
@@ -23648,7 +24356,13 @@ impl Transaction<'_> {
         // Execute within transaction context, skipping fast paths.
         // Fast paths write directly to storage (bypassing the transaction write set),
         // which would make rollback impossible and break isolation guarantees.
-        self.db.execute_in_transaction_no_fast_path(sql, &self.tx)
+        //
+        // HDB-008: wrapped in the failed-transaction boundary, so a statement
+        // issued after an earlier failure is refused with 25P02 instead of
+        // running as if nothing had happened.
+        self.db.run_statement_in_transaction(&self.tx, sql, || {
+            self.db.execute_in_transaction_no_fast_path(sql, &self.tx)
+        })
     }
 
     /// Query within transaction context
@@ -23688,6 +24402,16 @@ impl Transaction<'_> {
     /// # }
     /// ```
     pub fn query(&self, sql: &str, _params: &[&dyn std::fmt::Display]) -> Result<Vec<Tuple>> {
+        // HDB-008: parse, plan and execution all sit inside the
+        // failed-transaction boundary, so a planning error aborts this
+        // transaction exactly as an executor error does — and a query issued
+        // after an earlier failure is refused with 25P02.
+        self.db
+            .run_statement_in_transaction(&self.tx, sql, || self.query_inner(sql))
+    }
+
+    /// The body of [`query`](Self::query), inside the HDB-008 boundary.
+    fn query_inner(&self, sql: &str) -> Result<Vec<Tuple>> {
         // Parse SQL with cache
         let (statement, _) = self.db.parse_cached(sql)?;
 
@@ -24752,9 +25476,13 @@ mod tests {
             .try_cached_query_with_schema(sql)
             .expect("cached query_with_columns rows should be available to protocol handlers")
             .0;
-        let result_cache_rows = db.result_cache.get(sql).unwrap();
+        let result_cache_entry = db.result_cache.get(sql).unwrap();
         assert!(
-            std::sync::Arc::ptr_eq(&cached_rows, &result_cache_rows),
+            result_cache_entry.login.is_none(),
+            "HDB-009: a session-less embedded read caches its rows under no principal"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&cached_rows, &result_cache_entry.rows),
             "crate-internal query_with_columns cache path should avoid cloning cached row vectors"
         );
 
@@ -25683,8 +26411,13 @@ mod tests {
 
     #[test]
     fn test_transaction_after_error() {
-        // BEGIN -> invalid SQL -> valid SQL -> COMMIT
-        // The valid SQL after the error should still work.
+        // HDB-008: BEGIN -> invalid SQL -> the transaction is ABORTED.
+        //
+        // This test used to assert the opposite — that a statement after the
+        // error "should still work" and that `COMMIT` then persisted it. That
+        // was the reported bug: PostgreSQL aborts the whole block on any error,
+        // and an embedded caller could commit partial work because the engine
+        // had no failed state of its own (only the PG wire handler did).
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         db.execute("CREATE TABLE txn_err (id INT, val TEXT)").unwrap();
 
@@ -25694,19 +26427,24 @@ mod tests {
         let result = db.execute("INSERT INTO nonexistent_table VALUES (1)");
         assert!(result.is_err(), "Insert into nonexistent table should fail");
 
-        // Transaction should still be active (error in one statement does not abort)
+        // The transaction is still OPEN — but aborted: it must be ended, not
+        // continued.
         assert!(
             db.in_transaction(),
-            "Transaction should still be active after statement error"
+            "Transaction should still be open (aborted) after a statement error"
         );
 
-        // Valid SQL should still work
-        db.execute("INSERT INTO txn_err VALUES (1, 'after_error')").unwrap();
-        db.execute("COMMIT").unwrap();
+        let refused = db
+            .execute("INSERT INTO txn_err VALUES (1, 'after_error')")
+            .expect_err("statements after the error must be refused with 25P02");
+        assert!(refused.is_failed_transaction(), "got {refused:?}");
+
+        let commit = db.execute("COMMIT").expect_err("COMMIT must not persist partial work");
+        assert!(commit.is_failed_transaction(), "got {commit:?}");
+        assert!(!db.in_transaction(), "the refused COMMIT ends the transaction");
 
         let rows = db.query("SELECT * FROM txn_err", &[]).unwrap();
-        assert_eq!(rows.len(), 1, "Valid insert after error should be committed");
-        assert_eq!(rows[0].get(1), Some(&Value::String("after_error".to_string())));
+        assert!(rows.is_empty(), "nothing from an aborted transaction may be committed");
     }
 
     #[test]
@@ -35465,6 +36203,48 @@ mod tests {
         assert_eq!(got[0].values[1], Value::Int4(7));
         assert_eq!(got[1].values[1], Value::Int4(7));
         assert_eq!(got[1].values[2], Value::Null);
+    }
+
+    /// HDB-009: the COPY fast path evaluates column DEFAULTs itself, so a
+    /// `DEFAULT current_user` column has to see the COPYing session's identity.
+    ///
+    /// `expect("fast path taken")` is the load-bearing half: the wire test in
+    /// `tests/security_hdb_009.rs` would pass even if `copy_bulk_insert`
+    /// declined the batch, because the generic fallback routes through
+    /// `execute_for_session` and was always correct. This pins that the shape
+    /// really is served by the fast path AND that the fast path stamps the
+    /// right name — the exact combination that was broken.
+    #[test]
+    fn copy_bulk_insert_for_session_stamps_the_session_identity() {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE cbi_who (id INT, who TEXT DEFAULT current_user)")
+            .unwrap();
+        let alice = db
+            .create_session("alice", crate::session::IsolationLevel::ReadCommitted)
+            .unwrap();
+
+        let cols = vec!["id".to_string()];
+        let rows = copy_rows(&[&[Some("1")], &[Some("2")]]);
+        let n = db
+            .copy_bulk_insert_for_session(alice, "cbi_who", &cols, &rows)
+            .expect("fast path taken")
+            .unwrap();
+        assert_eq!(n, 2);
+
+        let got = db.query("SELECT id, who FROM cbi_who ORDER BY id", &[]).unwrap();
+        assert_eq!(got[0].values[1], Value::String("alice".to_string()));
+        assert_eq!(got[1].values[1], Value::String("alice".to_string()));
+
+        // And a session-less COPY still records the documented service user.
+        let session_less = db
+            .copy_bulk_insert("cbi_who", &cols, &copy_rows(&[&[Some("3")]]))
+            .expect("fast path taken")
+            .unwrap();
+        assert_eq!(session_less, 1);
+        let got = db.query("SELECT who FROM cbi_who WHERE id = 3", &[]).unwrap();
+        assert_eq!(got[0].values[0], Value::String("heliosdb".to_string()));
+
+        db.destroy_session(alice).unwrap();
     }
 
     #[test]

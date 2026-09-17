@@ -33,6 +33,28 @@
 /// Alias for `std::result::Result<T, Error>` for convenience.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// HDB-008: the SQLSTATE 25P02 message text, verbatim from PostgreSQL.
+///
+/// Carried by [`Error::in_failed_transaction`] and recognised by
+/// [`Error::is_failed_transaction`]; the PostgreSQL wire maps it back to
+/// `25P02` in `sqlstate_for_error`. A shared const rather than a literal so
+/// the engine, the wire handlers and the tests cannot drift.
+pub const IN_FAILED_TRANSACTION_MESSAGE: &str =
+    "current transaction is aborted, commands ignored until end of transaction block";
+
+/// HDB-008: the message a `COMMIT` of an already-aborted transaction returns
+/// on the ENGINE API. The transaction has been rolled back; nothing was
+/// committed.
+///
+/// PostgreSQL answers such a COMMIT on the wire with the `ROLLBACK` command
+/// tag and no error, and the PostgreSQL handler still does exactly that. An
+/// embedded caller has no command tag to inspect, so a silent `Ok` there would
+/// be indistinguishable from a real commit — which is the whole of the
+/// reported bug.
+pub const COMMIT_OF_FAILED_TRANSACTION_MESSAGE: &str =
+    "current transaction is aborted, COMMIT rolled it back and nothing was committed; \
+     issue the transaction again";
+
 /// Database error type
 ///
 /// All errors from HeliosDB Lite operations are represented by this enum.
@@ -181,6 +203,36 @@ impl Error {
     /// Create a transaction error
     pub fn transaction(msg: impl Into<String>) -> Self {
         Error::Transaction(msg.into())
+    }
+
+    /// HDB-008: a statement was issued inside a transaction that an earlier
+    /// statement had already aborted. PostgreSQL SQLSTATE 25P02.
+    ///
+    /// Deliberately a `Transaction` variant rather than a new enum arm: a new
+    /// variant would ripple through every error mapper in the tree (REST, MCP,
+    /// the Python binding, both wire protocols) and those mappers already do
+    /// the right thing for `Transaction`.
+    pub fn in_failed_transaction() -> Self {
+        Error::Transaction(IN_FAILED_TRANSACTION_MESSAGE.to_string())
+    }
+
+    /// HDB-008: `COMMIT` of an aborted transaction — the engine rolled it back
+    /// and committed nothing. See [`COMMIT_OF_FAILED_TRANSACTION_MESSAGE`].
+    pub fn commit_of_failed_transaction() -> Self {
+        Error::Transaction(COMMIT_OF_FAILED_TRANSACTION_MESSAGE.to_string())
+    }
+
+    /// HDB-008: true for both aborted-transaction errors above — the refusal
+    /// of a statement inside a failed block AND the refusal of its `COMMIT`.
+    ///
+    /// Callers that want to distinguish them compare the message against the
+    /// two consts; this is the "did my transaction die?" question, which is
+    /// the one an application actually branches on.
+    pub fn is_failed_transaction(&self) -> bool {
+        match self {
+            Error::Transaction(message) => message.starts_with("current transaction is aborted"),
+            _ => false,
+        }
     }
 
     /// Create a write-write conflict error (serialization failure, SQLSTATE

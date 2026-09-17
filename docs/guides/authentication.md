@@ -146,6 +146,45 @@ advertise SSL. Most drivers accept TLS automatically; `psql` requires
 psql "host=127.0.0.1 port=5432 user=postgres dbname=myapp sslmode=require"
 ```
 
+## SQL session identity
+
+`current_user`, `session_user`, `current_role` (bare or as `current_role()`)
+and `current_setting('session_authorization')` report the login name of the
+connection asking: the PG-wire StartupMessage `user`, published only *after*
+authentication succeeds (a rejected login never becomes a SQL identity, and a
+startup packet with no `user` is refused with `08P01`); the MySQL-wire
+handshake user — that listener is trust-only, so the name is asserted by the
+client, not proved, and an *empty* handshake user is not an identity at all
+(such a session reports `heliosdb`); or the name passed to `create_session()`
+on the embedded API. A session-less embedded call reports the service user
+`heliosdb`. Names are truncated to 63 bytes, PostgreSQL's identifier limit.
+`SHOW session_authorization` answers the same name, but on the **PostgreSQL
+wire only** — the embedded API and the MySQL wire do not serve that `SHOW`.
+
+`current_role` is a **reserved word**, exactly as in PostgreSQL: an unquoted
+`current_role` resolves to the function even when a table in scope has a column
+of that name, on every dialect Nano accepts (including SQLite drop-in apps,
+which SQLite itself would have resolved to the column). Quote it —
+`SELECT "current_role" FROM audit` — to read the column.
+
+This is identity **reporting**, not access control: no privilege or row-access
+decision is made from these functions, `SET ROLE` / `SET SESSION
+AUTHORIZATION` are refused because identity switching is not implemented, and
+the multi-tenant API's RLS policies are a separate system with their own
+session context. That refusal carries SQLSTATE `0A000` on the **PostgreSQL
+wire in the default configuration** (`[authentication] legacy_acl_noop =
+false`; set it to `true` and the PG wire silently acknowledges both statements
+instead of refusing them); the embedded API and the MySQL wire have no
+interceptor for them at all and refuse them with a plain engine error carrying
+no SQLSTATE.
+
+Identity reporting does not reach the catalog: `pg_tables.tableowner`,
+`pg_roles` / `pg_user` and ACL grantors still report the literal service role,
+so a wire login is a name no ownership surface knows about. In particular
+`SELECT … FROM pg_tables WHERE tableowner = current_user` matched every table
+before these functions were made real and now matches none — filter on a
+literal owner name instead until ownership is tracked per role.
+
 ## See also
 
 - [`upgrade.md`](upgrade.md) — what changes between auth-mode-affecting

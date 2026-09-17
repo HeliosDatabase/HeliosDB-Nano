@@ -637,87 +637,41 @@ impl SystemViewRegistry {
             description: "Catalog of table columns and their attributes".to_string(),
         });
 
-        // pg_type - Data type definitions
+        // pg_type — data type definitions.
+        //
+        // HDB-011: the column SET and ORDER follow PostgreSQL's own
+        // `pg_catalog.pg_type` prefix, so a client that projects `t.*`, reads
+        // `typlen` as an int2, or JOINs `typelem`/`typarray` sees the layout it
+        // expects. Rows come from `BUILTIN_TYPES` (see its rustdoc) — real
+        // PostgreSQL OIDs, one `_<name>` array row per element type, plus
+        // Nano's own `vector` (3614). Keep this list in lockstep with the value
+        // order in `execute_pg_type`.
         self.register_view(SystemViewSchema {
             name: "pg_type".to_string(),
             schema: Schema {
                 columns: vec![
-                    Column {
-                        name: "oid".to_string(),
-                        data_type: DataType::Int4,
-                        nullable: false,
-                        primary_key: false,
-                        source_table: None,
-                        source_table_name: None,
-                        default_expr: None,
-                        unique: false,
-                        storage_mode: ColumnStorageMode::Default,
-                    },
-                    Column {
-                        name: "typname".to_string(),
-                        data_type: DataType::Text,
-                        nullable: false,
-                        primary_key: false,
-                        source_table: None,
-                        source_table_name: None,
-                        default_expr: None,
-                        unique: false,
-                        storage_mode: ColumnStorageMode::Default,
-                    },
-                    Column {
-                        name: "typlen".to_string(),
-                        data_type: DataType::Int4,
-                        nullable: false,
-                        primary_key: false,
-                        source_table: None,
-                        source_table_name: None,
-                        default_expr: None,
-                        unique: false,
-                        storage_mode: ColumnStorageMode::Default,
-                    },
-                    Column {
-                        name: "typbyval".to_string(),
-                        data_type: DataType::Boolean,
-                        nullable: false,
-                        primary_key: false,
-                        source_table: None,
-                        source_table_name: None,
-                        default_expr: None,
-                        unique: false,
-                        storage_mode: ColumnStorageMode::Default,
-                    },
-                    Column {
-                        name: "typcategory".to_string(),
-                        data_type: DataType::Text,
-                        nullable: false,
-                        primary_key: false,
-                        source_table: None,
-                        source_table_name: None,
-                        default_expr: None,
-                        unique: false,
-                        storage_mode: ColumnStorageMode::Default,
-                    },
-                    Column {
-                        name: "typnotnull".to_string(),
-                        data_type: DataType::Boolean,
-                        nullable: false,
-                        primary_key: false,
-                        source_table: None,
-                        source_table_name: None,
-                        default_expr: None,
-                        unique: false,
-                        storage_mode: ColumnStorageMode::Default,
-                    },
-                    // KanttBan #23 phase 2.6: drizzle's
-                    // getColumnsInfoQuery LEFT-JOINs pg_type and then
-                    // pg_namespace on `enum_t.typnamespace`. Add the
-                    // column (every built-in lives in pg_catalog OID
-                    // 11) so the join resolves.
+                    sv_col("oid", DataType::Int4),
+                    sv_col("typname", DataType::Text),
                     sv_col("typnamespace", DataType::Int4),
-                    sv_col("typtype", DataType::Text),
                     sv_col("typowner", DataType::Int4),
+                    sv_col("typlen", DataType::Int2),
+                    sv_col("typbyval", DataType::Boolean),
+                    sv_col("typtype", DataType::Text),
+                    sv_col("typcategory", DataType::Text),
+                    sv_col("typispreferred", DataType::Boolean),
+                    sv_col("typisdefined", DataType::Boolean),
+                    sv_col("typdelim", DataType::Text),
                     sv_col("typrelid", DataType::Int4),
+                    sv_col("typelem", DataType::Int4),
+                    sv_col("typarray", DataType::Int4),
+                    sv_col("typinput", DataType::Text),
+                    sv_col("typoutput", DataType::Text),
+                    sv_col("typnotnull", DataType::Boolean),
                     sv_col("typbasetype", DataType::Int4),
+                    sv_col("typtypmod", DataType::Int4),
+                    sv_col("typndims", DataType::Int4),
+                    sv_col("typcollation", DataType::Int4),
+                    sv_col("typdefault", DataType::Text),
                 ],
             },
             description: "Catalog of data types".to_string(),
@@ -2655,6 +2609,48 @@ impl SystemViewRegistry {
             description: "PG-compat extended stats catalogue (empty stub)".to_string(),
         });
 
+        // pg_range / pg_enum — HDB-011: registered EMPTY, with PostgreSQL's
+        // column names, so the introspection queries every driver runs
+        // alongside `pg_type` get a correct zero-row answer instead of
+        // "relation does not exist". tokio-postgres' TYPEINFO lookup
+        // (`LEFT OUTER JOIN pg_catalog.pg_range r ON r.rngtypid = t.oid`) and
+        // drizzle-kit / Prisma enum introspection (`JOIN pg_enum e ON
+        // t.oid = e.enumtypid`) both tolerate an empty table and both used to
+        // fail outright. Nano has no range types (the six `*range` rows in
+        // `BUILTIN_TYPES` are name/OID compatibility only, with no subtype
+        // registered) and cannot enumerate enums: `storage::catalog` stores
+        // them under a per-name key with no list accessor, so `pg_enum` stays
+        // empty until that accessor exists.
+        self.register_view(SystemViewSchema {
+            name: "pg_range".to_string(),
+            schema: Schema {
+                columns: vec![
+                    sv_col("rngtypid", DataType::Int4),
+                    sv_col("rngsubtype", DataType::Int4),
+                    sv_col("rngmultitypid", DataType::Int4),
+                    sv_col("rngcollation", DataType::Int4),
+                    sv_col("rngsubopc", DataType::Int4),
+                    sv_col("rngcanonical", DataType::Int4),
+                    sv_col("rngsubdiff", DataType::Int4),
+                ],
+            },
+            description: "PG-compat range-type catalogue (empty — Nano registers no range subtypes)".to_string(),
+        });
+
+        self.register_view(SystemViewSchema {
+            name: "pg_enum".to_string(),
+            schema: Schema {
+                columns: vec![
+                    sv_col("oid", DataType::Int4),
+                    sv_col("enumtypid", DataType::Int4),
+                    sv_col("enumsortorder", DataType::Float4),
+                    sv_col("enumlabel", DataType::Text),
+                ],
+            },
+            description: "PG-compat enum-label catalogue (empty — no list accessor for CREATE TYPE … AS ENUM)"
+                .to_string(),
+        });
+
         // pg_attrdef — column-default catalogue. KanttBan #23
         // (v3.31.1 phase 1): drizzle-kit's getColumnsInfoQuery joins
         // here in an EXISTS subquery to detect SERIAL columns. Empty
@@ -2783,6 +2779,681 @@ fn sv_col(name: &str, data_type: DataType) -> Column {
         default_expr: None,
         unique: false,
         storage_mode: ColumnStorageMode::Default,
+    }
+}
+
+/// One PostgreSQL built-in type, as `pg_type` reports it (HDB-011).
+///
+/// `array_oid` is the OID of this type's `_<name>` array type, or `0` for the
+/// pseudo-types and for `vector`, which have no array form.
+struct BuiltinType {
+    name: &'static str,
+    oid: i32,
+    array_oid: i32,
+    len: i16,
+    byval: bool,
+    category: &'static str,
+    preferred: bool,
+    delim: &'static str,
+}
+
+/// The authoritative `pg_type` inventory (HDB-011).
+///
+/// Every OID here is PostgreSQL's real OID, so a client that hard-codes
+/// `int4 = 23` — or that resolves an unfamiliar RowDescription OID by querying
+/// `pg_type` — gets the same answer it would get from PostgreSQL. Each entry
+/// with a non-zero `array_oid` additionally emits its array type `_<name>`:
+/// the array row carries `typelem` = the element type's OID and `typarray` = 0,
+/// so `typarray`/`typelem` round-trip in both directions. Nano's own `vector`
+/// type (OID 3614) is listed as an ordinary base row.
+///
+/// User-defined types are NOT represented: enum labels are stored under a
+/// per-name catalog key with no list accessor, and `CREATE DOMAIN` is a
+/// parse-and-accept no-op that persists nothing, so neither can be enumerated
+/// from here without new catalog accessors.
+const BUILTIN_TYPES: &[BuiltinType] = &[
+    BuiltinType {
+        name: "bool",
+        oid: 16,
+        array_oid: 1000,
+        len: 1,
+        byval: true,
+        category: "B",
+        preferred: true,
+        delim: ",",
+    },
+    BuiltinType {
+        name: "bytea",
+        oid: 17,
+        array_oid: 1001,
+        len: -1,
+        byval: false,
+        category: "U",
+        preferred: false,
+        delim: ",",
+    },
+    BuiltinType {
+        name: "char",
+        oid: 18,
+        array_oid: 1002,
+        len: 1,
+        byval: true,
+        category: "Z",
+        preferred: false,
+        delim: ",",
+    },
+    BuiltinType {
+        name: "name",
+        oid: 19,
+        array_oid: 1003,
+        len: 64,
+        byval: false,
+        category: "S",
+        preferred: false,
+        delim: ",",
+    },
+    BuiltinType {
+        name: "int8",
+        oid: 20,
+        array_oid: 1016,
+        len: 8,
+        byval: true,
+        category: "N",
+        preferred: false,
+        delim: ",",
+    },
+    BuiltinType {
+        name: "int2",
+        oid: 21,
+        array_oid: 1005,
+        len: 2,
+        byval: true,
+        category: "N",
+        preferred: false,
+        delim: ",",
+    },
+    BuiltinType {
+        name: "int4",
+        oid: 23,
+        array_oid: 1007,
+        len: 4,
+        byval: true,
+        category: "N",
+        preferred: false,
+        delim: ",",
+    },
+    BuiltinType {
+        name: "regproc",
+        oid: 24,
+        array_oid: 1008,
+        len: 4,
+        byval: true,
+        category: "N",
+        preferred: false,
+        delim: ",",
+    },
+    BuiltinType {
+        name: "text",
+        oid: 25,
+        array_oid: 1009,
+        len: -1,
+        byval: false,
+        category: "S",
+        preferred: true,
+        delim: ",",
+    },
+    BuiltinType {
+        name: "oid",
+        oid: 26,
+        array_oid: 1028,
+        len: 4,
+        byval: true,
+        category: "N",
+        preferred: false,
+        delim: ",",
+    },
+    BuiltinType {
+        name: "tid",
+        oid: 27,
+        array_oid: 1010,
+        len: 6,
+        byval: false,
+        category: "U",
+        preferred: false,
+        delim: ",",
+    },
+    BuiltinType {
+        name: "xid",
+        oid: 28,
+        array_oid: 1011,
+        len: 4,
+        byval: true,
+        category: "U",
+        preferred: false,
+        delim: ",",
+    },
+    BuiltinType {
+        name: "cid",
+        oid: 29,
+        array_oid: 1012,
+        len: 4,
+        byval: true,
+        category: "U",
+        preferred: false,
+        delim: ",",
+    },
+    BuiltinType {
+        name: "json",
+        oid: 114,
+        array_oid: 199,
+        len: -1,
+        byval: false,
+        category: "U",
+        preferred: false,
+        delim: ",",
+    },
+    BuiltinType {
+        name: "xml",
+        oid: 142,
+        array_oid: 143,
+        len: -1,
+        byval: false,
+        category: "U",
+        preferred: false,
+        delim: ",",
+    },
+    BuiltinType {
+        name: "point",
+        oid: 600,
+        array_oid: 1017,
+        len: 16,
+        byval: false,
+        category: "G",
+        preferred: false,
+        delim: ",",
+    },
+    BuiltinType {
+        name: "cidr",
+        oid: 650,
+        array_oid: 651,
+        len: -1,
+        byval: false,
+        category: "I",
+        preferred: false,
+        delim: ",",
+    },
+    BuiltinType {
+        name: "float4",
+        oid: 700,
+        array_oid: 1021,
+        len: 4,
+        byval: true,
+        category: "N",
+        preferred: false,
+        delim: ",",
+    },
+    BuiltinType {
+        name: "float8",
+        oid: 701,
+        array_oid: 1022,
+        len: 8,
+        byval: true,
+        category: "N",
+        preferred: true,
+        delim: ",",
+    },
+    BuiltinType {
+        name: "unknown",
+        oid: 705,
+        array_oid: 0,
+        len: -2,
+        byval: false,
+        category: "X",
+        preferred: false,
+        delim: ",",
+    },
+    BuiltinType {
+        name: "money",
+        oid: 790,
+        array_oid: 791,
+        len: 8,
+        byval: true,
+        category: "N",
+        preferred: false,
+        delim: ",",
+    },
+    BuiltinType {
+        name: "macaddr",
+        oid: 829,
+        array_oid: 1040,
+        len: 6,
+        byval: false,
+        category: "U",
+        preferred: false,
+        delim: ",",
+    },
+    BuiltinType {
+        name: "inet",
+        oid: 869,
+        array_oid: 1041,
+        len: -1,
+        byval: false,
+        category: "I",
+        preferred: true,
+        delim: ",",
+    },
+    BuiltinType {
+        name: "bpchar",
+        oid: 1042,
+        array_oid: 1014,
+        len: -1,
+        byval: false,
+        category: "S",
+        preferred: false,
+        delim: ",",
+    },
+    BuiltinType {
+        name: "varchar",
+        oid: 1043,
+        array_oid: 1015,
+        len: -1,
+        byval: false,
+        category: "S",
+        preferred: false,
+        delim: ",",
+    },
+    BuiltinType {
+        name: "date",
+        oid: 1082,
+        array_oid: 1182,
+        len: 4,
+        byval: true,
+        category: "D",
+        preferred: false,
+        delim: ",",
+    },
+    BuiltinType {
+        name: "time",
+        oid: 1083,
+        array_oid: 1183,
+        len: 8,
+        byval: true,
+        category: "D",
+        preferred: false,
+        delim: ",",
+    },
+    BuiltinType {
+        name: "timestamp",
+        oid: 1114,
+        array_oid: 1115,
+        len: 8,
+        byval: true,
+        category: "D",
+        preferred: false,
+        delim: ",",
+    },
+    BuiltinType {
+        name: "timestamptz",
+        oid: 1184,
+        array_oid: 1185,
+        len: 8,
+        byval: true,
+        category: "D",
+        preferred: true,
+        delim: ",",
+    },
+    BuiltinType {
+        name: "interval",
+        oid: 1186,
+        array_oid: 1187,
+        len: 16,
+        byval: false,
+        category: "T",
+        preferred: true,
+        delim: ",",
+    },
+    BuiltinType {
+        name: "timetz",
+        oid: 1266,
+        array_oid: 1270,
+        len: 12,
+        byval: false,
+        category: "D",
+        preferred: false,
+        delim: ",",
+    },
+    BuiltinType {
+        name: "bit",
+        oid: 1560,
+        array_oid: 1561,
+        len: -1,
+        byval: false,
+        category: "V",
+        preferred: false,
+        delim: ",",
+    },
+    BuiltinType {
+        name: "varbit",
+        oid: 1562,
+        array_oid: 1563,
+        len: -1,
+        byval: false,
+        category: "V",
+        preferred: false,
+        delim: ",",
+    },
+    BuiltinType {
+        name: "numeric",
+        oid: 1700,
+        array_oid: 1231,
+        len: -1,
+        byval: false,
+        category: "N",
+        preferred: false,
+        delim: ",",
+    },
+    BuiltinType {
+        name: "refcursor",
+        oid: 1790,
+        array_oid: 2201,
+        len: -1,
+        byval: false,
+        category: "U",
+        preferred: false,
+        delim: ",",
+    },
+    BuiltinType {
+        name: "regclass",
+        oid: 2205,
+        array_oid: 2210,
+        len: 4,
+        byval: true,
+        category: "N",
+        preferred: false,
+        delim: ",",
+    },
+    BuiltinType {
+        name: "regtype",
+        oid: 2206,
+        array_oid: 2211,
+        len: 4,
+        byval: true,
+        category: "N",
+        preferred: false,
+        delim: ",",
+    },
+    BuiltinType {
+        name: "record",
+        oid: 2249,
+        array_oid: 2287,
+        len: -1,
+        byval: false,
+        category: "P",
+        preferred: false,
+        delim: ",",
+    },
+    BuiltinType {
+        name: "cstring",
+        oid: 2275,
+        array_oid: 1263,
+        len: -2,
+        byval: false,
+        category: "P",
+        preferred: false,
+        delim: ",",
+    },
+    BuiltinType {
+        name: "any",
+        oid: 2276,
+        array_oid: 0,
+        len: 4,
+        byval: true,
+        category: "P",
+        preferred: false,
+        delim: ",",
+    },
+    BuiltinType {
+        name: "anyarray",
+        oid: 2277,
+        array_oid: 0,
+        len: -1,
+        byval: false,
+        category: "P",
+        preferred: false,
+        delim: ",",
+    },
+    BuiltinType {
+        name: "void",
+        oid: 2278,
+        array_oid: 0,
+        len: 4,
+        byval: true,
+        category: "P",
+        preferred: false,
+        delim: ",",
+    },
+    BuiltinType {
+        name: "uuid",
+        oid: 2950,
+        array_oid: 2951,
+        len: 16,
+        byval: false,
+        category: "U",
+        preferred: false,
+        delim: ",",
+    },
+    BuiltinType {
+        name: "vector",
+        oid: 3614,
+        array_oid: 0,
+        len: -1,
+        byval: false,
+        category: "U",
+        preferred: false,
+        delim: ",",
+    },
+    BuiltinType {
+        name: "jsonb",
+        oid: 3802,
+        array_oid: 3807,
+        len: -1,
+        byval: false,
+        category: "U",
+        preferred: false,
+        delim: ",",
+    },
+    BuiltinType {
+        name: "int4range",
+        oid: 3904,
+        array_oid: 3905,
+        len: -1,
+        byval: false,
+        category: "R",
+        preferred: false,
+        delim: ",",
+    },
+    BuiltinType {
+        name: "numrange",
+        oid: 3906,
+        array_oid: 3907,
+        len: -1,
+        byval: false,
+        category: "R",
+        preferred: false,
+        delim: ",",
+    },
+    BuiltinType {
+        name: "tsrange",
+        oid: 3908,
+        array_oid: 3909,
+        len: -1,
+        byval: false,
+        category: "R",
+        preferred: false,
+        delim: ",",
+    },
+    BuiltinType {
+        name: "tstzrange",
+        oid: 3910,
+        array_oid: 3911,
+        len: -1,
+        byval: false,
+        category: "R",
+        preferred: false,
+        delim: ",",
+    },
+    BuiltinType {
+        name: "daterange",
+        oid: 3912,
+        array_oid: 3913,
+        len: -1,
+        byval: false,
+        category: "R",
+        preferred: false,
+        delim: ",",
+    },
+    BuiltinType {
+        name: "int8range",
+        oid: 3926,
+        array_oid: 3927,
+        len: -1,
+        byval: false,
+        category: "R",
+        preferred: false,
+        delim: ",",
+    },
+    BuiltinType {
+        name: "jsonpath",
+        oid: 4072,
+        array_oid: 4073,
+        len: -1,
+        byval: false,
+        category: "U",
+        preferred: false,
+        delim: ",",
+    },
+    BuiltinType {
+        name: "regnamespace",
+        oid: 4089,
+        array_oid: 4090,
+        len: 4,
+        byval: true,
+        category: "N",
+        preferred: false,
+        delim: ",",
+    },
+];
+
+/// `typinput` / `typoutput` for a built-in type, spelled the way PostgreSQL
+/// spells them. Most are `<name>in` / `<name>out`; the ones that are not are
+/// listed explicitly (PostgreSQL uses `textin`/`textout` for `refcursor`, and
+/// one shared `range_in`/`range_out` pair for every range type).
+///
+/// Every pair is `&'static str` — spelled out rather than `format!`ed —
+/// because `execute_pg_type` runs on EVERY scan of the view and materialises
+/// ~100 rows each time (HDB-011 review NIT-5). The `_` arm is unreachable for
+/// the current table and is pinned as such by
+/// `hdb011_pg_type_inventory_is_consistent`: a new `BUILTIN_TYPES` entry that
+/// forgets to add itself here reports `unknownin`, which that test rejects.
+fn builtin_type_io(name: &str) -> (&'static str, &'static str) {
+    match name {
+        // Regular `<name>in` / `<name>out`.
+        "bool" => ("boolin", "boolout"),
+        "bytea" => ("byteain", "byteaout"),
+        "char" => ("charin", "charout"),
+        "name" => ("namein", "nameout"),
+        "int8" => ("int8in", "int8out"),
+        "int2" => ("int2in", "int2out"),
+        "int4" => ("int4in", "int4out"),
+        "regproc" => ("regprocin", "regprocout"),
+        "text" => ("textin", "textout"),
+        "oid" => ("oidin", "oidout"),
+        "tid" => ("tidin", "tidout"),
+        "xid" => ("xidin", "xidout"),
+        "cid" => ("cidin", "cidout"),
+        "float4" => ("float4in", "float4out"),
+        "float8" => ("float8in", "float8out"),
+        "unknown" => ("unknownin", "unknownout"),
+        "bpchar" => ("bpcharin", "bpcharout"),
+        "varchar" => ("varcharin", "varcharout"),
+        "regclass" => ("regclassin", "regclassout"),
+        "regtype" => ("regtypein", "regtypeout"),
+        "regnamespace" => ("regnamespacein", "regnamespaceout"),
+        // Irregular spellings.
+        "json" => ("json_in", "json_out"),
+        "xml" => ("xml_in", "xml_out"),
+        "point" => ("point_in", "point_out"),
+        "cidr" => ("cidr_in", "cidr_out"),
+        "money" => ("cash_in", "cash_out"),
+        "macaddr" => ("macaddr_in", "macaddr_out"),
+        "inet" => ("inet_in", "inet_out"),
+        "date" => ("date_in", "date_out"),
+        "time" => ("time_in", "time_out"),
+        "timestamp" => ("timestamp_in", "timestamp_out"),
+        "timestamptz" => ("timestamptz_in", "timestamptz_out"),
+        "interval" => ("interval_in", "interval_out"),
+        "timetz" => ("timetz_in", "timetz_out"),
+        "bit" => ("bit_in", "bit_out"),
+        "varbit" => ("varbit_in", "varbit_out"),
+        "numeric" => ("numeric_in", "numeric_out"),
+        "refcursor" => ("textin", "textout"),
+        "record" => ("record_in", "record_out"),
+        "cstring" => ("cstring_in", "cstring_out"),
+        "any" => ("any_in", "any_out"),
+        "anyarray" => ("anyarray_in", "anyarray_out"),
+        "void" => ("void_in", "void_out"),
+        "uuid" => ("uuid_in", "uuid_out"),
+        "jsonb" => ("jsonb_in", "jsonb_out"),
+        "jsonpath" => ("jsonpath_in", "jsonpath_out"),
+        "vector" => ("vector_in", "vector_out"),
+        "int4range" | "numrange" | "tsrange" | "tstzrange" | "daterange" | "int8range" => ("range_in", "range_out"),
+        _ => ("unknownin", "unknownout"),
+    }
+}
+
+/// `typtype` for a built-in type, derived from its `typcategory` — in
+/// PostgreSQL the two are not independent: category `P`/`X` is exactly the
+/// pseudo-type set (`record`, `cstring`, `any`, `anyarray`, `void`,
+/// `unknown`), category `R` is exactly the range set, and everything else in
+/// this table is an ordinary base type.
+///
+/// HDB-011 review FIX-3: this used to be a hard-coded `'b'` for every base
+/// row, so `WHERE typtype = 'r'` found none of the six range types and
+/// `WHERE typtype = 'p'` none of the six pseudo-types — and a driver that
+/// classifies by `typtype` (Npgsql's type loader branches on
+/// `'b'`/`'r'`/`'m'`/`'e'`/`'d'`) misfiled every range as a base type.
+/// Array rows are `'b'` like PostgreSQL's.
+fn builtin_type_typtype(category: &str) -> &'static str {
+    match category {
+        "P" | "X" => "p",
+        "R" => "r",
+        _ => "b",
+    }
+}
+
+/// `typelem` for a NON-array built-in type: 0 for almost everything, since a
+/// scalar has no element type. `point` is PostgreSQL's exception in this
+/// inventory — it is a pair of `float8`s and reports `typelem = 701`
+/// (HDB-011 review NIT-4). Array rows get their element OID in
+/// `execute_pg_type` instead.
+fn builtin_type_elem(name: &str) -> i32 {
+    match name {
+        "point" => 701,
+        _ => 0,
+    }
+}
+
+/// `typcollation` for a built-in type: PostgreSQL's default collation (100)
+/// for the collatable text family, 0 for everything else. An array type
+/// inherits its element type's collation.
+///
+/// `name` is the exception PostgreSQL makes: it collates `C` (OID 950), not
+/// the database default (HDB-011 review NIT-4).
+fn builtin_type_collation(name: &str) -> i32 {
+    match name {
+        "name" => 950,
+        "text" | "varchar" | "bpchar" | "char" => 100,
+        _ => 0,
     }
 }
 
@@ -3097,6 +3768,11 @@ impl SystemViewRegistry {
             // NOT another wire-side fixed-shape copy.
             "pg_proc" | "pg_description" | "pg_policies" | "pg_policy" | "pg_inherits" | "pg_publication"
             | "pg_statistic_ext" => Ok(vec![]),
+            // Empty for the reasons given at registration (HDB-011): no range
+            // subtypes are registered, and enum types cannot be enumerated
+            // from the catalog. A driver's `LEFT OUTER JOIN pg_range` / enum
+            // introspection needs the RELATION to exist, not rows in it.
+            "pg_range" | "pg_enum" => Ok(vec![]),
             "sqlite_master" => Self::execute_sqlite_master(storage),
             "pg_index" => Self::execute_pg_index(storage),
             "pg_constraint" => Self::execute_pg_constraint(storage),
@@ -3553,43 +4229,68 @@ impl SystemViewRegistry {
         Ok(results)
     }
 
-    /// Execute pg_type() system view
+    /// Execute the `pg_type` system view (HDB-011).
     ///
-    /// Returns information about all data types
+    /// One row per [`BUILTIN_TYPES`] entry in PostgreSQL's column order, plus
+    /// the `_<name>` array row for every entry that declares an array OID. The
+    /// value order below MUST match the column order registered in
+    /// `register_phase3_views`.
     fn execute_pg_type(_storage: &StorageEngine) -> Result<Vec<Tuple>> {
-        let mut results = Vec::new();
-        let types = vec![
-            ("int4", 23, 4, true, "N", false),
-            ("int8", 20, 8, true, "N", false),
-            ("text", 25, -1, false, "S", false),
-            ("boolean", 16, 1, true, "B", false),
-            ("timestamp", 1114, 8, true, "D", false),
-            ("float8", 701, 8, true, "N", false),
-            ("vector", 3614, -1, false, "U", false),
-        ];
-
-        for (type_name, oid, len, byval, category, notnull) in types {
-            let tuple = Tuple::new(vec![
-                Value::Int4(oid),                     // oid
-                Value::String(type_name.to_string()), // typname
-                Value::Int4(len),                     // typlen
-                Value::Boolean(byval),                // typbyval
-                Value::String(category.to_string()),  // typcategory
-                Value::Boolean(notnull),              // typnotnull
-                // KanttBan #23 phase 2.6: typnamespace + 4 more
-                // columns drizzle joins / reads. Every built-in
-                // type lives in pg_catalog (OID 11). typtype 'b' =
-                // base type. typowner = postgres (10). typrelid /
-                // typbasetype = 0 for non-composite/non-domain.
-                Value::Int4(11),           // typnamespace
-                Value::String("b".into()), // typtype
-                Value::Int4(10),           // typowner
-                Value::Int4(0),            // typrelid
-                Value::Int4(0),            // typbasetype
-            ]);
-            results.push(tuple);
+        let mut results = Vec::with_capacity(BUILTIN_TYPES.len() * 2);
+        for t in BUILTIN_TYPES {
+            let (typinput, typoutput) = builtin_type_io(t.name);
+            let collation = builtin_type_collation(t.name);
+            results.push(Tuple::new(vec![
+                Value::Int4(t.oid),                                          // oid
+                Value::String(t.name.to_string()),                           // typname
+                Value::Int4(11),                                             // typnamespace = pg_catalog
+                Value::Int4(10),                                             // typowner = postgres
+                Value::Int2(t.len),                                          // typlen
+                Value::Boolean(t.byval),                                     // typbyval
+                Value::String(builtin_type_typtype(t.category).to_string()), // typtype: b / r / p
+                Value::String(t.category.to_string()),                       // typcategory
+                Value::Boolean(t.preferred),                                 // typispreferred
+                Value::Boolean(true),                                        // typisdefined
+                Value::String(t.delim.to_string()),                          // typdelim
+                Value::Int4(0),                                              // typrelid (not composite)
+                Value::Int4(builtin_type_elem(t.name)),                      // typelem (point -> float8)
+                Value::Int4(t.array_oid),                                    // typarray
+                Value::String(typinput.to_string()),                         // typinput
+                Value::String(typoutput.to_string()),                        // typoutput
+                Value::Boolean(false),                                       // typnotnull
+                Value::Int4(0),                                              // typbasetype (not a domain)
+                Value::Int4(-1),                                             // typtypmod
+                Value::Int4(0),                                              // typndims
+                Value::Int4(collation),                                      // typcollation
+                Value::Null,                                                 // typdefault
+            ]));
+            if t.array_oid != 0 {
+                results.push(Tuple::new(vec![
+                    Value::Int4(t.array_oid),               // oid
+                    Value::String(format!("_{}", t.name)),  // typname
+                    Value::Int4(11),                        // typnamespace
+                    Value::Int4(10),                        // typowner
+                    Value::Int2(-1),                        // typlen (varlena)
+                    Value::Boolean(false),                  // typbyval
+                    Value::String("b".to_string()),         // typtype
+                    Value::String("A".to_string()),         // typcategory = array
+                    Value::Boolean(false),                  // typispreferred
+                    Value::Boolean(true),                   // typisdefined
+                    Value::String(t.delim.to_string()),     // typdelim
+                    Value::Int4(0),                         // typrelid
+                    Value::Int4(t.oid),                     // typelem -> element type
+                    Value::Int4(0),                         // typarray
+                    Value::String("array_in".to_string()),  // typinput
+                    Value::String("array_out".to_string()), // typoutput
+                    Value::Boolean(false),                  // typnotnull
+                    Value::Int4(0),                         // typbasetype
+                    Value::Int4(-1),                        // typtypmod
+                    Value::Int4(0),                         // typndims
+                    Value::Int4(collation),                 // typcollation (inherited)
+                    Value::Null,                            // typdefault
+                ]));
+            }
         }
-
         Ok(results)
     }
 
@@ -5362,5 +6063,156 @@ mod tests {
 
         // Should return empty results if no vector indexes exist
         assert_eq!(results.len(), 0);
+    }
+
+    /// HDB-011: the `pg_type` inventory must be internally consistent. Nothing
+    /// downstream can tell two rows apart if they share an OID or a name, and a
+    /// client that follows `typelem` needs the element row to exist.
+    #[test]
+    #[allow(clippy::indexing_slicing, clippy::panic)]
+    fn hdb011_pg_type_inventory_is_consistent() {
+        let config = Config::in_memory();
+        let storage = StorageEngine::open_in_memory(&config).expect("storage");
+        let registry = SystemViewRegistry::new();
+        let rows = registry.execute("pg_type", &storage).expect("pg_type");
+        let schema = registry.get_schema("pg_type").expect("pg_type schema");
+
+        assert_eq!(schema.columns.len(), 22, "pg_type column count");
+        for row in &rows {
+            assert_eq!(
+                row.values.len(),
+                schema.columns.len(),
+                "every pg_type row must be as wide as the registered schema"
+            );
+        }
+
+        let col = |name: &str| {
+            schema
+                .columns
+                .iter()
+                .position(|c| c.name == name)
+                .unwrap_or_else(|| panic!("pg_type has no {name} column"))
+        };
+        let (oid_i, name_i, elem_i, arr_i) = (col("oid"), col("typname"), col("typelem"), col("typarray"));
+        let (typtype_i, cat_i) = (col("typtype"), col("typcategory"));
+        let (byval_i, coll_i) = (col("typbyval"), col("typcollation"));
+        let (in_i, out_i) = (col("typinput"), col("typoutput"));
+
+        let int4 = |t: &Tuple, i: usize| match &t.values[i] {
+            Value::Int4(v) => *v,
+            other => panic!("expected Int4, got {other:?}"),
+        };
+        let text = |t: &Tuple, i: usize| match &t.values[i] {
+            Value::String(s) => s.clone(),
+            other => panic!("expected text, got {other:?}"),
+        };
+
+        let mut by_oid: HashMap<i32, String> = HashMap::new();
+        let mut names: HashSet<String> = HashSet::new();
+        for row in &rows {
+            let oid = int4(row, oid_i);
+            let name = text(row, name_i);
+            assert!(
+                by_oid.insert(oid, name.clone()).is_none(),
+                "duplicate pg_type oid {oid} ({name})"
+            );
+            assert!(names.insert(name.clone()), "duplicate pg_type name {name}");
+        }
+
+        for row in &rows {
+            let name = text(row, name_i);
+            let elem = int4(row, elem_i);
+            if elem != 0 {
+                let base = by_oid
+                    .get(&elem)
+                    .unwrap_or_else(|| panic!("{name}.typelem = {elem} names no pg_type row"));
+                if text(row, cat_i) == "A" {
+                    assert_eq!(name, format!("_{base}"), "an array row must be named _<element>");
+                } else {
+                    // The one non-array `typelem` PostgreSQL has in this
+                    // inventory: a `point` is a pair of `float8` (review NIT-4).
+                    assert_eq!(
+                        (name.as_str(), base.as_str()),
+                        ("point", "float8"),
+                        "the only non-array typelem is point -> float8"
+                    );
+                }
+            }
+            let arr = int4(row, arr_i);
+            if arr != 0 {
+                let array_row = by_oid
+                    .get(&arr)
+                    .unwrap_or_else(|| panic!("{name}.typarray = {arr} names no pg_type row"));
+                assert_eq!(*array_row, format!("_{name}"), "typarray must point at _<name>");
+            }
+        }
+
+        // Review FIX-3: `typtype` is derived from `typcategory`, not hard-coded
+        // to 'b'. A driver that classifies by it (Npgsql) must see the ranges
+        // as ranges and the pseudo-types as pseudo-types.
+        let row_index = |want: &str| {
+            rows.iter()
+                .position(|r| text(r, name_i) == want)
+                .unwrap_or_else(|| panic!("pg_type has no {want} row"))
+        };
+        let str_of = |want: &str, col: usize| text(&rows[row_index(want)], col);
+        let i32_of = |want: &str, col: usize| int4(&rows[row_index(want)], col);
+        let bool_of =
+            |want: &str, col: usize| matches!(rows[row_index(want)].values.get(col), Some(Value::Boolean(true)));
+
+        assert_eq!(str_of("int4", typtype_i), "b", "a base type is typtype 'b'");
+        assert_eq!(str_of("int4range", typtype_i), "r", "a range type is typtype 'r'");
+        assert_eq!(str_of("void", typtype_i), "p", "a pseudo-type is typtype 'p'");
+        assert_eq!(str_of("unknown", typtype_i), "p", "`unknown` is a pseudo-type too");
+        assert_eq!(str_of("_int4", typtype_i), "b", "an array of a base type stays 'b'");
+
+        // Review NIT-4: the divergences from `pg_type.dat` the first pass had.
+        assert!(bool_of("xid", byval_i), "xid is pass-by-value in PostgreSQL");
+        assert!(bool_of("cid", byval_i), "cid is pass-by-value in PostgreSQL");
+        assert_eq!(i32_of("name", coll_i), 950, "name collates C (950)");
+        assert_eq!(i32_of("text", coll_i), 100, "text takes the default collation");
+        assert_eq!(i32_of("point", elem_i), 701, "point's element type is float8");
+
+        // Review NIT-5: `builtin_type_io` is a `&'static` table, so a new
+        // BUILTIN_TYPES entry that forgets to add itself there falls into the
+        // `_` arm and reports `unknownin` — which only `unknown` may report.
+        for row in &rows {
+            let name = text(row, name_i);
+            let (input, output) = (text(row, in_i), text(row, out_i));
+            assert!(
+                !input.is_empty() && !output.is_empty(),
+                "{name} must report typinput/typoutput"
+            );
+            if name != "unknown" {
+                assert_ne!(input, "unknownin", "{name} is missing from builtin_type_io");
+            }
+        }
+
+        // The whole point of the rewrite: the legacy 7-row set is a strict
+        // subset, and the inventory is big enough to answer real clients.
+        assert!(rows.len() >= 90, "expected the full inventory, got {}", rows.len());
+        for (name, oid) in [
+            ("bool", 16),
+            ("int8", 20),
+            ("int2", 21),
+            ("int4", 23),
+            ("text", 25),
+            ("json", 114),
+            ("float4", 700),
+            ("float8", 701),
+            ("varchar", 1043),
+            ("timestamp", 1114),
+            ("numeric", 1700),
+            ("uuid", 2950),
+            ("vector", 3614),
+            ("jsonb", 3802),
+            ("_int4", 1007),
+        ] {
+            assert_eq!(
+                by_oid.get(&oid).map(String::as_str),
+                Some(name),
+                "pg_type oid {oid} must be {name}"
+            );
+        }
     }
 }

@@ -730,6 +730,25 @@ impl Evaluator {
         }
     }
 
+    /// The SQL session identity (HDB-009): the login name this connection
+    /// authenticated with — the PG-wire startup `user` AFTER authentication,
+    /// the MySQL handshake user, or the name handed to
+    /// `EmbeddedDatabase::create_session` — installed for the duration of the
+    /// statement by the engine's session entry points and read here through
+    /// `crate::session_login_user_tls`, because this evaluator has no session
+    /// handle of its own.
+    ///
+    /// Falls back to `heliosdb`, the documented service user, for a caller with
+    /// no session identity at all: the embedded `query()` / `execute()` funnels,
+    /// the REPL and every engine-internal evaluation.
+    ///
+    /// This is identity REPORTING. Nano enforces no SQL privileges on it, and
+    /// `SET ROLE` / `SET SESSION AUTHORIZATION` stay refused (0A000) rather than
+    /// letting a session rewrite what these functions answer.
+    fn session_identity() -> String {
+        crate::session_login_user_tls().map_or_else(|| "heliosdb".to_string(), |login| login.to_string())
+    }
+
     /// Evaluate a scalar function
     fn evaluate_scalar_function(&self, fun: &str, args: &[LogicalExpr], tuple: &Tuple) -> Result<Value> {
         // Evaluate all arguments
@@ -1001,7 +1020,16 @@ impl Evaluator {
                 Ok(Value::Array(schemas))
             }
             "current_database" => Ok(Value::String("heliosdb".to_string())),
-            "current_user" | "session_user" => Ok(Value::String("heliosdb".to_string())),
+            // Session-aware identity (HDB-009), threaded in by exactly the
+            // mechanism `current_schema()` above uses. `user` is the bare SQL
+            // keyword form: sqlparser lowers `SELECT user` (and `SELECT
+            // current_user`, `SELECT session_user`) to a zero-argument function
+            // call, which is why the keyword forms land here at all. `SELECT
+            // current_role` WITHOUT parentheses is the one spelling sqlparser
+            // 0.53 does not lower to a function — it arrives as an identifier,
+            // so the PLANNER lowers that one itself (`expr_to_logical`'s
+            // `Expr::Identifier` arm) and it lands here too.
+            "current_user" | "session_user" | "current_role" | "user" => Ok(Value::String(Self::session_identity())),
             // Random UUID v4 — the default for Postgres 13+ PK columns.
             "gen_random_uuid" | "pg_catalog.gen_random_uuid" | "uuid_generate_v4" => {
                 Ok(Value::Uuid(uuid::Uuid::new_v4()))
@@ -1163,7 +1191,9 @@ impl Evaluator {
                     "integer_datetimes" => Some("on".to_string()),
                     // Trivia some clients probe
                     "is_superuser" => Some("on".to_string()),
-                    "session_authorization" | "current_user" | "current_role" => Some("postgres".to_string()),
+                    // HDB-009: the session's real login identity, not a
+                    // hardcoded `postgres` that contradicted `current_user`.
+                    "session_authorization" | "current_user" | "current_role" => Some(Self::session_identity()),
                     "search_path" => Some("\"$user\", public".to_string()),
                     _ => None,
                 };

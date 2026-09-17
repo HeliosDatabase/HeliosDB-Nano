@@ -117,11 +117,17 @@ fn in_txn_update_parent_pk_then_insert_child_fk_to_new_succeeds() {
     db.execute("INSERT INTO c (id, parent_id) VALUES (101, 42)")
         .expect("insert child FK→updated parent pk");
     // INSERT referencing the OLD pk must violate (the old key no longer indexes a row).
+    // HDB-008: that violation ABORTS the transaction, so the probe is fenced by
+    // a savepoint and the block is recovered through it before COMMIT — which
+    // is exactly how PostgreSQL lets a transaction survive a probing statement.
+    db.execute("SAVEPOINT stale_fk_probe").expect("savepoint");
     let stale = db.execute("INSERT INTO c (id, parent_id) VALUES (102, 1)");
     assert!(
         stale.is_err(),
         "INSERT child referencing pre-UPDATE parent pk must FK-violate; got {stale:?}"
     );
+    db.execute("ROLLBACK TO SAVEPOINT stale_fk_probe")
+        .expect("recover the block after the expected FK violation");
     db.execute("COMMIT").expect("commit");
 }
 

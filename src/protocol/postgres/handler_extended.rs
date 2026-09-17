@@ -235,7 +235,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
         // delegate so psycopg3 / JDBC / sqlx / node-postgres get the same
         // answer as psql instead of the params planner's error.
         let is_timeout_guc = crate::EmbeddedDatabase::is_timeout_guc_statement(trimmed_query);
-        if is_transaction_control || is_set_role || is_timeout_guc {
+        // HDB-008: `ROLLBACK TO SAVEPOINT` is not a transaction BOUNDARY, so it
+        // is normally executed as an ordinary statement — but inside an ABORTED
+        // block the `transaction_failed()` guard below refuses it before the
+        // engine ever sees it, leaving a client that binds parameters (psycopg3,
+        // JDBC, sqlx, node-postgres — i.e. everyone on this path) with no way to
+        // recover the block PostgreSQL's way. Delegate ONLY in that state, to
+        // the simple-query handler's savepoint-recovery arm, so both protocols
+        // answer from one implementation.
+        let is_failed_savepoint_recovery = self.transaction_failed()
+            && super::handler::classify_transaction_control(trimmed_query)
+                == Some(super::handler::TxnControl::RollbackToSavepoint);
+        if is_transaction_control || is_set_role || is_timeout_guc || is_failed_savepoint_recovery {
             let previous_suppress_ready = self.suppress_ready_for_query;
             self.suppress_ready_for_query = true;
             let result = self.handle_single_query(&statement.query).await;

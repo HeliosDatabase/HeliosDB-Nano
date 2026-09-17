@@ -210,6 +210,13 @@ fn test_nested_rollback_to_outer_removes_inner() {
     let result = db.execute_returning("RELEASE SAVEPOINT sp2");
     assert!(result.is_err(), "sp2 should be gone after ROLLBACK TO sp1");
 
+    // HDB-008: that error ABORTED the transaction (PostgreSQL semantics), so
+    // every later statement is refused with 25P02 until the block recovers.
+    // `ROLLBACK TO SAVEPOINT` is the one statement allowed through — and it
+    // doubles as the proof that sp1 is still on the stack.
+    db.execute_returning("ROLLBACK TO SAVEPOINT sp1")
+        .expect("sp1 must survive the failed RELEASE and recover the block");
+
     // sp1 should still be on the stack
     db.execute_returning("RELEASE SAVEPOINT sp1").unwrap();
 
@@ -279,6 +286,11 @@ fn test_rollback_to_outer_removes_all_inner() {
     assert!(r2.is_err(), "sp2 should be removed after ROLLBACK TO sp1");
     let r3 = db.execute_returning("RELEASE SAVEPOINT sp3");
     assert!(r3.is_err(), "sp3 should be removed after ROLLBACK TO sp1");
+
+    // HDB-008: the failed RELEASEs aborted the transaction; `ROLLBACK TO
+    // SAVEPOINT` is the one statement allowed through and recovers the block.
+    db.execute_returning("ROLLBACK TO SAVEPOINT sp1")
+        .expect("sp1 must survive the failed RELEASEs and recover the block");
 
     // sp1 should still exist
     db.execute_returning("RELEASE SAVEPOINT sp1").unwrap();
@@ -679,15 +691,25 @@ fn test_error_does_not_invalidate_savepoint() {
     let db = setup();
 
     db.execute("BEGIN").unwrap();
-    db.execute_returning("SAVEPOINT sp1").unwrap();
+    // The savepoint is taken AFTER the good insert so that recovering through
+    // it keeps that row — HDB-008 makes `ROLLBACK TO SAVEPOINT` the only way
+    // back from the error below, and rolling back to a savepoint taken before
+    // the insert would necessarily undo it.
     db.execute("INSERT INTO sp_test VALUES (1, 'good')").unwrap();
+    db.execute_returning("SAVEPOINT sp1").unwrap();
 
     // Cause an error (reference nonexistent table)
     let _ = db.execute("INSERT INTO no_such_table VALUES (99)");
 
-    // Savepoint should still be on the stack
+    // HDB-008: the DML error ABORTED the transaction, so RELEASE is refused
+    // with 25P02 — but the SAVEPOINT itself survives the error, which is what
+    // this test is about, and ROLLBACK TO it recovers the block.
     let release = db.execute_returning("RELEASE SAVEPOINT sp1");
-    assert!(release.is_ok(), "Savepoint should survive DML errors");
+    assert!(release.is_err(), "RELEASE must be refused inside an aborted block");
+    db.execute_returning("ROLLBACK TO SAVEPOINT sp1")
+        .expect("Savepoint should survive DML errors");
+    db.execute_returning("RELEASE SAVEPOINT sp1")
+        .expect("and be releasable once the block is usable again");
 
     db.execute("COMMIT").unwrap();
     assert_eq!(count_rows(&db), 1);
@@ -813,20 +835,33 @@ fn test_nested_begin_not_supported_with_savepoints() {
 
 #[test]
 fn test_savepoint_after_failed_dml() {
-    // Create a savepoint after a DML failure and continue working.
+    // HDB-008: a DML failure ABORTS the transaction (PostgreSQL semantics), so
+    // a NEW savepoint cannot be taken after it — `SAVEPOINT` is an ordinary
+    // statement and is refused with 25P02 like every other one. Only a
+    // `ROLLBACK TO` an EXISTING savepoint, or ending the block, gets you out.
+    // Until this item, the failure left no trace and the work below committed.
     let db = setup();
 
     db.execute("BEGIN").unwrap();
 
     // Failed DML (nonexistent table)
-    let _ = db.execute("INSERT INTO nonexistent VALUES (1)");
+    let failed = db.execute("INSERT INTO nonexistent VALUES (1)");
+    assert!(failed.is_err(), "the DML must fail");
 
-    // Should still be able to create a savepoint and work
-    db.execute_returning("SAVEPOINT sp1").unwrap();
-    db.execute("INSERT INTO sp_test VALUES (1, 'after_failure')").unwrap();
-    db.execute_returning("RELEASE SAVEPOINT sp1").unwrap();
-    db.execute("COMMIT").unwrap();
+    let savepoint = db.execute_returning("SAVEPOINT sp1");
+    assert!(
+        savepoint.is_err(),
+        "SAVEPOINT must be refused inside an aborted transaction block"
+    );
+    let insert = db.execute("INSERT INTO sp_test VALUES (1, 'after_failure')");
+    assert!(insert.is_err(), "DML must be refused inside an aborted block");
+    let commit = db.execute("COMMIT");
+    assert!(commit.is_err(), "COMMIT of an aborted block must roll back and report");
 
+    assert_eq!(count_rows(&db), 0, "nothing from an aborted block may be committed");
+
+    // The handle is usable again once the block is over.
+    db.execute("INSERT INTO sp_test VALUES (1, 'after_the_block')").unwrap();
     assert_eq!(count_rows(&db), 1);
 }
 
@@ -903,10 +938,15 @@ fn test_savepoint_case_sensitivity() {
         // Case-insensitive: release succeeded
         db.execute("COMMIT").unwrap();
     } else {
-        // Case-sensitive: 'mypoint' != 'MyPoint'
-        // Release the original casing
-        db.execute_returning("RELEASE SAVEPOINT MyPoint").unwrap();
-        db.execute("COMMIT").unwrap();
+        // Case-sensitive: 'mypoint' != 'MyPoint'. The failed RELEASE is an
+        // error inside the block, so (HDB-008, PostgreSQL semantics) the
+        // transaction is now aborted: releasing the original casing is refused
+        // with 25P02 and only ROLLBACK (or ROLLBACK TO SAVEPOINT) can end it.
+        let refused = db
+            .execute_returning("RELEASE SAVEPOINT MyPoint")
+            .expect_err("statements after a failed RELEASE are refused");
+        assert!(refused.is_failed_transaction(), "got {refused:?}");
+        db.execute("ROLLBACK").unwrap();
     }
 }
 
@@ -1037,7 +1077,10 @@ fn test_release_outer_also_releases_inner() {
     let r2 = db.execute_returning("RELEASE SAVEPOINT inner");
     assert!(r2.is_err(), "inner should be gone after releasing outer");
 
-    db.execute("COMMIT").unwrap();
+    // HDB-008: those errors aborted the transaction and no savepoint is left to
+    // recover through, so the block can only be ended. Nothing was written, so
+    // ROLLBACK is the honest way to end it.
+    db.execute("ROLLBACK").unwrap();
 }
 
 #[test]
@@ -1191,6 +1234,11 @@ fn test_rollback_to_middle_savepoint() {
     // sp3 should be gone
     let r3 = db.execute_returning("RELEASE SAVEPOINT sp3");
     assert!(r3.is_err(), "sp3 should be gone after ROLLBACK TO sp2");
+
+    // HDB-008: that error aborted the transaction; ROLLBACK TO SAVEPOINT is the
+    // one statement allowed through, and sp2 is still there to roll back to.
+    db.execute_returning("ROLLBACK TO SAVEPOINT sp2")
+        .expect("sp2 must survive the failed RELEASE and recover the block");
 
     // sp2 should still exist (ROLLBACK TO keeps the target)
     db.execute_returning("RELEASE SAVEPOINT sp2").unwrap();

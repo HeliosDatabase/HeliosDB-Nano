@@ -1108,9 +1108,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
                             }
                             _ => {
                                 error!("Command error: {}", e);
-                                let msg = e.to_string();
-                                let (code, state) = map_error_code(&msg);
-                                let _ = handler.send_error(code, state, &msg).await;
+                                // HDB-008: the catch-all for a statement that
+                                // propagated its error instead of sending its
+                                // own ERR packet. Same MySQL statement-level
+                                // semantics — see `send_statement_error`.
+                                let _ = handler.send_statement_error(&e.to_string()).await;
                             }
                         }
                     }
@@ -1139,6 +1141,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
         let hs = self.receive_handshake_response().await?;
         // Authenticate (trust-based for Nano — accept any non-empty creds)
         self.authenticate(&hs)?;
+        // HDB-009: publish the handshake user as this session's SQL identity,
+        // so `current_user` / `session_user` / `current_role` answer the name
+        // the client logged in with instead of the hardcoded service user, and
+        // so this connection's result-cache entries are keyed to it. NOTE: this
+        // listener is trust-only — the name is asserted by the client, not
+        // proved — which is documented in `docs/guides/authentication.md`; it
+        // is reported identity, never an authorization decision.
+        self.database
+            .set_session_login_user(self.session_id, self.username.clone())?;
         self.send_ok(0, 0).await?;
         Ok(())
     }
@@ -1284,6 +1295,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
                 self.send_ok(0, 0).await?;
             }
             Command::ComResetConnection => {
+                // HDB-008: COM_RESET_CONNECTION must also end the ENGINE
+                // transaction. Clearing only the handler flags leaked the
+                // session transaction (and, after a failed statement, its
+                // aborted mark) into the reset connection.
+                if self.in_transaction && self.database.session_in_transaction(self.session_id) {
+                    let _ = self.database.rollback_transaction_for_session(self.session_id);
+                }
                 self.status_flags = StatusFlags::default_flags();
                 self.in_transaction = false;
                 self.send_ok(0, 0).await?;
@@ -1453,7 +1471,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
 
     async fn handle_commit(&mut self) -> Result<()> {
         if self.in_transaction {
-            self.database.commit_transaction_for_session(self.session_id)?;
+            let outcome = self.database.commit_transaction_for_session(self.session_id);
+            if let Err(e) = outcome {
+                self.sync_transaction_state_after_error();
+                return Err(e.into());
+            }
             self.in_transaction = false;
             self.status_flags.clear(StatusFlags::SERVER_STATUS_IN_TRANS);
         }
@@ -1462,11 +1484,57 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
 
     async fn handle_rollback(&mut self) -> Result<()> {
         if self.in_transaction {
-            self.database.rollback_transaction_for_session(self.session_id)?;
+            let outcome = self.database.rollback_transaction_for_session(self.session_id);
+            if let Err(e) = outcome {
+                self.sync_transaction_state_after_error();
+                return Err(e.into());
+            }
             self.in_transaction = false;
             self.status_flags.clear(StatusFlags::SERVER_STATUS_IN_TRANS);
         }
         self.send_ok(0, 0).await
+    }
+
+    /// HDB-008: re-synchronise this connection's transaction state with the
+    /// ENGINE after a failed `COMMIT` / `ROLLBACK`.
+    ///
+    /// The engine can END a transaction and still return an error — a `COMMIT`
+    /// of an aborted block rolls back and reports
+    /// `commit_of_failed_transaction`. Returning that error without clearing
+    /// `in_transaction` WEDGED the connection permanently: `ROLLBACK` then
+    /// failed with "no active transaction to rollback", the next `BEGIN` was a
+    /// no-op because `in_transaction` was still `true` (so NO engine
+    /// transaction was opened), and every following statement silently
+    /// autocommitted while `SERVER_STATUS_IN_TRANS` told the client it was in
+    /// a transaction. Ask the engine instead of guessing.
+    fn sync_transaction_state_after_error(&mut self) {
+        if !self.database.session_in_transaction(self.session_id) {
+            self.in_transaction = false;
+            self.status_flags.clear(StatusFlags::SERVER_STATUS_IN_TRANS);
+        }
+    }
+
+    /// HDB-008: report a STATEMENT error on the MySQL wire, keeping MySQL's
+    /// statement-level transaction semantics.
+    ///
+    /// The engine aborts the whole transaction on any statement error
+    /// (PostgreSQL's `25P02` contract, which the embedded API, the REPL and
+    /// the PostgreSQL wire all keep). MySQL does not: InnoDB rolls back only
+    /// the failed statement, and `BEGIN; bad; good; COMMIT;` commits `good`.
+    /// WordPress, PHP and every MySQL driver are written against that, so this
+    /// listener clears the engine's mark once it has reported the error.
+    ///
+    /// ⚠️ Pre-existing gap (sprinter item): the rows the FAILED statement had
+    /// already staged before it failed are NOT discarded — the engine has no
+    /// per-statement undo point, so a multi-row `INSERT` that violates a
+    /// constraint on its third row leaves rows one and two in the write set.
+    /// Real MySQL would have discarded them.
+    async fn send_statement_error(&mut self, msg: &str) -> Result<()> {
+        if self.in_transaction {
+            let _ = self.database.clear_session_transaction_failure(self.session_id);
+        }
+        let (code, state) = map_error_code(msg);
+        self.send_error(code, state, msg).await
     }
 
     // ------------------------------------------------------------------
@@ -1479,11 +1547,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
                 self.last_row_count = rows.len() as u64;
                 self.send_result_set(&columns, &rows).await
             }
-            Err(e) => {
-                let msg = e.to_string();
-                let (code, state) = map_error_code(&msg);
-                self.send_error(code, state, &msg).await
-            }
+            Err(e) => self.send_statement_error(&e.to_string()).await,
         }
     }
 
@@ -1523,9 +1587,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
                     }
                 }
                 Err(e) => {
-                    let msg = e.to_string();
-                    let (code, state) = map_error_code(&msg);
-                    return self.send_error(code, state, &msg).await;
+                    return self.send_statement_error(&e.to_string()).await;
                 }
             }
         }
@@ -1810,6 +1872,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
             }
             Err(e) => {
                 tracing::debug!("query_last_serial_id({}) error: {}", table_name, e);
+                // HDB-008: this probe runs after every INSERT and its error is
+                // swallowed (the client gets LAST_INSERT_ID 0, not a failure).
+                // Inside an open transaction the engine has still marked the
+                // block aborted, so the client would eat a spurious 25P02 on
+                // its next statement for a query it never issued. Undo the
+                // mark, exactly as `send_statement_error` does for errors we
+                // DO report. Same caveat: rows already staged by a failed
+                // statement are not discarded.
+                if self.in_transaction {
+                    let _ = self.database.clear_session_transaction_failure(self.session_id);
+                }
                 0
             }
         }
@@ -2938,11 +3011,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
                     self.last_row_count = rows.len() as u64;
                     self.send_binary_result_set(&columns, &rows).await
                 }
-                Err(e) => {
-                    let msg = e.to_string();
-                    let (code, state) = map_error_code(&msg);
-                    self.send_error(code, state, &msg).await
-                }
+                Err(e) => self.send_statement_error(&e.to_string()).await,
             }
         } else {
             // DML / DDL with bound parameters
@@ -2970,11 +3039,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
                     self.last_row_count = affected;
                     self.send_ok(affected, insert_id).await
                 }
-                Err(e) => {
-                    let msg = e.to_string();
-                    let (code, state) = map_error_code(&msg);
-                    self.send_error(code, state, &msg).await
-                }
+                Err(e) => self.send_statement_error(&e.to_string()).await,
             }
         }
     }
@@ -3364,6 +3429,18 @@ fn map_error_code(err_msg: &str) -> (u16, &'static str) {
     // error" on the MySQL listener.
     if err_msg.contains(crate::sql::scope::CORRELATED_JOIN_SUBQUERY_UNSUPPORTED) {
         return (1235, "0A000"); // ER_NOT_SUPPORTED_YET
+    }
+    // HDB-008: the engine's aborted-transaction refusals — the 25P02 statement
+    // refusal and the embedded COMMIT refusal — share this prefix (the two
+    // consts in `src/error.rs`). MySQL has no dedicated error number for
+    // PostgreSQL's aborted-transaction-block state, so the generic number is
+    // kept and only the SQLSTATE is corrected: 25000 invalid_transaction_state
+    // instead of HY000 "unknown error", which is what the message text fell
+    // through to before. `contains`, not `starts_with`: this function is handed
+    // the Display form (`Transaction error: …`), as its own unit tests show.
+    // Checked before the wording arms below so none of them can claim it.
+    if lower.contains("current transaction is aborted") {
+        return (1105, "25000"); // ER_UNKNOWN_ERROR number, invalid-transaction-state SQLSTATE
     }
     if lower.contains("serialization failure") || lower.contains("deadlock") {
         // ER_LOCK_DEADLOCK — clients retry the transaction. Covers both the

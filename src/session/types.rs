@@ -237,6 +237,13 @@ pub struct Session {
     /// (I-USER). `None` on the embedded path, which has no login identity — a
     /// `"$user"` entry then resolves to nothing (dropped from the path).
     pub login_user: Option<String>,
+    /// HDB-009: the same login name as [`Self::login_user`], pre-interned as an
+    /// `Arc<str>` so the per-statement SQL-identity guard
+    /// (`EmbeddedDatabase::session_login_user_override_guard`) can install it
+    /// with one atomic increment instead of allocating and copying the name on
+    /// every statement of every wire connection. Always written together with
+    /// `login_user` by [`Self::set_login`], the single writer of both.
+    pub login_identity: Option<std::sync::Arc<str>>,
     /// GH#28: per-session `SET idle_session_timeout` override in milliseconds
     /// (`None` = inherit the listener's `[server] idle_session_timeout`).
     /// Lives on the session — never on the process-global `SessionSettings`
@@ -272,6 +279,7 @@ impl Session {
             current_schema: None,
             search_path: Vec::new(),
             login_user: None,
+            login_identity: None,
             idle_session_timeout_ms: None,
             idle_in_transaction_session_timeout_ms: None,
             active_txn: None,
@@ -279,6 +287,43 @@ impl Session {
             last_activity: now,
             stats: SessionStats::default(),
         }
+    }
+
+    /// Maximum length, in bytes, of a published login name: PostgreSQL's
+    /// `NAMEDATALEN - 1`, which is where PostgreSQL itself truncates an
+    /// identifier.
+    ///
+    /// HDB-009: both wire listeners default to trust, so the name in a startup
+    /// packet / handshake is asserted by the client and bounded only by the
+    /// packet framing (1 MiB on the PG wire, 16 MiB on MySQL). That name is now
+    /// cloned into a thread-local for every statement and compared on every
+    /// result-cache probe, so leaving it unbounded would hand a client a
+    /// per-statement cost it chooses. Truncating matches PostgreSQL and costs
+    /// nothing.
+    pub const LOGIN_NAME_MAX_BYTES: usize = 63;
+
+    /// Publish this session's login identity: the name `current_user`,
+    /// `session_user`, `current_role` and
+    /// `current_setting('session_authorization')` report (HDB-009), and what a
+    /// `"$user"` `search_path` entry expands to (I-USER).
+    ///
+    /// The ONLY writer of `login_user` / `login_identity`, so the two can never
+    /// disagree. The name is truncated to [`Self::LOGIN_NAME_MAX_BYTES`] on a
+    /// char boundary (never mid-UTF-8), and an empty name publishes no identity
+    /// at all rather than an empty `current_user`.
+    pub fn set_login(&mut self, login_user: Option<String>) {
+        let published = login_user.and_then(|mut name| {
+            if name.len() > Self::LOGIN_NAME_MAX_BYTES {
+                let mut end = Self::LOGIN_NAME_MAX_BYTES;
+                while end > 0 && !name.is_char_boundary(end) {
+                    end -= 1;
+                }
+                name.truncate(end);
+            }
+            (!name.is_empty()).then_some(name)
+        });
+        self.login_identity = published.as_deref().map(std::sync::Arc::<str>::from);
+        self.login_user = published;
     }
 
     /// Update last activity timestamp

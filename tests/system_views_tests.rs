@@ -311,33 +311,117 @@ fn test_pg_class_tables_and_matviews() {
     }
 }
 
+/// HDB-011. Two things were wrong with this test before:
+///
+///   1. it read `values[0]` as the type NAME. In the registry the planner
+///      actually consults that column is the `oid`, so the name list it built
+///      was always empty and `contains(...)` could only ever pass by luck (it
+///      passed against the LEGACY registry, whose column order differs);
+///   2. it asserted the registry the planner does NOT use.
+///      `heliosdb_nano::sql::SystemViewRegistry` is the legacy registry in
+///      `src/sql/system_views.rs`; every runtime caller — the planner, the
+///      executor scan, the REPL — resolves `pg_type` through
+///      `sql::phase3::SystemViewRegistry`. This test now pins the one that
+///      answers a real query.
 #[test]
 fn test_pg_type_builtin_types() {
     let config = Config::in_memory();
     let storage = StorageEngine::open_in_memory(&config).unwrap();
 
-    let registry = SystemViewRegistry::new();
+    let registry = heliosdb_nano::sql::phase3::SystemViewRegistry::new();
     let results = registry.execute("pg_type", &storage).unwrap();
+    let schema = registry.get_schema("pg_type").unwrap();
+    let name_idx = schema
+        .columns
+        .iter()
+        .position(|c| c.name == "typname")
+        .expect("pg_type must have a typname column");
 
-    // Should have multiple built-in types
-    assert!(results.len() >= 10, "Expected at least 10 built-in types");
+    // The full PostgreSQL inventory, not the seven rows this used to carry.
+    assert!(
+        results.len() >= 40,
+        "Expected at least 40 pg_type rows, got {}",
+        results.len()
+    );
 
-    // Verify we have common types
     let type_names: Vec<String> = results
         .iter()
-        .filter_map(|t| match &t.values[0] {
-            Value::String(name) => Some(name.clone()),
+        .filter_map(|t| match t.values.get(name_idx) {
+            Some(Value::String(name)) => Some(name.clone()),
             _ => None,
         })
         .collect();
 
-    let expected_types = vec!["bool", "int4", "int8", "text", "timestamp"];
+    let expected_types = vec![
+        "bool",
+        "int2",
+        "int4",
+        "int8",
+        "text",
+        "varchar",
+        "float4",
+        "float8",
+        "timestamp",
+        "uuid",
+        "json",
+        "jsonb",
+        "numeric",
+        "date",
+        // Array types are part of the inventory now, linked by typarray/typelem.
+        "_int4",
+    ];
     for expected in expected_types {
         assert!(
             type_names.contains(&expected.to_string()),
             "Expected type '{}' not found",
             expected
         );
+    }
+}
+
+/// HDB-011: `pg_range` and `pg_enum` are registered EMPTY in the registry the
+/// planner consults, so the introspection every driver runs alongside
+/// `pg_type` resolves instead of erroring. tokio-postgres' TYPEINFO lookup
+/// `LEFT OUTER JOIN`s `pg_range`; drizzle-kit and Prisma join `pg_enum` to
+/// read enum labels. Both tolerate zero rows; neither tolerates "relation does
+/// not exist".
+///
+/// Registered in `sql::phase3::SystemViewRegistry` — the one the planner, the
+/// executor scan and the REPL all resolve through. The legacy
+/// `sql::SystemViewRegistry` enumerated by
+/// `test_system_view_registry_initialization` above is a different table and
+/// does not carry these.
+#[test]
+fn test_pg_range_and_pg_enum_are_registered_and_empty() {
+    let config = Config::in_memory();
+    let storage = StorageEngine::open_in_memory(&config).unwrap();
+    let registry = heliosdb_nano::sql::phase3::SystemViewRegistry::new();
+
+    for (view, columns) in [
+        (
+            "pg_range",
+            vec![
+                "rngtypid",
+                "rngsubtype",
+                "rngmultitypid",
+                "rngcollation",
+                "rngsubopc",
+                "rngcanonical",
+                "rngsubdiff",
+            ],
+        ),
+        ("pg_enum", vec!["oid", "enumtypid", "enumsortorder", "enumlabel"]),
+    ] {
+        assert!(registry.is_system_view(view), "{view} must be a registered view");
+        let schema = registry
+            .get_schema(view)
+            .unwrap_or_else(|| panic!("{view} must have a schema"));
+        let names: Vec<&str> = schema.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, columns, "{view} must use PostgreSQL's column names");
+        let rows = registry
+            .execute(view, &storage)
+            .unwrap_or_else(|e| panic!("{view} must execute, got {e}"));
+        assert!(rows.is_empty(), "{view} must answer zero rows, got {}", rows.len());
     }
 }
 

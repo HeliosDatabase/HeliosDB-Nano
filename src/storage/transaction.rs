@@ -196,6 +196,21 @@ pub struct Transaction {
     /// `None` (the default configuration) makes every use a single `Option`
     /// check with no allocation and no copy.
     key_manager: Option<Arc<KeyManager>>,
+    /// HDB-008: a statement inside this transaction has failed, so the SQL
+    /// transaction is ABORTED and only the recovery statements may still run
+    /// (see [`mark_sql_aborted`](Self::mark_sql_aborted)).
+    ///
+    /// Owned by the transaction rather than by a protocol handler precisely
+    /// because every caller — the embedded Rust API, the REPL, the Python
+    /// binding, the REST/MCP layers and both wire protocols — must observe the
+    /// same state. The PostgreSQL handler keeps its own `TransactionStatus`
+    /// mirror for wire-exact `ReadyForQuery` reporting; this is the engine's,
+    /// and it is what stops `COMMIT` from persisting partial work.
+    ///
+    /// Per transaction, so two sessions never share it, and deliberately NOT
+    /// part of a savepoint snapshot: the flag is cleared by a successful
+    /// `ROLLBACK TO SAVEPOINT`, not restored by one.
+    sql_aborted: AtomicBool,
     /// Membership in the engine's [`UncommittedWriteCensus`], armed on this
     /// transaction's first staged write and released in `Drop`.
     ///
@@ -647,8 +662,33 @@ impl Transaction {
             conflict_validation: false,
             gc_pin_id: None,
             key_manager: None,
+            sql_aborted: AtomicBool::new(false),
             write_census: None,
         })
+    }
+
+    /// HDB-008: record that a statement inside this transaction failed.
+    ///
+    /// Until a ROLLBACK (the whole transaction) or a successful
+    /// `ROLLBACK TO SAVEPOINT`, every other statement is refused with
+    /// SQLSTATE 25P02 and `COMMIT` rolls back instead of committing —
+    /// PostgreSQL's aborted-transaction-block semantics, owned by the engine
+    /// so that EVERY caller gets them and not only the PostgreSQL wire.
+    pub fn mark_sql_aborted(&self) {
+        self.sql_aborted.store(true, Ordering::Release);
+    }
+
+    /// HDB-008: clear the aborted mark after a successful
+    /// `ROLLBACK TO SAVEPOINT` — the one statement PostgreSQL allows inside an
+    /// aborted block, and the one way back to a usable transaction without
+    /// discarding the work that preceded the savepoint.
+    pub fn clear_sql_aborted(&self) {
+        self.sql_aborted.store(false, Ordering::Release);
+    }
+
+    /// HDB-008: is this transaction in the aborted (failed) SQL state?
+    pub fn is_sql_aborted(&self) -> bool {
+        self.sql_aborted.load(Ordering::Acquire)
     }
 
     /// Attach the engine's TDE key manager so the commit batch seals the row
@@ -844,6 +884,7 @@ impl Transaction {
             conflict_validation: false,
             gc_pin_id: None,
             key_manager: None,
+            sql_aborted: AtomicBool::new(false),
             write_census: None,
         })
     }

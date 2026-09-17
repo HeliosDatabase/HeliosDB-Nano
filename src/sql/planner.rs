@@ -5147,6 +5147,24 @@ impl<'a> Planner<'a> {
 
     pub(crate) fn expr_to_logical(&self, expr: &Expr) -> Result<LogicalExpr> {
         match expr {
+            // HDB-009: `SELECT current_role` is PostgreSQL's own spelling and
+            // the only one the auth guide shows, but it is the ONE identity
+            // spelling sqlparser 0.53 does not lower to a zero-argument
+            // function (it lowers CURRENT_USER / SESSION_USER / USER /
+            // CURRENT_CATALOG and stops), so it arrived here as a bare column
+            // reference and failed with "column not found". Lower it here.
+            // Unquoted only — `"current_role"` stays a column name — and
+            // CURRENT_ROLE is a reserved keyword in PostgreSQL too, so a
+            // same-named column is shadowed there as well.
+            Expr::Identifier(ident)
+                if ident.quote_style.is_none() && ident.value.eq_ignore_ascii_case("current_role") =>
+            {
+                Ok(LogicalExpr::ScalarFunction {
+                    fun: "current_role".to_string(),
+                    args: Vec::new(),
+                })
+            }
+
             Expr::Identifier(ident) => Ok(LogicalExpr::Column {
                 table: None,
                 name: Self::normalize_ident(ident),

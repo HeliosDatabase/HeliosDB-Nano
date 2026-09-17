@@ -164,10 +164,15 @@ fn b10_tagged_dollar_quoted_literal() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------
-// B12 / B13 — `pg_catalog.pg_type` and `pg_tables`. These live in the
-// PG wire handler's catalog emulator (`PgCatalog::handle_query`), not
-// the core SQL engine. They're verified out-of-band against a running
-// server; see the end-to-end psycopg smoke in the doc for this bug.
+// B12 / B13 — `pg_catalog.pg_type` and `pg_tables`.
+//
+// HDB-011: `pg_type` no longer lives in the PG wire handler's catalog emulator
+// (`PgCatalog::handle_query`) — it is served by the planner-backed
+// SystemViewRegistry, so it is exercised by the core SQL engine on every route
+// and pinned by tests/security_hdb_011.rs. `pg_tables` is still intercepted,
+// except when its WHERE clause is a shape the emulator cannot evaluate, which
+// now defers to the planner too. Both remain verified out-of-band against a
+// running server; see the end-to-end psycopg smoke in the doc for this bug.
 // ---------------------------------------------------------------------
 
 // ---------------------------------------------------------------------
