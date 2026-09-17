@@ -110,7 +110,13 @@ argon2 = "0.5"  # Non-FIPS KDF (Argon2id)
 pbkdf2 = { version = "0.12", features = ["simple"] }  # FIPS-approved KDF
 zeroize = "1.8"
 hex = "0.4"
-rustls = { version = "0.23", default-features = false }
+# "prefer-post-quantum": without it, rustls's aws-lc-rs backend still lists
+# X25519MLKEM768 in DEFAULT_KX_GROUPS but LAST (least preferred) — a client
+# offering it only as its top choice would still get outranked by classical
+# groups on ties. With it, the hybrid group is the FIRST (most preferred)
+# entry on both the client and server side of `tls_provider::pq_capable_provider`,
+# which is what "quantum-ready TLS" (this feature's whole point) requires.
+rustls = { version = "0.23", default-features = false, features = ["prefer-post-quantum"] }
 tokio-rustls = "0.26"
 rustls-pemfile = "2.0"
 jsonwebtoken = "9"

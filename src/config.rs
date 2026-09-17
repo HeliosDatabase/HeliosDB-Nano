@@ -736,6 +736,13 @@ fn default_max_connections_warn_percent() -> u8 {
     80
 }
 
+/// PQ hybrid key exchange (`X25519MLKEM768`) is offered by default once TLS
+/// is enabled — same default-on posture as AWS, MySQL 26.7 and CockroachDB's
+/// own "quantum-ready TLS".
+fn default_tls_post_quantum() -> bool {
+    true
+}
+
 fn default_copy_max_buffered_rows() -> usize {
     10_000_000 // generous cap on rows buffered per COPY FROM STDIN; 0 disables
 }
@@ -1282,6 +1289,27 @@ pub struct ServerConfig {
     pub tls_cert_path: Option<PathBuf>,
     /// TLS key path
     pub tls_key_path: Option<PathBuf>,
+    /// Offer the `X25519MLKEM768` hybrid post-quantum key-exchange group
+    /// (draft-ietf-tls-ecdhe-mlkem) alongside classical groups on the
+    /// PostgreSQL TLS listener. Only meaningful when `tls_enabled` is set.
+    /// See `--tls-post-quantum` (the CLI flag is authoritative; this field
+    /// documents the same knob for the config file).
+    #[serde(default = "default_tls_post_quantum")]
+    pub tls_post_quantum: bool,
+    /// MySQL TLS enabled
+    #[serde(default)]
+    pub mysql_tls_enabled: bool,
+    /// MySQL TLS certificate path
+    #[serde(default)]
+    pub mysql_tls_cert_path: Option<PathBuf>,
+    /// MySQL TLS key path
+    #[serde(default)]
+    pub mysql_tls_key_path: Option<PathBuf>,
+    /// Offer the `X25519MLKEM768` hybrid post-quantum key-exchange group on
+    /// the MySQL TLS listener, mirroring `tls_post_quantum`. See
+    /// `--mysql-tls-post-quantum` (the CLI flag is authoritative).
+    #[serde(default = "default_tls_post_quantum")]
+    pub mysql_tls_post_quantum: bool,
 }
 
 impl Default for ServerConfig {
@@ -1304,6 +1332,11 @@ impl Default for ServerConfig {
             tls_enabled: false,
             tls_cert_path: None,
             tls_key_path: None,
+            tls_post_quantum: default_tls_post_quantum(),
+            mysql_tls_enabled: false,
+            mysql_tls_cert_path: None,
+            mysql_tls_key_path: None,
+            mysql_tls_post_quantum: default_tls_post_quantum(),
         }
     }
 }

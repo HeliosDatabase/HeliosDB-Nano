@@ -201,6 +201,40 @@ impl ConnectionTimeouts {
         let threshold = self.connection_warn_threshold_percent as usize;
         threshold != 0 && max != 0 && in_use != 0 && in_use.saturating_mul(100) >= threshold.saturating_mul(max)
     }
+
+    /// Edge-triggered utilisation WARN, shared by every listener
+    /// (`PgServer`, `MysqlServer`, the binary's UDS accept loops in
+    /// `main.rs`). `warned` is a per-listener `AtomicBool` flip-flop: the
+    /// line is logged once per crossing above
+    /// `connection_warn_threshold_percent`, never once per accept, and
+    /// re-arms when utilisation drops back below it.
+    ///
+    /// `listener` names the listener in the log line (e.g. `"PostgreSQL"`,
+    /// `"MySQL"`, `"MySQL UDS"`). `limiter`/`max` are read via
+    /// `Semaphore::available_permits()` — the single source of truth, no
+    /// side counter.
+    pub fn maybe_warn_utilisation(
+        &self,
+        listener: &str,
+        warned: &std::sync::atomic::AtomicBool,
+        limiter: &tokio::sync::Semaphore,
+        max: usize,
+    ) {
+        let in_use = max.saturating_sub(limiter.available_permits());
+        let over = self.should_warn_utilisation(in_use, max);
+        if warned.swap(over, std::sync::atomic::Ordering::Relaxed) != over && over {
+            tracing::warn!(
+                "{} connection utilisation {}/{} ({}%) is at or above [server] max_connections_warn_percent = {}; \
+                 new connections are refused at {} (raise --max-connections / [server] max_connections)",
+                listener,
+                in_use,
+                max,
+                in_use.saturating_mul(100) / max.max(1),
+                self.connection_warn_threshold_percent,
+                max
+            );
+        }
+    }
 }
 
 /// Apply the per-socket options every accepted PostgreSQL / MySQL TCP socket
