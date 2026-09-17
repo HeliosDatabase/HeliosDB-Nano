@@ -222,6 +222,14 @@ enum Commands {
         #[arg(long)]
         tls_key: Option<PathBuf>,
 
+        /// Offer the X25519MLKEM768 hybrid post-quantum key-exchange group
+        /// (draft-ietf-tls-ecdhe-mlkem) alongside classical groups on the
+        /// PostgreSQL TLS listener, in addition to a classical fallback for
+        /// clients that don't support it. Only meaningful with --tls-cert /
+        /// --tls-key. Default: on.
+        #[arg(long, default_value = "true")]
+        tls_post_quantum: bool,
+
         /// Authentication method: trust, password, md5, scram-sha-256
         #[arg(long, default_value = "trust")]
         auth: String,
@@ -288,6 +296,23 @@ enum Commands {
         /// Enables local-only connections for PHP mysqli / WordPress embedded mode.
         #[arg(long)]
         mysql_socket: Option<PathBuf>,
+
+        /// TLS certificate file path (PEM format) for the MySQL TCP listener.
+        /// Both --mysql-tls-cert and --mysql-tls-key must be given together.
+        /// TLS is offered (CLIENT_SSL), not required — plaintext MySQL
+        /// clients still connect. Not used for the MySQL Unix-socket listener.
+        #[arg(long)]
+        mysql_tls_cert: Option<PathBuf>,
+
+        /// TLS private key file path (PEM format) for the MySQL TCP listener.
+        #[arg(long)]
+        mysql_tls_key: Option<PathBuf>,
+
+        /// Offer the X25519MLKEM768 hybrid post-quantum key-exchange group on
+        /// the MySQL TLS listener, same as --tls-post-quantum for PostgreSQL.
+        /// Only meaningful with --mysql-tls-cert / --mysql-tls-key. Default: on.
+        #[arg(long, default_value = "true")]
+        mysql_tls_post_quantum: bool,
 
         /// PostgreSQL Unix domain socket directory. If set, listens at
         /// `<dir>/.s.PGSQL.<port>` — the libpq default. Use with psql `-h /tmp`.
@@ -515,6 +540,7 @@ async fn main() -> Result<()> {
             dump_schedule,
             tls_cert,
             tls_key,
+            tls_post_quantum,
             auth,
             password,
             replication_role,
@@ -531,6 +557,9 @@ async fn main() -> Result<()> {
             mysql,
             mysql_listen,
             mysql_socket,
+            mysql_tls_cert,
+            mysql_tls_key,
+            mysql_tls_post_quantum,
             pg_socket_dir,
             max_connections,
             join_memory_limit_mb,
@@ -553,6 +582,12 @@ async fn main() -> Result<()> {
             if tls_cert.is_some() != tls_key.is_some() {
                 return Err(Error::config(
                     "Both --tls-cert and --tls-key must be specified together for TLS.".to_string(),
+                ));
+            }
+            if mysql_tls_cert.is_some() != mysql_tls_key.is_some() {
+                return Err(Error::config(
+                    "Both --mysql-tls-cert and --mysql-tls-key must be specified together for MySQL TLS."
+                        .to_string(),
                 ));
             }
 
@@ -616,12 +651,16 @@ async fn main() -> Result<()> {
                     pid_file,
                     tls_cert,
                     tls_key,
+                    tls_post_quantum,
                     auth,
                     password,
                     ha_config,
                     mysql,
                     mysql_listen,
                     mysql_socket,
+                    mysql_tls_cert,
+                    mysql_tls_key,
+                    mysql_tls_post_quantum,
                     pg_socket_dir,
                     policy_args,
                     performance_args,
@@ -637,12 +676,16 @@ async fn main() -> Result<()> {
                     dump_on_shutdown,
                     tls_cert,
                     tls_key,
+                    tls_post_quantum,
                     auth,
                     password,
                     ha_config,
                     mysql,
                     mysql_listen,
                     mysql_socket,
+                    mysql_tls_cert,
+                    mysql_tls_key,
+                    mysql_tls_post_quantum,
                     pg_socket_dir,
                     policy_args,
                     performance_args,
@@ -764,12 +807,16 @@ async fn start_server(
     dump_on_shutdown: bool,
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
+    tls_post_quantum: bool,
     auth: String,
     password: Option<String>,
     ha_config: HAConfig,
     mysql_enabled: bool,
     mysql_listen: String,
     mysql_socket: Option<PathBuf>,
+    mysql_tls_cert: Option<PathBuf>,
+    mysql_tls_key: Option<PathBuf>,
+    mysql_tls_post_quantum: bool,
     pg_socket_dir: Option<PathBuf>,
     policy_args: ConnectionPolicyArgs,
     performance_args: PerformanceArgs,
@@ -778,7 +825,7 @@ async fn start_server(
     use heliosdb_nano::protocol::postgres::auth::{AuthManager, AuthMethod};
     use heliosdb_nano::protocol::postgres::server::{PgServer, PgServerConfig};
     use heliosdb_nano::protocol::postgres::ssl::{SslConfig, SslMode};
-    use heliosdb_nano::protocol::postgres::timeouts::{apply_socket_options, ConnectionTimeouts};
+    use heliosdb_nano::protocol::postgres::timeouts::ConnectionTimeouts;
     use heliosdb_nano::protocol::postgres::{InMemoryPasswordStore, PasswordStore, SharedPasswordStore};
     use heliosdb_nano::storage::{DumpCompressionType, DumpManager, DumpMode, DumpOptions};
     use std::net::SocketAddr;
@@ -889,7 +936,7 @@ async fn start_server(
     // Configure TLS if specified
     let tls_enabled = tls_cert.is_some();
     if let (Some(cert_path), Some(key_path)) = (&tls_cert, &tls_key) {
-        let ssl_config = SslConfig::new(SslMode::Prefer, cert_path, key_path);
+        let ssl_config = SslConfig::new(SslMode::Prefer, cert_path, key_path).with_post_quantum(tls_post_quantum);
         pg_config = pg_config.with_ssl(ssl_config);
     }
 
@@ -1112,80 +1159,37 @@ async fn start_server(
         None
     };
 
-    // Start MySQL listener if enabled
+    // Start MySQL listener if enabled.
+    //
+    // Uses `protocol::mysql::server::MysqlServer` (mirroring the PostgreSQL
+    // `PgServer` abstraction) instead of an inline accept loop, so the MySQL
+    // TCP listener gets the same TLS-negotiation machinery PostgreSQL has —
+    // including PQ hybrid key-exchange support — from day one.
     let mysql_handle = if mysql_enabled {
         let mysql_addr: SocketAddr = mysql_listen
             .parse()
             .map_err(|e| Error::config(format!("Invalid MySQL listen address '{}': {}", mysql_listen, e)))?;
-        let mysql_db = Arc::clone(&db);
-        info!("MySQL protocol listening on {}", mysql_addr);
-        let conn_counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1));
-        // Same per-listener cap the PostgreSQL server enforces — without it the
-        // MySQL side accepts unbounded connections/tasks/fds.
-        let conn_limiter = std::sync::Arc::new(tokio::sync::Semaphore::new(max_connections));
-        let policy = connection_policy.clone();
-        let utilisation_warned = std::sync::atomic::AtomicBool::new(false);
+
+        let mysql_tls_enabled = mysql_tls_cert.is_some();
+        let mut mysql_server_config =
+            heliosdb_nano::protocol::mysql::MysqlServerConfig::with_address(mysql_addr)
+                .with_max_connections(max_connections)
+                .with_timeouts(connection_policy.clone());
+        if let (Some(cert_path), Some(key_path)) = (&mysql_tls_cert, &mysql_tls_key) {
+            let mysql_ssl_config = heliosdb_nano::protocol::mysql::MysqlSslConfig::new(cert_path, key_path)
+                .with_post_quantum(mysql_tls_post_quantum);
+            mysql_server_config = mysql_server_config.with_ssl(mysql_ssl_config);
+        }
+
+        let mysql_server = heliosdb_nano::protocol::mysql::MysqlServer::new(mysql_server_config, Arc::clone(&db))?;
+        info!(
+            "MySQL protocol listening on {} (tls: {})",
+            mysql_addr,
+            if mysql_tls_enabled { "enabled" } else { "disabled" }
+        );
         Some(tokio::spawn(async move {
-            let listener = match tokio::net::TcpListener::bind(mysql_addr).await {
-                Ok(l) => l,
-                Err(e) => {
-                    tracing::error!("Failed to bind MySQL listener on {}: {}", mysql_addr, e);
-                    return;
-                }
-            };
-            loop {
-                match listener.accept().await {
-                    Ok((stream, addr)) => {
-                        tracing::debug!("MySQL connection from {}", addr);
-                        // GH#28: TCP_NODELAY + SO_KEEPALIVE on every accepted socket.
-                        if let Err(e) = apply_socket_options(&stream, &policy) {
-                            tracing::warn!("Failed to apply socket options for MySQL {}: {}", addr, e);
-                        }
-                        let permit = match Arc::clone(&conn_limiter).try_acquire_owned() {
-                            Ok(permit) => permit,
-                            Err(_) => {
-                                tracing::warn!(
-                                    "MySQL connection limit reached ({}), rejecting {}",
-                                    max_connections,
-                                    addr
-                                );
-                                drop(stream);
-                                continue;
-                            }
-                        };
-                        warn_listener_utilisation(
-                            "MySQL",
-                            &utilisation_warned,
-                            &conn_limiter,
-                            max_connections,
-                            &policy,
-                        );
-                        let db_clone = Arc::clone(&mysql_db);
-                        let conn_id = conn_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let conn_policy = policy.clone();
-                        tokio::spawn(async move {
-                            let _permit = permit;
-                            if let Err(e) =
-                                heliosdb_nano::protocol::mysql::handler::handle_mysql_connection_with_timeouts(
-                                    db_clone,
-                                    stream,
-                                    conn_id,
-                                    conn_policy,
-                                )
-                                .await
-                            {
-                                tracing::debug!("MySQL connection error: {}", e);
-                            }
-                        });
-                    }
-                    Err(e) => {
-                        tracing::error!("MySQL accept error: {}", e);
-                        // Accept errors (e.g. EMFILE at fd exhaustion) return
-                        // immediately — without a pause this loop busy-spins at
-                        // 100% CPU exactly when the process is resource-starved.
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    }
-                }
+            if let Err(e) = mysql_server.serve().await {
+                tracing::error!("MySQL server error: {}", e);
             }
         }))
     } else {
@@ -1519,12 +1523,16 @@ async fn start_server_daemon(
     pid_file: PathBuf,
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
+    tls_post_quantum: bool,
     auth: String,
     password: Option<String>,
     ha_config: HAConfig,
     mysql: bool,
     mysql_listen: String,
     mysql_socket: Option<PathBuf>,
+    mysql_tls_cert: Option<PathBuf>,
+    mysql_tls_key: Option<PathBuf>,
+    mysql_tls_post_quantum: bool,
     pg_socket_dir: Option<PathBuf>,
     policy_args: ConnectionPolicyArgs,
     performance_args: PerformanceArgs,
@@ -1614,6 +1622,19 @@ async fn start_server_daemon(
         args.push("--tls-key".to_string());
         args.push(key.display().to_string());
     }
+    args.push("--tls-post-quantum".to_string());
+    args.push(tls_post_quantum.to_string());
+
+    if let Some(cert) = mysql_tls_cert {
+        args.push("--mysql-tls-cert".to_string());
+        args.push(cert.display().to_string());
+    }
+    if let Some(key) = mysql_tls_key {
+        args.push("--mysql-tls-key".to_string());
+        args.push(key.display().to_string());
+    }
+    args.push("--mysql-tls-post-quantum".to_string());
+    args.push(mysql_tls_post_quantum.to_string());
 
     // Add auth options
     args.push("--auth".to_string());

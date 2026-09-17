@@ -18,8 +18,12 @@ pub mod compatibility;
 pub mod extended;
 pub mod features;
 pub mod handler;
+pub mod server;
+pub mod ssl;
 pub mod translator;
 
 #[cfg(unix)]
 pub use handler::handle_mysql_connection_unix;
 pub use handler::{handle_mysql_connection, MySqlError, MySqlHandler};
+pub use server::{MysqlServer, MysqlServerConfig};
+pub use ssl::{MysqlSslConfig, MysqlSslNegotiator};

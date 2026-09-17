@@ -34,7 +34,7 @@ const PROTOCOL_VERSION: u8 = 10;
 const SERVER_VERSION: &str = "8.0.35-HeliosDB-Nano";
 
 /// Default character set: utf8mb4_general_ci.
-const UTF8MB4_GENERAL_CI: u8 = 45;
+pub(crate) const UTF8MB4_GENERAL_CI: u8 = 45;
 
 // ============================================================================
 // Capability Flags
@@ -89,10 +89,11 @@ impl CapabilityFlags {
         self.0
     }
 
-    /// Sensible server-side defaults.
-    pub fn server_default() -> Self {
-        Self(
-            Self::CLIENT_LONG_PASSWORD
+    /// Sensible server-side defaults. `has_tls` ORs in `CLIENT_SSL` only when
+    /// the listener was constructed with TLS configured — a server that
+    /// cannot actually upgrade the connection must not advertise the bit.
+    pub fn server_default(has_tls: bool) -> Self {
+        let base = Self::CLIENT_LONG_PASSWORD
                 | Self::CLIENT_FOUND_ROWS
                 | Self::CLIENT_LONG_FLAG
                 | Self::CLIENT_CONNECT_WITH_DB
@@ -112,8 +113,8 @@ impl CapabilityFlags {
                 | Self::CLIENT_CONNECT_ATTRS
                 | Self::CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA
                 | Self::CLIENT_SESSION_TRACK
-                | Self::CLIENT_DEPRECATE_EOF,
-        )
+                | Self::CLIENT_DEPRECATE_EOF;
+        Self(if has_tls { base | Self::CLIENT_SSL } else { base })
     }
 }
 
@@ -300,7 +301,7 @@ pub type Result<T> = std::result::Result<T, MySqlError>;
 // ============================================================================
 
 /// Read one MySQL packet (3-byte length + 1-byte seq + payload).
-async fn read_packet<S: AsyncRead + Unpin>(stream: &mut S) -> Result<(u8, Bytes)> {
+pub(crate) async fn read_packet<S: AsyncRead + Unpin>(stream: &mut S) -> Result<(u8, Bytes)> {
     let mut hdr = [0u8; 4];
     stream.read_exact(&mut hdr).await.map_err(|e| {
         if e.kind() == ErrorKind::UnexpectedEof {
@@ -362,7 +363,7 @@ async fn read_packet_deadlined<S: AsyncRead + Unpin>(
 }
 
 /// Write one MySQL packet.
-async fn write_packet<S: AsyncWrite + Unpin>(stream: &mut S, seq: u8, payload: &[u8]) -> Result<()> {
+pub(crate) async fn write_packet<S: AsyncWrite + Unpin>(stream: &mut S, seq: u8, payload: &[u8]) -> Result<()> {
     let len = payload.len() as u32;
     let mut buf = BytesMut::with_capacity(4 + payload.len());
     buf.put_u8((len & 0xFF) as u8);
@@ -373,6 +374,71 @@ async fn write_packet<S: AsyncWrite + Unpin>(stream: &mut S, seq: u8, payload: &
     stream.write_all(&buf).await?;
     stream.flush().await?;
     Ok(())
+}
+
+/// Build the HandshakeV10 greeting payload (protocol version, server
+/// version, connection id, auth-plugin-data / seed, capability flags,
+/// character set, status flags, auth-plugin name). Extracted so
+/// `protocol::mysql::server` can send the SAME greeting bytes as
+/// `MySqlHandler::send_handshake` while negotiating TLS BEFORE the handler
+/// (with its final, possibly-upgraded stream type) is constructed.
+pub(crate) fn build_handshake_v10(
+    connection_id: u32,
+    auth_seed: &[u8; 20],
+    capabilities: &CapabilityFlags,
+    character_set: u8,
+    status_flags: &StatusFlags,
+    auth_plugin: &str,
+) -> BytesMut {
+    let mut p = BytesMut::new();
+
+    // Protocol version
+    p.put_u8(PROTOCOL_VERSION);
+
+    // Server version (null-terminated)
+    p.put_slice(SERVER_VERSION.as_bytes());
+    p.put_u8(0);
+
+    // Connection ID
+    p.put_u32_le(connection_id);
+
+    // Auth-plugin-data part 1 (8 bytes)
+    #[allow(clippy::indexing_slicing)]
+    p.put_slice(&auth_seed[0..8]);
+
+    // Filler
+    p.put_u8(0);
+
+    // Capability flags lower 2 bytes
+    p.put_u16_le((capabilities.as_u32() & 0xFFFF) as u16);
+
+    // Character set
+    p.put_u8(character_set);
+
+    // Status flags
+    p.put_u16_le(status_flags.as_u16());
+
+    // Capability flags upper 2 bytes
+    p.put_u16_le(((capabilities.as_u32() >> 16) & 0xFFFF) as u16);
+
+    // Auth-plugin data length (1 byte) — total seed len + 1
+    p.put_u8(21);
+
+    // Reserved (10 zero bytes)
+    p.put_bytes(0, 10);
+
+    // Auth-plugin-data part 2 (12 bytes + null)
+    #[allow(clippy::indexing_slicing)]
+    p.put_slice(&auth_seed[8..20]);
+    p.put_u8(0);
+
+    // Auth-plugin name (null-terminated)
+    if capabilities.has(CapabilityFlags::CLIENT_PLUGIN_AUTH) {
+        p.put_slice(auth_plugin.as_bytes());
+        p.put_u8(0);
+    }
+
+    p
 }
 
 // ============================================================================
@@ -485,7 +551,7 @@ fn read_null_terminated_bytes(buf: &mut Bytes) -> Result<Vec<u8>> {
 // ============================================================================
 
 #[derive(Debug)]
-struct HandshakeResponse {
+pub(crate) struct HandshakeResponse {
     capability_flags: CapabilityFlags,
     max_packet_size: u32,
     character_set: u8,
@@ -497,7 +563,7 @@ struct HandshakeResponse {
 }
 
 impl HandshakeResponse {
-    fn decode(mut payload: Bytes, server_caps: &CapabilityFlags) -> Result<Self> {
+    pub(crate) fn decode(mut payload: Bytes, server_caps: &CapabilityFlags) -> Result<Self> {
         if payload.remaining() < 4 {
             return Err(MySqlError::Protocol("handshake response too short".into()));
         }
@@ -943,6 +1009,13 @@ pub struct MySqlHandler<S: AsyncRead + AsyncWrite + Unpin + Send> {
     /// GH#28: the listener's connection-lifetime policy (authentication and
     /// idle deadlines). Disabled unless the listener installs one.
     timeouts: ConnectionTimeouts,
+    /// Whether TLS is actually configured on this server instance — drives
+    /// the `have_ssl` / `have_openssl` `SHOW VARIABLES` answer. Never derived
+    /// from the negotiated connection alone: a listener with TLS configured
+    /// but talking to a plaintext client still reports `YES` (matching
+    /// MySQL's own `have_ssl`, which reflects server capability, not the
+    /// current session).
+    tls_enabled: bool,
 }
 
 /// GH#28: MySQL's own wording (ER_CLIENT_INTERACTION_TIMEOUT, 4031) for a
@@ -976,7 +1049,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
             stream,
             seq: 0,
             connection_id,
-            capabilities: CapabilityFlags::server_default(),
+            capabilities: CapabilityFlags::server_default(false),
             status_flags: StatusFlags::default_flags(),
             character_set: UTF8MB4_GENERAL_CI,
             auth_seed,
@@ -990,6 +1063,88 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
             last_insert_id: 0,
             session_id,
             timeouts: ConnectionTimeouts::disabled(),
+            tls_enabled: false,
+        }
+    }
+
+    /// Construct a handler whose HandshakeV10 greeting has ALREADY been sent
+    /// and whose `HandshakeResponse41` has ALREADY been read (and, for a TLS
+    /// upgrade, re-read over the now-encrypted stream) by
+    /// `protocol::mysql::server::MysqlServer::negotiate` — the same
+    /// `auth_seed` / `capabilities` / `character_set` / `status_flags` /
+    /// `auth_plugin` used to build that already-sent greeting must be passed
+    /// in here so the handler's own state matches what the client saw.
+    /// `seq` is the NEXT sequence number the handler should use (one past the
+    /// client's `HandshakeResponse41`). Call [`Self::finish_handshake`]
+    /// immediately after construction to complete authentication.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_pre_negotiated(
+        database: Arc<EmbeddedDatabase>,
+        stream: S,
+        connection_id: u32,
+        seq: u8,
+        auth_seed: [u8; 20],
+        capabilities: CapabilityFlags,
+        character_set: u8,
+        status_flags: StatusFlags,
+        auth_plugin: String,
+        tls_enabled: bool,
+    ) -> Self {
+        let session_id = database
+            .create_wire_session("mysql_wire")
+            .expect("wire session creation is infallible");
+        Self {
+            database,
+            stream,
+            seq,
+            connection_id,
+            capabilities,
+            status_flags,
+            character_set,
+            auth_seed,
+            auth_plugin,
+            username: None,
+            current_database: None,
+            in_transaction: false,
+            prepared_statements: HashMap::new(),
+            next_stmt_id: 1,
+            last_row_count: 0,
+            last_insert_id: 0,
+            session_id,
+            timeouts: ConnectionTimeouts::disabled(),
+            tls_enabled,
+        }
+    }
+
+    /// GH#28: install the listener's connection-lifetime policy after
+    /// construction (used by [`crate::protocol::mysql::server::MysqlServer`],
+    /// which negotiates TLS — and therefore constructs the handler — before
+    /// the idle-timeout loop starts).
+    pub(crate) fn set_timeouts(&mut self, timeouts: ConnectionTimeouts) {
+        self.timeouts = timeouts;
+    }
+
+    /// Complete authentication for a [`Self::new_pre_negotiated`] handler
+    /// using an already-decoded `HandshakeResponse41` (read by
+    /// `MysqlServer::negotiate` over whichever stream — plain or
+    /// TLS-upgraded — the client ended up on). Mirrors the tail of
+    /// [`Self::handshake_and_authenticate`] after `receive_handshake_response`.
+    pub(crate) async fn finish_handshake(&mut self, hs: HandshakeResponse) -> Result<()> {
+        self.authenticate(&hs)?;
+        self.database
+            .set_session_login_user(self.session_id, self.username.clone())?;
+        self.send_ok(0, 0).await?;
+        Ok(())
+    }
+
+    /// `have_ssl` / `have_openssl` `SHOW VARIABLES` answer — `YES` only when
+    /// TLS is actually configured on this server instance (HDB security fix:
+    /// this used to unconditionally report `YES`).
+    fn have_ssl_value(&self) -> &'static str {
+        if self.tls_enabled {
+            "YES"
+        } else {
+            "NO"
         }
     }
 
@@ -1066,19 +1221,30 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
             None => handler.handshake_and_authenticate().await?,
         }
 
-        // Command loop. The idle deadline bounds ONLY the wait for the first
-        // byte of the next command packet (c2: first byte disarms, like the
-        // PostgreSQL path) — never the rest of a packet already arriving, and
-        // never statement execution.
+        handler.run_command_loop().await
+    }
+
+    /// The command loop, run after handshake + authentication have already
+    /// completed. Split out of [`Self::handle_connection_with_timeouts`] so
+    /// [`crate::protocol::mysql::server::MysqlServer`] can negotiate TLS (and
+    /// therefore handshake + authenticate) itself — with a handler
+    /// constructed via [`Self::new_pre_negotiated`] /
+    /// [`Self::finish_handshake`] — and then drive the same command loop.
+    ///
+    /// The idle deadline bounds ONLY the wait for the first byte of the next
+    /// command packet (first byte disarms, like the PostgreSQL path) — never
+    /// the rest of a packet already arriving, and never statement execution.
+    pub(crate) async fn run_command_loop(&mut self) -> Result<()> {
+        let connection_id = self.connection_id;
         loop {
-            handler.reset_seq();
-            let activity = if handler.in_transaction {
+            self.reset_seq();
+            let activity = if self.in_transaction {
                 SessionActivity::IdleInTransaction
             } else {
                 SessionActivity::Idle
             };
-            let budget = handler.timeouts.read_deadline(activity);
-            let received = match handler.receive_command_deadlined(budget).await {
+            let budget = self.timeouts.read_deadline(activity);
+            let received = match self.receive_command_deadlined(budget).await {
                 Ok(Some(received)) => Ok(received),
                 Ok(None) => {
                     info!(
@@ -1091,7 +1257,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
                     // an unarmed wait never expires).
                     let _ = tokio::time::timeout(
                         budget.unwrap_or(std::time::Duration::from_secs(1)),
-                        handler.send_error(4031, "HY000", MYSQL_IDLE_DISCONNECT_MESSAGE),
+                        self.send_error(4031, "HY000", MYSQL_IDLE_DISCONNECT_MESSAGE),
                     )
                     .await;
                     break;
@@ -1100,7 +1266,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
             };
             match received {
                 Ok((cmd, payload)) => {
-                    if let Err(e) = handler.dispatch_command(cmd, payload).await {
+                    if let Err(e) = self.dispatch_command(cmd, payload).await {
                         match e {
                             MySqlError::ConnectionClosed => {
                                 info!("MySQL connection {} closed", connection_id);
@@ -1112,7 +1278,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
                                 // propagated its error instead of sending its
                                 // own ERR packet. Same MySQL statement-level
                                 // semantics — see `send_statement_error`.
-                                let _ = handler.send_statement_error(&e.to_string()).await;
+                                let _ = self.send_statement_error(&e.to_string()).await;
                             }
                         }
                     }
@@ -1155,54 +1321,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
     }
 
     async fn send_handshake(&mut self) -> Result<()> {
-        let mut p = BytesMut::new();
-
-        // Protocol version
-        p.put_u8(PROTOCOL_VERSION);
-
-        // Server version (null-terminated)
-        p.put_slice(SERVER_VERSION.as_bytes());
-        p.put_u8(0);
-
-        // Connection ID
-        p.put_u32_le(self.connection_id);
-
-        // Auth-plugin-data part 1 (8 bytes)
-        #[allow(clippy::indexing_slicing)]
-        p.put_slice(&self.auth_seed[0..8]);
-
-        // Filler
-        p.put_u8(0);
-
-        // Capability flags lower 2 bytes
-        p.put_u16_le((self.capabilities.as_u32() & 0xFFFF) as u16);
-
-        // Character set
-        p.put_u8(self.character_set);
-
-        // Status flags
-        p.put_u16_le(self.status_flags.as_u16());
-
-        // Capability flags upper 2 bytes
-        p.put_u16_le(((self.capabilities.as_u32() >> 16) & 0xFFFF) as u16);
-
-        // Auth-plugin data length (1 byte) — total seed len + 1
-        p.put_u8(21);
-
-        // Reserved (10 zero bytes)
-        p.put_bytes(0, 10);
-
-        // Auth-plugin-data part 2 (12 bytes + null)
-        #[allow(clippy::indexing_slicing)]
-        p.put_slice(&self.auth_seed[8..20]);
-        p.put_u8(0);
-
-        // Auth-plugin name (null-terminated)
-        if self.capabilities.has(CapabilityFlags::CLIENT_PLUGIN_AUTH) {
-            p.put_slice(self.auth_plugin.as_bytes());
-            p.put_u8(0);
-        }
-
+        let p = build_handshake_v10(
+            self.connection_id,
+            &self.auth_seed,
+            &self.capabilities,
+            self.character_set,
+            &self.status_flags,
+            &self.auth_plugin,
+        );
         self.write_pkt(&p).await?;
         debug!("Sent HandshakeV10");
         Ok(())
@@ -2617,7 +2743,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
                 "time_zone" | "system_time_zone" => Value::String("SYSTEM".to_string()),
                 "tx_isolation" | "transaction_isolation" => Value::String("REPEATABLE-READ".to_string()),
                 "autocommit" => Value::Int8(1),
-                "have_ssl" | "have_openssl" => Value::String("YES".to_string()),
+                "have_ssl" | "have_openssl" => Value::String(self.have_ssl_value().to_string()),
                 "lower_case_table_names" => Value::Int8(0),
                 "sql_auto_is_null" => Value::Int8(0),
                 "last_insert_id" => Value::Int8(self.last_insert_id as i64),
@@ -3667,7 +3793,7 @@ mod tests {
 
     #[test]
     fn test_capability_flags_default() {
-        let caps = CapabilityFlags::server_default();
+        let caps = CapabilityFlags::server_default(false);
         assert!(caps.has(CapabilityFlags::CLIENT_PROTOCOL_41));
         assert!(caps.has(CapabilityFlags::CLIENT_SECURE_CONNECTION));
         assert!(!caps.has(CapabilityFlags::CLIENT_SSL));
@@ -3675,9 +3801,45 @@ mod tests {
 
     #[test]
     fn test_capability_flags_set() {
-        let mut caps = CapabilityFlags::server_default();
+        let mut caps = CapabilityFlags::server_default(true);
         caps.set(CapabilityFlags::CLIENT_SSL);
         assert!(caps.has(CapabilityFlags::CLIENT_SSL));
+    }
+
+    #[test]
+    fn test_capability_flags_server_default_has_tls() {
+        // `has_tls = true` ORs in CLIENT_SSL; `false` never advertises it —
+        // a listener without TLS configured must not offer the bit.
+        assert!(CapabilityFlags::server_default(true).has(CapabilityFlags::CLIENT_SSL));
+        assert!(!CapabilityFlags::server_default(false).has(CapabilityFlags::CLIENT_SSL));
+    }
+
+    /// HDB security fix: `have_ssl` / `have_openssl` must report `YES` only
+    /// when TLS is actually configured on this server instance, `NO`
+    /// otherwise — never an unconditional `YES`.
+    #[tokio::test]
+    async fn test_have_ssl_value_reflects_tls_configuration() {
+        let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("in-memory db"));
+        let (client, server) = tokio::io::duplex(4096);
+        drop(client);
+
+        let handler_no_tls = MySqlHandler::new(Arc::clone(&db), server, 1);
+        assert_eq!(handler_no_tls.have_ssl_value(), "NO");
+
+        let (_client2, server2) = tokio::io::duplex(4096);
+        let handler_tls = MySqlHandler::new_pre_negotiated(
+            db,
+            server2,
+            2,
+            0,
+            [0u8; 20],
+            CapabilityFlags::server_default(true),
+            UTF8MB4_GENERAL_CI,
+            StatusFlags::default_flags(),
+            "mysql_native_password".to_string(),
+            true,
+        );
+        assert_eq!(handler_tls.have_ssl_value(), "YES");
     }
 
     #[test]
