@@ -5,6 +5,106 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.35.0] - 2026-09-17
+
+The last three findings of the HeliosDB Nano 4.31.1 security report (HDB-002, HDB-003, HDB-005). With this
+release every finding in that report is closed.
+
+### Fixed — SECURITY: binary dump/restore silently dropped FOREIGN KEY, CHECK and table-level UNIQUE constraints (HDB-003)
+
+- A dump carried only the `Schema` (column flags), so a restored database accepted orphan rows and rows violating
+  CHECK, and the restore reported success on a database that no longer enforced its own rules.
+- Dump format v2 adds a per-table constraint blob (full and incremental dumps). Restore now runs in three phases:
+  create and populate every table; register the whole constraint graph through the same catalog paths `CREATE
+  TABLE` / `ALTER TABLE` use (a child that sorts before its parent and FK cycles both restore; FK and composite
+  UNIQUE indexes are backfilled over the restored rows); then validate every restored row against every FK and
+  CHECK. A dump whose data violates its own constraints now FAILS the restore, naming the table, the constraint
+  and the offending keys, aggregated across tables, with every non-fatal note logged first. `RestoreReport`
+  reports real table/row counts (they were hard-coded to zero) plus `constraints_restored` and
+  `validation_warnings`; `heliosdb-nano restore` prints both.
+- Parity with the write path's non-fatal modes: a `LOCK-FREE` FK, or a destination session in
+  `helios.fk_validation = 'audit'`, records violations as warnings instead of failing the restore. For a backup
+  taken under those modes and restored into an enforcing database, `RestoreOptions::validate_constraints = false`
+  / `heliosdb-nano restore --no-validate` accepts the data and reports the violations as warnings; the CLI's
+  failure banner then says exactly what is on disk (tables, rows and constraints are all in place; nothing is
+  rolled back). A restore while a non-main branch is active is refused before anything is created (it used to
+  fail half-way through registering UNIQUE constraints). Phase C compiles each CHECK once per table and probes
+  composite FKs against one parent-key set per constraint instead of a parent scan per key.
+- `create_incremental_dump(.., append = true)` on a path that does not exist yet now writes the file header (it
+  wrote a headerless file that no restore could read).
+- Version-1 dumps still restore (without constraints; recreate them from your DDL). A v2 dump is refused by a
+  pre-4.35 binary rather than misread.
+- Restore now decompresses with the compression the *file* records, not the restoring manager's setting: a dump
+  written by `dump_full_uncompressed` could not be restored by a default (zstd) manager.
+- Engine: an autocommit statement that fails its deferred-FK validation at commit left the deferred queue
+  behind, so the NEXT statement re-reported the same violation (`DEFERRABLE INITIALLY DEFERRED` FKs; found by
+  the restore tests).
+
+### Fixed — `dump_sql` output can be restored (HDB-005)
+
+- Every identifier is double-quoted and every value is rendered by one schema-aware serializer
+  (`storage::dump::sql_text`) instead of `format!("'{:?}'", value)`, which exported JSON, NUMERIC, UUID, BYTEA,
+  temporal, array and vector values as Rust debug strings (`'Json("[\"x\"]")'`, `'Numeric("3.14159")'`). NUMERIC
+  keeps every digit (`'…'::numeric`), floats round-trip including NaN/Infinity, arrays use the PostgreSQL text
+  form (`'{…}'::type[]`, typed empty arrays, NULL members), bytea/uuid/json/dates/times/timestamps are cast.
+- DEFAULTs, PRIMARY KEY (incl. composite), UNIQUE, CHECK, FOREIGN KEY and indexes are emitted; all `CREATE TABLE`
+  statements come first, then the data, then FOREIGN KEYs as `ALTER TABLE … ADD CONSTRAINT`, then indexes, so the
+  file loads in any table order. One statement per line; string values with newlines use `E'…'`.
+- New `EmbeddedDatabase::execute_sql_script(sql)` replays a dump into an empty database with the `$$`-aware
+  statement splitter and reports the 1-based index of a failing statement. The REPL's `\dump` no longer has its
+  own copy of the exporter (it printed column types with `{:?}` and wrote `-- Row data would go here`).
+- The PostgreSQL statement splitter now keeps multi-byte UTF-8 intact and tracks `"…"` identifiers (it used to
+  Latin-1-expand every UTF-8 continuation byte outside single-quoted literals).
+- CHECK bodies and column DEFAULTs are rendered by a dump renderer that quotes every identifier (a CHECK on
+  `"createdAt"` or `"a b"` used to be written unquoted and either failed to load or bound to the wrong column);
+  an expression the renderer cannot spell (`CASE`, aggregates, subqueries) or cannot read makes `dump_sql` fail
+  loudly naming the constraint, rather than writing a file that silently lacks it. FK `NOT ENFORCED` is carried;
+  a named single-column UNIQUE keeps its name; TIME/TIMESTAMP keep nanoseconds; non-ASCII strings use the `E'…'`
+  form so the planner's mojibake heuristic cannot rewrite them on re-import; vector literals carry their
+  dimension (`::vector(N)`).
+- The planner now reads FOREIGN KEY and CHECK constraint names like PostgreSQL (`normalize_ident`): a quoted
+  name comes back without its quote characters (a dump/restore cycle used to add a layer of quotes each time)
+  and an unquoted `CONSTRAINT MyFk` is stored as `myfk`; `DROP CONSTRAINT` was already case-insensitive.
+- The PostgreSQL statement splitter (simple-query protocol and `execute_sql_script`) now skips `--` and
+  `/* … */` comments — a quote or semicolon inside a comment no longer swallows or splits the batch — and a
+  trailing comment-only fragment is no longer sent to the parser.
+- Known fidelity gaps, documented in the test header: per-column `STORAGE` modes, SERIAL/IDENTITY (the resolved
+  type is written), non-vector indexes, product-quantized HNSW options (a `-- NOTE:` line records the loss),
+  INTERVAL columns (the engine cannot yet INSERT an interval literal — pre-existing).
+
+### Fixed — plain text could not be assigned to `tsvector` / `tsquery` columns (HDB-002)
+
+- `CREATE TABLE documents (search_vector tsvector); INSERT INTO documents VALUES ('hello world foo')` answered
+  `Invalid JSON string`: the planner mapped both types to JSON, whose assignment coercion validates the input as
+  JSON. They are now declared types of their own (`DataType::TsVector` / `TsQuery`, appended to the end of the
+  persisted enum) with PostgreSQL's input rule: plain text is tokenised, the quoted-lexeme form `'hello' 'world'`
+  is taken verbatim (positions parsed and dropped), a JSON token array from `to_tsvector(...)` passes through.
+  Storage, `@@`, `ts_rank` and the BM25 engine are unchanged; `json`/`jsonb` still validate their input. On the
+  PG wire the two types advertise their real OIDs (3614 / 3615) and print as PostgreSQL prints them
+  (`'hello' 'world'`, backslashes and quotes escaped as `tsvectorout` does) in `SELECT` results and in
+  `COPY … TO STDOUT`, so a COPY round trip is byte-exact; text and binary bound parameters of those types are
+  accepted; the REST data API accepts a string, a quoted-lexeme string or a JSON array of lexemes for such a
+  column. `pg_type`, `information_schema`, `pg_typeof` and `format_type` name the types. An empty lexeme or a
+  non-string array element is rejected rather than silently dropped.
+- Columns declared `tsvector` before 4.35 were persisted as JSON and keep that declared type on reopen; recreate
+  the column to pick up the new input rule (`docs/compatibility/fts.md`).
+
+### Changed — `vector` is listed under a private OID in `pg_type` and advertised as text on the wire
+
+- `pg_type` used to list `vector` under OID 3614 — PostgreSQL's `tsvector` OID, now taken by tsvector — while the
+  PG wire advertised 1000 (PostgreSQL's `_bool`) and `pg_attribute` said 25. `pg_type` now lists `vector` as
+  **16385** (array `_vector` 16386, `typnamespace` `public`), and both the wire RowDescription and `pg_attribute`
+  advertise TEXT (25) — which is what the value on the wire is (`[0.1,0.2]`). A pgvector client that registers the
+  type by name will not meet 16385 on the wire and decodes the text form. Advertising 16385 on the wire is blocked
+  by a pre-existing extended-protocol gap (parameter OID 0 sends rust-postgres clients into a type-lookup
+  recursion), tracked separately.
+
+### Regression coverage
+
+`tests/security_hdb_002.rs` (8), `tests/security_hdb_003.rs` (10, incl. a checked-in version-1 fixture
+`tests/fixtures/dump_v1_users.hdmp`), `tests/security_hdb_005.rs` (12), 17 unit tests for the SQL serializer and
+the type inventory; each suite was run against the unfixed tree (d44d4eb) first.
+
 ## [4.34.0] - 2026-09-17
 
 Three more findings from the HeliosDB Nano 4.31.1 security report (HDB-008, HDB-009, HDB-011) — the
