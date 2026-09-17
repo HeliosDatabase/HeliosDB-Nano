@@ -5,6 +5,114 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.34.0] - 2026-09-17
+
+Three more findings from the HeliosDB Nano 4.31.1 security report (HDB-008, HDB-009, HDB-011) — the
+last three High-severity items in it — plus the wire and catalog fixes their reviews surfaced.
+
+### Fixed — SECURITY: an embedded or session transaction could be COMMITted after a statement inside it failed (HDB-008)
+
+- `BEGIN; INSERT …; INSERT … (duplicate key → ERROR); COMMIT;` used to succeed and keep the first row on every
+  path except the PostgreSQL wire: the Rust API (`db.execute`, `db.begin()`/`commit()`, the RAII `Transaction`
+  handle, the params family, `execute_many_params`, `EXECUTE` of a prepared statement), the session API, the
+  REPL, the Python binding and the REST/MCP layers that use the session API. Only the PG wire handler had a
+  `Failed` state, and it lived in the handler, not the engine.
+- The failed state now lives on `storage::Transaction` itself and one error boundary wraps every entry point
+  that runs a statement inside an open transaction (global slot, session slot, RAII handle): any error — parse,
+  plan, constraint, executor — marks the transaction aborted; every later statement that reaches the
+  transaction is refused with SQLSTATE `25P02` (`current transaction is aborted, commands ignored until end of
+  transaction block`); `COMMIT` / `commit()` **rolls back and returns an error** on the engine API instead of
+  committing partial work (the PG wire keeps answering such a COMMIT with the `ROLLBACK` command tag, as
+  PostgreSQL does). `ROLLBACK`, `ROLLBACK TO SAVEPOINT` (which clears the mark on success) and `COMMIT`/`ROLLBACK`
+  in every spelling remain accepted; `SAVEPOINT` / `RELEASE` inside an aborted block are refused like any other
+  statement.
+- PostgreSQL wire: `ROLLBACK TO SAVEPOINT` inside a failed block is now accepted on both the simple and the
+  extended protocol (it used to be refused with `25P02` like everything else, so a wire client had no way to
+  recover a failed block without discarding the work before the savepoint); the savepoint family now reports
+  PostgreSQL's command tags (`SAVEPOINT`, `RELEASE`, `ROLLBACK`) instead of `OK 0`. A `COMMIT` the engine refuses
+  (aborted block, deferred-FK failure) leaves the connection `Idle`, never `InTransaction` with no transaction.
+  A `DO … EXCEPTION WHEN … THEN null` block that catches its statement's error inside a transaction (drizzle's
+  and Prisma's idempotent-migration shape) clears the mark, so the migration's following statements and COMMIT
+  still work.
+- MySQL wire: keeps **MySQL's** statement-level semantics — a failed statement does not abort the block
+  (`BEGIN; bad; good; COMMIT;` commits `good`), the handler clears the engine mark after reporting the error, and a
+  refused `COMMIT`/`ROLLBACK` re-synchronises the connection's transaction flag with the engine instead of
+  wedging it into silent autocommit; `COM_RESET_CONNECTION` rolls the engine transaction back instead of leaking
+  it. Error code for the (now unreachable on MySQL) aborted-commit message is `1105` with SQLSTATE `25000`.
+- Not changed: the pre-parse utility family (`SET`/`RESET`, `SET CONSTRAINTS`, `search_path`, `PRAGMA`,
+  `VACUUM`/`REINDEX`/`CREATE DOMAIN` no-ops) still runs inside an aborted block; the failed statement's own
+  partially staged rows are only discarded by `ROLLBACK` / `ROLLBACK TO SAVEPOINT` (no statement-level undo yet);
+  the savepoint stack is process-wide. All three are tracked separately.
+
+### Fixed — SECURITY: SQL identity functions returned hard-coded principals (HDB-009)
+
+- `current_user`, `session_user`, `current_role` (bare or `current_role()`) and
+  `current_setting('session_authorization')` answered `heliosdb` / `postgres` for every login. They now report
+  the name the connection authenticated with: the PG-wire startup `user` — published onto the session only
+  **after** authentication succeeds (it used to be written before the credential check), truncated to 63 bytes
+  like a PostgreSQL identifier; the MySQL handshake user (that listener is trust-only, the name is asserted, not
+  proved); the name passed to `create_session()` on the embedded API; `heliosdb` for a session-less embedded
+  call. `SHOW session_authorization` (PG wire) answers the same name; `SHOW role` answers `none`.
+- A PG startup packet without a `user` parameter is refused with `08P01`, as PostgreSQL does (it used to be
+  accepted; a CancelRequest-shaped packet was also accepted as a startup).
+- The identity reaches the storage-less evaluator through a per-statement thread-local installed by every
+  session entry point, including the COPY fast path (a `DEFAULT current_user` column filled through
+  `COPY … FROM STDIN` stamps the login). The shared result cache tags every entry with the principal that
+  computed it, so a row computed for one login — even through a view or a SQL UDF that hides `current_user` —
+  is never served to another (the PG simple-query handler's own cache probe now carries the identity too, so it
+  can hit for wire logins and cannot hand a session-less answer to an authenticated client); no allocation is
+  added on the lookup path.
+- `SET ROLE` / `SET SESSION AUTHORIZATION` stay refused: this is identity reporting, not access control.
+  Ownership surfaces (`pg_tables.tableowner`, `pg_roles`, ACL grantors) still report the literal service role
+  (tracked separately), so `WHERE tableowner = current_user` no longer matches for wire logins.
+
+### Fixed — `pg_type` queries ignored their WHERE clause and lowercased literals (HDB-011)
+
+- The PG-wire catalog emulator intercepted every `SELECT` mentioning `pg_type` and answered it from a fixed
+  12-row set, applying `WHERE` by string-splitting the lowercased statement: `typname='int4'` (no spaces), any
+  `OR`, and `SELECT count(*) FROM pg_type WHERE typname = 'hstore'` returned the whole table, and `= 'INT4'`
+  matched the row named `int4`. Drivers registering type handlers or introspecting types got wrong answers.
+- `pg_type` is now served only by the planner-backed system-view registry: PostgreSQL's 22-column layout
+  (`typlen` is `int2`), 53 base types with real OIDs plus their array types linked through `typarray` /
+  `typelem` (101 rows), `typtype` `b`/`p`/`r`, Nano's `vector` (3614), `pg_catalog` qualification, aliases,
+  joins to `pg_namespace`, `ORDER BY`/`LIMIT`, aggregates and bound parameters all use ordinary SQL semantics on
+  the simple and extended protocols and on the embedded API. `pg_range` and `pg_enum` are registered as empty
+  views so driver type-lookup queries that join them (tokio-postgres, drizzle, Prisma) get zero rows instead of
+  "relation does not exist".
+- The remaining emulator routes (`pg_tables`, `pg_settings`, psql meta-commands) compare literal values
+  case-sensitively (keywords and column names stay case-insensitive), fold line breaks and tabs like spaces, and
+  `pg_tables` defers to the planner instead of returning the unfiltered catalog when its `WHERE` uses a shape
+  the emulator cannot evaluate (`OR`, functions, parentheses, alias-qualified columns, `IN (SELECT …)`, no spaces
+  around the operator). The shape decision is made on literal-stripped text, so a bound parameter's value can no
+  longer flip a prepared `pg_tables` query between the two routes after Describe (which produced DataRows with
+  more fields than the RowDescription announced), and keywords inside a literal (`'x is null'`) are not syntax.
+  `pg_settings`, which has no registry twin, keeps its previous keep-every-row behaviour for unsupported shapes.
+- Embedded API note: `pg_type.typlen` values are now `Value::Int2` (were `Int4`).
+
+### Known limitations recorded by this release
+
+- The `vector` type OID is inconsistent between the wire (`1000`, PostgreSQL's `_bool`) and `pg_type` (`3614`);
+  pgvector clients that look the type up by name will find it and then meet a different OID on the wire.
+- Session-less callers of the params family (wire autocommit statements, REST, MCP) still join the embedded
+  handle's global transaction slot while an embedded `BEGIN` is open — pre-existing, now also subject to the
+  aborted-transaction rule.
+- REST/MCP/BaaS requests run session-less, so `current_user` is `heliosdb` there; `is_superuser` is always `on`.
+- psql `\dT` / `\dD` now error at the planner (they printed wrong columns before); enum and domain types are not
+  listed in `pg_type`.
+
+### Regression coverage
+
+`tests/security_hdb_008.rs` (18: report PoC, refusal until ROLLBACK, `begin()/commit()`, savepoint recovery,
+RAII handle, session API, parse error, DDL, cross-session isolation, params family, `execute_many_params`,
+prepared `EXECUTE`, wire savepoint recovery, wire COMMIT→ROLLBACK, MySQL statement-level semantics ×2, DO … EXCEPTION inside a block and inside a batch),
+`tests/security_hdb_009.rs` (11: embedded default, named sessions, UDF/view cache isolation, DEFAULT
+current_user, wire logins, WHERE on identity, no-user startup, MySQL login, COPY fast path, 63-byte clamp, identity-aware wire cache probe),
+`tests/security_hdb_011.rs` (13: equality, count, case, no-space/OR/IN, oid + alias + qualification,
+ORDER/LIMIT, namespace join, array links, legacy inventory subset, Describe types, pg_tables fallthrough incl.
+multi-line, pg_range/pg_enum + TYPEINFO join, bound-parameter route stability), plus unit tests for the type inventory, the WHERE-shape guard
+and the session-aware COPY path; existing savepoint/transaction suites updated to the aborted-block contract.
+Each suite was run against the unfixed tree first: 10/11, 8/8 and 8/11 of the original cases failed there.
+
 ## [4.33.0] - 2026-09-16
 
 Two more findings from the HeliosDB Nano 4.31.1 security report (HDB-001, HDB-004), plus the engine
