@@ -28,6 +28,7 @@ use super::handler::{
     build_handshake_v10, read_packet, write_packet, CapabilityFlags, HandshakeResponse, MySqlHandler, StatusFlags,
     UTF8MB4_GENERAL_CI,
 };
+use bytes::{BufMut, BytesMut};
 use super::ssl::{MysqlSslConfig, MysqlSslNegotiator};
 use crate::protocol::postgres::timeouts::ConnectionTimeouts;
 use crate::protocol::tls_stream::SecureConnection;
@@ -137,19 +138,12 @@ impl MysqlServer {
     }
 
     fn maybe_warn_utilisation(&self) {
-        let max = self.config.max_connections;
-        let in_use = max.saturating_sub(self.connection_limiter.available_permits());
-        let over = self.config.timeouts.should_warn_utilisation(in_use, max);
-        if self.utilisation_warned.swap(over, Ordering::Relaxed) != over && over {
-            tracing::warn!(
-                "MySQL connection utilisation {}/{} ({}%) is at or above [server] max_connections_warn_percent; \
-                 new connections are refused at {}",
-                in_use,
-                max,
-                in_use.saturating_mul(100) / max.max(1),
-                max
-            );
-        }
+        self.config.timeouts.maybe_warn_utilisation(
+            "MySQL",
+            &self.utilisation_warned,
+            &self.connection_limiter,
+            self.config.max_connections,
+        );
     }
 
     /// Start the server and listen for connections. Does not return unless
@@ -210,6 +204,16 @@ impl MysqlServer {
         }
     }
 
+    /// GH#28-style bound: the whole handshake — greeting, first-response
+    /// read, TLS upgrade (`acceptor.accept(stream).await` included) and the
+    /// post-upgrade re-read — runs under ONE absolute
+    /// `authentication_timeout` deadline computed here at connection-accept
+    /// time, mirroring `PgServer::handle_connection` /
+    /// `MySqlHandler::handle_connection_with_timeouts`. A client that never
+    /// completes its handshake (or stalls mid-TLS-handshake) is dropped
+    /// instead of holding a `max_connections` permit forever. On expiry
+    /// nothing further is written to the unauthenticated peer — the
+    /// half-built stream is simply dropped.
     async fn handle_connection(
         stream: TcpStream,
         database: Arc<EmbeddedDatabase>,
@@ -217,9 +221,26 @@ impl MysqlServer {
         timeouts: ConnectionTimeouts,
         connection_id: u32,
     ) -> Result<()> {
-        let mut handler = Self::negotiate(stream, database, ssl_negotiator, connection_id)
-            .await
-            .map_err(|e| Error::network(format!("MySQL TLS negotiation failed: {}", e)))?;
+        let auth_deadline = timeouts
+            .read_deadline(crate::protocol::postgres::timeouts::SessionActivity::Authenticating)
+            .map(|d| tokio::time::Instant::now() + d);
+
+        let negotiate = Self::negotiate(stream, database, ssl_negotiator, connection_id);
+        let mut handler = match auth_deadline {
+            Some(at) => match tokio::time::timeout_at(at, negotiate).await {
+                Ok(negotiated) => negotiated.map_err(|e| Error::network(format!("MySQL TLS negotiation failed: {}", e)))?,
+                Err(_elapsed) => {
+                    tracing::debug!(
+                        "MySQL connection {}: authentication_timeout expired during handshake; closing",
+                        connection_id
+                    );
+                    return Ok(());
+                }
+            },
+            None => negotiate
+                .await
+                .map_err(|e| Error::network(format!("MySQL TLS negotiation failed: {}", e)))?,
+        };
         handler.set_timeouts(timeouts);
         handler
             .run_command_loop()
@@ -231,6 +252,11 @@ impl MysqlServer {
     /// upgrade to TLS if the client set `CLIENT_SSL` and TLS is configured,
     /// and return a fully authenticated [`MySqlHandler`] ready for
     /// [`MySqlHandler::run_command_loop`].
+    ///
+    /// If `ssl_negotiator.config().require_tls` is set and the client did
+    /// NOT request TLS, the connection is rejected (an access-denied-style
+    /// ERR packet is sent, then the connection is closed) rather than
+    /// allowed to proceed in cleartext.
     async fn negotiate(
         stream: TcpStream,
         database: Arc<EmbeddedDatabase>,
@@ -288,6 +314,24 @@ impl MysqlServer {
                 }
             }
         } else {
+            // Client didn't set CLIENT_SSL. If this listener requires TLS
+            // for every connection, reject rather than silently accepting
+            // cleartext — `require_tls` must not be a no-op.
+            if ssl_negotiator
+                .as_ref()
+                .map(|n| n.config().require_tls)
+                .unwrap_or(false)
+            {
+                let mut stream = stream;
+                let err = build_access_denied_packet(&capabilities, "TLS is required by this server");
+                // Best-effort: the client is being rejected either way, and
+                // a write failure here (e.g. peer already gone) must not
+                // mask the rejection as a different kind of error.
+                let _ = write_packet(&mut stream, first_seq.wrapping_add(1), &err).await;
+                return Err(super::handler::MySqlError::Protocol(
+                    "rejected plaintext connection: TLS is required (require_tls)".into(),
+                ));
+            }
             (SecureConnection::Plain(stream), first_seq, first_payload)
         };
 
@@ -308,6 +352,25 @@ impl MysqlServer {
         handler.finish_handshake(hs).await?;
         Ok(handler)
     }
+}
+
+/// Build a MySQL ERR packet payload (access-denied-style, code 1045,
+/// SQL state 28000) used to reject a plaintext client when `require_tls` is
+/// set. Standalone (not a method on `MySqlHandler`) because rejection
+/// happens in [`MysqlServer::negotiate`] before any handler exists.
+fn build_access_denied_packet(capabilities: &CapabilityFlags, msg: &str) -> BytesMut {
+    let mut p = BytesMut::new();
+    p.put_u8(0xFF); // ERR header
+    p.put_u16_le(1045); // ER_ACCESS_DENIED_ERROR
+
+    if capabilities.has(CapabilityFlags::CLIENT_PROTOCOL_41) {
+        p.put_u8(b'#');
+        let state = b"28000"; // invalid authorization spec
+        p.put_slice(state);
+    }
+
+    p.put_slice(msg.as_bytes());
+    p
 }
 
 #[cfg(test)]

@@ -320,3 +320,76 @@ async fn pq_disabled_mysql_server_never_offers_hybrid_group() -> Result<()> {
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------
+// require_tls
+// ---------------------------------------------------------------------
+//
+// `MysqlSslConfig::with_require_tls(true)` must actually reject a
+// plaintext client rather than being a no-op (review finding #2).
+
+/// A plaintext handshake against a `require_tls = true` server must be
+/// rejected: the connection either closes without an OK packet, or
+/// delivers an ERR packet — never the OK a successful login would produce.
+async fn expect_plaintext_rejected(addr: SocketAddr) -> Result<()> {
+    let mut stream = TcpStream::connect(addr)
+        .await
+        .map_err(|e| heliosdb_nano::Error::network(format!("connect failed: {}", e)))?;
+    let (_seq, _greeting) = read_packet(&mut stream)
+        .await
+        .map_err(|e| heliosdb_nano::Error::network(format!("greeting read failed: {}", e)))?;
+
+    let response = build_handshake_response(CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION, "test_user");
+    write_packet(&mut stream, 1, &response)
+        .await
+        .map_err(|e| heliosdb_nano::Error::network(format!("handshake response write failed: {}", e)))?;
+
+    match read_packet(&mut stream).await {
+        Ok((_seq, payload)) => {
+            assert_ne!(
+                payload.first().copied(),
+                Some(0x00),
+                "require_tls=true must not let a plaintext client through with an OK packet"
+            );
+            // Non-OK (typically an ERR 0xFF packet) is the rejection.
+        }
+        Err(_) => {
+            // The server closed the connection outright — also an
+            // acceptable rejection.
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn require_tls_rejects_plaintext_client() -> Result<()> {
+    let (_certs_dir, cert_path, key_path) = setup_test_certs()?;
+    let ssl = MysqlSslConfig::new(&cert_path, &key_path).with_require_tls(true);
+    let addr = start_mysql_server(Some(ssl)).await?;
+    tokio::time::timeout(Duration::from_secs(10), expect_plaintext_rejected(addr))
+        .await
+        .expect("rejection check timed out")
+}
+
+#[tokio::test]
+async fn require_tls_still_accepts_tls_client() -> Result<()> {
+    let (_certs_dir, cert_path, key_path) = setup_test_certs()?;
+    let ssl = MysqlSslConfig::new(&cert_path, &key_path).with_require_tls(true);
+    let addr = start_mysql_server(Some(ssl)).await?;
+    tokio::time::timeout(Duration::from_secs(10), tls_login(addr, client_config(true)))
+        .await
+        .expect("TLS login timed out")?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn require_tls_false_plaintext_client_still_succeeds() -> Result<()> {
+    // No-regression check: `require_tls = false` (the default) must keep
+    // allowing plaintext clients even when TLS is enabled/offered.
+    let (_certs_dir, cert_path, key_path) = setup_test_certs()?;
+    let ssl = MysqlSslConfig::new(&cert_path, &key_path).with_require_tls(false);
+    let addr = start_mysql_server(Some(ssl)).await?;
+    tokio::time::timeout(Duration::from_secs(10), plaintext_login(addr))
+        .await
+        .expect("login timed out")
+}
