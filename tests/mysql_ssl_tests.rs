@@ -255,6 +255,386 @@ async fn tls_login(addr: SocketAddr, cfg: Arc<ClientConfig>) -> Result<rustls::N
     Ok(group)
 }
 
+// ---------------------------------------------------------------------
+// Item 1: per-connection negotiated-KX-group visibility
+// ---------------------------------------------------------------------
+
+/// Decode a length-encoded integer at `buf[*pos]`, advancing `*pos` past it.
+/// Only the single-byte and 0xFC (2-byte) forms are needed here — MySQL
+/// result-set column counts and short string lengths never exceed that.
+fn read_lenenc_int(buf: &[u8], pos: &mut usize) -> u64 {
+    let first = buf[*pos];
+    *pos += 1;
+    match first {
+        0xfc => {
+            let v = u16::from_le_bytes([buf[*pos], buf[*pos + 1]]) as u64;
+            *pos += 2;
+            v
+        }
+        _ => first as u64,
+    }
+}
+
+/// Decode a length-encoded string at `buf[*pos]`, advancing `*pos` past it.
+fn read_lenenc_str(buf: &[u8], pos: &mut usize) -> String {
+    let len = read_lenenc_int(buf, pos) as usize;
+    let s = String::from_utf8_lossy(&buf[*pos..*pos + len]).into_owned();
+    *pos += len;
+    s
+}
+
+/// Send `SELECT @@ssl_kx_group` over an already-authenticated connection
+/// (plain or TLS) and return the single string value in the result set.
+/// Speaks just enough of the MySQL text result-set protocol (column count,
+/// column defs, EOF, one row, EOF) — this listener never sets
+/// `CLIENT_DEPRECATE_EOF` in these tests' handshake, so EOF markers are
+/// always present.
+async fn query_ssl_kx_group<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S) -> Result<String> {
+    let sql = "SELECT @@ssl_kx_group";
+    let mut payload = Vec::with_capacity(1 + sql.len());
+    payload.push(0x03); // COM_QUERY
+    payload.extend_from_slice(sql.as_bytes());
+    write_packet(stream, 0, &payload)
+        .await
+        .map_err(|e| heliosdb_nano::Error::network(format!("COM_QUERY write failed: {}", e)))?;
+
+    // Column count packet.
+    let (_seq, col_count_payload) = read_packet(stream)
+        .await
+        .map_err(|e| heliosdb_nano::Error::network(format!("column-count read failed: {}", e)))?;
+    let mut pos = 0usize;
+    let ncols = read_lenenc_int(&col_count_payload, &mut pos);
+    assert_eq!(ncols, 1, "SELECT @@ssl_kx_group must return exactly one column");
+
+    // One column-definition packet per column.
+    for _ in 0..ncols {
+        read_packet(stream)
+            .await
+            .map_err(|e| heliosdb_nano::Error::network(format!("column-def read failed: {}", e)))?;
+    }
+
+    // EOF after column defs.
+    read_packet(stream)
+        .await
+        .map_err(|e| heliosdb_nano::Error::network(format!("post-column-def EOF read failed: {}", e)))?;
+
+    // One row packet: a single length-encoded string.
+    let (_seq, row_payload) = read_packet(stream)
+        .await
+        .map_err(|e| heliosdb_nano::Error::network(format!("row read failed: {}", e)))?;
+    let mut pos = 0usize;
+    let value = read_lenenc_str(&row_payload, &mut pos);
+
+    // Closing EOF.
+    read_packet(stream)
+        .await
+        .map_err(|e| heliosdb_nano::Error::network(format!("closing EOF read failed: {}", e)))?;
+
+    Ok(value)
+}
+
+/// TLS client that logs in AND reports the SQL-visible `@@ssl_kx_group`
+/// value, so a test can assert it agrees with what the client itself
+/// negotiated (`tls_stream`'s own `negotiated_key_exchange_group()`).
+async fn tls_login_and_query_kx_group(addr: SocketAddr, cfg: Arc<ClientConfig>) -> Result<(rustls::NamedGroup, String)> {
+    let mut stream = TcpStream::connect(addr)
+        .await
+        .map_err(|e| heliosdb_nano::Error::network(format!("connect failed: {}", e)))?;
+    let (_seq, _greeting) = read_packet(&mut stream)
+        .await
+        .map_err(|e| heliosdb_nano::Error::network(format!("greeting read failed: {}", e)))?;
+
+    let ssl_request = build_ssl_request(CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION | CLIENT_SSL);
+    write_packet(&mut stream, 1, &ssl_request)
+        .await
+        .map_err(|e| heliosdb_nano::Error::network(format!("SSLRequest write failed: {}", e)))?;
+
+    let connector = TlsConnector::from(cfg);
+    let server_name = ServerName::try_from("localhost")
+        .map_err(|e| heliosdb_nano::Error::network(format!("invalid server name: {}", e)))?
+        .to_owned();
+    let mut tls_stream = connector
+        .connect(server_name, stream)
+        .await
+        .map_err(|e| heliosdb_nano::Error::network(format!("TLS handshake failed: {}", e)))?;
+
+    let group = tls_stream
+        .get_ref()
+        .1
+        .negotiated_key_exchange_group()
+        .ok_or_else(|| heliosdb_nano::Error::network("no key-exchange group negotiated".to_string()))?
+        .name();
+
+    let response = build_handshake_response(
+        CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION | CLIENT_SSL,
+        "test_user",
+    );
+    write_packet(&mut tls_stream, 2, &response)
+        .await
+        .map_err(|e| heliosdb_nano::Error::network(format!("handshake response write failed: {}", e)))?;
+
+    let (_seq, ok_payload) = read_packet(&mut tls_stream)
+        .await
+        .map_err(|e| heliosdb_nano::Error::network(format!("OK read failed: {}", e)))?;
+    assert_eq!(ok_payload.first().copied(), Some(0x00), "expected an OK packet (0x00), got {:?}", ok_payload);
+
+    let reported = query_ssl_kx_group(&mut tls_stream).await?;
+    Ok((group, reported))
+}
+
+#[tokio::test]
+async fn pq_client_ssl_kx_group_matches_negotiated_group() -> Result<()> {
+    let (_certs_dir, cert_path, key_path) = setup_test_certs()?;
+    let ssl = MysqlSslConfig::new(&cert_path, &key_path).with_post_quantum(true);
+    let addr = start_mysql_server(Some(ssl)).await?;
+    let (group, reported) = tokio::time::timeout(
+        Duration::from_secs(10),
+        tls_login_and_query_kx_group(addr, client_config(true)),
+    )
+    .await
+    .expect("TLS login + query timed out")?;
+    assert_eq!(group, rustls::NamedGroup::X25519MLKEM768);
+    assert_eq!(
+        reported, "X25519MLKEM768",
+        "@@ssl_kx_group must report the group the client actually negotiated"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn classical_client_ssl_kx_group_matches_negotiated_group() -> Result<()> {
+    let (_certs_dir, cert_path, key_path) = setup_test_certs()?;
+    let ssl = MysqlSslConfig::new(&cert_path, &key_path).with_post_quantum(true);
+    let addr = start_mysql_server(Some(ssl)).await?;
+    let (group, reported) = tokio::time::timeout(
+        Duration::from_secs(10),
+        tls_login_and_query_kx_group(addr, client_config(false)),
+    )
+    .await
+    .expect("TLS login + query timed out")?;
+    assert_ne!(group, rustls::NamedGroup::X25519MLKEM768);
+    assert_eq!(
+        reported,
+        format!("{:?}", group),
+        "@@ssl_kx_group must report the group the client actually negotiated"
+    );
+    assert_ne!(reported, "X25519MLKEM768");
+    Ok(())
+}
+
+#[tokio::test]
+async fn plaintext_connection_reports_empty_ssl_kx_group() -> Result<()> {
+    let (_certs_dir, cert_path, key_path) = setup_test_certs()?;
+    let ssl = MysqlSslConfig::new(&cert_path, &key_path);
+    let addr = start_mysql_server(Some(ssl)).await?;
+
+    let mut stream = TcpStream::connect(addr)
+        .await
+        .map_err(|e| heliosdb_nano::Error::network(format!("connect failed: {}", e)))?;
+    let (_seq, _greeting) = read_packet(&mut stream)
+        .await
+        .map_err(|e| heliosdb_nano::Error::network(format!("greeting read failed: {}", e)))?;
+    let response = build_handshake_response(CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION, "test_user");
+    write_packet(&mut stream, 1, &response)
+        .await
+        .map_err(|e| heliosdb_nano::Error::network(format!("handshake response write failed: {}", e)))?;
+    let (_seq, ok_payload) = read_packet(&mut stream)
+        .await
+        .map_err(|e| heliosdb_nano::Error::network(format!("OK read failed: {}", e)))?;
+    assert_eq!(ok_payload.first().copied(), Some(0x00));
+
+    let reported = tokio::time::timeout(Duration::from_secs(10), query_ssl_kx_group(&mut stream))
+        .await
+        .expect("query timed out")?;
+    assert_eq!(reported, "", "a plaintext connection must report an empty ssl_kx_group");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// Item 2: mutual TLS (client certificate verification)
+// ---------------------------------------------------------------------
+
+/// Generate a CA (self-signed) and a leaf certificate signed by it, using
+/// the `openssl` CLI — the same tool `CertificateManager::generate_self_signed`
+/// shells out to. Returns `(ca_cert, ca_key, leaf_cert, leaf_key)` paths, all
+/// inside `dir`.
+fn generate_ca_and_signed_cert(
+    dir: &std::path::Path,
+    leaf_cn: &str,
+) -> Result<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)> {
+    let run = |args: &[&str]| -> Result<()> {
+        let output = std::process::Command::new("openssl")
+            .args(args)
+            .output()
+            .map_err(|e| heliosdb_nano::Error::io(format!("failed to execute openssl: {}", e)))?;
+        if !output.status.success() {
+            return Err(heliosdb_nano::Error::io(format!(
+                "openssl {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+        Ok(())
+    };
+
+    // Namespaced by `leaf_cn` — two calls into the SAME temp dir (as the
+    // wrong-CA test does, on purpose) must each get their own CA key/cert
+    // files, or the second call's CA silently overwrites the first's.
+    let ca_key = dir.join(format!("{leaf_cn}-ca.key"));
+    let ca_cert = dir.join(format!("{leaf_cn}-ca.crt"));
+    let leaf_key = dir.join(format!("{leaf_cn}.key"));
+    let leaf_csr = dir.join(format!("{leaf_cn}.csr"));
+    let leaf_cert = dir.join(format!("{leaf_cn}.crt"));
+
+    // Self-signed CA.
+    run(&[
+        "req",
+        "-x509",
+        "-newkey",
+        "rsa:2048",
+        "-nodes",
+        "-keyout",
+        ca_key.to_str().expect("path"),
+        "-out",
+        ca_cert.to_str().expect("path"),
+        "-days",
+        "365",
+        "-subj",
+        "/CN=Test CA",
+    ])?;
+
+    // Leaf key + CSR.
+    run(&[
+        "req",
+        "-newkey",
+        "rsa:2048",
+        "-nodes",
+        "-keyout",
+        leaf_key.to_str().expect("path"),
+        "-out",
+        leaf_csr.to_str().expect("path"),
+        "-subj",
+        &format!("/CN={leaf_cn}"),
+    ])?;
+
+    // Sign the leaf with the CA.
+    run(&[
+        "x509",
+        "-req",
+        "-in",
+        leaf_csr.to_str().expect("path"),
+        "-CA",
+        ca_cert.to_str().expect("path"),
+        "-CAkey",
+        ca_key.to_str().expect("path"),
+        "-CAcreateserial",
+        "-out",
+        leaf_cert.to_str().expect("path"),
+        "-days",
+        "365",
+    ])?;
+
+    Ok((ca_cert, ca_key, leaf_cert, leaf_key))
+}
+
+/// TLS client that, in addition to verifying the server cert, presents its
+/// OWN certificate/key for mutual TLS.
+async fn mtls_login(
+    addr: SocketAddr,
+    client_cert: &std::path::Path,
+    client_key: &std::path::Path,
+) -> Result<()> {
+    use rustls_pemfile::{certs, pkcs8_private_keys};
+    use std::fs::File;
+    use std::io::BufReader;
+
+    let cert_chain: Vec<_> = certs(&mut BufReader::new(
+        File::open(client_cert).map_err(|e| heliosdb_nano::Error::io(format!("open client cert: {}", e)))?,
+    ))
+    .collect::<std::result::Result<Vec<_>, _>>()
+    .map_err(|e| heliosdb_nano::Error::io(format!("parse client cert: {}", e)))?;
+    let mut keys: Vec<_> = pkcs8_private_keys(&mut BufReader::new(
+        File::open(client_key).map_err(|e| heliosdb_nano::Error::io(format!("open client key: {}", e)))?,
+    ))
+    .collect::<std::result::Result<Vec<_>, _>>()
+    .map_err(|e| heliosdb_nano::Error::io(format!("parse client key: {}", e)))?;
+    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(keys.remove(0));
+
+    let provider = pq_capable_provider(true);
+    let config = ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("TLS 1.3")
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAnyCert))
+        .with_client_auth_cert(cert_chain, key)
+        .map_err(|e| heliosdb_nano::Error::network(format!("client auth cert config: {}", e)))?;
+
+    let group = tls_login(addr, Arc::new(config)).await?;
+    let _ = group;
+    Ok(())
+}
+
+#[tokio::test]
+async fn mtls_client_with_ca_signed_cert_succeeds() -> Result<()> {
+    let temp_dir = tempfile::TempDir::new().expect("temp dir");
+    let (_certs_dir, cert_path, key_path) = setup_test_certs()?;
+    let (ca_cert, _ca_key, client_cert, client_key) =
+        generate_ca_and_signed_cert(temp_dir.path(), "test-client")?;
+
+    let ssl = MysqlSslConfig::new(&cert_path, &key_path).with_client_cert_verification(&ca_cert);
+    let addr = start_mysql_server(Some(ssl)).await?;
+
+    tokio::time::timeout(Duration::from_secs(10), mtls_login(addr, &client_cert, &client_key))
+        .await
+        .expect("mTLS login timed out")
+}
+
+#[tokio::test]
+async fn mtls_client_with_no_cert_is_rejected() -> Result<()> {
+    let temp_dir = tempfile::TempDir::new().expect("temp dir");
+    let (_certs_dir, cert_path, key_path) = setup_test_certs()?;
+    let (ca_cert, _ca_key, _client_cert, _client_key) = generate_ca_and_signed_cert(temp_dir.path(), "unused")?;
+
+    let ssl = MysqlSslConfig::new(&cert_path, &key_path).with_client_cert_verification(&ca_cert);
+    let addr = start_mysql_server(Some(ssl)).await?;
+
+    // `client_config(true)` presents no client certificate at all
+    // (`.with_no_client_auth()`); the mTLS-required server must refuse the
+    // handshake.
+    let result = tokio::time::timeout(Duration::from_secs(10), tls_login(addr, client_config(true))).await;
+    match result {
+        Ok(Ok(_)) => panic!("a client presenting no certificate must not complete an mTLS handshake"),
+        Ok(Err(_)) | Err(_) => {} // handshake failure or timeout: both are an acceptable rejection
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn mtls_client_with_wrong_ca_cert_is_rejected() -> Result<()> {
+    let temp_dir = tempfile::TempDir::new().expect("temp dir");
+    let (_certs_dir, cert_path, key_path) = setup_test_certs()?;
+    let (ca_cert, _ca_key, _client_cert, _client_key) = generate_ca_and_signed_cert(temp_dir.path(), "server-ca")?;
+
+    // A second, unrelated CA signs the "client" certificate — the server
+    // only trusts the first CA.
+    let (_other_ca_cert, _other_ca_key, wrong_client_cert, wrong_client_key) =
+        generate_ca_and_signed_cert(temp_dir.path(), "wrong-ca-client")?;
+
+    let ssl = MysqlSslConfig::new(&cert_path, &key_path).with_client_cert_verification(&ca_cert);
+    let addr = start_mysql_server(Some(ssl)).await?;
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        mtls_login(addr, &wrong_client_cert, &wrong_client_key),
+    )
+    .await;
+    match result {
+        Ok(Ok(())) => panic!("a certificate signed by the wrong CA must not be accepted"),
+        Ok(Err(_)) | Err(_) => {} // handshake failure or timeout: both are an acceptable rejection
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn plain_client_connects_when_tls_not_configured() -> Result<()> {
     let addr = start_mysql_server(None).await?;

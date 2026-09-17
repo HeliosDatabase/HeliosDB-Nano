@@ -12,7 +12,8 @@
 //! from this module. No ALPN is needed for the MySQL wire protocol.
 
 use crate::{Error, Result};
-use rustls::ServerConfig;
+use rustls::server::WebPkiClientVerifier;
+use rustls::{RootCertStore, ServerConfig};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio_rustls::TlsAcceptor;
@@ -34,6 +35,15 @@ pub struct MysqlSslConfig {
     /// in plaintext, same as a real MySQL server with `require_secure_transport`
     /// off.
     pub require_tls: bool,
+    /// Optional path to a CA certificate (PEM) used to verify client
+    /// certificates (mutual TLS). `None` (the default) builds the acceptor
+    /// with `.with_no_client_auth()`, same as before this field existed.
+    pub ca_cert_path: Option<PathBuf>,
+    /// Require every TLS client to present a certificate signed by
+    /// `ca_cert_path` (mutual TLS). Only meaningful when `ca_cert_path` is
+    /// set — `validate()` rejects `require_client_cert = true` with no CA
+    /// configured. Default `false`.
+    pub require_client_cert: bool,
 }
 
 impl MysqlSslConfig {
@@ -45,6 +55,8 @@ impl MysqlSslConfig {
             key_path: key_path.as_ref().to_path_buf(),
             post_quantum: true,
             require_tls: false,
+            ca_cert_path: None,
+            require_client_cert: false,
         }
     }
 
@@ -57,6 +69,15 @@ impl MysqlSslConfig {
     /// Require TLS for every connection (reject plaintext clients).
     pub fn with_require_tls(mut self, require_tls: bool) -> Self {
         self.require_tls = require_tls;
+        self
+    }
+
+    /// Require client-certificate verification (mutual TLS) against `ca_path`.
+    /// Every TLS client must present a certificate signed by this CA, or the
+    /// handshake is refused by rustls itself.
+    pub fn with_client_cert_verification<P: AsRef<Path>>(mut self, ca_path: P) -> Self {
+        self.ca_cert_path = Some(ca_path.as_ref().to_path_buf());
+        self.require_client_cert = true;
         self
     }
 
@@ -76,6 +97,15 @@ impl MysqlSslConfig {
                 "MySQL TLS private key not found: {}",
                 self.key_path.display()
             )));
+        }
+        if let Some(ref ca_path) = self.ca_cert_path {
+            if !ca_path.exists() {
+                return Err(Error::io(format!("MySQL TLS CA certificate not found: {}", ca_path.display())));
+            }
+        } else if self.require_client_cert {
+            return Err(Error::io(
+                "MySQL TLS require_client_cert is set but no ca_cert_path was configured",
+            ));
         }
         Ok(())
     }
@@ -117,12 +147,41 @@ impl MysqlSslNegotiator {
 
         // Explicit PQ-aware CryptoProvider — same shared helper as Postgres.
         let provider = crate::protocol::tls_provider::pq_capable_provider(config.post_quantum);
-        let tls_config = ServerConfig::builder_with_provider(provider)
+        let builder = ServerConfig::builder_with_provider(Arc::clone(&provider))
             .with_safe_default_protocol_versions()
-            .map_err(|e| Error::io(format!("Failed to select TLS protocol versions: {}", e)))?
-            .with_no_client_auth()
-            .with_single_cert(certs, private_key)
-            .map_err(|e| Error::io(format!("Failed to build MySQL TLS config: {}", e)))?;
+            .map_err(|e| Error::io(format!("Failed to select TLS protocol versions: {}", e)))?;
+
+        let tls_config = if let Some(ca_path) = &config.ca_cert_path {
+            // Mutual TLS: verify the client's certificate against this CA.
+            // `WebPkiClientVerifier` refuses the handshake outright for a
+            // missing or wrong-CA client certificate when `require_client_cert`
+            // is set — `.allow_unauthenticated()` would accept a connection
+            // with no client certificate at all, which we never want here.
+            // `builder_with_provider` (not `builder`) — the plain `builder()`
+            // reaches for the process-wide default `CryptoProvider`, which
+            // this crate deliberately never installs (see this module's
+            // doc comment on why aws-lc-rs is selected explicitly instead).
+            let mut roots = RootCertStore::empty();
+            let ca_certs = crate::protocol::tls_provider::load_ca_certs(ca_path, "MySQL TLS")?;
+            for cert in ca_certs {
+                roots
+                    .add(cert)
+                    .map_err(|e| Error::io(format!("Failed to add MySQL TLS CA certificate: {}", e)))?;
+            }
+            let roots = Arc::new(roots);
+            let verifier = WebPkiClientVerifier::builder_with_provider(roots, provider)
+                .build()
+                .map_err(|e| Error::io(format!("Failed to build MySQL TLS client verifier: {}", e)))?;
+            builder
+                .with_client_cert_verifier(verifier)
+                .with_single_cert(certs, private_key)
+                .map_err(|e| Error::io(format!("Failed to build MySQL TLS config: {}", e)))?
+        } else {
+            builder
+                .with_no_client_auth()
+                .with_single_cert(certs, private_key)
+                .map_err(|e| Error::io(format!("Failed to build MySQL TLS config: {}", e)))?
+        };
 
         // No ALPN needed for the MySQL wire protocol.
         Ok(TlsAcceptor::from(Arc::new(tls_config)))

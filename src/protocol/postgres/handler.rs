@@ -425,6 +425,12 @@ pub struct PgConnectionHandler<S = BufWriter<TcpStream>> {
     /// GUCs, so the default hot path (no override, `idle_* = 0`) never takes
     /// the session lock to compute a deadline.
     idle_guc_overridden: bool,
+    /// Negotiated TLS key-exchange group (e.g. `"X25519MLKEM768"` for the PQ
+    /// hybrid group, `"X25519"` for classical), captured once at TLS accept
+    /// time by [`super::server::PgServer::negotiate`]. `None` on a plaintext
+    /// connection, or when this handler was constructed without going
+    /// through the listener's TLS negotiation (embedders, tests).
+    tls_kx_group: Option<String>,
 }
 
 /// GH#28: what the listener decided for this connection at accept time.
@@ -529,6 +535,7 @@ impl PgConnectionHandler<BufWriter<TcpStream>> {
             session_id,
             policy,
             idle_guc_overridden: false,
+            tls_kx_group: None,
         }
     }
 }
@@ -560,6 +567,7 @@ impl PgConnectionHandler<BufWriter<UnixStream>> {
             session_id,
             policy,
             idle_guc_overridden: false,
+            tls_kx_group: None,
         }
     }
 }
@@ -634,6 +642,7 @@ impl PgConnectionHandler<BufWriter<SecureConnection<TcpStream>>> {
             session_id,
             policy,
             idle_guc_overridden: false,
+            tls_kx_group: None,
         }
     }
 }
@@ -651,6 +660,7 @@ where
             stream,
             policy: ConnectionPolicy::embedded_default(&database),
             idle_guc_overridden: false,
+            tls_kx_group: None,
             session_id: database
                 .create_wire_session("pg_wire_test")
                 .expect("wire session creation is infallible"),
@@ -675,6 +685,14 @@ where
     /// constructor's arity unchanged (embedders call `new_with_stream`).
     pub(super) fn with_connection_policy(mut self, policy: ConnectionPolicy) -> Self {
         self.policy = policy;
+        self
+    }
+
+    /// Record the TLS key-exchange group negotiated by
+    /// [`super::server::PgServer::negotiate`] (`None` on a plaintext
+    /// connection). Queryable via `SHOW ssl_key_exchange`.
+    pub(super) fn with_tls_kx_group(mut self, group: Option<String>) -> Self {
+        self.tls_kx_group = group;
         self
     }
 
@@ -3511,6 +3529,10 @@ where
             // REFUSED (0A000, HC4). Identity switching is not implemented, and
             // reporting a switched role would be a security lie.
             "role" => "none".to_string(),
+            // PQ hybrid TLS: the negotiated key-exchange group for THIS
+            // connection (e.g. `X25519MLKEM768` vs classical `X25519`), or
+            // empty on a plaintext connection.
+            "ssl_key_exchange" => self.tls_kx_group.clone().unwrap_or_default(),
             _ => return Self::resolve_show_parameter(param),
         };
         (lower, value)
@@ -5210,6 +5232,7 @@ mod failed_transaction_state_tests {
                 stream,
                 policy: ConnectionPolicy::embedded_default(&db),
                 idle_guc_overridden: false,
+            tls_kx_group: None,
                 session_id: db
                     .create_wire_session("pg_wire_test")
                     .expect("wire session creation is infallible"),
@@ -5304,6 +5327,7 @@ mod show_branches_wire_tests {
                 stream,
                 policy: ConnectionPolicy::embedded_default(&db),
                 idle_guc_overridden: false,
+            tls_kx_group: None,
                 session_id: db
                     .create_wire_session("pg_wire_test")
                     .expect("wire session creation is infallible"),
@@ -5937,6 +5961,7 @@ mod md5_auth_wire_tests {
                 stream,
                 policy: ConnectionPolicy::embedded_default(&db),
                 idle_guc_overridden: false,
+            tls_kx_group: None,
                 session_id: db
                     .create_wire_session("pg_wire_test")
                     .expect("wire session creation is infallible"),

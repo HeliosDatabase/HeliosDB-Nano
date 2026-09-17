@@ -519,4 +519,188 @@ mod pq_hybrid {
         );
         Ok(())
     }
+
+    // ------------------------------------------------------------------
+    // Item 1: `SHOW ssl_key_exchange` must agree with what the client
+    // actually negotiated.
+    // ------------------------------------------------------------------
+
+    /// Build a minimal PostgreSQL `StartupMessage` (protocol 3.0, `user`
+    /// param only — trust auth expects nothing further. With no explicit
+    /// `database` param the engine defaults it to the `user` name and
+    /// validates THAT against the catalog (`docs/guides/authentication.md`),
+    /// so `user` must be an existing database — `"postgres"` always is.
+    fn build_startup_message(user: &str) -> Vec<u8> {
+        let mut params = Vec::new();
+        params.extend_from_slice(b"user\0");
+        params.extend_from_slice(user.as_bytes());
+        params.push(0);
+        params.push(0); // terminator
+
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&(196_608i32).to_be_bytes()); // protocol 3.0
+        msg.extend_from_slice(&params);
+
+        let mut framed = Vec::with_capacity(4 + msg.len());
+        framed.extend_from_slice(&((msg.len() + 4) as i32).to_be_bytes());
+        framed.extend_from_slice(&msg);
+        framed
+    }
+
+    /// Read one tagged backend message: `(tag, payload)`.
+    async fn read_message<S: tokio::io::AsyncRead + Unpin>(stream: &mut S) -> Result<(u8, Vec<u8>)> {
+        use tokio::io::AsyncReadExt as _;
+        let mut tag = [0u8; 1];
+        stream
+            .read_exact(&mut tag)
+            .await
+            .map_err(|e| heliosdb_nano::Error::network(format!("tag read failed: {}", e)))?;
+        let mut len_buf = [0u8; 4];
+        stream
+            .read_exact(&mut len_buf)
+            .await
+            .map_err(|e| heliosdb_nano::Error::network(format!("length read failed: {}", e)))?;
+        let len = i32::from_be_bytes(len_buf) as usize;
+        let mut payload = vec![0u8; len - 4];
+        stream
+            .read_exact(&mut payload)
+            .await
+            .map_err(|e| heliosdb_nano::Error::network(format!("payload read failed: {}", e)))?;
+        Ok((tag[0], payload))
+    }
+
+    /// Complete a PQ (or classical) TLS handshake, run a trust-auth startup,
+    /// issue `SHOW ssl_key_exchange`, and return `(negotiated group, SQL
+    /// value)`.
+    async fn handshake_and_query_kx_group(
+        server_post_quantum: bool,
+        client_cfg: StdArc<ClientConfig>,
+    ) -> Result<(rustls::NamedGroup, String)> {
+        let _ = tracing_subscriber::fmt().with_env_filter("debug").try_init();
+        let temp_dir =
+            tempfile::TempDir::new().map_err(|e| heliosdb_nano::Error::io(format!("temp dir: {}", e)))?;
+        let cert_path = temp_dir.path().join("server.crt");
+        let key_path = temp_dir.path().join("server.key");
+        CertificateManager::generate_self_signed(&cert_path, &key_path, "localhost")?;
+
+        let db = Arc::new(EmbeddedDatabase::new_in_memory()?);
+        let ssl_config =
+            SslConfig::new(SslMode::Require, &cert_path, &key_path).with_post_quantum(server_post_quantum);
+        let addr: SocketAddr = format!("127.0.0.1:{}", free_loopback_port())
+            .parse()
+            .map_err(|e| heliosdb_nano::Error::config(format!("Invalid address: {}", e)))?;
+        let server = PgServerBuilder::new()
+            .address(addr)
+            .auth_method(AuthMethod::Trust)
+            .ssl_config(ssl_config)
+            .build(db)?;
+        let server_addr = server.config().address;
+        tokio::spawn(async move {
+            let _ = server.serve().await;
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        tokio::time::timeout(Duration::from_secs(10), async move {
+            let mut stream = TcpStream::connect(server_addr)
+                .await
+                .map_err(|e| heliosdb_nano::Error::network(format!("Connection failed: {}", e)))?;
+            let ssl_accepted = send_ssl_request(&mut stream).await?;
+            assert!(ssl_accepted, "server must accept the SSLRequest");
+
+            let connector = TlsConnector::from(client_cfg);
+            let server_name = ServerName::try_from("localhost")
+                .map_err(|e| heliosdb_nano::Error::network(format!("Invalid server name: {}", e)))?
+                .to_owned();
+            let mut tls_stream = connector
+                .connect(server_name, stream)
+                .await
+                .map_err(|e| heliosdb_nano::Error::network(format!("TLS handshake failed: {}", e)))?;
+
+            let group = tls_stream
+                .get_ref()
+                .1
+                .negotiated_key_exchange_group()
+                .ok_or_else(|| heliosdb_nano::Error::network("no key-exchange group negotiated".to_string()))?
+                .name();
+
+            // StartupMessage -> trust auth -> ReadyForQuery.
+            tls_stream
+                .write_all(&build_startup_message("postgres"))
+                .await
+                .map_err(|e| heliosdb_nano::Error::network(format!("startup write failed: {}", e)))?;
+            tls_stream
+                .flush()
+                .await
+                .map_err(|e| heliosdb_nano::Error::network(format!("startup flush failed: {}", e)))?;
+            loop {
+                let (tag, _payload) = read_message(&mut tls_stream).await?;
+                if tag == b'Z' {
+                    break; // ReadyForQuery
+                }
+            }
+
+            // Simple Query: SHOW ssl_key_exchange.
+            let sql = "SHOW ssl_key_exchange";
+            let mut q = Vec::new();
+            q.push(b'Q');
+            let body_len = sql.len() + 1 + 4;
+            q.extend_from_slice(&(body_len as i32).to_be_bytes());
+            q.extend_from_slice(sql.as_bytes());
+            q.push(0);
+            tls_stream
+                .write_all(&q)
+                .await
+                .map_err(|e| heliosdb_nano::Error::network(format!("query write failed: {}", e)))?;
+            tls_stream
+                .flush()
+                .await
+                .map_err(|e| heliosdb_nano::Error::network(format!("query flush failed: {}", e)))?;
+
+            let mut value = String::new();
+            loop {
+                let (tag, payload) = read_message(&mut tls_stream).await?;
+                match tag {
+                    b'D' => {
+                        // DataRow: int16 field count, then per field int32
+                        // length + bytes. One column, non-NULL.
+                        let field_len = i32::from_be_bytes([payload[2], payload[3], payload[4], payload[5]]);
+                        if field_len >= 0 {
+                            let start = 6;
+                            let end = start + field_len as usize;
+                            value = String::from_utf8_lossy(&payload[start..end]).into_owned();
+                        }
+                    }
+                    b'Z' => break, // ReadyForQuery: query round-trip done
+                    _ => {}
+                }
+            }
+
+            Ok((group, value))
+        })
+        .await
+        .expect("TLS handshake + query timed out after 10s")
+    }
+
+    #[tokio::test]
+    async fn pq_client_ssl_key_exchange_matches_negotiated_group() -> Result<()> {
+        let (group, reported) = handshake_and_query_kx_group(true, client_config(true)).await?;
+        assert_eq!(group, rustls::NamedGroup::X25519MLKEM768);
+        assert_eq!(
+            reported, "X25519MLKEM768",
+            "SHOW ssl_key_exchange must report the group the client actually negotiated"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn classical_client_ssl_key_exchange_matches_negotiated_group() -> Result<()> {
+        let (group, reported) = handshake_and_query_kx_group(true, client_config(false)).await?;
+        assert_ne!(group, rustls::NamedGroup::X25519MLKEM768);
+        assert_eq!(
+            reported,
+            format!("{:?}", group),
+            "SHOW ssl_key_exchange must report the group the client actually negotiated"
+        );
+        Ok(())
+    }
 }

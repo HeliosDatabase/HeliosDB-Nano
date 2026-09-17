@@ -1016,6 +1016,12 @@ pub struct MySqlHandler<S: AsyncRead + AsyncWrite + Unpin + Send> {
     /// MySQL's own `have_ssl`, which reflects server capability, not the
     /// current session).
     tls_enabled: bool,
+    /// Negotiated TLS key-exchange group for THIS connection (e.g.
+    /// `"X25519MLKEM768"` for the PQ hybrid group, `"X25519"` for classical),
+    /// captured once at TLS accept time by
+    /// [`super::server::MysqlServer::negotiate`]. `None` on a plaintext
+    /// connection. Exposed as `Ssl_kx_group` / `@@ssl_kx_group`.
+    tls_kx_group: Option<String>,
 }
 
 /// GH#28: MySQL's own wording (ER_CLIENT_INTERACTION_TIMEOUT, 4031) for a
@@ -1055,6 +1061,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
         status_flags: StatusFlags,
         auth_plugin: String,
         tls_enabled: bool,
+        tls_kx_group: Option<String>,
     ) -> Self {
         let session_id = database
             .create_wire_session("mysql_wire")
@@ -1079,6 +1086,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
             session_id,
             timeouts: ConnectionTimeouts::disabled(),
             tls_enabled,
+            tls_kx_group,
         }
     }
 
@@ -1098,6 +1106,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
             StatusFlags::default_flags(),
             "mysql_native_password".into(),
             false,
+            None,
         )
     }
 
@@ -1123,6 +1132,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
         status_flags: StatusFlags,
         auth_plugin: String,
         tls_enabled: bool,
+        tls_kx_group: Option<String>,
     ) -> Self {
         Self::new_inner(
             database,
@@ -1135,6 +1145,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
             status_flags,
             auth_plugin,
             tls_enabled,
+            tls_kx_group,
         )
     }
 
@@ -1168,6 +1179,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
         } else {
             "NO"
         }
+    }
+
+    /// `Ssl_kx_group` / `@@ssl_kx_group` value: the TLS key-exchange group
+    /// actually negotiated by THIS connection (empty string on a plaintext
+    /// connection — matches MySQL's own convention for unset `Ssl_*` status
+    /// variables).
+    fn ssl_kx_group_value(&self) -> String {
+        self.tls_kx_group.clone().unwrap_or_default()
     }
 
     // ------------------------------------------------------------------
@@ -2554,7 +2573,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
         };
 
         let cols = vec!["Variable_name".to_string(), "Value".to_string()];
-        let rows: Vec<Tuple> = vars
+        let mut rows: Vec<Tuple> = vars
             .iter()
             .filter(|(name, _)| {
                 if let Some(ref pat) = filter {
@@ -2570,6 +2589,24 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
                 ])
             })
             .collect();
+
+        // Dynamic, per-connection SSL status variables (not `'static str`,
+        // so kept out of the `vars` table above): `have_ssl` mirrors the
+        // `@@have_ssl` answer, and `ssl_kx_group` reports the negotiated
+        // key-exchange group (PQ hybrid vs classical) for THIS connection.
+        let dynamic_vars: [(&str, String); 2] = [
+            ("have_ssl", self.have_ssl_value().to_string()),
+            ("ssl_kx_group", self.ssl_kx_group_value()),
+        ];
+        for (name, val) in dynamic_vars {
+            let matches_filter = match &filter {
+                Some(pat) => name.to_lowercase().contains(pat.as_str()),
+                None => true,
+            };
+            if matches_filter {
+                rows.push(Tuple::new(vec![Value::String(name.to_string()), Value::String(val)]));
+            }
+        }
 
         self.send_result_set(&cols, &rows).await
     }
@@ -2766,6 +2803,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
                 "tx_isolation" | "transaction_isolation" => Value::String("REPEATABLE-READ".to_string()),
                 "autocommit" => Value::Int8(1),
                 "have_ssl" | "have_openssl" => Value::String(self.have_ssl_value().to_string()),
+                "ssl_kx_group" => Value::String(self.ssl_kx_group_value()),
                 "lower_case_table_names" => Value::Int8(0),
                 "sql_auto_is_null" => Value::Int8(0),
                 "last_insert_id" => Value::Int8(self.last_insert_id as i64),
@@ -3860,8 +3898,10 @@ mod tests {
             StatusFlags::default_flags(),
             "mysql_native_password".to_string(),
             true,
+            Some("X25519MLKEM768".to_string()),
         );
         assert_eq!(handler_tls.have_ssl_value(), "YES");
+        assert_eq!(handler_tls.ssl_kx_group_value(), "X25519MLKEM768");
     }
 
     #[test]

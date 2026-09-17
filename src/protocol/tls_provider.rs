@@ -115,6 +115,24 @@ pub fn load_cert_and_key(
     Ok((certs, private_key))
 }
 
+/// Load a PEM file of one or more CA certificates, for building a
+/// [`rustls::RootCertStore`] used by a mutual-TLS client-certificate
+/// verifier. Shared by any listener that wants to verify client certs.
+pub fn load_ca_certs(ca_path: &Path, label: &str) -> Result<Vec<CertificateDer<'static>>> {
+    let ca_file = File::open(ca_path)
+        .map_err(|e| Error::io(format!("Failed to open {} CA certificate {}: {}", label, ca_path.display(), e)))?;
+    let mut ca_reader = BufReader::new(ca_file);
+    let ca_certs: Vec<CertificateDer<'static>> = certs(&mut ca_reader)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| Error::io(format!("Failed to parse {} CA certificate: {}", label, e)))?;
+
+    if ca_certs.is_empty() {
+        return Err(Error::io(format!("No certificates found in {} CA certificate file", label)));
+    }
+
+    Ok(ca_certs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

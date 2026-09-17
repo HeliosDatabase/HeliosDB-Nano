@@ -289,19 +289,35 @@ impl MysqlServer {
                 & CapabilityFlags::CLIENT_SSL)
                 != 0;
 
-        let (secure_stream, final_seq, hs_payload) = if client_wants_ssl {
+        let (secure_stream, final_seq, hs_payload, kx_group) = if client_wants_ssl {
             match ssl_negotiator.as_ref() {
                 Some(negotiator) => {
                     tracing::debug!("MySQL connection {}: upgrading to TLS", connection_id);
                     let tls_stream = negotiator.acceptor().accept(stream).await.map_err(|e| {
                         super::handler::MySqlError::Protocol(format!("TLS handshake failed: {}", e))
                     })?;
+                    // Capture the negotiated key-exchange group (PQ hybrid
+                    // `X25519MLKEM768` vs classical `X25519`/etc.) before the
+                    // stream is wrapped — `.get_ref().1` is the
+                    // `&ServerConnection`, which derefs to `CommonState`.
+                    let kx_group = tls_stream
+                        .get_ref()
+                        .1
+                        .negotiated_key_exchange_group()
+                        .map(|g| format!("{:?}", g.name()));
+                    if let Some(group) = &kx_group {
+                        tracing::debug!(
+                            "MySQL connection {}: TLS negotiated key-exchange group: {}",
+                            connection_id,
+                            group
+                        );
+                    }
                     let mut secure = SecureConnection::Tls(tls_stream);
                     // The truncated SSLRequest carried no username/auth —
                     // the REAL HandshakeResponse41 arrives now, over the
                     // encrypted stream.
                     let (seq2, payload2) = read_packet(&mut secure).await?;
-                    (secure, seq2, payload2)
+                    (secure, seq2, payload2, kx_group)
                 }
                 None => {
                     // Client asked for SSL but the server didn't advertise
@@ -332,7 +348,7 @@ impl MysqlServer {
                     "rejected plaintext connection: TLS is required (require_tls)".into(),
                 ));
             }
-            (SecureConnection::Plain(stream), first_seq, first_payload)
+            (SecureConnection::Plain(stream), first_seq, first_payload, None)
         };
 
         let hs = HandshakeResponse::decode(hs_payload, &capabilities)?;
@@ -348,6 +364,7 @@ impl MysqlServer {
             status_flags,
             auth_plugin,
             has_tls,
+            kx_group,
         );
         handler.finish_handshake(hs).await?;
         Ok(handler)

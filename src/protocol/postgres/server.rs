@@ -346,6 +346,20 @@ impl PgServer {
                             .await
                             .map_err(|e| Error::network(format!("TLS handshake failed: {}", e)))?;
 
+                        // Capture the negotiated key-exchange group (PQ
+                        // hybrid `X25519MLKEM768` vs classical `X25519`/etc.)
+                        // before the stream is wrapped — `.get_ref().1` is
+                        // the `&ServerConnection`, which derefs to
+                        // `CommonState`.
+                        let kx_group = tls_stream
+                            .get_ref()
+                            .1
+                            .negotiated_key_exchange_group()
+                            .map(|g| format!("{:?}", g.name()));
+                        if let Some(group) = &kx_group {
+                            tracing::debug!("PostgreSQL TLS connection negotiated key-exchange group: {}", group);
+                        }
+
                         let secure_conn = SecureConnection::Tls(tls_stream);
                         let handler = PgConnectionHandler::new_with_stream(
                             secure_conn,
@@ -353,7 +367,7 @@ impl PgServer {
                             auth_manager,
                             None, // TLS stream starts fresh
                         );
-                        return Ok(handler.with_connection_policy(policy));
+                        return Ok(handler.with_connection_policy(policy).with_tls_kx_group(kx_group));
                     }
                 } else if negotiator.is_required() {
                     return Err(Error::network("SSL is required but was rejected"));
