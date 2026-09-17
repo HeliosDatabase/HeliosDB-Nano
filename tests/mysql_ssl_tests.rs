@@ -517,7 +517,16 @@ fn generate_ca_and_signed_cert(
         &format!("/CN={leaf_cn}"),
     ])?;
 
-    // Sign the leaf with the CA.
+    // Sign the leaf with the CA. `openssl x509 -req` without `-extfile` emits
+    // an X.509v1 certificate on some OpenSSL builds (no extensions block) —
+    // rustls's webpki verifier rejects v1 certs with `UnsupportedCertVersion`.
+    // Force v3 explicitly so this is stable across OpenSSL versions/distros.
+    let extfile = dir.join(format!("{leaf_cn}.ext"));
+    std::fs::write(
+        &extfile,
+        "basicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=clientAuth\n",
+    )
+    .map_err(|e| heliosdb_nano::Error::io(format!("failed to write {extfile:?}: {e}")))?;
     run(&[
         "x509",
         "-req",
@@ -532,6 +541,8 @@ fn generate_ca_and_signed_cert(
         leaf_cert.to_str().expect("path"),
         "-days",
         "365",
+        "-extfile",
+        extfile.to_str().expect("path"),
     ])?;
 
     Ok((ca_cert, ca_key, leaf_cert, leaf_key))
