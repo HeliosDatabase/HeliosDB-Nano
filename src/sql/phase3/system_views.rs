@@ -644,8 +644,8 @@ impl SystemViewRegistry {
         // `typlen` as an int2, or JOINs `typelem`/`typarray` sees the layout it
         // expects. Rows come from `BUILTIN_TYPES` (see its rustdoc) — real
         // PostgreSQL OIDs, one `_<name>` array row per element type, plus
-        // Nano's own `vector` (3614). Keep this list in lockstep with the value
-        // order in `execute_pg_type`.
+        // Nano's own `vector` (16385, HDB-002). Keep this list in lockstep with
+        // the value order in `execute_pg_type`.
         self.register_view(SystemViewSchema {
             name: "pg_type".to_string(),
             schema: Schema {
@@ -2761,6 +2761,8 @@ fn format_pg_type_name(dt: &DataType) -> String {
         DataType::Jsonb => "jsonb".into(),
         DataType::Array(inner) => format!("_{}", format_pg_type_name(inner)),
         DataType::Vector(_) => "vector".into(),
+        DataType::TsVector => "tsvector".into(),
+        DataType::TsQuery => "tsquery".into(),
     }
 }
 
@@ -2805,7 +2807,9 @@ struct BuiltinType {
 /// with a non-zero `array_oid` additionally emits its array type `_<name>`:
 /// the array row carries `typelem` = the element type's OID and `typarray` = 0,
 /// so `typarray`/`typelem` round-trip in both directions. Nano's own `vector`
-/// type (OID 3614) is listed as an ordinary base row.
+/// type is listed as an ordinary base row — on a PRIVATE user-band OID
+/// (16385), since PostgreSQL has no `vector` and the OID it used to take
+/// (3614) is PostgreSQL's `tsvector` (HDB-002).
 ///
 /// User-defined types are NOT represented: enum labels are stored under a
 /// per-name catalog key with no list accessor, and `CREATE DOMAIN` is a
@@ -3242,10 +3246,22 @@ const BUILTIN_TYPES: &[BuiltinType] = &[
         preferred: false,
         delim: ",",
     },
+    // HDB-002: PostgreSQL's real FTS types. Nano stores both as a JSON token
+    // array, but they are declared, advertised and printed as themselves.
     BuiltinType {
-        name: "vector",
+        name: "tsvector",
         oid: 3614,
-        array_oid: 0,
+        array_oid: 3643,
+        len: -1,
+        byval: false,
+        category: "U",
+        preferred: false,
+        delim: ",",
+    },
+    BuiltinType {
+        name: "tsquery",
+        oid: 3615,
+        array_oid: 3645,
         len: -1,
         byval: false,
         category: "U",
@@ -3342,6 +3358,27 @@ const BUILTIN_TYPES: &[BuiltinType] = &[
         preferred: false,
         delim: ",",
     },
+    // HDB-002: Nano's own `vector`. Every row above carries PostgreSQL's real
+    // OID; this one cannot, because PostgreSQL has no `vector` type — it is an
+    // extension type, and an extension type takes an OID from the first user
+    // band (16384+) at install time, which is where pgvector itself typically
+    // lands. It used to squat on 3614 here (PostgreSQL's `tsvector`) while the
+    // wire advertised 1000 (PostgreSQL's `_bool`!) and pg_attribute reported
+    // 25; `pg_type`, `get_type_oid` and `pg_attribute` now agree on 16385, while
+    // the PG wire deliberately advertises `text` (25) — see
+    // `handler::datatype_to_oid` for why. `typnamespace` is `public`
+    // (2200) rather than `pg_catalog`, because that is where a CREATE
+    // EXTENSION type lives — see `builtin_type_namespace`.
+    BuiltinType {
+        name: "vector",
+        oid: 16385,
+        array_oid: 16386,
+        len: -1,
+        byval: false,
+        category: "U",
+        preferred: false,
+        delim: ",",
+    },
 ];
 
 /// `typinput` / `typoutput` for a built-in type, spelled the way PostgreSQL
@@ -3405,6 +3442,8 @@ fn builtin_type_io(name: &str) -> (&'static str, &'static str) {
         "uuid" => ("uuid_in", "uuid_out"),
         "jsonb" => ("jsonb_in", "jsonb_out"),
         "jsonpath" => ("jsonpath_in", "jsonpath_out"),
+        "tsvector" => ("tsvectorin", "tsvectorout"),
+        "tsquery" => ("tsqueryin", "tsqueryout"),
         "vector" => ("vector_in", "vector_out"),
         "int4range" | "numrange" | "tsrange" | "tstzrange" | "daterange" | "int8range" => ("range_in", "range_out"),
         _ => ("unknownin", "unknownout"),
@@ -3454,6 +3493,20 @@ fn builtin_type_collation(name: &str) -> i32 {
         "name" => 950,
         "text" | "varchar" | "bpchar" | "char" => 100,
         _ => 0,
+    }
+}
+
+/// `typnamespace` for a built-in type (HDB-002).
+///
+/// Every PostgreSQL built-in lives in `pg_catalog` (OID 11). Nano's `vector`
+/// does not: it is the shape of a `CREATE EXTENSION` type, and pgvector
+/// installs `vector` into `public` (OID 2200). A client that resolves the
+/// type by `(nspname, typname)` — which is how extension types are looked up,
+/// precisely because their OIDs are not fixed — must find it there.
+fn builtin_type_namespace(name: &str) -> i32 {
+    match name {
+        "vector" | "_vector" => 2200,
+        _ => 11,
     }
 }
 
@@ -4240,10 +4293,11 @@ impl SystemViewRegistry {
         for t in BUILTIN_TYPES {
             let (typinput, typoutput) = builtin_type_io(t.name);
             let collation = builtin_type_collation(t.name);
+            let namespace = builtin_type_namespace(t.name);
             results.push(Tuple::new(vec![
                 Value::Int4(t.oid),                                          // oid
                 Value::String(t.name.to_string()),                           // typname
-                Value::Int4(11),                                             // typnamespace = pg_catalog
+                Value::Int4(namespace),                                      // typnamespace (11 = pg_catalog)
                 Value::Int4(10),                                             // typowner = postgres
                 Value::Int2(t.len),                                          // typlen
                 Value::Boolean(t.byval),                                     // typbyval
@@ -4268,7 +4322,7 @@ impl SystemViewRegistry {
                 results.push(Tuple::new(vec![
                     Value::Int4(t.array_oid),               // oid
                     Value::String(format!("_{}", t.name)),  // typname
-                    Value::Int4(11),                        // typnamespace
+                    Value::Int4(namespace),                 // typnamespace (inherited)
                     Value::Int4(10),                        // typowner
                     Value::Int2(-1),                        // typlen (varlena)
                     Value::Boolean(false),                  // typbyval
@@ -5294,7 +5348,14 @@ impl SystemViewRegistry {
             DataType::Json => 114,
             DataType::Jsonb => 3802,
             DataType::Array(_) => 2277,
-            DataType::Vector(_) => 3614,
+            // HDB-002: `vector` moved off 3614 (PostgreSQL's `tsvector` OID,
+            // which it was squatting on) to its own private user-band OID, in
+            // lockstep with the pg_attribute map and `BUILTIN_TYPES`. The PG
+            // wire RowDescription deliberately advertises `text` (25) for
+            // vector columns instead — see `handler::datatype_to_oid`.
+            DataType::Vector(_) => 16385,
+            DataType::TsVector => 3614,
+            DataType::TsQuery => 3615,
         }
     }
 
@@ -6204,7 +6265,12 @@ mod tests {
             ("timestamp", 1114),
             ("numeric", 1700),
             ("uuid", 2950),
-            ("vector", 3614),
+            // HDB-002: 3614/3615 are PostgreSQL's FTS OIDs, and `vector` has
+            // its own private one instead of squatting on `tsvector`'s.
+            ("tsvector", 3614),
+            ("tsquery", 3615),
+            ("vector", 16385),
+            ("_vector", 16386),
             ("jsonb", 3802),
             ("_int4", 1007),
         ] {

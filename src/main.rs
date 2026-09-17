@@ -446,6 +446,15 @@ enum Commands {
         #[arg(long)]
         verify: bool,
 
+        /// Restore even when the dump's rows violate the constraints it
+        /// carries, reporting each violation as a warning instead of failing.
+        /// Needed for a backup of a database that legitimately holds such rows
+        /// (a NOT ENFORCED / LOCK-FREE constraint, or helios.fk_validation =
+        /// 'audit'), since those are session settings that cannot be applied to
+        /// the target this command opens.
+        #[arg(long = "no-validate")]
+        no_validate: bool,
+
         /// Connection string (for server mode)
         #[arg(long)]
         connection: Option<String>,
@@ -683,6 +692,7 @@ async fn main() -> Result<()> {
             input,
             target,
             verify,
+            no_validate,
             connection,
             verbose,
         } => {
@@ -693,6 +703,7 @@ async fn main() -> Result<()> {
                 verify,
                 connection,
                 verbose,
+                no_validate,
             };
             cmd.execute()
         }

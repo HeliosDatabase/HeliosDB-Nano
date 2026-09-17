@@ -174,6 +174,19 @@ impl TypeInference for LogicalExpr {
                     "jsonb_typeof" => Ok(DataType::Text),
                     "jsonb_path_query" => Ok(DataType::Jsonb),
 
+                    // HDB-002: the FTS constructors have their own declared
+                    // types now. They used to fall into the conservative
+                    // `Text` default below, so `SELECT to_tsvector(body)` was
+                    // advertised on the wire as OID 25 even though the value
+                    // is a token array. `@@` still infers Boolean (see
+                    // `BinaryOperator::TsMatch`).
+                    "to_tsvector" | "pg_catalog.to_tsvector" => Ok(DataType::TsVector),
+                    "to_tsquery"
+                    | "plainto_tsquery"
+                    | "phraseto_tsquery"
+                    | "pg_catalog.to_tsquery"
+                    | "pg_catalog.plainto_tsquery" => Ok(DataType::TsQuery),
+
                     _ => Ok(DataType::Text), // Conservative fallback
                 }
             }

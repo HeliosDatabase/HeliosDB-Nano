@@ -410,6 +410,47 @@ pub fn json_to_value(json: &serde_json::Value, target_type: &crate::DataType) ->
 
             Ok(Value::Vector(values))
         }
+        // HDB-002: the FTS types over REST. `json_to_value` is the coercion
+        // for `POST`/`PATCH /v1/branches/:branch/tables/:table/data`, and it
+        // is the one write path that does NOT run through
+        // `Evaluator::cast_value` — so the moment `tsvector` stopped being
+        // declared `Json`, the catch-all below made a tsvector column
+        // unwritable over REST, the one surface on which it had always been
+        // writable. The accepted shapes are the SQL path's input rule, spelled
+        // in JSON:
+        //   • a string — plain text (tokenised) or PostgreSQL's quoted-lexeme
+        //     form (`"'Hello' 'World'"`, taken verbatim);
+        //   • an array of strings — the lexemes themselves, verbatim;
+        //   • `null` — accepted by the `(Null, _)` arm at the top of this
+        //     match, before any type dispatch.
+        // Anything else (a number, an object, an array with a non-string
+        // element) is refused rather than silently coerced.
+        (serde_json::Value::String(s), crate::DataType::TsVector | crate::DataType::TsQuery) => {
+            crate::sql::evaluator::Evaluator::fts_tokens_to_value(&crate::sql::evaluator::fts_input_tokens(s))
+                .map_err(|e| format!("Invalid {:?} value: {}", target_type, e))
+        }
+        (serde_json::Value::Array(arr), crate::DataType::TsVector | crate::DataType::TsQuery) => {
+            let mut tokens: Vec<String> = Vec::with_capacity(arr.len());
+            for item in arr {
+                match item {
+                    serde_json::Value::String(s) if s.is_empty() => {
+                        return Err(format!(
+                            "Cannot convert {:?} to {:?}: an empty lexeme is not allowed",
+                            json, target_type
+                        ))
+                    }
+                    serde_json::Value::String(s) => tokens.push(s.clone()),
+                    other => {
+                        return Err(format!(
+                            "Cannot convert {:?} to {:?}: lexeme {} is not a string",
+                            json, target_type, other
+                        ))
+                    }
+                }
+            }
+            crate::sql::evaluator::Evaluator::fts_tokens_to_value(&tokens)
+                .map_err(|e| format!("Invalid {:?} value: {}", target_type, e))
+        }
         _ => Err(format!("Cannot convert {:?} to {:?}", json, target_type)),
     }
 }
@@ -442,6 +483,56 @@ mod tests {
         let result = json_to_value(&json, &DataType::Text);
         assert!(result.is_ok());
         assert!(matches!(result.unwrap(), Value::String(s) if s == "test"));
+    }
+
+    /// HDB-002: the REST write path accepts the same three shapes for a
+    /// `tsvector` / `tsquery` column that the SQL path accepts, and refuses
+    /// anything else. Before the FTS types existed the column was declared
+    /// `Json`, so a string landed in the `(String, Json | Jsonb)` arm; the
+    /// new declared type has to carry its own arms or REST stops writing.
+    #[test]
+    fn test_json_to_value_tsvector_shapes() {
+        // The canonical encoding is `Value::Json(serde_json::to_string(tokens))`
+        // — compact, no spaces — so the expected values are written out in full
+        // rather than re-decoded, which would hide an encoding change.
+
+        // 1. plain text — tokenised, exactly as `'hello world'::tsvector` is.
+        let json = serde_json::Value::String("Hello World".to_string());
+        assert_eq!(
+            json_to_value(&json, &DataType::TsVector).expect("plain text is accepted"),
+            Value::Json(r#"["hello","world"]"#.to_string()),
+        );
+
+        // 2. PostgreSQL's quoted-lexeme form — verbatim, case preserved.
+        let json = serde_json::Value::String("'Hello' 'World'".to_string());
+        assert_eq!(
+            json_to_value(&json, &DataType::TsQuery).expect("the lexeme form is accepted"),
+            Value::Json(r#"["Hello","World"]"#.to_string()),
+        );
+
+        // 3. an array of lexemes — verbatim, spaces inside a lexeme included.
+        let json = serde_json::json!(["New York", "Hello"]);
+        assert_eq!(
+            json_to_value(&json, &DataType::TsVector).expect("a string array is accepted"),
+            Value::Json(r#"["New York","Hello"]"#.to_string()),
+        );
+
+        // ... and JSON null is still NULL (the arm at the top of the match).
+        assert!(matches!(
+            json_to_value(&serde_json::Value::Null, &DataType::TsVector),
+            Ok(Value::Null)
+        ));
+
+        // 4. REFUSED: a number, and an array holding a non-string element —
+        // neither is silently dropped or stored as an empty vector.
+        assert!(
+            json_to_value(&serde_json::json!(42), &DataType::TsVector).is_err(),
+            "a number is not a tsvector input"
+        );
+        assert!(
+            json_to_value(&serde_json::json!(["ok", 7]), &DataType::TsVector).is_err(),
+            "a non-string lexeme must be rejected, not skipped"
+        );
     }
 
     #[test]

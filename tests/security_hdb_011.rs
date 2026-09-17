@@ -19,8 +19,10 @@
 //! The fix retires the interception: `pg_type` is served by the planner-backed
 //! `SystemViewRegistry`, which filters, projects, joins, orders and aggregates
 //! with real SQL semantics — over a full PostgreSQL type inventory (real OIDs,
-//! array types linked through `typarray`/`typelem`, Nano's `vector` at 3614)
-//! instead of 12 hand-written rows.
+//! array types linked through `typarray`/`typelem`, Nano's `vector` at 16385)
+//! instead of 12 hand-written rows. (`vector` was registered at 3614 until
+//! HDB-002 moved it to its own user-band OID: 3614 is PostgreSQL's `tsvector`,
+//! which is now a real Nano type.)
 //!
 //! Each test runs the same SQL on all THREE surfaces: embedded
 //! (`EmbeddedDatabase::query`), the PostgreSQL simple-query protocol
@@ -440,6 +442,10 @@ async fn hdb011_array_types_are_linked() {
 /// `vector` — must still resolve to the SAME oid. Partly a regression before
 /// the fix: the names were there, but every one of these queries returned all
 /// 12 rows instead of one.
+///
+/// `vector` is the one exception to "the SAME oid": HDB-002 moved it off 3614,
+/// which is PostgreSQL's `tsvector` OID, onto its own private user-band OID.
+/// The other 12 are PostgreSQL's real OIDs and never move.
 #[tokio::test]
 async fn hdb011_legacy_inventory_is_a_subset() {
     const LEGACY: &[(&str, &str)] = &[
@@ -455,8 +461,10 @@ async fn hdb011_legacy_inventory_is_a_subset() {
         ("timestamp", "1114"),
         ("uuid", "2950"),
         ("jsonb", "3802"),
-        // Nano's own vector type, kept exactly as the registry had it.
-        ("vector", "3614"),
+        // Nano's own vector type. HDB-002: 16385, not the 3614 the registry
+        // used to give it — that OID belongs to PostgreSQL's `tsvector`, which
+        // Nano now declares for real.
+        ("vector", "16385"),
     ];
 
     let db = EmbeddedDatabase::new_in_memory().expect("db");

@@ -77,7 +77,7 @@ pub use catalog::Catalog;
 pub use dirty_tracker::{Change, ChangeType, DirtyTracker, DirtyTrackerError};
 pub use dump::{
     CompressionType as DumpCompressionType, DumpManager, DumpMetadata, DumpMode, DumpOptions, DumpOutputFormat,
-    DumpReport, DumpType, RestoreOptions, RestoreReport,
+    DumpReport, DumpType, RestoreOptions, RestoreReport, RestoreValidation,
 };
 pub(crate) use engine::{ColumnarAggregateOp, ColumnarAggregateSpec};
 pub use engine::{DirectBulkLoadResult, StorageEngine, StorageStats, SynchronousCommitOverrideGuard, TableKind};

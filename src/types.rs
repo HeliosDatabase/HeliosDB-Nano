@@ -149,6 +149,34 @@ pub enum DataType {
     Array(Box<DataType>),
     /// Fixed-dimension vector for ML embeddings
     Vector(usize),
+    // ---------------------------------------------------------------------
+    // HDB-002: APPEND-ONLY TAIL.
+    //
+    // `DataType` is persisted with bincode, which encodes an enum by its
+    // VARIANT INDEX. Inserting a variant anywhere above this line renumbers
+    // every variant after it and silently re-types every column in every
+    // existing database file. New variants go HERE, at the end, forever.
+    // ---------------------------------------------------------------------
+    /// PostgreSQL `tsvector`: a full-text document.
+    ///
+    /// Stored as `Value::Json` holding the canonical token array
+    /// (`["hello","world"]`) — the same representation `to_tsvector(...)`
+    /// produces, so `@@`, `ts_rank` and the BM25 engine are unchanged
+    /// (`Evaluator::fts_*`, `docs/compatibility/fts.md`). What the distinct
+    /// variant buys is the INPUT rule: plain text and PostgreSQL's
+    /// quoted-lexeme form (`'hello' 'world'`) are accepted and tokenised,
+    /// where `Json` would have rejected them as malformed JSON.
+    ///
+    /// Databases written before 4.35 declared their tsvector columns as
+    /// `Json`; they keep that declared type on reopen (recreate the column to
+    /// migrate). Advertised on the PG wire as OID 3614.
+    TsVector,
+    /// PostgreSQL `tsquery`: a full-text query.
+    ///
+    /// Same storage and the same input rule as [`DataType::TsVector`], with
+    /// `&`, `|`, `!`, `<->` and parentheses treated as term separators — what
+    /// `to_tsquery` already does. Advertised on the PG wire as OID 3615.
+    TsQuery,
 }
 
 impl fmt::Display for DataType {
@@ -176,6 +204,8 @@ impl fmt::Display for DataType {
             DataType::Jsonb => write!(f, "JSONB"),
             DataType::Array(inner) => write!(f, "{}[]", inner),
             DataType::Vector(dim) => write!(f, "VECTOR({})", dim),
+            DataType::TsVector => write!(f, "TSVECTOR"),
+            DataType::TsQuery => write!(f, "TSQUERY"),
         }
     }
 }

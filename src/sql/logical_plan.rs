@@ -1705,6 +1705,157 @@ impl LogicalExpr {
             other => format!("{other:?}"),
         }
     }
+
+    /// Render this expression as SQL a **dump** can re-import — the CHECK-body
+    /// and column-DEFAULT renderer behind `dump_sql` (HDB-005).
+    ///
+    /// Deliberately NOT [`LogicalExpr::to_default_sql`], and deliberately not a
+    /// reimplementation of it either — the two answer different questions:
+    ///
+    /// * `to_default_sql` is catalog READBACK (`information_schema`,
+    ///   `pg_get_expr`). It is best-effort, infallible, renders identifiers
+    ///   BARE, and falls back to a Rust `Debug` rendering for the variants it
+    ///   does not cover. That is tolerable for a human-read catalog column.
+    /// * `to_dump_sql` produces text that must PARSE AGAIN. Every identifier is
+    ///   double-quoted through `sql_text::quote_ident` (a CHECK on `"a b"` or
+    ///   on `"createdAt"` is unrestorable, or silently rebinds to a column that
+    ///   does not exist, when written bare), every literal goes through
+    ///   `sql_text::value_literal` (typed, one-line, `E'…'`-escaped), and every
+    ///   variant this renderer cannot spell is an `Err` — so the exporter fails
+    ///   loudly, naming the constraint, instead of writing a file that will not
+    ///   load.
+    ///
+    /// The operator spellings come from the same `binary_operator_sql` table
+    /// `to_default_sql` uses, so the two renderings cannot drift.
+    pub(crate) fn to_dump_sql(&self) -> crate::Result<String> {
+        use crate::storage::dump::sql_text::{quote_ident, value_literal};
+
+        let rendered = match self {
+            // A literal is typed against ITSELF: a CHECK body has no declared
+            // column type to borrow, and `Value::data_type()` is exactly the
+            // type the value re-parses back into.
+            LogicalExpr::Literal(v) => value_literal(v, &v.data_type())?,
+            LogicalExpr::Column { table: Some(t), name } => {
+                format!("{}.{}", quote_ident(t), quote_ident(name))
+            }
+            LogicalExpr::Column { table: None, name } => quote_ident(name),
+            LogicalExpr::ScalarFunction { fun, args } => {
+                let rendered: Vec<String> = args
+                    .iter()
+                    .map(|a| a.to_dump_sql())
+                    .collect::<crate::Result<Vec<_>>>()?;
+                format!("{}({})", fun, rendered.join(", "))
+            }
+            LogicalExpr::Cast { expr, data_type } => {
+                format!("{}::{}", expr.to_dump_sql()?, data_type)
+            }
+            LogicalExpr::UnaryExpr { op, expr } => {
+                let op_str = match op {
+                    UnaryOperator::Not => "NOT ",
+                    UnaryOperator::Minus => "-",
+                    UnaryOperator::Plus => "+",
+                };
+                format!("{}{}", op_str, expr.to_dump_sql()?)
+            }
+            LogicalExpr::BinaryExpr { left, op, right } => {
+                format!(
+                    "({} {} {})",
+                    left.to_dump_sql()?,
+                    binary_operator_sql(*op),
+                    right.to_dump_sql()?
+                )
+            }
+            LogicalExpr::IsNull { expr, is_null } => {
+                format!(
+                    "({} IS {}NULL)",
+                    expr.to_dump_sql()?,
+                    if *is_null { "" } else { "NOT " }
+                )
+            }
+            LogicalExpr::Between {
+                expr,
+                low,
+                high,
+                negated,
+            } => format!(
+                "({} {}BETWEEN {} AND {})",
+                expr.to_dump_sql()?,
+                if *negated { "NOT " } else { "" },
+                low.to_dump_sql()?,
+                high.to_dump_sql()?
+            ),
+            LogicalExpr::InList { expr, list, negated } => {
+                let rendered: Vec<String> = list
+                    .iter()
+                    .map(|item| item.to_dump_sql())
+                    .collect::<crate::Result<Vec<_>>>()?;
+                format!(
+                    "({} {}IN ({}))",
+                    expr.to_dump_sql()?,
+                    if *negated { "NOT " } else { "" },
+                    rendered.join(", ")
+                )
+            }
+            // Everything `to_default_sql` would have debug-printed. Listed by
+            // name rather than caught by a `_` arm so a new variant is a
+            // compile error here, not a `Case { operand: None, … }` in a dump
+            // file. `InSet` is the optimizer's rewrite of a long `IN (…)` and
+            // has no stable element order; `BoundColumn` is never persisted.
+            LogicalExpr::AggregateFunction { .. }
+            | LogicalExpr::Case { .. }
+            | LogicalExpr::InSet { .. }
+            | LogicalExpr::ScalarSubquery { .. }
+            | LogicalExpr::InSubquery { .. }
+            | LogicalExpr::Exists { .. }
+            | LogicalExpr::DefaultValue
+            | LogicalExpr::Wildcard
+            | LogicalExpr::Parameter { .. }
+            | LogicalExpr::NewRow { .. }
+            | LogicalExpr::OldRow { .. }
+            | LogicalExpr::ArraySubscript { .. }
+            | LogicalExpr::Tuple { .. }
+            | LogicalExpr::WindowFunction { .. }
+            | LogicalExpr::BoundColumn { .. } => {
+                return Err(crate::Error::storage(format!(
+                    "the SQL exporter has no spelling for a {} expression",
+                    self.dump_variant_name()
+                )))
+            }
+        };
+        Ok(rendered)
+    }
+
+    /// The variant name used in `to_dump_sql`'s error message. A plain word,
+    /// not a `Debug` dump of the whole subtree — the error is read by a person
+    /// deciding what to simplify.
+    fn dump_variant_name(&self) -> &'static str {
+        match self {
+            LogicalExpr::Column { .. } => "column",
+            LogicalExpr::Literal(_) => "literal",
+            LogicalExpr::BinaryExpr { .. } => "binary",
+            LogicalExpr::UnaryExpr { .. } => "unary",
+            LogicalExpr::AggregateFunction { .. } => "aggregate",
+            LogicalExpr::ScalarFunction { .. } => "function-call",
+            LogicalExpr::Case { .. } => "CASE",
+            LogicalExpr::Cast { .. } => "CAST",
+            LogicalExpr::IsNull { .. } => "IS NULL",
+            LogicalExpr::Between { .. } => "BETWEEN",
+            LogicalExpr::InList { .. } => "IN-list",
+            LogicalExpr::InSet { .. } => "IN-set",
+            LogicalExpr::ScalarSubquery { .. } => "scalar-subquery",
+            LogicalExpr::InSubquery { .. } => "IN-subquery",
+            LogicalExpr::Exists { .. } => "EXISTS",
+            LogicalExpr::DefaultValue => "DEFAULT",
+            LogicalExpr::Wildcard => "wildcard",
+            LogicalExpr::Parameter { .. } => "parameter",
+            LogicalExpr::NewRow { .. } => "NEW-row",
+            LogicalExpr::OldRow { .. } => "OLD-row",
+            LogicalExpr::ArraySubscript { .. } => "array-subscript",
+            LogicalExpr::Tuple { .. } => "tuple",
+            LogicalExpr::WindowFunction { .. } => "window-function",
+            LogicalExpr::BoundColumn { .. } => "bound-column",
+        }
+    }
 }
 
 /// PostgreSQL source text for a [`BinaryOperator`], for catalog readback

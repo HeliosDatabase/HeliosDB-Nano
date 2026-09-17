@@ -132,12 +132,21 @@ fn test_sql_dump_format() -> Result<()> {
     assert_eq!(report.table_count, 1);
     assert_eq!(report.total_rows, 2);
 
-    // Verify content
+    // Verify content. HDB-005: every identifier is double-quoted and the
+    // INSERT names its columns, so the file re-parses (the v1 spelling
+    // `CREATE TABLE IF NOT EXISTS users` was fine only because `users`
+    // happens to need no quoting — `my table` did not).
     let content = fs::read_to_string(&dump_path)?;
-    assert!(content.contains("CREATE TABLE IF NOT EXISTS users"));
-    assert!(content.contains("INSERT INTO users VALUES"));
-    assert!(content.contains("(1, 'Alice')"));
-    assert!(content.contains("(2, 'Bob')"));
+    assert!(
+        content.contains(r#"CREATE TABLE IF NOT EXISTS "users""#),
+        "unexpected dump:\n{content}"
+    );
+    assert!(
+        content.contains(r#"INSERT INTO "users" ("id", "name") VALUES"#),
+        "unexpected dump:\n{content}"
+    );
+    assert!(content.contains("(1, 'Alice')"), "unexpected dump:\n{content}");
+    assert!(content.contains("(2, 'Bob')"), "unexpected dump:\n{content}");
 
     Ok(())
 }
@@ -154,6 +163,25 @@ fn test_dump_version_compatibility() -> Result<()> {
     // Verify metadata is readable
     let metadata = db.read_dump_metadata(&dump_path)?;
     assert!(metadata.dump_id > 0);
+
+    // HDB-003: new dumps are format v2 (magic bytes 0..8, version 8..12 LE),
+    // which is the version that carries the per-table constraint blob.
+    let header = fs::read(&dump_path)?;
+    assert_eq!(&header[0..8], b"HELIODMP");
+    let version = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
+    assert_eq!(version, 2, "the writer must stamp format v2");
+
+    // ... and v1 files are still accepted: the real v1 fixture restores.
+    let v1 = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dump_v1_users.hdmp");
+    let v1_header = fs::read(&v1)?;
+    assert_eq!(
+        u32::from_le_bytes([v1_header[8], v1_header[9], v1_header[10], v1_header[11]]),
+        1,
+        "fixture is no longer a v1 dump"
+    );
+    let mut older = EmbeddedDatabase::new_in_memory()?;
+    older.restore_from_dump(&v1)?;
+    assert_eq!(older.query("SELECT id FROM users", &[])?.len(), 2);
 
     Ok(())
 }

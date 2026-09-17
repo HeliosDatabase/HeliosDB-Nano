@@ -262,6 +262,15 @@ heliosdb-nano start … --dump-schedule "0 */6 * * *"            # periodic dump
 Library: `db.dump_full(path)` / `db.restore_from_dump(path)` /
 `db.restore_tables(path, [t…])`.
 
+Binary dump format v2 (v4.35+) carries each table's FOREIGN KEY, CHECK and
+table-level UNIQUE constraints alongside its schema, indexes and rows. Restore
+creates and populates every table first, then registers the whole constraint
+graph (so a child that sorts before its parent, and FK cycles, both restore),
+then validates the restored rows against it — a dump whose data violates its
+own constraints FAILS the restore, naming the table, the constraint and the
+offending keys, rather than reporting a valid database. Version-1 dumps still
+restore, but carry no constraints: recreate those from your DDL.
+
 ## Skill catalogue (19 skills, .claude/skills/)
 
 Per-domain operating manuals for LLM agents (Claude Code picks them up

@@ -249,6 +249,8 @@ pub(crate) fn coerce_literal_to_column_type(v: crate::Value, col_type: &crate::D
         DataType::Interval => matches!(v, Value::Interval(_)).then_some(v),
         DataType::Json | DataType::Jsonb => matches!(v, Value::Json(_)).then_some(v),
         DataType::Vector(_) => matches!(v, Value::Vector(_)).then_some(v),
+        // HDB-002: stored as the JSON token array, same as json/jsonb above.
+        DataType::TsVector | DataType::TsQuery => matches!(v, Value::Json(_)).then_some(v),
         DataType::Array(_) => matches!(v, Value::Array(_)).then_some(v),
     }
 }

@@ -368,6 +368,16 @@ fn decode_text_parameter(data: &[u8], type_oid: i32) -> Result<Value> {
             // Value::Json stores the JSON as a String for bincode compatibility
             Ok(Value::Json(text.to_string()))
         }
+        3614 | 3615 => {
+            // HDB-002: tsvector / tsquery. The text spelling — plain text or
+            // PostgreSQL's quoted-lexeme form — is carried through as a
+            // `Value::String`; `Evaluator::cast_value` is what turns it into
+            // the canonical token array, because it is the only place that
+            // knows the target column's declared type. (The `_` default below
+            // would do the same thing; the arm is explicit so the binary
+            // sibling in `decode_binary_parameter` has an obvious counterpart.)
+            Ok(Value::String(text.to_string()))
+        }
         17 => {
             // Bytea. PostgreSQL's text format is hex (`\x..`) or the legacy
             // escape form. A text-format bytea Bind param must be decoded to raw
@@ -481,6 +491,26 @@ fn decode_binary_parameter(data: &[u8], type_oid: i32) -> Result<Value> {
             // Text, Varchar (variable length, UTF-8)
             let text = std::str::from_utf8(data)
                 .map_err(|e| Error::protocol(format!("Invalid UTF-8 in text parameter: {}", e)))?;
+            Ok(Value::String(text.to_string()))
+        }
+        3614 | 3615 => {
+            // HDB-002: tsvector / tsquery in BINARY format.
+            //
+            // PostgreSQL's binary `tsvector` layout (an int32 lexeme count
+            // followed by NUL-terminated lexemes with position arrays) is NOT
+            // implemented here — Nano stores a token array and carries no
+            // positions, so there is nothing to decode it into that the text
+            // form does not already give. The payload is read as UTF-8 and
+            // handed on as a `Value::String`, exactly like the text arm, so
+            // `Evaluator::cast_value` applies the one input rule.
+            //
+            // Without this arm the `_` default below produced `Value::Bytes`,
+            // and the coercion then answered `Cannot cast Bytes([..]) to
+            // TSVECTOR` — reachable from any client that binds by type
+            // (`prepare_typed(sql, &[Type::TS_VECTOR])`; tokio-postgres binds
+            // binary by default).
+            let text = std::str::from_utf8(data)
+                .map_err(|e| Error::protocol(format!("Invalid UTF-8 in tsvector parameter: {}", e)))?;
             Ok(Value::String(text.to_string()))
         }
         _ => {

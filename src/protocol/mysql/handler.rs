@@ -3545,6 +3545,11 @@ fn datatype_to_mysql(dt: &crate::DataType) -> String {
         crate::DataType::Uuid => "char(36)".to_string(),
         crate::DataType::Json | crate::DataType::Jsonb => "json".to_string(),
         crate::DataType::Array(_) => "json".to_string(),
+        // HDB-002: MySQL has no tsvector/tsquery. `text` is the honest DDL
+        // spelling — `json` would tell a MySQL client the column holds valid
+        // JSON, which is true of the storage but not of the input the type
+        // accepts.
+        crate::DataType::TsVector | crate::DataType::TsQuery => "text".to_string(),
         _ => "varchar(255)".to_string(),
     }
 }

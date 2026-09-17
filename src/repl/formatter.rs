@@ -166,6 +166,9 @@ fn format_datatype(dt: &DataType) -> String {
         DataType::Char(n) => format!("CHAR({})", n),
         DataType::Array(inner) => format!("{}[]", format_datatype(inner)),
         DataType::Vector(dim) => format!("VECTOR({})", dim),
+        // HDB-002: the FTS types are declared types of their own now.
+        DataType::TsVector => "TSVECTOR".to_string(),
+        DataType::TsQuery => "TSQUERY".to_string(),
     }
 }
 

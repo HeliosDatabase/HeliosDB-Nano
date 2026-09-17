@@ -400,6 +400,9 @@ fn datatype_to_string(data_type: &DataType) -> String {
         DataType::Json => "json".to_string(),
         DataType::Jsonb => "jsonb".to_string(),
         DataType::Vector(dims) => format!("vector({})", dims),
+        // HDB-002: distinct declared types, reported under their PG names.
+        DataType::TsVector => "tsvector".to_string(),
+        DataType::TsQuery => "tsquery".to_string(),
         DataType::Array(inner) => format!("{}[]", datatype_to_string(inner)),
     }
 }

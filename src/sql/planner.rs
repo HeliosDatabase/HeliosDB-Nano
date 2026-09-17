@@ -1037,6 +1037,11 @@ impl<'a> Planner<'a> {
             "UUID" => Ok(DataType::Uuid),
             "JSON" => Ok(DataType::Json),
             "JSONB" => Ok(DataType::Jsonb),
+            // HDB-002: distinct FTS types. Storage is still the JSON token
+            // array (`Evaluator::fts_*`), but the declared type carries the
+            // text→tsvector input rule that `Json` does not have.
+            "TSVECTOR" => Ok(DataType::TsVector),
+            "TSQUERY" => Ok(DataType::TsQuery),
             "BYTEA" => Ok(DataType::Bytea),
             "SERIAL" => Ok(DataType::Int4),
             "BIGSERIAL" => Ok(DataType::Int8),
@@ -6683,7 +6688,14 @@ impl<'a> Planner<'a> {
                 let enforcement = convert_constraint_enforcement(characteristics.as_ref());
 
                 Some(TableConstraint::ForeignKey {
-                    name: name.as_ref().map(|n| n.to_string()),
+                    // HDB-005 FIX 2: NORMALISED, like the PrimaryKey/Unique
+                    // arms above. `Ident::to_string()` re-emits the quote
+                    // characters, so `CONSTRAINT "MyFk"` was stored under the
+                    // name `"MyFk"` (quotes included) — which
+                    // `information_schema.table_constraints` then reported,
+                    // which `DROP CONSTRAINT MyFk` could not find, and which a
+                    // SQL dump re-quoted on every cycle (`\"\"\"MyFk\"\"\"` …).
+                    name: name.as_ref().map(Self::normalize_ident),
                     // Normalize identifiers so FK metadata matches the
                     // form tables/columns are stored under in the
                     // catalog. Previously `ObjectName::to_string()`
@@ -6705,7 +6717,8 @@ impl<'a> Planner<'a> {
                 // Convert sqlparser Expr to our LogicalExpr
                 match self.expr_to_logical(expr) {
                     Ok(expr) => Some(TableConstraint::Check {
-                        name: name.as_ref().map(|n| n.to_string()),
+                        // HDB-005 FIX 2: normalised, as above.
+                        name: name.as_ref().map(Self::normalize_ident),
                         expression: expr,
                     }),
                     Err(_) => None, // Skip constraints we can't parse
@@ -6967,7 +6980,10 @@ impl<'a> Planner<'a> {
                 let enforcement = convert_constraint_enforcement(characteristics.as_ref());
                 Ok(LogicalPlan::AlterTableAddForeignKey {
                     table_name,
-                    constraint_name: name.as_ref().map(|n| n.to_string()),
+                    // HDB-005 FIX 2: normalised, so the name a dump's
+                    // trailing `ADD CONSTRAINT "MyFk"` restores under is the
+                    // name the source recorded.
+                    constraint_name: name.as_ref().map(Self::normalize_ident),
                     columns: columns.iter().map(Self::normalize_ident).collect(),
                     references_table: self.resolve_table_ref(&foreign_table),
                     references_columns: referred_columns.iter().map(Self::normalize_ident).collect(),
@@ -7228,11 +7244,17 @@ impl<'a> Planner<'a> {
                     }
                     // PostgreSQL FTS column types. We store tsvector /
                     // tsquery values as JSON arrays of normalised tokens
-                    // (see `Evaluator::fts_*`), so treat the declared
-                    // type as JSON. Full Postgres fidelity (positions,
-                    // weights, phrase queries) is intentionally out of
-                    // scope — see docs/compatibility/fts.md.
-                    "TSVECTOR" | "TSQUERY" => Ok(DataType::Json),
+                    // (see `Evaluator::fts_*`). HDB-002: they are their OWN
+                    // declared types, not `Json` — mapping them to `Json`
+                    // made the coercion validate the input as JSON, so the
+                    // plain-text assignment PostgreSQL accepts
+                    // (`INSERT INTO documents VALUES ('hello world')`, or
+                    // `'hello world'::tsvector`) failed with "Invalid JSON
+                    // string". Full Postgres fidelity (positions, weights,
+                    // phrase queries) is still out of scope — see
+                    // docs/compatibility/fts.md.
+                    "TSVECTOR" => Ok(DataType::TsVector),
+                    "TSQUERY" => Ok(DataType::TsQuery),
                     // KanttBan #23 (v3.31.1 phase 1): regtype / regrole /
                     // regnamespace etc. — OID-alias types. drizzle-kit's
                     // getColumnsInfoQuery uses `'int'::regtype` to

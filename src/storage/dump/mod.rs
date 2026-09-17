@@ -5,9 +5,12 @@
 
 mod format;
 mod manager;
+/// HDB-005: the one schema-aware SQL text serializer behind `dump_sql` and the
+/// REPL's `\dump`. Everything else in this module writes the BINARY format.
+pub(crate) mod sql_text;
 
 pub use format::{CompressionType, DumpFormat, DumpMetadata as FormatMetadata, DUMP_MAGIC_NUMBER, DUMP_VERSION};
 pub use manager::{
     DatabaseInterface, DatabaseRestoreInterface, DirtyTracker, DumpManager, DumpMetadata, DumpMode, DumpOptions,
-    DumpOutputFormat, DumpReport, DumpType, IndexMetadata, RestoreOptions, RestoreReport,
+    DumpOutputFormat, DumpReport, DumpType, IndexMetadata, RestoreOptions, RestoreReport, RestoreValidation,
 };

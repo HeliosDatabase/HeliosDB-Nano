@@ -261,6 +261,9 @@ fn storage_filter_value_matches_type(data_type: &DataType, value: &Value) -> boo
         DataType::Numeric => matches!(value, Value::Numeric(_)),
         DataType::Json | DataType::Jsonb => matches!(value, Value::Json(_)),
         DataType::Vector(_) => matches!(value, Value::Vector(_)),
+        // HDB-002: tsvector/tsquery are stored as the JSON token array, so
+        // they accept exactly what json/jsonb accepts here.
+        DataType::TsVector | DataType::TsQuery => matches!(value, Value::Json(_)),
         DataType::Array(_) => matches!(value, Value::Array(_)),
     }
 }

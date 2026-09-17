@@ -9,8 +9,18 @@ use std::io::{Read, Write};
 /// Magic number for dump file identification: "HELIODMP"
 pub const DUMP_MAGIC_NUMBER: &[u8; 8] = b"HELIODMP";
 
-/// Current dump format version
-pub const DUMP_VERSION: u32 = 1;
+/// Current dump format version.
+///
+/// * v1 — table name, `Schema`, vector `IndexMetadata`, rows. No constraints:
+///   a dump/restore round trip silently dropped every FOREIGN KEY, CHECK and
+///   table-level UNIQUE constraint (HDB-003).
+/// * v2 — adds a length-prefixed bincode [`crate::sql::TableConstraints`] blob
+///   per table, written straight after the index blob and before the row count,
+///   and records the batch compression in the metadata header.
+///
+/// Readers accept every version up to and including this one; a v1 file simply
+/// has no constraint blob to read.
+pub const DUMP_VERSION: u32 = 2;
 
 /// Compression type for dump files
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -144,7 +154,10 @@ impl DumpMetadata {
             .map_err(|e| Error::io(format!("Failed to read version: {}", e)))?;
         let version = u32::from_le_bytes(version_bytes);
 
-        if version != DUMP_VERSION {
+        // Every version up to the current one is readable (v1 files just carry
+        // no constraint blob); only a FUTURE version is refused, with the same
+        // message shape this check has always produced.
+        if version > DUMP_VERSION {
             return Err(Error::io(format!(
                 "Incompatible dump version: expected {}, found {}",
                 DUMP_VERSION, version

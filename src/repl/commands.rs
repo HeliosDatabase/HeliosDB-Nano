@@ -3305,6 +3305,13 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                 Ok(MetaCommandResult::Continue)
             }
 
+            // HDB-005: ONE dump implementation. This arm used to hand-roll a
+            // second one that wrote unquoted identifiers, printed the COLUMN
+            // TYPE with `{:?}` (`Varchar(Some(50))`) and emitted
+            // `-- Row data would go here` in place of every row — a file that
+            // could not be restored and did not even contain the data. It now
+            // calls the library exporter, so the REPL and `dump_sql` can never
+            // drift again. User-facing messages are unchanged in shape.
             MetaCommand::Dump(output_path) => {
                 let output_file = output_path
                     .as_ref()
@@ -3316,99 +3323,26 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                 println!("Output: {}", output_file.display().to_string().cyan());
                 println!();
 
-                // Get all tables from catalog
-                let catalog = db.storage.catalog();
-                match catalog.list_tables() {
-                    Ok(tables) => {
-                        if tables.is_empty() {
+                match db.dump_sql(&output_file) {
+                    Ok(metadata) => {
+                        if metadata.table_count == 0 {
                             println!("{}", "No tables to dump.".yellow());
-                            return Ok(MetaCommandResult::Continue);
                         }
-
-                        let mut dump_content = String::new();
-                        dump_content.push_str("-- HeliosDB Nano Database Dump\n");
-                        dump_content.push_str(&format!(
-                            "-- Generated: {}\n",
-                            chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
-                        ));
-                        dump_content.push_str("-- Database: heliosdb-nano\n\n");
-
-                        let mut total_rows = 0;
-                        let mut dump_lines = 0;
-
-                        // Dump each table
-                        for table in &tables {
-                            match catalog.get_table_schema(&table) {
-                                Ok(schema) => {
-                                    // Add CREATE TABLE statement
-                                    dump_content.push_str(&format!("-- Table: {}\n", table));
-                                    dump_content.push_str("CREATE TABLE IF NOT EXISTS ");
-                                    dump_content.push_str(&table);
-                                    dump_content.push_str(" (\n");
-
-                                    for (i, col) in schema.columns.iter().enumerate() {
-                                        if i > 0 {
-                                            dump_content.push_str(",\n");
-                                        }
-                                        dump_content.push_str("  ");
-                                        dump_content.push_str(&col.name);
-                                        dump_content.push_str(" ");
-                                        dump_content.push_str(&format!("{:?}", col.data_type));
-                                        if col.primary_key {
-                                            dump_content.push_str(" PRIMARY KEY");
-                                        }
-                                        if !col.nullable {
-                                            dump_content.push_str(" NOT NULL");
-                                        }
-                                    }
-
-                                    dump_content.push_str("\n);\n\n");
-
-                                    // Dump data
-                                    match db.query(&format!("SELECT * FROM {}", table), &[]) {
-                                        Ok(rows) => {
-                                            for row in rows {
-                                                dump_content.push_str(&format!(
-                                                    "-- Row data would go here ({})\n",
-                                                    total_rows + 1
-                                                ));
-                                                total_rows += 1;
-                                            }
-                                        }
-                                        Err(_) => {
-                                            dump_content.push_str("-- Error reading table data\n");
-                                        }
-                                    }
-                                    dump_content.push_str("\n");
-                                    dump_lines += 1;
-                                }
-                                Err(_) => {
-                                    println!("{}: Could not read schema for table '{}'", "Warning".yellow(), table);
-                                }
-                            }
-                        }
-
-                        // Write to file
-                        match std::fs::write(&output_file, dump_content) {
-                            Ok(()) => {
-                                println!("{}: Dump completed successfully", "Success".green());
-                                println!("  Tables: {}", tables.len().to_string().cyan());
-                                println!("  Rows: {}", total_rows.to_string().cyan());
-                                println!("  Schema lines: {}", dump_lines.to_string().cyan());
-                                println!("  Output file: {}", output_file.display().to_string().green());
-                                println!();
-                                Ok(MetaCommandResult::Continue)
-                            }
-                            Err(e) => {
-                                println!("{}: Failed to write dump file", "Error".red());
-                                println!("  {}", format!("{}", e).dimmed());
-                                println!();
-                                Err(Error::io(format!("Failed to write dump file: {}", e)))
-                            }
-                        }
+                        println!("{}: Dump completed successfully", "Success".green());
+                        println!("  Tables: {}", metadata.table_count.to_string().cyan());
+                        println!("  Rows: {}", metadata.total_rows.to_string().cyan());
+                        println!("  Bytes: {}", metadata.uncompressed_size.to_string().cyan());
+                        println!("  Output file: {}", output_file.display().to_string().green());
+                        println!();
+                        println!(
+                            "{}",
+                            "Restore into an EMPTY database with EmbeddedDatabase::execute_sql_script.".dimmed()
+                        );
+                        println!();
+                        Ok(MetaCommandResult::Continue)
                     }
                     Err(e) => {
-                        println!("{}: Could not list tables", "Error".red());
+                        println!("{}: Failed to write dump file", "Error".red());
                         println!("  {}", format!("{}", e).dimmed());
                         println!();
                         Err(e)

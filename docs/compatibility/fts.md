@@ -15,10 +15,72 @@ what doesn't, so adapters and ORMs know what to rely on.
 
 ### Types
 
-- **`TSVECTOR`**: column type, stored as a JSON array of normalised
-  tokens (`["hello", "world"]`). Writes accept either a text literal
-  or the result of `to_tsvector(...)`.
-- **`TSQUERY`**: same encoding as `TSVECTOR`.
+Since **4.35** `TSVECTOR` and `TSQUERY` are distinct declared types
+(they used to be declared as `JSON`, which made the assignment
+coercion validate the input as JSON — so the plain-text write below
+failed with `Invalid JSON string`).
+
+- **`TSVECTOR`**: column type, **stored** as a JSON array of
+  normalised tokens (`["hello", "world"]`) — the storage format is
+  unchanged, so existing data and every `@@` / `ts_rank` path are
+  unaffected.
+- **`TSQUERY`**: same storage as `TSVECTOR`.
+
+**What a write accepts.** Three spellings, on `INSERT`, `UPDATE`, a
+bound parameter and an explicit `::tsvector` / `::tsquery` cast alike:
+
+| Input | Result |
+|---|---|
+| `to_tsvector(...)` / `to_tsquery(...)` (or any JSON token array) | kept verbatim — a hand-stemmed vector is **not** re-tokenised |
+| plain text — `'hello world'` | tokenised with the same tokenizer `to_tsvector` uses |
+| the quoted-lexeme form — `'hello' 'world'`, with optional `:1,2` / `:3A` suffixes | each lexeme taken **verbatim** (case preserved, `''` un-escaped to `'`); positions and weights are parsed and dropped |
+
+```sql
+CREATE TABLE documents (search_vector tsvector);
+INSERT INTO documents VALUES ('hello world foo');       -- plain text: OK
+INSERT INTO documents VALUES ('''Hello'' ''World''');   -- lexemes: Hello, World
+SELECT 'hello world'::tsvector @@ to_tsquery('hello');  -- true
+```
+
+> **Divergence.** PostgreSQL's `::tsvector` input does **not** normalise
+> — `'Fox'::tsvector` keeps `Fox`, and `@@ to_tsquery('fox')` then finds
+> nothing. Nano lower-cases and tokenises plain text so that the
+> implicit text→tsvector assignment keeps matching `to_tsquery`, which
+> is the reason applications rely on it. Use the quoted-lexeme form when
+> you need the exact lexemes preserved.
+
+**On the wire.** A `tsvector` column is advertised as PostgreSQL's real
+OID **3614** and a `tsquery` column as **3615** — both are builtin OIDs in
+every PostgreSQL driver, so a client resolves them without asking the
+server. Their values are **printed** in PostgreSQL's quoted-lexeme form
+(`'hello' 'world'`), not as the JSON array, in **`SELECT` rows and in
+`COPY … TO STDOUT` alike** — so `COPY … TO STDOUT` output re-imports
+through `COPY … FROM STDIN` with the identical token set.
+
+A bound parameter of either type is accepted in **text or binary**
+format; the binary payload is read as UTF-8 text, because PostgreSQL's
+binary `tsvector` layout (lexeme count, NUL-terminated lexemes, position
+arrays) carries positions that Nano does not store and is not
+implemented.
+
+**Other surfaces.** The embedded API, REST, MCP and dumps still **read**
+the JSON token array they always read. REST **writes** take the same
+three input shapes the SQL path takes, spelled in JSON: a string (plain
+text, or the quoted-lexeme form), an array of strings (the lexemes,
+verbatim), or `null`. Anything else — a number, an object, an array with
+a non-string element — is refused rather than silently coerced.
+
+**Migration.** A database written before 4.35 declared its tsvector
+columns as `JSON`, and they keep that declared type on reopen (the
+declared type is persisted, not re-derived). Recreate the column to pick
+up the new input rule:
+
+```sql
+ALTER TABLE documents ADD COLUMN search_vector_new tsvector;
+UPDATE documents SET search_vector_new = search_vector;
+ALTER TABLE documents DROP COLUMN search_vector;
+ALTER TABLE documents RENAME COLUMN search_vector_new TO search_vector;
+```
 
 ### Scalar functions
 
@@ -164,6 +226,32 @@ ORDER BY 0.7 * (1.0 - (embedding <=> $1::vector))
 LIMIT 10;
 ```
 
+> **`vector`'s OID changed in 4.35.** Giving `tsvector` PostgreSQL's real
+> OID (3614) required taking it back from Nano's `vector` type, which had
+> been registered there in `pg_type` while the PG wire advertised `1000`
+> (PostgreSQL's `_bool`). `vector` now answers two different, deliberate
+> numbers:
+>
+> * **Name lookup → `16385`.** `vector` is registered in `pg_type` under
+>   its own private OID in the first user band, where an extension type
+>   belongs and where pgvector itself typically lands; its array type
+>   `_vector` is **16386**, and `pg_type.typnamespace` for both is
+>   `public` (2200), not `pg_catalog`. Resolve the type by NAME —
+>   `SELECT oid FROM pg_type WHERE typname = 'vector'` — as you would
+>   against a real pgvector install, rather than hard-coding the number.
+> * **`RowDescription` → `text` (`25`).** A vector column is **advertised
+>   on the wire as text**, which is exactly what its value on the wire is
+>   (`[0.1,0.2]`, pgvector's text form). It is not advertised as 16385:
+>   a result-column OID that a driver does not know natively sends
+>   tokio-postgres — and therefore sqlx and Prisma's query engine — into
+>   a server-side `TYPEINFO` lookup whose `$1` Nano describes as OID `0`,
+>   which the driver cannot resolve either, so it re-prepares the lookup
+>   without bound.
+>
+> The practical consequence: a pgvector client that registers the type by
+> NAME will never meet 16385 on the wire, and decodes the text form. If
+> your driver needs a typed `vector` codec, register it against `text`.
+
 ---
 
 ## Implementation references
@@ -173,8 +261,23 @@ LIMIT 10;
   `src/sql/logical_plan.rs`; planner mapping in `src/sql/planner.rs`
   (look for `SqlBinaryOp::AtAt`); evaluation in
   `src/sql/evaluator.rs::evaluate_ts_match`.
-- `TSVECTOR` / `TSQUERY` type: `src/sql/planner.rs` (look for
-  `"TSVECTOR"`).
+- `TSVECTOR` / `TSQUERY` type: `DataType::TsVector` / `DataType::TsQuery`
+  in `src/types.rs`; declared-type parsing in `src/sql/planner.rs` (look
+  for `"TSVECTOR"`); the input rule in
+  `src/sql/evaluator.rs::fts_input_tokens` and the `cast_value` arm next
+  to it; wire OIDs in `src/protocol/postgres/handler.rs::datatype_to_oid`
+  and `BUILTIN_TYPES` in `src/sql/phase3/system_views.rs`.
+- Write vs read: the quoted-lexeme spelling is an **input** form, parsed
+  once on the write side (`fts_input_tokens`, reached through
+  `cast_value`). The read side (`Evaluator::fts_decode_tokens`) plainly
+  tokenises a `Value::String`, because it is also reached for ordinary
+  `text` columns used with `@@`, whose behaviour must not change.
+- Bound parameters: `src/protocol/postgres/prepared.rs::decode_parameter`
+  (OIDs 3614 / 3615, text and binary).
+- REST writes: `src/api/models/data.rs::json_to_value`.
+- `COPY … TO STDOUT` rendering:
+  `src/protocol/postgres/handler.rs::handle_copy_to_stdout`.
 - `USING gin` DDL: `src/sql/executor/ddl.rs` (look for `idx_type ==
   "gin"`).
-- Tests: `tests/fts_tests.rs` — 8 regression cases.
+- Tests: `tests/fts_tests.rs` — 8 regression cases;
+  `tests/security_hdb_002.rs` — the text-input and OID cases.

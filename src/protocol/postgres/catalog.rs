@@ -1230,7 +1230,14 @@ impl PgCatalog {
             DataType::Json => 114,
             DataType::Jsonb => 3802,
             DataType::Array(_) => 2277,
-            DataType::Vector(_) => 25, // stored as text
+            // HDB-002: `vector` used to report 25 here, 1000 on the wire and
+            // 3614 in `pg_type`. `pg_type` and this map now use its private OID
+            // 16385 (which frees PostgreSQL's real 3614 for `tsvector`); the PG
+            // wire RowDescription deliberately keeps advertising `text` (25) —
+            // see `handler::datatype_to_oid` for why.
+            DataType::Vector(_) => 16385,
+            DataType::TsVector => 3614,
+            DataType::TsQuery => 3615,
         }
     }
 
@@ -1751,6 +1758,8 @@ impl PgCatalog {
             DataType::Jsonb => "jsonb".into(),
             DataType::Array(inner) => format!("{}[]", Self::pg_format_type(inner)),
             DataType::Vector(n) => format!("vector({n})"),
+            DataType::TsVector => "tsvector".into(),
+            DataType::TsQuery => "tsquery".into(),
         }
     }
 

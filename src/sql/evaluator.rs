@@ -1650,24 +1650,41 @@ impl Evaluator {
             _ => return Err(Error::query_execution(format!("{fn_name} expects text argument"))),
         };
         let tokens = crate::search::tokenizer::tokenize(text);
+        Self::fts_tokens_to_value(&tokens)
+    }
+
+    /// Encode a token list in the canonical tsvector/tsquery representation:
+    /// `Value::Json` holding a JSON array of strings.
+    pub(crate) fn fts_tokens_to_value(tokens: &[String]) -> Result<Value> {
         let json =
-            serde_json::to_string(&tokens).map_err(|e| Error::query_execution(format!("tsvector encode: {e}")))?;
+            serde_json::to_string(tokens).map_err(|e| Error::query_execution(format!("tsvector encode: {e}")))?;
         Ok(Value::Json(json))
     }
 
     /// Decode a tsvector/tsquery value back into a `Vec<String>`.
     /// Accepts:
-    ///   • `Value::Json("[\"a\",\"b\"]")` — our canonical encoding.
-    ///   • `Value::String("'a' 'b' 'c'")` — a Postgres-style tsvector
-    ///     printout (tokens quoted, separated by spaces). We fall back
-    ///     to plain tokenisation if parsing the quoted form fails.
-    ///   • `Value::Array([String, ...])` — if someone hand-builds one.
-    fn fts_decode_tokens(v: &Value) -> Vec<String> {
+    ///   • `Value::Json("[\"a\",\"b\"]")` — our canonical encoding. A
+    ///     `Value::Json` that is not a token array is tokenised as raw text.
+    ///   • `Value::String("hello world")` — TOKENISED, never parsed as the
+    ///     quoted-lexeme form. This is the READ side, and it is reached for
+    ///     plain `text` columns used with `@@` as well as for declared
+    ///     tsvector ones; `'Hello' 'World'` stored in a `text` column has
+    ///     always matched `to_tsquery('hello')` and must keep doing so. The
+    ///     quoted-lexeme spelling is an INPUT form, handled once on the write
+    ///     side by `fts_input_tokens` via `cast_value`'s TsVector arm.
+    ///   • `Value::Array([String, ...])` — if someone hand-builds one;
+    ///     non-string elements are skipped here (the write side rejects them).
+    pub(crate) fn fts_decode_tokens(v: &Value) -> Vec<String> {
         match v {
             Value::Json(s) => serde_json::from_str::<Vec<String>>(s).unwrap_or_else(|_| {
                 // Fall back: treat as raw text if JSON parse fails.
                 crate::search::tokenizer::tokenize(s)
             }),
+            // HDB-002: plain tokenisation, deliberately NOT the quoted-lexeme
+            // parser — see the doc comment. Routing this arm through
+            // `fts_input_tokens` silently changed `@@` on plain TEXT columns.
+            // The invariant this whole function keeps: the quoted-lexeme
+            // parser runs on the WRITE side only (`cast_value`), never here.
             Value::String(s) => crate::search::tokenizer::tokenize(s),
             Value::Array(items) => items
                 .iter()
@@ -5839,6 +5856,61 @@ impl Evaluator {
                 _ => Err(Error::query_execution(format!("Cannot cast {:?} to JSONB", value))),
             },
 
+            // HDB-002: the FTS types. Storage is the same JSON token array
+            // `to_tsvector(...)` produces — what changes versus the old
+            // `Json` mapping is the TEXT input rule: PostgreSQL accepts
+            // `'hello world'::tsvector` and the implicit text→tsvector
+            // assignment, so a plain string is TOKENISED here instead of
+            // being validated as JSON (which failed with "Invalid JSON
+            // string" — the reported bug). See `fts_input_tokens` for the
+            // two accepted spellings and the one deliberate divergence.
+            DataType::TsVector | DataType::TsQuery => {
+                let type_name = if matches!(target_type, DataType::TsVector) {
+                    "TSVECTOR"
+                } else {
+                    "TSQUERY"
+                };
+                match value {
+                    // Already canonical: `to_tsvector(...)`, a value read back
+                    // from storage, or JSON the caller built itself. Kept
+                    // verbatim — re-tokenising would destroy a hand-stemmed
+                    // vector (the documented ingest-time stemming recipe).
+                    Value::Json(j) => Ok(Value::Json(j)),
+                    Value::String(s) => Self::fts_tokens_to_value(&fts_input_tokens(&s)),
+                    // An array of lexemes. A non-string element is an ERROR,
+                    // not a skipped element: `ARRAY[1,2]` used to store `[]`
+                    // and report success, which is silent data loss (PostgreSQL
+                    // raises here too).
+                    Value::Array(items) => {
+                        let mut tokens: Vec<String> = Vec::with_capacity(items.len());
+                        for item in &items {
+                            match item {
+                                Value::String(s) if s.is_empty() => {
+                                    return Err(Error::query_execution(format!(
+                                        "Cannot cast {:?} to {} (an empty lexeme is not allowed)",
+                                        Value::Array(items.clone()),
+                                        type_name
+                                    )));
+                                }
+                                Value::String(s) => tokens.push(s.clone()),
+                                other => {
+                                    return Err(Error::query_execution(format!(
+                                        "Cannot cast {:?} to {} (array element {:?} is not text)",
+                                        items, type_name, other
+                                    )))
+                                }
+                            }
+                        }
+                        Self::fts_tokens_to_value(&tokens)
+                    }
+                    Value::Null => Ok(Value::Null),
+                    other => Err(Error::query_execution(format!(
+                        "Cannot cast {:?} to {}",
+                        other, type_name
+                    ))),
+                }
+            }
+
             DataType::Numeric => match value {
                 // Numeric to Numeric: validate and preserve
                 Value::Numeric(n) => Ok(Value::Numeric(n)),
@@ -7877,7 +7949,12 @@ fn format_pg_type_oid(oid: Option<i32>) -> String {
         Some(1700) => "numeric".into(),
         Some(2277) => "anyarray".into(),
         Some(2950) => "uuid".into(),
+        // HDB-002: the FTS types carry PostgreSQL's real OIDs, and `vector`
+        // its own private one (16385) — see `BUILTIN_TYPES`.
+        Some(3614) => "tsvector".into(),
+        Some(3615) => "tsquery".into(),
         Some(3802) => "jsonb".into(),
+        Some(16385) => "vector".into(),
         Some(other) => format!("oid#{other}"),
         None => "???".into(),
     }
@@ -8121,6 +8198,128 @@ fn json_path_extract(root: serde_json::Value, path: &[Value]) -> Result<Option<s
     Ok(Some(current))
 }
 
+/// HDB-002: PostgreSQL's `tsvector` / `tsquery` INPUT rule, as a token list.
+///
+/// Two spellings arrive on the input side and both are accepted:
+///
+/// * The **quoted-lexeme form** — `'hello' 'world'`, optionally with
+///   `:1,2` / `:3A` position-and-weight suffixes. This is what PostgreSQL's
+///   `tsvectorout` PRINTS, so a value round-trips through a dump, a `psql`
+///   copy-paste or a client that read the column back. Each lexeme is taken
+///   VERBATIM (case and content preserved, `''` un-escaped to a single `'`);
+///   the position suffix is parsed and DISCARDED, because Nano's
+///   representation carries no positions (docs/compatibility/fts.md).
+/// * **Anything else** — plain text, normalised through
+///   [`crate::search::tokenizer::tokenize`]: the same lower-casing,
+///   Unicode-word tokenisation `to_tsvector` applies.
+///
+/// That second rule is a DELIBERATE divergence from PostgreSQL, whose
+/// `::tsvector` input does not normalise at all (`'Fox'::tsvector` keeps
+/// `Fox`, and `@@ to_tsquery('fox')` then finds nothing). Nano normalises so
+/// that the implicit text→tsvector assignment applications rely on keeps
+/// matching `to_tsquery`, which is the whole point of accepting it.
+///
+/// `&`, `|`, `!`, `<->` and parentheses need no special case for `tsquery`:
+/// the tokenizer keeps only segments with an alphanumeric character, so the
+/// boolean operators fall out as separators — exactly what `to_tsquery`
+/// already does today.
+pub(crate) fn fts_input_tokens(text: &str) -> Vec<String> {
+    match parse_quoted_lexemes(text) {
+        Some(lexemes) => lexemes,
+        None => crate::search::tokenizer::tokenize(text),
+    }
+}
+
+/// Parse the PostgreSQL `tsvector` output spelling — a whitespace-separated
+/// run of single-quoted lexemes, each optionally followed by `:<positions>`.
+///
+/// Returns `None` (→ the caller tokenises as plain text) unless the WHOLE
+/// input is that form: a leading `'`, every quote balanced, and nothing but
+/// whitespace and position suffixes between lexemes. Partial matches are
+/// rejected on purpose — `"it's fine"` is prose, not a lexeme list.
+fn parse_quoted_lexemes(input: &str) -> Option<Vec<String>> {
+    let trimmed = input.trim();
+    if !trimmed.starts_with('\'') {
+        return None;
+    }
+    let mut lexemes: Vec<String> = Vec::new();
+    let mut chars = trimmed.chars().peekable();
+    loop {
+        while chars.peek().is_some_and(|c| c.is_whitespace()) {
+            chars.next();
+        }
+        match chars.peek() {
+            None => break,
+            // A lexeme always opens with a quote; anything else means this is
+            // ordinary text that merely happened to start with one.
+            Some('\'') => {
+                chars.next();
+            }
+            Some(_) => return None,
+        }
+        let mut lexeme = String::new();
+        loop {
+            match chars.next() {
+                // Unterminated quote → not the lexeme form.
+                None => return None,
+                Some('\'') => {
+                    // `''` inside a lexeme is one literal quote.
+                    if chars.peek() == Some(&'\'') {
+                        chars.next();
+                        lexeme.push('\'');
+                    } else {
+                        break;
+                    }
+                }
+                // `\x` inside a lexeme is the literal character `x` — the
+                // escape PostgreSQL's `tsvectorout` writes for `\` and `'`.
+                Some('\\') => match chars.next() {
+                    Some(escaped) => lexeme.push(escaped),
+                    None => return None,
+                },
+                Some(c) => lexeme.push(c),
+            }
+        }
+        // `:1,2` / `:3A` — positions and weights. Parsed so they do not leak
+        // into the token, then dropped: Nano stores no positions.
+        if chars.peek() == Some(&':') {
+            chars.next();
+            while chars
+                .peek()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || *c == ',' || *c == '*')
+            {
+                chars.next();
+            }
+        }
+        if !lexeme.is_empty() {
+            lexemes.push(lexeme);
+        }
+    }
+    if lexemes.is_empty() {
+        None
+    } else {
+        Some(lexemes)
+    }
+}
+
+/// HDB-002: render a stored `tsvector` / `tsquery` the way PostgreSQL's
+/// `tsvectorout` does — `'hello' 'world'` — rather than as the JSON token
+/// array Nano stores it as.
+///
+/// Used by the PG wire text encoders for a column whose DECLARED type is
+/// `TsVector` / `TsQuery`; every other surface (embedded API, REST, dumps)
+/// still sees the JSON form, which is what it has always seen.
+pub(crate) fn fts_value_to_pg_text(value: &Value) -> String {
+    Evaluator::fts_decode_tokens(value)
+        .iter()
+        // PostgreSQL's `tsvectorout` escapes a backslash as `\\` and a quote as
+        // `''`; the parser below undoes both, so a value copied out of psql (or
+        // out of Nano) goes back in unchanged.
+        .map(|t| format!("'{}'", t.replace('\\', "\\\\").replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// PostgreSQL type name for a declared [`DataType`] — what `pg_typeof` and
 /// `format_type` render (`integer`, not `INT4`).
 ///
@@ -8154,6 +8353,8 @@ pub(crate) fn pg_type_name_of_datatype(data_type: &DataType) -> String {
         DataType::Array(inner) => format!("{}[]", pg_type_name_of_datatype(inner)),
         // pgvector spells the type simply `vector`; the dimension is a typmod.
         DataType::Vector(_) => "vector".to_string(),
+        DataType::TsVector => "tsvector".to_string(),
+        DataType::TsQuery => "tsquery".to_string(),
     }
 }
 

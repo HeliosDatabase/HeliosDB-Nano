@@ -11627,6 +11627,12 @@ impl EmbeddedDatabase {
                 if let Err(e) = self.validate_deferred_fk_checks(Some(&txn)) {
                     let _ = txn.rollback();
                     self.rollback_art_undo_log();
+                    // The queued deferred checks belong to THIS (now rolled back)
+                    // statement. Leaving them behind made the NEXT autocommit
+                    // statement re-report the same violation at its own commit
+                    // (found by the HDB-003 restore tests on a restored
+                    // DEFERRABLE INITIALLY DEFERRED foreign key).
+                    self.deferred_fk_checks.lock().clear();
                     return Err(e);
                 }
                 txn.commit()?;
@@ -18045,17 +18051,138 @@ impl EmbeddedDatabase {
         self.dump_manager.create_full_dump(path, self)
     }
 
-    /// Create a SQL dump of the database
+    /// Create a SQL dump of the database — a **restorable** PostgreSQL script.
     ///
-    /// Creates a text-based SQL dump compatible with SQLite and PostgreSQL.
-    /// The output contains CREATE TABLE and INSERT statements that can be
-    /// replayed to recreate the database.
+    /// The file is plain text, one statement per line, in four phases:
+    ///
+    /// 1. `CREATE TABLE IF NOT EXISTS "t" (…)` for every table, carrying its
+    ///    column types, `NOT NULL`, `DEFAULT`, `PRIMARY KEY` (inline for a
+    ///    single-column key, table-level for a composite one), `UNIQUE` and
+    ///    `CHECK` — but **not** its foreign keys;
+    /// 2. `INSERT INTO "t" ("c1", …) VALUES (…), (…)` with an explicit column
+    ///    list, every identifier double-quoted and every value rendered by the
+    ///    schema-aware serializer (`storage::dump::sql_text`) so JSON, NUMERIC,
+    ///    UUID, BYTEA, temporal, array and vector values come back as
+    ///    themselves rather than as Rust debug strings;
+    /// 3. `ALTER TABLE "t" ADD CONSTRAINT … FOREIGN KEY …` for every foreign
+    ///    key, so the file loads in any order — cycles included — and no
+    ///    referential check runs against a half-loaded database;
+    /// 4. `CREATE INDEX …` for every **vector** index — `get_table_indexes`
+    ///    reports only those today, so ordinary and unique indexes are absent
+    ///    from the SQL dump exactly as they are from the binary one.
+    ///
+    /// # Restoring
+    ///
+    /// Replay it with [`EmbeddedDatabase::execute_sql_script`] into an **empty**
+    /// database:
+    ///
+    /// ```no_run
+    /// # use heliosdb_nano::EmbeddedDatabase;
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let source = EmbeddedDatabase::new_in_memory()?;
+    /// source.dump_sql(std::path::Path::new("/tmp/dump.sql"))?;
+    ///
+    /// let restored = EmbeddedDatabase::new_in_memory()?;
+    /// restored.execute_sql_script(&std::fs::read_to_string("/tmp/dump.sql")?)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// The target must be EMPTY. `CREATE TABLE IF NOT EXISTS` keeps a table
+    /// that already exists — including its rows — and the INSERTs that follow
+    /// then fail on duplicate primary keys.
     ///
     /// # Arguments
     ///
     /// * `path` - File path where the SQL dump will be written
+    ///
+    /// # Errors
+    ///
+    /// Fails if the file cannot be written, or if a value cannot be given a
+    /// SQL spelling — an unresolved `DictRef` / `CasRef` / `ColumnarRef`
+    /// storage reference is reported rather than written out as a placeholder.
     pub fn dump_sql(&self, path: &std::path::Path) -> Result<storage::DumpMetadata> {
         self.dump_manager.create_sql_dump(path, self)
+    }
+
+    /// Execute a multi-statement SQL script — the restore half of
+    /// [`EmbeddedDatabase::dump_sql`].
+    ///
+    /// Splits on `;` with the PostgreSQL handler's own splitter
+    /// (`pg_split_sql_respecting_quotes`), so single-quoted strings,
+    /// double-quoted identifiers and `$$…$$` bodies keep their semicolons and a
+    /// script and a multi-statement simple query can never disagree about where
+    /// a statement ends — and `-- …` / `/* … */` comments are scanned AS
+    /// comments, so a `;` or an unpaired quote inside one neither splits nor
+    /// swallows a statement. Blank and comment-only segments are skipped, and a
+    /// statement's leading comments are stripped with the handler's own
+    /// `pg_skip_leading_comments` so the engine's raw-text fast paths still see
+    /// their keyword. Statements run one at a time, each autocommitting; a statement
+    /// that returns rows (none is expected in a dump) is run through
+    /// [`EmbeddedDatabase::query`] and its rows discarded.
+    ///
+    /// # Returns
+    ///
+    /// The number of statements executed.
+    ///
+    /// # Errors
+    ///
+    /// Stops at the FIRST failure and returns its error with the 1-based index
+    /// of the offending statement (counting only the statements the splitter
+    /// yielded). Statements before it have already taken effect — this is not
+    /// a transaction.
+    pub fn execute_sql_script(&self, sql: &str) -> Result<u64> {
+        let statements = crate::protocol::postgres::handler::pg_split_sql_respecting_quotes(sql);
+        let mut executed = 0u64;
+        for (index, statement) in statements.iter().enumerate() {
+            let trimmed = crate::protocol::postgres::handler::pg_skip_leading_comments(statement);
+            if trimmed.is_empty() {
+                continue;
+            }
+            let outcome = if Self::script_statement_returns_rows(trimmed) {
+                self.query(trimmed, &[]).map(|_| 0)
+            } else {
+                self.execute(trimmed)
+            };
+            outcome.map_err(|e| {
+                Error::query_execution(format!(
+                    "SQL script failed at statement {} ({}): {}",
+                    index + 1,
+                    Self::script_statement_excerpt(trimmed),
+                    e
+                ))
+            })?;
+            executed += 1;
+        }
+        Ok(executed)
+    }
+
+    /// True for the statement shapes that produce a result set, which
+    /// `execute()` does not serve. A dump contains none of them; this is the
+    /// tolerance clause for a hand-edited script.
+    fn script_statement_returns_rows(statement: &str) -> bool {
+        let head = statement
+            .split(|c: char| c.is_whitespace() || c == '(')
+            .find(|word| !word.is_empty())
+            .unwrap_or("");
+        matches!(
+            head.to_ascii_uppercase().as_str(),
+            "SELECT" | "WITH" | "VALUES" | "TABLE" | "SHOW" | "EXPLAIN"
+        )
+    }
+
+    /// First 60 characters of a statement, single-line, for an error message.
+    fn script_statement_excerpt(statement: &str) -> String {
+        let flattened: String = statement
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .take(60)
+            .collect();
+        if statement.chars().count() > 60 {
+            format!("{flattened}…")
+        } else {
+            flattened
+        }
     }
 
     /// Create an incremental dump of changed data

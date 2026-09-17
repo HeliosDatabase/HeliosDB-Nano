@@ -1062,6 +1062,10 @@ pub mod type_oid {
     pub const UUID: i32 = 2950;
     pub const JSON: i32 = 114;
     pub const JSONB: i32 = 3802;
+    /// PostgreSQL's real `tsvector` OID (HDB-002).
+    pub const TSVECTOR: i32 = 3614;
+    /// PostgreSQL's real `tsquery` OID (HDB-002).
+    pub const TSQUERY: i32 = 3615;
 }
 
 /// Convert DataType to PostgreSQL type OID
@@ -1082,6 +1086,19 @@ pub fn datatype_to_oid(dt: &DataType) -> i32 {
         DataType::Json => type_oid::JSON,
         DataType::Jsonb => type_oid::JSONB,
         DataType::Bytea => type_oid::BYTEA,
+        // HDB-002: the FTS types carry PostgreSQL's real OIDs — both are
+        // driver builtins, so a client resolves them without asking the
+        // server. `vector` is NOT: it is an extension type registered in
+        // `pg_type` under a user-band OID (16385), and advertising a
+        // user-band OID in a RowDescription drives tokio-postgres/sqlx/Prisma
+        // into a server-side TYPEINFO lookup that Nano cannot serve (its `$1`
+        // is described as OID 0, which the driver cannot resolve either, so
+        // it recurses). It is therefore advertised as TEXT — which is exactly
+        // what the value on the wire is, pgvector's `[0.1,0.2]` text form.
+        // Resolve `vector` by NAME against `pg_type`, as pgvector clients do.
+        DataType::TsVector => type_oid::TSVECTOR,
+        DataType::TsQuery => type_oid::TSQUERY,
+        DataType::Vector(_) => type_oid::TEXT,
         _ => type_oid::TEXT, // Default to TEXT for unknown types
     }
 }
@@ -1168,6 +1185,12 @@ pub fn parse_pg_text_param(data: &[u8], type_oid: i32) -> Result<Value, std::io:
             // Store as String for bincode compatibility
             Value::Json(text.to_string())
         }
+        // HDB-002: a `tsvector`/`tsquery` parameter arrives as TEXT — either
+        // plain text or the quoted-lexeme form. It stays a `Value::String`
+        // here on purpose: the assignment coercion (`Evaluator::cast_value`)
+        // is what turns it into the canonical token array, and it is the only
+        // place that knows the target column's declared type.
+        type_oid::TSVECTOR | type_oid::TSQUERY => Value::String(text.to_string()),
         type_oid::TIMESTAMP | type_oid::TIMESTAMPTZ => {
             let ts = chrono::DateTime::parse_from_rfc3339(text)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Invalid timestamp: {}", e)))?

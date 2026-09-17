@@ -2819,7 +2819,12 @@ where
                 .join(", ")
         };
         let sql = format!("SELECT {} FROM \"{}\"", cols_sql, copy.table.replace('"', "\"\""));
-        let (rows, columns) = match self.database.query_with_columns_for_session(self.session_id, &sql) {
+        // HDB-002: the result SCHEMA, not just the column names — a column's
+        // DECLARED type decides its text form, and COPY TO STDOUT is a text
+        // rendering exactly like DataRow. `COPY … TO STDOUT` only ever names a
+        // table (`copy::parse_copy` rejects the `COPY (query)` form), so this
+        // schema is the projected table schema in every case.
+        let (rows, schema) = match self.database.query_with_schema_for_session(self.session_id, &sql) {
             Ok(r) => r,
             Err(e) => {
                 return self
@@ -2827,7 +2832,21 @@ where
                     .await;
             }
         };
-        let ncols = columns.len();
+        let ncols = schema.columns.len();
+        // HDB-002: a column declared tsvector/tsquery prints its stored token
+        // array as PostgreSQL's quoted-lexeme form (`'New York' 'Hello'`), the
+        // same rule `encode_data_row_direct` / `single_value_to_pg_text` apply
+        // to a DataRow. Without it COPY emitted the raw JSON array while
+        // SELECT emitted lexemes, and re-importing the COPY output through
+        // `COPY … FROM STDIN` re-tokenised it (`["New York","Hello"]` came
+        // back as `new`, `york`, `hello`) — a lossy round trip through the two
+        // halves of the same statement pair.
+        let ts_columns: Vec<bool> = schema
+            .columns
+            .iter()
+            .map(|c| matches!(c.data_type, crate::DataType::TsVector | crate::DataType::TsQuery))
+            .collect();
+        let any_ts_column = ts_columns.iter().any(|is_ts| *is_ts);
         self.send_message(BackendMessage::CopyOutResponse {
             overall_format: 0,
             column_formats: vec![0i16; ncols],
@@ -2835,7 +2854,17 @@ where
         .await?;
         let total = rows.len();
         for row in &rows {
-            let fields = tuple_to_pg_values(row);
+            let mut fields = tuple_to_pg_values(row);
+            if any_ts_column {
+                for (index, value) in row.values.iter().enumerate() {
+                    if !matches!(ts_columns.get(index), Some(true)) || !matches!(value, Value::Json(_)) {
+                        continue;
+                    }
+                    if let Some(field) = fields.get_mut(index) {
+                        *field = Some(crate::sql::evaluator::fts_value_to_pg_text(value).into_bytes());
+                    }
+                }
+            }
             let line = if copy.format == super::copy::CopyFormat::Csv {
                 super::copy::encode_csv_row(&fields)
             } else {
@@ -2926,7 +2955,14 @@ where
                     self.write_buf.put_slice(hex.as_bytes());
                 }
                 Value::Json(j) => {
-                    let s = j.to_string();
+                    // HDB-002: a column DECLARED tsvector/tsquery prints in
+                    // PostgreSQL's quoted-lexeme form; a json/jsonb one keeps
+                    // the JSON text byte-for-byte as before.
+                    let s = if is_declared_ts_column(plan.get(index).map(|c| &c.data_type)) {
+                        crate::sql::evaluator::fts_value_to_pg_text(val)
+                    } else {
+                        j.to_string()
+                    };
                     self.write_buf.put_i32(s.len() as i32);
                     self.write_buf.put_slice(s.as_bytes());
                 }
@@ -3700,6 +3736,19 @@ fn timestamptz_suffix(plan: &[super::codec::ColumnCodec], index: usize) -> &'sta
     }
 }
 
+/// HDB-002: is the column at `index` DECLARED `tsvector` / `tsquery`?
+///
+/// Nano stores both as a `Value::Json` token array, but PostgreSQL prints a
+/// tsvector as `'hello' 'world'` — so a client that reads the column back
+/// (or a `pg_dump`-shaped round-trip) must see the lexeme form, not `["hello",
+/// "world"]`. The declared type is the only thing that distinguishes the two,
+/// and the wire plan carries it, exactly as `timestamptz_suffix` above reads
+/// it for the UTC offset. A `Value::Json` in a column declared `json`/`jsonb`
+/// is untouched.
+fn is_declared_ts_column(data_type: Option<&crate::DataType>) -> bool {
+    matches!(data_type, Some(crate::DataType::TsVector | crate::DataType::TsQuery))
+}
+
 /// Convert DataType to PostgreSQL OID
 pub(super) fn datatype_to_oid(dt: &crate::DataType) -> i32 {
     match dt {
@@ -3726,8 +3775,26 @@ pub(super) fn datatype_to_oid(dt: &crate::DataType) -> i32 {
         crate::DataType::Date => 1082,
         crate::DataType::Time => 1083,
         crate::DataType::Uuid => 2950,
-        crate::DataType::Vector(_) => 1000, // Custom type
-        _ => 705,                           // Unknown
+        // HDB-002: the FTS types carry PostgreSQL's real OIDs.
+        crate::DataType::TsVector => 3614,
+        crate::DataType::TsQuery => 3615,
+        // HDB-002: `vector` is advertised as TEXT (25) — which is what the
+        // value on the wire literally is: pgvector's text form, `[0.1,0.2]`.
+        // It deliberately does NOT advertise the user-band OID `pg_type`
+        // registers it under (16385): a RowDescription OID a driver does not
+        // know natively sends tokio-postgres — and therefore sqlx and
+        // Prisma's query engine — into its server-side TYPEINFO lookup, whose
+        // `$1` Nano describes as OID 0, and `Type::from_oid(0)` is `None`, so
+        // the driver re-prepares the TYPEINFO query forever. Two test files
+        // are already `#[ignore]`d on that recursion
+        // (`tests/server_mode_integration_test.rs`,
+        // `tests/extended_query_param_select.rs`). 16385 stays where it is
+        // resolvable without recursion: `pg_type` (the registry row and
+        // `get_type_oid`), i.e. by NAME, which is how a pgvector client
+        // resolves an extension type anyway. It used to be `1000` here,
+        // PostgreSQL's `_bool`.
+        crate::DataType::Vector(_) => 25,
+        _ => 705, // Unknown
     }
 }
 
@@ -3874,27 +3941,64 @@ fn single_value_to_pg_text(value: &Value, codec: Option<&super::codec::ColumnCod
         s.push_str(super::codec::TIMESTAMPTZ_UTC_SUFFIX);
         return Some(s.into_bytes());
     }
+    // HDB-002: same rule as the direct encoder — a tsvector/tsquery column
+    // prints its token array as `'hello' 'world'`.
+    if matches!(value, Value::Json(_)) && is_declared_ts_column(codec.map(|c| &c.data_type)) {
+        return Some(crate::sql::evaluator::fts_value_to_pg_text(value).into_bytes());
+    }
     let tuple = Tuple::new(vec![value.clone()]);
     tuple_to_pg_values(&tuple).into_iter().next().flatten()
 }
 
-/// Split a SQL string on `;` while respecting single-quoted strings
-/// and dollar-quoted strings. Mirrors the MySQL handler's splitter
+/// Split a SQL string on `;` while respecting single-quoted strings,
+/// double-quoted identifiers and dollar-quoted strings. Mirrors the
+/// MySQL handler's splitter
 /// (`protocol::mysql::handler::split_sql_respecting_quotes`) with
 /// added support for `$$…$$` / `$tag$…$tag$` blocks, which PG uses
 /// for procedure bodies and dollar-quoted literals.
-fn pg_split_sql_respecting_quotes(sql: &str) -> Vec<String> {
+///
+/// `pub(crate)` for HDB-005: `EmbeddedDatabase::execute_sql_script`
+/// replays a `dump_sql` file through this same splitter, so a dump and
+/// a multi-statement simple query can never disagree about where one
+/// statement ends.
+///
+/// Every scan below dispatches on ASCII structure characters only, so a
+/// non-ASCII byte is copied through as the WHOLE character it starts:
+/// the loop used to do `current.push(b as char)` per byte, which
+/// Latin-1-expanded each UTF-8 continuation byte and turned `'café'`
+/// into `'cafÃ©'`. Single-quoted literals happened to survive that —
+/// `Planner::repair_sqlparser_string` re-decodes exactly this mangling —
+/// but identifiers and `E'…'` literals did not.
+pub(crate) fn pg_split_sql_respecting_quotes(sql: &str) -> Vec<String> {
     let mut statements = Vec::new();
     let mut current = String::new();
     let mut in_single_quote = false;
+    let mut in_double_quote = false;
     let mut in_dollar: Option<String> = None; // tag between `$` delimiters
     let bytes = sql.as_bytes();
     let mut i = 0usize;
+
+    // Copy the (possibly multi-byte) character starting at `idx` into `out`
+    // and return its byte length. `idx` is always on a char boundary because
+    // every caller advances by whole characters.
+    fn copy_char(sql: &str, idx: usize, out: &mut String) -> usize {
+        match sql.get(idx..).and_then(|rest| rest.chars().next()) {
+            Some(ch) => {
+                out.push(ch);
+                ch.len_utf8()
+            }
+            None => 1,
+        }
+    }
 
     while i < bytes.len() {
         let b = bytes[i];
         // Inside a `$tag$ … $tag$` block, we scan for the closing tag.
         if let Some(tag) = &in_dollar {
+            if !b.is_ascii() {
+                i += copy_char(sql, i, &mut current);
+                continue;
+            }
             current.push(b as char);
             if b == b'$' {
                 // Try to match `$tag$`
@@ -3914,6 +4018,10 @@ fn pg_split_sql_respecting_quotes(sql: &str) -> Vec<String> {
         // Inside a single-quoted string: handle escaped quotes and
         // backslash escapes identically to the MySQL splitter.
         if in_single_quote {
+            if !b.is_ascii() {
+                i += copy_char(sql, i, &mut current);
+                continue;
+            }
             current.push(b as char);
             if b == b'\'' {
                 if bytes.get(i + 1) == Some(&b'\'') {
@@ -3923,13 +4031,67 @@ fn pg_split_sql_respecting_quotes(sql: &str) -> Vec<String> {
                 }
                 in_single_quote = false;
             } else if b == b'\\' {
-                if let Some(&next) = bytes.get(i + 1) {
-                    current.push(next as char);
-                    i += 2;
+                if i + 1 < bytes.len() {
+                    i += 1 + copy_char(sql, i + 1, &mut current);
                     continue;
                 }
             }
             i += 1;
+            continue;
+        }
+        // Inside a `"…"` identifier: only the closing quote ends it. A `;` or
+        // `'` there belongs to the NAME (`"a;b"`, `"it's"`) — splitting on it
+        // produced two invalid fragments, which is precisely what a `dump_sql`
+        // file of such a table replays (HDB-005 quotes every identifier).
+        if in_double_quote {
+            if !b.is_ascii() {
+                i += copy_char(sql, i, &mut current);
+                continue;
+            }
+            current.push(b as char);
+            if b == b'"' {
+                in_double_quote = false;
+            }
+            i += 1;
+            continue;
+        }
+        // A COMMENT. Copied through verbatim, but scanned as comment text: it
+        // never opens a quote or identifier state and a `;` inside it never
+        // ends a statement.
+        //
+        // Without this the splitter read `--` and `/* … */` as ordinary SQL, so
+        // ONE unpaired `"` or `'` anywhere in a comment swallowed every
+        // following statement — `-- widen to 24" panel` turned a three-statement
+        // migration into one. This splitter also serves the PostgreSQL
+        // SIMPLE-QUERY protocol, and Flyway / dbmate / sqlx send whole migration
+        // files as one simple query, so that was reachable from the wire
+        // (HDB-005 FIX 6).
+        if b == b'-' && bytes.get(i + 1) == Some(&b'-') {
+            current.push_str("--");
+            i += 2;
+            // The newline itself is left to the main loop, which copies it
+            // like any other whitespace.
+            while bytes.get(i).is_some_and(|c| *c != b'\n') {
+                i += copy_char(sql, i, &mut current);
+            }
+            continue;
+        }
+        if b == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            current.push_str("/*");
+            i += 2;
+            // Non-recursive, matching `pg_skip_leading_comments`: PostgreSQL
+            // nests block comments, this stops at the first `*/`. An
+            // unterminated comment consumes the rest of the input, which is
+            // what PostgreSQL does with it too.
+            loop {
+                let Some(&c) = bytes.get(i) else { break };
+                if c == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                    current.push_str("*/");
+                    i += 2;
+                    break;
+                }
+                i += copy_char(sql, i, &mut current);
+            }
             continue;
         }
         // Start of a dollar-quoted string? `$tag$` where tag is empty or [A-Za-z0-9_]+.
@@ -3954,6 +4116,10 @@ fn pg_split_sql_respecting_quotes(sql: &str) -> Vec<String> {
                 in_single_quote = true;
                 current.push('\'');
             }
+            b'"' => {
+                in_double_quote = true;
+                current.push('"');
+            }
             b';' => {
                 let trimmed = current.trim().to_string();
                 if !trimmed.is_empty() && !pg_stmt_is_only_comment(&trimmed) {
@@ -3961,7 +4127,10 @@ fn pg_split_sql_respecting_quotes(sql: &str) -> Vec<String> {
                 }
                 current.clear();
             }
-            _ => current.push(b as char),
+            _ => {
+                i += copy_char(sql, i, &mut current);
+                continue;
+            }
         }
         i += 1;
     }
@@ -3981,16 +4150,9 @@ fn pg_split_sql_respecting_quotes(sql: &str) -> Vec<String> {
 /// segments at the splitter level mirrors PG's tolerance for
 /// trailing comments after a terminating semicolon.
 fn pg_stmt_is_only_comment(stmt: &str) -> bool {
-    for line in stmt.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if !trimmed.starts_with("--") {
-            return false;
-        }
-    }
-    true
+    // `--` lines AND `/* … */` blocks (the splitter recognises both, so a
+    // trailing `/* done */` fragment must not reach the parser as a statement).
+    pg_skip_leading_comments(stmt).trim().is_empty()
 }
 
 /// Skip the leading `-- …` / `/* … */` comments of a statement so the first
@@ -4001,7 +4163,7 @@ fn pg_stmt_is_only_comment(stmt: &str) -> bool {
 /// scan inside the comment text, where an unrecognised first word classifies as
 /// "may write" — i.e. it falls back to opening the implicit block, the
 /// behaviour that was unconditional before this classifier existed.
-fn pg_skip_leading_comments(stmt: &str) -> &str {
+pub(crate) fn pg_skip_leading_comments(stmt: &str) -> &str {
     let mut rest = stmt.trim_start();
     loop {
         if let Some(after) = rest.strip_prefix("--") {
@@ -4574,6 +4736,31 @@ mod datatype_oid_tests {
         assert_eq!(datatype_to_oid(&DataType::Int8), 20);
         assert_eq!(datatype_to_oid(&DataType::Float8), 701);
         assert_eq!(datatype_to_oid(&DataType::Timestamp), 1114);
+    }
+
+    /// HDB-002. `tsvector`/`tsquery` advertise PostgreSQL's real OIDs, which
+    /// are BUILTINS in every driver — so a client resolves them locally.
+    ///
+    /// `vector` must NOT advertise the user-band OID it is registered under in
+    /// `pg_type` (16385). tokio-postgres — and with it sqlx and Prisma's query
+    /// engine — resolves an unknown result-column OID by preparing its own
+    /// TYPEINFO query, whose `$1` Nano describes as OID 0; `Type::from_oid(0)`
+    /// is `None`, so the driver re-prepares TYPEINFO without bound and the
+    /// connection never returns. `text` is both safe and honest: the value on
+    /// the wire IS text (`[0.1,0.2]`). The registry OID stays reachable by
+    /// name through `pg_type` (`BUILTIN_TYPES` / `get_type_oid`).
+    ///
+    /// Raising this to 16385 requires fixing ParameterDescription first.
+    #[test]
+    fn fts_types_take_builtin_oids_and_vector_stays_text() {
+        assert_eq!(datatype_to_oid(&DataType::TsVector), 3614);
+        assert_eq!(datatype_to_oid(&DataType::TsQuery), 3615);
+        assert_eq!(datatype_to_oid(&DataType::Vector(3)), 25);
+        assert_ne!(
+            datatype_to_oid(&DataType::Vector(3)),
+            16385,
+            "a user-band OID in a RowDescription hangs every rust-postgres client"
+        );
     }
 }
 
@@ -5194,6 +5381,84 @@ mod do_block_split_tests {
         assert!(main.to_ascii_uppercase().contains("MY_EXCEPTION_TABLE"));
         assert!(!main.to_ascii_uppercase().ends_with("EXCEPTION"));
         assert_eq!(codes, vec!["others".to_string()]);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::indexing_slicing)]
+mod sql_statement_splitter_tests {
+    //! HDB-005 FIX 6 — `pg_split_sql_respecting_quotes` scans COMMENTS as
+    //! comments.
+    //!
+    //! This splitter serves both `EmbeddedDatabase::execute_sql_script` and the
+    //! PostgreSQL SIMPLE-QUERY protocol, and migration runners (Flyway, dbmate,
+    //! sqlx) send a whole `.sql` file as one simple query. With no comment
+    //! state, a single unpaired `"` or `'` inside a comment opened an
+    //! identifier/literal that swallowed every following `;` — turning a
+    //! multi-statement migration into one unparseable blob.
+    use super::pg_split_sql_respecting_quotes as split;
+
+    #[test]
+    fn an_unpaired_double_quote_in_a_line_comment_does_not_swallow_the_file() {
+        let sql = "-- widen to 24\" panel\nALTER TABLE t ALTER COLUMN w TYPE INT;\nSELECT 1;";
+        let statements = split(sql);
+        assert_eq!(statements.len(), 2, "{statements:?}");
+        assert!(statements[0].contains("ALTER TABLE t"), "{statements:?}");
+        assert_eq!(statements[1], "SELECT 1");
+    }
+
+    #[test]
+    fn an_apostrophe_and_a_semicolon_in_a_block_comment_are_inert() {
+        let statements = split("/* don't; split */ SELECT 1; SELECT 2;");
+        assert_eq!(statements.len(), 2, "{statements:?}");
+        assert!(statements[0].ends_with("SELECT 1"), "{statements:?}");
+        assert_eq!(statements[1], "SELECT 2");
+    }
+
+    #[test]
+    fn comment_text_is_copied_through_verbatim() {
+        // The comment stays attached to the statement it precedes — the engine
+        // strips it with `pg_skip_leading_comments` — so nothing is lost, only
+        // re-classified.
+        let statements = split("-- header\nSELECT 1;");
+        assert_eq!(statements, vec!["-- header\nSELECT 1".to_string()]);
+    }
+
+    #[test]
+    fn quotes_still_win_over_comment_markers_inside_them() {
+        // `--` and `/*` inside a literal or an identifier are DATA, not the
+        // start of a comment.
+        let statements = split("SELECT '-- not a comment; really'; SELECT 2;");
+        assert_eq!(statements.len(), 2, "{statements:?}");
+        assert_eq!(statements[0], "SELECT '-- not a comment; really'");
+
+        let statements = split("SELECT \"/* col */\" FROM t; SELECT 2;");
+        assert_eq!(statements.len(), 2, "{statements:?}");
+        assert!(statements[0].contains("\"/* col */\""), "{statements:?}");
+    }
+
+    #[test]
+    fn an_unterminated_block_comment_consumes_the_rest() {
+        // PostgreSQL treats it the same way. The trailing chunk is comment
+        // TEXT, not a statement: `pg_stmt_is_only_comment` (now block-comment
+        // aware) drops it, so neither the simple-query batch nor
+        // `execute_sql_script` ever sees the `SELECT 2` a comment-blind
+        // splitter would have handed them.
+        let statements = split("SELECT 1; /* never closed ; SELECT 2;");
+        assert_eq!(statements, vec!["SELECT 1".to_string()], "{statements:?}");
+        assert!(super::pg_stmt_is_only_comment("/* never closed ; SELECT 2;"));
+        assert!(super::pg_stmt_is_only_comment("/* done */"));
+        assert!(!super::pg_stmt_is_only_comment("/* done */ SELECT 2"));
+    }
+
+    #[test]
+    fn dollar_quoted_bodies_and_doubled_apostrophes_still_split_correctly() {
+        // Regression guard for the states the comment arms sit next to.
+        let statements =
+            split("CREATE FUNCTION f() RETURNS int AS $$ BEGIN RETURN 1; END; $$ LANGUAGE plpgsql; SELECT 1;");
+        assert_eq!(statements.len(), 2, "{statements:?}");
+        let statements = split("INSERT INTO t VALUES ('it''s; fine'); SELECT 1;");
+        assert_eq!(statements.len(), 2, "{statements:?}");
     }
 }
 

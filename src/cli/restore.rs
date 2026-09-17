@@ -18,6 +18,16 @@ pub struct RestoreCommand {
     pub connection: Option<String>,
     /// Verbose output
     pub verbose: bool,
+    /// Restore even when the dump's rows violate the constraints it carries
+    /// (`--no-validate`), reporting the violations as warnings.
+    ///
+    /// A database may legitimately hold such rows — a `NOT ENFORCED` or
+    /// `LOCK-FREE` constraint never checked them, and
+    /// `SET helios.fk_validation = 'audit'` accepts orphans and logs them
+    /// instead. Those are session settings and cannot be applied to the fresh
+    /// target database a CLI restore opens, so without this switch a backup of
+    /// such a database would not be restorable through this command at all.
+    pub no_validate: bool,
 }
 
 impl RestoreCommand {
@@ -74,19 +84,21 @@ impl RestoreCommand {
             verify: self.verify,
             verbose: self.verbose,
             connection: self.connection.clone(),
+            validate_constraints: !self.no_validate,
         };
 
         if self.verbose {
             println!();
             println!("{}", "Restore configuration:".bold());
             println!("  Verify: {}", self.verify);
+            println!("  Validate constraints: {}", !self.no_validate);
             println!("  Input: {}", self.input.display());
             println!("  Target: {}", target_dir.display());
             println!();
         }
 
         // Show progress bar if not verbose
-        let progress = if !self.verbose {
+        let mut progress = if !self.verbose {
             let pb = ProgressBar::new_spinner();
             pb.set_style(
                 ProgressStyle::default_spinner()
@@ -101,10 +113,36 @@ impl RestoreCommand {
         };
 
         // Perform restore
-        let report = dump_manager.restore(&options, &mut db)?;
+        let report = match dump_manager.restore(&options, &mut db) {
+            Ok(report) => report,
+            Err(e) => {
+                if let Some(pb) = progress.take() {
+                    pb.abandon_with_message("Restore failed");
+                }
+                // Only a constraint-validation failure (phase C) leaves a
+                // fully restored directory behind: the tables, rows and
+                // constraints are all in place and nothing is rolled back. Any
+                // other failure (missing file, bad magic, unsupported version,
+                // a branch being active, a mid-restore I/O error) happened
+                // before or during the load, so the banner would be false —
+                // for those the error alone is printed by `main`.
+                if matches!(e, crate::Error::ConstraintViolation(_)) {
+                    eprintln!();
+                    let state = "The target directory contains the restored tables and rows; constraints are \
+                                 registered and reject new violations.";
+                    eprintln!("{}", state.yellow());
+                    eprintln!("  Target: {}", target_dir.display());
+                    eprintln!(
+                        "Re-run with {} to accept the data as it is; the violations are then reported as warnings.",
+                        "--no-validate".bold()
+                    );
+                }
+                return Err(e);
+            }
+        };
 
         // Finish progress bar
-        if let Some(pb) = progress {
+        if let Some(pb) = progress.take() {
             pb.finish_with_message("Restore completed");
         }
 
@@ -115,7 +153,17 @@ impl RestoreCommand {
         println!("{}", "Summary:".bold());
         println!("  Tables: {}", report.tables_restored);
         println!("  Rows: {}", format_number(report.rows_restored));
+        // Format-v2 dumps carry the FK / CHECK / UNIQUE records; a v1 dump
+        // carries none, so 0 here means "recreate them from your DDL".
+        println!("  Constraints: {}", format_number(report.constraints_restored));
         println!("  Duration: {}", format_duration(report.duration_ms));
+        if !report.validation_warnings.is_empty() {
+            println!();
+            println!("{}", "Constraint warnings:".yellow().bold());
+            for warning in &report.validation_warnings {
+                println!("  - {}", warning);
+            }
+        }
         println!();
         println!("Database restored to: {}", target_dir.display().to_string().cyan());
 
