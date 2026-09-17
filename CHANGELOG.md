@@ -5,6 +5,60 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.36.0] - 2026-09-17
+
+Post-quantum hybrid TLS (X25519MLKEM768) for both wire protocols, and MySQL wire TLS itself — MySQL
+previously had none.
+
+### Added — post-quantum hybrid key exchange for PostgreSQL and MySQL TLS
+
+- Both TLS listeners now offer the `X25519MLKEM768` hybrid post-quantum key-exchange group
+  (draft-ietf-tls-ecdhe-mlkem) alongside classical groups, through a shared `protocol::tls_provider`
+  rustls `CryptoProvider`. This is key-exchange only — it protects today's TLS traffic against
+  "harvest now, decrypt later"; certificate signatures remain classical (RSA/ECDSA). ML-DSA
+  certificate signing is explicitly out of scope and not scheduled for any release.
+  `docs/guides/authentication.md` documents the threat model this does and does not cover.
+  On by default once TLS is enabled, matching the default-on posture of AWS, MySQL 26.7 and
+  CockroachDB's "quantum-ready TLS"; disable per-listener with `tls_post_quantum = false` /
+  `--tls-post-quantum false` (PostgreSQL) and `mysql_tls_post_quantum = false` /
+  `--mysql-tls-post-quantum false` (MySQL).
+- The negotiated key-exchange group is now queryable per connection: `SHOW ssl_key_exchange` on the
+  PostgreSQL wire, and `Ssl_kx_group` (`SHOW VARIABLES`) / `@@ssl_kx_group` on the MySQL wire — useful
+  for confirming a client actually negotiated the hybrid group rather than falling back classical.
+
+### Added — SECURITY: TLS support for the MySQL wire listener, built from scratch
+
+- MySQL previously had no TLS at all: `CLIENT_SSL` was an unused capability bit, and the
+  `have_ssl` / `have_openssl` `SHOW VARIABLES` answer unconditionally reported `YES` regardless of
+  whether TLS was configured — a client (or a monitoring check reading those variables) had no way
+  to tell that its connection was in fact cleartext. `have_ssl` / `have_openssl` now report `YES`
+  only when the negotiating connection actually upgraded to TLS.
+  Enable with `mysql_tls_enabled = true` / `--mysql-tls-cert <path> --mysql-tls-key <path>`
+  (both flags must be given together). Mirrors the PostgreSQL listener's architecture
+  (`protocol::mysql::ssl::{MysqlSslConfig, MysqlSslNegotiator}`, `protocol::mysql::server::MysqlServer`)
+  rather than inventing a new shape.
+- `require_tls` now actually enforces rejection of plaintext clients when set: previously
+  `MysqlSslConfig::with_require_tls(true)` was documented as rejecting a client that omitted
+  `CLIENT_SSL`, but the negotiation path never checked it, so such a client connected in cleartext
+  regardless. A plaintext client is now sent an access-denied ERR packet and disconnected before
+  reaching the handler when `require_tls` is set.
+- The whole MySQL handshake (packet reads and any TLS upgrade) now runs under one absolute
+  `authentication_timeout` deadline computed at accept time, matching the PostgreSQL listener — a
+  client that stalls mid-handshake used to hold a `max_connections` semaphore permit forever.
+- MySQL mutual TLS: `MysqlSslConfig::ca_cert_path` / `require_client_cert` (config-level; no CLI flag
+  yet), via `WebPkiClientVerifier::builder_with_provider` over a `RootCertStore` loaded from the
+  configured CA — a client presenting no certificate, or one signed by an untrusted CA, is rejected
+  during the handshake.
+
+### Regression coverage
+
+`tests/postgres_ssl_tests.rs` (10) and `tests/mysql_ssl_tests.rs` (14): PQ-only and classical-only
+rustls clients against PQ-enabled and PQ-disabled servers, `ssl_key_exchange`/`ssl_kx_group`
+round trips proving the reported group matches what the client actually negotiated, `require_tls`
+rejecting/accepting plaintext and TLS clients, mutual-TLS accept/reject with CA-signed and
+wrong-CA certs (openssl-CLI-generated), and `have_ssl`/`have_openssl` reflecting real connection
+state rather than a hard-coded answer.
+
 ## [4.35.0] - 2026-09-17
 
 The last three findings of the HeliosDB Nano 4.31.1 security report (HDB-002, HDB-003, HDB-005). With this
