@@ -367,6 +367,30 @@ tls_enabled = false
 # TLS private key path (required if tls_enabled = true)
 # tls_key_path = "/path/to/key.pem"
 
+# Offer the X25519MLKEM768 hybrid post-quantum key-exchange group
+# (draft-ietf-tls-ecdhe-mlkem — the same "quantum-ready TLS" group AWS,
+# MySQL 26.7 and CockroachDB already ship) alongside classical groups on the
+# PostgreSQL TLS listener. A classical-only client still connects fine — this
+# only adds an option, never removes one. Only meaningful with tls_enabled.
+tls_post_quantum = true
+
+# Enable TLS/SSL for the MySQL wire-protocol listener. Unlike PostgreSQL,
+# TLS is OFFERED (via the CLIENT_SSL capability bit), not required —
+# plaintext MySQL clients still connect. Mirrors tls_enabled/tls_cert_path/
+# tls_key_path above; the CLI flags (--mysql-tls-cert / --mysql-tls-key /
+# --mysql-tls-post-quantum) are authoritative.
+mysql_tls_enabled = false
+
+# MySQL TLS certificate path (required if mysql_tls_enabled = true)
+# mysql_tls_cert_path = "/path/to/cert.pem"
+
+# MySQL TLS private key path (required if mysql_tls_enabled = true)
+# mysql_tls_key_path = "/path/to/key.pem"
+
+# Offer the X25519MLKEM768 hybrid post-quantum key-exchange group on the
+# MySQL TLS listener, mirroring tls_post_quantum above.
+mysql_tls_post_quantum = true
+
 # ============================================================================
 # PERFORMANCE CONFIGURATION
 # ============================================================================

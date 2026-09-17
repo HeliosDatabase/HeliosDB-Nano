@@ -83,6 +83,10 @@ pub struct SslConfig {
     pub key_path: PathBuf,
     /// Optional path to CA certificate for client verification
     pub ca_cert_path: Option<PathBuf>,
+    /// Offer the `X25519MLKEM768` hybrid post-quantum key-exchange group
+    /// (draft-ietf-tls-ecdhe-mlkem) alongside the classical groups. Default
+    /// `true` — see [`crate::protocol::tls_provider`].
+    pub post_quantum: bool,
 }
 
 impl SslConfig {
@@ -93,12 +97,19 @@ impl SslConfig {
             cert_path: cert_path.as_ref().to_path_buf(),
             key_path: key_path.as_ref().to_path_buf(),
             ca_cert_path: None,
+            post_quantum: true,
         }
     }
 
     /// Set CA certificate path for client verification
     pub fn with_ca_cert<P: AsRef<Path>>(mut self, ca_cert_path: P) -> Self {
         self.ca_cert_path = Some(ca_cert_path.as_ref().to_path_buf());
+        self
+    }
+
+    /// Enable or disable the PQ hybrid key-exchange group.
+    pub fn with_post_quantum(mut self, post_quantum: bool) -> Self {
+        self.post_quantum = post_quantum;
         self
     }
 
@@ -109,6 +120,7 @@ impl SslConfig {
             cert_path: PathBuf::from("certs/server.crt"),
             key_path: PathBuf::from("certs/server.key"),
             ca_cert_path: None,
+            post_quantum: true,
         }
     }
 
@@ -232,8 +244,13 @@ impl SslNegotiator {
             }
         };
 
-        // Build TLS server configuration
-        let mut tls_config = ServerConfig::builder()
+        // Build TLS server configuration, using an explicit PQ-aware
+        // CryptoProvider (aws-lc-rs-backed) instead of the implicit
+        // process-wide default — see `crate::protocol::tls_provider`.
+        let provider = crate::protocol::tls_provider::pq_capable_provider(config.post_quantum);
+        let mut tls_config = ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(|e| Error::io(format!("Failed to select TLS protocol versions: {}", e)))?
             .with_no_client_auth()
             .with_single_cert(certs, private_key)
             .map_err(|e| Error::io(format!("Failed to build TLS config: {}", e)))?;
@@ -335,59 +352,12 @@ impl SslNegotiator {
     }
 }
 
-/// Connection wrapper that can be either plain or TLS-encrypted
-pub enum SecureConnection<S> {
-    /// Plain TCP connection
-    Plain(S),
-    /// TLS-encrypted connection
-    Tls(tokio_rustls::server::TlsStream<S>),
-}
-
-impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for SecureConnection<S> {
-    fn poll_read(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        match self.get_mut() {
-            SecureConnection::Plain(stream) => std::pin::Pin::new(stream).poll_read(cx, buf),
-            SecureConnection::Tls(stream) => std::pin::Pin::new(stream).poll_read(cx, buf),
-        }
-    }
-}
-
-impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for SecureConnection<S> {
-    fn poll_write(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        match self.get_mut() {
-            SecureConnection::Plain(stream) => std::pin::Pin::new(stream).poll_write(cx, buf),
-            SecureConnection::Tls(stream) => std::pin::Pin::new(stream).poll_write(cx, buf),
-        }
-    }
-
-    fn poll_flush(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        match self.get_mut() {
-            SecureConnection::Plain(stream) => std::pin::Pin::new(stream).poll_flush(cx),
-            SecureConnection::Tls(stream) => std::pin::Pin::new(stream).poll_flush(cx),
-        }
-    }
-
-    fn poll_shutdown(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        match self.get_mut() {
-            SecureConnection::Plain(stream) => std::pin::Pin::new(stream).poll_shutdown(cx),
-            SecureConnection::Tls(stream) => std::pin::Pin::new(stream).poll_shutdown(cx),
-        }
-    }
-}
+/// Connection wrapper that can be either plain or TLS-encrypted.
+///
+/// Moved to [`crate::protocol::tls_stream`] so the MySQL TLS support can
+/// reuse the identical `Plain(S) | Tls(TlsStream<S>)` dispatch shape;
+/// re-exported here for source compatibility.
+pub use crate::protocol::tls_stream::SecureConnection;
 
 #[cfg(test)]
 mod tests {

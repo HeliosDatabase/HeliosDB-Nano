@@ -323,3 +323,200 @@ fn test_ssl_request_code_constant() {
     // Verify the SSL request code matches PostgreSQL specification
     assert_eq!(SSL_REQUEST_CODE, 80877103);
 }
+
+// ============================================================================
+// PQ hybrid TLS — full rustls client handshakes
+//
+// These build the server's `ServerConfig` from an EXPLICIT `CryptoProvider`
+// (`heliosdb_nano::protocol::tls_provider::pq_capable_provider`) instead of
+// the implicit process-wide default, so — unlike the negotiation-only tests
+// above (several of which are `#[ignore]`d because `ServerConfig::builder()`
+// needed a process-wide `CryptoProvider::install_default()` that conflicts
+// across the test binary) — a real client TLS handshake can run here without
+// installing anything process-wide.
+// ============================================================================
+
+mod pq_hybrid {
+    use super::*;
+    use heliosdb_nano::protocol::tls_provider::pq_capable_provider;
+    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+    use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
+    use std::sync::Arc as StdArc;
+    use tokio_rustls::TlsConnector;
+
+    /// Accepts any server certificate — fine for a test harness talking to
+    /// the self-signed cert `CertificateManager::setup_test_certs()` writes;
+    /// this suite is testing key-exchange group negotiation, not chain
+    /// validation.
+    #[derive(Debug)]
+    struct AcceptAnyCert;
+
+    impl ServerCertVerifier for AcceptAnyCert {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: UnixTime,
+        ) -> std::result::Result<ServerCertVerified, rustls::Error> {
+            Ok(ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            // Every scheme aws-lc-rs's default provider can verify — the
+            // test cert is RSA or ECDSA depending on `CertificateManager`,
+            // and this verifier doesn't care which.
+            vec![
+                SignatureScheme::RSA_PKCS1_SHA256,
+                SignatureScheme::RSA_PKCS1_SHA384,
+                SignatureScheme::RSA_PKCS1_SHA512,
+                SignatureScheme::ECDSA_NISTP256_SHA256,
+                SignatureScheme::ECDSA_NISTP384_SHA384,
+                SignatureScheme::RSA_PSS_SHA256,
+                SignatureScheme::RSA_PSS_SHA384,
+                SignatureScheme::RSA_PSS_SHA512,
+                SignatureScheme::ED25519,
+            ]
+        }
+    }
+
+    /// Build a rustls `ClientConfig` from an explicit provider (PQ-capable
+    /// or classical-only, matching the server-side helper under test) that
+    /// accepts any server certificate.
+    fn client_config(post_quantum: bool) -> StdArc<ClientConfig> {
+        let provider = pq_capable_provider(post_quantum);
+        let config = ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .expect("TLS 1.3 only (PQ hybrid key exchange is TLS 1.3-only)")
+            .dangerous()
+            .with_custom_certificate_verifier(StdArc::new(AcceptAnyCert))
+            .with_no_client_auth();
+        StdArc::new(config)
+    }
+
+    /// Start a PQ-capable (or classical-only) test server and complete a
+    /// real rustls TLS handshake against it as the given client config.
+    /// Returns the negotiated key-exchange group name.
+    async fn handshake_and_get_group(
+        server_post_quantum: bool,
+        client_cfg: StdArc<ClientConfig>,
+    ) -> Result<rustls::NamedGroup> {
+        // A per-test temp dir, NOT the shared `certs/server.{crt,key}` path
+        // the negotiation-only tests above use: those never build a real
+        // `rustls::ServerConfig` (SSL is either off or the test only checks
+        // the 'S'/'N' byte), but these tests do a full TLS handshake, so two
+        // of them regenerating the SAME shared cert+key pair in parallel
+        // (`cargo test` runs tests in one binary concurrently) raced and
+        // intermittently produced a mismatched cert/key pair
+        // ("keys may not be consistent: KeyMismatch").
+        let temp_dir =
+            tempfile::TempDir::new().map_err(|e| heliosdb_nano::Error::io(format!("temp dir: {}", e)))?;
+        let cert_path = temp_dir.path().join("server.crt");
+        let key_path = temp_dir.path().join("server.key");
+        // `generate_test_cert()`'s hardcoded fallback PEM template doesn't
+        // actually parse (`generate_self_signed` shells out to the real
+        // `openssl` binary, present on this dev host, and is what
+        // `setup_test_certs()` uses too) — use it directly.
+        CertificateManager::generate_self_signed(&cert_path, &key_path, "localhost")?;
+
+        let db = Arc::new(EmbeddedDatabase::new_in_memory()?);
+        let ssl_config =
+            SslConfig::new(SslMode::Require, &cert_path, &key_path).with_post_quantum(server_post_quantum);
+        let addr: SocketAddr = format!("127.0.0.1:{}", free_loopback_port())
+            .parse()
+            .map_err(|e| heliosdb_nano::Error::config(format!("Invalid address: {}", e)))?;
+        let server = PgServerBuilder::new()
+            .address(addr)
+            .auth_method(AuthMethod::Trust)
+            .ssl_config(ssl_config)
+            .build(db)?;
+        let server_addr = server.config().address;
+        tokio::spawn(async move {
+            let _ = server.serve().await;
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        tokio::time::timeout(Duration::from_secs(10), async move {
+            let mut stream = TcpStream::connect(server_addr)
+                .await
+                .map_err(|e| heliosdb_nano::Error::network(format!("Connection failed: {}", e)))?;
+            let ssl_accepted = send_ssl_request(&mut stream).await?;
+            assert!(ssl_accepted, "server must accept the SSLRequest");
+
+            let connector = TlsConnector::from(client_cfg);
+            let server_name = ServerName::try_from("localhost")
+                .map_err(|e| heliosdb_nano::Error::network(format!("Invalid server name: {}", e)))?
+                .to_owned();
+            let tls_stream = connector
+                .connect(server_name, stream)
+                .await
+                .map_err(|e| heliosdb_nano::Error::network(format!("TLS handshake failed: {}", e)))?;
+
+            let (_, conn) = tls_stream.get_ref();
+            let group = conn
+                .negotiated_key_exchange_group()
+                .ok_or_else(|| heliosdb_nano::Error::network("no key-exchange group negotiated".to_string()))?
+                .name();
+            Ok(group)
+        })
+        .await
+        .expect("TLS handshake timed out after 10s")
+    }
+
+    #[tokio::test]
+    async fn pq_only_client_negotiates_hybrid_group_against_pq_server() -> Result<()> {
+        let group = handshake_and_get_group(true, client_config(true)).await?;
+        assert_eq!(
+            group,
+            rustls::NamedGroup::X25519MLKEM768,
+            "a PQ-capable client against a PQ-enabled server must negotiate the hybrid group"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn classical_only_client_still_succeeds_against_pq_server() -> Result<()> {
+        // No regression: a client that only offers classical groups must
+        // still complete a handshake against a PQ-enabled server.
+        let group = handshake_and_get_group(true, client_config(false)).await?;
+        assert_ne!(
+            group,
+            rustls::NamedGroup::X25519MLKEM768,
+            "a classical-only client cannot have negotiated the PQ hybrid group"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pq_disabled_server_never_offers_hybrid_group() -> Result<()> {
+        // Even a PQ-capable client cannot negotiate the hybrid group when
+        // the server has tls_post_quantum = false.
+        let group = handshake_and_get_group(false, client_config(true)).await?;
+        assert_ne!(
+            group,
+            rustls::NamedGroup::X25519MLKEM768,
+            "tls_post_quantum = false must not offer the PQ hybrid group"
+        );
+        Ok(())
+    }
+}
