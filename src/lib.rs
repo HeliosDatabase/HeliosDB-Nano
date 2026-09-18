@@ -331,7 +331,9 @@ pub use crypto::{
     NonceTracker, TimestampValidator, ZeroKnowledgeSession, ZkeConfig, ZkeDerivedKeys, ZkeKeyDerivation,
     ZkeRequestContext,
 };
-pub use error::{Error, Result, COMMIT_OF_FAILED_TRANSACTION_MESSAGE, IN_FAILED_TRANSACTION_MESSAGE};
+pub use error::{
+    Error, Result, COMMIT_OF_FAILED_TRANSACTION_MESSAGE, IN_FAILED_TRANSACTION_MESSAGE, NOT_NULL_VIOLATION_MARKER,
+};
 pub use storage::StorageEngine;
 pub use types::{
     AgentMessage, AgentSession, Column, ColumnStorageMode, DataType, DocumentData, DocumentMetadata, Schema, Tuple,
@@ -525,6 +527,37 @@ thread_local! {
     /// branch — the autocommit path, which is every measured working `CALL`, never
     /// touches it.
     static GLOBAL_TXN_LOCK_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// sprinter d03de7fc3b22: true while a CLIENT statement already charged
+    /// against the active tenant's `max_qps` is running on this thread.
+    ///
+    /// `TenantManager::record_query` had exactly ONE production caller —
+    /// `execute_in_transaction_inner`, the simple-query / MySQL / embedded
+    /// `execute()` funnel — so `max_qps` was unenforced for every client that
+    /// binds parameters (psycopg3, JDBC, sqlx, node-postgres, Prisma, Drizzle)
+    /// and for every read. There is no single funnel all families pass through
+    /// (the params family and the read funnel are disjoint from that one), so
+    /// every family's entry point charges instead, and this marker is what makes
+    /// that safe: one statement is charged ONCE no matter how many layers it
+    /// traverses, and the nested executions the engine performs on its own
+    /// behalf — a trigger body, a `CALL` body, a SQL UDF, a text entry point
+    /// delegating into the params funnel — are never charged at all, because
+    /// they re-enter on this same thread inside the outer statement's guard.
+    static TENANT_QUERY_METERED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// RAII marker for `TENANT_QUERY_METERED` (sprinter d03de7fc3b22).
+///
+/// Restores the PREVIOUS value on `Drop` — including on an unwinding panic —
+/// rather than clearing unconditionally, exactly like [`GlobalTxnLockMarker`]:
+/// the engine re-enters itself on the same worker thread, and a nested guard
+/// that cleared the flag would let the REST of the outer statement's nested
+/// executions each charge the tenant again.
+struct TenantQueryMeter(bool);
+
+impl Drop for TenantQueryMeter {
+    fn drop(&mut self) {
+        TENANT_QUERY_METERED.with(|c| c.set(self.0));
+    }
 }
 
 /// RAII marker for `GLOBAL_TXN_LOCK_HELD`. Restores the PREVIOUS value on
@@ -679,6 +712,23 @@ pub(crate) fn session_scoped_state_tls() -> Option<std::sync::Arc<crate::session
     SESSION_SCOPED_STATE.with(|c| c.borrow().clone())
 }
 
+/// sprinter a3077a3f68d8: this session's `SET bulk_load_mode` override, if any.
+///
+/// Separate from [`session_scoped_state_tls`] because `StorageEngine::is_bulk_load_mode`
+/// calls it PER ROW on the insert paths: borrowing the slot and reading one
+/// atomic through the `&` costs no refcount traffic, while cloning the `Arc`
+/// would put an increment+decrement pair on every inserted row.
+pub(crate) fn session_bulk_load_mode_tls() -> Option<bool> {
+    SESSION_SCOPED_STATE.with(|c| c.borrow().as_ref().and_then(|s| s.bulk_load_mode()))
+}
+
+/// sprinter a3077a3f68d8: this session's `SET statement_timeout` override in
+/// milliseconds, if any (`Some(0)` is PostgreSQL's *unlimited*). Borrow-and-read
+/// for the same reason as above — this runs for every executor built.
+pub(crate) fn session_statement_timeout_tls() -> Option<u64> {
+    SESSION_SCOPED_STATE.with(|c| c.borrow().as_ref().and_then(|s| s.statement_timeout_ms()))
+}
+
 /// Record the value a sequence just produced as THIS connection's `lastval()`
 /// (sprinter 6dc0cc115db9).
 ///
@@ -694,6 +744,133 @@ pub(crate) fn note_session_lastval(value: i64) {
             state.note_lastval(value);
         }
     });
+}
+
+/// Record one `nextval('<name>')` return as BOTH this connection's `lastval()`
+/// and its `currval('<name>')` — sprinter 7903b7111cb4.
+///
+/// Called from the `nextval()` evaluator arm, the one place that produces such a
+/// value under a name the caller supplied. The SERIAL/IDENTITY fills keep
+/// calling [`note_session_lastval`]: they allocate from the row-id allocator and
+/// never learn a sequence name, so there is no `currval` to record.
+///
+/// A caller with no backend installed (engine-internal evaluation) records
+/// nothing rather than writing into a shared slot.
+pub(crate) fn note_session_nextval(name: &str, value: i64) {
+    SESSION_SCOPED_STATE.with(|c| {
+        if let Some(state) = c.borrow().as_ref() {
+            state.note_nextval(name, value);
+        }
+    });
+}
+
+/// Record a `setval('<name>', n)` as this connection's `currval('<name>')`
+/// WITHOUT moving `lastval()` — sprinter 7903b7111cb4. PostgreSQL's documented
+/// `setval` side effect.
+pub(crate) fn note_session_currval(name: &str, value: i64) {
+    SESSION_SCOPED_STATE.with(|c| {
+        if let Some(state) = c.borrow().as_ref() {
+            state.note_currval(name, value);
+        }
+    });
+}
+
+/// This session's override for a user-settable GUC, for the storage-less
+/// evaluator serving `current_setting('<name>')` — sprinter a3077a3f68d8.
+///
+/// `None` = this session has not set it, and the caller falls back to the
+/// registry default.
+pub(crate) fn session_guc_tls(name: &str) -> Option<sql::SettingValue> {
+    SESSION_SCOPED_STATE.with(|c| c.borrow().as_ref().and_then(|s| s.guc(name)))
+}
+
+/// `currval('<name>')` for the statement running on THIS thread — sprinter
+/// 7903b7111cb4.
+///
+/// `None` means this session has never advanced that sequence, which the caller
+/// reports as SQLSTATE 55000 with
+/// [`crate::session::scoped::currval_undefined_message`]. `None` is also what an
+/// evaluation with no backend installed gets (engine-internal only), and failing
+/// closed there is right for the same reason it is right for `lastval()`.
+pub(crate) fn session_currval(name: &str) -> Option<i64> {
+    SESSION_SCOPED_STATE.with(|c| c.borrow().as_ref().and_then(|s| s.currval(name)))
+}
+
+/// The declared column types a SERIAL / IDENTITY primary key can be
+/// auto-generated for — the integer family, and nothing else
+/// (sprinter f32ba64c00a7).
+///
+/// This is the predicate the identity-PK fast paths already applied by hand
+/// (`EmbeddedDatabase::fast_count_pk_spec`, `Executor::identity_pk_count_distinct_index`);
+/// it is a named function so the NULL-PK auto-fill in
+/// [`pk_autofill_value`] cannot drift from the shape those paths assume. It is
+/// also exactly PostgreSQL's rule: `SERIAL` / `BIGSERIAL` / `SMALLSERIAL`
+/// expand to `int4` / `int8` / `int2`, and `GENERATED … AS IDENTITY` is
+/// rejected at DDL time on any non-integer column.
+pub(crate) fn is_identity_pk_type(data_type: &DataType) -> bool {
+    matches!(data_type, DataType::Int2 | DataType::Int4 | DataType::Int8)
+}
+
+/// The value a NULL PRIMARY KEY column is auto-filled with from the row-id
+/// allocator — or the `23502` refusal when its DECLARED type is not one the
+/// allocator can produce (sprinter f32ba64c00a7).
+///
+/// THE single decision behind every NULL-PK fill site: three storage funnels
+/// (`insert_tuple_fast`, `insert_tuple_versioned_with_schema`,
+/// `insert_tuple_branch_aware_with_schema`) and four executor arms (the text
+/// family's in-transaction INSERT, `prepare_tuple_for_transaction_insert` —
+/// the fast/batch/session-txn funnel — and the params family's staged-INSERT
+/// and `RETURNING` arms). They used to gate on `col.primary_key` ALONE and
+/// then assign `Value::Int8(row_id)` for ANY declared type, so
+///
+/// ```sql
+/// CREATE TABLE t (id TEXT, v INT, PRIMARY KEY (id));
+/// INSERT INTO t (v) VALUES (1);
+/// ```
+///
+/// stored an INTEGER in a TEXT primary key. Three things went wrong at once:
+/// the row disagreed with its own declared schema (`length(id)` failed with
+/// "LENGTH requires a string argument" on a column declared `TEXT`); the ART
+/// index encoded that key at the INTEGER's type width while every later probe
+/// built from the declared TEXT type encoded differently, so
+/// `WHERE id = '1'` found NOTHING while a full scan returned the row — the
+/// same type-width class as the v3.60.6 DECIMAL-PK defect; and the client read
+/// back a type it never declared.
+///
+/// PostgreSQL has no path that invents a text key from a row counter: a NULL
+/// (or omitted) primary key with no DEFAULT and no identity is
+/// `23502 null value in column "…" violates not-null constraint`, and a DEFAULT
+/// is always of the column's OWN type.
+///
+/// The integer arms are byte-identical to what every site did before, so
+/// legitimate `SERIAL` / `BIGSERIAL` / `SMALLSERIAL` / `IDENTITY` auto-fill is
+/// unchanged. A DEFAULT, when the column has one, has already been applied by
+/// the planner arm that reaches here, so a NULL at this point means there was
+/// none.
+pub(crate) fn pk_autofill_value(table_name: &str, col: &Column, row_id: u64) -> Result<Value> {
+    match col.data_type {
+        DataType::Int2 => Ok(Value::Int2(row_id as i16)),
+        DataType::Int4 => Ok(Value::Int4(row_id as i32)),
+        DataType::Int8 => Ok(Value::Int8(row_id as i64)),
+        _ => {
+            // The two halves of the same rule, pinned together: anything the
+            // match above does not fill must be something
+            // `is_identity_pk_type` also rejects.
+            debug_assert!(
+                !is_identity_pk_type(&col.data_type),
+                "is_identity_pk_type admits a type pk_autofill_value cannot fill"
+            );
+            // PostgreSQL's own wording. The trailing marker const is what both
+            // wire classifiers anchor on (23502 / ER_BAD_NULL_ERROR); see
+            // `crate::error::NOT_NULL_VIOLATION_MARKER`.
+            Err(Error::constraint_violation(format!(
+                "null value in column \"{}\" of relation \"{}\" {}",
+                col.name,
+                table_name,
+                crate::error::NOT_NULL_VIOLATION_MARKER
+            )))
+        }
+    }
 }
 
 /// The calling thread's effective `search_path` current schema, as seen by the
@@ -1002,8 +1179,31 @@ pub struct EmbeddedDatabase {
     /// Lightweight SQL-visible query profiler, disabled by default.
     query_profiler: std::sync::Arc<query_trace::QueryProfiler>,
     /// ART index undo log for transaction rollback: (table, row_id, col_values)
-    /// Cleared on commit, replayed as on_delete on rollback
+    /// Cleared on commit, replayed as on_delete on rollback.
+    ///
+    /// Shared by the global-slot transaction (`BEGIN`/`COMMIT`/`ROLLBACK` on the
+    /// embedded handle) and the per-statement autocommit transactions. Those two
+    /// cannot interleave on one handle — `execute()`'s in-transaction branch
+    /// routes every statement INTO the open global transaction — so a single log
+    /// with whole-log `clear()` / drain is sound between them.
+    ///
+    /// The RAII handle from [`EmbeddedDatabase::begin_transaction`] is the
+    /// exception and gets [`Self::raii_art_undo`] instead: it sets NEITHER
+    /// `global_txn_active` nor the per-session count, so autocommit statements
+    /// run alongside it and their `clear()` here would throw away the open
+    /// handle's pending undo entries (sprinter 8a9b60eeef87).
     art_undo_log: std::sync::Arc<parking_lot::RwLock<Vec<ArtUndoOp>>>,
+    /// Per-RAII-transaction ART undo logs (sprinter 8a9b60eeef87), keyed by
+    /// `storage::Transaction::transaction_id`.
+    ///
+    /// The session-less twin of `session_art_undo`, and for the same reason: a
+    /// transaction that stays open across statements OTHER transactions can
+    /// interleave with needs its own log, so its ROLLBACK replays exactly its
+    /// own entries and its COMMIT drops exactly its own. `begin_transaction`
+    /// registers the slot; `Transaction::commit` / `Transaction::rollback` take
+    /// it, and `RaiiArtUndoSlot`'s `Drop` removes it however the handle ends —
+    /// including a handle dropped without either, which cannot leak an entry.
+    raii_art_undo: std::sync::Arc<dashmap::DashMap<u64, Vec<ArtUndoOp>>>,
     /// Per-session ART undo logs (R0.1). Session transactions mutate the ART
     /// indexes eagerly just like the global transaction path; their undo
     /// entries must be keyed by session so a session ROLLBACK replays exactly
@@ -1196,6 +1396,25 @@ struct SavepointState {
     /// rolled-back write set (without it, a post-savepoint INSERT leaves a
     /// ghost index entry that survives COMMIT — see the savepoint regression
     /// tests).
+    art_undo_len: usize,
+}
+
+/// sprinter 5b70b7ac5513: a [`SavepointState`] with no name and no stack entry —
+/// the IMPLICIT savepoint the MySQL listener takes around each statement inside
+/// an open transaction.
+///
+/// Same two pieces of state, captured the same way and undone by the same two
+/// primitives; see [`EmbeddedDatabase::statement_savepoint_for_session`] for why
+/// it is deliberately NOT a `SavepointState` pushed onto `savepoints` (that
+/// stack is process-wide and gates ten fast paths on being empty).
+pub(crate) struct ImplicitStatementSavepoint {
+    /// Staged writes as of just before the statement — the write set plus the
+    /// append-only `insert_log` length, which is what the multi-row INSERT
+    /// funnel actually stages through.
+    write_set_snapshot: storage::TransactionSavepointSnapshot,
+    /// ART/vector undo-log length as of just before the statement, so the index
+    /// entries the statement made are replayed away with its rows. Omitting this
+    /// is what leaves a ghost index entry behind a rolled-back INSERT.
     art_undo_len: usize,
 }
 
@@ -1670,6 +1889,21 @@ enum DbSettingStatement {
 /// cannot drift.
 pub(crate) const SET_LOCAL_TIMEOUT_GUC_UNSUPPORTED: &str = "SET LOCAL is not supported for parameter";
 
+/// sprinter d03de7fc3b22: marker text of every TENANT RESOURCE-QUOTA refusal —
+/// the `max_qps` limiter (`EmbeddedDatabase::charge_tenant_query`) and the
+/// `max_storage_bytes` check inside `execute_in_transaction_inner`, whose
+/// "Storage quota exceeded: …" wording already contains it.
+///
+/// Both wires map a message containing it (case-insensitively) to the resource
+/// class rather than to the generic internal error: SQLSTATE 53400
+/// `configuration_limit_exceeded` on the PostgreSQL wire and 1226
+/// `ER_USER_LIMIT_REACHED` on MySQL. Before this, a tenant that had merely spent
+/// its budget was reported as `XX000 internal_error` / `1105 HY000`, which
+/// PgBouncer, pgpool and every HA proxy read as a BROKEN BACKEND — so a
+/// perfectly healthy connection that hit its own rate limit could be evicted
+/// from the pool. Owned here, by the emitters, so wording and code cannot drift.
+pub(crate) const TENANT_QUOTA_EXCEEDED_MARKER: &str = "quota exceeded";
+
 impl EmbeddedDatabase {
     #[allow(clippy::expect_used)] // Safety: cache size is a non-zero compile-time constant.
     fn new_spec_cache<V: Clone>() -> std::sync::Arc<sharded_lru::ShardedLruCache<String, V>> {
@@ -1779,6 +2013,12 @@ impl EmbeddedDatabase {
                 // adds an index the planner may pick — so a cached plan built
                 // before it must not be reused.
                 | sql::LogicalPlan::AlterTableAddUnique { .. }
+                // Same reasoning for the two sibling spellings (sprinter
+                // 885ffe24eab6): ADD PRIMARY KEY registers a PK index the
+                // planner may pick and a new `ON CONFLICT` arbiter, and a new
+                // CHECK changes which rows a cached write plan may produce.
+                | sql::LogicalPlan::AlterTableAddPrimaryKey { .. }
+                | sql::LogicalPlan::AlterTableAddCheck { .. }
                 | sql::LogicalPlan::AlterTableAlterConstraintEnforcement { .. }
                 | sql::LogicalPlan::AlterTableDropConstraint { .. }
                 | sql::LogicalPlan::AlterTableMulti { .. }
@@ -2140,6 +2380,246 @@ impl EmbeddedDatabase {
         }
     }
 
+    /// sprinter a3077a3f68d8: the registry name this `SET` / `RESET` / `SHOW`
+    /// targets, when the target is a USER-SETTABLE GUC — the ones that must land
+    /// on THIS session rather than on the one process-global registry.
+    ///
+    /// `None` for anything the registry does not declare (so an unknown name
+    /// keeps whatever answer it had before this item), for the SERVER-level
+    /// parameters (`sql::is_server_level`), and for the three names that already
+    /// have their own dedicated session slot and interceptor —
+    /// `application_name` (sprinter f4f5d450e816) and the two GH#28
+    /// connection-lifetime timeouts.
+    ///
+    /// `helios.bulk_load_mode` normalizes onto `bulk_load_mode`: the two
+    /// spellings of the same knob were handled by two different code paths
+    /// (`try_handle_fk_setting` and the registry), and leaving one of them
+    /// process-wide would have made the fix depend on how a client spelled it.
+    fn session_guc_target(statement: &DbSettingStatement) -> Option<&'static str> {
+        let raw = match statement {
+            DbSettingStatement::Set { name, .. }
+            | DbSettingStatement::Reset { name }
+            | DbSettingStatement::Show { name } => name.as_str(),
+        };
+        let name = if raw == "helios.bulk_load_mode" {
+            "bulk_load_mode"
+        } else {
+            raw
+        };
+        // `sql::is_user_settable` is registered-AND-not-server-level, so an
+        // unknown name keeps falling through to whatever answered it before this
+        // item (the planner, or PostgreSQL's 42704 for `SHOW`).
+        sql::REGISTERED_PARAMETERS
+            .iter()
+            .copied()
+            .find(|candidate| *candidate == name && sql::is_user_settable(candidate))
+    }
+
+    /// sprinter a3077a3f68d8: true for `SET` / `SET LOCAL` / `RESET` / `SHOW` of
+    /// a user-settable GUC — the predicate both wire listeners use to route the
+    /// statement at THIS session instead of acking it (PostgreSQL simple query,
+    /// MySQL `COM_QUERY`) or erroring it (PostgreSQL extended).
+    ///
+    /// An associated fn, like its `is_*_statement` siblings: both wire listeners
+    /// classify the statement before any per-session state is in reach.
+    pub(crate) fn is_session_guc_statement(sql: &str) -> bool {
+        // PERF: same cheap discriminator as `try_handle_session_application_name`
+        // — only `SET`, `SHOW` and `RESET` can name a GUC.
+        if !matches!(
+            sql.trim_start().as_bytes().first().copied(),
+            Some(b'S' | b's' | b'R' | b'r')
+        ) {
+            return false;
+        }
+        Self::parse_db_setting_statement(sql)
+            .as_ref()
+            .and_then(Self::session_guc_target)
+            .is_some()
+    }
+
+    /// Apply a user-settable `SET` / `RESET` / `SHOW` to `state`, THE BACKEND THE
+    /// CALLER RESOLVED — sprinter a3077a3f68d8.
+    ///
+    /// The target is a parameter for exactly the reason
+    /// [`Self::try_handle_application_name_setting`] takes one: the protocol
+    /// layer knows its backend by `SessionId` and runs before any engine entry
+    /// point installs the per-statement thread-local, while the session-less
+    /// embedded funnels have no id and their own guard's thread-local IS the
+    /// answer. Resolving from the thread-local in the first case would ACK the
+    /// `SET` and discard it.
+    ///
+    /// `None` state is engine-internal evaluation: nothing to set, and `SHOW`
+    /// answers the server default.
+    fn apply_session_guc_setting(
+        &self,
+        statement: &DbSettingStatement,
+        name: &str,
+        sql: &str,
+        in_transaction: bool,
+        state: Option<std::sync::Arc<crate::session::scoped::SessionScopedState>>,
+    ) -> Result<(Vec<Tuple>, std::sync::Arc<Schema>)> {
+        match statement {
+            DbSettingStatement::Set { value, .. } => {
+                // `SET <name> TO DEFAULT` is `RESET <name>` (PostgreSQL), which
+                // for an overlay means DROPPING the override rather than writing
+                // the default over it — otherwise a later change to the server
+                // default would not reach a session that had "reset".
+                if value.eq_ignore_ascii_case("default") {
+                    if let Some(state) = state {
+                        state.reset_guc(name);
+                    }
+                    return Ok((Vec::new(), Self::empty_result_schema()));
+                }
+                // The two duration-typed GUCs accept PostgreSQL's GUC duration
+                // syntax (a bare integer is milliseconds, or `<n>us|ms|s|min|h|d`)
+                // and are STORED as a duration, so `SHOW statement_timeout`
+                // renders `1ms` / `30s` the way a stock server does instead of a
+                // bare integer. Parsing here is also the validation: a value that
+                // is not a duration fails closed with PostgreSQL's 22023 wording,
+                // exactly as GH#28 made the idle timeouts fail.
+                let parsed = match name {
+                    "statement_timeout" | "query_timeout" => sql::SettingValue::Duration(
+                        crate::protocol::postgres::timeouts::parse_guc_duration_ms(value, 1).map_err(|bad| {
+                            Error::query_execution(format!("invalid value for parameter \"{}\": \"{}\"", name, bad))
+                        })?,
+                    ),
+                    _ => sql::parse_setting_value(value),
+                };
+                // Validate through the ONE validator, so a session-scoped `SET`
+                // fails closed on a bad value exactly as the registry write did.
+                sql::SessionSettings::validate(name, &parsed)?;
+                if let Some(state) = state {
+                    if Self::set_statement_is_local(sql) {
+                        // PostgreSQL: `SET LOCAL` outside a transaction block
+                        // warns and has no effect. Applying it would be worse
+                        // than dropping it — the override would outlive a block
+                        // that never existed.
+                        if in_transaction {
+                            state.set_local_guc(name, parsed);
+                        }
+                    } else {
+                        state.set_guc(name, parsed);
+                    }
+                }
+                Ok((Vec::new(), Self::empty_result_schema()))
+            }
+            DbSettingStatement::Reset { .. } => {
+                if let Some(state) = state {
+                    state.reset_guc(name);
+                }
+                Ok((Vec::new(), Self::empty_result_schema()))
+            }
+            DbSettingStatement::Show { .. } => {
+                let value = state
+                    .and_then(|s| s.guc(name))
+                    .or_else(|| self.session_settings.get(name))
+                    .as_ref()
+                    .map(sql::render_value)
+                    .unwrap_or_default();
+                Ok((
+                    vec![Tuple {
+                        values: vec![Value::String(value)],
+                        row_id: None,
+                        branch_id: None,
+                    }],
+                    Self::typed_result_schema(name, DataType::Text),
+                ))
+            }
+        }
+    }
+
+    /// sprinter a3077a3f68d8: the `_for_session` interceptor for the
+    /// user-settable GUCs, modelled on
+    /// [`Self::try_handle_session_application_name`].
+    ///
+    /// The backend it writes is resolved from `session_id`, NOT from the
+    /// per-statement thread-local — the trap f4f5d450e816 hit and paid a gate
+    /// cycle for. The PostgreSQL simple-query `SET`/`RESET` arms and the MySQL
+    /// `COM_QUERY` arm are PROTOCOL-layer callers that run ahead of any engine
+    /// entry point, so the thread-local is empty for them and a write through it
+    /// would be acknowledged and silently discarded.
+    ///
+    /// The extra session lookup is paid ONLY by a statement that actually names
+    /// one of these parameters: the byte gate and the registry probe both run
+    /// first, so the per-statement hot path is unchanged.
+    pub(crate) fn try_handle_session_guc(
+        &self,
+        session_id: crate::session::SessionId,
+        sql: &str,
+    ) -> Result<Option<(Vec<Tuple>, std::sync::Arc<Schema>)>> {
+        if !matches!(
+            sql.trim_start().as_bytes().first().copied(),
+            Some(b'S' | b's' | b'R' | b'r')
+        ) {
+            return Ok(None);
+        }
+        let Some(statement) = Self::parse_db_setting_statement(sql) else {
+            return Ok(None);
+        };
+        let Some(name) = Self::session_guc_target(&statement) else {
+            return Ok(None);
+        };
+        let session_lock = self.session_manager.get_session(session_id)?;
+        let scoped = std::sync::Arc::clone(&session_lock.read().scoped);
+        self.apply_session_guc_setting(
+            &statement,
+            name,
+            sql,
+            self.session_has_open_transaction(session_id),
+            Some(scoped),
+        )
+        .map(Some)
+    }
+
+    /// sprinter a3077a3f68d8: the effective `bulk_load_mode` for statements that
+    /// arrive on THIS handle without a session — the embedded API, the REST /
+    /// BaaS layer, the MCP tools and the REPL, which all share the handle's own
+    /// backend state.
+    ///
+    /// `SET bulk_load_mode = on` used to flip a PROCESS-WIDE storage flag, so
+    /// `db.storage.is_bulk_load_mode()` was a faithful report of it. Now the knob
+    /// is per-session and `StorageEngine::is_bulk_load_mode` answers for whatever
+    /// session's statement is running on the calling thread — which, from a
+    /// caller that is not inside a statement, is the server-level flag. This is
+    /// the accessor that answers "what would a statement on this handle see?".
+    pub fn bulk_load_mode(&self) -> bool {
+        self.embedded_scoped
+            .bulk_load_mode()
+            .unwrap_or_else(|| self.storage.is_bulk_load_mode())
+    }
+
+    /// sprinter a3077a3f68d8: `SHOW <user-settable guc>` for a wire session —
+    /// this session's override, else the server default. `None` when the name is
+    /// not a user-settable registered GUC, which is the caller's signal to fall
+    /// through to its own table (and, ultimately, to PostgreSQL's 42704).
+    pub(crate) fn session_show_guc(&self, session_id: crate::session::SessionId, name: &str) -> Option<String> {
+        let name = Self::show_guc_name(name)?;
+        let value = self
+            .session_guc_value(session_id, name)
+            .or_else(|| self.session_settings.get(name))?;
+        Some(sql::render_value(&value))
+    }
+
+    /// The registry name a `SHOW` target maps to, when it is a user-settable GUC.
+    fn show_guc_name(name: &str) -> Option<&'static str> {
+        let name = if name == "helios.bulk_load_mode" {
+            "bulk_load_mode"
+        } else {
+            name
+        };
+        sql::REGISTERED_PARAMETERS
+            .iter()
+            .copied()
+            .find(|candidate| *candidate == name && sql::is_user_settable(candidate))
+    }
+
+    /// This session's override for a user-settable GUC, read off its backend.
+    fn session_guc_value(&self, session_id: crate::session::SessionId, name: &str) -> Option<sql::SettingValue> {
+        let session_lock = self.session_manager.get_session(session_id).ok()?;
+        let scoped = std::sync::Arc::clone(&session_lock.read().scoped);
+        scoped.guc(name)
+    }
+
     /// sprinter f4f5d450e816: true for `SET` / `SET LOCAL` / `RESET` / `SHOW`
     /// of `application_name` — the predicate the PostgreSQL extended-protocol
     /// Execute arm uses to delegate the statement to the simple-query handler,
@@ -2251,6 +2731,17 @@ impl EmbeddedDatabase {
             // feature that silently worked on the text family only.
             Some(DbSettingStatement::Set { ref name, .. }) | Some(DbSettingStatement::Reset { ref name })
                 if name == "application_name" => {}
+            // sprinter a3077a3f68d8: the user-settable GUCs are now session
+            // state too, so the reason GH#28 had to REFUSE them here is gone —
+            // the write lands on the caller's own backend and cannot reach
+            // another connection. They MUST be allowed: every extended-protocol
+            // driver (psycopg3, JDBC, sqlx, node-postgres, Prisma, Drizzle)
+            // reaches the params family for every statement it sends, and GH#28's
+            // own lesson was a feature that silently worked on the text family
+            // only. Anything the classifier does not recognise — an unregistered
+            // name, or a SERVER-level parameter — still falls through to the
+            // planner and still errors exactly as on main.
+            Some(ref statement) if Self::session_guc_target(statement).is_some() => {}
             _ => return Ok(None),
         }
         self.try_handle_db_setting_statement_with_schema(sql)
@@ -2285,32 +2776,41 @@ impl EmbeddedDatabase {
             return Ok(Some(handled));
         }
 
+        // sprinter a3077a3f68d8: every USER-SETTABLE GUC is per-session state,
+        // so — exactly like `application_name` above — it is answered BEFORE the
+        // process-global registry gate below. The registry entry now exists only
+        // to DECLARE the name and supply its default; it is no longer where a
+        // user-settable value is stored, because storing it there meant
+        // `SET statement_timeout = 1` on one connection cancelled every other
+        // connection's queries and `SET bulk_load_mode = on` flipped the storage
+        // engine's flag for the whole process.
+        //
+        // This arm serves the session-less funnels (embedded / REST / MCP /
+        // REPL) and, through them, a wire session's autocommit delegate; a wire
+        // session's own `SET` is intercepted earlier by `try_handle_session_guc`,
+        // which resolves the backend from the `SessionId`.
+        if let Some(name) = Self::session_guc_target(&statement) {
+            return self
+                .apply_session_guc_setting(
+                    &statement,
+                    name,
+                    sql,
+                    self.global_txn_active.load(std::sync::atomic::Ordering::Acquire),
+                    crate::session_scoped_state_tls(),
+                )
+                .map(Some);
+        }
+
         match statement {
             DbSettingStatement::Set { name, value } => {
                 if self.session_settings.get(&name).is_none() {
                     return Ok(None);
                 }
+                // Only SERVER-level parameters reach here now (the user-settable
+                // ones returned above), and `SessionSettings::set` refuses the
+                // postmaster-scoped subset with PostgreSQL's 55P02 wording.
                 let parsed = sql::parse_setting_value(&value);
-                // `bulk_load_mode` is registered as a session setting, but its
-                // real effect lives in the storage engine's atomic flag. This
-                // passive handler intercepts the bare `SET bulk_load_mode = …`
-                // form on every embedded execute()/query() path (it runs before
-                // try_handle_fk_setting), so without this propagation the
-                // documented perf knob would be a silent no-op — the shadow
-                // value would update but the engine's bulk-insert fast path
-                // would never turn on. (The `helios.bulk_load_mode` form is not
-                // a registered session setting and is handled by
-                // try_handle_fk_setting; the PG wire path routes it via
-                // is_fk_setting_statement.)
-                let bulk_flag = if name == "bulk_load_mode" {
-                    parsed.as_bool()
-                } else {
-                    None
-                };
                 self.session_settings.set(&name, parsed)?;
-                if let Some(enabled) = bulk_flag {
-                    self.storage.set_bulk_load_mode(enabled);
-                }
                 Ok(Some((Vec::new(), Self::empty_result_schema())))
             }
             DbSettingStatement::Show { name } => {
@@ -2331,12 +2831,6 @@ impl EmbeddedDatabase {
                     return Ok(None);
                 }
                 self.session_settings.reset(&name)?;
-                // Keep the storage-engine flag in sync when the bulk-load
-                // session setting is reset to its default (off); see the Set
-                // arm above for why this propagation is required.
-                if name == "bulk_load_mode" {
-                    self.storage.set_bulk_load_mode(false);
-                }
                 Ok(Some((Vec::new(), Self::empty_result_schema())))
             }
         }
@@ -2718,13 +3212,75 @@ impl EmbeddedDatabase {
     /// instead of pinning its worker indefinitely. Previously `SET
     /// statement_timeout` was accepted but never consulted here (dead code).
     fn effective_statement_timeout_ms(&self) -> Option<u64> {
-        if let Some(d) = self.session_settings.statement_timeout() {
-            return Some(d.as_millis() as u64);
+        // sprinter a3077a3f68d8: THIS session's `SET statement_timeout`, read
+        // from the per-statement backend state — never from the process-global
+        // registry, where connection A's `SET statement_timeout = 1` cancelled
+        // connection B's queries after 1 ms.
+        //
+        // `Some(0)` is PostgreSQL's *unlimited* and is NOT the same answer as
+        // "no override": it must beat a configured `statement_timeout_ms`, so
+        // this arm returns rather than falling through.
+        //
+        // PERF: this replaces a `String` allocation (the registry lowercased the
+        // name on every call) plus an `RwLock` read with one relaxed atomic
+        // load, on a path that runs for every executor.
+        if let Some(ms) = crate::session_statement_timeout_tls() {
+            return (ms > 0).then_some(ms);
         }
         self.config
             .storage
             .statement_timeout_ms
             .or(self.config.storage.query_timeout_ms)
+    }
+
+    /// Charge one client statement against the active tenant's QPS budget.
+    ///
+    /// SCOPE, deliberately: this is called from `execute_in_transaction_inner`
+    /// ONLY — the simple-query / MySQL / embedded `execute()` family — which is
+    /// exactly where it was called before. Sprinter d03de7fc3b22 is about the
+    /// params/extended-protocol family never being metered, and the call sites
+    /// that close that gap were written, ran, and were then REMOVED again
+    /// before release. Why, so nobody re-adds them without reading this:
+    ///
+    ///   * `active_tenant_id()` reads `TenantManager::current_context`, ONE
+    ///     process-global slot shared by every connection and thread. Its only
+    ///     production writer is the REPL's `\tenant use`; no wire handler sets
+    ///     it at all. Metering every family against that charges a connection's
+    ///     statements to whichever tenant some OTHER connection last selected,
+    ///     and lets one tenant's exhausted budget refuse another's queries.
+    ///   * The default "free" plan is `max_qps: 10`. Before the expansion an
+    ///     embedded caller's `query()` was never charged, so switching it on
+    ///     makes working applications start failing at ten statements a second.
+    ///   * Both were observed, not predicted: with the expansion in place, 7
+    ///     pre-existing RLS tests went red purely because a test binary's
+    ///     parallel tests share that one global context.
+    ///
+    /// The prerequisite is a `SessionId -> TenantId` binding, which exists
+    /// nowhere today. Until it does, widening this makes enforcement WRONG
+    /// rather than merely absent, which is the worse of the two. The item stays
+    /// open with that as its blocker.
+    ///
+    /// What did ship from d03de7fc3b22: quota refusals are now classified
+    /// 53400 `configuration_limit_exceeded` (MySQL 1226) instead of XX000
+    /// `internal_error`, which connection poolers read as a broken backend and
+    /// evict a healthy connection over.
+    #[inline]
+    fn charge_tenant_query(&self) -> Result<TenantQueryMeter> {
+        let previous = TENANT_QUERY_METERED.with(|c| c.replace(true));
+        let meter = TenantQueryMeter(previous);
+        if previous {
+            // Already inside a charged statement on this thread: this is a
+            // nested execution, not a new client statement.
+            return Ok(meter);
+        }
+        if let Some(tenant_id) = self.tenant_manager.active_tenant_id() {
+            // The guard is already live, so an over-quota refusal still restores
+            // the flag on the way out (its `Drop` runs as `meter` is dropped).
+            self.tenant_manager
+                .record_query(tenant_id)
+                .map_err(|e| Error::query_execution(format!("Tenant {TENANT_QUOTA_EXCEEDED_MARKER}: {e}")))?;
+        }
+        Ok(meter)
     }
 
     /// R-A1: admission gate for the parse/plan/result caches on the cold query
@@ -3587,7 +4143,12 @@ impl EmbeddedDatabase {
                     Ok(Some(0))
                 }
                 "helios.bulk_load_mode" | "bulk_load_mode" => {
-                    self.storage.set_bulk_load_mode(false);
+                    // sprinter a3077a3f68d8: per-SESSION, never the process-wide
+                    // storage flag. `RESET` drops the override, so the engine
+                    // falls back to its server-level default.
+                    if let Some(state) = crate::session_scoped_state_tls() {
+                        state.reset_guc("bulk_load_mode");
+                    }
                     Ok(Some(0))
                 }
                 _ => Ok(None),
@@ -3645,7 +4206,19 @@ impl EmbeddedDatabase {
                             ));
                         }
                     };
-                    self.storage.set_bulk_load_mode(enabled);
+                    // sprinter a3077a3f68d8: the `helios.`-namespaced spelling
+                    // lands on THIS caller's backend, exactly like the bare
+                    // `bulk_load_mode` spelling the registry path handles —
+                    // leaving one of the two process-wide would have made the
+                    // fix depend on how a client spelled the knob. A wire
+                    // session reaches this only through the autocommit delegate,
+                    // whose thread-local is already ITS backend (its
+                    // `_for_session` entry point installed it); the protocol-layer
+                    // `SET` arm routes to `try_handle_session_guc` first, which
+                    // resolves from the `SessionId`.
+                    if let Some(state) = crate::session_scoped_state_tls() {
+                        state.set_guc("bulk_load_mode", sql::SettingValue::Boolean(enabled));
+                    }
                     Ok(Some(0))
                 }
                 _ => Ok(None),
@@ -3998,10 +4571,28 @@ impl EmbeddedDatabase {
         }
     }
 
-    /// Route an ART undo entry to the owning transaction's log: session
-    /// transactions get a per-session log (replayed by session ROLLBACK,
-    /// cleared by session COMMIT); the global-slot transaction keeps using
-    /// the shared `art_undo_log`.
+    /// Route an ART undo entry to the OWNING transaction's log:
+    ///
+    /// * a session transaction gets its per-session log (replayed by session
+    ///   ROLLBACK, cleared by session COMMIT);
+    /// * the RAII handle from `begin_transaction()` gets its per-transaction
+    ///   slot in `raii_art_undo` (sprinter 8a9b60eeef87 — it used to fall into
+    ///   the shared log below, which its `rollback()` never replayed and its
+    ///   `commit()` never cleared, AND which an unrelated autocommit statement
+    ///   could `clear()` out from under it while it was still open);
+    /// * the session-less transactions that own their undo state — both
+    ///   autocommit implicit-transaction wrappers, the batch executor and the
+    ///   params multi-row insert funnel — claim a slot of their own via
+    ///   `claim_statement_art_undo` (sprinter beefd0d3d069);
+    /// * only the global `BEGIN` slot still uses the shared `art_undo_log`,
+    ///   and it is the one transaction that genuinely owns it, being serialized
+    ///   by `global_txn_active` and the `current_transaction` mutex.
+    ///
+    /// An earlier revision of this comment claimed the per-statement autocommit
+    /// transactions "cannot interleave with each other". That was FALSE — one
+    /// `EmbeddedDatabase` serves every connection and
+    /// `begin_autocommit_transaction` takes no global lock and sets no flag —
+    /// and the whole of beefd0d3d069 followed from believing it.
     fn push_art_undo(&self, txn: &storage::Transaction, op: ArtUndoOp) {
         // THE funnel for every eager ART mutation made inside a transaction —
         // which makes it the one place that knows a key was taken OUT of an
@@ -4028,10 +4619,21 @@ impl EmbeddedDatabase {
             Some(session_id) => {
                 self.session_art_undo.entry(session_id).or_default().push(op);
             }
-            None => {
-                self.art_undo_log.write().push(op);
-            }
+            None => match self.raii_art_undo.get_mut(&txn.transaction_id()) {
+                Some(mut slot) => slot.push(op),
+                None => self.art_undo_log.write().push(op),
+            },
         }
+    }
+
+    /// Take a RAII transaction's ART undo entries out of `raii_art_undo`.
+    /// Empty (and a no-op) for any other transaction, and idempotent — the
+    /// slot's `Drop` runs after `commit` / `rollback` have already taken it.
+    fn take_raii_art_undo(&self, txn_id: u64) -> Vec<ArtUndoOp> {
+        self.raii_art_undo
+            .remove(&txn_id)
+            .map(|(_, ops)| ops)
+            .unwrap_or_default()
     }
 
     /// Invalidate row-cache entries for rows a transaction just committed.
@@ -4046,6 +4648,45 @@ impl EmbeddedDatabase {
         self.replay_art_undo(undo_entries);
     }
 
+    /// Claim a per-transaction ART undo slot for a SESSION-LESS transaction
+    /// that owns its own undo state: the two autocommit implicit-transaction
+    /// wrappers, the batch executor, and the params multi-row insert funnel.
+    ///
+    /// sprinter beefd0d3d069. These used to fall through to the process-global
+    /// `art_undo_log`, and the comment on `push_art_undo` asserted they "cannot
+    /// interleave with each other" — which is false: one `EmbeddedDatabase`
+    /// serves every connection, `begin_autocommit_transaction` takes no global
+    /// lock and sets no flag, so concurrent statements on different threads
+    /// pushed into ONE shared `Vec`. Each wrapper then treated the whole log as
+    /// its own: commit `clear()`ed it, rollback `drain()`ed and replayed it. So
+    /// a refused statement replayed a COMMITTED statement's `RemoveInserted` and
+    /// stripped its key out of a UNIQUE tree (two rows, one key, index
+    /// disagreeing with the table), and a successful statement discarded an
+    /// in-flight one's entries, leaving phantom keys behind on its later
+    /// rollback.
+    ///
+    /// `push_art_undo` already routes on `transaction_id()`, so claiming a slot
+    /// is all it takes to make the entries land somewhere private. The returned
+    /// guard removes the slot however the caller's scope ends, so an early
+    /// `return Err(..)` — and these wrappers have several — cannot leak it.
+    fn claim_statement_art_undo(&self, txn: &storage::Transaction) -> RaiiArtUndoSlot {
+        let txn_id = txn.transaction_id();
+        self.raii_art_undo.insert(txn_id, Vec::new());
+        RaiiArtUndoSlot {
+            txn_id,
+            map: std::sync::Arc::clone(&self.raii_art_undo),
+        }
+    }
+
+    /// Replay and discard exactly ONE transaction's ART undo entries, leaving
+    /// every other in-flight transaction's slot untouched. The counterpart to
+    /// [`Self::rollback_art_undo_log`], which drains the shared log and is now
+    /// correct only for the global `BEGIN` slot that genuinely owns it.
+    fn rollback_art_undo_for(&self, txn_id: u64) {
+        let undo_entries = self.take_raii_art_undo(txn_id);
+        self.replay_art_undo(undo_entries);
+    }
+
     /// Current length of the ART/vector-index undo log that `txn`'s eager index
     /// ops append to — the per-session log for session transactions, else the
     /// global-slot log. Captured at SAVEPOINT creation so ROLLBACK TO SAVEPOINT
@@ -4053,7 +4694,12 @@ impl EmbeddedDatabase {
     fn art_undo_len_for(&self, txn: &storage::Transaction) -> usize {
         match txn.session_id() {
             Some(sid) => self.session_art_undo.get(&sid).map(|e| e.value().len()).unwrap_or(0),
-            None => self.art_undo_log.read().len(),
+            // sprinter 8a9b60eeef87: a SAVEPOINT inside a RAII transaction must
+            // measure ITS log, not the shared one.
+            None => match self.raii_art_undo.get(&txn.transaction_id()) {
+                Some(slot) => slot.value().len(),
+                None => self.art_undo_log.read().len(),
+            },
         }
     }
 
@@ -4067,14 +4713,24 @@ impl EmbeddedDatabase {
                 Some(mut entry) if entry.len() > target_len => entry.split_off(target_len),
                 _ => Vec::new(),
             },
-            None => {
-                let mut log = self.art_undo_log.write();
-                if log.len() > target_len {
-                    log.split_off(target_len)
-                } else {
-                    Vec::new()
+            // sprinter 8a9b60eeef87: same three-way routing as `push_art_undo`.
+            None => match self.raii_art_undo.get_mut(&txn.transaction_id()) {
+                Some(mut slot) => {
+                    if slot.len() > target_len {
+                        slot.split_off(target_len)
+                    } else {
+                        Vec::new()
+                    }
                 }
-            }
+                None => {
+                    let mut log = self.art_undo_log.write();
+                    if log.len() > target_len {
+                        log.split_off(target_len)
+                    } else {
+                        Vec::new()
+                    }
+                }
+            },
         };
         self.replay_art_undo(drained);
     }
@@ -5724,19 +6380,137 @@ impl EmbeddedDatabase {
         // the one an earlier sub-op is about to add. The hand-written
         // `ADD COLUMN a INT, ADD FOREIGN KEY (a) REFERENCES p(id)`
         // gets the same atomicity for free.
+        //
+        // sprinter 885ffe24eab6 extends the same rule to the OTHER inline
+        // constraints, now that `ADD COLUMN … UNIQUE / PRIMARY KEY / CHECK`
+        // desugars the way `REFERENCES` already did. Everything checkable
+        // WITHOUT the new column — the relation exists, the constraint name is
+        // free, the table has no primary key already, the table is empty —
+        // is checked here, so `ADD COLUMN id INT PRIMARY KEY` against a table
+        // that already has a key leaves no column behind.
         {
             let catalog = self.storage.catalog();
+            // Two whole-STATEMENT checks, because a per-sub-plan pass cannot
+            // see them: the sub-plans run in order, so the second
+            // `ADD COLUMN … PRIMARY KEY` of one statement would be refused only
+            // AFTER the first had installed a key and the second had added its
+            // column; and a UNIQUE over a column the same statement fills with
+            // a LITERAL default is a guaranteed 23505 the moment the table
+            // holds two rows (`add_column_to_rows` writes the identical value
+            // to every row — a non-literal default becomes NULL, and NULLs are
+            // distinct, so only the literal case is provably doomed).
+            let primary_keys = operations
+                .iter()
+                .filter(|p| matches!(p, sql::LogicalPlan::AlterTableAddPrimaryKey { .. }))
+                .count();
+            if primary_keys > 1 {
+                let table = operations
+                    .iter()
+                    .find_map(|p| match p {
+                        sql::LogicalPlan::AlterTableAddPrimaryKey { table_name, .. } => Some(table_name.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                return Err(Error::query_execution(format!(
+                    "multiple primary keys for table \"{}\" are not allowed",
+                    table
+                )));
+            }
             for sub_plan in operations {
-                if let sql::LogicalPlan::AlterTableAddForeignKey {
-                    table_name,
-                    columns,
-                    references_table,
-                    references_columns,
-                    ..
+                let sql::LogicalPlan::AlterTableAddUnique {
+                    table_name, columns, ..
                 } = sub_plan
-                {
-                    catalog.get_table_schema(table_name)?;
-                    Self::validate_fk_reference(&catalog, references_table, columns, references_columns)?;
+                else {
+                    continue;
+                };
+                let literal_default = operations.iter().any(|p| match p {
+                    sql::LogicalPlan::AlterTableAddColumn { column_def, .. } => {
+                        columns.iter().any(|c| c.eq_ignore_ascii_case(&column_def.name))
+                            && matches!(&column_def.default, Some(sql::LogicalExpr::Literal(_)))
+                    }
+                    _ => false,
+                });
+                if !literal_default {
+                    continue;
+                }
+                let schema = catalog.get_table_schema(table_name)?;
+                let rows = self.storage.scan_table_with_schema(table_name, &schema)?.len();
+                if rows > 1 {
+                    return Err(Error::query_execution(format!(
+                        "cannot add a UNIQUE constraint on new column \"{}\" of relation \"{}\": the column's \
+                         DEFAULT gives all {} existing rows the same value. Add the column, backfill distinct \
+                         values, then add the constraint.",
+                        columns.join(", "),
+                        table_name,
+                        rows
+                    )));
+                }
+            }
+            for sub_plan in operations {
+                match sub_plan {
+                    sql::LogicalPlan::AlterTableAddForeignKey {
+                        table_name,
+                        columns,
+                        references_table,
+                        references_columns,
+                        ..
+                    } => {
+                        catalog.get_table_schema(table_name)?;
+                        Self::validate_fk_reference(&catalog, references_table, columns, references_columns)?;
+                    }
+                    sql::LogicalPlan::AlterTableAddPrimaryKey {
+                        table_name,
+                        constraint_name,
+                        columns,
+                    } => {
+                        catalog.get_table_schema(table_name)?;
+                        // The branch guard belongs in the PRE-pass, not only in
+                        // the executor body: on a branch the statement must
+                        // fail without having added the column.
+                        if self.storage.is_branch_active() {
+                            return Err(Error::query_execution(
+                                "ALTER TABLE … ADD PRIMARY KEY must run on the main branch",
+                            ));
+                        }
+                        self.validate_add_primary_key_preconditions(table_name, columns)?;
+                        if let Some(name) = constraint_name {
+                            let existing = catalog.load_table_constraints(table_name)?;
+                            Self::reject_duplicate_constraint_name(&existing, table_name, name)?;
+                        }
+                    }
+                    sql::LogicalPlan::AlterTableAddUnique {
+                        table_name,
+                        constraint_name,
+                        columns,
+                    } => {
+                        catalog.get_table_schema(table_name)?;
+                        if self.storage.is_branch_active() {
+                            return Err(Error::query_execution(
+                                "ALTER TABLE … ADD CONSTRAINT … UNIQUE must run on the main branch",
+                            ));
+                        }
+                        // The columns may not exist YET (an earlier sub-op adds
+                        // them), so only the name is checkable here — it is
+                        // derived from the requested column names, which is
+                        // exactly what the executor will derive it from.
+                        let name = constraint_name
+                            .clone()
+                            .unwrap_or_else(|| format!("{}_{}_key", table_name, columns.join("_")));
+                        let existing = catalog.load_table_constraints(table_name)?;
+                        Self::reject_duplicate_constraint_name(&existing, table_name, &name)?;
+                    }
+                    sql::LogicalPlan::AlterTableAddCheck {
+                        table_name,
+                        constraint_name,
+                        ..
+                    } => {
+                        catalog.get_table_schema(table_name)?;
+                        if let Some(name) = constraint_name {
+                            let existing = catalog.load_table_constraints(table_name)?;
+                            Self::reject_duplicate_constraint_name(&existing, table_name, name)?;
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -6108,12 +6882,16 @@ impl EmbeddedDatabase {
         txn: &storage::Transaction,
         skip_fast_paths: bool,
     ) -> Result<u64> {
-        // Record query for quota tracking (QPS enforcement)
-        if let Some(context) = self.tenant_manager.get_current_context() {
-            self.tenant_manager
-                .record_query(context.tenant_id)
-                .map_err(|e| Error::query_execution(format!("Quota exceeded: {}", e)))?;
-        }
+        // Record query for quota tracking (QPS enforcement).
+        //
+        // sprinter d03de7fc3b22: this used to be the ONE production caller of
+        // `record_query` in the whole engine, which is why `max_qps` applied
+        // only to simple text statements. It is now one of many, and they are
+        // all re-entrancy-guarded so a statement is charged exactly once — see
+        // [`TENANT_QUERY_METERED`]. The charge stays HERE as well as at
+        // `execute()` because `execute_batch` and `Transaction::execute` reach
+        // this funnel once per statement without passing an outer entry point.
+        let _qps = self.charge_tenant_query()?;
 
         // Skip fast paths when:
         // 1. Savepoints are active (fast paths bypass write set, breaking rollback)
@@ -7061,27 +7839,17 @@ impl EmbeddedDatabase {
 
                         // Fill NULL values in SERIAL/BIGSERIAL PK columns with the auto-generated row_id.
                         // This makes LAST_INSERT_ID() and MAX(pk) return the correct value.
+                        //
+                        // sprinter f32ba64c00a7: gated on the column's DECLARED
+                        // type by the one shared decision. The old `_ =>` arm
+                        // wrote an Int8 into a TEXT / UUID / NUMERIC primary key.
                         let mut generated_identity = false;
                         for (i, col) in schema.columns.iter().enumerate() {
-                            if col.primary_key {
-                                if let Some(v) = tuple.values.get(i) {
-                                    if matches!(v, Value::Null) {
-                                        if i < tuple.values.len() {
-                                            #[allow(clippy::indexing_slicing)]
-                                            match col.data_type {
-                                                DataType::Int2 => {
-                                                    tuple.values[i] = Value::Int2(row_id as i16);
-                                                }
-                                                DataType::Int4 => {
-                                                    tuple.values[i] = Value::Int4(row_id as i32);
-                                                }
-                                                _ => {
-                                                    tuple.values[i] = Value::Int8(row_id as i64);
-                                                }
-                                            }
-                                            generated_identity = true;
-                                        }
-                                    }
+                            if col.primary_key && matches!(tuple.values.get(i), Some(Value::Null)) {
+                                let filled = crate::pk_autofill_value(table_name, col, row_id)?;
+                                if let Some(slot) = tuple.values.get_mut(i) {
+                                    *slot = filled;
+                                    generated_identity = true;
                                 }
                             }
                         }
@@ -7125,7 +7893,43 @@ impl EmbeddedDatabase {
                             pending_columnar.push((row_id, tuple.clone()));
                         }
                         let val = bincode::serialize(&tuple).map_err(|e| Error::storage(e.to_string()))?;
-                        txn.put(key.clone(), val.clone())?;
+
+                        // sprinter 5a78b8288153: CLAIM the row's PK/UNIQUE keys
+                        // BEFORE it is staged — the enforcing tree decides, in
+                        // one critical section, instead of the read-locked probe
+                        // further up being trusted across the write.
+                        //
+                        // That probe (`check_unique_constraints`, above) is NOT
+                        // removed: it is what intercepts a conflict for
+                        // `ON CONFLICT DO NOTHING / DO UPDATE`, and those legs
+                        // never reach this line. It is now an early-out and an
+                        // interception hook rather than the enforcement — which
+                        // is why the claim sits here, immediately before the
+                        // `put`, leaving no window at all rather than the wide
+                        // one that spanned CHECK, FK, RLS and trigger work.
+                        //
+                        // Placement mirrors `insert_prepared_tuple_in_transaction`,
+                        // which has claimed-then-staged (`RowState::NotStored`)
+                        // all along; this arm is the hand-inlined twin that did
+                        // not. All-or-nothing per row: a refusal takes back the
+                        // entries this row already took and becomes the
+                        // statement's error, so no phantom key is left behind.
+                        if !on_branch {
+                            self.storage
+                                .art_indexes()
+                                .reserve_insert_tuple(table_name, row_id, &schema, &tuple)
+                                .map_err(|e| Error::constraint_violation(e.to_string()))?;
+                        }
+                        if let Err(e) = txn.put(key.clone(), val.clone()) {
+                            // The row never landed, so the claim is a phantom.
+                            if !on_branch {
+                                let _ = self
+                                    .storage
+                                    .art_indexes()
+                                    .on_delete_tuple(table_name, row_id, &schema, &tuple);
+                            }
+                            return Err(e);
+                        }
 
                         // Log to WAL for replication (skip in explicit transactions —
                         // WAL entries should only reflect committed changes).
@@ -7138,20 +7942,10 @@ impl EmbeddedDatabase {
                             }
                         }
 
-                        // Update ART index for PK/unique constraint lookups
-                        // (main only — a branch INSERT lands in `bdata:`; the
-                        // shared ART must stay branch-free, else main probes and
-                        // unique checks observe the branch row; W2.0).
+                        // The ART entries were claimed above; only the rollback
+                        // bookkeeping is left (main only — a branch INSERT lands
+                        // in `bdata:` and the shared ART stays branch-free, W2.0).
                         if !on_branch {
-                            if let Err(e) = self.storage.art_indexes().on_insert(table_name, row_id, &col_values) {
-                                // The row is written by the line above, so this
-                                // refusal cannot unmake it: a duplicate is being
-                                // stored. `on_insert` keeps every entry the row
-                                // owns (maintenance-shaped, never all-or-nothing
-                                // — see `RowState`), and the fact goes to the log
-                                // at ERROR instead of a `debug!` nobody enables.
-                                storage::StorageEngine::note_index_maintenance_failure(table_name, row_id, &e);
-                            }
                             self.push_art_undo(
                                 txn,
                                 ArtUndoOp::RemoveInserted {
@@ -7427,25 +8221,25 @@ impl EmbeddedDatabase {
                             self.storage
                                 .insert_tuple_branch_aware_with_schema(table_name, tuple.clone(), &schema)?;
 
-                        // Update ART index (main only; a branch INSERT..SELECT row
-                        // lands in `bdata:` via `insert_tuple_branch_aware_with_schema`
-                        // above and must not touch the shared ART; W2.0).
-                        if self.storage.get_current_branch_id().is_none() {
-                            let mut col_values = std::collections::HashMap::new();
-                            for (i, col) in schema.columns.iter().enumerate() {
-                                if let Some(v) = tuple.values.get(i) {
-                                    col_values.insert(col.name.clone(), v.clone());
-                                }
-                            }
-                            if let Err(e) = self.storage.art_indexes().on_insert(table_name, row_id, &col_values) {
-                                // Same rule as the plain INSERT arm: the row is
-                                // already written, so a refusal here means a
-                                // stored duplicate and belongs in the log at
-                                // ERROR, not at `debug!`.
-                                storage::StorageEngine::note_index_maintenance_failure(table_name, row_id, &e);
-                            }
-                        }
-
+                        // sprinter 5a78b8288153: NO ART maintenance here.
+                        // `insert_tuple_branch_aware_with_schema` above resolves
+                        // to `insert_tuple_versioned_with_schema` on main, which
+                        // indexes the row itself, and on a branch writes to
+                        // `bdata:` and deliberately leaves the shared ART alone
+                        // (W2.0) — so this arm never had a case of its own.
+                        //
+                        // This block was a SECOND maintenance pass over a row the
+                        // funnel had already indexed: the PK/UNIQUE trees refused
+                        // the key they had just been given, and
+                        // `note_index_maintenance_failure` reported that refusal
+                        // at ERROR as "the table now holds a duplicate" — once
+                        // per row, for every autocommit `INSERT ... SELECT` on
+                        // the TEXT family against any table with a primary key.
+                        // (A pre-existing defect, not one this item introduced:
+                        // the params family's own INSERT..SELECT arm never had
+                        // the extra pass and is the correct shape.) Removing it
+                        // is also required now that the funnel CLAIMS its keys
+                        // before the write rather than maintaining them after.
                         count += 1;
 
                         // Collect tuple for RETURNING clause
@@ -8327,155 +9121,30 @@ impl EmbeddedDatabase {
 
                 Ok(rows_migrated as u64)
             }
+            // TEXT family. The three column-shape arms used to be a verbatim
+            // COPY of the bodies in `execute_alter_table_op` (which is what the
+            // params family and every `AlterTableMulti` sub-operation run), and
+            // that duplication is exactly how sprinter 0f258ed23d13 could be
+            // half-fixed: a constraint rewrite added to one arm would have left
+            // `db.execute()` and the PG extended protocol disagreeing about
+            // whether a renamed column's UNIQUE is still enforced. One body each,
+            // reached from both families.
             sql::LogicalPlan::AlterTableAddColumn {
                 table_name,
                 column_def,
                 if_not_exists,
-            } => {
-                let catalog = self.storage.catalog();
-                let mut schema = catalog.get_table_schema(table_name)?;
-
-                // Check if column already exists
-                if schema.columns.iter().any(|c| c.name == column_def.name) {
-                    if *if_not_exists {
-                        return Ok(0);
-                    }
-                    return Err(Error::query_execution(format!(
-                        "Column '{}' already exists in table '{}'",
-                        column_def.name, table_name
-                    )));
-                }
-
-                // Convert ColumnDef to Column
-                let new_column = Column {
-                    name: column_def.name.clone(),
-                    data_type: column_def.data_type.clone(),
-                    nullable: !column_def.not_null,
-                    primary_key: column_def.primary_key,
-                    source_table: None,
-                    source_table_name: Some(table_name.clone()),
-                    default_expr: Self::serialize_default_expr(&column_def.default),
-                    unique: column_def.unique,
-                    storage_mode: column_def.storage_mode,
-                };
-
-                // Add column to schema
-                schema.columns.push(new_column);
-                catalog.update_table_schema(table_name, &schema)?;
-
-                // Update existing rows with NULL (or default) for the new column
-                let rows_updated = self.storage.add_column_to_rows(table_name, &column_def.default)?;
-
-                tracing::info!(
-                    "Added column '{}' to table '{}', updated {} rows",
-                    column_def.name,
-                    table_name,
-                    rows_updated
-                );
-
-                Ok(rows_updated as u64)
-            }
+            } => self.alter_table_add_column(table_name, column_def, *if_not_exists),
             sql::LogicalPlan::AlterTableDropColumn {
                 table_name,
                 column_name,
                 if_exists,
                 cascade,
-            } => {
-                let catalog = self.storage.catalog();
-                let mut schema = catalog.get_table_schema(table_name)?;
-
-                // Find column index
-                let col_idx = schema.columns.iter().position(|c| c.name == *column_name);
-
-                match col_idx {
-                    Some(idx) => {
-                        // Check if column is primary key
-                        let is_pk = schema
-                            .get_column_at(idx)
-                            .ok_or_else(|| Error::internal("column index out of bounds"))?
-                            .primary_key;
-                        if is_pk && !cascade {
-                            return Err(Error::query_execution(format!(
-                                "Cannot drop primary key column '{}' without CASCADE",
-                                column_name
-                            )));
-                        }
-
-                        // Remove column from schema
-                        let was_columnar = schema
-                            .get_column_at(idx)
-                            .is_some_and(|c| c.storage_mode == ColumnStorageMode::Columnar);
-                        schema.columns.remove(idx);
-                        catalog.update_table_schema(table_name, &schema)?;
-
-                        // Update existing rows by removing the column value
-                        let rows_updated = self.storage.drop_column_from_rows(table_name, idx)?;
-                        self.cleanup_columnar_after_drop_column(table_name, column_name, was_columnar, &schema)?;
-
-                        tracing::info!(
-                            "Dropped column '{}' from table '{}', updated {} rows",
-                            column_name,
-                            table_name,
-                            rows_updated
-                        );
-
-                        Ok(rows_updated as u64)
-                    }
-                    None => {
-                        if *if_exists {
-                            Ok(0)
-                        } else {
-                            Err(Error::query_execution(format!(
-                                "Column '{}' does not exist in table '{}'",
-                                column_name, table_name
-                            )))
-                        }
-                    }
-                }
-            }
+            } => self.alter_table_drop_column(table_name, column_name, *if_exists, *cascade),
             sql::LogicalPlan::AlterTableRenameColumn {
                 table_name,
                 old_column_name,
                 new_column_name,
-            } => {
-                let catalog = self.storage.catalog();
-                let mut schema = catalog.get_table_schema(table_name)?;
-
-                // Check if new column name already exists
-                if schema.columns.iter().any(|c| c.name == *new_column_name) {
-                    return Err(Error::query_execution(format!(
-                        "Column '{}' already exists in table '{}'",
-                        new_column_name, table_name
-                    )));
-                }
-
-                // Find and rename column
-                let col_idx = schema
-                    .columns
-                    .iter()
-                    .position(|c| c.name == *old_column_name)
-                    .ok_or_else(|| {
-                        Error::query_execution(format!(
-                            "Column '{}' does not exist in table '{}'",
-                            old_column_name, table_name
-                        ))
-                    })?;
-
-                schema
-                    .get_column_at_mut(col_idx)
-                    .ok_or_else(|| Error::internal("column index out of bounds"))?
-                    .name = new_column_name.clone();
-                catalog.update_table_schema(table_name, &schema)?;
-
-                tracing::info!(
-                    "Renamed column '{}' to '{}' in table '{}'",
-                    old_column_name,
-                    new_column_name,
-                    table_name
-                );
-
-                Ok(0)
-            }
+            } => self.alter_table_rename_column(table_name, old_column_name, new_column_name),
             sql::LogicalPlan::AlterTableAlterColumnNullability {
                 table_name,
                 column_name,
@@ -8531,7 +9200,7 @@ impl EmbeddedDatabase {
                 catalog.save_table_constraints(table_name, &constraints)?;
                 Ok(0)
             }
-            // Both constraint arms delegate to ONE shared body each, so the
+            // Every constraint arm delegates to ONE shared body each, so the
             // params family (which routes the same plans through
             // `execute_plan_with_params_inner`) runs identical code.
             sql::LogicalPlan::AlterTableAddUnique {
@@ -8539,6 +9208,16 @@ impl EmbeddedDatabase {
                 constraint_name,
                 columns,
             } => self.alter_table_add_unique(table_name, constraint_name, columns),
+            sql::LogicalPlan::AlterTableAddPrimaryKey {
+                table_name,
+                constraint_name,
+                columns,
+            } => self.alter_table_add_primary_key(table_name, constraint_name, columns),
+            sql::LogicalPlan::AlterTableAddCheck {
+                table_name,
+                constraint_name,
+                expression,
+            } => self.alter_table_add_check(table_name, constraint_name, expression),
             sql::LogicalPlan::AlterTableDropConstraint {
                 table_name,
                 constraint_name,
@@ -8839,6 +9518,7 @@ impl EmbeddedDatabase {
             query_profiler: std::sync::Arc::new(query_trace::QueryProfiler::new()),
             art_undo_log: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
             session_art_undo: std::sync::Arc::new(dashmap::DashMap::new()),
+            raii_art_undo: std::sync::Arc::new(dashmap::DashMap::new()),
             session_txn_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             session_notices: std::sync::Arc::new(dashmap::DashMap::new()),
             fk_validation_mode: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationMode::Enforced)),
@@ -8970,6 +9650,7 @@ impl EmbeddedDatabase {
             query_profiler: std::sync::Arc::new(query_trace::QueryProfiler::new()),
             art_undo_log: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
             session_art_undo: std::sync::Arc::new(dashmap::DashMap::new()),
+            raii_art_undo: std::sync::Arc::new(dashmap::DashMap::new()),
             session_txn_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             session_notices: std::sync::Arc::new(dashmap::DashMap::new()),
             fk_validation_mode: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationMode::Enforced)),
@@ -9143,6 +9824,7 @@ impl EmbeddedDatabase {
             query_profiler: std::sync::Arc::new(query_trace::QueryProfiler::new()),
             art_undo_log: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
             session_art_undo: std::sync::Arc::new(dashmap::DashMap::new()),
+            raii_art_undo: std::sync::Arc::new(dashmap::DashMap::new()),
             session_txn_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             session_notices: std::sync::Arc::new(dashmap::DashMap::new()),
             fk_validation_mode: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationMode::Enforced)),
@@ -9272,6 +9954,9 @@ impl EmbeddedDatabase {
 
         let txn_start = std::time::Instant::now();
         let txn = self.storage.begin_transaction()?;
+        // sprinter beefd0d3d069: own slot, not the shared log.
+        let _undo_slot = self.claim_statement_art_undo(&txn);
+        let undo_txn_id = _undo_slot.txn_id;
         tracing::trace!(
             phase = "txn_begin",
             duration_us = txn_start.elapsed().as_micros() as u64,
@@ -9291,7 +9976,7 @@ impl EmbeddedDatabase {
                     // drop clears this transaction's uncommitted-write census
                     // slot, and a concurrent `COUNT(*)` that sees it cleared
                     // takes the index fast path (see `rollback_internal_locked`).
-                    self.rollback_art_undo_log();
+                    self.rollback_art_undo_for(undo_txn_id);
                     let _ = txn.rollback();
                     self.deferred_fk_checks.lock().clear();
                     return Err(e);
@@ -9302,12 +9987,12 @@ impl EmbeddedDatabase {
         let commit_start = std::time::Instant::now();
         if let Err(e) = self.validate_deferred_fk_checks(Some(&txn)) {
             // Same ordering requirement as the per-statement error path above.
-            self.rollback_art_undo_log();
+            self.rollback_art_undo_for(undo_txn_id);
             let _ = txn.rollback();
             return Err(e);
         }
         txn.commit()?;
-        self.art_undo_log.write().clear();
+        let _ = self.take_raii_art_undo(undo_txn_id);
         self.deferred_fk_checks.lock().clear();
         self.invalidate_result_cache();
         self.storage.increment_lsn();
@@ -9851,6 +10536,11 @@ impl EmbeddedDatabase {
     }
 
     pub fn execute(&self, sql: &str) -> Result<u64> {
+        // sprinter d03de7fc3b22: charge this CLIENT statement against the active
+        // tenant's `max_qps`. Every family's entry point charges — there is no
+        // funnel all of them pass through — and the returned guard makes every
+        // nested execution inside this one free, so a statement is counted
+        // exactly once. See `charge_tenant_query`.
         // Reflect an embedded `SET search_path` into the evaluator's thread-local
         // so a DML statement evaluating `current_schema()` sees the right schema
         // (see `embedded_current_schema_guard`). Free on the default path.
@@ -10187,28 +10877,31 @@ impl EmbeddedDatabase {
                 Ok(txn) => txn,
                 Err(e) => return Some(Err(e)),
             };
+            // sprinter beefd0d3d069: own slot, not the shared log.
+            let _undo_slot = self.claim_statement_art_undo(&txn);
+            let undo_txn_id = _undo_slot.txn_id;
             let inserted =
                 match self.insert_validated_tuples_in_transaction(&spec.table_name, tuples, &spec.schema, &txn) {
                     Ok(inserted) => inserted,
                     Err(e) => {
                         let _ = txn.rollback();
-                        self.rollback_art_undo_log();
+                        self.rollback_art_undo_for(undo_txn_id);
                         self.deferred_fk_checks.lock().clear();
                         return Some(Err(e));
                     }
                 };
             if let Err(e) = self.validate_deferred_fk_checks(Some(&txn)) {
                 let _ = txn.rollback();
-                self.rollback_art_undo_log();
+                self.rollback_art_undo_for(undo_txn_id);
                 self.deferred_fk_checks.lock().clear();
                 return Some(Err(e));
             }
             if let Err(e) = txn.commit() {
-                self.rollback_art_undo_log();
+                self.rollback_art_undo_for(undo_txn_id);
                 self.deferred_fk_checks.lock().clear();
                 return Some(Err(e));
             }
-            self.art_undo_log.write().clear();
+            let _ = self.take_raii_art_undo(undo_txn_id);
             self.deferred_fk_checks.lock().clear();
             self.storage.increment_lsn();
             return Some(Ok(inserted));
@@ -12136,6 +12829,11 @@ impl EmbeddedDatabase {
         // Begin implicit transaction
         let txn_start = std::time::Instant::now();
         let txn = self.storage.begin_autocommit_transaction()?;
+        // sprinter beefd0d3d069: this statement's eager index ops go in ITS own
+        // slot, not the shared log another concurrent autocommit statement
+        // clears or drains. The guard drops the slot on every exit path below.
+        let _undo_slot = self.claim_statement_art_undo(&txn);
+        let undo_txn_id = _undo_slot.txn_id;
         tracing::trace!(
             phase = "txn_begin",
             duration_us = txn_start.elapsed().as_micros() as u64,
@@ -12157,7 +12855,7 @@ impl EmbeddedDatabase {
                 let commit_start = std::time::Instant::now();
                 if let Err(e) = self.validate_deferred_fk_checks(Some(&txn)) {
                     let _ = txn.rollback();
-                    self.rollback_art_undo_log();
+                    self.rollback_art_undo_for(undo_txn_id);
                     // The queued deferred checks belong to THIS (now rolled back)
                     // statement. Leaving them behind made the NEXT autocommit
                     // statement re-report the same violation at its own commit
@@ -12167,7 +12865,7 @@ impl EmbeddedDatabase {
                     return Err(e);
                 }
                 txn.commit()?;
-                self.art_undo_log.write().clear();
+                let _ = self.take_raii_art_undo(undo_txn_id);
                 self.deferred_fk_checks.lock().clear();
                 // Increment LSN to track transaction commits
                 self.storage.increment_lsn();
@@ -12181,7 +12879,7 @@ impl EmbeddedDatabase {
             }
             Err(e) => {
                 let _ = txn.rollback(); // Ignore rollback errors
-                self.rollback_art_undo_log();
+                self.rollback_art_undo_for(undo_txn_id);
                 self.deferred_fk_checks.lock().clear();
                 Err(e)
             }
@@ -12705,6 +13403,472 @@ impl EmbeddedDatabase {
         Ok(0)
     }
 
+    /// `ALTER TABLE <t> ADD [CONSTRAINT <name>] PRIMARY KEY (<cols>)`, reached
+    /// only as the desugaring of `ADD COLUMN <c> … PRIMARY KEY`
+    /// (sprinter 885ffe24eab6).
+    ///
+    /// # What the three cases do, and why
+    ///
+    /// * **Table already has a primary key** → REFUSED, with PostgreSQL's own
+    ///   42P16 wording. Silently setting a second column's `primary_key` flag
+    ///   is not a no-op: `Catalog::rebuild_all_indexes` derives the PK index
+    ///   from EVERY flagged column, so at the next restart the table would come
+    ///   back with a COMPOSITE primary key nobody declared — a different table
+    ///   than the one that was shut down.
+    /// * **Table is not empty** → REFUSED. `add_column_to_rows` fills the new
+    ///   column with the column DEFAULT, i.e. NULL when there is none, so every
+    ///   pre-existing row would violate the key immediately; and a non-NULL
+    ///   default makes every row share one value, which violates it just as
+    ///   surely. PostgreSQL rejects both (`column "c" contains null values` /
+    ///   duplicate key), and Nano cannot do the one case PostgreSQL accepts —
+    ///   `ADD COLUMN id SERIAL PRIMARY KEY` — because SERIAL is filled at
+    ///   INSERT time, not by the ALTER.
+    /// * **No PK and no rows** → ACCEPTED, and the enforcing index is
+    ///   registered HERE. The schema flag alone is not enforcement: nothing
+    ///   probes it, so without this the PK would accept duplicates until the
+    ///   next restart re-derived an index from the flag — the "enforced by
+    ///   nothing while the catalog claims it exists" shape of the whole item.
+    ///
+    /// No `TableConstraints` record is written, deliberately: an inline
+    /// `CREATE TABLE t (id INT PRIMARY KEY)` records none either (only
+    /// table-level `PRIMARY KEY (…)` does), and introducing one here would make
+    /// the same declaration show up twice in catalog introspection depending on
+    /// which statement created it.
+    fn alter_table_add_primary_key(
+        &self,
+        table_name: &str,
+        constraint_name: &Option<String>,
+        columns: &[String],
+    ) -> Result<u64> {
+        if self.storage.is_branch_active() {
+            return Err(Error::query_execution(
+                "ALTER TABLE … ADD PRIMARY KEY must run on the main branch",
+            ));
+        }
+        let catalog = self.storage.catalog();
+        let schema = catalog.get_table_schema(table_name)?;
+        let mut resolved: Vec<String> = Vec::with_capacity(columns.len());
+        for col in columns {
+            let found = schema
+                .columns
+                .iter()
+                .find(|c| c.name.eq_ignore_ascii_case(col))
+                .ok_or_else(|| {
+                    Error::query_execution(format!(
+                        "column \"{}\" named in key does not exist in table \"{}\"",
+                        col, table_name
+                    ))
+                })?;
+            resolved.push(found.name.clone());
+        }
+        self.validate_add_primary_key_preconditions(table_name, &resolved)?;
+
+        let art = self.storage.art_indexes();
+        art.create_pk_index(table_name, &resolved).map_err(|e| {
+            Error::query_execution(format!(
+                "could not create the index enforcing PRIMARY KEY on {}({}): {} — \
+                 the constraint would not be enforced",
+                table_name,
+                resolved.join(", "),
+                e
+            ))
+        })?;
+        tracing::info!(
+            "Added PRIMARY KEY{} on {}({})",
+            constraint_name
+                .as_ref()
+                .map(|n| format!(" '{}'", n))
+                .unwrap_or_default(),
+            table_name,
+            resolved.join(", ")
+        );
+        Ok(0)
+    }
+
+    /// The refusal half of [`Self::alter_table_add_primary_key`], split out so
+    /// `execute_alter_table_multi` can run it BEFORE the column is added (GH#27's
+    /// validate-all-first rule: a rejected constraint must not leave the column
+    /// behind). `columns` may name a column that does not exist yet, so this
+    /// deliberately asks nothing about them.
+    fn validate_add_primary_key_preconditions(&self, table_name: &str, columns: &[String]) -> Result<()> {
+        let catalog = self.storage.catalog();
+        let schema = catalog.get_table_schema(table_name)?;
+        let existing_pk: Vec<&str> = schema
+            .columns
+            .iter()
+            .filter(|c| c.primary_key && !columns.iter().any(|n| n.eq_ignore_ascii_case(&c.name)))
+            .map(|c| c.name.as_str())
+            .collect();
+        let recorded_pk = catalog
+            .load_table_constraints(table_name)
+            .map(|c| c.unique_constraints.iter().any(|uc| uc.is_primary_key))
+            .unwrap_or(false);
+        if !existing_pk.is_empty() || recorded_pk {
+            return Err(Error::query_execution(format!(
+                "multiple primary keys for table \"{}\" are not allowed",
+                table_name
+            )));
+        }
+        let rows = self.storage.scan_table_with_schema(table_name, &schema)?.len();
+        if rows > 0 {
+            return Err(Error::query_execution(format!(
+                "ALTER TABLE … ADD COLUMN … PRIMARY KEY is not supported on a non-empty relation \
+                 (\"{}\" holds {} row(s)): the added column would be NULL — or the same DEFAULT — in every \
+                 existing row. Add the column, backfill it, then add the key.",
+                table_name, rows
+            )));
+        }
+        Ok(())
+    }
+
+    /// `ALTER TABLE <t> ADD [CONSTRAINT <name>] CHECK (<expr>)`, reached only as
+    /// the desugaring of `ADD COLUMN <c> … CHECK (…)` (sprinter 885ffe24eab6).
+    ///
+    /// The expression is stored the way `CREATE TABLE` stores one — a
+    /// serde_json `LogicalExpr`, which is what `parse_check_expression` reads
+    /// back — so a CHECK declared on ADD COLUMN and the identical CHECK
+    /// declared on CREATE TABLE are byte-identical records, enforced by the
+    /// same `validate_check_constraints` on every write path.
+    ///
+    /// Existing rows ARE validated first, as PostgreSQL validates them: the
+    /// constraint is recorded only if the data already satisfies it, so the
+    /// catalog never claims a rule the table violates. (On the ADD COLUMN path
+    /// the new column reads NULL in every existing row, and SQL's three-valued
+    /// logic makes an unknown CHECK pass — the same answer PostgreSQL gives.)
+    fn alter_table_add_check(
+        &self,
+        table_name: &str,
+        constraint_name: &Option<String>,
+        expression: &sql::LogicalExpr,
+    ) -> Result<u64> {
+        let catalog = self.storage.catalog();
+        let schema = catalog.get_table_schema(table_name)?;
+        let mut constraints = catalog.load_table_constraints(table_name)?;
+        let name = constraint_name
+            .clone()
+            .unwrap_or_else(|| Self::derived_check_constraint_name(table_name, expression, &constraints));
+        Self::reject_duplicate_constraint_name(&constraints, table_name, &name)?;
+
+        let body = serde_json::to_string(expression)
+            .map_err(|e| Error::query_execution(format!("could not store CHECK constraint \"{}\": {}", name, e)))?;
+
+        // Validate the rows already in the table, then record. Order matters
+        // for the same reason it does in `alter_table_add_unique`: a recorded
+        // constraint that the existing data violates is a catalog that lies.
+        let tuples = self.storage.scan_table_with_schema(table_name, &schema)?;
+        if !tuples.is_empty() {
+            let probe = sql::TableConstraints {
+                foreign_keys: Vec::new(),
+                unique_constraints: Vec::new(),
+                check_constraints: vec![sql::CheckConstraint::new(
+                    name.clone(),
+                    table_name.to_string(),
+                    body.clone(),
+                )],
+            };
+            for tuple in &tuples {
+                self.validate_check_constraints(&probe, &schema, &tuple.values)
+                    .map_err(|e| {
+                        Error::constraint_violation(format!(
+                            "check constraint \"{}\" of relation \"{}\" is violated by some row: {}",
+                            name, table_name, e
+                        ))
+                    })?;
+            }
+        }
+
+        constraints.add_check(sql::CheckConstraint::new(name.clone(), table_name.to_string(), body));
+        catalog.save_table_constraints(table_name, &constraints)?;
+        tracing::info!("Added CHECK constraint '{}' on {}", name, table_name);
+        Ok(0)
+    }
+
+    /// PostgreSQL's `{table}_{column}_check` for a column-level CHECK, with its
+    /// `_1`, `_2`, … disambiguation when a table carries several. Falls back to
+    /// `{table}_check` when the expression names no column (a constant CHECK).
+    fn derived_check_constraint_name(
+        table_name: &str,
+        expression: &sql::LogicalExpr,
+        existing: &sql::TableConstraints,
+    ) -> String {
+        let column = Self::first_column_referenced(expression);
+        let base = match column {
+            Some(col) => format!("{}_{}_check", table_name, col),
+            None => format!("{}_check", table_name),
+        };
+        if existing.find_by_name(&base).is_none() {
+            return base;
+        }
+        // Bounded, because the caller re-checks the name it gets back
+        // (`reject_duplicate_constraint_name`): exhausting the range reports a
+        // duplicate rather than looping, which is the honest failure.
+        for n in 1..=1024u32 {
+            let candidate = format!("{}{}", base, n);
+            if existing.find_by_name(&candidate).is_none() {
+                return candidate;
+            }
+        }
+        base
+    }
+
+    /// The first column a CHECK body names, for constraint naming only.
+    ///
+    /// Walks the SERIALIZED form rather than matching on `LogicalExpr`
+    /// variants: `serde` tags the enum externally, so one generic JSON descent
+    /// reaches a `Column` node at any depth and inside any variant, and a
+    /// variant added later cannot silently fall out of the walk.
+    fn first_column_referenced(expression: &sql::LogicalExpr) -> Option<String> {
+        fn walk(v: &serde_json::Value) -> Option<String> {
+            match v {
+                serde_json::Value::Object(map) => {
+                    for (key, child) in map {
+                        if key == "Column" {
+                            if let Some(name) = child.get("name").and_then(|n| n.as_str()) {
+                                return Some(name.to_string());
+                            }
+                        }
+                        if let Some(found) = walk(child) {
+                            return Some(found);
+                        }
+                    }
+                    None
+                }
+                serde_json::Value::Array(items) => items.iter().find_map(walk),
+                _ => None,
+            }
+        }
+        let json = serde_json::to_value(expression).ok()?;
+        walk(&json)
+    }
+
+    /// A constraint name is unique per relation across FK / UNIQUE / CHECK in
+    /// both PostgreSQL and MySQL. The same triple test `alter_table_add_unique`
+    /// applies, shared so the three ADD paths cannot answer differently.
+    fn reject_duplicate_constraint_name(
+        constraints: &sql::TableConstraints,
+        table_name: &str,
+        name: &str,
+    ) -> Result<()> {
+        let taken = constraints
+            .unique_constraints
+            .iter()
+            .any(|uc| uc.name.eq_ignore_ascii_case(name))
+            || constraints
+                .foreign_keys
+                .iter()
+                .any(|fk| fk.name.eq_ignore_ascii_case(name))
+            || constraints
+                .check_constraints
+                .iter()
+                .any(|ck| ck.name.eq_ignore_ascii_case(name));
+        if taken {
+            return Err(Error::query_execution(format!(
+                "constraint \"{}\" for relation \"{}\" already exists",
+                name, table_name
+            )));
+        }
+        Ok(())
+    }
+
+    /// `ALTER TABLE <t> ADD COLUMN …` — ONE body for BOTH executor families.
+    fn alter_table_add_column(
+        &self,
+        table_name: &str,
+        column_def: &sql::logical_plan::ColumnDef,
+        if_not_exists: bool,
+    ) -> Result<u64> {
+        let catalog = self.storage.catalog();
+        let mut schema = catalog.get_table_schema(table_name)?;
+
+        if schema.columns.iter().any(|c| c.name == column_def.name) {
+            if if_not_exists {
+                return Ok(0);
+            }
+            return Err(Error::query_execution(format!(
+                "Column '{}' already exists in table '{}'",
+                column_def.name, table_name
+            )));
+        }
+
+        let new_column = Column {
+            name: column_def.name.clone(),
+            data_type: column_def.data_type.clone(),
+            nullable: !column_def.not_null,
+            primary_key: column_def.primary_key,
+            source_table: None,
+            source_table_name: Some(table_name.to_string()),
+            default_expr: Self::serialize_default_expr(&column_def.default),
+            unique: column_def.unique,
+            storage_mode: column_def.storage_mode,
+        };
+
+        schema.columns.push(new_column);
+        catalog.update_table_schema(table_name, &schema)?;
+
+        let rows_updated = self.storage.add_column_to_rows(table_name, &column_def.default)?;
+
+        tracing::info!(
+            "Added column '{}' to table '{}', updated {} rows",
+            column_def.name,
+            table_name,
+            rows_updated
+        );
+
+        Ok(rows_updated as u64)
+    }
+
+    /// `ALTER TABLE <t> DROP COLUMN …` — ONE body for BOTH executor families.
+    ///
+    /// # sprinter 0f258ed23d13
+    ///
+    /// This used to do `schema.columns.remove(idx)` and nothing else, so every
+    /// persisted constraint record naming the column survived it — a UNIQUE
+    /// whose column no longer exists, an inbound FOREIGN KEY pointing at a
+    /// vanished parent column, a CHECK over a missing identifier. None of them
+    /// error; they are simply skipped by whatever would have enforced them, so
+    /// the catalog kept advertising rules that nothing applied.
+    ///
+    /// ORDER IS LOAD-BEARING. Validation (`validate_drop_column_constraints`)
+    /// runs BEFORE the schema is touched, so a refused DROP leaves the table
+    /// exactly as it was; the record cleanup runs AFTER, so it can never delete
+    /// a constraint for a statement that then fails.
+    fn alter_table_drop_column(
+        &self,
+        table_name: &str,
+        column_name: &str,
+        if_exists: bool,
+        cascade: bool,
+    ) -> Result<u64> {
+        let catalog = self.storage.catalog();
+        let mut schema = catalog.get_table_schema(table_name)?;
+
+        let col_idx = schema.columns.iter().position(|c| c.name == *column_name);
+
+        let Some(idx) = col_idx else {
+            if if_exists {
+                return Ok(0);
+            }
+            return Err(Error::query_execution(format!(
+                "Column '{}' does not exist in table '{}'",
+                column_name, table_name
+            )));
+        };
+
+        let is_pk = schema
+            .get_column_at(idx)
+            .ok_or_else(|| Error::internal("column index out of bounds"))?
+            .primary_key;
+        if is_pk && !cascade {
+            return Err(Error::query_execution(format!(
+                "Cannot drop primary key column '{}' without CASCADE",
+                column_name
+            )));
+        }
+
+        // Refuse BEFORE mutating anything (another table's FK depends on this
+        // column and no CASCADE was given).
+        catalog.validate_drop_column_constraints(table_name, column_name, cascade)?;
+
+        let was_columnar = schema
+            .get_column_at(idx)
+            .is_some_and(|c| c.storage_mode == ColumnStorageMode::Columnar);
+        schema.columns.remove(idx);
+        catalog.update_table_schema(table_name, &schema)?;
+
+        let rows_updated = self.storage.drop_column_from_rows(table_name, idx)?;
+        self.cleanup_columnar_after_drop_column(table_name, column_name, was_columnar, &schema)?;
+
+        // Retire every constraint record (and constraint-owned index) that
+        // named the column, on this table and on its children.
+        catalog.drop_column_from_constraints(table_name, column_name)?;
+
+        tracing::info!(
+            "Dropped column '{}' from table '{}', updated {} rows",
+            column_name,
+            table_name,
+            rows_updated
+        );
+
+        Ok(rows_updated as u64)
+    }
+
+    /// `ALTER TABLE <t> RENAME COLUMN <old> TO <new>` — ONE body for BOTH
+    /// executor families.
+    ///
+    /// # sprinter 0f258ed23d13
+    ///
+    /// This used to mutate `schema.columns[i].name` and stop. Two separate
+    /// things then went on naming the old column, and BOTH are enforcement:
+    ///
+    /// 1. the persisted `TableConstraints` record — so after a restart
+    ///    `register_unique_constraint_indexes` built a tree over a column the
+    ///    schema no longer had, every probe resolved it to `None`, and the
+    ///    UNIQUE silently accepted duplicates from then on;
+    /// 2. the LIVE ART index entries, whose `columns` are resolved by exact
+    ///    name on every write — so the same UNIQUE stopped being enforced
+    ///    IMMEDIATELY, in the process that ran the rename, with no restart
+    ///    needed at all.
+    ///
+    /// Validation first (a CHECK body that cannot be rewritten refuses the
+    /// statement), then the schema, then the records, then the live indexes.
+    /// Refusing is recoverable; a silently unenforced UNIQUE is not.
+    fn alter_table_rename_column(&self, table_name: &str, old_column_name: &str, new_column_name: &str) -> Result<u64> {
+        let catalog = self.storage.catalog();
+        let mut schema = catalog.get_table_schema(table_name)?;
+
+        if schema.columns.iter().any(|c| c.name == *new_column_name) {
+            return Err(Error::query_execution(format!(
+                "Column '{}' already exists in table '{}'",
+                new_column_name, table_name
+            )));
+        }
+
+        let col_idx = schema
+            .columns
+            .iter()
+            .position(|c| c.name == *old_column_name)
+            .ok_or_else(|| {
+                Error::query_execution(format!(
+                    "Column '{}' does not exist in table '{}'",
+                    old_column_name, table_name
+                ))
+            })?;
+
+        // Refuse BEFORE mutating anything.
+        catalog.validate_rename_column_constraints(table_name, old_column_name)?;
+
+        schema
+            .get_column_at_mut(col_idx)
+            .ok_or_else(|| Error::internal("column index out of bounds"))?
+            .name = new_column_name.to_string();
+        catalog.update_table_schema(table_name, &schema)?;
+
+        catalog.rename_column_in_constraints(table_name, old_column_name, new_column_name)?;
+        let repointed =
+            self.storage
+                .art_indexes()
+                .rename_column_in_indexes(table_name, old_column_name, new_column_name);
+        if !repointed.is_empty() {
+            tracing::debug!(
+                "Repointed {} live index(es) of '{}' from column '{}' to '{}': {:?}",
+                repointed.len(),
+                table_name,
+                old_column_name,
+                new_column_name,
+                repointed
+            );
+        }
+
+        tracing::info!(
+            "Renamed column '{}' to '{}' in table '{}'",
+            old_column_name,
+            new_column_name,
+            table_name
+        );
+
+        Ok(0)
+    }
+
     /// Execute a single ALTER TABLE operation from its logical plan.
     ///
     /// This is used by the `AlterTableMulti` handler to execute each sub-operation
@@ -12716,141 +13880,18 @@ impl EmbeddedDatabase {
                 table_name,
                 column_def,
                 if_not_exists,
-            } => {
-                let catalog = self.storage.catalog();
-                let mut schema = catalog.get_table_schema(table_name)?;
-
-                if schema.columns.iter().any(|c| c.name == column_def.name) {
-                    if *if_not_exists {
-                        return Ok(0);
-                    }
-                    return Err(Error::query_execution(format!(
-                        "Column '{}' already exists in table '{}'",
-                        column_def.name, table_name
-                    )));
-                }
-
-                let new_column = Column {
-                    name: column_def.name.clone(),
-                    data_type: column_def.data_type.clone(),
-                    nullable: !column_def.not_null,
-                    primary_key: column_def.primary_key,
-                    source_table: None,
-                    source_table_name: Some(table_name.clone()),
-                    default_expr: Self::serialize_default_expr(&column_def.default),
-                    unique: column_def.unique,
-                    storage_mode: column_def.storage_mode,
-                };
-
-                schema.columns.push(new_column);
-                catalog.update_table_schema(table_name, &schema)?;
-
-                let rows_updated = self.storage.add_column_to_rows(table_name, &column_def.default)?;
-
-                tracing::info!(
-                    "Added column '{}' to table '{}', updated {} rows",
-                    column_def.name,
-                    table_name,
-                    rows_updated
-                );
-
-                Ok(rows_updated as u64)
-            }
+            } => self.alter_table_add_column(table_name, column_def, *if_not_exists),
             sql::LogicalPlan::AlterTableDropColumn {
                 table_name,
                 column_name,
                 if_exists,
                 cascade,
-            } => {
-                let catalog = self.storage.catalog();
-                let mut schema = catalog.get_table_schema(table_name)?;
-
-                let col_idx = schema.columns.iter().position(|c| c.name == *column_name);
-
-                match col_idx {
-                    Some(idx) => {
-                        let is_pk = schema
-                            .get_column_at(idx)
-                            .ok_or_else(|| Error::internal("column index out of bounds"))?
-                            .primary_key;
-                        if is_pk && !cascade {
-                            return Err(Error::query_execution(format!(
-                                "Cannot drop primary key column '{}' without CASCADE",
-                                column_name
-                            )));
-                        }
-
-                        let was_columnar = schema
-                            .get_column_at(idx)
-                            .is_some_and(|c| c.storage_mode == ColumnStorageMode::Columnar);
-                        schema.columns.remove(idx);
-                        catalog.update_table_schema(table_name, &schema)?;
-
-                        let rows_updated = self.storage.drop_column_from_rows(table_name, idx)?;
-                        self.cleanup_columnar_after_drop_column(table_name, column_name, was_columnar, &schema)?;
-
-                        tracing::info!(
-                            "Dropped column '{}' from table '{}', updated {} rows",
-                            column_name,
-                            table_name,
-                            rows_updated
-                        );
-
-                        Ok(rows_updated as u64)
-                    }
-                    None => {
-                        if *if_exists {
-                            Ok(0)
-                        } else {
-                            Err(Error::query_execution(format!(
-                                "Column '{}' does not exist in table '{}'",
-                                column_name, table_name
-                            )))
-                        }
-                    }
-                }
-            }
+            } => self.alter_table_drop_column(table_name, column_name, *if_exists, *cascade),
             sql::LogicalPlan::AlterTableRenameColumn {
                 table_name,
                 old_column_name,
                 new_column_name,
-            } => {
-                let catalog = self.storage.catalog();
-                let mut schema = catalog.get_table_schema(table_name)?;
-
-                if schema.columns.iter().any(|c| c.name == *new_column_name) {
-                    return Err(Error::query_execution(format!(
-                        "Column '{}' already exists in table '{}'",
-                        new_column_name, table_name
-                    )));
-                }
-
-                let col_idx = schema
-                    .columns
-                    .iter()
-                    .position(|c| c.name == *old_column_name)
-                    .ok_or_else(|| {
-                        Error::query_execution(format!(
-                            "Column '{}' does not exist in table '{}'",
-                            old_column_name, table_name
-                        ))
-                    })?;
-
-                schema
-                    .get_column_at_mut(col_idx)
-                    .ok_or_else(|| Error::internal("column index out of bounds"))?
-                    .name = new_column_name.clone();
-                catalog.update_table_schema(table_name, &schema)?;
-
-                tracing::info!(
-                    "Renamed column '{}' to '{}' in table '{}'",
-                    old_column_name,
-                    new_column_name,
-                    table_name
-                );
-
-                Ok(0)
-            }
+            } => self.alter_table_rename_column(table_name, old_column_name, new_column_name),
             sql::LogicalPlan::AlterTableAlterColumnNullability {
                 table_name,
                 column_name,
@@ -12865,6 +13906,19 @@ impl EmbeddedDatabase {
                 constraint_name,
                 columns,
             } => self.alter_table_add_unique(table_name, constraint_name, columns),
+            // sprinter 885ffe24eab6: the two constraint spellings that
+            // `ADD COLUMN … PRIMARY KEY` / `… CHECK (…)` desugar into. Both
+            // families reach them through this one dispatcher.
+            sql::LogicalPlan::AlterTableAddPrimaryKey {
+                table_name,
+                constraint_name,
+                columns,
+            } => self.alter_table_add_primary_key(table_name, constraint_name, columns),
+            sql::LogicalPlan::AlterTableAddCheck {
+                table_name,
+                constraint_name,
+                expression,
+            } => self.alter_table_add_check(table_name, constraint_name, expression),
             sql::LogicalPlan::AlterTableDropConstraint {
                 table_name,
                 constraint_name,
@@ -13346,7 +14400,7 @@ impl EmbeddedDatabase {
     ) -> Result<Vec<(u64, Tuple)>> {
         let mut prepared = Vec::with_capacity(tuples.len());
         for tuple in tuples {
-            let (row_id, tuple) = self.prepare_tuple_for_transaction_insert(table_name, tuple, schema);
+            let (row_id, tuple) = self.prepare_tuple_for_transaction_insert(table_name, tuple, schema)?;
             prepared.push((row_id, tuple));
         }
         Ok(prepared)
@@ -13372,32 +14426,33 @@ impl EmbeddedDatabase {
         schema: &Schema,
         txn: &storage::Transaction,
     ) -> Result<u64> {
-        let (row_id, tuple) = self.prepare_tuple_for_transaction_insert(table_name, tuple, schema);
+        let (row_id, tuple) = self.prepare_tuple_for_transaction_insert(table_name, tuple, schema)?;
         self.insert_prepared_tuple_in_transaction(table_name, row_id, tuple, schema, txn, false, true)?;
         self.storage.stage_row_counter_in_transaction(table_name, row_id, txn)?;
         Ok(row_id)
     }
 
+    /// sprinter f32ba64c00a7: fallible since the NULL-PK auto-fill became
+    /// type-aware. A NULL in a PRIMARY KEY the row-id allocator cannot produce
+    /// (TEXT / UUID / NUMERIC / …) is 23502 here rather than a silent Int8, and
+    /// this funnel serves the fast, batch and session-transaction INSERT paths,
+    /// so the refusal has to be able to leave it. Both callers already return
+    /// `Result`.
     fn prepare_tuple_for_transaction_insert(
         &self,
         table_name: &str,
         mut tuple: Tuple,
         schema: &Schema,
-    ) -> (u64, Tuple) {
+    ) -> Result<(u64, Tuple)> {
         let row_id = self.storage.next_row_id_volatile(table_name);
 
         let mut generated_identity = false;
         for (i, col) in schema.columns.iter().enumerate() {
-            if col.primary_key {
-                if let Some(value) = tuple.values.get(i) {
-                    if matches!(value, Value::Null) && i < tuple.values.len() {
-                        match col.data_type {
-                            DataType::Int2 => tuple.values[i] = Value::Int2(row_id as i16),
-                            DataType::Int4 => tuple.values[i] = Value::Int4(row_id as i32),
-                            _ => tuple.values[i] = Value::Int8(row_id as i64),
-                        }
-                        generated_identity = true;
-                    }
+            if col.primary_key && matches!(tuple.values.get(i), Some(Value::Null)) {
+                let filled = crate::pk_autofill_value(table_name, col, row_id)?;
+                if let Some(slot) = tuple.values.get_mut(i) {
+                    *slot = filled;
+                    generated_identity = true;
                 }
             }
         }
@@ -13407,7 +14462,7 @@ impl EmbeddedDatabase {
             crate::note_session_lastval(row_id as i64);
         }
 
-        (row_id, tuple)
+        Ok((row_id, tuple))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -14598,7 +15653,10 @@ impl EmbeddedDatabase {
         if count_pk_col.is_some_and(|col| !col.eq_ignore_ascii_case(&pk_col.name)) {
             return None;
         }
-        if !matches!(pk_col.data_type, DataType::Int2 | DataType::Int4 | DataType::Int8) {
+        // sprinter f32ba64c00a7: the shared identity-PK type predicate, so this
+        // fast path and the NULL-PK auto-fill cannot disagree about which
+        // primary keys the row-id allocator owns.
+        if !crate::is_identity_pk_type(&pk_col.data_type) {
             return None;
         }
         self.fast_select_spec(table_name, &pk_col.name)
@@ -15871,6 +16929,11 @@ impl EmbeddedDatabase {
         params: &[Value],
         plan_override: Option<&std::sync::Arc<sql::LogicalPlan>>,
     ) -> Result<u64> {
+        // sprinter d03de7fc3b22: charge this CLIENT statement against the active
+        // tenant's `max_qps`. Every family's entry point charges — there is no
+        // funnel all of them pass through — and the returned guard makes every
+        // nested execution inside this one free, so a statement is counted
+        // exactly once. See `charge_tenant_query`.
         // HDB-008: the params family resolves the GLOBAL `current_transaction`
         // slot deep inside `execute_plan_with_params_inner`'s DML arms, so the
         // failed-transaction boundary is applied here, at the entry point,
@@ -15900,13 +16963,14 @@ impl EmbeddedDatabase {
         // for the autocommit case — it has already installed ITS session's backend,
         // and overwriting it here would make every connection share one `lastval()`.
         let _scoped = SessionScopedStateGuard::install_if_absent(&self.embedded_scoped);
-        // GH#28: the params family answers `SHOW <setting>` and `SET` /
-        // `RESET` of the three connection-lifetime GUCs from the registry —
-        // and NOTHING else (candidate 2: every other `SET` keeps erroring in
-        // the planner, because the registry is process-global; see
-        // `try_handle_params_family_setting_statement`). A `&str`-prefix
-        // check that bails in nanoseconds on anything else; on the wire path
-        // the `_for_session` wrapper has already consumed every session-scoped
+        // GH#28 + sprinter a3077a3f68d8: the params family answers
+        // `SHOW <setting>`, `SET`/`RESET` of the three connection-lifetime GUCs,
+        // and `SET`/`RESET` of every USER-SETTABLE GUC — which now land on the
+        // backend installed just above, never on the process-global registry
+        // that made GH#28 refuse them. An unregistered or SERVER-level name still
+        // falls through to the planner and still errors. A `&str`-prefix check
+        // that bails in nanoseconds on anything else; on the wire path the
+        // `_for_session` wrapper has already consumed every session-scoped
         // statement before reaching here.
         if let Some((rows, _schema)) = self.try_handle_params_family_setting_statement(sql)? {
             return Ok(rows.len() as u64);
@@ -15972,6 +17036,11 @@ impl EmbeddedDatabase {
     /// The body of [`execute_many_params`](Self::execute_many_params), inside
     /// the HDB-008 boundary.
     fn execute_many_params_inner(&self, sql: &str, rows: &[Vec<Value>]) -> Result<u64> {
+        // sprinter d03de7fc3b22: charge this CLIENT statement against the active
+        // tenant's `max_qps`. Every family's entry point charges — there is no
+        // funnel all of them pass through — and the returned guard makes every
+        // nested execution inside this one free, so a statement is counted
+        // exactly once. See `charge_tenant_query`.
         if rows.is_empty() {
             return Ok(0);
         }
@@ -16046,6 +17115,11 @@ impl EmbeddedDatabase {
     /// [`execute_params_returning`](Self::execute_params_returning), inside
     /// the HDB-008 boundary.
     fn execute_params_returning_inner(&self, sql: &str, params: &[Value]) -> Result<(u64, Vec<Tuple>)> {
+        // sprinter d03de7fc3b22: charge this CLIENT statement against the active
+        // tenant's `max_qps`. Every family's entry point charges — there is no
+        // funnel all of them pass through — and the returned guard makes every
+        // nested execution inside this one free, so a statement is counted
+        // exactly once. See `charge_tenant_query`.
         // Reflect an embedded `SET search_path` into the evaluator's thread-local
         // so RETURNING `current_schema()` sees the right schema (see
         // `embedded_current_schema_guard`). Free on the default path.
@@ -16370,23 +17444,26 @@ impl EmbeddedDatabase {
         original_sql: Option<&str>,
     ) -> Result<(u64, Vec<Tuple>)> {
         let txn = self.storage.begin_autocommit_transaction()?;
+        // sprinter beefd0d3d069: own slot, not the shared log.
+        let _undo_slot = self.claim_statement_art_undo(&txn);
+        let undo_txn_id = _undo_slot.txn_id;
         match self.execute_plan_with_params_inner(plan, params, Some(&txn), original_sql) {
             Ok(out) => {
                 if let Err(e) = self.validate_deferred_fk_checks(Some(&txn)) {
                     let _ = txn.rollback();
-                    self.rollback_art_undo_log();
+                    self.rollback_art_undo_for(undo_txn_id);
                     self.deferred_fk_checks.lock().clear();
                     return Err(e);
                 }
                 txn.commit()?;
-                self.art_undo_log.write().clear();
+                let _ = self.take_raii_art_undo(undo_txn_id);
                 self.deferred_fk_checks.lock().clear();
                 self.storage.increment_lsn();
                 Ok(out)
             }
             Err(e) => {
                 let _ = txn.rollback();
-                self.rollback_art_undo_log();
+                self.rollback_art_undo_for(undo_txn_id);
                 self.deferred_fk_checks.lock().clear();
                 Err(e)
             }
@@ -16478,6 +17555,8 @@ impl EmbeddedDatabase {
             | sql::LogicalPlan::AlterTableRenameColumn { .. }
             | sql::LogicalPlan::AlterTableAlterColumnNullability { .. }
             | sql::LogicalPlan::AlterTableAddUnique { .. }
+            | sql::LogicalPlan::AlterTableAddPrimaryKey { .. }
+            | sql::LogicalPlan::AlterTableAddCheck { .. }
             | sql::LogicalPlan::AlterTableDropConstraint { .. }
             | sql::LogicalPlan::AlterTableAddForeignKey { .. }
             | sql::LogicalPlan::AlterTableRename { .. } => Ok((self.execute_alter_table_op(plan)?, Vec::new())),
@@ -16709,17 +17788,16 @@ impl EmbeddedDatabase {
                                 self.storage.stage_row_counter_in_transaction(table_name, row_id, txn)?;
                                 let mut staged = tuple.clone();
                                 let mut generated_identity = false;
+                                // sprinter f32ba64c00a7: type-gated through the
+                                // one shared decision, like every other fill
+                                // site. The `_ =>` arm this replaced stored an
+                                // Int8 in a TEXT / UUID / NUMERIC primary key.
                                 for (i, col) in schema.columns.iter().enumerate() {
-                                    if col.primary_key {
-                                        if let Some(Value::Null) = staged.values.get(i) {
-                                            if let Some(slot) = staged.values.get_mut(i) {
-                                                *slot = match col.data_type {
-                                                    DataType::Int2 => Value::Int2(row_id as i16),
-                                                    DataType::Int4 => Value::Int4(row_id as i32),
-                                                    _ => Value::Int8(row_id as i64),
-                                                };
-                                                generated_identity = true;
-                                            }
+                                    if col.primary_key && matches!(staged.values.get(i), Some(Value::Null)) {
+                                        let value = crate::pk_autofill_value(table_name, col, row_id)?;
+                                        if let Some(slot) = staged.values.get_mut(i) {
+                                            *slot = value;
+                                            generated_identity = true;
                                         }
                                     }
                                 }
@@ -16751,23 +17829,44 @@ impl EmbeddedDatabase {
                                 }
                                 let key = self.storage.branch_aware_data_key(table_name, row_id);
                                 let val = bincode::serialize(&staged).map_err(|e| Error::storage(e.to_string()))?;
-                                txn.put(key, val)?;
-                                // W2.0: a branch INSERT writes to `bdata:` above;
+                                // W2.0: a branch INSERT writes to `bdata:` below;
                                 // keep the process-wide ART branch-free so main
                                 // probes/unique checks never observe the branch row
                                 // (the columnar-staging gate above already skips a
                                 // branch — this ART block sat outside it).
-                                if self.storage.get_current_branch_id().is_none() {
-                                    if let Err(e) =
-                                        self.storage
+                                let on_main = self.storage.get_current_branch_id().is_none();
+                                // sprinter 5a78b8288153: CLAIM before staging —
+                                // the params twin of the text arm's fix, and the
+                                // arm this item's own regression test actually
+                                // reaches. A multi-row autocommit
+                                // `INSERT ... VALUES (…),(…)` on this family runs
+                                // inside the v4.38.0 implicit statement
+                                // transaction (sprinter 6780488554df), so it
+                                // lands HERE — not in the COPY batch funnel —
+                                // and the read-locked probe above could not stop
+                                // two concurrent statements from both staging and
+                                // both committing the same UNIQUE value.
+                                //
+                                // `ON CONFLICT` legs never reach this line (they
+                                // are intercepted by that probe), so their
+                                // semantics are untouched.
+                                if on_main {
+                                    self.storage
+                                        .art_indexes()
+                                        .reserve_insert_tuple(table_name, row_id, &schema, &staged)
+                                        .map_err(|e| Error::constraint_violation(e.to_string()))?;
+                                }
+                                if let Err(e) = txn.put(key, val) {
+                                    // The row never landed, so the claim is a phantom.
+                                    if on_main {
+                                        let _ = self
+                                            .storage
                                             .art_indexes()
-                                            .on_insert(table_name, row_id, &staged_col_values)
-                                    {
-                                        // The row is in the transaction's write
-                                        // set by now: a refusal is a stored
-                                        // duplicate, reported at ERROR.
-                                        storage::StorageEngine::note_index_maintenance_failure(table_name, row_id, &e);
+                                            .on_delete_tuple(table_name, row_id, &schema, &staged);
                                     }
+                                    return Err(e);
+                                }
+                                if on_main {
                                     self.push_art_undo(
                                         txn,
                                         ArtUndoOp::RemoveInserted {
@@ -16787,18 +17886,18 @@ impl EmbeddedDatabase {
                             };
                             if has_returning {
                                 let mut filled = tuple;
+                                // The `RETURNING` mirror of the fill the write
+                                // above performed — so it uses the SAME decision
+                                // (sprinter f32ba64c00a7). Unreachable with a
+                                // non-integer PK now that the write itself
+                                // refuses one, but a mirror that could disagree
+                                // with what was stored is exactly the class of
+                                // bug this item is about.
                                 for (i, col) in schema.columns.iter().enumerate() {
-                                    if col.primary_key {
-                                        if let Some(v) = filled.values.get(i) {
-                                            if matches!(v, Value::Null) {
-                                                if let Some(slot) = filled.values.get_mut(i) {
-                                                    *slot = match col.data_type {
-                                                        DataType::Int2 => Value::Int2(row_id as i16),
-                                                        DataType::Int4 => Value::Int4(row_id as i32),
-                                                        _ => Value::Int8(row_id as i64),
-                                                    };
-                                                }
-                                            }
+                                    if col.primary_key && matches!(filled.values.get(i), Some(Value::Null)) {
+                                        let value = crate::pk_autofill_value(table_name, col, row_id)?;
+                                        if let Some(slot) = filled.values.get_mut(i) {
+                                            *slot = value;
                                         }
                                     }
                                 }
@@ -17979,6 +19078,11 @@ impl EmbeddedDatabase {
     /// # }
     /// ```
     pub fn query(&self, sql: &str, _params: &[&dyn std::fmt::Display]) -> Result<Vec<Tuple>> {
+        // sprinter d03de7fc3b22: charge this CLIENT statement against the active
+        // tenant's `max_qps`. Every family's entry point charges — there is no
+        // funnel all of them pass through — and the returned guard makes every
+        // nested execution inside this one free, so a statement is counted
+        // exactly once. See `charge_tenant_query`.
         // Snapshot the result-cache invalidation epoch BEFORE reading any
         // data. Every `cache_query_result` below publishes only if nothing
         // invalidated the cache in between (see `result_cache_epoch`).
@@ -18641,6 +19745,11 @@ impl EmbeddedDatabase {
     /// (GH#23). Every internal fast path answers with a real schema: the
     /// cached and the uncached branch describe a result identically.
     pub(crate) fn query_with_schema(&self, sql: &str) -> Result<(Vec<Tuple>, std::sync::Arc<Schema>)> {
+        // sprinter d03de7fc3b22: charge this CLIENT statement against the active
+        // tenant's `max_qps`. Every family's entry point charges — there is no
+        // funnel all of them pass through — and the returned guard makes every
+        // nested execution inside this one free, so a statement is counted
+        // exactly once. See `charge_tenant_query`.
         // Snapshot the result-cache invalidation epoch BEFORE reading any
         // data. Every `cache_query_result` below publishes only if nothing
         // invalidated the cache in between (see `result_cache_epoch`).
@@ -19631,6 +20740,11 @@ impl EmbeddedDatabase {
     ///
     /// Number of rows affected by the statement
     pub fn execute_in_session(&self, session_id: crate::session::SessionId, sql: &str) -> Result<u64> {
+        // sprinter d03de7fc3b22: charge this CLIENT statement against the active
+        // tenant's `max_qps`. Every family's entry point charges — there is no
+        // funnel all of them pass through — and the returned guard makes every
+        // nested execution inside this one free, so a statement is counted
+        // exactly once. See `charge_tenant_query`.
         // Spec 03: this session owns any advisory lock the statement takes.
         let _advisory = self.advisory_context_guard(session_id, sql);
         // HDB-009: this session's login identity answers `current_user` and
@@ -19642,6 +20756,15 @@ impl EmbeddedDatabase {
         // open-transaction fork below — the in-transaction branch is
         // sqlparser-first and would fail on a generic GUC statement.
         if let Some(_handled) = self.try_handle_session_application_name(session_id, sql)? {
+            return Ok(0);
+        }
+        // sprinter a3077a3f68d8: the same treatment for every USER-SETTABLE GUC
+        // (`statement_timeout`, `work_mem`, `bulk_load_mode`, the planner
+        // switches). They used to write the ONE process-global settings registry
+        // — so `SET statement_timeout = 1` here cancelled every OTHER
+        // connection's queries — and now land on THIS session's backend,
+        // resolved from `session_id`, never from the per-statement thread-local.
+        if let Some(_handled) = self.try_handle_session_guc(session_id, sql)? {
             return Ok(0);
         }
         // R1.3-p2: session-scoped SET/RESET synchronous_commit. Must run
@@ -19777,6 +20900,11 @@ impl EmbeddedDatabase {
         sql: &str,
         _params: &[&dyn std::fmt::Display],
     ) -> Result<Vec<Tuple>> {
+        // sprinter d03de7fc3b22: charge this CLIENT statement against the active
+        // tenant's `max_qps`. Every family's entry point charges — there is no
+        // funnel all of them pass through — and the returned guard makes every
+        // nested execution inside this one free, so a statement is counted
+        // exactly once. See `charge_tenant_query`.
         // Spec 03: this session owns any advisory lock the statement takes —
         // installed before the `self.query(...)` delegate below so the shared
         // funnel does not re-attribute the lock to the embedded handle.
@@ -19788,6 +20916,15 @@ impl EmbeddedDatabase {
         // open-transaction fork below — the in-transaction branch is
         // sqlparser-first and would fail on a generic GUC statement.
         if let Some(handled) = self.try_handle_session_application_name(session_id, sql)? {
+            return Ok(handled.0);
+        }
+        // sprinter a3077a3f68d8: the same treatment for every USER-SETTABLE GUC
+        // (`statement_timeout`, `work_mem`, `bulk_load_mode`, the planner
+        // switches). They used to write the ONE process-global settings registry
+        // — so `SET statement_timeout = 1` here cancelled every OTHER
+        // connection's queries — and now land on THIS session's backend,
+        // resolved from `session_id`, never from the per-statement thread-local.
+        if let Some(handled) = self.try_handle_session_guc(session_id, sql)? {
             return Ok(handled.0);
         }
         let session_lock = self.session_manager.get_session(session_id)?;
@@ -19864,12 +21001,13 @@ impl EmbeddedDatabase {
     /// A no-op when the session has no transaction (autocommit), and it never
     /// touches the global embedded slot or any other session.
     ///
-    /// ⚠️ Pre-existing gap, unchanged by this: rows the FAILED statement had
-    /// already staged before it failed (a multi-row `INSERT` that violates a
-    /// constraint on its third row) stay in the write set — the engine has no
-    /// per-statement undo point, so only `ROLLBACK` or
-    /// `ROLLBACK TO SAVEPOINT` removes them. MySQL would have discarded just
-    /// that statement's rows.
+    /// Clearing the mark is only HALF of MySQL's contract; the other half is
+    /// [`Self::statement_savepoint_for_session`] +
+    /// [`Self::rollback_statement_for_session`] (sprinter 5b70b7ac5513), which
+    /// the listener takes around each statement so the rows a failed statement
+    /// staged go away with it. Without that pairing this method is the exact
+    /// data-integrity hole: it un-aborts a transaction whose write set still
+    /// holds the partial rows, and the next `COMMIT` persists them.
     pub(crate) fn clear_session_transaction_failure(&self, session_id: crate::session::SessionId) -> Result<()> {
         if let Some(slot) = self.session_txn_slot(session_id) {
             let guard = slot.read();
@@ -19878,6 +21016,99 @@ impl EmbeddedDatabase {
             }
         }
         Ok(())
+    }
+
+    /// sprinter 5b70b7ac5513: take an IMPLICIT per-statement savepoint on this
+    /// session's transaction, so a statement that fails half-way can be undone
+    /// whole.
+    ///
+    /// # Why this is needed, and only on the MySQL listener
+    ///
+    /// A statement whose executor stages rows one at a time — a multi-row
+    /// `INSERT … VALUES (…),(…),(…)`, an `INSERT … SELECT` — that fails on row
+    /// N inside an open transaction leaves rows 1..N-1 in the write set.
+    /// PostgreSQL rolls back the whole STATEMENT; this engine does not, and on
+    /// the PG wire and the embedded API that is survivable because HDB-008
+    /// aborts the block: the partial rows cannot reach a `COMMIT`, and the one
+    /// recovery path that reopens the block — `ROLLBACK TO SAVEPOINT` — removes
+    /// them on its way through.
+    ///
+    /// The MySQL listener deliberately does NOT abort the block
+    /// ([`Self::clear_session_transaction_failure`]), because InnoDB does not.
+    /// There the partial rows survive the failed statement AND the following
+    /// `COMMIT` persists them. That is the live hole, and it is why the hook
+    /// lives at the listener rather than in `run_statement_in_transaction`:
+    /// putting it there would make every embedded and PG-wire statement in a
+    /// transaction pay for a problem those two do not have — including the
+    /// `BEGIN; N × INSERT; COMMIT` shape the perf gate measures.
+    ///
+    /// # Reuses the SAVEPOINT machinery, deliberately without its stack
+    ///
+    /// The captured state is exactly what `SavepointState` captures — the
+    /// write-set snapshot (`Transaction::savepoint_snapshot`, which also records
+    /// the append-only `insert_log` length) plus the ART/vector undo-log length
+    /// — and the undo is the same pair of primitives a real
+    /// `ROLLBACK TO SAVEPOINT` runs. What it does NOT do is push onto
+    /// `self.savepoints`: that stack is process-wide rather than per-session, and
+    /// a non-empty stack disables ten INSERT/UPDATE/DELETE fast paths for every
+    /// caller (`let has_savepoints = !self.savepoints.read().is_empty()`), so an
+    /// implicit per-statement push would be both a cross-session hazard and a
+    /// throughput cliff. A named savepoint the user creates is unaffected and
+    /// still nests normally around this.
+    ///
+    /// Cost: one `DashMap` iteration over the transaction's write set. The
+    /// transactional INSERT funnel stages through the append-only `insert_log`
+    /// (`Transaction::put_insert_fast`), not the write set, so for the bulk-load
+    /// shape this is a walk of a near-empty map; an UPDATE/DELETE-heavy
+    /// transaction pays in proportion to the rows it has already changed.
+    ///
+    /// `None` when the session has no open transaction — autocommit statements
+    /// are atomic by construction and take no snapshot at all.
+    pub(crate) fn statement_savepoint_for_session(
+        &self,
+        session_id: crate::session::SessionId,
+    ) -> Option<ImplicitStatementSavepoint> {
+        let slot = self.session_txn_slot(session_id)?;
+        let guard = slot.read();
+        let txn = guard.as_ref()?;
+        Some(ImplicitStatementSavepoint {
+            write_set_snapshot: txn.savepoint_snapshot(),
+            art_undo_len: self.art_undo_len_for(txn),
+        })
+    }
+
+    /// sprinter 5b70b7ac5513: undo everything the just-failed statement staged,
+    /// back to the point [`Self::statement_savepoint_for_session`] recorded.
+    ///
+    /// Same two primitives, same order, as the `ROLLBACK TO SAVEPOINT` arms:
+    /// restore the write set (which also truncates the `insert_log`), then
+    /// replay the ART/vector undo entries the statement pushed. The transaction
+    /// itself stays open and committable — that is the whole point on this
+    /// listener.
+    ///
+    /// ⚠️ What it cannot undo, for the same reason sprinter 6780488554df
+    /// excluded `ON CONFLICT` from the autocommit half of this class: the
+    /// `DO UPDATE` leg of an upsert writes the conflicting row with
+    /// `update_tuple_fast`, which goes STRAIGHT to `data:` and to the ART rather
+    /// than through the write set. Those effects are outside everything this
+    /// touches, so an `INSERT … ON DUPLICATE KEY UPDATE` that fails part-way is
+    /// left closer to atomic than it was, not atomic. It is not made WORSE — the
+    /// leg pushes no ART undo entry, so nothing here can replay against it and
+    /// desynchronise the index from `data:`.
+    pub(crate) fn rollback_statement_for_session(
+        &self,
+        session_id: crate::session::SessionId,
+        savepoint: &ImplicitStatementSavepoint,
+    ) {
+        let Some(slot) = self.session_txn_slot(session_id) else {
+            return;
+        };
+        let guard = slot.read();
+        let Some(txn) = guard.as_ref() else {
+            return;
+        };
+        txn.rollback_to_savepoint(&savepoint.write_set_snapshot);
+        self.rollback_art_undo_to(txn, savepoint.art_undo_len);
     }
 
     /// W3.3 autocommit statement-retry policy (from `[locks]` config). Read by
@@ -20633,6 +21864,11 @@ impl EmbeddedDatabase {
 
     /// Execute a statement on behalf of a wire-protocol session.
     pub fn execute_for_session(&self, session_id: crate::session::SessionId, sql: &str) -> Result<u64> {
+        // sprinter d03de7fc3b22: charge this CLIENT statement against the active
+        // tenant's `max_qps`. Every family's entry point charges — there is no
+        // funnel all of them pass through — and the returned guard makes every
+        // nested execution inside this one free, so a statement is counted
+        // exactly once. See `charge_tenant_query`.
         // Spec 03: this connection owns any advisory lock the statement takes.
         let _advisory = self.advisory_context_guard(session_id, sql);
         // HDB-009: identity for `current_user` and the result-cache key.
@@ -20642,6 +21878,15 @@ impl EmbeddedDatabase {
         // open-transaction fork below — the in-transaction branch is
         // sqlparser-first and would fail on a generic GUC statement.
         if let Some(_handled) = self.try_handle_session_application_name(session_id, sql)? {
+            return Ok(0);
+        }
+        // sprinter a3077a3f68d8: the same treatment for every USER-SETTABLE GUC
+        // (`statement_timeout`, `work_mem`, `bulk_load_mode`, the planner
+        // switches). They used to write the ONE process-global settings registry
+        // — so `SET statement_timeout = 1` here cancelled every OTHER
+        // connection's queries — and now land on THIS session's backend,
+        // resolved from `session_id`, never from the per-statement thread-local.
+        if let Some(_handled) = self.try_handle_session_guc(session_id, sql)? {
             return Ok(0);
         }
         if Self::is_transaction_control(sql) {
@@ -20740,6 +21985,11 @@ impl EmbeddedDatabase {
         session_id: crate::session::SessionId,
         sql: &str,
     ) -> Result<(Vec<Tuple>, std::sync::Arc<Schema>)> {
+        // sprinter d03de7fc3b22: charge this CLIENT statement against the active
+        // tenant's `max_qps`. Every family's entry point charges — there is no
+        // funnel all of them pass through — and the returned guard makes every
+        // nested execution inside this one free, so a statement is counted
+        // exactly once. See `charge_tenant_query`.
         // Spec 03: this connection owns any advisory lock the statement takes.
         // Installed before the autocommit delegate below, so the shared funnel
         // does not re-attribute the lock to the embedded handle.
@@ -20751,6 +22001,15 @@ impl EmbeddedDatabase {
         // open-transaction fork below — the in-transaction branch is
         // sqlparser-first and would fail on a generic GUC statement.
         if let Some(handled) = self.try_handle_session_application_name(session_id, sql)? {
+            return Ok(handled);
+        }
+        // sprinter a3077a3f68d8: the same treatment for every USER-SETTABLE GUC
+        // (`statement_timeout`, `work_mem`, `bulk_load_mode`, the planner
+        // switches). They used to write the ONE process-global settings registry
+        // — so `SET statement_timeout = 1` here cancelled every OTHER
+        // connection's queries — and now land on THIS session's backend,
+        // resolved from `session_id`, never from the per-statement thread-local.
+        if let Some(handled) = self.try_handle_session_guc(session_id, sql)? {
             return Ok(handled);
         }
         // Resolve bare names against THIS session's schema for both the
@@ -20812,6 +22071,11 @@ impl EmbeddedDatabase {
         session_id: crate::session::SessionId,
         sql: &str,
     ) -> Result<(u64, Vec<Tuple>)> {
+        // sprinter d03de7fc3b22: charge this CLIENT statement against the active
+        // tenant's `max_qps`. Every family's entry point charges — there is no
+        // funnel all of them pass through — and the returned guard makes every
+        // nested execution inside this one free, so a statement is counted
+        // exactly once. See `charge_tenant_query`.
         // Spec 03: this connection owns any advisory lock the statement takes.
         let _advisory = self.advisory_context_guard(session_id, sql);
         // HDB-009: identity for `current_user` and the result-cache key.
@@ -20821,6 +22085,15 @@ impl EmbeddedDatabase {
         // open-transaction fork below — the in-transaction branch is
         // sqlparser-first and would fail on a generic GUC statement.
         if let Some(_handled) = self.try_handle_session_application_name(session_id, sql)? {
+            return Ok((0, Vec::new()));
+        }
+        // sprinter a3077a3f68d8: the same treatment for every USER-SETTABLE GUC
+        // (`statement_timeout`, `work_mem`, `bulk_load_mode`, the planner
+        // switches). They used to write the ONE process-global settings registry
+        // — so `SET statement_timeout = 1` here cancelled every OTHER
+        // connection's queries — and now land on THIS session's backend,
+        // resolved from `session_id`, never from the per-statement thread-local.
+        if let Some(_handled) = self.try_handle_session_guc(session_id, sql)? {
             return Ok((0, Vec::new()));
         }
         if Self::is_transaction_control(sql) {
@@ -20917,6 +22190,11 @@ impl EmbeddedDatabase {
         sql: &str,
         params: &[Value],
     ) -> Result<(u64, Vec<Tuple>)> {
+        // sprinter d03de7fc3b22: charge this CLIENT statement against the active
+        // tenant's `max_qps`. Every family's entry point charges — there is no
+        // funnel all of them pass through — and the returned guard makes every
+        // nested execution inside this one free, so a statement is counted
+        // exactly once. See `charge_tenant_query`.
         // Installed BEFORE the delegate, so the session-less guard inside
         // `execute_params_returning` finds a context already present and keeps
         // this connection as the owner.
@@ -20928,6 +22206,15 @@ impl EmbeddedDatabase {
         // open-transaction fork below — the in-transaction branch is
         // sqlparser-first and would fail on a generic GUC statement.
         if let Some(_handled) = self.try_handle_session_application_name(session_id, sql)? {
+            return Ok((0, Vec::new()));
+        }
+        // sprinter a3077a3f68d8: the same treatment for every USER-SETTABLE GUC
+        // (`statement_timeout`, `work_mem`, `bulk_load_mode`, the planner
+        // switches). They used to write the ONE process-global settings registry
+        // — so `SET statement_timeout = 1` here cancelled every OTHER
+        // connection's queries — and now land on THIS session's backend,
+        // resolved from `session_id`, never from the per-statement thread-local.
+        if let Some(_handled) = self.try_handle_session_guc(session_id, sql)? {
             return Ok((0, Vec::new()));
         }
         // The interceptor prologue is the simple-protocol twin's: a driver that
@@ -21019,6 +22306,11 @@ impl EmbeddedDatabase {
         params: &[Value],
         plan_override: Option<&std::sync::Arc<sql::LogicalPlan>>,
     ) -> Result<u64> {
+        // sprinter d03de7fc3b22: charge this CLIENT statement against the active
+        // tenant's `max_qps`. Every family's entry point charges — there is no
+        // funnel all of them pass through — and the returned guard makes every
+        // nested execution inside this one free, so a statement is counted
+        // exactly once. See `charge_tenant_query`.
         // Spec 03: this connection owns any advisory lock the statement takes
         // (extended protocol / params family).
         let _advisory = self.advisory_context_guard(session_id, sql);
@@ -21029,6 +22321,15 @@ impl EmbeddedDatabase {
         // open-transaction fork below — the in-transaction branch is
         // sqlparser-first and would fail on a generic GUC statement.
         if let Some(_handled) = self.try_handle_session_application_name(session_id, sql)? {
+            return Ok(0);
+        }
+        // sprinter a3077a3f68d8: the same treatment for every USER-SETTABLE GUC
+        // (`statement_timeout`, `work_mem`, `bulk_load_mode`, the planner
+        // switches). They used to write the ONE process-global settings registry
+        // — so `SET statement_timeout = 1` here cancelled every OTHER
+        // connection's queries — and now land on THIS session's backend,
+        // resolved from `session_id`, never from the per-statement thread-local.
+        if let Some(_handled) = self.try_handle_session_guc(session_id, sql)? {
             return Ok(0);
         }
         if Self::is_transaction_control(sql) {
@@ -21115,6 +22416,11 @@ impl EmbeddedDatabase {
         params: &[Value],
         plan_override: Option<&std::sync::Arc<sql::LogicalPlan>>,
     ) -> Result<Vec<Tuple>> {
+        // sprinter d03de7fc3b22: charge this CLIENT statement against the active
+        // tenant's `max_qps`. Every family's entry point charges — there is no
+        // funnel all of them pass through — and the returned guard makes every
+        // nested execution inside this one free, so a statement is counted
+        // exactly once. See `charge_tenant_query`.
         // Spec 03: this connection owns any advisory lock the statement takes
         // (extended protocol / params family — the shape Prisma's psycopg3-style
         // clients send).
@@ -21126,6 +22432,15 @@ impl EmbeddedDatabase {
         // open-transaction fork below — the in-transaction branch is
         // sqlparser-first and would fail on a generic GUC statement.
         if let Some(handled) = self.try_handle_session_application_name(session_id, sql)? {
+            return Ok(handled.0);
+        }
+        // sprinter a3077a3f68d8: the same treatment for every USER-SETTABLE GUC
+        // (`statement_timeout`, `work_mem`, `bulk_load_mode`, the planner
+        // switches). They used to write the ONE process-global settings registry
+        // — so `SET statement_timeout = 1` here cancelled every OTHER
+        // connection's queries — and now land on THIS session's backend,
+        // resolved from `session_id`, never from the per-statement thread-local.
+        if let Some(handled) = self.try_handle_session_guc(session_id, sql)? {
             return Ok(handled.0);
         }
         // GH#28 (c2): a `SET` / `RESET` of a connection-lifetime GUC arriving
@@ -21198,6 +22513,11 @@ impl EmbeddedDatabase {
         sql: &str,
         params: &[Value],
     ) -> Result<(Vec<Tuple>, std::sync::Arc<Schema>)> {
+        // sprinter d03de7fc3b22: charge this CLIENT statement against the active
+        // tenant's `max_qps`. Every family's entry point charges — there is no
+        // funnel all of them pass through — and the returned guard makes every
+        // nested execution inside this one free, so a statement is counted
+        // exactly once. See `charge_tenant_query`.
         // Spec 03: this connection owns any advisory lock the statement takes.
         let _advisory = self.advisory_context_guard(session_id, sql);
         // HDB-009: identity for `current_user` and the result-cache key.
@@ -21207,6 +22527,15 @@ impl EmbeddedDatabase {
         // open-transaction fork below — the in-transaction branch is
         // sqlparser-first and would fail on a generic GUC statement.
         if let Some(handled) = self.try_handle_session_application_name(session_id, sql)? {
+            return Ok(handled);
+        }
+        // sprinter a3077a3f68d8: the same treatment for every USER-SETTABLE GUC
+        // (`statement_timeout`, `work_mem`, `bulk_load_mode`, the planner
+        // switches). They used to write the ONE process-global settings registry
+        // — so `SET statement_timeout = 1` here cancelled every OTHER
+        // connection's queries — and now land on THIS session's backend,
+        // resolved from `session_id`, never from the per-statement thread-local.
+        if let Some(handled) = self.try_handle_session_guc(session_id, sql)? {
             return Ok(handled);
         }
         let _schema_override = self.session_schema_override_guard(session_id);
@@ -21401,6 +22730,11 @@ impl EmbeddedDatabase {
         params: &[Value],
         plan_override: Option<&std::sync::Arc<sql::LogicalPlan>>,
     ) -> Result<Vec<Tuple>> {
+        // sprinter d03de7fc3b22: charge this CLIENT statement against the active
+        // tenant's `max_qps`. Every family's entry point charges — there is no
+        // funnel all of them pass through — and the returned guard makes every
+        // nested execution inside this one free, so a statement is counted
+        // exactly once. See `charge_tenant_query`.
         // HDB-008: see `execute_params_inner` — the read half of the same
         // boundary. `query_plan_with_params` attaches the global transaction
         // itself, so the statement genuinely runs inside it and its failure
@@ -21438,12 +22772,12 @@ impl EmbeddedDatabase {
         let sql: &str = &rewritten_owned;
         #[cfg(not(feature = "code-graph"))]
         let sql: &str = sql;
-        // GH#28: `SHOW <registered setting>` (and `SET` / `RESET` of the three
-        // connection-lifetime GUCs ONLY — candidate 2, see
-        // `try_handle_params_family_setting_statement`) from the params family
-        // — the entry point the REST layer and every server-side binding
-        // driver reach. Same registry as the text family; a prefix check that
-        // costs nothing on a SELECT.
+        // GH#28 + sprinter a3077a3f68d8: `SHOW <registered setting>`, and
+        // `SET`/`RESET` of the connection-lifetime GUCs and of every
+        // user-settable GUC (which land on the backend installed just above, not
+        // on the process-global registry) — from the params family, the entry
+        // point the REST layer and every server-side binding driver reach. A
+        // prefix check that costs nothing on a SELECT.
         if let Some((rows, _schema)) = self.try_handle_params_family_setting_statement(sql)? {
             return Ok(rows);
         }
@@ -21656,6 +22990,11 @@ impl EmbeddedDatabase {
         sql: &str,
         params: &[Value],
     ) -> Result<(Vec<Tuple>, std::sync::Arc<Schema>)> {
+        // sprinter d03de7fc3b22: charge this CLIENT statement against the active
+        // tenant's `max_qps`. Every family's entry point charges — there is no
+        // funnel all of them pass through — and the returned guard makes every
+        // nested execution inside this one free, so a statement is counted
+        // exactly once. See `charge_tenant_query`.
         // Spec 03: advisory-lock owner for a params-family statement with no
         // session. A no-op under `query_params_with_columns_for_session`.
         let _advisory = self.embedded_advisory_context_guard(sql);
@@ -21959,6 +23298,13 @@ impl EmbeddedDatabase {
 
             // Fill BIGSERIAL / SERIAL PK columns with the auto-allocated
             // row_id when the caller left them NULL.
+            //
+            // sprinter f32ba64c00a7 deliberately did NOT route this site through
+            // `crate::pk_autofill_value`: every caller is an engine-owned
+            // `_hdb_*` table (the code-graph symbol / ref ingestors), never user
+            // DML, and their auto-filled keys are declared integer columns. The
+            // seven user-DML fill sites raise 23502 for a non-integer PK; this
+            // one has no user to answer to and keeps its unconditional fill.
             for (i, col) in schema.columns.iter().enumerate() {
                 if col.primary_key {
                     if let Some(v) = tuple.values.get(i) {
@@ -22093,7 +23439,20 @@ impl EmbeddedDatabase {
     #[deprecated(since = "2.1.0", note = "Use `begin()`, `commit()`, and `rollback()` instead")]
     pub fn begin_transaction(&self) -> Result<Transaction<'_>> {
         let tx = self.storage.begin_transaction()?;
-        Ok(Transaction { tx, db: self })
+        // sprinter 8a9b60eeef87: claim this transaction's own ART undo slot
+        // BEFORE any statement can run on the handle, so `push_art_undo` routes
+        // its eager index ops here instead of into the shared `art_undo_log`
+        // that an unrelated autocommit statement may `clear()` at any moment.
+        let txn_id = tx.transaction_id();
+        self.raii_art_undo.insert(txn_id, Vec::new());
+        Ok(Transaction {
+            tx,
+            db: self,
+            undo_slot: RaiiArtUndoSlot {
+                txn_id,
+                map: std::sync::Arc::clone(&self.raii_art_undo),
+            },
+        })
     }
 
     /// Get the current WAL LSN (Log Sequence Number)
@@ -22852,6 +24211,10 @@ impl EmbeddedDatabase {
             query_profiler: self.query_profiler.clone(),
             art_undo_log: self.art_undo_log.clone(),
             session_art_undo: self.session_art_undo.clone(),
+            // sprinter 8a9b60eeef87: shared, like every other undo log — a
+            // trigger body re-enters on the SAME transaction, so its eager ART
+            // ops must land in that transaction's slot.
+            raii_art_undo: self.raii_art_undo.clone(),
             session_txn_count: self.session_txn_count.clone(),
             session_notices: self.session_notices.clone(),
             fk_validation_mode: self.fk_validation_mode.clone(),
@@ -25475,6 +26838,33 @@ pub struct Transaction<'a> {
     tx: storage::Transaction,
     /// Reference to the database for executing SQL
     db: &'a EmbeddedDatabase,
+    /// sprinter 8a9b60eeef87: owns this transaction's entry in
+    /// `EmbeddedDatabase::raii_art_undo` and removes it however the handle ends.
+    /// Deliberately a FIELD with a `Drop` rather than a `Drop` on `Transaction`
+    /// itself: `commit(self)` and `rollback(self)` move `tx` out of `self`,
+    /// which the compiler forbids on a type that implements `Drop`.
+    undo_slot: RaiiArtUndoSlot,
+}
+
+/// Removes a RAII transaction's `raii_art_undo` entry however its handle ends.
+///
+/// `commit` / `rollback` take the entry themselves (discarding or replaying it);
+/// this exists for the third ending — a handle simply DROPPED, which rolls the
+/// storage transaction back in `storage::Transaction::Drop`. Removing the entry
+/// there is what keeps the map bounded. It deliberately does not replay: a
+/// dropped handle behaved that way before this item too, and replaying from a
+/// `Drop` would need the storage engine handle this guard does not carry. A
+/// handle dropped mid-transaction therefore still leaves the eager index
+/// mutations standing — recorded, not fixed here.
+struct RaiiArtUndoSlot {
+    txn_id: u64,
+    map: std::sync::Arc<dashmap::DashMap<u64, Vec<ArtUndoOp>>>,
+}
+
+impl Drop for RaiiArtUndoSlot {
+    fn drop(&mut self) {
+        self.map.remove(&self.txn_id);
+    }
 }
 
 impl Transaction<'_> {
@@ -25495,7 +26885,14 @@ impl Transaction<'_> {
         // HDB-008: a statement inside this transaction failed, so there is
         // nothing to commit — roll back and say so. Same contract as
         // `EmbeddedDatabase::commit`; see `Transaction::mark_sql_aborted`.
+        let txn_id = self.tx.transaction_id();
         if self.tx.is_sql_aborted() {
+            // sprinter 8a9b60eeef87: this branch IS a rollback, so it replays
+            // this transaction's eager ART index undo exactly as `rollback`
+            // below does — and before `tx` is consumed, for the ordering reason
+            // spelled out there.
+            let undo = self.db.take_raii_art_undo(txn_id);
+            self.db.replay_art_undo(undo);
             self.tx.rollback()?;
             return Err(Error::commit_of_failed_transaction());
         }
@@ -25507,7 +26904,23 @@ impl Transaction<'_> {
             self.tx.written_data_keys()
         };
         let commit_ts = self.db.storage.next_commit_timestamp(self.tx.has_tracked_writes());
-        self.tx.commit_with_timestamp(commit_ts)?;
+        if let Err(e) = self.tx.commit_with_timestamp(commit_ts) {
+            // A failed commit behaves like ROLLBACK — the transaction is
+            // consumed either way, and its eager ART mutations are still in the
+            // index. Same rule the session path applies
+            // (`commit_transaction_for_session`'s `finish_session_art_undo(…, true)`
+            // on a failed `commit_with_timestamp`).
+            let undo = self.db.take_raii_art_undo(txn_id);
+            self.db.replay_art_undo(undo);
+            return Err(e);
+        }
+        // sprinter 8a9b60eeef87, second half: the eager ART mutations are now
+        // COMMITTED, so their undo entries must be DROPPED, not kept. Getting
+        // this wrong is worse than the bug the first half fixes — a later
+        // rollback would replay a committed transaction's ops and strip keys
+        // from rows that are really there. Exactly what the session path does on
+        // COMMIT (`finish_session_art_undo(session_id, false)`).
+        self.db.raii_art_undo.remove(&txn_id);
         if !written.is_empty() {
             self.db.invalidate_row_cache_for(&written);
         }
@@ -25518,7 +26931,42 @@ impl Transaction<'_> {
     ///
     /// Discards all buffered writes without applying them.
     /// After rollback, the transaction is consumed and cannot be used.
+    ///
+    /// # Index undo (sprinter 8a9b60eeef87)
+    ///
+    /// Statements run through this handle mutate the shared ART indexes
+    /// EAGERLY, at statement time — an `UPDATE` that moves a primary key calls
+    /// `on_delete(old)` + `on_insert(new)` immediately, while the row itself
+    /// moves only at COMMIT. `push_art_undo` records each such op so it can be
+    /// undone; it routes by `txn.session_id()`, and this handle has none, so
+    /// its ops used to land in the shared `art_undo_log` and now land in this
+    /// transaction's own slot in `raii_art_undo`.
+    ///
+    /// This used to be a bare `self.tx.rollback()`, which discarded the write
+    /// set and left the index mutations in place. After
+    /// `UPDATE t SET id = 99 WHERE id = 2` + `rollback()`, the committed row
+    /// still carried `id = 2` while the PK index did not hold key 2 at all, so
+    /// every point lookup, FK probe, fast UPDATE/DELETE and index-driven plan
+    /// MISSED a row that exists — silently, and for the life of the process.
+    /// The session-transaction path never had this hole (session ROLLBACK
+    /// replays its per-session log via `finish_session_art_undo(…, true)`);
+    /// this makes the two agree rather than inventing a third behaviour.
+    ///
+    /// The entries come from this transaction's OWN slot rather than the shared
+    /// `art_undo_log`, which is the other half of the same defect: the RAII
+    /// handle sets neither `global_txn_active` nor the per-session count, so
+    /// ordinary autocommit statements run alongside an open handle and their
+    /// `art_undo_log.write().clear()` on commit would discard the handle's
+    /// pending entries before it ever reached this point.
     pub fn rollback(self) -> Result<()> {
+        // ORDER: replay BEFORE `tx` is consumed. Dropping the transaction also
+        // clears its slot in the storage-level uncommitted-write census, and
+        // that census is what keeps concurrent readers off the index while its
+        // entries are wrong (see `abort_global_slot_locked`, which states the
+        // same requirement). Undoing afterwards leaves a window in which a
+        // reader sees the gate down and the index still stripped.
+        let undo = self.db.take_raii_art_undo(self.tx.transaction_id());
+        self.db.replay_art_undo(undo);
         self.tx.rollback()
     }
 
@@ -25612,6 +27060,11 @@ impl Transaction<'_> {
 
     /// The body of [`query`](Self::query), inside the HDB-008 boundary.
     fn query_inner(&self, sql: &str) -> Result<Vec<Tuple>> {
+        // sprinter d03de7fc3b22: the RAII transaction handle's READ half. Its
+        // write twin (`Transaction::execute`) reaches
+        // `EmbeddedDatabase::execute_in_transaction_inner`, which charges there;
+        // this one goes straight to the planner, so it charges here. Reached
+        // through the `db` field — `Transaction` has no `Deref` to the database.
         // Parse SQL with cache
         let (statement, _) = self.db.parse_cached(sql)?;
 

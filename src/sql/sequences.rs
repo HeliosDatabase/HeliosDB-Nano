@@ -42,11 +42,24 @@
 //! takes the max, so two processes over one data dir never reserve
 //! overlapping ranges).
 //!
+//! ## `currval` is SESSION-scoped, this store is not (sprinter 7903b7111cb4)
+//!
+//! "Process-scoped" above describes the STORE — a durability and scalability
+//! decision. It does NOT describe `currval`'s observable semantics, and for a
+//! while it wrongly did: [`try_currval`] read the shared runtime, so connection
+//! A's `nextval` answered connection B's `currval` (a client recovering the id
+//! it had just inserted could be handed another tenant's id, silently) and a
+//! sequence this session had never advanced answered `0` instead of raising.
+//!
+//! `currval`'s per-session value now lives on
+//! `crate::session::scoped::SessionScopedState`, written by the same
+//! `nextval()` evaluator arm that records `lastval()`, and an undefined
+//! `currval` raises SQLSTATE 55000 with PostgreSQL's wording. [`try_currval`] /
+//! [`currval`] below remain as the PROCESS-wide primitive — they are what the
+//! module's own unit tests exercise (no session exists there) and they never
+//! answer a SQL `currval()` call any more.
+//!
 //! ## Divergences from PostgreSQL (documented, intentional)
-//! * `currval` returns 0 (not an error) when the sequence has never been
-//!   advanced in this process: the evaluator is session-less, so PG's
-//!   per-session "currval is undefined before nextval" cannot be faithfully
-//!   emulated. a2h/ORMs rely on `nextval` for monotonicity, not `currval`.
 //! * An unknown `nextval('x')` auto-vivifies a default (bigint, from 1)
 //!   sequence and now persists it so it becomes discoverable, preserving the
 //!   leniency SERIAL internals and aggressive migrations rely on.
@@ -582,9 +595,15 @@ pub fn try_nextval(name: &str) -> Result<i64> {
     Ok(first)
 }
 
-/// `currval(name)` — last value served by this process, or 0 if never served
-/// (documented divergence from PG, which raises). Never advances durable state
-/// and — unlike the old behavior — NEVER auto-vivifies: a `currval` on a name
+/// PROCESS-wide "last value served for `name`", or 0 if never served.
+///
+/// sprinter 7903b7111cb4: this is NOT what SQL `currval('s')` evaluates to any
+/// more — that is session state (see the module docs and
+/// `crate::session::scoped::SessionScopedState::currval`). This function survives
+/// as the in-process primitive the module's own unit tests use, where no session
+/// backend exists.
+///
+/// Never advances durable state and NEVER auto-vivifies: a `currval` on a name
 /// with no live runtime returns 0 WITHOUT creating or persisting a sequence (a
 /// read-only function must not conjure a durable catalog object). Only `nextval`
 /// auto-vivifies (D7).
@@ -796,8 +815,8 @@ pub fn nextval(name: &str) -> i64 {
     }
 }
 
-/// `currval(name)` — last value produced by `nextval` for this sequence in
-/// this process, or 0 if unknown / never called (documented divergence).
+/// Infallible wrapper over [`try_currval`] — the PROCESS-wide primitive, not
+/// SQL `currval()` (sprinter 7903b7111cb4; see the module docs).
 pub fn currval(name: &str) -> i64 {
     try_currval(name).unwrap_or(0)
 }

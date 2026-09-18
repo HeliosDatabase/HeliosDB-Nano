@@ -1063,7 +1063,14 @@ impl Evaluator {
                 // same contract is recorded by the insert funnels, which fill
                 // those columns from the row-id allocator without ever
                 // evaluating a `nextval()` call.
-                crate::note_session_lastval(value);
+                //
+                // sprinter 7903b7111cb4: the SAME write also records this
+                // session's `currval('<name>')`. One call, so `lastval()` and
+                // `currval()` can never disagree about what "this session" means
+                // — they did: `LASTVAL()` shipped session-scoped while `currval`
+                // still read the process-wide sequence runtime and handed
+                // connection B the id connection A had just allocated.
+                crate::note_session_nextval(&name, value);
                 Ok(Value::Int8(value))
             }
             // sprinter 6dc0cc115db9: `lastval()` — the value most recently
@@ -1098,6 +1105,22 @@ impl Evaluator {
             "pg_backend_pid" | "pg_catalog.pg_backend_pid" => Ok(Value::Int4(
                 crate::session_scoped_state_tls().map_or(0, |state| state.backend_pid()),
             )),
+            // sprinter 7903b7111cb4: `currval('s')` — the value THIS SESSION's
+            // last `nextval('s')` (or `setval('s', …)`) returned.
+            //
+            // It used to read the process-global sequence runtime, which has two
+            // observable consequences a client cannot defend against: connection
+            // A's `nextval` became connection B's `currval` (a client recovering
+            // the id it just inserted could be handed ANOTHER TENANT's id, with
+            // no error), and a sequence this session had never advanced answered
+            // `0` instead of raising. Both are now closed — the durable sequence
+            // STORE stays process-wide (that is the durability decision
+            // documented in `crate::sql::sequences`), but the OBSERVABLE value
+            // comes from the session, exactly as PostgreSQL defines it.
+            //
+            // Fails closed with PostgreSQL's own wording under SQLSTATE 55000,
+            // the same contract `lastval()` uses: a `0` handed to a caller that
+            // asked "what id did I just get?" is strictly worse than an error.
             "currval" | "pg_catalog.currval" => {
                 let name = match arg_values.first() {
                     Some(Value::String(s)) => s.clone(),
@@ -1108,7 +1131,12 @@ impl Evaluator {
                         ))
                     }
                 };
-                Ok(Value::Int8(crate::sql::sequences::currval(&name)))
+                match crate::session_currval(&name) {
+                    Some(v) => Ok(Value::Int8(v)),
+                    None => Err(Error::query_execution(
+                        crate::session::scoped::currval_undefined_message(&name),
+                    )),
+                }
             }
             "setval" | "pg_catalog.setval" => {
                 let name = match arg_values.first() {
@@ -1135,7 +1163,13 @@ impl Evaluator {
                 // error rather than swallowing it. `try_setval` also fsyncs the
                 // new high-water before returning, so a pg_dump-emitted
                 // `setval(seq, max(col))` survives a restart.
-                Ok(Value::Int8(crate::sql::sequences::try_setval(&name, value, is_called)?))
+                let applied = crate::sql::sequences::try_setval(&name, value, is_called)?;
+                // sprinter 7903b7111cb4: PostgreSQL documents `setval` as setting
+                // `currval` for the CALLING session, so record it here — but NOT
+                // through `note_session_nextval`: this is not a value `nextval`
+                // returned, so it must not move `lastval()`.
+                crate::note_session_currval(&name, applied);
+                Ok(Value::Int8(applied))
             }
             // Self-introspection: summarise what HeliosDB Nano supports
             // vs. stock PostgreSQL. Useful for drivers / migration tools
@@ -1253,6 +1287,21 @@ impl Evaluator {
                             .unwrap_or_default(),
                     ),
                     "search_path" => Some("\"$user\", public".to_string()),
+                    // sprinter a3077a3f68d8: every USER-SETTABLE GUC —
+                    // `statement_timeout`, `work_mem`, `bulk_load_mode`, the
+                    // planner switches. THIS session's override if it set one,
+                    // else the registry default, read for the same reason
+                    // `application_name` above is: the evaluator holds no session
+                    // handle, and the process-global registry would answer
+                    // connection A with connection B's value.
+                    //
+                    // An UNREGISTERED name still falls through to `None`, so the
+                    // 42704 / `missing_ok` behaviour for a GUC this server does
+                    // not know is byte-unchanged.
+                    _ if crate::sql::is_user_settable(&name) => crate::session_guc_tls(&name)
+                        .or_else(|| crate::sql::default_value(&name))
+                        .as_ref()
+                        .map(crate::sql::render_value),
                     _ => None,
                 };
                 match value {

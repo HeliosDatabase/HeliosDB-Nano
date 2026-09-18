@@ -1743,6 +1743,146 @@ impl Drop for SynchronousCommitOverrideGuard {
     }
 }
 
+/// sprinter 5a78b8288153: the PK/UNIQUE keys an insert has CLAIMED for a row
+/// that is not durable yet.
+///
+/// The autocommit funnels now claim before they write
+/// (`StorageEngine::claim_index_entries` — the tree is the uniqueness arbiter,
+/// not a second opinion consulted after a lock was released). Between the claim
+/// and the write those entries describe a row that does not exist: if the write
+/// never happens they are PHANTOMS, and a phantom key is permanent index
+/// poisoning — nothing will ever delete it, and it rejects the next legitimate
+/// row that carries the same value (`ArtIndexManager::undo_row_index_entries`
+/// spells the failure mode out).
+///
+/// `Drop` is what makes giving them back EXHAUSTIVE. Each funnel has several
+/// fallible steps between the claim and the durable write — serialization, the
+/// disk-space and memory-limit checks, the logical-WAL append, the
+/// version/snapshot write — and an explicit undo at each `?` is a list the next
+/// edit forgets to extend. A guard cannot be forgotten.
+///
+/// [`Self::row_is_durable`] is called at the EXACT instant the row lands, and
+/// from then on the entries must be KEPT: stripping a stored row of its PRIMARY
+/// KEY entry is the inverse corruption (a row a full scan counts and
+/// `WHERE pk = …` cannot find, its key free for the next INSERT to claim a
+/// second time). That is why the disarm point is the write itself and not the
+/// end of the function — everything after the write is maintenance of a row
+/// that is already a fact.
+struct IndexClaim<'a> {
+    engine: &'a StorageEngine,
+    table_name: &'a str,
+    row_id: u64,
+    schema: &'a crate::Schema,
+    tuple: &'a Tuple,
+    /// `true` while the row is still un-written, i.e. while the claim is a
+    /// phantom that has to be given back.
+    pending: bool,
+}
+
+impl<'a> IndexClaim<'a> {
+    /// Claim the row's keys. `Err` means a PK/UNIQUE tree refused one of them —
+    /// nothing is left behind (the claim is all-or-nothing per row) and the
+    /// caller must not write the row.
+    fn acquire(
+        engine: &'a StorageEngine,
+        table_name: &'a str,
+        row_id: u64,
+        schema: &'a crate::Schema,
+        tuple: &'a Tuple,
+    ) -> Result<Self> {
+        engine.claim_index_entries(table_name, row_id, schema, tuple)?;
+        Ok(Self {
+            engine,
+            table_name,
+            row_id,
+            schema,
+            tuple,
+            pending: true,
+        })
+    }
+
+    /// The row is now written. Keep every entry from here on.
+    #[inline]
+    fn row_is_durable(&mut self) {
+        self.pending = false;
+    }
+}
+
+impl Drop for IndexClaim<'_> {
+    fn drop(&mut self) {
+        if self.pending {
+            self.engine
+                .release_index_claim(self.table_name, self.row_id, self.schema, self.tuple);
+        }
+    }
+}
+
+/// The batch shape of [`IndexClaim`], for the COPY / multi-row-`VALUES` funnel
+/// (sprinter 5a78b8288153).
+///
+/// The batch commits as ONE RocksDB `WriteBatch`, so the statement is already
+/// all-or-nothing on the data side; the uniqueness decision has to match that.
+/// Claiming every row's keys BEFORE the batch is written gives exactly that: if
+/// any row's key is taken — by a concurrent writer, or by an earlier row of this
+/// same batch — the claim fails, the rows claimed so far give their entries
+/// back, and NOTHING is written. Previously the caller pre-checked each row
+/// under a read lock and the entries were only entered after the batch was
+/// durable, so a racing duplicate was COMMITTED and could only be reported at
+/// ERROR after the fact.
+struct BatchIndexClaim<'a> {
+    engine: &'a StorageEngine,
+    table_name: &'a str,
+    schema: &'a crate::Schema,
+    rows: &'a [(u64, Tuple)],
+    /// How many leading entries of `rows` currently hold a claim. Only ever
+    /// short of `rows.len()` on the failure path inside `acquire`.
+    claimed: usize,
+    pending: bool,
+}
+
+impl<'a> BatchIndexClaim<'a> {
+    fn acquire(
+        engine: &'a StorageEngine,
+        table_name: &'a str,
+        schema: &'a crate::Schema,
+        rows: &'a [(u64, Tuple)],
+    ) -> Result<Self> {
+        let mut claim = Self {
+            engine,
+            table_name,
+            schema,
+            rows,
+            claimed: 0,
+            pending: true,
+        };
+        for (row_id, tuple) in rows {
+            // On refusal `claim` is dropped by the `?`, which releases the
+            // rows already claimed — the whole batch, all or nothing.
+            engine.claim_index_entries(table_name, *row_id, schema, tuple)?;
+            claim.claimed += 1;
+        }
+        Ok(claim)
+    }
+
+    /// The batch is committed. Every row is a fact now; keep every entry.
+    #[inline]
+    fn rows_are_durable(&mut self) {
+        self.pending = false;
+    }
+}
+
+impl Drop for BatchIndexClaim<'_> {
+    fn drop(&mut self) {
+        if !self.pending {
+            return;
+        }
+        for (row_id, tuple) in self.rows.iter().take(self.claimed) {
+            self.engine
+                .release_index_claim(self.table_name, *row_id, self.schema, tuple);
+        }
+    }
+}
+
 /// Catalog-existence classification for a table name, cached by the indexed-
 /// scan fast paths (see `StorageEngine::cached_table_kind`). Only `Table` is
 /// fast-path eligible; `MatView` and `Missing` fall back to the general scan
@@ -2986,11 +3126,27 @@ impl StorageEngine {
         &self.row_cache
     }
 
-    /// Check if bulk load mode is enabled
+    /// Check if bulk load mode is enabled for the statement running on THIS
+    /// thread.
     ///
     /// When enabled, per-row metrics tracking and delta recording are skipped
     /// to improve INSERT performance during bulk data loading.
+    ///
+    /// sprinter a3077a3f68d8: `SET bulk_load_mode = on` is a PER-SESSION knob,
+    /// so a session's own override wins over the server-level flag below. It
+    /// used to write that flag directly, which meant ONE connection turned off
+    /// MV-delta tracking, SMFI tracking and compression metrics for every other
+    /// connection in the process. The override is a single relaxed atomic load
+    /// off the per-statement backend state — this is read per row on the insert
+    /// paths, so it cannot be anything more expensive.
+    ///
+    /// `None` (no session override, or engine-internal work with no backend
+    /// installed) falls back to the server-level flag, which is what `[storage]`
+    /// config and an embedder's direct `set_bulk_load_mode` set.
     pub fn is_bulk_load_mode(&self) -> bool {
+        if let Some(on) = crate::session_bulk_load_mode_tls() {
+            return on;
+        }
         self.bulk_load_mode.load(Ordering::Acquire)
     }
 
@@ -4081,21 +4237,63 @@ impl StorageEngine {
     /// therefore persisted duplicate primary keys, silently and durably, under
     /// those profiles. Adding a check must never again mean adding a fourth copy.
     ///
-    /// Tuple-backed (`check_unique_constraints_tuple`) rather than the
-    /// `HashMap`-backed `check_unique_constraints`: every call site already has
-    /// the values in schema order, so no per-row column map is allocated. The
-    /// two are equivalent by construction — the map the HashMap variant used to
-    /// be handed was built by zipping `schema.columns` with `tuple.values`, and
-    /// `Schema::get_column_index` resolves names by the same exact-match rule
-    /// that `HashMap::get` did.
-    ///
     /// MUST be called AFTER the SERIAL NULL-PK fill on arms that have one, so
     /// the key checked is the key stored.
+    ///
+    /// # Superseded by [`Self::claim_index_entries`] (sprinter 5a78b8288153)
+    ///
+    /// All three arms now CLAIM their keys instead of asking whether they are
+    /// free, because asking and taking were two critical sections with the row
+    /// write in between. The one-rule-one-implementation property above is what
+    /// made that a three-line change instead of a hunt; it is preserved exactly
+    /// — `claim_index_entries` is the single gate now, and the ART funnel it
+    /// calls applies the same NULLs-are-distinct skip and resolves the same
+    /// per-table index set, so WHICH rows are refused is unchanged. Only WHEN
+    /// the decision becomes final moved.
+    ///
+    /// # Why a claim and not a question
+    ///
+    /// The pre-check answered the uniqueness question under a per-tree READ lock
+    /// and released it; the key was only entered under the WRITE lock much later,
+    /// after `put()` had already made the row durable. Two concurrent INSERTs of
+    /// the same UNIQUE value therefore both passed, both stored their row, and
+    /// only the loser's index entry was refused: a REAL duplicate in the table
+    /// (countable by a scan, reachable by primary key) that the violated
+    /// constraint's own index could not see. v4.31.0 made that refusal LOUD
+    /// (`note_index_maintenance_failure` at ERROR) without closing it.
+    ///
+    /// Claiming first makes the enforcing tree the arbiter instead of a second
+    /// opinion — `ArtIndex::insert` tests and takes the key in one critical
+    /// section — so the decision and the entry can no longer be separated. It is
+    /// also CHEAPER on the happy path: the per-tree READ probe the pre-check paid
+    /// is gone, and the WRITE-lock insert that used to follow it is the same one
+    /// work that now answers. No new lock, no lock held across a RocksDB write
+    /// (which is what shape (a), a per-table insert latch, would have cost).
+    ///
+    /// The row is NOT stored yet, so a claim that is not followed by a durable
+    /// write MUST be given back ([`Self::release_index_claim`]) — see
+    /// [`IndexClaim`], which is what makes that exhaustive.
     #[inline]
-    fn check_insert_constraints(&self, table_name: &str, schema: &crate::Schema, tuple: &Tuple) -> Result<()> {
+    fn claim_index_entries(&self, table_name: &str, row_id: u64, schema: &crate::Schema, tuple: &Tuple) -> Result<()> {
         self.art_index_manager
-            .check_unique_constraints_tuple(table_name, schema, tuple)
+            .reserve_insert_tuple(table_name, row_id, schema, tuple)
             .map_err(|e| Error::constraint_violation(e.to_string()))
+    }
+
+    /// Give back a claim whose row never became durable (sprinter 5a78b8288153).
+    ///
+    /// Symmetric to [`Self::claim_index_entries`]: `on_delete_tuple` removes
+    /// exactly the keys this row entered — the whole key on an enforcing tree,
+    /// only this row's id on a multi-value one — and skips the NULL-bearing
+    /// PK/UNIQUE keys that were never written, the same skip the claim applied.
+    ///
+    /// Best effort by design: the caller is already returning the error that
+    /// caused the unwind, and a failure to clean up must not replace it.
+    #[inline]
+    fn release_index_claim(&self, table_name: &str, row_id: u64, schema: &crate::Schema, tuple: &Tuple) {
+        let _ = self
+            .art_index_manager
+            .on_delete_tuple(table_name, row_id, schema, tuple);
     }
 
     /// Report an index-maintenance failure for a row that is stored anyway.
@@ -4151,37 +4349,6 @@ impl StorageEngine {
         );
     }
 
-    /// The batch shape of [`Self::note_index_maintenance_failure`], for the COPY
-    /// funnel: `ArtIndexManager::on_insert_tuples` has already named EVERY
-    /// refused row (table, row id, refusing index) at ERROR level — it is the
-    /// only place that knows which rows they were — and returns the first
-    /// refusal so this side can record the table-level fact and the recovery
-    /// action. The batch is committed by then, so there is nothing to propagate.
-    pub(crate) fn note_batch_index_maintenance_failure(table_name: &str, err: &ArtIndexError) {
-        if matches!(err, ArtIndexError::DuplicateKey(_)) {
-            tracing::error!(
-                "UNIQUE/PRIMARY KEY constraint refused at least one row of the committed COPY batch for \
-                 table '{}': {} — those rows are stored and keep their other index entries. Reopening \
-                 alone does NOT clear this: the ART rebuild from `data:` at open meets the same rows \
-                 and refuses the same keys again. Each duplicate persists until one of its rows is \
-                 explicitly removed (or rolled back); rebuild the index after that to restore \
-                 agreement.",
-                table_name,
-                err
-            );
-            return;
-        }
-        tracing::warn!(
-            "ART index maintenance failed for at least one row of the committed COPY batch for table \
-             '{}': {} — an indexed lookup may now disagree with a full scan for this table. The ART is \
-             rebuilt from `data:` when the database is next opened, which restores agreement for a \
-             transient failure; a refusal the rebuild meets again does not clear, and persists until \
-             the offending row is explicitly removed and the index rebuilt.",
-            table_name,
-            err
-        );
-    }
-
     /// Insert a tuple into a table
     ///
     /// Returns the row ID of the inserted tuple.
@@ -4191,7 +4358,7 @@ impl StorageEngine {
     /// transparent and requires zero configuration.
     ///
     /// Both arms enforce PRIMARY KEY / UNIQUE through the same shared gate
-    /// (`check_insert_constraints`) before anything is written — enforcement
+    /// ([`Self::claim_index_entries`]) before anything is written — enforcement
     /// never depends on `storage.time_travel_enabled`.
     pub fn insert_tuple(&self, table_name: &str, tuple: Tuple) -> Result<u64> {
         // Check if a non-main branch is active - use branch-aware insertion
@@ -4219,7 +4386,10 @@ impl StorageEngine {
             // it entirely, which made PK/UNIQUE enforcement depend on
             // `storage.time_travel_enabled` (i.e. on the active profile) for
             // every caller of plain `insert_tuple`.
-            self.check_insert_constraints(table_name, &schema, &tuple)?;
+            //
+            // sprinter 5a78b8288153: a CLAIM, not a question — same race, same
+            // close as the other two funnels.
+            let mut claim = IndexClaim::acquire(self, table_name, row_id, &schema, &tuple)?;
 
             // Check bulk load mode early - skip some operations if enabled
             let bulk_mode = self.is_bulk_load_mode();
@@ -4241,6 +4411,9 @@ impl StorageEngine {
 
             // Store transformed tuple
             self.put(&key, &value)?;
+            // sprinter 5a78b8288153: durability point — keep the claimed entries
+            // from here on.
+            claim.row_is_durable();
             self.flush_row_counter(table_name)?;
 
             // R1.1: nosync logical-WAL append by default (P0#2 contract).
@@ -4250,18 +4423,8 @@ impl StorageEngine {
                 self.log_data_insert_nosync(table_name, &key, &logical_value)?;
             }
 
-            // Update ART index for PK/unique constraint indexes
-            {
-                let mut col_values = std::collections::HashMap::new();
-                for (i, col) in schema.columns.iter().enumerate() {
-                    if let Some(v) = tuple.values.get(i) {
-                        col_values.insert(col.name.clone(), v.clone());
-                    }
-                }
-                if let Err(e) = self.art_index_manager.on_insert(table_name, row_id, &col_values) {
-                    Self::note_index_maintenance_failure(table_name, row_id, &e);
-                }
-            }
+            // sprinter 5a78b8288153: entries claimed before the write above; the
+            // post-write `on_insert` pass that used to sit here is gone.
 
             // R5.V1: maintain HNSW vector indexes (single atomic load when
             // the table has none).
@@ -8140,7 +8303,15 @@ impl StorageEngine {
         let storage_key = self.branch_aware_data_key(table_name, row_id);
         let raw_value = match self.get(&storage_key)? {
             Some(v) => v,
-            None => return Ok(None), // Key in index but not in storage (shouldn't happen)
+            // sprinter 5a78b8288153: "not in storage" is no longer only a
+            // corruption signal — it is also the brief, legitimate window in
+            // which a concurrent INSERT has CLAIMED this key in the tree but has
+            // not yet written the row. `Ok(None)` is the right answer for both:
+            // an un-written row is not visible, and the claim is released if the
+            // insert fails. (The old ordering had the inverse window — row
+            // written, entry missing — where this probe reported "no such row"
+            // for a row that was already durable.)
+            None => return Ok(None),
         };
 
         // Deserialize the tuple
@@ -11387,27 +11558,24 @@ impl StorageEngine {
         // durability contract.
         let row_id = self.next_row_id_volatile(table_name);
 
-        // Fill NULL PK columns with auto-generated row_id (SERIAL semantics)
+        // Fill NULL PK columns with auto-generated row_id (SERIAL semantics).
+        //
+        // sprinter f32ba64c00a7: the fill is gated on the column's DECLARED
+        // type through the one shared decision (`crate::pk_autofill_value`).
+        // Gating on `col.primary_key` ALONE — with an `_ =>` arm that wrote
+        // `Value::Int8(row_id)` for every other declared type — put an INTEGER
+        // in a TEXT / UUID / NUMERIC primary key, which the ART index then
+        // encoded at the integer's type width while every probe built from the
+        // declared type encoded differently (row present on a scan, absent to
+        // every point lookup). A NULL in a non-integer PK is now 23502.
         let mut tuple = tuple;
         let mut generated_identity = false;
         for (i, col) in schema.columns.iter().enumerate() {
-            if col.primary_key {
-                if let Some(v) = tuple.values.get(i) {
-                    if matches!(v, crate::Value::Null) && i < tuple.values.len() {
-                        #[allow(clippy::indexing_slicing)]
-                        match col.data_type {
-                            crate::DataType::Int2 => {
-                                tuple.values[i] = crate::Value::Int2(row_id as i16);
-                            }
-                            crate::DataType::Int4 => {
-                                tuple.values[i] = crate::Value::Int4(row_id as i32);
-                            }
-                            _ => {
-                                tuple.values[i] = crate::Value::Int8(row_id as i64);
-                            }
-                        }
-                        generated_identity = true;
-                    }
+            if col.primary_key && matches!(tuple.values.get(i), Some(crate::Value::Null)) {
+                let filled = crate::pk_autofill_value(table_name, col, row_id)?;
+                if let Some(slot) = tuple.values.get_mut(i) {
+                    *slot = filled;
+                    generated_identity = true;
                 }
             }
         }
@@ -11425,14 +11593,19 @@ impl StorageEngine {
 
         let logical_tuple = tuple.clone();
 
-        // PK / UNIQUE check before committing the write. Without this,
+        // PK / UNIQUE enforcement before committing the write. Without this,
         // parameterised INSERTs (`db.execute_params`) and other callers routed
         // here would silently insert duplicates that a cross-process
         // `Catalog::rebuild_all_indexes()` had already registered in the ART.
         // (FR `cross_process_on_conflict`.) Runs exactly once per insert: this
-        // is the only constraint check on this arm, and it is the same check
-        // the non-versioned arm and `insert_tuple_fast` run.
-        self.check_insert_constraints(table_name, schema, &tuple)?;
+        // is the only constraint gate on this arm, and it is the same gate the
+        // non-versioned arm and `insert_tuple_fast` run.
+        //
+        // sprinter 5a78b8288153: a CLAIM, not a question. This arm had the same
+        // race as the other two — the old read-locked pre-check could pass for
+        // two concurrent inserts of one UNIQUE value, and the entry was only
+        // taken far below, after `put()` had already made both rows durable.
+        let mut claim = IndexClaim::acquire(self, table_name, row_id, schema, &tuple)?;
 
         // Check bulk load mode early - skip some operations if enabled
         let bulk_mode = self.is_bulk_load_mode();
@@ -11469,6 +11642,9 @@ impl StorageEngine {
         // Write current version (for fast non-time-travel queries)
         let key = Self::build_data_key(table_name, row_id);
         self.put(&key, &value)?;
+        // sprinter 5a78b8288153: durability point — the claimed entries now
+        // describe a stored row and must be kept whatever follows.
+        claim.row_is_durable();
         self.flush_row_counter(table_name)?;
 
         // R1.1: logical-WAL append without a per-statement fsync by default
@@ -11480,18 +11656,10 @@ impl StorageEngine {
             self.log_data_insert_nosync(table_name, &key, &logical_value)?;
         }
 
-        // Update ART index for PK/unique constraint indexes
-        {
-            let mut col_values = std::collections::HashMap::new();
-            for (i, col) in schema.columns.iter().enumerate() {
-                if let Some(v) = tuple.values.get(i) {
-                    col_values.insert(col.name.clone(), v.clone());
-                }
-            }
-            if let Err(e) = self.art_index_manager.on_insert(table_name, row_id, &col_values) {
-                Self::note_index_maintenance_failure(table_name, row_id, &e);
-            }
-        }
+        // sprinter 5a78b8288153: the PK/unique ART entries were claimed above,
+        // before the row was written — the post-write `on_insert` pass that used
+        // to sit here (and the per-row `col_values` HashMap it needed) is gone
+        // with the race it could only report on.
 
         // R5.V1: maintain HNSW vector indexes (single atomic load when the
         // table has none).
@@ -11548,27 +11716,24 @@ impl StorageEngine {
         let _wv = crate::write_volume::stmt_scope(crate::write_volume::StmtClass::InsertSingle);
         let row_id = self.next_row_id_volatile(table_name);
 
-        // Fill NULL PK columns with auto-generated row_id (SERIAL semantics)
+        // Fill NULL PK columns with auto-generated row_id (SERIAL semantics).
+        //
+        // sprinter f32ba64c00a7: the fill is gated on the column's DECLARED
+        // type through the one shared decision (`crate::pk_autofill_value`).
+        // Gating on `col.primary_key` ALONE — with an `_ =>` arm that wrote
+        // `Value::Int8(row_id)` for every other declared type — put an INTEGER
+        // in a TEXT / UUID / NUMERIC primary key, which the ART index then
+        // encoded at the integer's type width while every probe built from the
+        // declared type encoded differently (row present on a scan, absent to
+        // every point lookup). A NULL in a non-integer PK is now 23502.
         let mut tuple = tuple;
         let mut generated_identity = false;
         for (i, col) in schema.columns.iter().enumerate() {
-            if col.primary_key {
-                if let Some(v) = tuple.values.get(i) {
-                    if matches!(v, crate::Value::Null) && i < tuple.values.len() {
-                        #[allow(clippy::indexing_slicing)]
-                        match col.data_type {
-                            crate::DataType::Int2 => {
-                                tuple.values[i] = crate::Value::Int2(row_id as i16);
-                            }
-                            crate::DataType::Int4 => {
-                                tuple.values[i] = crate::Value::Int4(row_id as i32);
-                            }
-                            _ => {
-                                tuple.values[i] = crate::Value::Int8(row_id as i64);
-                            }
-                        }
-                        generated_identity = true;
-                    }
+            if col.primary_key && matches!(tuple.values.get(i), Some(crate::Value::Null)) {
+                let filled = crate::pk_autofill_value(table_name, col, row_id)?;
+                if let Some(slot) = tuple.values.get_mut(i) {
+                    *slot = filled;
+                    generated_identity = true;
                 }
             }
         }
@@ -11584,8 +11749,14 @@ impl StorageEngine {
             crate::note_session_lastval(row_id as i64);
         }
 
-        // Check PK/UNIQUE constraints BEFORE writing data to prevent duplicates.
-        self.check_insert_constraints(table_name, schema, &tuple)?;
+        // sprinter 5a78b8288153: CLAIM the PK/UNIQUE keys instead of merely
+        // asking whether they are free. The claim is the enforcement — the tree
+        // tests and takes the key in one critical section — so the answer can no
+        // longer go stale in the window before the row is written, which is what
+        // let two concurrent INSERTs of the same UNIQUE value both store a row.
+        // Held until `row_is_durable()` below; given back automatically on every
+        // failure path in between (see `IndexClaim`).
+        let mut claim = IndexClaim::acquire(self, table_name, row_id, schema, &tuple)?;
 
         let uses_side_storage = schema_uses_column_storage(schema);
         let value = if uses_side_storage {
@@ -11658,6 +11829,12 @@ impl StorageEngine {
             }
         } else {
             self.put(&key, &value)?;
+            // sprinter 5a78b8288153: the row is durable HERE on this branch. From
+            // this point the claimed entries belong to a stored row and must be
+            // kept — a later failure must not strip it of its PRIMARY KEY entry.
+            // (The batched branch above writes nothing yet; it disarms further
+            // down, where its row actually lands.)
+            claim.row_is_durable();
         }
 
         if requires_logical_wal {
@@ -11671,37 +11848,26 @@ impl StorageEngine {
             }
         }
 
-        // ART index update (constraint already verified above).
+        // sprinter 5a78b8288153: the ART entries for this row were already taken
+        // by the `IndexClaim` above, BEFORE the row was written, so there is no
+        // second index pass here any more — and no `RowState::Stored` refusal to
+        // report, because a refusal now happens before anything is stored and
+        // comes back as this statement's constraint violation.
         //
-        // The row is written whatever this answers, so `on_insert_tuple` is a
-        // `RowState::Stored` funnel on BOTH branches — but they get there
-        // differently, and the old wording described only one of them
-        // (sprinter fa2d11f140fe):
+        // That is the whole fix: index maintenance used to run HERE, after the
+        // row was durable (non-batched) or was going to be written regardless
+        // (`data_and_version_batched`, whose row lands below in
+        // `write_data_version_and_register_snapshot` with no `return` in
+        // between). A duplicate that raced past the separate pre-check was
+        // therefore STORED and merely logged at ERROR by
+        // `note_index_maintenance_failure` — loud, per v4.31.0, but still a real
+        // duplicate in the table. Claiming the keys first removes the window the
+        // race needed rather than reporting what fell through it.
         //
-        // * non-batched — `self.put(&key, &value)` above has already written
-        //   the `data:` row, and the logical-WAL record with it. Stored, past
-        //   tense.
-        // * `data_and_version_batched` — the branch above writes NOTHING; it
-        //   only mirrors `put()`'s disk-space and memory-limit checks. The row
-        //   goes down BELOW this line, in
-        //   `write_data_version_and_register_snapshot`, which is unconditional:
-        //   no `return` sits between here and it, so an index refusal cannot
-        //   stop it either. Stored, future tense — same rule, not the same
-        //   sentence.
-        //
-        // A refusal here therefore cannot unmake the row, and must not take the
-        // row's PRIMARY KEY entry away either (that would hide a durable row
-        // from `WHERE pk = …` and free its key for the next INSERT). It keeps
-        // every entry the row owns and reports the refusal, which
-        // `note_index_maintenance_failure` logs at ERROR: a duplicate got past
-        // the pre-check (a concurrent writer between `check_insert_constraints`
-        // and here) and is now stored.
-        if let Err(e) = self
-            .art_index_manager
-            .on_insert_tuple(table_name, row_id, schema, &tuple)
-        {
-            Self::note_index_maintenance_failure(table_name, row_id, &e);
-        }
+        // `note_index_maintenance_failure` is still the right report for the
+        // funnels where the row genuinely is a fact before the ART is touched
+        // (UPDATE's re-insert half, the transactional `Stored` arm); it is just
+        // no longer reachable from this one.
 
         // R5.V1: maintain HNSW vector indexes (single atomic load when the
         // table has none).
@@ -11742,6 +11908,11 @@ impl StorageEngine {
                     self.memory_write_options.as_ref(),
                     allow_elide,
                 )?;
+                // sprinter 5a78b8288153: the batched branch's `data:` row lands
+                // HERE (the earlier branch only mirrored `put()`'s guards), so
+                // this is its durability point — the claim stops being a phantom
+                // and its entries must be kept from now on.
+                claim.row_is_durable();
             } else {
                 self.snapshot_manager.write_version_and_register_snapshot(
                     table_name,
@@ -11754,6 +11925,14 @@ impl StorageEngine {
             }
         }
 
+        // sprinter 5a78b8288153: belt-and-braces for the ONE path that reaches
+        // here with the claim still pending — `data_and_version_batched` is only
+        // ever true when `time_travel_enabled` is on, so the `version_timestamp`
+        // block above always runs for it and always disarms. If a future edit
+        // breaks that coupling, fail towards KEEPING the entries of a row that
+        // was written rather than stripping it: `Ok` is returned below, so the
+        // caller is about to be told the row exists.
+        claim.row_is_durable();
         Ok(row_id)
     }
 
@@ -12027,6 +12206,23 @@ impl StorageEngine {
             batch.put(counter_key.as_bytes(), stored_counter.as_ref());
         }
 
+        // sprinter 5a78b8288153: CLAIM every row's PK/UNIQUE keys before the
+        // batch is written, so the trees decide and the decision cannot go stale.
+        // Taken BEFORE the columnar zone-stats guard below on purpose: ART tree
+        // write locks are never otherwise nested under that lock, and this fix is
+        // not the place to introduce a new lock order. Released automatically if
+        // the columnar assembly or the RocksDB write then fails (see
+        // `BatchIndexClaim`); `rows_are_durable()` below is the disarm point.
+        //
+        // The caller's own per-row pre-check stays: it still short-circuits the
+        // intra-batch duplicate case earlier and with a better message. It is no
+        // longer what ENFORCES — that is this claim.
+        //
+        // W3.4 census note: the ART work this does is now attributed to the
+        // `BatchBuild` phase rather than `ArtMaintain`, because it has to happen
+        // before the commit. Same work, same row count, different bucket.
+        let mut batch_claim = BatchIndexClaim::acquire(self, table_name, schema, &indexed_rows)?;
+
         // R3.3: append the grouped columnar writes to the same WriteBatch.
         let columnar_guard = if uses_columnar {
             let row_refs: Vec<(u64, &Tuple)> = indexed_rows.iter().map(|(row_id, tuple)| (*row_id, tuple)).collect();
@@ -12058,6 +12254,10 @@ impl StorageEngine {
         };
         drop(columnar_guard);
         result.map_err(|e| Error::storage(format!("Fast batch insert failed: {}", e)))?;
+        // sprinter 5a78b8288153: the single WriteBatch landed — every row of the
+        // batch is durable, so the claimed entries stop being phantoms and must
+        // be kept from here on.
+        batch_claim.rows_are_durable();
         drop(_cps_cm);
 
         if let Some(ts) = commit_ts {
@@ -12070,22 +12270,18 @@ impl StorageEngine {
             }
         }
 
-        // W3.4: secondary-index (ART) + HNSW maintenance — the phase W3.4
-        // measures against total COPY wall time. §3.2/§3.3: `on_insert_tuples`
-        // resolves the table's own index set ONCE for the batch (was a per-row
-        // global-registry scan) and reuses one encode-once fragment cache.
+        // W3.4: HNSW maintenance — the phase W3.4 measures against total COPY
+        // wall time.
+        //
+        // sprinter 5a78b8288153: the ART half of this phase moved ABOVE the
+        // commit (the `BatchIndexClaim`), because running it here meant the
+        // batch was already durable when a unique index refused a row — a
+        // committed duplicate that the `RowState::Stored` funnel could only name
+        // at ERROR (its post-fact reporter is gone with the call site that was
+        // its only caller). Same tree inserts, same count, earlier: what changed is that
+        // a refusal can now stop the write instead of describing it. HNSW stays
+        // post-commit — it arbitrates nothing.
         let _cps_am = crate::copy_phase_stats::time(crate::copy_phase_stats::Phase::ArtMaintain, batch_rows);
-        if let Err(e) = self
-            .art_index_manager
-            .on_insert_tuples(table_name, schema, &indexed_rows)
-        {
-            // Post-fact: the batch is already durable, so this cannot be
-            // propagated — but it is a stored duplicate, not a debug detail.
-            // `on_insert_tuples` has already named every refused row at ERROR
-            // (`RowState::Stored`: it kept their entries rather than stripping a
-            // committed row of its primary key); this adds the recovery note.
-            Self::note_batch_index_maintenance_failure(table_name, &e);
-        }
         for (row_id, tuple) in &indexed_rows {
             // R5.V1: maintain HNSW vector indexes (single atomic load when the
             // table has none).
@@ -14382,27 +14578,24 @@ impl StorageEngine {
         // flushed after the row write.
         let row_id = self.next_row_id_volatile(table_name);
 
-        // Fill NULL PK columns with auto-generated row_id (SERIAL semantics)
+        // Fill NULL PK columns with auto-generated row_id (SERIAL semantics).
+        //
+        // sprinter f32ba64c00a7: the fill is gated on the column's DECLARED
+        // type through the one shared decision (`crate::pk_autofill_value`).
+        // Gating on `col.primary_key` ALONE — with an `_ =>` arm that wrote
+        // `Value::Int8(row_id)` for every other declared type — put an INTEGER
+        // in a TEXT / UUID / NUMERIC primary key, which the ART index then
+        // encoded at the integer's type width while every probe built from the
+        // declared type encoded differently (row present on a scan, absent to
+        // every point lookup). A NULL in a non-integer PK is now 23502.
         let mut tuple = tuple;
         let mut generated_identity = false;
         for (i, col) in schema.columns.iter().enumerate() {
-            if col.primary_key {
-                if let Some(v) = tuple.values.get(i) {
-                    if matches!(v, crate::Value::Null) && i < tuple.values.len() {
-                        #[allow(clippy::indexing_slicing)]
-                        match col.data_type {
-                            crate::DataType::Int2 => {
-                                tuple.values[i] = crate::Value::Int2(row_id as i16);
-                            }
-                            crate::DataType::Int4 => {
-                                tuple.values[i] = crate::Value::Int4(row_id as i32);
-                            }
-                            _ => {
-                                tuple.values[i] = crate::Value::Int8(row_id as i64);
-                            }
-                        }
-                        generated_identity = true;
-                    }
+            if col.primary_key && matches!(tuple.values.get(i), Some(crate::Value::Null)) {
+                let filled = crate::pk_autofill_value(table_name, col, row_id)?;
+                if let Some(slot) = tuple.values.get_mut(i) {
+                    *slot = filled;
+                    generated_identity = true;
                 }
             }
         }

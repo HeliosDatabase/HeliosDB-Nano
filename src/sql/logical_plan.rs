@@ -1368,6 +1368,58 @@ pub enum LogicalPlan {
         /// The constrained columns, normalized like every other identifier.
         columns: Vec<String>,
     },
+
+    /// `ALTER TABLE <t> ADD [CONSTRAINT <name>] PRIMARY KEY (<cols>)`.
+    ///
+    /// # sprinter 885ffe24eab6
+    ///
+    /// Produced ONLY as the desugaring of `ALTER TABLE … ADD COLUMN <c> …
+    /// PRIMARY KEY`, which used to copy the `primary_key` FLAG onto the new
+    /// column and create nothing — so the key was enforced by nothing until a
+    /// restart re-derived an index from the flag, and a table that already had
+    /// a key silently acquired a second one. The standalone
+    /// `ADD CONSTRAINT … PRIMARY KEY` spelling deliberately still reports the
+    /// planner's not-supported error: on an EXISTING column it would have to
+    /// build and backfill a PK index over live data, which is a different
+    /// change with a different risk profile.
+    ///
+    /// APPEND-ONLY — see [`LogicalPlan::Noop`]. Declared after
+    /// [`LogicalPlan::AlterTableAddUnique`], which was the last variant when
+    /// this was added.
+    AlterTableAddPrimaryKey {
+        /// Table the constraint is added to (already schema-resolved).
+        table_name: String,
+        /// `CONSTRAINT <name>` when the user named it. Only a label: Nano
+        /// records no `TableConstraints` row for a column-flag primary key,
+        /// exactly as `CREATE TABLE t (id INT PRIMARY KEY)` records none.
+        constraint_name: Option<String>,
+        /// The key columns, normalized like every other identifier.
+        columns: Vec<String>,
+    },
+
+    /// `ALTER TABLE <t> ADD [CONSTRAINT <name>] CHECK (<expr>)`.
+    ///
+    /// # sprinter 885ffe24eab6
+    ///
+    /// Produced ONLY as the desugaring of `ALTER TABLE … ADD COLUMN <c> …
+    /// CHECK (…)`, whose predicate used to be dropped on the floor with no
+    /// error at all (`sql_column_def_to_column_def` ignores
+    /// `ColumnOption::Check`; `ColumnDef` has nowhere to put it).
+    ///
+    /// The expression is carried as a planned [`LogicalExpr`], not as text, so
+    /// the executor stores the identical serde_json body `CREATE TABLE` stores
+    /// and `parse_check_expression` reads back.
+    ///
+    /// APPEND-ONLY — see [`LogicalPlan::Noop`].
+    AlterTableAddCheck {
+        /// Table the constraint is added to (already schema-resolved).
+        table_name: String,
+        /// `CONSTRAINT <name>` when the user named it; otherwise `None` and the
+        /// executor derives PostgreSQL's `{table}_{column}_check`.
+        constraint_name: Option<String>,
+        /// The predicate every row must satisfy.
+        expression: LogicalExpr,
+    },
 }
 
 /// Function/Procedure parameter
@@ -2433,6 +2485,8 @@ impl LogicalPlan {
             Self::RevokePrivileges { .. } => "RevokePrivileges",
             Self::DropIndex { .. } => "DropIndex",
             Self::AlterTableAddUnique { .. } => "AlterTableAddUnique",
+            Self::AlterTableAddPrimaryKey { .. } => "AlterTableAddPrimaryKey",
+            Self::AlterTableAddCheck { .. } => "AlterTableAddCheck",
             Self::CreateExtension { .. } => "CreateExtension",
             Self::CreateDatabase { .. } => "CreateDatabase",
             Self::DropDatabase { .. } => "DropDatabase",
@@ -2894,8 +2948,11 @@ impl LogicalPlan {
             | LogicalPlan::RevokePrivileges { .. }
             // DROP INDEX returns no rows, exactly like DROP TABLE.
             | LogicalPlan::DropIndex { .. }
-            // ALTER TABLE … ADD [CONSTRAINT] UNIQUE: DDL, no output rows.
+            // ALTER TABLE … ADD [CONSTRAINT] UNIQUE / PRIMARY KEY / CHECK:
+            // DDL, no output rows (sprinter 885ffe24eab6 for the latter two).
             | LogicalPlan::AlterTableAddUnique { .. }
+            | LogicalPlan::AlterTableAddPrimaryKey { .. }
+            | LogicalPlan::AlterTableAddCheck { .. }
             | LogicalPlan::Noop => {
                 // KanttBan #20 (v3.31.0): DDL — no output rows.
                 Arc::new(Schema { columns: vec![] })

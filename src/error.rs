@@ -76,6 +76,36 @@ pub const COMMIT_OF_FAILED_TRANSACTION_MESSAGE: &str =
 /// it used to interpolate with `{:?}` stays at DEBUG level.
 pub const UNSUPPORTED_STATEMENT_KIND_MARKER: &str = "is not supported by HeliosDB Nano";
 
+/// sprinter f32ba64c00a7: the marker carried by the refusal raised when a
+/// `NULL` reaches a PRIMARY KEY column whose DECLARED type the row-id
+/// allocator cannot produce — a `TEXT` / `UUID` / `NUMERIC` / … key.
+///
+/// The auto-fill that serves `SERIAL` / `IDENTITY` used to gate on
+/// `col.primary_key` ALONE and then write `Value::Int8(row_id)` whatever the
+/// column was declared as, so `CREATE TABLE t (id TEXT, v INT, PRIMARY KEY
+/// (id))` + `INSERT INTO t (v) VALUES (1)` stored an INTEGER in a TEXT key.
+/// PostgreSQL has no such path: an omitted / NULL primary key with no default
+/// and no identity is `23502 not_null_violation`, and a default is always of
+/// the column's OWN type.
+///
+/// A shared const rather than a literal at the raise sites (there are seven —
+/// three storage funnels and four executor arms) because two classifiers
+/// anchor on it:
+///
+/// * the PostgreSQL wire maps it to `23502 not_null_violation` in
+///   `sqlstate_for_error`, and
+/// * the MySQL wire maps it to ER_BAD_NULL_ERROR / SQLSTATE `23000` in
+///   `map_error_code`.
+///
+/// Without those arms the message falls through to `23000`
+/// integrity_constraint_violation on the PostgreSQL wire and — because it
+/// names a "constraint" — to `1452 ER_NO_REFERENCED_ROW_2` on the MySQL wire,
+/// which tells a driver a FOREIGN KEY failed.
+///
+/// The text is PostgreSQL's own wording, so the whole message reads
+/// `null value in column "id" of relation "t" violates not-null constraint`.
+pub const NOT_NULL_VIOLATION_MARKER: &str = "violates not-null constraint";
+
 /// Database error type
 ///
 /// All errors from HeliosDB Lite operations are represented by this enum.

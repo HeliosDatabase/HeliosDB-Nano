@@ -65,7 +65,10 @@ pub use logical_plan::{
 };
 pub use parser::Parser;
 pub use planner::Planner;
-pub use settings::{parse_setting_value, SessionSettings, SettingValue};
+pub use settings::{
+    default_value, is_registered, is_server_level, is_user_settable, parse_setting_value, render_value,
+    SessionSettings, SettingValue, REGISTERED_PARAMETERS,
+};
 pub use system_tables::{ProtocolType, SessionInfo, SessionRegistry, SessionState, SystemTables};
 pub use system_views::{SystemView, SystemViewRegistry, ViewCategory};
 pub use triggers::{

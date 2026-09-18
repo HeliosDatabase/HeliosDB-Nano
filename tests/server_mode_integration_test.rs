@@ -1,6 +1,20 @@
 //! Comprehensive server mode integration tests
 //!
 //! Tests for PostgreSQL-compatible server mode deployment.
+//!
+//! EVERY test in this file ran `#[ignore]`d until sprinter 6ac716be10ea, under
+//! two different explanations ("requires PostgreSQL wire protocol fixes" and
+//! "stack overflow issue") that were one defect: `handle_parse_extended`
+//! answered ParameterDescription with OID 0 for every inferred parameter, and
+//! `tokio_postgres::prepare::get_type` resolves an OID it does not know by
+//! preparing its own TYPEINFO query — whose `$1` Nano described as 0 in turn.
+//! `typeinfo_statement` caches only AFTER `prepare_rec` returns, so the second
+//! lookup re-entered the first: unbounded recursion, and the CLIENT's stack
+//! overflowed (which is why a 32 MB runtime stack never helped). Parse now
+//! infers real parameter OIDs — `WHERE id = $1` against an `int` column is 23,
+//! and a position with no type context is 705 (`unknown`), a driver builtin —
+//! so `get_type` resolves every one locally and never issues TYPEINFO at all.
+//! These tests are that fix's regression proof: they must RUN, not be skipped.
 
 use heliosdb_nano::{
     protocol::postgres::server::{PgServer, PgServerConfig},
@@ -47,7 +61,6 @@ async fn setup_test_server() -> Result<(String, tokio::task::JoinHandle<()>), Bo
 }
 
 #[tokio::test]
-#[ignore = "Server mode integration test - requires PostgreSQL wire protocol fixes"]
 async fn test_server_connection() {
     let (conn_string, _handle) = setup_test_server().await.expect("Failed to setup server");
 
@@ -68,7 +81,6 @@ async fn test_server_connection() {
 }
 
 #[tokio::test]
-#[ignore = "Server mode integration test - stack overflow issue"]
 async fn test_server_crud_operations() {
     let (conn_string, _handle) = setup_test_server().await.expect("Failed to setup server");
 
@@ -127,7 +139,6 @@ async fn test_server_crud_operations() {
 }
 
 #[tokio::test]
-#[ignore = "Server mode integration test - requires PostgreSQL wire protocol fixes"]
 async fn test_server_transaction_handling() {
     let (conn_string, _handle) = setup_test_server().await.expect("Failed to setup server");
 
@@ -180,7 +191,6 @@ async fn test_server_transaction_handling() {
 }
 
 #[tokio::test]
-#[ignore = "Server mode integration test - requires PostgreSQL wire protocol fixes"]
 async fn test_server_concurrent_clients() {
     let (conn_string, _handle) = setup_test_server().await.expect("Failed to setup server");
     let conn_string = Arc::new(conn_string);
@@ -247,13 +257,12 @@ async fn test_server_concurrent_clients() {
 /// combination returns `[]` against `heliosdb-nano:3.14.5` built from
 /// commit `0bb5ecb`. This test pins the wire-level behaviour.
 ///
-/// NOTE: Marked `#[ignore]` for the same reason as the other
-/// `setup_test_server()`-based tests in this file — the in-process
-/// `PgServer` currently stack-overflows under the test harness. The
-/// planner/executor side of B29 is covered in
+/// Ran `#[ignore]`d with the rest of this file until sprinter 6ac716be10ea
+/// (module doc): the overflow was tokio-postgres recursing on the OID-0
+/// ParameterDescription, not the server. The planner/executor side of B29 is
+/// covered separately in
 /// `tests/drizzle_compat_tests.rs::b29_canonical_drizzle_select_returns_row`.
 #[tokio::test]
-#[ignore = "Server mode integration test - stack overflow issue"]
 async fn test_b29_canonical_drizzle_shape() {
     let (conn_string, _handle) = setup_test_server().await.expect("Failed to setup server");
 

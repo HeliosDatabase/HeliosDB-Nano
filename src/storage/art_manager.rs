@@ -1246,6 +1246,82 @@ impl ArtIndexManager {
         Ok(())
     }
 
+    /// Repoint every live index of `table` from column `old` to column `new`
+    /// (`ALTER TABLE … RENAME COLUMN`, sprinter 0f258ed23d13). Returns the
+    /// registry keys of the entries that changed.
+    ///
+    /// # Why this is not cosmetic
+    ///
+    /// `IndexEntry.columns` is resolved against the CURRENT schema, BY EXACT
+    /// NAME, on every probe: `index_value_refs_from_tuple` calls
+    /// `Schema::get_column_index` and returns `None` for a name the schema no
+    /// longer has, whereupon `check_unique_constraints_tuple` silently SKIPS
+    /// that index. So without this call a `RENAME COLUMN` un-enforces every
+    /// PRIMARY KEY / UNIQUE rule over the renamed column *in the running
+    /// process*, before any restart is involved — the persisted-record half of
+    /// the same defect is fixed in `Catalog::rename_column_in_constraints`.
+    ///
+    /// The trees are NOT rebuilt: an ART key encodes VALUES, not column names,
+    /// so the existing entries stay exactly correct (see
+    /// [`AdaptiveRadixTree::rename_column`]).
+    ///
+    /// The registry KEY is left alone, exactly as `ALTER TABLE … RENAME TO`
+    /// leaves a `CREATE INDEX` name alone and as PostgreSQL leaves an index
+    /// name alone on a column rename. Nothing resolves a constraint index by
+    /// name any more — `constraint_owned_unique_index_on` and
+    /// `unique_indexes_on_columns` both match on the COLUMN SET — so a
+    /// `t_u_key` that now covers `u2` is a stale label, not a stale lookup. At
+    /// the next open the mint derives `t_u2_key` from the new schema, which is
+    /// the same index under the name it would have been created with.
+    pub fn rename_column_in_indexes(&self, table: &str, old: &str, new: &str) -> Vec<String> {
+        if old.eq_ignore_ascii_case(new) {
+            return Vec::new();
+        }
+        self.note_mutation();
+        let mut changed = Vec::new();
+        let mut indexes = self.indexes.write().unwrap_or_else(|e| e.into_inner());
+        for (name, entry) in indexes.iter_mut() {
+            if entry.table != table || !entry.columns.iter().any(|c| c.eq_ignore_ascii_case(old)) {
+                continue;
+            }
+            for col in entry.columns.iter_mut() {
+                if col.eq_ignore_ascii_case(old) {
+                    *col = new.to_string();
+                }
+            }
+            {
+                let mut tree = entry.tree.write().unwrap_or_else(|e| e.into_inner());
+                tree.rename_column(old, new);
+            }
+            changed.push(name.clone());
+        }
+        drop(indexes);
+
+        // The FK sidecar carries its own copy of both column lists (child and
+        // parent side); leaving it stale would make the FK probe resolve
+        // nothing on a renamed column while the tree itself was correct.
+        {
+            let mut fk_info = self.fk_info.write().unwrap_or_else(|e| e.into_inner());
+            for info in fk_info.values_mut() {
+                if info.table == table {
+                    for col in info.columns.iter_mut() {
+                        if col.eq_ignore_ascii_case(old) {
+                            *col = new.to_string();
+                        }
+                    }
+                }
+                if info.ref_table == table {
+                    for col in info.ref_columns.iter_mut() {
+                        if col.eq_ignore_ascii_case(old) {
+                            *col = new.to_string();
+                        }
+                    }
+                }
+            }
+        }
+        changed
+    }
+
     // =========================================================================
     // INDEX ACCESS
     // =========================================================================
@@ -1816,10 +1892,18 @@ impl ArtIndexManager {
         // single-index table takes the original direct encode (zero overhead).
         let multi_index = names.len() > 1;
         // The row's own undo log, oldest first: what has to come back out if an
-        // index further down the list refuses this row. Only ever filled on the
-        // `NotStored` arm — a stored row never gives an entry back — so it stays
-        // empty (and allocation-free) for every `Stored` caller and for the
-        // overwhelmingly common single-index table.
+        // index further down the list refuses this row.
+        //
+        // Filled only when BOTH (a) the caller unwinds the row (`NotStored`) and
+        // (b) the table has more than one index — with a single index there IS no
+        // "index further down the list", so a refusal has nothing to take back and
+        // recording the entry is pure waste. That second condition is a hot-path
+        // matter, not a tidiness one (sprinter 5a78b8288153): claim-first made
+        // `NotStored` the shape every INSERT now takes, and a single-index table
+        // is the overwhelmingly common one, so an unconditional push would add an
+        // allocation per row to the insert path. `undo_row_index_entries` on an
+        // empty log is a no-op, which is exactly right for that case.
+        let track_undo = row_state == RowState::NotStored && multi_index;
         let mut inserted: Vec<(&IndexEntry, Vec<u8>, Option<i64>)> = Vec::new();
         // `RowState::Stored` reports the FIRST refusal only after the whole row
         // has been maintained (maintenance-shaped, exactly like `on_insert`).
@@ -1880,7 +1964,7 @@ impl ArtIndexManager {
                         }
                     }
                     drop(index);
-                    if row_state == RowState::NotStored {
+                    if track_undo {
                         inserted.push((entry, key, dense_int));
                     }
                 }
@@ -1892,7 +1976,13 @@ impl ArtIndexManager {
                         match row_state {
                             RowState::NotStored => {
                                 Self::undo_row_index_entries(&inserted, row_id);
-                                return Err(e);
+                                // sprinter 5a78b8288153: report the CONSTRAINT,
+                                // not the tree's internal "key already exists".
+                                return Err(Self::rejected_duplicate_error(
+                                    Self::violation_name(entry, name),
+                                    entry.index_type,
+                                    &e,
+                                ));
                             }
                             RowState::Stored => {
                                 // The row is stored. Keep every entry it already
@@ -1956,6 +2046,43 @@ impl ArtIndexManager {
         ArtIndexError::DuplicateKey(format!(
             "index \"{index_name}\" refused the key of row {row_id}, which is stored anyway ({err}) — \
              that index cannot find this row, and its entry belongs to the row that claimed the value first"
+        ))
+    }
+
+    /// The error a [`RowState::NotStored`] refusal reports: the REJECTED-row
+    /// twin of [`Self::stored_duplicate_error`] (sprinter 5a78b8288153).
+    ///
+    /// The row is being refused and nothing is written, so the user-visible
+    /// message is the whole output of this path — and it has to be the message
+    /// the engine has always produced for a rejected duplicate:
+    /// `Duplicate key value violates PRIMARY KEY|UNIQUE constraint "<name>"`,
+    /// the exact wording of `check_unique_constraints_tuple`. That matters
+    /// because sprinter 5a78b8288153 makes the ENFORCING TREE the arbiter for
+    /// the autocommit insert funnels instead of the separate pre-check that
+    /// used to answer first: without this the message would degrade to the
+    /// tree's own internal text (`Key already exists in PrimaryKey index`),
+    /// which names neither the constraint nor the column and is not what the
+    /// PostgreSQL wire has been reporting.
+    ///
+    /// Only a genuine duplicate is relabelled — every other kind (a corrupt
+    /// tree, [`ArtIndexError::NullPrimaryKey`]) passes through untouched, for
+    /// the same reason its `Stored` twin leaves them alone: reporting "a
+    /// duplicate" for a fault that is not one buries the real one.
+    ///
+    /// SQLSTATE is unaffected either way (`sqlstate_for_error` sniffs
+    /// `duplicate key`, which both spellings contain); this is about the text a
+    /// human reads.
+    fn rejected_duplicate_error(index_name: &str, index_type: ArtIndexType, err: &ArtIndexError) -> ArtIndexError {
+        if !matches!(err, ArtIndexError::DuplicateKey(_)) {
+            return err.clone();
+        }
+        let kind = if index_type == ArtIndexType::PrimaryKey {
+            "PRIMARY KEY"
+        } else {
+            "UNIQUE"
+        };
+        ArtIndexError::DuplicateKey(format!(
+            "Duplicate key value violates {kind} constraint \"{index_name}\""
         ))
     }
 
@@ -2751,8 +2878,7 @@ impl ArtIndexManager {
 
     /// Update indexes after INSERT using an already-materialized tuple.
     ///
-    /// [`RowState::Stored`], always: the one production caller
-    /// (`StorageEngine::insert_tuple_fast`) has already `put()` the row (and
+    /// [`RowState::Stored`], always: a caller has already `put()` the row (and
     /// appended its logical-WAL record) before it gets here, so a refusal cannot
     /// unmake the row — it can only describe it. The row therefore keeps every
     /// entry it already owns, the indexes after the refusing one are still
@@ -2760,9 +2886,23 @@ impl ArtIndexManager {
     /// through `note_index_maintenance_failure` (ERROR for a stored duplicate).
     /// Undoing here would strip a durable row of its PRIMARY KEY entry.
     ///
-    /// The funnel that may undo is the transactional twin,
-    /// [`Self::on_insert_tuple_collect_index_values`] with
-    /// [`RowState::NotStored`] — the only shape whose caller unwinds the row.
+    /// # No production caller since sprinter 5a78b8288153
+    ///
+    /// `StorageEngine::insert_tuple_fast` was the one, and it is now the reason
+    /// this entry point is idle: that funnel used to `put()` the row and then
+    /// ask the ART to keep up, which is precisely how a duplicate that raced
+    /// past the pre-check ended up STORED and merely logged. It now CLAIMS its
+    /// keys first through [`Self::reserve_insert_tuple`], so a refusal arrives
+    /// before anything is written and becomes the statement's error instead of
+    /// an ERROR-level report about a row that is already there.
+    ///
+    /// Kept as the `Stored` reference shape — it is what an after-the-fact
+    /// maintenance caller must use, and the unit tests below pin that contract.
+    ///
+    /// The funnels that may undo are the `NotStored` ones:
+    /// [`Self::reserve_insert_tuple`] and
+    /// [`Self::on_insert_tuple_collect_index_values`] — the shapes whose caller
+    /// unwinds the row.
     pub fn on_insert_tuple(&self, table: &str, row_id: RowId, schema: &Schema, tuple: &Tuple) -> ArtResult<()> {
         self.note_mutation();
         // W3.2: hoist the write-volume census fast-out (one relaxed load for the
@@ -2787,6 +2927,67 @@ impl ArtIndexManager {
             &mut frag_cache,
             wv,
             RowState::Stored,
+        )
+    }
+
+    /// CLAIM this row's PK/UNIQUE keys before the row is written — the
+    /// [`RowState::NotStored`] twin of [`Self::on_insert_tuple`]
+    /// (sprinter 5a78b8288153).
+    ///
+    /// # Why this exists: the tree IS the check
+    ///
+    /// The autocommit insert funnels used to answer "is this key free?" with a
+    /// separate pre-check (`check_unique_constraints_tuple`, a READ lock per
+    /// enforcing tree) and only later take the WRITE lock to enter the key.
+    /// Between those two the lock is NOT held, so two concurrent INSERTs of the
+    /// same UNIQUE value both saw a free key, both wrote their row, and only the
+    /// loser's INDEX entry was refused — leaving a REAL DUPLICATE in the table,
+    /// visible by scan and by primary key, with one of the two unreachable
+    /// through the constraint's own index.
+    ///
+    /// `ArtIndex::insert` already decides "free or taken" and claims the key in
+    /// ONE critical section under the tree's write lock, so making it the
+    /// arbiter closes the window with no new lock at all. The caller writes the
+    /// row only if this returns `Ok`, and gives the claim back
+    /// ([`Self::on_delete_tuple`]) if the write then fails.
+    ///
+    /// # Lock ordering
+    ///
+    /// Unchanged from every other maintenance funnel, and that is the point:
+    /// `insert_row_indexes` holds ONE tree write lock at a time (it `drop`s each
+    /// before touching the next — rule 3), under the `indexes` map READ lock
+    /// taken first. A thread therefore never holds two tree locks at once, so no
+    /// cycle can form between the several unique trees of one table and no
+    /// deterministic acquisition order is even required for safety. The order IS
+    /// deterministic anyway — every thread walks the one shared
+    /// `table_indexes[table]` list — which additionally rules out two rows
+    /// aborting each other: whichever thread claims the first contended tree
+    /// goes on to win, and the loser gives back only the entries it took.
+    ///
+    /// All-or-nothing per row: if a later index refuses, the entries taken by
+    /// the earlier ones are removed again before the refusal is returned, so a
+    /// rejected row never leaves a phantom key behind.
+    pub fn reserve_insert_tuple(&self, table: &str, row_id: RowId, schema: &Schema, tuple: &Tuple) -> ArtResult<()> {
+        self.note_mutation();
+        let wv = crate::write_volume::enabled();
+        let names = {
+            let table_indexes = self.table_indexes.read().unwrap_or_else(|e| e.into_inner());
+            match table_indexes.get(table) {
+                Some(list) if !list.is_empty() => list.clone(),
+                _ => return Ok(()),
+            }
+        };
+        let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
+        let mut frag_cache: Vec<(usize, bool, Vec<u8>)> = Vec::new();
+        Self::insert_row_indexes(
+            &indexes,
+            &names,
+            row_id,
+            schema,
+            tuple,
+            &mut frag_cache,
+            wv,
+            RowState::NotStored,
         )
     }
 
@@ -2922,8 +3123,10 @@ impl ArtIndexManager {
         let mut frag_cache: Vec<(usize, bool, Vec<u8>)> = Vec::new();
         let mut indexed_values = HashMap::new();
         // The row's own undo log, oldest first (see `undo_row_index_entries`).
-        // Only filled on the `NotStored` arm — a stored row never gives an entry
-        // back.
+        // Filled only on the `NotStored` arm AND only for a multi-index table —
+        // with one index there is nothing earlier to give back. Same reasoning as
+        // the `insert_row_indexes` twin (sprinter 5a78b8288153).
+        let track_undo = row_state == RowState::NotStored && multi_index;
         let mut inserted: Vec<(&IndexEntry, Vec<u8>, Option<i64>)> = Vec::new();
         // `RowState::Stored` reports the FIRST refusal only after the whole row
         // has been maintained.
@@ -2983,7 +3186,7 @@ impl ArtIndexManager {
                             }
                         }
                         drop(index);
-                        if row_state == RowState::NotStored {
+                        if track_undo {
                             inserted.push((entry, key, dense_int));
                         }
                     }
@@ -2995,7 +3198,14 @@ impl ArtIndexManager {
                             match row_state {
                                 RowState::NotStored => {
                                     Self::undo_row_index_entries(&inserted, row_id);
-                                    return Err(e);
+                                    // sprinter 5a78b8288153: same relabelling as
+                                    // the `insert_row_indexes` twin — a rejected
+                                    // row must name the constraint it violated.
+                                    return Err(Self::rejected_duplicate_error(
+                                        Self::violation_name(entry, name),
+                                        entry.index_type,
+                                        &e,
+                                    ));
                                 }
                                 RowState::Stored => {
                                     // The caller writes this row whatever we

@@ -1040,6 +1040,18 @@ impl TenantManager {
         self.current_context.read().is_some()
     }
 
+    /// The active tenant's id, or `None` when no tenant context is set.
+    ///
+    /// sprinter d03de7fc3b22: the spelling the QPS meter uses. It runs on EVERY
+    /// statement of EVERY execution family, so it must not pay the
+    /// `TenantContext` clone [`Self::get_current_context`] does (a `String`
+    /// `user_id` plus a `Vec<String>` of roles, allocated and dropped again) just
+    /// to read one `Copy` id — that was affordable when metering existed on one
+    /// funnel and is not when it exists on all of them.
+    pub fn active_tenant_id(&self) -> Option<TenantId> {
+        self.current_context.read().as_ref().map(|c| c.tenant_id)
+    }
+
     /// Clear current tenant context
     pub fn clear_current_context(&self) {
         set_current_tenant_id(None);

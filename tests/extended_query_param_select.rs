@@ -6,6 +6,17 @@
 //!
 //! These tests fail on v3.23.1 main and should pass once the schema-synthesis
 //! and/or RowDescription serialisation fix lands.
+//!
+//! They then spent v3.23.1 → v4.38.0 `#[ignore]`d for a SECOND reason, which
+//! sprinter 6ac716be10ea removed: Parse answered ParameterDescription with OID
+//! 0 for every inferred parameter, and `tokio_postgres::prepare::get_type`
+//! resolves an unknown OID by preparing its own TYPEINFO query — whose `$1`
+//! Nano also described as 0. `typeinfo_statement` caches only after
+//! `prepare_rec` returns, so the lookup re-entered itself forever and the
+//! CLIENT's stack overflowed. Parse now infers real OIDs from the statement
+//! (`week_bucket = $1` against a `TEXT` column is 25), falling back to 705
+//! (`unknown`, a driver builtin) only where PostgreSQL itself would decline,
+//! so `get_type` resolves every parameter locally. These tests RUN now.
 
 use heliosdb_nano::{
     protocol::postgres::server::{PgServer, PgServerConfig},
@@ -51,15 +62,12 @@ async fn connect(s: &str) -> tokio_postgres::Client {
 /// On v3.19.1 the dashboard team saw node-pg crash with "Cannot read
 /// properties of undefined (reading 'name')" — RowDescription parser failed.
 ///
-/// **Status (verified 2026-05-03 against v3.23.1)**: FIXED via PG-wire repro
-/// using a real `target/release/heliosdb-nano start` daemon + psycopg2.
-/// Test stays `#[ignore]`'d because the in-process `PgServer` harness used
-/// here hits an unbounded-recursion stack-overflow that's been latent since
-/// at least v3.19.x — same root as the `#[ignore]`'d tests in
-/// `tests/server_mode_integration_test.rs`. Filed as a separate concern;
-/// not a blocker for any user-visible workflow.
+/// **Status**: FIXED (verified 2026-05-03 against v3.23.1 via a real
+/// `target/release/heliosdb-nano start` daemon + psycopg2). The in-process
+/// `PgServer` harness used here could not run it until sprinter 6ac716be10ea
+/// — see the module doc — because tokio-postgres, not the server, was the
+/// side that recursed. It runs in-process now.
 #[tokio::test]
-#[ignore = "in-process PgServer harness hits stack-overflow; bug 8 itself is FIXED — verified externally"]
 async fn parameterised_select_extended_query_returns_rows() {
     let (cs, _h) = setup().await;
     let client = connect(&cs).await;
@@ -99,7 +107,6 @@ async fn parameterised_select_extended_query_returns_rows() {
 ///
 /// **Status (verified 2026-05-03 against v3.23.1)**: FIXED.
 #[tokio::test]
-#[ignore = "in-process PgServer harness hits stack-overflow; bug 9 itself is FIXED — verified externally"]
 async fn count_distinct_with_extended_param_does_not_silently_return_zero() {
     let (cs, _h) = setup().await;
     let client = connect(&cs).await;
@@ -152,12 +159,14 @@ async fn count_distinct_with_extended_param_does_not_silently_return_zero() {
 ///
 /// **Status (verified 2026-05-03 against v3.23.1)**: FIXED.
 #[test]
-#[ignore = "in-process PgServer harness hits stack-overflow; bug 8 itself is FIXED — verified externally"]
 fn describe_returns_well_formed_row_description() {
-    // Use a manually-built runtime with a 32 MB stack. The stack-overflow
-    // issue in existing `tests/server_mode_integration_test.rs` traces
-    // back to this — the PG-wire server's serve() loop with rocksdb-backed
-    // catalog has a deep call stack that blows the default 2 MB.
+    // A manually-built runtime with a 32 MB stack, kept as it was. The
+    // diagnosis it records — "the server's serve() loop blows the default
+    // 2 MB stack" — was WRONG, which is why the bigger stack never made the
+    // test pass: the recursion was tokio-postgres' own TYPEINFO lookup on the
+    // OID-0 ParameterDescription (module doc), and an UNBOUNDED recursion
+    // overflows 32 MB just as surely as 2 MB. Left in place because it is
+    // harmless and this test is the one that proves `prepare` itself returns.
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .thread_stack_size(32 * 1024 * 1024)

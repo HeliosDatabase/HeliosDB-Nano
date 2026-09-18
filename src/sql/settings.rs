@@ -1,6 +1,30 @@
-//! SQL SET and SHOW command implementation
+//! SQL SET and SHOW command implementation.
 //!
-//! Provides session-level and global settings management for HeliosDB Lite.
+//! # What lives here, and what does NOT — sprinter a3077a3f68d8
+//!
+//! [`SessionSettings`] is ONE registry per `EmbeddedDatabase` handle. Its name
+//! was a lie: every connection shared it, so `SET statement_timeout = 1` from
+//! any authenticated client cancelled EVERY other connection's queries after
+//! 1 ms, and `SET bulk_load_mode = on` flipped the storage engine's flag for the
+//! whole process. On a multi-tenant or shared server that is a denial-of-service
+//! lever handed to any client that can type `SET`.
+//!
+//! So this registry now holds **defaults and genuine SERVER-level parameters
+//! only** ([`is_server_level`]). A parameter is server-level iff *its value is
+//! consumed by process-wide machinery on behalf of sessions other than the one
+//! that set it* — the buffer pool, the on-disk compression codec, the
+//! materialized-view refresher, the SMFI index maintainer, the version-retention
+//! switch. Everything else is [`is_user_settable`]: it is stored on the session
+//! (`crate::session::scoped::SessionScopedState`, the same place GH#28 put the
+//! connection-lifetime timeouts and sprinter f4f5d450e816 put
+//! `application_name`) and read back from there, so one connection's `SET` can
+//! never reach another's.
+//!
+//! The registry is still the place a name is DECLARED — an entry here is what
+//! makes `SHOW <name>` / `RESET <name>` something other than "unrecognized
+//! configuration parameter", and it supplies the default a `RESET` falls back
+//! to — and it is still where a value is validated. It is simply no longer where
+//! a user-settable value is STORED.
 
 use crate::{Error, Result};
 use std::collections::HashMap;
@@ -82,6 +106,168 @@ pub fn parse_setting_value(s: &str) -> SettingValue {
 
     // Default to string
     SettingValue::String(s.to_string())
+}
+
+/// sprinter a3077a3f68d8: the parameters that are genuinely SERVER-level.
+///
+/// The rule (see the module docs): a parameter is server-level iff its value is
+/// consumed by process-wide machinery **on behalf of sessions other than the one
+/// that set it**. A per-session value for these would either be silently ignored
+/// or — worse — would let one connection reconfigure shared machinery, which is
+/// the very defect this split exists to close.
+///
+/// Group by group, with the reason each one is here:
+///
+/// * `server_version`, `server_encoding`, `max_connections`, `port`,
+///   `authentication_timeout` — postmaster-scoped in PostgreSQL too, and
+///   already refused by `SessionSettings::is_read_only`. A session that could
+///   lengthen its own authentication window is a security regression (GH#28).
+/// * `shared_buffers` — there is ONE buffer pool in the process. PostgreSQL
+///   also makes it postmaster context.
+/// * `default_compression`, `compression_level` — the on-disk encoding of
+///   shared blocks; background compaction re-encodes other sessions' data with
+///   whatever this says.
+/// * `time_travel_enabled` — governs whether the storage engine RETAINS version
+///   history. Per-session retention is incoherent: the rows either exist for
+///   everyone or for no one.
+/// * `mv_auto_refresh`, `mv_max_cpu_percent` — drive the single background
+///   materialized-view refresher, which serves every session.
+/// * `smfi_*` — the Self-Maintaining Filter Index maintainer and its worker
+///   pool. The indexes are shared structures; a per-session threshold would
+///   mean one connection's inserts were tracked and another's were not, and the
+///   index would be wrong for both.
+///
+/// Everything else registered in [`SessionSettings::new`] is user-settable.
+pub fn is_server_level(name: &str) -> bool {
+    matches!(
+        name,
+        "server_version"
+            | "server_encoding"
+            | "max_connections"
+            | "port"
+            | "authentication_timeout"
+            | "shared_buffers"
+            | "default_compression"
+            | "compression_level"
+            | "time_travel_enabled"
+            | "mv_auto_refresh"
+            | "mv_max_cpu_percent"
+            | "smfi_enabled"
+            | "smfi_tracking_enabled"
+            | "smfi_bulk_load_threshold"
+            | "smfi_parallel_enabled"
+            | "smfi_max_cpu_percent"
+            | "smfi_delta_threshold"
+            | "smfi_parallel_threshold"
+            | "smfi_max_workers"
+    )
+}
+
+/// sprinter a3077a3f68d8: true for a registered parameter a client may set on
+/// its OWN session — i.e. everything in the registry that is not
+/// [`is_server_level`].
+///
+/// `application_name` is deliberately EXCLUDED: it is session state too, but it
+/// has its own dedicated slot and its own `SET`/`SHOW`/`RESET` interceptor
+/// (sprinter f4f5d450e816), which runs first. Routing it through the generic
+/// overlay as well would give it two homes that could disagree.
+///
+/// The three GH#28 connection-lifetime GUCs are excluded for the same reason:
+/// they live on `Session` (the listener's idle timers read them there) and have
+/// their own interceptor, `try_handle_session_timeout_guc`.
+pub fn is_user_settable(name: &str) -> bool {
+    is_registered(name)
+        && !is_server_level(name)
+        && name != "application_name"
+        && name != "idle_session_timeout"
+        && name != "idle_in_transaction_session_timeout"
+}
+
+/// Every parameter [`SessionSettings::new`] declares, as a static list.
+///
+/// sprinter a3077a3f68d8 needs "is this a parameter this server knows?" as a
+/// PURE predicate: both wire listeners classify a `SET` / `SHOW` / `RESET`
+/// before any handle is in reach (`session_show_parameter_name` is an
+/// associated fn on the PostgreSQL handler), and an unknown name must keep
+/// falling through to PostgreSQL's `42704 unrecognized configuration
+/// parameter`, not become a silently-accepted session override.
+///
+/// Kept in step with the constructor by `registered_list_matches_the_registry`.
+pub const REGISTERED_PARAMETERS: &[&str] = &[
+    "application_name",
+    "authentication_timeout",
+    "bulk_load_mode",
+    "client_encoding",
+    "compression_level",
+    "datestyle",
+    "default_compression",
+    "enable_hashjoin",
+    "enable_indexscan",
+    "enable_mergejoin",
+    "enable_nestloop",
+    "enable_seqscan",
+    "hnsw_ef_construction",
+    "hnsw_m",
+    "idle_in_transaction_session_timeout",
+    "idle_session_timeout",
+    "mv_auto_refresh",
+    "mv_max_cpu_percent",
+    "optimizer",
+    "query_timeout",
+    "server_encoding",
+    "server_version",
+    "shared_buffers",
+    "smfi_bulk_load_threshold",
+    "smfi_delta_threshold",
+    "smfi_enabled",
+    "smfi_max_cpu_percent",
+    "smfi_max_workers",
+    "smfi_parallel_enabled",
+    "smfi_parallel_threshold",
+    "smfi_tracking_enabled",
+    "statement_timeout",
+    "time_travel_enabled",
+    "timezone",
+    "transaction_isolation",
+    "transaction_read_only",
+    "vector_index_type",
+    "work_mem",
+];
+
+/// The registry DEFAULTS, built once.
+///
+/// sprinter a3077a3f68d8: the per-session overlay only holds what a session has
+/// actually `SET`, so every reader needs the default to fall back to — and
+/// `SessionSettings::new()` allocates the whole map, which is fine at open but
+/// not on a `SHOW` / `current_setting()` path.
+fn defaults() -> &'static HashMap<String, SettingValue> {
+    static DEFAULTS: std::sync::OnceLock<HashMap<String, SettingValue>> = std::sync::OnceLock::new();
+    DEFAULTS.get_or_init(|| SessionSettings::new().get_all())
+}
+
+/// The value a registered parameter has when no session has overridden it.
+pub fn default_value(name: &str) -> Option<SettingValue> {
+    defaults().get(name).cloned()
+}
+
+/// Render a setting value the way PostgreSQL's `SHOW` / `current_setting()` do.
+///
+/// Durations go through the ONE formatter GH#28 already uses for the
+/// connection-lifetime GUCs (`0`, `30s`, `10min`, `250ms`), so
+/// `SHOW statement_timeout` answers `0` rather than this module's internal `0ms`
+/// spelling and the two families cannot drift.
+pub fn render_value(value: &SettingValue) -> String {
+    match value {
+        SettingValue::Duration(ms) => crate::protocol::postgres::timeouts::format_guc_duration_ms(*ms),
+        other => other.as_string(),
+    }
+}
+
+/// True when `name` is a parameter this server declares — the gate that keeps an
+/// unknown `SET x = 1` falling through to the planner (and an unknown
+/// `SHOW x` to 42704) exactly as before this item.
+pub fn is_registered(name: &str) -> bool {
+    REGISTERED_PARAMETERS.contains(&name)
 }
 
 /// Session settings manager
@@ -241,6 +427,17 @@ impl SessionSettings {
             name,
             "server_version" | "server_encoding" | "max_connections" | "port" | "authentication_timeout"
         )
+    }
+
+    /// sprinter a3077a3f68d8: validate a value for `name` WITHOUT storing it.
+    ///
+    /// The per-session overlay stores user-settable GUCs on the session, but the
+    /// rules for what is a legal value are a property of the PARAMETER, not of
+    /// where it is kept — so both writers go through this one validator and a
+    /// session-scoped `SET default_compression = 'banana'` fails closed exactly
+    /// as the registry write did.
+    pub fn validate(name: &str, value: &SettingValue) -> Result<()> {
+        Self::validate_setting(&name.to_lowercase(), value)
     }
 
     /// Validate setting value
@@ -436,6 +633,35 @@ mod tests {
         // Invalid compression
         let result = settings.set("default_compression", SettingValue::String("invalid".to_string()));
         assert!(result.is_err());
+    }
+
+    /// sprinter a3077a3f68d8: the static [`REGISTERED_PARAMETERS`] list is what
+    /// both wire listeners classify against, so it must be exactly the set the
+    /// constructor declares. A name added to one and not the other is a name
+    /// that is either unsettable or unrecognized depending on which code path a
+    /// client reaches — the class of split-brain GH#28 was about.
+    #[test]
+    fn registered_list_matches_the_registry() {
+        let built: std::collections::BTreeSet<String> = SessionSettings::new().get_all().into_keys().collect();
+        let listed: std::collections::BTreeSet<String> = REGISTERED_PARAMETERS.iter().map(|s| s.to_string()).collect();
+        assert_eq!(built, listed, "REGISTERED_PARAMETERS drifted from SessionSettings::new");
+        // Every registered name is exactly one of: server-level, user-settable,
+        // or one of the three with a dedicated session slot of their own.
+        for name in REGISTERED_PARAMETERS {
+            let dedicated = matches!(
+                *name,
+                "application_name" | "idle_session_timeout" | "idle_in_transaction_session_timeout"
+            );
+            assert_eq!(
+                is_user_settable(name),
+                !is_server_level(name) && !dedicated,
+                "{name} is classified inconsistently"
+            );
+        }
+        assert!(
+            !is_user_settable("no_such_parameter"),
+            "an unknown name is not settable"
+        );
     }
 
     #[test]

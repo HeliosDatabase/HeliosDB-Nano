@@ -61,27 +61,31 @@ fn setup_pk_table() -> EmbeddedDatabase {
 /// hazard. A wire session would be gated out before reaching them and would
 /// prove nothing.
 fn assert_row_two_untouched(db: &EmbeddedDatabase, context: &str) {
-    // SCAN, do not probe `WHERE id = 2`.
+    // PROBE by key. The point lookup resolves through the PK ART index, so this
+    // asserts the index and the committed rows AGREE about id = 2 — strictly
+    // more than a scan says.
     //
-    // A point lookup resolves through the PK ART index, and sprinter
-    // 8a9b60eeef87 — `begin_transaction()`'s RAII rollback never replays the
-    // ART undo log — leaves that index without key 2 once the writer above
-    // rolls back, even though the committed row still carries it. That is a
-    // SEPARATE pre-existing defect (reproduced standalone, with no DELETE and
-    // no fast path involved), and asserting through it would make this helper
-    // fail for a reason that has nothing to do with what A1 fixes.
+    // v4.38.0 had to weaken this to a filter over a full scan because sprinter
+    // 8a9b60eeef87 (`begin_transaction()`'s RAII rollback never replayed the
+    // ART undo log) left the index without key 2 once the writer below rolled
+    // back. That is fixed: the handle now owns its ART undo slot
+    // (`EmbeddedDatabase::raii_art_undo`), `Transaction::rollback` replays it and
+    // `Transaction::commit` drops it — and, critically for THIS file, the
+    // autocommit `db.execute` between the two below can no longer `clear()` the
+    // open handle's entries out from under it. So the probe is back.
     //
-    // What A1 is about is whether the ROW SURVIVED, and a full scan answers
-    // that without consulting the index at all — so it stays a true proof of
-    // the wrong-row bug while 8a9b60eeef87 is open. When that lands, these can
-    // be tightened back to a key probe.
-    let found = db.query("SELECT id, v FROM t", &[]).unwrap();
-    let row_two: Vec<_> = found.iter().filter(|r| r.values[0] == Value::Int4(2)).collect();
+    // It is equally sound at the call sites that run while the writer is STILL
+    // OPEN: the key is genuinely out of the index at that moment, but the
+    // uncommitted-index-removal census makes that miss non-authoritative
+    // (`index_miss_is_authoritative`, src/sql/executor/scan.rs), so the lookup
+    // declines to a filtered scan of committed rows and still finds it.
+    let row_two = db.query("SELECT id, v FROM t WHERE id = 2", &[]).unwrap();
     assert_eq!(
         row_two.len(),
         1,
-        "{context}: *** WRONG ROW DESTROYED *** the row holding id = 2 is gone; the statement \
-         targeted id = 99, whose index entry an UNCOMMITTED transaction had just moved onto this row"
+        "{context}: *** WRONG ROW DESTROYED *** the row holding id = 2 is gone (or is no longer \
+         reachable by its own key); the statement targeted id = 99, whose index entry an \
+         UNCOMMITTED transaction had just moved onto this row"
     );
     assert_eq!(
         row_two[0].values[1],
@@ -89,6 +93,9 @@ fn assert_row_two_untouched(db: &EmbeddedDatabase, context: &str) {
         "{context}: *** WRONG ROW REWRITTEN *** the row holding id = 2 no longer carries the value \
          it was committed with; the statement targeted id = 99"
     );
+    // Kept: the key probe cannot see a row destroyed under ANOTHER key, nor a
+    // duplicate the statement left behind.
+    let found = db.query("SELECT id, v FROM t", &[]).unwrap();
     assert_eq!(found.len(), 2, "{context}: the table lost a row");
 }
 
@@ -274,10 +281,6 @@ fn literal_fast_update_does_not_rewrite_a_row_whose_key_an_open_txn_moved() {
     assert_row_two_untouched(&db, "literal UPDATE, writer still open");
 
     tx.rollback().unwrap();
-    // No `value_at(&db, 2)` here: that is a point lookup, and sprinter
-    // 8a9b60eeef87 leaves the PK index without key 2 once this writer rolls
-    // back. `assert_row_two_untouched` already pins the value via a scan, so
-    // the probe would add nothing but a dependency on an unrelated open defect.
     assert_row_two_untouched(&db, "literal UPDATE, after the writer rolled back");
 }
 
@@ -299,8 +302,6 @@ fn params_fast_update_does_not_rewrite_a_row_whose_key_an_open_txn_moved() {
     assert_row_two_untouched(&db, "params UPDATE, writer still open");
 
     tx.rollback().unwrap();
-    // See the note in the literal sibling: scan-based assertion only, because
-    // a post-rollback point lookup trips sprinter 8a9b60eeef87.
     assert_row_two_untouched(&db, "params UPDATE, after the writer rolled back");
 }
 

@@ -2952,6 +2952,511 @@ impl<'a> Catalog<'a> {
         Ok(())
     }
 
+    // =====================================================================
+    // COLUMN-level DDL vs. the persisted constraint records
+    // (sprinter 0f258ed23d13)
+    //
+    // `move_inbound_foreign_keys` above is the TABLE-level sibling of this
+    // block (sprinter 6d501be6013f): a `RENAME TO` used to leave other
+    // tables' foreign keys naming a relation that no longer existed. A
+    // `RENAME COLUMN` / `DROP COLUMN` leaves the same wreckage one level
+    // down — `meta:constraints:{table}` keeps the OLD column name — and the
+    // consequence is worse, because it is SILENT: at the next open
+    // `register_unique_constraint_indexes` builds a tree over a column the
+    // schema no longer has, every probe resolves that name to `None`
+    // (`index_value_refs_from_tuple`), and `check_unique_constraints_tuple`
+    // SKIPS the index. A declared UNIQUE then accepts duplicates forever,
+    // with `\d` still showing the constraint.
+    //
+    // Everything here runs in two phases on purpose — a `validate_*` that
+    // touches nothing, and an `apply_*` that only rewrites records that
+    // actually change. The executor calls the validator BEFORE it mutates
+    // `schema.columns`, so a refusal cannot leave a half-applied ALTER
+    // behind (the same rule GH#27 established in
+    // `execute_alter_table_multi`).
+    //
+    // WHAT THIS DELIBERATELY DOES NOT DO: it never turns an ALREADY-orphaned
+    // record — one written by a pre-fix binary — into a failure to open or a
+    // write block. A GH#21 candidate patch was rejected for exactly that: it
+    // would have bricked writes to every table whose column had ever been
+    // renamed. The reopen path in `rebuild_all_indexes` keeps its
+    // log-and-continue posture unchanged.
+    // =====================================================================
+
+    /// True when a persisted CHECK body is a serialized `LogicalExpr` (the
+    /// shape `CREATE TABLE` writes) rather than raw SQL text (the legacy /
+    /// dump-restore shape). Only the former can be rewritten structurally.
+    fn check_body_is_serialized(expression: &str) -> bool {
+        let trimmed = expression.trim_start();
+        trimmed.starts_with('{') || trimmed.starts_with('[')
+    }
+
+    /// Does raw CHECK *text* plausibly name `column`? Word-boundary match on
+    /// ASCII identifier characters, deliberately over-eager: a hit inside a
+    /// string literal costs a recoverable refusal, a miss costs a silently
+    /// unenforced constraint.
+    fn check_text_mentions_column(expression: &str, column: &str) -> bool {
+        let hay = expression.to_ascii_lowercase();
+        let needle = column.to_ascii_lowercase();
+        if needle.is_empty() {
+            return false;
+        }
+        let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '$';
+        let bytes: Vec<char> = hay.chars().collect();
+        let pat: Vec<char> = needle.chars().collect();
+        if pat.len() > bytes.len() {
+            return false;
+        }
+        for start in 0..=(bytes.len() - pat.len()) {
+            if bytes.get(start..start + pat.len()) != Some(pat.as_slice()) {
+                continue;
+            }
+            let before_ok = start == 0 || !bytes.get(start - 1).copied().is_some_and(is_ident);
+            let after = bytes.get(start + pat.len()).copied();
+            let after_ok = !after.is_some_and(is_ident);
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Walk a serialized `LogicalExpr` looking for (a) a `Column` /
+    /// `BoundColumn` node naming `column` and (b) any node this rewriter
+    /// refuses to touch.
+    ///
+    /// The walk is over raw JSON rather than over the `LogicalExpr` variants
+    /// because `serde` tags the enum externally (`{"Column":{…}}`), so ONE
+    /// generic descent finds every column reference at every nesting depth —
+    /// including the variants a hand-written matcher would forget. The
+    /// alternative, `sql::evaluator::map_column_refs`, deliberately does not
+    /// descend into sub-plans, and "silently did not rewrite" is the failure
+    /// mode this whole item exists to remove.
+    ///
+    /// `opaque` is set for a sub-PLAN node: a `Column` inside a subquery
+    /// resolves against a DIFFERENT relation, so renaming it would be wrong.
+    /// PostgreSQL forbids subqueries in CHECK, so this is a refusal for a
+    /// shape that should not exist rather than a real limitation.
+    fn scan_check_json(value: &serde_json::Value, column: &str, found: &mut bool, opaque: &mut bool) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, child) in map {
+                    if matches!(key.as_str(), "ScalarSubquery" | "InSubquery" | "Exists") {
+                        *opaque = true;
+                    }
+                    if matches!(key.as_str(), "Column" | "BoundColumn") {
+                        if let Some(name) = child.get("name").and_then(|n| n.as_str()) {
+                            if name.eq_ignore_ascii_case(column) {
+                                *found = true;
+                            }
+                        }
+                    }
+                    Self::scan_check_json(child, column, found, opaque);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    Self::scan_check_json(item, column, found, opaque);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The rewriting half of [`Self::scan_check_json`]: rename every
+    /// `Column` / `BoundColumn` node that names `old`. Returns `true` when
+    /// anything changed.
+    fn rename_check_json(value: &mut serde_json::Value, old: &str, new: &str) -> bool {
+        let mut changed = false;
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, child) in map.iter_mut() {
+                    // The immutable probe is finished (and its borrow of
+                    // `child` released) before `get_mut` is taken.
+                    let hit = matches!(key.as_str(), "Column" | "BoundColumn")
+                        && child
+                            .get("name")
+                            .and_then(|n| n.as_str())
+                            .is_some_and(|name| name.eq_ignore_ascii_case(old));
+                    if hit {
+                        if let Some(slot) = child.get_mut("name") {
+                            *slot = serde_json::Value::String(new.to_string());
+                            changed = true;
+                        }
+                    }
+                    if Self::rename_check_json(child, old, new) {
+                        changed = true;
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    if Self::rename_check_json(item, old, new) {
+                        changed = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+        changed
+    }
+
+    /// REFUSE-or-proceed check for `ALTER TABLE <table> RENAME COLUMN <old>
+    /// TO <new>`, run BEFORE the schema is touched.
+    ///
+    /// Only CHECK bodies can be un-rewritable; UNIQUE / PRIMARY KEY / FOREIGN
+    /// KEY records carry plain column lists that always rewrite. Refusing a
+    /// rename is recoverable (drop the constraint, rename, re-add it); a
+    /// constraint that quietly stops being enforced is not.
+    pub fn validate_rename_column_constraints(&self, table: &str, old: &str) -> Result<()> {
+        let constraints = self.load_table_constraints(table)?;
+        for cc in &constraints.check_constraints {
+            if Self::check_body_is_serialized(&cc.expression) {
+                let parsed: serde_json::Value = match serde_json::from_str(&cc.expression) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return Err(Error::query_execution(format!(
+                            "cannot rename column \"{}\" of relation \"{}\": CHECK constraint \"{}\" has an \
+                             unreadable stored expression ({}). Drop the constraint, rename the column, then \
+                             re-create it.",
+                            old, table, cc.name, e
+                        )))
+                    }
+                };
+                let (mut found, mut opaque) = (false, false);
+                Self::scan_check_json(&parsed, old, &mut found, &mut opaque);
+                if found && opaque {
+                    return Err(Error::query_execution(format!(
+                        "cannot rename column \"{}\" of relation \"{}\": CHECK constraint \"{}\" contains a \
+                         subquery, whose column references cannot be rewritten safely. Drop the constraint, \
+                         rename the column, then re-create it.",
+                        old, table, cc.name
+                    )));
+                }
+            } else if Self::check_text_mentions_column(&cc.expression, old) {
+                return Err(Error::query_execution(format!(
+                    "cannot rename column \"{}\" of relation \"{}\": CHECK constraint \"{}\" is stored as SQL \
+                     text that names the column and cannot be rewritten safely. Drop the constraint, rename \
+                     the column, then re-create it.",
+                    old, table, cc.name
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Rewrite EVERY persisted record in the database that names
+    /// `table`.`old` so it names `table`.`new`.
+    ///
+    /// Three places name a column, and all three are covered:
+    ///   * this table's own UNIQUE / PRIMARY KEY column lists, its outgoing
+    ///     foreign keys' referencing lists, a SELF-referential foreign key's
+    ///     `references_columns`, and its CHECK bodies;
+    ///   * every OTHER table's foreign keys whose `references_table` is this
+    ///     one — the PARENT side, which lives in the CHILD's record and which
+    ///     `move_inbound_foreign_keys` is the table-level analogue of;
+    ///   * the IDENTITY side record (`is_identity_column` is a name lookup, so
+    ///     a stale entry silently turns a GENERATED … AS IDENTITY column back
+    ///     into an ordinary one).
+    ///
+    /// Durable and cache-correct through `save_table_constraints` (record +
+    /// logical WAL + per-table constraint cache + reverse-FK cache), and only
+    /// records that actually CHANGE are written.
+    ///
+    /// Call [`Self::validate_rename_column_constraints`] first: this function
+    /// assumes every CHECK body is rewritable and would otherwise leave one
+    /// behind.
+    pub fn rename_column_in_constraints(&self, table: &str, old: &str, new: &str) -> Result<()> {
+        if old.eq_ignore_ascii_case(new) {
+            return Ok(());
+        }
+        let rename_list = |cols: &mut Vec<String>, changed: &mut bool| {
+            for col in cols.iter_mut() {
+                if col.eq_ignore_ascii_case(old) {
+                    *col = new.to_string();
+                    *changed = true;
+                }
+            }
+        };
+
+        // --- this table's own record -------------------------------------
+        let mut constraints = self.load_table_constraints(table)?;
+        let mut changed = false;
+        for uc in constraints.unique_constraints.iter_mut() {
+            rename_list(&mut uc.columns, &mut changed);
+        }
+        for fk in constraints.foreign_keys.iter_mut() {
+            rename_list(&mut fk.columns, &mut changed);
+            // A self-referencing FK has BOTH ends on this table.
+            if fk.references_table == table {
+                rename_list(&mut fk.references_columns, &mut changed);
+            }
+        }
+        for cc in constraints.check_constraints.iter_mut() {
+            if !Self::check_body_is_serialized(&cc.expression) {
+                // The validator refuses these when they name the column, so
+                // reaching here means the body cannot be affected.
+                continue;
+            }
+            let Ok(mut parsed) = serde_json::from_str::<serde_json::Value>(&cc.expression) else {
+                continue;
+            };
+            if Self::rename_check_json(&mut parsed, old, new) {
+                match serde_json::to_string(&parsed) {
+                    Ok(rewritten) => {
+                        cc.expression = rewritten;
+                        // The parsed cache is `#[serde(skip)]` and always
+                        // `None` on a loaded record, but clear it explicitly
+                        // rather than rely on that.
+                        cc.parsed_expression = None;
+                        changed = true;
+                    }
+                    Err(e) => {
+                        return Err(Error::query_execution(format!(
+                            "cannot rename column \"{}\" of relation \"{}\": CHECK constraint \"{}\" could not \
+                             be re-serialized ({})",
+                            old, table, cc.name, e
+                        )))
+                    }
+                }
+            }
+        }
+        if changed {
+            self.save_table_constraints(table, &constraints)?;
+        }
+
+        // --- every other table's PARENT-side reference -------------------
+        for other in self.list_tables()? {
+            if other == table {
+                continue;
+            }
+            let mut other_constraints = self.load_table_constraints(&other)?;
+            let mut other_changed = false;
+            for fk in other_constraints.foreign_keys.iter_mut() {
+                if fk.references_table == table {
+                    rename_list(&mut fk.references_columns, &mut other_changed);
+                }
+            }
+            if other_changed {
+                self.save_table_constraints(&other, &other_constraints)?;
+            }
+        }
+
+        // --- IDENTITY side record ----------------------------------------
+        let mut identity = self.list_identity_columns(table)?;
+        if identity.iter().any(|c| c.eq_ignore_ascii_case(old)) {
+            for col in identity.iter_mut() {
+                if col.eq_ignore_ascii_case(old) {
+                    *col = new.to_string();
+                }
+            }
+            self.register_identity_columns(table, &identity)?;
+        }
+
+        Ok(())
+    }
+
+    /// REFUSE-or-proceed check for `ALTER TABLE <table> DROP COLUMN
+    /// <column>`, run BEFORE the schema is touched.
+    ///
+    /// PostgreSQL drops a column's OWN table constraints automatically and
+    /// refuses only when another object depends on the column. The one such
+    /// dependency Nano records is another table's FOREIGN KEY pointing at
+    /// this column, and dropping the column silently would leave that child's
+    /// FK naming a parent column that no longer exists — enforced by nothing,
+    /// exactly the failure this item is about. Refused without `CASCADE`,
+    /// which is both PostgreSQL's rule and the fail-closed one.
+    pub fn validate_drop_column_constraints(&self, table: &str, column: &str, cascade: bool) -> Result<()> {
+        if cascade {
+            return Ok(());
+        }
+        let mut dependents: Vec<String> = Vec::new();
+        for other in self.list_tables()? {
+            if other == table {
+                continue;
+            }
+            let constraints = self.load_table_constraints(&other)?;
+            for fk in &constraints.foreign_keys {
+                if fk.references_table == table && fk.references_columns.iter().any(|c| c.eq_ignore_ascii_case(column))
+                {
+                    dependents.push(format!("constraint {} on table {}", fk.name, other));
+                }
+            }
+        }
+        if dependents.is_empty() {
+            return Ok(());
+        }
+        Err(Error::query_execution(format!(
+            "cannot drop column \"{}\" of relation \"{}\" because other objects depend on it: {}. \
+             Use DROP COLUMN … CASCADE, or drop those constraints first.",
+            column,
+            table,
+            dependents.join(", ")
+        )))
+    }
+
+    /// Retire every persisted record that names `table`.`column`, and the
+    /// constraint-owned indexes behind them.
+    ///
+    /// PostgreSQL semantics: "indexes and table constraints involving the
+    /// column will be automatically dropped". A COMPOSITE constraint goes in
+    /// full — `UNIQUE (a, b)` with `b` dropped is not `UNIQUE (a)`, and
+    /// narrowing it would INVENT a rule the user never declared — and each
+    /// removal is logged at INFO so an operator can see what the DDL took
+    /// with it.
+    ///
+    /// The live indexes must go too, and not merely to reclaim memory: a
+    /// constraint tree whose column no longer resolves is inert *until*
+    /// someone runs `ADD COLUMN` with the old name, at which point every
+    /// probe starts resolving again and the resurrected tree rejects
+    /// duplicates on behalf of a constraint that was dropped. A user
+    /// `CREATE [UNIQUE] INDEX` is left alone: it is a relation the user owns
+    /// and `DROP INDEX` names, and its durable `meta:index:` record would
+    /// bring it back at the next open anyway.
+    pub fn drop_column_from_constraints(&self, table: &str, column: &str) -> Result<()> {
+        let names_column = |cols: &[String]| cols.iter().any(|c| c.eq_ignore_ascii_case(column));
+
+        let mut constraints = self.load_table_constraints(table)?;
+        let mut changed = false;
+        let mut removed_uniques: Vec<crate::sql::UniqueConstraint> = Vec::new();
+
+        constraints.unique_constraints.retain(|uc| {
+            if names_column(&uc.columns) {
+                tracing::info!(
+                    "DROP COLUMN {}.{}: retiring {} constraint '{}' on ({})",
+                    table,
+                    column,
+                    if uc.is_primary_key { "PRIMARY KEY" } else { "UNIQUE" },
+                    uc.name,
+                    uc.columns.join(", ")
+                );
+                removed_uniques.push(uc.clone());
+                changed = true;
+                return false;
+            }
+            true
+        });
+        constraints.foreign_keys.retain(|fk| {
+            // Both ends: the referencing list, and a SELF-referential FK's
+            // parent-side list.
+            let self_ref = fk.references_table == table && names_column(&fk.references_columns);
+            let hits = names_column(&fk.columns) || self_ref;
+            if hits {
+                tracing::info!(
+                    "DROP COLUMN {}.{}: retiring FOREIGN KEY constraint '{}'",
+                    table,
+                    column,
+                    fk.name
+                );
+                changed = true;
+            }
+            !hits
+        });
+        let mut check_err: Option<Error> = None;
+        constraints.check_constraints.retain(|cc| {
+            let hits = if Self::check_body_is_serialized(&cc.expression) {
+                match serde_json::from_str::<serde_json::Value>(&cc.expression) {
+                    Ok(parsed) => {
+                        let (mut found, mut opaque) = (false, false);
+                        Self::scan_check_json(&parsed, column, &mut found, &mut opaque);
+                        found
+                    }
+                    Err(e) => {
+                        // Unreadable body: it may or may not name the column,
+                        // and guessing either way is a silent answer. Fail the
+                        // statement instead.
+                        check_err.get_or_insert_with(|| {
+                            Error::query_execution(format!(
+                                "cannot drop column \"{}\" of relation \"{}\": CHECK constraint \"{}\" has an \
+                                 unreadable stored expression ({}). Drop the constraint first.",
+                                column, table, cc.name, e
+                            ))
+                        });
+                        false
+                    }
+                }
+            } else {
+                Self::check_text_mentions_column(&cc.expression, column)
+            };
+            if hits {
+                tracing::info!(
+                    "DROP COLUMN {}.{}: retiring CHECK constraint '{}'",
+                    table,
+                    column,
+                    cc.name
+                );
+                changed = true;
+            }
+            !hits
+        });
+        if let Some(e) = check_err {
+            return Err(e);
+        }
+        if changed {
+            self.save_table_constraints(table, &constraints)?;
+        }
+        if !removed_uniques.is_empty() {
+            self.drop_unique_constraint_indexes(table, &removed_uniques);
+        }
+
+        // Every OTHER table's parent-side reference. Reaching here means
+        // either nothing references the column or the caller passed CASCADE
+        // (`validate_drop_column_constraints` refuses otherwise), so these
+        // FKs are dropped exactly as PostgreSQL's CASCADE drops them.
+        for other in self.list_tables()? {
+            if other == table {
+                continue;
+            }
+            let mut other_constraints = self.load_table_constraints(&other)?;
+            let before = other_constraints.foreign_keys.len();
+            other_constraints
+                .foreign_keys
+                .retain(|fk| !(fk.references_table == table && names_column(&fk.references_columns)));
+            if other_constraints.foreign_keys.len() != before {
+                tracing::info!(
+                    "DROP COLUMN {}.{} CASCADE: retiring {} foreign key(s) on table '{}'",
+                    table,
+                    column,
+                    before - other_constraints.foreign_keys.len(),
+                    other
+                );
+                self.save_table_constraints(&other, &other_constraints)?;
+            }
+        }
+
+        // Constraint-owned live indexes over the column.
+        let art = self.storage.art_indexes();
+        for (name, _kind, cols) in art.list_table_indexes(table) {
+            if !cols.iter().any(|c| c.eq_ignore_ascii_case(column)) {
+                continue;
+            }
+            if self.index_definition_exists(&name).unwrap_or(false) {
+                continue;
+            }
+            if let Err(e) = art.drop_index(&name) {
+                tracing::warn!(
+                    "DROP COLUMN {}.{}: could not drop the constraint index '{}': {}",
+                    table,
+                    column,
+                    name,
+                    e
+                );
+            }
+        }
+
+        // IDENTITY side record.
+        let identity = self.list_identity_columns(table)?;
+        if identity.iter().any(|c| c.eq_ignore_ascii_case(column)) {
+            let kept: Vec<String> = identity
+                .into_iter()
+                .filter(|c| !c.eq_ignore_ascii_case(column))
+                .collect();
+            self.register_identity_columns(table, &kept)?;
+        }
+
+        Ok(())
+    }
+
     /// Build metadata key for table schema
     fn table_metadata_key(table_name: &str) -> Vec<u8> {
         format!("meta:table:{}", table_name).into_bytes()

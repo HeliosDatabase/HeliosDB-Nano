@@ -372,6 +372,8 @@ impl Planner {
             | LogicalPlan::AlterTableSetSchema { .. }
             | LogicalPlan::AlterTableAddForeignKey { .. }
             | LogicalPlan::AlterTableAddUnique { .. }
+            | LogicalPlan::AlterTableAddPrimaryKey { .. }
+            | LogicalPlan::AlterTableAddCheck { .. }
             | LogicalPlan::AlterTableAlterConstraintEnforcement { .. }
             | LogicalPlan::AlterTableDropConstraint { .. }
             | LogicalPlan::Truncate { .. }

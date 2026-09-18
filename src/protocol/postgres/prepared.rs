@@ -361,6 +361,20 @@ fn decode_text_parameter(data: &[u8], type_oid: i32) -> Result<Value> {
             // Text, Varchar
             Ok(Value::String(text.to_string()))
         }
+        26 => {
+            // sprinter 6ac716be10ea: `oid`. Parse now describes a parameter
+            // compared against a `pg_catalog` OID column as 26 (PostgreSQL's
+            // own type for it) rather than the `int4` Nano stores it as —
+            // tokio-postgres' TYPEINFO lookup binds `WHERE t.oid = $1` as an
+            // `Oid`, and `ToSql for u32` accepts `Type::OID` and nothing else.
+            // Decoded to `Int4` because that is what the catalogue views
+            // declare the column as; the unsigned top half widens to `Int8`
+            // rather than wrapping negative.
+            let val = text
+                .parse::<u32>()
+                .map_err(|e| Error::protocol(format!("Invalid Oid parameter: {}", e)))?;
+            Ok(oid_value(val))
+        }
         114 | 3802 => {
             // Json, Jsonb
             let _json: serde_json::Value =
@@ -399,6 +413,18 @@ fn decode_text_parameter(data: &[u8], type_oid: i32) -> Result<Value> {
             // Unknown type - treat as text
             Ok(Value::String(text.to_string()))
         }
+    }
+}
+
+/// One PostgreSQL `oid` value as the `Value` the catalogue views compare
+/// against. They declare their OID columns `Int4` (`crate::DataType` has no
+/// `oid` variant), so an OID that fits stays `Int4`; the unsigned top half
+/// widens to `Int8` instead of wrapping to a negative `Int4` that would match
+/// nothing. sprinter 6ac716be10ea.
+fn oid_value(oid: u32) -> Value {
+    match i32::try_from(oid) {
+        Ok(narrow) => Value::Int4(narrow),
+        Err(_) => Value::Int8(i64::from(oid)),
     }
 }
 
@@ -492,6 +518,39 @@ fn decode_binary_parameter(data: &[u8], type_oid: i32) -> Result<Value> {
             let text = std::str::from_utf8(data)
                 .map_err(|e| Error::protocol(format!("Invalid UTF-8 in text parameter: {}", e)))?;
             Ok(Value::String(text.to_string()))
+        }
+        26 => {
+            // sprinter 6ac716be10ea: `oid` — 4 bytes big-endian, UNSIGNED
+            // (`postgres_protocol::types::oid_from_sql`). This is the arm
+            // tokio-postgres' own TYPEINFO lookup lands in: it binds binary by
+            // default, so without it `WHERE t.oid = $1` decoded to
+            // `Value::Bytes` and matched nothing. See the text twin above.
+            if data.len() < 4 {
+                return Err(Error::protocol("Invalid Oid parameter length"));
+            }
+            let bytes: [u8; 4] = data
+                .get(0..4)
+                .and_then(|b| <[u8; 4]>::try_from(b).ok())
+                .ok_or_else(|| Error::protocol("Invalid Oid parameter"))?;
+            Ok(oid_value(u32::from_be_bytes(bytes)))
+        }
+        705 => {
+            // sprinter 6ac716be10ea: `unknown` — the type Parse now reports for
+            // a parameter no context determines (a bare `SELECT $1`, a function
+            // argument). A client binding against `unknown` is sending the
+            // value's TEXT form: `ToSql for str` is what accepts
+            // `Type::UNKNOWN`, and it writes plain UTF-8 under format 1. Read
+            // it as text so the engine coerces it exactly as the text-format
+            // twin does, and fall back to raw bytes if it is not UTF-8.
+            //
+            // Deliberately NOT merged with OID 0. A 0 the CLIENT declared is
+            // node-pg's `useBinary` Buffer path (`wire_tests::gh25_*`), whose
+            // payload is genuinely raw bytes; 705 is a type NANO chose to
+            // advertise, so the provenance — and the right reading — differs.
+            match std::str::from_utf8(data) {
+                Ok(text) => Ok(Value::String(text.to_string())),
+                Err(_) => Ok(Value::Bytes(data.to_vec())),
+            }
         }
         3614 | 3615 => {
             // HDB-002: tsvector / tsquery in BINARY format.

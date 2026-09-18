@@ -1633,6 +1633,21 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
             };
         }
 
+        // sprinter a3077a3f68d8: a USER-SETTABLE GUC (`statement_timeout`,
+        // `work_mem`, `bulk_load_mode`, the planner switches) must land on THIS
+        // session. The blanket acknowledgement below answered OK to every `SET`
+        // and applied none of them, so the MySQL wire was the one listener where
+        // `SET statement_timeout` was a pure lie; routing it here also keeps the
+        // knob off the process-global registry that used to back it.
+        if (starts_with_icase(trimmed, "SET ") || starts_with_icase(trimmed, "RESET "))
+            && EmbeddedDatabase::is_session_guc_statement(trimmed)
+        {
+            return match self.database.try_handle_session_guc(self.session_id, trimmed) {
+                Ok(_) => self.send_ok(0, 0).await,
+                Err(e) => self.send_error(1064, "42000", &e.to_string()).await,
+            };
+        }
+
         // ---- SET (session variables) — acknowledge silently ----
         if starts_with_icase(trimmed, "SET ") {
             return self.send_ok(0, 0).await;
@@ -1790,17 +1805,46 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
     /// WordPress, PHP and every MySQL driver are written against that, so this
     /// listener clears the engine's mark once it has reported the error.
     ///
-    /// ⚠️ Pre-existing gap (sprinter item): the rows the FAILED statement had
-    /// already staged before it failed are NOT discarded — the engine has no
-    /// per-statement undo point, so a multi-row `INSERT` that violates a
-    /// constraint on its third row leaves rows one and two in the write set.
-    /// Real MySQL would have discarded them.
+    /// Keeping the block open is only safe together with
+    /// [`Self::statement_savepoint`] (sprinter 5b70b7ac5513): the callers that
+    /// run a statement take an implicit per-statement savepoint first and roll
+    /// back to it before they get here, so the rows a half-finished statement
+    /// staged are gone by the time the transaction is un-aborted. Un-aborting
+    /// WITHOUT that rollback is the data-integrity hole the item was filed for —
+    /// a multi-row `INSERT` that violates a constraint on its third row left
+    /// rows one and two in the write set, and the next `COMMIT` persisted them.
     async fn send_statement_error(&mut self, msg: &str) -> Result<()> {
         if self.in_transaction {
             let _ = self.database.clear_session_transaction_failure(self.session_id);
         }
         let (code, state) = map_error_code(msg);
         self.send_error(code, state, msg).await
+    }
+
+    /// sprinter 5b70b7ac5513: the implicit savepoint to take BEFORE running one
+    /// statement, so a statement that fails half-way can be undone whole.
+    ///
+    /// `None` outside an explicit transaction, which is the common case and
+    /// costs nothing: an autocommit statement is its own unit and the engine
+    /// already unwinds it.
+    ///
+    /// MySQL's statement-level semantics are the reason this listener needs it
+    /// and the PostgreSQL one does not — see
+    /// [`EmbeddedDatabase::statement_savepoint_for_session`].
+    fn statement_savepoint(&self) -> Option<crate::ImplicitStatementSavepoint> {
+        if !self.in_transaction {
+            return None;
+        }
+        self.database.statement_savepoint_for_session(self.session_id)
+    }
+
+    /// Undo whatever the statement staged before it failed. Paired with
+    /// [`Self::statement_savepoint`]; a no-op when that returned `None`.
+    fn rollback_failed_statement(&self, savepoint: Option<crate::ImplicitStatementSavepoint>) {
+        if let Some(savepoint) = savepoint {
+            self.database
+                .rollback_statement_for_session(self.session_id, &savepoint);
+        }
     }
 
     // ------------------------------------------------------------------
@@ -1839,6 +1883,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
                 None
             };
 
+            // sprinter 5b70b7ac5513: one implicit savepoint per STATEMENT — the
+            // loop matters, because `split_sql_respecting_quotes` above can hand
+            // this arm several statements and MySQL's unit of rollback is the
+            // statement, not the batch. Rows an earlier statement of the same
+            // batch committed to the write set stay staged, exactly as MySQL
+            // leaves them.
+            let savepoint = self.statement_savepoint();
             match self.database.execute_for_session(self.session_id, stmt) {
                 Ok(affected) => {
                     total_affected += affected;
@@ -1853,6 +1904,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
                     }
                 }
                 Err(e) => {
+                    // Discard the rows this statement staged BEFORE
+                    // `send_statement_error` un-aborts the transaction — the
+                    // order is the fix: un-aborting first would leave them
+                    // committable.
+                    self.rollback_failed_statement(savepoint);
                     return self.send_statement_error(&e.to_string()).await;
                 }
             }
@@ -1864,228 +1920,24 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
         self.send_ok(total_affected, last_insert_id).await
     }
 
-    /// Handle INSERT ... ON DUPLICATE KEY UPDATE (MySQL upsert).
-    ///
-    /// The translator has already stripped the ON DUPLICATE KEY UPDATE clause,
-    /// so `translated_sql` is a plain INSERT.  We try the INSERT first; if it
-    /// fails with a duplicate-key error we build an UPDATE from the original
-    /// MySQL SQL and execute that instead.
-    async fn handle_upsert_dml(&mut self, translated_sql: &str, raw_sql: &str) -> Result<()> {
-        // Try the plain INSERT first
-        match self.database.execute_for_session(self.session_id, translated_sql) {
-            Ok(affected) => {
-                let table_name = Self::extract_insert_table(translated_sql);
-                let insert_id = if affected > 0 {
-                    if let Some(ref tbl) = table_name {
-                        self.query_last_serial_id(tbl)
-                    } else {
-                        0
-                    }
-                } else {
-                    0
-                };
-                if insert_id > 0 {
-                    self.last_insert_id = insert_id;
-                }
-                self.send_ok(affected, insert_id).await
-            }
-            Err(e) => {
-                let msg = e.to_string();
-                let msg_lower = msg.to_lowercase();
-                // Check if this is a duplicate key error (case-insensitive)
-                if msg_lower.contains("duplicate key")
-                    || msg_lower.contains("unique constraint")
-                    || msg_lower.contains("primary key constraint")
-                {
-                    // Build an UPDATE from the ON DUPLICATE KEY UPDATE clause
-                    if let Some(update_sql) = Self::build_upsert_update(raw_sql) {
-                        let translated_update = super::translator::translate(&update_sql);
-                        match self.database.execute_for_session(self.session_id, &translated_update) {
-                            Ok(affected) => self.send_ok(affected, 0).await,
-                            Err(ue) => {
-                                let umsg = ue.to_string();
-                                let (code, state) = map_error_code(&umsg);
-                                self.send_error(code, state, &umsg).await
-                            }
-                        }
-                    } else {
-                        // Could not build UPDATE — report the original duplicate error
-                        let (code, state) = map_error_code(&msg);
-                        self.send_error(code, state, &msg).await
-                    }
-                } else {
-                    let (code, state) = map_error_code(&msg);
-                    self.send_error(code, state, &msg).await
-                }
-            }
-        }
-    }
-
-    /// Build an UPDATE statement from a MySQL INSERT ... ON DUPLICATE KEY UPDATE.
-    ///
-    /// Given: `INSERT INTO t (a, b, c) VALUES (1, 'x', 3) ON DUPLICATE KEY UPDATE b = VALUES(b), c = VALUES(c)`
-    /// Produce: `UPDATE t SET b = 'x', c = 3 WHERE a = 1`
-    /// (assuming `a` is the primary key)
-    fn build_upsert_update(raw_sql: &str) -> Option<String> {
-        let upper = raw_sql.to_uppercase();
-        let odk_pos = upper.find("ON DUPLICATE KEY UPDATE")?;
-
-        // Extract the SET clause from ON DUPLICATE KEY UPDATE
-        let set_part = raw_sql.get(odk_pos + 23..)?.trim();
-
-        // Extract table name
-        let table_name = Self::extract_insert_table(raw_sql)?;
-
-        // Extract column list and values from the INSERT part
-        let insert_part = &raw_sql[..odk_pos];
-        let (columns, values) = Self::extract_insert_columns_values(insert_part)?;
-
-        // Build a column -> value map for VALUES() references
-        let mut col_val_map = std::collections::HashMap::new();
-        for (i, col) in columns.iter().enumerate() {
-            if let Some(val) = values.get(i) {
-                col_val_map.insert(col.to_uppercase(), val.clone());
-            }
-        }
-
-        // Parse and resolve the SET assignments
-        let mut set_clauses = Vec::new();
-        for assignment in set_part.split(',') {
-            let parts: Vec<&str> = assignment.trim().splitn(2, '=').collect();
-            if parts.len() != 2 {
-                continue;
-            }
-            let col = parts[0].trim().trim_matches('`');
-            let expr = parts[1].trim();
-            let expr_upper = expr.to_uppercase();
-
-            // Resolve VALUES(col_name) references
-            if expr_upper.starts_with("VALUES(") || expr_upper.starts_with("VALUES (") {
-                let inner = expr.trim_end_matches(')');
-                let inner = inner.find('(').map(|p| &inner[p + 1..])?;
-                let ref_col = inner.trim().trim_matches('`').to_uppercase();
-                if let Some(val) = col_val_map.get(&ref_col) {
-                    set_clauses.push(format!("{} = {}", col, val));
-                }
-            } else {
-                set_clauses.push(format!("{} = {}", col, expr));
-            }
-        }
-
-        if set_clauses.is_empty() {
-            return None;
-        }
-
-        // Build WHERE clause from the first column (assumed to be PK)
-        // This is a simplification — the first column in the INSERT is typically the PK
-        // or UNIQUE key that caused the conflict
-        let where_clause = if let (Some(pk_col), Some(pk_val)) = (columns.first(), values.first()) {
-            format!("{} = {}", pk_col, pk_val)
-        } else {
-            return None;
-        };
-
-        Some(format!(
-            "UPDATE {} SET {} WHERE {}",
-            table_name,
-            set_clauses.join(", "),
-            where_clause
-        ))
-    }
-
-    /// Extract column names and value literals from an INSERT statement.
-    fn extract_insert_columns_values(insert_sql: &str) -> Option<(Vec<String>, Vec<String>)> {
-        // Find column list
-        let first_paren = insert_sql.find('(')?;
-        let first_close = insert_sql.find(')')?;
-        let col_str = insert_sql.get(first_paren + 1..first_close)?;
-        let columns: Vec<String> = col_str
-            .split(',')
-            .map(|c| c.trim().trim_matches('`').to_string())
-            .collect();
-
-        // Find VALUES
-        let upper = insert_sql.to_uppercase();
-        let values_pos = upper.find("VALUES")?;
-        let rest = insert_sql.get(values_pos + 6..)?.trim();
-        let val_open = rest.find('(')?;
-        // Find matching close paren (handle quoted strings)
-        let inner = rest.get(val_open + 1..)?;
-        let close_idx = Self::find_matching_close_paren(inner)?;
-        let val_str = inner.get(..close_idx)?;
-
-        // Split values respecting quoted strings
-        let values = Self::split_sql_values(val_str);
-
-        Some((columns, values))
-    }
-
-    /// Find matching close paren, respecting single-quoted strings.
-    fn find_matching_close_paren(s: &str) -> Option<usize> {
-        let mut depth = 0u32;
-        let mut in_quote = false;
-        for (i, ch) in s.char_indices() {
-            if in_quote {
-                if ch == '\'' {
-                    in_quote = false;
-                }
-                continue;
-            }
-            match ch {
-                '\'' => in_quote = true,
-                '(' => depth += 1,
-                ')' => {
-                    if depth == 0 {
-                        return Some(i);
-                    }
-                    depth -= 1;
-                }
-                _ => {}
-            }
-        }
-        None
-    }
-
-    /// Split comma-separated SQL values, respecting single-quoted strings.
-    fn split_sql_values(s: &str) -> Vec<String> {
-        let mut result = Vec::new();
-        let mut current = String::new();
-        let mut in_quote = false;
-        let mut depth = 0u32;
-
-        for ch in s.chars() {
-            if in_quote {
-                current.push(ch);
-                if ch == '\'' {
-                    in_quote = false;
-                }
-                continue;
-            }
-            match ch {
-                '\'' => {
-                    in_quote = true;
-                    current.push(ch);
-                }
-                '(' => {
-                    depth += 1;
-                    current.push(ch);
-                }
-                ')' => {
-                    depth = depth.saturating_sub(1);
-                    current.push(ch);
-                }
-                ',' if depth == 0 => {
-                    result.push(current.trim().to_string());
-                    current.clear();
-                }
-                _ => current.push(ch),
-            }
-        }
-        if !current.trim().is_empty() {
-            result.push(current.trim().to_string());
-        }
-        result
-    }
+    // sprinter 5b70b7ac5513: `handle_upsert_dml` and its four exclusive helpers
+    // (`build_upsert_update`, `extract_insert_columns_values`,
+    // `find_matching_close_paren`, `split_sql_values`) were REMOVED here as dead
+    // code — a caller census over src/, tests/, benches/, examples/, bindings/
+    // and tools/ found the entry point defined once and called nowhere, with the
+    // four helpers reachable only from it.
+    //
+    // It was the legacy MySQL upsert emulation: run the translator-stripped
+    // plain INSERT, string-match the error text for "duplicate key", and rebuild
+    // an UPDATE out of the original SQL. `ON DUPLICATE KEY UPDATE` is now
+    // translated to `ON CONFLICT DO UPDATE` (`super::translator`) and executed
+    // natively, so `handle_com_query` routes an upsert to `execute_dml` like any
+    // other DML. The crate-level `#![allow(dead_code)]` is why the compiler never
+    // said so.
+    //
+    // It was also the only DML path in this file that bypassed
+    // `send_statement_error`, so reviving it as written would have skipped both
+    // the HDB-008 handling and the per-statement savepoint added by this item.
 
     /// Extract the table name from an INSERT statement.
     fn extract_insert_table(sql: &str) -> Option<String> {
@@ -3338,6 +3190,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
             } else {
                 None
             };
+            // sprinter 5b70b7ac5513: the prepared/binary twin of the
+            // `execute_dml` arm — the extended protocol is how most MySQL
+            // drivers send a multi-row INSERT, so the statement savepoint has to
+            // cover it too or the hole simply moves here.
+            let savepoint = self.statement_savepoint();
             match self
                 .database
                 .execute_params_for_session(self.session_id, trimmed, &params)
@@ -3356,7 +3213,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
                     self.last_row_count = affected;
                     self.send_ok(affected, insert_id).await
                 }
-                Err(e) => self.send_statement_error(&e.to_string()).await,
+                Err(e) => {
+                    self.rollback_failed_statement(savepoint);
+                    self.send_statement_error(&e.to_string()).await
+                }
             }
         }
     }
@@ -3754,6 +3614,26 @@ fn map_error_code(err_msg: &str) -> (u16, &'static str) {
     // reported before).
     if err_msg.contains(crate::error::UNSUPPORTED_STATEMENT_KIND_MARKER) {
         return (1235, "0A000"); // ER_NOT_SUPPORTED_YET
+    }
+    // sprinter d03de7fc3b22: a spent tenant resource quota. MySQL's own code for
+    // "this account has exceeded a resource limit" is ER_USER_LIMIT_REACHED;
+    // both wires read the ONE marker const the emitters own, so they cannot
+    // disagree about which refusals are "out of budget" rather than "the server
+    // is broken" (1105 / HY000, which is what this reported before). Checked
+    // early, like the two markers above, because the message names the tenant
+    // and a tenant id is free text.
+    if lower.contains(crate::TENANT_QUOTA_EXCEEDED_MARKER) {
+        return (1226, "42000"); // ER_USER_LIMIT_REACHED
+    }
+    // sprinter f32ba64c00a7: a NULL in a PRIMARY KEY column whose declared type
+    // the row-id allocator cannot produce. MySQL's own code for a NULL in a NOT
+    // NULL column is ER_BAD_NULL_ERROR. Anchored on the same const the
+    // PostgreSQL wire keys 23502 on, and checked BEFORE the wording arms: the
+    // message says "constraint", which the `foreign key || constraint` arm
+    // below would otherwise claim as 1452 ER_NO_REFERENCED_ROW_2 — telling the
+    // client a FOREIGN KEY failed when no foreign key is involved.
+    if err_msg.contains(crate::error::NOT_NULL_VIOLATION_MARKER) {
+        return (1048, "23000"); // ER_BAD_NULL_ERROR
     }
     // HDB-008: the engine's aborted-transaction refusals — the 25P02 statement
     // refusal and the embedded COMMIT refusal — share this prefix (the two

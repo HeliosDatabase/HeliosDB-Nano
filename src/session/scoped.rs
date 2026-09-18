@@ -32,16 +32,34 @@
 //! `sql::settings::SessionSettings` registry, exactly as GH#28 kept the
 //! connection-lifetime timeouts off it.
 //!
+//! Two later items moved more state in here for exactly the same reason:
+//!
+//! * sprinter 7903b7111cb4 — `currval('s')`. The sequence STORE stays process-
+//!   wide (that is a durability decision, see `crate::sql::sequences`), but
+//!   `currval`'s OBSERVABLE value is "what *this session's* last `nextval` on
+//!   that sequence returned", so the per-sequence value is recorded here at the
+//!   same point `lastval` is. One write serves both.
+//! * sprinter a3077a3f68d8 — the USER-SETTABLE GUC overlay (`statement_timeout`,
+//!   `work_mem`, `bulk_load_mode`, the planner switches …). `SET` on those used
+//!   to write the ONE process-global `sql::settings::SessionSettings` registry,
+//!   so `SET statement_timeout = 1` on any connection cancelled every other
+//!   connection's queries. They are per-session in PostgreSQL and they are
+//!   per-session here now; the registry keeps only genuine SERVER-level
+//!   parameters (`sql::settings::is_server_level`).
+//!
 //! The one deliberately process-wide structure here is [`live_backends`] — the
 //! registry `pg_stat_activity` scans. Listing every live connection IS that
 //! view's purpose, and each entry is a `Weak` handle on the very state the
 //! session holds, so the catalog can never disagree with what the connection
 //! itself reports — and a closed connection drops out of it automatically.
 
-use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicI8, Ordering};
 use std::sync::{Arc, Weak};
 
 use dashmap::DashMap;
+
+use crate::sql::SettingValue;
 
 /// Sentinel stored in [`SessionScopedState::lastval`] for "no `nextval` has run
 /// in this session". `i64::MIN` is not a value any sequence can serve (a
@@ -58,6 +76,32 @@ const LASTVAL_UNDEFINED: i64 = i64::MIN;
 /// the message cannot drift — the same marker-const discipline GH#28 used for
 /// `SET_LOCAL_TIMEOUT_GUC_UNSUPPORTED`.
 pub const LASTVAL_UNDEFINED_MESSAGE: &str = "lastval is not yet defined in this session";
+
+/// PostgreSQL's own message for `currval('s')` before this session has advanced
+/// `s` (`commands/sequence.c`), reported under the same SQLSTATE 55000
+/// `object_not_in_prerequisite_state` as [`LASTVAL_UNDEFINED_MESSAGE`]
+/// — sprinter 7903b7111cb4.
+///
+/// The sequence NAME is interpolated, so the wire layer's SQLSTATE mapping
+/// anchors on [`CURRVAL_UNDEFINED_PREFIX`] rather than on the whole string; the
+/// message itself is still owned by the single emitter, so wording and code
+/// cannot drift.
+pub fn currval_undefined_message(name: &str) -> String {
+    format!("{CURRVAL_UNDEFINED_PREFIX} \"{name}\" is not yet defined in this session")
+}
+
+/// The invariant prefix of [`currval_undefined_message`] — the marker the
+/// SQLSTATE classifiers match on.
+pub const CURRVAL_UNDEFINED_PREFIX: &str = "currval of sequence";
+
+/// Sentinel stored in the `statement_timeout_ms` mirror for "this session has
+/// not set `statement_timeout`". `0` cannot be the sentinel: `SET
+/// statement_timeout = 0` is PostgreSQL for *unlimited*, and it must override a
+/// configured server default rather than fall through to it.
+const GUC_TIMEOUT_UNSET: i64 = -1;
+
+/// Sentinel for the `bulk_load_mode` mirror: `-1` no override, `0` off, `1` on.
+const GUC_TRISTATE_UNSET: i8 = -1;
 
 /// Allocate the next backend pid. Starts at 1 and never repeats within the
 /// process, which is all `pg_backend_pid()` promises: unique among LIVE
@@ -148,6 +192,48 @@ pub struct SessionScopedState {
     /// funnels and over an in-memory duplex stream).
     client_addr: parking_lot::RwLock<Option<String>>,
     client_port: AtomicI32,
+    /// sprinter 7903b7111cb4: `sequence name -> the value THIS session's last
+    /// `nextval` on it returned`. Absent = `currval('s')` raises 55000, exactly
+    /// as PostgreSQL does, instead of answering another connection's id.
+    ///
+    /// The map — not a single slot — because `currval` names a sequence and
+    /// must follow THAT one, while `lastval` (the slot above) follows whichever
+    /// sequence moved last. One `nextval` writes both (see [`Self::note_nextval`]).
+    seq_currval: parking_lot::RwLock<HashMap<String, i64>>,
+    /// Lock-free mirror of `!seq_currval.is_empty()`, so a session that has
+    /// never touched a sequence answers `currval` without taking the lock.
+    seq_currval_present: AtomicBool,
+    /// sprinter a3077a3f68d8: this session's USER-SETTABLE GUC overrides — the
+    /// values `SET` installs and `SHOW` / `current_setting()` / the executor
+    /// read back. Empty for every session that never issued one.
+    ///
+    /// This is the map that used to be `EmbeddedDatabase::session_settings`, a
+    /// single process-global registry whose name was a lie: one connection's
+    /// `SET statement_timeout = 1` cancelled every other connection's queries
+    /// and one connection's `SET bulk_load_mode = on` flipped the storage
+    /// engine's flag for the whole process.
+    gucs: parking_lot::RwLock<HashMap<String, SettingValue>>,
+    /// Lock-free mirror of `!gucs.is_empty()`. The long-tail GUC readers gate on
+    /// this so an unmodified session never pays the map lock.
+    guc_overrides_present: AtomicBool,
+    /// Lock-free mirror of the `statement_timeout` override in milliseconds
+    /// ([`GUC_TIMEOUT_UNSET`] = none). `EmbeddedDatabase::effective_statement_timeout_ms`
+    /// runs on EVERY executor construction, so it must not lowercase a name into
+    /// a fresh `String` and take a lock the way the old registry read did — this
+    /// mirror makes that read one relaxed atomic load, which is strictly cheaper
+    /// than what it replaces.
+    statement_timeout_ms: AtomicI64,
+    /// Lock-free mirror of the `bulk_load_mode` override
+    /// ([`GUC_TRISTATE_UNSET`] = none, `0` off, `1` on). Read by
+    /// `StorageEngine::is_bulk_load_mode` on per-row insert paths, so it has to
+    /// be exactly this cheap.
+    bulk_load_mode: AtomicI8,
+    /// `SET LOCAL` support for the overlay: `name -> the value to restore when
+    /// the current transaction block ends` (`None` = the name had no override,
+    /// so restoring means REMOVING it). Armed on the first `SET LOCAL` of a
+    /// block per name and disarmed by [`Self::end_transaction`], the same shape
+    /// `application_name_saved` above uses.
+    gucs_saved: parking_lot::Mutex<Option<HashMap<String, Option<SettingValue>>>>,
 }
 
 impl SessionScopedState {
@@ -165,6 +251,13 @@ impl SessionScopedState {
             username: parking_lot::RwLock::new(String::new()),
             client_addr: parking_lot::RwLock::new(None),
             client_port: AtomicI32::new(0),
+            seq_currval: parking_lot::RwLock::new(HashMap::new()),
+            seq_currval_present: AtomicBool::new(false),
+            gucs: parking_lot::RwLock::new(HashMap::new()),
+            guc_overrides_present: AtomicBool::new(false),
+            statement_timeout_ms: AtomicI64::new(GUC_TIMEOUT_UNSET),
+            bulk_load_mode: AtomicI8::new(GUC_TRISTATE_UNSET),
+            gucs_saved: parking_lot::Mutex::new(None),
         });
         live_backends().insert(state.backend_pid, Arc::downgrade(&state));
         state
@@ -186,14 +279,158 @@ impl SessionScopedState {
 
     /// `lastval()` — `None` when no `nextval` has run in this session.
     ///
-    /// Note the deliberate asymmetry with `currval`, which returns `0` for an
-    /// unknown sequence (a documented Nano divergence, see
-    /// `crate::sql::sequences`): a `0` here would be indistinguishable from a
-    /// real row id to `cursor.lastrowid`, so this one fails closed.
+    /// Fails closed: a `0` here would be indistinguishable from a real row id to
+    /// `cursor.lastrowid`. sprinter 7903b7111cb4 brought `currval` into line —
+    /// it used to be the odd one out, answering `0` for a sequence this session
+    /// had never advanced (and another connection's value when it had).
     pub fn lastval(&self) -> Option<i64> {
         match self.lastval.load(Ordering::Relaxed) {
             LASTVAL_UNDEFINED => None,
             v => Some(v),
+        }
+    }
+
+    /// sprinter 7903b7111cb4: record one `nextval('<name>')` return — BOTH the
+    /// session's `lastval()` and its `currval('<name>')`.
+    ///
+    /// One call from the one evaluator arm that produces such a value, so the
+    /// two functions can never disagree about what "this session" means (they
+    /// did: `LASTVAL()` shipped session-scoped in v4.38.0 while `currval` was
+    /// still reading the process-wide sequence runtime).
+    ///
+    /// `name` is stored exactly as the caller spelled it, because that is how
+    /// `crate::sql::sequences::STORE` keys the runtime too — `nextval('s')` and
+    /// `nextval('public.s')` are already two different sequences to this engine,
+    /// and a normalization here would make `currval` disagree with `nextval`.
+    pub fn note_nextval(&self, name: &str, value: i64) {
+        self.note_lastval(value);
+        self.note_currval(name, value);
+    }
+
+    /// Record a `currval` value for `name` WITHOUT touching `lastval`.
+    ///
+    /// The `setval('s', n)` arm calls this: PostgreSQL documents `setval` as
+    /// setting `currval` for the calling session, but it is not a value
+    /// `nextval` returned, so it must not move `lastval()`.
+    pub fn note_currval(&self, name: &str, value: i64) {
+        let mut map = self.seq_currval.write();
+        map.insert(name.to_string(), value);
+        drop(map);
+        self.seq_currval_present.store(true, Ordering::Relaxed);
+    }
+
+    /// `currval('<name>')` — `None` when THIS session has never advanced (or
+    /// `setval`'d) that sequence, which the caller must report as SQLSTATE 55000
+    /// with [`currval_undefined_message`].
+    pub fn currval(&self, name: &str) -> Option<i64> {
+        // Hot gate: a session that has never touched a sequence — every read-only
+        // connection — answers without taking the lock.
+        if !self.seq_currval_present.load(Ordering::Relaxed) {
+            return None;
+        }
+        self.seq_currval.read().get(name).copied()
+    }
+
+    // ---- sprinter a3077a3f68d8: the per-session USER-SETTABLE GUC overlay ----
+
+    /// `SET <name> = <value>` (session scope) for a user-settable GUC.
+    ///
+    /// The caller has already validated the value
+    /// (`sql::settings::SessionSettings::validate_setting`) and established that
+    /// `name` is user-settable rather than server-level — this type stores, it
+    /// does not police.
+    pub fn set_guc(&self, name: &str, value: SettingValue) {
+        let mut map = self.gucs.write();
+        map.insert(name.to_string(), value.clone());
+        let present = !map.is_empty();
+        drop(map);
+        self.guc_overrides_present.store(present, Ordering::Relaxed);
+        self.refresh_guc_mirror(name, Some(&value));
+    }
+
+    /// `SET LOCAL <name> = <value>` inside an open transaction block.
+    ///
+    /// Arms the restore slot for `name` on the FIRST `SET LOCAL` of the block
+    /// only, so two `SET LOCAL`s of the same name in one transaction both revert
+    /// to the value the block started with (PostgreSQL semantics), not to each
+    /// other — the rule [`Self::set_local_application_name`] already follows.
+    ///
+    /// GH#28 REFUSED `SET LOCAL` for the three connection-lifetime timeout GUCs
+    /// because `Session` had nowhere to keep transaction-scoped state. This
+    /// overlay is that place, so the generic GUCs do not need the refusal; the
+    /// GH#28 names keep theirs (they live on `Session`, not here).
+    pub fn set_local_guc(&self, name: &str, value: SettingValue) {
+        {
+            let mut saved = self.gucs_saved.lock();
+            let slot = saved.get_or_insert_with(HashMap::new);
+            if !slot.contains_key(name) {
+                let previous = self.gucs.read().get(name).cloned();
+                slot.insert(name.to_string(), previous);
+            }
+        }
+        self.set_guc(name, value);
+    }
+
+    /// `RESET <name>` / `SET <name> TO DEFAULT` — drop this session's override so
+    /// the name reads back as the server default again.
+    pub fn reset_guc(&self, name: &str) {
+        let mut map = self.gucs.write();
+        map.remove(name);
+        let present = !map.is_empty();
+        drop(map);
+        self.guc_overrides_present.store(present, Ordering::Relaxed);
+        self.refresh_guc_mirror(name, None);
+    }
+
+    /// This session's override for `name`, if it has one.
+    pub fn guc(&self, name: &str) -> Option<SettingValue> {
+        if !self.guc_overrides_present.load(Ordering::Relaxed) {
+            return None;
+        }
+        self.gucs.read().get(name).cloned()
+    }
+
+    /// This session's `statement_timeout` in milliseconds, or `None` when it has
+    /// not set one (`Some(0)` is PostgreSQL's *unlimited*, and is NOT the same
+    /// answer as `None` — it overrides a configured server default).
+    ///
+    /// One relaxed atomic load: this is read for every executor.
+    pub fn statement_timeout_ms(&self) -> Option<u64> {
+        match self.statement_timeout_ms.load(Ordering::Relaxed) {
+            GUC_TIMEOUT_UNSET => None,
+            ms => Some(ms.max(0) as u64),
+        }
+    }
+
+    /// This session's `bulk_load_mode`, or `None` when it has not set one (the
+    /// storage engine then uses its own server-level flag).
+    pub fn bulk_load_mode(&self) -> Option<bool> {
+        match self.bulk_load_mode.load(Ordering::Relaxed) {
+            GUC_TRISTATE_UNSET => None,
+            v => Some(v != 0),
+        }
+    }
+
+    /// Keep the two lock-free mirrors in step with the map. `value == None` is a
+    /// reset (back to the sentinel).
+    ///
+    /// Only the two hot-path names have a mirror; every other GUC is read
+    /// through [`Self::guc`], which is gated on `guc_overrides_present`.
+    fn refresh_guc_mirror(&self, name: &str, value: Option<&SettingValue>) {
+        match name {
+            "statement_timeout" => {
+                let ms = value
+                    .and_then(|v| v.as_duration_ms())
+                    .map_or(GUC_TIMEOUT_UNSET, |ms| ms.min(i64::MAX as u64) as i64);
+                self.statement_timeout_ms.store(ms, Ordering::Relaxed);
+            }
+            "bulk_load_mode" => {
+                let flag = value
+                    .and_then(|v| v.as_bool())
+                    .map_or(GUC_TRISTATE_UNSET, |on| i8::from(on));
+                self.bulk_load_mode.store(flag, Ordering::Relaxed);
+            }
+            _ => {}
         }
     }
 
@@ -232,13 +469,25 @@ impl SessionScopedState {
     /// End of a transaction block — COMMIT *and* ROLLBACK alike. PostgreSQL
     /// reverts a `SET LOCAL` in both cases, so this is called from both.
     ///
-    /// A no-op (one uncontended mutex probe) when no `SET LOCAL` is armed,
+    /// A no-op (two uncontended mutex probes) when no `SET LOCAL` is armed,
     /// which is every transaction in practice.
     pub fn end_transaction(&self) {
         let restore = self.application_name_saved.lock().take();
         if let Some(previous) = restore {
             let mut slot = self.application_name.write();
             *slot = previous;
+        }
+        // sprinter a3077a3f68d8: the generic GUC overlay reverts on the same
+        // boundary and for the same reason — PostgreSQL reverts `SET LOCAL` on
+        // COMMIT *and* ROLLBACK alike, and both callers already reach here.
+        let restore_gucs = self.gucs_saved.lock().take();
+        if let Some(previous) = restore_gucs {
+            for (name, value) in previous {
+                match value {
+                    Some(v) => self.set_guc(&name, v),
+                    None => self.reset_guc(&name),
+                }
+            }
         }
     }
 
@@ -350,6 +599,88 @@ mod tests {
             pid
         };
         assert!(!live_backends().contains_key(&pid), "a dropped backend stayed listed");
+    }
+
+    /// sprinter 7903b7111cb4: `currval` is per SEQUENCE and per SESSION, and one
+    /// `nextval` write serves both it and `lastval()`.
+    #[test]
+    fn currval_is_per_sequence_and_per_session() {
+        let a = SessionScopedState::new();
+        let b = SessionScopedState::new();
+        assert!(a.currval("s").is_none(), "a fresh session has no currval");
+
+        a.note_nextval("s", 7);
+        assert_eq!(a.currval("s"), Some(7));
+        assert_eq!(a.lastval(), Some(7), "one write must serve both");
+        assert!(b.currval("s").is_none(), "session B saw session A's currval");
+        assert!(a.currval("other").is_none(), "currval leaked across sequence names");
+
+        // `lastval` follows the LAST sequence; `currval` follows the NAMED one.
+        a.note_nextval("other", 500);
+        assert_eq!(a.lastval(), Some(500));
+        assert_eq!(a.currval("s"), Some(7));
+
+        // `setval` defines currval without moving lastval (PostgreSQL).
+        a.note_currval("s", 4242);
+        assert_eq!(a.currval("s"), Some(4242));
+        assert_eq!(a.lastval(), Some(500));
+    }
+
+    /// sprinter a3077a3f68d8: the GUC overlay is per session, the hot mirrors
+    /// track the map, and `RESET` really drops the override (rather than writing
+    /// a default over it, which would pin a session to a stale value).
+    #[test]
+    fn the_guc_overlay_is_per_session_and_its_mirrors_track_it() {
+        let a = SessionScopedState::new();
+        let b = SessionScopedState::new();
+        assert!(a.statement_timeout_ms().is_none());
+        assert!(a.bulk_load_mode().is_none());
+
+        a.set_guc("statement_timeout", SettingValue::Duration(250));
+        a.set_guc("bulk_load_mode", SettingValue::Boolean(true));
+        assert_eq!(a.statement_timeout_ms(), Some(250));
+        assert_eq!(a.bulk_load_mode(), Some(true));
+        assert!(b.statement_timeout_ms().is_none(), "session B saw session A's GUC");
+        assert!(b.bulk_load_mode().is_none(), "session B saw session A's GUC");
+
+        // `0` is PostgreSQL's *unlimited* — a VALUE, distinct from "unset",
+        // because it must beat a configured server default.
+        a.set_guc("statement_timeout", SettingValue::Duration(0));
+        assert_eq!(a.statement_timeout_ms(), Some(0));
+
+        a.reset_guc("statement_timeout");
+        assert!(a.statement_timeout_ms().is_none());
+        assert!(a.guc("statement_timeout").is_none());
+        // The other override survives its neighbour's reset.
+        assert_eq!(a.bulk_load_mode(), Some(true));
+        a.reset_guc("bulk_load_mode");
+        assert!(a.bulk_load_mode().is_none());
+    }
+
+    /// `SET LOCAL` reverts to the value the BLOCK started with, for every name it
+    /// touched — including back to "no override at all".
+    #[test]
+    fn set_local_guc_reverts_at_the_end_of_the_block() {
+        let s = SessionScopedState::new();
+        s.set_guc("statement_timeout", SettingValue::Duration(5_000));
+
+        s.set_local_guc("statement_timeout", SettingValue::Duration(250));
+        s.set_local_guc("statement_timeout", SettingValue::Duration(750));
+        // A name with NO prior override must go back to having none.
+        s.set_local_guc("work_mem", SettingValue::Integer(65_536));
+        assert_eq!(s.statement_timeout_ms(), Some(750));
+
+        s.end_transaction();
+        assert_eq!(s.statement_timeout_ms(), Some(5_000), "reverted to the wrong value");
+        assert!(
+            s.guc("work_mem").is_none(),
+            "a SET LOCAL on a fresh name must leave none"
+        );
+
+        // Disarmed: a later block end must not re-restore.
+        s.set_guc("statement_timeout", SettingValue::Duration(1));
+        s.end_transaction();
+        assert_eq!(s.statement_timeout_ms(), Some(1));
     }
 
     #[test]

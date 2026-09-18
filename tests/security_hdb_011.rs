@@ -34,17 +34,18 @@
 //! Not covered here, deliberately:
 //!   * tokio-postgres' `TYPEINFO` lookup does not fire on its own: every OID
 //!     Nano puts on the wire (`datatype_to_oid` in handler.rs — `vector`
-//!     included, which is advertised as 1000) is one tokio-postgres already
+//!     included, which is advertised as `text`) is one tokio-postgres already
 //!     knows. Case 12 runs the statement the driver WOULD send by hand
 //!     instead, including its `LEFT OUTER JOIN pg_catalog.pg_range`, which is
 //!     now a registered (empty) system view.
-//!   * `client.prepare`/`client.query` with an INFERRED parameter: Nano reports
-//!     OID 0 (unknown) in ParameterDescription, and tokio-postgres answers an
-//!     unknown OID by recursing into its own `TYPEINFO` lookup. That is a
-//!     separate, pre-existing extended-protocol gap (see the `#[ignore]`d tests
-//!     in tests/extended_query_param_select.rs). The parameterised cases below
-//!     therefore use `query_typed`, which states the parameter type on the
-//!     wire — still a real Parse/Bind/Describe/Execute round trip.
+//!   * `client.prepare`/`client.query` with an INFERRED parameter: Nano used to
+//!     report OID 0 (unknown) in ParameterDescription, and tokio-postgres
+//!     answers an unknown OID by recursing into its own `TYPEINFO` lookup.
+//!     FIXED by sprinter 6ac716be10ea (`tests/param_oid_batch_g5.rs`) — Parse
+//!     now infers the real type — but the parameterised cases below keep using
+//!     `query_typed`, which states the parameter type on the wire: it is still
+//!     a real Parse/Bind/Describe/Execute round trip, and stating the type is
+//!     what keeps THIS file's subject the catalogue, not the inference.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use heliosdb_nano::{
@@ -485,9 +486,11 @@ async fn hdb011_legacy_inventory_is_a_subset() {
 /// was told about columns the result would not have. `typlen` is int2 (21) as
 /// in PostgreSQL, not int4.
 ///
-/// The statement uses a literal rather than `$1`: an INFERRED parameter is
-/// reported as OID 0 and tokio-postgres answers an unknown OID by recursing
-/// into its own TYPEINFO lookup — a separate, pre-existing gap (module doc).
+/// The statement uses a literal rather than `$1`: when this was written an
+/// INFERRED parameter was reported as OID 0, and tokio-postgres answers an
+/// unknown OID by recursing into its own TYPEINFO lookup (module doc). That is
+/// fixed — sprinter 6ac716be10ea — and the literal is kept because this case is
+/// about the RESULT column types, which a parameter would not change.
 #[tokio::test]
 async fn hdb011_describe_reports_column_types() {
     let (client, _h) = server_client().await;

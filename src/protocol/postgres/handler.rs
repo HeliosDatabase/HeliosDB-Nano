@@ -1841,9 +1841,32 @@ where
                     self.send_error("ERROR", "22023", &e.to_string(), None, None).await?;
                     return Ok(());
                 }
+            } else if EmbeddedDatabase::is_session_guc_statement(trimmed) {
+                // sprinter a3077a3f68d8: a USER-SETTABLE GUC — `statement_timeout`,
+                // `work_mem`, `bulk_load_mode`, the planner switches. It lands on
+                // THIS session, resolved from the session id.
+                //
+                // Two defects close here at once. The generic `CommandComplete("SET")`
+                // at the bottom of this chain used to SWALLOW `SET statement_timeout`
+                // whole — the same "silently acked a SET that did nothing" class as
+                // HC4's `SET ROLE` — while `SET bulk_load_mode` was routed through
+                // `database.execute()` on the arm below and flipped a PROCESS-WIDE
+                // storage flag for every other connection.
+                //
+                // It must NOT go through `database.execute()`: that is the
+                // session-less funnel, whose per-statement backend is the HANDLE's,
+                // so the write would land on a slot shared by every embedded and
+                // REST caller instead of on this connection.
+                if let Err(e) = self.database.try_handle_session_guc(self.session_id, trimmed) {
+                    self.send_error("ERROR", sqlstate_for_error(&e), &e.to_string(), None, None)
+                        .await?;
+                    return Ok(());
+                }
             } else if EmbeddedDatabase::is_fk_setting_statement(trimmed) {
-                // FK/bulk-load knobs stay on the process-wide storage engine; the
-                // generic ack below would drop them.
+                // The remaining FK knobs (`fk_validation`, `foreign_key_checks`)
+                // stay on the process-wide storage engine; the generic ack below
+                // would drop them. `bulk_load_mode` no longer reaches here — the
+                // session-scoped arm above claims both of its spellings.
                 if let Err(e) = self.database.execute(trimmed) {
                     self.send_error("ERROR", "22023", &e.to_string(), None, None).await?;
                     return Ok(());
@@ -1933,6 +1956,20 @@ where
                 return Ok(());
             }
             self.send_parameter_status("application_name", "").await?; // GUC_REPORT
+            self.send_command_complete("RESET").await?;
+            self.send_ready_for_query().await?;
+            return Ok(());
+        } else if starts_with_icase(trimmed, "RESET ") && EmbeddedDatabase::is_session_guc_statement(trimmed) {
+            // sprinter a3077a3f68d8: `RESET statement_timeout` (and every other
+            // user-settable GUC) drops THIS session's override. Without this arm
+            // it fell through to the generic execution path and reached
+            // `execute_for_session` -> the process-global registry, so one
+            // connection's RESET rewrote a value every other connection read.
+            if let Err(e) = self.database.try_handle_session_guc(self.session_id, trimmed) {
+                self.send_error("ERROR", sqlstate_for_error(&e), &e.to_string(), None, None)
+                    .await?;
+                return Ok(());
+            }
             self.send_command_complete("RESET").await?;
             self.send_ready_for_query().await?;
             return Ok(());
@@ -3765,10 +3802,19 @@ where
                 | "application_name"
                 | "role"
         ) {
-            Some(name)
-        } else {
-            None
+            return Some(name);
         }
+        // sprinter a3077a3f68d8: every USER-SETTABLE GUC is per-connection state
+        // now, so `SHOW statement_timeout` must be answered from THIS session
+        // too — on both protocols. It used to reach neither: the static table
+        // below has no entry for it, so psql got `42704 unrecognized
+        // configuration parameter "statement_timeout"` for a parameter the
+        // server very much had.
+        //
+        // The predicate is `sql::is_user_settable`, which is registered-AND-not-
+        // server-level, so an unknown name is still NOT claimed here and still
+        // becomes 42704.
+        crate::sql::is_user_settable(&name).then_some(name)
     }
 
     /// GH#28: resolve a `SHOW` parameter to `(column, value)`, answering the
@@ -3820,7 +3866,31 @@ where
             // connection (e.g. `X25519MLKEM768` vs classical `X25519`), or
             // empty on a plaintext connection.
             "ssl_key_exchange" => self.tls_kx_group.clone().unwrap_or_default(),
-            _ => return Self::resolve_show_parameter(param),
+            // sprinter a3077a3f68d8: a user-settable GUC — THIS session's value.
+            //
+            // The static compatibility table below KEEPS priority for the names
+            // it lists (`client_encoding`, `transaction_isolation`, `datestyle`,
+            // `timezone`, `transaction_read_only`), deliberately. Those are the
+            // handful of registry names whose value this engine does not
+            // actually vary: it always speaks UTF8, always reads ISO dates,
+            // always runs READ COMMITTED. A `SET client_encoding = 'LATIN1'` is
+            // accepted-and-shadowed here exactly as it was before this item, and
+            // reporting the shadow back as though it were in force would be a
+            // new lie in the unsafe direction — the same reasoning that keeps
+            // `SET ROLE` refused rather than acked.
+            //
+            // Only when the table has no answer at all — `statement_timeout`,
+            // `work_mem`, `bulk_load_mode`, the planner switches — does this
+            // session's own override (else the server default) answer, instead
+            // of the `42704 unrecognized configuration parameter` a stock server
+            // would never give for a parameter it has.
+            _ => match Self::resolve_show_parameter(param) {
+                Ok(pair) => return Ok(pair),
+                Err(unknown) => match self.database.session_show_guc(self.session_id, &lower) {
+                    Some(value) => value,
+                    None => return Err(unknown),
+                },
+            },
         };
         Ok((lower, value))
     }
@@ -4051,21 +4121,33 @@ pub(super) fn datatype_to_oid(dt: &crate::DataType) -> i32 {
         // HDB-002: the FTS types carry PostgreSQL's real OIDs.
         crate::DataType::TsVector => 3614,
         crate::DataType::TsQuery => 3615,
-        // HDB-002: `vector` is advertised as TEXT (25) — which is what the
-        // value on the wire literally is: pgvector's text form, `[0.1,0.2]`.
-        // It deliberately does NOT advertise the user-band OID `pg_type`
-        // registers it under (16385): a RowDescription OID a driver does not
-        // know natively sends tokio-postgres — and therefore sqlx and
-        // Prisma's query engine — into its server-side TYPEINFO lookup, whose
-        // `$1` Nano describes as OID 0, and `Type::from_oid(0)` is `None`, so
-        // the driver re-prepares the TYPEINFO query forever. Two test files
-        // are already `#[ignore]`d on that recursion
-        // (`tests/server_mode_integration_test.rs`,
-        // `tests/extended_query_param_select.rs`). 16385 stays where it is
-        // resolvable without recursion: `pg_type` (the registry row and
-        // `get_type_oid`), i.e. by NAME, which is how a pgvector client
-        // resolves an extension type anyway. It used to be `1000` here,
+        // HDB-002 / sprinter 671743292162: `vector` is advertised as TEXT (25)
+        // — which is what the value on the wire literally is: pgvector's text
+        // form, `[0.1,0.2]`. It deliberately does NOT advertise the user-band
+        // OID `pg_type` registers it under (16385). It used to be `1000` here,
         // PostgreSQL's `_bool`.
+        //
+        // The ORIGINAL reason was the OID-0 ParameterDescription recursion, and
+        // that reason is GONE (sprinter 6ac716be10ea): `param_infer` now types
+        // every inferred parameter as something `Type::from_oid` resolves, so
+        // tokio-postgres' TYPEINFO lookup terminates. Raising this to 16385 is
+        // still NOT safe, for a second, independent reason found while closing
+        // that item — terminating is not the same as SUCCEEDING:
+        //
+        //   tokio-postgres reads its TYPEINFO row as `typtype: i8`,
+        //   `typelem/typbasetype/typrelid: Oid`, `rngsubtype: Option<Oid>`, and
+        //   `i8`/`u32` accept EXACTLY `Type::CHAR` (18) / `Type::OID` (26).
+        //   Nano's `pg_type` / `pg_range` views declare those columns `Text` and
+        //   `Int4` (`sql::phase3::system_views`), because `crate::DataType` has
+        //   no `char`/`oid` variant — so the lookup a 16385 RowDescription
+        //   FORCES fails `WrongType` and takes the user's query down with it.
+        //   Today's `text` needs no lookup at all, so it works.
+        //
+        // Shipping 16385 therefore requires typing those catalogue columns as
+        // PostgreSQL types first — a `DataType` change, not a wire change. The
+        // registry meanwhile keeps 16385 reachable by NAME through `pg_type`
+        // (the row and `get_type_oid`), which is how a pgvector client resolves
+        // an extension type anyway.
         crate::DataType::Vector(_) => 25,
         _ => 705, // Unknown
     }
@@ -5017,13 +5099,18 @@ mod datatype_oid_tests {
     /// `vector` must NOT advertise the user-band OID it is registered under in
     /// `pg_type` (16385). tokio-postgres — and with it sqlx and Prisma's query
     /// engine — resolves an unknown result-column OID by preparing its own
-    /// TYPEINFO query, whose `$1` Nano describes as OID 0; `Type::from_oid(0)`
-    /// is `None`, so the driver re-prepares TYPEINFO without bound and the
-    /// connection never returns. `text` is both safe and honest: the value on
-    /// the wire IS text (`[0.1,0.2]`). The registry OID stays reachable by
-    /// name through `pg_type` (`BUILTIN_TYPES` / `get_type_oid`).
+    /// TYPEINFO query against the server. `text` is both safe and honest: the
+    /// value on the wire IS text (`[0.1,0.2]`), and needs no lookup. The
+    /// registry OID stays reachable by name through `pg_type` (`BUILTIN_TYPES`
+    /// / `get_type_oid`).
     ///
-    /// Raising this to 16385 requires fixing ParameterDescription first.
+    /// The recursion that first forced this (`$1` described as OID 0) is fixed
+    /// — sprinter 6ac716be10ea — but 16385 is still refused: see
+    /// `datatype_to_oid`'s comment for the SECOND blocker, that Nano's
+    /// `pg_type` / `pg_range` columns are `Text`/`Int4` where the driver's
+    /// TYPEINFO row demands `char`/`oid`, so the lookup 16385 forces fails
+    /// `WrongType` instead of recursing. Loud either way, and today's `text`
+    /// avoids the lookup entirely.
     #[test]
     fn fts_types_take_builtin_oids_and_vector_stays_text() {
         assert_eq!(datatype_to_oid(&DataType::TsVector), 3614);
@@ -5151,7 +5238,17 @@ pub(crate) fn sqlstate_for_error(error: &Error) -> &'static str {
             // the second FK shape: `ArtIndexError::ForeignKeyViolation` Displays
             // as `Foreign key violation: …` (src/storage/art_index.rs) and
             // several sites wrap it with `constraint_violation(e.to_string())`.
-            if lower.contains("row-level security") {
+            // sprinter f32ba64c00a7: checked FIRST, anchored on the emitter's
+            // own const (marker-const discipline), so no wording arm below can
+            // claim it — `violates not-null constraint` contains neither
+            // "duplicate key" nor "unique constraint", but it DOES read as a
+            // generic constraint failure, and 23000 is what a driver reads as
+            // "some integrity rule, unknown which". PostgreSQL reports a NULL
+            // in a NOT NULL / PRIMARY KEY column as 23502, and an ORM branches
+            // on 23502 to blame a missing field rather than a conflict.
+            if message.contains(crate::error::NOT_NULL_VIOLATION_MARKER) {
+                sqlstate::NOT_NULL_VIOLATION // 23502
+            } else if lower.contains("row-level security") {
                 sqlstate::INSUFFICIENT_PRIVILEGE // 42501
             } else if lower.contains("foreign key constraint") || lower.contains("foreign key violation") {
                 sqlstate::FOREIGN_KEY_VIOLATION // 23503
@@ -5347,9 +5444,13 @@ fn message_names_a_column(lower: &str) -> bool {
 ///   src/sql/executor/mod.rs) matches no arm and returns XX000. Separate noun,
 ///   separate audit.
 /// * `NOT NULL constraint violated: …` / `PRIMARY KEY constraint 'c' violated:
-///   NULL value` report 23000 rather than 23502; `sqlstate::NOT_NULL_VIOLATION`
-///   exists with no caller. (They route through the `ConstraintViolation` arm of
-///   [`sqlstate_for_error`], not this function.)
+///   NULL value` report 23000 rather than 23502. (They route through the
+///   `ConstraintViolation` arm of [`sqlstate_for_error`], not this function.)
+///   `sqlstate::NOT_NULL_VIOLATION` is no longer caller-less: sprinter
+///   f32ba64c00a7's NULL-PK refusal spells PostgreSQL's own
+///   `null value in column "…" … violates not-null constraint` and that arm
+///   keys 23502 on it. Restating the two messages above in the same shape would
+///   fold them in too — a separate item, since several tests pin their wording.
 /// * `Division by zero` matches no arm here and returns XX000;
 ///   `sqlstate::DIVISION_BY_ZERO` (22012) exists with no caller.
 fn sqlstate_for_query_execution_message(message: &str) -> &'static str {
@@ -5377,6 +5478,31 @@ fn sqlstate_for_query_execution_message(message: &str) -> &'static str {
     // on the emitter's const (`session::scoped`), marker-const discipline.
     if message.contains(crate::session::scoped::LASTVAL_UNDEFINED_MESSAGE) {
         return sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE; // 55000
+    }
+    // sprinter 7903b7111cb4: `currval('s')` before this SESSION has advanced `s`.
+    // Same PostgreSQL class as `lastval()` above, and the same reason a driver
+    // needs it: 55000 says "you have not called nextval yet", XX000 says "the
+    // backend is broken". Anchored on the prefix because the emitter interpolates
+    // the sequence name (`session::scoped::currval_undefined_message`).
+    if message.contains(crate::session::scoped::CURRVAL_UNDEFINED_PREFIX) {
+        return sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE; // 55000
+    }
+    // sprinter d03de7fc3b22: a tenant that has spent its `max_qps` budget (or its
+    // `max_storage_bytes`) is OUT OF A RESOURCE, not broken. PostgreSQL has no
+    // exact per-tenant equivalent; 53400 `configuration_limit_exceeded` is the
+    // honest neighbour in class 53 `insufficient_resources`, and it is what a
+    // client can retry or back off on. This used to fall through to the `XX000
+    // internal_error` catch-all at the bottom of this function, which PgBouncer,
+    // pgpool and every HA proxy read as a broken backend — so a healthy
+    // connection that hit its own rate limit risked being evicted from the pool.
+    // Anchored on the emitters' marker const (marker-const discipline), matched
+    // case-insensitively so both "Tenant quota exceeded: …" and the storage
+    // path's "Storage quota exceeded: …" classify the same way.
+    //
+    // Checked BEFORE the wording arms below: the limiter's message names the
+    // tenant, and a tenant id is free text.
+    if lower.contains(crate::TENANT_QUOTA_EXCEEDED_MARKER) {
+        return sqlstate::CONFIGURATION_LIMIT_EXCEEDED; // 53400
     }
     // GH#28 (c2): `SET LOCAL idle_session_timeout` /
     // `idle_in_transaction_session_timeout` is refused rather than silently

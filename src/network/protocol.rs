@@ -1091,11 +1091,15 @@ pub fn datatype_to_oid(dt: &DataType) -> i32 {
         // server. `vector` is NOT: it is an extension type registered in
         // `pg_type` under a user-band OID (16385), and advertising a
         // user-band OID in a RowDescription drives tokio-postgres/sqlx/Prisma
-        // into a server-side TYPEINFO lookup that Nano cannot serve (its `$1`
-        // is described as OID 0, which the driver cannot resolve either, so
-        // it recurses). It is therefore advertised as TEXT — which is exactly
-        // what the value on the wire is, pgvector's `[0.1,0.2]` text form.
-        // Resolve `vector` by NAME against `pg_type`, as pgvector clients do.
+        // into a server-side TYPEINFO lookup Nano cannot SERVE. (That lookup
+        // no longer recurses — sprinter 6ac716be10ea types the `$1` it used to
+        // describe as OID 0 — but it now fails `WrongType` instead: the driver
+        // reads `typtype` as `char` and `typelem` as `oid`, and Nano's
+        // `pg_type` view declares them `Text`/`Int4`. See
+        // `protocol::postgres::handler::datatype_to_oid`.) It is therefore
+        // advertised as TEXT — which is exactly what the value on the wire is,
+        // pgvector's `[0.1,0.2]` text form. Resolve `vector` by NAME against
+        // `pg_type`, as pgvector clients do.
         DataType::TsVector => type_oid::TSVECTOR,
         DataType::TsQuery => type_oid::TSQUERY,
         DataType::Vector(_) => type_oid::TEXT,

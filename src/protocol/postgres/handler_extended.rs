@@ -28,16 +28,38 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
         let parser = crate::sql::Parser::new();
         let statement = parser.parse_one(&query)?;
 
-        // If param_types is empty, infer parameter count from query placeholders ($1, $2, etc)
-        // Use OID 0 (unknown) which tells the client to use its preferred type for each parameter
+        // Parameter types for `Describe(Statement)` → ParameterDescription.
+        //
+        // sprinter 6ac716be10ea. This used to be `vec![0i32; param_count]`, and
+        // OID 0 is the one answer PostgreSQL never gives: it reports what parse
+        // analysis RESOLVED, and `42P18` when it cannot. For rust-postgres 0 is
+        // not merely vague but FATAL — `Type::from_oid(0)` is `None`, so the
+        // driver prepares its own TYPEINFO query to look 0 up, and Nano
+        // described THAT query's `$1` as 0 too: unbounded recursion into a
+        // client-side stack overflow (see `param_infer`'s module doc).
+        //
+        // A type the client DID specify is always authoritative and is passed
+        // through untouched; a 0 it left for the server — and the all-empty
+        // list node-pg/JDBC send — is resolved from the statement, falling back
+        // to 705 (`unknown`, a driver builtin) where PostgreSQL itself would
+        // decline. Length is never changed: `handle_bind_extended` validates
+        // the client's parameter count against it.
         let inferred_param_types = if param_types.is_empty() {
             let param_count = Self::count_parameters(&query);
-            if param_count > 0 {
-                tracing::debug!("Inferred {} parameters, using unknown type (OID 0)", param_count);
-                vec![0i32; param_count] // OID 0 = unknown/unspecified
-            } else {
-                vec![]
-            }
+            self.infer_param_types(&statement, param_count)
+        } else if param_types.contains(&0) {
+            let resolved = self.infer_param_types(&statement, param_types.len());
+            param_types
+                .iter()
+                .enumerate()
+                .map(|(i, declared)| {
+                    if *declared == 0 {
+                        resolved.get(i).copied().unwrap_or(super::param_infer::UNKNOWN_OID)
+                    } else {
+                        *declared
+                    }
+                })
+                .collect()
         } else {
             param_types.clone()
         };
@@ -268,6 +290,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
         // under the portal's own wire plan, which already sent a RowDescription.
         let is_application_name_set = crate::EmbeddedDatabase::is_application_name_statement(trimmed_query)
             && !super::handler::starts_with_icase(trimmed_query, "SHOW");
+        // sprinter a3077a3f68d8: `SET` / `SET LOCAL` / `RESET` of a user-settable
+        // GUC (`statement_timeout`, `work_mem`, `bulk_load_mode`, the planner
+        // switches). The engine honours it on this path anyway — the session
+        // interceptor runs inside `execute_params_for_session` — but delegating
+        // to the simple-query arm is what makes the extended protocol answer with
+        // the same `SET` / `RESET` command tag psql gets, instead of the params
+        // family's row-count tag. `SHOW` is excluded: it is answered below under
+        // the portal's own wire plan, which already sent a RowDescription.
+        let is_session_guc_set = crate::EmbeddedDatabase::is_session_guc_statement(trimmed_query)
+            && !super::handler::starts_with_icase(trimmed_query, "SHOW");
         // HDB-008: `ROLLBACK TO SAVEPOINT` is not a transaction BOUNDARY, so it
         // is normally executed as an ordinary statement — but inside an ABORTED
         // block the `transaction_failed()` guard below refuses it before the
@@ -283,6 +315,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
             || is_set_role
             || is_timeout_guc
             || is_application_name_set
+            || is_session_guc_set
             || is_failed_savepoint_recovery
         {
             let previous_suppress_ready = self.suppress_ready_for_query;
@@ -723,6 +756,45 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
             .clone()
             .or_else(|| rows.first().map(crate::Tuple::schema))
             .unwrap_or_else(|| crate::Schema::new(vec![]))
+    }
+
+    /// sprinter 6ac716be10ea: the OID of every `$N` the client left for the
+    /// server to type, resolved against the relations this SESSION sees.
+    ///
+    /// The relation resolver is the planner's own (`resolve_table_ref` under
+    /// this session's `current_schema` + `search_path`), so Describe reports
+    /// the columns of the SAME relation Execute will read — a bare `t` under
+    /// `SET search_path TO s` must not be typed from `public.t`. A name the
+    /// catalog does not know is retried against the system-view registry, which
+    /// is what lets `pg_catalog.pg_type` resolve at all; that second source
+    /// also flags the relation as a CATALOG one, which is what turns its `oid`
+    /// column into OID 26 instead of the `int4` it is stored as.
+    ///
+    /// Never fails: an unresolvable relation (or an unplannable statement)
+    /// simply leaves its parameters at 705. Costs nothing for the common
+    /// zero-parameter Parse, which returns before touching the catalog.
+    fn infer_param_types(&self, statement: &sqlparser::ast::Statement, param_count: usize) -> Vec<i32> {
+        if param_count == 0 {
+            return Vec::new();
+        }
+        let current_schema = self.database.session_current_schema(self.session_id).unwrap_or(None);
+        let current_search_path = self.database.session_search_path(self.session_id).unwrap_or_default();
+        let catalog = self.database.storage.catalog();
+        let planner = crate::sql::planner::Planner::with_catalog(&catalog)
+            .with_current_schema(current_schema)
+            .with_search_path(current_search_path);
+        let lookup = |name: &sqlparser::ast::ObjectName| -> Option<(crate::Schema, bool)> {
+            let key = planner.resolve_table_ref(name);
+            if let Ok(schema) = catalog.get_table_schema(&key) {
+                return Some((schema, false));
+            }
+            crate::sql::phase3::SystemViewRegistry::shared()
+                .get_schema(&key)
+                .map(|schema| (schema.clone(), true))
+        };
+        let oids = super::param_infer::infer_parameter_oids(statement, param_count, &lookup);
+        tracing::debug!("Inferred {} parameter type OIDs: {:?}", oids.len(), oids);
+        oids
     }
 
     /// Derive result schema from SQL statement for prepared statements

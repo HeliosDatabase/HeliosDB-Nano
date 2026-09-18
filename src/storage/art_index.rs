@@ -268,6 +268,29 @@ impl AdaptiveRadixTree {
         self.name = new_name;
     }
 
+    /// Repoint this index's column list after `ALTER TABLE … RENAME COLUMN`
+    /// (sprinter 0f258ed23d13). Returns `true` when something changed.
+    ///
+    /// The TREE CONTENTS are deliberately untouched, and that is sound: an ART
+    /// key is the encoded concatenation of VALUES
+    /// ([`ArtIndexManager::encode_key`]), never of column names, so a rename is
+    /// pure metadata. What it is NOT is optional — every probe resolves
+    /// `entry.columns` against the CURRENT schema by exact name
+    /// (`Schema::get_column_index`), so an index still naming the old column
+    /// resolves to `None` and `check_unique_constraints_tuple` SKIPS it: the
+    /// UNIQUE stops being enforced the instant the column is renamed, in the
+    /// very same process.
+    pub fn rename_column(&mut self, old: &str, new: &str) -> bool {
+        let mut changed = false;
+        for col in self.columns.iter_mut() {
+            if col.eq_ignore_ascii_case(old) {
+                *col = new.to_string();
+                changed = true;
+            }
+        }
+        changed
+    }
+
     /// Get the number of keys
     pub fn len(&self) -> u64 {
         self.size

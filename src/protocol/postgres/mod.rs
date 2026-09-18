@@ -66,6 +66,10 @@ pub(crate) mod copy;
 pub mod handler;
 mod handler_extended;
 pub mod messages;
+// sprinter 6ac716be10ea: Parse-time parameter type inference for
+// ParameterDescription. Private for the same reason `handler_extended` is —
+// it is an implementation detail of the extended-query handler.
+mod param_infer;
 pub mod password_store;
 pub mod prepared;
 pub mod server;

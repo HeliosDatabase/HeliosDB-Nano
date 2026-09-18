@@ -600,17 +600,22 @@ async fn hdb002_wire_reports_tsvector_type_and_text_form() {
 /// * **RowDescription says 25 (`text`).** A user-band OID must NOT appear in
 ///   a RowDescription. tokio-postgres — and therefore sqlx and Prisma's query
 ///   engine — resolves any result-column OID it does not know natively by
-///   preparing its own TYPEINFO query against the server; that query's `$1` is
-///   described by Nano as OID `0`, which the driver cannot resolve either, so
-///   it re-prepares TYPEINFO forever. (Two test files are `#[ignore]`d on that
-///   recursion: `tests/server_mode_integration_test.rs` and
-///   `tests/extended_query_param_select.rs`; fixing ParameterDescription is
-///   filed separately.) `text` is also what the value on the wire literally
-///   is — pgvector's `[0.1,0.2]` text form — so a client that registered the
-///   type by name decodes exactly the bytes it expects.
+///   preparing its own TYPEINFO query against the server. `text` is also what
+///   the value on the wire literally is — pgvector's `[0.1,0.2]` text form —
+///   so a client that registered the type by name decodes exactly the bytes it
+///   expects, with no lookup at all.
 ///
-/// If Nano ever describes an inferred parameter as something a driver can
-/// resolve, advertising 16385 here becomes safe and this case changes with it.
+/// The FIRST reason 16385 was refused is gone: that TYPEINFO query's `$1` was
+/// described as OID `0`, which the driver could not resolve either, so it
+/// re-prepared TYPEINFO forever (the two test files `#[ignore]`d on that
+/// recursion now RUN — sprinter 6ac716be10ea). 25 stays anyway, because
+/// terminating is not succeeding: tokio-postgres reads that row as
+/// `typtype: i8` and `typelem/typbasetype/typrelid: Oid`, and `i8`/`u32`
+/// accept only `Type::CHAR` (18) / `Type::OID` (26) — while Nano's `pg_type`
+/// view declares those columns `Text`/`Int4`, because `crate::DataType` has no
+/// `char`/`oid` variant. A 16385 RowDescription therefore FORCES a lookup that
+/// fails `WrongType` and takes the user's query with it. Advertising 16385
+/// needs those catalogue columns typed as PostgreSQL types first.
 #[tokio::test]
 async fn hdb002_wire_vector_columns_advertise_text_and_register_under_16385() {
     let (addr, conn_string, _h) = setup_server().await;

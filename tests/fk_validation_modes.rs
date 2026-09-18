@@ -80,20 +80,35 @@ fn audit_mode_logs_fk_violations_without_rejecting() {
     assert_eq!(rows[0].values[1], Value::String("p".to_string()));
 }
 
+/// sprinter a3077a3f68d8 changed WHERE this knob lands, not whether it works:
+/// `SET bulk_load_mode` used to flip a process-wide storage-engine flag (so one
+/// connection turned off MV / SMFI delta tracking for every other connection)
+/// and now lands on the SETTING session's own backend. `db.bulk_load_mode()` is
+/// the accessor for "what would a statement on this handle see"; the raw
+/// `db.storage.is_bulk_load_mode()` now answers for whatever session's statement
+/// is running on the calling thread, which from a test thread is the
+/// server-level flag. Both spellings still take effect, which is what this test
+/// has always been about.
 #[test]
 fn bulk_load_mode_setting_reaches_storage_engine() {
     let db = EmbeddedDatabase::new_in_memory().expect("db");
-    assert!(!db.storage.is_bulk_load_mode());
+    assert!(!db.bulk_load_mode());
 
     db.execute("SET bulk_load_mode = true").expect("set true");
-    assert!(db.storage.is_bulk_load_mode());
+    assert!(db.bulk_load_mode());
 
     db.execute("SET helios.bulk_load_mode = off").expect("set off");
-    assert!(!db.storage.is_bulk_load_mode());
+    assert!(!db.bulk_load_mode());
 
     db.execute("SET bulk_load_mode = 1").expect("set 1");
-    assert!(db.storage.is_bulk_load_mode());
+    assert!(db.bulk_load_mode());
 
     db.execute("RESET bulk_load_mode").expect("reset");
-    assert!(!db.storage.is_bulk_load_mode());
+    assert!(!db.bulk_load_mode());
+
+    // The server-level flag was never touched by any of it.
+    assert!(
+        !db.storage.is_bulk_load_mode(),
+        "a session's SET bulk_load_mode must not reach the process-wide flag"
+    );
 }

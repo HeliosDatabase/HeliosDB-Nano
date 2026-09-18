@@ -7010,58 +7010,111 @@ impl<'a> Planner<'a> {
                 // `LogicalPlan` is persisted positionally, so nothing is added
                 // to either. A column with no REFERENCES plans byte-identically
                 // to before.
-                let mut fks = Vec::new();
+                //
+                // sprinter 885ffe24eab6: the SAME desugaring now covers the
+                // other inline constraints. `UNIQUE`, `PRIMARY KEY` and `CHECK`
+                // on an `ADD COLUMN` used to be copied into `ColumnDef`'s flags
+                // (or, for CHECK, dropped entirely — `ColumnDef` has no slot for
+                // a predicate) and NOTHING was ever created: the column arrived,
+                // no error was raised, and the declared rule was enforced by
+                // nothing while `\d` still printed the flag. A UNIQUE was the
+                // worst of the three, because the flag made the next RESTART
+                // mint an index from it — so the same statement produced an
+                // unenforced constraint before a restart and an enforced one
+                // after, on the same data.
+                //
+                // Every constraint reaches the ONE executor body both families
+                // share, and the ORDER is `[AddColumn, …constraints]` so each
+                // constraint sees the column it names. Atomicity is
+                // `execute_alter_table_multi`'s validate-all-first pass, which
+                // knows these plans.
+                let normalized_column = Self::normalize_ident(&column_def.name);
+                let mut extras = Vec::new();
                 for option in &column_def.options {
-                    let ColumnOption::ForeignKey {
-                        foreign_table,
-                        referred_columns,
-                        on_delete,
-                        on_update,
-                        characteristics,
-                    } = &option.option
-                    else {
-                        continue;
-                    };
-                    let TableConstraint::ForeignKey {
-                        columns,
-                        references_table,
-                        references_columns,
-                        on_delete,
-                        on_update,
-                        deferrable,
-                        initially_deferred,
-                        enforcement,
-                        ..
-                    } = self.inline_reference_constraint(
-                        &column_def.name,
-                        foreign_table,
-                        referred_columns,
-                        on_delete.as_ref(),
-                        on_update.as_ref(),
-                        characteristics.as_ref(),
-                    )
-                    else {
-                        continue;
-                    };
-                    fks.push(LogicalPlan::AlterTableAddForeignKey {
-                        table_name: table_name.clone(),
-                        constraint_name: None,
-                        columns,
-                        references_table,
-                        references_columns,
-                        on_delete,
-                        on_update,
-                        deferrable,
-                        initially_deferred,
-                        enforcement,
-                    });
+                    // `CONSTRAINT <name> UNIQUE` / `… CHECK (…)` names the
+                    // constraint; an unnamed one lets the executor derive
+                    // PostgreSQL's conventional name.
+                    let constraint_name = option.name.as_ref().map(Self::normalize_ident);
+                    match &option.option {
+                        ColumnOption::ForeignKey {
+                            foreign_table,
+                            referred_columns,
+                            on_delete,
+                            on_update,
+                            characteristics,
+                        } => {
+                            let TableConstraint::ForeignKey {
+                                columns,
+                                references_table,
+                                references_columns,
+                                on_delete,
+                                on_update,
+                                deferrable,
+                                initially_deferred,
+                                enforcement,
+                                ..
+                            } = self.inline_reference_constraint(
+                                &column_def.name,
+                                foreign_table,
+                                referred_columns,
+                                on_delete.as_ref(),
+                                on_update.as_ref(),
+                                characteristics.as_ref(),
+                            )
+                            else {
+                                continue;
+                            };
+                            // Deliberately `None`, unchanged from GH#27: the
+                            // executor's auto-name is what the shipped
+                            // behaviour records, and honouring an inline
+                            // `CONSTRAINT n REFERENCES …` name here is a
+                            // separate (if correct) change.
+                            extras.push(LogicalPlan::AlterTableAddForeignKey {
+                                table_name: table_name.clone(),
+                                constraint_name: None,
+                                columns,
+                                references_table,
+                                references_columns,
+                                on_delete,
+                                on_update,
+                                deferrable,
+                                initially_deferred,
+                                enforcement,
+                            });
+                        }
+                        ColumnOption::Unique { is_primary: false, .. } => {
+                            extras.push(LogicalPlan::AlterTableAddUnique {
+                                table_name: table_name.clone(),
+                                constraint_name,
+                                columns: vec![normalized_column.clone()],
+                            });
+                        }
+                        ColumnOption::Unique { is_primary: true, .. } => {
+                            extras.push(LogicalPlan::AlterTableAddPrimaryKey {
+                                table_name: table_name.clone(),
+                                constraint_name,
+                                columns: vec![normalized_column.clone()],
+                            });
+                        }
+                        ColumnOption::Check(expr) => {
+                            // `?`, NOT the `if let Ok(...)` the CREATE TABLE
+                            // column loop uses: an unplannable predicate must
+                            // fail the statement, never vanish from it.
+                            extras.push(LogicalPlan::AlterTableAddCheck {
+                                table_name: table_name.clone(),
+                                constraint_name,
+                                expression: self.expr_to_logical(expr)?,
+                            });
+                        }
+                        _ => {}
+                    }
                 }
-                if fks.is_empty() {
+                if extras.is_empty() {
                     return Ok(add);
                 }
-                let mut operations = Vec::with_capacity(1 + fks.len());
+                let mut operations = Vec::with_capacity(1 + extras.len());
                 operations.push(add);
-                operations.extend(fks);
+                operations.extend(extras);
                 Ok(LogicalPlan::AlterTableMulti { operations })
             }
             AlterTableOperation::DropColumn {
@@ -7168,6 +7221,23 @@ impl<'a> Planner<'a> {
             // ART index (whose row_id key space the storage layer also uses for
             // SERIAL fill), which is a different change with a different risk
             // profile. It keeps reporting the catch-all error.
+            // `ALTER TABLE … ADD [CONSTRAINT <name>] CHECK (<expr>)`
+            // (sprinter 885ffe24eab6). It used to hit the catch-all below with
+            // `Unsupported ALTER TABLE operation: AddConstraint(Check { … })`.
+            //
+            // It is wired here because the RENAME/DROP COLUMN refusals added
+            // for sprinter 0f258ed23d13 tell the user to "drop the constraint,
+            // rename the column, then re-create it" — advice that is
+            // unfollowable while there is no statement that re-creates a CHECK.
+            // Same executor body the `ADD COLUMN … CHECK` desugaring uses, so
+            // the two spellings cannot drift.
+            AlterTableOperation::AddConstraint(sqlparser::ast::TableConstraint::Check { name, expr }) => {
+                Ok(LogicalPlan::AlterTableAddCheck {
+                    table_name,
+                    constraint_name: name.as_ref().map(Self::normalize_ident),
+                    expression: self.expr_to_logical(&expr)?,
+                })
+            }
             AlterTableOperation::AddConstraint(sqlparser::ast::TableConstraint::Unique { name, columns, .. }) => {
                 if columns.is_empty() {
                     return Err(Error::query_execution(

@@ -2731,7 +2731,7 @@ impl<'a> Executor<'a> {
 
     fn identity_pk_count_distinct_index(expr: &crate::sql::LogicalExpr, schema: &Schema) -> Option<usize> {
         use crate::sql::{BinaryOperator, LogicalExpr};
-        use crate::{DataType, Value};
+        use crate::Value;
 
         fn is_integer_zero(expr: &LogicalExpr) -> bool {
             matches!(
@@ -2755,7 +2755,9 @@ impl<'a> Executor<'a> {
             _ => return None,
         };
         let column = schema.columns.get(idx)?;
-        if column.primary_key && matches!(column.data_type, DataType::Int2 | DataType::Int4 | DataType::Int8) {
+        // sprinter f32ba64c00a7: shared with the NULL-PK auto-fill, so "which
+        // primary keys the row-id allocator owns" has one definition.
+        if column.primary_key && crate::is_identity_pk_type(&column.data_type) {
             Some(idx)
         } else {
             None

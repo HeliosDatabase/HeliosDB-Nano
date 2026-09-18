@@ -5469,8 +5469,10 @@ async fn wire_gh22_extended_protocol_quoted_target_upsert_updates_twice() {
 // What is NOT covered there, and is covered here:
 //   * a BOUND PARAMETER key (`SELECT pg_try_advisory_lock($1)`) — the shape
 //     node-pg / Prisma actually put on the wire, where the key arrives as a
-//     text-format parameter with OID 0 (unknown) and must still coerce to a
-//     lock key rather than erroring or locking something else;
+//     text-format parameter of unknown type (OID 0 when this was written, 705
+//     since sprinter 6ac716be10ea declined to type a function argument) and
+//     must still coerce to a lock key rather than erroring or locking
+//     something else;
 //   * the (int, int) overload over the wire, on both protocols;
 //   * `pg_advisory_unlock_all()` over the wire;
 //   * an xact lock TAKEN on the extended protocol and COMMITted on the
@@ -5587,8 +5589,11 @@ async fn gh26_extended_protocol_advisory_lock_with_a_bound_parameter_key() {
     let (mut a, mut ca) = test_handler(Arc::clone(&db));
     let (mut b, mut cb) = test_handler(Arc::clone(&db));
 
-    // param_types empty → Parse infers one unknown (OID 0) parameter, exactly
-    // as node-pg leaves it.
+    // param_types empty → Parse infers the parameter's type itself, exactly as
+    // node-pg leaves it. `pg_try_advisory_lock($1)` is a FUNCTION argument, and
+    // `param_infer` deliberately declines to type those (sprinter
+    // 6ac716be10ea), so this stays `unknown` — 705 now rather than 0, which
+    // decodes to the same `Value::String("91100010")` the engine must coerce.
     a.handle_parse_extended("adv_p".into(), "SELECT pg_try_advisory_lock($1)".into(), vec![])
         .await
         .expect("parse");
@@ -8189,10 +8194,12 @@ fn gh25_db() -> Arc<EmbeddedDatabase> {
 ///
 /// node-pg serialises a `Buffer` parameter as RAW BYTES with param format code
 /// 1 (binary) while declaring NO parameter types at Parse (pg-protocol's
-/// `useBinary` branch). Nano fills the missing types with OID 0 at
-/// `handle_parse_extended`, and `decode_binary_parameter`'s catch-all maps
-/// (format 1, OID 0) to `Value::Bytes` — so the value must survive verbatim
-/// and come back from RETURNING as `\x`-hex under OID 17.
+/// `useBinary` branch). `handle_parse_extended` fills the missing types in —
+/// since sprinter 6ac716be10ea by INFERRING them, so `$2` is now typed `bytea`
+/// (17) from the INSERT column list rather than left at OID 0 — and
+/// `decode_binary_parameter` has no arm for 17 either, so its catch-all still
+/// maps the payload to `Value::Bytes`. The value must survive verbatim and
+/// come back from RETURNING as `\x`-hex under OID 17.
 ///
 /// POSITIVE CONTROL for this file: it exercises the same handler, the same
 /// >4 KiB payload and the same decoders as the failing tests below, and it
@@ -10512,12 +10519,17 @@ fn gh28_c1_registry_families_validate_and_refuse() {
 
 /// Connection A issues `SET statement_timeout = 1` (and `SET bulk_load_mode =
 /// on`) over the EXTENDED protocol — the path psycopg3 / JDBC / sqlx /
-/// node-postgres use. The process-global `SessionSettings` registry (read by
-/// `effective_statement_timeout_ms` on EVERY executor run) must be untouched,
-/// connection B's next statement must still succeed, and A's statement must
-/// produce the same outcome as on main: an error, no `SET` tag (the planner
-/// has no `SetVariable` arm; candidate 1 had widened this into a
-/// cross-session lever).
+/// node-postgres use. Connection B must be unaffected and the process-global
+/// `SessionSettings` registry must be untouched.
+///
+/// sprinter a3077a3f68d8 UPDATED the expected outcome for A. GH#28 asserted
+/// that these statements ERROR on this path, because the only place a value
+/// could have landed was the one process-global registry, and landing there was
+/// a cross-session denial-of-service lever. They are now per-session state, so
+/// the safe answer is no longer "refuse" but "apply it to A" — which is what
+/// PostgreSQL does and what every extended-protocol driver expects. The
+/// invariant the test exists to protect is unchanged and is asserted below: B
+/// does not see it, and the registry never does.
 #[tokio::test]
 async fn gh28_c2_extended_set_of_a_registry_guc_never_crosses_sessions() {
     let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
@@ -10548,18 +10560,20 @@ async fn gh28_c2_extended_set_of_a_registry_guc_never_crosses_sessions() {
         a.handle_bind_extended(portal.clone(), stmt, vec![], vec![], vec![])
             .await
             .unwrap_or_else(|e| panic!("{sql}: Bind: {e}"));
-        let outcome = a.handle_execute_extended(portal, 0).await;
+        a.handle_execute_extended(portal, 0)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: Execute: {e}"));
         let out = drain(&mut a_client).await;
-        let errored = outcome.is_err() || parse_messages(&out).iter().any(|(t, _)| *t == b'E');
         assert!(
-            errored,
-            "{sql}: over the extended protocol this must keep ERRORING exactly as on main \
-             (it must never be silently acked into the process-global registry); got {:?}",
-            command_tags(&out)
+            !parse_messages(&out).iter().any(|(t, _)| *t == b'E'),
+            "{sql}: sprinter a3077a3f68d8 — a session-scoped GUC must now APPLY on the \
+             extended protocol, not error: {:?}",
+            String::from_utf8_lossy(&out)
         );
         assert!(
-            !command_tags(&out).iter().any(|t| t == "SET"),
-            "{sql}: no SET tag may be emitted"
+            command_tags(&out).iter().any(|t| t == "SET"),
+            "{sql}: the extended path delegates to the simple arm for the SET tag; got {:?}",
+            command_tags(&out)
         );
     }
 
@@ -10571,6 +10585,10 @@ async fn gh28_c2_extended_set_of_a_registry_guc_never_crosses_sessions() {
     assert!(
         !db.storage.is_bulk_load_mode(),
         "SET bulk_load_mode over the extended protocol flipped the engine-wide bulk flag"
+    );
+    assert!(
+        !db.bulk_load_mode(),
+        "SET bulk_load_mode on connection A reached the session-less embedded backend"
     );
 
     // Connection B is not impacted: its statement runs and returns rows.
@@ -10584,6 +10602,21 @@ async fn gh28_c2_extended_set_of_a_registry_guc_never_crosses_sessions() {
         String::from_utf8_lossy(&out)
     );
     assert_eq!(first_data_row_text(&out).as_deref(), Some("64"));
+
+    // A really did get the value it set — proof the statement was applied
+    // somewhere, not merely acked (the HC4 / f4f5d450e816 failure mode).
+    a.handle_single_query("SHOW statement_timeout").await.unwrap();
+    assert_eq!(
+        first_data_row_text(&drain(&mut a_client).await).as_deref(),
+        Some("1ms"),
+        "connection A's own SET statement_timeout must be visible to A"
+    );
+    b.handle_single_query("SHOW statement_timeout").await.unwrap();
+    assert_eq!(
+        first_data_row_text(&drain(&mut b_client).await).as_deref(),
+        Some("0"),
+        "connection B must still see the server default"
+    );
 
     // Positive control for the narrowing: SHOW still reaches the registry from
     // the params family (a read), and the timeout GUCs still land on A's
@@ -10797,31 +10830,44 @@ fn gh28_c2_set_local_classifies_as_0a000() {
     assert_eq!(super::handler::sqlstate_for_error(&e), "0A000");
 }
 
-/// Embedded / params families (session-less): the narrowed hook still answers
-/// `SHOW` and the three timeout GUCs from the registry, and every other `SET`
-/// keeps failing on the params path exactly as on main — the registry is
-/// never written by it.
+/// Embedded / params families (session-less): the hook answers `SHOW`, the three
+/// timeout GUCs and — sprinter a3077a3f68d8 — every USER-SETTABLE GUC, which is
+/// now session state rather than a process-global registry write. The registry
+/// is still never written by any of it, and an UNREGISTERED name still falls
+/// through to the planner and errors exactly as on main.
 #[test]
 fn gh28_c2_params_family_hook_is_narrowed_to_show_and_timeout_gucs() {
     let db = EmbeddedDatabase::new_in_memory().unwrap();
     assert!(db.session_settings.statement_timeout().is_none());
-    assert!(
-        db.execute_params("SET statement_timeout = 1", &[]).is_err(),
-        "an ordinary registry GUC must keep erroring on the params path"
-    );
-    assert!(db.execute_params("SET bulk_load_mode = 'on'", &[]).is_err());
+    // sprinter a3077a3f68d8: these now APPLY on the params path (every
+    // extended-protocol driver reaches it for every statement it sends). GH#28
+    // had to refuse them only because the one place they could land was shared.
+    db.execute_params("SET statement_timeout = 1", &[])
+        .expect("a session-scoped GUC must apply on the params path");
+    db.execute_params("SET bulk_load_mode = 'on'", &[]).unwrap();
+    assert!(db.bulk_load_mode(), "the handle's own backend took the value");
+    // ...and the ONE process-global registry / engine flag still never sees them.
     assert!(db.session_settings.statement_timeout().is_none());
     assert!(!db.storage.is_bulk_load_mode());
+    db.execute_params("RESET statement_timeout", &[]).unwrap();
+    db.execute_params("RESET bulk_load_mode", &[]).unwrap();
+    assert!(!db.bulk_load_mode());
+    // A name this server does not declare keeps failing on the params path.
+    assert!(
+        db.execute_params("SET helios_no_such_guc = 1", &[]).is_err(),
+        "an unregistered name must keep erroring on the params path"
+    );
     // Still answered: SHOW (a read) and the three timeout GUCs.
     assert_eq!(db.query_params("SHOW statement_timeout", &[]).unwrap().len(), 1);
     db.execute_params("SET idle_session_timeout = '30s'", &[]).unwrap();
     assert!(db.execute_params("SET authentication_timeout = 0", &[]).is_err());
     db.execute_params("RESET idle_session_timeout", &[]).unwrap();
-    // The text family is untouched by the narrowing.
+    // The text family lands in the same session-scoped place, never the registry.
     db.execute("SET statement_timeout = 5000").unwrap();
+    assert!(db.session_settings.statement_timeout().is_none());
     assert_eq!(
-        db.session_settings.statement_timeout(),
-        Some(std::time::Duration::from_millis(5000))
+        db.query_params("SHOW statement_timeout", &[]).unwrap()[0].values[0],
+        crate::Value::String("5s".to_string())
     );
 }
 // ---- GH#29 (candidate 1) ----

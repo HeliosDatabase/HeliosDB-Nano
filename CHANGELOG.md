@@ -5,6 +5,140 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.39.0] - 2026-09-18
+
+Eleven backlog items plus one defect found while gating them. Five close silent
+data-corruption or cross-connection-leak paths; two of those were introduced or
+widened by earlier releases, and this notes which.
+
+### Fixed — storage and index integrity
+
+- **A NULL primary key of any declared type was overwritten with an integer row id.**
+  The SERIAL/IDENTITY auto-fill gated on `col.primary_key` alone, so a `TEXT` (or UUID)
+  primary key receiving NULL got an `Int8`. The row then disagreed with its own schema and
+  became **unfindable by point lookup while a full scan still returned it**, because the ART
+  index encodes the key at the integer's width. Now gated on the column's declared type;
+  a NULL into a non-integer primary key raises **23502**. Seven fill sites, not the five
+  originally identified — the params family has a second staged-INSERT arm and a RETURNING
+  mirror. Note this reproduces only via a table-level `PRIMARY KEY (c)`: the inline spelling
+  sets `not_null` and was already caught. (sprinter f32ba64c00a7)
+- **`begin_transaction().rollback()` never replayed the ART undo log**, so a rolled-back
+  PK-moving UPDATE left the index permanently disagreeing with committed data — every point
+  lookup, FK probe and index-driven plan missed a row a full scan found. The RAII handle now
+  owns a per-transaction undo slot, replayed on rollback and dropped on commit. The session
+  transaction path was verified already correct; the two now agree. (sprinter 8a9b60eeef87)
+- **Concurrent autocommit statements shared ONE process-global ART undo log.** A refused
+  statement's rollback drained and replayed the *whole* log — including a committed
+  statement's entry — stripping that row's key out of a UNIQUE tree and letting a duplicate
+  land. The mirror case discarded an in-flight statement's entries on someone else's commit,
+  leaving phantom keys. All four session-less wrappers now claim their own slot; only the
+  global `BEGIN` transaction, which genuinely owns it, still uses the shared log. Found by a
+  regression test in this release, not reported. (sprinter beefd0d3d069)
+- **Uniqueness pre-check and index insert are now atomic.** The check took a read lock and
+  released it before the row was written, so two concurrent INSERTs could both pass and both
+  store — a real duplicate, with the loser's index entry merely refused afterwards. The
+  enforcing tree is now the arbiter: entries are claimed before the row is written and given
+  back if it fails. Covers all four storage funnels, both `lib.rs` Insert arms and the COPY /
+  multi-row batch. Net faster — the separate pre-check is gone, and the write lock that
+  already ran now simply runs earlier. (sprinter 5a78b8288153)
+
+### Fixed — DDL constraint integrity
+
+- **`ALTER TABLE … ADD COLUMN … UNIQUE / PRIMARY KEY / CHECK` silently discarded the
+  constraint.** The column appeared, the constraint did not, and no error was raised. UNIQUE
+  was worse than unenforced — it was *restart-dependent*, since the reopen path mints an index
+  from the column flag, so the same statement was unenforced before a restart and enforced
+  after it on the same data. Now desugared with validate-all-first atomicity.
+  `ADD CONSTRAINT … CHECK`, which previously hard-errored as unsupported, is wired in the same
+  pass. (sprinter 885ffe24eab6)
+- **`RENAME COLUMN` / `DROP COLUMN` never updated constraint records.** A table-level UNIQUE
+  stopped being enforced — and not only after a restart, as filed: index entries resolve by
+  exact column name on every probe, so the rename un-enforced it in the same process. Orphaned
+  CHECK and FK records were worse still, turning into hard write blocks on the whole table.
+  Column DDL now rewrites every constraint record naming the column — UNIQUE, PRIMARY KEY,
+  FOREIGN KEY on both sides, and CHECK bodies — or refuses where rewriting is genuinely
+  ambiguous. Four duplicated executor arms were collapsed into one body each so this cannot be
+  half-fixed again. **No reopen-time repair and no write block was added**: a database already
+  carrying an orphan opens exactly as before. (sprinter 0f258ed23d13)
+
+### Fixed — session isolation
+
+- **`SET` wrote a process-global registry.** `SET statement_timeout = 1` from any connection
+  cancelled *every other connection's* queries; `SET bulk_load_mode = on` flipped a storage
+  flag for everyone. User-settable GUCs now live on the session, with a documented rule for
+  what stays server-level: a parameter is server-level only if process-wide machinery consumes
+  it on behalf of sessions other than the one that set it. Reading the statement timeout is now
+  one relaxed atomic instead of a string allocation and a lock. (sprinter a3077a3f68d8)
+- **`currval()` was process-scoped.** Connection A's `nextval` set connection B's `currval`, so
+  a client recovering the id it just inserted could be handed another tenant's. It is now
+  session-scoped alongside `lastval()`, which shipped correctly in v4.38.0 — the two no longer
+  disagree about what "this session" means. (sprinter 7903b7111cb4)
+
+### Fixed — driver compatibility
+
+- **The extended protocol advertised parameter OID 0 for every inferred parameter**, sending
+  tokio-postgres, sqlx and Prisma into an unbounded TYPEINFO recursion and a client stack
+  overflow. Parameter types are now inferred from the plan (a comparison or assignment against a
+  typed column yields that column's OID, including 26 for catalog oid columns), and `705`
+  (`unknown`) is advertised where PostgreSQL itself would decline rather than guessing — a wrong
+  OID makes the client encode in the wrong wire format. **Eight tests that had been `#[ignore]`d
+  because of this now run and pass.** (sprinter 6ac716be10ea)
+- `nextval`, `currval` and `setval` now declare `bigint`. Only `lastval` was given a declared
+  type in v4.38.0, so the extended protocol described the other three as `text` and a
+  binary-format client failed with 22P03 on a correct answer.
+
+### Fixed — statement atomicity on the MySQL wire
+
+- **A statement failing part-way inside a MySQL transaction left its earlier rows staged**, and
+  because that listener keeps MySQL's statement-level semantics (a failed statement does not
+  abort the block), those rows were committed by the following `COMMIT`. An implicit
+  per-statement savepoint now rolls back exactly that statement. Applied at the listener only:
+  the PostgreSQL and embedded paths already fail closed, and hooking it deeper would tax the
+  `BEGIN; N × INSERT; COMMIT` path. 222 lines of dead upsert code, hidden by a crate-level
+  `allow(dead_code)`, were removed. (sprinter 5b70b7ac5513)
+
+### Changed — behaviour
+
+Statements that previously succeeded, or failed differently, now behave as PostgreSQL does.
+
+- A NULL into a non-integer PRIMARY KEY raises **23502** instead of storing an integer.
+- `currval()` on a sequence this session never advanced raises **55000** instead of returning
+  `0`. Nothing in the corpus relied on the `0`; this was audited before the change.
+- `ADD COLUMN … PRIMARY KEY` is refused on a table that already has one (**42P16**) or that
+  holds rows. A second primary-key flag would make the reopen path derive a *composite* key —
+  a different table than the one shut down.
+- `DROP COLUMN` refuses when another table's foreign key depends on the column, unless
+  `CASCADE`.
+- A tenant quota refusal reaches clients as **53400** `configuration_limit_exceeded` (MySQL
+  **1226**) instead of **XX000** `internal_error`. Connection poolers read XX000 as a broken
+  backend and evict a healthy connection over it. This also covers storage-quota refusals.
+- `SET statement_timeout` / `work_mem` / `bulk_load_mode` and the planner switches now affect
+  only the connection that issued them.
+- Under a genuine write race, an `INSERT … ON CONFLICT DO NOTHING` whose row passes the
+  interception probe but is then refused by the index claim now raises rather than skipping.
+  Fail-closed and strictly better than storing the duplicate, but it is not PostgreSQL's retry
+  semantics.
+
+### Known follow-ups (filed)
+
+- **`d03de7fc3b22` — tenant `max_qps` remains unenforced for the params/extended-protocol
+  family.** The metering expansion was written, ran, and was deliberately **removed before
+  release**: `TenantManager::current_context` is one process-global slot that no wire handler
+  ever sets, so metering every family would charge a connection's statements to whichever
+  tenant another connection last selected, and would break embedded callers that do set a
+  context (the default plan is 10 QPS). That is enforcement that is wrong rather than absent.
+  The prerequisite is a `SessionId -> TenantId` binding, which does not exist. Only the SQLSTATE
+  classification above shipped. Pinned by tripwire tests that fail if metering is re-enabled.
+- `671743292162` — the vector type OID still cannot leave TEXT on the wire. Fixing parameter
+  OIDs removed the recursion, but a second blocker survives it: the driver's TYPEINFO query must
+  now *succeed*, and it reads `typtype`/`typelem` as `char`/`oid` while Nano declares those
+  catalogue columns `Text`/`Int4`. The prerequisite is a `DataType` change, not a wire change.
+  A test asserts the blocker still stands and fails when it lifts.
+- `max_connections` is entirely unenforced — its quota check has no production caller at all —
+  and `max_storage_bytes` has the same one-family gap `max_qps` has.
+- The in-repo trigger body is never executed (`create_trigger_to_plan` builds an empty body), so
+  `CREATE TRIGGER` succeeds and fires machinery that has nothing to run.
+
 ## [4.38.0] - 2026-09-18
 
 Seventeen backlog items in one release, spanning storage/DML correctness, executor

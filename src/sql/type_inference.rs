@@ -162,6 +162,16 @@ impl TypeInference for LogicalExpr {
                     // answer. PostgreSQL's own return types: `lastval()` bigint,
                     // `pg_backend_pid()` integer.
                     "lastval" | "pg_catalog.lastval" => Ok(DataType::Int8),
+                    // sprinter 7903b7111cb4: the same reasoning covers the other
+                    // three sequence scalars, which were left undeclared when
+                    // `lastval` was added. PostgreSQL returns bigint from all of
+                    // `nextval`, `currval` and `setval`, and leaving them out
+                    // meant the extended protocol advertised `text` (OID 25)
+                    // while the value arrived as an INT8 — a binary-format client
+                    // then failed with 22P03 on a correct answer.
+                    "nextval" | "pg_catalog.nextval" => Ok(DataType::Int8),
+                    "currval" | "pg_catalog.currval" => Ok(DataType::Int8),
+                    "setval" | "pg_catalog.setval" => Ok(DataType::Int8),
                     "pg_backend_pid" | "pg_catalog.pg_backend_pid" => Ok(DataType::Int4),
                     "now" | "current_timestamp" => Ok(DataType::Timestamp),
                     "current_date" => Ok(DataType::Date),
